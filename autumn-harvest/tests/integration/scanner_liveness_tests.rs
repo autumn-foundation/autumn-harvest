@@ -29,7 +29,9 @@ use autumn_harvest::types::ShardId;
 
 #[test]
 fn scanner_label_values_match_the_issue_bounded_set() {
-    // The issue names exactly these seven values. A new variant without a
+    // The issue named exactly seven values; issue #1269 added an eighth
+    // (`audit_export`) for the task it split out of the timeout loop. Issue
+    // #1839 adds a ninth (`rebalance_resume`). A new variant without a
     // deliberate decision here turns this red.
     let names: Vec<&str> = Scanner::ALL.iter().map(|s| s.as_str()).collect();
     assert_eq!(
@@ -42,9 +44,11 @@ fn scanner_label_values_match_the_issue_bounded_set() {
             "retention",
             "schedule",
             "pause_auto_resume",
+            "audit_export",
+            "rebalance_resume",
         ],
         "harvest.scanner.tick `scanner` label must carry exactly the bounded \
-         value set from issue #797"
+         value set from issue #797, plus the additions of issues #1269 and #1839"
     );
 }
 
@@ -1068,6 +1072,8 @@ fn every_spawned_loop_registers_ticks_and_deregisters() {
         ("retention.rs", &["Retention"][..]),
         ("scheduler.rs", &["Schedule"][..]),
         ("worker.rs", &["PauseAutoResume"][..]),
+        ("audit_export.rs", &["AuditExport"][..]),
+        ("rebalance_resume.rs", &["RebalanceResume"][..]),
     ];
 
     // Every `Scanner` variant must be owned by exactly one file, so a newly

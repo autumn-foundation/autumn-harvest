@@ -34,7 +34,6 @@
 
 use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -45,10 +44,6 @@ use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use tower::ServiceExt;
 
 type HarvestApiApp = axum::Router;
-
-fn test_app_state() -> AppState {
-    AppState::for_test().with_profile("test")
-}
 
 fn build_pool(database_url: &str) -> autumn_harvest::worker::DbPool {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
@@ -62,7 +57,7 @@ fn build_app(database_url: &str) -> HarvestApiApp {
     let pool = build_pool(database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool));
-    harvest_api_router(api_state).with_state(test_app_state())
+    harvest_api_router(api_state)
 }
 
 #[derive(diesel::QueryableByName, Debug)]

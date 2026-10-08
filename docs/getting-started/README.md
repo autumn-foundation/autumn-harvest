@@ -39,21 +39,39 @@ Stop at any chapter — each one ends in a runnable state.
 12. [Inbound webhooks](12-webhooks.md) — `#[webhook]`, `[security.webhooks]` verification, idempotent dispatch.
 13. [Broker connectors](13-broker-connectors.md) — Kafka and SQS topics/queues as workflow triggers: idempotent redelivery, ack ordering, poison isolation, backpressure.
 
+> **Not on autumn-web?** Every chapter above mounts `HarvestPlugin` on an
+> autumn-web app. If your service runs on plain Axum, take the fork:
+> [The first workflow on plain Axum](standalone-axum.md) runs the Chapter 2
+> workflow with `HarvestEmbedding`. Then continue at Chapter 3. The fork lists
+> the chapters that differ.
+
 Start with [Chapter 1 →](01-project-skeleton.md)
 
 ## Where to go next
 
-- **Upgrading.** [`upgrading/0.6.0.md`](../upgrading/0.6.0.md) is the current
-  0.5.0 → 0.6.0 upgrade guide — the `autumn-web` 0.7 bump and the move to
-  Autumn-owned plugin migrations. [`upgrading/0.5.0.md`](../upgrading/0.5.0.md)
-  covers the previous 0.4.0 → 0.5.0 hop.
+- **Activities reference.** [`activities.md`](activities.md) covers
+  heartbeating, cooperative cancellation, and activity interceptors — beyond
+  what Chapter 2 introduces.
+- **Streaming progress.** [`streaming-progress.md`](../streaming-progress.md)
+  — `ctx.publish_progress` for an ephemeral, best-effort live-output side
+  channel (an AI agent streaming tokens, a long import's per-item progress)
+  without standing up an external message bus.
+- **Disaster recovery.** [`cross-region-dr.md`](../cross-region-dr.md) — per-shard
+  cross-region replication, a fencing mechanism, a measured RPO, and the
+  operator-initiated failover runbook.
+- **Upgrading.** [`upgrading/0.7.0.md`](../upgrading/0.7.0.md) is the current
+  0.6.0 → 0.7.0 upgrade guide — the `autumn-web` 0.8 bump, fail-closed
+  mutations and the new runtime defaults. [`upgrading/0.6.0.md`](../upgrading/0.6.0.md)
+  covers the previous 0.5.0 → 0.6.0 hop: the `autumn-web` 0.7 bump and the move
+  to Autumn-owned plugin migrations.
 - **Reference example.** [`examples/billing-autumn-web/`](../../examples/billing-autumn-web/)
   is a full subscription-checkout integration: outbox → workflow start, saga
   compensation, child workflow, version gate, signal handoff, and a scheduled
   reconciliation DAG.
-- **Standalone runner.** [`examples/standalone-runner/`](../../examples/standalone-runner/)
-  shows the engine without `HarvestPlugin` — useful when embedding in a
-  non-Autumn service.
+- **Embedding on plain Axum.** [`embedding.md`](../embedding.md) is the
+  reference for the path without `HarvestPlugin`: auth, metrics, webhooks,
+  shutdown, and multi-shard. [`examples/standalone-runner/`](../../examples/standalone-runner/)
+  is a larger example of that path. Its `Cargo.toml` names no `autumn-web`.
 - **Embedded SQLite backend.** [`sqlite-backend.md`](../sqlite-backend.md) is a
   task-oriented guide to `autumn-harvest-sqlite`, a single-writer, no-server
   persistence backend for edge / local-first / single-server deployments (its

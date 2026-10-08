@@ -1,0 +1,10 @@
+label=before
+action=bulk-resume
+fixture: 300 matching schedules (workflow_name LIKE 'bulk_perf_target_%'), 200 non-matching noise schedules on the same shard
+request: POST /ui/schedules/bulk-resume target=bulk_perf_target
+acted_on=300
+audit_statement_shapes=1
+total_calls=300
+total_buffers=2590
+request_total_calls=304
+request_total_buffers=6552

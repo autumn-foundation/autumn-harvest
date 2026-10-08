@@ -1,0 +1,34 @@
+-- before: every statement pg_stat_statements recorded for this database during one real GET /admin/schedules request, 500 schedules --
+REQUEST TOTAL: calls=1557 buffers=2218
+aux-lookup shapes' share: calls=1550/1557 (99.6%), buffers=2185/2218 (98.5%)
+
+calls=500 shared_blks_hit=1130 shared_blks_read=0 total_buffers=1130
+query=SELECT COUNT(*) FROM "harvest_workflow_executions" WHERE (("harvest_workflow_executions"."workflow_name" = $1) AND ("harvest_workflow_executions"."state" = ANY($2)))
+
+calls=500 shared_blks_hit=1000 shared_blks_read=0 total_buffers=1000
+query=SELECT COUNT(*) AS n FROM harvest_start_throttle WHERE workflow_name = $1
+
+calls=50 shared_blks_hit=50 shared_blks_read=0 total_buffers=50
+query=SELECT "harvest_calendar_exclusions"."excluded_date" FROM "harvest_calendar_exclusions" WHERE ("harvest_calendar_exclusions"."calendar_name" = $1)
+
+calls=1 shared_blks_hit=15 shared_blks_read=0 total_buffers=15
+query=SELECT "harvest_schedules"."id", "harvest_schedules"."dag_name", "harvest_schedules"."schedule_expr", "harvest_schedules"."timezone", "harvest_schedules"."catchup", "harvest_schedules"."max_active_runs", "harvest_schedules"."is_paused", "harvest_schedules"."last_run_at", "harvest_schedules"."next_run_at", "harvest_schedules"."created_at", "harvest_schedules"."updated_at", "harvest_schedules"."workflow_name", "harvest_schedules"."workflow_input", "harvest_schedules"."queue_name", "harvest_schedules"."paused_at", "harvest_schedules"."paused_by", "harvest_schedules"."pause_reason", "harvest_schedules"."jitter_secs", "harvest_schedules"."overlap_policy", "harvest_schedules"."buffered_runs", "harvest_schedules"."buffer_all_max", "harvest_schedules"."calendar_name", "harvest_schedules"."skip_policy", "harvest_schedules"."fire_claim_token", "harvest_schedules"."fire_claimed_until", "harvest_schedules"."consecutive_failure_limit", "harvest_schedules"."consecutive_failure_count", "harvest_schedules"."auto_paused_at", "harvest_schedules"."end_at", "harvest_schedules"."max_runs", "harvest_schedules"."runs_started", "harvest_schedules"."exhausted_at", "harvest_schedules"."exhausted_reason", "harvest_schedules"."catchup_policy", "harvest_schedules"."catchup_window_secs", "harvest_schedules"."last_catchup_dropped", "harvest_schedules"."last_catchup_at", "harvest_schedules"."retry_policy" FROM "harvest_schedules" ORDER BY "harvest_schedules"."dag_name" ASC
+
+calls=1 shared_blks_hit=12 shared_blks_read=0 total_buffers=12
+query=SELECT "harvest_schedules"."id", "harvest_schedules"."dag_name", "harvest_schedules"."schedule_expr", "harvest_schedules"."timezone", "harvest_schedules"."catchup", "harvest_schedules"."max_active_runs", "harvest_schedules"."is_paused", "harvest_schedules"."last_run_at", "harvest_schedules"."next_run_at", "harvest_schedules"."created_at", "harvest_schedules"."updated_at", "harvest_schedules"."workflow_name", "harvest_schedules"."workflow_input", "harvest_schedules"."queue_name", "harvest_schedules"."paused_at", "harvest_schedules"."paused_by", "harvest_schedules"."pause_reason", "harvest_schedules"."jitter_secs", "harvest_schedules"."overlap_policy", "harvest_schedules"."buffered_runs", "harvest_schedules"."buffer_all_max", "harvest_schedules"."calendar_name", "harvest_schedules"."skip_policy", "harvest_schedules"."fire_claim_token", "harvest_schedules"."fire_claimed_until", "harvest_schedules"."consecutive_failure_limit", "harvest_schedules"."consecutive_failure_count", "harvest_schedules"."auto_paused_at", "harvest_schedules"."end_at", "harvest_schedules"."max_runs", "harvest_schedules"."runs_started", "harvest_schedules"."exhausted_at", "harvest_schedules"."exhausted_reason", "harvest_schedules"."catchup_policy", "harvest_schedules"."catchup_window_secs", "harvest_schedules"."last_catchup_dropped", "harvest_schedules"."last_catchup_at", "harvest_schedules"."retry_policy" FROM "harvest_schedules"
+
+calls=1 shared_blks_hit=6 shared_blks_read=0 total_buffers=6
+query=SELECT "harvest_backfill_log"."id", "harvest_backfill_log"."schedule_id", "harvest_backfill_log"."actor", "harvest_backfill_log"."source", "harvest_backfill_log"."from_ts", "harvest_backfill_log"."to_ts", "harvest_backfill_log"."dry_run", "harvest_backfill_log"."total", "harvest_backfill_log"."dispatched", "harvest_backfill_log"."skipped", "harvest_backfill_log"."failed", "harvest_backfill_log"."status", "harvest_backfill_log"."error_summary", "harvest_backfill_log"."started_at", "harvest_backfill_log"."completed_at" FROM "harvest_backfill_log" WHERE ("harvest_backfill_log"."schedule_id" = ANY($1)) ORDER BY "harvest_backfill_log"."schedule_id", "harvest_backfill_log"."started_at" DESC
+
+calls=500 shared_blks_hit=5 shared_blks_read=0 total_buffers=5
+query=SELECT to_regclass($1) IS NOT NULL AS present
+
+calls=1 shared_blks_hit=0 shared_blks_read=0 total_buffers=0
+query=SET CLIENT_ENCODING TO 'UTF8'
+
+calls=2 shared_blks_hit=0 shared_blks_read=0 total_buffers=0
+query=SELECT $1
+
+calls=1 shared_blks_hit=0 shared_blks_read=0 total_buffers=0
+query=SET TIME ZONE 'UTC'
+

@@ -156,13 +156,18 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
         } else if meta.path.is_ident("rate_limit_key") {
             let value: LitStr = meta.value()?.parse()?;
             let key = value.value();
-            // The `dyn-rate:` prefix is reserved for per-key/dynamic rate-limit
-            // buckets (issue #699); a static key beginning with it could collide
-            // with a generated dynamic bucket, so reject it at compile time.
-            if key.starts_with("dyn-rate:") {
+            // The `dyn-rate:` (issue #699) and `start-throttle:` (issue #607)
+            // prefixes namespace the caller-keyed bucket families; a static key
+            // beginning with either could collide with a generated bucket, and
+            // since issue #1127 would additionally be collectable by the
+            // idle-bucket GC with nothing to re-register it before the next
+            // worker startup. Reject at compile time. Mirrors
+            // `autumn_harvest::builder::RESERVED_RATE_LIMIT_KEY_PREFIXES`.
+            if key.starts_with("dyn-rate:") || key.starts_with("start-throttle:") {
                 return Err(meta.error(
-                    "`rate_limit_key` must not begin with the reserved `dyn-rate:` prefix \
-                     (reserved for per-key/dynamic rate-limit buckets)",
+                    "`rate_limit_key` must not begin with the reserved `dyn-rate:` or \
+                     `start-throttle:` prefix (reserved for caller-keyed rate-limit and \
+                     workflow-start-throttle buckets)",
                 ));
             }
             result.rate_limit_key = Some(key);
@@ -459,17 +464,7 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     let params: Vec<_> = input_fn.sig.inputs.iter().skip(1).collect();
-    let param_names: Vec<_> = params
-        .iter()
-        .filter_map(|arg| {
-            if let syn::FnArg::Typed(pat) = arg
-                && let syn::Pat::Ident(ident) = pat.pat.as_ref()
-            {
-                return Some(&ident.ident);
-            }
-            None
-        })
-        .collect();
+    let param_names: Vec<_> = crate::attr_util::param_idents(&params);
 
     // Encode the activity's error.
     //
@@ -492,44 +487,14 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             |e| e.to_string()
         }
     };
-    let dispatch = if param_names.is_empty() {
-        quote! {
-            let result = #fn_name(ctx).await;
-            result.map_err(#encode_err)
-                .and_then(|v| {
-                    ::autumn_harvest::serde_json::to_value(v)
-                        .map_err(|e| e.to_string())
-                })
-        }
-    } else if param_names.len() == 1 {
-        let name = &param_names[0];
-        quote! {
-            let #name = ::autumn_harvest::serde_json::from_value(input)
-                .map_err(|e| e.to_string())?;
-            let result = #fn_name(ctx, #name).await;
-            result.map_err(#encode_err)
-                .and_then(|v| {
-                    ::autumn_harvest::serde_json::to_value(v)
-                        .map_err(|e| e.to_string())
-                })
-        }
-    } else {
-        let indices = (0..param_names.len()).map(syn::Index::from);
-        let names = param_names.clone();
-        quote! {
-            let args: ::autumn_harvest::serde_json::Value = input;
-            #(
-                let #names = ::autumn_harvest::serde_json::from_value(args[#indices].clone())
-                    .map_err(|e| e.to_string())?;
-            )*
-            let result = #fn_name(ctx, #(#names),*).await;
-            result.map_err(#encode_err)
-                .and_then(|v| {
-                    ::autumn_harvest::serde_json::to_value(v)
-                        .map_err(|e| e.to_string())
-                })
-        }
-    };
+    let dispatch = crate::attr_util::build_handler_dispatch(
+        fn_name,
+        &param_names,
+        &format_ident!("input"),
+        &quote! { ctx },
+        &quote! { .await },
+        &encode_err,
+    );
 
     let is_local = attrs.local;
 
@@ -621,5 +586,111 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         pub fn #public_info_name() -> ::autumn_harvest::ActivityInfo {
             #companion_name()
         }
+    }
+}
+
+// ── Dispatch-block characterization tests (issue #1632) ─────────────────────
+//
+// `activity_macro` builds its dispatch block with
+// `attr_util::build_handler_dispatch`. These tests pin the generated block for
+// 0, 1, and many non-`ctx` params. They cover a plain return type and an
+// `ActivityFailure` return type.
+#[cfg(test)]
+mod dispatch_characterization_tests {
+    use super::activity_macro;
+    use quote::quote;
+
+    /// Isolate the `async move { ... }` dispatch body from `#companion_name`'s
+    /// `handler` closure. Brace-depth walk, mirroring `query.rs`'s
+    /// `extract_impl_body`.
+    fn extract_dispatch_body(full: &str) -> String {
+        let marker = "Box :: pin (async move {";
+        let start = full
+            .find(marker)
+            .unwrap_or_else(|| panic!("no dispatch marker in generated output:\n{full}"))
+            + marker.len();
+        let mut depth = 1i32;
+        let bytes = full.as_bytes();
+        let mut i = start;
+        while i < bytes.len() && depth > 0 {
+            match bytes[i] as char {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        full[start..i - 1].trim().to_string()
+    }
+
+    fn generate(item: proc_macro2::TokenStream) -> String {
+        activity_macro(quote! {}, item).to_string()
+    }
+
+    const ACTIVITY_DISPATCH_0_LEGACY: &str = "let result = my_activity (ctx) . await ; result . map_err (| e | e . to_string ()) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+    const ACTIVITY_DISPATCH_0_TYPED: &str = "let result = my_activity (ctx) . await ; result . map_err (| e | :: autumn_harvest :: failure :: IntoActivityErrorString :: into_error_payload (e)) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+    const ACTIVITY_DISPATCH_1_LEGACY: &str = "let n = :: autumn_harvest :: serde_json :: from_value (input) . map_err (| e | e . to_string ()) ? ; let result = my_activity (ctx , n) . await ; result . map_err (| e | e . to_string ()) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+    const ACTIVITY_DISPATCH_1_TYPED: &str = "let n = :: autumn_harvest :: serde_json :: from_value (input) . map_err (| e | e . to_string ()) ? ; let result = my_activity (ctx , n) . await ; result . map_err (| e | :: autumn_harvest :: failure :: IntoActivityErrorString :: into_error_payload (e)) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+    const ACTIVITY_DISPATCH_N_LEGACY: &str = "let __args : :: autumn_harvest :: serde_json :: Value = input ; let a = :: autumn_harvest :: serde_json :: from_value (__args [0] . clone ()) . map_err (| e | e . to_string ()) ? ; let b = :: autumn_harvest :: serde_json :: from_value (__args [1] . clone ()) . map_err (| e | e . to_string ()) ? ; let result = my_activity (ctx , a , b) . await ; result . map_err (| e | e . to_string ()) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+    const ACTIVITY_DISPATCH_N_TYPED: &str = "let __args : :: autumn_harvest :: serde_json :: Value = input ; let a = :: autumn_harvest :: serde_json :: from_value (__args [0] . clone ()) . map_err (| e | e . to_string ()) ? ; let b = :: autumn_harvest :: serde_json :: from_value (__args [1] . clone ()) . map_err (| e | e . to_string ()) ? ; let result = my_activity (ctx , a , b) . await ; result . map_err (| e | :: autumn_harvest :: failure :: IntoActivityErrorString :: into_error_payload (e)) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+
+    #[test]
+    fn zero_params_legacy_error_dispatch_is_pinned() {
+        let out = generate(quote! {
+            async fn my_activity(ctx: &ActivityContext) -> Result<u32, String> {
+                Ok(1)
+            }
+        });
+        assert_eq!(extract_dispatch_body(&out), ACTIVITY_DISPATCH_0_LEGACY);
+    }
+
+    #[test]
+    fn zero_params_typed_failure_dispatch_is_pinned() {
+        let out = generate(quote! {
+            async fn my_activity(ctx: &ActivityContext) -> Result<u32, ActivityFailure> {
+                Ok(1)
+            }
+        });
+        assert_eq!(extract_dispatch_body(&out), ACTIVITY_DISPATCH_0_TYPED);
+    }
+
+    #[test]
+    fn one_param_legacy_error_dispatch_is_pinned() {
+        let out = generate(quote! {
+            async fn my_activity(ctx: &ActivityContext, n: u32) -> Result<u32, String> {
+                Ok(n)
+            }
+        });
+        assert_eq!(extract_dispatch_body(&out), ACTIVITY_DISPATCH_1_LEGACY);
+    }
+
+    #[test]
+    fn one_param_typed_failure_dispatch_is_pinned() {
+        let out = generate(quote! {
+            async fn my_activity(ctx: &ActivityContext, n: u32) -> Result<u32, ActivityFailure> {
+                Ok(n)
+            }
+        });
+        assert_eq!(extract_dispatch_body(&out), ACTIVITY_DISPATCH_1_TYPED);
+    }
+
+    #[test]
+    fn multi_param_legacy_error_dispatch_is_pinned() {
+        let out = generate(quote! {
+            async fn my_activity(ctx: &ActivityContext, a: u32, b: u32) -> Result<u32, String> {
+                Ok(a + b)
+            }
+        });
+        assert_eq!(extract_dispatch_body(&out), ACTIVITY_DISPATCH_N_LEGACY);
+    }
+
+    #[test]
+    fn multi_param_typed_failure_dispatch_is_pinned() {
+        let out = generate(quote! {
+            async fn my_activity(ctx: &ActivityContext, a: u32, b: u32) -> Result<u32, ActivityFailure> {
+                Ok(a + b)
+            }
+        });
+        assert_eq!(extract_dispatch_body(&out), ACTIVITY_DISPATCH_N_TYPED);
     }
 }

@@ -28,6 +28,9 @@ use std::collections::BTreeMap;
 use std::hash::Hasher;
 
 #[cfg(feature = "db")]
+use diesel_async::AsyncPgConnection;
+
+#[cfg(feature = "db")]
 use crate::types::ExternalTarget;
 use crate::types::{ExecutionId, ShardId};
 #[cfg(feature = "db")]
@@ -244,6 +247,20 @@ pub struct ShardRouter {
     ///
     /// Empty by default. Populated via [`ShardRouter::with_residency_map`].
     residency_map: BTreeMap<String, ShardId>,
+    /// Operator-declared retired shard → successor mapping (issue #964).
+    ///
+    /// Empty by default. Populated via [`ShardRouter::with_shard_forwards`]
+    /// once a shard's residents have all been rebalanced off it and the shard
+    /// itself has been removed from `readable_shards`. Without it, an
+    /// `ExecutionId` minted on the retired shard would fall back to the default
+    /// shard and silently resolve to the wrong run — the one failure mode a
+    /// decommission must never produce.
+    shard_forwards: BTreeMap<ShardId, ShardId>,
+    /// Shards reserved for pinned work, one per tenant cell (issue #1837).
+    ///
+    /// Sorted and free of duplicates. Empty by default. Populated via
+    /// [`ShardRouter::with_reserved_shards`].
+    reserved_shards: Vec<ShardId>,
 }
 
 /// Every placement-affecting field of a [`ShardRouter`], borrowed together.
@@ -261,6 +278,10 @@ pub struct ShardRouterParts<'a> {
     pub default_shard: ShardId,
     /// The declared residency key → shard mapping (issue #697).
     pub residency_map: &'a BTreeMap<String, ShardId>,
+    /// The declared retired-shard → successor mapping (issue #964).
+    pub shard_forwards: &'a BTreeMap<ShardId, ShardId>,
+    /// The shards reserved for pinned work (issue #1837).
+    pub reserved_shards: &'a [ShardId],
 }
 
 impl ShardRouter {
@@ -294,6 +315,8 @@ impl ShardRouter {
             writable_shards,
             default_shard,
             residency_map: BTreeMap::new(),
+            shard_forwards: BTreeMap::new(),
+            reserved_shards: Vec::new(),
         }
     }
 
@@ -397,6 +420,184 @@ impl ShardRouter {
         &self.residency_map
     }
 
+    /// Declare where ids minted on a **retired** shard now resolve (issue #964).
+    ///
+    /// Shard rebalancing seals a migrated execution's source row with a
+    /// forwarding pointer, which is enough for as long as the source shard is
+    /// still readable. A fully *decommissioned* shard is not, and its
+    /// `ExecutionId`s would otherwise fall through
+    /// [`ShardRouter::shard_for_execution`]'s unknown-shard branch to the
+    /// default shard — resolving to the wrong database, silently. This map is
+    /// the decommission story: once every resident has been migrated off shard
+    /// A to shard B and A has been removed from `readable_shards`, declare
+    /// `A → B` and every id minted on A keeps resolving.
+    ///
+    /// ```rust
+    /// # use autumn_harvest::shard::ShardRouter;
+    /// # use autumn_harvest::types::ShardId;
+    /// let router = ShardRouter::new(
+    ///     vec![ShardId::new(1)],
+    ///     vec![ShardId::new(1)],
+    ///     ShardId::new(1),
+    /// )
+    /// .with_shard_forwards([(ShardId::new(0), ShardId::new(1))]);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Like [`ShardRouter::with_residency_map`], a misconfigured map fails at
+    /// boot rather than at the first misrouted lookup. Panics when a source
+    /// shard forwards to itself, when a source shard is still in
+    /// `readable_shards` (forwarding a *live* shard would shadow its own rows),
+    /// when a target is not readable, or when one source is declared twice with
+    /// conflicting targets.
+    ///
+    /// Chains and cycles need no separate rule: a forward's source must be
+    /// outside `readable_shards` and its target inside it, so no shard can be
+    /// both, and resolution is therefore a single hop by construction.
+    #[must_use]
+    pub fn with_shard_forwards(
+        mut self,
+        entries: impl IntoIterator<Item = (ShardId, ShardId)>,
+    ) -> Self {
+        let mut map: BTreeMap<ShardId, ShardId> = BTreeMap::new();
+        for (from, to) in entries {
+            if let Some(existing) = map.insert(from, to) {
+                assert_eq!(
+                    existing, to,
+                    "shard {from} is forwarded more than once with conflicting targets \
+                     {existing} and {to}; which one survives would depend on iteration order"
+                );
+            }
+        }
+        for (from, to) in &map {
+            assert_ne!(from, to, "shard {from} cannot be forwarded to itself");
+            assert!(
+                !self.readable_shards.contains(from),
+                "shard {from} is forwarded to {to} but is still in the readable set; \
+                 remove it from `readable_shards` first, or drop the forward"
+            );
+            assert!(
+                self.readable_shards.contains(to),
+                "shard {from} is forwarded to {to}, which is not in the readable set"
+            );
+            // A chain needs no separate check: the two assertions above already
+            // make one impossible. A forward's SOURCE must be outside
+            // `readable_shards` and its TARGET must be inside it, so no shard
+            // can be both, and `shard_for_execution`'s single hop is therefore
+            // exhaustive by construction rather than by a hop counter.
+        }
+        self.shard_forwards = map;
+        self
+    }
+
+    /// The declared retired-shard → successor mapping (issue #964).
+    ///
+    /// Empty unless [`ShardRouter::with_shard_forwards`] was used.
+    #[must_use]
+    pub const fn shard_forwards(&self) -> &BTreeMap<ShardId, ShardId> {
+        &self.shard_forwards
+    }
+
+    /// Reserve shards for pinned work only (issue #1837).
+    ///
+    /// A reserved shard is a tenant cell. Unpinned placement never picks it:
+    /// [`ShardPlacement::Auto`], idempotency-key routing, DAG pinning and
+    /// `ChildPlacement::Distributed` all skip it. A pin still reaches it,
+    /// through [`ShardPlacement::Shard`] or a residency key from
+    /// [`ShardRouter::with_residency_map`]. The shard stays readable and
+    /// writable.
+    ///
+    /// Only keys that hashed to a reserved shard move. They re-hash among
+    /// the other writable shards, which is the same redirect a drained shard
+    /// gets. All other keys keep their shard.
+    ///
+    /// Reserve a shard before it takes unpinned traffic. A business key that
+    /// already lives on it hashes elsewhere after the reservation, like a key
+    /// on a drained shard. See `docs/adr/0004-tenant-isolation-cells.md`.
+    ///
+    /// Calling this twice replaces the previous set.
+    ///
+    /// ```rust
+    /// # use autumn_harvest::shard::ShardRouter;
+    /// # use autumn_harvest::types::ShardId;
+    /// let all = vec![ShardId::new(0), ShardId::new(1)];
+    /// let router = ShardRouter::new(all.clone(), all, ShardId::new(0))
+    ///     .with_residency_map([("cell-a".to_string(), ShardId::new(1))])
+    ///     .with_reserved_shards([ShardId::new(1)]);
+    /// assert_eq!(router.pick_for_new_workflow("wf", "any"), ShardId::new(0));
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if a reserved shard is not in `readable_shards`. Panics if the
+    /// default shard is reserved: workflow schedules and unencoded ids resolve
+    /// to it without a pin. Panics if the reservation leaves no writable
+    /// shard for unpinned starts, or no readable one. All fail at boot, like
+    /// the other router builders.
+    #[must_use]
+    pub fn with_reserved_shards(mut self, shards: impl IntoIterator<Item = ShardId>) -> Self {
+        let mut reserved: Vec<ShardId> = shards.into_iter().collect();
+        reserved.sort_unstable();
+        reserved.dedup();
+        for shard in &reserved {
+            assert!(
+                self.readable_shards.contains(shard),
+                "reserved shard {shard} is not in the readable set"
+            );
+            assert_ne!(
+                *shard, self.default_shard,
+                "reserved shard {shard} is the default shard; unpinned schedules and \
+                 unencoded ids land there, so keep the default shard shared"
+            );
+        }
+        let shared_writable = self
+            .writable_shards
+            .iter()
+            .any(|shard| !reserved.contains(shard));
+        assert!(
+            shared_writable || self.writable_shards.is_empty(),
+            "reserving {reserved:?} leaves no writable shard for unpinned starts; \
+             keep at least one writable shard unreserved"
+        );
+        // A fully drained router places DAGs over the readable set, so one
+        // readable shard must also stay unreserved.
+        let shared_readable = self
+            .readable_shards
+            .iter()
+            .any(|shard| !reserved.contains(shard));
+        assert!(
+            shared_readable,
+            "reserving {reserved:?} leaves no readable shard for unpinned work; \
+             keep at least one readable shard unreserved"
+        );
+        self.reserved_shards = reserved;
+        self
+    }
+
+    /// The shards reserved for pinned work (issue #1837).
+    ///
+    /// Sorted. Empty unless [`ShardRouter::with_reserved_shards`] was used.
+    #[must_use]
+    pub fn reserved_shards(&self) -> &[ShardId] {
+        &self.reserved_shards
+    }
+
+    /// Is `shard` reserved for pinned work (issue #1837)?
+    #[must_use]
+    pub fn is_reserved(&self, shard: ShardId) -> bool {
+        self.reserved_shards.binary_search(&shard).is_ok()
+    }
+
+    /// Can unpinned placement pick `shard` (issue #1837)?
+    ///
+    /// True when the shard is writable and not reserved. A pin may still
+    /// target a shard for which this is false, if the shard is writable.
+    #[must_use]
+    pub fn accepts_unpinned(&self, shard: ShardId) -> bool {
+        self.is_writable(shard) && !self.is_reserved(shard)
+    }
+
     /// Borrow every placement-affecting field at once, for exhaustive
     /// destructuring by a projection that must not silently miss one.
     ///
@@ -423,12 +624,16 @@ impl ShardRouter {
             writable_shards,
             default_shard,
             residency_map,
+            shard_forwards,
+            reserved_shards,
         } = self;
         ShardRouterParts {
             readable_shards,
             writable_shards,
             default_shard: *default_shard,
             residency_map,
+            shard_forwards,
+            reserved_shards,
         }
     }
 
@@ -603,15 +808,32 @@ impl ShardRouter {
     /// The initial pick is taken over the full readable set (so the hash is
     /// stable while the writable set is widened/narrowed) and, when it lands
     /// outside the writable subset, re-hashed among the writable shards.
+    ///
+    /// A reserved shard (issue #1837) counts as outside the subset. The
+    /// re-hash then runs over the unreserved writable shards only.
     fn pick_writable(&self, primary: &str, secondary: &str) -> ShardId {
         let initial = rendezvous_pick(&self.readable_shards, primary, secondary);
-        if self.writable_shards.contains(&initial) {
+        if self.accepts_unpinned(initial) {
             return initial;
         }
         if self.writable_shards.is_empty() {
             return self.default_shard;
         }
-        rendezvous_pick(&self.writable_shards, primary, secondary)
+        if self.reserved_shards.is_empty() {
+            return rendezvous_pick(&self.writable_shards, primary, secondary);
+        }
+        // Never empty: `with_reserved_shards` keeps one writable shard free.
+        let candidates = self.without_reserved(&self.writable_shards);
+        rendezvous_pick(&candidates, primary, secondary)
+    }
+
+    /// `shards` minus the reserved ones, in the same order (issue #1837).
+    fn without_reserved(&self, shards: &[ShardId]) -> Vec<ShardId> {
+        shards
+            .iter()
+            .copied()
+            .filter(|shard| !self.is_reserved(*shard))
+            .collect()
     }
 
     /// Pick a shard for a brand new workflow using rendezvous hashing.
@@ -675,10 +897,16 @@ impl ShardRouter {
             return self.default_shard;
         }
         if self.readable_shards.contains(&encoded) {
-            encoded
-        } else {
-            self.default_shard
+            return encoded;
         }
+        // A retired shard's ids resolve to its declared successor (issue #964).
+        // Checked BEFORE the default-shard fallback, which for a decommissioned
+        // shard would silently answer with the wrong database. `with_shard_forwards`
+        // rejects chains at construction, so this single hop is exhaustive.
+        if let Some(successor) = self.shard_forwards.get(&encoded) {
+            return *successor;
+        }
+        self.default_shard
     }
 
     /// Pick a shard for a DAG at catalog-compile time.
@@ -687,6 +915,9 @@ impl ShardRouter {
     /// DAG must be pinned to a single shard that owns it.
     /// The same name always maps to the same shard because rendezvous hashing
     /// is stable.
+    ///
+    /// A DAG is unpinned work, so it never lands on a reserved shard
+    /// (issue #1837).
     #[must_use]
     pub fn pick_for_dag(&self, dag_name: &str) -> ShardId {
         let primary = if self.writable_shards.is_empty() {
@@ -694,7 +925,17 @@ impl ShardRouter {
         } else {
             &self.writable_shards
         };
-        rendezvous_pick(primary, dag_name, "")
+        if self.reserved_shards.is_empty() {
+            return rendezvous_pick(primary, dag_name, "");
+        }
+        let candidates = self.without_reserved(primary);
+        // `with_reserved_shards` keeps one readable and one writable shard
+        // free, so this is not empty. The default shard is never reserved,
+        // so it is the safe fallback.
+        if candidates.is_empty() {
+            return self.default_shard;
+        }
+        rendezvous_pick(&candidates, dag_name, "")
     }
 }
 
@@ -715,26 +956,47 @@ impl ShardRouter {
 /// `WorkflowId` target's owning shard needs no directory lookup for the
 /// overwhelming majority of workflows.
 ///
-/// # Known limitation — explicit shard placement (issue #697)
+/// # This is a placement *prediction*, not a location (issue #1146)
 ///
-/// This function has **no visibility into an explicit shard pin**
-/// (`ShardPlacement::Shard`/`ShardPlacement::ResidencyKey`) applied at start
-/// time. A workflow started with such a pin can live on a shard the pure
-/// hash never produces, and this function will silently return the WRONG
-/// shard for it — there is no directory of actual placements to consult, and
-/// adding one (or a cross-shard fan-out lookup) is a documented follow-up,
-/// out of scope for issue #751. Callers addressing a workflow by
-/// `(workflow_name, workflow_id)` should therefore only do so for workflows
-/// started under the default `Auto` placement; a workflow known to use
-/// explicit shard placement should be addressed by `ExecutionId` instead.
+/// For a `WorkflowId` target the returned shard answers "where would a fresh
+/// start of this business key be placed?" — **not** "where does this business
+/// key live?". The two differ whenever a workflow was started with an explicit
+/// pin (`ShardPlacement::Shard`/`ShardPlacement::ResidencyKey`, issue #697),
+/// which can place it on a shard the pure hash never produces, and whenever a
+/// shard has been drained out of `writable_shards` since the workflow was
+/// placed, which moves where the same key re-hashes.
+///
+/// Its remaining callers are `worker::reject_cross_shard_continue_as_new` and
+/// the deprecated [`ShardedDbPool::exact_pool_for_target`]. Both use it as a
+/// proxy for a *third* question: "which shard would a shard-local uniqueness
+/// check for this key run on?"
+///
+/// `execution`'s re-run `workflow_id`-override guard asks the same question.
+/// It reaches `pick_for_new_workflow` directly, though, rather than through
+/// this function. Those guards create the new run on an **existing** run's
+/// shard (the predecessor's, the re-run source's), never on the hashed one.
+///
+/// A divergent hash used to be refused outright. Issue #1308 replaced that
+/// with a real occupancy check
+/// ([`crate::external_target_location::check_cross_shard_occupancy`]) over
+/// #1146's fan-out. So a divergent key that is not actually occupied on the
+/// hashed shard may now proceed. A residency-pinned run (issue #697) whose key
+/// hashes elsewhere is no longer refused for that reason alone.
+///
+/// To find where an existing business key actually **lives** — which is what a
+/// `workflow_id`-addressed signal/cancel delivery needs — use
+/// [`crate::external_target_location::resolve_location_by_workflow_id`],
+/// which observes every expected shard instead of predicting one. Delivery
+/// stopped using this function for that in issue #1146.
 ///
 /// Returns `None` only when `target` is a `WorkflowId` and the process-global
 /// shard router has not been initialized (a boot-window / non-plugin-embedder
-/// edge case). Callers on this path already run inside an established shard
-/// connection, so the documented, accepted fallback — shared with every other
-/// `GLOBAL_SHARD_ROUTER` consumer (e.g. `completion_trigger.rs`) — is to
-/// treat this as "assume same shard as the caller", i.e. attempt inline
-/// resolution rather than deferring to the cross-shard outbox.
+/// edge case). Both remaining callers treat that as "no divergence is knowable,
+/// so do not refuse", which is also correct by construction: a deployment
+/// without a router is single-shard, and a single shard cannot diverge from
+/// itself. The delivery paths no longer consult this function at all, so the
+/// pre-#1146 "assume same shard as the caller, attempt inline" fallback this
+/// paragraph used to describe no longer exists.
 #[cfg(feature = "db")]
 #[must_use]
 pub fn external_target_owning_shard(target: &ExternalTarget) -> Option<ShardId> {
@@ -791,6 +1053,559 @@ fn rendezvous_hash(shard: ShardId, primary: &str, secondary: &str) -> u64 {
 pub struct ShardedDbPool {
     pools: BTreeMap<ShardId, DbPool>,
     default_shard: ShardId,
+    /// Which shards share one physical pool (issue #1266). Shards with the
+    /// same group number are the same physical database. A group number
+    /// is otherwise opaque. It has no meaning across two `ShardedDbPool`
+    /// instances. See `pool_groups`.
+    pool_group: BTreeMap<ShardId, u32>,
+}
+
+/// Group shards by underlying pool identity (issue #1266).
+///
+/// Two `Pool` values are the same physical pool exactly when they are
+/// clones of one `Arc`. `Pool::manager()` returns a reference into that
+/// shared allocation, so `ptr::eq` on it detects aliasing safely, with no
+/// private field or unsafe code.
+///
+/// This is the right signal for `from_map`, whose caller may hand in
+/// clones of one pool under two shard ids. It cannot see through two
+/// independently built pools that merely share a connection string.
+/// `from_dsns` computes its own grouping for that case instead, with
+/// [`canonical_dsn_key`], before the DSNs are ever built into a pool.
+#[cfg(feature = "db")]
+fn group_by_pool_identity(pools: &BTreeMap<ShardId, DbPool>) -> BTreeMap<ShardId, u32> {
+    let mut representatives: Vec<&DbPool> = Vec::new();
+    let mut groups = BTreeMap::new();
+    for (shard, pool) in pools {
+        let group = representatives
+            .iter()
+            .position(|existing| std::ptr::eq(existing.manager(), pool.manager()))
+            .unwrap_or_else(|| {
+                representatives.push(pool);
+                representatives.len() - 1
+            });
+        groups.insert(*shard, u32::try_from(group).unwrap_or(u32::MAX));
+    }
+    groups
+}
+
+/// Canonical grouping key for a DSN (issue #1266).
+///
+/// Two DSNs can reach the same physical database while written
+/// differently. Credentials can differ, a port can be explicit or
+/// default, or a connection-tuning parameter such as `application_name`
+/// or `sslmode` can differ. Comparing the raw strings would treat these
+/// as separate databases. Each apparent group would then apply its own
+/// protection decision to rows the other group was meant to protect.
+///
+/// Parsed with **`tokio_postgres::Config`**, the exact parser
+/// `diesel_async` hands the DSN to at connect time. This is the same
+/// choice `backup_verify.rs`'s `parse_dsn_identity` makes, for the same
+/// reason. `url::Url` disagrees with it on percent-decoding
+/// (`/%68arvest` is database `harvest`). It also disagrees on
+/// `?dbname=`/`?host=`/`?port=`/`?hostaddr=` overrides, and on
+/// comma-separated multi-host DSNs. Every one of those parses cleanly
+/// under `url`. Each resolves somewhere else entirely at connect time.
+/// A key built on `url` cannot see two spellings of one database as the
+/// same pool.
+///
+/// The key keeps host and `hostaddr` (a numeric `host` counts as an
+/// address, needing no DNS to compare). It prefers `hostaddr` over
+/// `host` whenever `hostaddr` is given at all, since `hostaddr` pins
+/// the actual TCP destination. Two DSNs sharing one stay one pool
+/// however differently each spells the hostname. The key also keeps
+/// port (defaulted to 5432 when absent) and the database name. It keeps
+/// only a `search_path` setting extracted from the `options` parameter
+/// — see [`extract_search_path`]. `options` is libpq's escape hatch for
+/// arbitrary session settings, and `search_path` is the one setting it
+/// can carry that picks the schema `harvest_audit_log` resolves to. Two
+/// DSNs that differ only there can still reach different data and must
+/// never be grouped as one pool. Every other query parameter is
+/// dropped. So is every other `options` flag, such as
+/// `application_name` or `client_min_messages`. None of it changes
+/// which relation a query resolves against.
+///
+/// A DNS hostname is lowercased, since it is case-insensitive. A
+/// Unix-socket path keeps its case instead, since a filesystem path is
+/// not: `/run/PG-A` and `/run/pg-a` name different sockets. It is
+/// otherwise normalized by [`normalize_unix_socket_path`], which strips
+/// harmless redundancy such as `.` components -- `/run/postgresql` and
+/// `/run/./postgresql` name the same socket.
+///
+/// A DSN with no path names no database. That is not the same as
+/// naming none: libpq defaults an omitted `dbname` to the connecting
+/// username. The key uses the username in that case, and only in that
+/// case. The rest of this comment's reasoning against using the
+/// username still holds whenever a path is present.
+///
+/// Four gaps are accepted rather than chased further:
+/// - A host alias — two hostnames that resolve to one address — is not
+///   detected. Closing it needs a live connection, and building a pool
+///   must stay a pure, local operation with no network access.
+/// - A role's own `search_path`, set server-side with `ALTER ROLE ...
+///   SET search_path`, is invisible in the DSN. The username is dropped
+///   with the rest of the credentials, not kept as a proxy for it. Two
+///   DSNs for one database under different usernames are a supported
+///   topology (`from_dsns`'s own `harvest shard rebalance` use, issue
+///   #964). Treating them as different pools would reopen the exact bug
+///   this key exists to close.
+/// - A multi-host DSN's hosts and ports are each sorted and deduplicated
+///   independently, not paired positionally. `host=a,b port=5432,6432`
+///   and `host=a,b port=6432,5432` can name different endpoint pairs,
+///   yet compare equal. `from_dsns` is built for its one documented use
+///   — one host per shard entry (`harvest shard rebalance`, issue #964)
+///   — where this never arises. Unlike the other two gaps, getting this
+///   wrong over-merges rather than under-merges. The failure is a
+///   skipped purge on one endpoint, not a premature delete. It is left
+///   for whoever first needs multi-host `from_dsns` entries to fix
+///   alongside a real use case to test it against.
+/// - Two different `search_path` orders can still resolve one unqualified
+///   relation to the identical schema. This happens when the
+///   earlier-searched schemas in one order do not contain that relation
+///   at all. `tenant_a,public` and `tenant_b,public` both resolve
+///   `harvest_audit_log` from `public`, whenever neither tenant schema
+///   defines its own copy of that table. Unlike the other three gaps,
+///   this one is not conservative. Two aliases of one physical table can
+///   compare as distinct pools. That is the same under-merging risk this
+///   key exists to close elsewhere. Detecting it needs to know what each
+///   named schema actually contains. That is a live catalog lookup, not
+///   a fact this key can read from the DSN text. It is out of reach for
+///   the same reason as the host alias gap above. Building a pool must
+///   stay a pure, local operation with no network access. It is left
+///   undetected rather than guessed at without a connection.
+///
+/// A DSN that does not parse falls back to the raw string, unchanged
+/// from before this key existed.
+#[cfg(feature = "db")]
+fn canonical_dsn_key(dsn: &str) -> String {
+    use std::str::FromStr as _;
+
+    let Ok(config) = tokio_postgres::Config::from_str(dsn.trim()) else {
+        return dsn.to_string();
+    };
+
+    let mut hostaddrs: Vec<String> = config
+        .get_hostaddrs()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let explicit_hostaddr = !hostaddrs.is_empty();
+    let mut hosts: Vec<String> = Vec::new();
+    for h in config.get_hosts() {
+        match h {
+            // A numeric `host` is skipped outright once `hostaddr` is
+            // explicit (issue #1266). `hostaddr` alone pins the TCP
+            // destination then. `host` text -- numeric or not -- only
+            // affects authentication, never which server is reached.
+            // Folding a numeric `host` into `hostaddrs` regardless made
+            // `host=10.0.0.1&hostaddr=10.0.0.2` key differently from
+            // `host=alias&hostaddr=10.0.0.2`, even though both pin the
+            // identical destination.
+            tokio_postgres::config::Host::Tcp(_) if explicit_hostaddr => {}
+            tokio_postgres::config::Host::Tcp(name) => {
+                if let Ok(addr) = std::net::IpAddr::from_str(name) {
+                    hostaddrs.push(addr.to_string());
+                } else if name.starts_with('/') {
+                    // `Config::host`'s `/`-prefix rule is `#[cfg(unix)]`-gated
+                    // upstream. A non-Unix build parses a `/`-prefixed `host`
+                    // value into this `Tcp` arm, never the `Unix` arm below.
+                    // Keep it case-sensitive like the `Unix` arm does.
+                    // Do not lowercase it like a real hostname. The key this
+                    // function returns for one DSN must not depend on which
+                    // platform built the binary that computed it.
+                    hosts.push(normalize_unix_socket_path(name));
+                } else {
+                    hosts.push(name.to_ascii_lowercase());
+                }
+            }
+            #[cfg(unix)]
+            tokio_postgres::config::Host::Unix(path) => {
+                hosts.push(normalize_unix_socket_path(&path.to_string_lossy()));
+            }
+        }
+    }
+    hosts.sort_unstable();
+    hosts.dedup();
+    hostaddrs.sort_unstable();
+    hostaddrs.dedup();
+    // `hostaddr` pins the actual TCP destination, so it wins over `host`
+    // text. `backup_verify.rs`'s `parse_dsn_identity` treats it the same
+    // way. Two DSNs sharing an address are one pool however differently
+    // each spells the hostname. `host` matters only when neither side
+    // pins an address.
+    let location = if hostaddrs.is_empty() {
+        &hosts
+    } else {
+        &hostaddrs
+    };
+
+    let mut ports: Vec<u16> = config.get_ports().to_vec();
+    if ports.is_empty() {
+        ports.push(5432);
+    }
+    ports.sort_unstable();
+    ports.dedup();
+
+    let db = config.get_dbname().or_else(|| config.get_user());
+    let search_path = extract_search_path(config.get_options().unwrap_or_default());
+
+    format!("{location:?}{ports:?}/{db:?}?search_path={search_path:?}")
+}
+
+/// Strips a Unix-socket path's harmless syntactic redundancy: a `.`
+/// component, and an empty component from a doubled or trailing `/`
+/// (Codex review, PR #1504). `/run/postgresql` and `/run/./postgresql`
+/// name the identical socket directory on every POSIX filesystem, with
+/// no lookup needed to know that.
+///
+/// A `..` component is deliberately left alone. Its target can depend
+/// on whether an earlier component is a symlink, which this function
+/// cannot know without asking the filesystem. That is the same reason
+/// [`canonical_dsn_key`]'s own doc leaves a host alias undetected:
+/// building a pool must stay a pure, local operation with no I/O.
+#[cfg(feature = "db")]
+fn normalize_unix_socket_path(path: &str) -> String {
+    let segments: Vec<&str> = path
+        .split('/')
+        .filter(|segment| !segment.is_empty() && *segment != ".")
+        .collect();
+    if path.starts_with('/') {
+        format!("/{}", segments.join("/"))
+    } else {
+        segments.join("/")
+    }
+}
+
+/// Pulls only `search_path` settings out of a libpq `options` string,
+/// discarding every other `-c name=value` flag it may carry (issue
+/// #1266). `options` is a general escape hatch. An operator can set
+/// `application_name`, `client_min_messages`, or anything else through
+/// it just as easily as `search_path`. None of those change which
+/// relation a query resolves against. Keeping the whole string verbatim
+/// reopened the same bug this key exists to close. Two DSNs for the
+/// same pool, differing only in an unrelated `-c` flag, no longer
+/// merged.
+///
+/// This recognizes three shapes. One is whitespace-separated tokens
+/// where a `-c` token is immediately followed by a `search_path=value`
+/// token. The other two are one-token spellings: the compact
+/// `-csearch_path=value`, and the long-form `--search_path=value`.
+/// `PostgreSQL`'s own server documentation names the long form as an
+/// alternate spelling for any run-time parameter. The GUC name itself
+/// is matched case-insensitively in all three shapes (issue #1266).
+/// `PostgreSQL` parameter names are case-insensitive, so
+/// `SEARCH_PATH=shared` sets the identical GUC as `search_path=shared`.
+/// The long form also normalizes a hyphen to an underscore in the name
+/// before matching. `PostgreSQL` does the same when mapping a
+/// `--long-option` to its GUC, so `--search-path=shared` sets the
+/// identical GUC as `--search_path=shared`. A quoted value with
+/// embedded spaces is not recognized. Treating an
+/// unparsed `options` string as carrying no `search_path` is the
+/// conservative direction here. It only widens which DSNs compare as
+/// different, never the reverse.
+///
+/// Splitting honors libpq's own escaping rule for `options` (issue
+/// #1266). A backslash before a space embeds a literal space in the
+/// current argument rather than ending it. `\\` embeds a literal
+/// backslash. Splitting on bare whitespace instead can truncate a value
+/// at an escaped space. A truncated value can then differ from an
+/// alias's untruncated one even when both name the same effective
+/// schema. That is exactly the false difference this key must not
+/// create, since it stops two aliases of one physical pool from being
+/// combined.
+///
+/// The extracted value is then normalized the way `PostgreSQL` itself
+/// parses a schema list (`SplitIdentifierString`): comma-separated,
+/// with insignificant whitespace around each name. An unquoted name is
+/// folded to lowercase, since `PostgreSQL` folds unquoted identifiers
+/// the same way. A double-quoted name keeps its case. It can also
+/// contain a comma or space that is not a separator. `""` inside one is
+/// a literal quote character. `tenant,public` and `tenant, public` name
+/// the same search path and must compare equal. `"tenant, one"` (one
+/// quoted name) must never compare equal to `tenant,one` (two unquoted
+/// names). Folding is ASCII-only (`A`-`Z` to `a`-`z`), matching
+/// `PostgreSQL` itself under a multibyte server encoding such as
+/// `UTF8`, where a non-ASCII byte is never downcased. A single-byte
+/// encoding's own further, locale-dependent folding is not chased
+/// here. That gap can only split two names `PostgreSQL` would treat
+/// as one, never merge two it keeps apart. It stands alongside the
+/// other documented gaps below.
+///
+/// `options` can repeat `-c search_path=...` more than once. libpq
+/// applies each as a `SET` in order at session start, so only the last
+/// one takes effect. Returning every match found would keep an
+/// overridden, inert value in the key, splitting two DSNs whose
+/// sessions actually resolve to the same schema. This keeps overwriting
+/// as it scans, so the last match wins, matching what the server does.
+#[cfg(feature = "db")]
+fn extract_search_path(options: &str) -> Option<String> {
+    let mut tokens = split_options_preserving_escapes(options).into_iter();
+    let mut search_path = None;
+    while let Some(tok) = tokens.next() {
+        let value: Option<String> = if tok == "-c" {
+            tokens
+                .next()
+                .and_then(|kv| strip_search_path_name(&kv).map(str::to_string))
+        } else if let Some(rest) = tok.strip_prefix("-c") {
+            strip_search_path_name(rest).map(str::to_string)
+        } else if let Some(rest) = tok.strip_prefix("--") {
+            strip_search_path_name_long_form(rest).map(str::to_string)
+        } else {
+            None
+        };
+        if let Some(value) = value {
+            search_path = Some(normalize_search_path(&value));
+        }
+    }
+    search_path
+}
+
+/// Splits a `name=value` token and returns `value` only when `name`
+/// case-insensitively equals `search_path` (issue #1266). `PostgreSQL`
+/// parameter names are case-insensitive, so `SEARCH_PATH=shared` sets
+/// the identical GUC as `search_path=shared` and must extract the same
+/// way.
+#[cfg(feature = "db")]
+fn strip_search_path_name(token: &str) -> Option<&str> {
+    let (name, value) = token.split_once('=')?;
+    name.eq_ignore_ascii_case("search_path").then_some(value)
+}
+
+/// Splits a long-form `--name=value` token and returns `value` only
+/// when `name` names `search_path` (issue #1266). `PostgreSQL`
+/// normalizes a hyphen to an underscore in a long-form GUC name before
+/// matching it, so `--search-path=shared` sets the identical GUC as
+/// `--search_path=shared`. The owned, hyphen-normalized name cannot
+/// reuse `strip_search_path_name`'s borrow of the original token.
+#[cfg(feature = "db")]
+fn strip_search_path_name_long_form(token: &str) -> Option<&str> {
+    let (name, value) = token.split_once('=')?;
+    name.replace('-', "_")
+        .eq_ignore_ascii_case("search_path")
+        .then_some(value)
+}
+
+/// Whether `PostgreSQL` itself treats `c` as whitespace when splitting a
+/// raw string into tokens (issue #1266). Two call sites rely on this.
+/// `pg_split_opts` tests with `isspace()`, byte-at-a-time in the `"C"`
+/// locale. `SplitIdentifierString` tests with `scanner_isspace()`,
+/// hardcoded to sidestep exactly this pitfall for multibyte input. Both
+/// resolve to the same six-character ASCII set, not Rust's
+/// `char::is_whitespace`. Rust's
+/// version follows Unicode's `White_Space` property, so it also matches
+/// U+00A0 (no-break space) and several other codepoints these `PostgreSQL`
+/// functions do not. An unquoted schema name containing one of those
+/// codepoints would then split here but stay one token server-side,
+/// silently truncating the extracted name.
+#[cfg(feature = "db")]
+const fn is_postgres_whitespace(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\u{0B}' | '\u{0C}' | '\r')
+}
+
+/// Splits a libpq `options` string into arguments, honoring its
+/// documented escaping (issue #1266). A backslash before any
+/// whitespace character embeds that character literally in the
+/// current argument instead of ending it there. `PostgreSQL`'s own
+/// splitter (`pg_split_opts`) tests with `isspace()`, not specifically
+/// a space, so a tab or other whitespace escapes the same way. A
+/// backslash before any other character consumes the backslash too
+/// (issue #1266). `pg_split_opts` removes it unconditionally, so
+/// `public\,public` reaches the server the same as `public,public` --
+/// the backslash never survives to `SplitIdentifierString`. Keeping it
+/// here would compare two equivalent values as different.
+/// A trailing backslash with nothing after it has nothing to escape,
+/// so it is kept literally. Naive whitespace splitting would end an
+/// argument at an escaped whitespace character, corrupting any value
+/// that contains one.
+#[cfg(feature = "db")]
+fn split_options_preserving_escapes(options: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut has_token = false;
+    let mut chars = options.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\'
+            && let Some(escaped) = chars.next()
+        {
+            current.push(escaped);
+            has_token = true;
+        } else if is_postgres_whitespace(c) {
+            if has_token {
+                tokens.push(std::mem::take(&mut current));
+                has_token = false;
+            }
+        } else {
+            current.push(c);
+            has_token = true;
+        }
+    }
+    if has_token {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// Normalizes a `search_path` value by parsing it as a `PostgreSQL`
+/// identifier list and rejoining the result (issue #1266). Falls back
+/// to the value unchanged when it does not parse. A malformed value
+/// cannot be normalized, so it is kept distinguishable from every other
+/// value rather than guessed at. This is the same conservative choice
+/// made elsewhere in this key.
+///
+/// Each item is escaped before rejoining, backslash-quoting its own
+/// backslashes and commas (issue #1266). Joining with a bare `,` would
+/// let a quoted item's own embedded comma read back as an item
+/// boundary. The one item `tenant,one` and the two items `tenant` and
+/// `one` would then both join to the same string `tenant,one` -- a
+/// real collision. Escaping first keeps every item's boundary in the
+/// joined key, so the two cases above never compare equal.
+///
+/// `pg_catalog` is inserted at the front when the parsed list omits it
+/// (issue #1266). `PostgreSQL` always searches `pg_catalog` first when
+/// it is not named explicitly. `public` and `pg_catalog,public`
+/// therefore resolve an unqualified relation the same way, and must
+/// key the same. A list that already names `pg_catalog` anywhere is
+/// left as-is. Its explicit position then decides the resolution
+/// order, and an explicit, non-leading position is a genuinely
+/// different order from the implicit one.
+///
+/// `pg_temp` is inserted the same way, but at the very front (issue
+/// #1266). `PostgreSQL` searches the session's temporary-object schema
+/// before `pg_catalog` too, unless `pg_temp` is named explicitly. The
+/// two implicit insertions are independent, so `pg_temp` is applied
+/// after `pg_catalog`'s, landing ahead of it exactly when both were
+/// omitted.
+///
+/// A repeated name is then dropped, keeping only its first occurrence
+/// (issue #1266). `public` and `public,public` search the identical
+/// schema in the identical order. A later repeat of a name already
+/// searched changes nothing about where a relation resolves, so they
+/// must key the same too.
+#[cfg(feature = "db")]
+fn normalize_search_path(value: &str) -> String {
+    parse_identifier_list(value).map_or_else(
+        || value.to_string(),
+        |mut items| {
+            if !items.iter().any(|item| item == "pg_catalog") {
+                items.insert(0, "pg_catalog".to_string());
+            }
+            if !items.iter().any(|item| item == "pg_temp") {
+                items.insert(0, "pg_temp".to_string());
+            }
+            let mut seen = std::collections::HashSet::new();
+            items.retain(|item| seen.insert(item.clone()));
+            items
+                .iter()
+                .map(|item| escape_identifier_list_item(item))
+                .collect::<Vec<_>>()
+                .join(",")
+        },
+    )
+}
+
+/// Backslash-escapes a parsed identifier-list item's own backslashes
+/// and commas (issue #1266). Joining escaped items with a bare `,`
+/// then keeps every item boundary recoverable in the joined string.
+#[cfg(feature = "db")]
+fn escape_identifier_list_item(item: &str) -> String {
+    let mut escaped = String::with_capacity(item.len());
+    for c in item.chars() {
+        if c == '\\' || c == ',' {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
+}
+
+/// The longest identifier `PostgreSQL` stores without truncating it
+/// (issue #1266). `NAMEDATALEN` is 64, and one byte is reserved for
+/// the terminator. A name longer than this is silently truncated to
+/// it. `SplitIdentifierString` truncates each `search_path` entry the
+/// same way. Two names differing only after this many bytes truncate
+/// to the identical stored name and must key the same.
+#[cfg(feature = "db")]
+const POSTGRES_MAX_IDENTIFIER_LEN: usize = 63;
+
+/// Truncates `name` to `PostgreSQL`'s identifier length limit (issue
+/// #1266). This cuts at the last full character rather than splitting
+/// a multi-byte one, matching `PostgreSQL`'s own byte-based truncation.
+#[cfg(feature = "db")]
+fn truncate_postgres_identifier(name: &str) -> &str {
+    if name.len() <= POSTGRES_MAX_IDENTIFIER_LEN {
+        return name;
+    }
+    let mut end = POSTGRES_MAX_IDENTIFIER_LEN;
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    &name[..end]
+}
+
+/// Parses a comma-separated identifier list the way `PostgreSQL`'s own
+/// `SplitIdentifierString` does (issue #1266), used for `search_path`
+/// and similar GUCs. Whitespace around an item is not significant, using
+/// `is_postgres_whitespace`'s six-character ASCII set rather than
+/// Rust's Unicode-aware `char::is_whitespace`, matching
+/// `SplitIdentifierString`'s own `scanner_isspace`. An
+/// unquoted item is folded to lowercase using ASCII-only `A`-`Z`
+/// folding, not Rust's Unicode-aware `str::to_lowercase`. `PostgreSQL`
+/// itself never downcases a non-ASCII byte under a multibyte server
+/// encoding such as `UTF8`. Unicode folding would collapse two
+/// genuinely distinct identifiers into one canonical key that
+/// `PostgreSQL` keeps apart. A double-quoted item keeps its
+/// case verbatim, including any comma or whitespace it encloses; `""`
+/// inside one is a literal quote character. Either form is then
+/// truncated to `PostgreSQL`'s identifier length limit, matching what
+/// `SplitIdentifierString` itself does. Returns `None` on anything
+/// that does not fit this grammar, rather than guessing at a malformed
+/// value. An unterminated quote is one such case. Content trailing a
+/// closing quote before the next comma is another.
+#[cfg(feature = "db")]
+fn parse_identifier_list(value: &str) -> Option<Vec<String>> {
+    let mut items = Vec::new();
+    let mut chars = value.chars().peekable();
+    loop {
+        while chars.next_if(|c| is_postgres_whitespace(*c)).is_some() {}
+        match chars.peek() {
+            None => break,
+            Some('"') => {
+                chars.next();
+                let mut ident = String::new();
+                loop {
+                    match chars.next() {
+                        None => return None,
+                        Some('"') if chars.peek() == Some(&'"') => {
+                            ident.push('"');
+                            chars.next();
+                        }
+                        Some('"') => break,
+                        Some(c) => ident.push(c),
+                    }
+                }
+                items.push(truncate_postgres_identifier(&ident).to_string());
+            }
+            Some(_) => {
+                let mut ident = String::new();
+                while let Some(&c) = chars.peek() {
+                    if c == ',' || is_postgres_whitespace(c) {
+                        break;
+                    }
+                    ident.push(c);
+                    chars.next();
+                }
+                let folded = ident.to_ascii_lowercase();
+                items.push(truncate_postgres_identifier(&folded).to_string());
+            }
+        }
+        while chars.next_if(|c| is_postgres_whitespace(*c)).is_some() {}
+        match chars.next() {
+            None => break,
+            Some(',') => {}
+            Some(_) => return None,
+        }
+    }
+    Some(items)
 }
 
 #[cfg(feature = "db")]
@@ -799,6 +1614,7 @@ impl std::fmt::Debug for ShardedDbPool {
         f.debug_struct("ShardedDbPool")
             .field("shards", &self.pools.keys())
             .field("default_shard", &self.default_shard)
+            .field("pool_group", &self.pool_group)
             .finish()
     }
 }
@@ -823,6 +1639,26 @@ pub fn install_global_router(router: ShardRouter) {
     }
 }
 
+/// Install a `ShardedDbPool` into the global registry.
+///
+/// `ShardedDbPool::single` and `from_map` already self-install at
+/// construction, so the global normally reflects whichever pool was built
+/// **last** — which is not necessarily the pool the runtime went on to select.
+/// A runtime that resolves a pool by precedence (see
+/// `runner::resolve_runtime_storage_pool`) must therefore re-install its
+/// choice, or every consumer of the global — the by-id fan-out, the inline
+/// gate, completion triggers, the timeout sweeps — reads a pool the runtime is
+/// not using (issue #1146 review).
+///
+/// Same caveat as [`install_global_router`]: this is runtime-initialization
+/// API, not something to call from a temporary constructor.
+#[cfg(feature = "db")]
+pub fn install_global_sharded_pool(pool: ShardedDbPool) {
+    if let Ok(mut lock) = GLOBAL_SHARDED_POOL.write() {
+        *lock = Some(pool);
+    }
+}
+
 #[cfg(feature = "db")]
 impl ShardedDbPool {
     /// Wrap an existing single pool as a one-shard sharded pool at `ShardId(0)`.
@@ -837,6 +1673,7 @@ impl ShardedDbPool {
         let this = Self {
             pools,
             default_shard: shard,
+            pool_group: BTreeMap::from([(shard, 0)]),
         };
         if let Ok(mut lock) = GLOBAL_SHARDED_POOL.write() {
             *lock = Some(this.clone());
@@ -845,6 +1682,17 @@ impl ShardedDbPool {
     }
 
     /// Build a sharded pool from a pre-computed map of shard → pool.
+    ///
+    /// Colocated shards must share one `DbPool` clone (issue #1266). Two
+    /// shards reaching the same physical database through separately
+    /// constructed `DbPool` handles are grouped as unrelated instead.
+    /// Retention then purges each apparent group on its own schedule. A
+    /// faster group can delete rows a slower, colocated group has not
+    /// yet acknowledged. The grouping relies on `Pool::manager()`
+    /// pointer identity, not on what database a pool actually targets.
+    /// [`ShardedDbPool::from_dsns`] groups by a canonical form of the
+    /// connection string instead, for callers building pools from raw
+    /// DSNs rather than handing in pre-built ones.
     ///
     /// # Panics
     ///
@@ -859,14 +1707,67 @@ impl ShardedDbPool {
             pools.contains_key(&default_shard),
             "default_shard {default_shard} has no configured pool"
         );
+        let pool_group = group_by_pool_identity(&pools);
         let this = Self {
             pools,
             default_shard,
+            pool_group,
         };
         if let Ok(mut lock) = GLOBAL_SHARDED_POOL.write() {
             *lock = Some(this.clone());
         }
         this
+    }
+
+    /// Every shard, grouped by underlying physical pool (issue #1266).
+    ///
+    /// `from_map` detects a shared pool by object identity — aliased
+    /// clones, the shape a pre-split staging deployment uses. `from_dsns`
+    /// builds a fresh pool per entry, even for two DSNs that reach one
+    /// physical database. It detects the alias from a canonical form of
+    /// each connection string instead.
+    ///
+    /// # Panics
+    ///
+    /// Never, in practice. Every constructor keeps `pool_group` naming
+    /// exactly the shards present in `pools`.
+    #[must_use]
+    pub fn pool_groups(&self) -> Vec<(&DbPool, Vec<ShardId>)> {
+        let mut by_group: BTreeMap<u32, Vec<ShardId>> = BTreeMap::new();
+        for (shard, group) in &self.pool_group {
+            by_group.entry(*group).or_default().push(*shard);
+        }
+        by_group
+            .into_values()
+            .map(|shards| {
+                #[expect(clippy::expect_used, reason = "`pool_group` names only pooled shards")]
+                let pool = self
+                    .pools
+                    .get(&shards[0])
+                    .expect("pool_group only names shards with a pool");
+                (pool, shards)
+            })
+            .collect()
+    }
+
+    /// Whether `a` and `b` name the same physical pool (issue #1266).
+    ///
+    /// Two distinct [`ShardId`]s can be aliased to one physical database
+    /// during a pre-split staging rollout (see [`Self::pool_groups`]). A
+    /// caller holding a checked-out connection for `a` must not check out
+    /// `b` too when this returns `true`. On a size-one pool, that would
+    /// wait for a second connection the held one can never release. It
+    /// would deadlock until the checkout times out. Comparing `a == b`
+    /// alone misses this,
+    /// since the aliasing is about physical pool identity, not shard-id
+    /// equality. Unknown shards (absent from `pool_group`) compare unequal
+    /// to everything, including themselves.
+    #[must_use]
+    pub fn same_physical_pool(&self, a: ShardId, b: ShardId) -> bool {
+        match (self.pool_group.get(&a), self.pool_group.get(&b)) {
+            (Some(ga), Some(gb)) => ga == gb,
+            _ => false,
+        }
     }
 
     /// The default shard used when an `ExecutionId` carries the unencoded
@@ -885,6 +1786,7 @@ impl ShardedDbPool {
     /// and the default shard entry has been removed; [`ShardedDbPool::single`]
     /// and [`ShardedDbPool::from_map`] guarantee a default entry exists.
     #[must_use]
+    #[expect(clippy::expect_used, reason = "the constructors keep a default pool")]
     pub fn pool_for(&self, shard: ShardId) -> &DbPool {
         self.pools
             .get(&shard)
@@ -898,36 +1800,168 @@ impl ShardedDbPool {
         self.pools.get(&shard)
     }
 
+    /// The shard an `ExecutionId` routes to, after any router-declared
+    /// retired-shard forward (issue #964).
+    ///
+    /// This is the **entry point** for an id, not necessarily where the run
+    /// currently lives: an execution rebalanced off a still-readable shard is
+    /// found by following the durable forwarding pointer on its sealed source
+    /// row, which needs a database and therefore lives in
+    /// [`crate::shard_rebalance::resolve_execution_shard`]. This function is the
+    /// synchronous part — the one that costs nothing on the hot path and is
+    /// correct for every execution that never moved.
+    #[must_use]
+    pub fn routed_shard_for_execution(&self, exec_id: ExecutionId) -> ShardId {
+        let shard = exec_id.shard();
+        if shard.is_unencoded() {
+            return self.default_shard;
+        }
+        // Consult the router for a declared retired-shard forward ONLY. Nothing
+        // else about the router is applied here: an id whose shard the router
+        // does not forward must keep resolving byte-for-byte as it did before
+        // issue #964, including the cases where the pool map and the router's
+        // readable set legitimately disagree (mid a shard-add rollout, or in a
+        // test that installs a pool without a router).
+        if let Ok(guard) = GLOBAL_SHARD_ROUTER.read()
+            && let Some(successor) = guard.as_ref().and_then(|r| r.shard_forwards.get(&shard))
+        {
+            return *successor;
+        }
+        shard
+    }
+
+    /// Whether `shard` has been declared **retired** — decommissioned, its pool
+    /// removed from every node, and its ids forwarded to a successor.
+    ///
+    /// A retired shard is not "a shard I happen to have no pool for right now".
+    /// The two look identical from the pool map and must not be treated alike:
+    /// a missing pool mid a shard-add rollout is a transient gap where the data
+    /// is very much still there, while a retired shard is one an operator has
+    /// asserted is gone. `ShardRouter::with_shard_forwards` refuses to declare a
+    /// forward for a shard that is still readable, which is what makes the
+    /// declaration mean something.
+    ///
+    /// The distinction matters wherever code must reach data on a shard rather
+    /// than merely route to it — cross-residence payload erasure above all,
+    /// which fails closed on an unreachable residence and would otherwise be
+    /// permanently unable to erase any run that ever lived on a retired shard.
+    #[must_use]
+    pub fn shard_is_retired(shard: ShardId) -> bool {
+        GLOBAL_SHARD_ROUTER
+            .read()
+            .ok()
+            .and_then(|guard| {
+                guard
+                    .as_ref()
+                    .map(|r| r.shard_forwards.contains_key(&shard))
+            })
+            .unwrap_or(false)
+    }
+
+    /// Build a multi-shard pool from `(shard, DSN)` pairs.
+    ///
+    /// The paved path for operator tooling that must reach several shard
+    /// databases directly rather than through the management API — `harvest
+    /// shard rebalance` (issue #964) is the first such command, and a rebalance
+    /// is inherently two-database. Lives here rather than in the CLI so the
+    /// pool's shape (and its `max_size`) stays a property of the engine.
+    ///
+    /// # Errors
+    ///
+    /// [`HarvestError::Config`](crate::error::HarvestError::Config) when a DSN
+    /// is not a usable connection string. Note that a pool is lazy: a DSN that
+    /// parses but cannot connect surfaces at first checkout, as
+    /// [`HarvestError::ShardUnavailable`](crate::error::HarvestError::ShardUnavailable).
+    pub fn from_dsns(
+        entries: impl IntoIterator<Item = (ShardId, String)>,
+        default_shard: ShardId,
+        max_size: usize,
+    ) -> crate::error::HarvestResult<Self> {
+        let mut pools = BTreeMap::new();
+        // A fresh `Pool` is built per entry here, even for two DSNs that
+        // reach one physical database (issue #1266).
+        // `group_by_pool_identity` could never see through that, so
+        // `canonical_dsn_key` is the grouping key, compared before the
+        // DSN is consumed into a manager.
+        let mut seen_keys: Vec<String> = Vec::new();
+        let mut pool_group = BTreeMap::new();
+        for (shard, dsn) in entries {
+            let key = canonical_dsn_key(&dsn);
+            let group = seen_keys
+                .iter()
+                .position(|seen| *seen == key)
+                .unwrap_or_else(|| {
+                    seen_keys.push(key.clone());
+                    seen_keys.len() - 1
+                });
+            pool_group.insert(shard, u32::try_from(group).unwrap_or(u32::MAX));
+
+            let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+                diesel_async::AsyncPgConnection,
+            >::new(dsn);
+            // Operator tooling, so the `Maintenance` session timeouts apply
+            // (issue #1788).
+            let pool = crate::pool::with_engine_timeouts(
+                deadpool::managed::Pool::builder(manager).max_size(max_size.max(1)),
+                crate::pool::DbRole::Maintenance,
+                &crate::pool::EngineDbTimeouts::default(),
+            )?
+            .build()
+            .map_err(|e| {
+                crate::error::HarvestError::Config(format!(
+                    "shard {shard}: could not build a connection pool: {e}"
+                ))
+            })?;
+            pools.insert(shard, pool);
+        }
+        let mut this = Self::from_map(pools, default_shard);
+        this.pool_group = pool_group;
+        if let Ok(mut lock) = GLOBAL_SHARDED_POOL.write() {
+            *lock = Some(this.clone());
+        }
+        Ok(this)
+    }
+
     /// Resolve the pool that owns a given `ExecutionId`.
     #[must_use]
     pub fn pool_for_execution(&self, exec_id: ExecutionId) -> &DbPool {
-        let shard = exec_id.shard();
-        if shard.is_unencoded() {
-            return self.pool_for(self.default_shard);
-        }
-        self.pool_for(shard)
+        self.pool_for(self.routed_shard_for_execution(exec_id))
     }
 
     /// Resolve the pool that owns a given `ExecutionId` exactly, with no default fallback.
     #[must_use]
     pub fn exact_pool_for_execution(&self, exec_id: ExecutionId) -> Option<&DbPool> {
-        let shard = exec_id.shard();
-        if shard.is_unencoded() {
-            return self.pools.get(&self.default_shard);
-        }
-        self.pools.get(&shard)
+        self.pools.get(&self.routed_shard_for_execution(exec_id))
     }
 
     /// Resolve the pool that owns `target` exactly, with no default fallback
     /// (issue #751).
     ///
     /// For [`ExternalTarget::ExecutionId`] this delegates to
-    /// [`Self::exact_pool_for_execution`]. For [`ExternalTarget::WorkflowId`]
-    /// the owning shard is resolved via [`external_target_owning_shard`];
-    /// when that returns `None` (the process-global shard router isn't
-    /// initialized), `fallback_shard` is used instead — the same
-    /// "assume same shard as the caller" contract documented on
-    /// [`external_target_owning_shard`].
+    /// [`Self::exact_pool_for_execution`] and is authoritative. For
+    /// [`ExternalTarget::WorkflowId`] the owning shard is resolved via
+    /// [`external_target_owning_shard`]; when that returns `None` (the
+    /// process-global shard router isn't initialized), `fallback_shard` is used
+    /// instead.
+    ///
+    /// # Deprecated (issue #1146)
+    ///
+    /// Asking which *pool* holds a target is always a "where does this live?"
+    /// question, and for a `WorkflowId` target the rendezvous hash answers a
+    /// different one — "where would a fresh start go?" (see
+    /// [`external_target_owning_shard`]). A workflow pinned by an explicit
+    /// [`ShardPlacement`], or one left behind by a shard drained out of
+    /// `writable_shards`, resolves here to a pool it is not in, and the caller
+    /// concludes the target does not exist.
+    ///
+    /// Use [`crate::external_target_location::resolve_location_by_workflow_id`]
+    /// and then [`Self::exact_pool_for`] on the shard it reports. Retained,
+    /// rather than removed, because it is public API.
+    #[deprecated(
+        since = "0.7.0",
+        note = "hash-derived and wrong for explicitly-placed or drained-shard workflows; \
+                use external_target_location::resolve_location_by_workflow_id then exact_pool_for"
+    )]
     #[must_use]
     pub fn exact_pool_for_target(
         &self,
@@ -970,6 +2004,138 @@ impl ShardedDbPool {
     }
 }
 
+/// What a per-shard scanner does when it cannot reach one shard's database.
+///
+/// Existing scanners disagree on this. So [`connect_to_shard`] takes it as
+/// a parameter. It does not pick one behavior for every scanner
+/// (issue #1362).
+#[cfg(feature = "db")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ShardConnectError {
+    /// Log the error and move to the next shard. The scan continues.
+    LogAndSkip,
+    /// Return the error. The scan stops.
+    Abort,
+}
+
+/// A pooled connection to one shard, as returned by [`connect_to_shard`].
+#[cfg(feature = "db")]
+pub(crate) type ShardConn = crate::replication::FencedConn;
+
+/// Get `shard`'s own connection from `sharded_pool`.
+///
+/// Every per-shard admission scanner does this lookup the same way
+/// (issue #1362). Debounce, throttle, event-batch, and completion-delivery
+/// each scan due rows shard by shard. Each one starts a shard's turn with
+/// exactly this step.
+///
+/// A shard absent from the pool map is not configured on this process.
+/// `Ok(None)` skips it; this is not an error. A `pool.get()` failure has
+/// two possible outcomes. [`ShardConnectError::LogAndSkip`] logs it and
+/// treats it the same as a missing shard. [`ShardConnectError::Abort`]
+/// returns it to the caller instead. Existing scanners disagree on which
+/// outcome to use, so this takes the choice as a parameter.
+///
+/// The claim query, the row shape, and the fire logic stay in each
+/// caller's own loop. They run on the returned connection, but this
+/// function does not share them. They differ across scanners. Forcing one
+/// shape onto them would be the actual bug. Sharing only this lookup keeps
+/// each caller's loop order intact. An earlier shard may already have
+/// fired and committed before a later shard's connection fails. This
+/// preserves that order.
+///
+/// # Errors
+/// Returns [`HarvestError::Database`](crate::error::HarvestError::Database)
+/// for a connect failure under [`ShardConnectError::Abort`].
+#[cfg(feature = "db")]
+pub(crate) async fn connect_to_shard(
+    sharded_pool: &ShardedDbPool,
+    shard: ShardId,
+    log_tag: &str,
+    on_connect_error: ShardConnectError,
+) -> crate::error::HarvestResult<Option<ShardConn>> {
+    let Some(pool) = sharded_pool.exact_pool_for(shard).cloned() else {
+        return Ok(None);
+    };
+    // Issue #1823: inside a fenced pass, a busy pool must not hold a bump
+    // off, and a lost guard must end this backend.
+    match crate::replication::fenced_checkout(&pool).await {
+        Ok(conn) => Ok(Some(conn)),
+        Err(e) => match on_connect_error {
+            ShardConnectError::LogAndSkip => {
+                tracing::error!("[{log_tag}] failed to get connection to shard {shard:?}: {e:?}");
+                Ok(None)
+            }
+            ShardConnectError::Abort => Err(crate::error::HarvestError::Database(e.to_string())),
+        },
+    }
+}
+
+/// A connection to one shard: the caller's own, or one checked out for it.
+#[cfg(feature = "db")]
+pub(crate) enum ShardConnRef<'a> {
+    Caller(&'a mut AsyncPgConnection),
+    // Boxed: a pooled connection is far larger than a borrow.
+    Pooled(Box<ShardConn>),
+}
+
+#[cfg(feature = "db")]
+impl std::ops::Deref for ShardConnRef<'_> {
+    type Target = AsyncPgConnection;
+
+    fn deref(&self) -> &AsyncPgConnection {
+        match self {
+            Self::Caller(conn) => conn,
+            Self::Pooled(conn) => conn,
+        }
+    }
+}
+
+#[cfg(feature = "db")]
+impl std::ops::DerefMut for ShardConnRef<'_> {
+    fn deref_mut(&mut self) -> &mut AsyncPgConnection {
+        match self {
+            Self::Caller(conn) => conn,
+            Self::Pooled(conn) => conn,
+        }
+    }
+}
+
+/// [`connect_to_shard`], but reuse `conn` when it already belongs to `shard`.
+///
+/// `conn_shard` names the shard `conn` came from. Only a caller that checked
+/// `conn` out of that shard's own pool may pass `Some`. Every other caller
+/// passes `None` and gets [`connect_to_shard`] unchanged. Nothing here infers
+/// the shard from `conn` or from the assignment list.
+///
+/// The per-shard timeout checker is the caller this exists for. It holds
+/// `conn` for the whole pass, and its scanners visit that same shard. A
+/// second `pool.get()` on that pool is then a hold-and-wait. A pool
+/// may have no deadpool acquisition timeout. Once the pool is exhausted,
+/// the wait never ends, and it wedges the whole pass (issue #1426
+/// follow-up).
+///
+/// # Errors
+/// Same as [`connect_to_shard`].
+#[cfg(feature = "db")]
+pub(crate) async fn connect_or_reuse<'a>(
+    conn: &'a mut AsyncPgConnection,
+    conn_shard: Option<ShardId>,
+    sharded_pool: &ShardedDbPool,
+    shard: ShardId,
+    log_tag: &str,
+    on_connect_error: ShardConnectError,
+) -> crate::error::HarvestResult<Option<ShardConnRef<'a>>> {
+    if conn_shard == Some(shard) && sharded_pool.exact_pool_for(shard).is_some() {
+        return Ok(Some(ShardConnRef::Caller(conn)));
+    }
+    Ok(
+        connect_to_shard(sharded_pool, shard, log_tag, on_connect_error)
+            .await?
+            .map(|c| ShardConnRef::Pooled(Box::new(c))),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -977,6 +2143,16 @@ mod tests {
     fn router_with(shards: &[i32]) -> ShardRouter {
         let ids: Vec<ShardId> = shards.iter().copied().map(ShardId::new).collect();
         ShardRouter::new(ids.clone(), ids.clone(), ids[0])
+    }
+
+    // Issue #1821: the escape split no longer uses `expect`. Pin its output.
+    #[test]
+    #[cfg(feature = "db")]
+    fn split_options_keeps_escapes_and_a_trailing_backslash_1821() {
+        assert_eq!(
+            split_options_preserving_escapes("a\\ b\\,c  d\\"),
+            vec!["a b,c".to_owned(), "d\\".to_owned()]
+        );
     }
 
     #[test]
@@ -1483,4 +2659,1597 @@ mod tests {
     fn residency_map_with_a_blank_key_panics_at_construction() {
         let _ = router_with(&[0, 1]).with_residency_map([(String::new(), ShardId::new(1))]);
     }
+
+    // Building a `Pool` never connects, so these need no live database.
+    #[cfg(feature = "db")]
+    fn test_pool() -> DbPool {
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new("postgres://unused/db");
+        DbPool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("pool builds without connecting")
+    }
+
+    // `from_map` sees a shared pool by object identity: two shard ids
+    // backed by clones of one `Pool` must land in one group (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_map_groups_cloned_pools_together() {
+        let pool = test_pool();
+        let mut pools = BTreeMap::new();
+        pools.insert(ShardId::new(0), pool.clone());
+        pools.insert(ShardId::new(1), pool);
+        let sharded = ShardedDbPool::from_map(pools, ShardId::new(0));
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "two clones of one pool must collapse to one group"
+        );
+        let mut shards = groups[0].1.clone();
+        shards.sort();
+        assert_eq!(shards, vec![ShardId::new(0), ShardId::new(1)]);
+    }
+
+    // `from_dsns` builds a fresh `Pool` per entry, even for one DSN reused
+    // across two shard ids. Object identity alone would report these as
+    // unrelated. The DSN itself must still group them (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_groups_shards_sharing_one_dsn() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (ShardId::new(0), "postgres://unused/shared".to_string()),
+                (ShardId::new(1), "postgres://unused/shared".to_string()),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "two shards on the same DSN must collapse to one group, even \
+             though from_dsns built them as two separate Pool objects"
+        );
+        let mut shards = groups[0].1.clone();
+        shards.sort();
+        assert_eq!(shards, vec![ShardId::new(0), ShardId::new(1)]);
+    }
+
+    // Two shards on genuinely different DSNs must never be combined
+    // (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_keeps_distinct_dsns_separate() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (ShardId::new(0), "postgres://unused/db-a".to_string()),
+                (ShardId::new(1), "postgres://unused/db-b".to_string()),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            2,
+            "two different DSNs must never collapse into one group"
+        );
+    }
+
+    // Two DSNs can reach one physical database while written differently:
+    // different credentials, and an explicit default port versus none
+    // (issue #1266). Comparing the raw strings would miss this.
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_groups_equivalent_dsns_with_different_credentials_and_port() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://alice:secret1@db.example/shared".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://bob:secret2@db.example:5432/shared".to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "same host and database, differing only in credentials and an \
+             explicit default port, must collapse to one group"
+        );
+        let mut shards = groups[0].1.clone();
+        shards.sort();
+        assert_eq!(shards, vec![ShardId::new(0), ShardId::new(1)]);
+    }
+
+    // Same host, different database name: never the same physical
+    // database (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_keeps_distinct_dbnames_on_the_same_host_separate() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (ShardId::new(0), "postgres://db.example/db-a".to_string()),
+                (ShardId::new(1), "postgres://db.example/db-b".to_string()),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            2,
+            "two different database names on the same host must never \
+             collapse into one group"
+        );
+    }
+
+    // A `search_path` set through `?options=...` selects which schema
+    // `harvest_audit_log` resolves to. Two DSNs differing only there
+    // must never collapse (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_keeps_distinct_search_path_options_separate() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dschema_a".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dschema_b".to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            2,
+            "different `options` can select a different schema, so these \
+             must never collapse into one group"
+        );
+    }
+
+    // `application_name` and `sslmode` never change which relation a
+    // query resolves against. Two shards on the same database, differing
+    // only in credentials and these tuning parameters, must still
+    // collapse to one group (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_ignores_connection_only_parameters() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://alice@db.example/shared?application_name=web".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://bob@db.example/shared?application_name=worker&sslmode=require"
+                        .to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "application_name and sslmode never affect relation \
+             resolution, so these must collapse to one group"
+        );
+    }
+
+    // A Unix-socket DSN carries the real endpoint in a `host` query
+    // parameter, not the URI authority. Two such DSNs for different
+    // sockets must never collapse (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_keeps_distinct_unix_socket_hosts_separate() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgresql:///harvest?host=%2Frun%2Fpg-a".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgresql:///harvest?host=%2Frun%2Fpg-b".to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            2,
+            "different `host` query parameters name different sockets, \
+             so these must never collapse into one group"
+        );
+    }
+
+    // Two Unix-socket DSNs for the *same* socket, named through `host`,
+    // must still collapse to one group (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_groups_shards_sharing_one_unix_socket_host() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgresql:///harvest?host=%2Frun%2Fpg-a".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgresql:///harvest?host=%2Frun%2Fpg-a".to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "the same `host` query parameter names the same socket, so \
+             these must collapse into one group"
+        );
+    }
+
+    // Unix filesystem paths are case-sensitive: `/run/PG-A` and
+    // `/run/pg-a` name different sockets (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_keeps_distinctly_cased_socket_paths_separate() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgresql:///harvest?host=%2Frun%2FPG-A".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgresql:///harvest?host=%2Frun%2Fpg-a".to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            2,
+            "a socket path's case is significant, so these must never \
+             collapse into one group"
+        );
+    }
+
+    // A Unix-socket path's `.` component and doubled `/` are harmless
+    // syntactic redundancy the OS ignores. `/run/postgresql` and
+    // `/run/./postgresql` name the same socket (Codex review, PR #1504).
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_groups_shards_sharing_one_socket_path_written_differently() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgresql:///harvest?host=%2Frun%2Fpostgresql".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgresql:///harvest?host=%2Frun%2F.%2Fpostgresql%2F".to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "a `.` component and a trailing `/` name the same directory \
+             the OS would resolve without them, so these must collapse \
+             into one group"
+        );
+    }
+
+    // A DNS hostname stays case-insensitive even when it arrives through
+    // `host=`, unlike a socket path (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_groups_shards_sharing_one_hostname_regardless_of_case() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgresql:///harvest?host=DB.EXAMPLE".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgresql:///harvest?host=db.example".to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "a DNS hostname is case-insensitive, so these must collapse \
+             into one group"
+        );
+    }
+
+    // libpq defaults an omitted dbname to the connecting username, so
+    // two users with no explicit dbname reach different databases
+    // (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_keeps_distinct_users_with_no_explicit_dbname_separate() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (ShardId::new(0), "postgres://alice@db.example".to_string()),
+                (ShardId::new(1), "postgres://bob@db.example".to_string()),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            2,
+            "an omitted dbname defaults to the username, so two \
+             different users must never collapse into one group"
+        );
+    }
+
+    // The username-as-dbname fallback applies only when no path is
+    // given. An explicit, shared dbname still groups regardless of
+    // username (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_ignores_username_when_dbname_is_explicit() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://alice@db.example/shared".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://bob@db.example/shared".to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "an explicit dbname is not defaulted from the username, so \
+             these must still collapse into one group"
+        );
+    }
+
+    // `url::Url` and `tokio_postgres::Config` disagree on percent-decoding:
+    // `url::Url::path()` returns the raw, still-encoded path, but the real
+    // connector decodes it. Two spellings of one database name must
+    // collapse (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_groups_percent_encoded_and_plain_dbname_spellings() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (ShardId::new(0), "postgres://db.example/harvest".to_string()),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/%68arvest".to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "`%68` decodes to `h`, so both DSNs name the same database \
+             and must collapse into one group"
+        );
+    }
+
+    // `options` can carry any `-c name=value` GUC, not only
+    // `search_path`. Two DSNs differing only in an unrelated one must
+    // still collapse (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_ignores_non_search_path_options_flags() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=-c%20application_name%3Dweb".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=-c%20application_name%3Dworker"
+                        .to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "`application_name` set through `options` never affects \
+             relation resolution, so these must collapse into one group"
+        );
+    }
+
+    // `hostaddr` pins the actual TCP destination. Two DSNs sharing one
+    // must collapse regardless of how each spells the hostname (issue
+    // #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_groups_shards_sharing_one_hostaddr_regardless_of_hostname() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://alias-a/shared?hostaddr=10.0.0.5".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://alias-b/shared?hostaddr=10.0.0.5".to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "a shared `hostaddr` names one physical destination, so these \
+             must collapse into one group even though the hostnames differ"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_groups_a_numeric_host_with_a_differing_explicit_hostaddr() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://10.0.0.1/shared?hostaddr=10.0.0.2".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://alias/shared?hostaddr=10.0.0.2".to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "an explicit hostaddr alone pins the TCP destination, so a \
+             numeric host text must not also be folded into the address \
+             set -- both DSNs pin the identical server and must collapse"
+        );
+    }
+
+    // The compact `-csearch_path=value` spelling has no space before
+    // `-c`. It is already used elsewhere in this codebase. It must be
+    // recognized the same as the spaced form (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_recognizes_the_compact_search_path_options_spelling() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=-csearch_path%3Dschema_a".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=-csearch_path%3Dschema_b".to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            2,
+            "the compact `-csearch_path=` spelling must select a schema \
+             just as the spaced form does, so these must never collapse"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_recognizes_the_long_form_search_path_options_spelling() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=--search_path%3Dschema_a".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=--search_path%3Dschema_b".to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            2,
+            "the long-form `--search_path=` spelling must select a schema \
+             just as `-c search_path=` does, so these must never collapse"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_recognizes_a_hyphenated_long_form_search_path_name() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=--search-path%3Dschema_a".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=--search_path%3Dschema_a".to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "PostgreSQL normalizes a hyphen to an underscore in a \
+             long-form GUC name, so --search-path= and --search_path= \
+             select the same schema and must collapse"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_groups_unquoted_names_differing_only_past_the_identifier_length_limit() {
+        let prefix = "a".repeat(63);
+        let name_a = format!("{prefix}x");
+        let name_b = format!("{prefix}y");
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    format!("postgres://db.example/shared?options=-c%20search_path%3D{name_a}"),
+                ),
+                (
+                    ShardId::new(1),
+                    format!("postgres://db.example/shared?options=-c%20search_path%3D{name_b}"),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "PostgreSQL silently truncates an unquoted identifier past \
+             its 63-byte limit, so two names sharing that many bytes \
+             store as the identical name and must collapse"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_groups_dsns_whose_search_path_differs_only_by_an_escaped_space() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dtenant%2Cpublic"
+                        .to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dtenant%2C%5C%20public"
+                        .to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "an escaped space in one alias's search_path value must not \
+             stop it from collapsing with the other: PostgreSQL treats \
+             `tenant,public` and `tenant, public` as the same schema list"
+        );
+    }
+
+    // A Codex review finding on this fix: `pg_split_opts` tests
+    // whitespace with `isspace()`, a byte-at-a-time ASCII test, not
+    // Unicode's `White_Space` property. A no-break space (U+00A0) is
+    // whitespace to Rust's `char::is_whitespace` but not to `PostgreSQL`,
+    // so it must not split an options token here either.
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_keeps_a_search_path_containing_a_non_ascii_space_distinct() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dtenant".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dtenant%C2%A0x"
+                        .to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            2,
+            "a no-break space is not ASCII whitespace to PostgreSQL's own \
+             options splitter, so `tenant\u{a0}x` must stay one unquoted \
+             token distinct from `tenant`, not split into `tenant` and a \
+             stray `x` that collides with the other DSN's search_path"
+        );
+    }
+
+    // The same ASCII-only whitespace rule applies inside
+    // `parse_identifier_list` itself, matching `SplitIdentifierString`'s
+    // `scanner_isspace` (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn parse_identifier_list_keeps_a_non_ascii_space_inside_an_unquoted_name() {
+        assert_eq!(
+            parse_identifier_list("tenant\u{a0}x,public"),
+            Some(vec!["tenant\u{a0}x".to_string(), "public".to_string()]),
+            "a no-break space is not whitespace to PostgreSQL's \
+             scanner_isspace, so it belongs inside the unquoted \
+             identifier rather than ending it early"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn parse_identifier_list_does_not_fold_a_non_ascii_uppercase_letter() {
+        assert_eq!(
+            parse_identifier_list("\u{c4}"),
+            Some(vec!["\u{c4}".to_string()]),
+            "PostgreSQL never downcases a non-ASCII byte under a \
+             multibyte server encoding such as UTF8, so Ä must stay Ä, \
+             not fold to ä the way Rust's Unicode-aware \
+             str::to_lowercase would"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_groups_search_path_identifiers_that_differ_only_by_case() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=-c%20search_path%3DPUBLIC".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dpublic".to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "PostgreSQL folds an unquoted identifier to lowercase, so \
+             `PUBLIC` and `public` name the same schema and must collapse"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_keeps_search_path_identifiers_that_differ_only_by_non_ascii_case_distinct() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=-c%20search_path%3D%C3%84".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=-c%20search_path%3D%C3%A4".to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            2,
+            "PostgreSQL never downcases a non-ASCII byte under a \
+             multibyte server encoding such as UTF8, so unquoted `Ä` \
+             and `ä` name two distinct schemas. Folding them together \
+             here would merge two apparent groups that are really \
+             separate databases, losing one pool's connection entirely"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_keeps_a_quoted_comma_containing_schema_distinct_from_two_plain_ones() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=-c%20search_path%3D%22tenant%2C%20one%22"
+                        .to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dtenant%2Cone"
+                        .to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            2,
+            "a quoted schema named literally `tenant, one` is one \
+             identifier, distinct from the two unquoted identifiers \
+             `tenant` and `one`, and must never collapse with them"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_keeps_a_quoted_comma_containing_schema_distinct_with_no_space_to_hide_behind() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=-c%20search_path%3D%22tenant%2Cone%22"
+                        .to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dtenant%2Cone"
+                        .to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            2,
+            "the one quoted item `tenant,one` and the two unquoted items \
+             `tenant` and `one` must not join to the same string just \
+             because a bare comma also separates joined items -- an \
+             unescaped join collapses both to `tenant,one`"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_groups_an_implicit_pg_catalog_with_an_explicit_leading_one() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dpublic".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dpg_catalog%2Cpublic"
+                        .to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "PostgreSQL always searches pg_catalog first when it is \
+             omitted, so `public` and `pg_catalog,public` resolve an \
+             unqualified relation the same way and must collapse"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_keeps_an_explicit_trailing_pg_catalog_distinct_from_the_implicit_leading_one() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dpublic".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dpublic%2Cpg_catalog"
+                        .to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            2,
+            "omitting pg_catalog always searches it first, but naming it \
+             explicitly last searches it last -- a genuinely different \
+             resolution order that must never collapse with the implicit one"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_groups_a_search_path_with_a_repeated_name() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dpublic".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dpublic%2Cpublic"
+                        .to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "public and public,public search the identical schema in \
+             the identical order, so a repeated name must not stop \
+             these from collapsing into one group"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_groups_dsns_whose_search_path_differs_only_by_an_escaped_tab() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dtenant%2Cpublic"
+                        .to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dtenant%2C%5C%09public"
+                        .to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "an escaped tab in one alias's search_path value must not \
+             stop it from collapsing with the other, just as an escaped \
+             space does not"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_recognizes_an_uppercase_search_path_guc_name() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=-c%20SEARCH_PATH%3Dshared".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dshared".to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "PostgreSQL parameter names are case-insensitive, so \
+             SEARCH_PATH=shared sets the identical GUC as \
+             search_path=shared and must select the same schema"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_groups_an_implicit_pg_temp_with_an_explicit_leading_one() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dpublic".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dpg_temp%2Cpg_catalog%2Cpublic"
+                        .to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "PostgreSQL always searches the session's temporary schema \
+             before pg_catalog when it is omitted, so public and \
+             pg_temp,pg_catalog,public resolve the same way and must \
+             collapse"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_keeps_an_explicit_trailing_pg_temp_distinct_from_the_implicit_leading_one() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dpublic".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dpublic%2Cpg_temp"
+                        .to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            2,
+            "omitting pg_temp always searches it first, but naming it \
+             explicitly last searches it last -- a genuinely different \
+             resolution order that must never collapse with the implicit one"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_groups_dsns_whose_search_path_differs_only_by_an_escaped_comma() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dpublic".to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dpublic%5C%2Cpublic"
+                        .to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "pg_split_opts removes a backslash before any character, so \
+             public\\,public reaches the server the same as \
+             public,public, and both must select the same schema"
+        );
+    }
+
+    // libpq applies a repeated `-c search_path=...` as a `SET`, in
+    // order, so only the last one has any effect. Two DSNs with the
+    // same effective `search_path` must collapse even when one carries
+    // an earlier, overridden value the other never mentions at all
+    // (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn from_dsns_groups_dsns_with_the_same_effective_search_path() {
+        let sharded = ShardedDbPool::from_dsns(
+            [
+                (
+                    ShardId::new(0),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dold%20-c%20search_path%3Dshared"
+                        .to_string(),
+                ),
+                (
+                    ShardId::new(1),
+                    "postgres://db.example/shared?options=-c%20search_path%3Dshared".to_string(),
+                ),
+            ],
+            ShardId::new(0),
+            1,
+        )
+        .expect("pool builds without connecting");
+
+        let groups = sharded.pool_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "only the last `-c search_path=` takes effect, so an \
+             overridden earlier value must not stop these from \
+             collapsing into one group"
+        );
+    }
+
+    // `connect_to_shard` (issue #1362): the per-shard connection lookup
+    // shared by debounce, throttle, event_batch, and completion_callback.
+    // These tests cover the one branch no scanner's own test suite
+    // exercises today: a shard whose connection cannot be obtained.
+    // `test_pool()` builds a pool that never connects, so `.get()` fails
+    // fast with no live database.
+    #[cfg(feature = "db")]
+    mod connect_to_shard_tests {
+        use super::*;
+
+        fn unreachable_pools(shards: &[ShardId]) -> BTreeMap<ShardId, DbPool> {
+            shards.iter().map(|s| (*s, test_pool())).collect()
+        }
+
+        #[tokio::test]
+        async fn log_and_skip_returns_none_on_a_connect_failure() {
+            let shard = ShardId::new(0);
+            let sharded = ShardedDbPool::from_map(unreachable_pools(&[shard]), shard);
+
+            let result = connect_to_shard(&sharded, shard, "test", ShardConnectError::LogAndSkip)
+                .await
+                .expect("a connect failure must not fail under LogAndSkip");
+
+            assert!(
+                result.is_none(),
+                "an unreachable shard must be skipped, not connected"
+            );
+        }
+
+        #[tokio::test]
+        async fn abort_returns_an_error_on_a_connect_failure() {
+            let shard = ShardId::new(0);
+            let sharded = ShardedDbPool::from_map(unreachable_pools(&[shard]), shard);
+
+            let result = connect_to_shard(&sharded, shard, "test", ShardConnectError::Abort).await;
+
+            assert!(
+                result.is_err(),
+                "Abort must surface a connect failure as an error"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_shard_with_no_pool_entry_is_skipped_without_connecting() {
+            let configured = ShardId::new(0);
+            let unconfigured = ShardId::new(5);
+            let sharded = ShardedDbPool::from_map(unreachable_pools(&[configured]), configured);
+
+            let result = connect_to_shard(&sharded, unconfigured, "test", ShardConnectError::Abort)
+                .await
+                .expect("an unconfigured shard is not a connect failure");
+
+            assert!(
+                result.is_none(),
+                "a shard with no pool entry must be skipped, never attempted"
+            );
+        }
+    }
+}
+
+// ── Cross-shard child placement (issue #956) ─────────────────────────────────
+
+/// Where a **child** workflow should be placed (issue #956).
+///
+/// Children are pinned to the parent's shard by default and that default is
+/// permanent: [`ChildPlacement::ParentShard`] is byte-for-byte today's
+/// behaviour, resolves without consulting the router at all, and is what every
+/// existing `spawn_child_workflow*` call gets. The other variants are an
+/// **opt-in, per-spawn** policy for the child-heavy orchestrator workloads that
+/// otherwise concentrate a whole fan-out's storage and dispatch load on one
+/// database.
+///
+/// # Choosing a variant
+///
+/// | Variant | Use when |
+/// |---|---|
+/// | [`ParentShard`](ChildPlacement::ParentShard) | Anything without a fan-out scale problem. The default. |
+/// | [`Distributed`](ChildPlacement::Distributed) | A large fan-out whose write load should spread across `writable_shards`. |
+/// | [`Shard`](ChildPlacement::Shard) | Ops tooling that already knows the shard number. |
+/// | [`ResidencyKey`](ChildPlacement::ResidencyKey) | The child has a jurisdiction of its own, distinct from the parent's. |
+///
+/// # Residency interaction (issue #697)
+///
+/// Residency is transitive across the workflow tree *under the default*: a
+/// child of a pinned parent stays on the parent's shard. Opting a child into
+/// `Distributed` deliberately breaks that transitivity for that child, which is
+/// exactly what a residency-bound tree must not do. Use
+/// [`ChildPlacement::ResidencyKey`] when the child has its own declared
+/// jurisdiction, and leave residency-bound trees on the default.
+///
+/// ```rust
+/// use autumn_harvest::shard::ChildPlacement;
+///
+/// assert_eq!(ChildPlacement::default(), ChildPlacement::ParentShard);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ChildPlacement {
+    /// Pin the child to the parent's shard. **The default, permanently.**
+    ///
+    /// Resolves without touching [`ShardRouter`], so a deployment that never
+    /// installs a router (every single-shard deployment, every existing test)
+    /// is unaffected.
+    #[default]
+    ParentShard,
+    /// Spread children across `writable_shards` by rendezvous hash.
+    ///
+    /// Uses the same [`ShardRouter::pick_for_new_workflow`] a top-level start
+    /// uses, keyed on a deterministic per-parent placement key (see
+    /// [`child_placement_key`]) so a decision cycle retried after a crash
+    /// re-derives the identical shard.
+    Distributed,
+    /// Pin the child to a concrete shard.
+    ///
+    /// Rejected — never silently re-hashed — unless the shard is both readable
+    /// and writable, exactly like [`ShardPlacement::Shard`].
+    Shard(ShardId),
+    /// Pin the child via an operator-declared residency key.
+    ///
+    /// Resolved through [`ShardRouter::with_residency_map`]; an undeclared key
+    /// is an error, never a hash fallback.
+    ResidencyKey(String),
+}
+
+impl ChildPlacement {
+    /// Is this the default (parent-pinned) placement?
+    ///
+    /// Callers use this to take the untouched same-shard code path without
+    /// pattern-matching on a `#[non_exhaustive]` enum.
+    #[must_use]
+    pub const fn is_parent_shard(&self) -> bool {
+        matches!(self, Self::ParentShard)
+    }
+}
+
+/// The deterministic rendezvous key for the `seq`-th child of `parent`.
+///
+/// Restart stability is the whole point: a top-level start hashes a caller-
+/// supplied `workflow_id`, which is stable by construction, but a child's
+/// `ExecutionId` is minted fresh on every dispatch. Hashing the *minted id*
+/// would re-roll the shard whenever a decision cycle is retried after a crash.
+/// Hashing `(parent, seq)` instead re-derives the identical shard, giving
+/// children the same restart-stability contract top-level starts have.
+///
+/// ```rust
+/// use autumn_harvest::shard::child_placement_key;
+/// use autumn_harvest::types::{ExecutionId, ShardId};
+///
+/// let parent = ExecutionId::new_for_shard(ShardId::new(0));
+/// assert_eq!(child_placement_key(parent, 3), child_placement_key(parent, 3));
+/// assert_ne!(child_placement_key(parent, 3), child_placement_key(parent, 4));
+/// ```
+#[must_use]
+pub fn child_placement_key(parent: ExecutionId, seq: u32) -> String {
+    format!("{parent}#{seq}")
+}
+
+/// Resolve a [`ChildPlacement`] to the shard the child must be created on.
+///
+/// Pure: the router is passed in rather than read from
+/// [`GLOBAL_SHARD_ROUTER`], so every branch is unit-testable without a process
+/// global. [`ChildPlacement::ParentShard`] short-circuits before `router` is
+/// even inspected, which is why `router` is an `Option` — the default path must
+/// work in a deployment that never installs one.
+///
+/// # Where a *drained* shard is rejected — and why not here
+///
+/// This function rejects only **static misconfiguration**: no router installed,
+/// an unknown shard, an undeclared or blank residency key. Retrying any of those
+/// never helps, so surfacing them to the workflow author as a terminal error is
+/// right.
+///
+/// A shard that is merely **drained** (readable but out of `writable_shards`)
+/// is a *transient* operational state, and it is deliberately **not** rejected
+/// here. This function runs inside the workflow handler, and the handler ABI
+/// erases the error type — a workflow's `?` turns any `HarvestError` into a
+/// `String`, which the executor maps to a terminal `WorkflowOutcome::Failed`.
+/// The worker's typed `ShardUnavailable` recovery would never see it, so
+/// rejecting a drain here would *permanently* fail every workflow that spawned a
+/// placed child during a maintenance window — the opposite of the documented
+/// bounded retry.
+///
+/// Writability is therefore enforced one layer down, by
+/// `cross_shard_child::preflight_target_shard`, which runs inside the parent's
+/// **persist** transaction where `ShardUnavailable` is recognised and requeued
+/// with a bounded backoff. Nothing is recorded in the meantime: the resolved id
+/// only reaches history if that persist succeeds, and the persist is exactly
+/// what rejects it.
+///
+/// This is not a fallback. The shard this returns is the shard the caller asked
+/// for (or the rendezvous pick); it is never quietly swapped for the parent's
+/// shard or the default shard, which is the failure mode AC8 exists to remove.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Config`] when a non-default placement is requested
+/// but no router is installed, or when the router rejects the pin as unknown or
+/// undeclared.
+pub fn resolve_child_placement(
+    router: Option<&ShardRouter>,
+    placement: &ChildPlacement,
+    parent_shard: ShardId,
+    workflow_name: &str,
+    placement_key: &str,
+) -> crate::error::HarvestResult<ShardId> {
+    if placement.is_parent_shard() {
+        return Ok(parent_shard);
+    }
+
+    let Some(router) = router else {
+        return Err(crate::error::HarvestError::Config(format!(
+            "child placement {placement:?} requires an installed ShardRouter; \
+             refusing to fall back to the parent's shard"
+        )));
+    };
+
+    let requested = match placement {
+        ChildPlacement::ParentShard => unreachable!("short-circuited above"),
+        ChildPlacement::Distributed => {
+            // `pick_for_new_workflow` falls back to `default_shard` when NOTHING
+            // is writable. That degenerate case is deliberately allowed to land
+            // the child, and it is deliberately traced.
+            //
+            // Allowed, because the alternatives are worse. Failing the spawn
+            // would be terminal (the handler ABI erases the error type — see the
+            // note above). Requeuing it would *deadlock the drain itself*: a
+            // drained shard is one that should let its in-flight work finish,
+            // and a parent cannot finish while the children it is awaiting are
+            // refused. And "the parent's shard" is not an arbitrary consolation
+            // prize here — with zero writable shards it is where an *unplaced*
+            // child would go, and where the parent already lives, so no
+            // cross-shard placement contract is broken: none was made.
+            //
+            // MUST be `parent_shard`, never `default_shard()` (issue #1263 item
+            // 15). The two coincide only when the parent happens to already live
+            // on the default shard. For any other in-flight parent,
+            // `default_shard()` would encode the child onto a DIFFERENT shard
+            // than the parent. The persist path then classifies that child
+            // remote, and `preflight_target_shard` rejects it — an empty
+            // writable set makes every shard, including the default one,
+            // unwritable. That is the exact drain deadlock this fallback exists
+            // to prevent. Returning the parent's own shard makes the child
+            // genuinely LOCAL, so it can never reach that remote-classifying
+            // check at all.
+            //
+            // Traced, because AC8's requirement is that a fallback never happens
+            // "without trace". A `warn!` naming the workflow and the shard is
+            // that trace; the operator draining the fleet can see exactly which
+            // placed spawns degenerated while the window was open.
+            if router.writable_shards().is_empty() {
+                tracing::warn!(
+                    workflow_name,
+                    shard = parent_shard.as_i32(),
+                    "no shard is currently writable; a Distributed child placement \
+                     stays on the parent's own shard for the duration of the drain"
+                );
+                return Ok(parent_shard);
+            }
+            return Ok(router.pick_for_new_workflow(workflow_name, placement_key));
+        }
+        ChildPlacement::Shard(shard) => ShardPlacement::Shard(*shard),
+        ChildPlacement::ResidencyKey(key) => ShardPlacement::ResidencyKey(key.clone()),
+    };
+
+    match router.resolve_placement(&requested, workflow_name, placement_key) {
+        Ok(shard) => Ok(shard),
+        // A drained shard is a *transient* operational state — a rebalance, a
+        // maintenance window. Resolve it to the shard the caller named and let
+        // the persist-boundary preflight reject it retryably; see this
+        // function's "Where a drained shard is rejected" note. Everything else
+        // is static misconfiguration and stays a terminal `Config` error.
+        Err(ShardPlacementError::ShardNotWritable { requested, .. }) => Ok(requested),
+        Err(other) => Err(crate::error::HarvestError::Config(other.to_string())),
+    }
+}
+
+/// Lifecycle status of one cross-shard child outbox row (issue #956).
+///
+/// Persisted as the row's `status` TEXT column. Deliberately a two-state
+/// machine: everything after `Started` is decided by *observed* facts (the
+/// child's state on the target shard, the parent's state here), never by a
+/// status the relay has to remember to advance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CrossShardChildStatus {
+    /// The parent committed the spawn; the child does not exist on the target
+    /// shard yet.
+    PendingStart,
+    /// The child row exists on the target shard.
+    Started,
+}
+
+impl CrossShardChildStatus {
+    /// The database representation of this status.
+    #[must_use]
+    pub const fn as_db_str(self) -> &'static str {
+        match self {
+            Self::PendingStart => "PENDING_START",
+            Self::Started => "STARTED",
+        }
+    }
+
+    /// Parse a database `status` value, or `None` when it is not recognised.
+    #[must_use]
+    pub fn from_db(raw: &str) -> Option<Self> {
+        match raw {
+            "PENDING_START" => Some(Self::PendingStart),
+            "STARTED" => Some(Self::Started),
+            _ => None,
+        }
+    }
+}
+
+/// Everything the relay knows about one cross-shard child this tick.
+///
+/// Assembled from the outbox row on the parent's shard plus one batched read of
+/// the child's state on the target shard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrossShardChildObservation<'a> {
+    /// Where the row is in its lifecycle.
+    pub status: CrossShardChildStatus,
+    /// A parent-side cancel that has not been delivered to the target shard yet.
+    pub cancel_requested: bool,
+    /// `None` for an **awaited** child; `Some(policy)` for a **detached** one.
+    pub parent_close_policy: Option<crate::types::ParentClosePolicy>,
+    /// Whether the parent has reached a terminal state on this shard, or `None`
+    /// when this sweep could not read it.
+    ///
+    /// The three-state shape is load-bearing. A failed batch read must NOT be
+    /// collapsed into "terminal": `Retire` deletes the row outright, with no
+    /// second look at the parent, so one transient read error would permanently
+    /// lose the wake of every awaited cross-shard child in the batch — and would
+    /// cascade-cancel detached children whose parents are alive and well.
+    /// `None` means "not known to be closed", and no destructive action is
+    /// decided from it.
+    ///
+    /// A `Some(true)` from a *successful* read whose result simply lacks the
+    /// parent's id is correct: the row is genuinely gone (retention collection,
+    /// erase), and there is nobody left to wake.
+    pub parent_terminal: Option<bool>,
+    /// The child's `state` column on the target shard, or `None` when the child
+    /// row is not visible yet (not created, or the shard was unreadable).
+    pub child_state: Option<&'a str>,
+}
+
+/// What the relay should do with one cross-shard child outbox row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrossShardChildAction {
+    /// Create the child execution on the target shard, then mark the row
+    /// [`CrossShardChildStatus::Started`].
+    StartChild,
+    /// Deliver an idempotent cancel to the child on the target shard.
+    CancelChild,
+    /// Append the child's terminal event to the parent's history, wake the
+    /// parent, and drop the row — all in one transaction on the parent's shard.
+    DeliverTerminal,
+    /// Apply the parent-close policy to a detached child on the target shard.
+    ApplyCloseCascade,
+    /// Nothing to do this tick.
+    Wait,
+    /// The row is owed nothing more; drop it.
+    Retire,
+}
+
+/// Decide what one cross-shard child outbox row needs, from observed facts only.
+///
+/// Factored out of the scanner so every branch is exhaustively unit-testable
+/// with no database. The ordering is load-bearing:
+///
+/// 1. A row that has not started yet always starts first — a cancel or a closed
+///    parent still needs a child row to act on, and the parent's history already
+///    records `ChildWorkflowStarted`.
+/// 2. A pending cancel beats everything else, so a race-loser or over-deadline
+///    child stops burning work at the first opportunity.
+/// 3. A terminal child beats a closed parent: delivery re-checks the parent
+///    under `FOR UPDATE` and degrades to a plain row-delete when it has sealed,
+///    whereas retiring first would drop a wake the parent could still consume.
+/// 4. An **unknown** parent (`parent_terminal: None` — this sweep could not read
+///    it) decides nothing destructive. Only `Some(true)` retires or cascades.
+#[must_use]
+pub fn next_cross_shard_child_action(
+    obs: &CrossShardChildObservation<'_>,
+) -> CrossShardChildAction {
+    use crate::types::ParentClosePolicy;
+
+    if obs.status == CrossShardChildStatus::PendingStart {
+        return CrossShardChildAction::StartChild;
+    }
+    if obs.cancel_requested {
+        return CrossShardChildAction::CancelChild;
+    }
+
+    let child_terminal = obs.child_state.is_some_and(is_terminal_execution_state);
+
+    obs.parent_close_policy.map_or_else(
+        // Awaited: the parent is parked on this child's terminal.
+        || {
+            if child_terminal {
+                CrossShardChildAction::DeliverTerminal
+            } else if obs.parent_terminal == Some(true) {
+                // Parity with the same-shard contract: an awaited child can
+                // outlive a cancelled or terminated parent. Nobody is left to
+                // wake, so stop tracking it rather than polling forever.
+                //
+                // `Some(true)` and not a bare truthiness check: an unread parent
+                // must never reach this arm, because retiring here is
+                // irreversible and silently drops the child's terminal wake.
+                CrossShardChildAction::Retire
+            } else {
+                CrossShardChildAction::Wait
+            }
+        },
+        // Detached: the parent never consumes a terminal; the only thing left
+        // owed is the parent-close cascade.
+        |policy| {
+            // `Abandon` is owed nothing at all once the child exists: no terminal
+            // to deliver, and by definition no cascade. Retiring immediately
+            // matters at scale — an abandoned child may be long-lived or never
+            // terminate, and keeping its row would grow the table and the poll
+            // set without bound across repeated detached fan-outs. The row's job
+            // (getting the child created on the target shard) is done.
+            if policy == ParentClosePolicy::Abandon || child_terminal {
+                CrossShardChildAction::Retire
+            } else if obs.parent_terminal == Some(true) {
+                CrossShardChildAction::ApplyCloseCascade
+            } else {
+                // Includes `None`: cascading a live parent's children because a
+                // read blipped would cancel or terminate perfectly healthy work.
+                CrossShardChildAction::Wait
+            }
+        },
+    )
+}
+
+/// Is `state` one of the engine's terminal execution states?
+///
+/// Delegates to [`crate::erase::is_terminal_state`] rather than restating the
+/// list. A local copy had already drifted — it omitted `CONTINUED_AS_NEW`, so a
+/// child sealing that way would have been polled as non-terminal forever, the
+/// parent parked forever and the outbox row leaked. `erase` carries no
+/// `db`-feature gate, so there is no reason to keep a second list.
+fn is_terminal_execution_state(state: &str) -> bool {
+    crate::erase::is_terminal_state(state)
 }

@@ -12,12 +12,17 @@ Every workflow execution accumulates an append-only event log in
 task claim, walking the full history. Once a history grows past ~10 000 events
 the replay CPU cost compounds and response latency increases noticeably.
 
-Harvest ships two complementary guards:
+Harvest ships three complementary guards:
 
 | Guard | Kind | Effect |
 |-------|------|--------|
 | `should_continue_as_new()` / `continue_as_new_threshold` | Soft, opt-in per workflow | Advisory; the workflow must cooperate by calling `ctx.continue_as_new()` |
-| `max_workflow_history_events` (hard ceiling) | Hard, server-side | Unconditional terminal transition when the count reaches the ceiling |
+| `history_event_hard_cap` / `history_byte_hard_cap` | Hard, worker, on by default (50,000 events / 50 MiB, issue #1804) | The worker fails the run and moves it to the DLQ with a typed reason |
+| `max_workflow_history_events` (hard ceiling) | Hard, server-side scanner, opt-in | Unconditional terminal transition when the count reaches the ceiling |
+
+A `max_workflow_history_events` value above the worker event cap never fires
+for a run that the worker still decides. Raise the worker cap too, or use the
+scanner ceiling only below it.
 
 ---
 
@@ -146,7 +151,7 @@ clear error if the constraint is violated.
 |-----------|----------------|
 | You have a short-term production fire with runaway histories | Enable immediately with a generous ceiling; fix the workflow in parallel |
 | You want blast-radius protection for all workflows | Set ceiling to 2–3× `continue_as_new_threshold` as a permanent floor |
-| You are confident the workflow correctly trims history | Leave ceiling disabled (`None`); the soft threshold is sufficient |
+| You are confident the workflow correctly trims history | Leave ceiling disabled (`None`); the soft threshold and the default worker caps are sufficient |
 
 ---
 

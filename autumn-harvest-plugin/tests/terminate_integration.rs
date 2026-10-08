@@ -31,7 +31,6 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -47,7 +46,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 type HarvestApiApp = axum::Router;
@@ -90,7 +89,7 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::default(),
     ));
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 async fn post_json(app: &HarvestApiApp, uri: &str, body: Value) -> (StatusCode, Value) {
@@ -155,7 +154,7 @@ async fn seed_running(conn: &mut AsyncPgConnection, workflow_id: &str) -> Execut
             workflow_name: "wedged",
             workflow_id,
             exec_id,
-            input: json!({ "n": 1 }),
+            input: json!({ "n": 1 }).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -197,6 +196,28 @@ async fn seed_running(conn: &mut AsyncPgConnection, workflow_id: &str) -> Execut
     )
     .await
     .expect("seed workflow");
+    exec_id
+}
+
+/// Seed an execution already in a terminal state, bypassing the terminal
+/// transition itself. Used to exercise terminate's idempotent no-op path
+/// against a state it never produced.
+async fn seed_terminal(
+    conn: &mut AsyncPgConnection,
+    workflow_id: &str,
+    state: &str,
+    error: Option<&str>,
+) -> ExecutionId {
+    let exec_id = seed_running(conn, workflow_id).await;
+    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+        .set((
+            harvest_workflow_executions::state.eq(state),
+            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::error.eq(error),
+        ))
+        .execute(conn)
+        .await
+        .unwrap();
     exec_id
 }
 
@@ -333,6 +354,63 @@ async fn terminate_idempotent_on_terminal() {
     );
 }
 
+/// Terminate's idempotent no-op reports a reason matching the row's real
+/// terminal state, not a cancel-specific fallback (issue #1456). A
+/// naturally-`COMPLETED` run — the reported repro — has no `error` and no
+/// `WorkflowCancelled` event, so its reason must not claim cancellation.
+/// `CONTINUED_AS_NEW` never populates `error` either, so it exercises the
+/// same derived-reason path. `CANCELLED` reaches `idempotent()` here via
+/// terminate's own terminal-state check, not cancel's. That pins the
+/// shared helper to answering "workflow already cancelled" from this
+/// call site too. `FAILED`, with a stored error, proves the derived
+/// reason never overrides a real one.
+#[tokio::test]
+async fn terminate_idempotent_reason_matches_state() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+
+    let cases: &[(&str, &str, Option<&str>, &str)] = &[
+        (
+            "completed-1",
+            "COMPLETED",
+            None,
+            "workflow already completed",
+        ),
+        (
+            "continued-1",
+            "CONTINUED_AS_NEW",
+            None,
+            "workflow already continued as new",
+        ),
+        (
+            "cancelled-1",
+            "CANCELLED",
+            None,
+            "workflow already cancelled",
+        ),
+        (
+            "failed-1",
+            "FAILED",
+            Some("boom: handler panicked"),
+            "boom: handler panicked",
+        ),
+    ];
+
+    for (workflow_id, state, error, expected_reason) in cases {
+        let exec_id = seed_terminal(&mut conn, workflow_id, state, *error).await;
+
+        let (status, body) =
+            post_json(&app, &format!("/workflows/{exec_id}/terminate"), json!({})).await;
+
+        assert_eq!(status, StatusCode::ACCEPTED, "state {state}, body: {body}");
+        assert_eq!(body["state"], *state, "state {state}: {body}");
+        assert_eq!(body["newly_terminated"], false, "state {state}: {body}");
+        assert_eq!(body["reason"], *expected_reason, "state {state}: {body}");
+    }
+}
+
 /// (d) Unknown execution id → 404.
 #[tokio::test]
 async fn terminate_unknown_returns_404() {
@@ -395,7 +473,7 @@ async fn seed_child(
             workflow_name: "child-wf",
             workflow_id,
             exec_id,
-            input: json!({ "n": 1 }),
+            input: json!({ "n": 1 }).into(),
             parent_id: Some(parent.as_uuid()),
             queue_name: "default",
             execution_timeout: None,

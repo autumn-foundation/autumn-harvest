@@ -1,4 +1,4 @@
-error: `rate_limit_key` must not begin with the reserved `dyn-rate:` prefix (reserved for per-key/dynamic rate-limit buckets)
+error: `rate_limit_key` must not begin with the reserved `dyn-rate:` or `start-throttle:` prefix (reserved for caller-keyed rate-limit and workflow-start-throttle buckets)
  --> tests/compile_fail/rate_limit_key_reserved_prefix.rs:6:33
   |
 6 | #[activity(rate_limit_rps = 50, rate_limit_key = "dyn-rate:9:tenant_id:acme")]

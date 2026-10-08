@@ -167,7 +167,7 @@ mod db_tests {
     use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
     fn init_sql() -> Vec<u8> {
-        autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+        autumn_harvest::test_init_sql().as_bytes().to_vec()
     }
 
     async fn setup_test_db() -> (
@@ -283,7 +283,7 @@ mod db_tests {
             workflow_name: "cart",
             workflow_id: "cart-running",
             exec_id,
-            input: serde_json::json!({}),
+            input: serde_json::json!({}).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -363,7 +363,7 @@ mod db_tests {
             workflow_name: "cart",
             workflow_id: "cart-reject",
             exec_id,
-            input: serde_json::json!({}),
+            input: serde_json::json!({}).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,

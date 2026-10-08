@@ -29,11 +29,15 @@
 //! # Scope enforcement (AC3/AC4)
 //!
 //! A `read` token reaches every [`autumn_harvest::audit::RouteClass::ReadOnly`]/`PublicSafe` route and
-//! is denied **403** on every mutating route; a `mutate` token reaches
-//! everything. The decision is [`deny_readonly_mutation`] over
-//! [`crate::api::classify_route`] — the single source of truth — which **fails
-//! closed**: an unclassified path resolves to `Mutating` and is denied to a
-//! `read` token.
+//! is denied **403** on every mutating route. The decision is
+//! [`deny_readonly_mutation`] over [`crate::api::classify_route`] — the single
+//! source of truth — which **fails closed**: an unclassified path resolves to
+//! `Mutating` and is denied to a `read` token.
+//!
+//! A `mutate` token is denied **403** on the
+//! [`autumn_harvest::audit::ADMIN_SCOPE_ROUTES`]. Only an `admin` token mints
+//! or revokes tokens, so one leaked `mutate` token cannot create others
+//! (issue #1803). Every scope deny writes an `authz.deny` audit row.
 //!
 //! # Rotation (AC5)
 //!
@@ -67,7 +71,10 @@ use autumn_harvest::audit::{HEADER_ACTOR, deny_readonly_mutation};
 use autumn_harvest::models::{ApiToken, NewApiToken};
 use autumn_harvest::schema::harvest_api_tokens;
 
-use crate::api::{HarvestApiState, acquire_conn, classify_route, read_only_forbidden_response};
+use crate::api::{
+    HarvestApiState, acquire_conn, audit_context, classify_route, read_only_forbidden_response,
+    requires_admin_scope,
+};
 
 /// The audit-actor namespace reserved for genuinely token-authenticated
 /// requests (issue #942, AC6). Only the valid-token path may set an actor in
@@ -85,31 +92,39 @@ const LAST_USED_DEBOUNCE_SECS: i64 = 60;
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 /// Verb-level scope drawn from the route classification (issue #942, AC3).
+///
+/// Each scope includes the one before it: `Read` < `Mutate` < `Admin`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TokenScope {
     /// Reaches every `ReadOnly`/`PublicSafe` route; denied 403 on mutations.
     Read,
-    /// Reaches every route.
+    /// Reaches every route except the admin-only ones (issue #1803).
     Mutate,
+    /// Reaches every route. Only this scope mints and revokes tokens
+    /// (issue #1803).
+    Admin,
 }
 
 impl TokenScope {
     /// Parse the persisted `scope` column value.
     #[must_use]
-    pub(crate) fn from_db(s: &str) -> Option<Self> {
+    pub fn from_db(s: &str) -> Option<Self> {
         match s {
             "read" => Some(Self::Read),
             "mutate" => Some(Self::Mutate),
+            "admin" => Some(Self::Admin),
             _ => None,
         }
     }
 
     /// The persisted `scope` column value.
     #[must_use]
-    pub(crate) const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Read => "read",
             Self::Mutate => "mutate",
+            Self::Admin => "admin",
         }
     }
 }
@@ -120,13 +135,9 @@ impl TokenScope {
 /// (issue #942, AC6/AC7).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TokenPrincipal {
-    // The token id is carried for provenance and future consumers. Actor
-    // attribution flows through the `x-harvest-actor` header the middleware
-    // rewrites to `token:{id}`, and `require_harvest_admin` only needs the
-    // extension's *presence*, so neither field is read on the admin path today.
-    #[allow(dead_code)]
+    // The authorizer hook (issue #1803) reads both fields.
+    // `require_harvest_admin` needs only the extension's presence.
     pub id: Uuid,
-    #[allow(dead_code)] // consulted by tests + future MCP gating; not read on the admin path
     pub scope: TokenScope,
 }
 
@@ -218,14 +229,27 @@ pub(crate) fn is_expired(expires_at: Option<DateTime<Utc>>, now: DateTime<Utc>) 
 /// route-classification single source of truth, so it fails closed for an
 /// unclassified route.
 ///
-/// A `Mutate` token is never denied. A `Read` token is denied exactly when the
-/// route resolves to a mutating class — and [`classify_route`] fails closed by
-/// resolving an unmatched path to [`autumn_harvest::audit::RouteClass::Mutating`], so an unclassified
-/// route is denied to a `read` token.
+/// - `Admin` is never denied.
+/// - `Mutate` is denied the admin-only routes (issue #1803).
+/// - `Read` is denied every route that resolves to a mutating class.
+///   [`classify_route`] resolves an unmatched path to
+///   [`autumn_harvest::audit::RouteClass::Mutating`], so it fails closed.
 #[must_use]
 pub(crate) fn token_scope_denies(scope: TokenScope, method: &Method, path: &str) -> bool {
-    let class = classify_route(method, path);
-    deny_readonly_mutation(matches!(scope, TokenScope::Read), class)
+    match scope {
+        TokenScope::Admin => false,
+        TokenScope::Mutate => requires_admin_scope(method, path),
+        TokenScope::Read => deny_readonly_mutation(true, classify_route(method, path)),
+    }
+}
+
+/// The `403` for a `mutate` token on an admin-only route (issue #1803).
+fn admin_scope_required_response() -> Response {
+    (
+        axum::http::StatusCode::FORBIDDEN,
+        axum::Json(serde_json::json!({ "error": "admin token scope required" })),
+    )
+        .into_response()
 }
 
 // ── DB CRUD (default/control shard) ───────────────────────────────────────────
@@ -308,6 +332,24 @@ pub(crate) async fn lookup_by_secret(
 
 /// Best-effort `last_used_at` bump. Called off the request critical path.
 pub(crate) async fn touch_last_used(conn: &mut AsyncPgConnection, id: Uuid) -> HarvestResult<()> {
+    use diesel_async::AsyncConnection as _;
+    // The update runs detached from the request, past its fence. With fencing
+    // on, it asserts the fence in its own transaction (issue #1823), as an
+    // audit write does. A process that lost write authority writes nothing.
+    if !autumn_harvest::replication::FenceRegistry::is_enabled() {
+        return write_last_used(conn, id).await;
+    }
+    Box::pin(
+        conn.transaction::<_, autumn_harvest::error::HarvestError, _>(async move |conn| {
+            autumn_harvest::replication::assert_database_fence(conn).await?;
+            write_last_used(conn, id).await
+        }),
+    )
+    .await
+}
+
+/// The update of [`touch_last_used`], with no DR fence check.
+async fn write_last_used(conn: &mut AsyncPgConnection, id: Uuid) -> HarvestResult<()> {
     use harvest_api_tokens::dsl;
     diesel::update(dsl::harvest_api_tokens.filter(dsl::id.eq(id)))
         .set(dsl::last_used_at.eq(Utc::now()))
@@ -387,7 +429,8 @@ fn strip_reserved_actor(request: &mut Request) {
 /// admits the request, and (2) strips any inbound `x-harvest-actor` and injects
 /// `token:{id}` so every audited mutation is attributed to the token, and no
 /// caller can spoof a different actor (AC6). A `read` token attempting a
-/// mutating route is denied 403 here, before any handler runs.
+/// mutating route, or a `mutate` token attempting an admin-only route, is
+/// denied 403 here, before any handler runs. The deny is audited.
 ///
 /// On the pass-through path (no/invalid `hvst_` bearer) it still reserves the
 /// `token:` audit-actor namespace via [`strip_reserved_actor`], so a non-token
@@ -438,14 +481,40 @@ pub async fn enforce_token_scope(
     let scope = TokenScope::from_db(&token.scope).unwrap_or(TokenScope::Read);
 
     // AC3/AC4: deny a read token every mutating route, before `require_admin`.
+    // Issue #1803: deny a mutate token the admin-only routes, and audit both.
     if token_scope_denies(scope, request.method(), request.uri().path()) {
         tracing::warn!(
             method = %request.method(),
             path = %request.uri().path(),
-            "harvest: read-scoped api token denied mutation (403)"
+            scope = scope.as_str(),
+            "harvest: api token scope denied route (403)"
         );
-        return read_only_forbidden_response();
+        let (_, source, request_id) = audit_context(request.headers(), &api_state);
+        let actor = format!("{TOKEN_ACTOR_PREFIX}{}", token.id);
+        crate::authz::audit_deny(
+            &mut conn,
+            &crate::authz::DenyAudit {
+                actor: &actor,
+                method: request.method(),
+                path: request.uri().path(),
+                request_id: request_id.as_deref(),
+                source: &source,
+                shard: None,
+                summary: &format!("token scope '{}' does not allow this route", scope.as_str()),
+            },
+        )
+        .await;
+        return if scope == TokenScope::Read {
+            read_only_forbidden_response()
+        } else {
+            admin_scope_required_response()
+        };
     }
+
+    // Issue #1827: give the connection back before the handler runs. The
+    // handler takes its own, so a held one would double each request's pool
+    // use. A rate-limited request would also hold one for nothing.
+    drop(conn);
 
     // AC6/D3: mark the verified principal so `require_admin` admits it.
     request.extensions_mut().insert(TokenPrincipal {
@@ -477,6 +546,28 @@ pub async fn enforce_token_scope(
                 let _ = touch_last_used(&mut c, id).await;
             }
         });
+    }
+
+    next.run(request).await
+}
+
+/// Require a Harvest bearer on every route that is not explicitly public.
+///
+/// This is the fail-closed outer half of standalone token authentication.
+/// [`enforce_token_scope`] intentionally permits missing and non-Harvest
+/// credentials so it can compose with an embedder's authentication boundary;
+/// a standalone mount has no such boundary. Claimed Harvest credentials are
+/// verified by the inner scope layer rather than duplicated here.
+pub(crate) async fn require_token_for_non_public(request: Request, next: Next) -> Response {
+    if *request.method() == Method::OPTIONS
+        || classify_route(request.method(), request.uri().path())
+            == autumn_harvest::audit::RouteClass::PublicSafe
+    {
+        return next.run(request).await;
+    }
+
+    if harvest_bearer(request.headers()).is_none() {
+        return unauthorized("harvest api token required");
     }
 
     next.run(request).await
@@ -527,13 +618,29 @@ pub async fn enforce_token_scope_mcp_mutation(
         return unauthorized("api token expired");
     }
     // Every generated route carrying this layer is a mutation, so a read token
-    // is always denied here.
-    if TokenScope::from_db(&token.scope) == Some(TokenScope::Read) {
+    // is always denied here. An unknown scope is `Read`, as in the main layer.
+    let scope = TokenScope::from_db(&token.scope).unwrap_or(TokenScope::Read);
+    if scope == TokenScope::Read {
         tracing::warn!(
             method = %request.method(),
             path = %request.uri().path(),
             "harvest: read-scoped api token denied MCP mutation tool (403)"
         );
+        let (_, source, request_id) = audit_context(request.headers(), &api_state);
+        let actor = format!("{TOKEN_ACTOR_PREFIX}{}", token.id);
+        crate::authz::audit_deny(
+            &mut conn,
+            &crate::authz::DenyAudit {
+                actor: &actor,
+                method: request.method(),
+                path: request.uri().path(),
+                request_id: request_id.as_deref(),
+                source: &source,
+                shard: None,
+                summary: "token scope 'read' does not allow this route",
+            },
+        )
+        .await;
         return read_only_forbidden_response();
     }
     next.run(request).await
@@ -729,8 +836,45 @@ mod tests {
     fn scope_round_trips_db_string() {
         assert_eq!(TokenScope::from_db("read"), Some(TokenScope::Read));
         assert_eq!(TokenScope::from_db("mutate"), Some(TokenScope::Mutate));
-        assert_eq!(TokenScope::from_db("admin"), None);
+        assert_eq!(TokenScope::from_db("admin"), Some(TokenScope::Admin));
+        assert_eq!(TokenScope::from_db("root"), None);
         assert_eq!(TokenScope::Read.as_str(), "read");
         assert_eq!(TokenScope::Mutate.as_str(), "mutate");
+        assert_eq!(TokenScope::Admin.as_str(), "admin");
+    }
+
+    #[test]
+    fn mutate_scope_is_denied_admin_routes() {
+        // Issue #1803: only an `admin` token mints or revokes tokens.
+        for (method, path) in [
+            (Method::POST, "/admin/tokens"),
+            (
+                Method::DELETE,
+                "/admin/tokens/0b7e6a52-4a3c-4f62-9d55-1f6a1c0a7e11",
+            ),
+        ] {
+            assert!(token_scope_denies(TokenScope::Read, &method, path));
+            assert!(token_scope_denies(TokenScope::Mutate, &method, path));
+            assert!(!token_scope_denies(TokenScope::Admin, &method, path));
+        }
+        // Listing tokens stays a read.
+        assert!(!token_scope_denies(
+            TokenScope::Read,
+            &Method::GET,
+            "/admin/tokens"
+        ));
+    }
+
+    #[test]
+    fn admin_scope_reaches_every_route() {
+        for path in ["/workflows/abc/cancel", "/nope/not-a-real-route"] {
+            assert!(!token_scope_denies(TokenScope::Admin, &Method::POST, path));
+        }
+        // A `mutate` token keeps every non-admin mutation.
+        assert!(!token_scope_denies(
+            TokenScope::Mutate,
+            &Method::POST,
+            "/workflows/abc/cancel"
+        ));
     }
 }

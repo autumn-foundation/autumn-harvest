@@ -125,7 +125,7 @@ fn build_api_app(pool: HarvestDbPool, router: ShardRouter) -> HarvestApiApp {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         router,
     ));
-    harvest_api_router(api_state).with_state(autumn_web::AppState::for_test())
+    harvest_api_router(api_state)
 }
 
 async fn read_json_response(response: axum::response::Response) -> Value {
@@ -188,7 +188,7 @@ async fn insert_version_execution_with_markers(
         workflow_id,
         run_id: uuid::Uuid::new_v4(),
         shard_id: shard.as_i32(),
-        input: json!({}),
+        input: json!({}).into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,

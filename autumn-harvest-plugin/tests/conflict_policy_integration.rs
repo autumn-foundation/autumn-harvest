@@ -51,7 +51,6 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -67,7 +66,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 type HarvestApiApp = axum::Router;
@@ -173,13 +172,17 @@ fn build_app(pool: &DbPool, infos: Vec<WorkflowInfo>) -> HarvestApiApp {
 
 /// App with NO admin (`admin_auth_boundary = false`, default) and no session —
 /// so an admin-gated start (`terminate_existing` / `terminate_if_running`)
-/// returns `401`.
+/// returns `401`. It sets the issue #1802 opt-out. Without the opt-out, a
+/// non-dev deployment refuses every anonymous start.
 fn build_app_no_admin(pool: &DbPool, infos: Vec<WorkflowInfo>) -> HarvestApiApp {
     build_app_inner(pool, infos, false)
 }
 
 fn build_app_inner(pool: &DbPool, infos: Vec<WorkflowInfo>, admin: bool) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
+    // Issue #1802: set the opt-out. The start handler keeps its own admin
+    // check for destructive policies, and the no-admin tests probe it.
+    api_state.set_allow_unauthenticated_mutations(true);
     if admin {
         api_state.set_admin_auth_boundary(true);
     }
@@ -197,7 +200,7 @@ fn build_app_inner(pool: &DbPool, infos: Vec<WorkflowInfo>, admin: bool) -> Harv
         ShardRouter::default(),
     ));
 
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 /// POST a start (body carries all fields, incl. `conflict_policy` when set).

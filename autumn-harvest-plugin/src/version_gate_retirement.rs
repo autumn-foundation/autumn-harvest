@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::api::{HarvestApiState, map_error};
+use crate::shard_fanout;
 
 /// Query string accepted by `GET /admin/version-gates/retirement-check`.
 #[derive(Debug, Clone, Deserialize)]
@@ -122,13 +123,21 @@ pub struct RetirementShardInspection {
     pub error: Option<String>,
 }
 
-#[derive(Debug)]
-struct ShardObservation {
-    shard_id: i32,
-    rows: Vec<RetirementCheckShardRow>,
-    error: Option<String>,
-}
+type ShardObservation = shard_fanout::ShardObservation<RetirementCheckShardRow>;
 
+/// Clone-class note. `RetirementKey`, `RetirementAccumulator`, `merge_row`,
+/// and `accumulator_from_row` below near-duplicate `VersionUsageKey`,
+/// `VersionUsageAccumulator`, and their helpers in `version_usage.rs`.
+/// [`build_retirement_check_report`]'s shard-aggregation body near-duplicates
+/// [`build_version_usage_report`](crate::version_usage::build_version_usage_report)
+/// the same way. PR #228 (this file) followed PR #223 (`version_usage.rs`)
+/// the same day, reusing its shard-aggregation shape for a
+/// retirement-specific read model. The two copies have diverged.
+/// `RetirementAccumulator` also tracks `sample_active_execution_ids`, capped
+/// at 10, so operators can look up specific blocking runs.
+/// `VersionUsageAccumulator` has no use for that field. Apply a fix to the
+/// shared aggregation shape to both files. Do not force sample-id tracking
+/// onto `version_usage.rs`.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
 struct RetirementKey {
     workflow_name: String,
@@ -173,7 +182,7 @@ pub async fn build_retirement_check_report(
     };
 
     let expected_shards = expected_shards(api_state, query.shard_id);
-    let pools = pools_by_shard(api_state);
+    let pools = shard_fanout::pools_by_shard(api_state);
 
     let observations = expected_shards
         .iter()
@@ -197,40 +206,22 @@ pub async fn build_retirement_check_report(
     ))
 }
 
+/// Which shards this read must inspect, honouring an explicit `shard_id` filter.
+///
+/// Beyond the filter this is the shared cross-shard fan-out rule, and it
+/// delegates to [`crate::shard_fanout::expected_shards`] (itself the core
+/// `external_target_location::fanout_shards`) rather than re-deriving it.
+/// This was a fourth hand-rolled copy of "pool keys ∪ readable ∪ default".
+/// Issue #1146 consolidated the other three onto the shared rule:
+/// `version_usage.rs`, `workflow_reachability.rs`, and `workflow_count.rs`.
+/// This one was left behind. The engine's own by-business-key resolution
+/// now depends on that set meaning the same thing everywhere.
 fn expected_shards(api_state: &HarvestApiState, shard_filter: Option<i32>) -> BTreeSet<i32> {
     if let Some(shard_id) = shard_filter {
         return BTreeSet::from([shard_id]);
     }
-
-    let mut shards = BTreeSet::new();
-    if let Ok(pool) = api_state.storage_pool() {
-        shards.extend(pool.iter_shards().map(|(shard, _)| shard.as_i32()));
-    }
-    if let Ok(runtime) = api_state.runtime() {
-        shards.extend(
-            runtime
-                .router()
-                .readable_shards()
-                .iter()
-                .map(|shard| shard.as_i32()),
-        );
-        shards.insert(runtime.router().default_shard().as_i32());
-    }
-    if shards.is_empty() {
-        shards.insert(0);
-    }
-    shards
-}
-
-fn pools_by_shard(api_state: &HarvestApiState) -> BTreeMap<i32, DbPool> {
-    api_state.storage_pool().map_or_else(
-        |_| BTreeMap::new(),
-        |pool| {
-            pool.iter_shards()
-                .map(|(shard, db_pool)| (shard.as_i32(), db_pool.clone()))
-                .collect()
-        },
-    )
+    let pools = crate::shard_fanout::pools_by_shard(api_state);
+    crate::shard_fanout::expected_shards(api_state, &pools)
 }
 
 async fn observe_shard(
@@ -238,24 +229,11 @@ async fn observe_shard(
     pool: Option<DbPool>,
     mut filters: RetirementCheckFilters,
 ) -> ShardObservation {
-    let Some(pool) = pool else {
-        return ShardObservation {
-            shard_id,
-            rows: Vec::new(),
-            error: Some(format!("shard {shard_id} has no configured storage pool")),
-        };
+    let mut conn = match shard_fanout::acquire_shard_conn(shard_id, pool).await {
+        Ok(conn) => conn,
+        Err(observation) => return observation,
     };
-
     filters.shard_id = Some(shard_id);
-    let Ok(mut conn) = pool.get().await else {
-        return ShardObservation {
-            shard_id,
-            rows: Vec::new(),
-            error: Some(format!(
-                "database connection for shard {shard_id} could not be acquired"
-            )),
-        };
-    };
 
     match load_retirement_check(&mut conn, &filters).await {
         Ok(rows) => ShardObservation {
@@ -385,8 +363,8 @@ fn blocker_from_accumulator(
         terminal_executions: acc.terminal_executions,
         oldest_blocker_started_at: acc.oldest_blocker_started_at,
         newest_blocker_started_at: acc.newest_blocker_started_at,
-        oldest_blocker_age_secs: age_secs(observed_at, acc.oldest_blocker_started_at),
-        newest_blocker_age_secs: age_secs(observed_at, acc.newest_blocker_started_at),
+        oldest_blocker_age_secs: shard_fanout::age_secs(observed_at, acc.oldest_blocker_started_at),
+        newest_blocker_age_secs: shard_fanout::age_secs(observed_at, acc.newest_blocker_started_at),
         sample_active_execution_ids: acc.sample_active_execution_ids.clone(),
         shard_coverage: RetirementShardCoverage {
             inspected_shards: inspected_shards.iter().copied().collect(),
@@ -394,13 +372,6 @@ fn blocker_from_accumulator(
             unavailable_shards: unavailable_shards.iter().copied().collect(),
         },
     }
-}
-
-fn age_secs(observed_at: DateTime<Utc>, started_at: DateTime<Utc>) -> i64 {
-    observed_at
-        .signed_duration_since(started_at)
-        .num_seconds()
-        .max(0)
 }
 
 const fn compute_status(

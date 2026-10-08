@@ -14,11 +14,12 @@ use std::pin::Pin;
 
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::debugger::{
-    AwaitableKind, Breakpoint, CommandSnapshot, DebugError, DebugStep, DiffKind, ReplayDebugger,
-    ReplayTrace, StepDivergence, StepOutcome, diff_traces,
+    AwaitableKind, Breakpoint, CommandSnapshot, DebugError, DebugStep, DecisionAttribution,
+    DiffKind, ReplayDebugger, ReplayTrace, StepDivergence, StepOutcome, diff_traces,
 };
 use autumn_harvest::event::{SideEffectKind, WorkflowEvent};
 use autumn_harvest::info::WorkflowHandlerFn;
+use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::prelude::activity;
 use autumn_harvest::testing::HistorySnapshot;
 use autumn_harvest::types::{ActivityExecId, ExecutionId, TimerId};
@@ -145,7 +146,10 @@ fn from_history_opens_and_closes_an_activity_awaitable() {
     let trace = ReplayTrace::from_history("two_step", ExecutionId::new(), &events);
 
     // After WorkflowStarted: nothing open.
-    assert!(trace.steps[0].open_awaitables.is_empty());
+    assert_eq!(
+        trace.steps[0].open_awaitables,
+        [] as [autumn_harvest::debugger::OpenAwaitable; 0]
+    );
 
     // After ActivityScheduled: exactly one open activity, opened at index 1.
     let open = &trace.steps[1].open_awaitables;
@@ -159,7 +163,10 @@ fn from_history_opens_and_closes_an_activity_awaitable() {
     );
 
     // After ActivityCompleted: closed again.
-    assert!(trace.steps[2].open_awaitables.is_empty());
+    assert_eq!(
+        trace.steps[2].open_awaitables,
+        [] as [autumn_harvest::debugger::OpenAwaitable; 0]
+    );
 }
 
 #[test]
@@ -401,7 +408,7 @@ fn from_history_passes_offload_envelope_through_verbatim() {
 #[test]
 fn from_history_on_empty_history_is_an_empty_trace() {
     let trace = ReplayTrace::from_history("two_step", ExecutionId::new(), &[]);
-    assert!(trace.steps.is_empty());
+    assert_eq!(trace.steps, [] as [autumn_harvest::debugger::DebugStep; 0]);
     assert_eq!(trace.total_events, 0);
     assert!(!trace.truncated);
 }
@@ -844,6 +851,87 @@ async fn a_subsecond_local_activity_timeout_change_is_a_divergence() {
         "this regression is only meaningful while the summaries are identical"
     );
     assert_ne!(l.commands[0].payload, r.commands[0].payload);
+}
+
+fn local_activity_from_builder_defaults<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let _: Value = ctx
+            .execute_local_activity_raw("checksum", json!({}), None, None)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!("done"))
+    })
+}
+
+#[tokio::test]
+async fn candidate_activity_defaults_reach_prefix_replay() {
+    let history = snapshot("local_wf", vec![started()]);
+    let short = debugger("local_wf", local_activity_from_builder_defaults)
+        .activity_defaults(None, Some(std::time::Duration::from_millis(100)))
+        .trace_snapshot(history.clone())
+        .await
+        .expect("registered");
+    let long = debugger("local_wf", local_activity_from_builder_defaults)
+        .activity_defaults(None, Some(std::time::Duration::from_millis(900)))
+        .trace_snapshot(history)
+        .await
+        .expect("registered");
+
+    let diff = diff_traces(&short, &long);
+    assert!(!diff.is_clean());
+    let div = diff
+        .divergence
+        .expect("candidate defaults must change the frontier command");
+    assert!(matches!(
+        div.kind,
+        DiffKind::CommandMismatch { command_index: 0 }
+    ));
+    let short_command = &div.left.expect("short side").commands[0];
+    let long_command = &div.right.expect("long side").commands[0];
+    assert_eq!(short_command.summary, long_command.summary);
+    let short_payload = short_command.payload.as_ref().expect("payload");
+    let long_payload = long_command.payload.as_ref().expect("payload");
+    assert_eq!(short_payload["start_to_close"]["nanos"], 100_000_000);
+    assert_eq!(long_payload["start_to_close"]["nanos"], 900_000_000);
+}
+
+#[tokio::test]
+async fn candidate_activity_retry_default_reaches_prefix_replay() {
+    let history = snapshot("local_wf", vec![started()]);
+    let three = debugger("local_wf", local_activity_from_builder_defaults)
+        .activity_defaults(
+            Some(RetryPolicy::fixed(3, std::time::Duration::from_secs(1))),
+            None,
+        )
+        .trace_snapshot(history.clone())
+        .await
+        .expect("registered");
+    let five = debugger("local_wf", local_activity_from_builder_defaults)
+        .activity_defaults(
+            Some(RetryPolicy::fixed(5, std::time::Duration::from_secs(1))),
+            None,
+        )
+        .trace_snapshot(history)
+        .await
+        .expect("registered");
+
+    let diff = diff_traces(&three, &five);
+    assert!(!diff.is_clean());
+    let div = diff.divergence.expect("retry defaults must differ");
+    assert!(matches!(
+        div.kind,
+        DiffKind::CommandMismatch { command_index: 0 }
+    ));
+    let three_command = &div.left.expect("three-attempt side").commands[0];
+    let five_command = &div.right.expect("five-attempt side").commands[0];
+    assert_eq!(three_command.summary, five_command.summary);
+    let three_payload = three_command.payload.as_ref().expect("payload");
+    let five_payload = five_command.payload.as_ref().expect("payload");
+    assert_eq!(three_payload["retry_policy"]["max_attempts"], 3);
+    assert_eq!(five_payload["retry_policy"]["max_attempts"], 5);
 }
 
 #[test]
@@ -2108,6 +2196,7 @@ const fn bare_step(
         resolved_payload: None,
         event_facts: serde_json::Value::Null,
         signal_name: None,
+        decision: None,
         divergence: None,
     }
 }
@@ -2817,4 +2906,180 @@ async fn a_configured_offloader_inflates_envelopes_before_replay() {
         .map(|c| c.summary.as_str())
         .collect();
     assert_eq!(scheduled_next, vec!["saw_envelope -> default"]);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Decision boundaries (issue #1833)
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn decision_committed(build: &str, worker: &str) -> WorkflowEvent {
+    WorkflowEvent::DecisionCommitted {
+        build_id: autumn_harvest::types::BuildId::new(build),
+        worker_id: autumn_harvest::types::WorkerId::new(worker),
+    }
+}
+
+#[test]
+fn a_decision_step_shows_its_build_and_worker() {
+    let id = ActivityExecId::new();
+    let events = vec![
+        started(),
+        scheduled(id, "step_a"),
+        decision_committed("build-7", "worker-eu-1"),
+    ];
+    let trace = handler_free_trace(&events);
+    assert_eq!(trace.steps[1].decision, None);
+    assert_eq!(
+        trace.steps[2].decision,
+        Some(DecisionAttribution {
+            build_id: "build-7".to_string(),
+            worker_id: "worker-eu-1".to_string(),
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_history_with_boundaries_replays_clean_step_by_step() {
+    // Each decision of `two_step` ends with a boundary, as a worker writes it.
+    let a = ActivityExecId::new();
+    let b = ActivityExecId::new();
+    let events = vec![
+        started(),
+        scheduled(a, "step_a"),
+        decision_committed("build-7", "worker-eu-1"),
+        completed(a, json!(1)),
+        scheduled(b, "step_b"),
+        decision_committed("build-7", "worker-eu-1"),
+        completed(b, json!(2)),
+        WorkflowEvent::WorkflowCompleted {
+            output: json!("done"),
+        },
+        decision_committed("build-8", "worker-us-1"),
+    ];
+    let trace = debugger("two_step", two_step)
+        .trace_snapshot(snapshot_of(events))
+        .await
+        .expect("trace");
+    assert!(trace.is_clean(), "{trace:#?}");
+    assert_eq!(
+        trace.steps[8]
+            .decision
+            .as_ref()
+            .map(|d| d.build_id.as_str()),
+        Some("build-8")
+    );
+}
+
+#[test]
+fn recordings_from_two_builds_differing_only_in_boundaries_do_not_diverge() {
+    // A cross-build diff compares behavior. The build and worker that made a
+    // decision are attribution, not behavior.
+    let run = |build: &str, worker: &str| {
+        let id = ActivityExecId::new();
+        vec![
+            started(),
+            scheduled(id, "step_a"),
+            decision_committed(build, worker),
+        ]
+    };
+    let left = handler_free_trace(&run("build-1", "worker-eu-1"));
+    let right = handler_free_trace(&run("build-2", "worker-us-1"));
+    assert!(diff_traces(&left, &right).divergence.is_none());
+}
+
+#[test]
+fn a_boundary_on_one_side_only_does_not_diverge() {
+    // A recording from before the upgrade has no boundaries. The same run
+    // after the upgrade has them. That alone is no change in behavior.
+    let before = vec![started(), scheduled(ActivityExecId::new(), "step_a")];
+    let after = vec![
+        started(),
+        scheduled(ActivityExecId::new(), "step_a"),
+        decision_committed("build-2", "worker-us-1"),
+    ];
+    let diff = diff_traces(&handler_free_trace(&before), &handler_free_trace(&after));
+    assert!(diff.is_clean(), "{diff:?}");
+}
+
+#[test]
+fn a_real_difference_after_a_one_sided_boundary_is_still_found() {
+    let before = vec![
+        started(),
+        scheduled(ActivityExecId::new(), "step_a"),
+        scheduled(ActivityExecId::new(), "step_b"),
+    ];
+    let after = vec![
+        started(),
+        scheduled(ActivityExecId::new(), "step_a"),
+        decision_committed("build-2", "worker-us-1"),
+        scheduled(ActivityExecId::new(), "step_c"),
+    ];
+    let diff = diff_traces(&handler_free_trace(&before), &handler_free_trace(&after));
+    let divergence = diff.divergence.expect("step_b against step_c must diverge");
+    assert_eq!(
+        divergence.step_index, 2,
+        "the compared position skips the boundary"
+    );
+    assert_eq!(divergence.left.expect("left step").index, 2);
+    assert_eq!(divergence.right.expect("right step").index, 3);
+}
+
+#[test]
+fn a_one_sided_boundary_does_not_shift_later_positions() {
+    // Snapshots record history positions: where an awaitable opened and where
+    // a side effect or marker landed. A boundary on one side must not move
+    // them, or a pre-upgrade recording diffs against its post-upgrade twin.
+    let tail = |id: ActivityExecId| {
+        vec![
+            scheduled(id, "step_b"),
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Custom,
+                name: Some("pick".to_string()),
+                value: json!(7),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "fan_out:1".to_string(),
+                details: json!(3),
+            },
+        ]
+    };
+    let mut before = vec![started(), scheduled(ActivityExecId::new(), "step_a")];
+    before.extend(tail(ActivityExecId::new()));
+    let mut after = vec![
+        started(),
+        scheduled(ActivityExecId::new(), "step_a"),
+        decision_committed("build-2", "worker-us-1"),
+    ];
+    after.extend(tail(ActivityExecId::new()));
+    after.push(decision_committed("build-2", "worker-us-1"));
+
+    let diff = diff_traces(&handler_free_trace(&before), &handler_free_trace(&after));
+    assert!(diff.is_clean(), "{diff:?}");
+}
+
+#[test]
+fn a_moved_side_effect_still_diverges_across_a_one_sided_boundary() {
+    // The control: positions still compare. They count only non-boundary
+    // events, so a side effect that really moves is still found.
+    let effect = || WorkflowEvent::SideEffectRecorded {
+        kind: SideEffectKind::Custom,
+        name: Some("pick".to_string()),
+        value: json!(7),
+    };
+    let before = vec![
+        started(),
+        effect(),
+        scheduled(ActivityExecId::new(), "step_a"),
+    ];
+    let after = vec![
+        started(),
+        decision_committed("build-2", "worker-us-1"),
+        scheduled(ActivityExecId::new(), "step_a"),
+        effect(),
+    ];
+    let diff = diff_traces(&handler_free_trace(&before), &handler_free_trace(&after));
+    assert!(
+        diff.divergence.is_some(),
+        "a reordered side effect must still diverge: {diff:?}"
+    );
 }

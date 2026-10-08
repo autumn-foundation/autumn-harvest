@@ -29,22 +29,55 @@ map, a workflow-porting checklist, and a dual-run cutover playbook.
 
 ## Quick example
 
-Try it end-to-end: `cargo run -p quickstart` (see [`examples/quickstart/`](examples/quickstart/)).
+Try it end-to-end with **no database, no Docker, and nothing to configure**:
+
+```bash
+cargo dev
+```
+
+That starts an ephemeral PostgreSQL, applies the migrations, runs a worker, and
+serves the management API and the Vantage dashboard — then prints the dashboard
+URL and one `curl` that starts a durable workflow. `Ctrl-C` reclaims everything
+it created. It is development-only and refuses to point at anything that is not
+a local database — and, when provisioning its own cluster, it refuses to run as `root`
+too, since PostgreSQL itself won't; a real situation for Docker devcontainers
+and many CI images, not a hypothetical. That check is scoped to provisioning
+though: point it at a database you already have
+(`HARVEST_DEV_DATABASE_URL`) and it runs fine as root. See
+[Chapter 1](docs/getting-started/01-project-skeleton.md).
+
+Running as root with nothing provisioned yet, or would rather bring your own
+Postgres? `docker compose -f examples/quickstart/compose.yaml up -d`, then
+`AUTUMN_MANIFEST_DIR=examples/quickstart AUTUMN_PROFILE=dev cargo run -p
+quickstart` (see [`examples/quickstart/`](examples/quickstart/)) — Postgres
+runs in its own container there, so root has no bearing on it.
 
 For a chapter-by-chapter walkthrough — first workflow, durable timers, signals,
 child workflows, idempotency, and operating the service — read
 [`docs/getting-started/`](docs/getting-started/).
 
 Upgrading an existing deployment? See the
-[0.4.0 → 0.5.0 upgrade guide](docs/upgrading/0.5.0.md).
+[0.6.0 → 0.7.0 upgrade guide](docs/upgrading/0.7.0.md) — the previous
+[0.5.0 → 0.6.0 upgrade guide](docs/upgrading/0.6.0.md) covers the hop before that.
+
+Working on the engine itself? [`docs/architecture.md`](docs/architecture.md) is
+the workspace, design-decision, module and macro reference, and
+[`docs/shipped-work.md`](docs/shipped-work.md) is the verbatim record of what
+has shipped.
 
 Need a real reference instead of the tiny hello-world path? See:
 
 - [`examples/billing-autumn-web/`](examples/billing-autumn-web/) for a full Autumn web billing
   integration with app routes, workflow outbox publication, `HarvestPlugin`, saga compensation,
   child workflows, version gates, signals, timers, deterministic side effects, and scheduled DAGs.
-- [`examples/standalone-runner/`](examples/standalone-runner/) for the out-of-the-box runner path:
-  no Autumn plugin, just `HarvestRunner` plus a manually mounted management API router.
+- [`examples/standalone-runner/`](examples/standalone-runner/) for Harvest on plain Axum. Its
+  `Cargo.toml` names no `autumn-web`. It shows the pool, migrations, management API, Vantage,
+  API tokens, metrics and webhooks.
+- [`examples/claude-agent-daemon/`](examples/claude-agent-daemon/) for a local daemon that runs
+  Claude agent sessions as durable workflows on the embedded SQLite backend — no Postgres, no
+  Docker. Each model call and tool call is an activity, a workspace write parks on an
+  approval signal with a deadline, and killing the daemon mid-session resumes by replay instead
+  of paying for completed turns twice. It runs with no API key (a scripted offline model).
 
 ```rust
 use autumn_harvest::prelude::*;
@@ -223,15 +256,33 @@ default threshold is `10_000` events.
 let harvest = HarvestBuilder::new()
     .workflows(workflows![polling_loop])
     .history_continue_as_new_threshold(5_000)
-    .history_event_hard_cap(20_000)
+    .history_event_hard_cap(40_000)
     .try_build()?;
 ```
 
-The optional hard cap is a last-resort guardrail. If an execution reaches
-`history_event_hard_cap` and the workflow does not issue `continue_as_new`, the
-worker fails the execution and moves it to the DLQ with a typed
-`HistoryCapExceeded { count, cap, workflow_type }` reason. No new workflow event
-variant is used for this guardrail.
+Two hard caps are on by default (issue #1804). They are last-resort
+guardrails against a runaway loop:
+
+| Cap | Default | Builder override | Typed DLQ reason |
+|---|---|---|---|
+| Durable events per run | `50_000` | `history_event_hard_cap(n)` | `HistoryCapExceeded { count, cap, workflow_type }` |
+| Stored history bytes per run | 50 MiB | `history_byte_hard_cap(n)` | `HistoryBytesCapExceeded { bytes, cap, workflow_type }` |
+
+A run that reaches a cap fails unless it calls `continue_as_new`. The worker
+moves it to the DLQ with the typed reason. The guardrail adds no workflow
+event variant. The byte measure is `pg_column_size(event_data)`, the
+same measure as the tenant `max_history_bytes` quota. The Postgres worker
+enforces both caps. The SQLite backend does not.
+
+`harvest.workflow.history_bloat` fires once per run at 20.48% of the event
+cap, so at `10_240` events by default. The worker also logs a warning. Set
+`history_bloat_warn_fraction(..)` to move the threshold. Keep the warning
+point above `history_continue_as_new_threshold`, or healthy runs warn before
+the advisory turns true. `try_build` logs a warning when they do.
+
+To remove a cap, call `history_event_hard_cap_unlimited()` or
+`history_byte_hard_cap_unlimited()`. With no event cap there is no
+history-bloat warning either.
 
 Harvest emits `harvest.workflow.history_size` for terminal executions and
 `harvest.workflow.continue_as_new` when a workflow rotates. Both metrics use
@@ -286,16 +337,32 @@ for a compile-checked polling loop that works with and without the `db` feature.
 | [`autumn-harvest-plugin`](autumn-harvest-plugin/) | `HarvestPlugin` — wires the engine into an Autumn `AppBuilder`, mounts the management API, owns the runtime lifecycle |
 | [`autumn-harvest-macros`](autumn-harvest-macros/) | `#[workflow]`, `#[activity]`, `#[dag]`, `workflows![]`, `activities![]` proc macros |
 | [`autumn-harvest-cli`](autumn-harvest-cli/) | `harvest` CLI: thin operator client for the management API |
+| [`autumn-harvest-redis`](autumn-harvest-redis/) | Optional Redis Streams dispatch channel — carries references to claimable rows; Postgres stays the source of truth |
+| [`autumn-harvest-sqlite`](autumn-harvest-sqlite/) | Optional SQLite storage backend for single-process and embedded deployments |
 
-Use `autumn-harvest-plugin` if you're building an Autumn app. Use the bare
-`autumn-harvest` crate if you want to embed the engine in another framework or
-a non-web context.
+Use `autumn-harvest-plugin` if you're building an Autumn app. For a non-web
+context — a worker or CLI process with no HTTP surface at all — use the bare
+`autumn-harvest` crate directly; it is the executor and storage layer, with
+no framework dependency of its own. To run Harvest and serve the management
+API and Vantage from a Rust service on plain Axum instead of autumn-web, use
+`HarvestEmbedding`. Start with the getting-started fork,
+[The first workflow on plain Axum](docs/getting-started/standalone-axum.md).
+[`docs/embedding.md`](docs/embedding.md) is the reference: auth, metrics,
+webhooks, shutdown, and what is not available off the plugin path.
+[`examples/standalone-runner`](examples/standalone-runner/) is the larger
+example of that path. Its `Cargo.toml` has no `autumn-web` entry. The
+router is `axum::Router<()>`, so this path is for Axum services, not an
+arbitrary framework.
 
 ## CLI
 
-The `harvest` binary is a thin HTTP client for the optional management API. It
-does not talk to Postgres directly, so workflow queries, DAG triggers, auth, and
-runtime-owned behavior stay behind the same API surface your service exposes.
+The `harvest` binary is a thin HTTP client for the optional management API, so
+workflow queries, DAG triggers, auth, and runtime-owned behavior stay behind the
+same API surface your service exposes. A few commands take a database DSN
+instead, because they exist for the moments when no app is up to ask:
+[`harvest migrate`](#migrating-a-dedicated-harvest-database) (the schema step
+before replicas roll) and `harvest backup verify` (a restore drill against
+scratch databases).
 
 ```bash
 cargo run -p autumn-harvest-cli -- health
@@ -330,6 +397,80 @@ a bearer token. Successful responses are printed as pretty JSON by default; use
 inline `--*-json` values or `--*-file PATH`; use `-` as the file path to read
 from stdin.
 
+Every API request has a timeout (issue #1832). Set it with
+`--http-timeout-secs` or `HARVEST_HTTP_TIMEOUT_SECS` (default 30, range
+1–3600). A request to an endpoint that never answers fails with
+`request timed out`. Two kinds of command get more time. `workflow update
+--wait completed` gets its `--timeout-secs` plus 10 s. A bulk DLQ command
+that writes gets at least 300 s. `events tail` applies the timeout to the
+response headers only. After that, it fails only when no data arrives for
+60 s or the timeout, whichever is longer. Server keepalives every 15 s keep
+a live stream open.
+
+The CLI sends `Accept: application/json` on every JSON request (issue
+#1579). Send the same header from `curl` or any other direct client of
+a JSON route. `curl` sends a bare `Accept: */*` by default. Autumn's
+error-page content negotiation treats that as browser navigation, and
+answers a validation error with a styled HTML page, not the JSON body
+this section documents.
+
+Match each route's own declared content type instead: `harvest events
+tail` sends `Accept: text/event-stream`, and so must any direct client
+of the `.../events/stream` or `.../stream` routes. `GET /admin/metrics`
+and `GET /admin/queues/scaling?format=prometheus` return Prometheus
+plain text; do not send `Accept: application/json` to either.
+
+### Migrating a dedicated Harvest database
+
+In the default `harvest.mode = "embedded"`, Harvest's migrations are Autumn's:
+they are registered with the framework and applied by `autumn migrate` (or
+automatically under the `dev` profile). Under `harvest.mode = "split"` or
+`"external"`, Harvest storage is a database Autumn has no handle on — that one
+is `harvest migrate`'s job:
+
+```bash
+export HARVEST_DATABASE_URL=postgres://…   # == harvest.database.url
+
+harvest migrate status          # what is applied, what is pending
+harvest migrate status --check  # same, but exits non-zero while anything is pending
+                                # (give it the same --include-dir you give `run`,
+                                #  or it gates on fewer sets than you apply)
+harvest migrate run             # apply every pending migration, in version order
+harvest migrate run --dry-run   # print the plan, change nothing
+
+# Sets the binary does not embed — the plugin's connector dead-letter table,
+# or your application's own — ride along:
+harvest migrate run --include-dir autumn-harvest-plugin/migrations/harvest
+
+# One invocation per shard database. Pass each DSN through the environment,
+# not `--database-url`: a command line is visible host-wide (`ps`, /proc) for
+# as long as the migration runs, and a shard DSN carries a password. `set -e`
+# keeps the repeated-flag behaviour of stopping before later shards on failure.
+set -e
+HARVEST_DATABASE_URL="$SHARD_A" harvest migrate run
+HARVEST_DATABASE_URL="$SHARD_B" harvest migrate run
+```
+
+Harvest's own migrations are embedded in the binary, so this needs neither a
+source tree nor the `diesel` CLI. A migration runs in one transaction together
+with its row in `__diesel_schema_migrations` — the same ledger Autumn and
+Diesel read — so it is applied exactly once whichever of them applies it, and a
+failure leaves neither the schema change nor the record of it.
+
+A migration whose `metadata.toml` says `run_in_transaction = false`, as a
+`CREATE INDEX CONCURRENTLY` migration must, is applied without one, exactly as
+Diesel applies it — and **the exactly-once guarantee above does not extend to
+it**. With no transaction there is nothing to hold a lock in and nothing to
+roll back, so two migrators racing can both execute its body; the loser reports
+it under `applied_unserialized` rather than pretending otherwise. Run migrators
+one at a time against a database, and write such migrations to be idempotent
+(`IF NOT EXISTS`), exactly as `diesel migration run` requires.
+
+TLS is supported and always *verified* — chain and hostname, against the
+platform trust store — so `sslmode=require`, `verify-ca` and `verify-full` all
+connect (a self-signed certificate has to be in that trust store).
+`sslmode=disable` still connects in plaintext.
+
 ### Deployment preflight
 
 Run preflight before promoting a Harvest-backed service:
@@ -346,6 +487,22 @@ resolvability, worker queue coverage and freshness, DLQ read access, retention
 visibility, and whether the admin API has an auth boundary in non-dev profiles.
 The default output is a compact table; `--output json` returns the same response
 shape as the API for CI and release scripts.
+
+**Authenticating the call.** `/admin/preflight` is admin-gated like every other
+`/admin` route, and how you satisfy that gate depends on the profile:
+
+- **`AUTUMN_PROFILE=dev` with no auth boundary** — nothing to do. The management
+  API is served unauthenticated to any caller that can reach the socket, so the
+  command above works as written against a local app (this is what makes the
+  [quickstart](examples/quickstart/README.md)'s preflight step run). The app logs
+  a warning at startup when it is in this state, and preflight's own
+  `admin_auth_boundary` check reports it as `unauthenticated_access: true` —
+  do not expose such a process beyond localhost.
+- **Any other profile** — the gate is fail-closed. Pass a scoped API token with
+  `--token` / `HARVEST_TOKEN` (a `read` scope is enough; see
+  `harvest token --help`), or run the command from a context that carries an
+  admin session for whatever middleware you mounted via
+  `HarvestPlugin::api_with_auth`.
 
 Exit codes are deploy-gate friendly: `0` means `overall_status = pass`, `2`
 means `warn`, and `1` means `fail` or a transport/API error. Use warning exit
@@ -370,12 +527,22 @@ Prometheus examples use only ADR-0001/#138 metric names and bounded labels;
 operators without Prometheus can run the equivalent CLI/API checks documented
 in [`docs/alerts/README.md`](docs/alerts/README.md).
 
+For SLO-based paging, add the optional burn-rate pack in
+[`docs/alerts/slo.md`](docs/alerts/slo.md). It pages on error-budget burn for
+workflow-task success, schedule-to-start latency, and canary success.
+
 ### Measured performance baselines
 
-[`docs/performance.md`](docs/performance.md) publishes measured task-claim and
-enqueue baselines: how claim latency scales with pending-backlog depth (the
+[`docs/benchmarks.md`](docs/benchmarks.md) publishes **end-to-end** numbers —
+sustained workflows/sec for a canonical 3-activity workflow, activity dispatch
+and signal round-trip percentiles, and replay throughput, each at 1, 2 and 4
+shards — with a committed `docker-compose.yml` and a one-command runner so you
+can reproduce any of them on your own hardware.
+
+[`docs/performance.md`](docs/performance.md) is the component-level complement:
+it publishes measured task-claim and enqueue baselines: how claim latency scales with pending-backlog depth (the
 number that answers *"when do I add a shard?"*), what five representative
-claim-path predicates cost (five more are in the query on every claim but are
+claim-path predicates cost (six more are in the query on every claim but are
 left on their cheapest null/empty path, so they are evaluated rather than
 measured — the page names them), and the `EXPLAIN (ANALYZE, BUFFERS)` plan
 behind both. Like the
@@ -513,6 +680,7 @@ helpers directly.
 
 ```rust
 use autumn_harvest::prelude::*;
+use std::time::Duration;
 
 #[activity(retry = RetryPolicy::exponential(5, Duration::from_secs(1)))]
 async fn charge_card(ctx: &ActivityContext, amount: u32) -> Result<(), ActivityFailure> {
@@ -806,6 +974,7 @@ trigger rules, or multi-step pipelines between tasks.
 
 ```rust
 use autumn_harvest::policy::{Schedule, WorkflowSchedule};
+use autumn_harvest::prelude::*;
 
 // Register a daily billing run at 03:00 UTC with at-most-1 concurrent run.
 let sched = WorkflowSchedule::new(
@@ -815,12 +984,15 @@ let sched = WorkflowSchedule::new(
 .with_input(serde_json::json!({"region": "us-east"}))
 .with_max_active_runs(1);
 
-// Wire it into the builder alongside your workflow registration.
-let app = autumn_web::app()
+// Wire it into `HarvestBuilder` alongside your workflow registration.
+let harvest = HarvestBuilder::new()
     .workflows(workflows![daily_billing_report])
     .workflow_schedule(sched)
     .worker(WorkerConfig::default());
 ```
+
+`HarvestPlugin` has no `workflow_schedule` method. An app that mounts the
+plugin creates schedules at runtime with the CLI or HTTP API below.
 
 The scheduler tick derives a deterministic `workflow_id` of
 `sched:{name}:{unix_ts}` so retries after a crashed tick are idempotent.
@@ -921,15 +1093,23 @@ The embedded Vantage UI (`harvest_ui_router`, typically mounted at `/api/harvest
 
 ## Requirements
 
-- Rust 1.88.0 or newer (MSRV)
-- Postgres 12+
+- Rust 1.88.0 or newer (MSRV). A checkout of this repository builds with the
+  release pinned in `rust-toolchain.toml` (currently 1.99.0); `rustup`
+  installs it on the first `cargo` call. CI uses the same pin, so a new
+  stable release changes CI only when that file changes.
+- Postgres 12+ — except for `cargo dev`, whose `dev-runtime-managed` tier
+  downloads one for you. CI runs Harvest's own DB suites on Postgres 16 and
+  does not test 12 to 15.
 - The `db` feature is enabled by default and pulls Diesel + diesel-async; build
   with `--no-default-features` for pure compile-checks on systems without
   libpq.
+- The `tls` feature is enabled by default. It lets LISTEN/NOTIFY connections
+  use `sslmode=require`, and it compiles `ring`. A build with
+  `default-features = false` must list `tls` to keep it.
 
 ## Status
 
-Version 0.6.0 builds on the Phase 4 surface (see
+Version 0.7.0 builds on the Phase 4 surface (see
 [`CHANGELOG.md`](CHANGELOG.md) for this release's full entry list). The core
 surface is broad: DAG scheduling, `#[dag]`, trigger rules, signal delivery,
 `ctx.wait_for_signal`, query registration/dispatch, the management API,
@@ -997,6 +1177,11 @@ reports `degraded` or `unavailable`. Only after the candidate row reports
 `readiness: "ready"` should you flip it into `writable_shards`. In-flight
 workflows drain on their original shard.
 
+For Kubernetes, probe `/api/harvest/health/live` and
+`/api/harvest/health/ready`. The readiness probe also honors the setting
+below. See
+[`docs/operations/kubernetes-probes.md`](docs/operations/kubernetes-probes.md).
+
 By default `/api/harvest/health` stays a cheap liveness check for local
 single-shard development. To make it a rollout/readiness probe that returns
 `503` until writable shard readiness is `ready`, enable:
@@ -1009,6 +1194,43 @@ require_shard_readiness = true
 The equivalent environment override is
 `AUTUMN_HARVEST_READINESS__REQUIRE_SHARD_READINESS=true`.
 
+## Redis dispatch (optional)
+
+Postgres is the only required infrastructure dependency. On a deep backlog
+the Postgres claim scans and sorts the queue on every claim. An optional
+Redis Streams **dispatch channel** removes that scan: the engine publishes a
+small reference (task id, queue, due time) for each claimable row, and a
+worker claims the named row in Postgres with the full claim predicate before
+it acks the reference. Postgres keeps every row, every claim gate and the
+whole history write path.
+
+Build `autumn-harvest-plugin` with the `redis` feature, then set the URL:
+
+```toml
+[harvest.redis]
+url = "redis://cache:6379"
+```
+
+Leave `url` unset and every worker stays on the Postgres claim path, which
+is the default. A build without the `redis` feature rejects a configured URL
+at config validation rather than ignoring it.
+
+The fallback covers the **running** state. A started process that loses Redis
+returns to the Postgres claim path, so availability with Redis down equals
+availability with Redis absent. It does not cover boot: a configured URL that
+cannot connect **fails startup**, in every mode, with an error naming the
+endpoint. A process that came up without its channel would look healthy and
+publish nothing, so the failure is loud instead.
+
+A `redis://` URL is plaintext and sends the password in cleartext. Use
+`rediss://` for TLS (issue #1834). The client verifies the server against the
+platform trust store. `SSL_CERT_FILE` or `SSL_CERT_DIR` replaces that store
+with a private CA bundle. v1 targets a single Redis instance and a
+single-shard runtime. Redis Cluster is not supported.
+
+See [`docs/operations/redis-dispatch.md`](docs/operations/redis-dispatch.md)
+for the key layout, the crash matrix, the failure modes and the v1 limits.
+
 ## Testing workflow code changes with the replayer
 
 Before deploying any edit to a `#[workflow]` function, verify it is
@@ -1019,7 +1241,7 @@ replay-safe against recorded production histories using `WorkflowReplayer`
 
 ```toml
 # Cargo.toml — in your app's dev-dependencies
-autumn-harvest = { version = "0.2", features = ["testing"] }
+autumn-harvest = { version = "0.7", features = ["testing"] }
 ```
 
 ```rust

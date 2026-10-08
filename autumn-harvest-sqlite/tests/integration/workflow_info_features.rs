@@ -53,6 +53,22 @@ fn registering_a_workflow_with_workflow_level_retry_panics_naming_the_feature() 
     rt.register_workflow(&retried_wf_info());
 }
 
+// ── Rejected: quota (issue #1239) ────────────────────────────────────────────
+
+#[workflow(quota(key = "input", max_active_executions = 100))]
+async fn quota_wf(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
+    let _ = ctx;
+    Ok(0)
+}
+
+#[test]
+#[should_panic(expected = "quota")]
+fn registering_a_workflow_with_quota_panics_naming_the_feature() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    // Would silently register with no cap enforced — reject at setup instead.
+    rt.register_workflow(&quota_wf_info());
+}
+
 // ── Accepted (inert): metadata / observability-only fields ─────────────────────
 
 #[workflow(description = "an ordinary workflow with only descriptive metadata")]

@@ -1,0 +1,6 @@
+-- before bulk-pause: pg_stat_statements @ one real POST /ui/schedules/bulk-pause request, 300 matching + 200 noise schedules --
+TOTAL across matching statement shapes: calls=300 buffers=2590
+
+calls=300 shared_blks_hit=2584 shared_blks_read=6 total_buffers=2590
+query=INSERT INTO "harvest_audit_log" ("actor", "operation", "target_type", "target_id", "route_or_command", "request_id", "idempotency_key", "status", "error_summary", "shard_id", "source") VALUES ($1, $2, $3, $4, $5, DEFAULT, DEFAULT, $6, DEFAULT, $7, $8) RETURNING "harvest_audit_log"."id"
+

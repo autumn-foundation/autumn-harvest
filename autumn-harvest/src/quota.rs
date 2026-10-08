@@ -70,20 +70,52 @@
 //! workflow type with no declared [`QuotaPolicy`] leaves `quota_key = NULL`
 //! everywhere and pays zero enforcement overhead (issue #946 AC9).
 //!
-//! # Known limitation — pre-upgrade rollout gap (issue #1226)
+//! # Pre-upgrade rollout gap, closed by a periodic reconciler (issue #1226)
 //!
-//! Because `quota_key` is resolved only at admission time, an execution
-//! that was already `RUNNING`/`PAUSED` *before* its workflow type's
-//! [`QuotaPolicy`] was declared/deployed keeps `quota_key = NULL` for the
-//! rest of its life — it is neither counted against the new cap nor
-//! blocked by it. The migration deliberately ships with no SQL backfill
-//! (the key-resolution expression is Rust application code, not something
-//! a pure-SQL migration can evaluate), so this is a bounded, self-healing
-//! rollout-window gap rather than a permanent one: pre-existing executions
-//! age out of it as they complete, fail, or are otherwise collected. A
-//! registry-aware startup reconciliation pass that re-resolves and
-//! backfills `quota_key` for such rows is tracked as a follow-up in
-//! issue #1226.
+//! `quota_key` is resolved only at admission time. Consider an execution
+//! already `RUNNING`/`PAUSED` *before* its workflow type's
+//! [`QuotaPolicy`] was declared/deployed. It would otherwise keep
+//! `quota_key = NULL` for the rest of its life — neither counted against
+//! the new cap nor blocked by it. [`crate::quota_reconcile`] closes this:
+//! a periodic, shard-local sweep re-resolves and backfills `quota_key` for
+//! exactly such rows. It uses this module's own [`resolve_quota_key`] —
+//! the same function the live admission path calls. A backfilled value
+//! can therefore never drift from what a fresh admission would compute.
+//!
+//! The sweep runs on the worker's heartbeat cadence, not synchronously
+//! inside admission. A row therefore stays invisible to
+//! [`load_quota_usage`] for up to one reconcile interval after its policy
+//! takes effect. See [`crate::quota_reconcile`]'s module doc for the full
+//! design (why periodic rather than startup-once, and why that residual
+//! window is not a new risk class).
+//!
+//! # Known limitation — batched-start key attribution (issue #1230)
+//!
+//! A batched execution charges its quota to whichever admission arrived
+//! first for the shared `batch(key = ...)` (see
+//! `crate::event_batch`'s own doc for the mechanism). Two consequences
+//! follow directly from that rule, not from a defect in it:
+//!
+//! - A caller who admits into a batch without a resolvable quota-key
+//!   field pays no quota charge for that admission. A direct start has
+//!   the same gap. Fail-open on an unresolvable key is this crate's
+//!   existing, uniform contract — see `unresolvable_key_fails_open` in
+//!   `quota_enforcement_tests.rs`. Batching does not change that
+//!   contract. It does not add a NEW way to evade it.
+//! - When a `batch(key = ...)` is shared across more than one tenant,
+//!   the resolved quota key belongs to the FIRST admission. That need
+//!   not be the admission whose payload happened to fill the batch and
+//!   trigger the fire. A caller who triggers a synchronous flush
+//!   (`admit_batched_start`'s in-request path) can therefore observe
+//!   another admission's resolved key. That key appears in the
+//!   [`HarvestError::QuotaExceeded`](crate::error::HarvestError::QuotaExceeded)
+//!   `key` field of a `429` response. Issue #946 AC4 already returns
+//!   that same wire shape for every other quota rejection. Batching
+//!   only changes whose key a caller might see, not the shape or
+//!   existence of the field. Sharing one `batch_key` across tenants is
+//!   an unusual workflow design choice. The common case, collapsing one
+//!   tenant's own burst into one run, never exposes another tenant's
+//!   key, because there is no other tenant in the batch.
 
 #[cfg(feature = "db")]
 use diesel::sql_types::{BigInt, Nullable, Text};
@@ -444,9 +476,30 @@ struct QuotaUsageRow {
 /// `active` and `dl` each hit the partial indexes created by migration
 /// `20260725000000_harvest_workflow_quotas`
 /// (`idx_harvest_we_quota_active`/`idx_harvest_dl_quota`); `history` joins
-/// `harvest_events` on `workflow_exec_id`, served by the existing
-/// `(workflow_exec_id, event_id)` index — bounded to the rows belonging to
-/// the key's own active executions, never a scan of the whole event log.
+/// `harvest_events` on `workflow_exec_id`, intended to be served by the
+/// existing `(workflow_exec_id, event_id)` index — bounded to the rows
+/// belonging to the key's own active executions, never a scan of the whole
+/// event log.
+///
+/// **AC7's "never a full-table scan" is a design intent, not a guarantee the
+/// query text enforces.** `WHERE e.workflow_exec_id IN (SELECT id FROM
+/// active)` lets the planner choose either an index-bounded Nested Loop *or*
+/// a Seq Scan of the entire `harvest_events` table, and it measurably picks
+/// the Seq Scan below roughly 300k total rows in the table (a plain,
+/// production-shaped early-life or heavily-retention-pruned deployment) —
+/// see the Ledger evidence in `docs/performance-quota-history-bytes.md`. This
+/// is not flagged as a bug: at that same size a query shape that *forces*
+/// the index-bounded plan measured **worse** (a per-row correlated
+/// `LATERAL`, tested and reverted — see the doc page's negative result), so
+/// the planner's own cost-based choice is already at least as good as the
+/// alternative tried. The real, unavoidable cost this query pays regardless
+/// of which plan runs: an exact `SUM(pg_column_size(...))` requires reading
+/// every contributing row, so cost scales with the target key's own
+/// accumulated active-execution history — for a tenant sitting near its
+/// configured `max_history_bytes` cap, that is tens of thousands of buffer
+/// touches on *every* admission, recomputed from scratch each time. See the
+/// doc page for the measured numbers and why a cheaper fix (an incrementally
+/// maintained running counter) is a human decision, not a query rewrite.
 ///
 /// `SUSPENDED` does not appear in the active-state filter: it is not a
 /// persisted state (the `harvest_workflow_executions.state` CHECK constraint
@@ -470,6 +523,18 @@ const QUOTA_USAGE_SQL: &str = "\
         (SELECT COUNT(*) FROM harvest_dead_letters \
          WHERE workflow_name = $1 AND quota_key = $2)::BIGINT AS dead_letters";
 
+/// The exact SQL text [`load_quota_usage`] executes.
+///
+/// Exposed read-only for evidence-capture tests to `EXPLAIN` — mirrors
+/// [`crate::queue::claim_task_query`]'s identical purpose for the claim path,
+/// so a captured plan is provably the production statement rather than a
+/// hand-copied (and driftable) approximation of it.
+#[cfg(feature = "db")]
+#[must_use]
+pub const fn quota_usage_query() -> &'static str {
+    QUOTA_USAGE_SQL
+}
+
 /// Load current usage for one `(workflow_name, quota_key)` pair.
 ///
 /// The admission-time primitive: called once per start attempt for a
@@ -489,6 +554,82 @@ pub async fn load_quota_usage(
     let row: QuotaUsageRow = diesel::sql_query(QUOTA_USAGE_SQL)
         .bind::<Text, _>(workflow_name)
         .bind::<Text, _>(quota_key)
+        .get_result(conn)
+        .await
+        .map_err(database_error)?;
+
+    Ok(QuotaUsage {
+        active_executions: row.active_executions,
+        history_bytes: row.history_bytes,
+        dead_letters: row.dead_letters,
+    })
+}
+
+/// SQL for [`load_quota_usage_excluding`]. Identical to [`QUOTA_USAGE_SQL`]
+/// except the `active` CTE also excludes `$3`, an array of execution ids.
+///
+/// A separate query text, not a wrapper around [`QUOTA_USAGE_SQL`]. Every
+/// OTHER caller still uses the unqualified admission-time read, unchanged.
+/// It keeps the exact query shape `docs/performance-quota-history-bytes.md`
+/// measured.
+#[cfg(feature = "db")]
+const QUOTA_USAGE_EXCLUDING_SQL: &str = "\
+    WITH active AS ( \
+        SELECT id FROM harvest_workflow_executions \
+        WHERE workflow_name = $1 AND quota_key = $2 AND state IN ('RUNNING', 'PAUSED') \
+          AND id <> ALL($3) \
+    ) \
+    SELECT \
+        (SELECT COUNT(*) FROM active)::BIGINT AS active_executions, \
+        COALESCE( \
+            (SELECT SUM(pg_column_size(e.event_data)) \
+             FROM harvest_events e \
+             WHERE e.workflow_exec_id IN (SELECT id FROM active)), \
+            0 \
+        )::BIGINT AS history_bytes, \
+        (SELECT COUNT(*) FROM harvest_dead_letters \
+         WHERE workflow_name = $1 AND quota_key = $2)::BIGINT AS dead_letters";
+
+/// Load current usage for one `(workflow_name, quota_key)` pair, excluding
+/// specific executions entirely from the `active_executions`/`history_bytes`
+/// counters (issue #1228 review).
+///
+/// An admission can plan to shed some incumbents. Or it can have just
+/// inserted its own row. Either way it needs usage as it will read once
+/// those executions are gone, or once its own row's history is set aside.
+/// Neither is usage as it stands right now. [`load_quota_usage`] followed
+/// by a separate subtraction computed the excluded executions'
+/// contribution from an EARLIER, separate read. A row could change state
+/// between that earlier read and this one. An incumbent could complete on
+/// its own. Or the caller's own row could pick up a `WorkflowStarted`
+/// event. Either change made the subtraction stale. Excluding the ids
+/// directly inside this ONE query removes the gap. There is no earlier
+/// read to go stale relative to, because there is no earlier read.
+///
+/// `excluded_ids` is typically the caller's own `self_exec_id`. That row
+/// is already `RUNNING`, so it always needs excluding: it would otherwise
+/// double-count itself against the very cap it is being checked against.
+/// On the `cancel_running` dry-run path, `excluded_ids` also holds the
+/// executions a pending supersede pass is about to shed. A row that
+/// starts existing, or newly matches the key, only AFTER this query runs
+/// is not excluded, and could not be. That case can only raise the
+/// reported usage, never lower it below the true value. It is the safe
+/// direction the rest of this mechanism already relies on.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+#[cfg(feature = "db")]
+pub async fn load_quota_usage_excluding(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    quota_key: &str,
+    excluded_ids: &[uuid::Uuid],
+) -> HarvestResult<QuotaUsage> {
+    let row: QuotaUsageRow = diesel::sql_query(QUOTA_USAGE_EXCLUDING_SQL)
+        .bind::<Text, _>(workflow_name)
+        .bind::<Text, _>(quota_key)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(excluded_ids)
         .get_result(conn)
         .await
         .map_err(database_error)?;
@@ -609,6 +750,15 @@ pub async fn list_quota_usage(conn: &mut AsyncPgConnection) -> HarvestResult<Vec
 // Advisory lock — serializes check-then-admit for one key (issue #946)
 // ---------------------------------------------------------------------------
 
+/// The exact advisory-lock namespace string [`lock_quota_key`] hashes. A
+/// single source of truth. The scanner lock-ordering pass
+/// ([`crate::quota_lock_order`]) resolves the SAME string this function
+/// locks on. It never uses a separately formatted copy that could drift.
+#[cfg(feature = "db")]
+pub(crate) fn quota_lock_namespace(workflow_name: &str, quota_key: &str) -> String {
+    format!("quota:{workflow_name}:{quota_key}")
+}
+
 /// Serialize a quota check-then-admit sequence for one key behind a
 /// transaction-scoped advisory lock.
 ///
@@ -636,7 +786,7 @@ pub async fn lock_quota_key(
     workflow_name: &str,
     quota_key: &str,
 ) -> HarvestResult<()> {
-    let namespaced = format!("quota:{workflow_name}:{quota_key}");
+    let namespaced = quota_lock_namespace(workflow_name, quota_key);
     diesel::sql_query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
         .bind::<Text, _>(namespaced)
         .execute(conn)

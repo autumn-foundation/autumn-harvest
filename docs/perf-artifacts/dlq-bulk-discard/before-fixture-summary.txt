@@ -1,0 +1,9 @@
+label=before
+fixture: 1000 matching dead letters (activity_name = 'dlq_bulk_perf_target'), 4000 non-matching noise dead letters across 25 other activities
+request: POST /dead-letters/discard {"activity_name": "dlq_bulk_perf_target", "limit": 1000}
+acted_on=1000
+discard_statement_shapes=1
+total_calls=1000
+total_buffers=4000
+request_total_calls=1006
+request_total_buffers=4329

@@ -828,17 +828,16 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Collect parameter names after the first (ctx is first, rest are inputs).
     let params: Vec<_> = input_fn.sig.inputs.iter().skip(1).collect();
-    let param_names: Vec<_> = params
-        .iter()
-        .filter_map(|arg| {
-            if let syn::FnArg::Typed(pat) = arg
-                && let syn::Pat::Ident(ident) = pat.pat.as_ref()
-            {
-                return Some(&ident.ident);
-            }
-            None
-        })
-        .collect();
+    let param_names: Vec<_> = crate::attr_util::param_idents(&params);
+    if let Some(pt) = crate::attr_util::first_non_ident_param(&params) {
+        return syn::Error::new_spanned(
+            &pt.pat,
+            "#[workflow] input parameters must be plain identifiers, so `_` and \
+             destructuring patterns are not supported; name the parameter, for \
+             example `_input: ()` (the leading underscore silences the unused warning)",
+        )
+        .to_compile_error();
+    }
 
     // If the workflow returns `Result<_, WorkflowFailure>`, route the error
     // through `WorkflowFailure`'s `IntoWorkflowErrorString` impl so the engine
@@ -854,45 +853,14 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! { |e| e.to_string() }
     };
 
-    let dispatch = if param_names.is_empty() {
-        quote! {
-            let result = #fn_name(ctx).await;
-            result.map_err(#encode_err)
-                .and_then(|v| {
-                    ::autumn_harvest::serde_json::to_value(v)
-                        .map_err(|e| e.to_string())
-                })
-        }
-    } else if param_names.len() == 1 {
-        let name = &param_names[0];
-        quote! {
-            let #name = ::autumn_harvest::serde_json::from_value(input)
-                .map_err(|e| e.to_string())?;
-            let result = #fn_name(ctx, #name).await;
-            result.map_err(#encode_err)
-                .and_then(|v| {
-                    ::autumn_harvest::serde_json::to_value(v)
-                        .map_err(|e| e.to_string())
-                })
-        }
-    } else {
-        // Multiple params: expect input to be a JSON array [arg1, arg2, ...]
-        let indices = (0..param_names.len()).map(syn::Index::from);
-        let names = param_names.clone();
-        quote! {
-            let args: ::autumn_harvest::serde_json::Value = input;
-            #(
-                let #names = ::autumn_harvest::serde_json::from_value(args[#indices].clone())
-                    .map_err(|e| e.to_string())?;
-            )*
-            let result = #fn_name(ctx, #(#names),*).await;
-            result.map_err(#encode_err)
-                .and_then(|v| {
-                    ::autumn_harvest::serde_json::to_value(v)
-                        .map_err(|e| e.to_string())
-                })
-        }
-    };
+    let dispatch = crate::attr_util::build_handler_dispatch(
+        fn_name,
+        &param_names,
+        &format_ident!("input"),
+        &quote! { ctx },
+        &quote! { .await },
+        &encode_err,
+    );
 
     // Emit execution_timeout as Option<Duration> using the task_duration helper.
     let execution_timeout_expr = attrs.execution_timeout.as_deref().map_or_else(
@@ -1075,9 +1043,9 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         |expr| quote! { ::std::option::Option::Some(#expr) },
     );
 
-    let camel_name = to_pascal_case(&fn_name_str);
+    let camel_name = crate::to_pascal_case(&fn_name_str);
     let stub_name = format_ident!("{}Stub", camel_name);
-    let ok_type = extract_ok_type(&input_fn.sig.output);
+    let ok_type = crate::extract_ok_type(&input_fn.sig.output);
 
     let serialize_args = if param_names.is_empty() {
         quote! { ::autumn_harvest::serde_json::Value::Null }
@@ -1211,65 +1179,9 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     // debounced start has no exec_id-keyed handle to return anyway.
                     // So rather than silently bypassing the policy or admitting onto
                     // the wrong shard, reject early with a clear pointer to the HTTP
-                    // route. (Compile-time `#[workflow(debounce(...))]` is visible
-                    // here via `info.debounce`; a fluent `.with_debounce(...)` policy
-                    // is registry-only and is enforced by the HTTP route instead.)
-                    if let ::std::option::Option::Some(debounce_policy) = info.debounce {
-                        if ::autumn_harvest::debounce::resolve_debounce_key(
-                            debounce_policy.key_expr,
-                            &input,
-                        )
-                        .is_some()
-                        {
-                            return ::std::result::Result::Err(
-                                ::autumn_harvest::error::HarvestError::Config(::std::format!(
-                                    "workflow '{0}' has a debounce policy; debounced starts \
-                                     must use the HTTP start route POST /workflows/{0}/start \
-                                     (the typed client cannot express a deferred debounced start)",
-                                    info.name,
-                                )),
-                            );
-                        }
-                    }
-                    // Same rationale as debounce: a throttle defers excess starts,
-                    // which the typed client cannot express (no exec_id-keyed handle
-                    // exists for a deferred start). A keyed throttle applies only when
-                    // its key resolves; an unkeyed (global) throttle always applies.
-                    if let ::std::option::Option::Some(throttle_policy) = info.throttle {
-                        let throttle_applies = match throttle_policy.key_expr {
-                            ::std::option::Option::Some(k) => {
-                                ::autumn_harvest::throttle::resolve_throttle_key(k, &input).is_some()
-                            }
-                            ::std::option::Option::None => true,
-                        };
-                        if throttle_applies {
-                            return ::std::result::Result::Err(
-                                ::autumn_harvest::error::HarvestError::Config(::std::format!(
-                                    "workflow '{0}' has a start-throttle policy; throttled starts \
-                                     must use the HTTP start route POST /workflows/{0}/start \
-                                     (the typed client cannot express a deferred throttled start)",
-                                    info.name,
-                                )),
-                            );
-                        }
-                    }
-                    if let ::std::option::Option::Some(batch_policy) = info.batch.as_ref() {
-                        if ::autumn_harvest::concurrency::resolve_concurrency_key(
-                            &batch_policy.key_expr,
-                            &input,
-                        )
-                        .is_some()
-                        {
-                            return ::std::result::Result::Err(
-                                ::autumn_harvest::error::HarvestError::Config(::std::format!(
-                                    "workflow '{0}' has an event batching policy; batched starts \
-                                     must use the HTTP start route POST /workflows/{0}/start \
-                                     (the typed client cannot express a deferred batched start)",
-                                    info.name,
-                                )),
-                            );
-                        }
-                    }
+                    // route. Same rationale covers the sibling throttle and batch
+                    // checks `reject_if_admission_may_defer` also runs.
+                    info.reject_if_admission_may_defer(&input)?;
                     if opts.batch.is_some() {
                         return ::std::result::Result::Err(
                             ::autumn_harvest::error::HarvestError::Config(::std::format!(
@@ -1344,22 +1256,15 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     };
 
                     let params = ::autumn_harvest::execution::StartWorkflowParams {
-                        workflow_name: info.name,
-                        workflow_id: &workflow_id,
-                        exec_id,
-                        input,
                         parent_id: opts.parent_id,
-                        queue_name: opts.queue_name.as_deref().unwrap_or("default"),
                         execution_timeout,
                         memo: opts.memo,
                         search_attrs: opts.search_attrs,
                         reuse_policy: opts.reuse_policy.unwrap_or(::autumn_harvest::types::WorkflowIdReusePolicy::AllowDuplicate),
-                        conflict_policy: ::autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
                         trace_context: opts.trace_context,
                         max_execution_timeout_ceiling,
                         chain_execution_timeout,
                         max_workflow_chain_timeout_ceiling,
-                        inherited_chain_deadline_at: ::std::option::Option::None,
                         concurrency_key,
                         concurrency_limit,
                         concurrency_on_conflict,
@@ -1375,17 +1280,16 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         sla: opts.sla.or(info.sla).and_then(|d|
                             ::autumn_harvest::chrono::Duration::from_std(d).ok()
                         ),
-                        schedule_id: ::std::option::Option::None,
-                        scheduled_for: ::std::option::Option::None,
-                        workflow_attempt: 1,
                         workflow_retry_policy: info.retry_policy.clone(),
-                        retry_of_exec_id: ::std::option::Option::None,
                         max_workflow_attempts_ceiling: client.max_workflow_attempts(),
-                        origin: None,
-                        completion_callbacks: ::std::option::Option::None,
                         start_source: ::autumn_harvest::types::StartSource::Api,
-                        start_source_ref: ::std::option::Option::None,
-                        started_by: ::std::option::Option::None,
+                        ..::autumn_harvest::execution::StartWorkflowParams::new(
+                            info.name,
+                            &workflow_id,
+                            exec_id,
+                            input,
+                            opts.queue_name.as_deref().unwrap_or("default"),
+                        )
                     };
 
                     let started = client.start_or_load(conn, params).await?;
@@ -1413,62 +1317,9 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     // debounced workflow must not be started — or signal-with-started —
                     // through the typed client, which cannot route to the debounce-key
                     // shard or admit through the gate. Reject with a pointer to HTTP.
-                    if let ::std::option::Option::Some(debounce_policy) = info.debounce {
-                        if ::autumn_harvest::debounce::resolve_debounce_key(
-                            debounce_policy.key_expr,
-                            &input,
-                        )
-                        .is_some()
-                        {
-                            return ::std::result::Result::Err(
-                                ::autumn_harvest::error::HarvestError::Config(::std::format!(
-                                    "workflow '{0}' has a debounce policy; debounced starts \
-                                     must use the HTTP start route POST /workflows/{0}/start \
-                                     (the typed client cannot express a deferred debounced start)",
-                                    info.name,
-                                )),
-                            );
-                        }
-                    }
-                    // Same rationale as debounce: a throttle defers excess starts,
-                    // which the typed client cannot express (no exec_id-keyed handle
-                    // exists for a deferred start). A keyed throttle applies only when
-                    // its key resolves; an unkeyed (global) throttle always applies.
-                    if let ::std::option::Option::Some(throttle_policy) = info.throttle {
-                        let throttle_applies = match throttle_policy.key_expr {
-                            ::std::option::Option::Some(k) => {
-                                ::autumn_harvest::throttle::resolve_throttle_key(k, &input).is_some()
-                            }
-                            ::std::option::Option::None => true,
-                        };
-                        if throttle_applies {
-                            return ::std::result::Result::Err(
-                                ::autumn_harvest::error::HarvestError::Config(::std::format!(
-                                    "workflow '{0}' has a start-throttle policy; throttled starts \
-                                     must use the HTTP start route POST /workflows/{0}/start \
-                                     (the typed client cannot express a deferred throttled start)",
-                                    info.name,
-                                )),
-                            );
-                        }
-                    }
-                    if let ::std::option::Option::Some(batch_policy) = info.batch.as_ref() {
-                        if ::autumn_harvest::concurrency::resolve_concurrency_key(
-                            &batch_policy.key_expr,
-                            &input,
-                        )
-                        .is_some()
-                        {
-                            return ::std::result::Result::Err(
-                                ::autumn_harvest::error::HarvestError::Config(::std::format!(
-                                    "workflow '{0}' has an event batching policy; batched starts \
-                                     must use the HTTP start route POST /workflows/{0}/start \
-                                     (the typed client cannot express a deferred batched start)",
-                                    info.name,
-                                )),
-                            );
-                        }
-                    }
+                    // Same rationale covers the sibling throttle and batch checks
+                    // `reject_if_admission_may_defer` also runs.
+                    info.reject_if_admission_may_defer(&input)?;
                     let exec_id = opts.exec_id.unwrap_or_else(|| {
                         let shard = client.pick_shard_for_new_workflow(info.name, &workflow_id);
                         ::autumn_harvest::types::ExecutionId::new_for_shard(shard)
@@ -1570,14 +1421,6 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
-fn to_pascal_case(s: &str) -> String {
-    crate::to_pascal_case(s)
-}
-
-fn extract_ok_type(output: &syn::ReturnType) -> syn::Type {
-    crate::extract_ok_type(output)
-}
-
 #[cfg(test)]
 mod duration_validation_tests {
     use super::is_valid_task_duration;
@@ -1632,5 +1475,112 @@ mod rate_validation_tests {
         ] {
             assert!(!is_valid_rate(s), "should reject '{s}'");
         }
+    }
+}
+
+// ── Dispatch-block characterization tests (issue #1632) ─────────────────────
+//
+// `workflow_macro` builds its dispatch block with
+// `attr_util::build_handler_dispatch`. These tests pin the generated block for
+// 0, 1, and many non-`ctx` params. They cover a plain return type and a
+// `WorkflowFailure` return type.
+#[cfg(test)]
+mod dispatch_characterization_tests {
+    use super::workflow_macro;
+    use quote::quote;
+
+    /// Isolate the `async move { ... }` dispatch body from `#companion_name`'s
+    /// `handler` closure, ignoring the module-normalized whitespace `quote!`'s
+    /// `Display` impl already collapses. Brace-depth walk, mirroring
+    /// `query.rs`'s `extract_impl_body`.
+    fn extract_dispatch_body(full: &str) -> String {
+        let marker = "Box :: pin (async move {";
+        let start = full
+            .find(marker)
+            .unwrap_or_else(|| panic!("no dispatch marker in generated output:\n{full}"))
+            + marker.len();
+        let mut depth = 1i32;
+        let bytes = full.as_bytes();
+        let mut i = start;
+        while i < bytes.len() && depth > 0 {
+            match bytes[i] as char {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        full[start..i - 1].trim().to_string()
+    }
+
+    fn generate(item: proc_macro2::TokenStream) -> String {
+        workflow_macro(quote! {}, item).to_string()
+    }
+
+    const WORKFLOW_DISPATCH_0_LEGACY: &str = "let result = my_workflow (ctx) . await ; result . map_err (| e | e . to_string ()) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+    const WORKFLOW_DISPATCH_0_TYPED: &str = "let result = my_workflow (ctx) . await ; result . map_err (| e | :: autumn_harvest :: failure :: IntoWorkflowErrorString :: into_workflow_error_payload (e)) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+    const WORKFLOW_DISPATCH_1_LEGACY: &str = "let n = :: autumn_harvest :: serde_json :: from_value (input) . map_err (| e | e . to_string ()) ? ; let result = my_workflow (ctx , n) . await ; result . map_err (| e | e . to_string ()) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+    const WORKFLOW_DISPATCH_1_TYPED: &str = "let n = :: autumn_harvest :: serde_json :: from_value (input) . map_err (| e | e . to_string ()) ? ; let result = my_workflow (ctx , n) . await ; result . map_err (| e | :: autumn_harvest :: failure :: IntoWorkflowErrorString :: into_workflow_error_payload (e)) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+    const WORKFLOW_DISPATCH_N_LEGACY: &str = "let __args : :: autumn_harvest :: serde_json :: Value = input ; let a = :: autumn_harvest :: serde_json :: from_value (__args [0] . clone ()) . map_err (| e | e . to_string ()) ? ; let b = :: autumn_harvest :: serde_json :: from_value (__args [1] . clone ()) . map_err (| e | e . to_string ()) ? ; let result = my_workflow (ctx , a , b) . await ; result . map_err (| e | e . to_string ()) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+    const WORKFLOW_DISPATCH_N_TYPED: &str = "let __args : :: autumn_harvest :: serde_json :: Value = input ; let a = :: autumn_harvest :: serde_json :: from_value (__args [0] . clone ()) . map_err (| e | e . to_string ()) ? ; let b = :: autumn_harvest :: serde_json :: from_value (__args [1] . clone ()) . map_err (| e | e . to_string ()) ? ; let result = my_workflow (ctx , a , b) . await ; result . map_err (| e | :: autumn_harvest :: failure :: IntoWorkflowErrorString :: into_workflow_error_payload (e)) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+
+    #[test]
+    fn zero_params_legacy_error_dispatch_is_pinned() {
+        let out = generate(quote! {
+            async fn my_workflow(ctx: &WorkflowContext) -> Result<u32, String> {
+                Ok(1)
+            }
+        });
+        assert_eq!(extract_dispatch_body(&out), WORKFLOW_DISPATCH_0_LEGACY);
+    }
+
+    #[test]
+    fn zero_params_typed_failure_dispatch_is_pinned() {
+        let out = generate(quote! {
+            async fn my_workflow(ctx: &WorkflowContext) -> Result<u32, WorkflowFailure> {
+                Ok(1)
+            }
+        });
+        assert_eq!(extract_dispatch_body(&out), WORKFLOW_DISPATCH_0_TYPED);
+    }
+
+    #[test]
+    fn one_param_legacy_error_dispatch_is_pinned() {
+        let out = generate(quote! {
+            async fn my_workflow(ctx: &WorkflowContext, n: u32) -> Result<u32, String> {
+                Ok(n)
+            }
+        });
+        assert_eq!(extract_dispatch_body(&out), WORKFLOW_DISPATCH_1_LEGACY);
+    }
+
+    #[test]
+    fn one_param_typed_failure_dispatch_is_pinned() {
+        let out = generate(quote! {
+            async fn my_workflow(ctx: &WorkflowContext, n: u32) -> Result<u32, WorkflowFailure> {
+                Ok(n)
+            }
+        });
+        assert_eq!(extract_dispatch_body(&out), WORKFLOW_DISPATCH_1_TYPED);
+    }
+
+    #[test]
+    fn multi_param_legacy_error_dispatch_is_pinned() {
+        let out = generate(quote! {
+            async fn my_workflow(ctx: &WorkflowContext, a: u32, b: u32) -> Result<u32, String> {
+                Ok(a + b)
+            }
+        });
+        assert_eq!(extract_dispatch_body(&out), WORKFLOW_DISPATCH_N_LEGACY);
+    }
+
+    #[test]
+    fn multi_param_typed_failure_dispatch_is_pinned() {
+        let out = generate(quote! {
+            async fn my_workflow(ctx: &WorkflowContext, a: u32, b: u32) -> Result<u32, WorkflowFailure> {
+                Ok(a + b)
+            }
+        });
+        assert_eq!(extract_dispatch_body(&out), WORKFLOW_DISPATCH_N_TYPED);
     }
 }

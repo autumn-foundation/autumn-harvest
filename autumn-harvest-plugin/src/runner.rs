@@ -1,14 +1,14 @@
 //! Reusable Harvest runtime ownership for standalone or embedded processes.
 
 use std::any::{Any, TypeId};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use autumn_harvest::BuiltHarvest;
 use autumn_harvest::batch::{BatchExecutorConfig, run_executor_once};
 use autumn_harvest::context::SharedStateMap;
 use autumn_harvest::effective_config::{
-    EffectiveConfigView, PayloadCapsView, PoolConfigView, ShardedInfo,
+    DispatchConfigView, EffectiveConfigView, PayloadCapsView, PoolConfigView, ShardedInfo,
 };
 use autumn_harvest::policy::WorkflowSchedule;
 use autumn_harvest::retention::{RetentionConfig, RetentionRuntime};
@@ -19,6 +19,7 @@ use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
 use autumn_harvest::types::ShardId;
 use autumn_harvest::worker::{
     DEFAULT_WORKER_POLL_INTERVAL, DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig,
+    spawn_dispatch_metrics_sampler,
 };
 use autumn_web::AppState;
 use autumn_web::error::AutumnError;
@@ -26,8 +27,12 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::api::{HarvestApiRuntime, HarvestRetentionRuntime};
-use crate::config::HarvestRuntimeConfig;
+use crate::config::{HarvestRedisConfig, HarvestRuntimeConfig, OrphanStartupAction};
 use crate::state::{AppDbPool, HarvestDbPool};
+use crate::workflow_reachability::{
+    ReachabilityReportStatus, ReachabilityVerdict, StartupOrphanDecision,
+    build_reachability_report_for_shards, startup_orphan_decision,
+};
 
 /// Resource bundle used to start a Harvest runtime outside `HarvestExt`.
 ///
@@ -48,6 +53,10 @@ pub struct HarvestRunnerResources {
     /// all assigned shards. When `None`, the runtime falls back to a
     /// single-shard wrapper around `harvest_pool`.
     sharded_pool: Option<ShardedDbPool>,
+    /// Set by a caller that has ALREADY run the boot-time orphaned-workflow-type
+    /// gate itself, so [`HarvestRunner::start`] does not run it a second time
+    /// (issue #1128). See [`HarvestRunnerResources::with_startup_orphan_gate_already_run`].
+    startup_orphan_gate_already_run: bool,
 }
 
 impl HarvestRunnerResources {
@@ -60,6 +69,7 @@ impl HarvestRunnerResources {
             harvest_pool,
             shard_router: None,
             sharded_pool: None,
+            startup_orphan_gate_already_run: false,
         }
     }
 
@@ -100,17 +110,69 @@ impl HarvestRunnerResources {
         self
     }
 
-    /// The explicit runner-level sharded-pool override, if set.
+    /// Declare that the boot-time orphaned-workflow-type gate has **already
+    /// been run** by the caller, so [`HarvestRunner::start`] skips it.
     ///
-    /// Used by the plugin's boot-time orphaned-workflow gate (issue #700 P2) to
-    /// select the same shard-0 pool `HarvestRunner::start` will run against, by
-    /// feeding this into [`select_runtime_shard0_pool`] with the exact inputs
-    /// `build` uses — so the gate queries the database the workers actually poll
-    /// rather than assuming `harvest_pool`. Borrowed (not cloned) so the gate's
-    /// selection touches no process global.
+    /// [`HarvestRunner::start`] runs the gate itself (issue #1128), which is
+    /// what a standalone embedder wants: the fail-fast is automatic. The
+    /// `HarvestPlugin` boot path, however, runs the very same gate *earlier* —
+    /// before it publishes any process-global admission state — so that an
+    /// abort has nothing at all to unwind (issue #700 AC4). This marker keeps
+    /// that path from paying for a second identical scan and logging a second
+    /// identical warning.
+    ///
+    /// An embedder driving its own custom boot sequence can use it for the same
+    /// reason, having called [`run_startup_orphan_gate`] itself.
+    ///
+    /// **This is an assertion the runtime trusts, not one it verifies.** Nothing
+    /// checks that an equivalent check ran, under the same action, over the same
+    /// pools. Setting it without having run the gate does not skip a duplicate —
+    /// it disables the gate outright, including under
+    /// `orphaned_workflows = "fail"`. [`HarvestRunner::start`] logs the skip at
+    /// debug level, so a boot log always records which of the two happened.
     #[must_use]
-    pub(crate) const fn sharded_pool_override(&self) -> Option<&ShardedDbPool> {
-        self.sharded_pool.as_ref()
+    pub const fn with_startup_orphan_gate_already_run(mut self) -> Self {
+        self.startup_orphan_gate_already_run = true;
+        self
+    }
+
+    /// Whether a caller already ran the boot-time orphaned-workflow-type gate.
+    #[must_use]
+    pub const fn startup_orphan_gate_already_run(&self) -> bool {
+        self.startup_orphan_gate_already_run
+    }
+
+    /// The default shard and its pool, as the runtime will resolve them.
+    ///
+    /// Uses the precedence of [`resolve_runtime_storage_pool`] and installs
+    /// no process global. The admission gate table is read from this pool.
+    pub(crate) fn default_shard_pool(&self, built: &BuiltHarvest) -> (ShardId, DbPool) {
+        match pick_runtime_pool_source(
+            self.sharded_pool.as_ref(),
+            built.worker_config().sharded_pool.as_ref(),
+            &self.harvest_pool,
+        ) {
+            RuntimePoolSource::Sharded(sp) => {
+                let shard = sp.default_shard();
+                (shard, sp.pool_for(shard).clone())
+            }
+            RuntimePoolSource::Single(pool) => (ShardId::new(0), pool.clone()),
+        }
+    }
+
+    /// The shards the runtime will hold a pool for.
+    ///
+    /// Uses the precedence of [`resolve_runtime_storage_pool`] and installs
+    /// no process global.
+    pub(crate) fn pool_shards(&self, built: &BuiltHarvest) -> Vec<ShardId> {
+        match pick_runtime_pool_source(
+            self.sharded_pool.as_ref(),
+            built.worker_config().sharded_pool.as_ref(),
+            &self.harvest_pool,
+        ) {
+            RuntimePoolSource::Sharded(sp) => sp.shard_ids(),
+            RuntimePoolSource::Single(_) => vec![ShardId::new(0)],
+        }
     }
 }
 
@@ -129,8 +191,9 @@ enum RuntimePoolSource<'a> {
 /// A runner-level `resources.sharded_pool` override wins, then a
 /// `WorkerConfig::with_sharded_pool` carried on the build, then the single
 /// `harvest_pool`. Pure SELECTION — installs no process global. Both the
-/// install path ([`resolve_runtime_storage_pool`]) and the boot-gate's read
-/// path ([`select_runtime_shard0_pool`]) route through it, so the
+/// install path ([`resolve_runtime_storage_pool`]) and both read paths
+/// ([`select_runtime_gate_shards`], which the boot gate uses, and
+/// [`select_runtime_shard0_pool`]) route through it, so the
 /// `sharded_pool`-over-`harvest_pool` precedence can never drift between the
 /// gate and the runner.
 const fn pick_runtime_pool_source<'a>(
@@ -151,9 +214,23 @@ const fn pick_runtime_pool_source<'a>(
 /// global `GLOBAL_SHARDED_POOL`. Used by `PreparedHarvestRuntime::build` on the
 /// normal startup path, where installing the global is intended.
 ///
+/// The sharded case installs explicitly, and must. `ShardedDbPool::single` and
+/// `from_map` self-install at *construction*, so the global reflects whichever
+/// pool was constructed last — not the one this function's precedence selects.
+/// Build a multi-shard `HarvestRunnerResources::sharded_pool` and then a
+/// single-shard `WorkerConfig::with_sharded_pool`, and the global is left
+/// single-shard while the runtime runs multi-shard. Every consumer of the
+/// global then reads a pool the runtime is not using: the by-id fan-out, the
+/// timeout sweeps, completion triggers, and — the reason this was found —
+/// `external_target_location::deployment_is_multi_shard`, which would answer
+/// "single shard" and re-open issue #1146 on the inline path, recording a
+/// permanent `not_running` against a target that is running on another shard.
+/// Re-installing the selected pool makes the global agree with the effective
+/// topology for all of them (issue #1146 review).
+///
 /// The boot-time orphaned-workflow gate must NOT call this — an aborting gate
 /// must mutate no process global (issue #700 P4). It uses
-/// [`select_runtime_shard0_pool`] instead, which shares this function's exact
+/// [`select_runtime_gate_shards`] instead, which shares this function's exact
 /// precedence (via [`pick_runtime_pool_source`]) but installs nothing.
 #[must_use]
 pub fn resolve_runtime_storage_pool(
@@ -166,7 +243,13 @@ pub fn resolve_runtime_storage_pool(
         worker_config_sharded_pool,
         harvest_pool,
     ) {
-        RuntimePoolSource::Sharded(sp) => HarvestDbPool::sharded(sp.clone()),
+        RuntimePoolSource::Sharded(sp) => {
+            // `HarvestDbPool::sharded` is a pure wrap (a `const fn`) — unlike
+            // the single-shard arm below, it installs nothing. Install the
+            // selection so the global matches what the runtime actually runs.
+            autumn_harvest::shard::install_global_sharded_pool(sp.clone());
+            HarvestDbPool::sharded(sp.clone())
+        }
         RuntimePoolSource::Single(pool) => HarvestDbPool::from(pool.clone()),
     }
 }
@@ -176,12 +259,16 @@ pub fn resolve_runtime_storage_pool(
 /// Honors the same precedence as [`resolve_runtime_storage_pool`] but
 /// **without installing any process global** (issue #700 P2 + P4).
 ///
-/// The boot-time orphaned-workflow gate reads through this so an `Abort` mutates
-/// no `GLOBAL_SHARDED_POOL`: it reads shard 0 from an already-constructed
-/// `ShardedDbPool` (`pool_for`, a read), or returns the `harvest_pool` handle
-/// directly — it never calls `ShardedDbPool::single`/`from_map`. Preserves the
-/// P2 guarantee (the gate queries the same database the runner will) while
-/// keeping an aborted gate side-effect-free.
+/// It reads shard 0 from an already-constructed `ShardedDbPool` (`pool_for`, a
+/// read), or returns the `harvest_pool` handle directly — it never calls
+/// `ShardedDbPool::single`/`from_map`.
+///
+/// This is the **single-shard** read selector. The boot-time orphaned-workflow
+/// gate read through it until issue #1128 made the gate cross-shard; it now uses
+/// [`select_runtime_gate_shards`], which enumerates every shard under the same
+/// precedence and the same no-install guarantee. Retained as public API — and
+/// exercised by `tests/gate_no_global_install.rs` — for callers that want only
+/// shard 0.
 #[must_use]
 pub fn select_runtime_shard0_pool(
     resources_sharded_pool: Option<&ShardedDbPool>,
@@ -195,6 +282,274 @@ pub fn select_runtime_shard0_pool(
     ) {
         RuntimePoolSource::Sharded(sp) => sp.pool_for(ShardId::new(0)).clone(),
         RuntimePoolSource::Single(pool) => pool.clone(),
+    }
+}
+
+/// Enumerate the shards the boot-time orphaned-workflow gate must inspect, as
+/// `shard id -> that shard's pool` (issue #1128).
+///
+/// Honors the same pool precedence as [`resolve_runtime_storage_pool`] (both
+/// route through [`pick_runtime_pool_source`], the single source of truth), so
+/// the gate reads the databases the workers will actually poll — issue #700's
+/// P2 guarantee, now for every shard rather than only shard 0.
+///
+/// **Installs no process global** (issue #700 P4). It reads each shard's pool
+/// from an already-constructed [`ShardedDbPool`], or returns the `harvest_pool`
+/// handle as shard 0; it never calls `ShardedDbPool::single`/`from_map`, so an
+/// aborting gate leaves `GLOBAL_SHARDED_POOL` exactly as it found it.
+///
+/// A shard the `router` names (readable, or the default) but for which this
+/// process has no pool maps to `None`: the report then marks it `unavailable`
+/// and its status degrades to `partial`, which
+/// [`startup_orphan_decision`] turns into a warning rather than an abort. That
+/// mirrors [`crate::shard_fanout::expected_shards`] — omitting the shard
+/// instead would let the gate claim a `complete` inspection of a fleet whose
+/// shard it never queried. (`PreparedHarvestRuntime::build` rejects that
+/// router/pool pair a moment later anyway, so this only ever converts a
+/// would-be abort into a warning followed by a hard startup error.)
+#[must_use]
+pub fn select_runtime_gate_shards(
+    resources_sharded_pool: Option<&ShardedDbPool>,
+    worker_config_sharded_pool: Option<&ShardedDbPool>,
+    harvest_pool: &DbPool,
+    router: Option<&ShardRouter>,
+) -> BTreeMap<i32, Option<DbPool>> {
+    let mut shards: BTreeMap<i32, Option<DbPool>> = match pick_runtime_pool_source(
+        resources_sharded_pool,
+        worker_config_sharded_pool,
+        harvest_pool,
+    ) {
+        RuntimePoolSource::Sharded(sp) => sp
+            .iter_shards()
+            .map(|(shard, pool)| (shard.as_i32(), Some(pool.clone())))
+            .collect(),
+        RuntimePoolSource::Single(pool) => BTreeMap::from([(0, Some(pool.clone()))]),
+    };
+    if let Some(router) = router {
+        for shard in router
+            .readable_shards()
+            .iter()
+            .copied()
+            .chain(std::iter::once(router.default_shard()))
+        {
+            shards.entry(shard.as_i32()).or_insert(None);
+        }
+    }
+    shards
+}
+
+/// Reject classic (non-unified) DAGs — pure configuration validation, run
+/// before anything with a side effect.
+///
+/// It lived inside `PreparedHarvestRuntime::build` until issue #1128 put the
+/// boot-time orphan gate ahead of `build`. Two reasons to hoist it rather than
+/// leave it behind the gate:
+///
+/// 1. **Diagnostics.** `registered_workflow_type_names` counts only *unified*
+///    DAGs, so a classic-DAG build's in-flight runs read as orphans and, under
+///    `orphaned_workflows = "fail"`, the operator would get an orphan refusal
+///    for what is really an unsupported-configuration error. Boot is refused
+///    either way; this decides which message they see.
+/// 2. **Side effects.** Inside `build` this check ran *after*
+///    `install_completion_callback_config`, so rejecting a configuration that
+///    can never boot had already replaced a process-global. Run here, it
+///    replaces nothing.
+///
+/// # Errors
+///
+/// Returns an error naming every classic DAG in the build.
+fn reject_classic_dags(built: &BuiltHarvest) -> autumn_web::AutumnResult<()> {
+    let classic_dag_names = built
+        .dags()
+        .iter()
+        .filter(|dag| dag.workflow_handler.is_none())
+        .map(|dag| dag.name)
+        .collect::<Vec<_>>();
+    if !classic_dag_names.is_empty() {
+        return Err(AutumnError::service_unavailable_msg(format!(
+            "classic DAG execution is not supported by this runtime; \
+             rebuild with autumn-harvest/unified-dag-execution or remove classic DAGs: {}",
+            classic_dag_names.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// The workflow-type names this build registers a handler for: plain workflow
+/// names UNION unified-DAG names.
+///
+/// The DAG half is load-bearing. A unified DAG's executions are stored with
+/// `workflow_name = <dag name>`, but `HandlerRegistry::workflows` does not carry
+/// DAG names — so a registered-set built from workflows alone would call every
+/// in-flight DAG run an orphan and refuse boot under `fail`. This replicates
+/// exactly the union
+/// [`build_workflow_reachability_report`](crate::workflow_reachability::build_workflow_reachability_report)
+/// makes from the started registry, so the boot gate and the management route
+/// classify the same names the same way.
+fn registered_workflow_type_names(built: &BuiltHarvest) -> BTreeSet<String> {
+    built
+        .workflow_infos()
+        .iter()
+        .map(|info| info.name.to_string())
+        .chain(
+            built
+                .dags()
+                .iter()
+                .filter(|dag| dag.workflow_handler.is_some())
+                .map(|dag| dag.name.to_string()),
+        )
+        .collect()
+}
+
+/// The boot-time orphaned-workflow-type reachability gate (issues #700 AC4 and
+/// #1128).
+///
+/// An **orphaned** type is one with non-terminal executions and no registered
+/// `#[workflow]` handler in this deployment: its in-flight runs cannot replay
+/// and will wedge. `action` decides what that means for boot — `off` skips the
+/// check, `warn` (the default) names the types and continues, `fail` refuses to
+/// start.
+///
+/// # Where it must run
+///
+/// **Before any worker can claim a task.** Under `fail` + `worker_enabled`, a
+/// worker polling during the boot window would claim an orphaned-type execution
+/// and terminally fail it (no registered handler → `WorkflowFailed` + `FAILED`)
+/// *before* an after-the-fact abort tore the runtime down — defeating the very
+/// protection the gate exists to provide. Both callers run it before that is
+/// possible:
+///
+/// - [`HarvestRunner::start`] calls it as its first act after the pure
+///   configuration validation, and before
+///   `PreparedHarvestRuntime::build` — so an abort has installed no global
+///   router, no completion-callback config and no sharded pool, and synced no
+///   completion triggers.
+/// - the `HarvestPlugin` boot path calls it earlier still, before it publishes
+///   any admission global, and marks its resources with
+///   [`HarvestRunnerResources::with_startup_orphan_gate_already_run`] so this
+///   runs exactly once per boot.
+///
+/// # Read-only
+///
+/// The check is a `GROUP BY workflow_name` over non-terminal executions and a
+/// pool *selection*; it writes no row and installs no process global, so an
+/// aborted boot leaves the database and the process exactly as it found them.
+///
+/// # Crash-loop safety
+///
+/// A DB read failure is not an error here: it surfaces as an `unavailable`
+/// shard, and [`startup_orphan_decision`] degrades an incomplete report to
+/// `Warn` — never `Abort`. A transient outage at boot can therefore never
+/// hard-fail startup, which matters because a boot loop has no human in it.
+///
+/// # Public
+///
+/// Exposed so an embedder driving its own custom boot sequence can run the
+/// check at whatever point in that sequence it needs to, then pass
+/// [`HarvestRunnerResources::with_startup_orphan_gate_already_run`] so
+/// [`HarvestRunner::start`] does not repeat it. That is exactly what the
+/// `HarvestPlugin` boot path does.
+///
+/// # Errors
+///
+/// Returns an error only for the `fail` action with a *complete* report that
+/// found at least one orphaned type.
+pub async fn run_startup_orphan_gate(
+    action: OrphanStartupAction,
+    built: &BuiltHarvest,
+    resources: &HarvestRunnerResources,
+) -> autumn_web::AutumnResult<()> {
+    if action == OrphanStartupAction::Off {
+        return Ok(());
+    }
+
+    let registered = registered_workflow_type_names(built);
+    let shards = select_runtime_gate_shards(
+        resources.sharded_pool.as_ref(),
+        built.worker_config().sharded_pool.as_ref(),
+        &resources.harvest_pool,
+        resources.shard_router.as_ref(),
+    );
+    let report = build_reachability_report_for_shards(&registered, &shards, None).await;
+    let orphaned_types: Vec<&str> = report
+        .items
+        .iter()
+        .filter(|item| item.verdict == ReachabilityVerdict::Orphaned)
+        .map(|item| item.workflow_type.as_str())
+        .collect();
+
+    match startup_orphan_decision(action, report.orphaned, report.status) {
+        StartupOrphanDecision::Continue => Ok(()),
+        // `startup_orphan_decision` returns `Warn` for two materially different
+        // situations, and they must not share a log line. An INCOMPLETE report
+        // warns regardless of `orphaned` — detection did not run everywhere — and
+        // on the multi-shard standalone path that is a routine case (one flaky
+        // shard), not the near-unreachable one it was on the plugin's single
+        // shard. Logging "orphaned workflow types detected" with an EMPTY list
+        // would either page an operator alerting on that string, or teach them to
+        // filter away the real detection.
+        //
+        // Codex round 1 (P2): key this on the report STATUS, not on whether any
+        // orphan happened to be seen. The mixed case — `fail`, an orphan found on
+        // a reachable shard, another shard unavailable — is exactly the one an
+        // operator most needs explained, and keying on `orphaned_types.is_empty()`
+        // sent it to the message below, which says nothing about the configured
+        // `fail` having been downgraded to a warning or about boot continuing.
+        // Status is also precisely what `startup_orphan_decision` keys on, so the
+        // branch and the decision cannot disagree. The orphan details ride along,
+        // so nothing is lost when some were found.
+        StartupOrphanDecision::Warn if report.status != ReachabilityReportStatus::Complete => {
+            let unavailable_shards: Vec<i32> = report
+                .shards
+                .iter()
+                .filter(|shard| shard.error.is_some())
+                .map(|shard| shard.shard_id)
+                .collect();
+            tracing::warn!(
+                action = ?action,
+                status = ?report.status,
+                unavailable_shards = ?unavailable_shards,
+                orphaned_types = ?orphaned_types,
+                total_orphaned_executions = report.total_orphaned_executions,
+                "the boot-time orphaned-workflow check did not complete: at least one \
+                 shard could not be inspected, so orphan detection did not run for the \
+                 whole fleet. Boot continues — an incomplete check never refuses \
+                 startup, even under orphaned_workflows = fail, because a boot loop has \
+                 no human in it. Any orphaned types listed here are what the REACHABLE \
+                 shards showed and may not be all of them. See \
+                 docs/runbooks/safe-deploy.md (Pre-cutover handler-coverage gate)."
+            );
+            Ok(())
+        }
+        StartupOrphanDecision::Warn => {
+            tracing::warn!(
+                orphaned_types = ?orphaned_types,
+                total_orphaned_executions = report.total_orphaned_executions,
+                status = ?report.status,
+                "orphaned workflow types detected at startup: their #[workflow] \
+                 handlers are no longer registered and in-flight runs would wedge \
+                 on replay. See docs/runbooks/safe-deploy.md \
+                 (Pre-cutover handler-coverage gate) and safe-handler-removal.md."
+            );
+            Ok(())
+        }
+        StartupOrphanDecision::Abort => {
+            tracing::error!(
+                orphaned_types = ?orphaned_types,
+                total_orphaned_executions = report.total_orphaned_executions,
+                "refusing startup (harvest.startup.orphaned_workflows = fail): \
+                 orphaned workflow types have in-flight runs but no registered \
+                 handler, so those runs would wedge on replay. The gate runs \
+                 before workers spawn, so no run was claimed or failed."
+            );
+            Err(AutumnError::service_unavailable_msg(format!(
+                "refusing startup: {} orphaned workflow type(s) with in-flight \
+                 runs have no registered handler ({} stranded executions): {:?}",
+                orphaned_types.len(),
+                report.total_orphaned_executions,
+                orphaned_types,
+            )))
+        }
     }
 }
 
@@ -215,78 +570,214 @@ struct PreparedHarvestRuntime {
     /// automatically, without a separate `set_effective_config` call the
     /// integrator must remember.
     effective_config: EffectiveConfigView,
+    /// Held unpublished until `HarvestRunner::start` finishes every fallible
+    /// step. Dropping this struct on an early return simply never publishes,
+    /// leaving whatever audit-export config the process already had.
+    audit_export_guard: Option<DeferredAuditExportInstall>,
+}
+
+/// Install the process-global completion-callback runtime config (issue #605).
+///
+/// Extracted from `PreparedHarvestRuntime::build` so it sits alongside its
+/// audit-export sibling below; the reasoning is unchanged.
+// Install the process-global completion-callback runtime config
+// (issue #605): the deliverer/secret/allowlist/defaults/retry policy
+// the core scanner (`fire_due_completion_deliveries`) and enqueue
+// path (`enqueue_completion_deliveries`) read via
+// `GLOBAL_CALLBACK_CONFIG`. Every `BuiltHarvest` consumer (the
+// `HarvestPlugin` web-app path and the standalone runner) funnels
+// through this one construction point, so this is set exactly once
+// regardless of which path started the runtime. Core ships no HTTP
+// client, so an embedder-supplied deliverer is used verbatim and a
+// `reqwest`-based default is substituted otherwise.
+// issue #605 code review: signing with an empty key is not a
+// silent no-op -- HMAC-SHA256 accepts any key length and
+// produces a valid, deterministic (and trivially
+// reproducible by anyone) signature, so a caller who never
+// configures `completion_callback_secret(...)` gets a
+// `X-Harvest-Signature` header that carries no real
+// authenticity guarantee at all. This is reachable for both
+// builder-default AND per-execution targets (the latter
+// bypass builder config entirely), so warn unconditionally
+// rather than only when default targets are configured.
+fn install_completion_callback_config(built: &BuiltHarvest) {
+    let callback_config = built.completion_callback_config();
+    let deliverer = callback_config
+        .deliverer
+        .clone()
+        .unwrap_or_else(|| Arc::new(crate::callback_deliverer::ReqwestCallbackDeliverer::new()));
+    let secret = callback_config.secret.clone().unwrap_or_else(|| {
+        // issue #605 code review: signing with an empty key is not a
+        // silent no-op -- HMAC-SHA256 accepts any key length and
+        // produces a valid, deterministic (and trivially
+        // reproducible by anyone) signature, so a caller who never
+        // configures `completion_callback_secret(...)` gets a
+        // `X-Harvest-Signature` header that carries no real
+        // authenticity guarantee at all. This is reachable for both
+        // builder-default AND per-execution targets (the latter
+        // bypass builder config entirely), so warn unconditionally
+        // rather than only when default targets are configured.
+        tracing::warn!(
+            "completion-callback HMAC secret was never configured via \
+                 HarvestBuilder::completion_callback_secret(...) -- every \
+                 delivered callback will be signed with an empty key, which \
+                 defeats the X-Harvest-Signature authenticity guarantee for \
+                 any receiver relying on it"
+        );
+        autumn_harvest::completion_callback::CallbackSecret::new(Vec::new())
+    });
+    if let Ok(mut lock) = autumn_harvest::completion_callback::GLOBAL_CALLBACK_CONFIG.write() {
+        *lock = Some(Arc::new(
+            autumn_harvest::completion_callback::CallbackRuntimeConfig {
+                deliverer,
+                secret,
+                ssrf_policy: callback_config.ssrf_policy(),
+                default_targets: callback_config.default_targets.clone(),
+                retry_policy: callback_config.retry_policy.clone(),
+            },
+        ));
+    }
+}
+
+/// Resolve the audit-export runtime config from a `BuiltHarvest` (issue #953).
+///
+/// **Pure**: it reads `built` and allocates, but touches no process-global
+/// state. Installing is a separate step ([`commit_audit_export_config`]) so
+/// that a runtime whose construction later *fails* cannot leave the global
+/// config replaced (issue #953, Codex review P1) — `PreparedHarvestRuntime::build`
+/// has several fallible steps after this point, and the config is a
+/// process-wide static shared with any runtime already running in this process.
+/// Clobbering it from a failed build would silently redirect a *live*
+/// runtime's audit records to the failed build's sink, or stop its export
+/// entirely.
+///
+/// Core ships no HTTP client, so an embedder-supplied `AuditSink` is used
+/// verbatim and a `reqwest` signed-webhook sink is substituted when only a URL
+/// was configured.
+///
+/// Resolves to `None` when neither was configured. That `None` is meaningful
+/// and gets written: the config is a process-wide static, so a second runtime
+/// built without a sink must not keep shipping audit records to the first
+/// runtime's destination.
+fn prepare_audit_export_config(
+    built: &BuiltHarvest,
+) -> Option<Arc<autumn_harvest::audit_export::AuditExportRuntimeConfig>> {
+    let audit_config = built.audit_export_config();
+    let sink: Option<Arc<dyn autumn_harvest::audit_export::AuditSink>> =
+        audit_config.sink.clone().or_else(|| {
+            audit_config.webhook_url.as_ref().map(|url| {
+                Arc::new(crate::audit_sink::ReqwestAuditSink::new(url.clone()))
+                    as Arc<dyn autumn_harvest::audit_export::AuditSink>
+            })
+        });
+    sink.map(|sink| {
+        // `HarvestBuilder::try_build` rejects a webhook with no secret, so
+        // reaching the empty-key fallback means an embedder-supplied sink that
+        // authenticates some other way (IAM, mTLS, a local file). Warn rather
+        // than fail: a signature is not always the relevant control there.
+        let secret = audit_config.secret.clone().unwrap_or_else(|| {
+            tracing::warn!(
+                "no audit-export HMAC secret was configured via \
+                 HarvestBuilder::audit_export_secret(...) -- exported batches will carry \
+                 an X-Harvest-Signature computed with an empty key, which any third party \
+                 can reproduce; it conveys no authenticity and a receiver must not treat \
+                 it as tamper evidence"
+            );
+            autumn_harvest::completion_callback::CallbackSecret::new(Vec::new())
+        });
+        Arc::new(autumn_harvest::audit_export::AuditExportRuntimeConfig {
+            sink,
+            secret,
+            batch_size: audit_config.effective_batch_size(),
+            backoff: audit_config.backoff.clone(),
+            lease: audit_config.effective_lease(),
+            chain_key: autumn_harvest::audit_export::runtime_chain_key(audit_config),
+        })
+    })
+}
+
+/// Publish the resolved audit-export config to the process-global static.
+///
+/// Deliberately the **last** thing `PreparedHarvestRuntime::build` does, after
+/// every fallible step has succeeded — see [`prepare_audit_export_config`].
+///
+/// Committing `None` over a live config marks export as disabled (issue #1506).
+fn commit_audit_export_config(
+    config: Option<Arc<autumn_harvest::audit_export::AuditExportRuntimeConfig>>,
+) {
+    autumn_harvest::audit_export::set_global_audit_export_config(config);
+}
+
+/// This runtime's audit-export config, held **unpublished** until every
+/// fallible step of `HarvestRunner::start` has succeeded (issue #953, Codex
+/// review rounds 2, 5, 16 and 19).
+///
+/// Publishing early is what the earlier revisions got wrong: the global is
+/// shared with any runtime already running in this process, so a build that
+/// then failed could redirect a live runtime's audit records to a sink that
+/// never came into service, or (for a webhook-only build, where the
+/// direct-worker path installs `None`) silence it outright.
+///
+/// **Deliberately no restore-on-drop.** An earlier revision snapshotted the
+/// previous config and put it back if the guard dropped uncommitted. That was
+/// needed only while `into_worker_parts*` still wrote the global mid-build;
+/// once that write was suppressed at the source
+/// (`BuiltHarvest::deferring_audit_export_install`), a failed startup makes no
+/// global change at all and has nothing to undo — and restoring anyway is
+/// worse than doing nothing. Two overlapping `start` calls snapshot the same
+/// old value; if the first succeeds and publishes while the second fails, the
+/// second's restore silently replaces the *running* runtime's sink with a
+/// stale snapshot (round 19 P1). Doing nothing on failure is both simpler and
+/// correct under concurrency.
+struct DeferredAuditExportInstall {
+    pending: Option<Arc<autumn_harvest::audit_export::AuditExportRuntimeConfig>>,
+}
+
+impl DeferredAuditExportInstall {
+    const fn new(
+        pending: Option<Arc<autumn_harvest::audit_export::AuditExportRuntimeConfig>>,
+    ) -> Self {
+        Self { pending }
+    }
+
+    /// Publish this runtime's config. Called only once startup has fully
+    /// succeeded; dropping this value instead leaves the global untouched.
+    fn commit(self) {
+        commit_audit_export_config(self.pending);
+    }
 }
 
 impl PreparedHarvestRuntime {
     fn build(
         built: BuiltHarvest,
         resources: HarvestRunnerResources,
+        worker_enabled: bool,
     ) -> autumn_web::AutumnResult<Self> {
         let shard_router = resources.shard_router.clone().unwrap_or_default();
+        // An auto pool covers every pool shard, cell shards included. It
+        // would drain a tenant cell and void its isolation (issue #1837).
+        // This pure check runs first, before any step publishes global state.
+        refuse_auto_pool_over_cells(
+            &shard_router,
+            &built.worker_config().shard_assignments,
+            worker_enabled,
+        )
+        .map_err(AutumnError::service_unavailable_msg)?;
         let retention_config = built.retention().clone();
         let history_archiver = built.history_archiver().cloned();
-        // Install the process-global completion-callback runtime config
-        // (issue #605): the deliverer/secret/allowlist/defaults/retry policy
-        // the core scanner (`fire_due_completion_deliveries`) and enqueue
-        // path (`enqueue_completion_deliveries`) read via
-        // `GLOBAL_CALLBACK_CONFIG`. Every `BuiltHarvest` consumer (the
-        // `HarvestPlugin` web-app path and the standalone runner) funnels
-        // through this one construction point, so this is set exactly once
-        // regardless of which path started the runtime. Core ships no HTTP
-        // client, so an embedder-supplied deliverer is used verbatim and a
-        // `reqwest`-based default is substituted otherwise.
-        {
-            let callback_config = built.completion_callback_config();
-            let deliverer = callback_config.deliverer.clone().unwrap_or_else(|| {
-                Arc::new(crate::callback_deliverer::ReqwestCallbackDeliverer::new())
-            });
-            let secret = callback_config.secret.clone().unwrap_or_else(|| {
-                // issue #605 code review: signing with an empty key is not a
-                // silent no-op -- HMAC-SHA256 accepts any key length and
-                // produces a valid, deterministic (and trivially
-                // reproducible by anyone) signature, so a caller who never
-                // configures `completion_callback_secret(...)` gets a
-                // `X-Harvest-Signature` header that carries no real
-                // authenticity guarantee at all. This is reachable for both
-                // builder-default AND per-execution targets (the latter
-                // bypass builder config entirely), so warn unconditionally
-                // rather than only when default targets are configured.
-                tracing::warn!(
-                    "completion-callback HMAC secret was never configured via \
-                     HarvestBuilder::completion_callback_secret(...) -- every \
-                     delivered callback will be signed with an empty key, which \
-                     defeats the X-Harvest-Signature authenticity guarantee for \
-                     any receiver relying on it"
-                );
-                autumn_harvest::completion_callback::CallbackSecret::new(Vec::new())
-            });
-            if let Ok(mut lock) =
-                autumn_harvest::completion_callback::GLOBAL_CALLBACK_CONFIG.write()
-            {
-                *lock = Some(Arc::new(
-                    autumn_harvest::completion_callback::CallbackRuntimeConfig {
-                        deliverer,
-                        secret,
-                        ssrf_policy: callback_config.ssrf_policy(),
-                        default_targets: callback_config.default_targets.clone(),
-                        retry_policy: callback_config.retry_policy.clone(),
-                    },
-                ));
-            }
-        }
-        let classic_dag_names = built
-            .dags()
-            .iter()
-            .filter(|dag| dag.workflow_handler.is_none())
-            .map(|dag| dag.name)
-            .collect::<Vec<_>>();
-        if !classic_dag_names.is_empty() {
-            return Err(AutumnError::service_unavailable_msg(format!(
-                "classic DAG execution is not supported by this runtime; \
-                 rebuild with autumn-harvest/unified-dag-execution or remove classic DAGs: {}",
-                classic_dag_names.join(", ")
-            )));
-        }
+        install_completion_callback_config(&built);
+        // Resolved here, while `built` is still owned, but NOT published until
+        // every fallible step below has succeeded (issue #953, Codex review
+        // P1). `install_completion_callback_config` above still publishes
+        // eagerly; that is #605's pre-existing behaviour and out of scope here.
+        let audit_export_config = prepare_audit_export_config(&built);
+        // ...and the conversion below must not publish it either (round 5 P1).
+        // Suppressing that write is what keeps the global *untouched* for the
+        // whole build, rather than clobbered and later repaired: a live
+        // runtime's scanner can tick during `compile_dag_catalog`, and a
+        // restore afterwards cannot un-send the records it exported to a sink
+        // that never came into service.
+        let built = built.deferring_audit_export_install();
         let registered_dag_names = built
             .dags()
             .iter()
@@ -313,10 +804,12 @@ impl PreparedHarvestRuntime {
         // sharded-ness, not solely the `WorkerConfig` field (issue #695 review).
         let resources_sharded_pool = resources.sharded_pool.is_some();
         // Single source of truth for the pool-resolution precedence (issue #700
-        // P2): the plugin's boot-time orphan gate calls the very same
-        // `resolve_runtime_storage_pool` so it queries the exact database the
-        // workers will poll, and the `sharded_pool`-over-`harvest_pool`
-        // precedence can never drift between the two.
+        // P2): the boot-time orphan gate resolves its shard pools through the
+        // very same `pick_runtime_pool_source`, via `select_runtime_gate_shards`
+        // (the read-only sibling of this install helper), so it queries the exact
+        // databases the workers will poll and the
+        // `sharded_pool`-over-`harvest_pool` precedence can never drift between
+        // the two.
         let storage_pool = resolve_runtime_storage_pool(
             resources.sharded_pool.as_ref(),
             built.worker_config().sharded_pool.as_ref(),
@@ -340,6 +833,13 @@ impl PreparedHarvestRuntime {
         // `built` is still owned — `built.into_worker_parts_*` below consumes it.
         let effective_config =
             capture_effective_config(&built, &storage_pool, &shard_router, resources_sharded_pool);
+        // Carried on the returned `PreparedHarvestRuntime` so it stays
+        // unpublished for the whole of `HarvestRunner::start` — not just this
+        // function (issue #953, Codex review round 16 P1). `start` has more
+        // fallible work after `build` returns (completion-trigger sync, worker
+        // construction, shard-pool validation); an early return there drops
+        // this without publishing, leaving the global exactly as it was.
+        let audit_export_guard = DeferredAuditExportInstall::new(audit_export_config);
         let (registry, dags, _ws, worker_config) =
             built.into_worker_parts_with_extra_state(injected_runtime_state(
                 resources.app_state,
@@ -374,6 +874,7 @@ impl PreparedHarvestRuntime {
         warn_uncovered_writable_shards(&shard_router, &worker_runtime_config.shard_assignments);
 
         Ok(Self {
+            audit_export_guard: Some(audit_export_guard),
             registry: Arc::new(registry),
             dag_catalog,
             registered_dag_names,
@@ -388,6 +889,9 @@ impl PreparedHarvestRuntime {
     }
 }
 
+/// How long [`HarvestRunner::stop`] waits for each notify sender to drain.
+const NOTIFY_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Running Harvest runtime ownership for a process.
 ///
 /// This owns any locally started worker and scheduler tasks while also
@@ -401,6 +905,33 @@ pub struct HarvestRunner {
     scheduler: Option<SchedulerRuntime>,
     retention: Option<RetentionRuntime>,
     batch: Option<BatchRuntime>,
+    codec_refresh: Option<CodecRefreshRuntime>,
+    /// The generation `dispatch::install` returned, if this runner installed
+    /// the single-shard channel.
+    ///
+    /// The slot is process wide and outlives one runner, so `stop` must
+    /// give it back (issue #1312). But only if a later runner in this same
+    /// process has not since replaced it with its own install. `stop`
+    /// passes this to `dispatch::uninstall_if_current`, which is a no-op
+    /// once the generation no longer matches (Codex review, issue #1429
+    /// follow-up). A runner that installed nothing carries `None`. It
+    /// leaves the slot alone unconditionally, same as before.
+    dispatch_install_generation: Option<u64>,
+    /// The shard + generation pairs `dispatch::install_for_shard` returned,
+    /// if this runner installed the per-shard slots (issue #1429) instead
+    /// of the single-shard one.
+    ///
+    /// `stop` passes these to `dispatch::uninstall_all_shards_if_current`
+    /// instead of the unconditional `uninstall_all_shards` (Codex review,
+    /// issue #1429 follow-up). The reason matches
+    /// `dispatch_install_generation`'s own: a later runner may have
+    /// reinstalled one of these shards since this runner started. Empty
+    /// when this runner used the single-shard path or installed nothing.
+    dispatch_shard_generations: Vec<(ShardId, u64)>,
+    /// The dropped-hints metrics sampler this runner owns. `Some` only for
+    /// an API-only process — no `Worker`, which spawns its own copy instead
+    /// (issue #1429 review). `stop` cancels and joins it.
+    dispatch_metrics_sampler: Option<(CancellationToken, JoinHandle<()>)>,
 }
 
 /// Background batch-operations executor handle (issue #102).
@@ -447,6 +978,96 @@ impl BatchRuntime {
     }
 }
 
+/// Independent codec-key refresh loop for a process that owns no local
+/// worker (issue #1244).
+///
+/// `refresh_active_codec_key` is normally reached through the worker's own
+/// timeout-checker loop. A worker-enabled process needs no second copy of
+/// it here (`HarvestRunner::start` only spawns this when `!worker_enabled`).
+///
+/// An API-only or scheduler-only process spawns no timeout checker at all,
+/// though it can still read and write codec-bearing payloads. `api.rs`'s
+/// `force_fail_activity` handler is one such path. Left unrefreshed, that
+/// process's `PayloadCodecs` would stay pinned to whichever key was active
+/// at startup, forever.
+///
+/// This closes that half of the gap: the process's own view of the active
+/// key catches up on a bounded cadence, same as a worker's.
+///
+/// It does **not** close the other half. `codec_rotation::activate_codec_key`'s
+/// capability scan reads `harvest_workers`. A process with no local worker
+/// never has a row there, so it stays invisible to that scan. An operator
+/// whose API/scheduler-only processes must gate activation on their own
+/// capability needs a separate mechanism; none exists yet.
+struct CodecRefreshRuntime {
+    cancel: CancellationToken,
+    handle: JoinHandle<()>,
+}
+
+impl CodecRefreshRuntime {
+    fn spawn(
+        sharded_pool: ShardedDbPool,
+        payload_codecs: autumn_harvest::payload_codec::PayloadCodecs,
+        interval: std::time::Duration,
+    ) -> Self {
+        let cancel = CancellationToken::new();
+        let cancel_for_task = cancel.clone();
+        let handle = tokio::spawn(async move {
+            'outer: loop {
+                for (shard, pool) in sharded_pool.iter_shards() {
+                    // Selected against `cancel`, mirroring
+                    // `spawn_worker_heartbeat` (issue #1209). Harvest
+                    // configures no deadpool `Timeouts`, so a bare
+                    // `pool.get()` can park this task indefinitely on an
+                    // exhausted shard pool or a database outage. Without
+                    // this, `shutdown` cancels the token and then awaits
+                    // this task's handle, so a parked acquisition would
+                    // make an API- or scheduler-only `HarvestRunner::stop`
+                    // hang forever.
+                    let get_result = tokio::select! {
+                        () = cancel_for_task.cancelled() => break 'outer,
+                        result = pool.get() => result,
+                    };
+                    match get_result {
+                        Ok(mut conn) => {
+                            if let Err(error) =
+                                autumn_harvest::codec_rotation::refresh_active_codec_key(
+                                    &mut conn,
+                                    &payload_codecs,
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    %error,
+                                    shard_id = shard.as_i32(),
+                                    "codec key refresh failed on a worker-less runtime"
+                                );
+                            }
+                        }
+                        Err(error) => tracing::warn!(
+                            %error,
+                            shard_id = shard.as_i32(),
+                            "codec key refresh: failed to acquire a connection"
+                        ),
+                    }
+                }
+                tokio::select! {
+                    () = cancel_for_task.cancelled() => return,
+                    () = tokio::time::sleep(interval) => {}
+                }
+            }
+        });
+        Self { cancel, handle }
+    }
+
+    async fn shutdown(self) {
+        self.cancel.cancel();
+        if let Err(error) = self.handle.await {
+            tracing::warn!(error = %error, "harvest codec refresh task failed during shutdown");
+        }
+    }
+}
+
 impl HarvestRunner {
     /// Start a Harvest runtime from a previously built registration set.
     ///
@@ -454,16 +1075,42 @@ impl HarvestRunner {
     ///
     /// # Errors
     ///
-    /// Returns an error if the workflow/activity registrations are invalid or
-    /// the worker configuration cannot be materialized.
+    /// Returns an error if the build registers classic (non-unified) DAGs, if
+    /// the boot-time orphaned-workflow-type gate refuses startup
+    /// (`[harvest.startup] orphaned_workflows = "fail"` with orphaned types
+    /// present and a complete report — see [`run_startup_orphan_gate`]), if the
+    /// workflow/activity registrations are invalid, or if the worker
+    /// configuration cannot be materialized.
     #[allow(clippy::too_many_lines)]
     pub async fn start(
         built: BuiltHarvest,
         config: &HarvestRuntimeConfig,
         resources: HarvestRunnerResources,
     ) -> autumn_web::AutumnResult<Self> {
+        // Pure configuration validation first: it touches no database and no
+        // process global, so a build that can never boot is rejected with the
+        // error that actually names its problem (see `reject_classic_dags`).
+        reject_classic_dags(&built)?;
+
+        // Issue #1128: the boot-time orphaned-workflow-type gate, on the
+        // STANDALONE path. It runs HERE — the first act of `start`, before
+        // `PreparedHarvestRuntime::build` — so an abort spawns no worker poll
+        // loop (which could otherwise claim and terminally fail one of the very
+        // runs the gate is protecting), installs no global router / sharded pool
+        // / completion-callback config, and syncs no completion triggers. The
+        // plugin boot path runs the same gate earlier still and marks its
+        // resources, so this is a no-op there rather than a second scan.
+        if resources.startup_orphan_gate_already_run() {
+            tracing::debug!(
+                action = ?config.startup.orphaned_workflows,
+                "boot-time orphaned-workflow gate skipped: the caller declared it already run"
+            );
+        } else {
+            run_startup_orphan_gate(config.startup.orphaned_workflows, &built, &resources).await?;
+        }
+
         let completion_triggers = built.completion_triggers().to_vec();
-        let prepared = PreparedHarvestRuntime::build(built, resources)?;
+        let mut prepared = PreparedHarvestRuntime::build(built, resources, config.worker_enabled)?;
         let registry = Arc::clone(&prepared.registry);
         let dag_catalog = Arc::clone(&prepared.dag_catalog);
         let workflow_schedules = Arc::clone(&prepared.workflow_schedules);
@@ -471,6 +1118,11 @@ impl HarvestRunner {
         let harvest_pool = prepared.storage_pool.clone_inner();
         let shard_router = prepared.shard_router.clone();
         autumn_harvest::shard::install_global_router(shard_router.clone());
+        // Start the post-commit notify sender for each storage pool (issue
+        // #1796). An API-only process has no `Worker` to do it.
+        for (_, shard_pool) in prepared.storage_pool.iter_shards() {
+            autumn_harvest::notify::register_pool(shard_pool);
+        }
 
         if !config.worker_enabled && !config.scheduler_enabled {
             tracing::info!(
@@ -479,18 +1131,66 @@ impl HarvestRunner {
             );
         }
 
+        // Issue #1823: pin the DR fence before this process writes anything.
+        // An API-only node owns no worker, so it must pin here. The management
+        // API checks these pins before every admin write. An in-process worker
+        // pins the same generations again, which is idempotent.
+        autumn_harvest::replication::pin_process_fence(
+            prepared.worker_runtime_config.dr.fencing,
+            &prepared.worker_runtime_config.dr.slot_prefix,
+            autumn_harvest::worker::dr_fence_targets(
+                &prepared.worker_runtime_config,
+                &harvest_pool,
+            ),
+            &harvest_pool,
+        )
+        .await
+        .map_err(|error| {
+            AutumnError::service_unavailable_msg(format!(
+                "refusing to start: cross-region DR fencing could not be resolved: {error}"
+            ))
+        })?;
+
         // Sync static triggers before starting workers (issue #517)
+        let single_pool = prepared.storage_pool.sharded_pool().len() == 1;
         for (shard_id, shard_pool) in prepared.storage_pool.iter_shards() {
+            // Issue #1823: a bump cannot commit while the sync writes. A single
+            // pool names its shard through the default pin.
+            let fence_key = if single_pool {
+                autumn_harvest::types::ShardId::UNENCODED
+            } else {
+                shard_id
+            };
+            // The connection comes first, so a sync that waits for one holds
+            // no fence barrier and cannot block a bump.
             let mut conn = shard_pool.get().await.map_err(|e| {
                 AutumnError::service_unavailable_msg(format!(
                     "Failed to get DB connection to sync completion triggers for shard {shard_id}: {e}"
                 ))
             })?;
-            autumn_harvest::completion_trigger::sync_completion_triggers(
-                &mut conn,
-                &completion_triggers,
-            )
+            // The sync rewrites a database-wide table, so it guards every
+            // pinned shard colocated on this database too.
+            let fence = autumn_harvest::replication::begin_fenced_group(shard_pool, fence_key)
+                .await
+                .map_err(|error| {
+                    AutumnError::service_unavailable_msg(format!(
+                        "refusing to start: shard {shard_id} is fenced: {error}"
+                    ))
+                })?;
+            // A lost fence session stops the sync. See `run_fenced_pass`.
+            autumn_harvest::replication::run_fenced_pass(&fence, async {
+                // The older connection joins the pass. A lost guard then
+                // ends its backend.
+                let _member =
+                    autumn_harvest::replication::join_fenced_pass(shard_pool, &mut conn).await;
+                autumn_harvest::completion_trigger::sync_completion_triggers(
+                    &mut conn,
+                    &completion_triggers,
+                )
+                .await
+            })
             .await
+            .and_then(|done| done)
             .map_err(|e| {
                 AutumnError::service_unavailable_msg(format!(
                     "Failed to sync completion triggers on startup for shard {shard_id}: {e:?}"
@@ -498,10 +1198,93 @@ impl HarvestRunner {
             })?;
         }
 
+        // Serialize this call's dispatch-install-through-commit-or-unwind
+        // span against every other overlapping `start` call (Codex review,
+        // issue #1429 follow-up). See `DISPATCH_START_LOCK`'s own doc
+        // comment for the race this closes. Held only until just after
+        // `dispatch_guard.commit()` below, not for the rest of this
+        // function. Everything after commit no longer touches dispatch
+        // state a racing start could observe mid-resolution.
+        let dispatch_start_guard = DISPATCH_START_LOCK.lock().await;
+
+        // Issue #1312: install the process-global dispatch channel(s) BEFORE
+        // the worker is constructed, and in every mode. An API-only process
+        // owns no worker but still publishes references for the fleet, so
+        // the install cannot sit inside the `worker_enabled` branch.
+        let dispatch_shards = prepared.storage_pool.sharded_pool().shard_ids();
+        reject_dispatch_queue_names(
+            config.redis.url.is_some(),
+            &prepared.worker_runtime_config.queues,
+        )
+        .map_err(AutumnError::service_unavailable_msg)?;
+        // A span of one shard (or none) installs the single-shard channel,
+        // named by that one shard's key family. A wider span installs one
+        // channel per shard instead (issue #1429). `Worker::new` requires
+        // full per-shard coverage before it accepts the wider span. A
+        // partial install here — cut short by a shard connect failure —
+        // therefore fails startup, rather than leaving some shards silently
+        // uncovered.
+        let (
+            dispatch_guard,
+            dispatch_installed,
+            dispatch_shard,
+            dispatch_installed_shards,
+            dispatch_install_generation,
+            dispatch_shard_generations,
+        ) = if dispatch_shards.len() > 1 {
+            let (installed_shards, snapshot) =
+                install_dispatch_channels_for_shards(config, &dispatch_shards).await?;
+            let installed = !installed_shards.is_empty();
+            let reported_shards: Vec<ShardId> =
+                installed_shards.iter().map(|(shard, _)| *shard).collect();
+            (
+                DispatchInstallGuard::new_shards(installed_shards.clone(), snapshot),
+                installed,
+                None,
+                reported_shards,
+                None,
+                installed_shards,
+            )
+        } else {
+            let dispatch_shard = match dispatch_shards.as_slice() {
+                [only] => Some(*only),
+                _ => None,
+            };
+            let installed = install_dispatch_channel(config, dispatch_shard).await?;
+            let generation = installed.0;
+            (
+                DispatchInstallGuard::new(installed),
+                generation.is_some(),
+                dispatch_shard,
+                Vec::new(),
+                generation,
+                Vec::new(),
+            )
+        };
+
         let worker = if config.worker_enabled {
-            let worker = Worker::new(
+            // Pass the exact generations this call's own install stamped,
+            // when it went through the multi-shard per-shard-channel path
+            // (Codex review, issue #1429 follow-up). A second, overlapping
+            // `start` call can install its own topology in the gap
+            // between the install above and this construction. At least
+            // one `.await` runs in between. `Worker::new` alone re-reads
+            // the global slot at construction time. It cannot tell this
+            // runtime's own channel from a stranger's that landed in that
+            // gap. `new_with_expected_shard_generations` can, via
+            // `dispatch::installed_for_shard_if_current`.
+            //
+            // The single-shard branch has no per-shard generations to
+            // compare. It installs through the independent global slot
+            // instead (`dispatch_install_generation`), which is not this
+            // race's shape, so it passes `None`, same as plain
+            // `Worker::new`.
+            let shard_generations_for_worker: Option<&[(ShardId, u64)]> =
+                (dispatch_shards.len() > 1).then_some(dispatch_shard_generations.as_slice());
+            let worker = Worker::new_with_expected_shard_generations(
                 prepared.worker_runtime_config.clone(),
                 Arc::clone(&registry),
+                shard_generations_for_worker,
             )
             .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
             // Fail the process at startup if any assigned shard is missing from
@@ -517,10 +1300,57 @@ impl HarvestRunner {
                      sharded_pool; refusing to start — check your ShardedDbPool configuration"
                 )));
             }
+            // Fix the dispatch binding while this call still holds the start
+            // lock (issue #1431). With Redis off, the worker saw no channel.
+            // It would otherwise bind at the run boundary, after the lock is
+            // gone, and could adopt another runtime's channel.
+            worker.bind_dispatch();
             Some(Arc::new(worker))
         } else {
             None
         };
+
+        // Every fallible step of startup has now succeeded -- `build`, the
+        // completion-trigger sync above, worker construction and its shard-pool
+        // validation. Only here may this runtime's sink replace whatever a
+        // previously started runtime installed (issue #953, Codex review round
+        // 16 P1). Returning `Err` anywhere above instead drops `prepared`,
+        // whose guard restores the previous config.
+        if let Some(guard) = prepared.audit_export_guard.take() {
+            guard.commit();
+        }
+        dispatch_guard.commit();
+        drop(dispatch_start_guard);
+        prepared.effective_config.dispatch = Some(dispatch_config_view(
+            &config.redis,
+            dispatch_installed,
+            dispatch_shard,
+            &dispatch_installed_shards,
+        ));
+
+        // A `Worker` already spawns its own copy of this sampler in
+        // `spawn_monitoring_tasks`. An API-only process (`worker_enabled =
+        // false`) owns no `Worker`, so nothing would otherwise sample
+        // `harvest_dispatch_dropped_hints` here. The dispatch background
+        // publisher this metric describes is installed unconditionally,
+        // above. That happens specifically because an API-only process
+        // still publishes references for the fleet (issue #1429 review).
+        // The same sampler also emits the notify gauges (issue #1796). An
+        // API-only process writes through the pools registered above, so it
+        // sends notifications and needs them too.
+        // Only spawn when there is no `Worker` to double up with.
+        let dispatch_metrics_sampler = if worker.is_none() {
+            let cancel = CancellationToken::new();
+            let handle = spawn_dispatch_metrics_sampler(
+                cancel.clone(),
+                Arc::clone(registry.telemetry()),
+                DEFAULT_WORKER_POLL_INTERVAL,
+            );
+            Some((cancel, handle))
+        } else {
+            None
+        };
+
         let worker_id = worker
             .as_ref()
             .map(|_| prepared.worker_runtime_config.worker_id.clone());
@@ -578,6 +1408,18 @@ impl HarvestRunner {
         } else {
             None
         };
+        // Issue #1244: a worker-enabled process already refreshes its
+        // active codec key through its own timeout-checker loop. Only a
+        // process with no local worker needs this independent one.
+        let codec_refresh = if config.worker_enabled {
+            None
+        } else {
+            Some(CodecRefreshRuntime::spawn(
+                prepared.storage_pool.sharded_pool().clone(),
+                registry.payload_codecs().clone(),
+                prepared.worker_runtime_config.poll_interval,
+            ))
+        };
         let api_runtime = HarvestApiRuntime::new(
             registry,
             dag_catalog,
@@ -603,6 +1445,10 @@ impl HarvestRunner {
             scheduler,
             retention,
             batch,
+            codec_refresh,
+            dispatch_install_generation,
+            dispatch_shard_generations,
+            dispatch_metrics_sampler,
         })
     }
 
@@ -619,16 +1465,81 @@ impl HarvestRunner {
     }
 
     /// Stop any locally owned worker and scheduler tasks.
+    ///
+    /// A runner that installed a dispatch channel also uninstalls it. The
+    /// slot(s) are process wide, so a channel left behind would still carry
+    /// references for a runtime that has stopped (issue #1312). It could
+    /// also make a later runtime's own per-shard coverage check misread
+    /// stale state (issue #1429 review).
+    ///
+    /// Uninstalls only if this runner's own install is still the current
+    /// occupant of the slot(s) it used (Codex review, issue #1429
+    /// follow-up). A process may start a replacement runner before calling
+    /// `stop` on this one. The replacement's install already overwrote the
+    /// slot(s) by then. An unconditional uninstall here would clear the
+    /// replacement's channel(s) instead of this runner's own. The
+    /// replacement's own effective-config snapshot would keep claiming
+    /// Redis dispatch is active, while every read and publish silently
+    /// falls through to Postgres. `dispatch::uninstall_if_current`/
+    /// `uninstall_all_shards_if_current` are no-ops once the generation(s)
+    /// this runner captured at install time no longer match.
+    ///
+    /// Also serializes against `DISPATCH_START_LOCK` for that same check
+    /// (Codex review, issue #1429 follow-up, once more). Without it, this
+    /// call could run its generation check while a replacement `start`
+    /// sits between its own install and its eventual commit or unwind.
+    /// This runner's generation would not be current yet -- the
+    /// replacement's is -- so this call would correctly leave the slot
+    /// alone.
+    ///
+    /// But suppose that replacement later fails. Its own unwind restores
+    /// the snapshot it captured. That snapshot is this runner's
+    /// already-stopped topology, with this runner's own original
+    /// generation. Nothing then cleans it back up. It stays installed
+    /// indefinitely, looking live with no worker consuming through it.
+    ///
+    /// Waiting for the same lock a racing `start` holds for its whole
+    /// install-through-resolution span closes that gap. This call's own
+    /// check then always runs after that span ends, one way or the
+    /// other. It either finds the replacement's own, still-uncontested
+    /// generation, a clean and correct no-op. Or it finds this runner's
+    /// own generation restored by that replacement's unwind, which this
+    /// call then correctly tears down itself.
     pub async fn stop(self) {
         let Self {
             api_runtime: _,
-            storage_pool: _,
+            storage_pool,
             worker,
             worker_handle,
             scheduler,
             retention,
             batch,
+            codec_refresh,
+            dispatch_install_generation,
+            dispatch_shard_generations,
+            dispatch_metrics_sampler,
         } = self;
+
+        {
+            let _dispatch_start_guard = DISPATCH_START_LOCK.lock().await;
+            if !dispatch_shard_generations.is_empty() {
+                autumn_harvest::dispatch::uninstall_all_shards_if_current(
+                    &dispatch_shard_generations,
+                );
+            } else if let Some(generation) = dispatch_install_generation {
+                autumn_harvest::dispatch::uninstall_if_current(generation);
+            }
+        }
+
+        if let Some((cancel, handle)) = dispatch_metrics_sampler {
+            cancel.cancel();
+            if let Err(error) = handle.await {
+                tracing::warn!(
+                    error = %error,
+                    "dispatch metrics sampler task failed during shutdown"
+                );
+            }
+        }
 
         if let Some(worker) = worker {
             worker.shutdown();
@@ -648,10 +1559,20 @@ impl HarvestRunner {
         if let Some(batch) = batch {
             batch.shutdown().await;
         }
+        if let Some(codec_refresh) = codec_refresh {
+            codec_refresh.shutdown().await;
+        }
         if let Some(worker_handle) = worker_handle
             && let Err(error) = worker_handle.await
         {
             tracing::warn!(error = %error, "harvest worker task failed during shutdown");
+        }
+        // Send the wakes of the last writes before the runtime can stop the
+        // notify senders (issue #1796).
+        for (_, shard_pool) in storage_pool.iter_shards() {
+            autumn_harvest::notify::register_pool(shard_pool)
+                .flush(NOTIFY_FLUSH_TIMEOUT)
+                .await;
         }
     }
 }
@@ -742,7 +1663,646 @@ fn capture_effective_config(
         pool_view,
         DEFAULT_WORKER_POLL_INTERVAL,
         Some(resolved_sharding),
+        // The `[harvest.redis]` section is filled in by `start`, once the
+        // dispatch channel install has actually run (issue #1429). This
+        // capture happens inside `PreparedHarvestRuntime::build`, before
+        // `install_dispatch_channel` and with no access to `config.redis`.
+        None,
     )
+}
+
+/// Reject Redis dispatch on a runtime whose queue names the channel cannot
+/// carry (issue #1312).
+///
+/// The channel builds its keys from the queue name, so it rejects a name that
+/// is empty or holds a colon. `WorkerConfig` and the Postgres claim path accept
+/// both. A process configured that way would fail every channel call and live
+/// on the Postgres fallback for all of its queues, in silence. `Worker::new`
+/// applies the same rule. A worker-disabled process never builds a worker, and
+/// it would still publish, so this check runs in the runner as well.
+///
+/// # Errors
+///
+/// Returns the operator-facing message when a URL is configured and a queue
+/// name fails [`autumn_harvest::dispatch::validate_queue_name`].
+fn reject_dispatch_queue_names(redis_url_set: bool, queues: &[String]) -> Result<(), String> {
+    if !redis_url_set {
+        return Ok(());
+    }
+    for queue in queues {
+        autumn_harvest::dispatch::validate_queue_name(queue).map_err(|reason| {
+            format!(
+                "harvest.redis.url is set and this runtime serves a queue redis dispatch \
+                 cannot address: {reason}. Unset harvest.redis.url, or rename the queue"
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// The shard an unsharded deployment resolves.
+///
+/// [`ShardedDbPool::single`] builds exactly this shard. A runtime that reports
+/// it owns one database and no shard layout.
+const DEFAULT_DISPATCH_SHARD: ShardId = ShardId::new(0);
+
+/// The Redis key prefix one shard's dispatch channel owns.
+///
+/// Two callers use this. A one-process-per-shard fleet (issue #1312) calls
+/// it once, for the single shard that process resolves. A process that
+/// spans several shards in one runtime (issue #1429) calls it once per
+/// shard, installing one channel per call. Either way, the configured
+/// prefix alone would give every shard the same `{prefix}:dispatch:{queue}`
+/// stream. A worker for shard B would then read shard A's reference. It
+/// would probe B's database, find no row, release it three times, and ack
+/// it as absent. Shard A's row would wait for A's reconcile sweep, and a
+/// peer could steal it again.
+///
+/// The shard suffix gives each shard its own key family instead, so a
+/// reference only ever reaches a channel that can resolve the named row. It
+/// extends the configured prefix and never replaces it. An operator who
+/// namespaces the prefix per environment keeps that namespace.
+///
+/// [`DEFAULT_DISPATCH_SHARD`] keeps the plain prefix. Every single-database
+/// deployment resolves that shard. A suffix there would move the key
+/// family away from the references a previous release published.
+///
+/// Used unconditionally by [`dispatch_config_view`] too, which every build
+/// evaluates regardless of the `redis` cargo feature. This function is
+/// therefore never dead code, even on a build without that feature.
+#[must_use]
+fn effective_dispatch_prefix(configured: &str, shard: Option<ShardId>) -> String {
+    match shard {
+        Some(shard) if shard != DEFAULT_DISPATCH_SHARD => {
+            format!("{configured}:s{}", shard.as_i32())
+        }
+        _ => configured.to_string(),
+    }
+}
+
+/// Build the `[harvest.redis]` section of the effective-config snapshot
+/// (issue #1429).
+///
+/// `installed` is the return value of [`install_dispatch_channel`], not a
+/// re-derivation from `redis.url`. A configured URL that fails to connect
+/// aborts `start` before this runs, so the two agree in practice. The
+/// caller's own result is the fact and never a guess.
+///
+/// The reported `key_prefix` is the effective, shard-suffixed prefix this
+/// process actually publishes under (see [`effective_dispatch_prefix`]). An
+/// operator comparing two shards' `/admin/config` output then sees the
+/// difference between their key families, not the one configured value the
+/// two processes share.
+///
+/// `multi_shards` names the shards a multi-shard install (issue #1429
+/// review) actually covers. A non-empty slice reports one prefix per shard
+/// under [`DispatchConfigView::key_prefixes`] and leaves `key_prefix` empty,
+/// since a multi-shard install has no single key family. An empty slice
+/// (the single-shard install) keeps the prior `key_prefix`-only shape,
+/// derived from `shard` alone.
+#[must_use]
+fn dispatch_config_view(
+    redis: &HarvestRedisConfig,
+    installed: bool,
+    shard: Option<ShardId>,
+    multi_shards: &[ShardId],
+) -> DispatchConfigView {
+    let configured = redis.url.is_some();
+    DispatchConfigView {
+        installed,
+        endpoint: redis.redacted_url(),
+        key_prefix: (configured && multi_shards.is_empty())
+            .then(|| effective_dispatch_prefix(&redis.key_prefix, shard)),
+        key_prefixes: (configured && !multi_shards.is_empty()).then(|| {
+            multi_shards
+                .iter()
+                .map(|shard| effective_dispatch_prefix(&redis.key_prefix, Some(*shard)))
+                .collect()
+        }),
+        consumer_group: configured.then(|| redis.consumer_group.clone()),
+        visibility_timeout_ms: configured.then_some(redis.visibility_timeout_ms),
+        poll_interval_ms: configured.then_some(redis.poll_interval_ms),
+        reconcile_interval_ms: configured.then_some(redis.reconcile_interval_ms),
+        reconcile_batch: configured.then_some(redis.reconcile_batch),
+    }
+}
+
+/// What kind of dispatch install [`DispatchInstallGuard`] owns.
+enum DispatchInstallKind {
+    /// Nothing installed. Dropping the guard does nothing.
+    None,
+    /// The single-shard slot (`dispatch::install_single`), stamped with the
+    /// generation that call returned, plus the [`TopologySnapshot`] of both
+    /// slots from immediately before it ran.
+    ///
+    /// Unwinding calls `dispatch::restore_single_if_current` rather than
+    /// `dispatch::uninstall_if_current` (Codex review, issue #1429
+    /// follow-up). `install_single` destructively replaces the topology
+    /// before `Worker::new` and the shard-pool validation after it have run
+    /// — both of which can still fail. Merely clearing this install on
+    /// unwind would leave a still-running previous runner without the
+    /// dispatch channels it had before this replacement startup began.
+    /// Restoring the snapshot instead puts that previous topology back,
+    /// generations and all. It does so only while this install is still
+    /// the current occupant of its slot. See `restore_single_if_current`'s
+    /// own doc for the race that guards against.
+    Single(u64, autumn_harvest::dispatch::TopologySnapshot),
+    /// The per-shard slots (`dispatch::install_shards`, issue #1429) this
+    /// call populated, each stamped with its own generation, plus the
+    /// [`TopologySnapshot`] that call returned.
+    ///
+    /// Unwinding calls `dispatch::restore_shards_if_current` (Codex review,
+    /// issue #1429 follow-up), the per-shard mirror of `Single`'s own
+    /// reasoning.
+    Shards(
+        Vec<(ShardId, u64)>,
+        autumn_harvest::dispatch::TopologySnapshot,
+    ),
+    /// This call cleared both dispatch slots (`dispatch::uninstall_all_capturing`)
+    /// instead of installing anything. Redis dispatch is off for this
+    /// startup. Also carries the [`TopologySnapshot`] that call returned
+    /// (Codex review, issue #1429 follow-up).
+    ///
+    /// A still-running previous runtime may own exactly what this cleared.
+    /// Unwinding calls `dispatch::restore_cleared_if_still_empty`. That
+    /// puts the topology back, as long as nothing else has installed into
+    /// either slot since. Neither the clear nor the restore mints a
+    /// generation. So this cannot use the same current-occupant check
+    /// `Single`/`Shards` use. See that function's own doc for the "still
+    /// empty" check it uses instead.
+    Cleared(autumn_harvest::dispatch::TopologySnapshot),
+}
+
+/// Serializes `start`'s dispatch-install-through-commit-or-unwind span,
+/// and `stop`'s own generation check, against every other overlapping
+/// call to either (Codex review, issue #1429 follow-up).
+///
+/// Two overlapping `start` calls can each install their own topology.
+/// Each one snapshots whatever the other's still-uncommitted install just
+/// put in the slot. Consider runner A installing first, then runner B
+/// installing over it, snapshotting A's topology as it does. Suppose A
+/// then fails and unwinds. That unwind is a no-op: the slot no longer
+/// carries A's generation, since B has since replaced it. Suppose B then
+/// *also* fails and unwinds. B's own generation still matches, so its
+/// restore succeeds, and it puts back the snapshot it captured earlier.
+///
+/// That snapshot is A's own topology. But A already returned `Err` and
+/// abandoned it; it was never committed. It is not the topology that was
+/// actually live before either of these two starts began. Nothing owns
+/// this resurrected topology. A kept no reference to it once it unwound.
+/// It stays installed indefinitely, looking live to `/admin/config` and
+/// to the next `is_installed()` check, with no worker ever consuming
+/// through it.
+///
+/// Holding this lock for `start`'s whole install-through-resolution
+/// span, not only around the install call itself, closes that gap. The
+/// *next* racing `start` cannot even take its own snapshot until the
+/// current one has fully committed or fully unwound. Its snapshot then
+/// always captures a topology in one of those two resolved states. It
+/// can never capture a concurrent start's own uncommitted,
+/// possibly-about-to-fail one.
+///
+/// `HarvestRunner::stop` holds this too, for its own generation check
+/// (Codex review, issue #1429 follow-up). See its own doc comment for
+/// the matching race on that side. A `stop` call whose generation check
+/// runs while a replacement `start` is mid-span can see itself already
+/// superseded and correctly leave the slot alone. That same
+/// replacement's later unwind can then restore its own topology right
+/// back, with nothing left to notice and clean it up again.
+static DISPATCH_START_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Uninstall the process-global dispatch channel(s) when startup fails later.
+///
+/// `start` installs the channel before it builds the worker, because an
+/// API-only process publishes too. A step after the install can still fail.
+/// The runtime is then dropped, but the channel is process-global and would
+/// stay installed for the next runtime in this process. The guard restores
+/// whatever topology the install replaced unless
+/// [`DispatchInstallGuard::commit`] runs, which mirrors how
+/// `DeferredAuditExportInstall` guards the audit sink.
+struct DispatchInstallGuard {
+    /// `None` once the guard is committed or was never armed.
+    kind: DispatchInstallKind,
+}
+
+impl DispatchInstallGuard {
+    /// A guard over what `install_dispatch_channel` did. Either a
+    /// single-shard install, carrying the generation and
+    /// [`TopologySnapshot`] `dispatch::install_single` returned. Or a
+    /// clear, carrying the [`TopologySnapshot`]
+    /// `dispatch::uninstall_all_capturing` returned when Redis dispatch is
+    /// off for this startup (Codex review, issue #1429 follow-up).
+    fn new(installed: (Option<u64>, autumn_harvest::dispatch::TopologySnapshot)) -> Self {
+        let (generation, snapshot) = installed;
+        Self {
+            kind: match generation {
+                Some(generation) => DispatchInstallKind::Single(generation, snapshot),
+                None => DispatchInstallKind::Cleared(snapshot),
+            },
+        }
+    }
+
+    /// A guard over what `install_dispatch_channels_for_shards` did.
+    /// Either the per-shard installs `shards` names (issue #1429),
+    /// carrying the [`TopologySnapshot`] `dispatch::install_shards`
+    /// returned. Or a clear, carrying the [`TopologySnapshot`]
+    /// `dispatch::uninstall_all_capturing` returned when Redis dispatch is
+    /// off for this startup (Codex review, issue #1429 follow-up).
+    fn new_shards(
+        shards: Vec<(ShardId, u64)>,
+        snapshot: autumn_harvest::dispatch::TopologySnapshot,
+    ) -> Self {
+        Self {
+            kind: if shards.is_empty() {
+                DispatchInstallKind::Cleared(snapshot)
+            } else {
+                DispatchInstallKind::Shards(shards, snapshot)
+            },
+        }
+    }
+
+    /// Keep the channel(s) installed, or the clear in place. Startup has
+    /// passed every fallible step.
+    fn commit(mut self) {
+        self.kind = DispatchInstallKind::None;
+    }
+}
+
+impl Drop for DispatchInstallGuard {
+    fn drop(&mut self) {
+        match &self.kind {
+            DispatchInstallKind::None => {}
+            DispatchInstallKind::Single(generation, snapshot) => {
+                tracing::warn!(
+                    "unwinding an uncommitted single-shard dispatch install: a later startup \
+                     step failed after this channel connected; restoring the previous topology"
+                );
+                autumn_harvest::dispatch::restore_single_if_current(snapshot, *generation);
+            }
+            DispatchInstallKind::Shards(shards, snapshot) => {
+                tracing::warn!(
+                    shards = ?shards.iter().map(|(shard, _)| shard.as_i32()).collect::<Vec<_>>(),
+                    "unwinding an uncommitted multi-shard dispatch install: a later startup \
+                     step failed after these shards' channels connected; restoring the \
+                     previous topology"
+                );
+                autumn_harvest::dispatch::restore_shards_if_current(snapshot, shards);
+            }
+            DispatchInstallKind::Cleared(snapshot) => {
+                tracing::warn!(
+                    "unwinding an uncommitted redis-off dispatch clear: a later startup step \
+                     failed after this call cleared the dispatch topology; restoring the \
+                     previous topology"
+                );
+                autumn_harvest::dispatch::restore_cleared_if_still_empty(snapshot);
+            }
+        }
+    }
+}
+
+/// Lifetime of a publish marker key, which makes a publish idempotent per
+/// task id. The plan fixes it at ten minutes.
+#[cfg(feature = "redis")]
+const DISPATCH_DEDUPE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Install the Redis dispatch channel when `[harvest.redis] url` is set.
+///
+/// Postgres stays the source of truth. The channel only carries references to
+/// claimable `harvest_task_queue` rows. With no URL the runtime keeps the
+/// Postgres claim path and this is a no-op.
+///
+/// Returns the generation `dispatch::install` stamped on the channel when
+/// one is installed (Codex review, issue #1429 follow-up). The caller
+/// keeps this to undo specifically this install on a later startup
+/// failure, without also clearing a later one that may have replaced it.
+///
+/// # Errors
+///
+/// Returns an error when the Redis endpoint cannot be reached. A configured
+/// URL that cannot connect fails startup in every mode, so an unreachable
+/// Redis is visible at boot rather than after the first read. The Postgres
+/// fallback covers the running state only. The message names the endpoint in
+/// credential-free form.
+///
+/// Clears the per-shard slot only after a Redis connect succeeds, or
+/// immediately on the redis-off branch (Codex review, issue #1429
+/// follow-up). An earlier version cleared it unconditionally on entry,
+/// before attempting to connect. A process may have previously run a
+/// multi-shard install and now start this single-shard one with no
+/// intervening `stop()`. If that connect then failed, the old version
+/// left the still-active multi-shard runner with every per-shard channel
+/// gone and nothing to replace them. It fell back to Postgres for no
+/// reason of its own. Connecting first, as
+/// [`install_dispatch_channels_for_shards`] also does, means a failed
+/// connect here leaves every existing channel exactly as this call found
+/// it.
+///
+/// The clear still needs to happen somewhere unconditionally reachable,
+/// though: on success, or on the redis-off branch. `run_poll_loop`
+/// prioritizes an installed per-shard channel for its polled shard over
+/// the freshly installed global one (see its own `per_shard_installed`
+/// check). A stale per-shard slot left behind would then keep this new
+/// runner consuming from the old endpoint or key prefix. `/admin/config`
+/// would report the newly installed global channel instead.
+///
+/// The success path replaces both slots through `dispatch::install_single`
+/// in one atomic step (Codex review, issue #1429 follow-up). That
+/// replaces clearing the per-shard slot and then separately calling
+/// `dispatch::install`. A racing `dispatch::install_shards` call could
+/// otherwise land in the gap between those two calls. It would then end
+/// up installed alongside this one, instead of cleanly replaced by it.
+///
+/// The generation is `None` on the redis-off branch, since nothing is
+/// installed there; the [`TopologySnapshot`] is always present, whichever
+/// branch ran. [`DispatchInstallGuard`] can then restore the topology
+/// either branch replaced if a later startup step still fails (Codex
+/// review, issue #1429 follow-up). Installing here happens before
+/// `Worker::new`. That constructor's own dispatch-coverage check can
+/// still fail, or shard-pool validation after it can. See
+/// [`DispatchInstallGuard`]'s doc for why undoing only this install is not
+/// enough on its own.
+#[cfg(feature = "redis")]
+async fn install_dispatch_channel(
+    config: &HarvestRuntimeConfig,
+    shard: Option<ShardId>,
+) -> autumn_web::AutumnResult<(Option<u64>, autumn_harvest::dispatch::TopologySnapshot)> {
+    use std::time::Duration;
+
+    // The endpoint string comes from the redacted form only, so neither the
+    // startup log line nor the connect error can carry a password. Both
+    // halves are `Some` together, because both read `config.redis.url`.
+    let (Some(url), Some(endpoint)) = (config.redis.url.as_deref(), config.redis.redacted_url())
+    else {
+        // Redis is off for this start. Both slots are process wide, so a
+        // channel a previous runtime installed is still live in them
+        // (issue #1312). Leaving either there would keep this process
+        // publishing and consuming through a channel the operator has
+        // turned off.
+        //
+        // One atomic clear, not `uninstall()` then `uninstall_all_shards()`
+        // separately (Codex review, issue #1429 follow-up). A racing,
+        // overlapping runner's own `install_shards` call replaces both
+        // slots in one lock acquisition. Two separate clears here could
+        // straddle it, with the second one wiping out the topology that
+        // call just installed. See `dispatch::uninstall_all`'s own doc for
+        // what that runtime would observe.
+        //
+        // `uninstall_all_capturing`, not `uninstall_all` (Codex review,
+        // issue #1429 follow-up). A still-running previous runtime may own
+        // exactly what this clears. Startup can still fail after this
+        // point -- `Worker::new` and the shard-pool validation after it
+        // are both still ahead. `DispatchInstallGuard` keeps the returned
+        // snapshot. It can then restore that previous topology on such a
+        // failure. That way the previous runtime is not left stranded on
+        // the Postgres fallback for a clear this startup never actually
+        // committed to.
+        let previous = autumn_harvest::dispatch::uninstall_all_capturing();
+        return Ok((None, previous));
+    };
+
+    // Each shard's processes own their own key family (issue #1312).
+    let key_prefix = effective_dispatch_prefix(&config.redis.key_prefix, shard);
+
+    let channel = autumn_harvest_redis::RedisDispatch::connect(
+        url,
+        autumn_harvest_redis::RedisDispatchConfig {
+            key_prefix: key_prefix.clone(),
+            consumer_group: config.redis.consumer_group.clone(),
+            visibility_timeout: Duration::from_millis(config.redis.visibility_timeout_ms),
+            dedupe_ttl: DISPATCH_DEDUPE_TTL,
+        },
+    )
+    .await
+    .map_err(|error| {
+        AutumnError::service_unavailable_msg(format!(
+            "failed to connect the Redis dispatch channel at {endpoint}: {error}"
+        ))
+    })?;
+
+    // Connected. Replace both slots atomically (Codex review, issue #1429
+    // follow-up). See the doc comment above for why the per-shard clear
+    // waits until here. `dispatch::install_single`'s own doc explains why
+    // this is one call rather than a separate clear and install.
+    let (generation, previous) = autumn_harvest::dispatch::install_single(
+        Arc::new(channel),
+        autumn_harvest::dispatch::DispatchSettings {
+            poll_interval: Duration::from_millis(config.redis.poll_interval_ms),
+            reconcile_interval: Duration::from_millis(config.redis.reconcile_interval_ms),
+            reconcile_batch: config.redis.reconcile_batch,
+            ..autumn_harvest::dispatch::DispatchSettings::default()
+        },
+    );
+
+    tracing::info!(
+        endpoint = %endpoint,
+        key_prefix = %key_prefix,
+        consumer_group = %config.redis.consumer_group,
+        poll_interval_ms = config.redis.poll_interval_ms,
+        reconcile_interval_ms = config.redis.reconcile_interval_ms,
+        reconcile_batch = config.redis.reconcile_batch,
+        "redis dispatch enabled: workers read task references from redis and claim the named \
+         row in postgres"
+    );
+    Ok((Some(generation), previous))
+}
+
+/// Install one Redis dispatch channel per shard for a runtime that spans
+/// more than one shard (issue #1429).
+///
+/// Each shard gets its own connection and its own shard-suffixed key prefix
+/// (see [`effective_dispatch_prefix`]). This is the same key-family split
+/// the existing one-process-per-shard deployment already relies on, except
+/// every shard's channel now lives in this one process. `Worker::new` reads
+/// and claims each shard through its own installed channel. A shard with
+/// none stays on the Postgres path.
+///
+/// Immediate hints from `queue.rs` helpers still route through the
+/// single-shard slot only, which this path never populates. So on a
+/// multi-shard runtime only the reconcile sweep publishes. That costs
+/// reconcile-interval latency, never a lost or duplicated dispatch: the
+/// reconcile sweep is the durability floor for every dispatch path.
+///
+/// Returns the shards this call actually installed, paired with the
+/// generation `dispatch::install_for_shard` stamped on each. Alongside
+/// the [`TopologySnapshot`] from immediately before this call replaced or
+/// cleared the topology (`dispatch::install_shards` on the success path,
+/// `dispatch::uninstall_all_capturing` on the redis-off path). A later
+/// startup step can still fail. The caller's guard then restores that
+/// snapshot, rather than leaving the slots as this call left them (Codex
+/// review, issue #1429 follow-up).
+///
+/// Connects every shard's channel first, into a local list, before touching
+/// either dispatch slot (Codex review, issue #1429 follow-up). An earlier
+/// version cleared both slots unconditionally on entry, then connected
+/// shards one at a time. A connection failure partway through that loop
+/// left this runtime with neither topology installed. The old channels were
+/// already cleared, and the new ones never finished connecting. Every shard
+/// then silently fell back to the Postgres claim path, instead of failing
+/// startup. Connecting first means a failure here leaves both slots exactly
+/// as this call found them.
+///
+/// Only once every shard in `shards` has connected does this function
+/// replace both slots, via `dispatch::install_shards`. That call clears
+/// and installs the whole topology in one atomic step (Codex review,
+/// issue #1429 follow-up). The replacement still needs to run
+/// unconditionally: a process may have previously run single-shard
+/// dispatch, or a differently shaped multi-shard install, with no
+/// intervening `stop()`:
+///
+/// - A stale single-shard slot: `Worker::new` prioritizes a populated
+///   single-shard slot over per-shard coverage.
+///   `dispatch::installed().is_some()` gates which check it applies. So it
+///   would reject the very multi-shard worker this call installs channels
+///   for.
+/// - A stale per-shard slot for a shard this call's own `shards` no longer
+///   names: `installed_for_shard` would still return that old channel. A
+///   later worker singly assigned to it could then pass its coverage check
+///   against a Redis namespace this runtime no longer owns.
+///
+/// # Errors
+///
+/// Returns an error, naming the shard, the first time a shard's Redis
+/// endpoint cannot be reached. Neither dispatch slot is touched on this
+/// path. The caller's guard has nothing to unwind, and the runtime keeps
+/// whatever topology, if any, it had before this call.
+#[cfg(feature = "redis")]
+async fn install_dispatch_channels_for_shards(
+    config: &HarvestRuntimeConfig,
+    shards: &[ShardId],
+) -> autumn_web::AutumnResult<(
+    Vec<(ShardId, u64)>,
+    autumn_harvest::dispatch::TopologySnapshot,
+)> {
+    use std::time::Duration;
+
+    let (Some(url), Some(endpoint)) = (config.redis.url.as_deref(), config.redis.redacted_url())
+    else {
+        // Redis is off for this start. Clear both slots, as before: a
+        // channel a previous runtime installed (issue #1312) must not
+        // outlive this process turning Redis off.
+        //
+        // One atomic clear (Codex review, issue #1429 follow-up); see
+        // `install_dispatch_channel`'s matching fix and
+        // `dispatch::uninstall_all`'s own doc for the race two separate
+        // clears leaves open.
+        //
+        // `uninstall_all_capturing`, not `uninstall_all` (Codex review,
+        // issue #1429 follow-up). See `install_dispatch_channel`'s
+        // matching fix: a still-running previous runtime may own exactly
+        // what this clears, and startup can still fail after this point.
+        let previous = autumn_harvest::dispatch::uninstall_all_capturing();
+        return Ok((Vec::new(), previous));
+    };
+
+    let mut connected = Vec::with_capacity(shards.len());
+    for &shard in shards {
+        let key_prefix = effective_dispatch_prefix(&config.redis.key_prefix, Some(shard));
+        let channel = autumn_harvest_redis::RedisDispatch::connect(
+            url,
+            autumn_harvest_redis::RedisDispatchConfig {
+                key_prefix: key_prefix.clone(),
+                consumer_group: config.redis.consumer_group.clone(),
+                visibility_timeout: Duration::from_millis(config.redis.visibility_timeout_ms),
+                dedupe_ttl: DISPATCH_DEDUPE_TTL,
+            },
+        )
+        .await
+        .map_err(|error| {
+            AutumnError::service_unavailable_msg(format!(
+                "failed to connect the Redis dispatch channel for shard {} at {endpoint}: \
+                 {error}",
+                shard.as_i32()
+            ))
+        })?;
+        connected.push((shard, key_prefix, channel));
+    }
+
+    // Every shard connected. Replace the whole topology in one atomic
+    // step (Codex review, issue #1429 follow-up). A loop that clears both
+    // slots, then installs each shard through its own separately locked
+    // call, is not atomic enough. See `dispatch::install_shards`'s own
+    // doc for why.
+    let mut key_prefixes = Vec::with_capacity(connected.len());
+    let channels = connected
+        .into_iter()
+        .map(|(shard, key_prefix, channel)| {
+            key_prefixes.push(key_prefix);
+            (
+                shard,
+                Arc::new(channel) as Arc<dyn autumn_harvest::dispatch::TaskDispatch>,
+                autumn_harvest::dispatch::DispatchSettings {
+                    poll_interval: Duration::from_millis(config.redis.poll_interval_ms),
+                    reconcile_interval: Duration::from_millis(config.redis.reconcile_interval_ms),
+                    reconcile_batch: config.redis.reconcile_batch,
+                    ..autumn_harvest::dispatch::DispatchSettings::default()
+                },
+            )
+        })
+        .collect();
+    let (installed_shards, previous) = autumn_harvest::dispatch::install_shards(channels);
+
+    for (key_prefix, &(shard, _generation)) in key_prefixes.iter().zip(installed_shards.iter()) {
+        tracing::info!(
+            shard = shard.as_i32(),
+            endpoint = %endpoint,
+            key_prefix = %key_prefix,
+            consumer_group = %config.redis.consumer_group,
+            poll_interval_ms = config.redis.poll_interval_ms,
+            reconcile_interval_ms = config.redis.reconcile_interval_ms,
+            reconcile_batch = config.redis.reconcile_batch,
+            "redis dispatch enabled for shard: workers read task references from redis and \
+             claim the named row in postgres"
+        );
+    }
+    Ok((installed_shards, previous))
+}
+
+/// No per-shard dispatch channel exists without the `redis` cargo feature.
+/// Mirrors [`install_dispatch_channel`]'s no-feature stub, including
+/// capturing and clearing both dispatch slots (issue #1429 review).
+///
+/// # Errors
+///
+/// Never returns an error.
+#[cfg(not(feature = "redis"))]
+#[allow(clippy::unused_async)]
+async fn install_dispatch_channels_for_shards(
+    _config: &HarvestRuntimeConfig,
+    _shards: &[ShardId],
+) -> autumn_web::AutumnResult<(
+    Vec<(ShardId, u64)>,
+    autumn_harvest::dispatch::TopologySnapshot,
+)> {
+    let previous = autumn_harvest::dispatch::uninstall_all_capturing();
+    Ok((Vec::new(), previous))
+}
+
+/// No dispatch channel exists without the `redis` cargo feature.
+///
+/// Configuration validation rejects `[harvest.redis] url` on such a build, so
+/// this path can only be reached with Redis dispatch off. The generation is
+/// always `None`, because nothing is installed.
+///
+/// Both slots are still cleared, and the [`TopologySnapshot`] from
+/// immediately before that clear is still returned (Codex review, issue
+/// #1429 follow-up). Each slot is process wide. A channel another owner
+/// installed would otherwise stay live for a runtime that has Redis off
+/// (issue #1312). But that owner's runtime may still be running, and this
+/// process's own startup can still fail after this clear. The per-shard half
+/// mirrors the Codex review at issue #1429 this stub's `redis`-feature
+/// counterpart applies the same fix for.
+///
+/// # Errors
+///
+/// Never returns an error.
+#[cfg(not(feature = "redis"))]
+#[allow(clippy::unused_async)]
+async fn install_dispatch_channel(
+    _config: &HarvestRuntimeConfig,
+    _shard: Option<ShardId>,
+) -> autumn_web::AutumnResult<(Option<u64>, autumn_harvest::dispatch::TopologySnapshot)> {
+    let previous = autumn_harvest::dispatch::uninstall_all_capturing();
+    Ok((None, previous))
 }
 
 /// The writable shards `assignments` does **not** cover, ascending (issue #961).
@@ -789,6 +2349,50 @@ fn warn_uncovered_writable_shards(router: &ShardRouter, assignments: &[ShardId])
     }
 }
 
+/// Refuse a worker pool that would drain a tenant cell (issue #1837).
+///
+/// An API-only process (`worker_enabled == false`) claims nothing, so it
+/// passes. Otherwise see [`reserved_shards_under_auto_assignment`].
+fn refuse_auto_pool_over_cells(
+    router: &ShardRouter,
+    assignments: &[ShardId],
+    worker_enabled: bool,
+) -> Result<(), String> {
+    if !worker_enabled {
+        return Ok(());
+    }
+    let cells = reserved_shards_under_auto_assignment(router, assignments);
+    if cells.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "ShardRouter reserves shards {cells:?} for tenant cells, but this worker has no \
+         explicit shard assignments and would drain them; call \
+         WorkerConfig::with_shard_assignments with the shards this pool serves, or disable \
+         the worker on an API-only replica (see docs/sharding.md#tenant-cells-issue-1837)"
+    ))
+}
+
+/// Reserved shards that an auto-assigned worker would drain (issue #1837).
+///
+/// An empty `assignments` list means auto: the worker covers every pool
+/// shard. When the router reserves shards for tenant cells, such a worker
+/// also claims cell work. An explicit list is a deliberate choice. Startup
+/// accepts it, even when it names a cell shard.
+fn reserved_shards_under_auto_assignment(
+    router: &ShardRouter,
+    assignments: &[ShardId],
+) -> Vec<i32> {
+    if !assignments.is_empty() {
+        return Vec::new();
+    }
+    router
+        .reserved_shards()
+        .iter()
+        .map(|shard| shard.as_i32())
+        .collect()
+}
+
 fn missing_router_shards(router: &ShardRouter, pool: &ShardedDbPool) -> Vec<ShardId> {
     let mut missing: Vec<ShardId> = router
         .readable_shards()
@@ -830,8 +2434,34 @@ pub(crate) fn injected_runtime_state(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_plugin_audit_export_config_keeps_the_chain_key() {
+        struct Nowhere;
+        impl autumn_harvest::audit_export::AuditSink for Nowhere {
+            fn deliver<'a>(
+                &'a self,
+                _batch: &'a autumn_harvest::audit_export::AuditBatch<'a>,
+            ) -> autumn_harvest::audit_export::SinkFuture<'a> {
+                Box::pin(async { autumn_harvest::audit_export::SinkAttempt::success(200) })
+            }
+        }
+        let built = autumn_harvest::HarvestBuilder::new()
+            .audit_export_sink(Nowhere)
+            .audit_export_chain_key(vec![2_u8; 32])
+            .try_build()
+            .expect("builds");
+        let config = super::prepare_audit_export_config(&built).expect("a sink is set");
+        assert_eq!(
+            config.chain_key.as_ref().map(|key| key.secret().as_bytes()),
+            Some(&[2_u8; 32][..])
+        );
+    }
     use super::{
-        resolve_runtime_storage_pool, select_runtime_shard0_pool, uncovered_writable_shards,
+        DeferredAuditExportInstall, HarvestRunnerResources, refuse_auto_pool_over_cells,
+        registered_workflow_type_names, reserved_shards_under_auto_assignment,
+        resolve_runtime_storage_pool, select_runtime_gate_shards, select_runtime_shard0_pool,
+        uncovered_writable_shards,
     };
     use autumn_harvest::shard::ShardRouter;
     use autumn_harvest::shard::ShardedDbPool;
@@ -840,7 +2470,83 @@ mod tests {
     use diesel_async::AsyncPgConnection;
     use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 
-    /// Build a pool tagged by its `max_size` (readable without connecting) so
+    /// A startup that fails must leave the process-global audit-export config
+    /// exactly as it found it — and, crucially, must do so by NOT publishing
+    /// rather than by restoring (issue #953, Codex review rounds 16 and 19).
+    /// Restoring a snapshot races a concurrent successful startup: both
+    /// snapshot the same old value, and the loser's restore would replace the
+    /// winner's live sink.
+    #[test]
+    fn a_failed_startup_leaves_the_global_exactly_as_it_found_it() {
+        struct Marker;
+        impl autumn_harvest::audit_export::AuditSink for Marker {
+            fn deliver<'a>(
+                &'a self,
+                _batch: &'a autumn_harvest::audit_export::AuditBatch<'a>,
+            ) -> autumn_harvest::audit_export::SinkFuture<'a> {
+                Box::pin(async { autumn_harvest::audit_export::SinkAttempt::success(200) })
+            }
+        }
+        fn config(
+            batch_size: i64,
+        ) -> std::sync::Arc<autumn_harvest::audit_export::AuditExportRuntimeConfig> {
+            std::sync::Arc::new(autumn_harvest::audit_export::AuditExportRuntimeConfig {
+                sink: std::sync::Arc::new(Marker),
+                secret: autumn_harvest::completion_callback::CallbackSecret::new(b"k".to_vec()),
+                batch_size,
+                backoff: autumn_harvest::audit_export::ExportBackoff::default(),
+                lease: std::time::Duration::from_secs(30),
+                chain_key: None,
+            })
+        }
+
+        // A runtime is already exporting in this process.
+        super::commit_audit_export_config(Some(config(7)));
+
+        // A second startup is prepared and then fails: dropped, never
+        // committed.
+        drop(DeferredAuditExportInstall::new(Some(config(99))));
+        assert_eq!(
+            autumn_harvest::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG
+                .read()
+                .expect("lock")
+                .clone()
+                .expect("the live config must still be installed")
+                .batch_size,
+            7,
+            "a runtime that never started must neither publish its own sink \
+             nor disturb the running one's"
+        );
+
+        // The concurrency case the restore got wrong: startup A succeeds and
+        // publishes while startup B, prepared earlier from the same old value,
+        // fails. B must not undo A.
+        let b = DeferredAuditExportInstall::new(Some(config(99)));
+        DeferredAuditExportInstall::new(Some(config(21))).commit(); // A wins
+        drop(b); // B fails afterwards
+        assert_eq!(
+            autumn_harvest::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG
+                .read()
+                .expect("lock")
+                .clone()
+                .expect("A's config must survive")
+                .batch_size,
+            21,
+            "a failed startup must not roll a concurrent successful one back"
+        );
+
+        // Success publishes, including a deliberate None.
+        DeferredAuditExportInstall::new(None).commit();
+        assert!(
+            autumn_harvest::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG
+                .read()
+                .expect("lock")
+                .is_none(),
+            "a runtime built with no sink must stop a previous one's export"
+        );
+    }
+
+    /// Build a pool tagged by its `max_size` (readable without connecting) so    /// Build a pool tagged by its `max_size` (readable without connecting) so
     /// two pools are distinguishable in a DB-free test.
     fn tagged_pool(max_size: usize) -> DbPool {
         let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(
@@ -989,4 +2695,1336 @@ mod tests {
             "a drained readable-only shard is not an uncovered *writable* shard",
         );
     }
+
+    // Issue #1837: a shared auto-assigned pool must not drain a cell shard.
+
+    fn cell_router() -> ShardRouter {
+        three_shard_router().with_reserved_shards([ShardId::new(1)])
+    }
+
+    #[test]
+    fn auto_assignment_is_refused_when_the_router_reserves_shards() {
+        assert_eq!(
+            reserved_shards_under_auto_assignment(&cell_router(), &[]),
+            vec![1],
+            "an auto pool would drain the reserved shard",
+        );
+    }
+
+    #[test]
+    fn explicit_assignment_is_accepted_with_reserved_shards() {
+        let router = cell_router();
+        let none = Vec::<i32>::new();
+        assert_eq!(
+            reserved_shards_under_auto_assignment(&router, &[ShardId::new(0)]),
+            none
+        );
+        assert_eq!(
+            reserved_shards_under_auto_assignment(&router, &[ShardId::new(1)]),
+            none
+        );
+    }
+
+    #[test]
+    fn auto_assignment_is_accepted_without_reserved_shards() {
+        assert_eq!(
+            reserved_shards_under_auto_assignment(&three_shard_router(), &[]),
+            Vec::<i32>::new()
+        );
+    }
+
+    #[test]
+    fn startup_refuses_an_auto_pool_over_a_cell() {
+        let error = refuse_auto_pool_over_cells(&cell_router(), &[], true)
+            .expect_err("an auto pool would drain the cell");
+        assert!(error.contains("[1]"), "the error names the cell: {error}");
+        assert!(error.contains("with_shard_assignments"), "{error}");
+    }
+
+    #[test]
+    fn startup_accepts_an_api_only_process_with_cells() {
+        assert_eq!(
+            refuse_auto_pool_over_cells(&cell_router(), &[], false),
+            Ok(())
+        );
+    }
+
+    /// A refused cell startup must publish no global state. The callback
+    /// config is the first thing `build` publishes, so the check runs before
+    /// it.
+    #[test]
+    fn a_refused_cell_startup_publishes_no_callback_config() {
+        const MARKER: u32 = 1837;
+        let built = autumn_harvest::HarvestBuilder::new()
+            .completion_callback_retry_policy(autumn_harvest::RetryPolicy {
+                max_attempts: MARKER,
+                ..autumn_harvest::RetryPolicy::default()
+            })
+            .build();
+        let pool = tagged_pool(1);
+        let mut pools = std::collections::BTreeMap::new();
+        pools.insert(ShardId::new(0), pool.clone());
+        pools.insert(ShardId::new(1), tagged_pool(2));
+        pools.insert(ShardId::new(2), tagged_pool(3));
+        let resources = HarvestRunnerResources::new(pool)
+            .with_sharded_pool(ShardedDbPool::from_map(pools, ShardId::new(0)))
+            .with_shard_router(cell_router());
+
+        let refused = super::PreparedHarvestRuntime::build(built, resources, true);
+        assert!(refused.is_err(), "an auto pool over a cell must be refused");
+        let published = autumn_harvest::completion_callback::GLOBAL_CALLBACK_CONFIG
+            .read()
+            .expect("lock")
+            .clone()
+            .map(|config| config.retry_policy.max_attempts);
+        assert_ne!(
+            published,
+            Some(MARKER),
+            "the refused startup published its callback config"
+        );
+    }
+
+    #[test]
+    fn startup_accepts_an_explicit_pool_with_cells() {
+        assert_eq!(
+            refuse_auto_pool_over_cells(&cell_router(), &[ShardId::new(0)], true),
+            Ok(())
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #1128: the standalone boot-time orphaned-workflow-type gate.
+    // ---------------------------------------------------------------------
+
+    fn test_workflow_info(name: &'static str) -> autumn_harvest::info::WorkflowInfo {
+        autumn_harvest::info::WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
+            mcp: false,
+            name,
+            module: "tests",
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            execution_timeout: None,
+            chain_execution_timeout: None,
+            concurrency: None,
+            debounce: None,
+            batch: None,
+            throttle: None,
+            max_input_bytes: None,
+            sla: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        }
+    }
+
+    /// A UNIFIED dag (`workflow_handler: Some`) — the only kind this runtime
+    /// accepts, and the kind whose name must count as a registered type.
+    fn test_unified_dag_info(name: &'static str) -> autumn_harvest::info::DagInfo {
+        fn build(_dag: &mut autumn_harvest::dag::DagBuilder) {}
+
+        autumn_harvest::info::DagInfo {
+            name,
+            module: "tests",
+            schedule: Some(autumn_harvest::policy::Schedule::Manual),
+            catchup: false,
+            max_active_runs: 1,
+            default_queue: Some("default"),
+            builder: build,
+            workflow_handler: Some(|_ctx, input| Box::pin(async move { Ok(input) })),
+            jitter: std::time::Duration::ZERO,
+            overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+            buffer_all_max: 100,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            mcp: false,
+            execution_timeout: None,
+            sla: None,
+        }
+    }
+
+    /// The gate's shard enumeration must cover EVERY shard of a multi-shard
+    /// standalone deployment, not just shard 0.
+    ///
+    /// The plugin's #700 gate reads shard 0 only, which is sound there because
+    /// the plugin rejects multi-shard configs outright. The standalone runner
+    /// is exactly the path that supports them (#522), so a shard-0-only gate
+    /// would report a `complete`, clean fleet while shards 1..N host orphans.
+    /// Tagged by `max_size`, so no connection is opened and no global is read.
+    #[test]
+    fn select_runtime_gate_shards_covers_every_shard_of_a_sharded_pool() {
+        let harvest = tagged_pool(3);
+        let sharded = ShardedDbPool::from_map(
+            [
+                (ShardId::new(0), tagged_pool(7)),
+                (ShardId::new(1), tagged_pool(8)),
+                (ShardId::new(2), tagged_pool(9)),
+            ]
+            .into_iter()
+            .collect(),
+            ShardId::new(0),
+        );
+
+        let shards = select_runtime_gate_shards(None, Some(&sharded), &harvest, None);
+        assert_eq!(
+            shards.keys().copied().collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "every shard of the resolved sharded pool must be inspected",
+        );
+        assert_eq!(
+            shards
+                .values()
+                .map(|pool| pool.as_ref().expect("pool present").status().max_size)
+                .collect::<Vec<_>>(),
+            vec![7, 8, 9],
+            "each shard must map to ITS OWN pool, not shard 0's",
+        );
+    }
+
+    /// The gate honors the same pool precedence as the runner it guards
+    /// (issue #700 P2, via the shared `pick_runtime_pool_source`): a
+    /// runner-level override beats `WorkerConfig`'s pool, which beats
+    /// `harvest_pool`. Querying the wrong database would let the gate validate
+    /// a DB the workers never poll.
+    #[test]
+    fn select_runtime_gate_shards_honors_the_runtime_pool_precedence() {
+        let harvest = tagged_pool(3);
+        let worker_config_sharded = ShardedDbPool::single(tagged_pool(7));
+        let resources_override = ShardedDbPool::single(tagged_pool(11));
+
+        let tag = |shards: std::collections::BTreeMap<i32, Option<DbPool>>| {
+            shards
+                .get(&0)
+                .expect("shard 0 present")
+                .as_ref()
+                .expect("pool present")
+                .status()
+                .max_size
+        };
+
+        assert_eq!(
+            tag(select_runtime_gate_shards(
+                None,
+                Some(&worker_config_sharded),
+                &harvest,
+                None
+            )),
+            7,
+            "gate: WorkerConfig::with_sharded_pool must win over harvest_pool",
+        );
+        assert_eq!(
+            tag(select_runtime_gate_shards(
+                Some(&resources_override),
+                Some(&worker_config_sharded),
+                &harvest,
+                None,
+            )),
+            11,
+            "gate: a runner-level sharded_pool override must win over WorkerConfig",
+        );
+        assert_eq!(
+            tag(select_runtime_gate_shards(None, None, &harvest, None)),
+            3,
+            "gate: with no sharded pool the harvest_pool handle is inspected as shard 0",
+        );
+    }
+
+    /// A shard the ROUTER knows about but for which this process has no pool
+    /// must appear in the enumeration with no pool, so the report marks it
+    /// `unavailable` and the completeness status degrades to `partial` — which
+    /// `startup_orphan_decision` turns into a warning, never an abort.
+    ///
+    /// Omitting it instead would let the report read `complete` for a fleet
+    /// whose shard was never inspected: the one way a gate can report a
+    /// confident clean boot it did not earn.
+    #[test]
+    fn select_runtime_gate_shards_reports_a_router_shard_with_no_pool() {
+        let harvest = tagged_pool(3);
+        let sharded = ShardedDbPool::single(tagged_pool(7));
+        let router = ShardRouter::new(
+            vec![ShardId::new(0), ShardId::new(1)],
+            vec![ShardId::new(0)],
+            ShardId::new(0),
+        );
+
+        let shards = select_runtime_gate_shards(None, Some(&sharded), &harvest, Some(&router));
+        assert_eq!(
+            shards.keys().copied().collect::<Vec<_>>(),
+            vec![0, 1],
+            "a router-known shard must not be silently dropped from the fan-out",
+        );
+        assert!(
+            shards[&1].is_none(),
+            "a router-known shard with no pool must be inspected as unavailable",
+        );
+    }
+
+    /// The registered set is workflow names UNION unified-DAG names.
+    ///
+    /// The DAG half is load-bearing: a unified DAG's in-flight executions carry
+    /// the DAG's name in `workflow_name`, so omitting DAG names would report
+    /// every running DAG as an orphan and refuse boot under `fail`.
+    #[test]
+    fn registered_workflow_type_names_unions_workflows_and_unified_dags() {
+        let built = autumn_harvest::builder::HarvestBuilder::new()
+            .workflows(vec![test_workflow_info("plain_workflow")])
+            .dags(vec![test_unified_dag_info("unified_dag")])
+            .build();
+
+        let registered = registered_workflow_type_names(&built);
+        assert!(
+            registered.contains("plain_workflow"),
+            "a registered workflow type must count as registered",
+        );
+        assert!(
+            registered.contains("unified_dag"),
+            "a registered unified DAG's name must count as registered",
+        );
+    }
+
+    /// The opt-out a caller that has ALREADY run the gate sets (the plugin boot
+    /// path, which runs it earlier than the runner can). Nothing else changes.
+    #[test]
+    fn startup_orphan_gate_can_be_marked_already_run() {
+        let resources = HarvestRunnerResources::new(tagged_pool(3));
+        assert!(
+            !resources.startup_orphan_gate_already_run(),
+            "the gate runs by default — that is the whole point of issue #1128",
+        );
+        assert!(
+            resources
+                .with_startup_orphan_gate_already_run()
+                .startup_orphan_gate_already_run(),
+            "a caller that already ran the gate must be able to say so",
+        );
+    }
+    /// An unsharded runtime keeps the configured prefix exactly (issue #1312).
+    ///
+    /// Every existing single-database deployment resolves the default shard.
+    /// A suffix there would move the key family and strand the references a
+    /// previous release published.
+    #[test]
+    fn the_default_shard_keeps_the_configured_dispatch_prefix() {
+        assert_eq!(
+            super::effective_dispatch_prefix("harvest", Some(ShardId::new(0))),
+            "harvest"
+        );
+        assert_eq!(super::effective_dispatch_prefix("harvest", None), "harvest");
+    }
+
+    /// A process that owns one non-default shard gets its own key family.
+    ///
+    /// Every process in a sharded fleet passes the single-shard check. Without
+    /// the suffix they would all read one stream, and a worker would probe its
+    /// own database for another shard's row.
+    #[test]
+    fn a_non_default_shard_gets_its_own_dispatch_prefix() {
+        assert_eq!(
+            super::effective_dispatch_prefix("harvest", Some(ShardId::new(3))),
+            "harvest:s3"
+        );
+        assert_eq!(
+            super::effective_dispatch_prefix("harvest", Some(ShardId::new(1))),
+            "harvest:s1"
+        );
+    }
+
+    /// The suffix extends the configured prefix and never replaces it.
+    ///
+    /// An operator who already namespaces the prefix per environment keeps
+    /// that namespace, so two environments on one Redis stay separate.
+    #[test]
+    fn a_configured_dispatch_prefix_survives_the_shard_suffix() {
+        assert_eq!(
+            super::effective_dispatch_prefix("acme:staging", Some(ShardId::new(7))),
+            "acme:staging:s7"
+        );
+        assert_eq!(
+            super::effective_dispatch_prefix("acme:staging", Some(ShardId::new(0))),
+            "acme:staging"
+        );
+    }
+
+    /// A multi-shard install reports one prefix per covered shard, not the
+    /// bare configured prefix (Codex review, issue #1429).
+    ///
+    /// `dispatch_shard` is `None` for a multi-shard install. `start` never
+    /// resolves one shard to represent the whole span. So applying
+    /// `effective_dispatch_prefix` to it alone would silently drop back to
+    /// the plain configured prefix and hide every shard's real key family
+    /// from `/admin/config`.
+    #[test]
+    fn a_multi_shard_install_reports_every_covered_prefix() {
+        let redis = super::HarvestRedisConfig {
+            url: Some("redis://example:6379".to_string()),
+            key_prefix: "harvest".to_string(),
+            ..super::HarvestRedisConfig::default()
+        };
+        let view =
+            super::dispatch_config_view(&redis, true, None, &[ShardId::new(1), ShardId::new(2)]);
+        assert_eq!(view.key_prefix, None);
+        assert_eq!(
+            view.key_prefixes,
+            Some(vec!["harvest:s1".to_string(), "harvest:s2".to_string()])
+        );
+    }
+
+    /// A single-shard install keeps reporting through `key_prefix` alone,
+    /// with `key_prefixes` empty — the shape every existing caller of
+    /// `/admin/config` already expects (issue #1429 review).
+    #[test]
+    fn a_single_shard_install_leaves_key_prefixes_empty() {
+        let redis = super::HarvestRedisConfig {
+            url: Some("redis://example:6379".to_string()),
+            key_prefix: "harvest".to_string(),
+            ..super::HarvestRedisConfig::default()
+        };
+        let view = super::dispatch_config_view(&redis, true, Some(ShardId::new(3)), &[]);
+        assert_eq!(view.key_prefix, Some("harvest:s3".to_string()));
+        assert_eq!(view.key_prefixes, None);
+    }
+
+    /// `start` installs the process-global channel before it builds the
+    /// worker. A later failure must leave no channel behind, or the next
+    /// runtime in this process inherits one it never configured (issue #1312).
+    #[test]
+    fn a_failed_startup_uninstalls_the_dispatch_channel() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+
+        autumn_harvest::dispatch::uninstall();
+        autumn_harvest::dispatch::uninstall_all_shards();
+        let (generation, snapshot) = autumn_harvest::dispatch::install_single(
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+        assert!(
+            autumn_harvest::dispatch::is_installed(),
+            "the test fixture must install a channel"
+        );
+
+        drop(super::DispatchInstallGuard::new((
+            Some(generation),
+            snapshot,
+        )));
+
+        assert!(
+            !autumn_harvest::dispatch::is_installed(),
+            "a startup that fails after the install must uninstall the channel, since nothing \
+             preceded it"
+        );
+    }
+
+    /// A failed replacement startup restores the previous single-shard
+    /// channel, not just clears the one it failed to finish installing
+    /// (Codex review, issue #1429 follow-up).
+    ///
+    /// `install_single` destructively replaces the topology before
+    /// `Worker::new` and the shard-pool validation after it can still fail.
+    /// A guard that only cleared its own install, as in the case above,
+    /// would leave a still-running previous runner without dispatch. This
+    /// pins that dropping an uncommitted guard restores the previous
+    /// channel instead, under its own, original generation. That previous
+    /// runner's own eventual `stop()` call can then still clear it.
+    #[test]
+    fn a_failed_replacement_startup_restores_the_previous_dispatch_channel() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+        autumn_harvest::dispatch::uninstall();
+        autumn_harvest::dispatch::uninstall_all_shards();
+
+        let original_generation = autumn_harvest::dispatch::install(
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+        let (replacement_generation, snapshot) = autumn_harvest::dispatch::install_single(
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+
+        drop(super::DispatchInstallGuard::new((
+            Some(replacement_generation),
+            snapshot,
+        )));
+
+        assert!(
+            autumn_harvest::dispatch::installed().is_some(),
+            "dropping the guard must restore the previous channel"
+        );
+        // `InstalledDispatch::generation` is private to `autumn_harvest`.
+        // This proves the restored slot carries the original generation
+        // indirectly: the replacement generation no longer names it, and
+        // the original one still does.
+        autumn_harvest::dispatch::uninstall_if_current(replacement_generation);
+        assert!(
+            autumn_harvest::dispatch::installed().is_some(),
+            "the replacement's own generation must no longer name the restored slot"
+        );
+        autumn_harvest::dispatch::uninstall_if_current(original_generation);
+        assert!(
+            autumn_harvest::dispatch::installed().is_none(),
+            "the original generation's own uninstall must still clear the restored slot"
+        );
+    }
+
+    /// A startup that reaches the commit point keeps its channel installed.
+    #[test]
+    fn a_committed_guard_keeps_the_dispatch_channel() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+        autumn_harvest::dispatch::uninstall();
+        autumn_harvest::dispatch::uninstall_all_shards();
+
+        let (generation, snapshot) = autumn_harvest::dispatch::install_single(
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+
+        super::DispatchInstallGuard::new((Some(generation), snapshot)).commit();
+
+        assert!(
+            autumn_harvest::dispatch::is_installed(),
+            "a committed guard must leave the channel installed"
+        );
+        autumn_harvest::dispatch::uninstall();
+    }
+
+    /// `DISPATCH_START_LOCK` must serialize `start`'s
+    /// install-through-commit-or-unwind span across overlapping calls
+    /// (Codex review, issue #1429 follow-up).
+    ///
+    /// Without it, a second overlapping `start` could snapshot a first
+    /// call's still-uncommitted, about-to-fail install. Suppose both then
+    /// fail and unwind. The second one's restore can then resurrect the
+    /// first one's already-abandoned topology, instead of the state that
+    /// was actually live before either started. See `DISPATCH_START_LOCK`'s
+    /// own doc comment for the full race.
+    ///
+    /// This pins the primitive itself. A second attempt must not acquire
+    /// the lock while the first holds it. It must succeed once the first
+    /// releases it.
+    #[tokio::test]
+    async fn dispatch_start_lock_serializes_overlapping_starts() {
+        let first = super::DISPATCH_START_LOCK.lock().await;
+        assert!(
+            super::DISPATCH_START_LOCK.try_lock().is_err(),
+            "a second start's own install must not begin while this one still holds the lock, \
+             mid install-through-commit-or-unwind"
+        );
+        drop(first);
+        assert!(
+            super::DISPATCH_START_LOCK.try_lock().is_ok(),
+            "the lock must be available again once its holder resolves, one way or the other"
+        );
+    }
+
+    /// A queue name the channel key
+    /// space cannot carry must fail startup, not degrade the process to the
+    /// Postgres fallback in silence.
+    #[test]
+    fn redis_dispatch_rejects_a_queue_name_with_a_colon() {
+        let queues = vec!["default".to_string(), "tenant:priority".to_string()];
+        let error = super::reject_dispatch_queue_names(true, &queues)
+            .expect_err("a colon in a queue name must fail startup");
+        assert!(
+            error.contains("tenant:priority"),
+            "the message must name the queue: {error}"
+        );
+        assert!(
+            error.contains("harvest.redis.url"),
+            "the message must name the setting to unset: {error}"
+        );
+    }
+
+    #[test]
+    fn dispatchable_queue_names_are_accepted() {
+        let queues = vec!["default".to_string(), "tenant-priority".to_string()];
+        super::reject_dispatch_queue_names(true, &queues)
+            .expect("a plain queue name must be accepted");
+    }
+
+    /// With no URL the channel stays off, so the queue names do not matter.
+    #[test]
+    fn queue_names_are_unchecked_when_redis_dispatch_is_off() {
+        let queues = vec!["tenant:priority".to_string()];
+        super::reject_dispatch_queue_names(false, &queues)
+            .expect("a runtime with redis dispatch off must not be rejected");
+    }
+
+    /// A runner that owns nothing but the dispatch generation it captured at
+    /// install time.
+    ///
+    /// `generation` is `None` for a runner that installed no single-shard
+    /// channel, or `Some` of the value `dispatch::install` actually
+    /// returned (Codex review, issue #1429 follow-up). A fabricated value
+    /// would not match the real slot's generation, so `stop`'s ownership
+    /// check would always treat it as stale. `stop` is driven through
+    /// this, so the case needs no database, no worker and no
+    /// scheduler.
+    fn runner_owning_dispatch(generation: Option<u64>) -> super::HarvestRunner {
+        let api_runtime = crate::api::HarvestApiRuntime::new(
+            std::sync::Arc::new(autumn_harvest::worker::HandlerRegistry::new(vec![], vec![])),
+            std::sync::Arc::new(autumn_harvest::scheduler::DagCatalog::default()),
+            std::sync::Arc::new(Vec::new()),
+            None,
+            Vec::new(),
+            autumn_harvest::scheduler::SchedulerMonitor::offline(),
+            crate::api::HarvestRetentionRuntime::disabled(
+                autumn_harvest::retention::RetentionConfig::default(),
+            ),
+            ShardRouter::single(),
+        );
+        super::HarvestRunner {
+            api_runtime,
+            storage_pool: crate::state::HarvestDbPool::single(tagged_pool(1)),
+            worker: None,
+            worker_handle: None,
+            scheduler: None,
+            retention: None,
+            batch: None,
+            codec_refresh: None,
+            dispatch_install_generation: generation,
+            dispatch_shard_generations: Vec::new(),
+            dispatch_metrics_sampler: None,
+        }
+    }
+
+    /// Like [`runner_owning_dispatch`], but the install it owns is the
+    /// per-shard slots rather than the single-shard slot.
+    ///
+    /// `shard_generations` must be the real values `dispatch::install_for_shard`
+    /// returned, for the same reason `runner_owning_dispatch`'s own
+    /// `generation` parameter must be.
+    fn runner_owning_multi_shard_dispatch(
+        shard_generations: Vec<(ShardId, u64)>,
+    ) -> super::HarvestRunner {
+        super::HarvestRunner {
+            dispatch_shard_generations: shard_generations,
+            ..runner_owning_dispatch(None)
+        }
+    }
+
+    /// `stop` cancels and joins an API-only process's dispatch metrics
+    /// sampler (issue #1429 review). A `Worker`-less runner previously
+    /// spawned no sampler for `harvest_dispatch_dropped_hints` at all.
+    ///
+    /// A hung join would make this test itself hang, so a passing test is
+    /// the proof. The sampler task actually observes its cancellation and
+    /// returns, rather than `stop` leaking a detached task forever.
+    #[test]
+    fn stop_cancels_and_joins_the_api_only_dispatch_metrics_sampler() {
+        // `tokio::spawn` (inside `spawn_dispatch_metrics_sampler`) needs a
+        // live runtime. The spawn and the `stop` it feeds must therefore
+        // share one `block_on` call, rather than spawning before entering
+        // it.
+        block_on(async {
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let telemetry =
+                std::sync::Arc::new(autumn_harvest::telemetry::TelemetryConfig::builder().build());
+            let handle = autumn_harvest::worker::spawn_dispatch_metrics_sampler(
+                cancel.clone(),
+                telemetry,
+                std::time::Duration::from_secs(3600),
+            );
+            let runner = super::HarvestRunner {
+                dispatch_metrics_sampler: Some((cancel, handle)),
+                ..runner_owning_dispatch(None)
+            };
+
+            runner.stop().await;
+        });
+    }
+
+    /// Run `future` on a private current-thread runtime.
+    ///
+    /// The dispatch cases hold a blocking lock, so they stay synchronous.
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(future)
+    }
+
+    /// A restart with Redis off must
+    /// not keep publishing and consuming through the channel of the previous
+    /// runtime.
+    #[test]
+    fn a_disabled_start_clears_a_previously_installed_channel() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+
+        autumn_harvest::dispatch::install(
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+
+        let config = crate::config::HarvestRuntimeConfig::default();
+        assert!(
+            config.redis.url.is_none(),
+            "the default config has redis dispatch off"
+        );
+        let installed = block_on(super::install_dispatch_channel(&config, None))
+            .expect("a disabled start must succeed");
+
+        assert!(
+            installed.0.is_none(),
+            "a disabled start installs no channel"
+        );
+        assert!(
+            autumn_harvest::dispatch::installed().is_none(),
+            "a disabled start must clear the channel a previous runtime installed"
+        );
+    }
+
+    /// Entering the single-shard install path clears a stale per-shard
+    /// slot too, the mirror of
+    /// `entering_the_multi_shard_path_clears_the_single_shard_slot` (Codex
+    /// review, issue #1429).
+    ///
+    /// `run_poll_loop` prioritizes an installed per-shard channel for its
+    /// polled shard over the single-shard slot this call installs. A
+    /// process may have previously run a multi-shard install. Starting this
+    /// single-shard one, with no intervening `stop()`, would otherwise keep
+    /// consuming from the old per-shard endpoint or key prefix. Meanwhile
+    /// `/admin/config` would report the newly installed global channel.
+    #[test]
+    fn a_disabled_single_shard_start_clears_a_stale_per_shard_slot() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+
+        let stale_shard = ShardId::new(2);
+        autumn_harvest::dispatch::install_for_shard(
+            stale_shard,
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(stale_shard).is_some(),
+            "the test fixture must install the stale shard's channel"
+        );
+
+        let config = crate::config::HarvestRuntimeConfig::default();
+        assert!(config.redis.url.is_none());
+        block_on(super::install_dispatch_channel(&config, None))
+            .expect("a disabled start must succeed");
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(stale_shard).is_none(),
+            "entering the single-shard install path must clear a stale per-shard slot"
+        );
+    }
+
+    /// A single-shard install whose connect fails leaves an active
+    /// multi-shard runner's per-shard channels untouched (Codex review,
+    /// issue #1429 follow-up), the single-shard mirror of
+    /// `a_shard_connect_failure_leaves_existing_channels_untouched`.
+    ///
+    /// An earlier version cleared every per-shard slot unconditionally on
+    /// entry, before attempting to connect. A single-shard runner could
+    /// then replace a still-active multi-shard runner with no intervening
+    /// `stop()`. If that connect failed, the multi-shard runner lost every
+    /// dispatch channel it owned, and fell back to Postgres for no reason
+    /// of its own. This drives a connect failure with a URL whose scheme is
+    /// not Redis. `RedisDispatch::connect` rejects it while it parses the
+    /// URL, before any network I/O — deterministic and fast on every
+    /// platform, unlike a black-holed address. A sandboxed CI
+    /// runner's network policy is not guaranteed to reproduce that
+    /// connect-timeout failure. Checks that a per-shard channel installed
+    /// before the call is still there after it fails.
+    ///
+    /// Gated on the `redis` feature. The no-feature stub of
+    /// `install_dispatch_channel` never inspects `config.redis.url` at
+    /// all, so it would return `Ok` here regardless of the URL
+    /// scheme. This test's own `is_err()` assertion would then fail for a
+    /// reason that has nothing to do with the connect-failure behavior it
+    /// means to pin.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn a_single_shard_connect_failure_leaves_existing_per_shard_channels_untouched() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+        autumn_harvest::dispatch::uninstall_all_shards();
+
+        let active_shard = ShardId::new(3);
+        autumn_harvest::dispatch::install_for_shard(
+            active_shard,
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+
+        let config = crate::config::HarvestRuntimeConfig {
+            redis: super::HarvestRedisConfig {
+                url: Some("http://127.0.0.1:6379".to_string()),
+                ..super::HarvestRedisConfig::default()
+            },
+            ..crate::config::HarvestRuntimeConfig::default()
+        };
+
+        let result = block_on(super::install_dispatch_channel(&config, None));
+        assert!(
+            result.is_err(),
+            "a non-Redis URL must fail the call before any connection attempt"
+        );
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(active_shard).is_some(),
+            "a failed connect must not clear a pre-existing per-shard channel"
+        );
+    }
+
+    /// The runner uninstalls the channel it installed when it stops.
+    #[test]
+    fn stop_uninstalls_a_channel_the_runner_installed() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+
+        let generation = autumn_harvest::dispatch::install(
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+
+        block_on(runner_owning_dispatch(Some(generation)).stop());
+
+        assert!(
+            autumn_harvest::dispatch::installed().is_none(),
+            "stop must uninstall the channel the runner installed"
+        );
+    }
+
+    /// `stop`'s own generation check must wait for a racing `start` that
+    /// is mid install-through-resolution, not run ahead of it (Codex
+    /// review, issue #1429 follow-up).
+    ///
+    /// Without `DISPATCH_START_LOCK`, `stop`'s check could run while a
+    /// replacement `start` sits between its own install and its eventual
+    /// unwind. This runner's generation would not be current yet, so
+    /// `stop` would leave the slot alone -- correctly, at that instant.
+    ///
+    /// Suppose the replacement then failed and unwound. Its own restore
+    /// would put this runner's original topology right back, with
+    /// nothing left watching to clean it up again. This pins that
+    /// `stop` now blocks on the same lock a racing `start` holds. So its
+    /// check always runs after that span ends, one way or the other.
+    #[test]
+    fn stop_waits_for_a_racing_starts_install_span_before_its_own_check() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+        autumn_harvest::dispatch::uninstall();
+
+        let generation = autumn_harvest::dispatch::install(
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+        let runner = runner_owning_dispatch(Some(generation));
+
+        block_on(async {
+            let local = tokio::task::LocalSet::new();
+            local
+                .run_until(async {
+                    // Simulate a racing `start` mid install-through-resolution:
+                    // hold the same lock `stop` must wait for.
+                    let guard = super::DISPATCH_START_LOCK.lock().await;
+                    let stop_handle = tokio::task::spawn_local(runner.stop());
+
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    assert!(
+                        autumn_harvest::dispatch::installed().is_some(),
+                        "stop's generation check must not run while a racing start \
+                         holds DISPATCH_START_LOCK"
+                    );
+
+                    drop(guard);
+                    stop_handle.await.expect("stop must complete");
+                })
+                .await;
+        });
+
+        assert!(
+            autumn_harvest::dispatch::installed().is_none(),
+            "stop must uninstall its own channel once the lock is free"
+        );
+    }
+
+    /// A runner that installed no channel leaves the slot alone.
+    ///
+    /// Another owner in the same process may hold it, and this runner has no
+    /// claim on it.
+    #[test]
+    fn stop_leaves_a_channel_the_runner_did_not_install() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+
+        autumn_harvest::dispatch::install(
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+
+        block_on(runner_owning_dispatch(None).stop());
+
+        assert!(
+            autumn_harvest::dispatch::is_installed(),
+            "stop must not uninstall a channel this runner never installed"
+        );
+        autumn_harvest::dispatch::uninstall();
+    }
+
+    /// A runner that installed per-shard channels (issue #1429) uninstalls
+    /// them via `uninstall_all_shards`, not the single-shard slot, when it
+    /// stops. `stop` previously called only `dispatch::uninstall` (issue
+    /// #1429 review), leaving per-shard state live for whatever runtime
+    /// started next in this process.
+    #[test]
+    fn stop_uninstalls_the_per_shard_channels_a_multi_shard_runner_installed() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+
+        let gen0 = autumn_harvest::dispatch::install_for_shard(
+            ShardId::new(0),
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+        let gen1 = autumn_harvest::dispatch::install_for_shard(
+            ShardId::new(1),
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+
+        block_on(
+            runner_owning_multi_shard_dispatch(vec![
+                (ShardId::new(0), gen0),
+                (ShardId::new(1), gen1),
+            ])
+            .stop(),
+        );
+
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(ShardId::new(0)).is_none(),
+            "stop must uninstall shard 0's channel"
+        );
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(ShardId::new(1)).is_none(),
+            "stop must uninstall shard 1's channel"
+        );
+    }
+
+    /// `stop` on an old runner must not clear a replacement runner's
+    /// channel (Codex review, issue #1429 follow-up).
+    ///
+    /// A process may start a replacement `HarvestRunner` before calling
+    /// `stop` on the previous one. The replacement's own `install` already
+    /// overwrote the single-shard slot by the time the old runner's `stop`
+    /// runs. An unconditional `uninstall` there would clear the
+    /// replacement's channel out from under it. The replacement's own
+    /// effective-config snapshot still says Redis dispatch is installed,
+    /// but every read and publish would silently fall through to Postgres.
+    #[test]
+    fn stop_does_not_clear_a_replacement_runners_single_shard_channel() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+
+        let old_generation = autumn_harvest::dispatch::install(
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+        // The replacement runner starts and installs its own channel before
+        // the old runner's `stop` gets a chance to run.
+        autumn_harvest::dispatch::install(
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+
+        block_on(runner_owning_dispatch(Some(old_generation)).stop());
+
+        assert!(
+            autumn_harvest::dispatch::installed().is_some(),
+            "stop must not clear a channel a replacement runner installed after this one"
+        );
+        autumn_harvest::dispatch::uninstall();
+    }
+
+    /// The per-shard mirror of
+    /// `stop_does_not_clear_a_replacement_runners_single_shard_channel`
+    /// (Codex review, issue #1429 follow-up).
+    ///
+    /// A replacement multi-shard runner may reinstall some, but not all, of
+    /// the shards the old runner owned before the old runner's `stop`
+    /// runs. Only the shards whose generation the old runner still
+    /// recognizes are cleared; the reinstalled shard is left alone.
+    #[test]
+    fn stop_does_not_clear_a_replacement_runners_per_shard_channel() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+        autumn_harvest::dispatch::uninstall_all_shards();
+
+        let shard0 = ShardId::new(0);
+        let shard1 = ShardId::new(1);
+        let old_gen0 = autumn_harvest::dispatch::install_for_shard(
+            shard0,
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+        let old_gen1 = autumn_harvest::dispatch::install_for_shard(
+            shard1,
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+        // The replacement runner reinstalls shard 0 only, before the old
+        // runner's `stop` gets a chance to run.
+        autumn_harvest::dispatch::install_for_shard(
+            shard0,
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+
+        block_on(
+            runner_owning_multi_shard_dispatch(vec![(shard0, old_gen0), (shard1, old_gen1)]).stop(),
+        );
+
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(shard0).is_some(),
+            "stop must not clear shard 0's channel: a replacement runner reinstalled it"
+        );
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(shard1).is_none(),
+            "stop must still clear shard 1's channel: no replacement ever touched it"
+        );
+        autumn_harvest::dispatch::uninstall_all_shards();
+    }
+
+    /// A restart with Redis off must clear per-shard channels too (issue
+    /// #1429), the multi-shard mirror of
+    /// `a_disabled_start_clears_a_previously_installed_channel`.
+    #[test]
+    fn a_disabled_start_clears_previously_installed_per_shard_channels() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+
+        let shard = ShardId::new(1);
+        autumn_harvest::dispatch::install_for_shard(
+            shard,
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+
+        let config = crate::config::HarvestRuntimeConfig::default();
+        assert!(
+            config.redis.url.is_none(),
+            "the default config has redis dispatch off"
+        );
+        let (installed_shards, _snapshot) = block_on(super::install_dispatch_channels_for_shards(
+            &config,
+            &[shard],
+        ))
+        .expect("a disabled start must succeed");
+
+        assert!(
+            installed_shards.is_empty(),
+            "a disabled start installs no per-shard channel"
+        );
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(shard).is_none(),
+            "a disabled start must clear the per-shard channel a previous runtime installed"
+        );
+    }
+
+    /// A multi-shard install clears a stale single-shard slot too (Codex
+    /// review, issue #1429).
+    ///
+    /// `Worker::new` treats a populated single-shard slot as authoritative
+    /// over per-shard coverage. A process that previously ran single-shard
+    /// dispatch, and now starts a multi-shard runtime with no intervening
+    /// `stop()`, would otherwise leave that stale slot in place. It would
+    /// then reject the very worker the fresh per-shard install was meant
+    /// to cover.
+    ///
+    /// `install_dispatch_channels_for_shards` clears the single-shard slot
+    /// unconditionally on the Redis-off branch, before returning. This test
+    /// exercises that branch, the only one this suite can drive without a
+    /// live Redis. The Redis-configured branch clears both slots too, but
+    /// only after every shard connects — see
+    /// `a_shard_connect_failure_leaves_existing_channels_untouched` for that
+    /// branch's own coverage.
+    #[test]
+    fn entering_the_multi_shard_path_clears_the_single_shard_slot() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+
+        autumn_harvest::dispatch::install(
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+        assert!(
+            autumn_harvest::dispatch::installed().is_some(),
+            "the test fixture must install the single-shard slot"
+        );
+
+        let disabled_config = crate::config::HarvestRuntimeConfig::default();
+        assert!(disabled_config.redis.url.is_none());
+        block_on(super::install_dispatch_channels_for_shards(
+            &disabled_config,
+            &[ShardId::new(0), ShardId::new(1)],
+        ))
+        .expect("a disabled start must succeed");
+        assert!(
+            autumn_harvest::dispatch::installed().is_none(),
+            "entering the multi-shard install path must clear the stale single-shard slot"
+        );
+    }
+
+    /// Reinstalling for a smaller or differently shaped multi-shard span
+    /// clears every per-shard slot first. It clears more than just the
+    /// shards the new call names (Codex review, issue #1429).
+    ///
+    /// A shard from an earlier, uncommitted-`stop()` multi-shard install
+    /// may fall outside the new call's own `shards`. It must not survive
+    /// as a stale entry. `installed_for_shard` would otherwise still
+    /// return it. A worker singly assigned to that shard could then pass
+    /// its coverage check against a Redis namespace this runtime no
+    /// longer owns.
+    #[test]
+    fn a_smaller_multi_shard_reinstall_clears_the_shard_it_drops() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+
+        let stale_shard = ShardId::new(9);
+        autumn_harvest::dispatch::install_for_shard(
+            stale_shard,
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(stale_shard).is_some(),
+            "the test fixture must install the stale shard's channel"
+        );
+
+        let disabled_config = crate::config::HarvestRuntimeConfig::default();
+        assert!(disabled_config.redis.url.is_none());
+        block_on(super::install_dispatch_channels_for_shards(
+            &disabled_config,
+            &[ShardId::new(0), ShardId::new(1)],
+        ))
+        .expect("a disabled start must succeed");
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(stale_shard).is_none(),
+            "reinstalling for a new shard span must clear a shard the new span no longer names"
+        );
+    }
+
+    /// A shard that fails to connect leaves every existing channel exactly
+    /// as this call found it (Codex review, issue #1429 follow-up).
+    ///
+    /// An earlier version cleared both dispatch slots unconditionally on
+    /// entry, then connected shards one at a time. A connect failure
+    /// partway through that loop left this runtime with no channels at
+    /// all. The old topology was already cleared, and the new one never
+    /// finished installing. The fix connects every shard into a local list
+    /// first, and only clears and installs once every shard has succeeded.
+    /// This test drives a connect failure with a URL whose scheme
+    /// is not Redis. `RedisDispatch::connect` rejects it while it parses
+    /// the URL, before any network I/O — deterministic and fast on every
+    /// platform, unlike a black-holed address. A sandboxed CI
+    /// runner's network policy is not guaranteed to reproduce that
+    /// connect-timeout failure. It checks that a channel installed before
+    /// the call is still there after it fails.
+    ///
+    /// Gated on the `redis` feature, the same reason
+    /// `a_single_shard_connect_failure_leaves_existing_per_shard_channels_untouched`
+    /// is: the no-feature stub of `install_dispatch_channels_for_shards`
+    /// never inspects `config.redis.url`, so it always succeeds.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn a_shard_connect_failure_leaves_existing_channels_untouched() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+        autumn_harvest::dispatch::uninstall_all_shards();
+
+        autumn_harvest::dispatch::install(
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+        let other_shard = ShardId::new(7);
+        autumn_harvest::dispatch::install_for_shard(
+            other_shard,
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+
+        let config = crate::config::HarvestRuntimeConfig {
+            redis: super::HarvestRedisConfig {
+                url: Some("http://127.0.0.1:6379".to_string()),
+                ..super::HarvestRedisConfig::default()
+            },
+            ..crate::config::HarvestRuntimeConfig::default()
+        };
+
+        let result = block_on(super::install_dispatch_channels_for_shards(
+            &config,
+            &[ShardId::new(0)],
+        ));
+        assert!(
+            result.is_err(),
+            "a non-Redis URL must fail the call before any connection attempt"
+        );
+        assert!(
+            autumn_harvest::dispatch::installed().is_some(),
+            "a failed connect must not clear the pre-existing single-shard channel"
+        );
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(other_shard).is_some(),
+            "a failed connect must not clear a pre-existing per-shard channel for another shard"
+        );
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(ShardId::new(0)).is_none(),
+            "the shard whose connect failed must not end up with a channel installed"
+        );
+    }
+
+    /// [`DispatchInstallGuard::new_shards`] unwinds every shard it was given
+    /// when it drops uncommitted, mirroring the single-shard guard's own
+    /// unwind test. Nothing preceded these shards, so unwinding restores
+    /// them to empty, the same as the single-shard case above.
+    #[test]
+    fn an_uncommitted_shard_guard_unwinds_every_shard_it_installed() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+        autumn_harvest::dispatch::uninstall_all_shards();
+
+        let shard_a = ShardId::new(1);
+        let shard_b = ShardId::new(2);
+        let channels = [shard_a, shard_b]
+            .into_iter()
+            .map(|shard| {
+                (
+                    shard,
+                    std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new())
+                        as std::sync::Arc<dyn autumn_harvest::dispatch::TaskDispatch>,
+                    autumn_harvest::dispatch::DispatchSettings::default(),
+                )
+            })
+            .collect();
+        let (shard_generations, snapshot) = autumn_harvest::dispatch::install_shards(channels);
+
+        drop(super::DispatchInstallGuard::new_shards(
+            shard_generations,
+            snapshot,
+        ));
+
+        assert!(autumn_harvest::dispatch::installed_for_shard(shard_a).is_none());
+        assert!(autumn_harvest::dispatch::installed_for_shard(shard_b).is_none());
+    }
+
+    /// A failed replacement startup restores the previous per-shard
+    /// channels, the multi-shard mirror of
+    /// `a_failed_replacement_startup_restores_the_previous_dispatch_channel`
+    /// (Codex review, issue #1429 follow-up).
+    #[test]
+    fn a_failed_shard_replacement_startup_restores_the_previous_channels() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+        autumn_harvest::dispatch::uninstall_all_shards();
+
+        let shard = ShardId::new(6);
+        let original_generation = autumn_harvest::dispatch::install_for_shard(
+            shard,
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+        let (replacement_shards, snapshot) = autumn_harvest::dispatch::install_shards(vec![(
+            shard,
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        )]);
+
+        drop(super::DispatchInstallGuard::new_shards(
+            replacement_shards.clone(),
+            snapshot,
+        ));
+
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(shard).is_some(),
+            "dropping the guard must restore the previous shard channel"
+        );
+        // `InstalledDispatch::generation` is private to `autumn_harvest`.
+        // This proves the restored slot carries the original generation
+        // indirectly: the replacement generation no longer names it, and
+        // the original one still does.
+        autumn_harvest::dispatch::uninstall_all_shards_if_current(&replacement_shards);
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(shard).is_some(),
+            "the replacement's own generation must no longer name the restored slot"
+        );
+        autumn_harvest::dispatch::uninstall_all_shards_if_current(&[(shard, original_generation)]);
+        assert!(
+            autumn_harvest::dispatch::installed_for_shard(shard).is_none(),
+            "the original generation's own uninstall must still clear the restored slot"
+        );
+    }
+
+    /// A committed shard guard leaves the per-shard channels installed.
+    #[test]
+    fn a_committed_shard_guard_leaves_the_channels_installed() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+        autumn_harvest::dispatch::uninstall_all_shards();
+
+        let shard = ShardId::new(1);
+        let (shard_generations, snapshot) = autumn_harvest::dispatch::install_shards(vec![(
+            shard,
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        )]);
+
+        super::DispatchInstallGuard::new_shards(shard_generations, snapshot).commit();
+
+        assert!(autumn_harvest::dispatch::installed_for_shard(shard).is_some());
+        autumn_harvest::dispatch::uninstall_all_shards();
+    }
+
+    /// The process-global dispatch slot is one resource. The dispatch cases
+    /// take this lock so they never observe each other.
+    static DISPATCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }

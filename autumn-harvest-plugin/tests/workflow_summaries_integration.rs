@@ -24,7 +24,6 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -42,7 +41,7 @@ use tower::ServiceExt;
 type HarvestApiApp = axum::Router;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 async fn setup_database() -> (String, Option<ContainerAsync<Postgres>>) {
@@ -83,13 +82,13 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::default(),
     ));
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 /// An app with NO external auth boundary (built-in admin guard active). Used to
 /// exercise the admin-guard rejection.
 fn build_unauth_app() -> HarvestApiApp {
-    harvest_api_router(HarvestApiState::new()).with_state(AppState::for_test())
+    harvest_api_router(HarvestApiState::new())
 }
 
 async fn scrub(conn: &mut AsyncPgConnection) {

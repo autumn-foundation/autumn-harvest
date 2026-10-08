@@ -1,0 +1,3545 @@
+//! Task dispatch channel seam (issue #1312).
+//!
+//! Postgres holds every `harvest_task_queue` row and stays the source of
+//! truth. A [`TaskDispatch`] implementation carries small references to
+//! claimable rows between processes. A worker reads a reference, claims the
+//! named row in Postgres with the full claim predicate, and then acks the
+//! reference. The Redis Streams implementation lives in `autumn-harvest-redis`.
+//!
+//! The channel is a latency and throughput optimization, never a durability
+//! store. A lost reference converges through the reconcile sweep in the
+//! worker, which republishes due `PENDING` rows. See
+//! `docs/plans/2026-09-07-redis-dispatch-worker-integration.md`.
+//!
+//! The installed channel is process-global, like the mutex lease TTL and the
+//! DR config. Every enqueue path outside a bound worker scope publishes
+//! through it. A worker binds the channel it starts with and keeps it (issue
+//! #1431). Its reads and its hints then ignore a later install.
+
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use uuid::Uuid;
+
+use crate::error::HarvestResult;
+
+/// Default wait for one blocking read on the channel.
+pub const DEFAULT_DISPATCH_POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// Default interval for the reconcile sweep over due `PENDING` rows.
+pub const DEFAULT_DISPATCH_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
+/// Default row cap for one reconcile sweep per queue.
+pub const DEFAULT_DISPATCH_RECONCILE_BATCH: usize = 1000;
+/// Default cap for the release backoff of a gated reference.
+pub const DEFAULT_DISPATCH_RELEASE_BACKOFF_CAP: Duration = Duration::from_secs(30);
+
+/// Which worker pool a reference needs (issue #1312).
+///
+/// The value is the `harvest_task_queue.task_type` column. A worker runs
+/// workflow tasks and activity tasks on separate semaphores. A reference that
+/// does not say which pool it needs can only be weighed against the sum of the
+/// two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DispatchKind {
+    /// A workflow task. It runs on the workflow pool.
+    Workflow,
+    /// An activity task. It runs on the activity pool.
+    Activity,
+}
+
+impl DispatchKind {
+    /// The `task_type` column value for this kind.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Workflow => "workflow",
+            Self::Activity => "activity",
+        }
+    }
+}
+
+impl From<&str> for DispatchKind {
+    /// The kind a `task_type` column value names.
+    ///
+    /// A `CHECK` constraint holds the column to `workflow` or `activity`, so
+    /// only those two values reach this conversion. Any other value reads as a
+    /// workflow. That is the conservative half. A typical worker weighs a
+    /// workflow reference against the smaller pool of the two.
+    fn from(task_type: &str) -> Self {
+        if task_type == Self::Activity.as_str() {
+            Self::Activity
+        } else {
+            Self::Workflow
+        }
+    }
+}
+
+/// A reference to a claimable `harvest_task_queue` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchHint {
+    /// Primary key of the row.
+    pub task_id: Uuid,
+    /// Logical queue the row belongs to.
+    pub queue_name: String,
+    /// Time the row becomes claimable.
+    pub scheduled_at: DateTime<Utc>,
+    /// Row priority. Implementations may use it for ordering.
+    pub priority: i32,
+    /// Shard the row lives on. `None` for a single-shard runtime.
+    pub shard: Option<crate::types::ShardId>,
+    /// Pool the row needs. `None` for a reference of unknown type.
+    pub kind: Option<DispatchKind>,
+}
+
+/// One delivered reference. The worker must `ack` or `release` it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchLease {
+    /// Primary key of the row.
+    pub task_id: Uuid,
+    /// Logical queue the reference was read from.
+    pub queue_name: String,
+    /// Number of times this reference was delivered before this one.
+    pub redeliveries: u32,
+    /// Implementation-specific handle for the delivered entry.
+    pub handle: String,
+    /// Shard the row lives on. `None` for a single-shard runtime.
+    pub shard: Option<crate::types::ShardId>,
+    /// Pool the row needs. `None` for a reference of unknown type.
+    pub kind: Option<DispatchKind>,
+}
+
+/// Counters returned by one maintenance pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DispatchMaintenance {
+    /// Delayed references that became claimable.
+    pub promoted: usize,
+    /// References recovered from a crashed consumer.
+    pub recovered: usize,
+}
+
+/// Worker-side tuning for the channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchSettings {
+    /// Wait for one blocking read when the channel is idle.
+    pub poll_interval: Duration,
+    /// Interval for the reconcile sweep over due `PENDING` rows.
+    pub reconcile_interval: Duration,
+    /// Row cap for one reconcile sweep per queue.
+    pub reconcile_batch: usize,
+    /// Cap for the exponential release backoff of a gated reference.
+    pub release_backoff_cap: Duration,
+}
+
+impl Default for DispatchSettings {
+    fn default() -> Self {
+        Self {
+            poll_interval: DEFAULT_DISPATCH_POLL_INTERVAL,
+            reconcile_interval: DEFAULT_DISPATCH_RECONCILE_INTERVAL,
+            reconcile_batch: DEFAULT_DISPATCH_RECONCILE_BATCH,
+            release_backoff_cap: DEFAULT_DISPATCH_RELEASE_BACKOFF_CAP,
+        }
+    }
+}
+
+/// The future that a [`TaskDispatch`] method returns.
+pub type DispatchFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// A channel that carries task references between processes.
+///
+/// Implementations deliver each published reference at least once. They do
+/// not need to persist references: the worker's reconcile sweep republishes
+/// every due `PENDING` row that the channel does not hold.
+///
+/// Implement it with `#[async_trait]` on the `impl` block and `async fn`
+/// methods. The method signatures here are the ones that `#[async_trait]`
+/// generates. They are written out because `#[async_trait]` on the trait adds
+/// a `#[must_use]` that clippy rejects as `double_must_use`.
+pub trait TaskDispatch: Send + Sync + std::fmt::Debug {
+    /// Publish references, keyed on `scheduled_at`.
+    ///
+    /// The channel holds at most one reference per task id. `scheduled_at`
+    /// decides what a second publish for a held id does.
+    ///
+    /// * The same `scheduled_at` as the held reference is a no-op. The
+    ///   implementation refreshes the reference's dedupe lifetime and keeps
+    ///   everything else, including the redelivery count and any backoff a
+    ///   release parked it under.
+    /// * A different `scheduled_at` replaces the held reference. The row moved,
+    ///   so the reference moves to the new due time and its redelivery count
+    ///   starts again at zero.
+    ///
+    /// A released reference keeps the row's `scheduled_at`, not the time the
+    /// backoff parked it under. The reconcile sweep republishes a row with the
+    /// row's own `scheduled_at`, so a sweep never disturbs a backoff. A wake or
+    /// a retry writes a new `scheduled_at`, so it does move the reference.
+    fn publish<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        hints: &'life1 [DispatchHint],
+    ) -> DispatchFuture<'async_trait, HarvestResult<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
+
+    /// Read up to `max` due references for `queues`. Wait up to `wait` when
+    /// the channel is empty. `consumer` names the caller for recovery.
+    fn next<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        queues: &'life1 [String],
+        consumer: &'life2 str,
+        max: usize,
+        wait: Duration,
+    ) -> DispatchFuture<'async_trait, HarvestResult<Vec<DispatchLease>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait;
+
+    /// Drop a reference. The row was claimed, or it is no longer claimable.
+    fn ack<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        lease: &'life1 DispatchLease,
+    ) -> DispatchFuture<'async_trait, HarvestResult<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
+
+    /// Give a reference back so it is delivered again after `delay`.
+    fn release<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        lease: &'life1 DispatchLease,
+        delay: Duration,
+    ) -> DispatchFuture<'async_trait, HarvestResult<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
+
+    /// Drop several references at once (issue #1429).
+    ///
+    /// The default calls [`Self::ack`] once per lease, so an implementation
+    /// with no batched path stays correct. An implementation that can dispose
+    /// of a batch in one round trip should override this.
+    ///
+    /// One lease's `ack` failing must not skip the rest of the batch (Codex
+    /// review, issue #1429). The pre-batch worker path called `ack` once per
+    /// lease independently, so one lease's error never stranded a sibling
+    /// lease's reference pending until visibility recovery. Every lease is
+    /// attempted; the first error, if any, is returned after the loop.
+    fn ack_many<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        leases: &'life1 [DispatchLease],
+    ) -> DispatchFuture<'async_trait, HarvestResult<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            let mut first_error = None;
+            for lease in leases {
+                if let Err(error) = self.ack(lease).await {
+                    first_error.get_or_insert(error);
+                }
+            }
+            first_error.map_or(Ok(()), Err)
+        })
+    }
+
+    /// Give several references back at once, each after its own delay
+    /// (issue #1429).
+    ///
+    /// The default calls [`Self::release`] once per lease. An implementation
+    /// that can requeue a batch in one round trip should override this.
+    ///
+    /// One lease's `release` failing must not skip the rest of the batch,
+    /// for the same reason as [`Self::ack_many`]'s default above (Codex
+    /// review, issue #1429). Every lease is attempted; the first error, if
+    /// any, is returned after the loop.
+    fn release_many<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        leases: &'life1 [(DispatchLease, Duration)],
+    ) -> DispatchFuture<'async_trait, HarvestResult<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            let mut first_error = None;
+            for (lease, delay) in leases {
+                if let Err(error) = self.release(lease, *delay).await {
+                    first_error.get_or_insert(error);
+                }
+            }
+            first_error.map_or(Ok(()), Err)
+        })
+    }
+
+    /// Promote due delayed references and recover references held by a
+    /// consumer that stopped acking.
+    fn maintain<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        queues: &'life1 [String],
+    ) -> DispatchFuture<'async_trait, HarvestResult<DispatchMaintenance>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
+
+    /// The most sequential round trips that one [`Self::next`] call over
+    /// `queue_count` queues can make outside its `wait`. The default is one
+    /// per queue.
+    ///
+    /// The worker times out a read after `wait` plus one call timeout per
+    /// such round trip. A timeout drops the read future, so an entry the
+    /// read already claimed stays pending until recovery. An implementation
+    /// that makes more round trips must return its real worst case, including
+    /// any work before or after the read itself. The count applies to this
+    /// implementation only, so a stalled channel with the default still
+    /// reaches the worker's timeout quickly (#1756).
+    fn next_round_trips(&self, queue_count: usize) -> usize {
+        queue_count
+    }
+}
+
+/// The installed channel and its settings.
+#[derive(Debug, Clone)]
+pub struct InstalledDispatch {
+    /// The channel.
+    pub channel: Arc<dyn TaskDispatch>,
+    /// Worker-side tuning.
+    pub settings: DispatchSettings,
+    /// The generation [`install`]/[`install_for_shard`] stamped on this
+    /// install, for [`uninstall_if_current`]/[`uninstall_all_shards_if_current`]
+    /// (Codex review, issue #1429 follow-up). Not read by anything else.
+    generation: u64,
+}
+
+#[cfg(all(test, feature = "testing"))]
+impl InstalledDispatch {
+    /// An install record that no slot holds. Unit tests use it to call a
+    /// resolver without a write to the process-global slot.
+    pub(crate) fn unslotted(channel: Arc<dyn TaskDispatch>) -> Self {
+        Self {
+            channel,
+            settings: DispatchSettings::default(),
+            generation: 0,
+        }
+    }
+}
+
+static INSTALLED: RwLock<Option<InstalledDispatch>> = RwLock::new(None);
+
+/// Serializes every unit test that writes the dispatch slots or the
+/// publisher (issue #1431). The `dispatch` and `worker` tests share these
+/// globals in one test binary, so one lock must cover both modules.
+#[cfg(all(test, feature = "testing"))]
+pub(crate) static TEST_SLOT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Shared source for every install's generation stamp, across both the
+/// single-shard and per-shard slots (Codex review, issue #1429 follow-up).
+///
+/// One counter for both slots keeps the ownership check simple. A caller
+/// that captured a generation from either [`install`] or
+/// [`install_for_shard`] can ask "is this still the current occupant of
+/// the slot I installed into". No single-shard generation ever collides
+/// with a per-shard one.
+static INSTALL_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Serializes every dispatch install/uninstall call, across both slots
+/// (Codex review, issue #1429 follow-up).
+///
+/// Each mutating function writes its own slot, then separately reads the
+/// *other* slot to recompute [`ANY_INSTALLED`] and decide whether to stop
+/// the publisher. A concurrent call touching the other slot could land in
+/// that gap. Its own `ANY_INSTALLED` write would then get overwritten by
+/// this call's stale recomputation, true clobbered back to false or the
+/// reverse. Every mutating function now holds this lock for its whole
+/// body. Its slot write and the `ANY_INSTALLED`/publisher decision it
+/// drives become one atomic step. No other install or uninstall call can
+/// land in between. [`installed`]/[`installed_for_shard`]/[`is_installed`]
+/// never take it, so a read never blocks on a concurrent install.
+static DISPATCH_SLOT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Install the process-global channel. A later call replaces the earlier one.
+///
+/// A worker keeps the channel it bound (issue #1431). A replacement reaches
+/// only a worker that has not bound a channel yet.
+///
+/// Returns the generation this install was stamped with. A caller that may
+/// need to undo only *this* install keeps this value, for
+/// [`uninstall_if_current`] (Codex review, issue #1429 follow-up). That
+/// call, unlike the unconditional [`uninstall`], never also clears a later
+/// install that has since replaced this one.
+pub fn install(channel: Arc<dyn TaskDispatch>, settings: DispatchSettings) -> u64 {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
+    let Ok(mut slot) = INSTALLED.write() else {
+        return 0;
+    };
+    // The generation is minted and stamped while still holding the write
+    // lock. Two racing installs cannot interleave: whichever call last
+    // wrote the slot is also the one whose generation the slot now carries.
+    let generation = INSTALL_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    *slot = Some(InstalledDispatch {
+        channel,
+        settings,
+        generation,
+    });
+    ANY_INSTALLED.store(true, Ordering::Relaxed);
+    generation
+}
+
+/// Remove the process-global channel unconditionally. Tests use this between
+/// cases.
+///
+/// A production caller wants [`uninstall_if_current`] instead, when it
+/// installed a channel earlier and wants to undo specifically that
+/// install. A later install may have replaced it in the same process, and
+/// this function's own unconditional clear does not distinguish that case.
+///
+/// The background publisher is stopped as well, so the next install starts
+/// with an empty publisher queue. A hint still in that queue is dropped; the
+/// reconcile sweep republishes its row.
+///
+/// Clears [`ANY_INSTALLED`] only when [`INSTALLED_BY_SHARD`] is also empty
+/// (Codex review, issue #1429), mirroring the check [`uninstall_all_shards`]
+/// already runs for the inverse case. A direct embedder using the
+/// per-shard API can call this on the independent single-shard slot while
+/// shard channels are still installed. Clearing the flag unconditionally
+/// then let `is_installed()` read false while `installed_for_shard` still
+/// returned live channels. `Worker::new` skips its full-coverage
+/// validation whenever `is_installed()` is false. A partial shard map
+/// could then run silently with mixed Redis/Postgres dispatch behaviour.
+pub fn uninstall() {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
+    if let Ok(mut slot) = INSTALLED.write() {
+        *slot = None;
+    }
+    if INSTALLED_BY_SHARD.read().is_ok_and(|slot| slot.is_none()) {
+        ANY_INSTALLED.store(false, Ordering::Relaxed);
+    }
+    stop_publisher();
+}
+
+/// Remove the process-global channel, but only if `generation` still names
+/// the currently installed one (Codex review, issue #1429 follow-up).
+/// `generation` is a value [`install`] returned earlier.
+///
+/// A process may start a replacement runner before stopping the previous
+/// one. The replacement's `install` overwrites the slot and returns a new
+/// generation of its own. The previous runner's later, unconditional
+/// `uninstall` would then clear the replacement's channel out from under
+/// it. The replacement believes Redis dispatch is still active, since its
+/// own effective-config snapshot says so, while every read and publish
+/// silently falls through to Postgres. Checking the generation first means
+/// a stop call overtaken by a fresher install becomes a no-op instead.
+pub fn uninstall_if_current(generation: u64) {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
+    let Ok(mut slot) = INSTALLED.write() else {
+        return;
+    };
+    let still_current = slot
+        .as_ref()
+        .is_some_and(|installed| installed.generation == generation);
+    if !still_current {
+        return;
+    }
+    *slot = None;
+    drop(slot);
+    if INSTALLED_BY_SHARD.read().is_ok_and(|slot| slot.is_none()) {
+        ANY_INSTALLED.store(false, Ordering::Relaxed);
+    }
+    stop_publisher();
+}
+
+/// Abort the background publisher task and drop its sender, if either is
+/// installed.
+///
+/// A later hint starts a fresh publisher lazily ([`publish_in_background`]),
+/// so this never needs to be re-armed by its own caller.
+fn stop_publisher() {
+    let publisher = lock(&PUBLISHER).take();
+    if let Some(publisher) = publisher {
+        publisher.task.abort();
+    }
+}
+
+/// The installed channel, if any.
+#[must_use]
+pub fn installed() -> Option<InstalledDispatch> {
+    INSTALLED.read().ok().and_then(|slot| slot.clone())
+}
+
+// ---------------------------------------------------------------------------
+// Per-shard channels (issue #1429)
+// ---------------------------------------------------------------------------
+
+/// One channel per shard, for a runtime that spans more than one shard.
+///
+/// [`install`]/[`installed`] above stay the single-shard slot. A multi-shard
+/// runtime never touches them. A worker that spans several shards cannot
+/// tell, from a task id alone, which shard's database holds the named row.
+/// A reference read from the wrong shard's channel would then always miss.
+/// Each shard here therefore gets its own channel, keyed to its own Redis
+/// key family. The multi-shard poll loop reads and claims against the
+/// matching pair.
+///
+/// Immediate hints still publish through the single-shard slot only, which
+/// stays empty here. `record_hint`/`record_hints` raise them from
+/// `queue.rs` helpers that do not know which shard they run on. So on a
+/// multi-shard runtime they fall through to the Postgres path, same as no
+/// channel installed at all. Only the reconcile sweep publishes into a
+/// per-shard channel. It already runs once per shard, against that shard's
+/// own pool connection. This costs a reconcile interval of latency on the
+/// first dispatch of a row, never a lost or duplicated one. That is the
+/// same durability floor every other dispatch path relies on.
+static INSTALLED_BY_SHARD: RwLock<
+    Option<std::collections::HashMap<crate::types::ShardId, InstalledDispatch>>,
+> = RwLock::new(None);
+
+/// Install a channel for one shard of a multi-shard runtime.
+///
+/// A later call for the same shard replaces the earlier one. Does not touch
+/// [`install`]'s single-shard slot.
+///
+/// Returns the generation this shard's install was stamped with, drawn from
+/// the same counter [`install`] uses. A caller that may need to undo only
+/// the shards it installed keeps these values, for
+/// [`uninstall_all_shards_if_current`] (Codex review, issue #1429
+/// follow-up). That call, unlike the unconditional [`uninstall_all_shards`],
+/// never also clears a later install that has since replaced one of them.
+pub fn install_for_shard(
+    shard: crate::types::ShardId,
+    channel: Arc<dyn TaskDispatch>,
+    settings: DispatchSettings,
+) -> u64 {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
+    let Ok(mut slot) = INSTALLED_BY_SHARD.write() else {
+        return 0;
+    };
+    let generation = INSTALL_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    slot.get_or_insert_with(std::collections::HashMap::new)
+        .insert(
+            shard,
+            InstalledDispatch {
+                channel,
+                settings,
+                generation,
+            },
+        );
+    ANY_INSTALLED.store(true, Ordering::Relaxed);
+    generation
+}
+
+/// The channel installed for `shard`, if any.
+#[must_use]
+pub fn installed_for_shard(shard: crate::types::ShardId) -> Option<InstalledDispatch> {
+    INSTALLED_BY_SHARD
+        .read()
+        .ok()
+        .and_then(|slot| slot.as_ref().and_then(|map| map.get(&shard).cloned()))
+}
+
+/// The channel installed for `shard`, but only while it still carries
+/// exactly `generation` (Codex review, issue #1429 follow-up).
+///
+/// `generation` is the value [`install_for_shard`]/[`install_shards`]
+/// stamped on the caller's own install. A caller that installed `shard`'s
+/// channel itself, then later wants to use exactly that install (not
+/// whatever is live now), calls this instead of [`installed_for_shard`].
+/// A later, unrelated install for the same shard mints a new generation
+/// from the shared counter. So a mismatch here can only mean a different
+/// call replaced the slot since. Returns `None` in that case, the same as
+/// if nothing were installed at all, rather than silently handing back
+/// the stranger's channel.
+#[must_use]
+pub fn installed_for_shard_if_current(
+    shard: crate::types::ShardId,
+    generation: u64,
+) -> Option<InstalledDispatch> {
+    installed_for_shard(shard).filter(|installed| installed.generation == generation)
+}
+
+/// Each of `assignments`' own per-shard channel, all read from one
+/// `INSTALLED_BY_SHARD` snapshot (Codex review, issue #1429 follow-up).
+///
+/// [`installed_for_shard`] called once per shard, in a caller's own loop,
+/// takes a separate read-lock acquisition each time. A concurrent
+/// [`install_shards`] call can replace the whole map between two of
+/// those reads. The loop could then see one shard from the map before
+/// the replacement, and another shard from the map after it. Each
+/// individual read still returns `Some`, so nothing
+/// about either read looks wrong on its own. The loop ends up mixing two
+/// different topologies into one captured result. This reads the whole
+/// map exactly once, so every shard in the result comes from the same
+/// point in time.
+///
+/// When `expected_generations` is given, a shard's entry is kept only
+/// while it still carries exactly the generation named for it there.
+/// That is the same contract [`installed_for_shard_if_current`]
+/// enforces, checked here against this one snapshot instead of a fresh
+/// read per shard. `expected_generations = None` keeps whatever this
+/// snapshot holds for each assigned shard, with no generation check.
+#[must_use]
+pub fn installed_for_shards(
+    assignments: &[crate::types::ShardId],
+    expected_generations: Option<&[(crate::types::ShardId, u64)]>,
+) -> std::collections::HashMap<crate::types::ShardId, InstalledDispatch> {
+    let Ok(snapshot) = INSTALLED_BY_SHARD.read() else {
+        return std::collections::HashMap::new();
+    };
+    let Some(installed_map) = snapshot.as_ref() else {
+        return std::collections::HashMap::new();
+    };
+    assignments
+        .iter()
+        .filter_map(|shard| {
+            let installed = installed_map.get(shard)?;
+            let current = expected_generations.is_none_or(|expected| {
+                expected.iter().any(|(candidate, generation)| {
+                    candidate == shard && installed.generation == *generation
+                })
+            });
+            current.then(|| (*shard, installed.clone()))
+        })
+        .collect()
+}
+
+/// Remove every per-shard channel. Tests use this between cases.
+///
+/// Also stops the background publisher, mirroring [`uninstall`] (Codex
+/// review, issue #1429). A multi-shard runtime can start that publisher
+/// through [`crate::dispatch::buffered_settled_in_background`]. It can
+/// never actually publish there, though: `publish_now` only ever reads
+/// the single-shard slot, never a per-shard one. Left running past this
+/// call, its task and channel sender would otherwise leak across an
+/// embedded runner's restart. It would wait on hints that only ever
+/// reach a dead end.
+pub fn uninstall_all_shards() {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
+    if let Ok(mut slot) = INSTALLED_BY_SHARD.write() {
+        *slot = None;
+    }
+    if INSTALLED.read().is_ok_and(|slot| slot.is_none()) {
+        ANY_INSTALLED.store(false, Ordering::Relaxed);
+    }
+    stop_publisher();
+}
+
+/// Remove both the single-shard slot and every per-shard channel, in one
+/// [`DISPATCH_SLOT_LOCK`] acquisition (Codex review, issue #1429
+/// follow-up).
+///
+/// A caller that instead calls [`uninstall`] and [`uninstall_all_shards`]
+/// separately still leaves a gap between the two clears. [`install_shards`]
+/// replaces both slots in one atomic step specifically so a racing,
+/// overlapping install is never observed half-applied. A two-step clear
+/// can still straddle it.
+///
+/// A concurrent [`install_shards`] call landing between the two separate
+/// clears has its per-shard topology wiped out by the second one. That
+/// happens immediately after the first one found nothing to clear.
+///
+/// That runtime's own `Worker::new` then sees `is_installed()` false,
+/// both slots now empty. It skips per-shard coverage validation entirely.
+/// It starts on the Postgres fallback for every shard — silently. Its
+/// own effective-config snapshot (captured before this race, from its
+/// own successful install) still reports Redis dispatch as installed.
+///
+/// A caller turning Redis dispatch off for this process calls this instead
+/// of `uninstall()` followed by `uninstall_all_shards()`. A caller whose
+/// own startup can still fail after that same clear uses
+/// [`uninstall_all_capturing`] instead. It can then undo the clear on
+/// that later failure (Codex review, issue #1429 follow-up).
+pub fn uninstall_all() {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
+    if let Ok(mut slot) = INSTALLED.write() {
+        *slot = None;
+    }
+    if let Ok(mut slot) = INSTALLED_BY_SHARD.write() {
+        *slot = None;
+    }
+    ANY_INSTALLED.store(false, Ordering::Relaxed);
+    stop_publisher();
+}
+
+/// As [`uninstall_all`], but returns a [`TopologySnapshot`] of both slots
+/// as they stood immediately before the clear (Codex review, issue #1429
+/// follow-up).
+///
+/// A caller turning Redis dispatch off for *this* startup, while a still-
+/// running previous runtime owns whatever this clears, keeps this
+/// snapshot. A later step in that same startup can still fail. On that
+/// failure, [`restore_cleared_if_still_empty`] puts the previous topology
+/// back. The still-running previous runtime is then not left stranded
+/// on the Postgres fallback for a clear its replacement never actually
+/// committed to.
+pub fn uninstall_all_capturing() -> TopologySnapshot {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
+    let previous = TopologySnapshot {
+        single: INSTALLED.read().ok().and_then(|slot| slot.clone()),
+        shards: INSTALLED_BY_SHARD.read().ok().and_then(|slot| slot.clone()),
+    };
+    if let Ok(mut slot) = INSTALLED.write() {
+        *slot = None;
+    }
+    if let Ok(mut slot) = INSTALLED_BY_SHARD.write() {
+        *slot = None;
+    }
+    ANY_INSTALLED.store(false, Ordering::Relaxed);
+    stop_publisher();
+    previous
+}
+
+/// Undo [`uninstall_all_capturing`], restoring the topology `snapshot`
+/// names, but only while both dispatch slots are still empty (Codex
+/// review, issue #1429 follow-up).
+///
+/// Neither the clear nor this restore mints a generation, unlike
+/// [`install_single`]/[`install_shards`] and their own
+/// [`restore_single_if_current`]/[`restore_shards_if_current`]
+/// counterparts. There is nothing to compare against, so this checks that
+/// both slots are still empty instead. A later, unrelated install may
+/// have already populated one or both slots since `snapshot` was
+/// captured. Restoring over it would discard that install instead of
+/// the failed startup this call is meant to undo. So this leaves both
+/// slots alone whenever either is no longer empty.
+pub fn restore_cleared_if_still_empty(snapshot: &TopologySnapshot) {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
+    let still_empty = INSTALLED.read().is_ok_and(|slot| slot.is_none())
+        && INSTALLED_BY_SHARD.read().is_ok_and(|slot| slot.is_none());
+    if !still_empty {
+        return;
+    }
+    if let Ok(mut slot) = INSTALLED.write() {
+        slot.clone_from(&snapshot.single);
+    }
+    if let Ok(mut slot) = INSTALLED_BY_SHARD.write() {
+        slot.clone_from(&snapshot.shards);
+    }
+    let any_installed =
+        snapshot.single.is_some() || snapshot.shards.as_ref().is_some_and(|map| !map.is_empty());
+    ANY_INSTALLED.store(any_installed, Ordering::Relaxed);
+    stop_publisher();
+}
+
+/// Remove only the shards in `expected` whose currently installed channel
+/// still carries the generation [`install_for_shard`] stamped on it.
+///
+/// `expected` holds the values that call returned earlier, one per shard
+/// (Codex review, issue #1429 follow-up). A shard whose generation has
+/// moved on was reinstalled by a later,
+/// unrelated call since `expected` was captured. This leaves it alone,
+/// rather than tearing out a replacement runner's channel for that shard.
+/// See [`uninstall_if_current`] for the single-shard version of the same
+/// race.
+pub fn uninstall_all_shards_if_current(expected: &[(crate::types::ShardId, u64)]) {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
+    let mut any_removed = false;
+    if let Ok(mut slot) = INSTALLED_BY_SHARD.write()
+        && let Some(map) = slot.as_mut()
+    {
+        for (shard, generation) in expected {
+            let still_current = map
+                .get(shard)
+                .is_some_and(|installed| installed.generation == *generation);
+            if still_current {
+                map.remove(shard);
+                any_removed = true;
+            }
+        }
+        if map.is_empty() {
+            *slot = None;
+        }
+    }
+    if !any_removed {
+        return;
+    }
+    let shards_now_empty = INSTALLED_BY_SHARD.read().is_ok_and(|slot| {
+        slot.as_ref()
+            .is_none_or(std::collections::HashMap::is_empty)
+    });
+    if shards_now_empty && INSTALLED.read().is_ok_and(|slot| slot.is_none()) {
+        ANY_INSTALLED.store(false, Ordering::Relaxed);
+    }
+    stop_publisher();
+}
+
+/// Replace the whole multi-shard topology atomically: clear both slots and
+/// install every given shard's channel in one [`DISPATCH_SLOT_LOCK`]
+/// acquisition (Codex review, issue #1429 follow-up).
+///
+/// A caller that instead clears the slots and then calls
+/// [`install_for_shard`] once per shard still leaves a gap between those
+/// calls. That holds even though each one is individually serialized
+/// against every other install or uninstall call. Two runtimes racing to
+/// install a fresh multi-shard topology could interleave their per-shard
+/// installs. Each runtime's own worker would then see a map mixing shards
+/// from both. It could read and claim through the wrong Redis endpoint or
+/// key prefix for a shard it does not actually own. Every entry here
+/// lands in the map as one atomic step. No other install or uninstall
+/// call can observe, or contribute to, a partial result.
+///
+/// Returns the generation stamped on each shard, in `channels`' order.
+/// It is paired with a [`TopologySnapshot`] of both slots as they stood
+/// immediately before this call replaced them.
+///
+/// A caller whose own startup can still fail after this call keeps that
+/// snapshot (Codex review, issue #1429 follow-up). It passes the
+/// snapshot to [`restore_shards_if_current`] on that later failure, to
+/// put the previous topology back rather than leave the slots empty. The
+/// snapshot is captured under the same [`DISPATCH_SLOT_LOCK`] acquisition
+/// as the replacement itself. No concurrent install can therefore land
+/// between the two and be captured as "previous" by mistake.
+pub fn install_shards(
+    channels: Vec<(
+        crate::types::ShardId,
+        Arc<dyn TaskDispatch>,
+        DispatchSettings,
+    )>,
+) -> (Vec<(crate::types::ShardId, u64)>, TopologySnapshot) {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
+    let previous = TopologySnapshot {
+        single: INSTALLED.read().ok().and_then(|slot| slot.clone()),
+        shards: INSTALLED_BY_SHARD.read().ok().and_then(|slot| slot.clone()),
+    };
+    if let Ok(mut slot) = INSTALLED.write() {
+        *slot = None;
+    }
+    let mut installed_shards = Vec::with_capacity(channels.len());
+    if let Ok(mut slot) = INSTALLED_BY_SHARD.write() {
+        let mut map = std::collections::HashMap::with_capacity(channels.len());
+        for (shard, channel, settings) in channels {
+            let generation = INSTALL_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+            map.insert(
+                shard,
+                InstalledDispatch {
+                    channel,
+                    settings,
+                    generation,
+                },
+            );
+            installed_shards.push((shard, generation));
+        }
+        *slot = if map.is_empty() { None } else { Some(map) };
+    }
+    ANY_INSTALLED.store(!installed_shards.is_empty(), Ordering::Relaxed);
+    stop_publisher();
+    (installed_shards, previous)
+}
+
+/// Replace the single-shard topology atomically: clear both slots and
+/// install `channel` into the single-shard slot, in one
+/// [`DISPATCH_SLOT_LOCK`] acquisition (Codex review, issue #1429
+/// follow-up).
+///
+/// Mirrors [`install_shards`]'s own reasoning, for the single-shard case.
+/// A caller that instead clears both slots and then calls [`install`]
+/// leaves a gap between those two calls. A racing [`install_shards`] call
+/// could land in that gap and end up installed alongside this one, rather
+/// than cleanly replaced by it.
+///
+/// Returns the generation stamped on the installed channel, paired with a
+/// [`TopologySnapshot`] of both slots as they stood immediately before
+/// this call replaced them. See [`install_shards`]'s own doc for why the
+/// snapshot is captured under the same lock acquisition as the
+/// replacement. See [`restore_single_if_current`] for how a caller uses
+/// it.
+pub fn install_single(
+    channel: Arc<dyn TaskDispatch>,
+    settings: DispatchSettings,
+) -> (u64, TopologySnapshot) {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
+    let previous = TopologySnapshot {
+        single: INSTALLED.read().ok().and_then(|slot| slot.clone()),
+        shards: INSTALLED_BY_SHARD.read().ok().and_then(|slot| slot.clone()),
+    };
+    if let Ok(mut slot) = INSTALLED_BY_SHARD.write() {
+        *slot = None;
+    }
+    let mut generation = 0;
+    if let Ok(mut slot) = INSTALLED.write() {
+        generation = INSTALL_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+        *slot = Some(InstalledDispatch {
+            channel,
+            settings,
+            generation,
+        });
+    }
+    ANY_INSTALLED.store(true, Ordering::Relaxed);
+    stop_publisher();
+    (generation, previous)
+}
+
+/// Both dispatch slots exactly as [`install_single`]/[`install_shards`]
+/// found them, immediately before replacing them (Codex review, issue
+/// #1429 follow-up).
+///
+/// A caller whose own startup can still fail after that replacement keeps
+/// this, and passes it to [`restore_single_if_current`] or
+/// [`restore_shards_if_current`] on that later failure. Restoring writes
+/// these slots back with their original generations, rather than minting
+/// fresh ones through [`install`]/[`install_for_shard`]. A still-running
+/// previous runner remembers its own, older generation for its eventual
+/// `stop()` call. A restore that minted a new generation for the same
+/// channel would desync that call. Its `uninstall_if_current` would then
+/// find a mismatch, treat itself as already superseded, and leave the
+/// restored channel installed forever.
+#[derive(Debug, Clone, Default)]
+pub struct TopologySnapshot {
+    single: Option<InstalledDispatch>,
+    shards: Option<std::collections::HashMap<crate::types::ShardId, InstalledDispatch>>,
+}
+
+/// Undo [`install_single`], restoring the topology `snapshot` names, but
+/// only while `generation` still names the single-shard slot's current
+/// occupant (Codex review, issue #1429 follow-up).
+///
+/// A later, unrelated install may have already replaced this one since
+/// `snapshot` was captured. Restoring over it would discard that install
+/// instead of the failed startup this call is meant to undo. This checks
+/// the generation first, mirroring [`uninstall_if_current`]'s own
+/// reasoning.
+///
+/// The per-shard slot is restored too, but only while it is still empty.
+/// `install_single` left it empty. A direct embedder may since have
+/// populated it with its own, unrelated [`install_for_shard`] calls; this
+/// leaves that alone rather than discarding it.
+pub fn restore_single_if_current(snapshot: &TopologySnapshot, generation: u64) {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
+    let mut restored = false;
+    if let Ok(mut slot) = INSTALLED.write() {
+        let still_current = slot
+            .as_ref()
+            .is_some_and(|installed| installed.generation == generation);
+        if still_current {
+            slot.clone_from(&snapshot.single);
+            restored = true;
+        }
+    }
+    if restored
+        && let Ok(mut slot) = INSTALLED_BY_SHARD.write()
+        && slot.is_none()
+    {
+        slot.clone_from(&snapshot.shards);
+    }
+    if !restored {
+        return;
+    }
+    let any_installed = INSTALLED.read().is_ok_and(|slot| slot.is_some())
+        || INSTALLED_BY_SHARD
+            .read()
+            .is_ok_and(|slot| slot.as_ref().is_some_and(|map| !map.is_empty()));
+    ANY_INSTALLED.store(any_installed, Ordering::Relaxed);
+    stop_publisher();
+}
+
+/// Undo [`install_shards`], restoring the topology `snapshot` names, but
+/// only while `generations` still names exactly the per-shard slot's
+/// current occupants (Codex review, issue #1429 follow-up).
+///
+/// Every shard `install_shards` installed must still carry the same
+/// generation, and no other shard may be present, or this leaves the
+/// per-shard slot alone. A later, unrelated install may have already
+/// replaced or extended it since `snapshot` was captured. See
+/// [`restore_single_if_current`] for the single-shard mirror of this same
+/// check.
+pub fn restore_shards_if_current(
+    snapshot: &TopologySnapshot,
+    generations: &[(crate::types::ShardId, u64)],
+) {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
+    let mut restored = false;
+    if let Ok(mut slot) = INSTALLED_BY_SHARD.write() {
+        let still_current = slot.as_ref().is_some_and(|map| {
+            map.len() == generations.len()
+                && generations.iter().all(|(shard, generation)| {
+                    map.get(shard)
+                        .is_some_and(|installed| installed.generation == *generation)
+                })
+        });
+        if still_current {
+            slot.clone_from(&snapshot.shards);
+            restored = true;
+        }
+    }
+    if restored
+        && let Ok(mut slot) = INSTALLED.write()
+        && slot.is_none()
+    {
+        slot.clone_from(&snapshot.single);
+    }
+    if !restored {
+        return;
+    }
+    let any_installed = INSTALLED.read().is_ok_and(|slot| slot.is_some())
+        || INSTALLED_BY_SHARD
+            .read()
+            .is_ok_and(|slot| slot.as_ref().is_some_and(|map| !map.is_empty()));
+    ANY_INSTALLED.store(any_installed, Ordering::Relaxed);
+    stop_publisher();
+}
+
+// ---------------------------------------------------------------------------
+// Fast path guard
+// ---------------------------------------------------------------------------
+
+/// Mirror of [`INSTALLED`] as one atomic flag.
+///
+/// Every publish hook in `queue.rs` reads this before it does any work. A
+/// deployment with no channel therefore pays one relaxed load per hook, which
+/// is what keeps the Postgres path unchanged.
+static ANY_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// True when a channel is installed in this process.
+#[must_use]
+pub fn is_installed() -> bool {
+    ANY_INSTALLED.load(Ordering::Relaxed)
+}
+
+// ---------------------------------------------------------------------------
+// Buffering scope
+// ---------------------------------------------------------------------------
+
+tokio::task_local! {
+    /// Hints raised by the current task while a buffering scope is active.
+    ///
+    /// The value is an [`Arc`] so [`buffered`] keeps a handle after the scope
+    /// ends. `tokio::task_local!` moves the value into the scope and never
+    /// gives it back.
+    static HINT_BUFFER: Arc<Mutex<Vec<DispatchHint>>>;
+}
+
+/// True when the current task runs inside a [`buffered`] scope.
+#[must_use]
+pub fn scope_active() -> bool {
+    HINT_BUFFER.try_with(|_| ()).is_ok()
+}
+
+/// Run `f` with a buffering scope installed and return its output plus every
+/// hint the scope still holds.
+///
+/// A hint raised inside the scope waits in a task-local buffer instead of
+/// going to the channel. The owner of the transaction publishes the buffer
+/// after the transaction commits, so the channel never names a row that the
+/// database has not committed.
+///
+/// The scope does not nest. When one is already active the future runs against
+/// the outer buffer and the returned vector is empty. A SAVEPOINT owner
+/// therefore never flushes the hints of the transaction that encloses it.
+pub async fn buffered<F: Future>(f: F) -> (F::Output, Vec<DispatchHint>) {
+    if scope_active() {
+        return (f.await, Vec::new());
+    }
+    let buffer: Arc<Mutex<Vec<DispatchHint>>> = Arc::new(Mutex::new(Vec::new()));
+    let handle = Arc::clone(&buffer);
+    let output = HINT_BUFFER.scope(buffer, f).await;
+    let hints = std::mem::take(&mut *lock(&handle));
+    (output, hints)
+}
+
+/// Remove every hint the active scope holds and return it.
+///
+/// Returns an empty vector when no scope is active.
+#[must_use]
+pub fn take_scoped_hints() -> Vec<DispatchHint> {
+    HINT_BUFFER
+        .try_with(|buffer| std::mem::take(&mut *lock(buffer)))
+        .unwrap_or_default()
+}
+
+/// Publish every hint the active scope holds.
+///
+/// Call this after the transaction that raised the hints commits. A failed
+/// transaction discards its hints instead, because the scope is dropped
+/// without a flush.
+pub async fn flush_scope() {
+    publish_now(take_scoped_hints()).await;
+}
+
+/// Publish the active scope's hints when `outcome` is `Ok`, discard them when
+/// it is `Err`.
+///
+/// Call this on the result of a transaction the scope owns. A transaction that
+/// rolled back left no `PENDING` row behind, so its hints name nothing and are
+/// dropped rather than published.
+///
+/// # Errors
+///
+/// Returns `outcome` unchanged.
+pub async fn settle_scope<T, E>(outcome: Result<T, E>) -> Result<T, E> {
+    let hints = take_scoped_hints();
+    if outcome.is_ok() {
+        publish_now(hints).await;
+    }
+    outcome
+}
+
+/// Run `f` in a buffering scope and settle its hints against its result.
+///
+/// This is the one call a transaction owner needs. `f` owns a transaction and
+/// returns its result. Every hint the transaction raises waits in the scope. A
+/// committed transaction publishes them, because each row they name is now
+/// durable. A rolled-back transaction discards them, because it left no
+/// `PENDING` row for them to name.
+///
+/// The call is safe inside an outer scope. [`buffered`] does not nest, so a
+/// nested owner returns no hints and the outer owner keeps them.
+/// [`settle_scope`] cannot do that. It drains whichever scope is active, so a
+/// nested caller would publish the enclosing transaction's hints before that
+/// transaction commits.
+///
+/// # Errors
+///
+/// Returns the result of `f` unchanged.
+pub async fn buffered_settled<T, E, F>(f: F) -> Result<T, E>
+where
+    F: Future<Output = Result<T, E>>,
+{
+    let (outcome, hints) = buffered(f).await;
+    if outcome.is_ok() {
+        publish_now(hints).await;
+    }
+    outcome
+}
+
+/// Same contract as [`buffered_settled`], but hands a committed `f`'s hints
+/// to the background publisher instead of awaiting the channel inline
+/// (Codex review, issue #1429).
+///
+/// `buffered_settled` is right for a caller that processes one row and then
+/// waits, such as a worker's own dispatch loop. A caller that instead loops
+/// over many rows in one sweep pays that same await once per row. That can
+/// cost up to `DISPATCH_CALL_TIMEOUT` per call when the channel is slow,
+/// stalling the sweep even though Postgres already committed. Reconciliation
+/// is the durability fallback regardless. This uses [`publish_in_background`].
+/// That is the same non-blocking, bounded-queue path [`record_hint`] falls
+/// back to outside a scope. So the sweep moves on to its next row
+/// immediately after commit.
+///
+/// # Errors
+///
+/// Returns the result of `f` unchanged.
+pub async fn buffered_settled_in_background<T, E, F>(f: F) -> Result<T, E>
+where
+    F: Future<Output = Result<T, E>>,
+{
+    let (outcome, hints) = buffered(f).await;
+    if outcome.is_ok() {
+        for hint in hints {
+            publish_in_background(hint);
+        }
+    }
+    outcome
+}
+
+/// Run `f` and tie its own hints to its own outcome, nested or not (Codex
+/// review, issue #1429).
+///
+/// `f` owns a nested transaction (typically a SAVEPOINT) inside an already
+/// active scope: a worker's outer [`buffered`] call around the whole task
+/// body, for example. [`buffered_settled`] cannot make that guarantee
+/// there. Nested, `buffered` is a documented no-op passthrough. So a hint
+/// `f` raises lands in the *outer* buffer and is flushed with the outer
+/// task's own outcome, not `f`'s. A `wake_workflow_task` call whose own
+/// transaction then fails to commit still gets its hint published, because
+/// the outer task around it went on to succeed.
+///
+/// This runs `f` against a fresh, private buffer nested inside the active
+/// scope, then merges that buffer into the enclosing one only when `f`
+/// succeeds. When no scope is active yet, this opens one and settles it
+/// against `f`'s own outcome, identically to [`buffered_settled`].
+///
+/// A length checkpoint on the *shared* enclosing buffer cannot isolate two
+/// sibling `run_transactional` calls an activity joins concurrently — say
+/// with `tokio::join!`. `run_transactional` takes `&self` and pools its
+/// own connection per call, so this interleaving is supported (Codex
+/// review, issue #1429). Both calls would capture the same checkpoint
+/// before either transaction finishes. A later rollback would then
+/// truncate away an earlier sibling's already-committed hint, not just its
+/// own. `tokio::task_local!`'s `.scope()` sets its ambient value only for
+/// the span it wraps, even under concurrent polling on the same task. So
+/// nesting a private buffer per call gives each one its own hints
+/// regardless of interleaving. Only this call's own successful outcome
+/// then merges them into whichever buffer is ambient once the nested scope
+/// ends. That is the enclosing scope normally, or a still-more-tightly
+/// nested `buffered_checkpoint` call when `f` itself calls one.
+///
+/// # Errors
+///
+/// Returns the result of `f` unchanged.
+pub async fn buffered_checkpoint<T, E, F>(f: F) -> Result<T, E>
+where
+    F: Future<Output = Result<T, E>>,
+{
+    if !scope_active() {
+        return buffered_settled(f).await;
+    }
+    let inner: Arc<Mutex<Vec<DispatchHint>>> = Arc::new(Mutex::new(Vec::new()));
+    let handle = Arc::clone(&inner);
+    let outcome = HINT_BUFFER.scope(inner, f).await;
+    if outcome.is_ok() {
+        let hints = std::mem::take(&mut *lock(&handle));
+        let _ = HINT_BUFFER.try_with(|buffer| lock(buffer).extend(hints));
+    }
+    outcome
+}
+
+// ---------------------------------------------------------------------------
+// Bound channel
+// ---------------------------------------------------------------------------
+
+tokio::task_local! {
+    /// The channel every publish from the current task uses (issue #1431).
+    ///
+    /// `None` means publish nothing. With no scope, a publish uses the live
+    /// slot.
+    static BOUND_CHANNEL: Option<Arc<dyn TaskDispatch>>;
+}
+
+/// Run `f` with every publish it makes bound to `channel` (issue #1431).
+///
+/// The slot is process-global, so a second runtime in the same process can
+/// replace it. A worker keeps the channel it started with. Its task hints must
+/// follow that channel. The replacement's worker would otherwise read them,
+/// probe its own database, miss, and ack them as absent.
+///
+/// `None` binds to no channel, so nothing in `f` publishes. A worker that
+/// does not read a channel must not feed one.
+///
+/// The binding is task-local. A task that `f` spawns does not inherit it.
+// The callers need the `db` feature (issue #1431).
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
+pub(crate) async fn with_bound_channel<F: Future>(
+    channel: Option<Arc<dyn TaskDispatch>>,
+    f: F,
+) -> F::Output {
+    BOUND_CHANNEL.scope(channel, f).await
+}
+
+/// Where a publish from the current task goes (issue #1431).
+enum PublishTarget {
+    /// No bound scope is active. The publish uses the live slot.
+    Live,
+    /// A bound scope is active. `None` publishes nothing.
+    Bound(Option<Arc<dyn TaskDispatch>>),
+}
+
+/// The publish target of the current task.
+fn publish_target() -> PublishTarget {
+    BOUND_CHANNEL
+        .try_with(Clone::clone)
+        .map_or(PublishTarget::Live, PublishTarget::Bound)
+}
+
+/// Spawn `f` with the binding of the current task (issue #1431).
+///
+/// A worker spawns its maintenance loops through this call, so their hints
+/// follow the worker's channel too. With no bound scope, this is a plain
+/// `tokio::spawn`.
+// The callers need the `db` feature (issue #1431).
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
+pub(crate) fn spawn_bound<F>(f: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    match BOUND_CHANNEL.try_with(Clone::clone) {
+        Ok(channel) => tokio::spawn(with_bound_channel(channel, f)),
+        Err(_) => tokio::spawn(f),
+    }
+}
+
+/// True when a hint raised now can reach a channel (issue #1431).
+///
+/// An active binding decides first. A task bound to a channel wants hints,
+/// even after another runtime clears the slot. A task bound to no channel
+/// wants none, even while another runtime has a channel installed. With no
+/// binding, the live slot decides. Hint writers check this call, not
+/// [`is_installed`], before they build a hint.
+#[must_use]
+pub fn hints_wanted() -> bool {
+    BOUND_CHANNEL
+        .try_with(Option::is_some)
+        .unwrap_or_else(|_| is_installed())
+}
+
+/// Publish `hints` on the bound channel, or else on the installed one, now.
+///
+/// Errors are logged and dropped. The reconcile sweep in the worker is the
+/// durability floor. It republishes every due `PENDING` row the channel does
+/// not hold. A lost publish therefore costs latency, never work.
+pub async fn publish_now(hints: Vec<DispatchHint>) {
+    if hints.is_empty() {
+        return;
+    }
+    let channel = match publish_target() {
+        PublishTarget::Bound(bound) => bound,
+        PublishTarget::Live => installed().map(|installed| installed.channel),
+    };
+    if let Some(channel) = channel {
+        publish_on(channel.as_ref(), hints).await;
+    }
+}
+
+/// Publish `hints` on `channel`, and log a failure.
+async fn publish_on(channel: &dyn TaskDispatch, hints: Vec<DispatchHint>) {
+    if let Err(error) = channel.publish(&hints).await {
+        tracing::warn!(
+            error = %error,
+            count = hints.len(),
+            "dispatch publish failed; the reconcile sweep republishes these rows"
+        );
+    }
+}
+
+/// Record one hint for a row a write left `PENDING`.
+///
+/// Inside a [`buffered`] scope the hint waits for the flush after commit.
+/// Outside one it goes to a background publisher that batches hints, so the
+/// caller never awaits the channel. With no channel, the call costs one atomic
+/// load and one task-local read.
+pub fn record_hint(hint: DispatchHint) {
+    if !hints_wanted() {
+        return;
+    }
+    let mut carried = Some(hint);
+    let buffered = HINT_BUFFER.try_with(|buffer| {
+        if let Some(hint) = carried.take() {
+            lock(buffer).push(hint);
+        }
+    });
+    if buffered.is_ok() {
+        return;
+    }
+    if let Some(hint) = carried {
+        publish_in_background(hint);
+    }
+}
+
+/// Record several hints. Equivalent to [`record_hint`] per element.
+pub fn record_hints(hints: Vec<DispatchHint>) {
+    // One guard for the whole batch, so a deployment with no channel does not
+    // pay one load per hint.
+    if !hints_wanted() {
+        return;
+    }
+    for hint in hints {
+        record_hint(hint);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Background publisher
+// ---------------------------------------------------------------------------
+
+/// Largest number of hints one background `publish` call carries.
+const PUBLISH_BATCH_MAX: usize = 256;
+
+/// Capacity of the queue that feeds the background publisher.
+///
+/// The queue is bounded so an unreachable channel cannot grow it without limit.
+/// A hint is small, so this holds well under a megabyte, and a burst of that
+/// size is already several seconds of enqueue work. A hint dropped at the
+/// bound costs latency, never work: the reconcile sweep republishes its row.
+const PUBLISH_QUEUE_CAPACITY: usize = 10_000;
+
+/// Shortest interval between two "publisher queue full" warnings.
+const DROPPED_HINT_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Hints the background publisher dropped because its queue was full.
+static DROPPED_HINTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// When the full-queue warning was last emitted.
+static DROPPED_HINT_LOGGED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// Number of hints the background publisher has dropped in this process.
+///
+/// The counter only grows. A non-zero value means the channel could not keep
+/// up with the enqueue rate, and the reconcile sweep carried those rows.
+#[must_use]
+pub fn dropped_hints() -> u64 {
+    DROPPED_HINTS.load(Ordering::Relaxed)
+}
+
+/// True when the full-queue warning may be emitted now, which resets `last`.
+fn may_log_dropped(
+    last: &mut Option<std::time::Instant>,
+    now: std::time::Instant,
+    interval: Duration,
+) -> bool {
+    match *last {
+        Some(at) if now.duration_since(at) < interval => false,
+        _ => {
+            *last = Some(now);
+            true
+        }
+    }
+}
+
+/// Count one dropped hint and warn at most once per interval.
+fn record_dropped_hint() {
+    let dropped = DROPPED_HINTS
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    let may_log = {
+        let mut last = lock(&DROPPED_HINT_LOGGED);
+        may_log_dropped(
+            &mut last,
+            std::time::Instant::now(),
+            DROPPED_HINT_LOG_INTERVAL,
+        )
+    };
+    if may_log {
+        tracing::warn!(
+            dropped,
+            capacity = PUBLISH_QUEUE_CAPACITY,
+            "the dispatch publisher queue is full; the reconcile sweep republishes these rows"
+        );
+    }
+}
+
+/// One hint in the publisher queue, with the channel it must go to.
+#[derive(Debug)]
+struct QueuedHint {
+    hint: DispatchHint,
+    /// The bound channel of the scope that queued the hint (issue #1431).
+    /// `None` means the live slot at publish time.
+    channel: Option<Arc<dyn TaskDispatch>>,
+}
+
+/// The background publisher task and the channel that feeds it.
+#[derive(Debug)]
+struct Publisher {
+    sender: tokio::sync::mpsc::Sender<QueuedHint>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+static PUBLISHER: Mutex<Option<Publisher>> = Mutex::new(None);
+
+/// Lock a mutex and take the value back after a panic elsewhere.
+///
+/// A poisoned buffer holds hints, never workflow state, so the worst outcome
+/// of using it is a duplicate publish, which the channel dedupes.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Hand `hint` to the background publisher, spawning it when needed.
+///
+/// The task is spawned lazily from inside a Tokio runtime. A caller with no
+/// current runtime cannot spawn one, so the hint is dropped and the reconcile
+/// sweep republishes the row.
+///
+/// A hint queued in a bound scope keeps that scope's channel (issue #1431).
+/// A scope bound to no channel drops the hint here.
+fn publish_in_background(hint: DispatchHint) {
+    let channel = match publish_target() {
+        PublishTarget::Live => None,
+        PublishTarget::Bound(Some(channel)) => Some(channel),
+        PublishTarget::Bound(None) => return,
+    };
+    let mut hint = QueuedHint { hint, channel };
+    let mut slot = lock(&PUBLISHER);
+    if let Some(publisher) = slot.as_ref()
+        && !publisher.task.is_finished()
+    {
+        match publisher.sender.try_send(hint) {
+            Ok(()) => return,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                // The queue is at its bound. Drop the hint rather than block the
+                // caller, which is a database write path.
+                drop(slot);
+                record_dropped_hint();
+                return;
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(returned)) => hint = returned,
+        }
+    }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        tracing::debug!(
+            "no Tokio runtime for the dispatch publisher; the reconcile sweep republishes this row"
+        );
+        *slot = None;
+        return;
+    };
+    let (sender, receiver) = tokio::sync::mpsc::channel(PUBLISH_QUEUE_CAPACITY);
+    let task = runtime.spawn(publisher_loop(receiver));
+    // The receiver is alive and the queue is empty, so this send cannot fail.
+    let _ = sender.try_send(hint);
+    *slot = Some(Publisher { sender, task });
+}
+
+/// Drain the publisher channel and issue one `publish` call per batch.
+async fn publisher_loop(mut receiver: tokio::sync::mpsc::Receiver<QueuedHint>) {
+    while let Some(first) = receiver.recv().await {
+        let mut batch = Vec::with_capacity(1);
+        batch.push(first);
+        while batch.len() < PUBLISH_BATCH_MAX {
+            match receiver.try_recv() {
+                Ok(queued) => batch.push(queued),
+                Err(_) => break,
+            }
+        }
+        publish_batch(batch).await;
+    }
+}
+
+/// Publish `batch` with one call per run of hints that share a channel.
+///
+/// The publisher task has no bound scope, so a run with no channel uses the
+/// live slot.
+async fn publish_batch(batch: Vec<QueuedHint>) {
+    let mut run: Vec<DispatchHint> = Vec::new();
+    let mut run_channel: Option<Arc<dyn TaskDispatch>> = None;
+    for queued in batch {
+        if !run.is_empty() && !same_channel(run_channel.as_ref(), queued.channel.as_ref()) {
+            publish_run(run_channel.take(), std::mem::take(&mut run)).await;
+        }
+        run_channel = queued.channel;
+        run.push(queued.hint);
+    }
+    publish_run(run_channel, run).await;
+}
+
+/// True when both name the live slot, or both name the same channel.
+fn same_channel(a: Option<&Arc<dyn TaskDispatch>>, b: Option<&Arc<dyn TaskDispatch>>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        _ => false,
+    }
+}
+
+/// Publish one run of hints on its channel, or on the live slot.
+async fn publish_run(channel: Option<Arc<dyn TaskDispatch>>, hints: Vec<DispatchHint>) {
+    match channel {
+        Some(channel) if !hints.is_empty() => publish_on(channel.as_ref(), hints).await,
+        Some(_) => {}
+        None => publish_now(hints).await,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Release backoff
+// ---------------------------------------------------------------------------
+
+/// Whether a queue name can travel through a dispatch channel (issue #1312).
+///
+/// A channel builds its keys from the queue name. The Redis channel joins key
+/// parts with a colon, so a name that holds one would address a key space that
+/// is not its own. An empty name addresses no key space at all.
+///
+/// The rule lives here, not in a channel implementation, because the worker and
+/// the plugin runner both apply it at startup. A channel rejects such a name on
+/// every call. A worker would otherwise stay on the Postgres fallback for all
+/// of its queues, and say nothing about it.
+///
+/// # Errors
+///
+/// Returns the operator-facing message when `queue_name` is empty or holds a
+/// colon.
+pub fn validate_queue_name(queue_name: &str) -> Result<(), String> {
+    if queue_name.is_empty() {
+        return Err(
+            "a dispatch channel cannot carry an empty queue name (issue #1312)".to_string(),
+        );
+    }
+    if queue_name.contains(':') {
+        return Err(format!(
+            "queue name \"{queue_name}\" holds a ':', which a dispatch channel uses to \
+             separate its key parts (issue #1312)"
+        ));
+    }
+    Ok(())
+}
+
+/// Delay before a released reference is delivered again.
+///
+/// `min(cap, base * 2^redeliveries)`, saturating at `cap`. A gated row
+/// therefore backs off instead of cycling once per poll.
+#[must_use]
+pub fn release_delay(redeliveries: u32, base: Duration, cap: Duration) -> Duration {
+    let factor = 1_u32.checked_shl(redeliveries).unwrap_or(u32::MAX);
+    base.checked_mul(factor).unwrap_or(cap).min(cap)
+}
+
+// ---------------------------------------------------------------------------
+// In-memory channel for tests
+// ---------------------------------------------------------------------------
+
+/// Default visibility timeout for [`MemoryDispatch`] leases.
+#[cfg(feature = "testing")]
+pub const DEFAULT_MEMORY_VISIBILITY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// One reference held by [`MemoryDispatch`].
+#[cfg(feature = "testing")]
+#[derive(Debug, Clone)]
+struct MemoryEntry {
+    task_id: Uuid,
+    queue_name: String,
+    /// The `scheduled_at` of the row, as the publish that placed this entry
+    /// gave it. Contract C1 keys the dedupe on this value, so a release must
+    /// keep it while it changes `due`.
+    scheduled_at: DateTime<Utc>,
+    /// When the entry becomes claimable. Equal to `scheduled_at` on publish, and
+    /// later than it while a release backs the entry off.
+    due: DateTime<Utc>,
+    redeliveries: u32,
+    shard: Option<crate::types::ShardId>,
+    /// Pool the row needs, as the publish gave it.
+    kind: Option<DispatchKind>,
+}
+
+/// A reference delivered to a consumer and not yet acked.
+#[cfg(feature = "testing")]
+#[derive(Debug, Clone)]
+struct MemoryInflight {
+    entry: MemoryEntry,
+    leased_at: std::time::Instant,
+}
+
+/// Everything [`MemoryDispatch`] holds, behind one lock.
+#[cfg(feature = "testing")]
+#[derive(Debug, Default)]
+struct MemoryState {
+    /// Claimable references per queue, in publish order.
+    ready: std::collections::HashMap<String, std::collections::VecDeque<Uuid>>,
+    /// References parked until their due time.
+    delayed: std::collections::BTreeSet<(DateTime<Utc>, Uuid)>,
+    /// Every reference the channel holds and has not delivered.
+    entries: std::collections::HashMap<Uuid, MemoryEntry>,
+    /// Delivered references, keyed by lease handle.
+    inflight: std::collections::HashMap<String, MemoryInflight>,
+    /// Remaining injected failures for `next` and `publish`.
+    fail_next: usize,
+    /// Handle counter, so every lease handle is unique.
+    next_handle: u64,
+    published: Vec<Uuid>,
+    delivered: Vec<Uuid>,
+    acked: Vec<Uuid>,
+    released: Vec<Uuid>,
+}
+
+/// An in-memory [`TaskDispatch`] for tests.
+///
+/// It reproduces the parts of the Redis Streams implementation the worker
+/// depends on. Those are per-queue order, a delayed set, dedupe by task id,
+/// leases with redelivery counts, and recovery of a lease a crashed consumer
+/// left behind. The test knobs [`MemoryDispatch::fail_next`] and
+/// [`MemoryDispatch::drop_all`] reproduce a channel error and a channel wipe.
+///
+/// The four event logs — published, delivered, acked and released — grow for
+/// the life of the instance. They are what a case asserts against, so nothing
+/// trims them. The type is behind the `testing` feature and every instance
+/// lives for one case, so the growth is bounded by that case.
+#[cfg(feature = "testing")]
+#[derive(Debug)]
+pub struct MemoryDispatch {
+    state: Mutex<MemoryState>,
+    visibility_timeout: Duration,
+}
+
+#[cfg(feature = "testing")]
+impl Default for MemoryDispatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "testing")]
+impl MemoryDispatch {
+    /// A channel with the default visibility timeout.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            state: Mutex::new(MemoryState::default()),
+            visibility_timeout: DEFAULT_MEMORY_VISIBILITY_TIMEOUT,
+        }
+    }
+
+    /// A channel that recovers a lease older than `visibility_timeout`.
+    #[must_use]
+    pub fn with_visibility_timeout(visibility_timeout: Duration) -> Self {
+        Self {
+            state: Mutex::new(MemoryState::default()),
+            visibility_timeout,
+        }
+    }
+
+    /// Make the next `n` calls to `next` or `publish` return
+    /// [`crate::error::HarvestError::Dispatch`].
+    pub fn fail_next(&self, n: usize) {
+        lock(&self.state).fail_next = n;
+    }
+
+    /// Discard every reference, as a Redis restart without persistence does.
+    ///
+    /// Counters are kept, so a test can still assert what was published.
+    pub fn drop_all(&self) {
+        let mut state = lock(&self.state);
+        state.ready.clear();
+        state.delayed.clear();
+        state.entries.clear();
+        state.inflight.clear();
+    }
+
+    /// Task ids accepted by `publish`, in call order.
+    #[must_use]
+    pub fn published_ids(&self) -> Vec<Uuid> {
+        lock(&self.state).published.clone()
+    }
+
+    /// Task ids handed to a consumer by `next`, in delivery order.
+    #[must_use]
+    pub fn delivered_ids(&self) -> Vec<Uuid> {
+        lock(&self.state).delivered.clone()
+    }
+
+    /// Task ids acked, in call order.
+    #[must_use]
+    pub fn acked_ids(&self) -> Vec<Uuid> {
+        lock(&self.state).acked.clone()
+    }
+
+    /// Task ids released, in call order.
+    #[must_use]
+    pub fn released_ids(&self) -> Vec<Uuid> {
+        lock(&self.state).released.clone()
+    }
+
+    /// Number of delivered references that are not acked or released.
+    #[must_use]
+    pub fn outstanding_leases(&self) -> usize {
+        lock(&self.state).inflight.len()
+    }
+
+    /// Number of references the channel holds and has not delivered.
+    #[must_use]
+    pub fn pending_references(&self) -> usize {
+        lock(&self.state).entries.len()
+    }
+
+    /// True when the channel holds no reference at all.
+    #[must_use]
+    pub fn is_drained(&self) -> bool {
+        let state = lock(&self.state);
+        state.entries.is_empty() && state.inflight.is_empty()
+    }
+
+    /// Take one injected failure. True when the caller must fail.
+    const fn take_failure(state: &mut MemoryState) -> bool {
+        if state.fail_next == 0 {
+            return false;
+        }
+        state.fail_next -= 1;
+        true
+    }
+
+    /// Put `entry` in the ready queue or the delayed set, by its due time.
+    fn place(state: &mut MemoryState, entry: MemoryEntry, now: DateTime<Utc>) {
+        let task_id = entry.task_id;
+        if entry.due <= now {
+            state
+                .ready
+                .entry(entry.queue_name.clone())
+                .or_default()
+                .push_back(task_id);
+        } else {
+            state.delayed.insert((entry.due, task_id));
+        }
+        state.entries.insert(task_id, entry);
+    }
+
+    /// Remove `task_id` from whichever holder it sits in.
+    fn unplace(state: &mut MemoryState, task_id: Uuid) -> Option<MemoryEntry> {
+        let entry = state.entries.remove(&task_id)?;
+        state.delayed.remove(&(entry.due, task_id));
+        if let Some(queue) = state.ready.get_mut(&entry.queue_name) {
+            queue.retain(|id| *id != task_id);
+        }
+        Some(entry)
+    }
+
+    /// Move every due delayed reference into its ready queue.
+    fn promote_due(state: &mut MemoryState, now: DateTime<Utc>) -> usize {
+        let due: Vec<(DateTime<Utc>, Uuid)> = state
+            .delayed
+            .iter()
+            .take_while(|(due, _)| *due <= now)
+            .copied()
+            .collect();
+        for key in &due {
+            state.delayed.remove(key);
+            if let Some(entry) = state.entries.get(&key.1) {
+                let queue_name = entry.queue_name.clone();
+                state.ready.entry(queue_name).or_default().push_back(key.1);
+            }
+        }
+        due.len()
+    }
+}
+
+#[cfg(feature = "testing")]
+#[async_trait::async_trait]
+impl TaskDispatch for MemoryDispatch {
+    async fn publish(&self, hints: &[DispatchHint]) -> HarvestResult<()> {
+        let mut state = lock(&self.state);
+        if Self::take_failure(&mut state) {
+            return Err(crate::error::HarvestError::Dispatch(
+                "injected publish failure".to_string(),
+            ));
+        }
+        let now = Utc::now();
+        for hint in hints {
+            state.published.push(hint.task_id);
+            // Contract C1. A held reference with the same `scheduled_at` names
+            // the same row state. The publish is a no-op, and the reference
+            // keeps its redelivery count and its backoff. A different
+            // `scheduled_at` means the row moved. The reference moves with it
+            // and counts redeliveries again from zero.
+            if let Some(held) = state.entries.get(&hint.task_id) {
+                if held.scheduled_at == hint.scheduled_at {
+                    continue;
+                }
+                Self::unplace(&mut state, hint.task_id);
+            }
+            // A delivered reference is held by its consumer. Publishing again
+            // must not create a second copy of it. The consumer judges the row
+            // against Postgres. Postgres is the authority on the new due time.
+            // The reconcile sweep republishes the row after the consumer
+            // releases or acks the reference.
+            if state
+                .inflight
+                .values()
+                .any(|held| held.entry.task_id == hint.task_id)
+            {
+                continue;
+            }
+            let entry = MemoryEntry {
+                task_id: hint.task_id,
+                queue_name: hint.queue_name.clone(),
+                scheduled_at: hint.scheduled_at,
+                due: hint.scheduled_at,
+                redeliveries: 0,
+                shard: hint.shard,
+                kind: hint.kind,
+            };
+            Self::place(&mut state, entry, now);
+        }
+        drop(state);
+        Ok(())
+    }
+
+    async fn next(
+        &self,
+        queues: &[String],
+        _consumer: &str,
+        max: usize,
+        wait: Duration,
+    ) -> HarvestResult<Vec<DispatchLease>> {
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            {
+                let mut state = lock(&self.state);
+                if Self::take_failure(&mut state) {
+                    return Err(crate::error::HarvestError::Dispatch(
+                        "injected read failure".to_string(),
+                    ));
+                }
+                let mut leases = Vec::new();
+                'queues: for queue in queues {
+                    while leases.len() < max {
+                        let Some(task_id) = state
+                            .ready
+                            .get_mut(queue)
+                            .and_then(std::collections::VecDeque::pop_front)
+                        else {
+                            continue 'queues;
+                        };
+                        let Some(entry) = state.entries.remove(&task_id) else {
+                            continue;
+                        };
+                        state.next_handle += 1;
+                        let handle = format!("m-{}", state.next_handle);
+                        state.delivered.push(task_id);
+                        leases.push(DispatchLease {
+                            task_id,
+                            queue_name: entry.queue_name.clone(),
+                            redeliveries: entry.redeliveries,
+                            handle: handle.clone(),
+                            shard: entry.shard,
+                            kind: entry.kind,
+                        });
+                        state.inflight.insert(
+                            handle,
+                            MemoryInflight {
+                                entry,
+                                leased_at: std::time::Instant::now(),
+                            },
+                        );
+                    }
+                    break;
+                }
+                if !leases.is_empty() {
+                    return Ok(leases);
+                }
+                drop(state);
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Ok(Vec::new());
+            }
+            let step = (deadline - now).min(Duration::from_millis(5));
+            tokio::time::sleep(step).await;
+        }
+    }
+
+    async fn ack(&self, lease: &DispatchLease) -> HarvestResult<()> {
+        let mut state = lock(&self.state);
+        state.inflight.remove(&lease.handle);
+        state.acked.push(lease.task_id);
+        drop(state);
+        Ok(())
+    }
+
+    async fn release(&self, lease: &DispatchLease, delay: Duration) -> HarvestResult<()> {
+        let mut state = lock(&self.state);
+        let Some(held) = state.inflight.remove(&lease.handle) else {
+            return Ok(());
+        };
+        state.released.push(lease.task_id);
+        let now = Utc::now();
+        let due = chrono::Duration::from_std(delay)
+            .map_or(now, |delay| now.checked_add_signed(delay).unwrap_or(now));
+        let entry = MemoryEntry {
+            due,
+            redeliveries: held.entry.redeliveries.saturating_add(1),
+            ..held.entry
+        };
+        Self::place(&mut state, entry, now);
+        drop(state);
+        Ok(())
+    }
+
+    async fn maintain(&self, _queues: &[String]) -> HarvestResult<DispatchMaintenance> {
+        let mut state = lock(&self.state);
+        let promoted = Self::promote_due(&mut state, Utc::now());
+
+        let visibility_timeout = self.visibility_timeout;
+        let expired: Vec<String> = state
+            .inflight
+            .iter()
+            .filter(|(_, held)| held.leased_at.elapsed() >= visibility_timeout)
+            .map(|(handle, _)| handle.clone())
+            .collect();
+        let recovered = expired.len();
+        let now = Utc::now();
+        for handle in expired {
+            let Some(held) = state.inflight.remove(&handle) else {
+                continue;
+            };
+            let entry = MemoryEntry {
+                due: now,
+                redeliveries: held.entry.redeliveries.saturating_add(1),
+                ..held.entry
+            };
+            Self::place(&mut state, entry, now);
+        }
+        drop(state);
+
+        Ok(DispatchMaintenance {
+            promoted,
+            recovered,
+        })
+    }
+}
+
+// Two `cfg` attributes, not `all(...)`: clippy then sees test code (issue #1821).
+#[cfg(test)]
+#[cfg(feature = "testing")]
+mod tests {
+    use super::*;
+
+    /// Serializes the cases that install the process-global channel.
+    use super::TEST_SLOT_LOCK as INSTALL_LOCK;
+
+    fn hint(queue: &str, at: DateTime<Utc>) -> DispatchHint {
+        DispatchHint {
+            task_id: Uuid::new_v4(),
+            queue_name: queue.to_string(),
+            scheduled_at: at,
+            priority: 0,
+            shard: None,
+            kind: Some(DispatchKind::Workflow),
+        }
+    }
+
+    fn queues() -> Vec<String> {
+        vec!["q".to_string()]
+    }
+
+    async fn read_one(channel: &MemoryDispatch) -> Option<DispatchLease> {
+        channel
+            .next(&queues(), "c", 8, Duration::from_millis(0))
+            .await
+            .expect("read")
+            .into_iter()
+            .next()
+    }
+
+    /// A channel with no override reports one round trip per queue. The
+    /// worker's read timeout then keeps its old bound (#1756).
+    #[test]
+    fn a_channel_reports_one_read_round_trip_per_queue_by_default() {
+        let channel = MemoryDispatch::new();
+        assert_eq!(channel.next_round_trips(1), 1);
+        assert_eq!(channel.next_round_trips(4), 4);
+    }
+
+    /// The kind is the `task_type`
+    /// column, so the two spellings must not drift.
+    #[test]
+    fn a_dispatch_kind_is_the_task_type_column() {
+        assert_eq!(DispatchKind::Workflow.as_str(), "workflow");
+        assert_eq!(DispatchKind::Activity.as_str(), "activity");
+        assert_eq!(DispatchKind::from("workflow"), DispatchKind::Workflow);
+        assert_eq!(DispatchKind::from("activity"), DispatchKind::Activity);
+    }
+
+    /// A hint carries its kind through the channel to the lease, so the worker
+    /// can weigh the reference against the pool it needs.
+    #[tokio::test]
+    async fn a_lease_carries_the_kind_of_its_hint() {
+        let channel = MemoryDispatch::new();
+        let mut activity = hint("q", Utc::now());
+        activity.kind = Some(DispatchKind::Activity);
+        channel.publish(&[activity.clone()]).await.expect("publish");
+
+        let lease = read_one(&channel).await.expect("one lease");
+        assert_eq!(lease.task_id, activity.task_id);
+        assert_eq!(
+            lease.kind,
+            Some(DispatchKind::Activity),
+            "the lease must name the pool the reference needs"
+        );
+    }
+
+    /// The rule must reject exactly
+    /// what a channel implementation rejects, and nothing more.
+    #[test]
+    fn a_queue_name_with_a_colon_is_not_dispatchable() {
+        assert!(validate_queue_name("default").is_ok());
+        assert!(validate_queue_name("tenant-priority").is_ok());
+        assert!(validate_queue_name("a.b_c-1").is_ok());
+
+        let error = validate_queue_name("tenant:priority")
+            .expect_err("a colon separates the channel key space");
+        assert!(
+            error.contains("tenant:priority"),
+            "the message must name the queue: {error}"
+        );
+        assert!(
+            error.contains(':'),
+            "the message must name the rule: {error}"
+        );
+        assert!(
+            validate_queue_name("").is_err(),
+            "an empty queue name is not dispatchable"
+        );
+    }
+
+    #[test]
+    fn release_delay_doubles_and_then_holds_at_the_cap() {
+        let base = Duration::from_millis(20);
+        let cap = Duration::from_secs(1);
+        assert_eq!(release_delay(0, base, cap), Duration::from_millis(20));
+        assert_eq!(release_delay(1, base, cap), Duration::from_millis(40));
+        assert_eq!(release_delay(4, base, cap), Duration::from_millis(320));
+        assert_eq!(release_delay(6, base, cap), cap);
+        assert_eq!(release_delay(1_000, base, cap), cap);
+    }
+
+    #[test]
+    fn release_delay_saturates_instead_of_overflowing() {
+        let base = Duration::from_secs(u64::MAX / 2);
+        let cap = Duration::from_secs(30);
+        assert_eq!(release_delay(31, base, cap), cap);
+        assert_eq!(release_delay(u32::MAX, base, cap), cap);
+    }
+
+    #[tokio::test]
+    async fn per_shard_channels_are_independent_of_each_other_and_of_the_global_slot() {
+        // Issue #1429. A multi-shard runtime installs one channel per shard;
+        // this pins that the slots do not leak into each other or into the
+        // single-shard `install`/`installed` pair.
+        let _guard = INSTALL_LOCK.lock().await;
+        uninstall();
+        uninstall_all_shards();
+
+        let shard_a = crate::types::ShardId::new(1);
+        let shard_b = crate::types::ShardId::new(2);
+        let channel_a = Arc::new(MemoryDispatch::new());
+        let channel_b = Arc::new(MemoryDispatch::new());
+        install_for_shard(
+            shard_a,
+            Arc::clone(&channel_a) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+        install_for_shard(
+            shard_b,
+            Arc::clone(&channel_b) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        assert!(installed_for_shard(shard_a).is_some());
+        assert!(installed_for_shard(shard_b).is_some());
+        assert!(
+            installed_for_shard(crate::types::ShardId::new(9)).is_none(),
+            "an unregistered shard has no channel"
+        );
+        assert!(
+            installed().is_none(),
+            "installing per-shard channels must not populate the single-shard slot"
+        );
+
+        uninstall_all_shards();
+        assert!(installed_for_shard(shard_a).is_none());
+        assert!(installed_for_shard(shard_b).is_none());
+    }
+
+    /// `install_shards` replaces the whole topology — both slots, and
+    /// every shard — in one atomic step (Codex review, issue #1429
+    /// follow-up).
+    ///
+    /// A caller that instead clears both slots and then calls
+    /// `install_for_shard` once per shard leaves a gap between those
+    /// calls. A racing installer could land in that gap. This pins the
+    /// single-call replacement's own correctness. It clears a stale
+    /// single-shard channel, and a stale per-shard channel for a shard
+    /// the new topology no longer names. It installs every given shard,
+    /// and returns generations that match what is actually in the map.
+    #[tokio::test]
+    async fn install_shards_replaces_both_slots_and_every_shard_atomically() {
+        let _guard = INSTALL_LOCK.lock().await;
+        uninstall();
+        uninstall_all_shards();
+
+        install(
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+        let stale_shard = crate::types::ShardId::new(9);
+        install_for_shard(
+            stale_shard,
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        let shard_a = crate::types::ShardId::new(1);
+        let shard_b = crate::types::ShardId::new(2);
+        let (installed_shards, previous) = install_shards(vec![
+            (
+                shard_a,
+                Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+                DispatchSettings::default(),
+            ),
+            (
+                shard_b,
+                Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+                DispatchSettings::default(),
+            ),
+        ]);
+
+        assert!(
+            previous.single.is_some(),
+            "the snapshot must carry the single-shard slot install_shards just cleared"
+        );
+        assert!(
+            installed().is_none(),
+            "install_shards must clear the single-shard slot too"
+        );
+        assert!(
+            installed_for_shard(stale_shard).is_none(),
+            "install_shards must clear a shard the new topology no longer names"
+        );
+        assert_eq!(installed_shards.len(), 2);
+        for (shard, generation) in installed_shards {
+            let live = installed_for_shard(shard).expect("each returned shard must be installed");
+            assert_eq!(
+                live.generation, generation,
+                "the returned generation must match the one actually stamped on the slot"
+            );
+        }
+
+        uninstall_all_shards();
+    }
+
+    /// `install_single` is the single-shard mirror of `install_shards`
+    /// (Codex review, issue #1429 follow-up): it replaces both slots, not
+    /// only the single-shard one, in one `DISPATCH_SLOT_LOCK` acquisition.
+    #[tokio::test]
+    async fn install_single_replaces_both_slots_atomically() {
+        let _guard = INSTALL_LOCK.lock().await;
+        uninstall();
+        uninstall_all_shards();
+
+        let stale_shard = crate::types::ShardId::new(3);
+        install_for_shard(
+            stale_shard,
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        let (generation, previous) = install_single(
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        assert!(
+            previous.shards.is_some(),
+            "the snapshot must carry the per-shard slot install_single just cleared"
+        );
+        assert!(
+            installed_for_shard(stale_shard).is_none(),
+            "install_single must clear a stale per-shard channel too"
+        );
+        let live = installed().expect("install_single must install the single-shard slot");
+        assert_eq!(
+            live.generation, generation,
+            "the returned generation must match the one actually stamped on the slot"
+        );
+
+        uninstall();
+    }
+
+    /// `restore_single_if_current` puts the previous single-shard channel
+    /// back with its own, original generation, not a freshly minted one
+    /// (Codex review, issue #1429 follow-up).
+    ///
+    /// A caller whose own startup fails after `install_single` replaced
+    /// the topology restores it this way, rather than through `install`.
+    /// The still-running previous runner's own remembered generation
+    /// still names the slot's occupant this way. This pins that: the
+    /// original generation's own `uninstall_if_current` clears the slot
+    /// again after the restore, proving the restored slot still carries
+    /// it.
+    #[tokio::test]
+    async fn restore_single_if_current_puts_back_the_previous_channel_and_its_generation() {
+        let _guard = INSTALL_LOCK.lock().await;
+        uninstall();
+        uninstall_all_shards();
+
+        let original_generation = install(
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        let (replacement_generation, previous) = install_single(
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+        assert_eq!(
+            previous
+                .single
+                .as_ref()
+                .map(|installed| installed.generation),
+            Some(original_generation)
+        );
+
+        restore_single_if_current(&previous, replacement_generation);
+        let live = installed().expect("restore must put the previous channel back");
+        assert_eq!(
+            live.generation, original_generation,
+            "restore must not mint a fresh generation for the restored channel"
+        );
+
+        uninstall_if_current(original_generation);
+        assert!(
+            installed().is_none(),
+            "the original generation's own uninstall must still clear the restored slot"
+        );
+    }
+
+    /// `restore_single_if_current` is a no-op once a newer, unrelated
+    /// install has already replaced the one it was meant to undo (Codex
+    /// review, issue #1429 follow-up).
+    ///
+    /// A restore that ignored this could discard that newer install
+    /// instead of undoing its own caller's failed startup.
+    #[tokio::test]
+    async fn restore_single_if_current_is_a_no_op_once_a_newer_install_has_replaced_it() {
+        let _guard = INSTALL_LOCK.lock().await;
+        uninstall();
+        uninstall_all_shards();
+
+        let (replacement_generation, previous) = install_single(
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+        let newer_generation = install(
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        restore_single_if_current(&previous, replacement_generation);
+        let live = installed().expect("the newer install must still be in place");
+        assert_eq!(
+            live.generation, newer_generation,
+            "restore must leave a newer, unrelated install alone"
+        );
+
+        uninstall();
+    }
+
+    /// `restore_shards_if_current` mirrors
+    /// `restore_single_if_current_puts_back_the_previous_channel_and_its_generation`
+    /// for the per-shard slot (Codex review, issue #1429 follow-up).
+    #[tokio::test]
+    async fn restore_shards_if_current_puts_back_the_previous_shards_and_their_generations() {
+        let _guard = INSTALL_LOCK.lock().await;
+        uninstall();
+        uninstall_all_shards();
+
+        let shard = crate::types::ShardId::new(4);
+        let original_generation = install_for_shard(
+            shard,
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        let (replacement_shards, previous) = install_shards(vec![(
+            shard,
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        )]);
+
+        restore_shards_if_current(&previous, &replacement_shards);
+        let live = installed_for_shard(shard).expect("restore must put the previous shard back");
+        assert_eq!(
+            live.generation, original_generation,
+            "restore must not mint a fresh generation for the restored shard"
+        );
+
+        uninstall_all_shards();
+    }
+
+    /// `restore_shards_if_current` is a no-op once a newer, unrelated
+    /// install has already replaced the shards it was meant to undo
+    /// (Codex review, issue #1429 follow-up).
+    #[tokio::test]
+    async fn restore_shards_if_current_is_a_no_op_once_a_newer_install_has_replaced_it() {
+        let _guard = INSTALL_LOCK.lock().await;
+        uninstall();
+        uninstall_all_shards();
+
+        let shard = crate::types::ShardId::new(5);
+        let (replacement_shards, previous) = install_shards(vec![(
+            shard,
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        )]);
+        let (newer_shards, _newer_previous) = install_shards(vec![(
+            shard,
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        )]);
+
+        restore_shards_if_current(&previous, &replacement_shards);
+        let live = installed_for_shard(shard).expect("the newer install must still be in place");
+        let newer_generation = newer_shards
+            .iter()
+            .find(|(installed_shard, _)| *installed_shard == shard)
+            .map(|(_, generation)| *generation)
+            .expect("the newer install must cover this shard");
+        assert_eq!(
+            live.generation, newer_generation,
+            "restore must leave a newer, unrelated install alone"
+        );
+
+        uninstall_all_shards();
+    }
+
+    #[tokio::test]
+    async fn a_hint_outside_a_scope_reaches_the_channel() {
+        let _guard = INSTALL_LOCK.lock().await;
+        let channel = Arc::new(MemoryDispatch::new());
+        install(
+            Arc::clone(&channel) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        let one = hint("q", Utc::now());
+        record_hint(one.clone());
+        for _ in 0..100 {
+            if channel.published_ids().contains(&one.task_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(channel.published_ids(), vec![one.task_id]);
+        uninstall();
+    }
+
+    #[tokio::test]
+    async fn a_scope_holds_hints_until_it_flushes() {
+        let _guard = INSTALL_LOCK.lock().await;
+        let channel = Arc::new(MemoryDispatch::new());
+        install(
+            Arc::clone(&channel) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        let one = hint("q", Utc::now());
+        let inner = one.clone();
+        let observed = Arc::clone(&channel);
+        let ((), leftover) = buffered(async move {
+            record_hint(inner);
+            assert!(scope_active());
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(
+                observed.published_ids().is_empty(),
+                "a scoped hint must not reach the channel before the flush"
+            );
+        })
+        .await;
+        assert_eq!(leftover, vec![one.clone()]);
+        assert_eq!(channel.published_ids(), [] as [uuid::Uuid; 0]);
+
+        publish_now(leftover).await;
+        assert_eq!(channel.published_ids(), vec![one.task_id]);
+        uninstall();
+    }
+
+    #[tokio::test]
+    async fn a_nested_scope_leaves_the_hints_with_the_outer_owner() {
+        let _guard = INSTALL_LOCK.lock().await;
+        let channel = Arc::new(MemoryDispatch::new());
+        install(
+            Arc::clone(&channel) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        let one = hint("q", Utc::now());
+        let inner = one.clone();
+        let ((), outer) = buffered(async move {
+            let ((), nested) = buffered(async move {
+                record_hint(inner);
+            })
+            .await;
+            assert!(nested.is_empty(), "a SAVEPOINT owner never takes the hints");
+        })
+        .await;
+        assert_eq!(outer, vec![one]);
+        uninstall();
+    }
+
+    #[tokio::test]
+    async fn flush_scope_publishes_and_empties_the_buffer() {
+        let _guard = INSTALL_LOCK.lock().await;
+        let channel = Arc::new(MemoryDispatch::new());
+        install(
+            Arc::clone(&channel) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        let one = hint("q", Utc::now());
+        let inner = one.clone();
+        let ((), leftover) = buffered(async move {
+            record_hint(inner);
+            flush_scope().await;
+        })
+        .await;
+        assert_eq!(leftover, [] as [crate::dispatch::DispatchHint; 0]);
+        assert_eq!(channel.published_ids(), vec![one.task_id]);
+        uninstall();
+    }
+
+    #[test]
+    fn the_publisher_queue_is_bounded() {
+        assert_eq!(PUBLISH_QUEUE_CAPACITY, 10_000);
+        const {
+            assert!(
+                PUBLISH_BATCH_MAX <= PUBLISH_QUEUE_CAPACITY,
+                "one batch must not exceed the queue it drains"
+            );
+        }
+    }
+
+    #[test]
+    fn the_dropped_hint_warning_is_rate_limited() {
+        let interval = Duration::from_secs(30);
+        let start = std::time::Instant::now();
+        let mut last = None;
+
+        assert!(
+            may_log_dropped(&mut last, start, interval),
+            "the first drop is always logged"
+        );
+        assert!(
+            !may_log_dropped(&mut last, start + Duration::from_secs(1), interval),
+            "a second drop inside the interval is suppressed"
+        );
+        assert!(
+            may_log_dropped(&mut last, start + Duration::from_secs(31), interval),
+            "a drop after the interval is logged again"
+        );
+    }
+
+    #[tokio::test]
+    async fn settle_scope_discards_the_hints_of_a_failed_transaction() {
+        let _guard = INSTALL_LOCK.lock().await;
+        let channel = Arc::new(MemoryDispatch::new());
+        install(
+            Arc::clone(&channel) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        let one = hint("q", Utc::now());
+        let inner = one.clone();
+        let (outcome, leftover) = buffered(async move {
+            record_hint(inner);
+            settle_scope(Err::<(), &str>("the transaction rolled back")).await
+        })
+        .await;
+
+        assert!(outcome.is_err());
+        assert!(leftover.is_empty(), "settle takes the buffer either way");
+        assert!(
+            channel.published_ids().is_empty(),
+            "a rolled-back transaction leaves no PENDING row to name"
+        );
+        uninstall();
+    }
+
+    #[tokio::test]
+    async fn buffered_settled_publishes_on_commit_and_discards_on_rollback() {
+        let _guard = INSTALL_LOCK.lock().await;
+        let channel = Arc::new(MemoryDispatch::new());
+        install(
+            Arc::clone(&channel) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        let committed = hint("q", Utc::now());
+        let inner = committed.clone();
+        let outcome = buffered_settled(async move {
+            record_hint(inner);
+            Ok::<(), &str>(())
+        })
+        .await;
+        assert!(outcome.is_ok());
+        assert_eq!(channel.published_ids(), vec![committed.task_id]);
+
+        let rolled_back = hint("q", Utc::now());
+        let inner = rolled_back.clone();
+        let outcome = buffered_settled(async move {
+            record_hint(inner);
+            Err::<(), &str>("rolled back")
+        })
+        .await;
+        assert!(outcome.is_err());
+        assert_eq!(
+            channel.published_ids(),
+            vec![committed.task_id],
+            "a rolled-back owner publishes nothing"
+        );
+        uninstall();
+    }
+
+    #[tokio::test]
+    async fn buffered_settled_leaves_the_hints_with_an_outer_owner() {
+        let _guard = INSTALL_LOCK.lock().await;
+        let channel = Arc::new(MemoryDispatch::new());
+        install(
+            Arc::clone(&channel) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        let one = hint("q", Utc::now());
+        let inner = one.clone();
+        let observed = Arc::clone(&channel);
+        let ((), outer) = buffered(async move {
+            let outcome = buffered_settled(async move {
+                record_hint(inner);
+                Ok::<(), &str>(())
+            })
+            .await;
+            assert!(outcome.is_ok());
+            assert!(
+                observed.published_ids().is_empty(),
+                "a nested owner must not publish the enclosing transaction's hints"
+            );
+        })
+        .await;
+
+        assert_eq!(outer, vec![one]);
+        uninstall();
+    }
+
+    #[tokio::test]
+    async fn checkpoint_discards_only_its_own_hints_on_error_when_nested() {
+        // Codex review, issue #1429. `buffered_settled` degrades to a no-op
+        // passthrough when nested. So a nested owner's own failure could
+        // not stop its hint from riding out with the enclosing scope. This
+        // is the guarantee `buffered_checkpoint` adds.
+        let _guard = INSTALL_LOCK.lock().await;
+        let channel = Arc::new(MemoryDispatch::new());
+        install(
+            Arc::clone(&channel) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        let sibling = hint("q", Utc::now());
+        let failed = hint("q", Utc::now());
+        let sibling_inner = sibling.clone();
+        let failed_inner = failed.clone();
+        let ((), outer) = buffered(async move {
+            // A sibling call earlier in the same enclosing scope.
+            record_hint(sibling_inner);
+
+            let outcome = buffered_checkpoint(async move {
+                record_hint(failed_inner);
+                Err::<(), &str>("commit failed")
+            })
+            .await;
+            assert!(outcome.is_err());
+        })
+        .await;
+
+        assert_eq!(
+            outer,
+            vec![sibling],
+            "the failed checkpoint's own hint is gone; the sibling's is not"
+        );
+        uninstall();
+    }
+
+    #[tokio::test]
+    async fn checkpoint_keeps_its_hints_on_success_when_nested() {
+        let _guard = INSTALL_LOCK.lock().await;
+        let channel = Arc::new(MemoryDispatch::new());
+        install(
+            Arc::clone(&channel) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        let one = hint("q", Utc::now());
+        let inner = one.clone();
+        let observed = Arc::clone(&channel);
+        let ((), outer) = buffered(async move {
+            let outcome = buffered_checkpoint(async move {
+                record_hint(inner);
+                Ok::<(), &str>(())
+            })
+            .await;
+            assert!(outcome.is_ok());
+            assert!(
+                observed.published_ids().is_empty(),
+                "a nested checkpoint must not publish before the enclosing scope flushes"
+            );
+        })
+        .await;
+
+        assert_eq!(outer, vec![one]);
+        uninstall();
+    }
+
+    #[tokio::test]
+    async fn checkpoint_matches_buffered_settled_when_not_nested() {
+        let _guard = INSTALL_LOCK.lock().await;
+        let channel = Arc::new(MemoryDispatch::new());
+        install(
+            Arc::clone(&channel) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        let committed = hint("q", Utc::now());
+        let inner = committed.clone();
+        let outcome = buffered_checkpoint(async move {
+            record_hint(inner);
+            Ok::<(), &str>(())
+        })
+        .await;
+        assert!(outcome.is_ok());
+        assert_eq!(channel.published_ids(), vec![committed.task_id]);
+        uninstall();
+    }
+
+    #[tokio::test]
+    async fn concurrent_checkpoints_do_not_clobber_each_others_hints() {
+        // Codex review, issue #1429. `run_transactional` takes `&self` and
+        // pools its own connection per call, so an activity can join two
+        // calls concurrently. A length checkpoint on the shared enclosing
+        // buffer cannot isolate them. Both capture the same checkpoint
+        // before either pushes a hint, so a later rollback truncates away
+        // an earlier sibling's already-committed hint too. Forcing that
+        // exact interleaving here reproduces the bug against the old
+        // checkpoint-and-truncate implementation. See
+        // `buffered_checkpoint`'s own doc comment.
+        let _guard = INSTALL_LOCK.lock().await;
+        let channel = Arc::new(MemoryDispatch::new());
+        install(
+            Arc::clone(&channel) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        let committed = hint("q", Utc::now());
+        let committed_inner = committed.clone();
+        let rolled_back = hint("q", Utc::now());
+
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let (committed_tx, committed_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let ((), outer) = buffered(async move {
+            let succeeding = async move {
+                // Wait until the failing sibling has entered its own
+                // checkpoint, while the buffer is still empty, before
+                // this one pushes anything.
+                ready_rx.await.unwrap();
+                let outcome = buffered_checkpoint(async move {
+                    record_hint(committed_inner);
+                    Ok::<(), &str>(())
+                })
+                .await;
+                assert!(outcome.is_ok());
+                committed_tx.send(()).unwrap();
+            };
+            let failing = async move {
+                let outcome = buffered_checkpoint(async move {
+                    // Signal readiness, then wait for the sibling to push
+                    // and commit its own hint before this one pushes and
+                    // fails.
+                    ready_tx.send(()).unwrap();
+                    committed_rx.await.unwrap();
+                    record_hint(rolled_back);
+                    Err::<(), &str>("commit failed")
+                })
+                .await;
+                assert!(outcome.is_err());
+            };
+            tokio::join!(succeeding, failing);
+        })
+        .await;
+
+        assert_eq!(
+            outer,
+            vec![committed],
+            "a concurrent sibling's rollback must not discard this call's committed hint"
+        );
+        uninstall();
+    }
+
+    /// `uninstall_all_shards` stops the background publisher, the
+    /// multi-shard mirror of `uninstall`'s own cleanup (Codex review,
+    /// issue #1429).
+    ///
+    /// A multi-shard runtime can start the publisher through
+    /// `buffered_settled_in_background`, even though `publish_now` only
+    /// ever reads the single-shard slot and can never actually publish
+    /// there. Left running, that task and its sender would leak across an
+    /// embedded runner's restart.
+    #[tokio::test]
+    async fn uninstall_all_shards_stops_the_background_publisher() {
+        let _guard = INSTALL_LOCK.lock().await;
+        publish_in_background(hint("q", Utc::now()));
+        assert!(
+            lock(&PUBLISHER)
+                .as_ref()
+                .is_some_and(|publisher| !publisher.task.is_finished()),
+            "the test fixture must start the publisher"
+        );
+
+        uninstall_all_shards();
+
+        assert!(
+            lock(&PUBLISHER).is_none(),
+            "uninstall_all_shards must stop and clear the background publisher"
+        );
+    }
+
+    /// `uninstall` must not clear [`is_installed`] while a per-shard
+    /// channel is still installed (Codex review, issue #1429).
+    ///
+    /// A direct embedder can call the single-shard `install`/`uninstall`
+    /// pair alongside the independent per-shard API. Clearing the flag
+    /// unconditionally on `uninstall` let `is_installed()` read false
+    /// while `installed_for_shard` still returned a live channel.
+    /// `Worker::new` skips its full-coverage validation whenever
+    /// `is_installed()` is false, so a partial shard map could then run
+    /// silently with mixed Redis/Postgres dispatch behaviour.
+    #[tokio::test]
+    async fn uninstall_leaves_the_flag_set_while_a_shard_channel_remains() {
+        let _guard = INSTALL_LOCK.lock().await;
+        uninstall();
+        uninstall_all_shards();
+
+        install(
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+        install_for_shard(
+            crate::types::ShardId::new(1),
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        uninstall();
+
+        assert!(installed().is_none(), "uninstall must clear its own slot");
+        assert!(
+            is_installed(),
+            "a shard channel is still installed, so the flag must stay set"
+        );
+
+        uninstall_all_shards();
+        assert!(!is_installed(), "the flag clears once every slot is empty");
+    }
+
+    /// Concurrent install/uninstall calls never leave `is_installed()`
+    /// disagreeing with `installed()` (Codex review, issue #1429
+    /// follow-up).
+    ///
+    /// `uninstall_if_current` used to drop its slot's write lock, then
+    /// separately read the other slot to recompute `ANY_INSTALLED`. A
+    /// concurrent `install` could land in that gap and set
+    /// `ANY_INSTALLED = true` for its own fresh channel. The stale
+    /// recomputation then clobbered it back to `false`: `is_installed()`
+    /// said no channel was installed while `installed()` still returned
+    /// one. `DISPATCH_SLOT_LOCK` now serializes every mutating call. This
+    /// hammers `install`/`uninstall_if_current` from several threads at
+    /// once, then checks the flag and the slot agree once every thread has
+    /// finished.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_install_and_uninstall_never_desyncs_the_installed_flag() {
+        let _guard = INSTALL_LOCK.lock().await;
+        uninstall();
+        uninstall_all_shards();
+
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for _ in 0..200 {
+                        let channel = Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>;
+                        let generation = install(channel, DispatchSettings::default());
+                        uninstall_if_current(generation);
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("a racing thread must not panic");
+        }
+
+        assert_eq!(
+            is_installed(),
+            installed().is_some(),
+            "the fast-path flag must never disagree with the slot it mirrors"
+        );
+
+        uninstall();
+    }
+
+    #[tokio::test]
+    async fn no_channel_makes_every_hook_a_no_op() {
+        let _guard = INSTALL_LOCK.lock().await;
+        uninstall();
+        assert!(!is_installed());
+        record_hint(hint("q", Utc::now()));
+        publish_now(vec![hint("q", Utc::now())]).await;
+    }
+
+    #[tokio::test]
+    async fn memory_dispatch_delivers_a_published_reference_once() {
+        let channel = MemoryDispatch::new();
+        let one = hint("q", Utc::now());
+        channel
+            .publish(std::slice::from_ref(&one))
+            .await
+            .expect("publish");
+
+        let lease = read_one(&channel).await.expect("one lease");
+        assert_eq!(lease.task_id, one.task_id);
+        assert_eq!(lease.redeliveries, 0);
+        assert!(read_one(&channel).await.is_none());
+        assert_eq!(channel.outstanding_leases(), 1);
+
+        channel.ack(&lease).await.expect("ack");
+        assert_eq!(channel.acked_ids(), vec![one.task_id]);
+        assert!(channel.is_drained());
+    }
+
+    #[tokio::test]
+    async fn ack_many_drops_every_lease_in_the_batch() {
+        // Issue #1429. `MemoryDispatch` does not override `ack_many`, so this
+        // exercises the trait's default sequential implementation.
+        let channel = MemoryDispatch::new();
+        let a = hint("q", Utc::now());
+        let b = hint("q", Utc::now());
+        channel
+            .publish(&[a.clone(), b.clone()])
+            .await
+            .expect("publish");
+
+        // One `next` call already returns both ready entries (`max` is 8).
+        // Two separate `read_one` calls would silently drop the second,
+        // since it never returns more than one lease per call.
+        let leases = channel
+            .next(&queues(), "c", 8, Duration::from_millis(0))
+            .await
+            .expect("read");
+        assert_eq!(leases.len(), 2, "both entries are ready in one read");
+        assert_eq!(channel.outstanding_leases(), 2);
+
+        channel.ack_many(&leases).await.expect("ack_many");
+        let mut acked = channel.acked_ids();
+        acked.sort();
+        let mut expected = vec![a.task_id, b.task_id];
+        expected.sort();
+        assert_eq!(acked, expected);
+        assert!(channel.is_drained());
+    }
+
+    /// Wraps [`MemoryDispatch`] and fails `ack`/`release` on one named
+    /// lease. `ack_many`'s and `release_many`'s trait-default sequential
+    /// loops then have something to fail partway through (Codex review,
+    /// issue #1429).
+    #[derive(Debug)]
+    struct FailOneLease {
+        inner: MemoryDispatch,
+        fails: Uuid,
+    }
+
+    #[async_trait::async_trait]
+    impl TaskDispatch for FailOneLease {
+        async fn publish(&self, hints: &[DispatchHint]) -> HarvestResult<()> {
+            self.inner.publish(hints).await
+        }
+
+        async fn next(
+            &self,
+            queues: &[String],
+            consumer: &str,
+            max: usize,
+            wait: Duration,
+        ) -> HarvestResult<Vec<DispatchLease>> {
+            self.inner.next(queues, consumer, max, wait).await
+        }
+
+        async fn ack(&self, lease: &DispatchLease) -> HarvestResult<()> {
+            if lease.task_id == self.fails {
+                return Err(crate::error::HarvestError::Dispatch(
+                    "injected ack failure".to_string(),
+                ));
+            }
+            self.inner.ack(lease).await
+        }
+
+        async fn release(&self, lease: &DispatchLease, delay: Duration) -> HarvestResult<()> {
+            if lease.task_id == self.fails {
+                return Err(crate::error::HarvestError::Dispatch(
+                    "injected release failure".to_string(),
+                ));
+            }
+            self.inner.release(lease, delay).await
+        }
+
+        async fn maintain(&self, queues: &[String]) -> HarvestResult<DispatchMaintenance> {
+            self.inner.maintain(queues).await
+        }
+    }
+
+    #[tokio::test]
+    async fn ack_many_default_attempts_every_lease_despite_one_failure() {
+        let a = hint("q", Utc::now());
+        let b = hint("q", Utc::now());
+        let inner = MemoryDispatch::new();
+        inner
+            .publish(&[a.clone(), b.clone()])
+            .await
+            .expect("publish");
+        let leases = inner
+            .next(&queues(), "c", 8, Duration::from_millis(0))
+            .await
+            .expect("read");
+        assert_eq!(leases.len(), 2, "both entries are ready in one read");
+
+        let channel = FailOneLease {
+            inner,
+            fails: a.task_id,
+        };
+        let result = channel.ack_many(&leases).await;
+        assert!(result.is_err(), "the injected failure surfaces");
+        // `b` still got acked despite `a`'s failure (Codex review, issue
+        // #1429): the default loop attempts every lease rather than
+        // stopping at the first error.
+        assert_eq!(channel.inner.acked_ids(), vec![b.task_id]);
+    }
+
+    #[tokio::test]
+    async fn release_many_default_attempts_every_lease_despite_one_failure() {
+        let a = hint("q", Utc::now());
+        let b = hint("q", Utc::now());
+        let inner = MemoryDispatch::new();
+        inner
+            .publish(&[a.clone(), b.clone()])
+            .await
+            .expect("publish");
+        let leases = inner
+            .next(&queues(), "c", 8, Duration::from_millis(0))
+            .await
+            .expect("read");
+        assert_eq!(leases.len(), 2, "both entries are ready in one read");
+        let delay = Duration::from_millis(5);
+        let batch: Vec<(DispatchLease, Duration)> =
+            leases.into_iter().map(|lease| (lease, delay)).collect();
+
+        let channel = FailOneLease {
+            inner,
+            fails: a.task_id,
+        };
+        let result = channel.release_many(&batch).await;
+        assert!(result.is_err(), "the injected failure surfaces");
+        // `b` still got released despite `a`'s failure, the same guarantee
+        // as `ack_many_default_attempts_every_lease_despite_one_failure`.
+        assert_eq!(channel.inner.released_ids(), vec![b.task_id]);
+    }
+
+    #[tokio::test]
+    async fn release_many_gives_every_lease_back_with_its_own_delay() {
+        // Issue #1429. Each lease in the batch carries its own delay, so a
+        // batch may mix an immediate return with a backed-off one. A shared
+        // delay for the whole batch would pass this assertion too, so the
+        // two leases here get different delays. Only the short one is ready
+        // right away; the long one is still not ready by then.
+        let channel = MemoryDispatch::new();
+        let a = hint("q", Utc::now());
+        let b = hint("q", Utc::now());
+        channel
+            .publish(&[a.clone(), b.clone()])
+            .await
+            .expect("publish");
+
+        // One `next` call already returns both ready entries; see the note
+        // in `ack_many_drops_every_lease_in_the_batch` above.
+        let mut leases = channel
+            .next(&queues(), "c", 8, Duration::from_millis(0))
+            .await
+            .expect("read");
+        assert_eq!(leases.len(), 2, "both entries are ready in one read");
+        leases.sort_by_key(|lease| lease.task_id);
+        let mut by_id = [a.task_id, b.task_id];
+        by_id.sort_unstable();
+        let (short, long) = (leases.remove(0), leases.remove(0));
+        assert_eq!(short.task_id, by_id[0]);
+        assert_eq!(long.task_id, by_id[1]);
+
+        channel
+            .release_many(&[
+                (short, Duration::from_millis(0)),
+                (long, Duration::from_millis(200)),
+            ])
+            .await
+            .expect("release_many");
+        let mut released = channel.released_ids();
+        released.sort();
+        let mut expected = vec![a.task_id, b.task_id];
+        expected.sort();
+        assert_eq!(released, expected);
+
+        let immediate = read_one(&channel).await.expect("the short delay is ready");
+        assert_eq!(
+            immediate.task_id, by_id[0],
+            "only the lease released with no delay is ready yet"
+        );
+        assert!(
+            channel
+                .next(&queues(), "c", 8, Duration::from_millis(0))
+                .await
+                .expect("read")
+                .is_empty(),
+            "the lease released with a 200ms delay must not be ready yet"
+        );
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        channel.maintain(&queues()).await.expect("maintain");
+        let delayed = read_one(&channel)
+            .await
+            .expect("the long delay is ready now");
+        assert_eq!(delayed.task_id, by_id[1]);
+        assert_eq!(delayed.redeliveries, 1);
+    }
+
+    #[tokio::test]
+    async fn memory_dispatch_dedupes_a_repeated_publish() {
+        let channel = MemoryDispatch::new();
+        let one = hint("q", Utc::now());
+        channel
+            .publish(std::slice::from_ref(&one))
+            .await
+            .expect("publish");
+        channel
+            .publish(std::slice::from_ref(&one))
+            .await
+            .expect("republish");
+
+        assert_eq!(channel.pending_references(), 1);
+        assert!(read_one(&channel).await.is_some());
+        assert!(read_one(&channel).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn memory_dispatch_moves_a_parked_reference_to_an_earlier_due_time() {
+        let channel = MemoryDispatch::new();
+        let later = hint("q", Utc::now() + chrono::Duration::seconds(60));
+        channel
+            .publish(std::slice::from_ref(&later))
+            .await
+            .expect("publish");
+        assert!(read_one(&channel).await.is_none());
+
+        let sooner = DispatchHint {
+            scheduled_at: Utc::now() - chrono::Duration::seconds(1),
+            ..later.clone()
+        };
+        channel.publish(&[sooner]).await.expect("republish");
+        channel.maintain(&queues()).await.expect("maintain");
+
+        let lease = read_one(&channel).await.expect("promoted lease");
+        assert_eq!(lease.task_id, later.task_id);
+        assert_eq!(channel.pending_references(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_republish_at_the_same_due_time_leaves_a_backed_off_reference_alone() {
+        let channel = MemoryDispatch::new();
+        let one = hint("q", Utc::now());
+        channel
+            .publish(std::slice::from_ref(&one))
+            .await
+            .expect("publish");
+
+        let first = read_one(&channel).await.expect("first");
+        channel
+            .release(&first, Duration::from_secs(60))
+            .await
+            .expect("release");
+
+        // The reconcile sweep reads the same row and republishes it with the
+        // row's own `scheduled_at`. The backoff must survive that.
+        channel
+            .publish(std::slice::from_ref(&one))
+            .await
+            .expect("reconcile republish");
+        channel.maintain(&queues()).await.expect("maintain");
+        assert!(read_one(&channel).await.is_none());
+        assert_eq!(channel.pending_references(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_publish_at_a_new_due_time_moves_a_backed_off_reference_forward() {
+        let channel = MemoryDispatch::new();
+        // Both due times are in the past, so the case tests the dedupe rule and
+        // never the clock.
+        let one = hint("q", Utc::now() - chrono::Duration::seconds(2));
+        channel
+            .publish(std::slice::from_ref(&one))
+            .await
+            .expect("publish");
+
+        let first = read_one(&channel).await.expect("first");
+        channel
+            .release(&first, Duration::from_secs(60))
+            .await
+            .expect("release");
+
+        // A signal moved the row. Its `scheduled_at` differs, so the reference
+        // moves to the new due time and its redelivery count starts again.
+        let woken = DispatchHint {
+            scheduled_at: one.scheduled_at + chrono::Duration::seconds(1),
+            ..one.clone()
+        };
+        channel.publish(&[woken]).await.expect("wake");
+        channel.maintain(&queues()).await.expect("maintain");
+
+        let second = read_one(&channel).await.expect("second");
+        assert_eq!(second.task_id, one.task_id);
+        assert_eq!(second.redeliveries, 0);
+    }
+
+    #[tokio::test]
+    async fn a_publish_at_a_later_due_time_parks_a_ready_reference() {
+        let channel = MemoryDispatch::new();
+        let one = hint("q", Utc::now());
+        channel
+            .publish(std::slice::from_ref(&one))
+            .await
+            .expect("publish");
+
+        // A retry moved the row into the future. The reference moves with it.
+        let retried = DispatchHint {
+            scheduled_at: Utc::now() + chrono::Duration::seconds(60),
+            ..one.clone()
+        };
+        channel.publish(&[retried]).await.expect("retry");
+        channel.maintain(&queues()).await.expect("maintain");
+
+        assert!(read_one(&channel).await.is_none());
+        assert_eq!(channel.pending_references(), 1);
+    }
+
+    #[tokio::test]
+    async fn memory_dispatch_promotes_a_delayed_reference_when_it_is_due() {
+        let channel = MemoryDispatch::new();
+        let soon = hint("q", Utc::now() + chrono::Duration::milliseconds(60));
+        channel
+            .publish(std::slice::from_ref(&soon))
+            .await
+            .expect("publish");
+
+        assert_eq!(
+            channel.maintain(&queues()).await.expect("maintain"),
+            DispatchMaintenance {
+                promoted: 0,
+                recovered: 0
+            }
+        );
+        assert!(read_one(&channel).await.is_none());
+
+        tokio::time::sleep(Duration::from_millis(90)).await;
+        assert_eq!(
+            channel.maintain(&queues()).await.expect("maintain"),
+            DispatchMaintenance {
+                promoted: 1,
+                recovered: 0
+            }
+        );
+        assert_eq!(
+            read_one(&channel).await.expect("lease").task_id,
+            soon.task_id
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_dispatch_counts_a_redelivery_after_a_release() {
+        let channel = MemoryDispatch::new();
+        let one = hint("q", Utc::now());
+        channel
+            .publish(std::slice::from_ref(&one))
+            .await
+            .expect("publish");
+
+        let first = read_one(&channel).await.expect("first");
+        assert_eq!(first.redeliveries, 0);
+        channel
+            .release(&first, Duration::from_millis(0))
+            .await
+            .expect("release");
+        assert_eq!(channel.released_ids(), vec![one.task_id]);
+
+        let second = read_one(&channel).await.expect("second");
+        assert_eq!(second.redeliveries, 1);
+    }
+
+    #[tokio::test]
+    async fn memory_dispatch_recovers_a_lease_a_dead_consumer_left_behind() {
+        let channel = MemoryDispatch::with_visibility_timeout(Duration::from_millis(40));
+        let one = hint("q", Utc::now());
+        channel
+            .publish(std::slice::from_ref(&one))
+            .await
+            .expect("publish");
+
+        let lease = read_one(&channel).await.expect("lease");
+        assert_eq!(channel.outstanding_leases(), 1);
+        assert!(read_one(&channel).await.is_none());
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            channel
+                .maintain(&queues())
+                .await
+                .expect("maintain")
+                .recovered,
+            1
+        );
+
+        let recovered = read_one(&channel).await.expect("recovered");
+        assert_eq!(recovered.task_id, lease.task_id);
+        assert_eq!(recovered.redeliveries, 1);
+    }
+
+    #[tokio::test]
+    async fn memory_dispatch_drop_all_wipes_every_reference() {
+        let channel = MemoryDispatch::new();
+        let ready = hint("q", Utc::now());
+        let parked = hint("q", Utc::now() + chrono::Duration::seconds(60));
+        channel
+            .publish(&[ready.clone(), parked])
+            .await
+            .expect("publish");
+        let lease = read_one(&channel).await.expect("lease");
+
+        channel.drop_all();
+
+        assert!(channel.is_drained());
+        assert!(read_one(&channel).await.is_none());
+        // Acking a wiped lease is harmless, exactly as it is against Redis.
+        channel.ack(&lease).await.expect("ack");
+    }
+
+    #[tokio::test]
+    async fn memory_dispatch_fail_next_fails_reads_and_publishes() {
+        let channel = MemoryDispatch::new();
+        channel.fail_next(2);
+
+        let one = hint("q", Utc::now());
+        assert!(matches!(
+            channel.publish(std::slice::from_ref(&one)).await,
+            Err(crate::error::HarvestError::Dispatch(_))
+        ));
+        assert!(matches!(
+            channel.next(&queues(), "c", 1, Duration::ZERO).await,
+            Err(crate::error::HarvestError::Dispatch(_))
+        ));
+
+        channel
+            .publish(std::slice::from_ref(&one))
+            .await
+            .expect("publish");
+        assert_eq!(
+            read_one(&channel).await.expect("lease").task_id,
+            one.task_id
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_dispatch_keeps_queue_order_and_honours_max() {
+        let channel = MemoryDispatch::new();
+        let first = hint("q", Utc::now());
+        let second = hint("q", Utc::now());
+        let other = hint("other", Utc::now());
+        channel
+            .publish(&[first.clone(), second.clone(), other])
+            .await
+            .expect("publish");
+
+        let leases = channel
+            .next(&queues(), "c", 1, Duration::ZERO)
+            .await
+            .expect("read");
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].task_id, first.task_id);
+
+        let leases = channel
+            .next(&queues(), "c", 8, Duration::ZERO)
+            .await
+            .expect("read");
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].task_id, second.task_id);
+        assert_eq!(channel.delivered_ids().len(), 2);
+    }
+
+    /// A publish inside a bound scope goes to the bound channel, not to the
+    /// live slot (issue #1431).
+    ///
+    /// Runner B can replace runner A's channel while A's worker still runs.
+    /// A's task hints must stay on A's channel. B's worker would otherwise
+    /// probe its own database, miss, and ack them as absent.
+    #[tokio::test]
+    async fn a_bound_scope_publishes_to_its_own_channel_not_the_live_slot() {
+        let _guard = INSTALL_LOCK.lock().await;
+        let live = Arc::new(MemoryDispatch::new());
+        install(
+            Arc::clone(&live) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+        let bound = Arc::new(MemoryDispatch::new());
+
+        let one = hint("q", Utc::now());
+        let inner = one.clone();
+        with_bound_channel(
+            Some(Arc::clone(&bound) as Arc<dyn TaskDispatch>),
+            async move {
+                let ((), hints) = buffered(async move { record_hint(inner) }).await;
+                publish_now(hints).await;
+            },
+        )
+        .await;
+        uninstall();
+
+        assert_eq!(bound.published_ids(), vec![one.task_id]);
+        assert!(
+            live.published_ids().is_empty(),
+            "the live slot must not receive a bound scope's hint"
+        );
+    }
+
+    /// A scope bound to no channel publishes nothing, even while another
+    /// runtime has a channel installed (issue #1431).
+    #[tokio::test]
+    async fn a_scope_bound_to_no_channel_publishes_nothing() {
+        let _guard = INSTALL_LOCK.lock().await;
+        let live = Arc::new(MemoryDispatch::new());
+        install(
+            Arc::clone(&live) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        let wanted = with_bound_channel(None, async { hints_wanted() }).await;
+        with_bound_channel(None, publish_now(vec![hint("q", Utc::now())])).await;
+        with_bound_channel(None, async { publish_in_background(hint("q", Utc::now())) }).await;
+        // The publisher queue is FIFO. A leaked hint lands before this one.
+        let sentinel = hint("q", Utc::now());
+        publish_in_background(sentinel.clone());
+        for _ in 0..100 {
+            if !live.published_ids().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        uninstall();
+
+        assert!(
+            !wanted,
+            "a scope bound to no channel must not ask writers to build hints"
+        );
+        assert_eq!(
+            live.published_ids(),
+            vec![sentinel.task_id],
+            "a scope bound to no channel must not publish into the live slot"
+        );
+    }
+
+    /// The publisher splits a batch into runs by channel and keeps the order
+    /// inside each channel (issue #1431).
+    #[tokio::test]
+    async fn the_publisher_groups_a_mixed_batch_by_channel() {
+        let first = Arc::new(MemoryDispatch::new());
+        let second = Arc::new(MemoryDispatch::new());
+        let queued = |channel: &Arc<MemoryDispatch>| QueuedHint {
+            hint: hint("q", Utc::now()),
+            channel: Some(Arc::clone(channel) as Arc<dyn TaskDispatch>),
+        };
+        let batch = vec![
+            queued(&first),
+            queued(&second),
+            queued(&first),
+            queued(&first),
+        ];
+        let first_ids = [&batch[0], &batch[2], &batch[3]].map(|q| q.hint.task_id);
+        let second_ids = [batch[1].hint.task_id];
+
+        publish_batch(batch).await;
+
+        assert_eq!(first.published_ids(), first_ids.to_vec());
+        assert_eq!(second.published_ids(), second_ids.to_vec());
+    }
+
+    /// The background publisher honours the binding of the scope that
+    /// queued the hint (issue #1431).
+    #[tokio::test]
+    async fn a_background_publish_in_a_bound_scope_uses_the_bound_channel() {
+        let _guard = INSTALL_LOCK.lock().await;
+        let live = Arc::new(MemoryDispatch::new());
+        install(
+            Arc::clone(&live) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+        let bound = Arc::new(MemoryDispatch::new());
+
+        let one = hint("q", Utc::now());
+        let unbound = hint("q", Utc::now());
+        let inner = one.clone();
+        with_bound_channel(
+            Some(Arc::clone(&bound) as Arc<dyn TaskDispatch>),
+            async move { publish_in_background(inner) },
+        )
+        .await;
+        publish_in_background(unbound.clone());
+        for _ in 0..100 {
+            if !bound.published_ids().is_empty() && !live.published_ids().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        uninstall();
+
+        assert_eq!(bound.published_ids(), vec![one.task_id]);
+        assert_eq!(
+            live.published_ids(),
+            vec![unbound.task_id],
+            "a hint queued outside a bound scope still uses the live slot"
+        );
+    }
+
+    /// A bound task keeps publishing after another runtime clears the slot
+    /// (issue #1431). The hint gate reads the binding, not only the slot.
+    #[tokio::test]
+    async fn a_bound_task_publishes_with_the_slot_empty() {
+        let _guard = INSTALL_LOCK.lock().await;
+        uninstall_all();
+        let bound = Arc::new(MemoryDispatch::new());
+
+        let one = hint("q", Utc::now());
+        let inner = one.clone();
+        let wanted = with_bound_channel(
+            Some(Arc::clone(&bound) as Arc<dyn TaskDispatch>),
+            async move {
+                let wanted = hints_wanted();
+                record_hint(inner);
+                wanted
+            },
+        )
+        .await;
+        for _ in 0..100 {
+            if !bound.published_ids().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        uninstall_all();
+
+        assert!(wanted, "a bound task must want hints with the slot empty");
+        assert!(!hints_wanted(), "an unbound task with no slot wants none");
+        assert_eq!(bound.published_ids(), vec![one.task_id]);
+    }
+
+    /// A task spawned through `spawn_bound` inherits the binding (issue
+    /// #1431). A plain `tokio::spawn` would lose it.
+    #[tokio::test]
+    async fn spawn_bound_carries_the_binding_into_the_new_task() {
+        let _guard = INSTALL_LOCK.lock().await;
+        let live = Arc::new(MemoryDispatch::new());
+        install(
+            Arc::clone(&live) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+        let bound = Arc::new(MemoryDispatch::new());
+
+        let one = hint("q", Utc::now());
+        let inner = one.clone();
+        with_bound_channel(
+            Some(Arc::clone(&bound) as Arc<dyn TaskDispatch>),
+            async move {
+                spawn_bound(publish_now(vec![inner]))
+                    .await
+                    .expect("the spawned task must finish");
+            },
+        )
+        .await;
+        uninstall();
+
+        assert_eq!(bound.published_ids(), vec![one.task_id]);
+        assert_eq!(live.published_ids(), [] as [uuid::Uuid; 0]);
+    }
+}

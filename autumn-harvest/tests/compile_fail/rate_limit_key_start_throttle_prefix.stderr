@@ -1,0 +1,5 @@
+error: `rate_limit_key` must not begin with the reserved `dyn-rate:` or `start-throttle:` prefix (reserved for caller-keyed rate-limit and workflow-start-throttle buckets)
+ --> tests/compile_fail/rate_limit_key_start_throttle_prefix.rs:9:33
+  |
+9 | #[activity(rate_limit_rps = 50, rate_limit_key = "start-throttle:onboarding:acme")]
+  |                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

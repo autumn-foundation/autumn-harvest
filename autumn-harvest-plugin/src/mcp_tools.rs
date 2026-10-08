@@ -628,7 +628,8 @@ fn register_harvest_mcp_schemas(registry: &mut autumn_web::openapi::SchemaRegist
 
 /// Permissive schema used when a workflow (or update) publishes no
 /// `input_schema`. Deliberately carries **no** `"type"` constraint: per
-/// CLAUDE.md's "Multi-param dispatch packs into JSON array" convention, an
+/// `docs/architecture.md`'s "Multi-param dispatch packs into JSON array"
+/// convention, an
 /// unpublished workflow's actual expected input can be a JSON object
 /// (single struct param), an array (multi-param, positional), or a bare
 /// scalar (single non-object param) — asserting `"type": "object"` here
@@ -877,6 +878,7 @@ fn build_tool_route(
     let path: &'static str = leak(spec.path.clone());
     let operation_id: &'static str = leak(spec.operation_id.clone());
     let workflow: &'static str = leak(spec.workflow.clone());
+    let gate_state = api_state.clone();
 
     let handler: MethodRouter<autumn_web::AppState> = match spec.kind {
         ToolKind::Start => axum::routing::post(
@@ -909,6 +911,7 @@ fn build_tool_route(
             },
         ),
         ToolKind::Update => {
+            #[expect(clippy::expect_used, reason = "an update spec always names its update")]
             let update: &'static str = leak(
                 spec.update
                     .clone()
@@ -943,6 +946,18 @@ fn build_tool_route(
     } else {
         handler
     };
+    // Issue #1802: outside `dev`, this gate refuses a mutating tool call with
+    // no credential. A declared boundary, an admin session or the opt-out
+    // admits it. It sits inside the auth middleware below, so it reads the
+    // `Session` that middleware sets.
+    let handler = if spec.kind.is_mutation() {
+        handler.layer(axum::middleware::from_fn_with_state(
+            gate_state,
+            crate::api::require_mutation_auth_by_method,
+        ))
+    } else {
+        handler
+    };
     // Issue #597 hardening: these routes are registered via
     // `AppBuilder::routes(...)`, not `nest()`, so they never pass through
     // the harvest management API's own auth layer (which only wraps the
@@ -969,7 +984,7 @@ fn build_tool_route(
         idempotency: autumn_web::RouteIdempotency::Direct,
         // Inherit the global request-timeout deadline (autumn-web 0.6).
         timeout: autumn_web::RouteTimeout::Inherit,
-        // Generated API routes carry no SEO meta (autumn-web 0.7): EMPTY is
+        // Generated API routes carry no SEO meta (since autumn-web 0.7): EMPTY is
         // what a route attribute without `seo(...)` produces.
         seo: autumn_web::SeoRouteDefaults::EMPTY,
     }
@@ -1265,7 +1280,20 @@ async fn watch_tool(
     // caught by the first notification instead of being lost. Continue-as-new
     // successors always live on the same shard, so one listener connection
     // covers the whole chain even if we later jump to a successor's exec_id.
-    let notification_url = match api_state.sse_notification_url(exec_id.shard()) {
+    //
+    // Resolved through the forwarding pointer, not `exec_id.shard()` (issue
+    // #1317). A rebalanced execution's origin shard is not where
+    // `load_owned_execution` below actually finds it. This LISTEN
+    // connection must open against the same database, or every
+    // notification for the chain is missed.
+    let Some(shard) = crate::api::resolve_shard_best_effort(&api_state, exec_id).await else {
+        return crate::api::map_error(autumn_harvest::error::HarvestError::ShardUnavailable {
+            shard_id: exec_id.shard().as_i32(),
+            reason: format!("could not resolve the current shard for {exec_id}"),
+        })
+        .into_response();
+    };
+    let notification_url = match api_state.sse_notification_url(shard) {
         Ok(url) => url,
         Err(e) => return crate::api::map_error(e).into_response(),
     };
@@ -1330,8 +1358,32 @@ async fn watch_tool(
         }
 
         let mut listener = listener;
+        let mut listener_shard = shard;
         let mut exec_id = exec_id;
         loop {
+            // Shard-residence rebind (issue #1317 review, P2 follow-up).
+            // The doc comment above guarantees a continue-as-new successor
+            // stays on the same shard, so tracking `exec_id` alone covers
+            // that case. It says nothing about a shard-rebalance migration,
+            // which is a different mechanism. The listener would stay
+            // bound to the shard it first resolved. Once the watched
+            // execution migrates, that silently degrades wakeups from
+            // event-driven to poll-only cadence (bounded by `wait_timeout`
+            // below).
+            if let Ok(pool) = api_clone.storage_pool()
+                && let Ok(current_shard) = autumn_harvest::shard_rebalance::resolve_execution_shard(
+                    pool.sharded_pool(),
+                    exec_id,
+                )
+                .await
+                && current_shard != listener_shard
+                && let Ok(url) = api_clone.sse_notification_url(current_shard)
+                && let Ok(l) = WorkflowEventListener::connect(&url).await
+            {
+                listener = l;
+                listener_shard = current_shard;
+            }
+
             // 2x keepalive so the KeepAlive wrapper pings between wakeups; a
             // TimedOut wakeup re-checks terminal state as a missed-NOTIFY
             // safety net without emitting a progress frame.
@@ -1529,7 +1581,10 @@ mod tests {
         let descriptors = collect_descriptors(&[wf("plain", false), wf("exposed", true)], &[], &[]);
         assert_eq!(descriptors.len(), 1);
         assert_eq!(descriptors[0].name, "exposed");
-        assert!(descriptors[0].updates.is_empty());
+        assert_eq!(
+            descriptors[0].updates,
+            [] as [crate::mcp_tools::McpUpdateDescriptor; 0]
+        );
     }
 
     /// Code-review regression test (issue #597, PR #908): a debounced or
@@ -1886,7 +1941,7 @@ mod tests {
         assert_eq!(start.kind, ToolKind::Start);
         assert_eq!(start.method, "POST");
         assert_eq!(start.path, "/api/harvest/mcp/workflows/order_flow/start");
-        assert!(start.path_params.is_empty());
+        assert_eq!(start.path_params, [] as [&str; 0]);
         assert_eq!(
             start.body_component.as_deref(),
             Some("HarvestMcpInput_order_flow")
@@ -2236,10 +2291,14 @@ mod tests {
 
         let descriptors = collect_descriptors(&[wf("order_flow", true)], &[], &[]);
         record_schemas(&descriptors);
+        // Issue #1802: `api_with_auth` declares a boundary, which opens the
+        // mutation gate. So the 401 comes from the configured middleware alone.
+        let api_state = crate::api::HarvestApiState::new();
+        api_state.set_admin_auth_boundary(true);
         let routes = build_mcp_tool_routes(
             "/api/harvest/mcp",
             &descriptors,
-            &crate::api::HarvestApiState::new(),
+            &api_state,
             Some(&tool_middleware),
             false,
         );
@@ -2263,18 +2322,18 @@ mod tests {
     /// Without a configured middleware (`None`, matching every existing
     /// test above), a request must still reach the real handler — i.e. this
     /// module's hardening does not accidentally start gating requests when
-    /// the embedder never opted into `api_with_auth`.
+    /// the embedder never opted into `api_with_auth`. The issue #1802 gate
+    /// is a separate check, so this test opens it.
     #[tokio::test]
     async fn mcp_tool_routes_are_unwrapped_when_no_middleware_is_configured() {
         let descriptors = collect_descriptors(&[wf("order_flow", true)], &[], &[]);
         record_schemas(&descriptors);
-        let routes = build_mcp_tool_routes(
-            "/api/harvest/mcp",
-            &descriptors,
-            &crate::api::HarvestApiState::new(),
-            None,
-            false,
-        );
+        // Issue #1802: the opt-out opens the mutation gate, so this test sees
+        // the absent middleware and not the gate.
+        let api_state = crate::api::HarvestApiState::new();
+        api_state.set_allow_unauthenticated_mutations(true);
+        let routes =
+            build_mcp_tool_routes("/api/harvest/mcp", &descriptors, &api_state, None, false);
 
         let client = autumn_web::test::TestApp::new().routes(routes).build();
 

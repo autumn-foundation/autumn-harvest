@@ -6,7 +6,7 @@
 //!
 //!   1. Duplicate migration timestamp prefixes (two `migrations/<ts>_*` dirs
 //!      sharing a `<ts>`), which make Diesel's ordering ambiguous.
-//!   2. An incomplete `full_migrations_sql()` bundle (the paved-path helper new
+//!   2. An incomplete `test_init_sql()` bundle (the paved-path helper new
 //!      testcontainers tests apply), proving it is regenerated from the whole
 //!      `migrations/` tree.
 //!   3. A test fixture that *reintroduces* a hand-rolled migration bundle
@@ -75,6 +75,81 @@ fn duplicate_version_prefixes_is_empty_for_distinct_prefixes() {
     assert!(
         duplicate_version_prefixes(ok).is_empty(),
         "distinct prefixes must produce no duplicates"
+    );
+}
+
+/// The last grandfathered version — anything *after* it must carry a real
+/// time-of-day component.
+///
+/// Every migration up to and including this point is `YYYYMMDD000000` and stays
+/// that way: renaming an applied migration would orphan its
+/// `__diesel_schema_migrations` row and make Diesel re-run it. The boundary is
+/// the one CLAUDE.md states under *Name every migration with a second-precision
+/// UTC timestamp*, and the two must not drift — an operator reading the rule and
+/// a contributor tripping the guard have to be told the same thing.
+const TIME_BEARING_VERSION_CUTOFF: &str = "20260728000000";
+
+/// Migration versions after the cutoff whose time component is all zeros.
+///
+/// Pure, so the guard and its RED demonstration share one predicate.
+fn day_granular_versions(list: &str) -> Vec<&str> {
+    list.split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .filter_map(|n| n.split('_').next())
+        .filter(|v| v.len() == 14 && *v > TIME_BEARING_VERSION_CUTOFF)
+        .filter(|v| v.ends_with("000000"))
+        .collect()
+}
+
+#[test]
+fn day_granular_detection_flags_a_zero_time_version_after_the_cutoff() {
+    // Before the cutoff: grandfathered, however zeroed.
+    assert_eq!(day_granular_versions("20260101000000_old"), [] as [&str; 0]);
+    // The cutoff itself is the last grandfathered version, not the first
+    // flagged one — `20260728000000_harvest_audit_export` is on disk and must
+    // keep its name.
+    assert_eq!(
+        day_granular_versions("20260728000000_audit_export"),
+        [] as [&str; 0]
+    );
+    // After it: flagged.
+    assert_eq!(
+        day_granular_versions("20260901000000_new"),
+        vec!["20260901000000"],
+        "a zero time component after the cutoff must be detected"
+    );
+    // A real time of day passes.
+    assert_eq!(day_granular_versions("20260901115500_new"), [] as [&str; 0]);
+}
+
+/// Migration versions must carry a real time of day, not just a date.
+///
+/// Two branches authored on the same day both reach for `YYYYMMDD000000` and
+/// collide — and the collision does not surface where it was made. It surfaces
+/// as a merge conflict in the upgrade guide, or as
+/// `real_migrations_have_unique_version_prefixes` failing once both migrations
+/// are finally in one tree, which is long after both authors have moved on.
+///
+/// This branch hit it twice: `20260727000000` against the codec-rotation cursor
+/// (#948), then `20260728000000` against the audit export (#953). Seconds
+/// granularity makes an accidental collision essentially impossible, and costs
+/// nothing — `date -u +%Y%m%d%H%M%S` is the whole convention.
+#[test]
+fn migration_versions_carry_a_time_of_day_not_just_a_date() {
+    // Both trees, for the same reason `version_collision_detection_covers_both_trees`
+    // covers both: a plugin migration collides with a core one just as easily.
+    let plugin = plugin_harvest_migration_names().join(",");
+    let all = format!("{MIGRATIONS_LIST},{plugin}");
+    let flagged = day_granular_versions(&all);
+    assert!(
+        flagged.is_empty(),
+        "these migrations use a date-only version ({flagged:?}), which collides with \
+         any other migration authored the same day — and only shows up when the two \
+         branches meet. Use a real timestamp: `date -u +%Y%m%d%H%M%S`. Migrations \
+         up to and including {TIME_BEARING_VERSION_CUTOFF} are grandfathered and \
+         must not be renamed, because renaming an applied migration makes Diesel \
+         re-run it."
     );
 }
 
@@ -172,12 +247,15 @@ fn version_collision_detection_covers_both_trees() {
     // A distinct version is not a collision, so the guard cannot be vacuously
     // green by flagging everything.
     let distinct = ["20260719000000_plugin_thing".to_string()];
-    assert!(versions_colliding_with_core(&distinct, core).is_empty());
+    assert_eq!(
+        versions_colliding_with_core(&distinct, core),
+        [] as [&str; 0]
+    );
 }
 
 #[test]
 fn full_migrations_sql_bundle_is_complete() {
-    let bundle = autumn_harvest::full_migrations_sql();
+    let bundle = autumn_harvest::test_init_sql();
     assert!(!bundle.is_empty(), "migration bundle must not be empty");
 
     // A sentinel from the very first migration (the initial schema) proves the
@@ -205,7 +283,7 @@ fn full_migrations_sql_bundle_is_complete() {
     missing.sort_unstable();
     assert!(
         missing.is_empty(),
-        "full_migrations_sql() is missing {} of {} migration(s) — the bundle drifted from \
+        "test_init_sql() is missing {} of {} migration(s) — the bundle drifted from \
          the migrations/ tree: {missing:?}",
         missing.len(),
         names.len()
@@ -234,7 +312,7 @@ fn full_migrations_sql_bundle_is_complete() {
 
 // ── Paved-path reintroduction guard (PR #1031 / PR #1045 follow-up) ───────────
 //
-// PR #1031 added a completeness guard for `full_migrations_sql()` itself (above),
+// PR #1031 added a completeness guard for `test_init_sql()` itself (above),
 // and PR #1045 swept every DB fixture onto that paved path. Neither prevents a
 // NEW fixture from *reintroducing* a hand-rolled
 // `concat!(include_str!("…migrations/…up.sql"), …)` bundle — which silently
@@ -245,7 +323,7 @@ fn full_migrations_sql_bundle_is_complete() {
 
 /// Test-fixture files (workspace-root-relative paths) that legitimately still
 /// hand-roll a migration bundle instead of calling
-/// `autumn_harvest::full_migrations_sql()`. Each entry documents WHY the fixture
+/// `autumn_harvest::test_init_sql()`. Each entry documents WHY the fixture
 /// needs a bespoke — usually deliberately-partial — schema. Adding a new partial
 /// fixture requires a conscious edit here with a reason; that is the point.
 const ALLOWED_HANDROLLED_MIGRATION_INCLUDES: &[&str] = &[
@@ -253,17 +331,20 @@ const ALLOWED_HANDROLLED_MIGRATION_INCLUDES: &[&str] = &[
     // deliberately excluded from the workflow-start-uniqueness column set, so it
     // must build a partial, hand-picked schema rather than the full bundle.
     "autumn-harvest/tests/integration/integration_e2e.rs",
-    // Omits `harvest_start_throttle` on purpose to exercise the `to_regclass`
-    // graceful-degradation path (the scheduler tolerates the table's absence).
-    "autumn-harvest-plugin/tests/schedule_update_integration.rs",
     // Inserts into `harvest_dag_runs`, which the full bundle drops
     // (`20260514000000_drop_harvest_dag_runs`); needs the pre-drop schema.
     "autumn-harvest-plugin/tests/timeline_integration.rs",
     // Separate plugin app-DB `harvest_workflow_outbox` migration — not part of
-    // the core `migrations/` bundle that `full_migrations_sql()` emits.
+    // the core `migrations/` bundle that `test_init_sql()` emits.
     "autumn-harvest-plugin/tests/outbox_integration.rs",
+    // Same plugin app-DB `harvest_workflow_outbox` migration as
+    // `outbox_integration.rs` above, for the same reason. The manual
+    // `pg_stat_statements` perf-evidence harness for issue #1620 builds
+    // its own split app/Harvest database pair, not through
+    // `test_init_sql()`.
+    "autumn-harvest-plugin/tests/outbox_start_relay_perf.rs",
     // The three connector suites (issue #944) each build
-    // `full_migrations_sql()` and then append the plugin-owned
+    // `test_init_sql()` and then append the plugin-owned
     // `harvest_connector_dead_letters` migration, which likewise lives in
     // `autumn-harvest-plugin/migrations/harvest/` rather than the core bundle.
     // The paved path is used for everything it covers; only the one plugin
@@ -271,6 +352,40 @@ const ALLOWED_HANDROLLED_MIGRATION_INCLUDES: &[&str] = &[
     "autumn-harvest-plugin/tests/connector_integration.rs",
     "autumn-harvest-plugin/tests/connector_kafka_broker.rs",
     "autumn-harvest-plugin/tests/connector_sqs_broker.rs",
+    // Does not BUILD a schema from the include: it asserts on the #958
+    // migration's own text, that the migration documented as inert on apply
+    // contains no `CREATE INDEX`. A plain index build on
+    // `harvest_workflow_executions` holds SHARE for its duration and stops
+    // every execution-state write, which is the opposite of inert — and the
+    // only way to guard that property is to read the migration itself. The
+    // suite bootstraps its databases through `test_init_sql()` like every
+    // other.
+    "autumn-harvest/tests/integration/event_partitioning_tests.rs",
+    // Does not BUILD a schema from the include either: the suite bootstraps
+    // through `test_init_sql()` like every other. It only REPLAYS the
+    // already-applied `20260921011505_harvest_task_queue_timer_fires_at`
+    // migration's own `up.sql`, a second time, idempotently (issue #1402
+    // review, Codex finding). The target is a row seeded to look like one
+    // that predates the column. That is the only way to test the
+    // migration's own backfill `UPDATE` against pre-existing data.
+    // `test_init_sql()` always applies every migration to an empty
+    // database instead.
+    "autumn-harvest-plugin/tests/stall_diagnosis_integration.rs",
+    // Does not BUILD a schema from the include. The suite bootstraps through
+    // `full_migrations_sql()` like every other. It REPLAYS the lazy
+    // audit-index migration's own `up.sql` (issue #1667), named
+    // `20261001190405_harvest_audit_unexported_idx_lazy`. The replay runs
+    // against hand-built states: an index in another schema, a held table
+    // lock, and a database with and without an export cursor. A migration
+    // that has already run on a fresh database cannot meet those states any
+    // other way.
+    "autumn-harvest/tests/integration/audit_export_tests.rs",
+    // Does not BUILD a schema from the include. The suite bootstraps through
+    // `test_init_sql()` like every other. It REPLAYS the task-queue hygiene
+    // migration (issue #1811), `20261003201739_harvest_task_queue_hygiene`.
+    // The test runs `down.sql`, then `up.sql` twice, on a migrated database.
+    // That proves the round trip and that a second `up.sql` changes nothing.
+    "autumn-harvest/tests/integration/terminal_task_gc_tests.rs",
 ];
 
 /// True when a single source line reintroduces a hand-rolled migration bundle: a
@@ -307,7 +422,7 @@ fn line_is_handrolled_migration_include(line: &str) -> bool {
 /// rustfmt-wrapped shapes, and is STRICTLY MORE PRECISE than a per-line substring
 /// test — the tokens must belong to one real `include_str!` argument — so
 /// prose/doc comments merely mentioning `migrations/.../up.sql`, or a
-/// `full_migrations_sql()` reference, are never flagged.
+/// `test_init_sql()` reference, are never flagged.
 fn detects_handrolled_migration_include(contents: &str) -> bool {
     // Collapse every run of whitespace (incl. newlines/indent) to a single space
     // so a wrapped `include_str!(\n  "..."\n)` becomes `include_str!( "..." )`, and
@@ -407,7 +522,7 @@ fn line_detector_flags_a_handrolled_include_and_ignores_others() {
     ));
     // The paved path itself is not a hand-rolled include.
     assert!(!line_is_handrolled_migration_include(
-        "    let sql = autumn_harvest::full_migrations_sql();"
+        "    let sql = autumn_harvest::test_init_sql();"
     ));
 }
 
@@ -439,7 +554,7 @@ fn whole_file_detector_flags_a_rustfmt_wrapped_include() {
         "const CI: &str = include_str!(\n    \"../../../.github/workflows/ci.yml\"\n);"
     ));
     assert!(!detects_handrolled_migration_include(
-        "// this fixture used to include_str! a migrations/foo/up.sql bundle; now paved.\nlet sql = autumn_harvest::full_migrations_sql();"
+        "// this fixture used to include_str! a migrations/foo/up.sql bundle; now paved.\nlet sql = autumn_harvest::test_init_sql();"
     ));
 }
 
@@ -447,7 +562,7 @@ fn whole_file_detector_flags_a_rustfmt_wrapped_include() {
 /// `autumn-harvest-plugin/tests/**` may reintroduce a hand-rolled migration
 /// bundle outside `ALLOWED_HANDROLLED_MIGRATION_INCLUDES`, and every allowlisted
 /// entry must still actually contain one (a stale entry — a fixture later
-/// converted to `full_migrations_sql()` — fails and must be removed).
+/// converted to `test_init_sql()` — fails and must be removed).
 #[test]
 fn no_new_handrolled_migration_bundles_outside_allowlist() {
     let root = workspace_root();
@@ -494,7 +609,7 @@ fn no_new_handrolled_migration_bundles_outside_allowlist() {
     assert!(
         new_offenders.is_empty(),
         "these test fixtures reintroduce a hand-rolled migration bundle \
-         (include_str!(\"…migrations/…up.sql\")). Use autumn_harvest::full_migrations_sql() \
+         (include_str!(\"…migrations/…up.sql\")). Use autumn_harvest::test_init_sql() \
          instead (see PR #1045), or — only if the fixture genuinely needs a partial schema — \
          add it to ALLOWED_HANDROLLED_MIGRATION_INCLUDES with a documented reason:\n  {}",
         new_offenders
@@ -514,7 +629,7 @@ fn no_new_handrolled_migration_bundles_outside_allowlist() {
     assert!(
         stale.is_empty(),
         "ALLOWED_HANDROLLED_MIGRATION_INCLUDES has stale entries — these no longer contain a \
-         hand-rolled migration include (converted to full_migrations_sql()?). Remove them:\n  {}",
+         hand-rolled migration include (converted to test_init_sql()?). Remove them:\n  {}",
         stale.join("\n  ")
     );
 }

@@ -24,7 +24,7 @@
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
 //! against it directly (single-threaded, each test scrubs first); otherwise a
 //! fresh testcontainers Postgres is booted with the full migration bundle
-//! (`autumn_harvest::full_migrations_sql()`).
+//! (`autumn_harvest::test_init_sql()`).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -45,7 +45,7 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 /// Capturing metrics recorder — records `(workflow, count)` from
@@ -108,6 +108,8 @@ fn build_pool(url: &str) -> DbPool {
 async fn scrub(conn: &mut AsyncPgConnection) {
     for stmt in [
         "DELETE FROM harvest_execution_summaries",
+        "DELETE FROM harvest_completion_trigger_fires",
+        "DELETE FROM harvest_completion_trigger_outbox",
         "DELETE FROM harvest_completion_deliveries",
         "DELETE FROM harvest_dead_letters",
         "DELETE FROM harvest_workflow_executions",
@@ -300,13 +302,50 @@ async fn run_one_tick(
     metrics: Arc<CapturingMetrics>,
 ) -> autumn_harvest::retention::RetentionTickResult {
     let pools = ShardedDbPool::single(pool);
-    let runtime = RetentionRuntime::spawn(pools, config, metrics, None, None)
-        .expect("retention runtime should spawn when enabled");
+    let runtime = RetentionRuntime::spawn(
+        pools,
+        config,
+        Arc::clone(&metrics) as Arc<dyn MetricsRecorder>,
+        None,
+        None,
+    )
+    .expect("retention runtime should spawn when enabled");
     runtime.run_now();
 
+    // Wait for the tick to FINISH, not for `ran_at`.
+    //
+    // `ran_at` is stamped by the history-retention phase. Later phases run
+    // after it in the same iteration: partition maintenance, and the
+    // execution-summary GC under test here.
+    //
+    // A prior version of this helper waited for `ran_at` together with
+    // `metrics.completed_ticks()` crossing a baseline. That reasoning
+    // assumed the end-of-iteration liveness tick from issue #797 is the
+    // only source of that counter, since it is unconditional and runs
+    // last.
+    //
+    // That assumption was wrong. Under partitioned layout,
+    // `run_partition_maintenance_pass` emits its own liveness tick once per
+    // shard, and the runtime emits one more before the main loop even
+    // starts. Both share the exact same counter as the true
+    // end-of-iteration tick. `completed_ticks()` can cross the baseline
+    // right after `ran_at` is stamped, well before the summary-GC phase
+    // runs. `shutdown()` then wins the race against that phase and it
+    // silently deletes nothing. This was the CI-only failure of
+    // `summary_gc_deletes_expired_and_emits_metric` under the partitioned
+    // layout.
+    //
+    // `RetentionMonitor::iterations_completed()` replaces that counter. It
+    // advances exactly once per main-loop iteration, at the true end, after
+    // every phase — GC included — has run. Pairing it with `ran_at` is not
+    // a race.
+    let baseline = runtime.monitor().iterations_completed();
     let mut result = None;
-    for _ in 0..200 {
+    for _ in 0..400 {
         tokio::time::sleep(Duration::from_millis(50)).await;
+        if runtime.monitor().iterations_completed() <= baseline {
+            continue;
+        }
         let snap = runtime.monitor().snapshot();
         if let Some(r) = snap.per_shard.iter().find(|r| r.shard == 0)
             && r.ran_at.is_some()
@@ -352,6 +391,145 @@ async fn summary_disabled_deletes_and_writes_no_summary() {
     );
     assert_eq!(count_executions(&mut conn).await, 0, "execution deleted");
     assert_eq!(count_summaries(&mut conn).await, 0, "no summary row");
+}
+
+/// Issue #1317 review, P1. A row this shard EVER received via
+/// shard-rebalance migration can still be the un-reconciled forwarding
+/// target of a `MIGRATED` seal on another shard. Deleting it with no trace
+/// at all, even under the default `summary: None` policy, would make that
+/// seal's reconciliation error forever. So this one case gets a minimal,
+/// payload-free tombstone summary even though summary retention is
+/// otherwise off.
+#[tokio::test]
+async fn summary_disabled_still_tombstones_a_row_that_was_ever_a_migration_target() {
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn).await;
+
+    let old = Utc::now() - chrono::Duration::days(2);
+    let exec_id = insert_completed_full(
+        &mut conn,
+        "wf",
+        "migrated-target",
+        "COMPLETED",
+        old,
+        None,
+        None,
+        Some(serde_json::json!({"tenant": "acme"})),
+    )
+    .await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET migrated_from_shards = '[0]'::jsonb \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id)
+    .execute(&mut conn)
+    .await
+    .expect("mark the row as a migration target");
+
+    let config = history_only(Some(Duration::from_secs(86_400))); // summary: None
+    let metrics = Arc::new(CapturingMetrics::default());
+    let result = run_one_tick(pool, config, Arc::clone(&metrics)).await;
+
+    assert_eq!(result.deleted_count, 1);
+    assert_eq!(
+        result.summarized_count, 1,
+        "a migration target must be tombstoned even with summary retention off"
+    );
+    assert_eq!(count_executions(&mut conn).await, 0, "execution deleted");
+    assert_eq!(
+        count_summaries(&mut conn).await,
+        1,
+        "tombstone summary written"
+    );
+
+    let s = load_summary(&mut conn, exec_id).await.expect("summary row");
+    assert_eq!(s.workflow_name, "wf");
+    assert_eq!(s.workflow_id, "migrated-target");
+    assert_eq!(s.state, "COMPLETED");
+    assert!(s.result.is_none(), "the tombstone never captures a payload");
+    assert!(s.error.is_none(), "the tombstone never captures a payload");
+    assert!(
+        s.search_attrs.is_none(),
+        "a forced no-policy tombstone must never carry search attrs -- \
+         they can hold plaintext business/PII data"
+    );
+}
+
+/// Read a still-live execution row's `parent_id`.
+async fn execution_parent(conn: &mut AsyncPgConnection, exec_id: uuid::Uuid) -> Option<uuid::Uuid> {
+    #[derive(diesel::QueryableByName)]
+    struct ParentRow {
+        #[diesel(sql_type = Nullable<diesel::sql_types::Uuid>)]
+        parent_id: Option<uuid::Uuid>,
+    }
+    diesel::sql_query("SELECT parent_id FROM harvest_workflow_executions WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(exec_id)
+        .get_result::<ParentRow>(conn)
+        .await
+        .expect("execution row must still exist")
+        .parent_id
+}
+
+/// Issue #1317 review, P1 follow-up. The forced migration-target tombstone
+/// (previous test) writes a summary row even though `summary` retention is
+/// off. `delete_candidate_execution`'s child-lineage null-out must treat
+/// that exactly like a configured summary policy. A child still inside its
+/// own retention window must keep its `parent_id` pointed at the parent.
+/// It must not be cleared just because no `SummaryPolicy` is configured.
+/// Otherwise a LATER #495 erase of the parent's tombstone summary can never
+/// discover that child, via `collect_child_ids` or otherwise.
+#[tokio::test]
+async fn migration_tombstone_preserves_a_still_live_childs_parent_id() {
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn).await;
+
+    let old = Utc::now() - chrono::Duration::days(2);
+    let recent = Utc::now() - chrono::Duration::seconds(1);
+
+    let parent = insert_completed(&mut conn, "parent_wf", "migrated-parent", old).await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET migrated_from_shards = '[0]'::jsonb \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(parent)
+    .execute(&mut conn)
+    .await
+    .expect("mark the parent as a migration target");
+
+    // Recent enough that this tick's age cutoff (1 day) leaves it alone.
+    let child = insert_completed(&mut conn, "child_wf", "c1", recent).await;
+    set_parent(&mut conn, child, parent).await;
+
+    // Summary retention OFF -- only the forced migration tombstone should
+    // produce a summary row this tick.
+    let config = history_only(Some(Duration::from_secs(86_400)));
+    let metrics = Arc::new(CapturingMetrics::default());
+    let result = run_one_tick(pool, config, Arc::clone(&metrics)).await;
+
+    assert_eq!(
+        result.deleted_count, 1,
+        "only the parent is old enough to delete"
+    );
+    assert_eq!(
+        result.summarized_count, 1,
+        "the forced tombstone summarized the parent"
+    );
+    assert_eq!(
+        count_executions(&mut conn).await,
+        1,
+        "the child execution row survives this tick"
+    );
+
+    assert_eq!(
+        execution_parent(&mut conn, child).await,
+        Some(parent),
+        "the surviving child must keep parent_id -- the parent got a forced \
+         tombstone summary despite summary retention being off"
+    );
 }
 
 // AC2 + AC3: a summary row is written in the same delete transaction, carrying
@@ -546,6 +724,352 @@ async fn summary_gc_deletes_expired_and_emits_metric() {
         metrics.summary_deleted(),
         vec![("gc_wf".to_string(), 2)],
         "summary GC emits the per-workflow deletion count"
+    );
+}
+
+// ── Completion-trigger fire GC (issue #1676) ────────────────────────────────
+
+/// Inserts a delivered fire (`outcome IS NULL`) for `source`, fired at
+/// `fired_at`.
+async fn insert_fire(conn: &mut AsyncPgConnection, source: uuid::Uuid, fired_at: DateTime<Utc>) {
+    diesel::sql_query(
+        "INSERT INTO harvest_completion_trigger_fires
+            (source_exec_id, trigger_id, fired_at)
+         VALUES ($1, gen_random_uuid(), $2)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(source)
+    .bind::<Timestamptz, _>(fired_at)
+    .execute(conn)
+    .await
+    .expect("insert fire");
+}
+
+/// Inserts a fire already resolved with `outcome`, for example
+/// `admission_blocked`.
+async fn insert_resolved_fire(
+    conn: &mut AsyncPgConnection,
+    fired_at: DateTime<Utc>,
+    outcome: &str,
+) {
+    diesel::sql_query(
+        "INSERT INTO harvest_completion_trigger_fires
+            (source_exec_id, trigger_id, fired_at, outcome)
+         VALUES (gen_random_uuid(), gen_random_uuid(), $1, $2)",
+    )
+    .bind::<Timestamptz, _>(fired_at)
+    .bind::<Text, _>(outcome)
+    .execute(conn)
+    .await
+    .expect("insert resolved fire");
+}
+
+/// Inserts an undelivered outbox row for `source`'s fire.
+async fn insert_outbox_for(conn: &mut AsyncPgConnection, source: uuid::Uuid) {
+    diesel::sql_query(
+        "INSERT INTO harvest_completion_trigger_outbox
+            (source_exec_id, trigger_id, target_shard, target_workflow_name,
+             target_workflow_id, target_input, priority, max_workflow_input_bytes)
+         SELECT source_exec_id, trigger_id, 0, 't', 'tid', '{}'::jsonb,
+                '\"Normal\"'::jsonb, 1024
+         FROM harvest_completion_trigger_fires WHERE source_exec_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(source)
+    .execute(conn)
+    .await
+    .expect("insert outbox");
+}
+
+async fn count_fires(conn: &mut AsyncPgConnection) -> i64 {
+    diesel::sql_query("SELECT COUNT(*) AS n FROM harvest_completion_trigger_fires")
+        .get_result::<CountRow>(conn)
+        .await
+        .expect("count fires")
+        .n
+}
+
+fn summary_gc_config() -> RetentionConfig {
+    history_only(Some(Duration::from_secs(86_400)))
+        .with_summary_retention(SummaryPolicy::for_duration(Duration::from_secs(3_600)))
+}
+
+/// A delivered fire older than the summary horizon is deleted. A younger
+/// one stays. `backup verify` then never scans a fire whose target summary
+/// has aged out.
+#[tokio::test]
+async fn summary_gc_prunes_a_delivered_fire_past_the_horizon() {
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn).await;
+
+    let now = Utc::now();
+    insert_fire(
+        &mut conn,
+        uuid::Uuid::new_v4(),
+        now - chrono::Duration::days(2),
+    )
+    .await;
+    insert_fire(
+        &mut conn,
+        uuid::Uuid::new_v4(),
+        now - chrono::Duration::minutes(5),
+    )
+    .await;
+
+    run_one_tick(
+        pool,
+        summary_gc_config(),
+        Arc::new(CapturingMetrics::default()),
+    )
+    .await;
+
+    assert_eq!(count_fires(&mut conn).await, 1, "only the young fire stays");
+}
+
+/// A fire with an outbox row is still awaiting relay. Deleting it would
+/// drop a delivery, so it stays whatever its age.
+#[tokio::test]
+async fn summary_gc_keeps_a_fire_that_still_has_an_outbox_row() {
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn).await;
+
+    let source = uuid::Uuid::new_v4();
+    insert_fire(&mut conn, source, Utc::now() - chrono::Duration::days(2)).await;
+    insert_outbox_for(&mut conn, source).await;
+
+    run_one_tick(
+        pool,
+        summary_gc_config(),
+        Arc::new(CapturingMetrics::default()),
+    )
+    .await;
+
+    assert_eq!(count_fires(&mut conn).await, 1, "pending relay is kept");
+}
+
+/// The fire row also guards against a second fire for the same source
+/// run. It stays while that run still has an execution row.
+#[tokio::test]
+async fn summary_gc_keeps_a_fire_whose_source_execution_still_exists() {
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn).await;
+
+    // Completed inside the history horizon, so the tick keeps the row.
+    let source = insert_completed(
+        &mut conn,
+        "src",
+        "s1",
+        Utc::now() - chrono::Duration::hours(2),
+    )
+    .await;
+    insert_fire(&mut conn, source, Utc::now() - chrono::Duration::days(2)).await;
+
+    run_one_tick(
+        pool,
+        summary_gc_config(),
+        Arc::new(CapturingMetrics::default()),
+    )
+    .await;
+
+    assert_eq!(
+        count_fires(&mut conn).await,
+        1,
+        "live source keeps its fire"
+    );
+}
+
+/// With no summary horizon, the fire table keeps every row. The summary
+/// horizon is the only retention signal the prune follows.
+#[tokio::test]
+async fn fire_gc_is_off_without_a_summary_horizon() {
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn).await;
+
+    insert_fire(
+        &mut conn,
+        uuid::Uuid::new_v4(),
+        Utc::now() - chrono::Duration::days(30),
+    )
+    .await;
+
+    let config = history_only(Some(Duration::from_secs(86_400)));
+    run_one_tick(pool, config, Arc::new(CapturingMetrics::default())).await;
+
+    assert_eq!(count_fires(&mut conn).await, 1);
+}
+
+/// A small batch size drains every expired fire over several loop passes.
+/// Five rows with a batch of two ends on a short batch. Four rows with a
+/// batch of two ends on an empty batch.
+#[tokio::test]
+async fn fire_gc_drains_several_batches() {
+    for (rows, batch) in [(5_usize, 2_usize), (4, 2)] {
+        let (url, _c) = setup_db().await;
+        let pool = build_pool(&url);
+        let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+        scrub(&mut conn).await;
+
+        let old = Utc::now() - chrono::Duration::days(2);
+        for _ in 0..rows {
+            insert_fire(&mut conn, uuid::Uuid::new_v4(), old).await;
+        }
+        let mut config = summary_gc_config();
+        config.batch_size = batch;
+        run_one_tick(pool, config, Arc::new(CapturingMetrics::default())).await;
+
+        assert_eq!(
+            count_fires(&mut conn).await,
+            0,
+            "{rows} rows, batch {batch}"
+        );
+    }
+}
+
+/// A resolved fire (no target, no outbox row) expires like a delivered one.
+/// Pinned and deletable rows in one run are handled separately.
+#[tokio::test]
+async fn fire_gc_deletes_resolved_fires_and_keeps_only_pinned_rows() {
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn).await;
+
+    let old = Utc::now() - chrono::Duration::days(2);
+    insert_resolved_fire(&mut conn, old, "admission_blocked").await;
+    insert_resolved_fire(&mut conn, old, "payload_too_large").await;
+    insert_fire(&mut conn, uuid::Uuid::new_v4(), old).await;
+    let pinned = uuid::Uuid::new_v4();
+    insert_fire(&mut conn, pinned, old - chrono::Duration::days(1)).await;
+    insert_outbox_for(&mut conn, pinned).await;
+
+    run_one_tick(
+        pool,
+        summary_gc_config(),
+        Arc::new(CapturingMetrics::default()),
+    )
+    .await;
+
+    assert_eq!(
+        count_fires(&mut conn).await,
+        1,
+        "only the pinned fire stays"
+    );
+    let kept: CountRow = diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM harvest_completion_trigger_fires WHERE source_exec_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(pinned)
+    .get_result(&mut conn)
+    .await
+    .expect("count pinned");
+    assert_eq!(kept.n, 1, "the surviving row is the pinned one");
+}
+
+/// A dry-run tick deletes no fire row.
+#[tokio::test]
+async fn fire_gc_does_nothing_in_dry_run() {
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn).await;
+
+    insert_fire(
+        &mut conn,
+        uuid::Uuid::new_v4(),
+        Utc::now() - chrono::Duration::days(2),
+    )
+    .await;
+    let mut config = summary_gc_config();
+    config.dry_run = true;
+    run_one_tick(pool, config, Arc::new(CapturingMetrics::default())).await;
+
+    assert_eq!(count_fires(&mut conn).await, 1);
+}
+
+/// Issue #1317 review, P1 follow-up. A summary demoted from a row that was
+/// EVER a shard-rebalance migration target can still be the only surviving
+/// evidence an un-reconciled seal elsewhere needs.
+///
+/// A bounded `SummaryPolicy` must not hard-delete it past its horizon like
+/// an ordinary summary. That would reopen the exact "seal blocked forever"
+/// gap on a delay instead of immediately. It must, however, still strip the
+/// row's OPT-IN payload fields past that same horizon (issue #1317 review,
+/// P1 follow-up). Otherwise a `SummaryPolicy` that captures payloads
+/// retains them forever for any execution a shard rebalance ever touched,
+/// silently turning a finite horizon into unbounded retention.
+#[tokio::test]
+async fn summary_gc_tombstones_but_never_deletes_a_migration_target_summary() {
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn).await;
+
+    let now = Utc::now();
+    // An ordinary old summary (GC-eligible) and a migration-target summary
+    // just as old, carrying a payload (result/error/search_attrs). The
+    // test also proves the payload gets stripped rather than left intact.
+    let ordinary = insert_summary(&mut conn, "gc_wf", "g1", now - chrono::Duration::days(2)).await;
+    let migrated_id: uuid::Uuid = diesel::sql_query(
+        "INSERT INTO harvest_execution_summaries
+            (execution_id, workflow_name, workflow_id, state, started_at,
+             completed_at, duration_ms, shard_id, migrated_from_shards,
+             result, error, search_attrs)
+         VALUES (gen_random_uuid(), 'gc_wf', 'g2', 'COMPLETED', $1, $1, 5000, 0,
+                 '[0]'::jsonb, '{\"secret\":\"payload\"}'::jsonb, 'boom',
+                 '{\"tenant\":\"acme\"}'::jsonb)
+         RETURNING execution_id AS id",
+    )
+    .bind::<Timestamptz, _>(now - chrono::Duration::days(2))
+    .get_result::<IdRow>(&mut conn)
+    .await
+    .expect("insert migration-target summary")
+    .id;
+
+    let config = history_only(Some(Duration::from_secs(86_400)))
+        .with_summary_retention(SummaryPolicy::for_duration(Duration::from_secs(3_600)));
+    let metrics = Arc::new(CapturingMetrics::default());
+    run_one_tick(pool, config, Arc::clone(&metrics)).await;
+
+    assert!(
+        load_summary(&mut conn, ordinary).await.is_none(),
+        "an ordinary old summary is still GC'd normally"
+    );
+    let migrated = load_summary(&mut conn, migrated_id)
+        .await
+        .expect("a migration-target summary must survive its configured horizon");
+    assert_eq!(
+        migrated.state, "COMPLETED",
+        "reconciliation-relevant state stays"
+    );
+    assert_eq!(
+        migrated.workflow_name, "gc_wf",
+        "reconciliation-relevant identity stays"
+    );
+    assert_eq!(
+        migrated.workflow_id, "g2",
+        "reconciliation-relevant identity stays"
+    );
+    assert!(
+        migrated.result.is_none(),
+        "the payload-bearing result field must be stripped past the horizon"
+    );
+    assert!(
+        migrated.error.is_none(),
+        "the payload-bearing error field must be stripped past the horizon"
+    );
+    assert!(
+        migrated.search_attrs.is_none(),
+        "the payload-bearing search_attrs field must be stripped past the horizon"
+    );
+    assert_eq!(
+        count_summaries(&mut conn).await,
+        1,
+        "only the migration-target summary remains"
     );
 }
 
@@ -929,6 +1453,67 @@ async fn legal_held_execution_is_not_summarized_until_released() {
     .execute(&mut conn)
     .await
     .expect("release hold");
+
+    let result = run_one_tick(pool, config, Arc::clone(&metrics)).await;
+    assert_eq!(result.deleted_count, 1);
+    assert_eq!(result.summarized_count, 1);
+    assert_eq!(count_executions(&mut conn).await, 0, "now deleted");
+    assert_eq!(count_summaries(&mut conn).await, 1, "now summarized");
+}
+
+// Issue #1317 review, P1 follow-up. `stage_copy` can seal a row
+// `CONTINUED_AS_NEW` mid-flight to vacate its business key. That row then
+// carries a non-NULL `staging_vacated_state`, the real prior state a
+// migration abort restores. Retention must not delete it out from under
+// an in-flight migration. The abort path could never restore it, and any
+// summary would record the transient `CONTINUED_AS_NEW` instead of the
+// run's real outcome.
+#[tokio::test]
+async fn staging_vacated_row_is_not_summarized_until_the_marker_clears() {
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn).await;
+
+    let old = Utc::now() - chrono::Duration::days(2);
+    let exec_id = insert_completed(&mut conn, "staged_wf", "s1", old).await;
+    // Seal it exactly as `stage_copy`'s vacate does: CONTINUED_AS_NEW with
+    // the real prior state carried in `staging_vacated_state`.
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions
+         SET state = 'CONTINUED_AS_NEW', staging_vacated_state = 'COMPLETED'
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id)
+    .execute(&mut conn)
+    .await
+    .expect("seal as an in-flight staging vacate");
+
+    let config = history_only(Some(Duration::from_secs(86_400)))
+        .with_summary_retention(SummaryPolicy::for_days(30));
+    let metrics = Arc::new(CapturingMetrics::default());
+    run_one_tick(pool.clone(), config.clone(), Arc::clone(&metrics)).await;
+
+    assert_eq!(
+        count_executions(&mut conn).await,
+        1,
+        "staging-vacated row not deleted"
+    );
+    assert_eq!(
+        count_summaries(&mut conn).await,
+        0,
+        "staging-vacated row not summarized"
+    );
+
+    // The migration settles (success or abort both clear the marker), tick
+    // again.
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET staging_vacated_state = NULL WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id)
+    .execute(&mut conn)
+    .await
+    .expect("clear the marker");
 
     let result = run_one_tick(pool, config, Arc::clone(&metrics)).await;
     assert_eq!(result.deleted_count, 1);

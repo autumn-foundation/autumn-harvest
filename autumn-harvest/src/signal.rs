@@ -71,79 +71,139 @@ pub async fn send_signal_idempotent(
     // collide across unrelated signals — treat it as no key (at-least-once).
     let idempotency_key = idempotency_key.filter(|k| !k.is_empty());
 
-    Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
-        let execution = harvest_workflow_executions::table
-            .find(exec_id.as_uuid())
-            .for_update()
-            .select(crate::models::WorkflowExecution::as_select())
-            .first(conn)
-            .await
-            .optional()
-            .map_err(crate::error::database_error)?
-            .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
+    // The wake at the end of this transaction re-pends a parked workflow task,
+    // so it raises a dispatch hint (issue #1312). A hint published before the
+    // COMMIT names a row that no reader outside this transaction can see. The
+    // reader probes it, finds nothing, and drops the reference after three
+    // short releases. The buffering scope holds the hint until the commit. The
+    // signal then reaches a worker through the channel rather than waiting for
+    // the reconcile sweep.
+    crate::dispatch::buffered_settled(Box::pin(conn.transaction::<bool, HarvestError, _>(
+        async |conn| {
+            let execution = harvest_workflow_executions::table
+                .find(exec_id.as_uuid())
+                .for_update()
+                .select(crate::models::WorkflowExecution::as_select())
+                .first(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?
+                .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
 
-        let row = NewHarvestSignal {
-            workflow_exec_id: exec_id.as_uuid(),
-            signal_name,
-            payload,
-            idempotency_key,
-        };
+            let row = NewHarvestSignal {
+                workflow_exec_id: exec_id.as_uuid(),
+                signal_name,
+                payload,
+                idempotency_key,
+            };
 
-        // Attempt the insert before validating state so a keyed retry that
-        // already landed dedupes to a no-op even after the workflow has gone
-        // terminal. `on_conflict_do_nothing()` (no explicit target) lets
-        // Postgres arbitrate against the partial unique index
-        // `uq_harvest_signals_idem`; a NULL key is excluded from the index,
-        // so the insert always succeeds (rows-affected = 1).
-        let inserted = diesel::insert_into(harvest_signals::table)
-            .values(&row)
-            .on_conflict_do_nothing()
-            .execute(conn)
-            .await
-            .map_err(crate::error::database_error)?;
+            // Attempt the insert before validating state so a keyed retry that
+            // already landed dedupes to a no-op even after the workflow has gone
+            // terminal. `on_conflict_do_nothing()` (no explicit target) lets
+            // Postgres arbitrate against the partial unique index
+            // `uq_harvest_signals_idem`; a NULL key is excluded from the index,
+            // so the insert always succeeds (rows-affected = 1).
+            let inserted = diesel::insert_into(harvest_signals::table)
+                .values(&row)
+                .on_conflict_do_nothing()
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
 
-        if inserted == 0 {
-            // Idempotency-key collision: an equivalent signal already landed
-            // once. Idempotent success regardless of current state — do not
-            // re-wake (the original insert already did).
-            return Ok(false);
-        }
-
-        // Fresh row: the execution must be able to accept it. Returning Err
-        // here rolls back the transaction, undoing the insert above.
-        match execution.state.as_str() {
-            // PAUSED is a non-terminal active state: a paused workflow
-            // waiting on a signal must still accept (buffer) it so it is
-            // delivered on resume. The wake below re-pends the task, which
-            // the claim gate defers until the execution is RUNNING.
-            "RUNNING" | "PAUSED" => {}
-            "CANCELLED" => {
-                return Err(HarvestError::Cancelled(execution.error.unwrap_or_else(
-                    || format!("workflow execution {exec_id} is cancelled"),
-                )));
+            if inserted == 0 {
+                // Idempotency-key collision: an equivalent signal already landed
+                // once. Idempotent success regardless of current state — do not
+                // re-wake (the original insert already did).
+                return Ok(false);
             }
-            state => {
-                return Err(HarvestError::Config(format!(
-                    "workflow execution {exec_id} is terminal ({state})"
-                )));
+
+            // Fresh row: the execution must be able to accept it. Returning Err
+            // here rolls back the transaction, undoing the insert above.
+            match execution.state.as_str() {
+                // PAUSED is a non-terminal active state: a paused workflow
+                // waiting on a signal must still accept (buffer) it so it is
+                // delivered on resume. The wake below re-pends the task, which
+                // the claim gate defers until the execution is RUNNING.
+                "RUNNING" | "PAUSED" => {}
+                // Issue #964. Neither is terminal, and calling them terminal is the
+                // damaging answer: a caller that sees "terminal" reasonably stops
+                // retrying, and the outbox records `target_terminal` in the
+                // sender's history for a workflow that is alive.
+                //
+                // `MIGRATED` — the run was rebalanced onto another shard; this row
+                // is the seal it left behind. The caller reached the wrong database
+                // and should re-resolve through the forwarding pointer.
+                // `MIGRATING` — a staged copy that is not live yet; it becomes
+                // claimable at activation, moments away.
+                //
+                // Both are reported as `ShardUnavailable`, which is the engine's
+                // existing RETRYABLE classification (`HarvestError::is_shard_unavailable`),
+                // so the outbox leaves the row pending and tries again rather than
+                // failing the delivery permanently.
+                //
+                // `MIGRATING` covers two different moments (issue #1317). This
+                // row cannot tell them apart. `commit_cutover` writes only the
+                // SOURCE database, on purpose. That lets it commit even when
+                // the target is briefly unreachable. No distributed two-phase
+                // commit is needed.
+                //
+                // A connection resolved to the target sees the same
+                // `MIGRATING` row in both moments: before cutover, and after
+                // cutover but before activation.
+                //
+                // Accepting the write in the first moment is not safe. If the
+                // migration later aborts, the staged copy is discarded. This
+                // signal would go with it. The caller would see `Ok` for a
+                // signal that silently never existed.
+                //
+                // Refusing in the second moment is suboptimal, not unsafe.
+                // Activation normally follows cutover in the same call.
+                // `resume_incomplete_migrations` finishes the pair after a
+                // crash in between.
+                //
+                // Telling the two moments apart needs a source connection, or
+                // a target-side marker from `commit_cutover`. Callers of this
+                // function are not guaranteed a source connection. A
+                // target-side marker would revive the two-phase dependency
+                // cutover deliberately avoids. So this refuses both,
+                // retryably, rather than risk the unsafe one.
+                state @ ("MIGRATED" | "MIGRATING") => {
+                    return Err(HarvestError::ShardUnavailable {
+                        shard_id: exec_id.shard().as_i32(),
+                        reason: format!(
+                            "workflow execution {exec_id} is mid shard-rebalance on this shard \
+                         ({state}); re-resolve it through its forwarding pointer and retry"
+                        ),
+                    });
+                }
+                "CANCELLED" => {
+                    return Err(HarvestError::Cancelled(execution.error.unwrap_or_else(
+                        || format!("workflow execution {exec_id} is cancelled"),
+                    )));
+                }
+                state => {
+                    return Err(HarvestError::Config(format!(
+                        "workflow execution {exec_id} is terminal ({state})"
+                    )));
+                }
             }
-        }
 
-        // ADR-0001 §2.5: harvest.signal.send — PRODUCER, emitted only for an
-        // accepted signal. in_scope is synchronous so EnteredSpan (!Send) is
-        // dropped before any await.
-        tracing::info_span!(
-            "harvest.signal.send",
-            "otel.kind" = "producer",
-            { ATTR_WORKFLOW_ID } = execution.workflow_name.as_str(),
-            { ATTR_EXECUTION_ID } = %exec_id,
-            signal.name = %signal_name,
-        )
-        .in_scope(|| {});
+            // ADR-0001 §2.5: harvest.signal.send — PRODUCER, emitted only for an
+            // accepted signal. in_scope is synchronous so EnteredSpan (!Send) is
+            // dropped before any await.
+            tracing::info_span!(
+                "harvest.signal.send",
+                "otel.kind" = "producer",
+                { ATTR_WORKFLOW_ID } = execution.workflow_name.as_str(),
+                { ATTR_EXECUTION_ID } = %exec_id,
+                signal.name = %signal_name,
+            )
+            .in_scope(|| {});
 
-        crate::queue::wake_workflow_task(conn, exec_id).await?;
-        Ok(true)
-    }))
+            crate::queue::wake_workflow_task(conn, exec_id).await?;
+            Ok(true)
+        },
+    )))
     .await
 }
 
@@ -206,7 +266,23 @@ pub async fn send_signal_to_live_attempt(
     payload: serde_json::Value,
     idempotency_key: Option<&str>,
 ) -> HarvestResult<RoutedSignalDelivery> {
-    let target = crate::execution::resolve_live_attempt_id(conn, exec_id).await?;
+    // `conn` is supplied by the caller (generated typed-signal code predating
+    // sharding), so its shard is not known here. `resolve_live_attempt_id_best_effort`
+    // (issue #1596 review) recovers it from the row itself rather than
+    // trusting a retry successor's stale `MIGRATED` stub across a rebalance.
+    //
+    // `send_signal_from_resolved` binds to `target`'s own shard itself
+    // (issue #1596 follow-up review, comment 4052389744). Passing `conn`
+    // through unchanged here is correct even when the resolve above hopped
+    // to a different shard than `conn` currently holds.
+    let (target, rebind) =
+        crate::execution::resolve_live_attempt_id_best_effort(conn, exec_id).await?;
+    // Drop this checkout before `send_signal_from_resolved` binds again for
+    // the same shard (fresh review, P1). `rebind` is not reused below: this
+    // call passes `conn` and lets `send_signal_from_resolved` rebind on its
+    // own. Holding both open at once can deadlock a pool-size-one shard
+    // against itself.
+    drop(rebind);
     send_signal_from_resolved(conn, exec_id, target, signal_name, payload, idempotency_key).await
 }
 
@@ -220,6 +296,16 @@ pub async fn send_signal_to_live_attempt(
 /// the resolved row's `workflow_name` — uses this so one request performs one
 /// chain walk instead of two, and so the row it validated against is provably
 /// the row it delivers to.
+///
+/// `resolved` may have been resolved by a caller that holds no
+/// [`crate::shard::ShardedDbPool`] of its own. This function's `conn`-only
+/// signature is unchanged since before sharding. Or it may come from a
+/// caller that does hold one, such as the management API. Either way,
+/// `conn` is not guaranteed to already be bound to `resolved`'s own shard
+/// (issue #1596 follow-up review, comment 4052389744). This function binds
+/// to it itself, rather than trusting the caller to have done so. A hop
+/// that moved shards mid-resolution leaves `conn` on the ORIGINAL shard,
+/// not the resolved one.
 ///
 /// # Errors
 ///
@@ -235,9 +321,20 @@ pub async fn send_signal_from_resolved(
 ) -> HarvestResult<RoutedSignalDelivery> {
     let exec_id = logical_exec_id;
     let mut target = resolved;
+    let mut rebind = crate::execution::bind_to_shard_best_effort(conn, target).await?;
     for _ in 0..crate::execution::RETRY_CHAIN_MAX_REDRIVES {
-        match send_signal_idempotent(conn, target, signal_name, payload.clone(), idempotency_key)
-            .await
+        let active: &mut AsyncPgConnection = match &mut rebind {
+            Some(fresh) => fresh,
+            None => conn,
+        };
+        match send_signal_idempotent(
+            active,
+            target,
+            signal_name,
+            payload.clone(),
+            idempotency_key,
+        )
+        .await
         {
             // A fresh insert is final: it landed on the attempt we resolved.
             Ok(true) => {
@@ -251,9 +348,11 @@ pub async fn send_signal_from_resolved(
             // sealed `FAILED` — swallowing a re-send the live attempt still
             // needs. Nothing was queued, so re-driving cannot double-deliver.
             Ok(false) => {
-                let fresh = crate::execution::resolve_live_attempt_id(conn, exec_id)
-                    .await
-                    .unwrap_or(target);
+                drop(rebind);
+                let (fresh, fresh_rebind) =
+                    crate::execution::resolve_live_attempt_id_best_effort(conn, exec_id)
+                        .await
+                        .unwrap_or((target, None));
                 if !crate::execution::redrive_target(target, fresh) {
                     return Ok(RoutedSignalDelivery {
                         target,
@@ -261,22 +360,30 @@ pub async fn send_signal_from_resolved(
                     });
                 }
                 target = fresh;
+                rebind = fresh_rebind;
             }
             Err(error) => {
                 // The delivery was rolled back, so re-driving is safe: it can
                 // never double-deliver a signal that was actually queued.
-                let fresh = crate::execution::resolve_live_attempt_id(conn, exec_id)
-                    .await
-                    .unwrap_or(target);
+                drop(rebind);
+                let (fresh, fresh_rebind) =
+                    crate::execution::resolve_live_attempt_id_best_effort(conn, exec_id)
+                        .await
+                        .unwrap_or((target, None));
                 if !crate::execution::redrive_target(target, fresh) {
                     return Err(error);
                 }
                 target = fresh;
+                rebind = fresh_rebind;
             }
         }
     }
+    let active: &mut AsyncPgConnection = match &mut rebind {
+        Some(fresh) => fresh,
+        None => conn,
+    };
     let delivered =
-        send_signal_idempotent(conn, target, signal_name, payload, idempotency_key).await?;
+        send_signal_idempotent(active, target, signal_name, payload, idempotency_key).await?;
     Ok(RoutedSignalDelivery { target, delivered })
 }
 

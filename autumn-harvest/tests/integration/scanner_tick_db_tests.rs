@@ -31,7 +31,7 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 /// Prefer an operator-supplied database (a local Postgres) and fall back to
@@ -55,7 +55,7 @@ async fn setup_test_db_url() -> (String, Option<ContainerAsync<Postgres>>) {
                 .await
                 .expect("HARVEST_TEST_DATABASE_URL must be reachable");
             fresh
-                .batch_execute(autumn_harvest::full_migrations_sql())
+                .batch_execute(&autumn_harvest::test_init_sql())
                 .await
                 .expect("migrations should apply");
         }
@@ -161,6 +161,8 @@ async fn spawned_timeout_checker_ticks_all_owned_scanners_with_no_work() {
         None,
         60,
         Some(ShardId::new(0)),
+        autumn_harvest::payload_codec::PayloadCodecs::default(),
+        0,
     );
 
     // Poll (bounded) rather than sleeping a fixed span: fast when the loop is
@@ -258,6 +260,8 @@ async fn enforce_timeouts_once_records_no_scanner_ticks() {
         None,
         None,
         60,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        0,
     )
     .await
     .expect("a no-work enforcement pass must succeed");
@@ -305,6 +309,8 @@ async fn the_loop_advances_liveness_without_a_metrics_recorder() {
         None,
         60,
         Some(ShardId::new(0)),
+        autumn_harvest::payload_codec::PayloadCodecs::default(),
+        0,
     );
 
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
@@ -358,8 +364,10 @@ async fn spawned_poison_pill_reclaimer_registers_ticks_and_deregisters() {
         Duration::from_millis(50),
         3,
         60,
+        None,
         telemetry,
         Some(ShardId::new(0)),
+        autumn_harvest::payload_codec::PayloadCodecs::default(),
     );
     assert_eq!(
         global_scanner_liveness().registrations(Scanner::PoisonPill),
@@ -402,6 +410,80 @@ async fn spawned_poison_pill_reclaimer_registers_ticks_and_deregisters() {
     let _ = handle.await;
     assert_eq!(
         global_scanner_liveness().registrations(Scanner::PoisonPill),
+        before,
+        "a graceful stop must release the registration"
+    );
+}
+
+/// The same register/tick/deregister proof as the poison-pill reclaimer
+/// above, for the dedicated audit-export task (issue #1269).
+///
+/// No sink is installed, so this also exercises AC3's "ticks even with
+/// nothing to do" property on the new loop. It must tick on every
+/// iteration even though every tick is a no-op: no sink configured means no
+/// connection is even attempted.
+#[tokio::test]
+async fn spawned_audit_export_checker_registers_ticks_and_deregisters() {
+    // Serialize against sibling tests that touch the process-global registry;
+    // the delta assertions below are only sound with exclusive access.
+    let _serial = TEST_SERIAL.lock().await;
+    let (url, _container) = setup_test_db_url().await;
+    let pool = build_pool(&url);
+    let recorder = std::sync::Arc::new(TickRecorder::default());
+    let telemetry = std::sync::Arc::new(autumn_harvest::telemetry::TelemetryConfig {
+        metrics: recorder.clone(),
+        ..Default::default()
+    });
+    let cancel = tokio_util::sync::CancellationToken::new();
+
+    let before = global_scanner_liveness().registrations(Scanner::AuditExport);
+    let handle = autumn_harvest::audit_export::spawn_audit_export_checker_for_shard(
+        pool.clone(),
+        cancel.clone(),
+        Duration::from_millis(50),
+        telemetry,
+        Some(ShardId::new(0)),
+        None,
+        None,
+    );
+    assert_eq!(
+        global_scanner_liveness().registrations(Scanner::AuditExport),
+        before + 1,
+        "the loop must register itself at spawn time, before its first iteration"
+    );
+    assert!(
+        global_scanner_liveness()
+            .snapshot()
+            .iter()
+            .any(|status| status.scanner == Scanner::AuditExport
+                && status.shard == Some(ShardId::new(0))),
+        "the spawner's shard must reach the liveness snapshot"
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if recorder
+            .ticks()
+            .iter()
+            .filter(|t| *t == "audit_export")
+            .count()
+            >= 2
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the export task must tick on every iteration with no sink \
+             configured; got {:?}",
+            recorder.ticks()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    cancel.cancel();
+    let _ = handle.await;
+    assert_eq!(
+        global_scanner_liveness().registrations(Scanner::AuditExport),
         before,
         "a graceful stop must release the registration"
     );
@@ -476,8 +558,105 @@ fn the_public_spawn_signatures_are_unchanged_by_shard_attribution() {
         i32,
         i64,
         std::sync::Arc<autumn_harvest::telemetry::TelemetryConfig>,
+        autumn_harvest::payload_codec::PayloadCodecs,
     ) -> tokio::task::JoinHandle<()>;
 
     let _: TimeoutCheckerFn = timeout::spawn_timeout_checker;
     let _: PoisonPillReclaimerFn = autumn_harvest::poison_pill::spawn_poison_pill_reclaimer;
+}
+
+/// Issue #1879: the spawned reclaimer loop holds the last strike of a late
+/// worker's task. It quarantines only once the death is confirmed.
+///
+/// A loop that used the first-sight sweep would quarantine on its first
+/// iteration, about 50 ms after the spawn.
+#[tokio::test]
+async fn spawned_poison_pill_reclaimer_holds_the_last_strike_of_a_late_worker() {
+    use diesel_async::RunQueryDsl as _;
+
+    #[derive(diesel::QueryableByName)]
+    struct StateRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        state: String,
+    }
+
+    let _serial = TEST_SERIAL.lock().await;
+    let (url, _container) = setup_test_db_url().await;
+    let pool = build_pool(&url);
+    let worker_id = format!("late-{}", uuid::Uuid::new_v4());
+    let task_id = uuid::Uuid::new_v4();
+    let mut conn = pool.get().await.expect("connection");
+    diesel::sql_query(
+        "INSERT INTO harvest_workers (worker_id, last_heartbeat_at, max_concurrency, host) \
+         VALUES ($1, NOW() - INTERVAL '15 seconds', 10, 'localhost')",
+    )
+    .bind::<diesel::sql_types::Text, _>(&worker_id)
+    .execute(&mut conn)
+    .await
+    .expect("insert a late worker");
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+         (id, queue_name, task_type, input, state, worker_id, attempt, max_attempts, \
+          started_at, crash_strikes) \
+         VALUES ($1, $2, 'activity', '{}'::jsonb, 'RUNNING', $2, 1, 3, NOW(), 2)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .bind::<diesel::sql_types::Text, _>(&worker_id)
+    .execute(&mut conn)
+    .await
+    .expect("insert a task one strike from the threshold");
+    let state =
+        async |conn: &mut diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>| {
+            diesel::sql_query("SELECT state FROM harvest_task_queue WHERE id = $1")
+                .bind::<diesel::sql_types::Uuid, _>(task_id)
+                .get_result::<StateRow>(conn)
+                .await
+                .expect("task state")
+                .state
+        };
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let handle = autumn_harvest::poison_pill::spawn_poison_pill_reclaimer_for_shard(
+        pool.clone(),
+        cancel.clone(),
+        Duration::from_millis(50),
+        3,
+        10,
+        None,
+        std::sync::Arc::new(autumn_harvest::telemetry::TelemetryConfig::default()),
+        None,
+        autumn_harvest::payload_codec::PayloadCodecs::default(),
+    );
+    // A failed assertion must still stop the loop. A loop left running keeps
+    // its registration and breaks the delta checks of the other tests here.
+    let stop = cancel.clone().drop_guard();
+
+    // About 20 sweeps. The heartbeat is 15 s old, inside the 20 s confirm
+    // window, so every sweep must hold the row.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        state(&mut conn).await,
+        "RUNNING",
+        "a late worker keeps its task"
+    );
+
+    diesel::sql_query(
+        "UPDATE harvest_workers SET last_heartbeat_at = NOW() - INTERVAL '25 seconds' \
+         WHERE worker_id = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(&worker_id)
+    .execute(&mut conn)
+    .await
+    .expect("age the worker past the confirm window");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while state(&mut conn).await != "FAILED" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the loop must quarantine once the death is confirmed"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    drop(stop);
+    let _ = handle.await;
 }

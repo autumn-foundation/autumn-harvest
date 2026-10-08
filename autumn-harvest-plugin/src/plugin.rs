@@ -5,7 +5,7 @@ use std::any::Any;
 #[cfg(feature = "connectors")]
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use autumn_web::AppState;
 use autumn_web::app::AppBuilder;
@@ -14,10 +14,12 @@ use autumn_web::db;
 use autumn_web::error::AutumnError;
 use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
 use autumn_web::plugin::Plugin;
+use autumn_web::plugin_contract::PluginContract;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::api::{HarvestApiState, acquire_conn, harvest_api_router};
+use crate::api::{HarvestApiState, harvest_api_router};
+use crate::boot::{AdmissionGlobalsGuard, GateRefreshRuntime, dev_admin_api_is_open};
 use crate::config::{HarvestMode, HarvestRuntimeConfig};
 use crate::outbox::spawn_workflow_start_outbox_relay;
 use crate::runner::{HarvestRunner, HarvestRunnerResources};
@@ -52,7 +54,10 @@ const PLUGIN_HARVEST_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrati
 /// any `on_startup` hook runs, so `start_harvest_runtime` always observes an
 /// already-migrated database. It also keeps the same dev/prod policy the plugin
 /// applied by hand before: auto-apply under the `dev` profile, warn-only
-/// otherwise (run a one-shot `autumn migrate` before rolling prod replicas).
+/// otherwise (run a one-shot `autumn migrate` before rolling prod replicas —
+/// and, for the dedicated Harvest database under `Split`/`External` that
+/// `autumn migrate` cannot reach, `harvest migrate run`; see
+/// [`ensure_runtime_migrations_blocking`]).
 ///
 /// Registering here rather than migrating ourselves is what lets Autumn resolve
 /// **version collisions across plugins**. Diesel's `__diesel_schema_migrations`
@@ -79,15 +84,37 @@ const PLUGIN_HARVEST_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrati
 /// rather than guessing: applying the sets to the app database for an unknown
 /// mode could create Harvest tables in the wrong place, while registering only
 /// the outbox would let migration-only commands report false success.
-fn register_plugin_migrations(app: AppBuilder) -> AppBuilder {
+/// `require_embedded` is set only by the dev runtime (issue #1291): when
+/// true, a resolved mode other than `Embedded` panics rather than silently
+/// registering split/external migrations. The dev runtime's own startup gate
+/// already refuses this earlier; this is a backstop for ambient
+/// configuration changing in the narrow window since that check.
+fn register_plugin_migrations(app: AppBuilder, require_embedded: bool) -> AppBuilder {
     let app = app.plugin_migrations("autumn-harvest-plugin (outbox)", OUTBOX_MIGRATIONS);
 
-    match migration_registration_mode(HarvestRuntimeConfig::load()) {
+    let mode = migration_registration_mode(HarvestRuntimeConfig::load());
+    assert!(
+        !embedded_harvest_mode_violated(require_embedded, mode),
+        "harvest dev runtime requires embedded Harvest storage, but ambient configuration now \
+         resolves harvest.mode to {mode:?}. This should be unreachable: the dev runtime's own \
+         startup gate (issue #1291) already refuses this case, so ambient configuration must \
+         have changed since that check"
+    );
+    match mode {
         HarvestMode::Embedded => app
             .plugin_migrations("autumn-harvest", HARVEST_MIGRATIONS)
             .plugin_migrations("autumn-harvest-plugin", PLUGIN_HARVEST_MIGRATIONS),
         HarvestMode::Split | HarvestMode::External => app,
     }
+}
+
+/// Whether the dev runtime's embedded-only backstop (issue #1291) should
+/// refuse. True only when the caller requires embedded storage and the
+/// resolved mode is not `Embedded`. Pure so both call sites --
+/// [`register_plugin_migrations`] and `start_harvest_runtime` -- share one
+/// unit-testable decision instead of duplicating the boolean logic.
+const fn embedded_harvest_mode_violated(require_embedded: bool, mode: HarvestMode) -> bool {
+    require_embedded && !matches!(mode, HarvestMode::Embedded)
 }
 
 /// Resolve the topology before migration registration. This must be fail-fast:
@@ -103,11 +130,6 @@ fn migration_registration_mode(
 }
 
 struct OutboxRuntime {
-    shutdown: CancellationToken,
-    handle: JoinHandle<()>,
-}
-
-struct GateRefreshRuntime {
     shutdown: CancellationToken,
     handle: JoinHandle<()>,
 }
@@ -135,10 +157,13 @@ struct HarvestRuntimeSlot {
     connectors: Vec<ConnectorRegistration>,
 }
 
+/// Wraps the nested management-API router in the embedder's auth layer.
+///
+/// Operates on `Router<()>` because both exported routers are state-free
+/// (issue #1606). The router is converted to `Router<AppState>` once, at the
+/// `AppBuilder::nest` boundary below.
 type ApiMiddlewareFn = Box<
-    dyn FnOnce(
-            autumn_web::reexports::axum::Router<autumn_web::AppState>,
-        ) -> autumn_web::reexports::axum::Router<autumn_web::AppState>
+    dyn FnOnce(autumn_web::reexports::axum::Router<()>) -> autumn_web::reexports::axum::Router<()>
         + Send
         + Sync,
 >;
@@ -211,6 +236,15 @@ pub struct HarvestPlugin {
     /// [`Self::enable_api_tokens`]; installs the token verification + scope
     /// layer. Default off — the router is byte-for-byte unchanged (AC7).
     api_tokens_enabled: bool,
+    /// The authorizer hook (issue #1803). Set via [`Self::with_authorizer`].
+    /// `None` installs no layer, so the router is unchanged.
+    authorizer: Option<crate::authz::SharedAuthorizer>,
+    /// The per-client API rate limiter (issue #1827). Set via
+    /// [`Self::with_api_rate_limit`]. `None` installs no layer.
+    api_rate_limit: Option<crate::api_rate_limit::ApiRateLimit>,
+    /// Opt-out that opens mutating routes with no auth (issue #1802). Set
+    /// true by [`Self::allow_unauthenticated_mutations`]. Default off.
+    allow_unauthenticated_mutations: bool,
     /// Thresholds for the rolled-up `GET /admin/status` verdict (issue #679).
     /// Set via [`Self::with_status_thresholds`]; starter defaults otherwise.
     status_thresholds: crate::status_summary::StatusThresholds,
@@ -231,6 +265,14 @@ pub struct HarvestPlugin {
     /// [`Self::with_metrics_scrape`] (feature `metrics`).
     #[cfg(feature = "metrics")]
     metrics_scrape_enabled: bool,
+    /// Refuse to build unless ambient Harvest configuration resolves to
+    /// `embedded` mode (issue #1291). Set only by the dev runtime
+    /// (`crate::dev`) via [`Self::require_embedded_harvest_mode`]; every
+    /// ordinary embedder leaves this `false` and keeps full `split`/
+    /// `external` support. This is a backstop: the dev runtime's own
+    /// startup gate already refuses this case earlier. It only matters if
+    /// ambient configuration changed in the narrow window since.
+    require_embedded_harvest_mode: bool,
 }
 
 /// One registered broker connector: a binding plus the source that feeds it.
@@ -301,6 +343,9 @@ impl HarvestPlugin {
             decode_payloads_on_read: false,
             role_auth_enabled: false,
             api_tokens_enabled: false,
+            authorizer: None,
+            api_rate_limit: None,
+            allow_unauthenticated_mutations: false,
             status_thresholds: crate::status_summary::StatusThresholds::default(),
             canary_config: None,
             #[cfg(feature = "webhooks")]
@@ -309,6 +354,7 @@ impl HarvestPlugin {
             connectors: Vec::new(),
             #[cfg(feature = "metrics")]
             metrics_scrape_enabled: false,
+            require_embedded_harvest_mode: false,
         }
     }
 
@@ -372,6 +418,27 @@ impl HarvestPlugin {
     #[must_use]
     pub fn retention(mut self, config: autumn_harvest::retention::RetentionConfig) -> Self {
         self.builder = self.builder.retention(config);
+        self
+    }
+
+    /// Turn on automatic load shedding for the queues in `config` (issue #1794).
+    ///
+    /// A queue with an old backlog then refuses new starts with `429` and
+    /// `Retry-After`. See `docs/operations/load-shedding.md`.
+    #[must_use]
+    pub fn load_shed(mut self, config: autumn_harvest::load_shed::LoadShedConfig) -> Self {
+        self.builder = self.builder.load_shed(config);
+        self
+    }
+
+    /// Turn on the build ramp guard (issue #1814).
+    ///
+    /// The guard aborts a build ramp when the target build fails or ND-blocks
+    /// more runs than the base build. See
+    /// `docs/operations/build-ramp-guard.md`.
+    #[must_use]
+    pub fn ramp_guard(mut self, config: autumn_harvest::ramp_guard::RampGuardConfig) -> Self {
+        self.builder = self.builder.ramp_guard(config);
         self
     }
 
@@ -546,6 +613,57 @@ impl HarvestPlugin {
     #[must_use]
     pub const fn enable_api_tokens(mut self) -> Self {
         self.api_tokens_enabled = true;
+        self
+    }
+
+    /// Install an authorizer hook on the management API (issue #1803).
+    ///
+    /// The hook sees each request after the token and read-only layers. It can
+    /// deny by principal, route class, tenant key or shard, and each deny is
+    /// audited. It cannot widen a token scope. See [`crate::authz`].
+    ///
+    /// Default off: with no hook the router is byte-for-byte unchanged.
+    #[must_use]
+    pub fn with_authorizer(mut self, authorizer: impl crate::authz::HarvestAuthorizer) -> Self {
+        self.authorizer = Some(crate::authz::SharedAuthorizer::new(authorizer));
+        self
+    }
+
+    /// Rate-limit each client of the management API (issue #1827).
+    ///
+    /// Each verified API token, or each client IP without one, gets one
+    /// bucket for mutating routes and one for read routes. A client over its
+    /// limit gets `429` with `Retry-After`. `PublicSafe` routes and `OPTIONS`
+    /// requests are exempt. See
+    /// [`crate::api_rate_limit`].
+    ///
+    /// Default off: with no limiter the router is byte-for-byte unchanged.
+    #[must_use]
+    pub const fn with_api_rate_limit(
+        mut self,
+        rate_limit: crate::api_rate_limit::ApiRateLimit,
+    ) -> Self {
+        self.api_rate_limit = Some(rate_limit);
+        self
+    }
+
+    /// Open the mutating routes to a caller with no credential (issue #1802).
+    ///
+    /// Outside the `dev` profile, a mount with no [`Self::api_with_auth`]
+    /// refuses every mutating route with 401. This opt-out restores the
+    /// pre-#1802 posture for routes with no admin gate. Those are workflow
+    /// start, signal and update (with the with-start variants), reset, DAG
+    /// trigger, patch and retry, schedule changes, external-activity
+    /// callbacks and worker drain. The opt-out also opens the Vantage form
+    /// posts and the mutating MCP tool routes that have no admin gate.
+    /// Admin-gated routes keep their gate.
+    ///
+    /// Outside `dev`, startup logs a warning while the opt-out is set. Prefer
+    /// [`Self::api_with_auth`] or [`Self::enable_api_tokens`]. Tokens do not
+    /// cover the MCP tool routes.
+    #[must_use]
+    pub const fn allow_unauthenticated_mutations(mut self) -> Self {
+        self.allow_unauthenticated_mutations = true;
         self
     }
 
@@ -769,6 +887,24 @@ impl HarvestPlugin {
             source,
             config,
         });
+        self
+    }
+
+    /// Refuse to build, and refuse to start, unless ambient Harvest
+    /// configuration resolves to `embedded` mode (issue #1291).
+    ///
+    /// Crate-internal: only the dev runtime (`crate::dev`) calls this. It
+    /// owns one ephemeral cluster and has no second database to offer
+    /// `split`/`external` storage. It already refuses ambient non-embedded
+    /// configuration before this plugin is ever built. This flag is a
+    /// backstop against ambient configuration changing in the narrow window
+    /// since that check. It is checked again both at build time
+    /// ([`register_plugin_migrations`]) and at startup
+    /// ([`start_harvest_runtime`]).
+    #[cfg(feature = "dev-runtime")]
+    #[must_use]
+    pub(crate) const fn require_embedded_harvest_mode(mut self) -> Self {
+        self.require_embedded_harvest_mode = true;
         self
     }
 }
@@ -1027,7 +1163,32 @@ const fn mcp_tools_unprotected(mcp_tools_enabled: bool, has_tool_middleware: boo
     mcp_tools_enabled && !has_tool_middleware
 }
 
+/// The `autumn-web` series this crate supports.
+///
+/// It must equal the `autumn-web` requirement in this crate's `Cargo.toml`.
+/// A unit test enforces that, so a dependency bump cannot leave it stale.
+pub const AUTUMN_WEB_REQUIREMENT: &str = "0.8";
+
+/// The compatibility contract that [`HarvestPlugin`] declares to Autumn.
+///
+/// Harvest does not release in lockstep with Autumn, so the contract names an
+/// explicit `autumn-web` range, not `lockstep_contract`.
+#[must_use]
+pub fn harvest_plugin_contract() -> PluginContract {
+    PluginContract::new(env!("CARGO_PKG_NAME"))
+        .plugin_version(env!("CARGO_PKG_VERSION"))
+        .autumn_web(AUTUMN_WEB_REQUIREMENT)
+}
+
 impl Plugin for HarvestPlugin {
+    /// Declares the `autumn-web` range that Harvest supports.
+    ///
+    /// `AppBuilder::plugin` panics at registration when the host framework is
+    /// outside this range. `autumn plugin-check` fails a plugin with no range.
+    fn contract(&self) -> Option<PluginContract> {
+        Some(harvest_plugin_contract())
+    }
+
     #[allow(clippy::too_many_lines)]
     fn build(self, app: AppBuilder) -> AppBuilder {
         let Self {
@@ -1040,6 +1201,9 @@ impl Plugin for HarvestPlugin {
             decode_payloads_on_read,
             role_auth_enabled,
             api_tokens_enabled,
+            authorizer,
+            api_rate_limit,
+            allow_unauthenticated_mutations,
             status_thresholds,
             canary_config,
             #[cfg(feature = "webhooks")]
@@ -1048,15 +1212,21 @@ impl Plugin for HarvestPlugin {
             connectors,
             #[cfg(feature = "metrics")]
             metrics_scrape_enabled,
+            require_embedded_harvest_mode,
         } = self;
         #[cfg(not(feature = "mcp"))]
         let _ = (mcp_tool_middleware, mcp_tools_enabled, mcp_tools_prefix);
 
         // Autumn owns migrations for every set that lives in the application
-        // database (autumn-web 0.7). See `register_plugin_migrations`.
-        let app = register_plugin_migrations(app);
+        // database (since autumn-web 0.7). See `register_plugin_migrations`.
+        let app = register_plugin_migrations(app, require_embedded_harvest_mode);
 
         let api_state = HarvestApiState::new();
+        api_state.set_allow_unauthenticated_mutations(allow_unauthenticated_mutations);
+        // Issue #1291: mirror onto `api_state` so `start_harvest_runtime` --
+        // which only receives `api_state`, not this consumed `HarvestPlugin`
+        // -- can also refuse a non-embedded ambient mode.
+        api_state.set_require_embedded_harvest_mode(require_embedded_harvest_mode);
 
         // Issue #355: one shared `HarvestMetricsRecorder` instance backs both
         // the engine-side `MetricsRecorder` (installed on `builder` before it
@@ -1307,12 +1477,12 @@ impl Plugin for HarvestPlugin {
             if mcp_tools_unprotected(mcp_tools_enabled, mcp_tool_middleware.is_some()) {
                 tracing::warn!(
                     "HarvestPlugin::mcp_tools() is enabled with no HarvestPlugin::api_with_auth(..) \
-                     configured -- the generated start_/signal_/update_ tool routes are reachable \
-                     UNAUTHENTICATED at their own HTTP path, even if the app also configures \
-                     autumn-web's secure_mcp(...) (which only gates the /mcp JSON-RPC envelope, not \
-                     these routes' direct paths). Configure HarvestPlugin::api_with_auth(path, mw) \
-                     to protect the generated tool routes, or disregard this warning if \
-                     unauthenticated access is intentional (e.g. local development)."
+                     configured. autumn-web's secure_mcp(...) gates only the /mcp JSON-RPC \
+                     envelope, not the direct HTTP paths of the generated tool routes. Outside the \
+                     dev profile, the start_/signal_/update_ tool routes answer 401 to a caller \
+                     with no admin session (issue #1802). In the dev profile, or with \
+                     allow_unauthenticated_mutations(), they are reachable UNAUTHENTICATED. \
+                     Configure HarvestPlugin::api_with_auth(path, mw) to protect them."
                 );
             }
             let prefix =
@@ -1422,121 +1592,108 @@ impl Plugin for HarvestPlugin {
 
         if let Some(path) = api_path {
             let ui_router = harvest_ui_router(api_state.clone());
-            // Clone the state for the token layer only when it will be installed,
-            // so a disabled deployment does an identical amount of work as before.
-            let token_layer_state = api_tokens_enabled.then(|| api_state.clone());
-            let mut router = harvest_api_router(api_state).nest("/ui", ui_router);
-            // Issue #776: install the class-aware read-only enforcement layer
-            // BEFORE the embedder's auth middleware wraps the router, so the
-            // request order is: embedder auth mw (sets Session) → this layer
-            // (reads Session + method + nest-stripped path) → per-route
-            // require_admin → handler. Applied to the combined router so it
-            // also covers the nested /ui sub-router (which, being unclassified,
-            // fails closed → 403 for read-only principals). Only installed
-            // under api_with_role_auth; the default and api_with_auth paths are
-            // byte-for-byte unchanged (AC6).
-            if role_auth_enabled {
-                router = router.layer(autumn_web::reexports::axum::middleware::from_fn(
-                    crate::api::enforce_read_only_class,
-                ));
-            }
-            // Issue #942: install the scoped-API-token verification + scope layer
-            // OUTSIDE the read-only-class layer (so it runs first: verify token →
-            // set TokenPrincipal / authoritative actor → deny read-scope mutation)
-            // and INSIDE the embedder's auth middleware. Only installed under
-            // enable_api_tokens(); the default path is byte-for-byte unchanged (AC7).
-            if let Some(state) = token_layer_state {
-                router = router.layer(autumn_web::reexports::axum::middleware::from_fn_with_state(
-                    state,
-                    crate::api_token::enforce_token_scope,
-                ));
-            }
+            let router = harvest_api_router(api_state.clone()).nest("/ui", ui_router);
+            // The layer stack and its load-bearing ordering live in
+            // `apply_admin_auth_layers`, which the standalone mount path also
+            // calls (issue #1608), so the two cannot drift. Neither layer is
+            // installed unless its opt-in is set, so the default and
+            // api_with_auth paths are byte-for-byte unchanged (AC6, AC7).
+            let mut router = crate::api::apply_admin_auth_layers(
+                router,
+                &api_state,
+                &crate::api::AdminAuthLayers {
+                    api_tokens: api_tokens_enabled,
+                    read_only_role: role_auth_enabled,
+                    authorizer,
+                    rate_limit: api_rate_limit,
+                },
+            );
             if let Some(mw) = api_middleware {
                 router = mw(router);
             }
-            app.nest(&path, router)
+            // `AppBuilder::nest` takes a `Router<AppState>`. The router is
+            // `Router<()>`, so it declares the state type it never reads
+            // (issue #1606). No handler in either router takes a `State`
+            // extractor for it.
+            app.nest(&path, router.with_state(()))
         } else {
-            let _ = api_tokens_enabled;
+            let _ = (api_tokens_enabled, authorizer, api_rate_limit);
             app
         }
     }
 }
 
-/// RAII guard (issue #618, F-round7) that clears the process-global admission
-/// gate cache and metrics recorder if `start_harvest_runtime` returns early with
-/// an error AFTER publishing them — so a failed startup never leaves the globals
-/// pointing at a dead runtime's stale cache/recorder. Defused with `.commit()`
-/// only once startup fully succeeds. Each clear is ptr-eq-guarded against THIS
-/// runtime's `Arc`s (mirroring `stop_harvest_runtime`) so a concurrently-live
-/// sibling runtime's globals are never clobbered.
-struct AdmissionGlobalsGuard {
-    gate_cache: Arc<autumn_harvest::admission_gate::AdmissionGateCache>,
-    /// The global gate cache installed BEFORE this guard published its own (a
-    /// concurrently-live sibling runtime's, or `None`). Restored — not cleared to
-    /// `None` — on a drop-without-commit, so a failed second-runtime startup in the
-    /// same process does not wipe a still-running sibling's enforcement (issue #618
-    /// final pass).
-    prev_gate_cache: Option<Arc<autumn_harvest::admission_gate::AdmissionGateCache>>,
-    metrics: Option<Arc<dyn autumn_harvest::telemetry::MetricsRecorder>>,
-    /// The global metrics recorder installed before `publish_metrics` ran (restored
-    /// on a drop-without-commit, same rationale as `prev_gate_cache`).
-    prev_metrics: Option<Arc<dyn autumn_harvest::telemetry::MetricsRecorder>>,
-    committed: bool,
+/// The application configuration this startup hook should read.
+///
+/// `state.config()` first, **not** `AutumnConfig::load()`. Re-loading reads
+/// `autumn.toml` + `AUTUMN_*` from scratch and so silently ignores any
+/// `ConfigLoader` the embedder installed via `AppBuilder::with_config_loader` —
+/// the seam autumn-web documents for exactly this. Autumn had already resolved
+/// the database URL through that loader, applied the migrations with it and
+/// built the pool from it; this function then looked at a *different* config
+/// and refused to start with "requires database.url when harvest.mode is
+/// embedded".
+///
+/// But `state.config()` is not always populated. `autumn_web::test::TestApp`
+/// starts from `AutumnConfig::default()`, and `AppState::config_arc` falls back
+/// to a default when no config extension is present — so a harness that
+/// supplies its database another way leaves `database.url` empty while the
+/// process environment still carries it. Reading only `state.config()` broke
+/// exactly those suites.
+///
+/// So: prefer the config the app is actually running on, and fall back to the
+/// ambient one **only when the app's own config names no database at all**. The
+/// fallback can add a URL where there was none; it can never override one the
+/// embedder resolved, which is what the `ConfigLoader` fix depends on.
+fn resolve_app_config(state: &AppState) -> AutumnConfig {
+    preferred_app_config(state.config(), AutumnConfig::load().ok())
 }
 
-impl AdmissionGlobalsGuard {
-    /// Publish the gate cache to the global static and begin guarding it.
-    fn publish_gate_cache(cache: Arc<autumn_harvest::admission_gate::AdmissionGateCache>) -> Self {
-        // Capture the previous global BEFORE overwriting it, so a failed startup
-        // restores a live sibling's cache rather than clearing to None.
-        let prev_gate_cache = autumn_harvest::admission_gate::global_admission_gate_cache();
-        autumn_harvest::admission_gate::set_global_admission_gate_cache(Some(cache.clone()));
-        Self {
-            gate_cache: cache,
-            prev_gate_cache,
-            metrics: None,
-            prev_metrics: None,
-            committed: false,
-        }
+/// The choice [`resolve_app_config`] makes, as a pure function of both configs.
+///
+/// Split out so the rule is unit-testable: the bug it fixes only reproduced
+/// inside a live `TestApp` against a Docker-backed database, which is the
+/// slowest possible place to notice a one-line policy change.
+fn preferred_app_config(from_state: AutumnConfig, ambient: Option<AutumnConfig>) -> AutumnConfig {
+    if from_state.database.url.is_some() {
+        return from_state;
     }
-
-    /// Publish the metrics recorder to the global static and begin guarding it.
-    fn publish_metrics(&mut self, recorder: Arc<dyn autumn_harvest::telemetry::MetricsRecorder>) {
-        self.prev_metrics = autumn_harvest::admission_gate::global_admission_metrics();
-        autumn_harvest::admission_gate::set_global_admission_metrics(Some(recorder.clone()));
-        self.metrics = Some(recorder);
-    }
-
-    /// Defuse the guard: startup succeeded, keep the published globals.
-    fn commit(mut self) {
-        self.committed = true;
+    match ambient {
+        Some(ambient) if ambient.database.url.is_some() => ambient,
+        // Neither names a database. Return the app's own config so the caller
+        // reports the invariant it actually cares about ("requires
+        // database.url when harvest.mode is embedded") rather than a difference
+        // between two empty configs.
+        _ => from_state,
     }
 }
 
-impl Drop for AdmissionGlobalsGuard {
-    fn drop(&mut self) {
-        if self.committed {
-            return;
-        }
-        // RESTORE the previous global (a still-running sibling runtime's cache, or
-        // `None` when there was no prior) instead of clearing to `None`: a failed
-        // second-runtime startup in the same process must not wipe a live sibling's
-        // enforcement (issue #618 final pass). Guard on ptr_eq so we only touch the
-        // global while it is still OUR published value (a third party may have
-        // replaced it — then leave it, as before).
-        if let Some(installed) = autumn_harvest::admission_gate::global_admission_gate_cache()
-            && Arc::ptr_eq(&installed, &self.gate_cache)
-        {
-            autumn_harvest::admission_gate::set_global_admission_gate_cache(
-                self.prev_gate_cache.take(),
-            );
-        }
-        if let Some(ref m) = self.metrics
-            && let Some(installed) = autumn_harvest::admission_gate::global_admission_metrics()
-            && Arc::ptr_eq(&installed, m)
-        {
-            autumn_harvest::admission_gate::set_global_admission_metrics(self.prev_metrics.take());
-        }
+/// Announce an unauthenticated management API at startup (issue #1284).
+///
+/// In the `dev` profile with no declared auth boundary, a caller that presents
+/// no session cookie reaches every admin route — that is what makes the
+/// quickstart's documented `harvest preflight` step work without a manual
+/// credential setup, and it is the posture `set_deployment_profile` has always
+/// documented. Deliberate, but never silent: an operator who left a `dev`-profile
+/// process bound to a shared interface should learn it from the log, not from an
+/// incident. The two ways out are named in the message.
+///
+/// Split out as a free function so the exact predicate is unit-testable without
+/// booting an `AppState` — the failure mode that matters is this warning firing
+/// for a profile that is *not* open (noise operators learn to ignore) or staying
+/// quiet for one that is.
+fn warn_if_dev_admin_api_is_open(profile: &str, auth_boundary_present: bool) {
+    if dev_admin_api_is_open(profile, auth_boundary_present) {
+        tracing::warn!(
+            "AUTUMN_PROFILE=dev with no HarvestPlugin::api_with_auth(..) boundary: the Harvest \
+             management API (including every /admin route, every mutating route and the Vantage \
+             dashboard) is reachable UNAUTHENTICATED by any caller that can open a socket to this \
+             process. This is the documented dev-profile posture and is what lets `harvest \
+             preflight` run against a local quickstart app. Do not expose this process beyond \
+             localhost. To close it, configure HarvestPlugin::api_with_auth(path, middleware), or \
+             run a non-dev AUTUMN_PROFILE (where the API fails closed unless \
+             allow_unauthenticated_mutations() is set)."
+        );
     }
 }
 
@@ -1546,12 +1703,36 @@ async fn start_harvest_runtime(
     slot: &Arc<Mutex<HarvestRuntimeSlot>>,
     api_state: &HarvestApiState,
 ) -> autumn_web::AutumnResult<()> {
+    // Issue #1812: a new start ends an old drain. autumn-web marks its probe
+    // state at SIGTERM, before the shutdown hook runs, so readiness reads it.
+    api_state.end_draining();
+    api_state.link_host_probes(state.probes().clone());
     api_state.set_deployment_profile(state.profile().to_string());
     api_state.set_admin_auth_session_key(state.auth_session_key());
-    let app_config = AutumnConfig::load()
-        .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+    warn_if_dev_admin_api_is_open(state.profile(), api_state.admin_auth_boundary());
+    crate::boot::warn_if_mutation_opt_out_is_open(
+        state.profile(),
+        api_state.admin_auth_boundary(),
+        api_state.allow_unauthenticated_mutations(),
+    );
+    let app_config = resolve_app_config(state);
     let harvest_config = HarvestRuntimeConfig::load()
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+    // Issue #1291 backstop: the dev runtime already refused a non-embedded
+    // ambient mode before this plugin was even built. This only fires if
+    // ambient configuration changed in the narrow window since that check.
+    if embedded_harvest_mode_violated(
+        api_state.require_embedded_harvest_mode(),
+        harvest_config.mode,
+    ) {
+        return Err(AutumnError::service_unavailable_msg(format!(
+            "harvest dev runtime requires embedded Harvest storage, but ambient configuration \
+             now resolves harvest.mode to {:?}. This should be unreachable: the dev runtime's \
+             own startup gate already refuses this case, so ambient configuration must have \
+             changed since that check",
+            harvest_config.mode
+        )));
+    }
     let workflow_result_notification_url = harvest_database_url(&app_config, &harvest_config)?;
     api_state.set_health_requires_shard_readiness(harvest_config.readiness.require_shard_readiness);
     api_state
@@ -1564,12 +1745,12 @@ async fn start_harvest_runtime(
     let router = ShardRouter::single();
 
     let (builder, runtime_already_started) = {
-        let mut guard = slot.lock().expect("harvest lock poisoned");
+        let mut guard = slot.lock().unwrap_or_else(PoisonError::into_inner);
         (guard.builder.take(), guard.runtime.is_some())
     };
     #[cfg(feature = "connectors")]
     let connector_registrations = {
-        let mut guard = slot.lock().expect("harvest lock poisoned");
+        let mut guard = slot.lock().unwrap_or_else(PoisonError::into_inner);
         std::mem::take(&mut guard.connectors)
     };
 
@@ -1630,64 +1811,12 @@ async fn start_harvest_runtime(
         built.workflow_infos().to_vec(),
     );
 
-    // Derive the API stale threshold from the worker heartbeat interval so that
-    // /workers correctly classifies workers under non-default configurations.
-    api_state.set_worker_stale_threshold(built.worker_config().worker_heartbeat_interval * 2);
-    // Mirror the configured shutdown timeout so drain requests can compute a
-    // sensible default deadline without the caller having to supply one.
-    api_state.set_worker_shutdown_timeout(built.worker_config().shutdown_timeout);
-    // Propagate the per-query timeout from WorkerConfig (issue #234).
-    api_state.set_query_timeout(built.worker_config().query_timeout);
-    // Propagate the server-side execution timeout ceiling (issue #243).
-    api_state.set_max_workflow_execution_timeout(built.max_workflow_execution_timeout);
-    // Propagate the server-side chain-cap ceiling / fleet-wide default (issue #617).
-    api_state.set_max_workflow_chain_timeout(built.max_workflow_chain_timeout);
-    // Propagate the hard history event ceiling (issue #493).
-    // Prefer the builder-level value; fall back to the WorkerConfig value so
-    // that /admin/preflight accurately reflects the ceiling even when it was
-    // configured via WorkerConfig::with_max_workflow_history_events rather
-    // than HarvestBuilder::max_workflow_history_events.
-    api_state.set_max_workflow_history_events(
-        built
-            .max_workflow_history_events
-            .or_else(|| built.worker_config().max_workflow_history_events),
-    );
-    // Propagate the server-side start delay ceiling (issue #322).
-    api_state.set_max_workflow_start_delay(built.worker_config().max_workflow_start_delay);
-    // Propagate the default debounce max-wait cap (issue #499).
-    api_state.set_default_debounce_max_wait(built.worker_config().default_debounce_max_wait);
-    // Propagate the server-side workflow retry attempt ceiling (issue #523).
-    api_state.set_max_workflow_attempts(built.max_workflow_attempts);
-    // Propagate the request-scoped start-idempotency retention window (issue
-    // #808): the HTTP start route reads it to dedup a repeated idempotency_key,
-    // and the background expiry sweep reads the same value from a process-global
-    // static (mirroring GLOBAL_CALLBACK_CONFIG) so it needs no extra param
-    // threaded through enforce_timeouts_once.
-    api_state.set_start_idempotency_window(built.start_idempotency_window);
-    autumn_harvest::start_idempotency::set_purge_window_secs(built.start_idempotency_window);
-    // Propagate the GET /admin/usage window ceiling (issue #596).
-    api_state.set_usage_window_ceiling(built.usage_window_ceiling);
-    // Propagate the GET /admin/usage group-count cap (issue #596).
-    api_state.set_usage_max_groups(built.usage_max_groups);
-    // Propagate batch start caps from builder config (issue #357).
-    api_state.set_batch_start_config(&built.batch_start_config);
-    // Propagate the completion-callback SSRF policy (issue #605) so the
-    // HTTP start route validates a per-execution target against the same
-    // allowlist the scanner re-validates at delivery time. The full runtime
-    // config (deliverer/secret/defaults/retry policy) is installed by
-    // `PreparedHarvestRuntime::build` inside `HarvestRunner::start` below,
-    // which every `BuiltHarvest` consumer (this plugin and the standalone
-    // runner) funnels through.
-    api_state.set_completion_callback_ssrf_policy(built.completion_callback_config().ssrf_policy());
+    // Copy the builder limits into the API state. `HarvestEmbedding` runs the
+    // same step, so the two boot paths serve the same limits (issue #1613).
+    crate::boot::mirror_built_config(api_state, &mut built);
     // The read-path decode codec registry (issue #608) is mirrored in
     // `Plugin::build`, together with the opt-in flag, so it is in place
     // before the HTTP server binds — not here.
-
-    // Apply the api_state audit retention override only when explicitly set,
-    // so that builder-level retention config is not silently clobbered.
-    if let Some(days) = api_state.audit_retention_days() {
-        built.set_audit_retention_days(days);
-    }
 
     // The resolved effective runtime configuration (issue #695) served by
     // `GET /admin/config` is captured inside `PreparedHarvestRuntime::build`
@@ -1716,24 +1845,7 @@ async fn start_harvest_runtime(
     // caveat as a mid-run fail-closed with no cached match. We deliberately do
     // NOT block-drop on boot-load failure (that reintroduces the permanent-drop
     // fixed in F3); the direct HTTP start path still fails closed via `check()`.
-    if let Ok(mut boot_conn) = acquire_conn(&harvest_pool).await {
-        match autumn_harvest::admission_gate::db::load_active_gates(&mut boot_conn).await {
-            Ok(gates) => {
-                api_state.gate_cache().refresh(gates);
-                tracing::debug!("admission gate cache populated at startup (before workers spawn)");
-            }
-            Err(e) => tracing::warn!(
-                error = %e,
-                "could not load admission gates at startup; cache stays empty until first refresh"
-            ),
-        }
-    }
-
-    // Issue #700 AC4 (P1 fix): capture a shard-0 pool handle for the boot-time
-    // orphaned-workflow gate (run just below, before HarvestRunner::start
-    // spawns workers) BEFORE `harvest_pool` is moved into the runner resources.
-    // `DbPool` (a deadpool handle) is cheap to clone.
-    let gate_pool = harvest_pool.clone();
+    crate::boot::load_boot_admission_gates(api_state, &harvest_pool).await;
 
     let mut runner_resources = HarvestRunnerResources::new(harvest_pool)
         .with_app_state(runtime_state.clone())
@@ -1780,111 +1892,34 @@ async fn start_harvest_runtime(
 
     // Issue #700 AC4 (P1 fix): boot-time orphaned-workflow-type reachability gate.
     // Run it HERE — BEFORE `HarvestRunner::start` spawns the worker poll loop and
-    // the scanners — not after. Under `orphaned_workflows = fail` + `worker_enabled`,
-    // a worker spawned by `HarvestRunner::start` could CLAIM and terminally FAIL an
-    // orphaned-type execution (no registered handler -> WorkflowFailed + FAILED
-    // state) during the boot window before an after-the-fact abort tore the runner
-    // down — defeating the gate's protective purpose. Placing the gate before any
-    // task can be claimed closes that window; on Abort we `return Err` with nothing
-    // to tear down (no runner / gate-refresh / outbox spawned yet, no admission
+    // the scanners, and before any admission global is published — not after.
+    // Under `orphaned_workflows = fail` + `worker_enabled`, a worker spawned by
+    // `HarvestRunner::start` could CLAIM and terminally FAIL an orphaned-type
+    // execution (no registered handler -> WorkflowFailed + FAILED state) during
+    // the boot window before an after-the-fact abort tore the runner down —
+    // defeating the gate's protective purpose. Placing the gate before any task
+    // can be claimed closes that window; on Abort we `return Err` with nothing to
+    // tear down (no runner / gate-refresh / outbox spawned yet, no admission
     // globals published).
     //
-    // Both gate inputs are available before the runner starts: `registered` is
-    // derived directly from the owned `built` (workflow names UNION unified-DAG
-    // names, replicating `build_workflow_reachability_report`'s registry-key +
-    // `registered_dag_names` union EXACTLY — `registry.workflows` does NOT hold
-    // unified-DAG names, so the DAG union is load-bearing), and `gate_pool` is the
-    // shard-0 pool clone captured above. The plugin is single-shard-only (multi-shard
-    // configs were rejected just above), so a single-shard report reads the identical
-    // rows the started-runtime cross-shard fan-out would. `off` skips the check;
-    // default `warn` never blocks boot. Crash-loop safety: a DB read failure is
-    // encoded as `status == Unavailable`, and `startup_orphan_decision(Fail, .,
-    // Unavailable) == Warn` (never Abort).
-    {
-        use crate::config::OrphanStartupAction;
-        use crate::workflow_reachability::{
-            ReachabilityVerdict, StartupOrphanDecision, build_reachability_report_single_shard,
-            startup_orphan_decision,
-        };
-
-        let orphan_action = harvest_config.startup.orphaned_workflows;
-        if orphan_action != OrphanStartupAction::Off {
-            let registered: std::collections::BTreeSet<String> = built
-                .workflow_infos()
-                .iter()
-                .map(|info| info.name.to_string())
-                .chain(
-                    built
-                        .dags()
-                        .iter()
-                        .filter(|dag| dag.workflow_handler.is_some())
-                        .map(|dag| dag.name.to_string()),
-                )
-                .collect();
-
-            // Select the SAME shard-0 storage pool `HarvestRunner::start` will
-            // run the workers against (issue #700 P2). `PreparedHarvestRuntime::build`
-            // gives `WorkerConfig::with_sharded_pool` PRECEDENCE over
-            // `harvest_pool`, so a `HarvestBuilder::with_sharded_pool` deployment
-            // would otherwise have the gate query `harvest_pool` while the
-            // workers poll a DIFFERENT database — the gate could validate the
-            // wrong DB, miss an orphan, and the worker would then start
-            // polling+failing it. `select_runtime_shard0_pool` shares the exact
-            // precedence `build` uses (the runner-resources override, which the
-            // plugin never sets; WorkerConfig's sharded pool; the harvest_pool
-            // clone) via `pick_runtime_pool_source`, so gate and runner agree by
-            // construction. Critically it is READ-ONLY (issue #700 P4): it reads
-            // shard 0 from an already-constructed `ShardedDbPool`, or returns the
-            // `harvest_pool` handle directly, and never calls
-            // `ShardedDbPool::single`/`from_map` — so an aborting gate installs
-            // no `GLOBAL_SHARDED_POOL` and stays side-effect-free (the real
-            // global install happens later in `HarvestRunner::start`, unchanged).
-            let gate_shard0_pool = crate::runner::select_runtime_shard0_pool(
-                runner_resources.sharded_pool_override(),
-                built.worker_config().sharded_pool.as_ref(),
-                &gate_pool,
-            );
-            let report =
-                build_reachability_report_single_shard(&registered, &gate_shard0_pool, None).await;
-            let orphaned_types: Vec<&str> = report
-                .items
-                .iter()
-                .filter(|item| item.verdict == ReachabilityVerdict::Orphaned)
-                .map(|item| item.workflow_type.as_str())
-                .collect();
-            match startup_orphan_decision(orphan_action, report.orphaned, report.status) {
-                StartupOrphanDecision::Continue => {}
-                StartupOrphanDecision::Warn => {
-                    tracing::warn!(
-                        orphaned_types = ?orphaned_types,
-                        total_orphaned_executions = report.total_orphaned_executions,
-                        status = ?report.status,
-                        "orphaned workflow types detected at startup: their #[workflow] \
-                         handlers are no longer registered and in-flight runs would wedge \
-                         on replay. See docs/runbooks/safe-deploy.md \
-                         (Pre-cutover handler-coverage gate) and safe-handler-removal.md."
-                    );
-                }
-                StartupOrphanDecision::Abort => {
-                    tracing::error!(
-                        orphaned_types = ?orphaned_types,
-                        total_orphaned_executions = report.total_orphaned_executions,
-                        "refusing startup (harvest.startup.orphaned_workflows = fail): \
-                         orphaned workflow types have in-flight runs but no registered \
-                         handler, so those runs would wedge on replay. The gate runs \
-                         before workers spawn, so no run was claimed or failed."
-                    );
-                    return Err(AutumnError::service_unavailable_msg(format!(
-                        "refusing startup: {} orphaned workflow type(s) with in-flight \
-                         runs have no registered handler ({} stranded executions): {:?}",
-                        orphaned_types.len(),
-                        report.total_orphaned_executions,
-                        orphaned_types,
-                    )));
-                }
-            }
-        }
-    }
+    // The gate itself lives in `runner::run_startup_orphan_gate` (issue #1128),
+    // which `HarvestRunner::start` also calls so the STANDALONE embedder path
+    // gets the identical fail-fast. One implementation, so the registered-set
+    // union, the pool precedence, the decision table and the operator-facing
+    // messages cannot drift between the two boot paths. Everything it needs is
+    // available before the runner starts: `built` (workflow names UNION
+    // unified-DAG names) and `runner_resources` (the pool the runner will
+    // resolve, plus the router). It is READ-ONLY and installs no process global,
+    // so an aborting gate is side-effect-free (issue #700 P4).
+    //
+    // `runner_resources` is marked below with `with_startup_orphan_gate_already_run()`
+    // so `HarvestRunner::start` does not repeat the scan for this boot.
+    crate::runner::run_startup_orphan_gate(
+        harvest_config.startup.orphaned_workflows,
+        &built,
+        &runner_resources,
+    )
+    .await?;
 
     // issue #618 (F11 + F1 re-review): publish the SAME gate-cache Arc the
     // management API uses into the process-global static BEFORE
@@ -1916,7 +1951,13 @@ async fn start_harvest_runtime(
     // keeping both only on `.commit()`.
     admission_guard.publish_metrics(std::sync::Arc::clone(&built.telemetry().metrics));
 
-    let runner = HarvestRunner::start(built, &harvest_config, runner_resources).await?;
+    let runner = HarvestRunner::start(
+        built,
+        &harvest_config,
+        // The gate above already ran for this boot (issue #1128).
+        runner_resources.with_startup_orphan_gate_already_run(),
+    )
+    .await?;
     let harvest_db_pool = runner.storage_pool();
     // Defense-in-depth: the pre-flight above catches WorkerConfig::with_sharded_pool;
     // this catches any future path that sets runner_resources.sharded_pool.
@@ -2003,6 +2044,13 @@ async fn start_harvest_runtime(
                 let metrics = registry
                     .as_ref()
                     .map(|r| std::sync::Arc::clone(&r.telemetry().metrics));
+                // Issue #1243: `input` above is payload-bearing. Fall back to
+                // the identity registry only in the boot window where the
+                // registry extension is not yet installed.
+                let codecs = registry
+                    .as_ref()
+                    .map(|r| r.payload_codecs().clone())
+                    .unwrap_or_default();
                 let (owner, runbook_url, severity, info_sla, info_retry_policy) = registry
                     .and_then(|registry| {
                         registry.workflows.get("webhook_delivery").map(|wf| {
@@ -2034,9 +2082,13 @@ async fn start_harvest_runtime(
                         ));
                     };
                     let pool = harvest_db.pool_for(shard).clone();
-                    let mut conn = pool.get().await.map_err(|e| {
-                        autumn_web::error::AutumnError::internal_server_error_msg(e.to_string())
-                    })?;
+                    // Issue #1823: fence-aware, as this start can run inside a
+                    // fenced handler.
+                    let mut conn = autumn_harvest::replication::fenced_checkout(&pool)
+                        .await
+                        .map_err(|e| {
+                            autumn_web::error::AutumnError::internal_server_error_msg(e.to_string())
+                        })?;
 
                     // Issue #618, Finding A (round 9 → round 12): the OUTBOUND
                     // webhook-delivery producer is gated as a FRESH in-process start —
@@ -2060,52 +2112,29 @@ async fn start_harvest_runtime(
                     // sealed/absent run's fresh create is gated (matching gate → block+count;
                     // fail-closed sentinel → block a fresh start, per round 5).
                     let start_params = autumn_harvest::execution::StartWorkflowParams {
-                        workflow_name: "webhook_delivery",
-                        workflow_id: &workflow_id,
-                        exec_id,
-                        input: serde_json::json!({
-                            "subscription_id": sub.id,
-                            "topic": log.topic,
-                            "payload": log.payload,
-                        }),
-                        parent_id: None,
-                        queue_name: "webhooks",
-                        execution_timeout: None,
-                        memo: None,
-                        search_attrs: None,
                         reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
-                        conflict_policy:
-                            autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
-                        trace_context: None,
-                        max_execution_timeout_ceiling: None,
-                        chain_execution_timeout: None,
-                        max_workflow_chain_timeout_ceiling: None,
-                        inherited_chain_deadline_at: None,
-                        concurrency_key: None,
-                        concurrency_limit: None,
                         concurrency_on_conflict:
                             autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
                         priority: autumn_harvest::prelude::Priority::default(),
                         max_workflow_input_bytes,
-                        start_at: None,
-                        delay: None,
-                        max_workflow_start_delay: None,
                         owner,
                         runbook_url,
                         severity,
-                        context_headers: None,
                         sla,
-                        schedule_id: None,
-                        scheduled_for: None,
-                        workflow_attempt: 1,
                         workflow_retry_policy: webhook_retry_policy,
-                        retry_of_exec_id: None,
                         max_workflow_attempts_ceiling: client.max_workflow_attempts(),
-                        origin: None,
-                        completion_callbacks: None,
                         start_source: autumn_harvest::StartSource::Api,
-                        start_source_ref: None,
-                        started_by: None,
+                        ..autumn_harvest::execution::StartWorkflowParams::new(
+                            "webhook_delivery",
+                            &workflow_id,
+                            exec_id,
+                            serde_json::json!({
+                                "subscription_id": sub.id,
+                                "topic": log.topic,
+                                "payload": log.payload,
+                            }),
+                            "webhooks",
+                        )
                     };
 
                     // The metrics recorder (`Arc<dyn MetricsRecorder>`) coerced to the
@@ -2128,11 +2157,12 @@ async fn start_harvest_runtime(
                     // webhook delivery is in-flight continuation of already-committed
                     // work and must not be permanently dropped by a boot/DB blip it
                     // cannot retry past.
-                    match autumn_harvest::execution::start_or_load_workflow_execution_with_metrics(
+                    match autumn_harvest::execution::start_or_load_workflow_execution_with_metrics_and_codecs(
                         &mut conn,
                         start_params,
                         metrics_ref,
                         Some(autumn_harvest::admission_gate::GateMode::CheckCached),
+                        &codecs,
                     )
                     .await
                     {
@@ -2171,58 +2201,14 @@ async fn start_harvest_runtime(
     // than an empty snapshot.
 
     // issue #377: spawn background gate-cache refresh (≤2 s p95 cross-replica propagation).
-    let gate_refresh = {
-        let cache = api_state.gate_cache();
-        let api_state_for_metrics = api_state.clone();
-        let pool = harvest_db_pool.clone_inner();
-        let shutdown = CancellationToken::new();
-        let cancel_for_task = shutdown.child_token();
-        let handle = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    () = cancel_for_task.cancelled() => return,
-                    () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
-                }
-                // Fail-closed on any error: if the gate table is
-                // unreadable the cache transitions to uninitialized so
-                // check() blocks new starts rather than silently admitting
-                // them with a stale open snapshot.
-                match acquire_conn(&pool).await {
-                    Ok(mut conn) => {
-                        match autumn_harvest::admission_gate::db::load_active_gates(&mut conn).await
-                        {
-                            Ok(gates) => {
-                                let count = i64::try_from(gates.len()).unwrap_or(0);
-                                cache.refresh(gates);
-                                if let Ok(rt) = api_state_for_metrics.runtime() {
-                                    rt.registry()
-                                        .telemetry()
-                                        .metrics
-                                        .record_admission_gates_active(count);
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "admission gate refresh failed; entering fail-closed mode"
-                                );
-                                cache.set_fail_closed();
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "admission gate refresh: could not acquire DB connection; \
-                             entering fail-closed mode"
-                        );
-                        cache.set_fail_closed();
-                    }
-                }
-            }
-        });
-        Some(GateRefreshRuntime { shutdown, handle })
-    };
+    // The load-shed sampler takes its registry data from the runtime here, not
+    // from `api_state.install(...)` below, so its first tick cannot race the
+    // install (issue #1794).
+    let gate_refresh = Some(crate::boot::spawn_gate_refresh(
+        api_state,
+        &harvest_db_pool,
+        &runner.api_runtime(),
+    ));
 
     let outbox = app_pool.as_ref().and_then(|_| {
         if harvest_config.outbox.enabled {
@@ -2236,10 +2222,11 @@ async fn start_harvest_runtime(
     });
     api_state.install(runner.api_runtime());
 
-    // The boot-time orphaned-workflow-type reachability gate (issue #700 AC4)
-    // runs earlier — BEFORE `HarvestRunner::start` spawns any worker — so a
-    // `fail` action cannot let a worker claim and terminally fail an orphaned
-    // run before the abort. See the gate block above the runner start.
+    // The boot-time orphaned-workflow-type reachability gate (issue #700 AC4,
+    // shared with the standalone runner path by issue #1128) runs earlier —
+    // BEFORE `HarvestRunner::start` spawns any worker — so a `fail` action
+    // cannot let a worker claim and terminally fail an orphaned run before the
+    // abort. See the gate call above the runner start.
 
     // Issue #944: spawn one consumer loop per registered broker binding, after
     // `api_state.install(...)` above so the very first message a connector
@@ -2258,7 +2245,7 @@ async fn start_harvest_runtime(
     };
 
     {
-        let mut guard = slot.lock().expect("harvest lock poisoned");
+        let mut guard = slot.lock().unwrap_or_else(PoisonError::into_inner);
         guard.runtime = Some(HarvestRuntime {
             runner,
             outbox,
@@ -2346,7 +2333,16 @@ fn harvest_database_url(
 }
 
 async fn stop_harvest_runtime(slot: Arc<Mutex<HarvestRuntimeSlot>>, api_state: HarvestApiState) {
-    let runtime = { slot.lock().expect("harvest lock poisoned").runtime.take() };
+    // Issue #1812: autumn-web has already closed the listener at this point.
+    // The linked probe state reported the drain earlier. This call covers a
+    // state with no linked probes.
+    api_state.begin_draining();
+    let runtime = {
+        slot.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .runtime
+            .take()
+    };
 
     let Some(runtime) = runtime else {
         // No runtime to stop (never started, or already stopped by a prior call).
@@ -2355,11 +2351,7 @@ async fn stop_harvest_runtime(slot: Arc<Mutex<HarvestRuntimeSlot>>, api_state: H
         // plugin never clobbers a concurrently-live sibling's cache. The metrics
         // recorder is not cleared here: without a runtime we have no recorder Arc to
         // ptr-eq against (it was either never published by us or already cleared).
-        if let Some(installed) = autumn_harvest::admission_gate::global_admission_gate_cache()
-            && Arc::ptr_eq(&installed, &api_state.gate_cache())
-        {
-            autumn_harvest::admission_gate::set_global_admission_gate_cache(None);
-        }
+        crate::boot::clear_admission_globals(&api_state, None);
         api_state.clear();
         return;
     };
@@ -2383,8 +2375,7 @@ async fn stop_harvest_runtime(slot: Arc<Mutex<HarvestRuntimeSlot>>, api_state: H
     stop_connectors(runtime.connectors).await;
 
     if let Some(gate_refresh) = runtime.gate_refresh {
-        gate_refresh.shutdown.cancel();
-        let _ = gate_refresh.handle.await;
+        gate_refresh.stop().await;
     }
     if let Some(outbox) = runtime.outbox {
         outbox.shutdown.cancel();
@@ -2410,16 +2401,7 @@ async fn stop_harvest_runtime(slot: Arc<Mutex<HarvestRuntimeSlot>>, api_state: H
     // completion-trigger gate check. Each clear is ptr-eq guarded so tearing down one
     // plugin never clobbers a concurrently-live sibling's cache/recorder. Mirrors
     // #921's teardown of GLOBAL_CALLBACK_CONFIG.
-    if let Some(installed) = autumn_harvest::admission_gate::global_admission_gate_cache()
-        && Arc::ptr_eq(&installed, &api_state.gate_cache())
-    {
-        autumn_harvest::admission_gate::set_global_admission_gate_cache(None);
-    }
-    if let Some(installed) = autumn_harvest::admission_gate::global_admission_metrics()
-        && Arc::ptr_eq(&installed, &stopped_metrics)
-    {
-        autumn_harvest::admission_gate::set_global_admission_metrics(None);
-    }
+    crate::boot::clear_admission_globals(&api_state, Some(&stopped_metrics));
     api_state.clear();
 }
 
@@ -2427,10 +2409,10 @@ async fn stop_harvest_runtime(slot: Arc<Mutex<HarvestRuntimeSlot>>, api_state: H
 /// Harvest storage databases, awaiting the result off the calling task's own
 /// async executor thread.
 ///
-/// `autumn_web::migrate::run_pending`/`pending_migrations` are synchronous and
-/// genuinely block the calling thread: as of autumn-web 0.7 both route through
-/// `with_migration_connection!`, which runs the connect *and* the migration
-/// body on a freshly spawned `std::thread::scope` thread and `join()`s it.
+/// `autumn_web::migrate::run_pending` and `pending_migrations` are synchronous.
+/// They block the calling thread. Since autumn-web 0.7, both route through
+/// `with_migration_connection!`. That macro runs the connect *and* the
+/// migration body on a new `std::thread::scope` thread and `join()`s it.
 /// `spawn_blocking` keeps that join off an async worker thread, where it would
 /// otherwise stall the worker for the full duration of the migration.
 ///
@@ -2511,6 +2493,7 @@ fn ensure_runtime_migrations_blocking(
         harvest_database_url,
         HARVEST_MIGRATIONS,
         "Harvest storage",
+        HARVEST_MIGRATE_REMEDY,
     )?;
 
     // Plugin-owned tables that live in the harvest database (issue #944's
@@ -2522,14 +2505,55 @@ fn ensure_runtime_migrations_blocking(
         harvest_database_url,
         PLUGIN_HARVEST_MIGRATIONS,
         "Harvest plugin storage",
+        PLUGIN_HARVEST_MIGRATE_REMEDY,
     )
 }
+
+/// The command that applies [`HARVEST_MIGRATIONS`] to a dedicated Harvest
+/// database.
+///
+/// `autumn migrate` is deliberately NOT named: this path only ever runs for a
+/// dedicated Harvest database (`ensure_runtime_migrations_blocking` returns
+/// early under `Embedded`), which that command cannot reach — it applies the
+/// application database's sets and exits 0 having changed nothing (issue
+/// #1240).
+const HARVEST_MIGRATE_REMEDY: &str = concat!(
+    "Set HARVEST_DATABASE_URL=<harvest.database.url> and run `harvest migrate run` ",
+    // The DSN usually carries a password, and a command line is readable by
+    // every process on the host (`ps`, /proc) for as long as the migration
+    // runs. `--database-url` still works and is right for a passwordless DSN.
+    "to apply them. Prefer the environment variable over `--database-url`: a ",
+    "command line is visible host-wide, and this DSN usually carries a password."
+);
+
+/// The command that applies [`PLUGIN_HARVEST_MIGRATIONS`].
+///
+/// **Not the same command.** The `harvest` binary embeds Harvest's own
+/// migrations, not the plugin's, so this set only applies when its directory is
+/// named explicitly. An operator given [`HARVEST_MIGRATE_REMEDY`] for *this*
+/// warning would see a successful exit and roll replicas with
+/// `harvest_connector_dead_letters` still absent — the exact wedge issue #944
+/// added the table to prevent, since the first poison message then fails its
+/// dead-letter write and redelivers forever.
+const PLUGIN_HARVEST_MIGRATE_REMEDY: &str = concat!(
+    "Set HARVEST_DATABASE_URL=<harvest.database.url> and run `harvest migrate run ",
+    "--include-dir <autumn-harvest-plugin>/migrations/harvest` to apply them. ",
+    "Prefer the environment variable over `--database-url`: a command line is ",
+    "visible host-wide, and this DSN usually carries a password. ",
+    // Said out loud because the process logging this is usually a container
+    // with installed binaries and no checkout: unlike Harvest's own set, this
+    // one is NOT embedded in the `harvest` binary, so a workspace-relative
+    // path would send an operator at a directory that does not exist there.
+    "That directory ships in the autumn-harvest-plugin crate source, not in the ",
+    "`harvest` binary, so make it available wherever you run the command."
+);
 
 fn apply_migrations_for_profile(
     profile: &str,
     database_url: &str,
     migrations: EmbeddedMigrations,
     label: &str,
+    remedy: &str,
 ) -> autumn_web::AutumnResult<()> {
     if profile == "dev" {
         let result = autumn_web::migrate::run_pending(database_url, migrations)
@@ -2552,7 +2576,8 @@ fn apply_migrations_for_profile(
             tracing::warn!(
                 target = label,
                 count = pending.len(),
-                "Pending migrations detected. Run `autumn migrate` to apply them."
+                remedy,
+                "Pending migrations detected."
             );
             for migration in pending {
                 tracing::warn!(target = label, migration = %migration, "Pending migration");
@@ -2567,194 +2592,73 @@ fn apply_migrations_for_profile(
 }
 
 #[cfg(test)]
-mod admission_globals_guard_tests {
-    use super::AdmissionGlobalsGuard;
-    use autumn_harvest::admission_gate::{
-        AdmissionGateCache, global_admission_gate_cache, global_admission_metrics,
-        set_global_admission_gate_cache, set_global_admission_metrics,
-    };
-    use autumn_harvest::telemetry::{MetricsRecorder, NoOpMetrics};
-    use std::sync::Arc;
+mod migration_remedy_tests {
+    use super::{HARVEST_MIGRATE_REMEDY, PLUGIN_HARVEST_MIGRATE_REMEDY};
 
-    // The guard mutates the process-global admission statics; serialize the tests.
-    static GUARD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn recorder() -> Arc<dyn MetricsRecorder> {
-        Arc::new(NoOpMetrics)
-    }
-
-    /// F-round7: an early-return error path (guard dropped without `commit()`)
-    /// clears BOTH published globals.
     #[test]
-    fn guard_drop_clears_both_globals() {
-        let _g = GUARD_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        set_global_admission_gate_cache(None);
-        set_global_admission_metrics(None);
-        {
-            let mut guard =
-                AdmissionGlobalsGuard::publish_gate_cache(Arc::new(AdmissionGateCache::new()));
-            guard.publish_metrics(recorder());
-            assert!(global_admission_gate_cache().is_some());
-            assert!(global_admission_metrics().is_some());
-            // dropped here WITHOUT commit -> simulates a startup error after publish
-        }
-        assert!(
-            global_admission_gate_cache().is_none(),
-            "guard drop clears the gate cache"
-        );
-        assert!(
-            global_admission_metrics().is_none(),
-            "guard drop clears the metrics recorder"
-        );
-    }
-
-    /// F-round7: an error while only the gate cache has been published (before the
-    /// adjacent `publish_metrics` call runs) still clears the gate cache. As of
-    /// F-round14 both publishes happen back-to-back BEFORE `HarvestRunner::start`, so
-    /// this guards the guard's own Drop semantics in isolation rather than a specific
-    /// `start_harvest_runtime` error site.
-    #[test]
-    fn guard_drop_before_metrics_publish_clears_the_gate_cache() {
-        let _g = GUARD_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        set_global_admission_gate_cache(None);
-        set_global_admission_metrics(None);
-        {
-            let _guard =
-                AdmissionGlobalsGuard::publish_gate_cache(Arc::new(AdmissionGateCache::new()));
-            // dropped before publish_metrics
-        }
-        assert!(
-            global_admission_gate_cache().is_none(),
-            "early drop (pre-metrics-publish) clears the gate cache"
-        );
-        assert!(global_admission_metrics().is_none());
-    }
-
-    /// F-round7: `commit()` (successful startup) keeps both globals published.
-    #[test]
-    fn guard_commit_keeps_both_globals() {
-        let _g = GUARD_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        set_global_admission_gate_cache(None);
-        set_global_admission_metrics(None);
-        {
-            let mut guard =
-                AdmissionGlobalsGuard::publish_gate_cache(Arc::new(AdmissionGateCache::new()));
-            guard.publish_metrics(recorder());
-            guard.commit();
-        }
-        assert!(
-            global_admission_gate_cache().is_some(),
-            "commit keeps the gate cache"
-        );
-        assert!(
-            global_admission_metrics().is_some(),
-            "commit keeps the metrics recorder"
-        );
-        set_global_admission_gate_cache(None);
-        set_global_admission_metrics(None);
-    }
-
-    /// F-round14: both globals are visible after the two publishes run back-to-back,
-    /// BEFORE any consumer (the worker poll loops / timeout scanner spawned by
-    /// `HarvestRunner::start`) could observe them. In `start_harvest_runtime` both
-    /// `publish_gate_cache` and `publish_metrics` now run before the runner starts, so
-    /// a cancel / terminate / parent-close-cascade completion-trigger block firing in
-    /// the boot window finds a live `global_admission_metrics()` and counts the block
-    /// rather than dropping it.
-    #[test]
-    fn guard_publishes_both_globals_before_any_consumer_runs() {
-        let _g = GUARD_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        set_global_admission_gate_cache(None);
-        set_global_admission_metrics(None);
-        let mut guard =
-            AdmissionGlobalsGuard::publish_gate_cache(Arc::new(AdmissionGateCache::new()));
-        guard.publish_metrics(recorder());
-        // Both must be live at this point — this is the state the runner (and its
-        // workers/scanner) is started against in `start_harvest_runtime`.
-        assert!(
-            global_admission_gate_cache().is_some(),
-            "gate cache is published before the runner starts"
-        );
-        assert!(
-            global_admission_metrics().is_some(),
-            "metrics recorder is published before the runner starts (F-round14)"
-        );
-        drop(guard);
-        set_global_admission_gate_cache(None);
-        set_global_admission_metrics(None);
-    }
-
-    /// F-round7: a stopping guard must NOT clobber a concurrently-live sibling's
-    /// globals — the clear is ptr-eq-guarded against THIS guard's Arcs.
-    #[test]
-    fn guard_drop_does_not_clobber_a_sibling_cache() {
-        let _g = GUARD_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        set_global_admission_gate_cache(None);
-        set_global_admission_metrics(None);
-        let sibling = Arc::new(AdmissionGateCache::new());
-        {
-            let _guard =
-                AdmissionGlobalsGuard::publish_gate_cache(Arc::new(AdmissionGateCache::new()));
-            // A sibling runtime overwrites the global with its OWN cache.
-            set_global_admission_gate_cache(Some(Arc::clone(&sibling)));
-            // our guard drops here -> ptr-eq(our cache, sibling) is false -> no clear
-        }
-        assert!(
-            global_admission_gate_cache().is_some_and(|c| Arc::ptr_eq(&c, &sibling)),
-            "guard drop must not clobber a sibling's installed cache"
-        );
-        set_global_admission_gate_cache(None);
-    }
-
-    /// issue #618 (final pass): when THIS guard published its cache OVER a
-    /// still-running sibling's (the sibling was installed first), a
-    /// drop-without-commit must RESTORE the sibling's cache — not clear the global
-    /// to `None`, which would wipe the live sibling's gate enforcement. Same for
-    /// the metrics recorder.
-    #[test]
-    fn guard_drop_restores_the_previous_sibling_globals_not_none() {
-        let _g = GUARD_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Sibling runtime A is already live with its own cache + metrics.
-        let sibling_cache = Arc::new(AdmissionGateCache::new());
-        let sibling_metrics: Arc<dyn MetricsRecorder> = recorder();
-        set_global_admission_gate_cache(Some(Arc::clone(&sibling_cache)));
-        set_global_admission_metrics(Some(Arc::clone(&sibling_metrics)));
-        {
-            // Second runtime B publishes its OWN globals over A's, then fails
-            // (dropped without commit).
-            let mut guard =
-                AdmissionGlobalsGuard::publish_gate_cache(Arc::new(AdmissionGateCache::new()));
-            guard.publish_metrics(recorder());
-            // Sanity: B's globals are installed now (not A's).
+    fn both_remedies_name_the_command_that_can_reach_a_dedicated_harvest_database() {
+        // `autumn migrate` reaches the application database only; naming it in
+        // either warning sends the operator to a command that exits 0 having
+        // changed nothing (issue #1240).
+        for remedy in [HARVEST_MIGRATE_REMEDY, PLUGIN_HARVEST_MIGRATE_REMEDY] {
             assert!(
-                global_admission_gate_cache().is_some_and(|c| !Arc::ptr_eq(&c, &sibling_cache)),
-                "B's cache is installed over A's before the failure"
+                remedy.contains("harvest migrate run"),
+                "remedy must name the dedicated-database command: {remedy}"
+            );
+            assert!(
+                !remedy.contains("autumn migrate"),
+                "remedy must not name a command that cannot apply these: {remedy}"
             );
         }
-        // B's guard dropped without commit -> A's cache + metrics must be restored,
-        // NOT cleared to None (the live sibling keeps its enforcement).
+    }
+
+    #[test]
+    fn neither_remedy_puts_the_dsn_in_a_command_line() {
+        // These strings are copied verbatim by an operator mid-incident, and
+        // the DSN they substitute usually carries a password. A command line
+        // is readable by every process on the host (`ps`, /proc) for as long
+        // as the migration runs, so the remedy must demonstrate the
+        // environment form.
+        for remedy in [HARVEST_MIGRATE_REMEDY, PLUGIN_HARVEST_MIGRATE_REMEDY] {
+            assert!(
+                remedy.contains("HARVEST_DATABASE_URL="),
+                "remedy must show the environment form: {remedy}"
+            );
+            assert!(
+                !remedy.contains("--database-url <"),
+                "remedy must not demonstrate passing the DSN as an argument: {remedy}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_plugin_remedy_names_the_plugin_migration_directory() {
+        // The `harvest` binary embeds Harvest's own migrations, not the
+        // plugin's: without `--include-dir` the plugin set is silently not
+        // applied, and the operator rolls replicas with
+        // `harvest_connector_dead_letters` absent.
         assert!(
-            global_admission_gate_cache().is_some_and(|c| Arc::ptr_eq(&c, &sibling_cache)),
-            "a failed second-runtime startup must RESTORE the sibling's cache, not clear it"
+            PLUGIN_HARVEST_MIGRATE_REMEDY.contains("--include-dir"),
+            "the plugin-storage warning must name its own migration directory: \
+             {PLUGIN_HARVEST_MIGRATE_REMEDY}"
         );
         assert!(
-            global_admission_metrics().is_some_and(|m| Arc::ptr_eq(&m, &sibling_metrics)),
-            "a failed second-runtime startup must RESTORE the sibling's metrics recorder"
+            PLUGIN_HARVEST_MIGRATE_REMEDY.contains("migrations/harvest"),
+            "{PLUGIN_HARVEST_MIGRATE_REMEDY}"
         );
-        set_global_admission_gate_cache(None);
-        set_global_admission_metrics(None);
+        // The process logging this is usually a container with no checkout, so
+        // the warning must say where that directory comes from rather than
+        // implying a path relative to the working directory.
+        assert!(
+            PLUGIN_HARVEST_MIGRATE_REMEDY.contains("crate source"),
+            "the warning must say where the directory comes from: \
+             {PLUGIN_HARVEST_MIGRATE_REMEDY}"
+        );
+        assert!(
+            !HARVEST_MIGRATE_REMEDY.contains("--include-dir"),
+            "the core-storage warning needs no extra directory -- the binary \
+             embeds that set: {HARVEST_MIGRATE_REMEDY}"
+        );
     }
 }
 
@@ -2762,6 +2666,183 @@ mod admission_globals_guard_tests {
 mod tests {
     use super::*;
     use std::any::TypeId;
+
+    /// The declared range is the `autumn-web` requirement in `Cargo.toml`.
+    /// A dependency bump that skips the constant fails here.
+    #[test]
+    fn contract_range_matches_the_cargo_toml_requirement() {
+        let manifest: toml::Table =
+            toml::from_str(include_str!("../Cargo.toml")).expect("the crate manifest parses");
+        let requirement = manifest["dependencies"]["autumn-web"]
+            .as_str()
+            .expect("autumn-web is a plain version requirement");
+        assert_eq!(AUTUMN_WEB_REQUIREMENT, requirement);
+    }
+
+    /// The contract accepts the `autumn-web` this crate compiles against.
+    /// Otherwise `AppBuilder::plugin` panics when an app mounts the plugin.
+    #[test]
+    fn contract_accepts_the_compiled_autumn_web() {
+        use autumn_web::plugin_contract::{AUTUMN_WEB_VERSION, ContractVerdict, evaluate};
+
+        let contract = HarvestPlugin::new()
+            .contract()
+            .expect("HarvestPlugin declares a contract");
+        assert_eq!(contract, harvest_plugin_contract());
+        assert_eq!(contract.plugin, "autumn-harvest-plugin");
+        assert_eq!(
+            contract.plugin_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(contract.experimental_surfaces, Vec::<String>::new());
+        assert_eq!(
+            evaluate(&contract, AUTUMN_WEB_VERSION),
+            ContractVerdict::Compatible
+        );
+    }
+
+    /// The API rate limiter is off by default, and the builder keeps the
+    /// declared rates (issue #1827). `build` passes the field to
+    /// `apply_admin_auth_layers`, which the standalone suites exercise.
+    #[test]
+    fn api_rate_limit_is_off_by_default_and_kept_when_declared() {
+        use crate::api_rate_limit::{ApiRateLimit, BucketRate};
+
+        assert!(HarvestPlugin::new().api_rate_limit.is_none());
+
+        let limit = ApiRateLimit::new(BucketRate::per_second(10), BucketRate::per_second(50));
+        let plugin = HarvestPlugin::new().with_api_rate_limit(limit);
+        let kept = plugin
+            .api_rate_limit
+            .expect("the builder keeps the limiter");
+        assert_eq!(kept.mutating(), BucketRate::per_second(10));
+        assert_eq!(kept.read(), BucketRate::per_second(50));
+    }
+
+    /// The range excludes the previous and the next `autumn-web` series.
+    #[test]
+    fn contract_rejects_other_autumn_web_series() {
+        use autumn_web::plugin_contract::{ContractVerdict, evaluate};
+
+        let contract = harvest_plugin_contract();
+        for other in ["0.7.0", "0.9.0"] {
+            assert!(
+                matches!(evaluate(&contract, other), ContractVerdict::Incompatible(_)),
+                "autumn-web {other} must be outside the declared range"
+            );
+        }
+    }
+
+    /// Issue #1812: the shutdown hook sets the drain, also with no runtime.
+    #[tokio::test]
+    async fn stop_harvest_runtime_sets_the_drain() {
+        let api_state = HarvestApiState::new();
+        let slot = Arc::new(Mutex::new(HarvestRuntimeSlot::default()));
+        stop_harvest_runtime(slot, api_state.clone()).await;
+        assert!(api_state.is_draining());
+    }
+
+    /// **Issue #1284.** The startup warning's predicate must be exact: it fires
+    /// for, and only for, the one configuration under which
+    /// `has_harvest_admin_access` admits a caller that presented no credential.
+    /// A warning that fires for closed deployments is noise operators learn to
+    /// scroll past; one that stays quiet for an open deployment is the incident
+    /// it was added to prevent.
+    #[test]
+    fn dev_admin_api_is_open_only_without_a_boundary_in_the_dev_profile() {
+        assert!(
+            dev_admin_api_is_open("dev", false),
+            "dev profile with no declared boundary is the open case"
+        );
+        assert!(
+            !dev_admin_api_is_open("dev", true),
+            "a declared boundary closes the dev profile"
+        );
+        for profile in [
+            "prod",
+            "staging",
+            "test",
+            "unknown",
+            "",
+            "development",
+            "DEV",
+        ] {
+            assert!(
+                !dev_admin_api_is_open(profile, false),
+                "profile {profile:?} is not `dev` and stays fail-closed"
+            );
+            assert!(!dev_admin_api_is_open(profile, true));
+        }
+    }
+
+    /// Issue #1802: the predicate is true exactly when a caller with no
+    /// credential reaches a mutating route. A declared boundary makes it false.
+    #[test]
+    fn unauthenticated_mutations_are_open_only_for_dev_or_the_opt_out() {
+        use crate::boot::unauthenticated_mutations_open;
+        assert!(unauthenticated_mutations_open("dev", false, false));
+        assert!(unauthenticated_mutations_open("prod", false, true));
+        assert!(unauthenticated_mutations_open("unknown", false, true));
+        assert!(!unauthenticated_mutations_open("dev", true, false));
+        assert!(!unauthenticated_mutations_open("prod", true, true));
+        for profile in ["prod", "staging", "unknown", "", "DEV", "development"] {
+            assert!(
+                !unauthenticated_mutations_open(profile, false, false),
+                "profile {profile:?} fails closed with no opt-out"
+            );
+        }
+    }
+
+    /// Issue #1802: the opt-out warning fires only when the opt-out, and not
+    /// the `dev` profile, opens the mutating routes.
+    #[test]
+    fn mutation_opt_out_warning_fires_only_when_the_opt_out_opens_the_routes() {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self {
+                self.clone()
+            }
+        }
+        let capture = |profile: &str, boundary: bool, opt_out: bool| {
+            let buf = Buf::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(buf.clone())
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                crate::boot::warn_if_mutation_opt_out_is_open(profile, boundary, opt_out);
+            });
+            let bytes = buf.0.lock().unwrap().clone();
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
+        let marker = "allow_unauthenticated_mutations is set";
+        for profile in ["prod", "unknown", "staging"] {
+            assert!(capture(profile, false, true).contains(marker), "{profile}");
+        }
+        for (profile, boundary, opt_out) in [
+            ("prod", true, true),
+            ("prod", false, false),
+            ("dev", false, true),
+            ("dev", false, false),
+        ] {
+            assert!(
+                !capture(profile, boundary, opt_out).contains(marker),
+                "{profile} boundary={boundary} opt_out={opt_out}"
+            );
+        }
+    }
 
     use crate::config::{
         HarvestDatabaseConfig, HarvestMode, HarvestOutboxConfig, HarvestRuntimeConfig,
@@ -2771,6 +2852,60 @@ mod tests {
     use autumn_harvest::dag::DagBuilder;
     use autumn_harvest::policy::Schedule;
     use autumn_web::config::DatabaseConfig;
+
+    /// An `AutumnConfig` naming `url`, or naming no database when `None`.
+    fn config_naming(url: Option<&str>) -> AutumnConfig {
+        AutumnConfig {
+            database: DatabaseConfig {
+                url: url.map(str::to_owned),
+                ..DatabaseConfig::default()
+            },
+            ..AutumnConfig::default()
+        }
+    }
+
+    #[test]
+    fn the_app_s_own_config_wins_over_the_ambient_one() {
+        // The whole point of reading `state.config()`: a `ConfigLoader` the
+        // embedder installed must not be silently overridden by `autumn.toml`
+        // or `AUTUMN_*`. This is the dev runtime's case.
+        let chosen = preferred_app_config(
+            config_naming(Some("postgres://loader/db")),
+            Some(config_naming(Some("postgres://ambient/db"))),
+        );
+        assert_eq!(chosen.database.url.as_deref(), Some("postgres://loader/db"));
+    }
+
+    #[test]
+    fn the_ambient_config_fills_in_when_the_app_names_no_database() {
+        // Regression: `autumn_web::test::TestApp` starts from
+        // `AutumnConfig::default()`, and `AppState::config_arc` falls back to a
+        // default when no config extension is present — so a harness that
+        // supplies its database another way leaves `database.url` empty while
+        // the process environment still carries it. Reading only
+        // `state.config()` broke those suites with "requires database.url when
+        // harvest.mode is embedded".
+        let chosen = preferred_app_config(
+            config_naming(None),
+            Some(config_naming(Some("postgres://ambient/db"))),
+        );
+        assert_eq!(
+            chosen.database.url.as_deref(),
+            Some("postgres://ambient/db")
+        );
+    }
+
+    #[test]
+    fn no_database_anywhere_still_reports_the_real_invariant() {
+        // The fallback may only ever ADD a URL. With neither source naming one
+        // the caller must still fail with the embedded-mode message, not with
+        // something about configuration precedence.
+        let chosen = preferred_app_config(config_naming(None), Some(config_naming(None)));
+        assert!(chosen.database.url.is_none());
+
+        let chosen = preferred_app_config(config_naming(None), None);
+        assert!(chosen.database.url.is_none());
+    }
 
     /// Shutting a fleet of connectors down must not serialize their drains.
     ///
@@ -3181,7 +3316,14 @@ mod tests {
                 outbox: HarvestOutboxConfig::default(),
                 batch: crate::config::HarvestBatchConfig::default(),
                 readiness: crate::config::HarvestReadinessConfig::default(),
+                // Deliberately the DEFAULT action (`warn`), not `off`: the
+                // classic-DAG rejection is pure configuration validation that
+                // `start` runs BEFORE the issue-#1128 orphan gate, so this
+                // `--lib` test stays DB-free with the gate fully enabled. If the
+                // rejection ever moved back behind the gate, this test would
+                // start reaching for a database it has no access to.
                 startup: crate::config::HarvestStartupConfig::default(),
+                redis: crate::config::HarvestRedisConfig::default(),
             },
             HarvestRunnerResources::new(pool),
         )
@@ -3290,6 +3432,7 @@ mod tests {
             batch: crate::config::HarvestBatchConfig::default(),
             readiness: crate::config::HarvestReadinessConfig::default(),
             startup: crate::config::HarvestStartupConfig::default(),
+            redis: crate::config::HarvestRedisConfig::default(),
         };
 
         let harvest_pool = resolve_harvest_pool(&state, &config)
@@ -3343,6 +3486,25 @@ mod tests {
         migration_registration_mode(Err(autumn_web::config::ConfigError::Validation(
             "bad mode".to_owned(),
         )));
+    }
+
+    /// The pinned-mode backstop (issue #1291), unit-tested at the pure
+    /// predicate both `register_plugin_migrations` and
+    /// `start_harvest_runtime` share.
+    #[test]
+    fn embedded_harvest_mode_violated_only_when_required_and_not_embedded() {
+        assert!(!embedded_harvest_mode_violated(
+            false,
+            HarvestMode::Embedded
+        ));
+        assert!(!embedded_harvest_mode_violated(false, HarvestMode::Split));
+        assert!(!embedded_harvest_mode_violated(
+            false,
+            HarvestMode::External
+        ));
+        assert!(!embedded_harvest_mode_violated(true, HarvestMode::Embedded));
+        assert!(embedded_harvest_mode_violated(true, HarvestMode::Split));
+        assert!(embedded_harvest_mode_violated(true, HarvestMode::External));
     }
 
     /// Pins the ownership split itself: under `Embedded` the plugin migrates
@@ -3539,6 +3701,45 @@ mod tests {
             .expect("valid retention config should build");
         assert_eq!(built.retention().max_age_secs, Some(42));
         assert_eq!(built.retention().tick_interval_secs, 7);
+    }
+
+    #[test]
+    fn harvest_plugin_forwards_load_shed_to_builder() {
+        // Issue #1794: the plugin owns its builder, so without this forwarder
+        // a plugin deployment cannot turn on load shedding.
+        let policy = autumn_harvest::load_shed::LoadShedPolicy::new(
+            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(5),
+        )
+        .expect("valid policy");
+        let config = autumn_harvest::load_shed::LoadShedConfig::new().queue("default", policy);
+        let plugin = HarvestPlugin::new().load_shed(config.clone());
+        let built = plugin
+            .builder
+            .try_build()
+            .expect("valid load-shed config should build");
+        assert_eq!(built.load_shed, config);
+        assert!(built.load_shed.is_enabled());
+    }
+
+    #[test]
+    fn harvest_plugin_forwards_ramp_guard_to_builder() {
+        // Issue #1814: the plugin owns its builder, so without this forwarder
+        // a plugin deployment cannot turn on the ramp guard.
+        let config = autumn_harvest::ramp_guard::RampGuardConfig::new().with_min_samples(7);
+        let built = HarvestPlugin::new()
+            .ramp_guard(config)
+            .builder
+            .try_build()
+            .expect("valid ramp-guard config should build");
+        assert_eq!(built.ramp_guard, config);
+        assert!(built.ramp_guard.is_enabled());
+        let default = HarvestPlugin::new()
+            .builder
+            .try_build()
+            .expect("default build");
+        assert!(!default.ramp_guard.is_enabled(), "the guard is opt-in");
     }
 
     // ── Connector build-time validation (issue #944) ──────────────────────

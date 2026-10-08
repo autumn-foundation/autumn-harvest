@@ -53,7 +53,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 static TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 fn rewrite_pg_db(base: &str, db: &str) -> String {
@@ -85,7 +85,7 @@ async fn setup_test_database_url() -> (String, Option<ContainerAsync<Postgres>>)
         let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&new_url)
             .await
             .expect("failed to connect to per-test database");
-        conn.batch_execute(autumn_harvest::full_migrations_sql())
+        conn.batch_execute(&autumn_harvest::test_init_sql())
             .await
             .expect("failed to apply migrations to per-test database");
         return (new_url, None);
@@ -152,7 +152,7 @@ async fn insert_running_row(
         workflow_id,
         run_id: uuid::Uuid::new_v4(),
         shard_id: exec_id.shard().as_i32(),
-        input: serde_json::json!({}),
+        input: serde_json::json!({}).into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -236,7 +236,7 @@ async fn continue_as_new_atomically(
             workflow_id,
             run_id: uuid::Uuid::new_v4(),
             shard_id: succ.shard().as_i32(),
-            input: serde_json::json!({}),
+            input: serde_json::json!({}).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -636,6 +636,44 @@ async fn resolver_picks_most_recent_of_multiple_terminal_runs() {
          (-5h, inserted last) or the middle predecessor (-3h)"
     );
     assert_eq!(resolved.state, "CONTINUED_AS_NEW");
+}
+
+/// Issue #1317 review, P1 follow-up: a reconciled `MIGRATED` seal
+/// (`migrated_run_terminal_at` set) no longer represents anything current
+/// for this business key. It must be excluded from the terminal fallback
+/// outright, not merely lose an ordinary `started_at` tie-break. The seal
+/// can be the ONLY row for this key on this shard, with no newer run to
+/// naturally outrank it.
+#[tokio::test]
+async fn resolver_never_returns_a_reconciled_seal() {
+    let _guard = TEST_MUTEX.lock().await;
+    let (url, _c) = setup_test_database_url().await;
+    let mut conn = connect(&url).await;
+
+    let workflow_id = "res-reconciled-seal-only";
+    let seal = ExecutionId::new_for_shard(ShardId::new(0));
+    insert_running_row(&mut conn, "resolver_wf", workflow_id, seal).await;
+    diesel::update(harvest_workflow_executions::table.find(seal.as_uuid()))
+        .set((
+            harvest_workflow_executions::state.eq("MIGRATED"),
+            harvest_workflow_executions::migrated_to_shard.eq(1),
+            harvest_workflow_executions::migrated_at.eq(chrono::Utc::now()),
+            harvest_workflow_executions::migrated_run_terminal_at.eq(chrono::Utc::now()),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("seed a reconciled seal as the only row for this key");
+
+    let resolved =
+        execution::resolve_execution_id_by_workflow_id(&mut conn, "resolver_wf", workflow_id)
+            .await
+            .expect("resolve should succeed");
+
+    assert!(
+        resolved.is_none(),
+        "a reconciled seal must never be returned, even as the sole \
+         candidate on this shard; got {resolved:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1266,7 +1304,7 @@ fn default_start_params(
         exec_id,
         workflow_name,
         workflow_id,
-        input,
+        input: input.into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -2397,14 +2435,19 @@ async fn cross_shard_cancel_reports_unfinished_handlers_on_the_target_shard() {
         &mut caller_conn,
         recorder.as_ref(),
         Duration::from_secs(60),
-        &Some(sharded_pool),
+        &Some(sharded_pool.clone()),
         &[caller_exec_id.shard()],
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await
     .expect("cancel outbox sweep should succeed");
+    // The sweep that ends a live run cancels and runs its follow-ups, and
+    // leaves the terminal event to the next fan-out (issue #1313). The
+    // deferred check under test belongs to the sweep that cancelled, so it has
+    // already run here.
     assert_eq!(
-        processed, 1,
-        "exactly one cancel-by-id delivery should be processed"
+        processed, 0,
+        "the cancelling sweep resolves nothing yet, by design"
     );
 
     // The target must actually be CANCELLED on its own database.
@@ -2427,6 +2470,21 @@ async fn cross_shard_cancel_reports_unfinished_handlers_on_the_target_shard() {
         "the unfinished-handler check must run against the target's own \
          shard and report exactly the one still-admitted update handler; \
          got: {calls:?}"
+    );
+
+    let processed = autumn_harvest::timeout::enforce_external_cancels_outbox(
+        &mut caller_conn,
+        recorder.as_ref(),
+        Duration::from_secs(60),
+        &Some(sharded_pool),
+        &[caller_exec_id.shard()],
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+    .expect("second cancel outbox sweep should succeed");
+    assert_eq!(
+        processed, 1,
+        "exactly one cancel-by-id delivery should be processed"
     );
 }
 
@@ -2603,12 +2661,30 @@ async fn cross_shard_cancel_target_followups_survive_a_failed_caller_side_commit
         .expect("seed deliberately undecodable third row");
 
     let recorder = Arc::new(CrossPoolFollowupRecorder::default());
+    // Sweep 1 does the cross-pool cancel and its follow-ups. It appends no
+    // terminal event, because a cancel that ends a live run leaves that to the
+    // next fan-out (issue #1313). So it never reaches the undecodable row.
+    autumn_harvest::timeout::enforce_external_cancels_outbox(
+        &mut caller_conn,
+        recorder.as_ref(),
+        Duration::from_secs(60),
+        &Some(sharded_pool.clone()),
+        &[caller_exec_id.shard()],
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+    .expect("the cancelling sweep should succeed");
+
+    // Sweep 2 loads the caller's history to append the terminal event, and
+    // fails on that row. The follow-ups under test belong to sweep 1 and are
+    // already recorded, which is exactly what this failure must not undo.
     let outcome = autumn_harvest::timeout::enforce_external_cancels_outbox(
         &mut caller_conn,
         recorder.as_ref(),
         Duration::from_secs(60),
         &Some(sharded_pool),
         &[caller_exec_id.shard()],
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await;
 
@@ -2776,6 +2852,7 @@ async fn cross_shard_cancel_deferred_check_does_not_deadlock_on_unencoded_caller
             Duration::from_secs(60),
             &Some(sharded_pool),
             &[caller_exec_id.shard()],
+            &autumn_harvest::payload_codec::PayloadCodecs::default(),
         ),
     )
     .await;

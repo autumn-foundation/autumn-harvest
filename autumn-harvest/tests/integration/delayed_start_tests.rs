@@ -26,7 +26,7 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 async fn setup_test_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
@@ -139,7 +139,7 @@ async fn test_delayed_start_validation() {
             workflow_name: "delay_workflow",
             workflow_id: "conflict-001",
             exec_id: autumn_harvest::ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0)),
-            input: serde_json::json!({}),
+            input: serde_json::json!({}).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -202,7 +202,7 @@ async fn test_delayed_start_validation() {
             workflow_name: "delay_workflow",
             workflow_id: "past-001",
             exec_id: autumn_harvest::ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0)),
-            input: serde_json::json!({}),
+            input: serde_json::json!({}).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -276,6 +276,9 @@ async fn test_delayed_start_no_premature_dispatch() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
+                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
+                dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "delay-worker".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -291,6 +294,7 @@ async fn test_delayed_start_no_premature_dispatch() {
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
+                resident_workflows: true,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
@@ -329,7 +333,7 @@ async fn test_delayed_start_no_premature_dispatch() {
             workflow_name: "delay_workflow",
             workflow_id: "delay-001",
             exec_id,
-            input: serde_json::json!({ "val": 42 }),
+            input: serde_json::json!({ "val": 42 }).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -423,7 +427,7 @@ async fn test_delayed_start_cancel_before_firing() {
             workflow_name: "delay_workflow",
             workflow_id: "delay-cancel-001",
             exec_id,
-            input: serde_json::json!({}),
+            input: serde_json::json!({}).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -524,7 +528,7 @@ async fn test_delayed_start_workflow_started_event_timestamp() {
             workflow_name: "delay_workflow",
             workflow_id: "delay-timestamp-001",
             exec_id,
-            input: serde_json::json!({}),
+            input: serde_json::json!({}).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -593,7 +597,7 @@ async fn test_immediate_start_skew_tolerance() {
             workflow_name: "delay_workflow",
             workflow_id: "immediate-skew-001",
             exec_id,
-            input: serde_json::json!({}),
+            input: serde_json::json!({}).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,

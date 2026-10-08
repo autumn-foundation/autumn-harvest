@@ -13,7 +13,9 @@
 //!   (2)  A history that diverges from the registered handler (a recorded
 //!        activity name the handler no longer schedules) → 200 `diverged` with
 //!        `{kind, event_index, expected, actual}`.
-//!   (3)  A `FAILED` run diagnosed retroactively (AC4) → 200.
+//!   (3)  A `FAILED` run diagnosed retroactively (AC4) → 200 `clean` carrying the
+//!        reproduced failure (issue #952: reproducing a recorded terminal failure
+//!        is not a divergence).
 //!   (4)  Unknown execution id → 404.
 //!   (5)  Malformed execution id → 400.
 //!   (6)  A workflow type not registered on this node → 200 `not_registered`.
@@ -32,7 +34,7 @@
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to an already-migrated Postgres to
 //! run against it directly (no Docker); otherwise a testcontainer is started with
-//! the schema applied via `autumn_harvest::full_migrations_sql()`. This suite is
+//! the schema applied via `autumn_harvest::test_init_sql()`. This suite is
 //! executed Docker-backed in CI (per the #543/#544/#601 precedent).
 
 #![allow(clippy::similar_names)]
@@ -56,7 +58,6 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -71,7 +72,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 // ── Test workflow ────────────────────────────────────────────────────────────
@@ -292,7 +293,7 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
     )
     .with_registered_dag_names(["classic_dag".to_string()]);
     api_state.install(runtime);
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 /// Like [`build_app`] but registers `policy_branch_wf` on a registry carrying a
@@ -321,7 +322,7 @@ fn build_app_with_history_policy(pool: &DbPool) -> HarvestApiApp {
         ShardRouter::default(),
     );
     api_state.install(runtime);
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 /// Like [`build_app`] but registers `state_reading_wf` on a registry carrying a
@@ -358,7 +359,7 @@ fn build_app_with_state(pool: &DbPool) -> HarvestApiApp {
         ShardRouter::default(),
     );
     api_state.install(runtime);
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 async fn post_diagnosis(app: &HarvestApiApp, id: &str) -> (StatusCode, Value) {
@@ -667,8 +668,15 @@ async fn failed_run_is_diagnosable_retroactively() {
 
     let (status, body) = post_diagnosis(&app, &exec.to_string()).await;
     assert_eq!(status, StatusCode::OK, "body={body}");
-    assert_eq!(body["diagnosis"], json!("workflow_failed"));
-    assert!(body["failure"]["error"].as_str().is_some());
+    // Issue #952: a history sealed by a terminal `WorkflowFailed` that replays to
+    // the same failure has NOT diverged — the verdict is `clean`, and the
+    // reproduced error is surfaced in `failure` so this endpoint stays the
+    // post-mortem surface it was built to be (#614 AC4).
+    assert_eq!(body["diagnosis"], json!("clean"));
+    assert!(
+        body["failure"]["error"].as_str().is_some(),
+        "a clean verdict that reproduced the recorded failure must still carry it: {body}"
+    );
 }
 
 #[tokio::test]
@@ -1146,7 +1154,7 @@ fn build_app_with_codecs(pool: &DbPool, decode_on: bool, codecs: PayloadCodecs) 
         ShardRouter::default(),
     );
     api_state.install(runtime);
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 /// Seed an execution whose event payloads are codec-ENCODED (envelopes), using

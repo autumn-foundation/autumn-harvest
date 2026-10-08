@@ -63,7 +63,7 @@ use uuid::Uuid;
 // ---------------------------------------------------------------------------
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 async fn setup_db() -> (String, Option<ContainerAsync<Postgres>>) {
@@ -121,6 +121,9 @@ fn build_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> 
     Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
+                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
+                dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: worker_id.to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -136,6 +139,7 @@ fn build_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> 
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
+                resident_workflows: true,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
@@ -174,7 +178,7 @@ async fn seed_workflow(
         workflow_id: &format!("wf-{}", exec_id.as_uuid()),
         run_id: Uuid::new_v4(),
         shard_id: 0,
-        input: input.clone(),
+        input: input.clone().into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -452,6 +456,8 @@ async fn auto_heartbeat_prevents_spurious_heartbeat_reclaim() {
                         None,
                         None,
                         60,
+                        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+                        0,
                     )
                     .await;
                 }
@@ -549,11 +555,13 @@ async fn fresh_heartbeat_does_not_defeat_start_to_close() {
 
     // Row 1 — FRESH heartbeat + start_to_close (started 10s ago, s2c 1s):
     // a fresh heartbeat (what auto-heartbeat produces) must NOT shield a wedged
-    // activity from the independent start_to_close ceiling.
+    // activity from the independent start_to_close ceiling. The fresh rows use
+    // a 5s heartbeat timeout. It is shorter than the 10s since the start, so
+    // only the heartbeat protects them. It also stays fresh on a loaded runner.
     let fresh_with_s2c = seed_running_activity(
         &mut conn,
         exec_id,
-        Some(Duration::from_secs(1)), // heartbeat_timeout 1s
+        Some(Duration::from_secs(5)), // heartbeat_timeout 5s
         Some(Duration::from_secs(1)), // start_to_close 1s
         10,                           // started 10s ago
         true,                         // fresh last_heartbeat_at = NOW()
@@ -565,7 +573,7 @@ async fn fresh_heartbeat_does_not_defeat_start_to_close() {
     let fresh_no_s2c = seed_running_activity(
         &mut conn,
         exec_id,
-        Some(Duration::from_secs(1)),
+        Some(Duration::from_secs(5)),
         None,
         10,
         true,
@@ -661,6 +669,8 @@ async fn auto_heartbeat_activity_still_reclaimed_by_start_to_close() {
                         None,
                         None,
                         60,
+                        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+                        0,
                     )
                     .await;
                 }

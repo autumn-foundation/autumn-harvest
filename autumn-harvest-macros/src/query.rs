@@ -76,7 +76,7 @@ pub fn query_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     // First parameter must be ctx: &WorkflowContext.
-    if !first_param_is_ctx(&func.sig.inputs) {
+    if !crate::attr_util::first_param_is_ctx_type(&func.sig.inputs, "WorkflowContext") {
         return syn::Error::new_spanned(
             &func.sig,
             "#[query] handlers must take `ctx: &WorkflowContext` as the first argument",
@@ -85,7 +85,7 @@ pub fn query_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     // Return type must be Result<T, E>.
-    if !returns_result(&func.sig.output) {
+    if !crate::attr_util::returns_result(&func.sig.output) {
         return syn::Error::new_spanned(
             &func.sig.output,
             "#[query] return type must be `Result<T, E>`",
@@ -107,20 +107,10 @@ pub fn query_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Skip the leading ctx param when building type hints and dispatch args.
     let params: Vec<_> = func.sig.inputs.iter().skip(1).collect();
-    let param_names: Vec<_> = params
-        .iter()
-        .filter_map(|arg| {
-            if let syn::FnArg::Typed(pt) = arg
-                && let syn::Pat::Ident(ident) = &*pt.pat
-            {
-                return Some(&ident.ident);
-            }
-            None
-        })
-        .collect();
+    let param_names: Vec<_> = crate::attr_util::param_idents(&params);
 
-    let input_type_hint = build_input_type_hint(&params);
-    let output_type_hint = extract_ok_type_hint(&func.sig.output);
+    let input_type_hint = crate::attr_util::arg_type_hint(&params);
+    let output_type_hint = crate::extract_ok_type_hint(&func.sig.output);
 
     let dispatch = build_query_dispatch(fn_name, &param_names);
 
@@ -131,11 +121,12 @@ pub fn query_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Ok(p) => p,
         Err(e) => return e.to_compile_error(),
     };
+    let (leading_colon, nested_path_tokens) = parsed_path.nested_stub_use_tokens();
     let workflow_simple_name = parsed_path.workflow_simple_name;
-    let camel_wf = to_pascal_case(&workflow_simple_name);
+    let camel_wf = crate::to_pascal_case(&workflow_simple_name);
     let stub_ident = format_ident!("{camel_wf}Stub");
     let method_name = format_ident!("query_{fn_name}");
-    let ok_type = extract_ok_type(&func.sig.output);
+    let ok_type = crate::extract_ok_type(&func.sig.output);
 
     let serialize_payload = if param_names.is_empty() {
         quote! { ::autumn_harvest::serde_json::Value::Null }
@@ -148,54 +139,29 @@ pub fn query_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let mod_name = format_ident!("__autumn_query_impl_{fn_name}");
     let path_tokens = parsed_path.path_tokens;
-    let is_absolute = parsed_path.is_absolute;
-    let leading_colon = if is_absolute {
-        quote! { :: }
-    } else {
-        quote! {}
-    };
-    let nested_path_tokens = if is_absolute
-        || parsed_path
-            .original_module_parts
-            .first()
-            .is_some_and(|s| s == "crate")
-    {
-        path_tokens.clone()
-    } else if parsed_path.original_module_parts.is_empty() {
-        Vec::new()
-    } else {
-        let mut tokens = Vec::new();
-        tokens.push(quote! { super });
-        let first = parsed_path.original_module_parts.first().unwrap();
-        if first == "self" {
-            for p in parsed_path.original_module_parts.iter().skip(1) {
-                let id = format_ident!("{}", p);
-                tokens.push(quote! { #id });
-            }
-        } else {
-            for p in &parsed_path.original_module_parts {
-                let id = format_ident!("{}", p);
-                tokens.push(quote! { #id });
-            }
+    // See `update.rs`'s identical hoist (and its comment) for why this is a
+    // single shared block spliced into both `impl_block` arms rather than
+    // two hand-kept-in-sync copies.
+    let method_defs = quote! {
+        /// Execute this typed query in-process.
+        pub async fn #method_name(
+            handle: &::autumn_harvest::WorkflowHandle,
+            #(#params),*
+        ) -> ::autumn_harvest::HarvestResult<#ok_type> {
+            let args = #serialize_payload;
+            let info = #stub_ident::info();
+            let q_info = #companion_name();
+            let raw = handle.execute_query_in_process(&info, &q_info, #fn_name_str, args).await?;
+            ::autumn_harvest::serde_json::from_value(raw)
+                .map_err(::autumn_harvest::error::HarvestError::Serialization)
         }
-        tokens
     };
+
     let impl_block = if path_tokens.is_empty() {
         quote! {
             ::autumn_harvest::cfg_db! {
                 impl #stub_ident {
-                    /// Execute this typed query in-process.
-                    pub async fn #method_name(
-                        handle: &::autumn_harvest::WorkflowHandle,
-                        #(#params),*
-                    ) -> ::autumn_harvest::HarvestResult<#ok_type> {
-                        let args = #serialize_payload;
-                        let info = #stub_ident::info();
-                        let q_info = #companion_name();
-                        let raw = handle.execute_query_in_process(&info, &q_info, #fn_name_str, args).await?;
-                        ::autumn_harvest::serde_json::from_value(raw)
-                            .map_err(::autumn_harvest::error::HarvestError::Serialization)
-                    }
+                    #method_defs
                 }
             }
         }
@@ -206,18 +172,7 @@ pub fn query_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use super::*;
                     use #leading_colon #(#nested_path_tokens::)*#stub_ident;
                     impl #stub_ident {
-                        /// Execute this typed query in-process.
-                        pub async fn #method_name(
-                            handle: &::autumn_harvest::WorkflowHandle,
-                            #(#params),*
-                        ) -> ::autumn_harvest::HarvestResult<#ok_type> {
-                            let args = #serialize_payload;
-                            let info = #stub_ident::info();
-                            let q_info = #companion_name();
-                            let raw = handle.execute_query_in_process(&info, &q_info, #fn_name_str, args).await?;
-                            ::autumn_harvest::serde_json::from_value(raw)
-                                .map_err(::autumn_harvest::error::HarvestError::Serialization)
-                        }
+                        #method_defs
                     }
                 }
             }
@@ -263,117 +218,262 @@ pub fn query_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Returns `true` when the first parameter in the list matches `ctx: &WorkflowContext`.
-fn first_param_is_ctx(inputs: &syn::punctuated::Punctuated<syn::FnArg, syn::token::Comma>) -> bool {
-    let Some(first) = inputs.first() else {
-        return false;
-    };
-    let syn::FnArg::Typed(pt) = first else {
-        return false;
-    };
-    // Accept any `&Xxx` reference type whose last path segment is `WorkflowContext`.
-    let syn::Type::Reference(r) = &*pt.ty else {
-        return false;
-    };
-    let syn::Type::Path(tp) = &*r.elem else {
-        return false;
-    };
-    tp.path
-        .segments
-        .last()
-        .is_some_and(|s| s.ident == "WorkflowContext")
-}
-
-fn returns_result(output: &syn::ReturnType) -> bool {
-    let syn::ReturnType::Type(_, ty) = output else {
-        return false;
-    };
-    let syn::Type::Path(type_path) = &**ty else {
-        return false;
-    };
-    type_path
-        .path
-        .segments
-        .last()
-        .is_some_and(|s| s.ident == "Result")
-}
-
 fn build_query_dispatch(fn_name: &syn::Ident, param_names: &[&syn::Ident]) -> TokenStream {
-    if param_names.is_empty() {
-        quote! {
-            let result = #fn_name(ctx);
-            result.map_err(|e| e.to_string())
-                .and_then(|v| {
-                    ::autumn_harvest::serde_json::to_value(v).map_err(|e| e.to_string())
-                })
-        }
-    } else if param_names.len() == 1 {
-        let name = &param_names[0];
-        quote! {
-            let #name = ::autumn_harvest::serde_json::from_value(args)
-                .map_err(|e| e.to_string())?;
-            let result = #fn_name(ctx, #name);
-            result.map_err(|e| e.to_string())
-                .and_then(|v| {
-                    ::autumn_harvest::serde_json::to_value(v).map_err(|e| e.to_string())
-                })
-        }
-    } else {
-        let indices = (0..param_names.len()).map(syn::Index::from);
-        let names = param_names.to_owned();
-        quote! {
-            let __args: ::autumn_harvest::serde_json::Value = args;
-            #(
-                let #names = ::autumn_harvest::serde_json::from_value(__args[#indices].clone())
-                    .map_err(|e| e.to_string())?;
-            )*
-            let result = #fn_name(ctx, #(#names),*);
-            result.map_err(|e| e.to_string())
-                .and_then(|v| {
-                    ::autumn_harvest::serde_json::to_value(v).map_err(|e| e.to_string())
-                })
-        }
-    }
+    crate::attr_util::build_handler_dispatch(
+        fn_name,
+        param_names,
+        &format_ident!("args"),
+        &quote! { ctx },
+        &quote! {},
+        &quote! { |e| e.to_string() },
+    )
 }
 
-/// Returns a `String` describing the input parameters for `input_type_hint`.
-fn build_input_type_hint(params: &[&syn::FnArg]) -> String {
-    if params.is_empty() {
-        return "()".to_string();
-    }
-    if params.len() == 1
-        && let syn::FnArg::Typed(pt) = params[0]
-    {
-        return type_name_hint(&pt.ty);
-    }
-    // Multiple params: show as tuple
-    let parts: Vec<_> = params
-        .iter()
-        .filter_map(|arg| {
-            if let syn::FnArg::Typed(pt) = arg {
-                Some(type_name_hint(&pt.ty))
-            } else {
-                None
+// ── Characterization tests ──────────────────────────────────────────────────
+//
+// `query_macro` generates the typed-stub `#method_name` twice: once for the
+// same-module case (`path_tokens.is_empty()`) and once wrapped in a private
+// `mod` for the nested-module case. See `update.rs`'s
+// `same_module_vs_nested_module_parity_tests` for the sibling case (and a
+// real missed-fix defect this shape produced there, commit 896978eb). Query
+// handlers have no update-with-start analogue, so there's no missed-fix
+// history here yet, but the same two-copy risk exists.
+#[cfg(test)]
+mod same_module_vs_nested_module_parity_tests {
+    use super::query_macro;
+    use quote::quote;
+
+    /// See `update.rs`'s identically-named helper for why this is needed:
+    /// `quote!`'s fallback (`cargo test`) `Display` renders doc comments as
+    /// raw string literals (`r"..."`) whose content can itself contain `]`.
+    fn strip_docs(s: &str) -> String {
+        const PREFIX: &str = "# [doc = r\"";
+        let mut out = String::new();
+        let mut rest = s;
+        loop {
+            match rest.find(PREFIX) {
+                None => {
+                    out.push_str(rest);
+                    break;
+                }
+                Some(start) => {
+                    out.push_str(&rest[..start]);
+                    let after_prefix = &rest[start + PREFIX.len()..];
+                    let quote_end = after_prefix
+                        .find('"')
+                        .expect("unterminated raw string in doc attribute");
+                    let after_quote = &after_prefix[quote_end + 1..];
+                    let close = after_quote
+                        .find(']')
+                        .expect("expected ']' closing the doc attribute");
+                    rest = &after_quote[close + 1..];
+                }
             }
-        })
-        .collect();
-    format!("({})", parts.join(", "))
+        }
+        out
+    }
+
+    fn extract_impl_body(full: &str, stub_ident: &str) -> String {
+        let marker = format!("impl {stub_ident} {{");
+        let start = full
+            .find(&marker)
+            .unwrap_or_else(|| panic!("no `{marker}` in generated output:\n{full}"))
+            + marker.len();
+        let mut depth = 1i32;
+        let bytes = full.as_bytes();
+        let mut i = start;
+        while i < bytes.len() && depth > 0 {
+            match bytes[i] as char {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        strip_docs(full[start..i - 1].trim())
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn generate(workflow_path: &str) -> String {
+        let attr = quote! { workflow = #workflow_path };
+        let item = quote! {
+            fn my_query(ctx: &WorkflowContext, n: u32) -> Result<u32, String> {
+                Ok(n)
+            }
+        };
+        query_macro(attr, item).to_string()
+    }
+
+    #[test]
+    fn same_module_and_nested_module_branches_generate_identical_impl_bodies() {
+        let same_module = generate("MyWorkflow");
+        let nested = generate("some_mod::MyWorkflow");
+
+        let same_module_body = extract_impl_body(&same_module, "MyWorkflowStub");
+        let nested_body = extract_impl_body(&nested, "MyWorkflowStub");
+
+        assert_eq!(
+            same_module_body, nested_body,
+            "the same-module and nested-module branches of `query_macro` must \
+             generate identical method bodies (module wrapper and doc comments \
+             aside) -- see update.rs's sibling test for why this class of \
+             divergence is a real, previously-shipped risk"
+        );
+        assert!(same_module_body.contains("execute_query_in_process"));
+    }
+
+    fn use_line(full: &str) -> &str {
+        let start = full
+            .find("use ")
+            .unwrap_or_else(|| panic!("no `use` in generated output:\n{full}"));
+        let end = start
+            + full[start..]
+                .find("impl ")
+                .unwrap_or_else(|| panic!("no `impl` after `use` in:\n{full}"));
+        full[start..end].trim()
+    }
+
+    /// Pins the exact stub-`use` tokens `query_macro` emits for each shape of
+    /// `workflow = "..."` path. The shapes are plain nested, `self::`-relative,
+    /// `crate::`-prefixed, and fully absolute (`::`-leading). This is before
+    /// the shared derivation moves to `WorkflowPath::nested_stub_use_tokens`.
+    /// See `update.rs`/`signal.rs`'s identical siblings: all three handler
+    /// macros resolve a `workflow` path to a stub `use` the same way.
+    #[test]
+    fn stub_use_tokens_pinned_per_path_shape() {
+        assert_eq!(
+            use_line(&generate("some_mod::MyWorkflow")),
+            "use super :: * ; use super :: some_mod :: MyWorkflowStub ;"
+        );
+        assert_eq!(
+            use_line(&generate("self::MyWorkflow")),
+            "use super :: * ; use super :: MyWorkflowStub ;"
+        );
+        assert_eq!(
+            use_line(&generate("self::a::b::MyWorkflow")),
+            "use super :: * ; use super :: a :: b :: MyWorkflowStub ;"
+        );
+        assert_eq!(
+            use_line(&generate("crate::some_mod::MyWorkflow")),
+            "use super :: * ; use crate :: some_mod :: MyWorkflowStub ;"
+        );
+        assert_eq!(
+            use_line(&generate("::abs_mod::MyWorkflow")),
+            "use super :: * ; use :: abs_mod :: MyWorkflowStub ;"
+        );
+    }
 }
 
-/// Extracts the `T` from `Result<T, E>` for use as `output_type_hint`.
-fn extract_ok_type_hint(output: &syn::ReturnType) -> String {
-    crate::extract_ok_type_hint(output)
+// ── Characterization tests: signature-validation error paths ────────────────
+//
+// Pins `query_macro`'s current rejection messages for the two structural
+// checks (`first_param_is_ctx`, `returns_result`). A later change switches
+// those checks to call the already-shared `attr_util::first_param_is_ctx_type`/
+// `attr_util::returns_result`. See the sibling copies in `update.rs` and
+// `signal.rs`. See also the generalized versions in `attr_util.rs` that
+// `webhook.rs` already uses. Committed first so the refactor cannot silently
+// change a caller-visible compile error.
+#[cfg(test)]
+mod signature_validation_characterization_tests {
+    use super::query_macro;
+    use quote::quote;
+
+    #[test]
+    fn wrong_first_param_type_is_rejected() {
+        let attr = quote! { workflow = "MyWorkflow" };
+        let item = quote! {
+            fn my_query(n: u32) -> Result<u32, String> {
+                Ok(n)
+            }
+        };
+        let out = query_macro(attr, item).to_string();
+        assert!(
+            out.contains("must take") && out.contains("WorkflowContext"),
+            "expected the ctx-param rejection message, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn non_result_return_type_is_rejected() {
+        let attr = quote! { workflow = "MyWorkflow" };
+        let item = quote! {
+            fn my_query(ctx: &WorkflowContext) -> u32 {
+                0
+            }
+        };
+        let out = query_macro(attr, item).to_string();
+        assert!(
+            out.contains("return type must be") && out.contains("Result"),
+            "expected the return-type rejection message, got:\n{out}"
+        );
+    }
 }
 
-/// Returns the human-readable name of a type suitable for type hints.
-fn type_name_hint(ty: &syn::Type) -> String {
-    crate::type_name_hint(ty)
-}
+// Pins the output of `attr_util::build_handler_dispatch` as used by `#[query]`
+// (issue #1632).
+#[cfg(test)]
+mod dispatch_characterization_tests {
+    use super::query_macro;
+    use quote::quote;
 
-fn to_pascal_case(s: &str) -> String {
-    crate::to_pascal_case(s)
-}
+    /// Isolate the body of the generated `__dispatch` function.
+    fn extract_dispatch_body(full: &str) -> String {
+        let marker = "-> Result < :: autumn_harvest :: serde_json :: Value , String > {";
+        let start = full
+            .find(marker)
+            .unwrap_or_else(|| panic!("no dispatch marker in generated output:\n{full}"))
+            + marker.len();
+        let mut depth = 1i32;
+        let bytes = full.as_bytes();
+        let mut i = start;
+        while i < bytes.len() && depth > 0 {
+            match bytes[i] as char {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        full[start..i - 1].trim().to_string()
+    }
 
-fn extract_ok_type(output: &syn::ReturnType) -> syn::Type {
-    crate::extract_ok_type(output)
+    fn generate(item: proc_macro2::TokenStream) -> String {
+        query_macro(quote! { workflow = "MyWorkflow" }, item).to_string()
+    }
+
+    const QUERY_DISPATCH_0: &str = "let result = my_query (ctx) ; result . map_err (| e | e . to_string ()) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+    const QUERY_DISPATCH_1: &str = "let n = :: autumn_harvest :: serde_json :: from_value (args) . map_err (| e | e . to_string ()) ? ; let result = my_query (ctx , n) ; result . map_err (| e | e . to_string ()) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+    const QUERY_DISPATCH_N: &str = "let __args : :: autumn_harvest :: serde_json :: Value = args ; let a = :: autumn_harvest :: serde_json :: from_value (__args [0] . clone ()) . map_err (| e | e . to_string ()) ? ; let b = :: autumn_harvest :: serde_json :: from_value (__args [1] . clone ()) . map_err (| e | e . to_string ()) ? ; let result = my_query (ctx , a , b) ; result . map_err (| e | e . to_string ()) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+
+    #[test]
+    fn zero_params_dispatch_is_pinned() {
+        let out = generate(quote! {
+            fn my_query(ctx: &WorkflowContext) -> Result<u32, String> {
+                Ok(1)
+            }
+        });
+        assert_eq!(extract_dispatch_body(&out), QUERY_DISPATCH_0);
+    }
+
+    #[test]
+    fn one_params_dispatch_is_pinned() {
+        let out = generate(quote! {
+            fn my_query(ctx: &WorkflowContext, n: u32) -> Result<u32, String> {
+                Ok(1)
+            }
+        });
+        assert_eq!(extract_dispatch_body(&out), QUERY_DISPATCH_1);
+    }
+
+    #[test]
+    fn multi_params_dispatch_is_pinned() {
+        let out = generate(quote! {
+            fn my_query(ctx: &WorkflowContext, a: u32, b: u32) -> Result<u32, String> {
+                Ok(1)
+            }
+        });
+        assert_eq!(extract_dispatch_body(&out), QUERY_DISPATCH_N);
+    }
 }

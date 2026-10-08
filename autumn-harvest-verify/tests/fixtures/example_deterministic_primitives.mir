@@ -1,0 +1,4998 @@
+// WARNING: This output format is intended for human consumers only
+// and is subject to change without notice. Knock yourself out.
+// HINT: See also -Z dump-mir for MIR at specific points during compilation.
+fn <impl at autumn-harvest/examples/deterministic_primitives.rs:25:10: 25:15>::fmt(_1: &NotificationEvent, _2: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+    debug self => _1;
+    debug f => _2;
+    let mut _0: std::result::Result<(), std::fmt::Error>;
+    let mut _3: &str;
+    let mut _4: &str;
+    let mut _5: &dyn std::fmt::Debug;
+    let _6: &i64;
+    let mut _7: &str;
+    let mut _8: &dyn std::fmt::Debug;
+    let _9: &&std::string::String;
+    let _10: &std::string::String;
+
+    bb0: {
+        _3 = const "NotificationEvent";
+        _4 = const "occurred_at_epoch_secs";
+        _6 = &((*_1).0: i64);
+        _5 = copy _6 as &dyn std::fmt::Debug (PointerCoercion(Unsize, Implicit));
+        _7 = const "recipient";
+        _10 = &((*_1).1: std::string::String);
+        _9 = &_10;
+        _8 = copy _9 as &dyn std::fmt::Debug (PointerCoercion(Unsize, Implicit));
+        _0 = std::fmt::Formatter::<'_>::debug_struct_field2_finish(copy _2, move _3, move _4, move _5, move _7, move _8) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+alloc17 (size: 17, align: 1) {
+    0x00 │ 4e 6f 74 69 66 69 63 61 74 69 6f 6e 45 76 65 6e │ NotificationEven
+    0x10 │ 74                                              │ t
+}
+
+alloc6 (size: 9, align: 1) {
+    72 65 63 69 70 69 65 6e 74                      │ recipient
+}
+
+alloc5 (size: 22, align: 1) {
+    0x00 │ 6f 63 63 75 72 72 65 64 5f 61 74 5f 65 70 6f 63 │ occurred_at_epoc
+    0x10 │ 68 5f 73 65 63 73                               │ h_secs
+}
+
+const _: () = const ();
+
+fn _::<impl at autumn-harvest/examples/deterministic_primitives.rs:25:17: 25:26>::serialize(_1: &NotificationEvent, _2: __S) -> Result<<__S as _::_serde::Serializer>::Ok, <__S as _::_serde::Serializer>::Error> {
+    debug self => _1;
+    debug __serializer => _2;
+    let mut _0: std::result::Result<<__S as _::_serde::Serializer>::Ok, <__S as _::_serde::Serializer>::Error>;
+    let mut _3: <__S as _::_serde::Serializer>::SerializeStruct;
+    let mut _4: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, <__S as _::_serde::Serializer>::Error>, <__S as _::_serde::Serializer>::SerializeStruct>;
+    let mut _5: std::result::Result<<__S as _::_serde::Serializer>::SerializeStruct, <__S as _::_serde::Serializer>::Error>;
+    let mut _6: __S;
+    let mut _7: usize;
+    let mut _8: usize;
+    let mut _9: usize;
+    let mut _10: (usize, bool);
+    let mut _11: (usize, bool);
+    let mut _12: isize;
+    let _13: std::result::Result<std::convert::Infallible, <__S as _::_serde::Serializer>::Error>;
+    let _14: <__S as _::_serde::Serializer>::SerializeStruct;
+    let mut _15: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, <__S as _::_serde::Serializer>::Error>>;
+    let mut _16: std::result::Result<(), <__S as _::_serde::Serializer>::Error>;
+    let mut _17: &mut <__S as _::_serde::Serializer>::SerializeStruct;
+    let _18: &i64;
+    let mut _19: isize;
+    let mut _21: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, <__S as _::_serde::Serializer>::Error>>;
+    let mut _22: std::result::Result<(), <__S as _::_serde::Serializer>::Error>;
+    let mut _23: &mut <__S as _::_serde::Serializer>::SerializeStruct;
+    let _24: &std::string::String;
+    let mut _25: isize;
+    let mut _27: <__S as _::_serde::Serializer>::SerializeStruct;
+    let mut _28: bool;
+    let mut _29: bool;
+    scope 1 {
+        debug __serde_state => _3;
+        let _20: std::result::Result<std::convert::Infallible, <__S as _::_serde::Serializer>::Error>;
+        let _26: std::result::Result<std::convert::Infallible, <__S as _::_serde::Serializer>::Error>;
+        scope 6 {
+            debug residual => _20;
+            scope 7 {
+            }
+        }
+        scope 8 {
+            debug val => const ();
+            scope 9 {
+            }
+        }
+        scope 10 {
+            debug residual => _26;
+            scope 11 {
+            }
+        }
+        scope 12 {
+            debug val => const ();
+            scope 13 {
+            }
+        }
+    }
+    scope 2 {
+        debug residual => _13;
+        scope 3 {
+        }
+    }
+    scope 4 {
+        debug val => _14;
+        scope 5 {
+        }
+    }
+
+    bb0: {
+        _28 = const false;
+        _29 = const false;
+        _29 = const true;
+        _6 = move _2;
+        _9 = const false as usize (IntToInt);
+        _10 = AddWithOverflow(copy _9, const 1_usize);
+        assert(!move (_10.1: bool), "attempt to compute `{} + {}`, which would overflow", move _9, const 1_usize) -> [success: bb1, unwind: bb24];
+    }
+
+    bb1: {
+        _8 = move (_10.0: usize);
+        _11 = AddWithOverflow(copy _8, const 1_usize);
+        assert(!move (_11.1: bool), "attempt to compute `{} + {}`, which would overflow", move _8, const 1_usize) -> [success: bb2, unwind: bb24];
+    }
+
+    bb2: {
+        _7 = move (_11.0: usize);
+        _29 = const false;
+        _5 = <__S as _::_serde::Serializer>::serialize_struct(move _6, const "NotificationEvent", move _7) -> [return: bb3, unwind: bb24];
+    }
+
+    bb3: {
+        _29 = const false;
+        _4 = <Result<<__S as _::_serde::Serializer>::SerializeStruct, <__S as _::_serde::Serializer>::Error> as Try>::branch(move _5) -> [return: bb4, unwind continue];
+    }
+
+    bb4: {
+        _12 = discriminant(_4);
+        switchInt(move _12) -> [0: bb6, 1: bb7, otherwise: bb5];
+    }
+
+    bb5: {
+        unreachable;
+    }
+
+    bb6: {
+        _14 = move ((_4 as Continue).0: <__S as _::_serde::Serializer>::SerializeStruct);
+        _28 = const true;
+        _3 = move _14;
+        _17 = &mut _3;
+        _18 = &((*_1).0: i64);
+        _16 = <<__S as _::_serde::Serializer>::SerializeStruct as SerializeStruct>::serialize_field::<i64>(copy _17, const "occurred_at_epoch_secs", copy _18) -> [return: bb8, unwind: bb22];
+    }
+
+    bb7: {
+        _13 = move ((_4 as Break).0: std::result::Result<std::convert::Infallible, <__S as _::_serde::Serializer>::Error>);
+        _0 = <Result<<__S as _::_serde::Serializer>::Ok, <__S as _::_serde::Serializer>::Error> as FromResidual<Result<Infallible, <__S as _::_serde::Serializer>::Error>>>::from_residual(copy _13) -> [return: bb18, unwind continue];
+    }
+
+    bb8: {
+        _15 = <Result<(), <__S as _::_serde::Serializer>::Error> as Try>::branch(move _16) -> [return: bb9, unwind: bb22];
+    }
+
+    bb9: {
+        _19 = discriminant(_15);
+        switchInt(move _19) -> [0: bb10, 1: bb11, otherwise: bb5];
+    }
+
+    bb10: {
+        _23 = &mut _3;
+        _24 = &((*_1).1: std::string::String);
+        _22 = <<__S as _::_serde::Serializer>::SerializeStruct as SerializeStruct>::serialize_field::<std::string::String>(copy _23, const "recipient", copy _24) -> [return: bb12, unwind: bb22];
+    }
+
+    bb11: {
+        _20 = move ((_15 as Break).0: std::result::Result<std::convert::Infallible, <__S as _::_serde::Serializer>::Error>);
+        _0 = <Result<<__S as _::_serde::Serializer>::Ok, <__S as _::_serde::Serializer>::Error> as FromResidual<Result<Infallible, <__S as _::_serde::Serializer>::Error>>>::from_residual(copy _20) -> [return: bb25, unwind: bb22];
+    }
+
+    bb12: {
+        _21 = <Result<(), <__S as _::_serde::Serializer>::Error> as Try>::branch(move _22) -> [return: bb13, unwind: bb22];
+    }
+
+    bb13: {
+        _25 = discriminant(_21);
+        switchInt(move _25) -> [0: bb14, 1: bb15, otherwise: bb5];
+    }
+
+    bb14: {
+        _28 = const false;
+        _27 = move _3;
+        _0 = <<__S as _::_serde::Serializer>::SerializeStruct as SerializeStruct>::end(move _27) -> [return: bb16, unwind: bb22];
+    }
+
+    bb15: {
+        _26 = move ((_21 as Break).0: std::result::Result<std::convert::Infallible, <__S as _::_serde::Serializer>::Error>);
+        _0 = <Result<<__S as _::_serde::Serializer>::Ok, <__S as _::_serde::Serializer>::Error> as FromResidual<Result<Infallible, <__S as _::_serde::Serializer>::Error>>>::from_residual(copy _26) -> [return: bb26, unwind: bb22];
+    }
+
+    bb16: {
+        _28 = const false;
+        goto -> bb19;
+    }
+
+    bb17: {
+        drop(_3) -> [return: bb18, unwind continue];
+    }
+
+    bb18: {
+        _28 = const false;
+        goto -> bb19;
+    }
+
+    bb19: {
+        return;
+    }
+
+    bb20 (cleanup): {
+        resume;
+    }
+
+    bb21 (cleanup): {
+        drop(_3) -> [return: bb20, unwind terminate(cleanup)];
+    }
+
+    bb22 (cleanup): {
+        switchInt(copy _28) -> [0: bb20, otherwise: bb21];
+    }
+
+    bb23 (cleanup): {
+        drop(_6) -> [return: bb20, unwind terminate(cleanup)];
+    }
+
+    bb24 (cleanup): {
+        switchInt(copy _29) -> [0: bb20, otherwise: bb23];
+    }
+
+    bb25: {
+        goto -> bb17;
+    }
+
+    bb26: {
+        goto -> bb17;
+    }
+}
+
+alloc17 (size: 17, align: 1) {
+    0x00 │ 4e 6f 74 69 66 69 63 61 74 69 6f 6e 45 76 65 6e │ NotificationEven
+    0x10 │ 74                                              │ t
+}
+
+alloc6 (size: 9, align: 1) {
+    72 65 63 69 70 69 65 6e 74                      │ recipient
+}
+
+alloc5 (size: 22, align: 1) {
+    0x00 │ 6f 63 63 75 72 72 65 64 5f 61 74 5f 65 70 6f 63 │ occurred_at_epoc
+    0x10 │ 68 5f 73 65 63 73                               │ h_secs
+}
+
+const _: () = const ();
+
+fn _::<impl at autumn-harvest/examples/deterministic_primitives.rs:25:28: 25:39>::deserialize(_1: __D) -> Result<NotificationEvent, <__D as _::_serde::Deserializer<'_>>::Error> {
+    debug __deserializer => _1;
+    let mut _0: std::result::Result<NotificationEvent, <__D as _::_serde::Deserializer<'_>>::Error>;
+
+    bb0: {
+        _0 = <__D as _::_serde::Deserializer<'_>>::deserialize_struct::<_::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Visitor<'_>>(copy _1, const "NotificationEvent", const _::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::FIELDS, const _::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Visitor::<'_> {{ marker: PhantomData::<NotificationEvent>, lifetime: PhantomData::<&()> }}) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+alloc17 (size: 17, align: 1) {
+    0x00 │ 4e 6f 74 69 66 69 63 61 74 69 6f 6e 45 76 65 6e │ NotificationEven
+    0x10 │ 74                                              │ t
+}
+
+fn _::<impl at autumn-harvest/examples/deterministic_primitives.rs:25:28: 25:39>::deserialize::<impl at autumn-harvest/examples/deterministic_primitives.rs:25:28: 25:39>::expecting(_1: &_::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__FieldVisitor, _2: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+    debug self => _1;
+    debug __formatter => _2;
+    let mut _0: std::result::Result<(), std::fmt::Error>;
+    let mut _3: &str;
+
+    bb0: {
+        _3 = const "field identifier";
+        _0 = std::fmt::Formatter::<'_>::write_str(copy _2, move _3) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+alloc21 (size: 16, align: 1) {
+    66 69 65 6c 64 20 69 64 65 6e 74 69 66 69 65 72 │ field identifier
+}
+
+fn _::<impl at autumn-harvest/examples/deterministic_primitives.rs:25:28: 25:39>::deserialize::<impl at autumn-harvest/examples/deterministic_primitives.rs:25:28: 25:39>::visit_u64(_1: _::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__FieldVisitor, _2: u64) -> Result<_::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field, __E> {
+    debug self => const _::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__FieldVisitor;
+    debug __value => _2;
+    let mut _0: std::result::Result<_::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field, __E>;
+    let mut _3: _::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field;
+    let mut _4: _::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field;
+    let mut _5: _::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field;
+
+    bb0: {
+        switchInt(copy _2) -> [0: bb3, 1: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _5 = _::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field::__ignore;
+        _0 = Result::<_::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field, __E>::Ok(move _5);
+        goto -> bb4;
+    }
+
+    bb2: {
+        _4 = _::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field::__field1;
+        _0 = Result::<_::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field, __E>::Ok(move _4);
+        goto -> bb4;
+    }
+
+    bb3: {
+        _3 = _::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field::__field0;
+        _0 = Result::<_::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field, __E>::Ok(move _3);
+        goto -> bb4;
+    }
+
+    bb4: {
+        return;
+    }
+}
+
+fn _::<impl at autumn-harvest/examples/deterministic_primitives.rs:25:28: 25:39>::deserialize::<impl at autumn-harvest/examples/deterministic_primitives.rs:25:28: 25:39>::visit_str(_1: _::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__FieldVisitor, _2: &str) -> Result<_::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field, __E> {
+    debug self => const _::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__FieldVisitor;
+    debug __value => _2;
+    let mut _0: std::result::Result<_::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field, __E>;
+    let mut _3: bool;
+    let mut _4: bool;
+    let mut _5: _::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field;
+    let mut _6: _::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field;
+    let mut _7: _::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field;
+
+    bb0: {
+        _4 = <str as PartialEq>::eq(copy _2, const "occurred_at_epoch_secs") -> [return: bb6, unwind continue];
+    }
+
+    bb1: {
+        _7 = _::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field::__ignore;
+        _0 = Result::<_::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field, __E>::Ok(move _7);
+        goto -> bb7;
+    }
+
+    bb2: {
+        _5 = _::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field::__field0;
+        _0 = Result::<_::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field, __E>::Ok(move _5);
+        goto -> bb7;
+    }
+
+    bb3: {
+        _3 = <str as PartialEq>::eq(copy _2, const "recipient") -> [return: bb5, unwind continue];
+    }
+
+    bb4: {
+        _6 = _::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field::__field1;
+        _0 = Result::<_::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field, __E>::Ok(move _6);
+        goto -> bb7;
+    }
+
+    bb5: {
+        switchInt(move _3) -> [0: bb1, otherwise: bb4];
+    }
+
+    bb6: {
+        switchInt(move _4) -> [0: bb3, otherwise: bb2];
+    }
+
+    bb7: {
+        return;
+    }
+}
+
+fn _::<impl at autumn-harvest/examples/deterministic_primitives.rs:25:28: 25:39>::deserialize::<impl at autumn-harvest/examples/deterministic_primitives.rs:25:28: 25:39>::visit_bytes(_1: _::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__FieldVisitor, _2: &[u8]) -> Result<_::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field, __E> {
+    debug self => const _::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__FieldVisitor;
+    debug __value => _2;
+    let mut _0: std::result::Result<_::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field, __E>;
+    let mut _3: usize;
+    let mut _4: bool;
+    let mut _5: usize;
+    let mut _6: bool;
+    let mut _7: _::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field;
+    let mut _8: _::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field;
+    let mut _9: _::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field;
+
+    bb0: {
+        _5 = PtrMetadata(copy _2);
+        _6 = Eq(copy _5, const 22_usize);
+        switchInt(move _6) -> [0: bb24, otherwise: bb2];
+    }
+
+    bb1: {
+        _9 = _::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field::__ignore;
+        _0 = Result::<_::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field, __E>::Ok(move _9);
+        goto -> bb36;
+    }
+
+    bb2: {
+        switchInt(copy (*_2)[0 of 22]) -> [111: bb3, otherwise: bb1];
+    }
+
+    bb3: {
+        switchInt(copy (*_2)[1 of 22]) -> [99: bb4, otherwise: bb1];
+    }
+
+    bb4: {
+        switchInt(copy (*_2)[2 of 22]) -> [99: bb5, otherwise: bb1];
+    }
+
+    bb5: {
+        switchInt(copy (*_2)[3 of 22]) -> [117: bb6, otherwise: bb1];
+    }
+
+    bb6: {
+        switchInt(copy (*_2)[4 of 22]) -> [114: bb7, otherwise: bb1];
+    }
+
+    bb7: {
+        switchInt(copy (*_2)[5 of 22]) -> [114: bb8, otherwise: bb1];
+    }
+
+    bb8: {
+        switchInt(copy (*_2)[6 of 22]) -> [101: bb9, otherwise: bb1];
+    }
+
+    bb9: {
+        switchInt(copy (*_2)[7 of 22]) -> [100: bb10, otherwise: bb1];
+    }
+
+    bb10: {
+        switchInt(copy (*_2)[8 of 22]) -> [95: bb11, otherwise: bb1];
+    }
+
+    bb11: {
+        switchInt(copy (*_2)[9 of 22]) -> [97: bb12, otherwise: bb1];
+    }
+
+    bb12: {
+        switchInt(copy (*_2)[10 of 22]) -> [116: bb13, otherwise: bb1];
+    }
+
+    bb13: {
+        switchInt(copy (*_2)[11 of 22]) -> [95: bb14, otherwise: bb1];
+    }
+
+    bb14: {
+        switchInt(copy (*_2)[12 of 22]) -> [101: bb15, otherwise: bb1];
+    }
+
+    bb15: {
+        switchInt(copy (*_2)[13 of 22]) -> [112: bb16, otherwise: bb1];
+    }
+
+    bb16: {
+        switchInt(copy (*_2)[14 of 22]) -> [111: bb17, otherwise: bb1];
+    }
+
+    bb17: {
+        switchInt(copy (*_2)[15 of 22]) -> [99: bb18, otherwise: bb1];
+    }
+
+    bb18: {
+        switchInt(copy (*_2)[16 of 22]) -> [104: bb19, otherwise: bb1];
+    }
+
+    bb19: {
+        switchInt(copy (*_2)[17 of 22]) -> [95: bb20, otherwise: bb1];
+    }
+
+    bb20: {
+        switchInt(copy (*_2)[18 of 22]) -> [115: bb21, otherwise: bb1];
+    }
+
+    bb21: {
+        switchInt(copy (*_2)[19 of 22]) -> [101: bb22, otherwise: bb1];
+    }
+
+    bb22: {
+        switchInt(copy (*_2)[20 of 22]) -> [99: bb23, otherwise: bb1];
+    }
+
+    bb23: {
+        switchInt(copy (*_2)[21 of 22]) -> [115: bb35, otherwise: bb1];
+    }
+
+    bb24: {
+        _3 = PtrMetadata(copy _2);
+        _4 = Eq(copy _3, const 9_usize);
+        switchInt(move _4) -> [0: bb1, otherwise: bb25];
+    }
+
+    bb25: {
+        switchInt(copy (*_2)[0 of 9]) -> [114: bb26, otherwise: bb1];
+    }
+
+    bb26: {
+        switchInt(copy (*_2)[1 of 9]) -> [101: bb27, otherwise: bb1];
+    }
+
+    bb27: {
+        switchInt(copy (*_2)[2 of 9]) -> [99: bb28, otherwise: bb1];
+    }
+
+    bb28: {
+        switchInt(copy (*_2)[3 of 9]) -> [105: bb29, otherwise: bb1];
+    }
+
+    bb29: {
+        switchInt(copy (*_2)[4 of 9]) -> [112: bb30, otherwise: bb1];
+    }
+
+    bb30: {
+        switchInt(copy (*_2)[5 of 9]) -> [105: bb31, otherwise: bb1];
+    }
+
+    bb31: {
+        switchInt(copy (*_2)[6 of 9]) -> [101: bb32, otherwise: bb1];
+    }
+
+    bb32: {
+        switchInt(copy (*_2)[7 of 9]) -> [110: bb33, otherwise: bb1];
+    }
+
+    bb33: {
+        switchInt(copy (*_2)[8 of 9]) -> [116: bb34, otherwise: bb1];
+    }
+
+    bb34: {
+        _8 = _::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field::__field1;
+        _0 = Result::<_::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field, __E>::Ok(move _8);
+        goto -> bb36;
+    }
+
+    bb35: {
+        _7 = _::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field::__field0;
+        _0 = Result::<_::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field, __E>::Ok(move _7);
+        goto -> bb36;
+    }
+
+    bb36: {
+        return;
+    }
+}
+
+fn _::<impl at autumn-harvest/examples/deterministic_primitives.rs:25:28: 25:39>::deserialize::<impl at autumn-harvest/examples/deterministic_primitives.rs:25:28: 25:39>::deserialize(_1: __D) -> Result<_::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field, <__D as _::_serde::Deserializer<'_>>::Error> {
+    debug __deserializer => _1;
+    let mut _0: std::result::Result<_::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field, <__D as _::_serde::Deserializer<'_>>::Error>;
+
+    bb0: {
+        _0 = <__D as _::_serde::Deserializer<'_>>::deserialize_identifier::<_::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__FieldVisitor>(copy _1, const _::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__FieldVisitor) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+fn _::<impl at autumn-harvest/examples/deterministic_primitives.rs:25:28: 25:39>::deserialize::<impl at autumn-harvest/examples/deterministic_primitives.rs:25:28: 25:39>::expecting(_1: &_::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Visitor<'_>, _2: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+    debug self => _1;
+    debug __formatter => _2;
+    let mut _0: std::result::Result<(), std::fmt::Error>;
+    let mut _3: &str;
+
+    bb0: {
+        _3 = const "struct NotificationEvent";
+        _0 = std::fmt::Formatter::<'_>::write_str(copy _2, move _3) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+alloc24 (size: 24, align: 1) {
+    0x00 │ 73 74 72 75 63 74 20 4e 6f 74 69 66 69 63 61 74 │ struct Notificat
+    0x10 │ 69 6f 6e 45 76 65 6e 74                         │ ionEvent
+}
+
+fn _::<impl at autumn-harvest/examples/deterministic_primitives.rs:25:28: 25:39>::deserialize::<impl at autumn-harvest/examples/deterministic_primitives.rs:25:28: 25:39>::visit_seq(_1: _::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Visitor<'_>, _2: __A) -> Result<NotificationEvent, <__A as SeqAccess<'_>>::Error> {
+    debug self => const _::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Visitor::<'_> {{ marker: PhantomData::<NotificationEvent>, lifetime: PhantomData::<&()> }};
+    debug __seq => _2;
+    let mut _0: std::result::Result<NotificationEvent, <__A as _::_serde::de::SeqAccess<'_>>::Error>;
+    let mut _3: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, <__A as _::_serde::de::SeqAccess<'_>>::Error>, std::option::Option<i64>>;
+    let mut _4: std::result::Result<std::option::Option<i64>, <__A as _::_serde::de::SeqAccess<'_>>::Error>;
+    let mut _5: &mut __A;
+    let mut _6: isize;
+    let _7: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::SeqAccess<'_>>::Error>;
+    let _8: std::option::Option<i64>;
+    let mut _9: isize;
+    let _10: i64;
+    let mut _11: <__A as _::_serde::de::SeqAccess<'_>>::Error;
+    let mut _12: &dyn _::_serde::de::Expected;
+    let _13: &&str;
+    let mut _14: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, <__A as _::_serde::de::SeqAccess<'_>>::Error>, std::option::Option<std::string::String>>;
+    let mut _15: std::result::Result<std::option::Option<std::string::String>, <__A as _::_serde::de::SeqAccess<'_>>::Error>;
+    let mut _16: &mut __A;
+    let mut _17: isize;
+    let mut _20: isize;
+    let mut _22: <__A as _::_serde::de::SeqAccess<'_>>::Error;
+    let mut _23: &dyn _::_serde::de::Expected;
+    let _24: &&str;
+    let mut _25: NotificationEvent;
+    scope 1 {
+        debug __field0 => _10;
+        let _18: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::SeqAccess<'_>>::Error>;
+        let _19: std::option::Option<std::string::String>;
+        let _21: std::string::String;
+        scope 7 {
+            debug __field1 => _21;
+        }
+        scope 8 {
+            debug residual => _18;
+            scope 9 {
+            }
+        }
+        scope 10 {
+            debug val => _19;
+            scope 11 {
+            }
+        }
+        scope 12 {
+            debug __value => _21;
+        }
+    }
+    scope 2 {
+        debug residual => _7;
+        scope 3 {
+        }
+    }
+    scope 4 {
+        debug val => _8;
+        scope 5 {
+        }
+    }
+    scope 6 {
+        debug __value => _10;
+    }
+
+    bb0: {
+        _5 = &mut _2;
+        _4 = <__A as SeqAccess<'_>>::next_element::<i64>(copy _5) -> [return: bb1, unwind: bb18];
+    }
+
+    bb1: {
+        _3 = <Result<std::option::Option<i64>, <__A as SeqAccess<'_>>::Error> as Try>::branch(move _4) -> [return: bb2, unwind: bb18];
+    }
+
+    bb2: {
+        _6 = discriminant(_3);
+        switchInt(move _6) -> [0: bb4, 1: bb5, otherwise: bb3];
+    }
+
+    bb3: {
+        unreachable;
+    }
+
+    bb4: {
+        _8 = copy ((_3 as Continue).0: std::option::Option<i64>);
+        _9 = discriminant(_8);
+        switchInt(move _9) -> [0: bb6, 1: bb7, otherwise: bb3];
+    }
+
+    bb5: {
+        _7 = move ((_3 as Break).0: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::SeqAccess<'_>>::Error>);
+        _0 = <Result<NotificationEvent, <__A as SeqAccess<'_>>::Error> as FromResidual<Result<Infallible, <__A as SeqAccess<'_>>::Error>>>::from_residual(copy _7) -> [return: bb20, unwind: bb18];
+    }
+
+    bb6: {
+        _13 = const <_::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Visitor<'_> as _::_serde::de::Visitor<'_>>::visit_seq::<__A>::promoted[0];
+        _12 = copy _13 as &dyn _::_serde::de::Expected (PointerCoercion(Unsize, Implicit));
+        _11 = <<__A as SeqAccess<'_>>::Error as _::_serde::de::Error>::invalid_length(const 0_usize, move _12) -> [return: bb8, unwind: bb18];
+    }
+
+    bb7: {
+        _10 = copy ((_8 as Some).0: i64);
+        _16 = &mut _2;
+        _15 = <__A as SeqAccess<'_>>::next_element::<std::string::String>(copy _16) -> [return: bb9, unwind: bb18];
+    }
+
+    bb8: {
+        _0 = Result::<NotificationEvent, <__A as SeqAccess<'_>>::Error>::Err(move _11);
+        goto -> bb16;
+    }
+
+    bb9: {
+        _14 = <Result<std::option::Option<std::string::String>, <__A as SeqAccess<'_>>::Error> as Try>::branch(move _15) -> [return: bb10, unwind: bb18];
+    }
+
+    bb10: {
+        _17 = discriminant(_14);
+        switchInt(move _17) -> [0: bb11, 1: bb12, otherwise: bb3];
+    }
+
+    bb11: {
+        _19 = move ((_14 as Continue).0: std::option::Option<std::string::String>);
+        _20 = discriminant(_19);
+        switchInt(move _20) -> [0: bb13, 1: bb14, otherwise: bb3];
+    }
+
+    bb12: {
+        _18 = move ((_14 as Break).0: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::SeqAccess<'_>>::Error>);
+        _0 = <Result<NotificationEvent, <__A as SeqAccess<'_>>::Error> as FromResidual<Result<Infallible, <__A as SeqAccess<'_>>::Error>>>::from_residual(copy _18) -> [return: bb21, unwind: bb18];
+    }
+
+    bb13: {
+        _24 = const <_::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Visitor<'_> as _::_serde::de::Visitor<'_>>::visit_seq::<__A>::promoted[1];
+        _23 = copy _24 as &dyn _::_serde::de::Expected (PointerCoercion(Unsize, Implicit));
+        _22 = <<__A as SeqAccess<'_>>::Error as _::_serde::de::Error>::invalid_length(const 1_usize, move _23) -> [return: bb15, unwind: bb18];
+    }
+
+    bb14: {
+        _21 = copy ((_19 as Some).0: std::string::String);
+        _25 = NotificationEvent { occurred_at_epoch_secs: copy _10, recipient: copy _21 };
+        _0 = Result::<NotificationEvent, <__A as SeqAccess<'_>>::Error>::Ok(move _25);
+        drop(_2) -> [return: bb17, unwind continue];
+    }
+
+    bb15: {
+        _0 = Result::<NotificationEvent, <__A as SeqAccess<'_>>::Error>::Err(move _22);
+        goto -> bb16;
+    }
+
+    bb16: {
+        drop(_2) -> [return: bb17, unwind continue];
+    }
+
+    bb17: {
+        return;
+    }
+
+    bb18 (cleanup): {
+        drop(_2) -> [return: bb19, unwind terminate(cleanup)];
+    }
+
+    bb19 (cleanup): {
+        resume;
+    }
+
+    bb20: {
+        goto -> bb16;
+    }
+
+    bb21: {
+        goto -> bb16;
+    }
+}
+
+const _::<impl at autumn-harvest/examples/deterministic_primitives.rs:25:28: 25:39>::deserialize::<impl at autumn-harvest/examples/deterministic_primitives.rs:25:28: 25:39>::visit_seq::promoted[0]: &&str = {
+    let mut _0: &&str;
+    let mut _1: &str;
+
+    bb0: {
+        _1 = const "struct NotificationEvent with 2 elements";
+        _0 = &_1;
+        return;
+    }
+}
+
+alloc25 (size: 40, align: 1) {
+    0x00 │ 73 74 72 75 63 74 20 4e 6f 74 69 66 69 63 61 74 │ struct Notificat
+    0x10 │ 69 6f 6e 45 76 65 6e 74 20 77 69 74 68 20 32 20 │ ionEvent with 2 
+    0x20 │ 65 6c 65 6d 65 6e 74 73                         │ elements
+}
+
+const _::<impl at autumn-harvest/examples/deterministic_primitives.rs:25:28: 25:39>::deserialize::<impl at autumn-harvest/examples/deterministic_primitives.rs:25:28: 25:39>::visit_seq::promoted[1]: &&str = {
+    let mut _0: &&str;
+    let mut _1: &str;
+
+    bb0: {
+        _1 = const "struct NotificationEvent with 2 elements";
+        _0 = &_1;
+        return;
+    }
+}
+
+alloc25 (size: 40, align: 1) {
+    0x00 │ 73 74 72 75 63 74 20 4e 6f 74 69 66 69 63 61 74 │ struct Notificat
+    0x10 │ 69 6f 6e 45 76 65 6e 74 20 77 69 74 68 20 32 20 │ ionEvent with 2 
+    0x20 │ 65 6c 65 6d 65 6e 74 73                         │ elements
+}
+
+fn _::<impl at autumn-harvest/examples/deterministic_primitives.rs:25:28: 25:39>::deserialize::<impl at autumn-harvest/examples/deterministic_primitives.rs:25:28: 25:39>::visit_map(_1: _::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Visitor<'_>, _2: __A) -> Result<NotificationEvent, <__A as MapAccess<'_>>::Error> {
+    debug self => const _::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Visitor::<'_> {{ marker: PhantomData::<NotificationEvent>, lifetime: PhantomData::<&()> }};
+    debug __map => _2;
+    let mut _0: std::result::Result<NotificationEvent, <__A as _::_serde::de::MapAccess<'_>>::Error>;
+    let mut _3: std::option::Option<i64>;
+    let mut _5: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>, std::option::Option<_::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field>>;
+    let mut _6: std::result::Result<std::option::Option<_::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field>, <__A as _::_serde::de::MapAccess<'_>>::Error>;
+    let mut _7: &mut __A;
+    let mut _8: isize;
+    let mut _11: isize;
+    let mut _13: isize;
+    let mut _14: bool;
+    let _15: &std::option::Option<i64>;
+    let mut _16: <__A as _::_serde::de::MapAccess<'_>>::Error;
+    let mut _17: std::option::Option<i64>;
+    let mut _18: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>, i64>;
+    let mut _19: std::result::Result<i64, <__A as _::_serde::de::MapAccess<'_>>::Error>;
+    let mut _20: &mut __A;
+    let mut _21: isize;
+    let mut _24: bool;
+    let _25: &std::option::Option<std::string::String>;
+    let mut _26: <__A as _::_serde::de::MapAccess<'_>>::Error;
+    let mut _27: std::option::Option<std::string::String>;
+    let mut _28: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>, std::string::String>;
+    let mut _29: std::result::Result<std::string::String, <__A as _::_serde::de::MapAccess<'_>>::Error>;
+    let mut _30: &mut __A;
+    let mut _31: isize;
+    let mut _34: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>, _::_serde::de::IgnoredAny>;
+    let mut _35: std::result::Result<_::_serde::de::IgnoredAny, <__A as _::_serde::de::MapAccess<'_>>::Error>;
+    let mut _36: &mut __A;
+    let mut _37: isize;
+    let mut _40: isize;
+    let mut _42: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>, i64>;
+    let mut _43: std::result::Result<i64, <__A as _::_serde::de::MapAccess<'_>>::Error>;
+    let mut _44: isize;
+    let mut _48: isize;
+    let mut _50: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>, std::string::String>;
+    let mut _51: std::result::Result<std::string::String, <__A as _::_serde::de::MapAccess<'_>>::Error>;
+    let mut _52: isize;
+    let mut _55: NotificationEvent;
+    let mut _56: i64;
+    let mut _57: std::string::String;
+    let mut _58: bool;
+    let mut _59: isize;
+    let mut _60: isize;
+    scope 1 {
+        debug __field0 => _3;
+        let mut _4: std::option::Option<std::string::String>;
+        scope 2 {
+            debug __field1 => _4;
+            let _39: i64;
+            let _41: i64;
+            let _45: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>;
+            let _46: i64;
+            scope 3 {
+                debug __key => _12;
+                let _9: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>;
+                let _10: std::option::Option<_::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field>;
+                let _12: _::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field;
+                let _22: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>;
+                let _23: i64;
+                let _32: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>;
+                let _33: std::string::String;
+                let _38: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>;
+                scope 4 {
+                    debug residual => _9;
+                    scope 5 {
+                    }
+                }
+                scope 6 {
+                    debug val => _10;
+                    scope 7 {
+                    }
+                }
+                scope 8 {
+                    debug residual => _22;
+                    scope 9 {
+                    }
+                }
+                scope 10 {
+                    debug val => _23;
+                    scope 11 {
+                    }
+                }
+                scope 12 {
+                    debug residual => _32;
+                    scope 13 {
+                    }
+                }
+                scope 14 {
+                    debug val => _33;
+                    scope 15 {
+                    }
+                }
+                scope 16 {
+                }
+                scope 17 {
+                    debug residual => _38;
+                    scope 18 {
+                    }
+                }
+                scope 19 {
+                    debug val => const IgnoredAny;
+                    scope 20 {
+                    }
+                }
+            }
+            scope 21 {
+                debug __field0 => _39;
+                let _47: std::string::String;
+                let _49: std::string::String;
+                let _53: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>;
+                let _54: std::string::String;
+                scope 27 {
+                    debug __field1 => _47;
+                }
+                scope 28 {
+                    debug __field1 => _49;
+                }
+                scope 29 {
+                    debug residual => _53;
+                    scope 30 {
+                    }
+                }
+                scope 31 {
+                    debug val => _54;
+                    scope 32 {
+                    }
+                }
+            }
+            scope 22 {
+                debug __field0 => _41;
+            }
+            scope 23 {
+                debug residual => _45;
+                scope 24 {
+                }
+            }
+            scope 25 {
+                debug val => _46;
+                scope 26 {
+                }
+            }
+        }
+    }
+
+    bb0: {
+        _58 = const false;
+        _3 = std::option::Option::<i64>::None;
+        _58 = const true;
+        _4 = std::option::Option::<std::string::String>::None;
+        goto -> bb1;
+    }
+
+    bb1: {
+        _7 = &mut _2;
+        _6 = <__A as MapAccess<'_>>::next_key::<_::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field>(copy _7) -> [return: bb2, unwind: bb56];
+    }
+
+    bb2: {
+        _5 = <Result<std::option::Option<_::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field>, <__A as MapAccess<'_>>::Error> as Try>::branch(move _6) -> [return: bb3, unwind: bb56];
+    }
+
+    bb3: {
+        _8 = discriminant(_5);
+        switchInt(move _8) -> [0: bb5, 1: bb6, otherwise: bb4];
+    }
+
+    bb4: {
+        unreachable;
+    }
+
+    bb5: {
+        _10 = move ((_5 as Continue).0: std::option::Option<_::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field>);
+        _11 = discriminant(_10);
+        switchInt(move _11) -> [1: bb8, 0: bb7, otherwise: bb4];
+    }
+
+    bb6: {
+        _9 = move ((_5 as Break).0: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>);
+        _0 = <Result<NotificationEvent, <__A as MapAccess<'_>>::Error> as FromResidual<Result<Infallible, <__A as MapAccess<'_>>::Error>>>::from_residual(copy _9) -> [return: bb57, unwind: bb56];
+    }
+
+    bb7: {
+        _40 = discriminant(_3);
+        switchInt(move _40) -> [0: bb33, 1: bb34, otherwise: bb4];
+    }
+
+    bb8: {
+        _12 = copy ((_10 as Some).0: _::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::__Field);
+        _13 = discriminant(_12);
+        switchInt(move _13) -> [0: bb11, 1: bb10, 2: bb9, otherwise: bb4];
+    }
+
+    bb9: {
+        _36 = &mut _2;
+        _35 = <__A as MapAccess<'_>>::next_value::<IgnoredAny>(copy _36) -> [return: bb30, unwind: bb56];
+    }
+
+    bb10: {
+        _25 = &_4;
+        _24 = std::option::Option::<std::string::String>::is_some(copy _25) -> [return: bb20, unwind: bb56];
+    }
+
+    bb11: {
+        _15 = &_3;
+        _14 = std::option::Option::<i64>::is_some(copy _15) -> [return: bb12, unwind: bb56];
+    }
+
+    bb12: {
+        switchInt(move _14) -> [0: bb15, otherwise: bb13];
+    }
+
+    bb13: {
+        _16 = <<__A as MapAccess<'_>>::Error as _::_serde::de::Error>::duplicate_field(const "occurred_at_epoch_secs") -> [return: bb14, unwind: bb56];
+    }
+
+    bb14: {
+        _0 = Result::<NotificationEvent, <__A as MapAccess<'_>>::Error>::Err(move _16);
+        goto -> bb53;
+    }
+
+    bb15: {
+        _20 = &mut _2;
+        _19 = <__A as MapAccess<'_>>::next_value::<i64>(copy _20) -> [return: bb16, unwind: bb56];
+    }
+
+    bb16: {
+        _18 = <Result<i64, <__A as MapAccess<'_>>::Error> as Try>::branch(move _19) -> [return: bb17, unwind: bb56];
+    }
+
+    bb17: {
+        _21 = discriminant(_18);
+        switchInt(move _21) -> [0: bb18, 1: bb19, otherwise: bb4];
+    }
+
+    bb18: {
+        _23 = copy ((_18 as Continue).0: i64);
+        _17 = std::option::Option::<i64>::Some(copy _23);
+        _3 = move _17;
+        goto -> bb1;
+    }
+
+    bb19: {
+        _22 = move ((_18 as Break).0: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>);
+        _0 = <Result<NotificationEvent, <__A as MapAccess<'_>>::Error> as FromResidual<Result<Infallible, <__A as MapAccess<'_>>::Error>>>::from_residual(copy _22) -> [return: bb58, unwind: bb56];
+    }
+
+    bb20: {
+        switchInt(move _24) -> [0: bb23, otherwise: bb21];
+    }
+
+    bb21: {
+        _26 = <<__A as MapAccess<'_>>::Error as _::_serde::de::Error>::duplicate_field(const "recipient") -> [return: bb22, unwind: bb56];
+    }
+
+    bb22: {
+        _0 = Result::<NotificationEvent, <__A as MapAccess<'_>>::Error>::Err(move _26);
+        goto -> bb53;
+    }
+
+    bb23: {
+        _30 = &mut _2;
+        _29 = <__A as MapAccess<'_>>::next_value::<std::string::String>(copy _30) -> [return: bb24, unwind: bb56];
+    }
+
+    bb24: {
+        _28 = <Result<std::string::String, <__A as MapAccess<'_>>::Error> as Try>::branch(move _29) -> [return: bb25, unwind: bb56];
+    }
+
+    bb25: {
+        _31 = discriminant(_28);
+        switchInt(move _31) -> [0: bb26, 1: bb27, otherwise: bb4];
+    }
+
+    bb26: {
+        _33 = move ((_28 as Continue).0: std::string::String);
+        _27 = std::option::Option::<std::string::String>::Some(copy _33);
+        drop(_4) -> [return: bb28, unwind: bb29];
+    }
+
+    bb27: {
+        _32 = move ((_28 as Break).0: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>);
+        _0 = <Result<NotificationEvent, <__A as MapAccess<'_>>::Error> as FromResidual<Result<Infallible, <__A as MapAccess<'_>>::Error>>>::from_residual(copy _32) -> [return: bb59, unwind: bb56];
+    }
+
+    bb28: {
+        _58 = const true;
+        _4 = move _27;
+        goto -> bb1;
+    }
+
+    bb29 (cleanup): {
+        _58 = const true;
+        _4 = move _27;
+        goto -> bb56;
+    }
+
+    bb30: {
+        _34 = <Result<IgnoredAny, <__A as MapAccess<'_>>::Error> as Try>::branch(move _35) -> [return: bb31, unwind: bb56];
+    }
+
+    bb31: {
+        _37 = discriminant(_34);
+        switchInt(move _37) -> [0: bb1, 1: bb32, otherwise: bb4];
+    }
+
+    bb32: {
+        _38 = move ((_34 as Break).0: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>);
+        _0 = <Result<NotificationEvent, <__A as MapAccess<'_>>::Error> as FromResidual<Result<Infallible, <__A as MapAccess<'_>>::Error>>>::from_residual(copy _38) -> [return: bb60, unwind: bb56];
+    }
+
+    bb33: {
+        _43 = _::_serde::__private228::de::missing_field::<'_, i64, <__A as MapAccess<'_>>::Error>(const "occurred_at_epoch_secs") -> [return: bb35, unwind: bb56];
+    }
+
+    bb34: {
+        _41 = copy ((_3 as Some).0: i64);
+        _39 = copy _41;
+        goto -> bb39;
+    }
+
+    bb35: {
+        _42 = <Result<i64, <__A as MapAccess<'_>>::Error> as Try>::branch(move _43) -> [return: bb36, unwind: bb56];
+    }
+
+    bb36: {
+        _44 = discriminant(_42);
+        switchInt(move _44) -> [0: bb37, 1: bb38, otherwise: bb4];
+    }
+
+    bb37: {
+        _46 = copy ((_42 as Continue).0: i64);
+        _39 = copy _46;
+        goto -> bb39;
+    }
+
+    bb38: {
+        _45 = move ((_42 as Break).0: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>);
+        _0 = <Result<NotificationEvent, <__A as MapAccess<'_>>::Error> as FromResidual<Result<Infallible, <__A as MapAccess<'_>>::Error>>>::from_residual(copy _45) -> [return: bb61, unwind: bb56];
+    }
+
+    bb39: {
+        _48 = discriminant(_4);
+        switchInt(move _48) -> [0: bb40, 1: bb41, otherwise: bb4];
+    }
+
+    bb40: {
+        _51 = _::_serde::__private228::de::missing_field::<'_, std::string::String, <__A as MapAccess<'_>>::Error>(const "recipient") -> [return: bb42, unwind: bb56];
+    }
+
+    bb41: {
+        _58 = const false;
+        _49 = move ((_4 as Some).0: std::string::String);
+        _47 = move _49;
+        goto -> bb46;
+    }
+
+    bb42: {
+        _50 = <Result<std::string::String, <__A as MapAccess<'_>>::Error> as Try>::branch(move _51) -> [return: bb43, unwind: bb56];
+    }
+
+    bb43: {
+        _52 = discriminant(_50);
+        switchInt(move _52) -> [0: bb44, 1: bb45, otherwise: bb4];
+    }
+
+    bb44: {
+        _54 = move ((_50 as Continue).0: std::string::String);
+        _47 = move _54;
+        goto -> bb46;
+    }
+
+    bb45: {
+        _53 = move ((_50 as Break).0: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>);
+        _0 = <Result<NotificationEvent, <__A as MapAccess<'_>>::Error> as FromResidual<Result<Infallible, <__A as MapAccess<'_>>::Error>>>::from_residual(copy _53) -> [return: bb62, unwind: bb56];
+    }
+
+    bb46: {
+        _56 = copy _39;
+        _57 = move _47;
+        _55 = NotificationEvent { occurred_at_epoch_secs: move _56, recipient: move _57 };
+        _0 = Result::<NotificationEvent, <__A as MapAccess<'_>>::Error>::Ok(move _55);
+        _58 = const false;
+        drop(_2) -> [return: bb47, unwind continue];
+    }
+
+    bb47: {
+        return;
+    }
+
+    bb48 (cleanup): {
+        drop(_2) -> [return: bb49, unwind terminate(cleanup)];
+    }
+
+    bb49 (cleanup): {
+        resume;
+    }
+
+    bb50: {
+        _58 = const false;
+        drop(_2) -> [return: bb47, unwind continue];
+    }
+
+    bb51: {
+        switchInt(copy _58) -> [0: bb50, otherwise: bb52];
+    }
+
+    bb52: {
+        drop(((_4 as Some).0: std::string::String)) -> [return: bb50, unwind: bb48];
+    }
+
+    bb53: {
+        _59 = discriminant(_4);
+        switchInt(move _59) -> [1: bb51, 0: bb50, otherwise: bb4];
+    }
+
+    bb54 (cleanup): {
+        switchInt(copy _58) -> [0: bb48, otherwise: bb55];
+    }
+
+    bb55 (cleanup): {
+        drop(((_4 as Some).0: std::string::String)) -> [return: bb48, unwind terminate(cleanup)];
+    }
+
+    bb56 (cleanup): {
+        _60 = discriminant(_4);
+        switchInt(move _60) -> [1: bb54, otherwise: bb48];
+    }
+
+    bb57: {
+        goto -> bb53;
+    }
+
+    bb58: {
+        goto -> bb53;
+    }
+
+    bb59: {
+        goto -> bb53;
+    }
+
+    bb60: {
+        goto -> bb53;
+    }
+
+    bb61: {
+        goto -> bb53;
+    }
+
+    bb62: {
+        goto -> bb53;
+    }
+}
+
+alloc6 (size: 9, align: 1) {
+    72 65 63 69 70 69 65 6e 74                      │ recipient
+}
+
+alloc5 (size: 22, align: 1) {
+    0x00 │ 6f 63 63 75 72 72 65 64 5f 61 74 5f 65 70 6f 63 │ occurred_at_epoc
+    0x10 │ 68 5f 73 65 63 73                               │ h_secs
+}
+
+const _::<impl at autumn-harvest/examples/deterministic_primitives.rs:25:28: 25:39>::deserialize::FIELDS: &[&str] = {
+    let mut _0: &[&str];
+    let mut _1: &[&str; 2];
+    let _2: &[&str; 2];
+    let _3: [&str; 2];
+    let mut _4: &[&str; 2];
+
+    bb0: {
+        StorageLive(_1);
+        StorageLive(_2);
+        _4 = const _::<impl _::_serde::Deserialize<'de> for NotificationEvent>::deserialize::FIELDS::promoted[0];
+        _2 = &(*_4);
+        _1 = &(*_2);
+        _0 = move _1 as &[&str] (PointerCoercion(Unsize, Implicit));
+        StorageDead(_2);
+        StorageDead(_1);
+        return;
+    }
+}
+
+const _::<impl at autumn-harvest/examples/deterministic_primitives.rs:25:28: 25:39>::deserialize::FIELDS::promoted[0]: &[&str; 2] = {
+    let mut _0: &[&str; 2];
+    let mut _1: [&str; 2];
+
+    bb0: {
+        _1 = [const "occurred_at_epoch_secs", const "recipient"];
+        _0 = &_1;
+        return;
+    }
+}
+
+alloc6 (size: 9, align: 1) {
+    72 65 63 69 70 69 65 6e 74                      │ recipient
+}
+
+alloc5 (size: 22, align: 1) {
+    0x00 │ 6f 63 63 75 72 72 65 64 5f 61 74 5f 65 70 6f 63 │ occurred_at_epoc
+    0x10 │ 68 5f 73 65 63 73                               │ h_secs
+}
+
+fn <impl at autumn-harvest/examples/deterministic_primitives.rs:25:41: 25:46>::clone(_1: &NotificationEvent) -> NotificationEvent {
+    debug self => _1;
+    let mut _0: NotificationEvent;
+    let mut _2: i64;
+    let _3: &i64;
+    let mut _4: std::string::String;
+    let _5: &std::string::String;
+
+    bb0: {
+        _3 = &((*_1).0: i64);
+        _2 = copy (*_3);
+        _5 = &((*_1).1: std::string::String);
+        _4 = <std::string::String as Clone>::clone(copy _5) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        _0 = NotificationEvent { occurred_at_epoch_secs: move _2, recipient: move _4 };
+        return;
+    }
+}
+
+fn <impl at autumn-harvest/examples/deterministic_primitives.rs:32:10: 32:15>::fmt(_1: &NotificationDecision, _2: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+    debug self => _1;
+    debug f => _2;
+    let mut _0: std::result::Result<(), std::fmt::Error>;
+    let mut _3: &str;
+    let mut _4: &str;
+    let mut _5: &dyn std::fmt::Debug;
+    let _6: &std::string::String;
+    let mut _7: &str;
+    let mut _8: &dyn std::fmt::Debug;
+    let _9: &bool;
+    let mut _10: &str;
+    let mut _11: &dyn std::fmt::Debug;
+    let _12: &i32;
+    let mut _13: &str;
+    let mut _14: &dyn std::fmt::Debug;
+    let _15: &&std::string::String;
+    let _16: &std::string::String;
+
+    bb0: {
+        _3 = const "NotificationDecision";
+        _4 = const "idempotency_key";
+        _6 = &((*_1).0: std::string::String);
+        _5 = copy _6 as &dyn std::fmt::Debug (PointerCoercion(Unsize, Implicit));
+        _7 = const "send";
+        _9 = &((*_1).1: bool);
+        _8 = copy _9 as &dyn std::fmt::Debug (PointerCoercion(Unsize, Implicit));
+        _10 = const "rollout_bucket";
+        _12 = &((*_1).2: i32);
+        _11 = copy _12 as &dyn std::fmt::Debug (PointerCoercion(Unsize, Implicit));
+        _13 = const "region";
+        _16 = &((*_1).3: std::string::String);
+        _15 = &_16;
+        _14 = copy _15 as &dyn std::fmt::Debug (PointerCoercion(Unsize, Implicit));
+        _0 = std::fmt::Formatter::<'_>::debug_struct_field4_finish(copy _2, move _3, move _4, move _5, move _7, move _8, move _10, move _11, move _13, move _14) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+alloc26 (size: 20, align: 1) {
+    0x00 │ 4e 6f 74 69 66 69 63 61 74 69 6f 6e 44 65 63 69 │ NotificationDeci
+    0x10 │ 73 69 6f 6e                                     │ sion
+}
+
+alloc13 (size: 6, align: 1) {
+    72 65 67 69 6f 6e                               │ region
+}
+
+alloc12 (size: 14, align: 1) {
+    72 6f 6c 6c 6f 75 74 5f 62 75 63 6b 65 74       │ rollout_bucket
+}
+
+alloc11 (size: 4, align: 1) {
+    73 65 6e 64                                     │ send
+}
+
+alloc10 (size: 15, align: 1) {
+    69 64 65 6d 70 6f 74 65 6e 63 79 5f 6b 65 79    │ idempotency_key
+}
+
+const _: () = const ();
+
+fn _::<impl at autumn-harvest/examples/deterministic_primitives.rs:32:17: 32:26>::serialize(_1: &NotificationDecision, _2: __S) -> Result<<__S as _::_serde::Serializer>::Ok, <__S as _::_serde::Serializer>::Error> {
+    debug self => _1;
+    debug __serializer => _2;
+    let mut _0: std::result::Result<<__S as _::_serde::Serializer>::Ok, <__S as _::_serde::Serializer>::Error>;
+    let mut _3: <__S as _::_serde::Serializer>::SerializeStruct;
+    let mut _4: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, <__S as _::_serde::Serializer>::Error>, <__S as _::_serde::Serializer>::SerializeStruct>;
+    let mut _5: std::result::Result<<__S as _::_serde::Serializer>::SerializeStruct, <__S as _::_serde::Serializer>::Error>;
+    let mut _6: __S;
+    let mut _7: usize;
+    let mut _8: usize;
+    let mut _9: usize;
+    let mut _10: usize;
+    let mut _11: usize;
+    let mut _12: (usize, bool);
+    let mut _13: (usize, bool);
+    let mut _14: (usize, bool);
+    let mut _15: (usize, bool);
+    let mut _16: isize;
+    let _17: std::result::Result<std::convert::Infallible, <__S as _::_serde::Serializer>::Error>;
+    let _18: <__S as _::_serde::Serializer>::SerializeStruct;
+    let mut _19: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, <__S as _::_serde::Serializer>::Error>>;
+    let mut _20: std::result::Result<(), <__S as _::_serde::Serializer>::Error>;
+    let mut _21: &mut <__S as _::_serde::Serializer>::SerializeStruct;
+    let _22: &std::string::String;
+    let mut _23: isize;
+    let mut _25: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, <__S as _::_serde::Serializer>::Error>>;
+    let mut _26: std::result::Result<(), <__S as _::_serde::Serializer>::Error>;
+    let mut _27: &mut <__S as _::_serde::Serializer>::SerializeStruct;
+    let _28: &bool;
+    let mut _29: isize;
+    let mut _31: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, <__S as _::_serde::Serializer>::Error>>;
+    let mut _32: std::result::Result<(), <__S as _::_serde::Serializer>::Error>;
+    let mut _33: &mut <__S as _::_serde::Serializer>::SerializeStruct;
+    let _34: &i32;
+    let mut _35: isize;
+    let mut _37: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, <__S as _::_serde::Serializer>::Error>>;
+    let mut _38: std::result::Result<(), <__S as _::_serde::Serializer>::Error>;
+    let mut _39: &mut <__S as _::_serde::Serializer>::SerializeStruct;
+    let _40: &std::string::String;
+    let mut _41: isize;
+    let mut _43: <__S as _::_serde::Serializer>::SerializeStruct;
+    let mut _44: bool;
+    let mut _45: bool;
+    scope 1 {
+        debug __serde_state => _3;
+        let _24: std::result::Result<std::convert::Infallible, <__S as _::_serde::Serializer>::Error>;
+        let _30: std::result::Result<std::convert::Infallible, <__S as _::_serde::Serializer>::Error>;
+        let _36: std::result::Result<std::convert::Infallible, <__S as _::_serde::Serializer>::Error>;
+        let _42: std::result::Result<std::convert::Infallible, <__S as _::_serde::Serializer>::Error>;
+        scope 6 {
+            debug residual => _24;
+            scope 7 {
+            }
+        }
+        scope 8 {
+            debug val => const ();
+            scope 9 {
+            }
+        }
+        scope 10 {
+            debug residual => _30;
+            scope 11 {
+            }
+        }
+        scope 12 {
+            debug val => const ();
+            scope 13 {
+            }
+        }
+        scope 14 {
+            debug residual => _36;
+            scope 15 {
+            }
+        }
+        scope 16 {
+            debug val => const ();
+            scope 17 {
+            }
+        }
+        scope 18 {
+            debug residual => _42;
+            scope 19 {
+            }
+        }
+        scope 20 {
+            debug val => const ();
+            scope 21 {
+            }
+        }
+    }
+    scope 2 {
+        debug residual => _17;
+        scope 3 {
+        }
+    }
+    scope 4 {
+        debug val => _18;
+        scope 5 {
+        }
+    }
+
+    bb0: {
+        _44 = const false;
+        _45 = const false;
+        _45 = const true;
+        _6 = move _2;
+        _11 = const false as usize (IntToInt);
+        _12 = AddWithOverflow(copy _11, const 1_usize);
+        assert(!move (_12.1: bool), "attempt to compute `{} + {}`, which would overflow", move _11, const 1_usize) -> [success: bb1, unwind: bb34];
+    }
+
+    bb1: {
+        _10 = move (_12.0: usize);
+        _13 = AddWithOverflow(copy _10, const 1_usize);
+        assert(!move (_13.1: bool), "attempt to compute `{} + {}`, which would overflow", move _10, const 1_usize) -> [success: bb2, unwind: bb34];
+    }
+
+    bb2: {
+        _9 = move (_13.0: usize);
+        _14 = AddWithOverflow(copy _9, const 1_usize);
+        assert(!move (_14.1: bool), "attempt to compute `{} + {}`, which would overflow", move _9, const 1_usize) -> [success: bb3, unwind: bb34];
+    }
+
+    bb3: {
+        _8 = move (_14.0: usize);
+        _15 = AddWithOverflow(copy _8, const 1_usize);
+        assert(!move (_15.1: bool), "attempt to compute `{} + {}`, which would overflow", move _8, const 1_usize) -> [success: bb4, unwind: bb34];
+    }
+
+    bb4: {
+        _7 = move (_15.0: usize);
+        _45 = const false;
+        _5 = <__S as _::_serde::Serializer>::serialize_struct(move _6, const "NotificationDecision", move _7) -> [return: bb5, unwind: bb34];
+    }
+
+    bb5: {
+        _45 = const false;
+        _4 = <Result<<__S as _::_serde::Serializer>::SerializeStruct, <__S as _::_serde::Serializer>::Error> as Try>::branch(move _5) -> [return: bb6, unwind continue];
+    }
+
+    bb6: {
+        _16 = discriminant(_4);
+        switchInt(move _16) -> [0: bb8, 1: bb9, otherwise: bb7];
+    }
+
+    bb7: {
+        unreachable;
+    }
+
+    bb8: {
+        _18 = move ((_4 as Continue).0: <__S as _::_serde::Serializer>::SerializeStruct);
+        _44 = const true;
+        _3 = move _18;
+        _21 = &mut _3;
+        _22 = &((*_1).0: std::string::String);
+        _20 = <<__S as _::_serde::Serializer>::SerializeStruct as SerializeStruct>::serialize_field::<std::string::String>(copy _21, const "idempotency_key", copy _22) -> [return: bb10, unwind: bb32];
+    }
+
+    bb9: {
+        _17 = move ((_4 as Break).0: std::result::Result<std::convert::Infallible, <__S as _::_serde::Serializer>::Error>);
+        _0 = <Result<<__S as _::_serde::Serializer>::Ok, <__S as _::_serde::Serializer>::Error> as FromResidual<Result<Infallible, <__S as _::_serde::Serializer>::Error>>>::from_residual(copy _17) -> [return: bb28, unwind continue];
+    }
+
+    bb10: {
+        _19 = <Result<(), <__S as _::_serde::Serializer>::Error> as Try>::branch(move _20) -> [return: bb11, unwind: bb32];
+    }
+
+    bb11: {
+        _23 = discriminant(_19);
+        switchInt(move _23) -> [0: bb12, 1: bb13, otherwise: bb7];
+    }
+
+    bb12: {
+        _27 = &mut _3;
+        _28 = &((*_1).1: bool);
+        _26 = <<__S as _::_serde::Serializer>::SerializeStruct as SerializeStruct>::serialize_field::<bool>(copy _27, const "send", copy _28) -> [return: bb14, unwind: bb32];
+    }
+
+    bb13: {
+        _24 = move ((_19 as Break).0: std::result::Result<std::convert::Infallible, <__S as _::_serde::Serializer>::Error>);
+        _0 = <Result<<__S as _::_serde::Serializer>::Ok, <__S as _::_serde::Serializer>::Error> as FromResidual<Result<Infallible, <__S as _::_serde::Serializer>::Error>>>::from_residual(copy _24) -> [return: bb35, unwind: bb32];
+    }
+
+    bb14: {
+        _25 = <Result<(), <__S as _::_serde::Serializer>::Error> as Try>::branch(move _26) -> [return: bb15, unwind: bb32];
+    }
+
+    bb15: {
+        _29 = discriminant(_25);
+        switchInt(move _29) -> [0: bb16, 1: bb17, otherwise: bb7];
+    }
+
+    bb16: {
+        _33 = &mut _3;
+        _34 = &((*_1).2: i32);
+        _32 = <<__S as _::_serde::Serializer>::SerializeStruct as SerializeStruct>::serialize_field::<i32>(copy _33, const "rollout_bucket", copy _34) -> [return: bb18, unwind: bb32];
+    }
+
+    bb17: {
+        _30 = move ((_25 as Break).0: std::result::Result<std::convert::Infallible, <__S as _::_serde::Serializer>::Error>);
+        _0 = <Result<<__S as _::_serde::Serializer>::Ok, <__S as _::_serde::Serializer>::Error> as FromResidual<Result<Infallible, <__S as _::_serde::Serializer>::Error>>>::from_residual(copy _30) -> [return: bb36, unwind: bb32];
+    }
+
+    bb18: {
+        _31 = <Result<(), <__S as _::_serde::Serializer>::Error> as Try>::branch(move _32) -> [return: bb19, unwind: bb32];
+    }
+
+    bb19: {
+        _35 = discriminant(_31);
+        switchInt(move _35) -> [0: bb20, 1: bb21, otherwise: bb7];
+    }
+
+    bb20: {
+        _39 = &mut _3;
+        _40 = &((*_1).3: std::string::String);
+        _38 = <<__S as _::_serde::Serializer>::SerializeStruct as SerializeStruct>::serialize_field::<std::string::String>(copy _39, const "region", copy _40) -> [return: bb22, unwind: bb32];
+    }
+
+    bb21: {
+        _36 = move ((_31 as Break).0: std::result::Result<std::convert::Infallible, <__S as _::_serde::Serializer>::Error>);
+        _0 = <Result<<__S as _::_serde::Serializer>::Ok, <__S as _::_serde::Serializer>::Error> as FromResidual<Result<Infallible, <__S as _::_serde::Serializer>::Error>>>::from_residual(copy _36) -> [return: bb37, unwind: bb32];
+    }
+
+    bb22: {
+        _37 = <Result<(), <__S as _::_serde::Serializer>::Error> as Try>::branch(move _38) -> [return: bb23, unwind: bb32];
+    }
+
+    bb23: {
+        _41 = discriminant(_37);
+        switchInt(move _41) -> [0: bb24, 1: bb25, otherwise: bb7];
+    }
+
+    bb24: {
+        _44 = const false;
+        _43 = move _3;
+        _0 = <<__S as _::_serde::Serializer>::SerializeStruct as SerializeStruct>::end(move _43) -> [return: bb26, unwind: bb32];
+    }
+
+    bb25: {
+        _42 = move ((_37 as Break).0: std::result::Result<std::convert::Infallible, <__S as _::_serde::Serializer>::Error>);
+        _0 = <Result<<__S as _::_serde::Serializer>::Ok, <__S as _::_serde::Serializer>::Error> as FromResidual<Result<Infallible, <__S as _::_serde::Serializer>::Error>>>::from_residual(copy _42) -> [return: bb38, unwind: bb32];
+    }
+
+    bb26: {
+        _44 = const false;
+        goto -> bb29;
+    }
+
+    bb27: {
+        drop(_3) -> [return: bb28, unwind continue];
+    }
+
+    bb28: {
+        _44 = const false;
+        goto -> bb29;
+    }
+
+    bb29: {
+        return;
+    }
+
+    bb30 (cleanup): {
+        resume;
+    }
+
+    bb31 (cleanup): {
+        drop(_3) -> [return: bb30, unwind terminate(cleanup)];
+    }
+
+    bb32 (cleanup): {
+        switchInt(copy _44) -> [0: bb30, otherwise: bb31];
+    }
+
+    bb33 (cleanup): {
+        drop(_6) -> [return: bb30, unwind terminate(cleanup)];
+    }
+
+    bb34 (cleanup): {
+        switchInt(copy _45) -> [0: bb30, otherwise: bb33];
+    }
+
+    bb35: {
+        goto -> bb27;
+    }
+
+    bb36: {
+        goto -> bb27;
+    }
+
+    bb37: {
+        goto -> bb27;
+    }
+
+    bb38: {
+        goto -> bb27;
+    }
+}
+
+alloc26 (size: 20, align: 1) {
+    0x00 │ 4e 6f 74 69 66 69 63 61 74 69 6f 6e 44 65 63 69 │ NotificationDeci
+    0x10 │ 73 69 6f 6e                                     │ sion
+}
+
+alloc13 (size: 6, align: 1) {
+    72 65 67 69 6f 6e                               │ region
+}
+
+alloc12 (size: 14, align: 1) {
+    72 6f 6c 6c 6f 75 74 5f 62 75 63 6b 65 74       │ rollout_bucket
+}
+
+alloc11 (size: 4, align: 1) {
+    73 65 6e 64                                     │ send
+}
+
+alloc10 (size: 15, align: 1) {
+    69 64 65 6d 70 6f 74 65 6e 63 79 5f 6b 65 79    │ idempotency_key
+}
+
+const _: () = const ();
+
+fn _::<impl at autumn-harvest/examples/deterministic_primitives.rs:32:28: 32:39>::deserialize(_1: __D) -> Result<NotificationDecision, <__D as _::_serde::Deserializer<'_>>::Error> {
+    debug __deserializer => _1;
+    let mut _0: std::result::Result<NotificationDecision, <__D as _::_serde::Deserializer<'_>>::Error>;
+
+    bb0: {
+        _0 = <__D as _::_serde::Deserializer<'_>>::deserialize_struct::<_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Visitor<'_>>(copy _1, const "NotificationDecision", const _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::FIELDS, const _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Visitor::<'_> {{ marker: PhantomData::<NotificationDecision>, lifetime: PhantomData::<&()> }}) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+alloc26 (size: 20, align: 1) {
+    0x00 │ 4e 6f 74 69 66 69 63 61 74 69 6f 6e 44 65 63 69 │ NotificationDeci
+    0x10 │ 73 69 6f 6e                                     │ sion
+}
+
+fn _::<impl at autumn-harvest/examples/deterministic_primitives.rs:32:28: 32:39>::deserialize::<impl at autumn-harvest/examples/deterministic_primitives.rs:32:28: 32:39>::expecting(_1: &_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__FieldVisitor, _2: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+    debug self => _1;
+    debug __formatter => _2;
+    let mut _0: std::result::Result<(), std::fmt::Error>;
+    let mut _3: &str;
+
+    bb0: {
+        _3 = const "field identifier";
+        _0 = std::fmt::Formatter::<'_>::write_str(copy _2, move _3) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+alloc21 (size: 16, align: 1) {
+    66 69 65 6c 64 20 69 64 65 6e 74 69 66 69 65 72 │ field identifier
+}
+
+fn _::<impl at autumn-harvest/examples/deterministic_primitives.rs:32:28: 32:39>::deserialize::<impl at autumn-harvest/examples/deterministic_primitives.rs:32:28: 32:39>::visit_u64(_1: _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__FieldVisitor, _2: u64) -> Result<_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field, __E> {
+    debug self => const _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__FieldVisitor;
+    debug __value => _2;
+    let mut _0: std::result::Result<_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field, __E>;
+    let mut _3: _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field;
+    let mut _4: _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field;
+    let mut _5: _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field;
+    let mut _6: _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field;
+    let mut _7: _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field;
+
+    bb0: {
+        switchInt(copy _2) -> [0: bb5, 1: bb4, 2: bb3, 3: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _7 = _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field::__ignore;
+        _0 = Result::<_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field, __E>::Ok(move _7);
+        goto -> bb6;
+    }
+
+    bb2: {
+        _6 = _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field::__field3;
+        _0 = Result::<_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field, __E>::Ok(move _6);
+        goto -> bb6;
+    }
+
+    bb3: {
+        _5 = _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field::__field2;
+        _0 = Result::<_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field, __E>::Ok(move _5);
+        goto -> bb6;
+    }
+
+    bb4: {
+        _4 = _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field::__field1;
+        _0 = Result::<_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field, __E>::Ok(move _4);
+        goto -> bb6;
+    }
+
+    bb5: {
+        _3 = _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field::__field0;
+        _0 = Result::<_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field, __E>::Ok(move _3);
+        goto -> bb6;
+    }
+
+    bb6: {
+        return;
+    }
+}
+
+fn _::<impl at autumn-harvest/examples/deterministic_primitives.rs:32:28: 32:39>::deserialize::<impl at autumn-harvest/examples/deterministic_primitives.rs:32:28: 32:39>::visit_str(_1: _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__FieldVisitor, _2: &str) -> Result<_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field, __E> {
+    debug self => const _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__FieldVisitor;
+    debug __value => _2;
+    let mut _0: std::result::Result<_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field, __E>;
+    let mut _3: bool;
+    let mut _4: bool;
+    let mut _5: bool;
+    let mut _6: bool;
+    let mut _7: _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field;
+    let mut _8: _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field;
+    let mut _9: _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field;
+    let mut _10: _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field;
+    let mut _11: _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field;
+
+    bb0: {
+        _6 = <str as PartialEq>::eq(copy _2, const "idempotency_key") -> [return: bb12, unwind continue];
+    }
+
+    bb1: {
+        _11 = _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field::__ignore;
+        _0 = Result::<_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field, __E>::Ok(move _11);
+        goto -> bb13;
+    }
+
+    bb2: {
+        _7 = _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field::__field0;
+        _0 = Result::<_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field, __E>::Ok(move _7);
+        goto -> bb13;
+    }
+
+    bb3: {
+        _5 = <str as PartialEq>::eq(copy _2, const "send") -> [return: bb11, unwind continue];
+    }
+
+    bb4: {
+        _8 = _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field::__field1;
+        _0 = Result::<_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field, __E>::Ok(move _8);
+        goto -> bb13;
+    }
+
+    bb5: {
+        _4 = <str as PartialEq>::eq(copy _2, const "rollout_bucket") -> [return: bb10, unwind continue];
+    }
+
+    bb6: {
+        _9 = _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field::__field2;
+        _0 = Result::<_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field, __E>::Ok(move _9);
+        goto -> bb13;
+    }
+
+    bb7: {
+        _3 = <str as PartialEq>::eq(copy _2, const "region") -> [return: bb9, unwind continue];
+    }
+
+    bb8: {
+        _10 = _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field::__field3;
+        _0 = Result::<_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field, __E>::Ok(move _10);
+        goto -> bb13;
+    }
+
+    bb9: {
+        switchInt(move _3) -> [0: bb1, otherwise: bb8];
+    }
+
+    bb10: {
+        switchInt(move _4) -> [0: bb7, otherwise: bb6];
+    }
+
+    bb11: {
+        switchInt(move _5) -> [0: bb5, otherwise: bb4];
+    }
+
+    bb12: {
+        switchInt(move _6) -> [0: bb3, otherwise: bb2];
+    }
+
+    bb13: {
+        return;
+    }
+}
+
+fn _::<impl at autumn-harvest/examples/deterministic_primitives.rs:32:28: 32:39>::deserialize::<impl at autumn-harvest/examples/deterministic_primitives.rs:32:28: 32:39>::visit_bytes(_1: _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__FieldVisitor, _2: &[u8]) -> Result<_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field, __E> {
+    debug self => const _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__FieldVisitor;
+    debug __value => _2;
+    let mut _0: std::result::Result<_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field, __E>;
+    let mut _3: usize;
+    let mut _4: bool;
+    let mut _5: usize;
+    let mut _6: bool;
+    let mut _7: usize;
+    let mut _8: bool;
+    let mut _9: usize;
+    let mut _10: bool;
+    let mut _11: _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field;
+    let mut _12: _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field;
+    let mut _13: _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field;
+    let mut _14: _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field;
+    let mut _15: _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field;
+
+    bb0: {
+        _9 = PtrMetadata(copy _2);
+        _10 = Eq(copy _9, const 15_usize);
+        switchInt(move _10) -> [0: bb17, otherwise: bb2];
+    }
+
+    bb1: {
+        _15 = _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field::__ignore;
+        _0 = Result::<_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field, __E>::Ok(move _15);
+        goto -> bb48;
+    }
+
+    bb2: {
+        switchInt(copy (*_2)[0 of 15]) -> [105: bb3, otherwise: bb1];
+    }
+
+    bb3: {
+        switchInt(copy (*_2)[1 of 15]) -> [100: bb4, otherwise: bb1];
+    }
+
+    bb4: {
+        switchInt(copy (*_2)[2 of 15]) -> [101: bb5, otherwise: bb1];
+    }
+
+    bb5: {
+        switchInt(copy (*_2)[3 of 15]) -> [109: bb6, otherwise: bb1];
+    }
+
+    bb6: {
+        switchInt(copy (*_2)[4 of 15]) -> [112: bb7, otherwise: bb1];
+    }
+
+    bb7: {
+        switchInt(copy (*_2)[5 of 15]) -> [111: bb8, otherwise: bb1];
+    }
+
+    bb8: {
+        switchInt(copy (*_2)[6 of 15]) -> [116: bb9, otherwise: bb1];
+    }
+
+    bb9: {
+        switchInt(copy (*_2)[7 of 15]) -> [101: bb10, otherwise: bb1];
+    }
+
+    bb10: {
+        switchInt(copy (*_2)[8 of 15]) -> [110: bb11, otherwise: bb1];
+    }
+
+    bb11: {
+        switchInt(copy (*_2)[9 of 15]) -> [99: bb12, otherwise: bb1];
+    }
+
+    bb12: {
+        switchInt(copy (*_2)[10 of 15]) -> [121: bb13, otherwise: bb1];
+    }
+
+    bb13: {
+        switchInt(copy (*_2)[11 of 15]) -> [95: bb14, otherwise: bb1];
+    }
+
+    bb14: {
+        switchInt(copy (*_2)[12 of 15]) -> [107: bb15, otherwise: bb1];
+    }
+
+    bb15: {
+        switchInt(copy (*_2)[13 of 15]) -> [101: bb16, otherwise: bb1];
+    }
+
+    bb16: {
+        switchInt(copy (*_2)[14 of 15]) -> [121: bb47, otherwise: bb1];
+    }
+
+    bb17: {
+        _7 = PtrMetadata(copy _2);
+        _8 = Eq(copy _7, const 4_usize);
+        switchInt(move _8) -> [0: bb22, otherwise: bb18];
+    }
+
+    bb18: {
+        switchInt(copy (*_2)[0 of 4]) -> [115: bb19, otherwise: bb1];
+    }
+
+    bb19: {
+        switchInt(copy (*_2)[1 of 4]) -> [101: bb20, otherwise: bb1];
+    }
+
+    bb20: {
+        switchInt(copy (*_2)[2 of 4]) -> [110: bb21, otherwise: bb1];
+    }
+
+    bb21: {
+        switchInt(copy (*_2)[3 of 4]) -> [100: bb46, otherwise: bb1];
+    }
+
+    bb22: {
+        _5 = PtrMetadata(copy _2);
+        _6 = Eq(copy _5, const 14_usize);
+        switchInt(move _6) -> [0: bb37, otherwise: bb23];
+    }
+
+    bb23: {
+        switchInt(copy (*_2)[0 of 14]) -> [114: bb24, otherwise: bb1];
+    }
+
+    bb24: {
+        switchInt(copy (*_2)[1 of 14]) -> [111: bb25, otherwise: bb1];
+    }
+
+    bb25: {
+        switchInt(copy (*_2)[2 of 14]) -> [108: bb26, otherwise: bb1];
+    }
+
+    bb26: {
+        switchInt(copy (*_2)[3 of 14]) -> [108: bb27, otherwise: bb1];
+    }
+
+    bb27: {
+        switchInt(copy (*_2)[4 of 14]) -> [111: bb28, otherwise: bb1];
+    }
+
+    bb28: {
+        switchInt(copy (*_2)[5 of 14]) -> [117: bb29, otherwise: bb1];
+    }
+
+    bb29: {
+        switchInt(copy (*_2)[6 of 14]) -> [116: bb30, otherwise: bb1];
+    }
+
+    bb30: {
+        switchInt(copy (*_2)[7 of 14]) -> [95: bb31, otherwise: bb1];
+    }
+
+    bb31: {
+        switchInt(copy (*_2)[8 of 14]) -> [98: bb32, otherwise: bb1];
+    }
+
+    bb32: {
+        switchInt(copy (*_2)[9 of 14]) -> [117: bb33, otherwise: bb1];
+    }
+
+    bb33: {
+        switchInt(copy (*_2)[10 of 14]) -> [99: bb34, otherwise: bb1];
+    }
+
+    bb34: {
+        switchInt(copy (*_2)[11 of 14]) -> [107: bb35, otherwise: bb1];
+    }
+
+    bb35: {
+        switchInt(copy (*_2)[12 of 14]) -> [101: bb36, otherwise: bb1];
+    }
+
+    bb36: {
+        switchInt(copy (*_2)[13 of 14]) -> [116: bb45, otherwise: bb1];
+    }
+
+    bb37: {
+        _3 = PtrMetadata(copy _2);
+        _4 = Eq(copy _3, const 6_usize);
+        switchInt(move _4) -> [0: bb1, otherwise: bb38];
+    }
+
+    bb38: {
+        switchInt(copy (*_2)[0 of 6]) -> [114: bb39, otherwise: bb1];
+    }
+
+    bb39: {
+        switchInt(copy (*_2)[1 of 6]) -> [101: bb40, otherwise: bb1];
+    }
+
+    bb40: {
+        switchInt(copy (*_2)[2 of 6]) -> [103: bb41, otherwise: bb1];
+    }
+
+    bb41: {
+        switchInt(copy (*_2)[3 of 6]) -> [105: bb42, otherwise: bb1];
+    }
+
+    bb42: {
+        switchInt(copy (*_2)[4 of 6]) -> [111: bb43, otherwise: bb1];
+    }
+
+    bb43: {
+        switchInt(copy (*_2)[5 of 6]) -> [110: bb44, otherwise: bb1];
+    }
+
+    bb44: {
+        _14 = _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field::__field3;
+        _0 = Result::<_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field, __E>::Ok(move _14);
+        goto -> bb48;
+    }
+
+    bb45: {
+        _13 = _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field::__field2;
+        _0 = Result::<_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field, __E>::Ok(move _13);
+        goto -> bb48;
+    }
+
+    bb46: {
+        _12 = _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field::__field1;
+        _0 = Result::<_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field, __E>::Ok(move _12);
+        goto -> bb48;
+    }
+
+    bb47: {
+        _11 = _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field::__field0;
+        _0 = Result::<_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field, __E>::Ok(move _11);
+        goto -> bb48;
+    }
+
+    bb48: {
+        return;
+    }
+}
+
+fn _::<impl at autumn-harvest/examples/deterministic_primitives.rs:32:28: 32:39>::deserialize::<impl at autumn-harvest/examples/deterministic_primitives.rs:32:28: 32:39>::deserialize(_1: __D) -> Result<_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field, <__D as _::_serde::Deserializer<'_>>::Error> {
+    debug __deserializer => _1;
+    let mut _0: std::result::Result<_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field, <__D as _::_serde::Deserializer<'_>>::Error>;
+
+    bb0: {
+        _0 = <__D as _::_serde::Deserializer<'_>>::deserialize_identifier::<_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__FieldVisitor>(copy _1, const _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__FieldVisitor) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+fn _::<impl at autumn-harvest/examples/deterministic_primitives.rs:32:28: 32:39>::deserialize::<impl at autumn-harvest/examples/deterministic_primitives.rs:32:28: 32:39>::expecting(_1: &_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Visitor<'_>, _2: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+    debug self => _1;
+    debug __formatter => _2;
+    let mut _0: std::result::Result<(), std::fmt::Error>;
+    let mut _3: &str;
+
+    bb0: {
+        _3 = const "struct NotificationDecision";
+        _0 = std::fmt::Formatter::<'_>::write_str(copy _2, move _3) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+alloc34 (size: 27, align: 1) {
+    0x00 │ 73 74 72 75 63 74 20 4e 6f 74 69 66 69 63 61 74 │ struct Notificat
+    0x10 │ 69 6f 6e 44 65 63 69 73 69 6f 6e                │ ionDecision
+}
+
+fn _::<impl at autumn-harvest/examples/deterministic_primitives.rs:32:28: 32:39>::deserialize::<impl at autumn-harvest/examples/deterministic_primitives.rs:32:28: 32:39>::visit_seq(_1: _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Visitor<'_>, _2: __A) -> Result<NotificationDecision, <__A as SeqAccess<'_>>::Error> {
+    debug self => const _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Visitor::<'_> {{ marker: PhantomData::<NotificationDecision>, lifetime: PhantomData::<&()> }};
+    debug __seq => _2;
+    let mut _0: std::result::Result<NotificationDecision, <__A as _::_serde::de::SeqAccess<'_>>::Error>;
+    let _3: std::string::String;
+    let mut _4: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, <__A as _::_serde::de::SeqAccess<'_>>::Error>, std::option::Option<std::string::String>>;
+    let mut _5: std::result::Result<std::option::Option<std::string::String>, <__A as _::_serde::de::SeqAccess<'_>>::Error>;
+    let mut _6: &mut __A;
+    let mut _7: isize;
+    let _8: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::SeqAccess<'_>>::Error>;
+    let _9: std::option::Option<std::string::String>;
+    let mut _10: isize;
+    let _11: std::string::String;
+    let mut _12: <__A as _::_serde::de::SeqAccess<'_>>::Error;
+    let mut _13: &dyn _::_serde::de::Expected;
+    let _14: &&str;
+    let mut _15: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, <__A as _::_serde::de::SeqAccess<'_>>::Error>, std::option::Option<bool>>;
+    let mut _16: std::result::Result<std::option::Option<bool>, <__A as _::_serde::de::SeqAccess<'_>>::Error>;
+    let mut _17: &mut __A;
+    let mut _18: isize;
+    let mut _21: isize;
+    let mut _23: <__A as _::_serde::de::SeqAccess<'_>>::Error;
+    let mut _24: &dyn _::_serde::de::Expected;
+    let _25: &&str;
+    let mut _26: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, <__A as _::_serde::de::SeqAccess<'_>>::Error>, std::option::Option<i32>>;
+    let mut _27: std::result::Result<std::option::Option<i32>, <__A as _::_serde::de::SeqAccess<'_>>::Error>;
+    let mut _28: &mut __A;
+    let mut _29: isize;
+    let mut _32: isize;
+    let mut _34: <__A as _::_serde::de::SeqAccess<'_>>::Error;
+    let mut _35: &dyn _::_serde::de::Expected;
+    let _36: &&str;
+    let mut _37: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, <__A as _::_serde::de::SeqAccess<'_>>::Error>, std::option::Option<std::string::String>>;
+    let mut _38: std::result::Result<std::option::Option<std::string::String>, <__A as _::_serde::de::SeqAccess<'_>>::Error>;
+    let mut _39: &mut __A;
+    let mut _40: isize;
+    let mut _43: isize;
+    let mut _45: <__A as _::_serde::de::SeqAccess<'_>>::Error;
+    let mut _46: &dyn _::_serde::de::Expected;
+    let _47: &&str;
+    let mut _48: NotificationDecision;
+    let mut _49: std::string::String;
+    scope 1 {
+        debug __field0 => _3;
+        let _19: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::SeqAccess<'_>>::Error>;
+        let _20: std::option::Option<bool>;
+        let _22: bool;
+        scope 7 {
+            debug __field1 => _22;
+            let _30: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::SeqAccess<'_>>::Error>;
+            let _31: std::option::Option<i32>;
+            let _33: i32;
+            scope 13 {
+                debug __field2 => _33;
+                let _41: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::SeqAccess<'_>>::Error>;
+                let _42: std::option::Option<std::string::String>;
+                let _44: std::string::String;
+                scope 19 {
+                    debug __field3 => _44;
+                }
+                scope 20 {
+                    debug residual => _41;
+                    scope 21 {
+                    }
+                }
+                scope 22 {
+                    debug val => _42;
+                    scope 23 {
+                    }
+                }
+                scope 24 {
+                    debug __value => _44;
+                }
+            }
+            scope 14 {
+                debug residual => _30;
+                scope 15 {
+                }
+            }
+            scope 16 {
+                debug val => _31;
+                scope 17 {
+                }
+            }
+            scope 18 {
+                debug __value => _33;
+            }
+        }
+        scope 8 {
+            debug residual => _19;
+            scope 9 {
+            }
+        }
+        scope 10 {
+            debug val => _20;
+            scope 11 {
+            }
+        }
+        scope 12 {
+            debug __value => _22;
+        }
+    }
+    scope 2 {
+        debug residual => _8;
+        scope 3 {
+        }
+    }
+    scope 4 {
+        debug val => _9;
+        scope 5 {
+        }
+    }
+    scope 6 {
+        debug __value => _11;
+    }
+
+    bb0: {
+        _6 = &mut _2;
+        _5 = <__A as SeqAccess<'_>>::next_element::<std::string::String>(copy _6) -> [return: bb1, unwind: bb34];
+    }
+
+    bb1: {
+        _4 = <Result<std::option::Option<std::string::String>, <__A as SeqAccess<'_>>::Error> as Try>::branch(move _5) -> [return: bb2, unwind: bb34];
+    }
+
+    bb2: {
+        _7 = discriminant(_4);
+        switchInt(move _7) -> [0: bb4, 1: bb5, otherwise: bb3];
+    }
+
+    bb3: {
+        unreachable;
+    }
+
+    bb4: {
+        _9 = move ((_4 as Continue).0: std::option::Option<std::string::String>);
+        _10 = discriminant(_9);
+        switchInt(move _10) -> [0: bb6, 1: bb7, otherwise: bb3];
+    }
+
+    bb5: {
+        _8 = move ((_4 as Break).0: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::SeqAccess<'_>>::Error>);
+        _0 = <Result<NotificationDecision, <__A as SeqAccess<'_>>::Error> as FromResidual<Result<Infallible, <__A as SeqAccess<'_>>::Error>>>::from_residual(copy _8) -> [return: bb36, unwind: bb34];
+    }
+
+    bb6: {
+        _14 = const <_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Visitor<'_> as _::_serde::de::Visitor<'_>>::visit_seq::<__A>::promoted[0];
+        _13 = copy _14 as &dyn _::_serde::de::Expected (PointerCoercion(Unsize, Implicit));
+        _12 = <<__A as SeqAccess<'_>>::Error as _::_serde::de::Error>::invalid_length(const 0_usize, move _13) -> [return: bb8, unwind: bb34];
+    }
+
+    bb7: {
+        _11 = copy ((_9 as Some).0: std::string::String);
+        _3 = move _11;
+        _17 = &mut _2;
+        _16 = <__A as SeqAccess<'_>>::next_element::<bool>(copy _17) -> [return: bb9, unwind: bb33];
+    }
+
+    bb8: {
+        _0 = Result::<NotificationDecision, <__A as SeqAccess<'_>>::Error>::Err(move _12);
+        goto -> bb31;
+    }
+
+    bb9: {
+        _15 = <Result<std::option::Option<bool>, <__A as SeqAccess<'_>>::Error> as Try>::branch(move _16) -> [return: bb10, unwind: bb33];
+    }
+
+    bb10: {
+        _18 = discriminant(_15);
+        switchInt(move _18) -> [0: bb11, 1: bb12, otherwise: bb3];
+    }
+
+    bb11: {
+        _20 = copy ((_15 as Continue).0: std::option::Option<bool>);
+        _21 = discriminant(_20);
+        switchInt(move _21) -> [0: bb13, 1: bb14, otherwise: bb3];
+    }
+
+    bb12: {
+        _19 = move ((_15 as Break).0: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::SeqAccess<'_>>::Error>);
+        _0 = <Result<NotificationDecision, <__A as SeqAccess<'_>>::Error> as FromResidual<Result<Infallible, <__A as SeqAccess<'_>>::Error>>>::from_residual(copy _19) -> [return: bb37, unwind: bb33];
+    }
+
+    bb13: {
+        _25 = const <_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Visitor<'_> as _::_serde::de::Visitor<'_>>::visit_seq::<__A>::promoted[1];
+        _24 = copy _25 as &dyn _::_serde::de::Expected (PointerCoercion(Unsize, Implicit));
+        _23 = <<__A as SeqAccess<'_>>::Error as _::_serde::de::Error>::invalid_length(const 1_usize, move _24) -> [return: bb15, unwind: bb33];
+    }
+
+    bb14: {
+        _22 = copy ((_20 as Some).0: bool);
+        _28 = &mut _2;
+        _27 = <__A as SeqAccess<'_>>::next_element::<i32>(copy _28) -> [return: bb16, unwind: bb33];
+    }
+
+    bb15: {
+        _0 = Result::<NotificationDecision, <__A as SeqAccess<'_>>::Error>::Err(move _23);
+        goto -> bb30;
+    }
+
+    bb16: {
+        _26 = <Result<std::option::Option<i32>, <__A as SeqAccess<'_>>::Error> as Try>::branch(move _27) -> [return: bb17, unwind: bb33];
+    }
+
+    bb17: {
+        _29 = discriminant(_26);
+        switchInt(move _29) -> [0: bb18, 1: bb19, otherwise: bb3];
+    }
+
+    bb18: {
+        _31 = copy ((_26 as Continue).0: std::option::Option<i32>);
+        _32 = discriminant(_31);
+        switchInt(move _32) -> [0: bb20, 1: bb21, otherwise: bb3];
+    }
+
+    bb19: {
+        _30 = move ((_26 as Break).0: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::SeqAccess<'_>>::Error>);
+        _0 = <Result<NotificationDecision, <__A as SeqAccess<'_>>::Error> as FromResidual<Result<Infallible, <__A as SeqAccess<'_>>::Error>>>::from_residual(copy _30) -> [return: bb38, unwind: bb33];
+    }
+
+    bb20: {
+        _36 = const <_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Visitor<'_> as _::_serde::de::Visitor<'_>>::visit_seq::<__A>::promoted[2];
+        _35 = copy _36 as &dyn _::_serde::de::Expected (PointerCoercion(Unsize, Implicit));
+        _34 = <<__A as SeqAccess<'_>>::Error as _::_serde::de::Error>::invalid_length(const 2_usize, move _35) -> [return: bb22, unwind: bb33];
+    }
+
+    bb21: {
+        _33 = copy ((_31 as Some).0: i32);
+        _39 = &mut _2;
+        _38 = <__A as SeqAccess<'_>>::next_element::<std::string::String>(copy _39) -> [return: bb23, unwind: bb33];
+    }
+
+    bb22: {
+        _0 = Result::<NotificationDecision, <__A as SeqAccess<'_>>::Error>::Err(move _34);
+        goto -> bb30;
+    }
+
+    bb23: {
+        _37 = <Result<std::option::Option<std::string::String>, <__A as SeqAccess<'_>>::Error> as Try>::branch(move _38) -> [return: bb24, unwind: bb33];
+    }
+
+    bb24: {
+        _40 = discriminant(_37);
+        switchInt(move _40) -> [0: bb25, 1: bb26, otherwise: bb3];
+    }
+
+    bb25: {
+        _42 = move ((_37 as Continue).0: std::option::Option<std::string::String>);
+        _43 = discriminant(_42);
+        switchInt(move _43) -> [0: bb27, 1: bb28, otherwise: bb3];
+    }
+
+    bb26: {
+        _41 = move ((_37 as Break).0: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::SeqAccess<'_>>::Error>);
+        _0 = <Result<NotificationDecision, <__A as SeqAccess<'_>>::Error> as FromResidual<Result<Infallible, <__A as SeqAccess<'_>>::Error>>>::from_residual(copy _41) -> [return: bb39, unwind: bb33];
+    }
+
+    bb27: {
+        _47 = const <_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Visitor<'_> as _::_serde::de::Visitor<'_>>::visit_seq::<__A>::promoted[3];
+        _46 = copy _47 as &dyn _::_serde::de::Expected (PointerCoercion(Unsize, Implicit));
+        _45 = <<__A as SeqAccess<'_>>::Error as _::_serde::de::Error>::invalid_length(const 3_usize, move _46) -> [return: bb29, unwind: bb33];
+    }
+
+    bb28: {
+        _44 = copy ((_42 as Some).0: std::string::String);
+        _49 = move _3;
+        _48 = NotificationDecision { idempotency_key: move _49, send: copy _22, rollout_bucket: copy _33, region: copy _44 };
+        _0 = Result::<NotificationDecision, <__A as SeqAccess<'_>>::Error>::Ok(move _48);
+        drop(_2) -> [return: bb32, unwind continue];
+    }
+
+    bb29: {
+        _0 = Result::<NotificationDecision, <__A as SeqAccess<'_>>::Error>::Err(move _45);
+        goto -> bb30;
+    }
+
+    bb30: {
+        drop(_3) -> [return: bb31, unwind: bb34];
+    }
+
+    bb31: {
+        drop(_2) -> [return: bb32, unwind continue];
+    }
+
+    bb32: {
+        return;
+    }
+
+    bb33 (cleanup): {
+        drop(_3) -> [return: bb34, unwind terminate(cleanup)];
+    }
+
+    bb34 (cleanup): {
+        drop(_2) -> [return: bb35, unwind terminate(cleanup)];
+    }
+
+    bb35 (cleanup): {
+        resume;
+    }
+
+    bb36: {
+        goto -> bb31;
+    }
+
+    bb37: {
+        goto -> bb30;
+    }
+
+    bb38: {
+        goto -> bb30;
+    }
+
+    bb39: {
+        goto -> bb30;
+    }
+}
+
+const _::<impl at autumn-harvest/examples/deterministic_primitives.rs:32:28: 32:39>::deserialize::<impl at autumn-harvest/examples/deterministic_primitives.rs:32:28: 32:39>::visit_seq::promoted[0]: &&str = {
+    let mut _0: &&str;
+    let mut _1: &str;
+
+    bb0: {
+        _1 = const "struct NotificationDecision with 4 elements";
+        _0 = &_1;
+        return;
+    }
+}
+
+alloc35 (size: 43, align: 1) {
+    0x00 │ 73 74 72 75 63 74 20 4e 6f 74 69 66 69 63 61 74 │ struct Notificat
+    0x10 │ 69 6f 6e 44 65 63 69 73 69 6f 6e 20 77 69 74 68 │ ionDecision with
+    0x20 │ 20 34 20 65 6c 65 6d 65 6e 74 73                │  4 elements
+}
+
+const _::<impl at autumn-harvest/examples/deterministic_primitives.rs:32:28: 32:39>::deserialize::<impl at autumn-harvest/examples/deterministic_primitives.rs:32:28: 32:39>::visit_seq::promoted[1]: &&str = {
+    let mut _0: &&str;
+    let mut _1: &str;
+
+    bb0: {
+        _1 = const "struct NotificationDecision with 4 elements";
+        _0 = &_1;
+        return;
+    }
+}
+
+alloc35 (size: 43, align: 1) {
+    0x00 │ 73 74 72 75 63 74 20 4e 6f 74 69 66 69 63 61 74 │ struct Notificat
+    0x10 │ 69 6f 6e 44 65 63 69 73 69 6f 6e 20 77 69 74 68 │ ionDecision with
+    0x20 │ 20 34 20 65 6c 65 6d 65 6e 74 73                │  4 elements
+}
+
+const _::<impl at autumn-harvest/examples/deterministic_primitives.rs:32:28: 32:39>::deserialize::<impl at autumn-harvest/examples/deterministic_primitives.rs:32:28: 32:39>::visit_seq::promoted[2]: &&str = {
+    let mut _0: &&str;
+    let mut _1: &str;
+
+    bb0: {
+        _1 = const "struct NotificationDecision with 4 elements";
+        _0 = &_1;
+        return;
+    }
+}
+
+alloc35 (size: 43, align: 1) {
+    0x00 │ 73 74 72 75 63 74 20 4e 6f 74 69 66 69 63 61 74 │ struct Notificat
+    0x10 │ 69 6f 6e 44 65 63 69 73 69 6f 6e 20 77 69 74 68 │ ionDecision with
+    0x20 │ 20 34 20 65 6c 65 6d 65 6e 74 73                │  4 elements
+}
+
+const _::<impl at autumn-harvest/examples/deterministic_primitives.rs:32:28: 32:39>::deserialize::<impl at autumn-harvest/examples/deterministic_primitives.rs:32:28: 32:39>::visit_seq::promoted[3]: &&str = {
+    let mut _0: &&str;
+    let mut _1: &str;
+
+    bb0: {
+        _1 = const "struct NotificationDecision with 4 elements";
+        _0 = &_1;
+        return;
+    }
+}
+
+alloc35 (size: 43, align: 1) {
+    0x00 │ 73 74 72 75 63 74 20 4e 6f 74 69 66 69 63 61 74 │ struct Notificat
+    0x10 │ 69 6f 6e 44 65 63 69 73 69 6f 6e 20 77 69 74 68 │ ionDecision with
+    0x20 │ 20 34 20 65 6c 65 6d 65 6e 74 73                │  4 elements
+}
+
+fn _::<impl at autumn-harvest/examples/deterministic_primitives.rs:32:28: 32:39>::deserialize::<impl at autumn-harvest/examples/deterministic_primitives.rs:32:28: 32:39>::visit_map(_1: _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Visitor<'_>, _2: __A) -> Result<NotificationDecision, <__A as MapAccess<'_>>::Error> {
+    debug self => const _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Visitor::<'_> {{ marker: PhantomData::<NotificationDecision>, lifetime: PhantomData::<&()> }};
+    debug __map => _2;
+    let mut _0: std::result::Result<NotificationDecision, <__A as _::_serde::de::MapAccess<'_>>::Error>;
+    let mut _3: std::option::Option<std::string::String>;
+    let mut _7: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>, std::option::Option<_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field>>;
+    let mut _8: std::result::Result<std::option::Option<_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field>, <__A as _::_serde::de::MapAccess<'_>>::Error>;
+    let mut _9: &mut __A;
+    let mut _10: isize;
+    let mut _13: isize;
+    let mut _15: isize;
+    let mut _16: bool;
+    let _17: &std::option::Option<std::string::String>;
+    let mut _18: <__A as _::_serde::de::MapAccess<'_>>::Error;
+    let mut _19: std::option::Option<std::string::String>;
+    let mut _20: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>, std::string::String>;
+    let mut _21: std::result::Result<std::string::String, <__A as _::_serde::de::MapAccess<'_>>::Error>;
+    let mut _22: &mut __A;
+    let mut _23: isize;
+    let mut _26: bool;
+    let _27: &std::option::Option<bool>;
+    let mut _28: <__A as _::_serde::de::MapAccess<'_>>::Error;
+    let mut _29: std::option::Option<bool>;
+    let mut _30: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>, bool>;
+    let mut _31: std::result::Result<bool, <__A as _::_serde::de::MapAccess<'_>>::Error>;
+    let mut _32: &mut __A;
+    let mut _33: isize;
+    let mut _36: bool;
+    let _37: &std::option::Option<i32>;
+    let mut _38: <__A as _::_serde::de::MapAccess<'_>>::Error;
+    let mut _39: std::option::Option<i32>;
+    let mut _40: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>, i32>;
+    let mut _41: std::result::Result<i32, <__A as _::_serde::de::MapAccess<'_>>::Error>;
+    let mut _42: &mut __A;
+    let mut _43: isize;
+    let mut _46: bool;
+    let _47: &std::option::Option<std::string::String>;
+    let mut _48: <__A as _::_serde::de::MapAccess<'_>>::Error;
+    let mut _49: std::option::Option<std::string::String>;
+    let mut _50: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>, std::string::String>;
+    let mut _51: std::result::Result<std::string::String, <__A as _::_serde::de::MapAccess<'_>>::Error>;
+    let mut _52: &mut __A;
+    let mut _53: isize;
+    let mut _56: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>, _::_serde::de::IgnoredAny>;
+    let mut _57: std::result::Result<_::_serde::de::IgnoredAny, <__A as _::_serde::de::MapAccess<'_>>::Error>;
+    let mut _58: &mut __A;
+    let mut _59: isize;
+    let mut _62: isize;
+    let mut _64: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>, std::string::String>;
+    let mut _65: std::result::Result<std::string::String, <__A as _::_serde::de::MapAccess<'_>>::Error>;
+    let mut _66: isize;
+    let mut _70: isize;
+    let mut _72: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>, bool>;
+    let mut _73: std::result::Result<bool, <__A as _::_serde::de::MapAccess<'_>>::Error>;
+    let mut _74: isize;
+    let mut _78: isize;
+    let mut _80: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>, i32>;
+    let mut _81: std::result::Result<i32, <__A as _::_serde::de::MapAccess<'_>>::Error>;
+    let mut _82: isize;
+    let mut _86: isize;
+    let mut _88: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>, std::string::String>;
+    let mut _89: std::result::Result<std::string::String, <__A as _::_serde::de::MapAccess<'_>>::Error>;
+    let mut _90: isize;
+    let mut _93: NotificationDecision;
+    let mut _94: std::string::String;
+    let mut _95: bool;
+    let mut _96: i32;
+    let mut _97: std::string::String;
+    let mut _98: bool;
+    let mut _99: bool;
+    let mut _100: isize;
+    let mut _101: isize;
+    let mut _102: isize;
+    let mut _103: isize;
+    scope 1 {
+        debug __field0 => _3;
+        let mut _4: std::option::Option<bool>;
+        scope 2 {
+            debug __field1 => _4;
+            let mut _5: std::option::Option<i32>;
+            scope 3 {
+                debug __field2 => _5;
+                let mut _6: std::option::Option<std::string::String>;
+                scope 4 {
+                    debug __field3 => _6;
+                    let _61: std::string::String;
+                    let _63: std::string::String;
+                    let _67: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>;
+                    let _68: std::string::String;
+                    scope 5 {
+                        debug __key => _14;
+                        let _11: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>;
+                        let _12: std::option::Option<_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field>;
+                        let _14: _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field;
+                        let _24: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>;
+                        let _25: std::string::String;
+                        let _34: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>;
+                        let _35: bool;
+                        let _44: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>;
+                        let _45: i32;
+                        let _54: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>;
+                        let _55: std::string::String;
+                        let _60: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>;
+                        scope 6 {
+                            debug residual => _11;
+                            scope 7 {
+                            }
+                        }
+                        scope 8 {
+                            debug val => _12;
+                            scope 9 {
+                            }
+                        }
+                        scope 10 {
+                            debug residual => _24;
+                            scope 11 {
+                            }
+                        }
+                        scope 12 {
+                            debug val => _25;
+                            scope 13 {
+                            }
+                        }
+                        scope 14 {
+                            debug residual => _34;
+                            scope 15 {
+                            }
+                        }
+                        scope 16 {
+                            debug val => _35;
+                            scope 17 {
+                            }
+                        }
+                        scope 18 {
+                            debug residual => _44;
+                            scope 19 {
+                            }
+                        }
+                        scope 20 {
+                            debug val => _45;
+                            scope 21 {
+                            }
+                        }
+                        scope 22 {
+                            debug residual => _54;
+                            scope 23 {
+                            }
+                        }
+                        scope 24 {
+                            debug val => _55;
+                            scope 25 {
+                            }
+                        }
+                        scope 26 {
+                        }
+                        scope 27 {
+                            debug residual => _60;
+                            scope 28 {
+                            }
+                        }
+                        scope 29 {
+                            debug val => const IgnoredAny;
+                            scope 30 {
+                            }
+                        }
+                    }
+                    scope 31 {
+                        debug __field0 => _61;
+                        let _69: bool;
+                        let _71: bool;
+                        let _75: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>;
+                        let _76: bool;
+                        scope 37 {
+                            debug __field1 => _69;
+                            let _77: i32;
+                            let _79: i32;
+                            let _83: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>;
+                            let _84: i32;
+                            scope 43 {
+                                debug __field2 => _77;
+                                let _85: std::string::String;
+                                let _87: std::string::String;
+                                let _91: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>;
+                                let _92: std::string::String;
+                                scope 49 {
+                                    debug __field3 => _85;
+                                }
+                                scope 50 {
+                                    debug __field3 => _87;
+                                }
+                                scope 51 {
+                                    debug residual => _91;
+                                    scope 52 {
+                                    }
+                                }
+                                scope 53 {
+                                    debug val => _92;
+                                    scope 54 {
+                                    }
+                                }
+                            }
+                            scope 44 {
+                                debug __field2 => _79;
+                            }
+                            scope 45 {
+                                debug residual => _83;
+                                scope 46 {
+                                }
+                            }
+                            scope 47 {
+                                debug val => _84;
+                                scope 48 {
+                                }
+                            }
+                        }
+                        scope 38 {
+                            debug __field1 => _71;
+                        }
+                        scope 39 {
+                            debug residual => _75;
+                            scope 40 {
+                            }
+                        }
+                        scope 41 {
+                            debug val => _76;
+                            scope 42 {
+                            }
+                        }
+                    }
+                    scope 32 {
+                        debug __field0 => _63;
+                    }
+                    scope 33 {
+                        debug residual => _67;
+                        scope 34 {
+                        }
+                    }
+                    scope 35 {
+                        debug val => _68;
+                        scope 36 {
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    bb0: {
+        _99 = const false;
+        _98 = const false;
+        _99 = const true;
+        _3 = std::option::Option::<std::string::String>::None;
+        _4 = std::option::Option::<bool>::None;
+        _5 = std::option::Option::<i32>::None;
+        _98 = const true;
+        _6 = std::option::Option::<std::string::String>::None;
+        goto -> bb1;
+    }
+
+    bb1: {
+        _9 = &mut _2;
+        _8 = <__A as MapAccess<'_>>::next_key::<_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field>(copy _9) -> [return: bb2, unwind: bb96];
+    }
+
+    bb2: {
+        _7 = <Result<std::option::Option<_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field>, <__A as MapAccess<'_>>::Error> as Try>::branch(move _8) -> [return: bb3, unwind: bb96];
+    }
+
+    bb3: {
+        _10 = discriminant(_7);
+        switchInt(move _10) -> [0: bb5, 1: bb6, otherwise: bb4];
+    }
+
+    bb4: {
+        unreachable;
+    }
+
+    bb5: {
+        _12 = move ((_7 as Continue).0: std::option::Option<_::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field>);
+        _13 = discriminant(_12);
+        switchInt(move _13) -> [1: bb8, 0: bb7, otherwise: bb4];
+    }
+
+    bb6: {
+        _11 = move ((_7 as Break).0: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>);
+        _0 = <Result<NotificationDecision, <__A as MapAccess<'_>>::Error> as FromResidual<Result<Infallible, <__A as MapAccess<'_>>::Error>>>::from_residual(copy _11) -> [return: bb99, unwind: bb96];
+    }
+
+    bb7: {
+        _62 = discriminant(_3);
+        switchInt(move _62) -> [0: bb53, 1: bb54, otherwise: bb4];
+    }
+
+    bb8: {
+        _14 = copy ((_12 as Some).0: _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::__Field);
+        _15 = discriminant(_14);
+        switchInt(move _15) -> [0: bb13, 1: bb12, 2: bb11, 3: bb10, 4: bb9, otherwise: bb4];
+    }
+
+    bb9: {
+        _58 = &mut _2;
+        _57 = <__A as MapAccess<'_>>::next_value::<IgnoredAny>(copy _58) -> [return: bb50, unwind: bb96];
+    }
+
+    bb10: {
+        _47 = &_6;
+        _46 = std::option::Option::<std::string::String>::is_some(copy _47) -> [return: bb40, unwind: bb96];
+    }
+
+    bb11: {
+        _37 = &_5;
+        _36 = std::option::Option::<i32>::is_some(copy _37) -> [return: bb32, unwind: bb96];
+    }
+
+    bb12: {
+        _27 = &_4;
+        _26 = std::option::Option::<bool>::is_some(copy _27) -> [return: bb24, unwind: bb96];
+    }
+
+    bb13: {
+        _17 = &_3;
+        _16 = std::option::Option::<std::string::String>::is_some(copy _17) -> [return: bb14, unwind: bb96];
+    }
+
+    bb14: {
+        switchInt(move _16) -> [0: bb17, otherwise: bb15];
+    }
+
+    bb15: {
+        _18 = <<__A as MapAccess<'_>>::Error as _::_serde::de::Error>::duplicate_field(const "idempotency_key") -> [return: bb16, unwind: bb96];
+    }
+
+    bb16: {
+        _0 = Result::<NotificationDecision, <__A as MapAccess<'_>>::Error>::Err(move _18);
+        goto -> bb90;
+    }
+
+    bb17: {
+        _22 = &mut _2;
+        _21 = <__A as MapAccess<'_>>::next_value::<std::string::String>(copy _22) -> [return: bb18, unwind: bb96];
+    }
+
+    bb18: {
+        _20 = <Result<std::string::String, <__A as MapAccess<'_>>::Error> as Try>::branch(move _21) -> [return: bb19, unwind: bb96];
+    }
+
+    bb19: {
+        _23 = discriminant(_20);
+        switchInt(move _23) -> [0: bb20, 1: bb21, otherwise: bb4];
+    }
+
+    bb20: {
+        _25 = move ((_20 as Continue).0: std::string::String);
+        _19 = std::option::Option::<std::string::String>::Some(copy _25);
+        drop(_3) -> [return: bb22, unwind: bb23];
+    }
+
+    bb21: {
+        _24 = move ((_20 as Break).0: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>);
+        _0 = <Result<NotificationDecision, <__A as MapAccess<'_>>::Error> as FromResidual<Result<Infallible, <__A as MapAccess<'_>>::Error>>>::from_residual(copy _24) -> [return: bb100, unwind: bb96];
+    }
+
+    bb22: {
+        _99 = const true;
+        _3 = move _19;
+        goto -> bb1;
+    }
+
+    bb23 (cleanup): {
+        _99 = const true;
+        _3 = move _19;
+        goto -> bb96;
+    }
+
+    bb24: {
+        switchInt(move _26) -> [0: bb27, otherwise: bb25];
+    }
+
+    bb25: {
+        _28 = <<__A as MapAccess<'_>>::Error as _::_serde::de::Error>::duplicate_field(const "send") -> [return: bb26, unwind: bb96];
+    }
+
+    bb26: {
+        _0 = Result::<NotificationDecision, <__A as MapAccess<'_>>::Error>::Err(move _28);
+        goto -> bb90;
+    }
+
+    bb27: {
+        _32 = &mut _2;
+        _31 = <__A as MapAccess<'_>>::next_value::<bool>(copy _32) -> [return: bb28, unwind: bb96];
+    }
+
+    bb28: {
+        _30 = <Result<bool, <__A as MapAccess<'_>>::Error> as Try>::branch(move _31) -> [return: bb29, unwind: bb96];
+    }
+
+    bb29: {
+        _33 = discriminant(_30);
+        switchInt(move _33) -> [0: bb30, 1: bb31, otherwise: bb4];
+    }
+
+    bb30: {
+        _35 = copy ((_30 as Continue).0: bool);
+        _29 = std::option::Option::<bool>::Some(copy _35);
+        _4 = move _29;
+        goto -> bb1;
+    }
+
+    bb31: {
+        _34 = move ((_30 as Break).0: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>);
+        _0 = <Result<NotificationDecision, <__A as MapAccess<'_>>::Error> as FromResidual<Result<Infallible, <__A as MapAccess<'_>>::Error>>>::from_residual(copy _34) -> [return: bb101, unwind: bb96];
+    }
+
+    bb32: {
+        switchInt(move _36) -> [0: bb35, otherwise: bb33];
+    }
+
+    bb33: {
+        _38 = <<__A as MapAccess<'_>>::Error as _::_serde::de::Error>::duplicate_field(const "rollout_bucket") -> [return: bb34, unwind: bb96];
+    }
+
+    bb34: {
+        _0 = Result::<NotificationDecision, <__A as MapAccess<'_>>::Error>::Err(move _38);
+        goto -> bb90;
+    }
+
+    bb35: {
+        _42 = &mut _2;
+        _41 = <__A as MapAccess<'_>>::next_value::<i32>(copy _42) -> [return: bb36, unwind: bb96];
+    }
+
+    bb36: {
+        _40 = <Result<i32, <__A as MapAccess<'_>>::Error> as Try>::branch(move _41) -> [return: bb37, unwind: bb96];
+    }
+
+    bb37: {
+        _43 = discriminant(_40);
+        switchInt(move _43) -> [0: bb38, 1: bb39, otherwise: bb4];
+    }
+
+    bb38: {
+        _45 = copy ((_40 as Continue).0: i32);
+        _39 = std::option::Option::<i32>::Some(copy _45);
+        _5 = move _39;
+        goto -> bb1;
+    }
+
+    bb39: {
+        _44 = move ((_40 as Break).0: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>);
+        _0 = <Result<NotificationDecision, <__A as MapAccess<'_>>::Error> as FromResidual<Result<Infallible, <__A as MapAccess<'_>>::Error>>>::from_residual(copy _44) -> [return: bb102, unwind: bb96];
+    }
+
+    bb40: {
+        switchInt(move _46) -> [0: bb43, otherwise: bb41];
+    }
+
+    bb41: {
+        _48 = <<__A as MapAccess<'_>>::Error as _::_serde::de::Error>::duplicate_field(const "region") -> [return: bb42, unwind: bb96];
+    }
+
+    bb42: {
+        _0 = Result::<NotificationDecision, <__A as MapAccess<'_>>::Error>::Err(move _48);
+        goto -> bb90;
+    }
+
+    bb43: {
+        _52 = &mut _2;
+        _51 = <__A as MapAccess<'_>>::next_value::<std::string::String>(copy _52) -> [return: bb44, unwind: bb96];
+    }
+
+    bb44: {
+        _50 = <Result<std::string::String, <__A as MapAccess<'_>>::Error> as Try>::branch(move _51) -> [return: bb45, unwind: bb96];
+    }
+
+    bb45: {
+        _53 = discriminant(_50);
+        switchInt(move _53) -> [0: bb46, 1: bb47, otherwise: bb4];
+    }
+
+    bb46: {
+        _55 = move ((_50 as Continue).0: std::string::String);
+        _49 = std::option::Option::<std::string::String>::Some(copy _55);
+        drop(_6) -> [return: bb48, unwind: bb49];
+    }
+
+    bb47: {
+        _54 = move ((_50 as Break).0: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>);
+        _0 = <Result<NotificationDecision, <__A as MapAccess<'_>>::Error> as FromResidual<Result<Infallible, <__A as MapAccess<'_>>::Error>>>::from_residual(copy _54) -> [return: bb103, unwind: bb96];
+    }
+
+    bb48: {
+        _98 = const true;
+        _6 = move _49;
+        goto -> bb1;
+    }
+
+    bb49 (cleanup): {
+        _98 = const true;
+        _6 = move _49;
+        goto -> bb96;
+    }
+
+    bb50: {
+        _56 = <Result<IgnoredAny, <__A as MapAccess<'_>>::Error> as Try>::branch(move _57) -> [return: bb51, unwind: bb96];
+    }
+
+    bb51: {
+        _59 = discriminant(_56);
+        switchInt(move _59) -> [0: bb1, 1: bb52, otherwise: bb4];
+    }
+
+    bb52: {
+        _60 = move ((_56 as Break).0: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>);
+        _0 = <Result<NotificationDecision, <__A as MapAccess<'_>>::Error> as FromResidual<Result<Infallible, <__A as MapAccess<'_>>::Error>>>::from_residual(copy _60) -> [return: bb104, unwind: bb96];
+    }
+
+    bb53: {
+        _65 = _::_serde::__private228::de::missing_field::<'_, std::string::String, <__A as MapAccess<'_>>::Error>(const "idempotency_key") -> [return: bb55, unwind: bb96];
+    }
+
+    bb54: {
+        _99 = const false;
+        _63 = move ((_3 as Some).0: std::string::String);
+        _61 = move _63;
+        goto -> bb59;
+    }
+
+    bb55: {
+        _64 = <Result<std::string::String, <__A as MapAccess<'_>>::Error> as Try>::branch(move _65) -> [return: bb56, unwind: bb96];
+    }
+
+    bb56: {
+        _66 = discriminant(_64);
+        switchInt(move _66) -> [0: bb57, 1: bb58, otherwise: bb4];
+    }
+
+    bb57: {
+        _68 = move ((_64 as Continue).0: std::string::String);
+        _61 = move _68;
+        goto -> bb59;
+    }
+
+    bb58: {
+        _67 = move ((_64 as Break).0: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>);
+        _0 = <Result<NotificationDecision, <__A as MapAccess<'_>>::Error> as FromResidual<Result<Infallible, <__A as MapAccess<'_>>::Error>>>::from_residual(copy _67) -> [return: bb105, unwind: bb96];
+    }
+
+    bb59: {
+        _70 = discriminant(_4);
+        switchInt(move _70) -> [0: bb60, 1: bb61, otherwise: bb4];
+    }
+
+    bb60: {
+        _73 = _::_serde::__private228::de::missing_field::<'_, bool, <__A as MapAccess<'_>>::Error>(const "send") -> [return: bb62, unwind: bb83];
+    }
+
+    bb61: {
+        _71 = copy ((_4 as Some).0: bool);
+        _69 = copy _71;
+        goto -> bb66;
+    }
+
+    bb62: {
+        _72 = <Result<bool, <__A as MapAccess<'_>>::Error> as Try>::branch(move _73) -> [return: bb63, unwind: bb83];
+    }
+
+    bb63: {
+        _74 = discriminant(_72);
+        switchInt(move _74) -> [0: bb64, 1: bb65, otherwise: bb4];
+    }
+
+    bb64: {
+        _76 = copy ((_72 as Continue).0: bool);
+        _69 = copy _76;
+        goto -> bb66;
+    }
+
+    bb65: {
+        _75 = move ((_72 as Break).0: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>);
+        _0 = <Result<NotificationDecision, <__A as MapAccess<'_>>::Error> as FromResidual<Result<Infallible, <__A as MapAccess<'_>>::Error>>>::from_residual(copy _75) -> [return: bb106, unwind: bb83];
+    }
+
+    bb66: {
+        _78 = discriminant(_5);
+        switchInt(move _78) -> [0: bb67, 1: bb68, otherwise: bb4];
+    }
+
+    bb67: {
+        _81 = _::_serde::__private228::de::missing_field::<'_, i32, <__A as MapAccess<'_>>::Error>(const "rollout_bucket") -> [return: bb69, unwind: bb83];
+    }
+
+    bb68: {
+        _79 = copy ((_5 as Some).0: i32);
+        _77 = copy _79;
+        goto -> bb73;
+    }
+
+    bb69: {
+        _80 = <Result<i32, <__A as MapAccess<'_>>::Error> as Try>::branch(move _81) -> [return: bb70, unwind: bb83];
+    }
+
+    bb70: {
+        _82 = discriminant(_80);
+        switchInt(move _82) -> [0: bb71, 1: bb72, otherwise: bb4];
+    }
+
+    bb71: {
+        _84 = copy ((_80 as Continue).0: i32);
+        _77 = copy _84;
+        goto -> bb73;
+    }
+
+    bb72: {
+        _83 = move ((_80 as Break).0: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>);
+        _0 = <Result<NotificationDecision, <__A as MapAccess<'_>>::Error> as FromResidual<Result<Infallible, <__A as MapAccess<'_>>::Error>>>::from_residual(copy _83) -> [return: bb107, unwind: bb83];
+    }
+
+    bb73: {
+        _86 = discriminant(_6);
+        switchInt(move _86) -> [0: bb74, 1: bb75, otherwise: bb4];
+    }
+
+    bb74: {
+        _89 = _::_serde::__private228::de::missing_field::<'_, std::string::String, <__A as MapAccess<'_>>::Error>(const "region") -> [return: bb76, unwind: bb83];
+    }
+
+    bb75: {
+        _98 = const false;
+        _87 = move ((_6 as Some).0: std::string::String);
+        _85 = move _87;
+        goto -> bb80;
+    }
+
+    bb76: {
+        _88 = <Result<std::string::String, <__A as MapAccess<'_>>::Error> as Try>::branch(move _89) -> [return: bb77, unwind: bb83];
+    }
+
+    bb77: {
+        _90 = discriminant(_88);
+        switchInt(move _90) -> [0: bb78, 1: bb79, otherwise: bb4];
+    }
+
+    bb78: {
+        _92 = move ((_88 as Continue).0: std::string::String);
+        _85 = move _92;
+        goto -> bb80;
+    }
+
+    bb79: {
+        _91 = move ((_88 as Break).0: std::result::Result<std::convert::Infallible, <__A as _::_serde::de::MapAccess<'_>>::Error>);
+        _0 = <Result<NotificationDecision, <__A as MapAccess<'_>>::Error> as FromResidual<Result<Infallible, <__A as MapAccess<'_>>::Error>>>::from_residual(copy _91) -> [return: bb108, unwind: bb83];
+    }
+
+    bb80: {
+        _94 = move _61;
+        _95 = copy _69;
+        _96 = copy _77;
+        _97 = move _85;
+        _93 = NotificationDecision { idempotency_key: move _94, send: move _95, rollout_bucket: move _96, region: move _97 };
+        _0 = Result::<NotificationDecision, <__A as MapAccess<'_>>::Error>::Ok(move _93);
+        _98 = const false;
+        _99 = const false;
+        drop(_2) -> [return: bb82, unwind continue];
+    }
+
+    bb81: {
+        drop(_61) -> [return: bb90, unwind: bb96];
+    }
+
+    bb82: {
+        return;
+    }
+
+    bb83 (cleanup): {
+        drop(_61) -> [return: bb96, unwind terminate(cleanup)];
+    }
+
+    bb84 (cleanup): {
+        _103 = discriminant(_3);
+        switchInt(move _103) -> [1: bb97, otherwise: bb85];
+    }
+
+    bb85 (cleanup): {
+        drop(_2) -> [return: bb86, unwind terminate(cleanup)];
+    }
+
+    bb86 (cleanup): {
+        resume;
+    }
+
+    bb87: {
+        _98 = const false;
+        _101 = discriminant(_3);
+        switchInt(move _101) -> [1: bb92, 0: bb91, otherwise: bb4];
+    }
+
+    bb88: {
+        switchInt(copy _98) -> [0: bb87, otherwise: bb89];
+    }
+
+    bb89: {
+        drop(((_6 as Some).0: std::string::String)) -> [return: bb87, unwind: bb84];
+    }
+
+    bb90: {
+        _100 = discriminant(_6);
+        switchInt(move _100) -> [1: bb88, 0: bb87, otherwise: bb4];
+    }
+
+    bb91: {
+        _99 = const false;
+        drop(_2) -> [return: bb82, unwind continue];
+    }
+
+    bb92: {
+        switchInt(copy _99) -> [0: bb91, otherwise: bb93];
+    }
+
+    bb93: {
+        drop(((_3 as Some).0: std::string::String)) -> [return: bb91, unwind: bb85];
+    }
+
+    bb94 (cleanup): {
+        switchInt(copy _98) -> [0: bb84, otherwise: bb95];
+    }
+
+    bb95 (cleanup): {
+        drop(((_6 as Some).0: std::string::String)) -> [return: bb84, unwind terminate(cleanup)];
+    }
+
+    bb96 (cleanup): {
+        _102 = discriminant(_6);
+        switchInt(move _102) -> [1: bb94, otherwise: bb84];
+    }
+
+    bb97 (cleanup): {
+        switchInt(copy _99) -> [0: bb85, otherwise: bb98];
+    }
+
+    bb98 (cleanup): {
+        drop(((_3 as Some).0: std::string::String)) -> [return: bb85, unwind terminate(cleanup)];
+    }
+
+    bb99: {
+        goto -> bb90;
+    }
+
+    bb100: {
+        goto -> bb90;
+    }
+
+    bb101: {
+        goto -> bb90;
+    }
+
+    bb102: {
+        goto -> bb90;
+    }
+
+    bb103: {
+        goto -> bb90;
+    }
+
+    bb104: {
+        goto -> bb90;
+    }
+
+    bb105: {
+        goto -> bb90;
+    }
+
+    bb106: {
+        goto -> bb81;
+    }
+
+    bb107: {
+        goto -> bb81;
+    }
+
+    bb108: {
+        goto -> bb81;
+    }
+}
+
+alloc13 (size: 6, align: 1) {
+    72 65 67 69 6f 6e                               │ region
+}
+
+alloc12 (size: 14, align: 1) {
+    72 6f 6c 6c 6f 75 74 5f 62 75 63 6b 65 74       │ rollout_bucket
+}
+
+alloc11 (size: 4, align: 1) {
+    73 65 6e 64                                     │ send
+}
+
+alloc10 (size: 15, align: 1) {
+    69 64 65 6d 70 6f 74 65 6e 63 79 5f 6b 65 79    │ idempotency_key
+}
+
+const _::<impl at autumn-harvest/examples/deterministic_primitives.rs:32:28: 32:39>::deserialize::FIELDS: &[&str] = {
+    let mut _0: &[&str];
+    let mut _1: &[&str; 4];
+    let _2: &[&str; 4];
+    let _3: [&str; 4];
+    let mut _4: &[&str; 4];
+
+    bb0: {
+        StorageLive(_1);
+        StorageLive(_2);
+        _4 = const _::<impl _::_serde::Deserialize<'de> for NotificationDecision>::deserialize::FIELDS::promoted[0];
+        _2 = &(*_4);
+        _1 = &(*_2);
+        _0 = move _1 as &[&str] (PointerCoercion(Unsize, Implicit));
+        StorageDead(_2);
+        StorageDead(_1);
+        return;
+    }
+}
+
+const _::<impl at autumn-harvest/examples/deterministic_primitives.rs:32:28: 32:39>::deserialize::FIELDS::promoted[0]: &[&str; 4] = {
+    let mut _0: &[&str; 4];
+    let mut _1: [&str; 4];
+
+    bb0: {
+        _1 = [const "idempotency_key", const "send", const "rollout_bucket", const "region"];
+        _0 = &_1;
+        return;
+    }
+}
+
+alloc13 (size: 6, align: 1) {
+    72 65 67 69 6f 6e                               │ region
+}
+
+alloc12 (size: 14, align: 1) {
+    72 6f 6c 6c 6f 75 74 5f 62 75 63 6b 65 74       │ rollout_bucket
+}
+
+alloc11 (size: 4, align: 1) {
+    73 65 6e 64                                     │ send
+}
+
+alloc10 (size: 15, align: 1) {
+    69 64 65 6d 70 6f 74 65 6e 63 79 5f 6b 65 79    │ idempotency_key
+}
+
+fn <impl at autumn-harvest/examples/deterministic_primitives.rs:32:41: 32:46>::clone(_1: &NotificationDecision) -> NotificationDecision {
+    debug self => _1;
+    let mut _0: NotificationDecision;
+    let mut _2: std::string::String;
+    let _3: &std::string::String;
+    let mut _4: bool;
+    let _5: &bool;
+    let mut _6: i32;
+    let _7: &i32;
+    let mut _8: std::string::String;
+    let _9: &std::string::String;
+
+    bb0: {
+        _3 = &((*_1).0: std::string::String);
+        _2 = <std::string::String as Clone>::clone(copy _3) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        _5 = &((*_1).1: bool);
+        _4 = copy (*_5);
+        _7 = &((*_1).2: i32);
+        _6 = copy (*_7);
+        _9 = &((*_1).3: std::string::String);
+        _8 = <std::string::String as Clone>::clone(copy _9) -> [return: bb2, unwind: bb3];
+    }
+
+    bb2: {
+        _0 = NotificationDecision { idempotency_key: move _2, send: move _4, rollout_bucket: move _6, region: move _8 };
+        return;
+    }
+
+    bb3 (cleanup): {
+        drop(_2) -> [return: bb4, unwind terminate(cleanup)];
+    }
+
+    bb4 (cleanup): {
+        resume;
+    }
+}
+
+fn send_email(_1: &autumn_harvest::ActivityContext, _2: std::string::String) -> {async fn body of send_email()} {
+    debug _ctx => _1;
+    debug key => _2;
+    let mut _0: {async fn body of send_email()};
+
+    bb0: {
+        _0 = {coroutine@autumn-harvest/examples/deterministic_primitives.rs:44:84: 47:2 (#0)} { _ctx: copy _1, key: move _2 };
+        return;
+    }
+}
+
+fn send_email::{closure#0}(_1: Pin<&mut {async fn body of send_email()}>, _2: &mut Context<'_>) -> Poll<Result<(), std::string::String>> {
+    debug _task_context => _2;
+    debug _ctx => ((*_17).0: &autumn_harvest::ActivityContext);
+    debug key => ((*_17).1: std::string::String);
+    let mut _0: std::task::Poll<std::result::Result<(), std::string::String>>;
+    let _3: &autumn_harvest::ActivityContext;
+    let _5: ();
+    let mut _6: std::fmt::Arguments<'_>;
+    let mut _8: &std::string::String;
+    let mut _10: core::fmt::rt::Argument<'_>;
+    let mut _11: &[u8; 51];
+    let _12: &[core::fmt::rt::Argument<'_>; 1];
+    let mut _13: ();
+    let mut _14: &std::string::String;
+    let mut _15: std::result::Result<(), std::string::String>;
+    let mut _16: u32;
+    let mut _17: &mut {async fn body of send_email()};
+    scope 1 {
+        debug _ctx => _3;
+        let _4: std::string::String;
+        scope 2 {
+            debug key => _4;
+            let _7: (&std::string::String,);
+            scope 3 {
+                debug args => _7;
+                let _9: [core::fmt::rt::Argument<'_>; 1];
+                scope 4 {
+                    debug args => _9;
+                }
+            }
+        }
+    }
+
+    bb0: {
+        _17 = copy (_1.0: &mut {async fn body of send_email()});
+        _16 = discriminant((*_17));
+        switchInt(move _16) -> [0: bb1, 1: bb9, 2: bb8, otherwise: bb10];
+    }
+
+    bb1: {
+        _3 = copy ((*_17).0: &autumn_harvest::ActivityContext);
+        _4 = move ((*_17).1: std::string::String);
+        _8 = &_4;
+        _7 = (move _8,);
+        _14 = copy (_7.0: &std::string::String);
+        _10 = core::fmt::rt::Argument::<'_>::new_display::<std::string::String>(copy _14) -> [return: bb2, unwind: bb6];
+    }
+
+    bb2: {
+        _9 = [move _10];
+        _11 = const b".[Activity] sending email with idempotency key \xc0\x01\n\x00";
+        _12 = &_9;
+        _6 = Arguments::<'_>::new::<51, 1>(move _11, copy _12) -> [return: bb3, unwind: bb6];
+    }
+
+    bb3: {
+        _5 = _print(move _6) -> [return: bb4, unwind: bb6];
+    }
+
+    bb4: {
+        _13 = ();
+        _15 = Result::<(), std::string::String>::Ok(move _13);
+        drop(_4) -> [return: bb5, unwind: bb7];
+    }
+
+    bb5: {
+        _0 = Poll::<Result<(), std::string::String>>::Ready(move _15);
+        discriminant((*_17)) = 1;
+        return;
+    }
+
+    bb6 (cleanup): {
+        drop(_4) -> [return: bb7, unwind terminate(cleanup)];
+    }
+
+    bb7 (cleanup): {
+        discriminant((*_17)) = 2;
+        resume;
+    }
+
+    bb8: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb8, unwind continue];
+    }
+
+    bb9: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb9, unwind continue];
+    }
+
+    bb10: {
+        unreachable;
+    }
+}
+
+alloc1 (size: 51, align: 1) {
+    0x00 │ 2e 5b 41 63 74 69 76 69 74 79 5d 20 73 65 6e 64 │ .[Activity] send
+    0x10 │ 69 6e 67 20 65 6d 61 69 6c 20 77 69 74 68 20 69 │ ing email with i
+    0x20 │ 64 65 6d 70 6f 74 65 6e 63 79 20 6b 65 79 20 c0 │ dempotency key .
+    0x30 │ 01 0a 00                                        │ ...
+}
+
+fn __autumn_activity_info_send_email() -> ActivityInfo {
+    let mut _0: autumn_harvest::ActivityInfo;
+    let mut _1: std::option::Option<autumn_harvest::RetryPolicy>;
+    let mut _2: std::option::Option<std::time::Duration>;
+    let mut _3: std::time::Duration;
+    let mut _4: std::option::Option<std::time::Duration>;
+    let mut _5: &str;
+    let mut _6: &str;
+    let mut _7: std::option::Option<std::time::Duration>;
+    let mut _8: std::option::Option<std::time::Duration>;
+    let mut _9: std::option::Option<std::time::Duration>;
+    let mut _10: std::option::Option<&str>;
+    let mut _11: &str;
+    let mut _12: std::option::Option<u32>;
+    let mut _13: std::option::Option<&str>;
+    let mut _14: std::option::Option<u64>;
+    let mut _15: std::option::Option<u64>;
+    let mut _16: std::option::Option<f64>;
+    let mut _17: std::option::Option<f64>;
+    let mut _18: std::option::Option<&str>;
+    let mut _19: std::option::Option<&str>;
+    let mut _20: std::option::Option<autumn_harvest::policy::CircuitBreakerPolicy>;
+    let mut _21: std::option::Option<&str>;
+    let mut _22: for<'a> fn(&'a autumn_harvest::ActivityContext, autumn_harvest::serde_json::Value) -> std::pin::Pin<std::boxed::Box<(dyn std::future::Future<Output = std::result::Result<autumn_harvest::serde_json::Value, std::string::String>> + std::marker::Send + 'a)>>;
+
+    bb0: {
+        _1 = std::option::Option::<RetryPolicy>::None;
+        _5 = const "10s";
+        _4 = task_duration(move _5) -> [return: bb1, unwind: bb3];
+    }
+
+    bb1: {
+        _6 = const "invalid duration string: 10s";
+        _3 = std::option::Option::<Duration>::expect(move _4, move _6) -> [return: bb2, unwind: bb3];
+    }
+
+    bb2: {
+        _2 = std::option::Option::<Duration>::Some(move _3);
+        _7 = std::option::Option::<Duration>::None;
+        _8 = std::option::Option::<Duration>::None;
+        _9 = std::option::Option::<Duration>::None;
+        _11 = const "email-workers";
+        _10 = std::option::Option::<&str>::Some(move _11);
+        _12 = std::option::Option::<u32>::None;
+        _13 = std::option::Option::<&str>::None;
+        _14 = std::option::Option::<u64>::None;
+        _15 = std::option::Option::<u64>::None;
+        _16 = std::option::Option::<f64>::None;
+        _17 = std::option::Option::<f64>::None;
+        _18 = std::option::Option::<&str>::None;
+        _19 = std::option::Option::<&str>::None;
+        _20 = std::option::Option::<CircuitBreakerPolicy>::None;
+        _21 = std::option::Option::<&str>::None;
+        _22 = const ZeroSized: {closure@autumn-harvest/examples/deterministic_primitives.rs:43:1: 43:61} as for<'a> fn(&'a autumn_harvest::ActivityContext, autumn_harvest::serde_json::Value) -> std::pin::Pin<std::boxed::Box<(dyn std::future::Future<Output = std::result::Result<autumn_harvest::serde_json::Value, std::string::String>> + std::marker::Send + 'a)>> (PointerCoercion(ClosureFnPointer(Safe), Implicit));
+        _0 = ActivityInfo { name: const "send_email", module: const "deterministic_primitives", default_retry_policy: move _1, default_start_to_close: move _2, default_heartbeat_timeout: move _7, default_schedule_to_start: move _8, default_queue: move _10, max_concurrent: move _12, concurrency_key: move _13, default_schedule_to_close: move _9, is_local: const false, max_input_bytes: move _14, max_result_bytes: move _15, rate_limit_rps: move _16, rate_limit_burst: move _17, rate_limit_key: move _18, rate_limit_key_expr: move _19, circuit_breaker: move _20, requires: move _21, handler: move _22 };
+        return;
+    }
+
+    bb3 (cleanup): {
+        drop(_1) -> [return: bb4, unwind terminate(cleanup)];
+    }
+
+    bb4 (cleanup): {
+        resume;
+    }
+}
+
+alloc40 (size: 13, align: 1) {
+    65 6d 61 69 6c 2d 77 6f 72 6b 65 72 73          │ email-workers
+}
+
+alloc39 (size: 28, align: 1) {
+    0x00 │ 69 6e 76 61 6c 69 64 20 64 75 72 61 74 69 6f 6e │ invalid duration
+    0x10 │ 20 73 74 72 69 6e 67 3a 20 31 30 73             │  string: 10s
+}
+
+alloc38 (size: 3, align: 1) {
+    31 30 73                                        │ 10s
+}
+
+alloc37 (size: 24, align: 1) {
+    0x00 │ 64 65 74 65 72 6d 69 6e 69 73 74 69 63 5f 70 72 │ deterministic_pr
+    0x10 │ 69 6d 69 74 69 76 65 73                         │ imitives
+}
+
+alloc36 (size: 10, align: 1) {
+    73 65 6e 64 5f 65 6d 61 69 6c                   │ send_email
+}
+
+fn __autumn_activity_info_send_email::{closure#0}(_1: &{closure@autumn-harvest/examples/deterministic_primitives.rs:43:1: 43:61}, _2: &autumn_harvest::ActivityContext, _3: Value) -> Pin<Box<dyn std::future::Future<Output = Result<Value, std::string::String>> + std::marker::Send>> {
+    debug ctx => _2;
+    debug input => _3;
+    let mut _0: std::pin::Pin<std::boxed::Box<dyn std::future::Future<Output = std::result::Result<autumn_harvest::serde_json::Value, std::string::String>> + std::marker::Send>>;
+    let mut _4: std::pin::Pin<std::boxed::Box<{async block@autumn-harvest/examples/deterministic_primitives.rs:43:1: 43:61}>>;
+    let mut _5: {async block@autumn-harvest/examples/deterministic_primitives.rs:43:1: 43:61};
+
+    bb0: {
+        _5 = {coroutine@autumn-harvest/examples/deterministic_primitives.rs:43:1: 43:61 (#24)} { input: move _3, ctx: copy _2 };
+        _4 = Box::<{async block@autumn-harvest/examples/deterministic_primitives.rs:43:1: 43:61}>::pin(move _5) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        _0 = move _4 as std::pin::Pin<std::boxed::Box<dyn std::future::Future<Output = std::result::Result<autumn_harvest::serde_json::Value, std::string::String>> + std::marker::Send>> (PointerCoercion(Unsize, Implicit));
+        return;
+    }
+}
+
+fn __autumn_activity_info_send_email::{closure#0}::{closure#0}(_1: Pin<&mut {async block@autumn-harvest/examples/deterministic_primitives.rs:43:1: 43:61}>, _2: &mut Context<'_>) -> Poll<Result<Value, std::string::String>> {
+    debug _task_context => _2;
+    debug input => ((*_28).0: autumn_harvest::serde_json::Value);
+    debug ctx => ((*_28).1: &autumn_harvest::ActivityContext);
+    let mut _0: std::task::Poll<std::result::Result<autumn_harvest::serde_json::Value, std::string::String>>;
+    let _3: std::string::String;
+    let mut _4: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, std::string::String>, std::string::String>;
+    let mut _5: std::result::Result<std::string::String, std::string::String>;
+    let mut _6: std::result::Result<std::string::String, autumn_harvest::serde_json::Error>;
+    let mut _7: autumn_harvest::serde_json::Value;
+    let mut _8: {closure@autumn-harvest/examples/deterministic_primitives.rs:43:1: 43:61};
+    let mut _9: isize;
+    let _10: std::result::Result<std::convert::Infallible, std::string::String>;
+    let _11: std::string::String;
+    let mut _12: {async fn body of send_email()};
+    let mut _13: {async fn body of send_email()};
+    let mut _14: std::string::String;
+    let mut _15: std::task::Poll<std::result::Result<(), std::string::String>>;
+    let mut _16: std::pin::Pin<&mut {async fn body of send_email()}>;
+    let mut _17: &mut {async fn body of send_email()};
+    let mut _18: &mut std::task::Context<'_>;
+    let mut _19: isize;
+    let mut _21: &mut std::task::Context<'_>;
+    let mut _22: std::result::Result<(), std::string::String>;
+    let mut _23: {closure@autumn-harvest/examples/deterministic_primitives.rs:43:1: 43:61};
+    let mut _24: {closure@autumn-harvest/examples/deterministic_primitives.rs:43:1: 43:61};
+    let mut _25: &autumn_harvest::ActivityContext;
+    let mut _26: std::result::Result<autumn_harvest::serde_json::Value, std::string::String>;
+    let mut _27: u32;
+    let mut _28: &mut {async block@autumn-harvest/examples/deterministic_primitives.rs:43:1: 43:61};
+    scope 1 {
+        debug key => _3;
+        scope 6 {
+            debug result => _20;
+        }
+        scope 7 {
+            debug __awaitee => (((*_28) as variant#3).0: {async fn body of send_email()});
+            let _20: std::result::Result<(), std::string::String>;
+            scope 8 {
+                debug result => _20;
+            }
+        }
+    }
+    scope 2 {
+        debug residual => _10;
+        scope 3 {
+        }
+    }
+    scope 4 {
+        debug val => _11;
+        scope 5 {
+        }
+    }
+
+    bb0: {
+        _28 = copy (_1.0: &mut {async block@autumn-harvest/examples/deterministic_primitives.rs:43:1: 43:61});
+        _27 = discriminant((*_28));
+        switchInt(move _27) -> [0: bb1, 1: bb26, 2: bb25, 3: bb24, otherwise: bb5];
+    }
+
+    bb1: {
+        (((*_28) as variant#3).1: bool) = const false;
+        _7 = move ((*_28).0: autumn_harvest::serde_json::Value);
+        _6 = from_value::<std::string::String>(move _7) -> [return: bb2, unwind: bb22];
+    }
+
+    bb2: {
+        _8 = {closure@autumn-harvest/examples/deterministic_primitives.rs:43:1: 43:61};
+        _5 = Result::<std::string::String, autumn_harvest::serde_json::Error>::map_err::<std::string::String, {closure@autumn-harvest/examples/deterministic_primitives.rs:43:1: 43:61}>(move _6, move _8) -> [return: bb3, unwind: bb22];
+    }
+
+    bb3: {
+        _4 = <Result<std::string::String, std::string::String> as Try>::branch(move _5) -> [return: bb4, unwind: bb22];
+    }
+
+    bb4: {
+        _9 = discriminant(_4);
+        switchInt(move _9) -> [0: bb6, 1: bb7, otherwise: bb5];
+    }
+
+    bb5: {
+        unreachable;
+    }
+
+    bb6: {
+        _11 = move ((_4 as Continue).0: std::string::String);
+        (((*_28) as variant#3).1: bool) = const true;
+        _3 = move _11;
+        _25 = copy ((*_28).1: &autumn_harvest::ActivityContext);
+        (((*_28) as variant#3).1: bool) = const false;
+        _14 = move _3;
+        _13 = send_email(copy _25, move _14) -> [return: bb9, unwind: bb21];
+    }
+
+    bb7: {
+        _10 = move ((_4 as Break).0: std::result::Result<std::convert::Infallible, std::string::String>);
+        _26 = <Result<Value, std::string::String> as FromResidual<Result<Infallible, std::string::String>>>::from_residual(copy _10) -> [return: bb8, unwind: bb22];
+    }
+
+    bb8: {
+        (((*_28) as variant#3).1: bool) = const false;
+        goto -> bb19;
+    }
+
+    bb9: {
+        _12 = <{async fn body of send_email()} as std::future::IntoFuture>::into_future(move _13) -> [return: bb10, unwind: bb21];
+    }
+
+    bb10: {
+        (((*_28) as variant#3).0: {async fn body of send_email()}) = move _12;
+        goto -> bb11;
+    }
+
+    bb11: {
+        _17 = &mut (((*_28) as variant#3).0: {async fn body of send_email()});
+        _16 = Pin::<&mut {async fn body of send_email()}>::new_unchecked(copy _17) -> [return: bb12, unwind: bb20];
+    }
+
+    bb12: {
+        _18 = copy _2;
+        _15 = <{async fn body of send_email()} as std::future::Future>::poll(move _16, copy _18) -> [return: bb13, unwind: bb20];
+    }
+
+    bb13: {
+        _19 = discriminant(_15);
+        switchInt(move _19) -> [0: bb15, 1: bb14, otherwise: bb5];
+    }
+
+    bb14: {
+        _0 = Poll::<Result<Value, std::string::String>>::Pending;
+        discriminant((*_28)) = 3;
+        return;
+    }
+
+    bb15: {
+        _20 = move ((_15 as Ready).0: std::result::Result<(), std::string::String>);
+        drop((((*_28) as variant#3).0: {async fn body of send_email()})) -> [return: bb16, unwind: bb21];
+    }
+
+    bb16: {
+        _23 = {closure@autumn-harvest/examples/deterministic_primitives.rs:43:1: 43:61};
+        _22 = Result::<(), std::string::String>::map_err::<std::string::String, {closure@autumn-harvest/examples/deterministic_primitives.rs:43:1: 43:61}>(copy _20, move _23) -> [return: bb17, unwind: bb21];
+    }
+
+    bb17: {
+        _24 = {closure@autumn-harvest/examples/deterministic_primitives.rs:43:1: 43:61};
+        _26 = Result::<(), std::string::String>::and_then::<Value, {closure@autumn-harvest/examples/deterministic_primitives.rs:43:1: 43:61}>(move _22, move _24) -> [return: bb18, unwind: bb21];
+    }
+
+    bb18: {
+        (((*_28) as variant#3).1: bool) = const false;
+        goto -> bb19;
+    }
+
+    bb19: {
+        _0 = Poll::<Result<Value, std::string::String>>::Ready(move _26);
+        discriminant((*_28)) = 1;
+        return;
+    }
+
+    bb20 (cleanup): {
+        drop((((*_28) as variant#3).0: {async fn body of send_email()})) -> [return: bb21, unwind terminate(cleanup)];
+    }
+
+    bb21 (cleanup): {
+        switchInt(copy (((*_28) as variant#3).1: bool)) -> [0: bb22, otherwise: bb23];
+    }
+
+    bb22 (cleanup): {
+        (((*_28) as variant#3).1: bool) = const false;
+        discriminant((*_28)) = 2;
+        resume;
+    }
+
+    bb23 (cleanup): {
+        drop(_3) -> [return: bb22, unwind terminate(cleanup)];
+    }
+
+    bb24: {
+        _21 = move _2;
+        _2 = move _21;
+        goto -> bb11;
+    }
+
+    bb25: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb25, unwind continue];
+    }
+
+    bb26: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb26, unwind continue];
+    }
+}
+
+fn __autumn_activity_info_send_email::{closure#0}::{closure#0}::{closure#0}(_1: {closure@autumn-harvest/examples/deterministic_primitives.rs:43:1: 43:61}, _2: autumn_harvest::serde_json::Error) -> std::string::String {
+    debug e => _2;
+    let mut _0: std::string::String;
+    let mut _3: &autumn_harvest::serde_json::Error;
+
+    bb0: {
+        _3 = &_2;
+        _0 = <autumn_harvest::serde_json::Error as ToString>::to_string(move _3) -> [return: bb1, unwind: bb3];
+    }
+
+    bb1: {
+        drop(_2) -> [return: bb2, unwind continue];
+    }
+
+    bb2: {
+        return;
+    }
+
+    bb3 (cleanup): {
+        drop(_2) -> [return: bb4, unwind terminate(cleanup)];
+    }
+
+    bb4 (cleanup): {
+        resume;
+    }
+}
+
+fn __autumn_activity_info_send_email::{closure#0}::{closure#0}::{closure#1}(_1: {closure@autumn-harvest/examples/deterministic_primitives.rs:43:1: 43:61}, _2: std::string::String) -> std::string::String {
+    debug e => _2;
+    let mut _0: std::string::String;
+    let mut _3: &std::string::String;
+
+    bb0: {
+        _3 = &_2;
+        _0 = <std::string::String as ToString>::to_string(move _3) -> [return: bb1, unwind: bb3];
+    }
+
+    bb1: {
+        drop(_2) -> [return: bb2, unwind continue];
+    }
+
+    bb2: {
+        return;
+    }
+
+    bb3 (cleanup): {
+        drop(_2) -> [return: bb4, unwind terminate(cleanup)];
+    }
+
+    bb4 (cleanup): {
+        resume;
+    }
+}
+
+fn __autumn_activity_info_send_email::{closure#0}::{closure#0}::{closure#2}(_1: {closure@autumn-harvest/examples/deterministic_primitives.rs:43:1: 43:61}, _2: ()) -> Result<Value, std::string::String> {
+    debug v => const ();
+    let mut _0: std::result::Result<autumn_harvest::serde_json::Value, std::string::String>;
+    let mut _3: std::result::Result<autumn_harvest::serde_json::Value, autumn_harvest::serde_json::Error>;
+
+    bb0: {
+        _3 = to_value::<()>(const ()) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        _0 = Result::<Value, autumn_harvest::serde_json::Error>::map_err::<std::string::String, {closure@autumn-harvest/examples/deterministic_primitives.rs:43:1: 43:61}>(move _3, const ZeroSized: {closure@autumn-harvest/examples/deterministic_primitives.rs:43:1: 43:61}) -> [return: bb2, unwind continue];
+    }
+
+    bb2: {
+        return;
+    }
+}
+
+fn __autumn_activity_info_send_email::{closure#0}::{closure#0}::{closure#2}::{closure#0}(_1: {closure@autumn-harvest/examples/deterministic_primitives.rs:43:1: 43:61}, _2: autumn_harvest::serde_json::Error) -> std::string::String {
+    debug e => _2;
+    let mut _0: std::string::String;
+    let mut _3: &autumn_harvest::serde_json::Error;
+
+    bb0: {
+        _3 = &_2;
+        _0 = <autumn_harvest::serde_json::Error as ToString>::to_string(move _3) -> [return: bb1, unwind: bb3];
+    }
+
+    bb1: {
+        drop(_2) -> [return: bb2, unwind continue];
+    }
+
+    bb2: {
+        return;
+    }
+
+    bb3 (cleanup): {
+        drop(_2) -> [return: bb4, unwind terminate(cleanup)];
+    }
+
+    bb4 (cleanup): {
+        resume;
+    }
+}
+
+fn send_email_info() -> ActivityInfo {
+    let mut _0: autumn_harvest::ActivityInfo;
+
+    bb0: {
+        _0 = __autumn_activity_info_send_email() -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+fn notify_decision(_1: &autumn_harvest::WorkflowContext, _2: NotificationEvent) -> {async fn body of notify_decision()} {
+    debug ctx => _1;
+    debug event => _2;
+    let mut _0: {async fn body of notify_decision()};
+
+    bb0: {
+        _0 = {coroutine@autumn-harvest/examples/deterministic_primitives.rs:61:43: 97:2 (#0)} { ctx: copy _1, event: move _2 };
+        return;
+    }
+}
+
+fn notify_decision::{closure#0}(_1: Pin<&mut {async fn body of notify_decision()}>, _2: &mut Context<'_>) -> Poll<Result<NotificationDecision, std::string::String>> {
+    debug _task_context => _2;
+    debug ctx => ((*_54).0: &autumn_harvest::WorkflowContext);
+    debug event => ((*_54).1: NotificationEvent);
+    let mut _0: std::task::Poll<std::result::Result<NotificationDecision, std::string::String>>;
+    let _3: &autumn_harvest::WorkflowContext;
+    let mut _5: i64;
+    let mut _6: &autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>;
+    let mut _7: i64;
+    let mut _8: (i64, bool);
+    let mut _10: i64;
+    let mut _11: i64;
+    let mut _12: (i64, bool);
+    let mut _13: (i64, bool);
+    let mut _14: &autumn_harvest::uuid::Uuid;
+    let _15: autumn_harvest::uuid::Uuid;
+    let mut _16: std::ops::Range<i32>;
+    let mut _18: i32;
+    let mut _19: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, std::string::String>, std::string::String>;
+    let mut _20: std::result::Result<std::string::String, std::string::String>;
+    let mut _21: std::result::Result<std::string::String, autumn_harvest::HarvestError>;
+    let mut _22: &str;
+    let mut _23: {closure@autumn-harvest/examples/deterministic_primitives.rs:77:39: 77:41};
+    let mut _24: {closure@autumn-harvest/examples/deterministic_primitives.rs:81:18: 81:21};
+    let mut _25: isize;
+    let mut _28: bool;
+    let mut _29: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, std::string::String>>;
+    let mut _30: std::result::Result<(), std::string::String>;
+    let mut _31: {async fn body of autumn_harvest::WorkflowContext::execute_activity<std::string::String, ()>()};
+    let mut _32: {async fn body of autumn_harvest::WorkflowContext::execute_activity<std::string::String, ()>()};
+    let _33: &autumn_harvest::ActivityInfo;
+    let mut _34: std::string::String;
+    let mut _35: &std::string::String;
+    let mut _36: std::task::Poll<std::result::Result<(), autumn_harvest::HarvestError>>;
+    let mut _37: std::pin::Pin<&mut {async fn body of autumn_harvest::WorkflowContext::execute_activity<std::string::String, ()>()}>;
+    let mut _38: &mut {async fn body of autumn_harvest::WorkflowContext::execute_activity<std::string::String, ()>()};
+    let mut _39: &mut std::task::Context<'_>;
+    let mut _40: isize;
+    let mut _42: &mut std::task::Context<'_>;
+    let mut _43: {closure@autumn-harvest/examples/deterministic_primitives.rs:88:22: 88:25};
+    let mut _44: isize;
+    let mut _47: NotificationDecision;
+    let mut _48: std::string::String;
+    let mut _49: bool;
+    let mut _50: i32;
+    let mut _51: std::string::String;
+    let mut _52: std::result::Result<NotificationDecision, std::string::String>;
+    let mut _53: u32;
+    let mut _54: &mut {async fn body of notify_decision()};
+    scope 1 {
+        debug ctx => _3;
+        scope 2 {
+            debug event => (((*_54) as variant#3).0: NotificationEvent);
+            scope 3 {
+                debug now => (((*_54) as variant#3).1: autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>);
+                let _4: i64;
+                scope 4 {
+                    debug age_secs => _4;
+                    let _9: bool;
+                    scope 5 {
+                        debug fresh => _9;
+                        scope 6 {
+                            debug idempotency_key => (((*_54) as variant#3).2: std::string::String);
+                            scope 7 {
+                                debug rollout_bucket => (((*_54) as variant#3).3: i32);
+                                let _17: bool;
+                                scope 8 {
+                                    debug in_rollout => _17;
+                                    let _26: std::result::Result<std::convert::Infallible, std::string::String>;
+                                    let _27: std::string::String;
+                                    scope 9 {
+                                        debug region => (((*_54) as variant#3).4: std::string::String);
+                                        scope 14 {
+                                            debug send => (((*_54) as variant#3).5: bool);
+                                            let _45: std::result::Result<std::convert::Infallible, std::string::String>;
+                                            let _46: ();
+                                            scope 15 {
+                                            }
+                                            scope 16 {
+                                                debug __awaitee => (((*_54) as variant#3).7: {async fn body of autumn_harvest::WorkflowContext::execute_activity<std::string::String, ()>()});
+                                                let _41: std::result::Result<(), autumn_harvest::HarvestError>;
+                                                scope 17 {
+                                                    debug result => _41;
+                                                }
+                                            }
+                                            scope 18 {
+                                                debug residual => _45;
+                                                scope 19 {
+                                                }
+                                            }
+                                            scope 20 {
+                                                debug val => _46;
+                                                scope 21 {
+                                                }
+                                            }
+                                        }
+                                    }
+                                    scope 10 {
+                                        debug residual => _26;
+                                        scope 11 {
+                                        }
+                                    }
+                                    scope 12 {
+                                        debug val => _27;
+                                        scope 13 {
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    bb0: {
+        _54 = copy (_1.0: &mut {async fn body of notify_decision()});
+        _53 = discriminant((*_54));
+        switchInt(move _53) -> [0: bb1, 1: bb48, 2: bb47, 3: bb46, otherwise: bb13];
+    }
+
+    bb1: {
+        _3 = copy ((*_54).0: &autumn_harvest::WorkflowContext);
+        (((*_54) as variant#3).0: NotificationEvent) = move ((*_54).1: NotificationEvent);
+        (((*_54) as variant#3).1: autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>) = autumn_harvest::WorkflowContext::system_now(copy _3) -> [return: bb2, unwind: bb44];
+    }
+
+    bb2: {
+        _6 = &(((*_54) as variant#3).1: autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>);
+        _5 = DateTime::<Utc>::timestamp(move _6) -> [return: bb3, unwind: bb44];
+    }
+
+    bb3: {
+        _7 = copy ((((*_54) as variant#3).0: NotificationEvent).0: i64);
+        _8 = SubWithOverflow(copy _5, copy _7);
+        assert(!move (_8.1: bool), "attempt to compute `{} - {}`, which would overflow", move _5, move _7) -> [success: bb4, unwind: bb44];
+    }
+
+    bb4: {
+        _4 = move (_8.0: i64);
+        _12 = MulWithOverflow(const 24_i64, const 60_i64);
+        assert(!move (_12.1: bool), "attempt to compute `{} * {}`, which would overflow", const 24_i64, const 60_i64) -> [success: bb5, unwind: bb44];
+    }
+
+    bb5: {
+        _11 = move (_12.0: i64);
+        _13 = MulWithOverflow(copy _11, const 60_i64);
+        assert(!move (_13.1: bool), "attempt to compute `{} * {}`, which would overflow", move _11, const 60_i64) -> [success: bb6, unwind: bb44];
+    }
+
+    bb6: {
+        _10 = move (_13.0: i64);
+        _9 = Lt(copy _4, move _10);
+        _15 = autumn_harvest::WorkflowContext::new_uuid(copy _3) -> [return: bb7, unwind: bb44];
+    }
+
+    bb7: {
+        _14 = &_15;
+        (((*_54) as variant#3).2: std::string::String) = <autumn_harvest::uuid::Uuid as ToString>::to_string(move _14) -> [return: bb8, unwind: bb44];
+    }
+
+    bb8: {
+        _16 = std::ops::Range::<i32> { start: const 0_i32, end: const 100_i32 };
+        (((*_54) as variant#3).3: i32) = autumn_harvest::WorkflowContext::random_range::<i32, std::ops::Range<i32>>(copy _3, move _16) -> [return: bb9, unwind: bb43];
+    }
+
+    bb9: {
+        _18 = copy (((*_54) as variant#3).3: i32);
+        _17 = Lt(move _18, const 10_i32);
+        _22 = const "deploy_region";
+        _23 = {closure@autumn-harvest/examples/deterministic_primitives.rs:77:39: 77:41};
+        _21 = autumn_harvest::WorkflowContext::side_effect::<{closure@autumn-harvest/examples/deterministic_primitives.rs:77:39: 77:41}, std::string::String>(copy _3, move _22, move _23) -> [return: bb10, unwind: bb43];
+    }
+
+    bb10: {
+        _24 = {closure@autumn-harvest/examples/deterministic_primitives.rs:81:18: 81:21};
+        _20 = Result::<std::string::String, HarvestError>::map_err::<std::string::String, {closure@autumn-harvest/examples/deterministic_primitives.rs:81:18: 81:21}>(move _21, move _24) -> [return: bb11, unwind: bb43];
+    }
+
+    bb11: {
+        _19 = <Result<std::string::String, std::string::String> as Try>::branch(move _20) -> [return: bb12, unwind: bb43];
+    }
+
+    bb12: {
+        _25 = discriminant(_19);
+        switchInt(move _25) -> [0: bb14, 1: bb15, otherwise: bb13];
+    }
+
+    bb13: {
+        unreachable;
+    }
+
+    bb14: {
+        _27 = move ((_19 as Continue).0: std::string::String);
+        (((*_54) as variant#3).4: std::string::String) = move _27;
+        switchInt(copy _9) -> [0: bb17, otherwise: bb16];
+    }
+
+    bb15: {
+        _26 = move ((_19 as Break).0: std::result::Result<std::convert::Infallible, std::string::String>);
+        _52 = <Result<NotificationDecision, std::string::String> as FromResidual<Result<Infallible, std::string::String>>>::from_residual(copy _26) -> [return: bb49, unwind: bb43];
+    }
+
+    bb16: {
+        (((*_54) as variant#3).5: bool) = copy _17;
+        goto -> bb18;
+    }
+
+    bb17: {
+        (((*_54) as variant#3).5: bool) = const false;
+        goto -> bb18;
+    }
+
+    bb18: {
+        _28 = copy (((*_54) as variant#3).5: bool);
+        switchInt(move _28) -> [0: bb35, otherwise: bb19];
+    }
+
+    bb19: {
+        (((*_54) as variant#3).6: autumn_harvest::ActivityInfo) = send_email_info() -> [return: bb20, unwind: bb42];
+    }
+
+    bb20: {
+        _33 = &(((*_54) as variant#3).6: autumn_harvest::ActivityInfo);
+        _35 = &(((*_54) as variant#3).2: std::string::String);
+        _34 = <std::string::String as Clone>::clone(move _35) -> [return: bb21, unwind: bb41];
+    }
+
+    bb21: {
+        _32 = autumn_harvest::WorkflowContext::execute_activity::<std::string::String, ()>(copy _3, copy _33, move _34) -> [return: bb22, unwind: bb41];
+    }
+
+    bb22: {
+        _31 = <{async fn body of autumn_harvest::WorkflowContext::execute_activity<std::string::String, ()>()} as std::future::IntoFuture>::into_future(move _32) -> [return: bb23, unwind: bb41];
+    }
+
+    bb23: {
+        (((*_54) as variant#3).7: {async fn body of autumn_harvest::WorkflowContext::execute_activity<std::string::String, ()>()}) = move _31;
+        goto -> bb24;
+    }
+
+    bb24: {
+        _38 = &mut (((*_54) as variant#3).7: {async fn body of autumn_harvest::WorkflowContext::execute_activity<std::string::String, ()>()});
+        _37 = Pin::<&mut {async fn body of autumn_harvest::WorkflowContext::execute_activity<std::string::String, ()>()}>::new_unchecked(copy _38) -> [return: bb25, unwind: bb40];
+    }
+
+    bb25: {
+        _39 = copy _2;
+        _36 = <{async fn body of autumn_harvest::WorkflowContext::execute_activity<std::string::String, ()>()} as std::future::Future>::poll(move _37, copy _39) -> [return: bb26, unwind: bb40];
+    }
+
+    bb26: {
+        _40 = discriminant(_36);
+        switchInt(move _40) -> [0: bb28, 1: bb27, otherwise: bb13];
+    }
+
+    bb27: {
+        _0 = Poll::<Result<NotificationDecision, std::string::String>>::Pending;
+        discriminant((*_54)) = 3;
+        return;
+    }
+
+    bb28: {
+        _41 = move ((_36 as Ready).0: std::result::Result<(), autumn_harvest::HarvestError>);
+        drop((((*_54) as variant#3).7: {async fn body of autumn_harvest::WorkflowContext::execute_activity<std::string::String, ()>()})) -> [return: bb29, unwind: bb41];
+    }
+
+    bb29: {
+        _43 = {closure@autumn-harvest/examples/deterministic_primitives.rs:88:22: 88:25};
+        _30 = Result::<(), HarvestError>::map_err::<std::string::String, {closure@autumn-harvest/examples/deterministic_primitives.rs:88:22: 88:25}>(copy _41, move _43) -> [return: bb30, unwind: bb41];
+    }
+
+    bb30: {
+        _29 = <Result<(), std::string::String> as Try>::branch(move _30) -> [return: bb31, unwind: bb41];
+    }
+
+    bb31: {
+        _44 = discriminant(_29);
+        switchInt(move _44) -> [0: bb32, 1: bb33, otherwise: bb13];
+    }
+
+    bb32: {
+        _46 = copy ((_29 as Continue).0: ());
+        drop((((*_54) as variant#3).6: autumn_harvest::ActivityInfo)) -> [return: bb35, unwind: bb42];
+    }
+
+    bb33: {
+        _45 = move ((_29 as Break).0: std::result::Result<std::convert::Infallible, std::string::String>);
+        _52 = <Result<NotificationDecision, std::string::String> as FromResidual<Result<Infallible, std::string::String>>>::from_residual(copy _45) -> [return: bb34, unwind: bb41];
+    }
+
+    bb34: {
+        drop((((*_54) as variant#3).6: autumn_harvest::ActivityInfo)) -> [return: bb36, unwind: bb42];
+    }
+
+    bb35: {
+        _48 = move (((*_54) as variant#3).2: std::string::String);
+        _49 = copy (((*_54) as variant#3).5: bool);
+        _50 = copy (((*_54) as variant#3).3: i32);
+        _51 = move (((*_54) as variant#3).4: std::string::String);
+        _47 = NotificationDecision { idempotency_key: move _48, send: move _49, rollout_bucket: move _50, region: move _51 };
+        _52 = Result::<NotificationDecision, std::string::String>::Ok(move _47);
+        drop((((*_54) as variant#3).0: NotificationEvent)) -> [return: bb39, unwind: bb45];
+    }
+
+    bb36: {
+        drop((((*_54) as variant#3).4: std::string::String)) -> [return: bb37, unwind: bb43];
+    }
+
+    bb37: {
+        drop((((*_54) as variant#3).2: std::string::String)) -> [return: bb38, unwind: bb44];
+    }
+
+    bb38: {
+        drop((((*_54) as variant#3).0: NotificationEvent)) -> [return: bb39, unwind: bb45];
+    }
+
+    bb39: {
+        _0 = Poll::<Result<NotificationDecision, std::string::String>>::Ready(move _52);
+        discriminant((*_54)) = 1;
+        return;
+    }
+
+    bb40 (cleanup): {
+        drop((((*_54) as variant#3).7: {async fn body of autumn_harvest::WorkflowContext::execute_activity<std::string::String, ()>()})) -> [return: bb41, unwind terminate(cleanup)];
+    }
+
+    bb41 (cleanup): {
+        drop((((*_54) as variant#3).6: autumn_harvest::ActivityInfo)) -> [return: bb42, unwind terminate(cleanup)];
+    }
+
+    bb42 (cleanup): {
+        drop((((*_54) as variant#3).4: std::string::String)) -> [return: bb43, unwind terminate(cleanup)];
+    }
+
+    bb43 (cleanup): {
+        drop((((*_54) as variant#3).2: std::string::String)) -> [return: bb44, unwind terminate(cleanup)];
+    }
+
+    bb44 (cleanup): {
+        drop((((*_54) as variant#3).0: NotificationEvent)) -> [return: bb45, unwind terminate(cleanup)];
+    }
+
+    bb45 (cleanup): {
+        discriminant((*_54)) = 2;
+        resume;
+    }
+
+    bb46: {
+        _42 = move _2;
+        _2 = move _42;
+        goto -> bb24;
+    }
+
+    bb47: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb47, unwind continue];
+    }
+
+    bb48: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb48, unwind continue];
+    }
+
+    bb49: {
+        goto -> bb37;
+    }
+}
+
+alloc4 (size: 13, align: 1) {
+    64 65 70 6c 6f 79 5f 72 65 67 69 6f 6e          │ deploy_region
+}
+
+fn notify_decision::{closure#0}::{closure#0}(_1: {closure@autumn-harvest/examples/deterministic_primitives.rs:77:39: 77:41}) -> std::string::String {
+    let mut _0: std::string::String;
+    let mut _2: std::result::Result<std::string::String, std::env::VarError>;
+
+    bb0: {
+        _2 = var::<&str>(const "DEPLOY_REGION") -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        _0 = Result::<std::string::String, VarError>::unwrap_or_else::<{closure@autumn-harvest/examples/deterministic_primitives.rs:79:59: 79:62}>(move _2, const ZeroSized: {closure@autumn-harvest/examples/deterministic_primitives.rs:79:59: 79:62}) -> [return: bb2, unwind continue];
+    }
+
+    bb2: {
+        return;
+    }
+}
+
+alloc3 (size: 13, align: 1) {
+    44 45 50 4c 4f 59 5f 52 45 47 49 4f 4e          │ DEPLOY_REGION
+}
+
+fn notify_decision::{closure#0}::{closure#0}::{closure#0}(_1: {closure@autumn-harvest/examples/deterministic_primitives.rs:79:59: 79:62}, _2: VarError) -> std::string::String {
+    let mut _0: std::string::String;
+    let mut _3: &str;
+
+    bb0: {
+        _3 = const "us-east-1";
+        _0 = <str as ToString>::to_string(move _3) -> [return: bb1, unwind: bb3];
+    }
+
+    bb1: {
+        drop(_2) -> [return: bb2, unwind continue];
+    }
+
+    bb2: {
+        return;
+    }
+
+    bb3 (cleanup): {
+        drop(_2) -> [return: bb4, unwind terminate(cleanup)];
+    }
+
+    bb4 (cleanup): {
+        resume;
+    }
+}
+
+alloc2 (size: 9, align: 1) {
+    75 73 2d 65 61 73 74 2d 31                      │ us-east-1
+}
+
+fn notify_decision::{closure#0}::{closure#1}(_1: {closure@autumn-harvest/examples/deterministic_primitives.rs:81:18: 81:21}, _2: HarvestError) -> std::string::String {
+    debug e => _2;
+    let mut _0: std::string::String;
+    let mut _3: &autumn_harvest::HarvestError;
+
+    bb0: {
+        _3 = &_2;
+        _0 = <HarvestError as ToString>::to_string(move _3) -> [return: bb1, unwind: bb3];
+    }
+
+    bb1: {
+        drop(_2) -> [return: bb2, unwind continue];
+    }
+
+    bb2: {
+        return;
+    }
+
+    bb3 (cleanup): {
+        drop(_2) -> [return: bb4, unwind terminate(cleanup)];
+    }
+
+    bb4 (cleanup): {
+        resume;
+    }
+}
+
+fn notify_decision::{closure#0}::{closure#2}(_1: {closure@autumn-harvest/examples/deterministic_primitives.rs:88:22: 88:25}, _2: HarvestError) -> std::string::String {
+    debug e => _2;
+    let mut _0: std::string::String;
+    let mut _3: &autumn_harvest::HarvestError;
+
+    bb0: {
+        _3 = &_2;
+        _0 = <HarvestError as ToString>::to_string(move _3) -> [return: bb1, unwind: bb3];
+    }
+
+    bb1: {
+        drop(_2) -> [return: bb2, unwind continue];
+    }
+
+    bb2: {
+        return;
+    }
+
+    bb3 (cleanup): {
+        drop(_2) -> [return: bb4, unwind terminate(cleanup)];
+    }
+
+    bb4 (cleanup): {
+        resume;
+    }
+}
+
+fn __autumn_workflow_info_notify_decision() -> WorkflowInfo {
+    let mut _0: autumn_harvest::WorkflowInfo;
+    let mut _1: for<'a> fn(&'a autumn_harvest::WorkflowContext, autumn_harvest::serde_json::Value) -> std::pin::Pin<std::boxed::Box<(dyn std::future::Future<Output = std::result::Result<autumn_harvest::serde_json::Value, std::string::String>> + std::marker::Send + 'a)>>;
+    let mut _2: std::option::Option<std::time::Duration>;
+    let mut _3: std::option::Option<std::time::Duration>;
+    let mut _4: std::option::Option<std::time::Duration>;
+    let mut _5: std::option::Option<autumn_harvest::concurrency::ConcurrencyPolicy>;
+    let mut _6: std::option::Option<autumn_harvest::debounce::DebouncePolicy>;
+    let mut _7: std::option::Option<autumn_harvest::event_batch::BatchPolicy>;
+    let mut _8: std::option::Option<autumn_harvest::throttle::ThrottlePolicy>;
+    let mut _9: std::option::Option<autumn_harvest::quota::QuotaPolicy>;
+    let mut _10: std::option::Option<u64>;
+    let mut _11: std::option::Option<&str>;
+    let mut _12: std::option::Option<&str>;
+    let mut _13: std::option::Option<&str>;
+    let mut _14: std::option::Option<&str>;
+    let mut _15: &str;
+    let mut _16: std::option::Option<fn() -> autumn_harvest::serde_json::Value>;
+    let mut _17: std::option::Option<fn() -> autumn_harvest::serde_json::Value>;
+    let mut _18: std::option::Option<fn() -> autumn_harvest::serde_json::Value>;
+    let mut _19: std::option::Option<autumn_harvest::RetryPolicy>;
+    let mut _20: std::option::Option<&[&str]>;
+    let mut _21: std::option::Option<&[&str]>;
+
+    bb0: {
+        _1 = const ZeroSized: {closure@autumn-harvest/examples/deterministic_primitives.rs:57:1: 57:98} as for<'a> fn(&'a autumn_harvest::WorkflowContext, autumn_harvest::serde_json::Value) -> std::pin::Pin<std::boxed::Box<(dyn std::future::Future<Output = std::result::Result<autumn_harvest::serde_json::Value, std::string::String>> + std::marker::Send + 'a)>> (PointerCoercion(ClosureFnPointer(Safe), Implicit));
+        _2 = std::option::Option::<Duration>::None;
+        _3 = std::option::Option::<Duration>::None;
+        _4 = std::option::Option::<Duration>::None;
+        _5 = std::option::Option::<ConcurrencyPolicy>::None;
+        _6 = std::option::Option::<DebouncePolicy>::None;
+        _7 = std::option::Option::<BatchPolicy>::None;
+        _8 = std::option::Option::<ThrottlePolicy>::None;
+        _9 = std::option::Option::<QuotaPolicy>::None;
+        _10 = std::option::Option::<u64>::None;
+        _11 = std::option::Option::<&str>::None;
+        _12 = std::option::Option::<&str>::None;
+        _13 = std::option::Option::<&str>::None;
+        _15 = const "Replay-safe notification decision using ctx deterministic primitives";
+        _14 = std::option::Option::<&str>::Some(move _15);
+        _16 = std::option::Option::<fn() -> Value>::None;
+        _17 = std::option::Option::<fn() -> Value>::None;
+        _18 = std::option::Option::<fn() -> Value>::None;
+        _19 = std::option::Option::<RetryPolicy>::None;
+        _20 = std::option::Option::<&[&str]>::None;
+        _21 = std::option::Option::<&[&str]>::None;
+        _0 = WorkflowInfo { name: const "notify_decision", module: const "deterministic_primitives", handler: move _1, execution_timeout: move _2, chain_execution_timeout: move _3, sla: move _4, concurrency: move _5, debounce: move _6, batch: move _7, throttle: move _8, quota: move _9, max_input_bytes: move _10, owner: move _11, runbook_url: move _12, severity: move _13, description: move _14, input_schema: move _16, output_schema: move _17, error_schema: move _18, retry_policy: move _19, mcp: const false, declared_activities: move _20, declared_children: move _21 };
+        return;
+    }
+}
+
+alloc47 (size: 68, align: 1) {
+    0x00 │ 52 65 70 6c 61 79 2d 73 61 66 65 20 6e 6f 74 69 │ Replay-safe noti
+    0x10 │ 66 69 63 61 74 69 6f 6e 20 64 65 63 69 73 69 6f │ fication decisio
+    0x20 │ 6e 20 75 73 69 6e 67 20 63 74 78 20 64 65 74 65 │ n using ctx dete
+    0x30 │ 72 6d 69 6e 69 73 74 69 63 20 70 72 69 6d 69 74 │ rministic primit
+    0x40 │ 69 76 65 73                                     │ ives
+}
+
+alloc46 (size: 15, align: 1) {
+    6e 6f 74 69 66 79 5f 64 65 63 69 73 69 6f 6e    │ notify_decision
+}
+
+alloc37 (size: 24, align: 1) {
+    0x00 │ 64 65 74 65 72 6d 69 6e 69 73 74 69 63 5f 70 72 │ deterministic_pr
+    0x10 │ 69 6d 69 74 69 76 65 73                         │ imitives
+}
+
+fn __autumn_workflow_info_notify_decision::{closure#0}(_1: &{closure@autumn-harvest/examples/deterministic_primitives.rs:57:1: 57:98}, _2: &autumn_harvest::WorkflowContext, _3: Value) -> Pin<Box<dyn std::future::Future<Output = Result<Value, std::string::String>> + std::marker::Send>> {
+    debug ctx => _2;
+    debug input => _3;
+    let mut _0: std::pin::Pin<std::boxed::Box<dyn std::future::Future<Output = std::result::Result<autumn_harvest::serde_json::Value, std::string::String>> + std::marker::Send>>;
+    let mut _4: std::pin::Pin<std::boxed::Box<{async block@autumn-harvest/examples/deterministic_primitives.rs:57:1: 57:98}>>;
+    let mut _5: {async block@autumn-harvest/examples/deterministic_primitives.rs:57:1: 57:98};
+
+    bb0: {
+        _5 = {coroutine@autumn-harvest/examples/deterministic_primitives.rs:57:1: 57:98 (#31)} { input: move _3, ctx: copy _2 };
+        _4 = Box::<{async block@autumn-harvest/examples/deterministic_primitives.rs:57:1: 57:98}>::pin(move _5) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        _0 = move _4 as std::pin::Pin<std::boxed::Box<dyn std::future::Future<Output = std::result::Result<autumn_harvest::serde_json::Value, std::string::String>> + std::marker::Send>> (PointerCoercion(Unsize, Implicit));
+        return;
+    }
+}
+
+fn __autumn_workflow_info_notify_decision::{closure#0}::{closure#0}(_1: Pin<&mut {async block@autumn-harvest/examples/deterministic_primitives.rs:57:1: 57:98}>, _2: &mut Context<'_>) -> Poll<Result<Value, std::string::String>> {
+    debug _task_context => _2;
+    debug input => ((*_28).0: autumn_harvest::serde_json::Value);
+    debug ctx => ((*_28).1: &autumn_harvest::WorkflowContext);
+    let mut _0: std::task::Poll<std::result::Result<autumn_harvest::serde_json::Value, std::string::String>>;
+    let _3: NotificationEvent;
+    let mut _4: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, std::string::String>, NotificationEvent>;
+    let mut _5: std::result::Result<NotificationEvent, std::string::String>;
+    let mut _6: std::result::Result<NotificationEvent, autumn_harvest::serde_json::Error>;
+    let mut _7: autumn_harvest::serde_json::Value;
+    let mut _8: {closure@autumn-harvest/examples/deterministic_primitives.rs:57:1: 57:98};
+    let mut _9: isize;
+    let _10: std::result::Result<std::convert::Infallible, std::string::String>;
+    let _11: NotificationEvent;
+    let mut _12: {async fn body of notify_decision()};
+    let mut _13: {async fn body of notify_decision()};
+    let mut _14: NotificationEvent;
+    let mut _15: std::task::Poll<std::result::Result<NotificationDecision, std::string::String>>;
+    let mut _16: std::pin::Pin<&mut {async fn body of notify_decision()}>;
+    let mut _17: &mut {async fn body of notify_decision()};
+    let mut _18: &mut std::task::Context<'_>;
+    let mut _19: isize;
+    let mut _21: &mut std::task::Context<'_>;
+    let mut _22: std::result::Result<NotificationDecision, std::string::String>;
+    let mut _23: {closure@autumn-harvest/examples/deterministic_primitives.rs:57:1: 57:98};
+    let mut _24: {closure@autumn-harvest/examples/deterministic_primitives.rs:57:1: 57:98};
+    let mut _25: &autumn_harvest::WorkflowContext;
+    let mut _26: std::result::Result<autumn_harvest::serde_json::Value, std::string::String>;
+    let mut _27: u32;
+    let mut _28: &mut {async block@autumn-harvest/examples/deterministic_primitives.rs:57:1: 57:98};
+    scope 1 {
+        debug event => _3;
+        scope 6 {
+            debug result => _20;
+        }
+        scope 7 {
+            debug __awaitee => (((*_28) as variant#3).0: {async fn body of notify_decision()});
+            let _20: std::result::Result<NotificationDecision, std::string::String>;
+            scope 8 {
+                debug result => _20;
+            }
+        }
+    }
+    scope 2 {
+        debug residual => _10;
+        scope 3 {
+        }
+    }
+    scope 4 {
+        debug val => _11;
+        scope 5 {
+        }
+    }
+
+    bb0: {
+        _28 = copy (_1.0: &mut {async block@autumn-harvest/examples/deterministic_primitives.rs:57:1: 57:98});
+        _27 = discriminant((*_28));
+        switchInt(move _27) -> [0: bb1, 1: bb26, 2: bb25, 3: bb24, otherwise: bb5];
+    }
+
+    bb1: {
+        (((*_28) as variant#3).1: bool) = const false;
+        _7 = move ((*_28).0: autumn_harvest::serde_json::Value);
+        _6 = from_value::<NotificationEvent>(move _7) -> [return: bb2, unwind: bb22];
+    }
+
+    bb2: {
+        _8 = {closure@autumn-harvest/examples/deterministic_primitives.rs:57:1: 57:98};
+        _5 = Result::<NotificationEvent, autumn_harvest::serde_json::Error>::map_err::<std::string::String, {closure@autumn-harvest/examples/deterministic_primitives.rs:57:1: 57:98}>(move _6, move _8) -> [return: bb3, unwind: bb22];
+    }
+
+    bb3: {
+        _4 = <Result<NotificationEvent, std::string::String> as Try>::branch(move _5) -> [return: bb4, unwind: bb22];
+    }
+
+    bb4: {
+        _9 = discriminant(_4);
+        switchInt(move _9) -> [0: bb6, 1: bb7, otherwise: bb5];
+    }
+
+    bb5: {
+        unreachable;
+    }
+
+    bb6: {
+        _11 = move ((_4 as Continue).0: NotificationEvent);
+        (((*_28) as variant#3).1: bool) = const true;
+        _3 = move _11;
+        _25 = copy ((*_28).1: &autumn_harvest::WorkflowContext);
+        (((*_28) as variant#3).1: bool) = const false;
+        _14 = move _3;
+        _13 = notify_decision(copy _25, move _14) -> [return: bb9, unwind: bb21];
+    }
+
+    bb7: {
+        _10 = move ((_4 as Break).0: std::result::Result<std::convert::Infallible, std::string::String>);
+        _26 = <Result<Value, std::string::String> as FromResidual<Result<Infallible, std::string::String>>>::from_residual(copy _10) -> [return: bb8, unwind: bb22];
+    }
+
+    bb8: {
+        (((*_28) as variant#3).1: bool) = const false;
+        goto -> bb19;
+    }
+
+    bb9: {
+        _12 = <{async fn body of notify_decision()} as std::future::IntoFuture>::into_future(move _13) -> [return: bb10, unwind: bb21];
+    }
+
+    bb10: {
+        (((*_28) as variant#3).0: {async fn body of notify_decision()}) = move _12;
+        goto -> bb11;
+    }
+
+    bb11: {
+        _17 = &mut (((*_28) as variant#3).0: {async fn body of notify_decision()});
+        _16 = Pin::<&mut {async fn body of notify_decision()}>::new_unchecked(copy _17) -> [return: bb12, unwind: bb20];
+    }
+
+    bb12: {
+        _18 = copy _2;
+        _15 = <{async fn body of notify_decision()} as std::future::Future>::poll(move _16, copy _18) -> [return: bb13, unwind: bb20];
+    }
+
+    bb13: {
+        _19 = discriminant(_15);
+        switchInt(move _19) -> [0: bb15, 1: bb14, otherwise: bb5];
+    }
+
+    bb14: {
+        _0 = Poll::<Result<Value, std::string::String>>::Pending;
+        discriminant((*_28)) = 3;
+        return;
+    }
+
+    bb15: {
+        _20 = move ((_15 as Ready).0: std::result::Result<NotificationDecision, std::string::String>);
+        drop((((*_28) as variant#3).0: {async fn body of notify_decision()})) -> [return: bb16, unwind: bb21];
+    }
+
+    bb16: {
+        _23 = {closure@autumn-harvest/examples/deterministic_primitives.rs:57:1: 57:98};
+        _22 = Result::<NotificationDecision, std::string::String>::map_err::<std::string::String, {closure@autumn-harvest/examples/deterministic_primitives.rs:57:1: 57:98}>(copy _20, move _23) -> [return: bb17, unwind: bb21];
+    }
+
+    bb17: {
+        _24 = {closure@autumn-harvest/examples/deterministic_primitives.rs:57:1: 57:98};
+        _26 = Result::<NotificationDecision, std::string::String>::and_then::<Value, {closure@autumn-harvest/examples/deterministic_primitives.rs:57:1: 57:98}>(move _22, move _24) -> [return: bb18, unwind: bb21];
+    }
+
+    bb18: {
+        (((*_28) as variant#3).1: bool) = const false;
+        goto -> bb19;
+    }
+
+    bb19: {
+        _0 = Poll::<Result<Value, std::string::String>>::Ready(move _26);
+        discriminant((*_28)) = 1;
+        return;
+    }
+
+    bb20 (cleanup): {
+        drop((((*_28) as variant#3).0: {async fn body of notify_decision()})) -> [return: bb21, unwind terminate(cleanup)];
+    }
+
+    bb21 (cleanup): {
+        switchInt(copy (((*_28) as variant#3).1: bool)) -> [0: bb22, otherwise: bb23];
+    }
+
+    bb22 (cleanup): {
+        (((*_28) as variant#3).1: bool) = const false;
+        discriminant((*_28)) = 2;
+        resume;
+    }
+
+    bb23 (cleanup): {
+        drop(_3) -> [return: bb22, unwind terminate(cleanup)];
+    }
+
+    bb24: {
+        _21 = move _2;
+        _2 = move _21;
+        goto -> bb11;
+    }
+
+    bb25: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb25, unwind continue];
+    }
+
+    bb26: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb26, unwind continue];
+    }
+}
+
+fn __autumn_workflow_info_notify_decision::{closure#0}::{closure#0}::{closure#0}(_1: {closure@autumn-harvest/examples/deterministic_primitives.rs:57:1: 57:98}, _2: autumn_harvest::serde_json::Error) -> std::string::String {
+    debug e => _2;
+    let mut _0: std::string::String;
+    let mut _3: &autumn_harvest::serde_json::Error;
+
+    bb0: {
+        _3 = &_2;
+        _0 = <autumn_harvest::serde_json::Error as ToString>::to_string(move _3) -> [return: bb1, unwind: bb3];
+    }
+
+    bb1: {
+        drop(_2) -> [return: bb2, unwind continue];
+    }
+
+    bb2: {
+        return;
+    }
+
+    bb3 (cleanup): {
+        drop(_2) -> [return: bb4, unwind terminate(cleanup)];
+    }
+
+    bb4 (cleanup): {
+        resume;
+    }
+}
+
+fn __autumn_workflow_info_notify_decision::{closure#0}::{closure#0}::{closure#1}(_1: {closure@autumn-harvest/examples/deterministic_primitives.rs:57:1: 57:98}, _2: std::string::String) -> std::string::String {
+    debug e => _2;
+    let mut _0: std::string::String;
+    let mut _3: &std::string::String;
+
+    bb0: {
+        _3 = &_2;
+        _0 = <std::string::String as ToString>::to_string(move _3) -> [return: bb1, unwind: bb3];
+    }
+
+    bb1: {
+        drop(_2) -> [return: bb2, unwind continue];
+    }
+
+    bb2: {
+        return;
+    }
+
+    bb3 (cleanup): {
+        drop(_2) -> [return: bb4, unwind terminate(cleanup)];
+    }
+
+    bb4 (cleanup): {
+        resume;
+    }
+}
+
+fn __autumn_workflow_info_notify_decision::{closure#0}::{closure#0}::{closure#2}(_1: {closure@autumn-harvest/examples/deterministic_primitives.rs:57:1: 57:98}, _2: NotificationDecision) -> Result<Value, std::string::String> {
+    debug v => _2;
+    let mut _0: std::result::Result<autumn_harvest::serde_json::Value, std::string::String>;
+    let mut _3: std::result::Result<autumn_harvest::serde_json::Value, autumn_harvest::serde_json::Error>;
+
+    bb0: {
+        _3 = to_value::<NotificationDecision>(copy _2) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        _0 = Result::<Value, autumn_harvest::serde_json::Error>::map_err::<std::string::String, {closure@autumn-harvest/examples/deterministic_primitives.rs:57:1: 57:98}>(move _3, const ZeroSized: {closure@autumn-harvest/examples/deterministic_primitives.rs:57:1: 57:98}) -> [return: bb2, unwind continue];
+    }
+
+    bb2: {
+        return;
+    }
+}
+
+fn __autumn_workflow_info_notify_decision::{closure#0}::{closure#0}::{closure#2}::{closure#0}(_1: {closure@autumn-harvest/examples/deterministic_primitives.rs:57:1: 57:98}, _2: autumn_harvest::serde_json::Error) -> std::string::String {
+    debug e => _2;
+    let mut _0: std::string::String;
+    let mut _3: &autumn_harvest::serde_json::Error;
+
+    bb0: {
+        _3 = &_2;
+        _0 = <autumn_harvest::serde_json::Error as ToString>::to_string(move _3) -> [return: bb1, unwind: bb3];
+    }
+
+    bb1: {
+        drop(_2) -> [return: bb2, unwind continue];
+    }
+
+    bb2: {
+        return;
+    }
+
+    bb3 (cleanup): {
+        drop(_2) -> [return: bb4, unwind terminate(cleanup)];
+    }
+
+    bb4 (cleanup): {
+        resume;
+    }
+}
+
+fn notify_decision_info() -> WorkflowInfo {
+    let mut _0: autumn_harvest::WorkflowInfo;
+
+    bb0: {
+        _0 = __autumn_workflow_info_notify_decision() -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+fn main() -> () {
+    let mut _0: ();
+    let _1: ();
+    let mut _2: std::fmt::Arguments<'_>;
+    let _3: ();
+    let mut _4: std::fmt::Arguments<'_>;
+    let _5: ();
+    let mut _6: std::fmt::Arguments<'_>;
+    let _7: ();
+    let mut _8: std::fmt::Arguments<'_>;
+    let _9: ();
+    let mut _10: std::fmt::Arguments<'_>;
+    let _11: ();
+    let mut _12: std::fmt::Arguments<'_>;
+    let _13: ();
+    let mut _14: std::fmt::Arguments<'_>;
+    let _15: ();
+    let mut _16: std::fmt::Arguments<'_>;
+    let _17: ();
+    let mut _18: std::fmt::Arguments<'_>;
+    let _19: ();
+    let mut _20: std::fmt::Arguments<'_>;
+    let _21: ();
+    let mut _22: std::fmt::Arguments<'_>;
+
+    bb0: {
+        _2 = Arguments::<'_>::from_str(const "deterministic_primitives example loaded successfully!\n") -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        _1 = _print(move _2) -> [return: bb2, unwind continue];
+    }
+
+    bb2: {
+        _4 = Arguments::<'_>::from_str(const "\n") -> [return: bb3, unwind continue];
+    }
+
+    bb3: {
+        _3 = _print(move _4) -> [return: bb4, unwind continue];
+    }
+
+    bb4: {
+        _6 = Arguments::<'_>::from_str(const "Replay-safe primitives demonstrated:\n") -> [return: bb5, unwind continue];
+    }
+
+    bb5: {
+        _5 = _print(move _6) -> [return: bb6, unwind continue];
+    }
+
+    bb6: {
+        _8 = Arguments::<'_>::from_str(const "  ctx.system_now()        — wall-clock captured once, replayed verbatim\n") -> [return: bb7, unwind continue];
+    }
+
+    bb7: {
+        _7 = _print(move _8) -> [return: bb8, unwind continue];
+    }
+
+    bb8: {
+        _10 = Arguments::<'_>::from_str(const "  ctx.new_uuid()          — UUIDv7 idempotency key captured once\n") -> [return: bb9, unwind continue];
+    }
+
+    bb9: {
+        _9 = _print(move _10) -> [return: bb10, unwind continue];
+    }
+
+    bb10: {
+        _12 = Arguments::<'_>::from_str(const "  ctx.random_range(0..100)— sampling draw, deterministic across replays\n") -> [return: bb11, unwind continue];
+    }
+
+    bb11: {
+        _11 = _print(move _12) -> [return: bb12, unwind continue];
+    }
+
+    bb12: {
+        _14 = Arguments::<'_>::from_str(const "  ctx.side_effect(name,f) — one-shot environment lookup captured once\n") -> [return: bb13, unwind continue];
+    }
+
+    bb13: {
+        _13 = _print(move _14) -> [return: bb14, unwind continue];
+    }
+
+    bb14: {
+        _16 = Arguments::<'_>::from_str(const "\n") -> [return: bb15, unwind continue];
+    }
+
+    bb15: {
+        _15 = _print(move _16) -> [return: bb16, unwind continue];
+    }
+
+    bb16: {
+        _18 = Arguments::<'_>::from_str(const "Register on a HarvestBuilder:\n") -> [return: bb17, unwind continue];
+    }
+
+    bb17: {
+        _17 = _print(move _18) -> [return: bb18, unwind continue];
+    }
+
+    bb18: {
+        _20 = Arguments::<'_>::from_str(const "  .workflows(workflows![notify_decision])\n") -> [return: bb19, unwind continue];
+    }
+
+    bb19: {
+        _19 = _print(move _20) -> [return: bb20, unwind continue];
+    }
+
+    bb20: {
+        _22 = Arguments::<'_>::from_str(const "  .activities(activities![send_email])\n") -> [return: bb21, unwind continue];
+    }
+
+    bb21: {
+        _21 = _print(move _22) -> [return: bb22, unwind continue];
+    }
+
+    bb22: {
+        return;
+    }
+}
+
+alloc57 (size: 39, align: 1) {
+    0x00 │ 20 20 2e 61 63 74 69 76 69 74 69 65 73 28 61 63 │   .activities(ac
+    0x10 │ 74 69 76 69 74 69 65 73 21 5b 73 65 6e 64 5f 65 │ tivities![send_e
+    0x20 │ 6d 61 69 6c 5d 29 0a                            │ mail]).
+}
+
+alloc56 (size: 42, align: 1) {
+    0x00 │ 20 20 2e 77 6f 72 6b 66 6c 6f 77 73 28 77 6f 72 │   .workflows(wor
+    0x10 │ 6b 66 6c 6f 77 73 21 5b 6e 6f 74 69 66 79 5f 64 │ kflows![notify_d
+    0x20 │ 65 63 69 73 69 6f 6e 5d 29 0a                   │ ecision]).
+}
+
+alloc55 (size: 30, align: 1) {
+    0x00 │ 52 65 67 69 73 74 65 72 20 6f 6e 20 61 20 48 61 │ Register on a Ha
+    0x10 │ 72 76 65 73 74 42 75 69 6c 64 65 72 3a 0a       │ rvestBuilder:.
+}
+
+alloc54 (size: 72, align: 1) {
+    0x00 │ 20 20 63 74 78 2e 73 69 64 65 5f 65 66 66 65 63 │   ctx.side_effec
+    0x10 │ 74 28 6e 61 6d 65 2c 66 29 20 e2 80 94 20 6f 6e │ t(name,f) ... on
+    0x20 │ 65 2d 73 68 6f 74 20 65 6e 76 69 72 6f 6e 6d 65 │ e-shot environme
+    0x30 │ 6e 74 20 6c 6f 6f 6b 75 70 20 63 61 70 74 75 72 │ nt lookup captur
+    0x40 │ 65 64 20 6f 6e 63 65 0a                         │ ed once.
+}
+
+alloc53 (size: 74, align: 1) {
+    0x00 │ 20 20 63 74 78 2e 72 61 6e 64 6f 6d 5f 72 61 6e │   ctx.random_ran
+    0x10 │ 67 65 28 30 2e 2e 31 30 30 29 e2 80 94 20 73 61 │ ge(0..100)... sa
+    0x20 │ 6d 70 6c 69 6e 67 20 64 72 61 77 2c 20 64 65 74 │ mpling draw, det
+    0x30 │ 65 72 6d 69 6e 69 73 74 69 63 20 61 63 72 6f 73 │ erministic acros
+    0x40 │ 73 20 72 65 70 6c 61 79 73 0a                   │ s replays.
+}
+
+alloc52 (size: 67, align: 1) {
+    0x00 │ 20 20 63 74 78 2e 6e 65 77 5f 75 75 69 64 28 29 │   ctx.new_uuid()
+    0x10 │ 20 20 20 20 20 20 20 20 20 20 e2 80 94 20 55 55 │           ... UU
+    0x20 │ 49 44 76 37 20 69 64 65 6d 70 6f 74 65 6e 63 79 │ IDv7 idempotency
+    0x30 │ 20 6b 65 79 20 63 61 70 74 75 72 65 64 20 6f 6e │  key captured on
+    0x40 │ 63 65 0a                                        │ ce.
+}
+
+alloc51 (size: 74, align: 1) {
+    0x00 │ 20 20 63 74 78 2e 73 79 73 74 65 6d 5f 6e 6f 77 │   ctx.system_now
+    0x10 │ 28 29 20 20 20 20 20 20 20 20 e2 80 94 20 77 61 │ ()        ... wa
+    0x20 │ 6c 6c 2d 63 6c 6f 63 6b 20 63 61 70 74 75 72 65 │ ll-clock capture
+    0x30 │ 64 20 6f 6e 63 65 2c 20 72 65 70 6c 61 79 65 64 │ d once, replayed
+    0x40 │ 20 76 65 72 62 61 74 69 6d 0a                   │  verbatim.
+}
+
+alloc50 (size: 37, align: 1) {
+    0x00 │ 52 65 70 6c 61 79 2d 73 61 66 65 20 70 72 69 6d │ Replay-safe prim
+    0x10 │ 69 74 69 76 65 73 20 64 65 6d 6f 6e 73 74 72 61 │ itives demonstra
+    0x20 │ 74 65 64 3a 0a                                  │ ted:.
+}
+
+alloc49 (size: 1, align: 1) {
+    0a                                              │ .
+}
+
+alloc48 (size: 54, align: 1) {
+    0x00 │ 64 65 74 65 72 6d 69 6e 69 73 74 69 63 5f 70 72 │ deterministic_pr
+    0x10 │ 69 6d 69 74 69 76 65 73 20 65 78 61 6d 70 6c 65 │ imitives example
+    0x20 │ 20 6c 6f 61 64 65 64 20 73 75 63 63 65 73 73 66 │  loaded successf
+    0x30 │ 75 6c 6c 79 21 0a                               │ ully!.
+}

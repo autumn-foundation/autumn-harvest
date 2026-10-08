@@ -1,0 +1,99 @@
+# Deep property-test pass (issue #1829).
+#
+# CI runs the property suites on each change with the default 128 cases. This
+# workflow runs them deep every night, with `PROPTEST_CASES` raised:
+#
+# - `property`: every suite of the `property` target, 100000 cases each.
+# - `lifecycle`: the stateful lifecycle model (`lifecycle_model_props`), which
+#   runs each case against a real Postgres. One case costs about 150 ms, so
+#   eight shards run 12500 cases each, 100000 in total. Each shard draws its
+#   own random seed.
+# - `alert`: a failed scheduled run opens an issue, or comments on the open
+#   one. GitHub tells only the last editor of a cron about a failure.
+#
+# A failure prints the shrunk operation sequence. Replay it locally as
+# `docs/testing/property-and-fuzz.md` describes.
+name: Proptest deep
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Nightly at 03:29 UTC, off the hour and away from the chaos run.
+    - cron: "29 3 * * *"
+
+concurrency:
+  group: proptest-nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  property:
+    name: Property suites (deep)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      PROPTEST_CASES: "100000"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Run the property suites
+        run: cargo test -p autumn-harvest --features db --test property
+
+  lifecycle:
+    name: Lifecycle model (deep, shard ${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    env:
+      PROPTEST_CASES: "12500"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Run the lifecycle model
+        # Each test owns a Postgres container (testcontainers), so the
+        # runner needs only Docker.
+        run: 'cargo test -p autumn-harvest --test integration lifecycle_model_props:: -- --test-threads=1'
+
+  alert:
+    name: Report a failed nightly
+    needs: [property, lifecycle]
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      LIFECYCLE_RESULT: ${{ needs.lifecycle.result }}
+    steps:
+      - name: Open or update the alert issue
+        run: |
+          title="Proptest nightly: a scheduled run failed"
+          body="The deep property run failed: ${RUN_URL}"
+          if [ "$LIFECYCLE_RESULT" = "failure" ]; then
+            body="${body}. Add each shrunk lifecycle sequence to PINNED in lifecycle_model_props.rs (docs/testing/property-and-fuzz.md)."
+          fi
+          issue="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "in:title \"$title\"" --json number,title \
+            --jq "map(select(.title == \"$title\")) | .[0].number // empty")"
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi

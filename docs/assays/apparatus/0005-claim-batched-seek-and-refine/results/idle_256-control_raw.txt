@@ -1,0 +1,5 @@
+ id | task_type | concurrency_key | concurrency_cap 
+----+-----------+-----------------+-----------------
+  1 | activity  | bench-ck-0      |         1000000
+(1 row)
+

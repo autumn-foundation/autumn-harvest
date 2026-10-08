@@ -45,7 +45,6 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -125,7 +124,7 @@ async fn setup_three_shards() -> ((String, String, String), Option<ContainerAsyn
         let mut conn = <AsyncPgConnection as AsyncConnection>::establish(url)
             .await
             .expect("shard connect");
-        conn.batch_execute(autumn_harvest::full_migrations_sql())
+        conn.batch_execute(&autumn_harvest::test_init_sql())
             .await
             .expect("migrate shard");
     }
@@ -218,6 +217,18 @@ fn build_app_with_writable(
     url_drained: &str,
     writable: &[i32],
 ) -> HarvestApiApp {
+    build_app_with_reserved(url_eu, url_us, url_drained, writable, &[])
+}
+
+/// As [`build_app_with_writable`] but also reserves `reserved` for tenant
+/// cells (issue #1837).
+fn build_app_with_reserved(
+    url_eu: &str,
+    url_us: &str,
+    url_drained: &str,
+    writable: &[i32],
+    reserved: &[i32],
+) -> HarvestApiApp {
     let mut pools = BTreeMap::new();
     pools.insert(ShardId::new(EU_SHARD), build_pool(url_eu));
     pools.insert(ShardId::new(US_SHARD), build_pool(url_us));
@@ -236,7 +247,8 @@ fn build_app_with_writable(
     .with_residency_map([
         ("eu".to_string(), ShardId::new(EU_SHARD)),
         ("us".to_string(), ShardId::new(US_SHARD)),
-    ]);
+    ])
+    .with_reserved_shards(reserved.iter().copied().map(ShardId::new));
 
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(true);
@@ -260,7 +272,7 @@ fn build_app_with_writable(
         router,
     ));
 
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 async fn post_start(app: &HarvestApiApp, body: Value) -> (StatusCode, Value) {
@@ -412,6 +424,38 @@ async fn residency_key_pins_the_execution_to_the_mapped_shard() {
     assert_eq!(exec_id.shard(), ShardId::new(US_SHARD));
     assert_eq!(row_count(&us, exec_id).await, 1);
     assert_eq!(row_count(&eu, exec_id).await, 0);
+}
+
+/// A pin into a reserved cell with no `workflow_id` lands in the cell
+/// (issue #1837). No minted id can hash to a cell, so the start must not
+/// depend on the mint loop. An unpinned start still avoids the cell.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pin_into_a_reserved_cell_without_a_workflow_id_lands_in_the_cell() {
+    let ((eu, us, drained), _guard) = setup_three_shards().await;
+    let app = build_app_with_reserved(&eu, &us, &drained, &[EU_SHARD, US_SHARD], &[US_SHARD]);
+
+    for _ in 0..3 {
+        let (status, body) = post_start(&app, json!({ "input": {}, "residency_key": "us" })).await;
+        assert_eq!(status, StatusCode::CREATED, "body: {body}");
+        assert_eq!(body["shard_id"].as_i64(), Some(i64::from(US_SHARD)));
+        let exec_id = exec_id_of(&body);
+        assert_eq!(exec_id.shard(), ShardId::new(US_SHARD));
+        assert_eq!(row_count(&us, exec_id).await, 1);
+    }
+
+    for i in 0..10 {
+        let (status, body) = post_start(
+            &app,
+            json!({ "workflow_id": format!("shared-{i}"), "input": {} }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "body: {body}");
+        assert_eq!(
+            exec_id_of(&body).shard(),
+            ShardId::new(EU_SHARD),
+            "an unpinned start must not land in the cell"
+        );
+    }
 }
 
 // ── Success metric: N workflows across K residency keys ──────────────────────
@@ -787,7 +831,7 @@ fn build_app_with_unpooled_shard(url_eu: &str, url_us: &str, url_drained: &str) 
         router,
     ));
 
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 /// AC2/AC5 (fail closed): a pin to a shard the router accepts but that has no

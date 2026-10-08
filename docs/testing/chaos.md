@@ -54,6 +54,8 @@ off.
 | `SCHED_AFTER_START_BEFORE_ADVANCE` | `scheduler.after_start.before_advance` | KILL, DELAY | #350 — double-fire on crash-recovery |
 | `POISON_RECLAIM_BEFORE_LOAD` | `poison.reclaim.before_load` | ERROR | AC1(b) — a transient Diesel/connection error at the reclaim scan |
 | `NOTIFY_TASK_ENQUEUED` | `notify.task_enqueued` | DROP_NOTIFY | AC1(c) — a dropped `LISTEN`/`NOTIFY` wake; dispatch must converge via the poll loop |
+| `DISPATCH_AFTER_CLAIM_BEFORE_ACK` | `dispatch.after_claim.before_ack` | KILL, DELAY | #1312 — a worker death between the by-id claim commit and the reference ack |
+| `WORKER_DISPATCH_BEFORE_START` | `worker.dispatch.before_start` | KILL, DELAY | #1813 — a shutdown between the claim and the task start |
 
 Caps declare the primitive classes a point can host:
 
@@ -188,6 +190,10 @@ HARVEST_TEST_DATABASE_URL=postgres://harvest@127.0.0.1:5432/harvest_chaos \
 Without `HARVEST_TEST_DATABASE_URL` the suite spins a fresh migrated Postgres 16
 container per test (the CI path).
 
+The `infra_faults` tests always start their own containers and need Docker.
+To leave them out of a fast local run, add `--skip infra_faults` after the
+`--`.
+
 ## The convergence sweep (AC5)
 
 `chaos_seeded_convergence_sweep` runs a bounded workload under
@@ -242,8 +248,174 @@ and on a nightly `cron`. The cron leaves `CHAOS_SEEDS` empty so the sweep uses
 its computed default (≥ 5 seeds per run, AC5); a manual dispatch can supply
 explicit seeds to replay a printed failure.
 
+### Nightly watchdog (issue #1790)
+
+Before the fix for issue #1790, `chaos.yml` did not parse, so the nightly never
+ran. Two checks now catch a repeat:
+
+- `ci_run_coverage` parses every workflow file. It also checks that `chaos.yml`
+  has a cron and runs `chaos_tests::` with the `chaos` feature. An `if` or a
+  `continue-on-error: true` on that step or its job fails the check. In the
+  step's `run:` text, a flag such as `--no-run` or `--skip` fails it too. The
+  step must be one plain `cargo test` command, so `|| true`, `; true` or an
+  `echo` of the arguments also fails it.
+- `.github/workflows/chaos-watchdog.yml` runs daily at 10:41 UTC. It runs
+  `.github/ci/chaos-watchdog.sh`. When no scheduled `chaos.yml` run succeeds in
+  a 48-hour window, the script opens an issue with this title:
+  `Chaos nightly: no successful scheduled run in 48 h`.
+  While the gap continues, the script adds a comment to that issue. After the
+  next success, it closes the issue.
+
+The watchdog is a separate file, so a defect in `chaos.yml` cannot also stop the
+alert. An API error makes the watchdog run fail. It does not open a false alert.
+A final `if: failure()` step then runs `chaos-watchdog.sh self-failed`. It opens
+an issue titled `Chaos watchdog: a watchdog run failed`, or comments on the open
+one. GitHub tells only the last editor of a cron about a failed scheduled run, so
+without this step the failure is silent. The next clean watchdog run closes that
+issue. Each step has its own timeout, and the step timeouts sum to less than the
+job timeout. A step timeout is a failure, so the report step still runs, also
+after a hung checkout. When checkout fails, the report step opens the
+issue without the script, or comments on the open one. A concurrency group runs
+one watchdog job at a time, so two runs cannot both open an issue.
+
+## Infrastructure faults (issue #1801)
+
+A chaos KILL is a panic in one tokio task. The tests in
+`chaos_tests::infra_faults` inject faults below the engine instead. They are a
+submodule of `chaos_tests`, so the nightly `chaos_tests::` step runs them, and
+the watchdog alerts on a failure. The module compiles on Unix only.
+
+Each test starts its own Postgres 16 container and a toxiproxy container on a
+private docker network. Workers connect through the `worker` proxy. The test
+reads state through the `admin` proxy, which never gets a toxic. A Postgres
+restart therefore does not change any URL. These tests ignore
+`HARVEST_TEST_DATABASE_URL`, because a restart or a pause cannot target a
+shared database.
+
+Workers use a 500 ms heartbeat, so the lease TTL (the stale threshold) is 1 s.
+The latency test also raises the workflow-task budget to 60 s, because a
+decision cycle takes more than 10 s at that latency.
+
+| Scenario | Test | Fault | Proof the fault landed |
+|---|---|---|---|
+| Kill mid-commit | `terminate_backend_mid_commit_append` | `pg_terminate_backend` while COMMIT of an `ActivityCompleted` insert waits; the transaction rolls back | the blocked backend exits |
+| | `terminate_backend_mid_commit_complete` | the same, for a `WorkflowCompleted` insert | the blocked backend exits |
+| | `terminate_backend_mid_commit_claim` | the same, for the first `PENDING` to `RUNNING` claim | the blocked backend exits |
+| Lost COMMIT ack | `terminate_backend_after_commit_ack_lost_append` | a downstream blackhole drops the replies; the COMMIT lands; then `pg_terminate_backend` | the backend goes idle, then exits |
+| | `terminate_backend_after_commit_ack_lost_complete` | the same, for a `WorkflowCompleted` insert | the backend goes idle, then exits |
+| | `terminate_backend_after_commit_ack_lost_claim` | the same, for the first claim | the backend goes idle, then exits |
+| Restart | `postgres_crash_restart_mid_workload` | stop Postgres with no grace period, then start it | an activity runs at the crash |
+| Pause | `postgres_pause_longer_than_lease_ttl` | `docker pause` for 4 s, two workers | activities run at the pause |
+| Latency | `toxiproxy_latency_between_worker_and_db` | 100 ms ± 50 ms in each direction | a probe round trip is slow |
+| Partition | `toxiproxy_partition_longer_than_lease_ttl` | blackhole worker A for at least 4 s, until worker B holds every task | B reclaims all three tasks; the stale results of A are rejected |
+| SIGKILL | `sigkill_child_worker_mid_activity` | SIGKILL of a worker that runs as a child process | the child dies by signal 9; its task is reclaimed |
+
+**The COMMIT rendezvous.** A test-only `DEFERRABLE INITIALLY DEFERRED`
+constraint trigger runs inside COMMIT. It waits on a shared advisory lock that
+the test holds. The test finds the waiting backend in `pg_locks`. For a
+rollback, it terminates the backend, waits up to 10 s for the exit, and then
+releases the lock. For a lost acknowledgement, it first blackholes the
+replies, then releases the lock. The COMMIT lands, and the test terminates the
+idle backend. Either way the kill lands after COMMIT is sent and before the
+worker reads a reply. No production code changes.
+
+**The partition test.** Attempt 1 of each activity waits on worker A. Worker
+B reclaims the tasks, and its attempt 2 waits too. After the heal, the test
+releases attempt 1, and A writes three stale results. No result exists yet, so
+only the claim fence can reject them, and the test asserts that no
+`ActivityCompleted` exists. Then the test releases attempt 2, and B finishes
+the workflows. With the fence disabled, the test fails.
+
+**The oracle.** Every test checks `assert_converged`, the oracle of the
+convergence sweep. It requires every workflow `COMPLETED`, exactly one terminal
+event per execution, no stranded `RUNNING` task, and no dangling
+`ExternalSignalRequested`. The table key does not stop a second terminal event
+at a new event id, so the oracle counts terminal events itself.
+`oracle_flags_a_duplicate_terminal_event` forges a duplicate to prove the
+check. Each activity workflow must also have exactly one activity terminal
+event, an `ActivityCompleted`.
+
+**Known bugs.** The tests found four bugs:
+
+- #1871: the worker did not retry the activity result write after a DB
+  error. The result was lost, and only `start_to_close` recovered the task.
+  #1788 fixed #1871 for a session that the server ends. The worker now
+  writes the result again, up to 10 times, and gets a new connection after
+  a lost one.
+- #1870: a `StartToClose` timeout ignored the retry policy and failed the
+  workflow. #1809 and #1870 fixed it. A timeout with attempts left now starts
+  a new attempt.
+- #1876: Postgres keeps the open transaction of a partitioned worker until
+  TCP keepalive ends the session. That transaction keeps its row locks.
+  Orphan reclaim blocked on such a lock, so no orphan was reclaimed. The
+  #1876 fix makes reclaim skip a locked row and reclaim the other rows.
+- #1879: the heartbeat period was the interval plus the tick latency. When a
+  tick took longer than one interval, a live worker looked dead. False
+  reclaims then counted crash strikes and quarantined healthy work. The fix
+  makes the heartbeat fixed-rate. The reclaimer also holds the last strike
+  until it confirms the death of the worker.
+
+Each test works around a bug only where the bug applies:
+
+- Both append tests require `COMPLETED`, with one attempt of the activity.
+  The rolled-back test pins the #1871 fix: the worker writes the result
+  again, and the handler does not run again. With the repeat turned off, the
+  worker gives the claim back and a second attempt runs. Only the attempt
+  check fails. In the ack-lost test, the commit landed, so the repeat must
+  change nothing.
+- A result write reaches the `StartToClose` timeout when its repeats and
+  the claim give-back all fail. A crash restart can cause that. The retry
+  policy then starts a new attempt (#1870), so the restart test requires
+  `COMPLETED` for every workflow.
+- The partition test sets `idle_in_transaction_session_timeout = 5s` on the
+  server. This setting is no longer a #1876 workaround. A row that the
+  cut-off session locks stays locked until the session ends. The 5 s limit
+  ends that session within the test budget, so the setting stays.
+
+When a fix for a bug merges, remove its workaround.
+
+**Replay.** Run one test locally with Docker:
+
+```bash
+cargo test -p autumn-harvest --features chaos --test integration \
+  chaos_tests::infra_faults::toxiproxy_partition_longer_than_lease_ttl -- --nocapture
+```
+
+## History checks (issue #1829)
+
+Two chaos reproducers and a crash suite record client histories and check
+them for linearizability. `tests/integration/history_checker.rs` holds the checker.
+It follows Porcupine: a search for one real-time order that a sequential
+model accepts, done per key. An operation with no clear outcome after a
+crash is an `info` operation, as in Jepsen. It may or may not have taken
+effect.
+
+- `chaos_repro_350_crashed_fire_claim_is_refired_exactly_once` and
+  `chaos_repro_350_post_start_crash_dedupes_to_exactly_one` record their
+  ticks and reads. The history must satisfy the `ExactlyOnceFire` model.
+- `tests/integration/history_crash_tests.rs` runs concurrent clients while
+  it drops request futures and calls `pg_terminate_backend` at random.
+  Idempotent starts must satisfy `StartIdempotency`. Scheduler replicas
+  must satisfy `ExactlyOnceFire`. The suite needs only the `db` feature, so
+  the `test-db-linux` job runs it on each change. That job is not a required
+  check yet. Set `HISTORY_SEED` to replay the random choices of a printed
+  seed. The thread timing can still differ.
+
+A crashed operation has no known outcome, so it may take effect at any
+later time. When the test knows that nothing a crash started can still run,
+it calls `Recorder::bound_open_infos`. A later read then constrains the
+crashed operations. Each suite calls it after the server has no session of
+the test left. The chaos reproducers call it after the killed task joins.
+
+The convergence sweep does not record a history. It drives workflow tasks,
+not starts or schedule fires.
+
+The checker self-tests feed it forged violations: two creators, a read of
+two runs, a real-time inversion, a lost fire, a replaced run, and a crashed
+fire that takes effect after its bound.
+
 ## Out of scope
 
-Production/runtime chaos (#796), network-partition / Jepsen / Antithesis-style
-testing, DAG what-if simulation, and *fixing* any new bug the harness surfaces —
-new bugs are filed and fixed separately.
+Production/runtime chaos (#796), Antithesis-style deterministic simulation, DAG
+what-if simulation, and *fixing* any new bug the harness surfaces — new bugs
+are filed and fixed separately.

@@ -599,10 +599,18 @@ async fn typed_workflow_failure_preserves_metadata_and_replays_on_core() {
         )
         .replay_from_events(history)
         .await;
+    // Issue #952: a history ending in a terminal `WorkflowFailed` that replays to
+    // the same failure is a CLEAN replay (`ReplaySucceeded`), and the reproduced
+    // error is read through `failure_message()`. The property under test is
+    // unchanged: no non-determinism divergence, and the typed failure reproduced.
     assert!(
-        matches!(report.status, ReplayStatus::WorkflowFailed { .. }),
-        "a typed-workflow-failure history must replay to a clean WorkflowFailed \
-         (no non-determinism divergence) on the core engine:\n{report}"
+        !matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "a typed-workflow-failure history must replay without drift on the core \
+         engine:\n{report}"
+    );
+    assert!(
+        report.failure_message().is_some(),
+        "the typed workflow failure must be reproduced:\n{report}"
     );
 }
 

@@ -16,6 +16,19 @@ workflow event history and never stores raw payloads.
 Read-only routes (health checks, list/get/query, worker heartbeats, activity
 heartbeats) intentionally produce no audit rows.
 
+## Shipping the trail off-box
+
+By default these rows live per shard, **inside the same Postgres databases they
+describe** — so the principal who can rewrite the record of what they did is
+the same principal who has database access. If you are answering a SOC 2 /
+ISO 27001 question about where privileged-action logs ship and how you know
+none were lost, turn on audit export (issue #953): Harvest streams every audit
+record to a sink you run with at-least-once delivery, a dense per-shard
+sequence the receiver can check for contiguity, a visible lag metric, and a
+redrive path. See **[`docs/audit-export.md`](../audit-export.md)**.
+
+The scenarios below query the local trail directly and work either way.
+
 ---
 
 ## Scenario 1 — "Who cancelled workflow X?"
@@ -131,10 +144,19 @@ curl -s "https://app.example.com/api/harvest/admin/audit?actor=alice%40co&status
 | Outcome | `--status` | `status` | `succeeded` or `failed` |
 | Lower time bound (inclusive) | `--since` | `since` | RFC 3339 |
 | Upper time bound (exclusive) | `--before` | `before` | RFC 3339 |
+| `before` tiebreaker | `--before-id` | `before_id` | Row id. See below. |
 | Page size | `--limit` | `limit` | 1–500, default 50 |
 
-Results are always ordered `occurred_at DESC`. The CLI prints a table by
-default; pass `--output json` for machine-readable output.
+Results are always ordered `(occurred_at, id) DESC`. The CLI prints a table
+by default; pass `--output json` for machine-readable output.
+
+### Paging past tied timestamps
+
+A batch action (e.g. bulk pause/resume) can write many rows with one exact
+`occurred_at`. To page past a tie without loss, pass `--before-id` (or
+`before_id`) alongside `--before`: use the prior page's last row id. Without
+`--before-id`, a request paging on `--before` alone can skip a row tied at
+the page boundary (issue #1408).
 
 ---
 

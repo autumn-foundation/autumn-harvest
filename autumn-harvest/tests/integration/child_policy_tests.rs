@@ -33,7 +33,7 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 async fn setup_test_db_url() -> (String, ContainerAsync<Postgres>) {
@@ -65,8 +65,16 @@ fn build_pool(url: &str) -> DbPool {
 }
 
 fn make_worker(registry: Arc<HandlerRegistry>) -> Worker {
+    make_worker_with_redeliveries(registry, 5)
+}
+
+/// Builds a worker with `redeliveries` as its capability-miss budget.
+fn make_worker_with_redeliveries(registry: Arc<HandlerRegistry>, redeliveries: u32) -> Worker {
     Worker::new(
         WorkerRuntimeConfig {
+            codec_rotation_batch_size: 0,
+            scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
+            dr: autumn_harvest::replication::DrConfig::default(),
             worker_id: uuid::Uuid::new_v4().to_string(),
             queues: vec!["default".to_string()],
             notification_database_url: None,
@@ -82,10 +90,11 @@ fn make_worker(registry: Arc<HandlerRegistry>) -> Worker {
             build_id: String::new(),
             deployment_name: None,
             workflow_cache_size: 100,
+            resident_workflows: true,
             priority_aging_secs: None,
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
-            capability_miss_max_redeliveries: 5,
+            capability_miss_max_redeliveries: redeliveries,
             workflow_task_timeout: std::time::Duration::from_secs(10),
             workflow_panic_max_attempts: 3,
             max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
@@ -115,7 +124,7 @@ async fn start_workflow(
             workflow_name: name,
             workflow_id: id,
             exec_id: ExecutionId::new_for_shard(ShardId::new(0)),
-            input,
+            input: input.into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -355,7 +364,7 @@ async fn insert_detached_child_execution(
             workflow_id,
             run_id: uuid::Uuid::new_v4(),
             shard_id: 0,
-            input: Value::Null,
+            input: Value::Null.into(),
             parent_id: Some(parent_exec_id.as_uuid()),
             queue_name: "default",
             execution_timeout: None,
@@ -958,7 +967,7 @@ async fn detached_child_execution_timeout_does_not_wake_parent() {
             workflow_id: &child_workflow_id,
             run_id: uuid::Uuid::new_v4(),
             shard_id: 0,
-            input: Value::Null,
+            input: Value::Null.into(),
             parent_id: Some(parent_exec_id.as_uuid()),
             queue_name: "default",
             execution_timeout: Some(timeout),
@@ -1062,7 +1071,10 @@ async fn terminal_detached_spawn_setup_error_fails_workflow() {
     )
     .await;
 
-    let worker = Arc::new(make_worker(registry));
+    // A missing handler is a capability miss (issue #804). With the default
+    // budget, the backoff releases the task for more than 30 seconds before it
+    // fails. A budget of 0 fails the workflow on the first miss.
+    let worker = Arc::new(make_worker_with_redeliveries(registry, 0));
     let worker_pool = pool.clone();
     let worker_ref = worker.clone();
     let worker_handle = tokio::spawn(async move {
@@ -1277,6 +1289,8 @@ async fn workflow_task_timeout_cascades_detached_children() {
         None,
         None,
         60,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        0,
     )
     .await
     .expect("timeout enforcement should succeed");

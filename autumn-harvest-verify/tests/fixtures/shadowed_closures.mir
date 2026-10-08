@@ -1,0 +1,308 @@
+// WARNING: This output format is intended for human consumers only
+// and is subject to change without notice. Knock yourself out.
+// HINT: See also -Z dump-mir for MIR at specific points during compilation.
+fn <impl at shadowed_closures.rs:32:1: 32:21>::execute_activity_raw(_1: &WorkflowContext, _2: String, _3: u64) -> Result<u64, String> {
+    debug self => _1;
+    debug name => _2;
+    debug arg => _3;
+    let mut _0: std::result::Result<u64, std::string::String>;
+
+    bb0: {
+        _0 = Result::<u64, String>::Ok(copy _3);
+        drop(_2) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+fn wall_clock_secs() -> u64 {
+    let mut _0: u64;
+    let mut _1: &std::time::Duration;
+    let _2: std::time::Duration;
+    let mut _3: std::result::Result<std::time::Duration, std::time::SystemTimeError>;
+    let mut _4: &std::time::SystemTime;
+    let _5: std::time::SystemTime;
+
+    bb0: {
+        _5 = SystemTime::now() -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        _4 = &_5;
+        _3 = SystemTime::duration_since(move _4, const std::time::UNIX_EPOCH) -> [return: bb2, unwind continue];
+    }
+
+    bb2: {
+        _2 = Result::<Duration, SystemTimeError>::unwrap_or_default(move _3) -> [return: bb3, unwind continue];
+    }
+
+    bb3: {
+        _1 = &_2;
+        _0 = Duration::as_secs(move _1) -> [return: bb4, unwind continue];
+    }
+
+    bb4: {
+        return;
+    }
+}
+
+fn __autumn_workflow_info_wf_macro_closure_clean() -> u8 {
+    let mut _0: u8;
+
+    bb0: {
+        _0 = const 0_u8;
+        return;
+    }
+}
+
+fn wf_macro_closure_clean(_1: &WorkflowContext, _2: Option<u64>) -> {async fn body of wf_macro_closure_clean()} {
+    debug ctx => _1;
+    debug o => _2;
+    let mut _0: {async fn body of wf_macro_closure_clean()};
+
+    bb0: {
+        _0 = {coroutine@shadowed_closures.rs:61:26: 64:2 (#0)} { ctx: copy _1, o: copy _2 };
+        return;
+    }
+}
+
+fn wf_macro_closure_clean::{closure#0}(_1: Pin<&mut {async fn body of wf_macro_closure_clean()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    coroutine layout {
+        variant_fields = {
+            Unresumed(0): [],
+            Returned (1): [],
+            Panicked (2): [],
+        }
+        storage_conflicts = BitMatrix(0x0) {}
+    }
+    debug _task_context => _13;
+    debug ctx => ((*_12).0: &WorkflowContext);
+    debug o => ((*_12).1: std::option::Option<u64>);
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let _3: &WorkflowContext;
+    let mut _6: std::option::Option<u64>;
+    let mut _7: {closure@shadowed_closures.rs:49:9: 49:17};
+    let mut _8: std::string::String;
+    let mut _9: &str;
+    let mut _10: std::result::Result<u64, std::string::String>;
+    let mut _11: u32;
+    let mut _12: &mut {async fn body of wf_macro_closure_clean()};
+    let mut _13: std::future::ResumeTy;
+    let mut _14: std::ptr::NonNull<std::task::Context<'_>>;
+    scope 1 {
+        debug ctx => _3;
+        let _4: std::option::Option<u64>;
+        scope 2 {
+            debug o => _4;
+            let _5: u64;
+            scope 3 {
+                debug v => _5;
+            }
+        }
+    }
+
+    bb0: {
+        _14 = move _2 as std::ptr::NonNull<std::task::Context<'_>> (Transmute);
+        _13 = std::future::ResumeTy(move _14);
+        _12 = copy (_1.0: &mut {async fn body of wf_macro_closure_clean()});
+        _11 = discriminant((*_12));
+        switchInt(move _11) -> [0: bb9, 1: bb7, 2: bb6, otherwise: bb8];
+    }
+
+    bb1: {
+        _5 = Option::<u64>::unwrap_or_default(move _6) -> [return: bb2, unwind: bb5];
+    }
+
+    bb2: {
+        _9 = const "charge";
+        _8 = <str as ToString>::to_string(move _9) -> [return: bb3, unwind: bb5];
+    }
+
+    bb3: {
+        _10 = WorkflowContext::execute_activity_raw(copy _3, move _8, copy _5) -> [return: bb4, unwind: bb5];
+    }
+
+    bb4: {
+        _0 = Poll::<Result<u64, String>>::Ready(move _10);
+        discriminant((*_12)) = 1;
+        return;
+    }
+
+    bb5 (cleanup): {
+        discriminant((*_12)) = 2;
+        resume;
+    }
+
+    bb6: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb6, unwind continue];
+    }
+
+    bb7: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb7, unwind continue];
+    }
+
+    bb8: {
+        unreachable;
+    }
+
+    bb9: {
+        _3 = copy ((*_12).0: &WorkflowContext);
+        _4 = copy ((*_12).1: std::option::Option<u64>);
+        _7 = {closure@shadowed_closures.rs:49:9: 49:17};
+        _6 = Option::<u64>::map::<u64, {closure@shadowed_closures.rs:49:9: 49:17}>(copy _4, move _7) -> [return: bb1, unwind: bb5];
+    }
+}
+
+alloc1 (size: 6, align: 1) {
+    63 68 61 72 67 65                               │ charge
+}
+
+fn wf_macro_closure_clean::{closure#0}::{closure#0}(_1: {closure@shadowed_closures.rs:49:9: 49:17}, _2: u64) -> u64 {
+    debug x => _2;
+    let mut _0: u64;
+    let mut _3: (u64, bool);
+
+    bb0: {
+        _3 = AddWithOverflow(copy _2, const 1_u64);
+        assert(!move (_3.1: bool), "attempt to compute `{} + {}`, which would overflow", copy _2, const 1_u64) -> [success: bb1, unwind continue];
+    }
+
+    bb1: {
+        _0 = move (_3.0: u64);
+        return;
+    }
+}
+
+fn __autumn_workflow_info_wf_macro_closure_ambient() -> u8 {
+    let mut _0: u8;
+
+    bb0: {
+        _0 = const 0_u8;
+        return;
+    }
+}
+
+fn wf_macro_closure_ambient(_1: &WorkflowContext, _2: Option<u64>) -> {async fn body of wf_macro_closure_ambient()} {
+    debug ctx => _1;
+    debug o => _2;
+    let mut _0: {async fn body of wf_macro_closure_ambient()};
+
+    bb0: {
+        _0 = {coroutine@shadowed_closures.rs:75:26: 78:2 (#0)} { ctx: copy _1, o: copy _2 };
+        return;
+    }
+}
+
+fn wf_macro_closure_ambient::{closure#0}(_1: Pin<&mut {async fn body of wf_macro_closure_ambient()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    coroutine layout {
+        variant_fields = {
+            Unresumed(0): [],
+            Returned (1): [],
+            Panicked (2): [],
+        }
+        storage_conflicts = BitMatrix(0x0) {}
+    }
+    debug _task_context => _13;
+    debug ctx => ((*_12).0: &WorkflowContext);
+    debug o => ((*_12).1: std::option::Option<u64>);
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let _3: &WorkflowContext;
+    let mut _6: std::option::Option<u64>;
+    let mut _7: {closure@shadowed_closures.rs:49:9: 49:17};
+    let mut _8: std::string::String;
+    let mut _9: &str;
+    let mut _10: std::result::Result<u64, std::string::String>;
+    let mut _11: u32;
+    let mut _12: &mut {async fn body of wf_macro_closure_ambient()};
+    let mut _13: std::future::ResumeTy;
+    let mut _14: std::ptr::NonNull<std::task::Context<'_>>;
+    scope 1 {
+        debug ctx => _3;
+        let _4: std::option::Option<u64>;
+        scope 2 {
+            debug o => _4;
+            let _5: u64;
+            scope 3 {
+                debug v => _5;
+            }
+        }
+    }
+
+    bb0: {
+        _14 = move _2 as std::ptr::NonNull<std::task::Context<'_>> (Transmute);
+        _13 = std::future::ResumeTy(move _14);
+        _12 = copy (_1.0: &mut {async fn body of wf_macro_closure_ambient()});
+        _11 = discriminant((*_12));
+        switchInt(move _11) -> [0: bb9, 1: bb7, 2: bb6, otherwise: bb8];
+    }
+
+    bb1: {
+        _5 = Option::<u64>::unwrap_or_default(move _6) -> [return: bb2, unwind: bb5];
+    }
+
+    bb2: {
+        _9 = const "charge";
+        _8 = <str as ToString>::to_string(move _9) -> [return: bb3, unwind: bb5];
+    }
+
+    bb3: {
+        _10 = WorkflowContext::execute_activity_raw(copy _3, move _8, copy _5) -> [return: bb4, unwind: bb5];
+    }
+
+    bb4: {
+        _0 = Poll::<Result<u64, String>>::Ready(move _10);
+        discriminant((*_12)) = 1;
+        return;
+    }
+
+    bb5 (cleanup): {
+        discriminant((*_12)) = 2;
+        resume;
+    }
+
+    bb6: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb6, unwind continue];
+    }
+
+    bb7: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb7, unwind continue];
+    }
+
+    bb8: {
+        unreachable;
+    }
+
+    bb9: {
+        _3 = copy ((*_12).0: &WorkflowContext);
+        _4 = copy ((*_12).1: std::option::Option<u64>);
+        _7 = {closure@shadowed_closures.rs:49:9: 49:17};
+        _6 = Option::<u64>::map::<u64, {closure@shadowed_closures.rs:49:9: 49:17}>(copy _4, move _7) -> [return: bb1, unwind: bb5];
+    }
+}
+
+alloc1 (size: 6, align: 1) {
+    63 68 61 72 67 65                               │ charge
+}
+
+fn wf_macro_closure_ambient::{closure#0}::{closure#0}(_1: {closure@shadowed_closures.rs:49:9: 49:17}, _2: u64) -> u64 {
+    debug x => _2;
+    let mut _0: u64;
+    let mut _3: u64;
+    let mut _4: (u64, bool);
+
+    bb0: {
+        _3 = wall_clock_secs() -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        _4 = AddWithOverflow(copy _2, copy _3);
+        assert(!move (_4.1: bool), "attempt to compute `{} + {}`, which would overflow", copy _2, move _3) -> [success: bb2, unwind continue];
+    }
+
+    bb2: {
+        _0 = move (_4.0: u64);
+        return;
+    }
+}

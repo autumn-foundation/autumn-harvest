@@ -47,7 +47,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 // ── Harness ────────────────────────────────────────────────────────────────
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 /// Dual-mode setup: prefer an operator-supplied `HARVEST_TEST_DATABASE_URL`
@@ -68,7 +68,7 @@ async fn setup() -> (String, Option<ContainerAsync<Postgres>>) {
         drop(admin);
         let url = replace_database(&admin_url, &db_name);
         let mut conn = connect(&url).await;
-        SimpleAsyncConnection::batch_execute(&mut conn, autumn_harvest::full_migrations_sql())
+        SimpleAsyncConnection::batch_execute(&mut conn, &autumn_harvest::test_init_sql())
             .await
             .expect("apply migrations");
         drop(conn);
@@ -231,6 +231,9 @@ fn make_worker(
     ));
     Worker::new(
         WorkerRuntimeConfig {
+            codec_rotation_batch_size: 0,
+            scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
+            dr: autumn_harvest::replication::DrConfig::default(),
             worker_id: uuid::Uuid::new_v4().to_string(),
             queues: vec!["default".to_string()],
             queue_weights: std::collections::HashMap::new(),
@@ -248,6 +251,7 @@ fn make_worker(
             build_id: String::new(),
             deployment_name: None,
             workflow_cache_size: 100,
+            resident_workflows: true,
             priority_aging_secs: None,
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
@@ -303,7 +307,7 @@ async fn start_workflow(
             workflow_name,
             workflow_id,
             exec_id: ExecutionId::new_for_shard(ShardId::new(0)),
-            input: Value::Null,
+            input: Value::Null.into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -1107,16 +1111,18 @@ async fn resolve_live_attempt_walks_the_chain() {
     let mut conn = connect(&url).await;
 
     assert_eq!(
-        autumn_harvest::execution::resolve_live_attempt_id(&mut conn, original)
+        autumn_harvest::execution::resolve_live_attempt_id_best_effort(&mut conn, original)
             .await
-            .expect("resolve"),
+            .expect("resolve")
+            .0,
         retry
     );
     // Resolving from the deepest attempt is a fixed point.
     assert_eq!(
-        autumn_harvest::execution::resolve_live_attempt_id(&mut conn, retry)
+        autumn_harvest::execution::resolve_live_attempt_id_best_effort(&mut conn, retry)
             .await
-            .expect("resolve"),
+            .expect("resolve")
+            .0,
         retry
     );
     drop(conn);
@@ -1133,9 +1139,10 @@ async fn resolve_live_attempt_is_a_noop_without_a_retry_chain() {
 
     let running = start_workflow(&mut conn, "plain_wf", "plain-001", None).await;
     assert_eq!(
-        autumn_harvest::execution::resolve_live_attempt_id(&mut conn, running)
+        autumn_harvest::execution::resolve_live_attempt_id_best_effort(&mut conn, running)
             .await
-            .expect("resolve running"),
+            .expect("resolve running")
+            .0,
         running
     );
 
@@ -1147,9 +1154,10 @@ async fn resolve_live_attempt_is_a_noop_without_a_retry_chain() {
         .await
         .expect("seal failed");
     assert_eq!(
-        autumn_harvest::execution::resolve_live_attempt_id(&mut conn, running)
+        autumn_harvest::execution::resolve_live_attempt_id_best_effort(&mut conn, running)
             .await
-            .expect("resolve failed"),
+            .expect("resolve failed")
+            .0,
         running
     );
 }
@@ -1197,12 +1205,20 @@ async fn a_chain_deeper_than_the_walk_bound_fails_closed() {
     let head = head.expect("chain is non-empty");
     let live = previous.expect("chain is non-empty");
 
-    let error = autumn_harvest::execution::resolve_live_attempt_id(&mut conn, head)
+    let error = autumn_harvest::execution::resolve_live_attempt_id_best_effort(&mut conn, head)
         .await
+        .map(|_| ())
         .expect_err("a chain deeper than the walk bound must fail closed, not return a stale row");
+    // Distinct from `Config` (issue #1445 review) so cancel/pause's shared
+    // `conflict_from` mapper can pattern-match this precisely instead of
+    // inspecting the rendered message.
     assert!(
-        matches!(error, autumn_harvest::HarvestError::Config(_)),
-        "expected a Config error naming the depth, got {error:?}"
+        matches!(
+            error,
+            autumn_harvest::HarvestError::RetryChainMaxDepthExceeded { exec_id, max_depth }
+                if exec_id == head && max_depth == autumn_harvest::execution::RETRY_CHAIN_MAX_DEPTH
+        ),
+        "expected a RetryChainMaxDepthExceeded error naming the depth, got {error:?}"
     );
 
     // Falsifier: the live attempt genuinely IS beyond the bound, so the pre-fix
@@ -1220,9 +1236,10 @@ async fn a_chain_deeper_than_the_walk_bound_fails_closed() {
     // blanket rejection of deep chains.
     let shallow = start_workflow(&mut conn, "plain_wf", "deep-guard-001", None).await;
     assert_eq!(
-        autumn_harvest::execution::resolve_live_attempt_id(&mut conn, shallow)
+        autumn_harvest::execution::resolve_live_attempt_id_best_effort(&mut conn, shallow)
             .await
-            .expect("a chain within the bound still resolves"),
+            .expect("a chain within the bound still resolves")
+            .0,
         shallow
     );
 }

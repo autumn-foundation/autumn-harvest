@@ -24,6 +24,11 @@ use serde_json::{Value, json};
 
 /// Per-tenant onboarding: provisions resources then waits for either a
 /// completion signal or a `cancel_onboarding` cancellation signal.
+///
+/// # Errors
+///
+/// Returns an error if the provisioning or cleanup activity fails, or if the
+/// wait for the `onboarding_outcome` signal fails.
 #[workflow(
     owner = "platform",
     runbook = "https://wiki.acme.com/onboarding-runbook",
@@ -67,6 +72,12 @@ pub async fn onboarding(ctx: &WorkflowContext, input: Value) -> HarvestResult<Va
 /// Uses `ctx.signal_external_workflow` for deterministic, replay-safe delivery.
 /// A `target_terminal` or `target_unknown` result means the onboarding already
 /// finished — treated as a no-op (not an error) for the cancellation saga.
+///
+/// # Errors
+///
+/// Returns an error for a signal-delivery failure other than the target
+/// already being terminal or unknown. Those two outcomes are not errors;
+/// this workflow treats them as a no-op instead of propagating them.
 #[workflow(
     owner = "platform",
     runbook = "https://wiki.acme.com/cancel-runbook",

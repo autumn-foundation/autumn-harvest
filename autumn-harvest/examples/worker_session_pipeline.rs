@@ -16,7 +16,8 @@
 //! `transcode_chunk`, and `upload_chunk` below are ordinary `#[activity]`
 //! functions; only the workflow's dispatch calls change.
 //!
-//! See the "Worker Sessions" decision-matrix section of `CLAUDE.md` for when
+//! See the "Worker Sessions" decision-matrix section of `docs/architecture.md`
+//! for when
 //! to reach for a session instead of a local activity, a plain activity, or
 //! claim-check payload offloading (issue #524).
 //!

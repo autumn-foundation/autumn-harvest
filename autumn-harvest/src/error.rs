@@ -74,6 +74,7 @@ impl std::fmt::Display for PayloadKind {
 /// assert_eq!(timeout.to_string(), "StartToClose");
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub enum TimeoutType {
     /// Worker claimed the task but didn't finish in time.
     StartToClose,
@@ -113,6 +114,93 @@ pub struct NonDeterministicDetails {
     pub actual: Option<String>,
     pub workflow_type: Option<String>,
     pub build_id: Option<String>,
+}
+
+/// One shard's contribution to a refused codec-key retirement (issue #948).
+///
+/// Either the shard still holds `rows` events referencing the key, or it could
+/// not be read at all (`reachable = false`) — which blocks retirement just as
+/// firmly, because an uncounted shard is never a zero.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CodecKeyShardRemainder {
+    /// The shard this remainder was observed on.
+    pub shard_id: i32,
+    /// Rows still carrying the key id. `0` when `reachable` is `false` — the
+    /// count is unknown, not zero.
+    pub rows: i64,
+    /// `false` when the shard could not be read; the retirement is refused on
+    /// that basis alone.
+    pub reachable: bool,
+    /// Why the shard could not be read, when `reachable` is `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl std::fmt::Display for CodecKeyShardRemainder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.reachable {
+            write!(f, "shard {}: {} row(s)", self.shard_id, self.rows)
+        } else {
+            let reason = self.reason.as_deref().unwrap_or("unreachable");
+            write!(f, "shard {}: unreadable ({reason})", self.shard_id)
+        }
+    }
+}
+
+/// One worker that blocks activating a keyed codec (issue #1244).
+///
+/// Two independent reasons put a worker on this list.
+///
+/// A live worker that does not advertise support for the version-2 envelope
+/// would silently hand a `kid`-bearing payload to workflow code unchanged.
+/// It would not decode it (see
+/// [`crate::payload_codec::PayloadCodecs::set_active_key`]).
+///
+/// A live worker can support version 2 but still lack the target key id.
+/// That worker would fail to decode a payload some other worker encodes
+/// under it.
+///
+/// Activation is refused while any such worker is live, on any expected
+/// shard. `reason` (from the reachable path) says which.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CodecKeyActivationBlocker {
+    /// The shard this worker's heartbeat row was read from.
+    pub shard_id: i32,
+    /// The blocking worker's id, when the shard itself was reachable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+    /// The blocking worker's host, when the shard itself was reachable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// `false` when the shard could not be read; activation is refused on
+    /// that basis alone, the same fail-closed posture as retirement.
+    pub reachable: bool,
+    /// Why the shard could not be read, when `reachable` is `false`. Why
+    /// this worker blocks activation, when `reachable` is `true` -- missing
+    /// envelope-version support, or the target key id not registered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl std::fmt::Display for CodecKeyActivationBlocker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.reachable {
+            let reason = self
+                .reason
+                .as_deref()
+                .unwrap_or("cannot read envelope version 2");
+            write!(
+                f,
+                "shard {}: worker {} on {} {reason}",
+                self.shard_id,
+                self.worker_id.as_deref().unwrap_or("?"),
+                self.host.as_deref().unwrap_or("?")
+            )
+        } else {
+            let reason = self.reason.as_deref().unwrap_or("unreachable");
+            write!(f, "shard {}: unreadable ({reason})", self.shard_id)
+        }
+    }
 }
 
 /// Errors produced by the autumn-harvest workflow engine.
@@ -275,11 +363,79 @@ pub enum HarvestError {
     #[error("database error: {0}")]
     Database(String),
 
+    /// The task dispatch channel failed (issue #1312).
+    #[error("dispatch error: {0}")]
+    Dispatch(String),
+
     /// Replay encountered a payload encoded with an unregistered codec id.
     #[error("unknown payload codec: {id}")]
     UnknownPayloadCodec {
         /// The codec identifier stored on the event payload.
         id: String,
+    },
+
+    /// A stored codec envelope names a codec **key id** that is not registered
+    /// (issue #948).
+    ///
+    /// Distinct from [`HarvestError::UnknownPayloadCodec`]: the codec itself may
+    /// well be registered — it is the *key material* for that envelope's `kid`
+    /// that is missing, typically because the key was retired before the lazy
+    /// re-encryption sweep finished, or because a reader in a rotation window
+    /// was never given the outgoing key.
+    #[error("unknown payload codec key id {key_id} (codec {codec_id})")]
+    UnknownCodecKey {
+        /// The key id stored in the envelope's `kid` field.
+        key_id: String,
+        /// The `codec_id` stored alongside it.
+        codec_id: String,
+    },
+
+    /// Retiring a codec key was refused because stored rows still reference it
+    /// (issue #948).
+    ///
+    /// `remaining` names, per shard, how many `harvest_events` rows still carry
+    /// the key id. A shard that could not be read appears with
+    /// `reachable = false` and blocks retirement on its own — a shard we cannot
+    /// count is never counted as zero.
+    #[error(
+        "codec key id {key_id} cannot be retired: {} shard(s) still reference it or could not be \
+         read ({})",
+        remaining.len(),
+        remaining
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )]
+    CodecKeyRetirementBlocked {
+        /// The key id whose retirement was refused.
+        key_id: String,
+        /// One entry per blocking shard.
+        remaining: Vec<CodecKeyShardRemainder>,
+    },
+
+    /// Activating a codec key was refused because a live worker cannot read
+    /// the version-2 envelope the activation would start writing (issue
+    /// #1244).
+    ///
+    /// `blockers` names, per shard, every live worker still missing the
+    /// capability advertisement. A shard that could not be read is named too.
+    /// It blocks activation just as firmly — an uncounted shard is never
+    /// proof every worker on it is upgraded.
+    #[error(
+        "codec key id {key_id} cannot be activated: {} worker(s) or shard(s) block it ({})",
+        blockers.len(),
+        blockers
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )]
+    CodecKeyActivationBlocked {
+        /// The key id whose activation was refused.
+        key_id: String,
+        /// One entry per blocking worker or unreachable shard.
+        blockers: Vec<CodecKeyActivationBlocker>,
     },
 
     /// A payload-store operation (offload `put`, fetch `get`, or `delete`)
@@ -307,6 +463,65 @@ pub enum HarvestError {
     /// Invalid configuration provided to the engine.
     #[error("invalid configuration: {0}")]
     Config(String),
+
+    /// `workflow_id` was an explicit empty string (issue #1353).
+    ///
+    /// Distinct from [`Self::Config`] so a caller can pattern-match on it
+    /// precisely. A debounce or throttle fire scanner treats it as a
+    /// permanently doomed legacy row -- one that predates this validation.
+    /// It deletes the row, like [`Self::AlreadyExists`]. It does not
+    /// propagate the error and abort the whole batch transaction.
+    #[error("workflow_id must not be empty")]
+    EmptyWorkflowId,
+
+    /// The workflow-level retry chain rooted at `exec_id` exceeded
+    /// [`crate::execution::RETRY_CHAIN_MAX_DEPTH`] while walking to the live
+    /// attempt (issue #843).
+    ///
+    /// Distinct from [`Self::Config`] (issue #1445) so a caller can
+    /// pattern-match on it precisely, rather than inspecting the rendered
+    /// message. `resolve_live_attempt_id` runs ahead of `cancel`/`pause`'s
+    /// own "already terminal" state-conflict check, on the same call path.
+    /// A message-content match risks misclassifying either direction there.
+    /// Matching too broadly relabels this operational, corrupted-chain
+    /// failure as a 409 state conflict. Matching too narrowly fails to catch
+    /// it. Either way it can also be spoofed: caller-controlled text can
+    /// land inside an unrelated `Config` message, for example a queue name.
+    ///
+    /// This is an operator-facing engine fault, not a bad request. An
+    /// operator seeing it has a corrupted chain, not a request to fix.
+    #[error(
+        "retry chain for execution {exec_id} exceeds the maximum walk depth of {max_depth}; \
+         refusing to route to a possibly-stale attempt"
+    )]
+    RetryChainMaxDepthExceeded {
+        /// The execution whose retry chain was being walked.
+        exec_id: ExecutionId,
+        /// The configured maximum walk depth that was exceeded.
+        max_depth: usize,
+    },
+
+    /// A child execution's stored `parent_close_policy` column failed to
+    /// parse as a [`crate::types::ParentClosePolicy`] (issue #1445).
+    ///
+    /// Reached from [`crate::execution::apply_parent_close_cascade`], on the
+    /// same `cancel`/`terminate` transaction path as a genuine "already
+    /// terminal" state conflict. Distinct from [`Self::Config`] for the same
+    /// reason as [`Self::RetryChainMaxDepthExceeded`].
+    ///
+    /// This is a data-integrity fault on stored parent/child linkage, not a
+    /// resource-state conflict. It can surface even when the target
+    /// execution is not terminal at all -- a `RUNNING` parent with a
+    /// corrupted child row. A blanket `Config` match would misreport it as
+    /// 409 "already terminal". That would tell an operator the workflow
+    /// finished when it did not.
+    #[error("stored parent_close_policy is invalid for child execution {child_exec_id}: {raw:?}")]
+    InvalidParentClosePolicy {
+        /// The child execution whose stored policy failed to parse.
+        child_exec_id: ExecutionId,
+        /// The raw, unparseable stored value.
+        raw: String,
+    },
 
     /// A workflow execution with the same `(workflow_name, workflow_id)` already
     /// exists and the caller's reuse policy does not permit reuse.
@@ -422,7 +637,6 @@ pub enum HarvestError {
     /// The cap is enforced **only on new writes**. Payloads already stored in
     /// history replay correctly even if they exceed the current cap — the replay
     /// engine never re-checks sizes on existing events.
-    ///
     #[error(
         "payload too large: {kind} for workflow '{workflow_type}' exceeded cap of \
          {cap_bytes} bytes (observed {observed_bytes} bytes)"
@@ -457,6 +671,27 @@ pub enum HarvestError {
         gate_id: Uuid,
         /// Human-readable reason recorded on the gate.
         reason: String,
+    },
+
+    /// Load shedding refused a new workflow start because its queue has an
+    /// old backlog (issue #1794).
+    ///
+    /// Only a fresh admission under
+    /// [`GateMode::Check`](crate::admission_gate::GateMode::Check) can get it.
+    /// The refused start writes no execution, event or task row. The
+    /// management API returns `429 Too Many Requests` with a `Retry-After`
+    /// header.
+    #[error(
+        "load shed on queue '{queue}': oldest pending task is {oldest_pending_age_secs}s old; \
+         retry after {retry_after_secs}s"
+    )]
+    LoadShed {
+        /// The shed queue.
+        queue: String,
+        /// The last sampled age of the oldest claimable task, in seconds.
+        oldest_pending_age_secs: u64,
+        /// The delay the caller waits before a retry, in seconds.
+        retry_after_secs: u64,
     },
 
     /// A workflow start was rejected because a declared
@@ -495,6 +730,105 @@ pub enum HarvestError {
         /// The usage observed at rejection time, before this admission
         /// attempt.
         current: u64,
+    },
+
+    /// This process is pinned to a shard generation the database has moved
+    /// past: another region holds write authority now (issue #954).
+    ///
+    /// Raised by [`crate::replication::assert_fence`] on the persist path and
+    /// by the worker's periodic self-fence check. It is **terminal for the
+    /// worker, not for the workflow**: the work is untouched and will be
+    /// claimed by a worker in the region that actually holds authority. A
+    /// worker that sees this must stop, never retry and never re-pin — re-
+    /// pinning to the newer generation is exactly the split-brain the epoch
+    /// exists to prevent.
+    ///
+    /// `current` is `None` when the shard's `harvest_shard_generation` row is
+    /// absent entirely. That also fences: a pinned worker with nothing to
+    /// check against fails closed rather than assuming it still has authority.
+    #[error(
+        "shard {shard_id} is fenced: this process expects generation {pinned} but the \
+         database is at {current:?} — another region holds write authority"
+    )]
+    ShardFenced {
+        /// The shard whose write authority moved.
+        shard_id: i32,
+        /// The generation this process pinned at startup.
+        pinned: i64,
+        /// The generation the database currently reports, or `None` when the
+        /// fencing row is absent.
+        current: Option<i64>,
+    },
+
+    /// A shard this operation must reach is not available from this process.
+    ///
+    /// Raised when an opt-in cross-shard child placement (issue #956) resolves
+    /// to a shard that this node has no pool for, or whose pool cannot hand out
+    /// a connection. It is deliberately **not** a fallback: placing the child on
+    /// the parent's shard instead would break the placement contract silently,
+    /// which is exactly the failure mode issue #956 AC8 rules out.
+    ///
+    /// **Retryable.** Nothing was written — the caller (a parked parent whose
+    /// decision cycle rolled back, or the cross-shard relay) should retry once
+    /// the shard is reachable again. Classify it with
+    /// [`HarvestError::is_shard_unavailable`] rather than by matching the
+    /// variant, so a caller keeps compiling as this enum grows.
+    ///
+    /// Distinct from [`HarvestError::ShardFenced`], which means the shard *is*
+    /// reachable but this process has lost write authority over it and must
+    /// **not** retry.
+    #[error("shard {shard_id} is unavailable from this process: {reason}")]
+    ShardUnavailable {
+        /// The shard that could not be reached.
+        shard_id: i32,
+        /// Why it could not be reached (no pool configured, pool checkout
+        /// failed, ...).
+        reason: String,
+    },
+
+    /// A pool did not hand out a connection within the bound (issue #1788).
+    ///
+    /// The pool is full, or the database does not answer. Nothing was
+    /// written, so the caller can retry. Classify it with
+    /// [`HarvestError::is_pool_acquire_timeout`].
+    #[error("database pool acquire timed out after {waited:?}")]
+    PoolAcquireTimeout {
+        /// How long the acquire waited before it failed.
+        waited: std::time::Duration,
+    },
+
+    /// A pool could not open or hand out a connection (issue #1788).
+    ///
+    /// For example, Postgres refuses the connect, or the connection setup
+    /// hook fails. Nothing was written, so the caller can retry. Classify it
+    /// with [`HarvestError::is_pool_acquire_failure`].
+    #[error("database pool acquire failed: {reason}")]
+    PoolAcquireFailed {
+        /// The pool error.
+        reason: String,
+    },
+
+    /// A shard checkout named a shard outside the request's shard fence
+    /// (issue #1803).
+    ///
+    /// The authorizer hook fences a request to the shards its policy allowed
+    /// ([`crate::shard_fence`]). A rebalance cutover after that check can
+    /// move the run to another shard. The handler then names that shard, and
+    /// this error stops the checkout before any read or write there.
+    ///
+    /// **Retryable.** Nothing was read or written on `shard_id`. The
+    /// management API answers `503` with a retry hint. The retry resolves
+    /// the run on its new shard, and the policy decides on that shard.
+    ///
+    /// Distinct from [`HarvestError::ShardFenced`]. That variant is the
+    /// write-authority fence, and a caller must not retry it.
+    #[error(
+        "shard {shard_id} is outside the authorized shard set of this request: \
+         the execution moved after authorization; retry the request"
+    )]
+    OutsideShardFence {
+        /// The shard the checkout named.
+        shard_id: i32,
     },
 
     /// Delivery of a `signal_external_workflow`/`signal_external_workflow_by_id`
@@ -684,6 +1018,29 @@ pub enum HarvestError {
     /// the transaction have both returned, with no other lock held.
     #[error("suspended workflow dispatch made no progress and could not confirm claim ownership")]
     SuspendedClaimAmbiguous {
+        /// The task-queue row whose ownership could not be confirmed.
+        task_id: Uuid,
+    },
+
+    /// An ordinary workflow-task terminal write (complete, fail, or an
+    /// operator-pause park) could not confirm it still owns the task's claim
+    /// under the row lock (issue #1184).
+    ///
+    /// Sibling of [`Self::SuspendedClaimAmbiguous`], not a reuse of it: that
+    /// variant is scoped to issue #1182's narrow empty-command-set escalation
+    /// branch specifically, while this one covers the ordinary completion/
+    /// failure/pause-park paths #1184 closes the same gap for. Same
+    /// blameless-sentinel contract and the same rollback/lock-ordering
+    /// rationale apply verbatim: propagating this with `?` out of the entire
+    /// persistence transaction rolls back every lock and bookkeeping write
+    /// from this cycle *before* any claim-release attempt runs, avoiding the
+    /// ABBA cycle against `poison_pill::quarantine_orphan`'s reversed
+    /// (task-row-first) lock order that a release attempted while still
+    /// holding the execution row would risk. See
+    /// [`Self::SuspendedClaimAmbiguous`]'s doc comment for the full
+    /// explanation.
+    #[error("a workflow-task terminal write could not confirm it still owns the task's claim")]
+    TerminalWriteClaimAmbiguous {
         /// The task-queue row whose ownership could not be confirmed.
         task_id: Uuid,
     },
@@ -1062,6 +1419,33 @@ impl HarvestError {
         }
     }
 
+    /// Is this a [`HarvestError::ShardUnavailable`]?
+    ///
+    /// A retryable "I cannot reach that shard right now" classification, kept
+    /// as a predicate so callers can classify without matching the variant —
+    /// this enum grows over releases (issue #956).
+    #[must_use]
+    pub const fn is_shard_unavailable(&self) -> bool {
+        matches!(self, Self::ShardUnavailable { .. })
+    }
+
+    /// Is this a [`HarvestError::PoolAcquireTimeout`]?
+    #[must_use]
+    pub const fn is_pool_acquire_timeout(&self) -> bool {
+        matches!(self, Self::PoolAcquireTimeout { .. })
+    }
+
+    /// Did a pool fail to hand out a connection? True for
+    /// [`HarvestError::PoolAcquireTimeout`] and
+    /// [`HarvestError::PoolAcquireFailed`].
+    #[must_use]
+    pub const fn is_pool_acquire_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::PoolAcquireTimeout { .. } | Self::PoolAcquireFailed { .. }
+        )
+    }
+
     /// Returns `true` if this is a
     /// [`MutexSelfDeadlock`](HarvestError::MutexSelfDeadlock) — a workflow
     /// re-acquiring a durable mutex key it already holds (issue #691).
@@ -1144,6 +1528,23 @@ impl HarvestError {
     pub const fn suspended_claim_ambiguous(&self) -> Option<Uuid> {
         match self {
             Self::SuspendedClaimAmbiguous { task_id } => Some(*task_id),
+            _ => None,
+        }
+    }
+
+    /// Classify this error as an **ambiguous ordinary terminal-write claim**
+    /// (issue #1184): a complete/fail/pause-park write could not confirm it
+    /// still owns the task, so no terminal decision was made.
+    ///
+    /// Returns `Some(task_id)` for [`Self::TerminalWriteClaimAmbiguous`] and
+    /// `None` for every other variant — the sibling accessor to
+    /// [`Self::suspended_claim_ambiguous`]. The caller uses this to skip the
+    /// ordinary terminal-failure path and instead perform the standalone claim
+    /// release *after* the enclosing transaction has rolled back.
+    #[must_use]
+    pub const fn terminal_write_claim_ambiguous(&self) -> Option<Uuid> {
+        match self {
+            Self::TerminalWriteClaimAmbiguous { task_id } => Some(*task_id),
             _ => None,
         }
     }

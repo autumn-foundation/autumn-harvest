@@ -5,7 +5,7 @@
 *Version 0.1 — Draft*
 *March 2026*
 
-**Release status note (0.6.0):** DAG scheduling, signals, queries, the
+**Release status note (0.7.0):** DAG scheduling, signals, queries, the
 management API, dead-letter list/replay endpoints, durable workflow
 cancellation, pause/resume controls, DLQ aggregation, DAG retry from failed
 nodes, timezone-aware cron schedules, scaling signals, and metrics endpoints
@@ -39,7 +39,7 @@ are implemented. First-class Saga compensation is implemented through the
 
 Autumn Harvest is a workflow orchestration engine that combines Airflow's DAG scheduling model with Temporal's durable execution guarantees, implemented natively in Rust as a companion to the Autumn web framework. It provides code-as-workflow definitions through proc macros, Postgres-backed persistence using the same diesel-async + deadpool stack as Autumn, and production-grade features including sharding, retries, timeouts, heartbeats, signals, and queries.
 
-The core thesis: workflows should be defined in Rust with the same ergonomics as Autumn routes and tasks, scheduled like Airflow DAGs, and executed with Temporal's durability guarantees — all without requiring external brokers like Redis, RabbitMQ, or a separate Temporal server. Postgres is the only infrastructure dependency.
+The core thesis: workflows should be defined in Rust with the same ergonomics as Autumn routes and tasks, scheduled like Airflow DAGs, and executed with Temporal's durability guarantees — all without requiring external brokers like Redis, RabbitMQ, or a separate Temporal server. Postgres is the only *required* infrastructure dependency. An optional Redis dispatch channel raises the claim rate on a saturated queue; it is off by default and adds no guarantee Postgres does not already provide (§9.1).
 
 ---
 
@@ -74,8 +74,8 @@ Workflow orchestration is a heavyweight dependency. Many Autumn users will never
 ```toml
 # Cargo.toml — only when you need workflows
 [dependencies]
-autumn-web = "0.7"
-autumn-harvest = "0.6"
+autumn-web = "0.8"
+autumn-harvest = "0.7"
 ```
 
 The `autumn-harvest-macros` crate is separate from `autumn-macros` because proc-macro crates cannot export non-macro items. Harvest macros generate different companion functions (`__autumn_workflow_info_*`, `__autumn_activity_info_*`) that need their own expansion logic.
@@ -794,12 +794,16 @@ Timed-out activities are marked as `FAILED` with a `HeartbeatTimeout` reason and
 
 ### 7.5 Graceful Shutdown
 
-On SIGTERM/SIGINT:
+On SIGTERM/SIGINT, or on a remote drain (issue #1813):
 
-1. Stop accepting new tasks (drain the poller).
-2. Wait up to `shutdown_timeout` (default: 30 seconds) for in-flight activities to complete.
-3. For activities that don't complete, record a `WorkerShutdown` failure and let the retry policy handle rescheduling.
-4. For workflows, flush the current state to the event history so replay can resume on another worker.
+1. Stop claiming tasks.
+2. Release each claimed task that has not started. It is `PENDING` again at once, with its `attempt` restored.
+3. Wait for in-flight tasks to complete, up to `shutdown_timeout` (default: 25 seconds) or the remote drain deadline.
+4. One join window before the deadline, cancel running activities. The join window is `cancellation_grace_period`, capped at half the drain. Running workflow tasks are not cancelled. `workflow_task_timeout` bounds them.
+5. Release the claim of each cancelled activity whose handler returns a retryable error. The row is `PENDING` again with an error that starts with `worker shutdown:`, so a peer retries it at once.
+6. At the deadline, stop waiting. A handler that ignored the cancel keeps its claim. The worker keeps its lease and the task heartbeat alive until that handler returns, even after `run` returns, so no peer starts a second copy. The claim-epoch fence (#1789) rejects stale writes. If the process exits, orphan reclaim requeues the task.
+
+A claim is released only when no handler for it can still run. Keep `shutdown_timeout` at least 5 seconds below the platform grace period, for example Kubernetes `terminationGracePeriodSeconds` (default: 30 seconds).
 
 ---
 
@@ -876,13 +880,15 @@ CREATE TABLE harvest_task_queue (
     output          JSONB,
     error           TEXT,
 
-    CONSTRAINT valid_state CHECK (state IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED'))
+    CONSTRAINT valid_state CHECK (state IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED', 'CANCELLED'))
 );
 
 CREATE INDEX idx_harvest_tq_poll ON harvest_task_queue (queue_name, state, priority DESC, scheduled_at)
     WHERE state = 'PENDING';
-CREATE INDEX idx_harvest_tq_running ON harvest_task_queue (state, last_heartbeat_at)
+CREATE INDEX idx_harvest_tq_running_started ON harvest_task_queue (started_at)
     WHERE state = 'RUNNING';
+CREATE INDEX idx_harvest_tq_terminal_completed_at ON harvest_task_queue (completed_at, id)
+    WHERE state IN ('COMPLETED', 'FAILED', 'CANCELLED');
 CREATE INDEX idx_harvest_tq_workflow ON harvest_task_queue (workflow_exec_id);
 
 -- DAG runs
@@ -985,15 +991,22 @@ CREATE TABLE harvest_events_p1 PARTITION OF harvest_events FOR VALUES WITH (MODU
 -- ... up to p15
 ```
 
-The `harvest_task_queue` table is also partitioned by `queue_name` using list partitioning, enabling queue-specific vacuum and index tuning.
+The `harvest_task_queue` table is **not** partitioned. It is one table with per-table autovacuum and fillfactor settings (issue #1811). Vacuum starts at 2% dead rows, and a fillfactor of 80 lets a heartbeat update stay on its page as a HOT update. The terminal-task janitor (§8.3) keeps the table small.
 
 ### 8.3 History Retention
 
-Harvest ships an opt-in retention janitor for completed workflow histories. Operators configure `RetentionConfig` on `HarvestBuilder`; default behavior is disabled (`max_age = None`), so upgrading does not delete any rows until explicitly enabled.
+Harvest ships an opt-in retention janitor for completed workflow histories. Operators configure `RetentionConfig` on `HarvestBuilder`; default behavior for **workflow history** is disabled (`max_age = None`), so upgrading deletes no history until explicitly enabled. Four janitor passes are on by default:
 
-When enabled, each tick selects terminal workflow executions older than `max_age` and deletes them transactionally. Rows in `harvest_events`, `harvest_task_queue`, `harvest_timers`, and `harvest_signals` are removed by `ON DELETE CASCADE`; `harvest_dead_letters` rows are deleted explicitly in the same retention transaction because `workflow_exec_id` is not a foreign key.
+- Audit-log purging keeps 90 days (`audit_retention_days`).
+- Schedule-decision purging keeps 7 days (`schedule_decision_retention_days`).
+- The idle rate-limit-bucket GC collects inert per-tenant token buckets after 7 days (`rate_limit_bucket_retention_secs`, issue #1127).
+- The terminal-task janitor deletes finished task rows after 7 days (`terminal_task_retention_secs`, issue #1811).
+
+When history retention is enabled, each tick selects terminal workflow executions older than `max_age` and deletes them transactionally. Rows in `harvest_events`, `harvest_task_queue`, `harvest_timers`, and `harvest_signals` are removed by `ON DELETE CASCADE`; `harvest_dead_letters` rows are deleted explicitly in the same retention transaction because `workflow_exec_id` is not a foreign key.
 
 In-flight workflows are never eligible because retention only targets terminal states with `completed_at` older than the configured window.
+
+The terminal-task janitor deletes `harvest_task_queue` rows in `COMPLETED`, `FAILED` or `CANCELLED` state whose `completed_at` is older than the window. It never deletes a `PENDING` or `RUNNING` row. It keeps a terminal workflow-task row while its execution is live, because the concurrency supersede scan reads that row. It also keeps that row while a dead letter exists for the execution, because a DLQ redrive can revive a `FAILED` execution. It reads the partial index `idx_harvest_tq_terminal_completed_at` in `(completed_at, id)` order. It deletes in batches of `batch_size`, capped at 10,000 rows, with `FOR UPDATE SKIP LOCKED`. It runs at most 50 batches per shard per tick. `GET /admin/retention` reports its per-shard outcome as `terminal_task_gc`.
 
 The management API exposes retention introspection and control via `GET /admin/retention` and `POST /admin/retention/run-now`.
 
@@ -1009,10 +1022,16 @@ Autumn Harvest uses Postgres as the task queue. No external broker (Redis, Rabbi
 
 - **Operational simplicity.** Autumn already requires Postgres. Adding Redis or RabbitMQ doubles the infrastructure surface area for a capability (queueing) that Postgres handles well at the scale Harvest targets.
 - **Transactional consistency.** Enqueuing a task and recording an event in the workflow history happens in a single Postgres transaction. With an external broker, you need distributed transactions or outbox patterns.
-- **Sufficient throughput.** With `SKIP LOCKED`, Postgres can handle thousands of dequeues per second. Harvest targets workloads up to ~10,000 tasks/second, which is well within Postgres' capability.
+- **Sufficient throughput.** With `SKIP LOCKED`, Postgres can handle thousands of dequeues per second, though the measured ceiling is well below the "~10,000 tasks/second" figure once cited here — see the measured numbers below.
 - **Simplicity of deployment.** One binary, one database. This matters enormously for adoption.
 
-**When Postgres is not enough:** If a deployment needs >10,000 tasks/second sustained, Harvest will support an optional `autumn-harvest-redis` adapter crate (Phase 4) that uses Redis Streams for the task queue while keeping Postgres for history and state. But this is an escape hatch, not the default path.
+**Measured, not targeted.** The "~10,000 tasks/second" framing above described a target, not a measurement, and the measured claim path falls well short of it: `docs/performance.md` publishes 640 claims/sec at an 8-concurrent-claimer / 1,000-row-backlog scenario on a 4-core reference machine, falling to 29/sec at a 10,000-row backlog. The bottleneck is a documented, partially-fixed structural query-plan defect (a non-indexable `ORDER BY` forcing a full sequential scan and sort per claim), not a flat ops/sec wall — see that page for the detail and the fixes already landed.
+
+**When Postgres is not enough:** the optional `autumn-harvest-redis` crate supplies a Redis Streams **dispatch channel**, wired into the worker by issue #1312. Postgres stays the source of truth. Every `harvest_task_queue` row, every claim gate, and the whole history write path are unchanged. The channel carries only a small reference to a claimable row: task id, queue, and due time. A worker reads a reference, claims the named row in Postgres with the full existing claim predicate, and then acks the reference. The claim commit is the only Postgres write the reference exists to trigger, so the ack follows that commit immediately. A reconcile sweep republishes due `PENDING` rows on a fixed interval. That sweep is the durability floor: a lost reference, a dropped hint, and a Redis restart all converge through it. When Redis is unreachable the worker falls back to the Postgres claim path for that iteration, so availability equals the Postgres-only path. That fallback covers the running state, not boot: a configured URL that cannot connect fails startup in every mode, with an error naming the endpoint. Turn the channel on with `[harvest.redis] url` and the `redis` cargo feature of `autumn-harvest-plugin`. Leave the URL unset and nothing changes. See [`docs/operations/redis-dispatch.md`](operations/redis-dispatch.md).
+
+**v1 limits.** Single-shard runtimes only: `HarvestRunner::start` rejects a configured URL before it installs the channel when the runtime resolves more than one shard pool, and `Worker::new` repeats the check. Config validation cannot enforce this, because it does not see the resolved pool. One Redis instance only: the keys carry no Cluster hash tags. A `rediss://` URL connects over TLS and verifies the server (issue #1834). A plain `redis://` URL sends the password in cleartext. Priority order and sticky affinity degrade to best effort, because a stream delivers in publish order and only the reconcile sweep publishes in priority order.
+
+**Numbers, and what they do not yet say.** The *standalone* adapter throughput is measured in [`docs/assays/0001-redis-adapter-throughput-ceiling.md`](assays/0001-redis-adapter-throughput-ceiling.md): draining a 1,000-entry backlog with 8 claim-only workers averaged 12,004 claims/sec across three runs. That number is *not* a matched comparison against the Postgres figure above — two attempts at matching the workload shape (queue topology, drain fraction, backlog depth held roughly constant) both turned out to miss how `docs/performance.md`'s own harness actually works, so no multiplier is reported. A narrower, artificially-constrained sub-question that assay separately posed — an always-near-empty queue at exactly 8 concurrent workers — did miss 10,000/sec (~8,760 mean); see the report for why that is not the same finding. Neither figure measures the wired path, which also pays a Postgres claim per reference. The deployment-shaped number is now measured in [`docs/assays/0008-redis-dispatch-integrated-throughput.md`](assays/0008-redis-dispatch-integrated-throughput.md): the integrated path sustained a mean **173.04 completed tasks/sec** draining a 10,000-workflow backlog on the four-core reference machine, where the same worker pool on the Postgres claim path completed **zero** task rows in the same window. That assay is a **kill** on the founding line. Redis dispatch delivers a large measured multiplier over the Postgres path at a deep backlog, not 10,000 tasks/sec, and its dispatch-latency p99 at that pace (426.96 ms) misses the assay's 250 ms line as well.
 
 ### 9.2 Queue Semantics
 
@@ -1020,7 +1039,7 @@ Each task queue is identified by a name string. Tasks are enqueued with a `queue
 
 - **At-most-once delivery** for the initial attempt (no duplicate execution).
 - **At-least-once delivery** across retries (a task may execute multiple times if it fails).
-- **Ordering:** Within a queue, tasks are ordered by `(priority DESC, scheduled_at ASC)`. Priority 0 is default; higher numbers execute first.
+- **Ordering:** Within a queue, tasks are ordered by `priority DESC`, then by due time. Priority 0 is default; higher numbers execute first. Within one priority, continuations of running workflows go before new starts. See [`operations/claim-order.md`](operations/claim-order.md).
 - **Delayed scheduling:** Tasks can be enqueued with a future `scheduled_at` for retry backoff or scheduled execution.
 - **Visibility timeout:** If a worker claims a task and doesn't complete it within `start_to_close`, the scheduler marks it as failed and requeues it.
 
@@ -1118,9 +1137,14 @@ Four distinct timeouts, matching Temporal's model:
 | Timeout | What it measures | Default | Effect on failure |
 |---------|-----------------|---------|-------------------|
 | **Schedule-to-Start** | Time from task enqueued to worker claiming it | None (unlimited) | Task marked `TIMED_OUT`, NOT retried (requeuing to same queue would repeat the problem) |
-| **Start-to-Close** | Time from worker claiming task to completion | 5 minutes | Task marked `TIMED_OUT`, retried per policy |
-| **Heartbeat** | Time between consecutive heartbeats from the activity | None (disabled unless set) | Task marked `TIMED_OUT`, retried per policy |
+| **Start-to-Close** | Time from worker claiming task to completion | 10 minutes (`DEFAULT_ACTIVITY_START_TO_CLOSE`) | Attempt ends and retries per policy (row back to `PENDING`). The last attempt appends `ActivityTimedOut`, and the row becomes `FAILED` |
+| **Heartbeat** | Time between consecutive heartbeats from the activity | None (disabled unless set) | Same as start-to-close |
 | **Schedule-to-Close** | Total time from enqueue to final completion (across all retries) | None (unlimited) | Task and all retries cancelled |
+
+[ADR 0005](adr/0005-activity-timeout-retry-and-open-circuit.md) records the
+retry rule and how the code applies it (issue #1809). A retried timeout appends
+no event. Only the last attempt appends `ActivityTimedOut`. A timeout feeds the
+circuit breaker only when the attempt's handler started.
 
 The scheduler enforces timeouts by running a periodic check (every 10 seconds):
 
@@ -1293,6 +1317,8 @@ POST   /api/harvest/dead-letters/:id/replay       # replay a dead-lettered task
 
 GET    /api/harvest/workers                       # list connected workers
 GET    /api/harvest/health                        # scheduler + worker health
+GET    /api/harvest/health/live                   # liveness probe
+GET    /api/harvest/health/ready                  # readiness probe
 ```
 
 ### 12.4 Error Integration
@@ -1334,13 +1360,7 @@ impl From<HarvestError> for AutumnError {
 
 ### 13.1 Sharding Strategy
 
-Workflow executions are sharded by hashing the `workflow_id` to a shard number. The shard count is configured at deployment time and is immutable after initial migration (matching Temporal's model):
-
-```rust
-// In autumn.toml
-[harvest]
-num_shards = 16  # must be power of 2, default 16
-```
+Workflow executions are sharded by hashing the `workflow_id` to a shard number, and the shard count is immutable after initial migration. Shard topology is configured through the Rust builder API (`ShardedDbPool`, `HarvestRunnerResources::with_sharded_pool`), not a `[harvest]` TOML key — see [`docs/sharding.md`](sharding.md) for the real configuration surface and per-shard database wiring.
 
 Sharding provides two benefits:
 
@@ -1380,20 +1400,7 @@ Every node runs the full stack (scheduler + worker + web). The scheduler loop on
 
 ### 13.3 Connection Pool Management
 
-The shared deadpool is configured per-instance:
-
-```toml
-[database]
-max_connections = 20  # shared across web + harvest
-
-[harvest.pool]
-# Harvest reserves a portion of the shared pool
-max_scheduler_connections = 2    # for scheduler loop
-max_worker_connections = 8       # for task execution
-# Remaining connections available for web requests
-```
-
-Activities that need their own connections use `ctx.db()` which draws from the shared pool. This means a burst of concurrent activities can temporarily starve web requests. To mitigate this, the worker's `max_concurrent_activities` should be tuned relative to the pool size.
+Harvest does not reserve its own named slice of the connection pool via a `[harvest.pool]` config key — there is no such key. Activities that need their own connections use `ctx.db()`, which draws from the same pool the embedder configured for the rest of the application, so a burst of concurrent activities can temporarily starve unrelated requests against that pool. See [`docs/sharding.md`](sharding.md) for how pool sizing interacts with per-shard `ShardedDbPool` configuration.
 
 ### 13.4 Archival and Retention
 
@@ -1407,67 +1414,82 @@ For long-running deployments, the event history table will be the largest table.
 
 ## 14. Configuration Schema
 
-Harvest configuration lives under the `[harvest]` section of `autumn.toml` and follows Autumn's 5-layer config system:
+Harvest configuration lives under the `[harvest]` section of `autumn.toml`, deserialized by `HarvestRuntimeConfig::load` (`autumn-harvest-plugin/src/config.rs`) in three layers, later layers overriding earlier ones: `autumn.toml`'s `[harvest]` table, then `autumn-{profile}.toml`'s `[harvest]` table, then environment-variable overrides (listed below). The profile itself is resolved in order: the `AUTUMN_PROFILE` env var, then a `--profile <NAME>`/`--profile=<NAME>` process argument, then `AUTUMN_IS_DEBUG` (`1` → `dev`, `0` → `prod`) — the first of those that's set wins; with none set, no profile file is loaded. Every field is optional and falls back to a built-in default when omitted at every layer:
 
 ```toml
 [harvest]
-# Sharding — immutable after first migration
-num_shards = 16
+mode = "embedded"            # "embedded" | "split" | "external" — default: embedded
+worker_enabled = true        # default: true
+scheduler_enabled = true     # default: true
 
-# Scheduler
-scheduler_tick_interval = "30s"
-dag_default_timeout = "24h"
+[harvest.database]
+url = "postgres://..."       # required when mode is "split" or "external"; unused for "embedded"
 
-# Worker
-worker_enabled = true
-worker_queues = ["default"]
-max_concurrent_workflows = 20
-max_concurrent_activities = 50
-shutdown_timeout = "30s"
+[harvest.outbox]
+enabled = true                # default: true
+batch_size = 32                # default: 32
+poll_interval_ms = 1000        # default: 1000
+claim_ttl_ms = 30000            # default: 30000
+base_retry_delay_ms = 1000      # default: 1000
+max_retry_delay_ms = 60000      # default: 60000
 
-# Sticky execution
-sticky_timeout = "5s"
-workflow_cache_size = 1000
+[harvest.batch]
+concurrency = 32              # default: 32 — also accepts the key `batch_concurrency` (issue #102's original name); either sets the same field, and `batch_concurrency` wins if both are present
+tick_interval_ms = 500        # default: 500
 
-# Task defaults
-default_start_to_close = "5m"
-default_retry_policy.max_attempts = 3
-default_retry_policy.initial_interval = "1s"
-default_retry_policy.backoff_coefficient = 2.0
-default_retry_policy.max_interval = "5m"
+[harvest.readiness]
+require_shard_readiness = false  # default: false — when true, `/health` and `/health/ready` return 503 unless writable/candidate shards are ready
 
-# History management
-# configured via `HarvestBuilder::retention(RetentionConfig { ... })`
+[harvest.startup]
+orphaned_workflows = "warn"   # "off" | "warn" | "fail" — default: warn
 
-# Management API
-api_enabled = true
-api_path = "/api/harvest"
-
-# Polling (fallback when LISTEN/NOTIFY misses)
-poll_interval = "5s"
-
-# Connection pool allocation
-pool.max_scheduler_connections = 2
-pool.max_worker_connections = 8
+[harvest.redis]
+url = "redis://cache:6379"        # unset by default — unset means Redis dispatch is off
+key_prefix = "harvest"            # default: harvest — prefix for every key the channel owns
+consumer_group = "harvest_workers" # default: harvest_workers — the Redis Streams consumer group the workers join
+visibility_timeout_ms = 60000     # default: 60000 — how long a delivered reference may stay unacked before recovery
+poll_interval_ms = 20             # default: 20 — blocking read wait when the channel is idle
+reconcile_interval_ms = 1000      # default: 1000 — interval of the reconcile sweep over due PENDING rows
 ```
 
-Environment variable overrides follow Autumn's pattern:
+Setting `harvest.redis.url` needs the `redis` cargo feature of `autumn-harvest-plugin`. A build without that feature carries no channel implementation, so it rejects the URL at load rather than ignoring it. Validation also rejects an empty `key_prefix` or `consumer_group`, a `poll_interval_ms` outside 1 to 5000, and a `visibility_timeout_ms` below 1000. See [`docs/operations/redis-dispatch.md`](operations/redis-dispatch.md).
+
+**Not part of this schema.** Sharding (`ShardedDbPool`, `HarvestRunnerResources::with_sharded_pool`) and per-worker queue/capability routing (`WorkerConfig::with_shard_assignments`, task-queue labels) are configured through the Rust builder API, not TOML or env vars — see [`docs/sharding.md`](sharding.md) and [`docs/getting-started/09-worker-routing.md`](getting-started/09-worker-routing.md). History retention is configured via `HarvestBuilder::retention(RetentionConfig { .. })`, also Rust-only (§13.4 above). The management API's mount path is chosen by the embedder via `HarvestPlugin::api` (or `api_with_auth`/`api_with_role_auth` for an authenticated mount), not a config key.
+
+Environment variable overrides, one per field:
 
 ```bash
-AUTUMN_HARVEST__NUM_SHARDS=32
-AUTUMN_HARVEST__WORKER_QUEUES=default,email-workers
-AUTUMN_HARVEST__MAX_CONCURRENT_ACTIVITIES=100
+AUTUMN_HARVEST__MODE=split
+AUTUMN_HARVEST__WORKER_ENABLED=false
+AUTUMN_HARVEST__SCHEDULER_ENABLED=false
+AUTUMN_HARVEST_DATABASE__URL=postgres://...
+AUTUMN_HARVEST_OUTBOX__ENABLED=true
+AUTUMN_HARVEST_OUTBOX__BATCH_SIZE=64
+AUTUMN_HARVEST_OUTBOX__POLL_INTERVAL_MS=500
+AUTUMN_HARVEST_OUTBOX__CLAIM_TTL_MS=30000
+AUTUMN_HARVEST_OUTBOX__BASE_RETRY_DELAY_MS=1000
+AUTUMN_HARVEST_OUTBOX__MAX_RETRY_DELAY_MS=60000
+AUTUMN_HARVEST_BATCH__CONCURRENCY=32
+AUTUMN_HARVEST_BATCH__TICK_INTERVAL_MS=500
+AUTUMN_HARVEST_READINESS__REQUIRE_SHARD_READINESS=true
+AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS=fail
+AUTUMN_HARVEST_REDIS__URL=redis://cache:6379
+AUTUMN_HARVEST_REDIS__KEY_PREFIX=harvest
+AUTUMN_HARVEST_REDIS__CONSUMER_GROUP=harvest_workers
+AUTUMN_HARVEST_REDIS__VISIBILITY_TIMEOUT_MS=60000
+AUTUMN_HARVEST_REDIS__POLL_INTERVAL_MS=20
+AUTUMN_HARVEST_REDIS__RECONCILE_INTERVAL_MS=1000
 ```
 
-Profile-specific overrides:
+Profile-specific overrides work the same way, in a profile-named file:
 
 ```toml
 # autumn-production.toml
 [harvest]
-num_shards = 64
-max_concurrent_activities = 200
-history_retention = "90d"
-archive_enabled = true
+mode = "split"
+
+[harvest.readiness]
+require_shard_readiness = true
 ```
 
 ---
@@ -1688,7 +1710,7 @@ The foundation. After this phase, you can define and execute workflows and activ
 - Child workflow support (`ctx.spawn_child_workflow`)
 - Continue-as-new (for infinite-running workflows)
 - Workflow versioning (handle code changes across running workflows)
-- Optional Redis-backed task queue adapter (`autumn-harvest-redis`)
+- Optional Redis dispatch channel (`autumn-harvest-redis`), wired into the worker by issue #1312
 - Cron workflow schedules (recurring workflows without the DAG model)
 - Batch operations (start/signal/cancel many workflows at once)
 - Workflow search with custom attributes and SQL-like query syntax
@@ -1703,8 +1725,8 @@ The foundation. After this phase, you can define and execute workflows and activ
 | Workflow definition | SDK code (Go, Java, Python, TS) | Python DAGs | Rust proc macros |
 | Scheduling | Timer-based in workflow | Cron/timetable on DAGs | Both (timers in workflows + cron on DAGs) |
 | Persistence | Postgres/MySQL/Cassandra | Postgres/MySQL | Postgres only |
-| Task queue | gRPC-based, in-memory + DB | Celery/K8s/Local executor | Postgres-backed (SKIP LOCKED + LISTEN/NOTIFY) |
-| External broker | None (built into server) | Redis/RabbitMQ (for Celery) | None (Postgres only) |
+| Task queue | gRPC-based, in-memory + DB | Celery/K8s/Local executor | Postgres-backed (SKIP LOCKED + LISTEN/NOTIFY), with an optional Redis dispatch channel in front of it |
+| External broker | None (built into server) | Redis/RabbitMQ (for Celery) | None by default; optional Redis for dispatch only, never for state |
 | Infrastructure | Separate Temporal server | Separate Airflow server | Embedded in application |
 | Sharding | Hash-based, immutable count | None (DB-level only) | Hash-based, immutable count |
 | Signals/Queries | Yes | No (XCom for task data) | Yes |
@@ -1720,6 +1742,6 @@ Harvest's value proposition is operational simplicity: one Rust binary, one Post
 
 1. **Workflow versioning.** When a workflow's code changes while executions are in-flight, replay will fail due to non-determinism. Temporal solves this with versioning APIs (`workflow.GetVersion()`). Harvest needs an equivalent — likely a `ctx.version("change-id", min_version, max_version)` call that records version markers in the event history.
 
-2. **Multi-tenancy.** Should Harvest support namespace isolation (like Temporal namespaces) for multi-tenant deployments? Initial answer: no, keep it simple. Namespaces can be added later by prefixing all table queries with a `namespace` column.
+2. **Multi-tenancy.** Should Harvest support namespace isolation (like Temporal namespaces) for multi-tenant deployments? Initial answer: no, keep it simple. Namespaces can be added later by prefixing all table queries with a `namespace` column. Resolved by [ADR 0004](adr/0004-tenant-isolation-cells.md) (issue #1837): no namespaces; isolate a tenant in a cell instead.
 
 3. **Exactly-once semantics.** Activity execution is at-least-once by design (retries after failure). For operations that must not be duplicated (e.g., charging a credit card), users must implement idempotency keys in their activity code. Should Harvest provide built-in idempotency key management? Initial answer: provide a `ctx.idempotency_key()` helper that generates a deterministic key from the workflow ID + activity ID + attempt number, but leave enforcement to the activity implementation.

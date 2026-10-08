@@ -1,0 +1,43 @@
+dhat allocation attribution, payload_codec_profile (n=500, reps=200, 454,000
+encode_event+decode_event round trips), PayloadCodecs::default() (identity
+codec, no key rotation).
+
+Computed from before-dhat.json by summing every program point whose call
+stack includes `PayloadCodecs::encode_payload` or `PayloadCodecs::decode_payload`.
+
+  total_bytes=5,864,636,320   total_blocks=41,447,698
+  target_bytes=2,398,018,842  (40.89%)
+  target_blocks=21,571,722    (52.05%)
+  matching program points: 160
+
+Reproduce:
+  BIN=$(cargo bench -p autumn-harvest --no-default-features \
+    --bench payload_codec_profile --no-run --message-format=json 2>/dev/null \
+    | jq -r 'select(.reason=="compiler-artifact" and .target.name=="payload_codec_profile") | .executable')
+  valgrind --tool=dhat --dhat-out-file=dhat.json "$BIN"
+  python3 - <<'PY'
+import json
+d = json.load(open("dhat.json"))
+ftbl, pps = d["ftbl"], d["pps"]
+total_b = total_bk = tgt_b = tgt_bk = 0
+for pp in pps:
+    tb, tbk = pp.get("tb", 0), pp.get("tbk", 0)
+    total_b += tb; total_bk += tbk
+    frames = [ftbl[i] for i in pp.get("fs", [])]
+    if any("encode_payload" in f or "decode_payload" in f for f in frames):
+        tgt_b += tb; tgt_bk += tbk
+print(tgt_b / total_b, tgt_bk / total_bk)
+PY
+
+--- AFTER (encode_payload_owned/decode_payload_owned + mem::take fix) ---
+
+  total: 3,466,617,478 bytes in 19,875,976 blocks
+
+Delta vs. before:
+  Ir (callgrind, --branch-sim=no --cache-sim=no): 21,222,464,061 -> 13,393,996,412  (-36.89%)
+  dhat bytes:   5,864,636,320 -> 3,466,617,478  (-40.89%)
+  dhat blocks: 41,447,698 -> 19,875,976  (-52.05%)
+
+The block/byte deltas match the before-side attribution above almost
+exactly (52.05% / 40.89%), confirming the fix removed exactly the
+allocations it targeted and nothing else.

@@ -1,0 +1,15 @@
+                                                                   QUERY PLAN                                                                    
+-------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=5.90..5.91 rows=1 width=8) (actual rows=1 loops=1)
+   Output: count(*)
+   Buffers: shared hit=1
+   ->  Index Scan using idx_harvest_tq_running on public.harvest_task_queue recheck  (cost=0.12..5.89 rows=1 width=0) (actual rows=0 loops=1)
+         Output: id, queue_name, task_type, state, priority, scheduled_at, concurrency_key, concurrency_cap, worker_id, last_heartbeat_at
+         Filter: ((recheck.worker_id IS NOT NULL) AND (recheck.concurrency_key = 'bench-ck-0'::text) AND (recheck.task_type = 'activity'::text))
+         Buffers: shared hit=1
+ Planning:
+   Buffers: shared hit=1
+ Planning Time: 0.059 ms
+ Execution Time: 0.014 ms
+(11 rows)
+

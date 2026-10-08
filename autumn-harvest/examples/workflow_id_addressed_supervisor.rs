@@ -35,10 +35,13 @@
 //!   goal — "not running" — is already met).
 //! * **Self-targeting** (own `workflow_name`/`workflow_id`) → immediate typed
 //!   failure (`"self_signal"` / `"self_cancel"`), no DB round trip.
-//! * Cross-shard: resolution routes to the owning shard via the same
-//!   `(workflow_name, workflow_id)` rendezvous hash a fresh start would use —
-//!   same-shard delivers inline, cross-shard uses the existing outbox
-//!   (reusing the #492 same-shard/outbox split).
+//! * Cross-shard: the owning shard is found by *observation* (issue #1146) —
+//!   delivery inspects every shard the deployment expects and merges the
+//!   answers — so a target works wherever it was placed, including one pinned
+//!   by an explicit `ShardPlacement` (issue #697) or left behind on a drained
+//!   shard. A single-shard deployment still delivers inline in the caller's own
+//!   transaction; a multi-shard one routes every by-id delivery through the
+//!   existing outbox (reusing the #492 same-shard/outbox split).
 //!
 //! # Two correlated events per call (append-only, appended to the CALLER's
 //! history — unchanged from the `ExecutionId`-targeted primitives)

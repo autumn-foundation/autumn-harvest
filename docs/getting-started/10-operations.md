@@ -30,9 +30,16 @@ Opt in to the same deploy-time check by declaring what the workflow dispatches:
 ```rust
 #[workflow(activities = [send_email, charge_card], children = [generate_report])]
 async fn onboarding(ctx: &WorkflowContext, user_id: i64) -> Result<(), String> {
-    ctx.execute_activity(&send_email_info(), user_id).await?;
-    ctx.execute_activity(&charge_card_info(), user_id).await?;
-    let _: Report = ctx.spawn_child_workflow(&generate_report_info(), user_id).await?;
+    ctx.execute_activity::<_, serde_json::Value>(&send_email_info(), user_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    ctx.execute_activity::<_, serde_json::Value>(&charge_card_info(), user_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let _: Report = ctx
+        .spawn_child_workflow(&generate_report_info(), user_id)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 ```
@@ -142,33 +149,87 @@ the target database:
   the application-database set (the workflow-start outbox). In non-`dev`
   profiles, the plugin only checks the dedicated Harvest database and warns
   about pending migrations; it does **not** apply them. Before rolling replicas,
-  run `autumn migrate`, then apply both Harvest sets to the URL configured as
-  `harvest.database.url`:
+  run `autumn migrate` for the application database and `harvest migrate run`
+  for the one configured as `harvest.database.url`:
 
   ```bash
   autumn migrate
 
-  diesel migration run \
-    --database-url "$HARVEST_DATABASE_URL" \
-    --migration-dir autumn-harvest/migrations
-  diesel migration run \
-    --database-url "$HARVEST_DATABASE_URL" \
-    --migration-dir autumn-harvest-plugin/migrations/harvest
+  export HARVEST_DATABASE_URL=postgres://…   # == harvest.database.url
+  harvest migrate run
   ```
 
-  Set `HARVEST_DATABASE_URL` to the same value as `harvest.database.url`, and
-  run these commands from the workspace root (or adjust the migration paths to
-  the installed source tree). Do not roll replicas if any command fails. See
-  the [0.6.0 upgrade guide](../upgrading/0.6.0.md#split--external-mode-still-applies-its-own-harvest-migrations)
+  `harvest migrate` connects to Postgres directly — no running app, no
+  management API — and writes the same `__diesel_schema_migrations` ledger
+  Autumn and Diesel use, so a migration is applied exactly once no matter which
+  of them applies it. Harvest's own migrations are embedded in the `harvest`
+  binary, so no source tree is needed. TLS DSNs work: `sslmode=require`,
+  `verify-ca` and `verify-full` all connect, and the certificate chain and
+  hostname are verified against the platform trust store in every case.
+
+  Sets the binary does not embed are added with `--include-dir`. The one that
+  matters in practice is the plugin's connector dead-letter table, needed
+  before you enable a [broker connector](13-broker-connectors.md):
+
+  ```bash
+  harvest migrate run --include-dir autumn-harvest-plugin/migrations/harvest
+  ```
+
+  To gate a deploy without applying anything, `harvest migrate status --check`
+  exits non-zero while any migration is still pending (and `harvest migrate run
+  --dry-run` prints the same plan). Give the gate the **same `--include-dir`
+  flags you give `run`** — one that checks fewer sets than the deploy applies
+  can exit 0 with a migration still pending, which is worse than no gate:
+
+  ```bash
+  harvest migrate status --check \
+    --include-dir autumn-harvest-plugin/migrations/harvest
+  ```
+
+  Do not roll replicas if any command fails.
+  See the [0.6.0 upgrade guide](../upgrading/0.6.0.md#split--external-mode-still-applies-its-own-harvest-migrations)
   for the ownership table and complete procedure.
 - **Multi-shard deployments** — each Harvest shard database needs the full set
-  applied. See [`sharding.md`](../sharding.md).
+  applied; repeat `--database-url` once per shard. See
+  [`sharding.md`](../sharding.md).
+
+## TLS for LISTEN/NOTIFY connections
+
+Workers and result waits open their own LISTEN connection. The URL comes from
+`with_notification_database_url` or `with_shard_notification_database_urls`.
+`harvest backup verify` and `harvest dr` also open their own connections.
+The `sslmode` in the URL sets the transport for all of them:
+
+| `sslmode` | Transport |
+|---|---|
+| `disable` | Plaintext. |
+| `allow` | Plaintext. When the server rejects it, one retry with TLS and no certificate check, as in libpq. |
+| `prefer`, or not set | TLS when the server offers it, else plaintext. The certificate is not checked, as in libpq. |
+| `require`, `verify-full` | TLS. The chain and the hostname are verified. |
+| `verify-ca` | TLS. The chain is verified, the hostname is not. |
+
+A managed Postgres, Fly for example, often hands out a URL with no `sslmode`
+and refuses plaintext. The default `prefer` reaches it over TLS. Set
+`sslmode=require` when the certificate must be verified.
+
+- The trust store is the platform store. To trust a private CA, such as the
+  RDS CA, set `SSL_CERT_FILE` or `SSL_CERT_DIR`. These variables replace the
+  platform store.
+- TLS needs the `tls` feature. It is on by default. Without it, `prefer`
+  stays plaintext, and a verified `sslmode` gets a configuration error.
+- `sslmode` is read with the libpq grammar, in URL and keyword/value form.
+- A result wait (`result_raw`, `result_raw_with_timeout`,
+  `result_snapshot_with_wait`) does not fail when the listener cannot connect
+  within 5 s. It logs a warning and polls every 500 ms. After 30 s it tries
+  the listener again. A configuration error is still returned. Examples are a
+  URL that does not parse, or a `require` URL without the `tls` feature.
 
 ## Dashboard
 
 `http://localhost:3000/api/harvest/ui` shows live executions, event histories,
 the DLQ, schedules, and the worker fleet. It's served by the plugin — no
-separate process.
+separate process. See [`docs/vantage-ui.md`](../vantage-ui.md) for a
+page-by-page reference to every tab.
 
 ## CLI
 
@@ -186,8 +247,11 @@ harvest dlq replay <dead-letter-id>
 harvest concurrency status
 ```
 
-It never talks to Postgres directly — every call goes through the API your
-service already exposes, so auth and policy stay in one place.
+Almost every call goes through the API your service already exposes, so auth
+and policy stay in one place. The exceptions are the commands that exist
+precisely because no app is up to ask: `harvest migrate` (the schema step that
+runs *before* replicas roll) and `harvest backup verify` (a restore drill
+against scratch databases). Both take a DSN and talk to Postgres directly.
 
 ## Dead letters
 
@@ -212,7 +276,7 @@ harvest worker health                     # rollup: active / draining / stale
 When you need to roll a node — deploy, autoscale-down, drain a host before
 maintenance — request a remote drain instead of sending `SIGTERM`. The
 worker stops claiming new tasks within two heartbeat intervals and finishes
-its in-flight work before exiting:
+or gives back its in-flight work before exiting:
 
 ```bash
 # Dry run first: who would be affected, what's in-flight, on which shards.
@@ -239,6 +303,40 @@ curl -s 'http://localhost:3000/api/harvest/workers/drain-preview?queue=email-wor
 Drain requests are recorded in the audit log under the `worker.drain`
 operation, so you have a "who quiesced this node, when" record without
 correlating shell history across machines.
+
+### What a drain does with its claims
+
+A `SIGTERM` and a remote drain run the same drain (issue #1813):
+
+1. The worker stops claiming tasks.
+2. It gives back each claimed task that has not started. The task is
+   `PENDING` again at once and does not use an attempt.
+3. It lets running tasks finish.
+4. One join window before the deadline, it cancels running activities. The
+   join window is `cancellation_grace_period`, capped at half the drain.
+   Running workflow tasks are not cancelled. `workflow_task_timeout` bounds
+   them.
+5. It gives back the claim of each cancelled activity whose handler returns
+   a retryable error. A peer retries it at once. The cancelled attempt
+   raises `attempt`, and the peer runs the next attempt even past
+   `max_attempts`. A handler that returns `Ok` completes as usual. A
+   non-retryable error fails the activity as usual.
+6. At the deadline it stops waiting. A handler that ignored the cancel keeps
+   its claim. The worker keeps its lease and the task heartbeat alive until
+   that handler returns, even after `run` returns, so no peer starts a
+   second copy. The worker also gives back each claim it abandoned in the
+   drain, such as one whose release write failed. The claim fence
+   (#1789) rejects stale writes. If the process exits, orphan reclaim
+   recovers the task.
+
+A cancel cannot be undone. A later remote deadline does not give the
+activities back.
+
+The deadline is `WorkerConfig::shutdown_timeout`, or the remote drain
+deadline. The default is 25 s. Keep `shutdown_timeout` at least 5 s below
+the platform grace period. On Kubernetes that is
+`terminationGracePeriodSeconds`, 30 s by default. A larger value lets the
+platform kill the process before the drain gives back its claims.
 
 ## Reuse policies
 
@@ -294,7 +392,8 @@ terminate_existing`, or `reuse_policy = terminate_if_running` with the
 default/omitted `conflict_policy`. The flagship idempotent-starter shape above
 (`terminate_if_running` + `use_existing`) resolves to *attach* and provably
 cannot cancel a live run, so it does **not** require admin — non-admin
-webhook/cron callers can use it directly. `terminate_if_running` +
+webhook/cron callers can use it directly. Outside `dev`, those callers still
+need a credential or a declared auth layer (issue #1802). `terminate_if_running` +
 `fail` (resolves to `409`) is likewise non-admin.
 
 `conflict_policy` is **not** supported combined with a throttle / debounce /
@@ -309,7 +408,8 @@ request time) — that combination returns `400`.
 > double-run.
 
 For the full `reuse_policy` × `conflict_policy` matrix see the
-"Standalone Start — Conflict Policy" section in `CLAUDE.md`.
+"Standalone Start — Conflict Policy" section in
+[`docs/architecture.md`](../architecture.md#standalone-start--conflict-policy-issue-685).
 
 ---
 

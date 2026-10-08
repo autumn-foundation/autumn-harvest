@@ -75,7 +75,7 @@ use uuid::Uuid;
 // ---------------------------------------------------------------------------
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 async fn setup_db() -> (String, Option<ContainerAsync<Postgres>>) {
@@ -482,6 +482,9 @@ fn build_worker(worker_id: &str, queue: &str, registry: Arc<HandlerRegistry>) ->
     Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
+                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
+                dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: worker_id.to_string(),
                 queues: vec![queue.to_string()],
                 notification_database_url: None,
@@ -497,6 +500,7 @@ fn build_worker(worker_id: &str, queue: &str, registry: Arc<HandlerRegistry>) ->
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
+                resident_workflows: true,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
@@ -549,7 +553,7 @@ async fn seed_workflow_with_headers(
         workflow_id: &format!("wf-{}", exec_id.as_uuid()),
         run_id: Uuid::new_v4(),
         shard_id: 0,
-        input: input.clone(),
+        input: input.clone().into(),
         parent_id: None,
         queue_name: queue,
         execution_timeout: None,
@@ -1282,11 +1286,11 @@ async fn interceptor_error_feeds_circuit_breaker_like_a_handler_error() {
             echo_activity,
             false,
             Some(RetryPolicy::fixed(5, Duration::from_millis(30))),
-            Some(CircuitBreakerPolicy::new(
-                2,
-                Duration::from_secs(30),
-                Duration::from_secs(60),
-            )),
+            // Fail-fast, so the open breaker ends the activity (issue #1809).
+            Some(
+                CircuitBreakerPolicy::new(2, Duration::from_secs(30), Duration::from_secs(60))
+                    .with_open_mode(autumn_harvest::policy::CircuitOpenMode::FailFast),
+            ),
         )],
         vec![Arc::new(ErrorInterceptor {
             attempts: attempts.clone(),

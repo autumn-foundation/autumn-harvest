@@ -6,7 +6,8 @@
 //! instead of activities. Reach for a child workflow instead of an activity
 //! when each unit of work needs its own durable history, timers, signals, or
 //! retry/compensation logic — see the "Fan-out / Parallel Child Workflows"
-//! section of CLAUDE.md for the full activity-vs-child decision guidance.
+//! section of docs/architecture.md for the full activity-vs-child decision
+//! guidance.
 //!
 //! Demonstrates:
 //! 1. Fail-fast fan-out: N child workflows run in parallel; returns on first failure.

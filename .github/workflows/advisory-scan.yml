@@ -1,0 +1,88 @@
+# Daily RUSTSEC advisory scan (issue #1826).
+#
+# The `dependency-audit` job in ci.yml runs `cargo deny` on code changes only.
+# A new advisory lands with no code change, so that job does not see it. This
+# workflow runs `cargo deny check advisories` every day.
+#
+# A scheduled run that finds an advisory opens an issue, or comments on the
+# open one. A clean scheduled run closes it. A pull request that changes the
+# scan runs it too, with no issue write and no token. The logic is in
+# .github/ci/advisory-scan.sh. The supply_chain_ci tests in
+# autumn-harvest/tests/integration run it against a stub `gh`.
+name: Advisory scan
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Daily at 05:37 UTC, off the hour and away from the other nightlies.
+    - cron: "37 5 * * *"
+  pull_request:
+    branches: [trunk, trunk-dev]
+    paths:
+      - .github/workflows/advisory-scan.yml
+      - .github/ci/advisory-scan.sh
+      - deny.toml
+
+# One run at a time, so two runs cannot both open an alert issue. Queue, do
+# not cancel: a cancelled run skips the failure report step.
+concurrency:
+  group: advisory-scan-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  scan:
+    name: cargo deny check advisories
+    runs-on: ubuntu-latest
+    # A job timeout cancels the job, and then the report step does not run. A
+    # step timeout is a step failure, so the step timeouts sum to less than
+    # this.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 2
+      # The same cargo-deny version as the `dependency-audit` gate in ci.yml.
+      # A test checks that the two agree.
+      - uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2.87.25
+        timeout-minutes: 3
+        with:
+          tool: cargo-deny@0.20.2
+      - name: Scan for advisories
+        id: scan
+        timeout-minutes: 10
+        env:
+          # Only a scheduled run gets a token. A pull request run writes no
+          # issue, so its script needs none.
+          GH_TOKEN: ${{ github.event_name == 'schedule' && github.token || '' }}
+          ADVISORY_ALERT: ${{ github.event_name == 'schedule' }}
+        run: bash .github/ci/advisory-scan.sh
+      # The script sets `reported=true` after it writes its result. A red run
+      # without it failed in setup, timed out, or lost a `gh` call. This step
+      # reports it.
+      - name: Report an unreported failure on the alert issue
+        if: failure() && github.event_name == 'schedule' && steps.scan.outputs.reported != 'true'
+        timeout-minutes: 2
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # If checkout failed, the script is not on disk. Then comment on the
+        # open issue, or open one, directly. The title and the lookup match
+        # the script.
+        run: |
+          if [ -f .github/ci/advisory-scan.sh ]; then
+            bash .github/ci/advisory-scan.sh run-failed
+            exit 0
+          fi
+          title="Advisory scan: cargo deny check advisories failed"
+          body="The advisory scan failed before checkout: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          issue="$(gh api --paginate -X GET "repos/$GITHUB_REPOSITORY/issues" \
+            -f state=open -f per_page=100 -f "creator=github-actions[bot]" \
+            | jq -rs --arg title "$title" \
+              '(add // []) | map(select(.pull_request == null and .title == $title)) | .[0].number // empty')"
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi

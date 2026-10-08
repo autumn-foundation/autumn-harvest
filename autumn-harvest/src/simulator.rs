@@ -247,7 +247,7 @@ impl WorkflowSimulator {
                 });
             }
 
-            let (outcome, pending, _span) = run_workflow_with_state(
+            let (outcome, pending, _span, _resolved_router) = run_workflow_with_state(
                 exec_id,
                 history.clone(),
                 self.handler,
@@ -287,6 +287,15 @@ impl WorkflowSimulator {
                     history.push(WorkflowEvent::workflow_failed_typed(&decoded));
                     return SimulatorResult {
                         final_output: Err(decoded.message),
+                        history,
+                    };
+                }
+                // Issue #1797: a deadlocked cycle fails the task, not the run.
+                // A retry would deadlock again, so the simulation stops here.
+                // No terminal event is recorded, as on the worker.
+                WorkflowOutcome::TaskFailed { error } => {
+                    return SimulatorResult {
+                        final_output: Err(error),
                         history,
                     };
                 }
@@ -994,6 +1003,38 @@ mod tests {
         }
     }
 
+    /// Awaits a foreign 3 s sleep, past the deadlock timeout (issue #1797).
+    fn deadlocking_workflow(
+        _ctx: &crate::context::WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>> {
+        Box::pin(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            Ok(Value::Null)
+        })
+    }
+
+    /// Issue #1797: the simulation stops with the task error and records no
+    /// terminal event.
+    #[tokio::test(start_paused = true)]
+    async fn a_deadlocked_cycle_stops_the_simulation_without_a_terminal_event() {
+        let res = WorkflowSimulator::new(deadlocking_workflow)
+            .run(Value::Null)
+            .await;
+        let error = res
+            .final_output
+            .expect_err("a deadlock must surface as an error");
+        assert!(error.contains("potential deadlock detected"), "{error}");
+        assert!(
+            !res.history.iter().any(|e| matches!(
+                e,
+                WorkflowEvent::WorkflowFailed { .. } | WorkflowEvent::WorkflowCompleted { .. }
+            )),
+            "a failed task must record no terminal event: {:?}",
+            res.history
+        );
+    }
+
     fn single_activity_workflow(
         ctx: &crate::context::WorkflowContext,
         input: Value,
@@ -1270,17 +1311,17 @@ mod tests {
         assert!(res.final_output.is_err(), "workflow must fail overall");
     }
 
-    /// AC6: retries must not perform any real-time sleep. The executor's
-    /// suspension-detection window (`SUSPENSION_TIMEOUT`, `executor.rs`) is a
-    /// fixed, pre-existing per-suspension cost unrelated to this issue — the
-    /// whole retry loop for one `ScheduleActivity` command resolves inside a
-    /// *single* suspension, so that fixed cost is paid exactly once
-    /// regardless of `max_attempts`. This test isolates the retry-specific
-    /// cost by asserting elapsed time does not scale with `max_attempts`:
-    /// a policy configured with a 10-second initial backoff and 50 attempts
-    /// must run in essentially the same wall-clock time as one with 2
-    /// attempts, proving no attempt actually sleeps for its configured delay.
-    #[tokio::test]
+    /// AC6: retries must not perform any real-time sleep. The whole retry
+    /// loop for one `ScheduleActivity` command resolves inside a *single*
+    /// suspension. `start_paused` drives a virtual clock, and this test
+    /// measures elapsed time with `tokio::time::Instant`, which follows it.
+    /// A suspension does not move that clock (issue #1797). A real backoff
+    /// sleep would advance it by the configured 10 seconds. Elapsed time
+    /// therefore stays far below that scale for any attempt count,
+    /// independent of host speed. Two earlier versions measured real time.
+    /// Both could fail on a heavily loaded CI runner, since real elapsed time
+    /// includes time the process spends descheduled (issue #1290).
+    #[tokio::test(start_paused = true)]
     async fn test_simulator_retries_are_logical_only_no_real_sleep() {
         async fn run_with_max_attempts(max_attempts: u32) -> std::time::Duration {
             let sim = WorkflowSimulator::new(single_activity_workflow)
@@ -1290,19 +1331,28 @@ mod tests {
                 )
                 .mock_activity("flaky", |_input| Err("always fails".to_string()));
 
-            let started = std::time::Instant::now();
+            let started = tokio::time::Instant::now();
             let res = sim.run(serde_json::json!("input")).await;
             assert!(res.final_output.is_err());
             started.elapsed()
         }
 
-        let few_attempts = run_with_max_attempts(2).await;
-        let many_attempts = run_with_max_attempts(50).await;
+        // A suspension does not move the virtual clock. This ceiling stays
+        // far below the 10-second configured backoff.
+        let no_real_sleep_ceiling = std::time::Duration::from_millis(300);
 
+        let few_attempts = run_with_max_attempts(2).await;
         assert!(
-            many_attempts.abs_diff(few_attempts) < std::time::Duration::from_millis(100),
-            "50 attempts ({many_attempts:?}) took far longer than 2 attempts \
-             ({few_attempts:?}); retries must be logical-only, not real-time sleeps"
+            few_attempts < no_real_sleep_ceiling,
+            "2 attempts advanced the virtual clock by {few_attempts:?}; retries must be \
+             logical-only, not real sleeps"
+        );
+
+        let many_attempts = run_with_max_attempts(50).await;
+        assert!(
+            many_attempts < no_real_sleep_ceiling,
+            "50 attempts advanced the virtual clock by {many_attempts:?}; retries must be \
+             logical-only, not real sleeps"
         );
     }
 

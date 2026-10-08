@@ -32,7 +32,8 @@
 //! ```
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use base64::Engine as _;
 use serde_json::Value;
@@ -56,8 +57,211 @@ pub const CODEC_ENVELOPE_KEY: &str = "_harvest_codec_envelope";
 /// (issue #495).
 pub const UNDECODABLE_MARKER_KEY: &str = "_harvest_undecodable";
 
+/// Envelope key carrying the **codec key id** a payload was encoded under
+/// (issue #948).
+///
+/// Optional by design. An envelope written before key rotation existed
+/// carries no `kid` at all. Neither does one written while the
+/// [`CODEC_LEGACY_KEY_ID`] key is active — that is the canonical spelling of
+/// the same thing. An absent `kid` **is** [`CODEC_LEGACY_KEY_ID`]. The two
+/// forms are one key id, not two.
+///
+/// Before issue #1253, an un-rotated deployment's *encoded* envelope bytes
+/// were byte-identical to pre-#948. That still holds: a real (non-identity)
+/// codec's write always stays flat, version 1 or 2. It is never the
+/// [`PayloadCodecs::encode_payload`] escape case — encrypting a coincidental
+/// collision already changes its bytes, so there is nothing to escape.
+///
+/// Only the identity codec's collision-escape case nests — see
+/// [`CODEC_ENVELOPE_VERSION_NESTED`]. An identity-codec deployment otherwise
+/// stores the field verbatim, with no envelope, exactly as before.
+///
+/// The key id rides *inside* the codec envelope, which is already opaque
+/// payload content. Rotation adds no `WorkflowEvent` variant, and does not
+/// touch the adjacently-tagged event JSON contract.
+pub const CODEC_ENVELOPE_KID_KEY: &str = "kid";
+
+/// Discriminator value of a **legacy** (pre-#948) codec envelope: exactly three
+/// keys, no [`CODEC_ENVELOPE_KID_KEY`].
+///
+/// Every envelope ever written before key rotation carries this, and so does
+/// every envelope written while [`CODEC_LEGACY_KEY_ID`] is the active key — so
+/// an un-rotated deployment's stored bytes stay byte-identical to pre-#948.
+pub const CODEC_ENVELOPE_VERSION_LEGACY: i64 = 1;
+
+/// Discriminator value of a **keyed** flat codec envelope (issue #948): exactly
+/// four keys, the fourth a valid [`CODEC_ENVELOPE_KID_KEY`].
+///
+/// **Still the current shape for every keyed write**, unchanged by issue
+/// #1253. [`PayloadCodecs::encode_payload`]'s doc explains why: this shape
+/// is already fleet-gated, and moving a keyed write to
+/// [`CODEC_ENVELOPE_VERSION_NESTED`] instead would open a rollout hazard
+/// nothing gates.
+///
+/// A distinct version rather than a fourth key under
+/// [`CODEC_ENVELOPE_VERSION_LEGACY`], because reusing version `1` would
+/// retroactively reinterpret data. Pre-#948, `{"_harvest_codec_envelope": 1,
+/// "codec_id": ..., "data": ..., "kid": ...}` was **not** an envelope — the
+/// parser required exactly three keys — so on an identity deployment such a
+/// value could legitimately be stored *business plaintext*. Widening version
+/// `1` to accept it would turn that plaintext into a decode target: strict
+/// reads would fail with `UnknownCodecKey` where they used to pass through, and
+/// with a matching key registered the sweep would decode and rewrite data that
+/// was never ciphertext. Version `2` is a shape no prior release could write or
+/// accept, so nothing already stored is reinterpreted.
+///
+/// It did not close the hazard going forward, however. A *new* business
+/// value shaped exactly like this one collided too: four keys, integer `2`
+/// under the discriminator, a `kid` passing [`validate_key_id`].
+///
+/// That is issue #1253. The fix is [`CODEC_ENVELOPE_VERSION_NESTED`], not a
+/// version `3` flat shape. Bumping the version again only relocates the same
+/// collision.
+pub const CODEC_ENVELOPE_VERSION_KEYED: i64 = 2;
+
+/// Discriminator shape of the **current** codec envelope (issue #1253).
+///
+/// The payload-bearing field's *only* top-level key is
+/// [`CODEC_ENVELOPE_KEY`]. Its value is an object carrying `codec_id`, an
+/// optional [`CODEC_ENVELOPE_KID_KEY`], and `data`.
+///
+/// Nesting, not another version integer, is the fix. A flat envelope's
+/// "envelope-ness" depends on an exact combination of sibling keys, types,
+/// and key count. That is a shape business data can coincidentally match.
+/// Every version bump so far has re-created that hazard one shape later —
+/// see [`CODEC_ENVELOPE_VERSION_KEYED`]'s doc. A nested envelope's
+/// "envelope-ness" depends on one fact: is [`CODEC_ENVELOPE_KEY`] the
+/// object's only key. That is the same convention this module's own
+/// [`UNDECODABLE_MARKER_KEY`] marker already uses safely —
+/// [`undecodable_marker`] nests under it the same way.
+///
+/// [`PayloadCodecs::encode_payload`] also refuses to let this remain merely
+/// improbable. It escapes any payload already shaped like a recognized
+/// envelope, nested or legacy flat, into a nested envelope before storing
+/// it. So nothing this method writes going forward can ever collide — by
+/// construction, not by improbability.
+///
+/// See [`PayloadCodecs::encode_payload`]'s doc for the escape mechanism.
+/// Its doc also names two residual gaps: a mixed-binary rollout window, and
+/// history already on disk before this shape existed at all.
+///
+/// Not stored inside the envelope itself — the nesting alone disambiguates,
+/// so there is no integer here to collide with. Unlike
+/// [`CODEC_ENVELOPE_VERSION_KEYED`], nothing advertises fleet-wide readiness
+/// to *read* this shape: only [`PayloadCodecs::encode_payload`]'s
+/// collision-escape case ever writes it, and that path is not fleet-gated.
+/// See that method's doc for why.
+pub const CODEC_ENVELOPE_VERSION_NESTED: i64 = 3;
+
+/// The designated key id for envelopes that carry no explicit
+/// [`CODEC_ENVELOPE_KID_KEY`] (issue #948).
+///
+/// Every pre-rotation row in existence resolves here, so an embedder adopting
+/// rotation registers its *current* codec under this id (or keeps it
+/// registered by `codec_id` via [`PayloadCodecs::register`], which is the
+/// kid-less fallback) and its stored history keeps decoding unchanged.
+pub const CODEC_LEGACY_KEY_ID: &str = "legacy";
+
+/// Maximum length in bytes of a codec key id (issue #948).
+///
+/// Key ids are operator-chosen and appear in stored envelopes, in the
+/// `GET /admin/codec/rotation` census, and in the retirement gate's typed
+/// error, so they are bounded and restricted to
+/// `[A-Za-z0-9._:-]` — see [`PayloadCodecs::register_key`].
+pub const MAX_CODEC_KEY_ID_BYTES: usize = 64;
+
+/// `harvest_workers.labels` key a worker advertises its highest readable
+/// codec envelope version under (issue #1244).
+///
+/// Written automatically by `workers::register_worker` /
+/// `workers::heartbeat_worker`. It is never operator-configured, so an old
+/// binary that has never heard of this label can never claim a version it
+/// cannot read. Absence reads as [`CODEC_ENVELOPE_VERSION_LEGACY`] (`1`) — the
+/// fail-closed default. `codec_rotation::activate_codec_key` refuses to
+/// switch new writes to a keyed codec while any live worker's row is missing
+/// this label or names a version below [`CODEC_ENVELOPE_VERSION_KEYED`].
+/// Unaffected by issue #1253: a keyed write still emits the same flat,
+/// four-key shape this label has always gated. See
+/// [`PayloadCodecs::encode_payload`]'s doc for why the nested shape stays
+/// ungated instead of raising this threshold.
+pub const CODEC_ENVELOPE_CAPABILITY_LABEL: &str = "codec_envelope_version";
+
+/// `harvest_workers.labels` key a worker advertises its registered codec key
+/// ids under (issue #1244).
+///
+/// Envelope version alone proves a worker's *binary* can parse a version-2
+/// envelope. It proves nothing about whether that worker's `PayloadCodecs`
+/// has the *specific* key being activated registered.
+///
+/// An operator can deploy the new binary fleet-wide before pushing the new
+/// key's material everywhere. A worker missing the key cannot decode a
+/// payload written under it. So `codec_rotation::activate_codec_key` also
+/// refuses while any live worker's row omits the target key id here.
+///
+/// Written automatically, refreshed on every heartbeat: never
+/// operator-configured, mirroring [`CODEC_ENVELOPE_CAPABILITY_LABEL`].
+/// Absence reads as "no keys registered" — the fail-closed default.
+pub const CODEC_REGISTERED_KEY_IDS_LABEL: &str = "codec_registered_key_ids";
+
+/// Merge this build's highest readable envelope version, and this process's
+/// registered codec key ids, into a worker's `labels` JSON (issue #1244).
+///
+/// `labels` is otherwise entirely operator-chosen (issue #382). These are the
+/// two keys the engine itself writes. Both always overwrite any prior
+/// value — a worker cannot advertise a capability its own binary and
+/// registry do not actually have.
+///
+/// Non-object `labels` is replaced with a fresh object, rather than silently
+/// dropping the capability markers. [`crate::worker::WorkerRegistration`]
+/// never actually produces a non-object value; its type does not rule one
+/// out.
+#[must_use]
+pub fn advertise_codec_capability(labels: &Value, registered_key_ids: &[String]) -> Value {
+    let mut merged = match labels {
+        Value::Object(map) => Value::Object(map.clone()),
+        _ => Value::Object(serde_json::Map::new()),
+    };
+    merged[CODEC_ENVELOPE_CAPABILITY_LABEL] = Value::from(CODEC_ENVELOPE_VERSION_KEYED);
+    merged[CODEC_REGISTERED_KEY_IDS_LABEL] = Value::from(registered_key_ids.to_vec());
+    merged
+}
+
+/// A worker's operator-set capability labels, read back for `requires` /
+/// `capable_of` matching (issue #382), as string values only.
+///
+/// `harvest_workers.labels` now always carries the two engine-owned,
+/// non-string entries [`advertise_codec_capability`] writes: an integer under
+/// [`CODEC_ENVELOPE_CAPABILITY_LABEL`] and an array under
+/// [`CODEC_REGISTERED_KEY_IDS_LABEL`]. A blanket
+/// `serde_json::from_value::<HashMap<String, String>>` of the whole object
+/// fails the instant either key is present. Every call site historically
+/// swallowed that error with `.unwrap_or_default()`, silently discarding
+/// every real operator label along with it, on every worker, on every call.
+/// That turns `requires`-based routing fleet-wide into a no-op the moment a
+/// worker advertises codec capabilities, which happens on every
+/// registration and heartbeat.
+///
+/// This keeps only the string-valued entries instead of failing the whole
+/// object. Operator labels keep matching exactly as before, and the two
+/// engine-owned keys are simply invisible to capability matching -- neither
+/// was ever an operator-settable capability.
+#[must_use]
+pub fn string_valued_labels(labels: &Value) -> std::collections::HashMap<String, String> {
+    labels
+        .as_object()
+        .into_iter()
+        .flat_map(serde_json::Map::iter)
+        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+        .collect()
+}
+
 /// Undecodable reason: the envelope names a codec that is not registered.
 pub const UNDECODABLE_REASON_UNKNOWN_CODEC: &str = "unknown_codec";
+/// Undecodable reason: the envelope names an unregistered codec **key id**.
+///
+/// Issue #948. Typically a key retired too early, or a reader that has not been
+/// given the outgoing key during a rotation window.
+pub const UNDECODABLE_REASON_UNKNOWN_KEY: &str = "unknown_key";
 /// Undecodable reason: the envelope's `data` field is not valid base64.
 pub const UNDECODABLE_REASON_INVALID_BASE64: &str = "invalid_base64";
 /// Undecodable reason: the codec's `decode` returned an error (bad key,
@@ -114,24 +318,218 @@ impl LossyDecodeOutcome {
     }
 }
 
+/// The parsed contents of a codec envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CodecEnvelopeParts<'a> {
+    /// The `codec_id` the payload was encoded with.
+    codec_id: &'a str,
+    /// The explicit key id, or `None` for a kid-less (legacy) envelope. Use
+    /// [`CodecEnvelopeParts::key_id`] to resolve `None` to
+    /// [`CODEC_LEGACY_KEY_ID`].
+    kid: Option<&'a str>,
+    /// The base64 `data` field.
+    encoded_b64: &'a str,
+}
+
+impl<'a> CodecEnvelopeParts<'a> {
+    /// The envelope's effective key id: its explicit `kid`, or
+    /// [`CODEC_LEGACY_KEY_ID`] when it carries none (issue #948).
+    const fn key_id(&self) -> &'a str {
+        match self.kid {
+            Some(kid) => kid,
+            None => CODEC_LEGACY_KEY_ID,
+        }
+    }
+}
+
 /// The exact codec-envelope shape check shared by the strict
 /// (`decode_payload`) and lossy (`decode_value_lossy`) read paths, so the two
-/// can never disagree about what an envelope is: an object with **exactly**
-/// three keys — `_harvest_codec_envelope == 1`, string `codec_id`, and string
-/// `data`. Returns `(codec_id, base64_data)` for an envelope, `None` for
-/// anything else (offload envelopes, erase tombstones, business data carrying
-/// a `codec_id` field, malformed near-envelopes).
-fn codec_envelope_parts(payload: &Value) -> Option<(&str, &str)> {
+/// can never disagree about what an envelope is. Three shapes qualify.
+///
+/// **Nested (issue #1253):** [`CODEC_ENVELOPE_VERSION_NESTED`]. The
+/// payload-bearing field's only top-level key is [`CODEC_ENVELOPE_KEY`].
+/// Its value is an object with string `codec_id`, string `data`, and either
+/// nothing else or a [`CODEC_ENVELOPE_KID_KEY`] that satisfies
+/// [`validate_key_id`]. [`PayloadCodecs::encode_payload`] writes this shape
+/// only for its collision-escape case. See that method's doc for why a
+/// genuinely rotated key still writes the flat shape below instead.
+///
+/// **Flat**, both still written today, both introduced by issue #948:
+///
+/// - [`CODEC_ENVELOPE_VERSION_LEGACY`] with **exactly three** keys —
+///   `_harvest_codec_envelope`, string `codec_id`, string `data`. Written
+///   whenever no key is genuinely active (the identity codec, or any
+///   non-identity codec with rotation never configured).
+/// - [`CODEC_ENVELOPE_VERSION_KEYED`] with **exactly four** — those three
+///   plus a [`CODEC_ENVELOPE_KID_KEY`] that satisfies [`validate_key_id`].
+///   Written whenever a non-legacy key is active.
+///
+/// Anything else is **not** an envelope. None of these qualify:
+///
+/// - an unknown discriminator value
+/// - a legacy version carrying a `kid`
+/// - a keyed version without one
+/// - a non-string or malformed `kid`
+/// - a nested object with the wrong key count
+///
+/// That preserves the pre-#948 strictness against near-envelopes — offload
+/// envelopes, erase tombstones, business data carrying its own `codec_id`
+/// field.
+///
+/// # Why nesting, and not a version 3 flat shape
+///
+/// Issue #1253: business data shaped *exactly* like a legacy flat envelope
+/// is structurally indistinguishable from a real one. Three or four keys,
+/// the right discriminator, a `kid` passing [`validate_key_id`] — that is
+/// all it takes. A pre-#948 reader that rejected the shape outright could
+/// have stored such data as plaintext.
+///
+/// Bumping the version only relocates the collision. Issue #948 did once
+/// already, and a hypothetical version 3 flat shape would do it again.
+/// Whichever shape a reader newly recognises, data coincidentally matching
+/// it stops being plaintext the moment that reader ships.
+///
+/// A nested envelope's "envelope-ness" depends on one fact instead of an
+/// exact key combination: is [`CODEC_ENVELOPE_KEY`] the object's *only* key.
+/// [`PayloadCodecs::encode_payload`] makes that fact true by construction
+/// rather than by improbability, for every value it writes from here on. It
+/// escapes any payload already shaped like a recognized envelope, nested or
+/// legacy flat, before it is ever stored — see that method's doc.
+///
+/// **This construction guarantee is about future writes, not present
+/// history.** Recognizing the nested shape at all is itself a new
+/// discriminator added to an already-populated log. It carries the same
+/// category of risk the flat shapes always have.
+///
+/// A row written before this fix shipped — by identity, with no escape
+/// guard yet to apply — can happen to already match
+/// `{"_harvest_codec_envelope": {"codec_id": ..., "data": ...}}`. Such a row
+/// reads as ciphertext now, exactly like the flat-shape collision this
+/// issue reports.
+///
+/// That is not a new class of danger. Every reserved marker in this crate
+/// carries this same remote, accepted risk the moment it is introduced.
+/// `_harvest_offload_envelope` and [`UNDECODABLE_MARKER_KEY`] were each new
+/// markers over already-populated history once too.
+///
+/// It cannot be eliminated for rows already on disk without rewriting
+/// stored history. `harvest_events` being append-only forbids that outside
+/// the two sanctioned exceptions in `CLAUDE.md`. The legacy flat shapes
+/// above carry the identical, pre-existing residual for the same reason.
+///
+/// **Third residual: columns [`PayloadCodecs::encode_payload`] never
+/// touches at all.** `harvest_workflow_executions.input`/`output` and
+/// similar denormalized queue and dead-letter columns are populated
+/// directly from caller-supplied values. They never go through
+/// `encode_payload`. So [`PayloadCodecs::decode_value_lossy`] can misread
+/// a coincidental collision there, for the same reason it can on
+/// `harvest_events`.
+///
+/// This predates issue #1253. It applied to the legacy flat shapes too,
+/// so it is not new. An escape guard on `encode_payload` cannot close it,
+/// because these columns never reach `encode_payload` to escape through.
+/// Out of scope for this fix — see issue #1253's PR discussion. Those
+/// columns stay directly queryable by design, which a codec envelope
+/// would break.
+fn codec_envelope_parts(payload: &Value) -> Option<CodecEnvelopeParts<'_>> {
     let obj = payload.as_object()?;
-    if obj.get(CODEC_ENVELOPE_KEY).and_then(Value::as_i64) != Some(1) {
+    let marker = obj.get(CODEC_ENVELOPE_KEY)?;
+    if let Some(nested) = marker.as_object() {
+        return parse_nested_envelope(obj, nested);
+    }
+    parse_flat_envelope(obj, marker)
+}
+
+/// Parse the current nested shape ([`CODEC_ENVELOPE_VERSION_NESTED`]).
+///
+/// `obj` is the whole payload-bearing field; `nested` is the value already
+/// resolved to sit under [`CODEC_ENVELOPE_KEY`]. Requires `obj` to have no
+/// other top-level key. That is the entire structural guarantee this shape
+/// is built on, so this checks it first and unconditionally.
+fn parse_nested_envelope<'a>(
+    obj: &'a serde_json::Map<String, Value>,
+    nested: &'a serde_json::Map<String, Value>,
+) -> Option<CodecEnvelopeParts<'a>> {
+    if obj.len() != 1 {
         return None;
     }
+    let codec_id = nested.get("codec_id").and_then(Value::as_str)?;
+    let encoded_b64 = nested.get("data").and_then(Value::as_str)?;
+    let kid = match nested.len() {
+        2 => None,
+        3 => {
+            let kid = nested.get(CODEC_ENVELOPE_KID_KEY).and_then(Value::as_str)?;
+            // See the matching comment in `parse_flat_envelope`: a
+            // `kid` read back out of storage is untrusted input.
+            if validate_key_id(kid).is_err() {
+                return None;
+            }
+            Some(kid)
+        }
+        _ => return None,
+    };
+    Some(CodecEnvelopeParts {
+        codec_id,
+        kid,
+        encoded_b64,
+    })
+}
+
+/// Parse a flat shape ([`CODEC_ENVELOPE_VERSION_LEGACY`] or
+/// [`CODEC_ENVELOPE_VERSION_KEYED`]) — issue #948's original envelope,
+/// still written today for every non-escaping encode. See
+/// [`PayloadCodecs::encode_payload`]'s doc for when nesting applies instead.
+///
+/// `marker` is the value already resolved to sit under [`CODEC_ENVELOPE_KEY`],
+/// confirmed by the caller not to be an object (a nested envelope).
+fn parse_flat_envelope<'a>(
+    obj: &'a serde_json::Map<String, Value>,
+    marker: &Value,
+) -> Option<CodecEnvelopeParts<'a>> {
+    let version = marker.as_i64()?;
     let codec_id = obj.get("codec_id").and_then(Value::as_str)?;
     let encoded_b64 = obj.get("data").and_then(Value::as_str)?;
-    if obj.len() != 3 {
-        return None;
-    }
-    Some((codec_id, encoded_b64))
+    let kid = match (version, obj.len()) {
+        (CODEC_ENVELOPE_VERSION_LEGACY, 3) => None,
+        (CODEC_ENVELOPE_VERSION_KEYED, 4) => {
+            let kid = obj.get(CODEC_ENVELOPE_KID_KEY).and_then(Value::as_str)?;
+            // A `kid` read back out of STORAGE is untrusted. On a deployment
+            // with no non-identity codec, `encode_payload` stores caller input
+            // verbatim, so a workflow can be started with an input that is
+            // literally envelope-shaped and carries an arbitrary `kid` — which
+            // would otherwise land in the rotation census as an
+            // attacker-chosen, unbounded JSON object key, keep
+            // `rows_remaining` permanently non-zero (a denial of the retirement
+            // procedure), and stream unbounded untrusted text into the sweep's
+            // logs. `register_key` applies the same rule on the way in, so a
+            // genuinely-written envelope always passes.
+            if validate_key_id(kid).is_err() {
+                return None;
+            }
+            Some(kid)
+        }
+        // Anything else -- version 1 with four keys, version 2 with three, an
+        // unknown version -- is NOT an envelope, exactly as before.
+        _ => return None,
+    };
+    Some(CodecEnvelopeParts {
+        codec_id,
+        kid,
+        encoded_b64,
+    })
+}
+
+/// The codec key id a payload field was encoded under (issue #948), or `None`
+/// when `payload` is not a codec envelope at all (plaintext, an offload
+/// reference envelope, an erase tombstone).
+///
+/// A kid-less envelope resolves to [`CODEC_LEGACY_KEY_ID`], so this is the one
+/// place the "absent `kid` means legacy" rule is applied for external callers
+/// — the re-encryption sweep and the retirement-gate census both read key ids
+/// through here rather than reaching into the envelope themselves.
+#[must_use]
+pub fn codec_envelope_key_id(payload: &Value) -> Option<&str> {
+    codec_envelope_parts(payload).map(|parts| parts.key_id())
 }
 
 /// `true` when `payload` is a codec envelope written by
@@ -152,6 +550,29 @@ fn codec_envelope_parts(payload: &Value) -> Option<(&str, &str)> {
 #[must_use]
 pub fn is_codec_envelope(payload: &Value) -> bool {
     codec_envelope_parts(payload).is_some()
+}
+
+/// True if `payload`, or anything nested inside it, is shaped like a
+/// recognized codec envelope (issue #1253).
+///
+/// [`PayloadCodecs::encode_payload`]'s escape guard must close the collision
+/// at every depth a lossy decoder can reach, not only the payload root.
+/// [`PayloadCodecs::decode_value_lossy`] recurses into every object and
+/// array looking for an envelope. This check mirrors that walk, so the two
+/// can never disagree about what counts as a collision.
+fn payload_or_a_descendant_is_a_codec_envelope(payload: &Value) -> bool {
+    if is_codec_envelope(payload) {
+        return true;
+    }
+    match payload {
+        Value::Object(map) => map
+            .values()
+            .any(payload_or_a_descendant_is_a_codec_envelope),
+        Value::Array(items) => items
+            .iter()
+            .any(payload_or_a_descendant_is_a_codec_envelope),
+        _ => false,
+    }
 }
 
 /// A trait for intercepting and transforming raw payload bytes.
@@ -177,6 +598,16 @@ pub trait PayloadCodec: Send + Sync {
     ///
     /// Returns [`CodecError`] when decoding fails.
     fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, CodecError>;
+    /// The codec key id that this codec binds into its own output, if any
+    /// (issue #1825).
+    ///
+    /// [`PayloadCodecs::register_key`] refuses a codec whose bound key id
+    /// differs from the registry key id. Otherwise the census and the sweep
+    /// track rows under a key id that does not name their key material.
+    /// The default is `None`: the codec binds no key id.
+    fn bound_key_id(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Represents an error that occurred during encoding or decoding.
@@ -256,6 +687,78 @@ impl PayloadCodec for IdentityCodec {
 pub struct PayloadCodecs {
     default: Arc<dyn PayloadCodec>,
     codecs: BTreeMap<&'static str, Arc<dyn PayloadCodec>>,
+    /// Key-rotation state (issue #948), deliberately **shared** across clones.
+    ///
+    /// `PayloadCodecs` is cloned into the worker, the store call sites, and the
+    /// management API at build time. If the active key id lived in the cloned
+    /// value, a clone captured before a rotation would keep encrypting under
+    /// the retired key for the life of the process — the exact
+    /// restart-ordering window AC2 forbids. Behind an `Arc<RwLock<_>>` every
+    /// clone observes [`PayloadCodecs::set_active_key`] the instant it returns.
+    keyed: Arc<RwLock<KeyRegistry>>,
+    /// Lock-free mirror of "is the keyed registry non-empty?".
+    ///
+    /// `encode_payload` and `resolve_decoder` run per payload field per event on
+    /// the hot write/read paths, and the overwhelmingly common case is a
+    /// deployment that has never registered a keyed codec at all. Consulting an
+    /// atomic instead of taking the `RwLock` keeps that case free. Written only
+    /// under the write lock, so it can never claim keys exist when they do not.
+    any_keys: Arc<AtomicBool>,
+}
+
+/// When the key set or the active key last changed (issue #1815).
+///
+/// `generation` counts the changes, so a change back to an earlier key set is
+/// still a change. `changed_at` is the instant of the last change, taken under
+/// the write lock that makes it. `None` until the first change.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeyEpoch {
+    /// How many times the key set or the active key changed.
+    pub generation: u64,
+    /// When the last change happened.
+    pub changed_at: Option<std::time::Instant>,
+}
+
+/// The registered key ids, the active key id and the [`KeyEpoch`], read under
+/// one lock (issue #1815).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyState {
+    /// The registered key ids, sorted.
+    pub registered: Vec<String>,
+    /// The active key id.
+    pub active: String,
+    /// When the key set or the active key last changed.
+    pub epoch: KeyEpoch,
+}
+
+/// The multi-key half of the codec registry (issue #948): every registered
+/// keyed codec plus the single active key id used for new writes.
+struct KeyRegistry {
+    keys: BTreeMap<String, Arc<dyn PayloadCodec>>,
+    /// Exactly one key id is active at a time. Defaults to
+    /// [`CODEC_LEGACY_KEY_ID`], which is also the resolution target for every
+    /// kid-less stored envelope.
+    active: String,
+    /// Count of live [`SweepKeyPin`] guards per key id (issue #1251).
+    ///
+    /// A re-encryption batch pins the key it is about to write rows onto for
+    /// the whole batch. [`PayloadCodecs::retire_key_local`] refuses a key with
+    /// a non-zero count here, under the same write lock that would otherwise
+    /// let it race a batch's own commit. Several shards can pin the same key
+    /// at once, so this counts rather than flags.
+    sweep_pins: BTreeMap<String, u64>,
+    /// When `keys` or `active` last changed (issue #1815).
+    epoch: KeyEpoch,
+}
+
+impl KeyRegistry {
+    /// Record a change to `keys` or `active`. Call it under the write lock.
+    fn changed(&mut self) {
+        self.epoch = KeyEpoch {
+            generation: self.epoch.generation.saturating_add(1),
+            changed_at: Some(std::time::Instant::now()),
+        };
+    }
 }
 
 impl Default for PayloadCodecs {
@@ -266,8 +769,91 @@ impl Default for PayloadCodecs {
         Self {
             default: identity,
             codecs,
+            keyed: Arc::new(RwLock::new(KeyRegistry {
+                keys: BTreeMap::new(),
+                active: CODEC_LEGACY_KEY_ID.to_string(),
+                sweep_pins: BTreeMap::new(),
+                epoch: KeyEpoch::default(),
+            })),
+            any_keys: Arc::new(AtomicBool::new(false)),
         }
     }
+}
+
+impl std::fmt::Debug for PayloadCodecs {
+    /// Never prints codec state that could carry key material — only the
+    /// registered identifiers, which are operator-chosen labels.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let keyed = self.keys_read();
+        f.debug_struct("PayloadCodecs")
+            .field("default_codec_id", &self.default.codec_id())
+            .field("codec_ids", &self.codecs.keys().collect::<Vec<_>>())
+            .field("key_ids", &keyed.keys.keys().collect::<Vec<_>>())
+            .field("active_key_id", &keyed.active)
+            // `finish_non_exhaustive`: the `keyed` field itself is deliberately
+            // not printed as a field — only the identifiers read out of it —
+            // because it holds live codec handles that may close over key
+            // material.
+            .finish_non_exhaustive()
+    }
+}
+
+/// Deserialize a wire event without serde's `Content` buffering.
+///
+/// `WorkflowEvent` is adjacently tagged. Without the `preserve_order` feature,
+/// `serde_json::Map` iterates keys in sorted order, so `data` comes before `type`. Serde then buffers the whole
+/// event in `Content` before it can pick a variant. This function feeds
+/// `type` first, so serde reads `data` straight into the chosen variant.
+///
+/// Any other shape takes the plain `from_value` path, so every error message
+/// stays the same. That covers a non-object root, a missing `type`, and extra
+/// keys.
+fn event_from_wire(value: Value) -> Result<crate::event::WorkflowEvent, serde_json::Error> {
+    use serde::de::IntoDeserializer;
+    use serde::de::value::MapDeserializer;
+
+    let Value::Object(mut map) = value else {
+        return serde_json::from_value(value);
+    };
+    let tagged = map.get("type").is_some_and(Value::is_string)
+        && map.keys().all(|key| key == "type" || key == "data");
+    if !tagged {
+        return serde_json::from_value(Value::Object(map));
+    }
+    let tag = map.remove("type").unwrap_or_default();
+    let data = map.remove("data");
+    let pairs = std::iter::once(("type", tag)).chain(data.map(|data| ("data", data)));
+    let de: MapDeserializer<'_, _, serde_json::Error> =
+        MapDeserializer::new(pairs.map(|(key, value)| (key.into_deserializer(), value)));
+    serde::Deserialize::deserialize(de)
+}
+
+/// Validate an operator-supplied codec key id (issue #948).
+///
+/// Key ids are persisted inside stored envelopes and echoed in the rotation
+/// census and the retirement gate's error, so they are bounded and restricted
+/// to a conservative ASCII alphabet.
+pub(crate) fn validate_key_id(key_id: &str) -> HarvestResult<()> {
+    if key_id.is_empty() {
+        return Err(HarvestError::Config(
+            "codec key id must not be empty".to_string(),
+        ));
+    }
+    if key_id.len() > MAX_CODEC_KEY_ID_BYTES {
+        return Err(HarvestError::Config(format!(
+            "codec key id {key_id:?} is {} bytes; the maximum is {MAX_CODEC_KEY_ID_BYTES}",
+            key_id.len()
+        )));
+    }
+    if !key_id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
+    {
+        return Err(HarvestError::Config(format!(
+            "codec key id {key_id:?} must contain only ASCII alphanumerics and `-_.:`"
+        )));
+    }
+    Ok(())
 }
 
 impl PayloadCodecs {
@@ -289,6 +875,417 @@ impl PayloadCodecs {
         self.default = codec;
     }
 
+    /// The id of the default codec, which encodes new payloads (issue #1815).
+    #[must_use]
+    pub fn default_codec_id(&self) -> &'static str {
+        self.default.codec_id()
+    }
+
+    /// Every registered codec id, sorted (issue #1815).
+    ///
+    /// The default codec is always one of them. Keyed codecs are not. See
+    /// [`PayloadCodecs::registered_key_ids`] for those.
+    #[must_use]
+    pub fn codec_ids(&self) -> Vec<&'static str> {
+        self.codecs.keys().copied().collect()
+    }
+
+    // ── Key rotation (issue #948) ────────────────────────────────────────
+
+    fn keys_read(&self) -> RwLockReadGuard<'_, KeyRegistry> {
+        // A panic inside a codec while a guard is held must not brick payload
+        // decoding for the rest of the process: recover the inner state rather
+        // than propagating the poison.
+        self.keyed.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn keys_write(&self) -> RwLockWriteGuard<'_, KeyRegistry> {
+        self.keyed.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Register a keyed codec under `key_id` (issue #948).
+    ///
+    /// Unlike [`PayloadCodecs::register`], which is keyed by the codec's own
+    /// `codec_id`, this is keyed by **key material identity**: rotation means
+    /// two codecs that share a `codec_id` (`"aes-gcm"`) and differ only in the
+    /// key they hold, so `codec_id` cannot distinguish them and this registry
+    /// deliberately does not consult it.
+    ///
+    /// The **first** key registered on an empty registry becomes the active
+    /// key, so a single-key deployment needs no separate activation call. Use
+    /// [`PayloadCodecs::set_active_key`] to rotate.
+    ///
+    /// **Registrations are immutable.** Re-registering an existing key id is
+    /// refused, not silently replaced: a config reload that bound the same id
+    /// to different key material would otherwise destroy the *only* decoder for
+    /// every stored envelope bearing that `kid`, and the sweep could not repair
+    /// them — it classifies their unchanged key id as already active and skips
+    /// them. Failing loudly at registration is the only recoverable outcome. To
+    /// re-assert a configuration, build a fresh [`PayloadCodecs`].
+    ///
+    /// Takes `&self`: rotation state is shared across clones of the registry,
+    /// so a key may be added at runtime (a config reload) and every existing
+    /// clone sees it.
+    ///
+    /// # Errors
+    ///
+    /// [`HarvestError::Config`] when `key_id` is empty, longer than
+    /// [`MAX_CODEC_KEY_ID_BYTES`], contains anything outside ASCII
+    /// alphanumerics and `-_.:`, or is **already registered**. The same
+    /// error applies when the codec's [`PayloadCodec::bound_key_id`] is a
+    /// different id and `key_id` is not [`CODEC_LEGACY_KEY_ID`].
+    pub fn register_key(&self, key_id: &str, codec: Arc<dyn PayloadCodec>) -> HarvestResult<()> {
+        validate_key_id(key_id)?;
+        // The legacy id may hold any codec: kid-less history predates key ids.
+        if let Some(bound) = codec.bound_key_id()
+            && bound != key_id
+            && key_id != CODEC_LEGACY_KEY_ID
+        {
+            return Err(HarvestError::Config(format!(
+                "codec key id {key_id:?} does not match the key id {bound:?} that the codec \
+                 binds into its output; register the codec under {bound:?}"
+            )));
+        }
+        let mut guard = self.keys_write();
+        if guard.keys.contains_key(key_id) {
+            return Err(HarvestError::Config(format!(
+                "codec key id {key_id:?} is already registered; key registrations are \
+                 immutable because replacing one would destroy the only decoder for every \
+                 stored envelope bearing that key id"
+            )));
+        }
+        let first = guard.keys.is_empty();
+        guard.keys.insert(key_id.to_string(), codec);
+        if first {
+            guard.active = key_id.to_string();
+        }
+        guard.changed();
+        // Publish the mirror while STILL holding the write guard. Storing it
+        // after `drop(guard)` leaves it unordered against the map mutation, so
+        // a concurrent `retire_key_local` that removed the last key can compute
+        // `false`, lose the race to this insert, and then overwrite this `true`
+        // -- leaving a non-empty registry advertising itself as empty, which
+        // makes `resolve_decoder` skip the keyed lookup and encoding fall back
+        // to the default codec. Under the lock, the two stores are ordered by
+        // the same mutex that orders the map.
+        self.any_keys.store(true, Ordering::Release);
+        drop(guard);
+        Ok(())
+    }
+
+    /// Make `key_id` the active key: **all** new writes encode under it from
+    /// the moment this returns (issue #948, AC2).
+    ///
+    /// Because the rotation state is shared across every clone of this
+    /// registry, there is no restart-ordering window in which a clone taken
+    /// before the flip keeps writing under the old key.
+    ///
+    /// # ⚠️ Rollout ordering: upgrade every reader before you activate
+    ///
+    /// Activating a **non-legacy** key switches new writes to envelope
+    /// version 2 ([`CODEC_ENVELOPE_VERSION_KEYED`]), which carries a `kid`
+    /// and so has four keys instead of three. A reader built before issue
+    /// #948 recognises an envelope only as *exactly three keys with version
+    /// 1*, and its decoder returns anything else **unchanged**:
+    ///
+    /// ```text
+    /// let Some(parts) = codec_envelope_parts(payload) else { return Ok(payload.clone()) };
+    /// ```
+    ///
+    /// So a pre-#948 worker does not reject a version-2 envelope loudly — it
+    /// hands the raw `{_harvest_codec_envelope, codec_id, kid, data}` object
+    /// to workflow code as if it were the payload. That is silent wrong
+    /// data, not an error. This shape is unaffected by issue #1253: a keyed
+    /// write still emits this exact flat form, never nested (see
+    /// [`PayloadCodecs::encode_payload`]'s doc for why).
+    ///
+    /// Therefore: **deploy the version-2-capable binary to every reader in
+    /// the fleet first, and only then activate a keyed codec.** While the
+    /// legacy key is active no `kid` is written and envelopes stay version
+    /// 1, so the upgrade itself is safe to roll out in any order — it is
+    /// the *activation* that must come last. This crate cannot enforce the
+    /// ordering: it has no fleet-wide view of which binaries are running.
+    ///
+    /// # Errors
+    ///
+    /// [`HarvestError::Config`] when `key_id` is not registered. The active key
+    /// is left unchanged — a rotation onto a key this process cannot encode
+    /// with must fail loudly rather than half-apply.
+    pub fn set_active_key(&self, key_id: &str) -> HarvestResult<()> {
+        let mut guard = self.keys_write();
+        if !guard.keys.contains_key(key_id) {
+            return Err(HarvestError::Config(format!(
+                "cannot activate unregistered codec key id {key_id:?}; register it with \
+                 `PayloadCodecs::register_key` first"
+            )));
+        }
+        if guard.active != key_id {
+            guard.active = key_id.to_string();
+            guard.changed();
+        }
+        drop(guard);
+        Ok(())
+    }
+
+    /// The key id new writes are currently encoded under (issue #948).
+    ///
+    /// [`CODEC_LEGACY_KEY_ID`] when no keyed codec is registered, which is also
+    /// the key id every kid-less stored envelope resolves to.
+    #[must_use]
+    pub fn active_key_id(&self) -> String {
+        self.keys_read().active.clone()
+    }
+
+    /// Every registered key id, sorted (issue #948).
+    #[must_use]
+    pub fn registered_key_ids(&self) -> Vec<String> {
+        self.keys_read().keys.keys().cloned().collect()
+    }
+
+    /// The registered key ids, sorted, and the active key id, read under one
+    /// lock (issue #1815).
+    ///
+    /// `register_key` changes both under one write lock. Two separate reads can
+    /// see the old key set with the new active key, a pair that never existed.
+    #[must_use]
+    pub fn key_ids(&self) -> (Vec<String>, String) {
+        let state = self.key_state();
+        (state.registered, state.active)
+    }
+
+    /// [`Self::key_ids`] with the [`KeyEpoch`] of the last change, read under
+    /// the same lock (issue #1815).
+    #[must_use]
+    pub fn key_state(&self) -> KeyState {
+        let guard = self.keys_read();
+        KeyState {
+            registered: guard.keys.keys().cloned().collect(),
+            active: guard.active.clone(),
+            epoch: guard.epoch,
+        }
+    }
+
+    /// Whether any keyed codec is registered (issue #948).
+    ///
+    /// `false` on every deployment that has not adopted rotation, which is what
+    /// lets the re-encryption sweep return without touching a connection.
+    #[must_use]
+    pub fn has_keyed_codecs(&self) -> bool {
+        self.any_keys.load(Ordering::Acquire)
+    }
+
+    /// The codec registered under `key_id`, if any (issue #948).
+    #[must_use]
+    pub fn codec_for_key(&self, key_id: &str) -> Option<Arc<dyn PayloadCodec>> {
+        self.keys_read().keys.get(key_id).map(Arc::clone)
+    }
+
+    /// Pin `key_id` so it cannot be retired while the returned guard lives
+    /// (issue #1251).
+    ///
+    /// A re-encryption batch resolves its target key once and writes every row
+    /// of the batch under that exact id (see
+    /// [`crate::codec_rotation::reencrypt_event_payload_fields_under`]). Without
+    /// a pin, a second rotation can move the active key away from the batch's
+    /// target *while the batch is still running*.
+    /// [`PayloadCodecs::retire_key_local`] can then drop that target. Its own
+    /// census reads zero rows, because the batch has not committed yet. The
+    /// next row the batch writes then lands under a key that no longer has a
+    /// decoder anywhere: silent, permanent data loss.
+    ///
+    /// Call this once per batch, right after resolving the target key id, and
+    /// hold the guard for the whole batch. Retirement then fails closed
+    /// instead of racing: see [`PayloadCodecs::retire_key_local`].
+    ///
+    /// Several batches — one per shard, say — may pin the same key id at once;
+    /// the pin is a count, not a flag.
+    ///
+    /// This is `#[doc(hidden)] pub` rather than `pub(crate)`. The
+    /// batch-oriented public sweep entry point calls this internally. But
+    /// the race this guards is exercised directly by an integration test
+    /// outside this crate. Not part of the semver-stable surface.
+    #[doc(hidden)]
+    #[must_use = "dropping the guard immediately un-pins the key"]
+    pub fn pin_key_for_sweep(&self, key_id: &str) -> SweepKeyPin {
+        let mut guard = self.keys_write();
+        *guard.sweep_pins.entry(key_id.to_string()).or_insert(0) += 1;
+        drop(guard);
+        SweepKeyPin {
+            codecs: self.clone(),
+            key_id: key_id.to_string(),
+        }
+    }
+
+    /// Release one pin taken by [`PayloadCodecs::pin_key_for_sweep`].
+    ///
+    /// Only [`SweepKeyPin::drop`] calls this. A pin therefore always
+    /// releases, even when its batch returns early on an error. An unpin
+    /// lost to a failed batch would block that key's retirement forever.
+    fn unpin_key_for_sweep(&self, key_id: &str) {
+        let mut guard = self.keys_write();
+        if let Some(count) = guard.sweep_pins.get_mut(key_id) {
+            *count -= 1;
+            if *count == 0 {
+                guard.sweep_pins.remove(key_id);
+            }
+        }
+        drop(guard);
+    }
+
+    /// Whether an in-flight sweep batch currently holds a pin on `key_id`
+    /// (issue #1251). See [`PayloadCodecs::pin_key_for_sweep`].
+    ///
+    /// `#[doc(hidden)] pub` for the same reason as `pin_key_for_sweep`: an
+    /// integration test outside this crate asserts on it directly.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn is_pinned_by_sweep(&self, key_id: &str) -> bool {
+        self.keys_read().sweep_pins.contains_key(key_id)
+    }
+
+    /// Drop `key_id` from this process's in-memory registry (issue #948).
+    ///
+    /// This is the **local** half of retirement and carries no storage
+    /// guarantee of its own. The gate that proves no stored row still depends
+    /// on the key lives in [`crate::codec_rotation`]; call that instead unless
+    /// you have independently established the same fact.
+    ///
+    /// # Errors
+    ///
+    /// [`HarvestError::Config`] when `key_id` is the active key. Retiring the
+    /// key new writes are being encoded under would immediately produce
+    /// undecodable history. The same error applies when a sweep batch holds
+    /// a pin on it (issue #1251; see [`PayloadCodecs::pin_key_for_sweep`]).
+    pub fn retire_key_local(&self, key_id: &str) -> HarvestResult<()> {
+        let mut guard = self.keys_write();
+        if guard.sweep_pins.contains_key(key_id) {
+            return Err(HarvestError::Config(format!(
+                "codec key id {key_id:?} is pinned by an in-flight re-encryption sweep batch \
+                 and cannot be retired yet; retry once the batch completes"
+            )));
+        }
+        if guard.active == key_id {
+            return Err(HarvestError::Config(format!(
+                "codec key id {key_id:?} is the active key and cannot be retired; \
+                 activate a different key first"
+            )));
+        }
+        // Issue #1815: a key that is not registered leaves the cohort as it
+        // was, so the epoch stays.
+        if guard.keys.remove(key_id).is_some() {
+            guard.changed();
+        }
+        let any_left = !guard.keys.is_empty();
+        // Under the guard, for the reason spelled out in `register_key`: the
+        // mirror and the map must be mutated inside the same critical section
+        // or a concurrent registration can be undone by this store.
+        self.any_keys.store(any_left, Ordering::Release);
+        drop(guard);
+        Ok(())
+    }
+
+    /// The `(key_id, codec)` pair new writes encode under.
+    ///
+    /// Falls back to the [`PayloadCodecs::set_default`] codec under
+    /// [`CODEC_LEGACY_KEY_ID`] when no keyed codec is registered, so a
+    /// pre-rotation deployment behaves exactly as it did before issue #948.
+    fn active_codec(&self) -> (Option<String>, Arc<dyn PayloadCodec>) {
+        if !self.has_keyed_codecs() {
+            // The un-rotated path: no lock, no allocation. `None` means the
+            // legacy key id, which is exactly the envelope form that omits
+            // `kid`.
+            return (None, Arc::clone(&self.default));
+        }
+        let guard = self.keys_read();
+        if let Some(codec) = guard.keys.get(&guard.active) {
+            let key_id = (guard.active != CODEC_LEGACY_KEY_ID).then(|| guard.active.clone());
+            return (key_id, Arc::clone(codec));
+        }
+        drop(guard);
+        (None, Arc::clone(&self.default))
+    }
+
+    /// The `codec_id` of the codec new writes would encode under, or `None`
+    /// when no keyed codec is registered.
+    ///
+    /// A single lock acquisition and no allocation — the sweep's
+    /// "would activating this key decrypt history?" guard calls it per batch.
+    #[must_use]
+    pub fn active_codec_id(&self) -> Option<&'static str> {
+        if !self.has_keyed_codecs() {
+            return None;
+        }
+        let guard = self.keys_read();
+        guard.keys.get(&guard.active).map(|codec| codec.codec_id())
+    }
+
+    /// Resolve the codec that can decode an envelope's `(codec_id, kid)` pair.
+    ///
+    /// Resolution order:
+    ///
+    /// - An envelope naming an explicit `kid` resolves **only** through the
+    ///   keyed registry, by exact key id. It deliberately does not fall back to
+    ///   the `codec_id` map: two keys share a `codec_id` during a rotation, so
+    ///   that fallback would decode with the wrong key material and produce
+    ///   garbage instead of a clean failure.
+    /// - A **kid-less** envelope resolves to the [`CODEC_LEGACY_KEY_ID`] entry
+    ///   *only when that entry's own `codec_id` matches the envelope's*,
+    ///   otherwise through the pre-#948 `codec_id` map — so a deployment using
+    ///   today's [`PayloadCodecs::register`] / [`PayloadCodecs::set_default`]
+    ///   API keeps decoding its own history verbatim after adopting rotation.
+    ///
+    /// That `codec_id` match on the legacy entry is load-bearing. Kid-less
+    /// history can span *several* codec ids — an embedder who migrated
+    /// `"aes-v1"` to `"aes-v2"` before rotation existed has both in the
+    /// `codec_id` map. Letting the legacy keyed entry win unconditionally would
+    /// decode every one of those rows with whichever codec happened to be
+    /// registered under `legacy`: the wrong algorithm and the wrong key. An
+    /// unauthenticated codec can return plausible-but-wrong bytes rather than
+    /// failing, and the sweep would then re-encrypt that garbage under the
+    /// active key — silently and permanently destroying the payload.
+    fn resolve_decoder(&self, parts: &CodecEnvelopeParts<'_>) -> Option<Arc<dyn PayloadCodec>> {
+        // Bind and release the guard before touching `self.codecs`, so the
+        // rotation lock is never held across the fallback lookup.
+        let keyed = if self.has_keyed_codecs() {
+            let guard = self.keys_read();
+            guard.keys.get(parts.key_id()).map(Arc::clone)
+        } else {
+            None
+        };
+        let Some(codec) = keyed else {
+            // No keyed entry for this key id. A kid-less envelope may still
+            // resolve through the pre-#948 map.
+            return if parts.kid.is_none() {
+                self.codecs.get(parts.codec_id).map(Arc::clone)
+            } else {
+                None
+            };
+        };
+        if codec.codec_id() == parts.codec_id {
+            return Some(codec);
+        }
+        if parts.kid.is_some() {
+            // An EXPLICIT kid resolved to a registered key, but the envelope
+            // names a different algorithm than that key is registered with. It
+            // is malformed -- corrupted, imported from elsewhere, or crafted --
+            // and there is no safe reading of it. Decoding under the key's own
+            // codec anyway is the exact hazard this function's doc names: an
+            // unauthenticated codec returns plausible-but-wrong bytes instead
+            // of failing, and the sweep re-encrypts that garbage under the
+            // active key, destroying the payload permanently.
+            //
+            // Falling back to the codec_id map would be just as wrong: the
+            // envelope named a KEY, and resolving it through a codec unrelated
+            // to that key is the confusion being rejected. Fail cleanly, so
+            // strict decode raises `UnknownCodecKey` and lossy decode leaves a
+            // bounded marker.
+            return None;
+        }
+        // Kid-less, and the legacy entry is for a DIFFERENT codec than this
+        // envelope names. Defer to the codec_id map, which knows the right one.
+        self.codecs.get(parts.codec_id).map(Arc::clone)
+    }
+
     /// Encode payload-bearing fields inside an event into codec envelopes.
     ///
     /// # Errors
@@ -307,7 +1304,7 @@ impl PayloadCodecs {
     /// Returns [`HarvestError`] if codec decoding or event deserialization fails.
     pub fn decode_event(&self, mut value: Value) -> HarvestResult<crate::event::WorkflowEvent> {
         self.transform_event_data(&mut value, false)?;
-        Ok(serde_json::from_value(value)?)
+        Ok(event_from_wire(value)?)
     }
 
     fn transform_event_data(&self, root: &mut Value, encode: bool) -> HarvestResult<()> {
@@ -327,47 +1324,424 @@ impl PayloadCodecs {
         // output carried; it is unique to WorkflowStarted among event variants.
         for key in crate::payload_store::PAYLOAD_FIELD_KEYS {
             if let Some(payload) = data.get_mut(key) {
-                if encode {
-                    *payload = self.encode_payload(payload)?;
+                // `transform_event_data` already owns the whole event tree:
+                // `root: &mut Value` is an owned `Value` at every call
+                // site. `payload` is therefore already owned data, not a
+                // borrow into something a caller still needs afterward.
+                // `mem::take` moves it out, leaving `Value::Null` behind.
+                // This lets `encode_payload_owned`/`decode_payload_owned`
+                // hand the unchanged value straight back on the common
+                // (non-envelope) fast path. It avoids cloning the whole
+                // JSON tree just to produce a copy of data already in
+                // hand. If encoding or decoding fails, `?` returns before
+                // the `Null` placeholder is ever observed. The caller
+                // discards the whole partially-transformed `value` along
+                // with the error (see `encode_event`/`decode_event`).
+                let owned = std::mem::take(payload);
+                *payload = if encode {
+                    self.encode_payload_owned(owned)?
                 } else {
-                    *payload = self.decode_payload(payload)?;
-                }
+                    self.decode_payload_owned(owned)?
+                };
             }
         }
         Ok(())
     }
 
-    fn encode_payload(&self, payload: &Value) -> HarvestResult<Value> {
-        if self.default.codec_id() == "identity" {
+    /// Encode ONE payload-bearing field into a codec envelope under the
+    /// **active** key (issue #948).
+    ///
+    /// Returns `payload` unchanged when the active codec is the identity
+    /// codec. The one exception: `payload` is itself already shaped like a
+    /// recognized codec envelope, nested or legacy flat — see "The escape
+    /// case" below. The emitted envelope carries a [`CODEC_ENVELOPE_KID_KEY`]
+    /// only when the active key id is not [`CODEC_LEGACY_KEY_ID`].
+    ///
+    /// Public so the re-encryption sweep can re-encode a field it has just
+    /// decoded with a retired key, without duplicating the envelope-writing
+    /// rules.
+    ///
+    /// # The escape case (issue #1253)
+    ///
+    /// An identity-codec deployment stores payload fields verbatim, with no
+    /// envelope at all. That is the whole point of the identity codec.
+    ///
+    /// Suppose `payload`, or anything nested inside it, happens to already
+    /// be shaped like a codec envelope. Storing it verbatim is then exactly
+    /// the collision issue #1253 reports. A later lossy read cannot tell
+    /// that plaintext apart from real ciphertext by shape alone.
+    /// [`decode_value_lossy`](Self::decode_value_lossy) looks for that shape
+    /// at every depth, not only the field root.
+    ///
+    /// So this checks the payload tree, root and every descendant, before
+    /// the identity fast-path bails out. When any node matches, encoding
+    /// falls through to the normal flow instead. For the
+    /// identity codec that means wrapping the WHOLE `payload` byte-for-byte
+    /// — via `IdentityCodec::encode`, the identity function — in a nested
+    /// envelope naming `codec_id: "identity"`.
+    /// [`decode_payload`] reverses it the same way it reverses any other
+    /// envelope, recovering `payload` unchanged, because `"identity"` is
+    /// always registered.
+    ///
+    /// This closes the collision **by construction, not by improbability**,
+    /// for everything written through this method from here on. Nothing
+    /// this method ever stores can be shaped like a recognized envelope
+    /// without actually being one.
+    ///
+    /// A **keyed** write does not nest, even though it is also enveloped
+    /// here — see the private `envelope` builder's doc for why. Its shape
+    /// must stay exactly what issue #948 already fleet-gates, because
+    /// nothing gates the moment a *pre-existing* rotated deployment's
+    /// binary gets upgraded.
+    ///
+    /// **Residual gap.** The fleet-readiness gate
+    /// (`codec_rotation::activate_codec_key`) only runs when an operator
+    /// explicitly activates a keyed codec. It is not consulted here,
+    /// because this escape path can fire on a deployment that has never
+    /// rotated a key at all. So a worker running a pre-#1253 binary cannot
+    /// parse a nested envelope this escape path wrote. It falls through
+    /// `codec_envelope_parts`'s flat-only check, and hands the wrapped
+    /// object to workflow code as literal data, same as any other
+    /// unrecognized shape.
+    ///
+    /// That is silently wrong output, not silent data loss. The original
+    /// collision this method closes was the latter kind — corrupted by a
+    /// re-encryption sweep that could never be undone. Triggering this gap
+    /// needs both the pre-existing collision, independently assessed as
+    /// remote, and a live mixed-binary rollout window. So it is accepted
+    /// and documented rather than gated: upgrade every reader before
+    /// relying on data that might hit it.
+    ///
+    /// **Second residual gap: history predating this shape.** Recognizing
+    /// the nested shape at all is a new discriminator over an
+    /// already-populated log. Take a row written by identity before this
+    /// fix shipped, with no escape guard yet to apply. If it happens to
+    /// already match the nested shape, it reads as ciphertext now. That is
+    /// the same collision this method exists to close, just for a row
+    /// this method never had a chance to escape.
+    ///
+    /// That residual is identical in kind to the flat shapes' own
+    /// pre-existing risk — see [`codec_envelope_parts`]'s doc. It is just
+    /// as unfixable without rewriting history. Every reserved marker this
+    /// crate has ever introduced carried it once, at the moment it was
+    /// introduced.
+    ///
+    /// # Errors
+    ///
+    /// [`HarvestError`] when serialization or the codec's `encode` fails.
+    pub fn encode_payload(&self, payload: &Value) -> HarvestResult<Value> {
+        let (key_id, codec) = self.active_codec();
+        let is_identity = codec.codec_id() == "identity";
+        if is_identity && !payload_or_a_descendant_is_a_codec_envelope(payload) {
             return Ok(payload.clone());
         }
         let raw = serde_json::to_vec(payload)?;
-        let encoded = self
-            .default
+        let encoded = codec
             .encode(&raw)
             .map_err(|e| HarvestError::Config(e.to_string()))?;
-        Ok(
-            serde_json::json!({"_harvest_codec_envelope": 1, "codec_id": self.default.codec_id(), "data": base64::engine::general_purpose::STANDARD.encode(encoded)}),
-        )
+        Ok(Self::envelope(
+            codec.codec_id(),
+            key_id.as_deref().unwrap_or(CODEC_LEGACY_KEY_ID),
+            &encoded,
+            // Reaching this point with the identity codec is only possible
+            // via the escape case above (the non-colliding case already
+            // returned). Force nesting even though the key id is legacy, so
+            // the escaped value is unambiguously an envelope — see
+            // `encode_payload`'s doc.
+            is_identity,
+        ))
     }
 
-    fn decode_payload(&self, payload: &Value) -> HarvestResult<Value> {
-        let Some((codec_id, encoded_b64)) = codec_envelope_parts(payload) else {
+    /// [`PayloadCodecs::encode_payload`], taking `payload` by value.
+    ///
+    /// [`PayloadCodecs::transform_event_data`] already owns the whole event
+    /// tree it walks. Its per-field call here hands over ownership (via
+    /// `std::mem::take`) instead of borrowing. The identity fast path
+    /// below can then return the value it was already given. It avoids
+    /// cloning it, on the hot write path every event append runs.
+    ///
+    /// Deliberately **not** implemented by cloning into
+    /// [`PayloadCodecs::encode_payload`]. That would add a full-payload
+    /// clone to the non-identity (real-codec) slow path. The borrowing
+    /// version never paid that cost (Codex review on PR #1710). The two
+    /// stay independent so neither path regresses the other.
+    fn encode_payload_owned(&self, payload: Value) -> HarvestResult<Value> {
+        let (key_id, codec) = self.active_codec();
+        let is_identity = codec.codec_id() == "identity";
+        if is_identity && !payload_or_a_descendant_is_a_codec_envelope(&payload) {
+            return Ok(payload);
+        }
+        let raw = serde_json::to_vec(&payload)?;
+        let encoded = codec
+            .encode(&raw)
+            .map_err(|e| HarvestError::Config(e.to_string()))?;
+        Ok(Self::envelope(
+            codec.codec_id(),
+            key_id.as_deref().unwrap_or(CODEC_LEGACY_KEY_ID),
+            &encoded,
+            // Reaching this point with the identity codec is only possible
+            // via the escape case above (the non-colliding case already
+            // returned). Force nesting even though the key id is legacy, so
+            // the escaped value is unambiguously an envelope — see
+            // `encode_payload`'s doc.
+            is_identity,
+        ))
+    }
+
+    /// Encode ONE payload-bearing field under a **specific registered key id**
+    /// (issue #948).
+    ///
+    /// The re-encryption sweep uses this rather than
+    /// [`PayloadCodecs::encode_payload`] for two reasons, both correctness:
+    ///
+    /// 1. **It cannot silently decrypt.** `encode_payload` returns the payload
+    ///    unchanged when the active codec is the identity codec — correct on
+    ///    the write path, catastrophic on the sweep path, where the value in
+    ///    hand is freshly decoded *plaintext* and returning it unchanged would
+    ///    commit cleartext over ciphertext. Because the active key can be
+    ///    flipped at runtime from another thread, a check-then-encode against
+    ///    `encode_payload` has a real window; this refuses an identity codec at
+    ///    the point of use, closing it structurally.
+    /// 2. **It pins one key for a whole row.** Re-encoding each field through
+    ///    "whatever is active right now" could straddle a mid-row flip and
+    ///    leave a half-rotated row. The sweep resolves the key id once and
+    ///    passes it here for every field.
+    ///
+    /// Emits a [`CODEC_ENVELOPE_KID_KEY`] only when `key_id` is not
+    /// [`CODEC_LEGACY_KEY_ID`], exactly like `encode_payload`.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::UnknownCodecKey`] when `key_id` is not registered.
+    /// - [`HarvestError::Config`] when the codec registered under `key_id` is
+    ///   the identity codec (see reason 1 above).
+    /// - [`HarvestError`] when serialization or the codec's `encode` fails.
+    pub fn encode_payload_under(&self, key_id: &str, payload: &Value) -> HarvestResult<Value> {
+        let raw = serde_json::to_vec(payload)?;
+        self.encode_payload_bytes_under(key_id, &raw)
+    }
+
+    /// [`PayloadCodecs::encode_payload_under`], taking raw plaintext bytes
+    /// rather than a `Value` to serialize (issue #948).
+    ///
+    /// Pairs with [`PayloadCodecs::decode_payload_bytes`] so the
+    /// re-encryption sweep ([`crate::codec_rotation`]) can migrate a field's
+    /// ciphertext onto a new key without ever parsing or re-serializing its
+    /// JSON structure — it rewrites ciphertext only and never needs the
+    /// decoded value.
+    ///
+    /// # Errors
+    ///
+    /// As [`PayloadCodecs::encode_payload_under`].
+    pub(crate) fn encode_payload_bytes_under(
+        &self,
+        key_id: &str,
+        raw: &[u8],
+    ) -> HarvestResult<Value> {
+        let codec = self
+            .codec_for_key(key_id)
+            .ok_or_else(|| HarvestError::UnknownCodecKey {
+                key_id: key_id.to_string(),
+                codec_id: String::new(),
+            })?;
+        if codec.codec_id() == "identity" {
+            return Err(HarvestError::Config(format!(
+                "refusing to encode under codec key id {key_id:?}: it is registered to the \
+                 identity codec, and writing its output would replace stored ciphertext with \
+                 plaintext"
+            )));
+        }
+        let encoded = codec
+            .encode(raw)
+            .map_err(|e| HarvestError::Config(e.to_string()))?;
+        // Never the escape case: identity is refused above, so this key id
+        // is always a genuinely active rotation key.
+        Ok(Self::envelope(codec.codec_id(), key_id, &encoded, false))
+    }
+
+    /// Build the stored envelope for `encoded`, omitting `kid` for the legacy
+    /// key id — an absent `kid` is defined to mean [`CODEC_LEGACY_KEY_ID`],
+    /// see [`CODEC_ENVELOPE_KID_KEY`].
+    ///
+    /// The only place in this crate that writes an envelope, so there is
+    /// exactly one code path that decides the wire shape.
+    ///
+    /// **Shape (issue #1253):** nested — [`CODEC_ENVELOPE_VERSION_NESTED`] —
+    /// only when `force_nested` is set. That flag is the
+    /// [`PayloadCodecs::encode_payload`] collision-escape case.
+    ///
+    /// Otherwise flat: [`CODEC_ENVELOPE_VERSION_KEYED`] when `key_id` is not
+    /// [`CODEC_LEGACY_KEY_ID`], else [`CODEC_ENVELOPE_VERSION_LEGACY`] —
+    /// byte-identical to every issue #948 envelope, keyed or not.
+    ///
+    /// **Deliberately not gated on `key_id` alone.** An earlier version of
+    /// this fix nested every keyed write. It reasoned that key activation
+    /// was already fleet-gated by `codec_rotation::activate_codec_key`.
+    ///
+    /// That gate only runs when an operator calls it, though.
+    /// `HarvestBuilder`'s `payload_codec_key`/`active_payload_codec_key`
+    /// register and activate a key entirely locally, at process startup,
+    /// with no fleet check at all. A deployment that has used that path
+    /// since before this fix shipped would start emitting envelopes older
+    /// binaries cannot parse. That happens the moment a single worker
+    /// upgrades — silent wrong data. It is the exact hazard
+    /// [`PayloadCodecs::set_active_key`]'s rollout-ordering doc warns
+    /// against, with no way to enforce the ordering at all.
+    ///
+    /// Keyed writes staying flat avoids this. Nothing about their wire
+    /// shape changes, so there is nothing new to roll out in order. Only
+    /// the escape case is new. It is new *behavior* — a value that was
+    /// previously corrupted is now protected — not a changed shape for
+    /// anything already relied upon.
+    fn envelope(codec_id: &str, key_id: &str, encoded: &[u8], force_nested: bool) -> Value {
+        let keyed = key_id != CODEC_LEGACY_KEY_ID;
+        let data = Value::from(base64::engine::general_purpose::STANDARD.encode(encoded));
+        if force_nested {
+            let mut nested = serde_json::Map::with_capacity(3);
+            nested.insert("codec_id".to_string(), Value::from(codec_id));
+            if keyed {
+                nested.insert(CODEC_ENVELOPE_KID_KEY.to_string(), Value::from(key_id));
+            }
+            nested.insert("data".to_string(), data);
+            let mut envelope = serde_json::Map::with_capacity(1);
+            envelope.insert(CODEC_ENVELOPE_KEY.to_string(), Value::Object(nested));
+            return Value::Object(envelope);
+        }
+        let mut envelope = serde_json::Map::with_capacity(4);
+        envelope.insert(
+            CODEC_ENVELOPE_KEY.to_string(),
+            Value::from(if keyed {
+                CODEC_ENVELOPE_VERSION_KEYED
+            } else {
+                CODEC_ENVELOPE_VERSION_LEGACY
+            }),
+        );
+        envelope.insert("codec_id".to_string(), Value::from(codec_id));
+        if keyed {
+            envelope.insert(CODEC_ENVELOPE_KID_KEY.to_string(), Value::from(key_id));
+        }
+        envelope.insert("data".to_string(), data);
+        Value::Object(envelope)
+    }
+
+    /// Decode ONE payload-bearing field, resolving whichever registered key the
+    /// envelope names (issue #948) — so a mixed-key history decodes
+    /// transparently throughout a rotation window.
+    ///
+    /// Returns `payload` unchanged when it is not a codec envelope (plaintext,
+    /// an offload reference envelope, an erase tombstone).
+    ///
+    /// Public for the same reason as [`PayloadCodecs::encode_payload`].
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::UnknownCodecKey`] when the envelope names an explicit
+    ///   key id that is not registered (a key retired too early).
+    /// - [`HarvestError::UnknownPayloadCodec`] when a kid-less envelope names a
+    ///   `codec_id` that is not registered.
+    /// - [`HarvestError`] on invalid base64, a codec `decode` failure, or
+    ///   plaintext that is not valid JSON.
+    pub fn decode_payload(&self, payload: &Value) -> HarvestResult<Value> {
+        let Some(parts) = codec_envelope_parts(payload) else {
             return Ok(payload.clone());
         };
-        let codec = self
-            .codecs
-            .get(codec_id)
-            .ok_or_else(|| HarvestError::UnknownPayloadCodec {
-                id: codec_id.to_string(),
-            })?;
-        let encoded = base64::engine::general_purpose::STANDARD
-            .decode(encoded_b64)
-            .map_err(|e| HarvestError::Config(e.to_string()))?;
-        let decoded = codec
-            .decode(&encoded)
-            .map_err(|e| HarvestError::Config(e.to_string()))?;
+        let decoded = self.decode_envelope_bytes(&parts)?;
         Ok(serde_json::from_slice(&decoded)?)
+    }
+
+    /// [`PayloadCodecs::decode_payload`], taking `payload` by value.
+    ///
+    /// [`PayloadCodecs::transform_event_data`] already owns the whole event
+    /// tree it walks. Its per-field call here hands over ownership (via
+    /// `std::mem::take`) instead of borrowing. The not-an-envelope fast
+    /// path below can then return the value it was already given. It
+    /// avoids cloning it, once per payload-bearing field of every event,
+    /// on the hot read/replay path every history load runs.
+    ///
+    /// Deliberately **not** implemented by cloning into
+    /// [`PayloadCodecs::decode_payload`]. That would add a full-envelope
+    /// clone, including its base64 ciphertext, to the codec-envelope slow
+    /// path. The borrowing version never paid that cost. It decodes
+    /// straight from the borrow.
+    ///
+    /// Codex review on PR #1710 flagged this: the production
+    /// continue-as-new carryover path in `worker.rs` calls the borrowing
+    /// version on a real envelope. The two stay independent so neither
+    /// path regresses the other.
+    fn decode_payload_owned(&self, payload: Value) -> HarvestResult<Value> {
+        let Some(parts) = codec_envelope_parts(&payload) else {
+            return Ok(payload);
+        };
+        let decoded = self.decode_envelope_bytes(&parts)?;
+        Ok(serde_json::from_slice(&decoded)?)
+    }
+
+    /// [`PayloadCodecs::decode_payload`], returning the raw plaintext bytes
+    /// instead of a parsed `Value` (issue #948).
+    ///
+    /// The re-encryption sweep ([`crate::codec_rotation`]) migrates a field's
+    /// ciphertext from one registered key to another; it never inspects or
+    /// modifies the decoded structure, so materializing a full `Value` here
+    /// only for [`PayloadCodecs::encode_payload_bytes_under`] to immediately
+    /// re-serialize it back to bytes is a `serde_json::Value` tree — with its
+    /// heap-backed `Map` — built and torn down for nothing, on every field,
+    /// of every row, of every sweep batch, forever, on any deployment that
+    /// rotates keys.
+    ///
+    /// The bytes are still **validated** as well-formed JSON — via
+    /// `serde_json::from_slice::<serde::de::IgnoredAny>`, which walks the
+    /// document to confirm its syntax without allocating a `Value` for it —
+    /// so a codec that "successfully" decodes corrupt or mismatched
+    /// ciphertext into garbage bytes is caught here exactly as
+    /// [`PayloadCodecs::decode_payload`] would catch it, and the sweep counts
+    /// the row unresolved rather than writing the garbage back out under a
+    /// new key.
+    ///
+    /// Returns `Ok(None)` when `payload` is not a codec envelope, exactly
+    /// like [`codec_envelope_key_id`] returning `None`. The re-encryption
+    /// sweep has already confirmed `payload` names a key id via that function
+    /// before calling this one, so `None` is unreachable at its call site —
+    /// but it is returned rather than assumed, the same defensive choice
+    /// [`crate::codec_rotation::reencrypt_event_payload_fields_under`] makes
+    /// for its own "cannot happen" branch.
+    ///
+    /// # Errors
+    ///
+    /// As [`PayloadCodecs::decode_payload`], including
+    /// [`HarvestError::Serialization`] when the decoded bytes are not valid
+    /// JSON.
+    pub(crate) fn decode_payload_bytes(&self, payload: &Value) -> HarvestResult<Option<Vec<u8>>> {
+        let Some(parts) = codec_envelope_parts(payload) else {
+            return Ok(None);
+        };
+        let decoded = self.decode_envelope_bytes(&parts)?;
+        serde_json::from_slice::<serde::de::IgnoredAny>(&decoded)?;
+        Ok(Some(decoded))
+    }
+
+    /// Decode one already-shape-verified envelope's ciphertext to raw
+    /// plaintext bytes. Shared by [`PayloadCodecs::decode_payload`] (which
+    /// parses the result as JSON) and [`PayloadCodecs::decode_payload_bytes`]
+    /// (which does not).
+    fn decode_envelope_bytes(&self, parts: &CodecEnvelopeParts<'_>) -> HarvestResult<Vec<u8>> {
+        let codec = self.resolve_decoder(parts).ok_or_else(|| {
+            if parts.kid.is_some() {
+                HarvestError::UnknownCodecKey {
+                    key_id: parts.key_id().to_string(),
+                    codec_id: parts.codec_id.to_string(),
+                }
+            } else {
+                HarvestError::UnknownPayloadCodec {
+                    id: parts.codec_id.to_string(),
+                }
+            }
+        })?;
+        let encoded = base64::engine::general_purpose::STANDARD
+            .decode(parts.encoded_b64)
+            .map_err(|e| HarvestError::Config(e.to_string()))?;
+        codec
+            .decode(&encoded)
+            .map_err(|e| HarvestError::Config(e.to_string()))
     }
 
     /// Decode one already-shape-verified envelope, mapping every failure mode
@@ -376,14 +1750,21 @@ impl PayloadCodecs {
     /// `Ok(plaintext)` on success, `Err(marker)` on failure — the caller
     /// substitutes whichever it gets, so a bad key / rotated-away codec can
     /// never fail the surrounding response.
-    fn decode_envelope_lossy(&self, codec_id: &str, encoded_b64: &str) -> Result<Value, Value> {
-        let Some(codec) = self.codecs.get(codec_id) else {
-            return Err(undecodable_marker(
-                codec_id,
-                UNDECODABLE_REASON_UNKNOWN_CODEC,
-            ));
+    fn decode_envelope_lossy(&self, parts: &CodecEnvelopeParts<'_>) -> Result<Value, Value> {
+        let codec_id = parts.codec_id;
+        let Some(codec) = self.resolve_decoder(parts) else {
+            // An explicit, unregistered `kid` is a *key* miss (issue #948); a
+            // kid-less envelope whose `codec_id` is unknown keeps the pre-#948
+            // reason so existing operator tooling reads unchanged.
+            let reason = if parts.kid.is_some() {
+                UNDECODABLE_REASON_UNKNOWN_KEY
+            } else {
+                UNDECODABLE_REASON_UNKNOWN_CODEC
+            };
+            return Err(undecodable_marker(codec_id, reason));
         };
-        let Ok(encoded) = base64::engine::general_purpose::STANDARD.decode(encoded_b64) else {
+        let Ok(encoded) = base64::engine::general_purpose::STANDARD.decode(parts.encoded_b64)
+        else {
             return Err(undecodable_marker(
                 codec_id,
                 UNDECODABLE_REASON_INVALID_BASE64,
@@ -420,8 +1801,8 @@ impl PayloadCodecs {
     }
 
     fn decode_value_lossy_inner(&self, value: &mut Value, outcome: &mut LossyDecodeOutcome) {
-        let replacement = codec_envelope_parts(value)
-            .map(|(codec_id, encoded_b64)| self.decode_envelope_lossy(codec_id, encoded_b64));
+        let replacement =
+            codec_envelope_parts(value).map(|parts| self.decode_envelope_lossy(&parts));
         if let Some(result) = replacement {
             match result {
                 Ok(plaintext) => {
@@ -467,10 +1848,10 @@ impl PayloadCodecs {
         let Ok(parsed) = serde_json::from_str::<Value>(raw) else {
             return (None, LossyDecodeOutcome::default());
         };
-        let Some((codec_id, encoded_b64)) = codec_envelope_parts(&parsed) else {
+        let Some(parts) = codec_envelope_parts(&parsed) else {
             return (None, LossyDecodeOutcome::default());
         };
-        match self.decode_envelope_lossy(codec_id, encoded_b64) {
+        match self.decode_envelope_lossy(&parts) {
             Ok(plaintext) => {
                 let decoded = match plaintext {
                     Value::String(s) => s,
@@ -495,9 +1876,28 @@ impl PayloadCodecs {
     }
 }
 
+/// RAII guard returned by [`PayloadCodecs::pin_key_for_sweep`] (issue #1251).
+///
+/// Holds one key id pinned against retirement for as long as the guard lives.
+/// Dropping it always releases the pin — on the happy path, and on an early
+/// return from a batch that hit an error. A failed batch can therefore
+/// never leave a key permanently unretirable.
+#[must_use = "the key is pinned only while this guard is alive; dropping it immediately un-pins"]
+pub struct SweepKeyPin {
+    codecs: PayloadCodecs,
+    key_id: String,
+}
+
+impl Drop for SweepKeyPin {
+    fn drop(&mut self) {
+        self.codecs.unpin_key_for_sweep(&self.key_id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[derive(Debug)]
     struct ReverseCodec;
@@ -516,6 +1916,93 @@ mod tests {
             v.reverse();
             Ok(v)
         }
+    }
+
+    // ── advertise_codec_capability (issue #1244) ─────────────────────────
+
+    #[test]
+    fn advertise_codec_capability_adds_the_label_to_an_empty_object() {
+        let merged = advertise_codec_capability(&json!({}), &[]);
+        assert_eq!(
+            merged[CODEC_ENVELOPE_CAPABILITY_LABEL],
+            CODEC_ENVELOPE_VERSION_KEYED
+        );
+        assert_eq!(merged[CODEC_REGISTERED_KEY_IDS_LABEL], json!([]));
+    }
+
+    #[test]
+    fn advertise_codec_capability_preserves_operator_labels() {
+        let merged = advertise_codec_capability(
+            &json!({"gpu": "true", "region": "eu-west-1"}),
+            &["k1".to_string()],
+        );
+        assert_eq!(merged["gpu"], "true");
+        assert_eq!(merged["region"], "eu-west-1");
+        assert_eq!(
+            merged[CODEC_ENVELOPE_CAPABILITY_LABEL],
+            CODEC_ENVELOPE_VERSION_KEYED
+        );
+        assert_eq!(merged[CODEC_REGISTERED_KEY_IDS_LABEL], json!(["k1"]));
+    }
+
+    #[test]
+    fn advertise_codec_capability_overwrites_a_forged_lower_version() {
+        // The label is engine-written, never operator-configured. A stale or
+        // tampered value must never survive the merge. Issue #1244's whole
+        // point is that this label can be trusted as this binary's true
+        // capability.
+        let merged = advertise_codec_capability(&json!({"codec_envelope_version": 1}), &[]);
+        assert_eq!(
+            merged[CODEC_ENVELOPE_CAPABILITY_LABEL],
+            CODEC_ENVELOPE_VERSION_KEYED
+        );
+    }
+
+    #[test]
+    fn advertise_codec_capability_overwrites_forged_registered_keys() {
+        // Same trust boundary as the version label above: this process's
+        // actual registry always wins over anything already in `labels`.
+        let merged = advertise_codec_capability(
+            &json!({"codec_registered_key_ids": ["not-really-registered"]}),
+            &["k1".to_string(), "k2".to_string()],
+        );
+        assert_eq!(merged[CODEC_REGISTERED_KEY_IDS_LABEL], json!(["k1", "k2"]));
+    }
+
+    #[test]
+    fn advertise_codec_capability_replaces_a_non_object_labels_value() {
+        let merged = advertise_codec_capability(&json!("not-an-object"), &[]);
+        assert!(merged.is_object());
+        assert_eq!(
+            merged[CODEC_ENVELOPE_CAPABILITY_LABEL],
+            CODEC_ENVELOPE_VERSION_KEYED
+        );
+    }
+
+    #[test]
+    fn string_valued_labels_recovers_operator_labels_past_the_merged_engine_keys() {
+        // The exact shape `register_worker` / `heartbeat_worker` persist: an
+        // operator string label alongside both engine-owned, non-string keys.
+        let merged = advertise_codec_capability(
+            &json!({"gpu": "true", "region": "eu-west-1"}),
+            &["k1".to_string(), "k2".to_string()],
+        );
+        let labels = string_valued_labels(&merged);
+        assert_eq!(
+            labels.len(),
+            2,
+            "engine-owned non-string keys must be dropped, not fail the whole map: {labels:?}"
+        );
+        assert_eq!(labels.get("gpu").map(String::as_str), Some("true"));
+        assert_eq!(labels.get("region").map(String::as_str), Some("eu-west-1"));
+        assert!(!labels.contains_key(CODEC_ENVELOPE_CAPABILITY_LABEL));
+        assert!(!labels.contains_key(CODEC_REGISTERED_KEY_IDS_LABEL));
+    }
+
+    #[test]
+    fn string_valued_labels_on_a_non_object_value_is_empty() {
+        assert!(string_valued_labels(&json!("not-an-object")).is_empty());
+        assert!(string_valued_labels(&json!(null)).is_empty());
     }
 
     #[test]
@@ -542,6 +2029,35 @@ mod tests {
             }
             _ => panic!("unexpected event"),
         }
+    }
+
+    #[test]
+    fn a_payload_shaped_like_an_offload_envelope_is_still_encoded() {
+        // Issue #1243 review (P1, Codex): the codec boundary must stay
+        // unconditional. A workflow's own input can legally contain any
+        // JSON shape, including one that happens to carry the offload
+        // discriminator key. Nothing may use that shape as a signal to
+        // skip encoding -- doing so would store the field in plaintext
+        // under a real codec.
+        let mut codecs = PayloadCodecs::default();
+        codecs.set_default(Arc::new(ReverseCodec));
+
+        let event = crate::event::WorkflowEvent::WorkflowStarted {
+            input: serde_json::json!({
+                "_harvest_offload_envelope": 1,
+                "secret": "still must be encoded",
+            }),
+            timestamp: chrono::Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        };
+
+        let encoded = codecs.encode_event(&event).expect("encode");
+        assert_eq!(
+            encoded["data"]["input"]["_harvest_codec_envelope"], 1,
+            "an offload-shaped user payload must still be wrapped in a codec envelope: {encoded}"
+        );
     }
 
     #[test]
@@ -770,6 +2286,35 @@ mod tests {
         let marker = &value["input"][UNDECODABLE_MARKER_KEY];
         assert_eq!(marker["codec_id"], "kms-rotated-away");
         assert_eq!(marker["reason"], UNDECODABLE_REASON_UNKNOWN_CODEC);
+    }
+
+    #[test]
+    fn decode_value_lossy_nested_envelope_with_unregistered_key_yields_marker() {
+        // The lossy path must degrade a nested envelope exactly like a flat
+        // one -- an unrecognized `kid` is a key miss, not a codec miss.
+        let codecs = lossy_test_codecs();
+        let mut value = serde_json::json!({
+            "input": {
+                CODEC_ENVELOPE_KEY: {
+                    "codec_id": "reverse",
+                    CODEC_ENVELOPE_KID_KEY: "retired-key",
+                    "data": "AAAA",
+                }
+            }
+        });
+
+        let outcome = codecs.decode_value_lossy(&mut value);
+
+        assert_eq!(
+            outcome,
+            LossyDecodeOutcome {
+                decoded: 0,
+                failed: 1
+            }
+        );
+        let marker = &value["input"][UNDECODABLE_MARKER_KEY];
+        assert_eq!(marker["codec_id"], "reverse");
+        assert_eq!(marker["reason"], UNDECODABLE_REASON_UNKNOWN_KEY);
     }
 
     #[test]
@@ -1251,5 +2796,918 @@ mod tests {
             }
         );
         assert_eq!(zero.merged(zero), zero);
+    }
+
+    // ── issue #948: keyed codecs / key rotation ───────────────────────────
+
+    /// A second "encryption key" for the same logical codec: rotation means
+    /// two codecs with the SAME `codec_id` and different key material, which
+    /// is precisely why a key id cannot be folded into `codec_id`.
+    #[derive(Debug)]
+    struct XorCodec(u8);
+
+    impl PayloadCodec for XorCodec {
+        fn codec_id(&self) -> &'static str {
+            "xor"
+        }
+        fn encode(&self, raw: &[u8]) -> Result<Vec<u8>, CodecError> {
+            Ok(raw.iter().map(|b| b ^ self.0).collect())
+        }
+        fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, CodecError> {
+            Ok(encoded.iter().map(|b| b ^ self.0).collect())
+        }
+    }
+
+    fn started(input: Value) -> crate::event::WorkflowEvent {
+        crate::event::WorkflowEvent::WorkflowStarted {
+            input,
+            timestamp: chrono::Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }
+    }
+
+    #[test]
+    fn envelope_carries_kid_once_a_non_legacy_key_is_active() {
+        // AC1: the envelope carries a key id alongside the discriminator.
+        let codecs = PayloadCodecs::default();
+        codecs
+            .register_key("k2", Arc::new(XorCodec(0x5a)))
+            .expect("register");
+
+        let encoded = codecs
+            .encode_event(&started(json!({"user": "alice"})))
+            .expect("encode");
+        let env = &encoded["data"]["input"];
+        assert_eq!(
+            env[CODEC_ENVELOPE_KEY], CODEC_ENVELOPE_VERSION_KEYED,
+            "a keyed envelope declares its own version, so it can never be confused with a \
+             four-key version-1 value that a prior release would have stored as plaintext"
+        );
+        assert_eq!(env["codec_id"], "xor");
+        assert_eq!(env[CODEC_ENVELOPE_KID_KEY], "k2");
+    }
+
+    #[test]
+    fn envelope_omits_kid_while_the_legacy_key_is_active() {
+        // AC1 (back-compat half): an un-rotated deployment's stored bytes are
+        // byte-identical to pre-#948 — the three-key envelope is the canonical
+        // spelling of "kid == CODEC_LEGACY_KEY_ID".
+        let mut codecs = PayloadCodecs::default();
+        codecs.set_default(Arc::new(ReverseCodec));
+
+        let encoded = codecs
+            .encode_event(&started(json!({"user": "alice"})))
+            .expect("encode");
+        let env = encoded["data"]["input"].as_object().expect("object");
+        assert_eq!(env.len(), 3, "no `kid` key is written: {env:?}");
+        assert!(!env.contains_key(CODEC_ENVELOPE_KID_KEY));
+        assert_eq!(
+            env[CODEC_ENVELOPE_KEY], CODEC_ENVELOPE_VERSION_LEGACY,
+            "and the discriminator is unchanged, so the bytes match pre-#948 exactly"
+        );
+    }
+
+    #[test]
+    fn kidless_envelope_resolves_to_the_legacy_key_id() {
+        // AC1: pre-upgrade rows (no `kid`) decode unchanged, resolving to the
+        // designated legacy key id.
+        let writer = PayloadCodecs::default();
+        writer
+            .register_key(CODEC_LEGACY_KEY_ID, Arc::new(XorCodec(0x11)))
+            .expect("register");
+        let encoded = writer
+            .encode_event(&started(json!({"n": 1})))
+            .expect("encode");
+        assert!(
+            encoded["data"]["input"]
+                .get(CODEC_ENVELOPE_KID_KEY)
+                .is_none(),
+            "legacy-active writes stay kid-less"
+        );
+
+        // A reader that only knows the legacy key still decodes it.
+        let reader = PayloadCodecs::default();
+        reader
+            .register_key(CODEC_LEGACY_KEY_ID, Arc::new(XorCodec(0x11)))
+            .expect("register");
+        let decoded = reader.decode_event(encoded).expect("decode");
+        match decoded {
+            crate::event::WorkflowEvent::WorkflowStarted { input, .. } => {
+                assert_eq!(input, json!({"n": 1}));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_resolves_any_registered_key_by_id() {
+        // AC3: a mixed-key history replays transparently.
+        let codecs = PayloadCodecs::default();
+        codecs
+            .register_key("k1", Arc::new(XorCodec(0x01)))
+            .expect("register k1");
+        let under_k1 = codecs
+            .encode_event(&started(json!({"v": "one"})))
+            .expect("encode k1");
+
+        codecs
+            .register_key("k2", Arc::new(XorCodec(0x02)))
+            .expect("register k2");
+        codecs.set_active_key("k2").expect("activate k2");
+        let under_k2 = codecs
+            .encode_event(&started(json!({"v": "two"})))
+            .expect("encode k2");
+
+        assert_eq!(under_k1["data"]["input"][CODEC_ENVELOPE_KID_KEY], "k1");
+        assert_eq!(under_k2["data"]["input"][CODEC_ENVELOPE_KID_KEY], "k2");
+
+        for (encoded, expected) in [(under_k1, "one"), (under_k2, "two")] {
+            match codecs.decode_event(encoded).expect("decode") {
+                crate::event::WorkflowEvent::WorkflowStarted { input, .. } => {
+                    assert_eq!(input, json!({ "v": expected }));
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn active_key_flip_is_observed_by_registry_clones() {
+        // AC2: no restart-ordering window. A clone taken BEFORE the flip (the
+        // shape every worker/store call site holds) must encrypt under the new
+        // key immediately after the flip is acknowledged.
+        let codecs = PayloadCodecs::default();
+        codecs
+            .register_key("k1", Arc::new(XorCodec(0x01)))
+            .expect("register k1");
+        codecs
+            .register_key("k2", Arc::new(XorCodec(0x02)))
+            .expect("register k2");
+
+        let captured_at_boot = codecs.clone();
+        assert_eq!(captured_at_boot.active_key_id(), "k1");
+
+        codecs.set_active_key("k2").expect("activate k2");
+
+        assert_eq!(captured_at_boot.active_key_id(), "k2");
+        let encoded = captured_at_boot
+            .encode_event(&started(json!({"after": "flip"})))
+            .expect("encode");
+        assert_eq!(encoded["data"]["input"][CODEC_ENVELOPE_KID_KEY], "k2");
+    }
+
+    #[test]
+    fn exactly_one_key_is_active_and_activation_requires_registration() {
+        let codecs = PayloadCodecs::default();
+        assert_eq!(
+            codecs.active_key_id(),
+            CODEC_LEGACY_KEY_ID,
+            "an unconfigured registry is on the legacy key"
+        );
+        assert_eq!(codecs.registered_key_ids(), [] as [std::string::String; 0]);
+
+        codecs
+            .register_key("k1", Arc::new(XorCodec(1)))
+            .expect("register k1");
+        codecs
+            .register_key("k2", Arc::new(XorCodec(2)))
+            .expect("register k2");
+        assert_eq!(
+            codecs.registered_key_ids(),
+            vec!["k1".to_string(), "k2".to_string()]
+        );
+        assert_eq!(
+            codecs.active_key_id(),
+            "k1",
+            "first registered key is active"
+        );
+
+        let err = codecs
+            .set_active_key("nope")
+            .expect_err("unregistered key must be refused");
+        assert!(err.to_string().contains("nope"), "{err}");
+        assert_eq!(
+            codecs.active_key_id(),
+            "k1",
+            "a refused flip must not change the active key"
+        );
+    }
+
+    #[test]
+    fn register_key_rejects_malformed_key_ids() {
+        let codecs = PayloadCodecs::default();
+        for bad in [
+            "",
+            " ",
+            "has space",
+            "emoji-🔑",
+            &"x".repeat(MAX_CODEC_KEY_ID_BYTES + 1),
+        ] {
+            assert!(
+                codecs.register_key(bad, Arc::new(XorCodec(1))).is_err(),
+                "key id {bad:?} must be refused"
+            );
+        }
+        codecs
+            .register_key("2026-q3.rotation:a_b", Arc::new(XorCodec(1)))
+            .expect("sane id");
+    }
+
+    #[test]
+    fn strict_decode_of_an_unknown_kid_is_a_typed_error() {
+        let writer = PayloadCodecs::default();
+        writer
+            .register_key("k9", Arc::new(XorCodec(9)))
+            .expect("register");
+        let encoded = writer
+            .encode_event(&started(json!({"a": 1})))
+            .expect("encode");
+
+        let reader = PayloadCodecs::default();
+        reader
+            .register_key("k1", Arc::new(XorCodec(1)))
+            .expect("register");
+        let err = reader
+            .decode_event(encoded)
+            .expect_err("unknown kid must fail closed");
+        match err {
+            HarvestError::UnknownCodecKey { key_id, codec_id } => {
+                assert_eq!(key_id, "k9");
+                assert_eq!(codec_id, "xor");
+            }
+            other => panic!("expected UnknownCodecKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lossy_decode_of_an_unknown_kid_is_a_bounded_marker() {
+        let writer = PayloadCodecs::default();
+        writer
+            .register_key("k9", Arc::new(XorCodec(9)))
+            .expect("register");
+        let mut encoded = writer
+            .encode_event(&started(json!({"a": 1})))
+            .expect("encode");
+
+        let reader = PayloadCodecs::default();
+        let outcome = reader.decode_value_lossy(&mut encoded);
+        assert_eq!(outcome.failed, 1);
+        assert_eq!(
+            encoded["data"]["input"][UNDECODABLE_MARKER_KEY]["reason"],
+            UNDECODABLE_REASON_UNKNOWN_KEY
+        );
+    }
+
+    #[test]
+    fn a_four_key_version_1_payload_is_still_plaintext() {
+        // The regression this envelope versioning exists to prevent. Pre-#948
+        // the parser required EXACTLY three keys, so on an identity deployment
+        // business data of this exact shape was stored — and read back —
+        // verbatim. Widening version 1 to accept a fourth `kid` key would have
+        // turned that plaintext into a decode target: a strict read would fail
+        // with `UnknownCodecKey` where it used to pass through, and with a
+        // matching key registered the sweep would decode and rewrite data that
+        // was never ciphertext.
+        let business_data = json!({
+            CODEC_ENVELOPE_KEY: CODEC_ENVELOPE_VERSION_LEGACY,
+            "codec_id": "xor",
+            "data": "AAAA",
+            CODEC_ENVELOPE_KID_KEY: "k1",
+        });
+        assert!(!is_codec_envelope(&business_data));
+
+        // And it survives a real decode untouched, on a registry that HAS `k1`.
+        let codecs = PayloadCodecs::default();
+        codecs
+            .register_key("k1", Arc::new(XorCodec(0x11)))
+            .expect("register k1");
+        assert_eq!(
+            codecs
+                .decode_payload(&business_data)
+                .expect("must not error"),
+            business_data,
+            "previously-valid four-key plaintext must pass through verbatim"
+        );
+
+        // The mirror case: version 2 with only three keys is not an envelope
+        // either.
+        assert!(!is_codec_envelope(&json!({
+            CODEC_ENVELOPE_KEY: CODEC_ENVELOPE_VERSION_KEYED,
+            "codec_id": "xor",
+            "data": "AAAA",
+        })));
+        // Nor is an unknown version.
+        assert!(!is_codec_envelope(&json!({
+            CODEC_ENVELOPE_KEY: 3,
+            "codec_id": "xor",
+            "data": "AAAA",
+        })));
+    }
+
+    #[test]
+    fn a_flat_envelope_shaped_plaintext_is_escaped_on_encode_and_round_trips() {
+        // Issue #1253's acceptance criterion, going forward: business data
+        // shaped like an envelope is never classified as ciphertext, by
+        // construction. This runs the value through the CURRENT
+        // `encode_payload` (identity codec, no rotation configured), then
+        // reads it back. It must round-trip byte-identical.
+        //
+        // A row genuinely written by pre-#1253 code, with no escape
+        // wrapper, still collides on read. That residual risk is
+        // unavoidable, documented in ADR-0003 and `codec_envelope_parts`'
+        // doc. This test is about what THIS version writes from here on.
+        //
+        // This shape -- four keys, discriminator `2`, a valid `kid` -- is
+        // EXACTLY the version-2 envelope shape. `is_codec_envelope` says so
+        // correctly below; that coincidence is the whole collision issue
+        // #1253 reports. Before this fix, `encode_payload`'s identity fast
+        // path stored such a value completely unchanged, ambiguous forever
+        // after. Any later read had no way to tell it apart from a real
+        // version-2 envelope.
+        let business_data = json!({
+            CODEC_ENVELOPE_KEY: CODEC_ENVELOPE_VERSION_KEYED,
+            "codec_id": "xor",
+            "data": "AAAA",
+            CODEC_ENVELOPE_KID_KEY: "k1",
+        });
+        assert!(
+            is_codec_envelope(&business_data),
+            "sanity: this business value coincidentally matches the flat version-2 shape -- \
+             that ambiguity is exactly what this test exercises"
+        );
+
+        let codecs = PayloadCodecs::default();
+        let stored = codecs
+            .encode_payload(&business_data)
+            .expect("encode must not error");
+
+        assert_ne!(
+            stored, business_data,
+            "colliding plaintext must not be stored byte-for-byte verbatim: {stored}"
+        );
+        assert_eq!(
+            stored[CODEC_ENVELOPE_KEY]["codec_id"], "identity",
+            "escaped via the identity codec, since no real codec is configured: {stored}"
+        );
+
+        let read_back = codecs
+            .decode_payload(&stored)
+            .expect("decode must not error");
+        assert_eq!(
+            read_back, business_data,
+            "the original business value round-trips byte-identical, never garbled or rejected \
+             as ciphertext"
+        );
+    }
+
+    #[test]
+    fn a_nested_envelope_shaped_plaintext_is_also_escaped_on_encode() {
+        // The same collision, but shaped like the CURRENT nested envelope
+        // (issue #1253) rather than a legacy flat one. This proves the
+        // escape guard checks every recognized shape, not just the ones it
+        // replaces.
+        let business_data = json!({
+            CODEC_ENVELOPE_KEY: {
+                "codec_id": "evil",
+                "data": "whatever a caller might legitimately name these fields",
+            }
+        });
+        assert!(
+            is_codec_envelope(&business_data),
+            "sanity: this IS envelope-shaped"
+        );
+
+        let codecs = PayloadCodecs::default();
+        let stored = codecs
+            .encode_payload(&business_data)
+            .expect("encode must not error");
+        assert_ne!(
+            stored, business_data,
+            "must be escaped one level deeper, not stored as-is: {stored}"
+        );
+
+        let read_back = codecs
+            .decode_payload(&stored)
+            .expect("decode must not error");
+        assert_eq!(read_back, business_data);
+    }
+
+    #[test]
+    fn a_descendant_envelope_shaped_field_is_also_escaped_on_encode() {
+        // Issue #1253: the escape guard must match every depth
+        // `decode_value_lossy` recurses into, not only the payload root.
+        // An ordinary object whose CHILD happens to be envelope-shaped is
+        // exactly as dangerous as the root being envelope-shaped. A lossy
+        // read would decode or mark that child as if it were real
+        // ciphertext.
+        let business_data = json!({
+            "note": "ordinary field",
+            "child": {
+                CODEC_ENVELOPE_KEY: {"codec_id": "evil", "data": "not really ciphertext"},
+            },
+        });
+        assert!(
+            !is_codec_envelope(&business_data),
+            "sanity: the ROOT is not envelope-shaped, only a descendant is"
+        );
+
+        let codecs = PayloadCodecs::default();
+        let mut stored = codecs
+            .encode_payload(&business_data)
+            .expect("encode must not error");
+        assert_ne!(
+            stored, business_data,
+            "a descendant collision must escape the whole field, not just its own subtree: \
+             {stored}"
+        );
+
+        let read_back = codecs
+            .decode_payload(&stored)
+            .expect("decode must not error");
+        assert_eq!(
+            read_back, business_data,
+            "the original business value, descendant and all, round-trips byte-identical"
+        );
+
+        // The lossy decoder must agree: it decodes the escape wrapper once,
+        // at the root, and never re-examines the recovered descendant.
+        let outcome = codecs.decode_value_lossy(&mut stored);
+        assert_eq!(
+            outcome.decoded, 1,
+            "one envelope decoded, the escape wrapper"
+        );
+        assert_eq!(outcome.failed, 0);
+        assert_eq!(stored, business_data);
+    }
+
+    #[test]
+    fn ordinary_identity_payloads_are_unaffected_by_the_escape_guard() {
+        // The overwhelmingly common case: a non-colliding value under the
+        // identity codec must still be stored completely unchanged, with no
+        // envelope at all. The escape guard must not widen its own footprint
+        // beyond the exact shapes `codec_envelope_parts` recognizes.
+        let codecs = PayloadCodecs::default();
+        for ordinary in [
+            json!({"user": "alice", "amount": 42}),
+            json!({"codec_id": "not-an-envelope-without-the-marker-key"}),
+            json!(["a", "list", "of", "things"]),
+            json!("a bare string"),
+            Value::Null,
+        ] {
+            let stored = codecs.encode_payload(&ordinary).expect("encode");
+            assert_eq!(
+                stored, ordinary,
+                "non-colliding identity payloads must be stored verbatim: {ordinary}"
+            );
+        }
+    }
+
+    #[test]
+    fn codec_envelope_parts_recognizes_the_nested_shape() {
+        // Direct coverage of the new branch in `codec_envelope_parts`,
+        // mirroring the existing near-envelope strictness tests for the
+        // legacy flat shapes.
+        assert!(is_codec_envelope(&json!({
+            CODEC_ENVELOPE_KEY: {"codec_id": "aes", "data": "AAAA"}
+        })));
+        assert!(is_codec_envelope(&json!({
+            CODEC_ENVELOPE_KEY: {"codec_id": "aes", "data": "AAAA", CODEC_ENVELOPE_KID_KEY: "k1"}
+        })));
+        // A sibling key alongside the marker breaks the one-key guarantee.
+        assert!(!is_codec_envelope(&json!({
+            CODEC_ENVELOPE_KEY: {"codec_id": "aes", "data": "AAAA"},
+            "something_else": true,
+        })));
+        // Wrong field count inside the nested object.
+        assert!(!is_codec_envelope(&json!({
+            CODEC_ENVELOPE_KEY: {"codec_id": "aes", "data": "AAAA", "extra": 1}
+        })));
+        assert!(!is_codec_envelope(&json!({
+            CODEC_ENVELOPE_KEY: {"codec_id": "aes"}
+        })));
+        // Malformed kid, same rule as the flat shape.
+        assert!(!is_codec_envelope(&json!({
+            CODEC_ENVELOPE_KEY: {"codec_id": "aes", "data": "AAAA", CODEC_ENVELOPE_KID_KEY: 7}
+        })));
+        assert!(!is_codec_envelope(&json!({
+            CODEC_ENVELOPE_KEY: {"codec_id": "aes", "data": "AAAA", CODEC_ENVELOPE_KID_KEY: "has space"}
+        })));
+        for bad in ["", &"k".repeat(MAX_CODEC_KEY_ID_BYTES + 1)] {
+            assert!(
+                !is_codec_envelope(&json!({
+                    CODEC_ENVELOPE_KEY: {"codec_id": "aes", "data": "AAAA", CODEC_ENVELOPE_KID_KEY: bad}
+                })),
+                "kid {bad:?} must not be accepted from storage"
+            );
+        }
+        // Non-string codec_id / data.
+        assert!(!is_codec_envelope(&json!({
+            CODEC_ENVELOPE_KEY: {"codec_id": 1, "data": "AAAA"}
+        })));
+    }
+
+    #[test]
+    fn a_real_codec_without_rotation_still_writes_the_legacy_flat_shape() {
+        // Scoping check: this fix must not change stored bytes for the vast
+        // majority of deployments that were never at risk of the collision.
+        // That is a single non-identity codec, no key rotation ever
+        // configured. Only the rare escape case ever produces the new
+        // nested shape -- a genuinely rotated key still writes flat too.
+        let mut codecs = PayloadCodecs::default();
+        codecs.set_default(Arc::new(ReverseCodec));
+        let encoded = codecs
+            .encode_event(&started(json!({"user": "alice"})))
+            .expect("encode");
+        let field = encoded["data"]["input"].as_object().expect("object");
+        assert_eq!(
+            field.len(),
+            3,
+            "an un-rotated real codec keeps writing the pre-#948 three-key shape: {field:?}"
+        );
+        assert_eq!(field[CODEC_ENVELOPE_KEY], CODEC_ENVELOPE_VERSION_LEGACY);
+    }
+
+    #[test]
+    fn a_malformed_kid_in_stored_bytes_is_not_an_envelope() {
+        // A `kid` read back out of storage is untrusted: on an identity
+        // deployment a caller's workflow input is stored verbatim, so crafted
+        // input must not be able to inject an unbounded key id into the
+        // rotation census, the admin response, or the sweep's logs.
+        for bad in ["has space", &"A".repeat(MAX_CODEC_KEY_ID_BYTES + 1), ""] {
+            assert!(
+                !is_codec_envelope(&json!({
+                    CODEC_ENVELOPE_KEY: CODEC_ENVELOPE_VERSION_KEYED,
+                    "codec_id": "xor",
+                    "data": "AAAA",
+                    CODEC_ENVELOPE_KID_KEY: bad,
+                })),
+                "kid {bad:?} must not be accepted from storage"
+            );
+        }
+    }
+
+    #[test]
+    fn a_kidless_envelope_prefers_the_codec_it_actually_names() {
+        // Kid-less history can span several codec ids -- an embedder who
+        // migrated "reverse" to "xor" before rotation existed has both in the
+        // codec_id map. Registering the CURRENT pre-rotation codec under
+        // `legacy` must not make it win for envelopes naming the other one:
+        // that decodes with the wrong algorithm and key, and an unauthenticated
+        // codec returns plausible-but-wrong bytes rather than failing -- which
+        // the sweep would then re-encrypt under the active key, destroying the
+        // payload permanently.
+        let mut writer = PayloadCodecs::default();
+        writer.set_default(Arc::new(ReverseCodec));
+        let old_history = writer
+            .encode_event(&started(json!({"era": "reverse"})))
+            .expect("encode under the older codec");
+        assert_eq!(old_history["data"]["input"]["codec_id"], "reverse");
+
+        // The reader: "reverse" still registered by codec_id, and the CURRENT
+        // pre-rotation codec ("xor") registered under the legacy key id.
+        let mut codecs = PayloadCodecs::default();
+        codecs.register(Arc::new(ReverseCodec));
+        codecs
+            .register_key(CODEC_LEGACY_KEY_ID, Arc::new(XorCodec(0x11)))
+            .expect("register legacy");
+
+        match codecs.decode_event(old_history).expect("decode") {
+            crate::event::WorkflowEvent::WorkflowStarted { input, .. } => {
+                assert_eq!(
+                    input,
+                    json!({"era": "reverse"}),
+                    "a kid-less envelope must be decoded by the codec it NAMES, not by \
+                     whatever happens to sit under the legacy key id"
+                );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        // And the legacy entry still wins when it IS the named codec.
+        let legacy_history = {
+            let w = PayloadCodecs::default();
+            w.register_key(CODEC_LEGACY_KEY_ID, Arc::new(XorCodec(0x11)))
+                .expect("register legacy");
+            w.encode_event(&started(json!({"era": "xor"})))
+                .expect("encode")
+        };
+        assert_eq!(legacy_history["data"]["input"]["codec_id"], "xor");
+        match codecs.decode_event(legacy_history).expect("decode") {
+            crate::event::WorkflowEvent::WorkflowStarted { input, .. } => {
+                assert_eq!(input, json!({"era": "xor"}));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn key_registration_is_immutable() {
+        // Silently replacing a registered key id would destroy the only decoder
+        // for every stored envelope bearing that `kid`, and the sweep could not
+        // repair them — it sees the key id as already active and skips.
+        let codecs = PayloadCodecs::default();
+        codecs
+            .register_key("k1", Arc::new(XorCodec(0x11)))
+            .expect("first registration");
+
+        let err = codecs
+            .register_key("k1", Arc::new(XorCodec(0x99)))
+            .expect_err("re-registering an existing key id must be refused");
+        assert!(err.to_string().contains("already registered"), "{err}");
+
+        // The original codec is still the one installed.
+        let encoded = codecs
+            .encode_event(&started(json!({"a": 1})))
+            .expect("encode");
+        match codecs.decode_event(encoded).expect("decode") {
+            crate::event::WorkflowEvent::WorkflowStarted { input, .. } => {
+                assert_eq!(input, json!({"a": 1}));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_four_key_object_without_a_kid_is_not_an_envelope() {
+        // The pre-#948 strictness against near-envelopes must survive widening
+        // the shape check from "exactly 3 keys" to "3 keys, or 4 with a kid".
+        let not_an_envelope = json!({
+            CODEC_ENVELOPE_KEY: CODEC_ENVELOPE_VERSION_KEYED,
+            "codec_id": "xor",
+            "data": "AAAA",
+            "something_else": true,
+        });
+        assert!(!is_codec_envelope(&not_an_envelope));
+
+        let numeric_kid = json!({
+            CODEC_ENVELOPE_KEY: CODEC_ENVELOPE_VERSION_KEYED,
+            "codec_id": "xor",
+            "data": "AAAA",
+            CODEC_ENVELOPE_KID_KEY: 7,
+        });
+        assert!(
+            !is_codec_envelope(&numeric_kid),
+            "a non-string kid is not an envelope"
+        );
+    }
+
+    #[test]
+    fn codec_id_registration_remains_the_kidless_fallback() {
+        // Back-compat: a deployment using today's `register()` + `set_default()`
+        // API (no key ids at all) keeps decoding its own history verbatim.
+        let mut codecs = PayloadCodecs::default();
+        codecs.set_default(Arc::new(ReverseCodec));
+        let encoded = codecs
+            .encode_event(&started(json!({"legacy": true})))
+            .expect("encode");
+
+        // Now rotate onto a keyed codec; the old kid-less rows must still decode
+        // through the codec_id map.
+        codecs
+            .register_key("k2", Arc::new(XorCodec(2)))
+            .expect("register");
+        codecs.set_active_key("k2").expect("activate");
+        match codecs.decode_event(encoded).expect("decode") {
+            crate::event::WorkflowEvent::WorkflowStarted { input, .. } => {
+                assert_eq!(input, json!({"legacy": true}));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_keyed_envelope_naming_the_wrong_codec_is_refused() {
+        // Codex round 8 (P2). The round-2 fix required the codec_id to match
+        // for KID-LESS envelopes and left the keyed branch short-circuiting on
+        // `parts.kid.is_some()`, so an explicit kid that resolved was decoded
+        // without ever checking the algorithm the envelope named.
+        //
+        // That is the hazard `resolve_decoder`'s own doc describes: an
+        // unauthenticated codec returns plausible-but-wrong bytes rather than
+        // failing, and the sweep then re-encrypts that garbage under the active
+        // key -- silently and permanently destroying the payload. `XorCodec`
+        // is exactly such a codec: it never fails, it just returns different
+        // bytes, which is why it can stand in for the real thing here.
+        let codecs = PayloadCodecs::default();
+        codecs
+            .register_key("k1", Arc::new(XorCodec(1)))
+            .expect("register k1");
+        codecs.set_active_key("k1").expect("activate k1");
+
+        let encoded = codecs
+            .encode_event(&started(json!({"secret": "value"})))
+            .expect("encode");
+        let mut tampered = encoded;
+        let field = tampered
+            .get_mut("data")
+            .and_then(|d| d.get_mut("input"))
+            .expect("input envelope");
+        // Same registered kid, a codec_id the key is not registered with.
+        field["codec_id"] = json!("not-the-registered-codec");
+
+        assert!(
+            codecs.decode_event(tampered.clone()).is_err(),
+            "a keyed envelope naming a different codec must fail, not decode \
+             under the key's own algorithm"
+        );
+
+        // And the lossy path degrades to a bounded marker rather than handing
+        // workflow code the wrong plaintext.
+        let mut lossy = tampered;
+        let outcome = codecs.decode_value_lossy(&mut lossy);
+        assert_eq!(outcome.failed, 1, "the mismatch is counted as undecodable");
+        assert_eq!(outcome.decoded, 0);
+    }
+
+    #[test]
+    fn retire_key_local_refuses_the_active_key() {
+        let codecs = PayloadCodecs::default();
+        codecs
+            .register_key("k1", Arc::new(XorCodec(1)))
+            .expect("register k1");
+        codecs
+            .register_key("k2", Arc::new(XorCodec(2)))
+            .expect("register k2");
+        codecs.set_active_key("k2").expect("activate k2");
+
+        assert!(
+            codecs.retire_key_local("k2").is_err(),
+            "the active key is never retirable"
+        );
+        codecs
+            .retire_key_local("k1")
+            .expect("retire the inactive key");
+        assert_eq!(codecs.registered_key_ids(), vec!["k2".to_string()]);
+        assert!(codecs.codec_for_key("k1").is_none());
+    }
+
+    /// Issue #1251: a sweep batch pins the key it is writing onto.
+    /// Retirement must refuse that key while the pin holds. That holds even
+    /// though a zero census -- no rows committed under it yet -- would
+    /// otherwise say it is safe.
+    #[test]
+    fn retire_key_local_refuses_a_key_pinned_by_a_sweep_batch() {
+        let codecs = PayloadCodecs::default();
+        codecs
+            .register_key("k1", Arc::new(XorCodec(1)))
+            .expect("register k1");
+        codecs
+            .register_key("k2", Arc::new(XorCodec(2)))
+            .expect("register k2");
+        codecs.set_active_key("k2").expect("activate k2");
+
+        let pin = codecs.pin_key_for_sweep("k1");
+        assert!(codecs.is_pinned_by_sweep("k1"));
+
+        let err = codecs
+            .retire_key_local("k1")
+            .expect_err("a pinned key must not be retirable");
+        assert!(matches!(err, HarvestError::Config(_)), "{err:?}");
+        assert_eq!(
+            codecs.registered_key_ids(),
+            vec!["k1".to_string(), "k2".to_string()],
+            "the refused retirement must not have removed the key"
+        );
+
+        drop(pin);
+        assert!(!codecs.is_pinned_by_sweep("k1"));
+        codecs
+            .retire_key_local("k1")
+            .expect("retirable once the pin is released");
+    }
+
+    /// Several batches -- one per shard -- can pin the same key id at once.
+    /// The key must stay protected until every pin on it releases, not just
+    /// the first.
+    #[test]
+    fn a_key_pinned_by_two_batches_stays_protected_until_both_release() {
+        let codecs = PayloadCodecs::default();
+        codecs
+            .register_key("k1", Arc::new(XorCodec(1)))
+            .expect("register k1");
+        codecs
+            .register_key("k2", Arc::new(XorCodec(2)))
+            .expect("register k2");
+        codecs.set_active_key("k2").expect("activate k2");
+
+        let pin_a = codecs.pin_key_for_sweep("k1");
+        let pin_b = codecs.pin_key_for_sweep("k1");
+
+        drop(pin_a);
+        assert!(
+            codecs.is_pinned_by_sweep("k1"),
+            "one release must not clear a second, still-live pin"
+        );
+        assert!(codecs.retire_key_local("k1").is_err());
+
+        drop(pin_b);
+        assert!(!codecs.is_pinned_by_sweep("k1"));
+        codecs
+            .retire_key_local("k1")
+            .expect("retirable once both pins are released");
+    }
+
+    /// Issue #1815: `key_ids` returns the key set and the active key together.
+    #[test]
+    fn key_ids_returns_the_registered_and_active_keys() {
+        let codecs = PayloadCodecs::default();
+        assert_eq!(
+            codecs.key_ids(),
+            (Vec::new(), CODEC_LEGACY_KEY_ID.to_owned())
+        );
+        for key in ["k2", "k1"] {
+            codecs
+                .register_key(key, Arc::new(IdentityCodec))
+                .expect("register a key");
+        }
+        codecs.set_active_key("k2").expect("activate k2");
+        assert_eq!(
+            codecs.key_ids(),
+            (vec!["k1".to_owned(), "k2".to_owned()], "k2".to_owned())
+        );
+    }
+
+    /// Issue #1815: every key change moves the epoch when it happens, so a
+    /// worker can tell when the policy behind its cohort changed. Activating
+    /// the key that is already active changes nothing. Retiring a key that is
+    /// not registered changes nothing either.
+    #[test]
+    fn a_key_change_moves_the_key_epoch() {
+        let codecs = PayloadCodecs::default();
+        let start = codecs.key_state().epoch;
+        assert_eq!((start.generation, start.changed_at), (0, None));
+        let before = std::time::Instant::now();
+        codecs
+            .register_key("k1", Arc::new(IdentityCodec))
+            .expect("register k1");
+        let registered = codecs.key_state().epoch;
+        assert_eq!(registered.generation, 1);
+        assert!(registered.changed_at.is_some_and(|at| at >= before));
+        codecs
+            .register_key("k2", Arc::new(IdentityCodec))
+            .expect("register k2");
+        codecs.set_active_key("k2").expect("activate k2");
+        assert_eq!(codecs.key_state().epoch.generation, 3);
+        codecs.set_active_key("k2").expect("activate k2 again");
+        assert_eq!(codecs.key_state().epoch.generation, 3, "no change, no move");
+        codecs.retire_key_local("k1").expect("retire k1");
+        let state = codecs.key_state();
+        assert_eq!(state.epoch.generation, 4);
+        codecs.retire_key_local("k1").expect("retire k1 again");
+        codecs
+            .retire_key_local("absent")
+            .expect("retire an unknown key");
+        let state = codecs.key_state();
+        assert_eq!(state.epoch.generation, 4, "no removal, no move");
+        assert_eq!(
+            (state.registered, state.active),
+            (vec!["k2".to_owned()], "k2".to_owned())
+        );
+    }
+
+    /// The `any_keys` mirror must be published **under** the map lock.
+    ///
+    /// It is a lock-free fast path for `has_keyed_codecs`, so a stale `false`
+    /// makes `resolve_decoder` skip the keyed lookup entirely and encoding fall
+    /// back to the default codec — a non-empty keyed registry behaving as if it
+    /// were empty. Storing it after `drop(guard)` leaves the store unordered
+    /// with respect to the map mutation, so two writers can interleave:
+    /// a retirement removes the last key and computes `false`, a registration
+    /// then inserts and stores `true`, and the retirement's delayed store
+    /// overwrites it with `false`.
+    ///
+    /// Source-level because the hazard is *statement order* across two
+    /// functions, which no single-threaded assertion can observe: the race
+    /// window is a few instructions wide and would make a timing test flaky in
+    /// both directions.
+    #[test]
+    fn the_key_presence_mirror_is_published_under_the_lock() {
+        let src = include_str!("payload_codec.rs");
+        for func in ["pub fn register_key(", "pub fn retire_key_local("] {
+            let start = src
+                .find(func)
+                .expect("both key-mutating functions must exist");
+            let body = &src[start..];
+            let end = body[1..].find("\n    /// ").map_or(body.len(), |o| o + 1);
+            let body = &body[..end];
+
+            // Match the STATEMENTS, not the prose: the comments below each of
+            // these lines discuss `drop(guard)` by name, and a bare substring
+            // search finds the explanation before the code it explains.
+            let store = body
+                .find("self.any_keys.store(")
+                .expect("each key-mutating function must publish the presence mirror");
+            let unlock = body
+                .find("drop(guard);")
+                .expect("each key-mutating function must release the write guard");
+            assert!(
+                store < unlock,
+                "{func}: the any_keys store must happen BEFORE drop(guard), or it is \
+                 unordered against the map mutation and a concurrent register/retire \
+                 pair can leave the mirror disagreeing with a non-empty map"
+            );
+        }
     }
 }

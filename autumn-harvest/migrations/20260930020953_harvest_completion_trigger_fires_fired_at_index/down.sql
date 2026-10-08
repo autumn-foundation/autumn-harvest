@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS idx_harvest_completion_trigger_fires_fired_at;

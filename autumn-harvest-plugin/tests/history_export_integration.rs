@@ -134,7 +134,7 @@ fn build_api_app(pool: HarvestDbPool, router: ShardRouter) -> HarvestApiApp {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         router,
     ));
-    harvest_api_router(api_state).with_state(autumn_web::AppState::for_test())
+    harvest_api_router(api_state)
 }
 
 fn build_two_shard_pool(shard0_url: &str, shard1_url: &str) -> HarvestDbPool {
@@ -192,7 +192,7 @@ async fn insert_execution(
         workflow_id,
         run_id: uuid::Uuid::new_v4(),
         shard_id: shard.as_i32(),
-        input: json!({}),
+        input: json!({}).into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -272,12 +272,16 @@ async fn set_execution_and_event_times(
     .await
     .expect("failed to backdate workflow execution row");
 
-    diesel::update(
-        autumn_harvest::schema::harvest_events::table
-            .filter(autumn_harvest::schema::harvest_events::workflow_exec_id.eq(exec_id.as_uuid())),
-    )
-    .set(autumn_harvest::schema::harvest_events::timestamp.eq(event_time))
-    .execute(&mut conn)
+    autumn_harvest::append_only::with_guard_off(&mut conn, async |c| {
+        diesel::update(
+            autumn_harvest::schema::harvest_events::table.filter(
+                autumn_harvest::schema::harvest_events::workflow_exec_id.eq(exec_id.as_uuid()),
+            ),
+        )
+        .set(autumn_harvest::schema::harvest_events::timestamp.eq(event_time))
+        .execute(c)
+        .await
+    })
     .await
     .expect("failed to set history event timestamp");
 }
@@ -305,12 +309,16 @@ async fn set_running_execution_and_event_times(
     .await
     .expect("failed to backdate running workflow execution row");
 
-    diesel::update(
-        autumn_harvest::schema::harvest_events::table
-            .filter(autumn_harvest::schema::harvest_events::workflow_exec_id.eq(exec_id.as_uuid())),
-    )
-    .set(autumn_harvest::schema::harvest_events::timestamp.eq(event_time))
-    .execute(&mut conn)
+    autumn_harvest::append_only::with_guard_off(&mut conn, async |c| {
+        diesel::update(
+            autumn_harvest::schema::harvest_events::table.filter(
+                autumn_harvest::schema::harvest_events::workflow_exec_id.eq(exec_id.as_uuid()),
+            ),
+        )
+        .set(autumn_harvest::schema::harvest_events::timestamp.eq(event_time))
+        .execute(c)
+        .await
+    })
     .await
     .expect("failed to set history event timestamp");
 }

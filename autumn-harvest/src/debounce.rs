@@ -255,7 +255,9 @@ pub struct DebounceAdmitOutcome {
     pub debounce_key: String,
     /// The stable `workflow_id` the eventual run will be created with. This is
     /// the **first** request's id for the key (kept across retriggers), which
-    /// the caller should echo instead of its own generated id.
+    /// the caller should echo instead of its own generated id. See
+    /// [`admit_debounced_start`]'s doc comment for the legacy-empty-id healing
+    /// exception (issue #1430).
     pub workflow_id: String,
     /// Current fire deadline after this admission.
     pub fire_at: DateTime<Utc>,
@@ -294,6 +296,12 @@ pub struct PendingDebounceRecord {
 /// first request** so the stable id echoed in every `202` response is the one
 /// the run will actually be created with; the stored id is returned so the
 /// caller can echo it rather than its own (possibly-discarded) generated id.
+///
+/// **Legacy healing (issue #1430):** a row admitted before the #1353 empty-id
+/// check shipped can hold a stored empty `workflow_id`. Such a row can never
+/// start. A conflicting upsert heals it: the stored id becomes this request's
+/// id instead of staying empty. Only an empty stored id is ever healed. A
+/// valid first-request id is still kept, as documented above.
 ///
 /// Returns the current state of the record after the upsert.
 ///
@@ -355,6 +363,12 @@ pub async fn admit_debounced_start(
         )));
     }
 
+    // Reject an empty id before persisting a row (issue #1353). A stored
+    // deferred start with no id could only be discarded on fire, not started.
+    if params.workflow_id.is_empty() {
+        return Err(crate::error::HarvestError::EmptyWorkflowId);
+    }
+
     let now = Utc::now();
     // Clamp absurd/overflowing durations to a large-but-finite value and use
     // checked addition so an extreme `window`/`max_wait` can never panic.
@@ -384,8 +398,18 @@ pub async fn admit_debounced_start(
         VALUES
             ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1, $10, NOW(), NOW())
         ON CONFLICT (workflow_name, debounce_key) DO UPDATE SET
-            -- workflow_id is intentionally NOT overwritten: the first request's
-            -- id is the one the run is created with, and every 202 echoes it.
+            -- workflow_id keeps the first request's id. That is the id the
+            -- run is created with, and every 202 echoes it. One exception
+            -- (issue #1430): a row admitted before #1353's empty-id check
+            -- shipped can hold a stored empty id. Heal it to this request's
+            -- valid id instead of keeping the poisoned empty string.
+            -- Otherwise this request's merged payload rides a row the fire
+            -- path can only drop as unfireable (see the EmptyWorkflowId arm
+            -- in fire_claimed_debounce_row).
+            workflow_id = CASE
+                WHEN harvest_debounce.workflow_id = '' THEN EXCLUDED.workflow_id
+                ELSE harvest_debounce.workflow_id
+            END,
             queue_name        = EXCLUDED.queue_name,
             last_input        = EXCLUDED.last_input,
             -- issue #921 review (Codex P2): start_options is last-input-wins
@@ -499,6 +523,21 @@ struct FireDueRow {
     start_options: serde_json::Value,
     #[diesel(sql_type = diesel::sql_types::Integer)]
     shard_id: i32,
+    /// Needed to compute [`redefer_target`] if this row's fire is blocked by
+    /// a quota (issue #1227, Finding 3). It is fetched here, under the same
+    /// `FOR UPDATE` claim, rather than in a second round trip.
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    max_fire_at: DateTime<Utc>,
+}
+
+#[cfg(feature = "db")]
+impl crate::quota_lock_order::QuotaLockRow for FireDueRow {
+    fn workflow_name(&self) -> &str {
+        &self.workflow_name
+    }
+    fn quota_input(&self) -> &serde_json::Value {
+        &self.last_input
+    }
 }
 
 /// Fire all pending debounce records whose `effective_fire_at` has elapsed.
@@ -549,7 +588,8 @@ type FiredDebounce = (
 #[cfg(feature = "db")]
 async fn fire_due_on_conn(
     conn: &mut diesel_async::AsyncPgConnection,
-    _metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<Vec<FiredDebounce>> {
     use diesel_async::{AsyncConnection, RunQueryDsl};
 
@@ -576,12 +616,22 @@ async fn fire_due_on_conn(
     // `FOR UPDATE SKIP LOCKED` locks are held until each row is deleted.
     // Deferred trigger-starts are collected and spawned *after* the transaction
     // commits so a rollback can't leave orphaned completion-trigger workflows.
-    let fired: Vec<FiredDebounce> = Box::pin(
-        conn.transaction::<Vec<FiredDebounce>, crate::error::HarvestError, _>(async |conn| {
-            let now = Utc::now();
-            let due_sql = "
+    //
+    // Issue #1822: a deadlock or serialization abort runs the batch again.
+    // The rollback releases every claimed row, so the next run claims afresh.
+    let fired: Vec<FiredDebounce> = Box::pin(crate::tx_retry::run_with_conflict_retry(
+        conn,
+        crate::tx_retry::SITE_SCANNER,
+        metrics.unwrap_or(&crate::telemetry::NoOpMetrics),
+        crate::tx_retry::TxRetryPolicy::DEFAULT,
+        async |conn| {
+            Box::pin(
+                conn.transaction::<Vec<FiredDebounce>, crate::error::HarvestError, _>(
+                    async |conn| {
+                        let now = Utc::now();
+                        let due_sql = "
                 SELECT id, workflow_name, debounce_key, workflow_id, queue_name,
-                       last_input, start_options, shard_id
+                       last_input, start_options, shard_id, max_fire_at
                 FROM harvest_debounce
                 WHERE effective_fire_at <= $1
                 ORDER BY effective_fire_at ASC
@@ -589,22 +639,33 @@ async fn fire_due_on_conn(
                 FOR UPDATE SKIP LOCKED
             ";
 
-            let due_rows: Vec<FireDueRow> = diesel::sql_query(due_sql)
-                .bind::<diesel::sql_types::Timestamptz, _>(now)
-                .bind::<diesel::sql_types::BigInt, _>(DEBOUNCE_FIRE_BATCH_SIZE)
-                .load(conn)
-                .await
-                .map_err(crate::error::database_error)?;
+                        let due_rows: Vec<FireDueRow> = diesel::sql_query(due_sql)
+                            .bind::<diesel::sql_types::Timestamptz, _>(now)
+                            .bind::<diesel::sql_types::BigInt, _>(DEBOUNCE_FIRE_BATCH_SIZE)
+                            .load(conn)
+                            .await
+                            .map_err(crate::error::database_error)?;
 
-            let mut results = Vec::with_capacity(due_rows.len());
-            for row in due_rows {
-                if let Some(item) = fire_claimed_debounce_row(conn, row).await? {
-                    results.push(item);
-                }
-            }
-            Ok(results)
-        }),
-    )
+                        let due_rows =
+                            crate::quota_lock_order::order_due_rows_for_deadlock_free_firing(
+                                conn, due_rows,
+                            )
+                            .await?;
+
+                        let mut results = Vec::with_capacity(due_rows.len());
+                        for row in due_rows {
+                            if let Some(item) = fire_claimed_debounce_row(conn, row, codecs).await?
+                            {
+                                results.push(item);
+                            }
+                        }
+                        Ok(results)
+                    },
+                ),
+            )
+            .await
+        },
+    ))
     .await?;
 
     Ok(fired)
@@ -634,6 +695,52 @@ pub async fn fire_due_debounced_starts(
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
     shard_assignments: &[crate::types::ShardId],
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+) -> crate::error::HarvestResult<usize> {
+    fire_due_debounced_starts_with_codecs(
+        conn,
+        sharded_pool,
+        shard_assignments,
+        metrics,
+        &crate::store::DEFAULT_PAYLOAD_CODECS,
+    )
+    .await
+}
+
+/// [`fire_due_debounced_starts`], encoding a flushed `WorkflowStarted.input`
+/// through `codecs` (issue #1243).
+///
+/// # Errors
+///
+/// Same as [`fire_due_debounced_starts`].
+#[cfg(feature = "db")]
+pub async fn fire_due_debounced_starts_with_codecs(
+    conn: &mut diesel_async::AsyncPgConnection,
+    sharded_pool: &Option<crate::shard::ShardedDbPool>,
+    shard_assignments: &[crate::types::ShardId],
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> crate::error::HarvestResult<usize> {
+    fire_due_debounced_starts_on_conn_shard(
+        conn,
+        None,
+        sharded_pool.as_ref(),
+        shard_assignments,
+        metrics,
+        codecs,
+    )
+    .await
+}
+
+/// [`fire_due_debounced_starts_with_codecs`] for a caller that knows `conn`'s
+/// shard. See [`crate::shard::connect_or_reuse`].
+#[cfg(feature = "db")]
+pub(crate) async fn fire_due_debounced_starts_on_conn_shard(
+    conn: &mut diesel_async::AsyncPgConnection,
+    conn_shard: Option<crate::types::ShardId>,
+    sharded_pool: Option<&crate::shard::ShardedDbPool>,
+    shard_assignments: &[crate::types::ShardId],
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<usize> {
     // Spawn a shard's fired follow-ups + record metrics, returning the count.
     // Done per-shard immediately after that shard's claim transaction commits, so
@@ -676,28 +783,28 @@ pub async fn fire_due_debounced_starts(
         // Multi-shard: scan each assigned shard's own harvest_debounce table.
         Some(sp) if !shard_assignments.is_empty() => {
             for shard in shard_assignments {
-                let Some(pool) = sp.exact_pool_for(*shard).cloned() else {
+                let Some(mut shard_conn) = crate::shard::connect_or_reuse(
+                    conn,
+                    conn_shard,
+                    sp,
+                    *shard,
+                    "debounce",
+                    crate::shard::ShardConnectError::LogAndSkip,
+                )
+                .await?
+                else {
                     continue;
-                };
-                let mut shard_conn = match pool.get().await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!(
-                            "[debounce] failed to get connection to shard {shard:?}: {e:?}"
-                        );
-                        continue;
-                    }
                 };
                 // Spawn this shard's results before moving on; on this shard's own
                 // error the transaction rolled back, so there is nothing committed
                 // to drain and propagating is safe.
-                let fired = fire_due_on_conn(&mut shard_conn, Some(metrics)).await?;
+                let fired = fire_due_on_conn(&mut shard_conn, Some(metrics), codecs).await?;
                 fired_count += spawn_fired(fired, metrics, &mut shard_conn).await;
             }
         }
         // Single-shard / no sharded pool: the passed connection is the only shard.
         _ => {
-            let fired = fire_due_on_conn(conn, Some(metrics)).await?;
+            let fired = fire_due_on_conn(conn, Some(metrics), codecs).await?;
             fired_count += spawn_fired(fired, metrics, conn).await;
         }
     }
@@ -728,18 +835,49 @@ async fn delete_debounce_row(
 #[cfg(feature = "db")]
 const QUOTA_REDEFER_BACKOFF: Duration = Duration::from_secs(5);
 
-/// Push a quota-blocked debounce row's `effective_fire_at` forward by
-/// [`QUOTA_REDEFER_BACKOFF`] (issue #946, Task #7 hardening) so it is
-/// re-attempted less often instead of thrashing the claim batch every
-/// scanner tick.
+/// Compute the new `effective_fire_at` for a debounce row blocked by an
+/// exhausted per-tenant quota at fire time (issue #946, hardened by #1227
+/// Finding 3).
 ///
-/// Clamped to never exceed the row's own `max_fire_at` (`LEAST($2,
-/// max_fire_at)`), preserving the pre-existing debounce `max_wait` contract:
-/// a quota block can delay a fire past its trailing-edge deadline, but never
-/// past the absolute cap the caller configured at admission. Runs inside the
-/// caller's fire transaction so the row-level `FOR UPDATE` lock is held
-/// through the update. Mirrors [`delete_debounce_row`]'s parameterized
-/// `sql_query` style.
+/// Clamps `proposed` to the row's own `max_fire_at`, preserving the
+/// pre-existing `max_wait` contract, **unless `max_fire_at` has already
+/// passed**. Once the deadline itself is in the past, `LEAST(proposed,
+/// max_fire_at)` would always evaluate to that past `max_fire_at`. That
+/// writes an already-expired `effective_fire_at` back to the row. The row
+/// then re-qualifies as due on the very next scanner tick. That defeats the
+/// backoff entirely for exactly the case where it matters most: a row stuck
+/// past its deadline on a persistently exhausted quota. Past that point the
+/// row instead gets the bounded backoff **unclamped**. The quota block has
+/// already blown the `max_wait` cap, so there is no deadline left to honor.
+/// The alternative is to drop the row. That would silently discard a
+/// debounced start the caller is still waiting on.
+///
+/// Deliberately NOT gated behind `#[cfg(feature = "db")]` like its caller
+/// (`redefer_debounce_row`). This function is pure `DateTime` arithmetic with
+/// no database dependency. The ungated unit tests below need to call it
+/// regardless of which features are enabled. Its only PRODUCTION caller is
+/// still `db`-gated, though. So a downstream crate's non-test build with `db`
+/// off would flag it as dead code (as `autumn-harvest-sqlite` does). Hence the
+/// standard `#[cfg_attr(not(feature = "db"), allow(dead_code))]`, used
+/// throughout this crate for exactly that shape.
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
+fn redefer_target(
+    now: DateTime<Utc>,
+    max_fire_at: DateTime<Utc>,
+    proposed: DateTime<Utc>,
+) -> DateTime<Utc> {
+    if max_fire_at < now {
+        proposed
+    } else {
+        proposed.min(max_fire_at)
+    }
+}
+
+/// Push a quota-blocked debounce row's `effective_fire_at` forward to
+/// `new_effective_fire_at` — the caller has already applied
+/// [`redefer_target`]'s `max_fire_at` clamp. Runs inside the caller's fire
+/// transaction so the row-level `FOR UPDATE` lock is held through the
+/// update. Mirrors [`delete_debounce_row`]'s parameterized `sql_query` style.
 #[cfg(feature = "db")]
 async fn redefer_debounce_row(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -747,14 +885,12 @@ async fn redefer_debounce_row(
     new_effective_fire_at: DateTime<Utc>,
 ) -> crate::error::HarvestResult<()> {
     use diesel_async::RunQueryDsl;
-    diesel::sql_query(
-        "UPDATE harvest_debounce SET effective_fire_at = LEAST($2, max_fire_at) WHERE id = $1",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(row_id)
-    .bind::<diesel::sql_types::Timestamptz, _>(new_effective_fire_at)
-    .execute(conn)
-    .await
-    .map_err(crate::error::database_error)?;
+    diesel::sql_query("UPDATE harvest_debounce SET effective_fire_at = $2 WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(row_id)
+        .bind::<diesel::sql_types::Timestamptz, _>(new_effective_fire_at)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
     Ok(())
 }
 
@@ -772,44 +908,29 @@ async fn redefer_debounce_row(
 async fn fire_claimed_debounce_row(
     conn: &mut diesel_async::AsyncPgConnection,
     row: FireDueRow,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<Option<FiredDebounce>> {
     let opts: DebounceStartOptions = serde_json::from_value(row.start_options).unwrap_or_default();
 
     let shard = crate::types::ShardId::new(row.shard_id);
     let exec_id = crate::types::ExecutionId::new_for_shard(shard);
 
-    let reuse_policy = opts
-        .reuse_policy
-        .as_deref()
-        .and_then(parse_reuse_policy)
-        .unwrap_or(crate::types::WorkflowIdReusePolicy::AllowDuplicate);
-
-    let execution_timeout = opts
-        .execution_timeout_secs
-        .and_then(chrono::Duration::try_seconds);
-    let sla = opts.sla_secs.and_then(chrono::Duration::try_seconds);
-    let max_execution_timeout_ceiling = opts
-        .max_execution_timeout_ceiling_secs
-        .and_then(chrono::Duration::try_seconds);
-    // Chain-scoped lifetime cap captured at admission (issue #617), so a debounced
-    // start of a `#[workflow(chain_execution_timeout = ...)]` workflow does not
-    // silently drop the declared cap.
-    let chain_execution_timeout = opts
-        .chain_execution_timeout_secs
-        .and_then(chrono::Duration::try_seconds);
-    let max_workflow_chain_timeout_ceiling = opts
-        .max_workflow_chain_timeout_ceiling_secs
-        .and_then(chrono::Duration::try_seconds);
-    let priority = opts
-        .priority
-        .and_then(crate::types::Priority::from_i32)
-        .unwrap_or_default();
+    let DeferredAdmissionFields {
+        reuse_policy,
+        execution_timeout,
+        sla,
+        max_execution_timeout_ceiling,
+        chain_execution_timeout,
+        max_workflow_chain_timeout_ceiling,
+        priority,
+    } = decode_deferred_admission_fields(&opts);
 
     let workflow_name = row.workflow_name;
     let workflow_id = row.workflow_id;
     let queue_name = row.queue_name;
     let debounce_key = row.debounce_key;
     let row_id = row.id;
+    let max_fire_at = row.max_fire_at;
     let owner = opts.owner;
     let runbook_url = opts.runbook_url;
     let severity = opts.severity;
@@ -824,48 +945,39 @@ async fn fire_claimed_debounce_row(
     let started_by = opts.started_by;
 
     let params = crate::execution::StartWorkflowParams {
-        workflow_name: &workflow_name,
-        workflow_id: &workflow_id,
-        exec_id,
-        input: row.last_input,
-        parent_id: None,
-        queue_name: &queue_name,
         execution_timeout,
         memo: opts.memo,
         search_attrs: opts.search_attrs,
         reuse_policy,
-        conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
         trace_context: opts.trace_context,
         max_execution_timeout_ceiling,
         chain_execution_timeout,
         max_workflow_chain_timeout_ceiling,
-        inherited_chain_deadline_at: None,
         concurrency_key: opts.concurrency_key,
         concurrency_limit: opts.concurrency_limit,
         concurrency_on_conflict: opts.concurrency_on_conflict.unwrap_or_default(),
         priority,
         max_workflow_input_bytes: opts.max_workflow_input_bytes.unwrap_or(u64::MAX),
-        start_at: None,
-        delay: None,
-        max_workflow_start_delay: None,
         owner: owner.as_deref(),
         runbook_url: runbook_url.as_deref(),
         severity: severity.as_deref(),
         context_headers: opts.context_headers,
         sla,
-        schedule_id: None,
-        scheduled_for: None,
-        workflow_attempt: 1,
         workflow_retry_policy: opts
             .workflow_retry_policy
             .and_then(|v| serde_json::from_value(v).ok()),
-        retry_of_exec_id: None,
         max_workflow_attempts_ceiling: opts.max_workflow_attempts_ceiling,
-        origin: None,
         completion_callbacks: opts.completion_callbacks,
         start_source,
         start_source_ref: start_source_ref.as_deref(),
         started_by: started_by.as_deref(),
+        ..crate::execution::StartWorkflowParams::new(
+            &workflow_name,
+            &workflow_id,
+            exec_id,
+            row.last_input,
+            &queue_name,
+        )
     };
 
     // `in_outer_transaction = true`: this runs inside the scanner's fire
@@ -873,8 +985,8 @@ async fn fire_claimed_debounce_row(
     // that rolls back with this transaction on error — the collect fn must not
     // spawn its follow-ups (they'd be orphaned). Deferred starts returned on
     // success are spawned by the caller only after the fire transaction commits.
-    match crate::execution::start_or_load_workflow_execution_collect(
-        conn, params, true, false, None, None,
+    match crate::execution::start_or_load_workflow_execution_collect_with_codecs(
+        conn, params, true, false, None, None, codecs,
     )
     .await
     {
@@ -909,6 +1021,25 @@ async fn fire_claimed_debounce_row(
             );
             Ok(None)
         }
+        // An empty workflow_id here can only be a LEGACY row (issue #1353).
+        // It predates this validation -- the admission path now rejects an
+        // empty id before a debounce row can ever be written. Such a row
+        // can never start, so retrying it changes
+        // nothing. An un-caught `?` here would abort this whole batch's
+        // fire transaction. It would repeat the same failure every scanner
+        // tick. That starves every later scanner duty for as long as the
+        // row sits at the head of the claim queue. That is the exact
+        // hazard the `AlreadyExists` arm above already guards against.
+        // Drop the row the same way.
+        Err(crate::error::HarvestError::EmptyWorkflowId) => {
+            delete_debounce_row(conn, row_id).await?;
+            tracing::warn!(
+                workflow_name = %workflow_name,
+                debounce_key = %debounce_key,
+                "debounced start skipped: legacy row has an empty workflow_id (issue #1353)",
+            );
+            Ok(None)
+        }
         // issue #946 (Task #7 hardening): a declared per-tenant quota is
         // exhausted at fire time. Unlike `AlreadyExists` above this is
         // TEMPORARY — the tenant's usage can free up as an existing
@@ -933,7 +1064,9 @@ async fn fire_claimed_debounce_row(
             current,
         }) => {
             let now = Utc::now();
-            redefer_debounce_row(conn, row_id, now + QUOTA_REDEFER_BACKOFF).await?;
+            let new_effective_fire_at =
+                redefer_target(now, max_fire_at, now + QUOTA_REDEFER_BACKOFF);
+            redefer_debounce_row(conn, row_id, new_effective_fire_at).await?;
             tracing::debug!(
                 workflow_name = %workflow_name,
                 debounce_key = %debounce_key,
@@ -966,6 +1099,63 @@ pub(crate) fn parse_reuse_policy(s: &str) -> Option<crate::types::WorkflowIdReus
         "allow_duplicate_failed_only" => Some(AllowDuplicateFailedOnly),
         "terminate_if_running" => Some(TerminateIfRunning),
         _ => None,
+    }
+}
+
+/// Timing, reuse-policy and priority fields common to every deferred
+/// (debounce/throttle/batch) fire path, decoded from the persisted
+/// [`DebounceStartOptions`].
+///
+/// Shared with `throttle.rs` and `event_batch.rs`, which each fire a
+/// different deferred-start carrier from the same `DebounceStartOptions`
+/// blob. `start_source`'s pre-#740-row fallback differs by carrier (API vs.
+/// batch vs. schedule/backfill-derived), so it stays decoded at each call
+/// site rather than here.
+#[cfg(feature = "db")]
+pub(crate) struct DeferredAdmissionFields {
+    pub reuse_policy: crate::types::WorkflowIdReusePolicy,
+    pub execution_timeout: Option<chrono::Duration>,
+    pub sla: Option<chrono::Duration>,
+    pub max_execution_timeout_ceiling: Option<chrono::Duration>,
+    /// Chain-scoped lifetime cap captured at admission (issue #617), so a
+    /// deferred start of a `#[workflow(chain_execution_timeout = ...)]`
+    /// workflow does not silently drop the declared cap.
+    pub chain_execution_timeout: Option<chrono::Duration>,
+    pub max_workflow_chain_timeout_ceiling: Option<chrono::Duration>,
+    pub priority: crate::types::Priority,
+}
+
+/// Decode [`DeferredAdmissionFields`] from persisted start options.
+///
+/// Pure and unit-testable without a database.
+#[cfg(feature = "db")]
+#[must_use]
+pub(crate) fn decode_deferred_admission_fields(
+    opts: &DebounceStartOptions,
+) -> DeferredAdmissionFields {
+    DeferredAdmissionFields {
+        reuse_policy: opts
+            .reuse_policy
+            .as_deref()
+            .and_then(parse_reuse_policy)
+            .unwrap_or(crate::types::WorkflowIdReusePolicy::AllowDuplicate),
+        execution_timeout: opts
+            .execution_timeout_secs
+            .and_then(chrono::Duration::try_seconds),
+        sla: opts.sla_secs.and_then(chrono::Duration::try_seconds),
+        max_execution_timeout_ceiling: opts
+            .max_execution_timeout_ceiling_secs
+            .and_then(chrono::Duration::try_seconds),
+        chain_execution_timeout: opts
+            .chain_execution_timeout_secs
+            .and_then(chrono::Duration::try_seconds),
+        max_workflow_chain_timeout_ceiling: opts
+            .max_workflow_chain_timeout_ceiling_secs
+            .and_then(chrono::Duration::try_seconds),
+        priority: opts
+            .priority
+            .and_then(crate::types::Priority::from_i32)
+            .unwrap_or_default(),
     }
 }
 
@@ -1042,6 +1232,25 @@ pub async fn list_pending_debounce(
 mod tests {
     use super::*;
     use chrono::TimeZone as _;
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn fire_due_row_gives_the_quota_lock_inputs() {
+        use crate::quota_lock_order::QuotaLockRow;
+        let row = FireDueRow {
+            id: uuid::Uuid::new_v4(),
+            workflow_name: "wf_a".to_string(),
+            debounce_key: "k".to_string(),
+            workflow_id: "w".to_string(),
+            queue_name: "default".to_string(),
+            last_input: serde_json::json!({ "tenant_id": "t1" }),
+            start_options: serde_json::json!({ "tenant_id": "wrong" }),
+            shard_id: 0,
+            max_fire_at: Utc::now(),
+        };
+        assert_eq!(row.workflow_name(), "wf_a");
+        assert_eq!(row.quota_input()["tenant_id"], "t1");
+    }
 
     fn ts(year: i32, month: u32, day: u32, h: u32, m: u32, s: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(year, month, day, h, m, s).unwrap()
@@ -1207,5 +1416,142 @@ mod tests {
         // A zero window means every request fires immediately (trailing edge = now).
         let deadline = compute_fire_deadline(t0, Duration::ZERO, t0, Duration::from_secs(300));
         assert_eq!(deadline, t0, "zero window should produce fire_at = now");
+    }
+
+    // ── redefer_target (issue #1227, Finding 3) ─────────────────────────────
+
+    #[test]
+    fn redefer_target_clamps_to_max_fire_at_when_deadline_still_ahead() {
+        let now = ts(2026, 6, 18, 10, 0, 0);
+        let max_fire_at = now + chrono::Duration::seconds(3); // deadline in 3s
+        let proposed = now + QUOTA_REDEFER_BACKOFF_FOR_TEST; // backoff of 5s overshoots it
+        let target = redefer_target(now, max_fire_at, proposed);
+        assert_eq!(
+            target, max_fire_at,
+            "a still-future max_fire_at must keep clamping the backoff, \
+             preserving the pre-existing max_wait contract"
+        );
+    }
+
+    #[test]
+    fn redefer_target_does_not_clamp_when_max_fire_at_already_passed() {
+        let now = ts(2026, 6, 18, 10, 0, 0);
+        let max_fire_at = now - chrono::Duration::seconds(30); // deadline already blown
+        let proposed = now + QUOTA_REDEFER_BACKOFF_FOR_TEST;
+        let target = redefer_target(now, max_fire_at, proposed);
+        assert_eq!(
+            target, proposed,
+            "once max_fire_at has passed, the clamp must not apply -- clamping \
+             would write an already-expired effective_fire_at"
+        );
+        assert!(
+            target > now,
+            "the redeferred target must be in the future, not a past timestamp \
+             (issue #1227 Finding 3: LEAST(now + backoff, an already-past \
+             max_fire_at) evaluates to the past max_fire_at, defeating the \
+             backoff and re-qualifying the row as due on the very next tick)"
+        );
+    }
+
+    #[test]
+    fn redefer_target_at_exact_deadline_still_clamps() {
+        // max_fire_at == now is the boundary: not yet "passed", so the
+        // pre-existing clamp behavior applies unchanged.
+        let now = ts(2026, 6, 18, 10, 0, 0);
+        let proposed = now + QUOTA_REDEFER_BACKOFF_FOR_TEST;
+        let target = redefer_target(now, now, proposed);
+        assert_eq!(target, now);
+    }
+
+    const QUOTA_REDEFER_BACKOFF_FOR_TEST: chrono::Duration = chrono::Duration::seconds(5);
+
+    // ── decode_deferred_admission_fields ─────────────────────────────────────
+    //
+    // Characterizes the field-by-field decode shared by debounce/throttle/
+    // batch fire (clone class: debounce.rs, throttle.rs, event_batch.rs x2;
+    // co-changed in 896978eb (#617) and 3fa812d2 (#740)). Pins the behavior
+    // that was previously inlined at each of those four call sites.
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn decode_deferred_admission_fields_all_absent_uses_defaults() {
+        let decoded = decode_deferred_admission_fields(&DebounceStartOptions::default());
+        assert_eq!(
+            decoded.reuse_policy,
+            crate::types::WorkflowIdReusePolicy::AllowDuplicate
+        );
+        assert_eq!(decoded.execution_timeout, None);
+        assert_eq!(decoded.sla, None);
+        assert_eq!(decoded.max_execution_timeout_ceiling, None);
+        assert_eq!(decoded.chain_execution_timeout, None);
+        assert_eq!(decoded.max_workflow_chain_timeout_ceiling, None);
+        assert_eq!(decoded.priority, crate::types::Priority::default());
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn decode_deferred_admission_fields_decodes_every_present_field() {
+        let opts = DebounceStartOptions {
+            reuse_policy: Some("reject_duplicate".to_string()),
+            execution_timeout_secs: Some(30),
+            sla_secs: Some(60),
+            max_execution_timeout_ceiling_secs: Some(3600),
+            chain_execution_timeout_secs: Some(7200),
+            max_workflow_chain_timeout_ceiling_secs: Some(86400),
+            priority: Some(crate::types::Priority::High.as_i32()),
+            ..DebounceStartOptions::default()
+        };
+        let decoded = decode_deferred_admission_fields(&opts);
+        assert_eq!(
+            decoded.reuse_policy,
+            crate::types::WorkflowIdReusePolicy::RejectDuplicate
+        );
+        assert_eq!(
+            decoded.execution_timeout,
+            Some(chrono::Duration::seconds(30))
+        );
+        assert_eq!(decoded.sla, Some(chrono::Duration::seconds(60)));
+        assert_eq!(
+            decoded.max_execution_timeout_ceiling,
+            Some(chrono::Duration::seconds(3600))
+        );
+        assert_eq!(
+            decoded.chain_execution_timeout,
+            Some(chrono::Duration::seconds(7200))
+        );
+        assert_eq!(
+            decoded.max_workflow_chain_timeout_ceiling,
+            Some(chrono::Duration::seconds(86400))
+        );
+        assert_eq!(decoded.priority, crate::types::Priority::High);
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn decode_deferred_admission_fields_unparseable_reuse_policy_falls_back() {
+        // An unrecognised persisted string must fall back to AllowDuplicate,
+        // not error. A future build version may write a string this build
+        // does not know. This mirrors every inline call site's prior
+        // behavior.
+        let opts = DebounceStartOptions {
+            reuse_policy: Some("some_future_policy".to_string()),
+            ..DebounceStartOptions::default()
+        };
+        let decoded = decode_deferred_admission_fields(&opts);
+        assert_eq!(
+            decoded.reuse_policy,
+            crate::types::WorkflowIdReusePolicy::AllowDuplicate
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn decode_deferred_admission_fields_unparseable_priority_falls_back() {
+        let opts = DebounceStartOptions {
+            priority: Some(999),
+            ..DebounceStartOptions::default()
+        };
+        let decoded = decode_deferred_admission_fields(&opts);
+        assert_eq!(decoded.priority, crate::types::Priority::default());
     }
 }

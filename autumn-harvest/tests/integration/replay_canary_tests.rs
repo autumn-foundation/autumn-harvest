@@ -32,7 +32,7 @@ async fn make_pool() -> (
     let mut conn = diesel_async::AsyncPgConnection::establish(&url)
         .await
         .expect("connect");
-    conn.batch_execute(autumn_harvest::full_migrations_sql())
+    conn.batch_execute(&autumn_harvest::test_init_sql())
         .await
         .expect("migration");
 
