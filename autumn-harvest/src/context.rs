@@ -7093,10 +7093,16 @@ impl WorkflowContext {
     /// it is driven purely by the workflow's own `start_timer`/`cancel_timer`/
     /// `reset_timer` calls in program order.
     fn set_timer_logical_state(&self, timer_id: &str, state: TimerLogicalState) {
+        let armed = matches!(state, TimerLogicalState::Armed { .. });
         self.cancellable_timer_state
             .lock()
             .expect("cancellable_timer_state lock poisoned")
             .insert(timer_id.to_string(), state);
+        // Issue #1984: a scope cancel also cancels the timers that its body arms.
+        if armed {
+            let stack = self.scope_stack.lock().expect("scope stack lock poisoned");
+            crate::cancellation_scope::note_armed_timer(&stack, timer_id);
+        }
     }
 
     /// Clear the logical lifecycle entry for `timer_id` (issue #768).

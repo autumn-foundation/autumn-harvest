@@ -152,6 +152,9 @@ struct ScopeInner {
     holding: bool,
     held: Vec<WorkflowCommand>,
     members: ScopeMembers,
+    /// The handle timers that the body arms, matched or live.
+    /// A replay that matches an arm pushes no command, so `members` can miss it.
+    armed_timers: Vec<TimerId>,
 }
 
 impl ScopeShared {
@@ -213,6 +216,22 @@ pub(crate) fn route_command(
     Some((cmd, tags))
 }
 
+/// Record that the body arms the handle timer `timer_id`.
+///
+/// Each cancellable scope up to the nearest shield records it. Live and
+/// replay call this at the same point in the body.
+pub(crate) fn note_armed_timer(stack: &[ScopeFrame], timer_id: &str) {
+    for frame in stack.iter().rev() {
+        let ScopeFrame::Cancellable(shared) = frame else {
+            break;
+        };
+        let mut inner = shared.lock();
+        if !inner.armed_timers.iter().any(|id| id.as_str() == timer_id) {
+            inner.armed_timers.push(TimerId::new(timer_id));
+        }
+    }
+}
+
 /// A group of workflow operations that cancel together (issue #1984).
 ///
 /// Create one with [`WorkflowContext::cancellation_scope`]. Run a body in
@@ -266,6 +285,7 @@ impl<'a> CancellationScope<'a> {
                     holding: false,
                     held: Vec::new(),
                     members: ScopeMembers::default(),
+                    armed_timers: Vec::new(),
                 }),
             }),
         };
@@ -367,6 +387,7 @@ impl<F: Future> ScopeRun<'_, F> {
                 ctx.mark_scope_timers_cancelled(&marker.members.timers);
                 // The held commands are the commands that the live cycle withdrew.
                 ctx.mark_scope_timers_cancelled(&armed_timer_ids(&self.shared.lock().held));
+                ctx.mark_scope_timers_cancelled(&self.armed_timers());
                 marker.reason
             })
         } else if self.replay.is_some() || ctx.has_unconsumed_marker(&name) {
@@ -392,6 +413,7 @@ impl<F: Future> ScopeRun<'_, F> {
             });
             ctx.mark_scope_timers_cancelled(&marker.members.timers);
             ctx.mark_scope_timers_cancelled(&armed_timer_ids(&withdrawn));
+            ctx.mark_scope_timers_cancelled(&self.armed_timers());
             if !marker.members.is_empty() {
                 ctx.push_command(WorkflowCommand::CancelRaceLosers {
                     reason: LoserCancelReason::ScopeCancelled,
@@ -406,6 +428,10 @@ impl<F: Future> ScopeRun<'_, F> {
         self.body = None;
         drop(withdrawn);
         result.and_then(|reason| Err(HarvestError::Cancelled(reason)))
+    }
+
+    fn armed_timers(&self) -> Vec<TimerId> {
+        self.shared.lock().armed_timers.clone()
     }
 
     fn finish(&mut self) {
@@ -873,6 +899,40 @@ mod tests {
             )
         });
         assert!(rearm.is_some(), "the re-arm is not a no-op: {commands:?}");
+    }
+
+    /// A handle timer that an earlier cycle armed and the body never awaits
+    /// is not a member. The scope cancel still clears its armed state.
+    #[tokio::test]
+    async fn scope_cancel_clears_the_armed_state_of_an_unawaited_timer() {
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started(),
+                WorkflowEvent::TimerStarted {
+                    timer_id: TimerId::new("deadline"),
+                    duration_secs: 60,
+                },
+            ],
+        );
+
+        let result = bounded(run_then_cancel(&ctx, async {
+            let _handle = ctx.start_timer("deadline", 60);
+            std::future::pending::<()>().await;
+        }))
+        .await;
+
+        assert!(
+            matches!(result, Err(HarvestError::Cancelled(_))),
+            "{result:?}"
+        );
+        let _handle = ctx.start_timer("deadline", 30);
+        let commands = ctx.drain_commands();
+        assert_eq!(
+            arms(&commands),
+            1,
+            "the re-arm is not a no-op: {commands:?}"
+        );
     }
 
     #[tokio::test]
