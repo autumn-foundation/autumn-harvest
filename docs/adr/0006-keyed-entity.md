@@ -59,9 +59,11 @@ adds no `WorkflowEvent` variant, no migration and no worker path.
 ### 4. How the entity survives continue-as-new and history caps
 
 - After each op, the loop asks for a checkpoint. The live answer is
-  `should_continue_as_new()`, or this run's own op count and op bytes. The
-  loaded history count does not include the current task, so a long backlog
-  needs the own count. The loop records the answer with `ctx.side_effect`.
+  `should_continue_as_new()`, this run's own op count, or a byte estimate.
+  The loaded history count does not include the current task, so a long
+  backlog needs the own count. The byte estimate is the loaded history
+  bytes plus this run's op bytes. It trips at half the history byte cap, so
+  large activity results also force a checkpoint. The loop records the answer with `ctx.side_effect`.
   Replay reads the recorded answer, so it takes the checkpoint at the same
   op.
 - The cost is one `SideEffectRecorded` event for each op. A run with an

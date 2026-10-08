@@ -324,7 +324,7 @@ where
             run.ops += 1;
             *lock(&published) = Published::of(&checkpoint);
 
-            if checkpoint_due(ctx, &run, max_ops_per_run)? {
+            if checkpoint_due(ctx, &mut run, max_ops_per_run)? {
                 let limit = match budget {
                     Some(limit) => limit,
                     None => *budget.insert(
@@ -354,6 +354,9 @@ struct RunCounters {
     ops: u64,
     /// Serialized bytes of those messages.
     op_bytes: u64,
+    /// The loaded history size, as `(event count, bytes)`. A new task loads
+    /// more events, so a new count means a new measure.
+    loaded: Option<(u64, u64)>,
 }
 
 /// The committed view that the queries read.
@@ -449,11 +452,14 @@ fn record_failure(stats: &mut EntityStats, error: String) {
 ///
 /// The loaded history count does not include the events of the current
 /// task. The run therefore also counts one event for each op it took, so a
-/// long backlog in one task still reaches the threshold. Op bytes count
-/// against a quarter of the history byte cap for the same reason.
+/// long backlog in one task still reaches the threshold.
+///
+/// The byte check adds the loaded history bytes and this run's op bytes. The
+/// loaded bytes include the activity results of earlier tasks. The check
+/// trips at half the history byte cap, which leaves room for estimate error.
 fn checkpoint_due(
     ctx: &WorkflowContext,
-    run: &RunCounters,
+    run: &mut RunCounters,
     max_ops_per_run: Option<u64>,
 ) -> HarvestResult<bool> {
     if max_ops_per_run.is_some_and(|max| run.ops >= max) {
@@ -461,13 +467,29 @@ fn checkpoint_due(
     }
     let policy = ctx.history_policy();
     let by_engine = ctx.should_continue_as_new();
-    let by_events =
-        ctx.history_event_count().saturating_add(run.ops) > policy.continue_as_new_threshold();
-    let by_bytes = policy
-        .byte_hard_cap()
-        .is_some_and(|cap| run.op_bytes > cap / 4);
+    let events = ctx.history_event_count();
+    let by_events = events.saturating_add(run.ops) > policy.continue_as_new_threshold();
+    let by_bytes = match policy.byte_hard_cap() {
+        Some(cap) => {
+            let loaded = match run.loaded {
+                Some((count, bytes)) if count == events => bytes,
+                _ => {
+                    let bytes = ctx.loaded_history_bytes();
+                    run.loaded = Some((events, bytes));
+                    bytes
+                }
+            };
+            over_byte_budget(loaded, run.op_bytes, cap)
+        }
+        None => false,
+    };
     let live = by_engine || by_events || by_bytes;
     ctx.side_effect(ENTITY_CHECKPOINT_SIDE_EFFECT, || live)
+}
+
+/// Whether the history bytes reach half of `cap`.
+const fn over_byte_budget(loaded: u64, op_bytes: u64, cap: u64) -> bool {
+    loaded.saturating_add(op_bytes) > cap / 2
 }
 
 #[cfg(test)]
@@ -663,6 +685,50 @@ mod tests {
             Some(100),
             "offload above the cap leaves a rejected band"
         );
+    }
+
+    #[test]
+    fn the_byte_budget_is_half_the_cap() {
+        assert!(!over_byte_budget(40, 10, 100));
+        assert!(over_byte_budget(40, 11, 100));
+        assert!(over_byte_budget(u64::MAX, 1, 100));
+    }
+
+    /// Large activity results fill the history while the ops stay tiny. The
+    /// loaded history bytes still force a checkpoint before the byte cap.
+    #[tokio::test]
+    async fn large_activity_results_force_a_checkpoint() {
+        let messages: Vec<Value> = (0..40).map(|_| op(1)).collect();
+        let outcome = env_with(&messages)
+            .mock_activity("entity_step", |_| Ok(json!("x".repeat(1 << 20))))
+            .run(blob_counter, json!({}))
+            .await;
+        let carried: EntityCheckpoint<i64> =
+            serde_json::from_value(outcome.result.expect("checkpoint")).unwrap();
+        let half_cap = crate::context::DEFAULT_HISTORY_BYTE_HARD_CAP / 2;
+        let applied = i64::try_from(half_cap >> 20).unwrap();
+        assert!(
+            carried.state > 0 && carried.state <= applied + 1,
+            "the run checkpoints near half the byte cap, after {} ops",
+            carried.state
+        );
+        assert_eq!(carried.stats.checkpoints, 1);
+    }
+
+    /// A counter entity whose handler stores a large activity result.
+    fn blob_counter(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        Box::pin(async move {
+            let state = Entity::new(ctx, checkpoint_of(input)?)
+                .run(|count, _: CounterOp| async move {
+                    ctx.execute_activity_raw("entity_step", json!(null), "default")
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    Ok(count + 1)
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(state))
+        })
     }
 
     #[test]

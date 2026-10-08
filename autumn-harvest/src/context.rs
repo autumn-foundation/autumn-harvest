@@ -3985,6 +3985,14 @@ impl WorkflowContext {
         self.history_policy
     }
 
+    /// Serialized bytes of the history loaded for this task.
+    ///
+    /// It reads only the loaded events, so the result is the same on each
+    /// call within one task (issue #1975).
+    pub(crate) fn loaded_history_bytes(&self) -> u64 {
+        self.match_history(|matcher| matcher.loaded_bytes())
+    }
+
     /// The largest same-type continue-as-new input this run can write.
     ///
     /// Returns `None` when every size is accepted. That is true when the cap

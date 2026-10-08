@@ -27,8 +27,9 @@ a new entity.
 - A checkpoint is replay-stable. The loop records each decision as a side
   effect. A hand-written loop over `should_continue_as_new()` can diverge on
   replay, because it reads the loaded history size. The decision also counts
-  this run's own ops and op bytes, so a backlog in one task still
-  checkpoints. `max_ops_per_run(n)` adds a fixed bound with no event.
+  this run's own ops, so a backlog in one task still checkpoints. A byte
+  estimate (loaded history plus op bytes) trips at half the history byte
+  cap. `max_ops_per_run(n)` adds a fixed bound with no event.
 - A delete completes the run only when no operation waits in history.
 
 **Limits.** See the ADR consequences: the delete race, the state size cap,
@@ -37,13 +38,14 @@ trusted start input.
 
 **Invariants.** No new `WorkflowEvent` variant, no migration and no new
 route. Each operation adds one `SideEffectRecorded` event, or two with an
-`execution_timeout`. Two crate-private `WorkflowContext` accessors feed the
+`execution_timeout`. Crate-private `WorkflowContext` accessors feed the
 checkpoint decision.
 
 **Tests.**
 
-- `entity::tests` (21): serialization, rollback, decode errors, delete,
-  checkpoint carry, the input-cap budget and its offload rule,
+- `entity::tests` (23): serialization, rollback, decode errors, delete,
+  checkpoint carry, the input-cap budget and its offload rule, the byte
+  trigger,
   recorded-decision replay, replay stability against a naive loop, the
   deadline probe, cancellation, bad input and queries.
 - `tests/integration/entity_tests.rs` (Postgres): a worker crash in the
