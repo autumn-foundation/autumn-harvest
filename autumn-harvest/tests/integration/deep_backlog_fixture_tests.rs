@@ -158,6 +158,23 @@ fn the_seed_sql_is_a_pure_function_of_the_spec() {
 }
 
 #[test]
+fn the_ledger_workload_scales_its_churn_with_the_table() {
+    for live in [fixture::SHALLOW_LIVE_ROWS, LEDGER_LIVE_ROWS] {
+        let spec = FixtureSpec::ledger(1).at_scale(live);
+        let workload = WorkloadConfig::ledger(&spec);
+        // Each cycle leaves about three dead versions: the claim, the
+        // completion and the delete. Autovacuum is off, so they add up.
+        #[allow(clippy::cast_precision_loss)]
+        let drift = (3 * workload.max_claims) as f64 / live as f64;
+        assert!(
+            drift <= 0.015,
+            "{live} rows: the workload adds {drift} dead per live row"
+        );
+        assert!(workload.max_claims >= 20, "enough claims for a mean");
+    }
+}
+
+#[test]
 fn claim_slots_never_exceed_the_cap_under_contention() {
     use std::sync::atomic::AtomicU64;
     let slots = std::sync::Arc::new(AtomicU64::new(0));
@@ -532,10 +549,10 @@ async fn zz_capture_deep_backlog_ledger_evidence() {
     std::fs::create_dir_all(&out_dir).expect("create the artifact directory");
     let seed = fixture::env_u64("HARVEST_DEEP_BACKLOG_SEED", 1956);
     let deep_rows = fixture::env_u64("HARVEST_DEEP_BACKLOG_ROWS", LEDGER_LIVE_ROWS);
-    let workload = WorkloadConfig::ledger();
     let mut summary = String::new();
     for (label, rows) in [("shallow", fixture::SHALLOW_LIVE_ROWS), ("deep", deep_rows)] {
         let spec = FixtureSpec::ledger(seed).at_scale(rows);
+        let workload = WorkloadConfig::ledger(&spec);
         let (text, report) = fixture::capture_run(&server, label, &spec, &workload, &out_dir).await;
         summary.push_str(&text);
         assert!(report.claims > 0, "{label}: the workload claimed nothing");

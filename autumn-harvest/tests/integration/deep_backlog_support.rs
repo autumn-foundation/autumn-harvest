@@ -863,12 +863,18 @@ pub struct WorkloadConfig {
 }
 
 impl WorkloadConfig {
-    /// The Ledger workload. `HARVEST_DEEP_BACKLOG_SECS` sets the budget.
+    /// The Ledger workload for `spec`. `HARVEST_DEEP_BACKLOG_SECS` sets the
+    /// budget.
+    ///
+    /// The claim cap scales with the table: one claim per 200 live rows, and
+    /// at least 20. Each cycle leaves about three dead versions, and
+    /// autovacuum is off. So a run adds at most 1.5 dead versions per 100
+    /// live rows, and a shallow and a deep run keep a similar dead ratio.
     #[must_use]
-    pub fn ledger() -> Self {
+    pub fn ledger(spec: &FixtureSpec) -> Self {
         Self {
             claimers: 4,
-            max_claims: 2_000,
+            max_claims: (spec.live_rows / 200).max(20),
             budget: Duration::from_secs(env_u64("HARVEST_DEEP_BACKLOG_SECS", 600)),
         }
     }
