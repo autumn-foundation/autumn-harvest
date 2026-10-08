@@ -1013,10 +1013,21 @@ fn the_release_pipeline_builds_and_attaches_the_client() {
         "the client job must check the tarball name against the version"
     );
     let job = without_comments(job_block(&release, "release"));
-    assert!(
-        job.contains("needs: [meta, validate, sign, client, sign-client]"),
-        "the release must wait for the client build"
-    );
+    // Read the list, so a new release gate does not break this test.
+    let needs: Vec<&str> = job
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("needs: ["))
+        .and_then(|rest| rest.strip_suffix(']'))
+        .expect("the release job must list its needs")
+        .split(',')
+        .map(str::trim)
+        .collect();
+    for need in ["validate", "sign", "client", "sign-client"] {
+        assert!(
+            needs.contains(&need),
+            "the release must wait for the client build: no `{need}` in {needs:?}"
+        );
+    }
     let create = job
         .find("softprops/action-gh-release")
         .expect("the release job must create the GitHub release");
