@@ -70,6 +70,9 @@ pub async fn send_signal_idempotent(
     // An empty key is not in the partial index's NULL exclusion, so it would
     // collide across unrelated signals — treat it as no key (at-least-once).
     let idempotency_key = idempotency_key.filter(|k| !k.is_empty());
+    // Issue #1985: a durable promise settles once on every signal path.
+    let idempotency_key =
+        crate::durable_promise::settlement_idempotency_key(signal_name, &payload, idempotency_key)?;
 
     // The wake at the end of this transaction re-pends a parked workflow task,
     // so it raises a dispatch hint (issue #1312). A hint published before the

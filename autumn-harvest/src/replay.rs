@@ -4199,7 +4199,27 @@ impl HistoryMatcher {
         signal_name: &str,
         predicate: &dyn Fn(&Value) -> bool,
     ) -> HistoryMatch {
-        self.match_signal_inner(signal_name, None, Some(predicate))
+        self.match_signal_inner(signal_name, None, Some(&|_, payload| predicate(payload)))
+    }
+
+    /// [`match_signal_where`](Self::match_signal_where) with the verdict
+    /// already taken: a signal matches only if its event index is in
+    /// `accepted` (issue #1985).
+    ///
+    /// `WorkflowContext` runs the author predicate over
+    /// [`signal_candidates`](Self::signal_candidates) with no lock held. A
+    /// predicate that calls back into the context then cannot deadlock on
+    /// the matcher lock, and a panic in it cannot poison the lock.
+    pub(crate) fn match_signal_accepting(
+        &mut self,
+        signal_name: &str,
+        accepted: &HashSet<usize>,
+    ) -> HistoryMatch {
+        self.match_signal_inner(
+            signal_name,
+            None,
+            Some(&|index, _| accepted.contains(&index)),
+        )
     }
 
     /// [`match_signal`](Self::match_signal) for a **race branch** (issue #950).
@@ -4237,13 +4257,14 @@ impl HistoryMatcher {
     /// `wait_for_signal`.
     ///
     /// `predicate` is `None` for a plain wait. For a payload-matching wait
-    /// (issue #1985), a same-name signal must also satisfy it.
+    /// (issue #1985), a same-name signal must also satisfy it. It takes the
+    /// event index and the payload.
     #[allow(clippy::too_many_lines)]
     fn match_signal_inner(
         &mut self,
         signal_name: &str,
         tolerate_interleaved: Option<&str>,
-        predicate: Option<&dyn Fn(&Value) -> bool>,
+        predicate: Option<&dyn Fn(usize, &Value) -> bool>,
     ) -> HistoryMatch {
         if let Some(index) = self.claim_buffered_signal_position(signal_name, predicate)
             && let Some((_name, payload, _idx)) = self.pending_signals.remove(index)
@@ -4275,7 +4296,9 @@ impl HistoryMatcher {
                 WorkflowEvent::SignalReceived {
                     signal_name: recorded_name,
                     payload,
-                } if recorded_name == signal_name && predicate.is_some_and(|p| !p(payload)) => {
+                } if recorded_name == signal_name
+                    && predicate.is_some_and(|accepts| !accepts(scan_cursor, payload)) =>
+                {
                     // A payload-matching wait rejects this payload (issue
                     // #1985). Buffer it for a later wait and keep scanning.
                     self.predicate_rejected_signal_events.insert(scan_cursor);
@@ -6393,25 +6416,49 @@ impl HistoryMatcher {
         signal_name: &str,
         predicate: &dyn Fn(&Value) -> bool,
     ) -> bool {
-        if self
+        self.signal_candidates(signal_name)
+            .iter()
+            .any(|(_, payload)| predicate(payload))
+    }
+
+    /// [`has_unconsumed_signal`](Self::has_unconsumed_signal) for a verdict
+    /// taken by [`match_signal_accepting`](Self::match_signal_accepting)'s
+    /// caller (issue #1985). A pure read.
+    pub(crate) fn has_unconsumed_signal_accepting(
+        &self,
+        signal_name: &str,
+        accepted: &HashSet<usize>,
+    ) -> bool {
+        self.signal_candidates(signal_name)
+            .iter()
+            .any(|(index, _)| accepted.contains(index))
+    }
+
+    /// Every unclaimed `signal_name` signal, as `(event index, payload)`
+    /// (issue #1985).
+    ///
+    /// This is the buffered signals plus the unconsumed `SignalReceived`
+    /// events at or after the cursor. A payload-matching wait runs its
+    /// predicate over this list. A pure read.
+    #[must_use]
+    pub fn signal_candidates(&self, signal_name: &str) -> Vec<(usize, Value)> {
+        let buffered = self
             .pending_signals
             .iter()
-            .any(|(name, payload, _)| name == signal_name && predicate(payload))
-        {
-            return true;
-        }
-        self.events
-            .iter()
-            .enumerate()
-            .skip(self.cursor)
-            .any(|(i, e)| {
-                !self.is_consumed(i)
-                    && matches!(
-                        e,
-                        WorkflowEvent::SignalReceived { signal_name: n, payload }
-                            if n == signal_name && predicate(payload)
-                    )
-            })
+            .filter(|(name, _, _)| name == signal_name)
+            .map(|(_, payload, index)| (*index, payload.clone()));
+        let recorded = self.events.iter().enumerate().skip(self.cursor).filter_map(
+            |(index, event)| match event {
+                WorkflowEvent::SignalReceived {
+                    signal_name: name,
+                    payload,
+                } if name == signal_name && !self.is_consumed(index) => {
+                    Some((index, payload.clone()))
+                }
+                _ => None,
+            },
+        );
+        buffered.chain(recorded).collect()
     }
 
     /// Position in `pending_signals` of the first buffered `signal_name`
@@ -6423,14 +6470,14 @@ impl HistoryMatcher {
     fn claim_buffered_signal_position(
         &mut self,
         signal_name: &str,
-        predicate: Option<&dyn Fn(&Value) -> bool>,
+        predicate: Option<&dyn Fn(usize, &Value) -> bool>,
     ) -> Option<usize> {
         for (position, (name, payload, index)) in self.pending_signals.iter().enumerate() {
             if name != signal_name {
                 continue;
             }
             match predicate {
-                Some(accepts) if !accepts(payload) => {
+                Some(accepts) if !accepts(*index, payload) => {
                     self.predicate_rejected_signal_events.insert(*index);
                 }
                 _ => return Some(position),

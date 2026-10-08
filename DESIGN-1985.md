@@ -40,7 +40,7 @@ entry.
 |---|------------------------|------------|
 | R1 | A warm (resident) workflow gets a non-matching payload. `Awaiting::deliver` sends any same-name signal to the parked future. | A predicate wait marks its signal name as probed. `ResidentWorkflow::capture` then declines. A resident test proves it. |
 | R2 | Strict or canary replay reports a skipped signal as unconsumed history. | The matcher records each rejected event index. `has_non_lifecycle_unconsumed` excuses it. Replay tests prove a parked and a completed history. |
-| R3 | The excuse hides a removed wait. | The excuse is per event index. Only a predicate that examined and rejected the event sets it. A signal that no code examines still flags. |
+| R3 | The excuse hides a removed wait. | The excuse is per event index. Only a predicate that examined and rejected the event sets it. A signal that no code examines still flags. Limit: a removed *later* wait that would take a rejected signal does not flag, because consumption records no event. `late_race_signal_events` has the same limit. The docs state it. |
 | R4 | A skipped signal is lost. | It stays in `pending_signals`. A later `wait_for_signal` for the same name takes it. A unit test proves it. |
 | R5 | A promise resolves twice with different values. | The resolve uses the promise key as the signal idempotency key. The second insert is a no-op. A DB test proves it. |
 | R6 | A promise key collides with a user signal name. | The signal name has the reserved prefix `harvest.promise:`. |
@@ -49,7 +49,10 @@ entry.
 | R9 | `AllowAll` passes the first gate but the dispatch loop defers it. | The dispatch loop skips its `max_active_runs` check for `AllowAll`. A catch-up test fires several slots in one tick. |
 | R10 | An old binary reads `allow_all`. | `OverlapPolicy::from_db` maps an unknown value to `Skip`. Rollback is safe and conservative. |
 | R11 | `last_completion_result` carryover reads a stale result. | Carryover assumes runs do not overlap. The docs state this for `AllowAll`. |
-| R12 | A predicate that is not pure breaks replay. | The docs require a pure predicate. This is the rule for all workflow code. |
+| R12 | A predicate that is not pure breaks replay. | The docs require a pure predicate. This is the rule for all workflow code. `harvest-verify` analyses the predicate closure. |
+| R13 | A predicate calls `ctx` and deadlocks on the matcher lock. | The context runs the predicate over `signal_candidates` with no lock held, then matches by accepted event index. A test calls `ctx.is_replaying()` inside the predicate. |
+| R14 | A caller settles a promise with no key, another key, or a bad payload. | `send_signal_idempotent` forces the promise key, refuses a bad payload, and reserves the key prefix. A DB test covers each case. |
+| R15 | `AllowAll` starts every slot of a long outage in one tick. | `ALLOW_ALL_MAX_STARTS_PER_TICK` (100) defers the rest to the next tick. A DB test proves it. |
 
 ### 0.3 Six thinking hats
 
@@ -92,14 +95,15 @@ buffered signal of that name.
 ### 1.2 Durable promise (item 2)
 
 ```rust
-let promise = ctx.new_promise();             // key from ctx.new_uuid()
+let promise = ctx.new_promise()?;            // key: a recorded UUIDv7
 let token = promise.id().to_string();        // "<exec-id>/<key>"
 // ...hand `token` to any caller...
 let value: Approval = promise.wait().await??;
 ```
 
 - `PromiseId { execution_id, key }`. The string form is
-  `<execution-id>/<key>`.
+  `<execution-id>/<key>`. `ctx.promise` and `ctx.new_promise` record it with
+  `side_effect`, so replay does not depend on the execution id.
 - The signal name is `harvest.promise:<key>`. The idempotency key is the
   same string.
 - The settlement payload is `{"outcome":"resolved","value":…}` or
@@ -111,8 +115,9 @@ let value: Approval = promise.wait().await??;
   - `durable_promise::resolve` and `durable_promise::reject` (feature `db`).
     They return `true` on the first settlement and `false` after.
   - `ctx.resolve_promise` and `ctx.reject_promise` from another workflow.
-  - `POST /workflows/{id}/signal/{signal_name}` with an `Idempotency-Key`
-    header. This route follows the workflow retry chain.
+  - `POST /workflows/{id}/signal/{signal_name}`. This route follows the
+    workflow retry chain, which helps a named promise only.
+- `send_signal_idempotent` enforces the settlement rules on every path.
 
 **Alignment.** #2006 can resolve a promise when a remote MCP task completes.
 #1975 (keyed entities) can use named promises for per-key replies. Neither
@@ -121,9 +126,10 @@ needs a new storage shape.
 ### 1.3 `AllowAll` overlap (item 4)
 
 `OverlapPolicy::AllowAll` serialises as `allow_all`. `apply_overlap_policy`
-returns `OverlapAction::Proceed`. The dispatch loop skips its
-`max_active_runs` check for `AllowAll`. So `AllowAll` ignores
-`max_active_runs`, as Temporal does. Per-workflow concurrency limits,
+returns `OverlapAction::Proceed`. The dispatch loop and the manual DAG
+trigger skip their `max_active_runs` checks for `AllowAll`. So `AllowAll`
+ignores `max_active_runs`, as Temporal does. One tick starts at most
+`ALLOW_ALL_MAX_STARTS_PER_TICK` runs. Per-workflow concurrency limits,
 throttles and admission gates still apply.
 
 ### 1.4 Counting semaphore (item 3) — declined
@@ -140,13 +146,11 @@ reclaim, a terminal sweep, reset and rebalance hooks. That is the size of
 
 | Test | Item | Phase |
 |------|------|-------|
-| `replay.rs` `match_signal_where_*` (unit) | 1 | Red, then green |
-| `context.rs` `wait_for_signal_matching_*` (unit) | 1 | Red, then green |
-| `resident.rs` `a_predicate_signal_wait_is_never_resumed_warm` (unit) | 1 | Red, then green |
-| `replayer_tests.rs` `signal_matching_*` (replay) | 1 | Red, then green |
-| `workflow_test_env_tests.rs` `test_signal_matching_*` | 1 | Red, then green |
-| `durable_promise.rs` unit tests | 2 | Red, then green |
-| `replayer_tests.rs` `durable_promise_*` (replay) | 2 | Red, then green |
-| `workflow_test_env_tests.rs` `test_durable_promise_*` | 2 | Red, then green |
-| `primitives_db_tests.rs` (DB): matching wait, promise settle once, promise replay, `AllowAll` overlap and replay | 1, 2, 4 | Red, then green |
+| `replay.rs` `match_signal_where_*` and rejected-signal checks (unit) | 1 | Red, then green |
+| `context.rs` `wait_for_signal_matching_*`, `receive_signal_matching_*` (unit) | 1 | Red, then green |
+| `resident.rs` `ineligible_suspensions_are_not_resident` predicate case (unit) | 1 | Red, then green |
+| `durable_promise.rs` unit tests, settlement rules included | 2 | Red, then green |
 | `policy.rs` and `scheduler.rs` `allow_all` unit tests | 4 | Red, then green |
+| `tests/integration/small_primitives_tests.rs`: replay, canary and test-env cases | 1, 2 | Red, then green |
+| `tests/integration/small_primitives_db_tests.rs`: worker runs, each replayed with `WorkflowReplayer` | 1, 2, 4 | Red, then green |
+| `autumn-harvest-verify` `model_coverage` | 1, 2 | Red, then green |

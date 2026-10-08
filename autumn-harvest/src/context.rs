@@ -3339,16 +3339,16 @@ impl WorkflowContext {
     /// any matching signal remains available at all. Mirrors the #779 fix, which
     /// exempted the child-timeout race's `InProgress` arm for the same reason.
     ///
-    /// For a payload-matching wait (issue #1985), only a signal that
-    /// `predicate` accepts counts as available.
+    /// For a payload-matching wait (issue #1985), only a signal whose event
+    /// index is in `accepted` counts as available.
     fn check_strict_replay_signal_no_match(
         &self,
         signal_name: &str,
-        predicate: Option<&dyn Fn(&Value) -> bool>,
+        accepted: Option<&std::collections::HashSet<usize>>,
     ) -> HarvestResult<()> {
         if self.canary_mode
-            && !self.match_history(|m| match predicate {
-                Some(accepts) => m.has_unconsumed_signal_where(signal_name, accepts),
+            && !self.match_history(|m| match accepted {
+                Some(set) => m.has_unconsumed_signal_accepting(signal_name, set),
                 None => m.has_unconsumed_signal(signal_name),
             })
         {
@@ -9189,14 +9189,35 @@ impl WorkflowContext {
     /// Returns `Ok(Ok(payload))` for a recorded match. Returns `Ok(Err(rx))`
     /// after it pushes `WaitForSignal`. The caller then awaits `rx`. The
     /// predicate is not held across the await, so it needs no `Sync` bound.
+    ///
+    /// The predicate runs with no matcher lock held. It may call back into
+    /// the context, and a panic in it does not poison the matcher lock.
     #[allow(clippy::type_complexity)]
     fn begin_signal_wait(
         &self,
         signal_name: &str,
         predicate: Option<&dyn Fn(&Value) -> bool>,
     ) -> HarvestResult<Result<Value, oneshot::Receiver<Value>>> {
-        let history_match = self.match_history(|m| match predicate {
-            Some(accepts) => m.match_signal_where(signal_name, accepts),
+        let accepted: Option<std::collections::HashSet<usize>> = predicate.map(|accepts| {
+            let candidates = self
+                .matcher
+                .lock()
+                .expect("matcher lock poisoned")
+                .signal_candidates(signal_name);
+            candidates
+                .into_iter()
+                .filter(|(_, payload)| accepts(payload))
+                .map(|(index, _)| index)
+                .collect()
+        });
+        let history_match = self.match_history(|m| match &accepted {
+            Some(set) => {
+                let found = m.match_signal_accepting(signal_name, set);
+                if matches!(found, HistoryMatch::NoMatch) {
+                    m.note_predicate_signal_wait(signal_name);
+                }
+                found
+            }
             None => m.match_signal(signal_name),
         });
 
@@ -9234,10 +9255,7 @@ impl WorkflowContext {
                 ))
             }
             HistoryMatch::NoMatch => {
-                self.check_strict_replay_signal_no_match(signal_name, predicate)?;
-                if predicate.is_some() {
-                    self.match_history(|m| m.note_predicate_signal_wait(signal_name));
-                }
+                self.check_strict_replay_signal_no_match(signal_name, accepted.as_ref())?;
 
                 let (tx, rx) = oneshot::channel();
                 self.push_command(WorkflowCommand::WaitForSignal {
@@ -22760,6 +22778,26 @@ mod tests {
             !ctx.history_has_unconsumed_events(),
             "the rejected signal is not drift"
         );
+    }
+
+    #[tokio::test]
+    async fn wait_for_signal_matching_predicate_may_call_the_context() {
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started_event(),
+                order_signal(serde_json::json!({"id": 41})),
+                order_signal(serde_json::json!({"id": 42})),
+            ],
+        );
+        let matched = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ctx.wait_for_signal_matching("order", |p| !ctx.is_replaying() || p["id"] == 42),
+        )
+        .await
+        .expect("a predicate that reads the context must not deadlock")
+        .expect("the matching signal replays");
+        assert_eq!(matched, serde_json::json!({"id": 42}));
     }
 
     #[derive(Debug, serde::Deserialize, PartialEq)]

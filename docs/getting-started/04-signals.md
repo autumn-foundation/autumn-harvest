@@ -88,7 +88,12 @@ async fn ship(ctx: &WorkflowContext, order_id: u64) -> HarvestResult<serde_json:
   signal, and replay then reports drift.
 - Do not register a push handler for the same name. The handler claims every
   buffered signal of that name.
-- There is no timeout form yet.
+- There is no timeout form yet. Do not join it with a `receive_signal_timeout`
+  for the same name: the timeout can win over a signal that arrived in time.
+- A rejected signal stays buffered, so the run replays cold on each new
+  signal. It does not stay resident in worker memory.
+- Replay cannot see a removed wait that would have taken a rejected signal.
+  Consuming a signal records no event.
 
 ## Durable promises (issue #1985)
 

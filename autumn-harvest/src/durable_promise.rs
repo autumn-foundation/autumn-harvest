@@ -34,19 +34,26 @@
 //!
 //! # Settle a promise
 //!
-//! - [`resolve`] and [`reject`] (feature `db`), on a connection to the shard
+//! - `resolve` and `reject` (feature `db`), on a connection to the shard
 //!   that holds the run.
 //! - `ctx.resolve_promise` and `ctx.reject_promise`, from another workflow.
-//! - `POST /workflows/{id}/signal/{signal_name}` with an `Idempotency-Key`
-//!   header and a [`PromiseSettlement`] body. Use the values from
-//!   [`PromiseId::signal_name`] and [`PromiseId::idempotency_key`].
+//! - `POST /workflows/{id}/signal/{signal_name}` with a [`PromiseSettlement`]
+//!   body. Use the value from [`PromiseId::signal_name`].
 //!
-//! A promise belongs to the run that created it. Continue-as-new does not
-//! carry it. A named promise ([`crate::WorkflowContext::promise`]) can be
-//! created again in the next run with the same key. A reset fork keeps the
-//! recorded token of a promise made before the reset point. That token
-//! still names the source run, so create a new promise after the reset
-//! point when a caller must settle it.
+//! `signal::send_signal_idempotent` applies the settlement rules on every
+//! path. A `harvest.promise:` signal always uses its name as its idempotency
+//! key, and its payload must be a settlement.
+//!
+//! # Limits
+//!
+//! - A promise belongs to the run that created it.
+//! - Continue-as-new moves an unconsumed settlement to the next run. A named
+//!   promise ([`crate::WorkflowContext::promise`]) with the same key there
+//!   receives it.
+//! - A reset fork keeps the recorded token of a promise made before the
+//!   reset point. That token names the source run. Settle the fork with
+//!   `PromiseId::new(fork_execution_id, id.key())`.
+//! - The token is not a secret. History shows it.
 
 use std::fmt;
 use std::str::FromStr;
@@ -198,6 +205,7 @@ impl<'de> Deserialize<'de> for PromiseId {
 /// `{"outcome":"rejected","error":"…"}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum PromiseSettlement {
     /// The promise has a value.
     Resolved {
@@ -223,6 +231,21 @@ impl PromiseSettlement {
     pub fn rejected(error: impl Into<String>) -> Self {
         Self::Rejected {
             error: error.into(),
+        }
+    }
+
+    /// Decodes a settlement signal payload.
+    ///
+    /// Use it with the raw payload of a `ctx.race().signal(..)` branch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::HarvestError::Serialization`] if `raw` is not a
+    /// settlement or its value does not decode into `T`.
+    pub fn decode<T: DeserializeOwned>(raw: Value) -> HarvestResult<Result<T, PromiseRejected>> {
+        match serde_json::from_value::<Self>(raw)? {
+            Self::Resolved { value } => Ok(Ok(serde_json::from_value(value)?)),
+            Self::Rejected { error } => Ok(Err(PromiseRejected { error })),
         }
     }
 
@@ -252,6 +275,7 @@ pub struct PromiseRejected {
 ///
 /// Make one with [`WorkflowContext::promise`] or
 /// [`WorkflowContext::new_promise`].
+#[must_use = "a promise records its token; wait on it or hand the token out"]
 pub struct DurablePromise<'a> {
     context: &'a WorkflowContext,
     id: PromiseId,
@@ -288,7 +312,7 @@ impl<'a> DurablePromise<'a> {
     /// [`WorkflowContext::wait_for_signal`].
     pub async fn wait<T: DeserializeOwned>(&self) -> HarvestResult<Result<T, PromiseRejected>> {
         let raw = self.context.wait_for_signal(&self.id.signal_name()).await?;
-        decode_settlement(raw)
+        PromiseSettlement::decode(raw)
     }
 
     /// Waits until a caller settles the promise, or until `timeout` passes.
@@ -307,16 +331,55 @@ impl<'a> DurablePromise<'a> {
         self.context
             .wait_for_signal_timeout(&self.id.signal_name(), timeout)
             .await?
-            .map(decode_settlement)
+            .map(PromiseSettlement::decode)
             .transpose()
     }
 }
 
-fn decode_settlement<T: DeserializeOwned>(raw: Value) -> HarvestResult<Result<T, PromiseRejected>> {
-    match serde_json::from_value::<PromiseSettlement>(raw)? {
-        PromiseSettlement::Resolved { value } => Ok(Ok(serde_json::from_value(value)?)),
-        PromiseSettlement::Rejected { error } => Ok(Err(PromiseRejected { error })),
+/// Applies the promise settlement rules to a signal before it is stored
+/// (issue #1985).
+///
+/// Every signal path calls this through `signal::send_signal_idempotent`:
+/// the Rust API, the HTTP route, the CLI and the cross-workflow outbox.
+///
+/// - A `harvest.promise:` signal always uses its own name as the
+///   idempotency key. A missing key gets that value. A different key is an
+///   error. So the first settlement wins on every path.
+/// - Its payload must decode as a [`PromiseSettlement`]. A bad payload would
+///   use up the promise and then fail the waiting run.
+/// - Any other signal must not use a `harvest.promise:` key, because that
+///   key would block the real settlement.
+///
+/// Returns the idempotency key to store.
+///
+/// # Errors
+///
+/// Returns [`crate::HarvestError::Config`] when a rule fails.
+pub(crate) fn settlement_idempotency_key<'a>(
+    signal_name: &'a str,
+    payload: &Value,
+    idempotency_key: Option<&'a str>,
+) -> HarvestResult<Option<&'a str>> {
+    if !signal_name.starts_with(PROMISE_SIGNAL_PREFIX) {
+        if idempotency_key.is_some_and(|key| key.starts_with(PROMISE_SIGNAL_PREFIX)) {
+            return Err(crate::HarvestError::Config(format!(
+                "idempotency keys that start with '{PROMISE_SIGNAL_PREFIX}' are reserved \
+                 for promise settlements"
+            )));
+        }
+        return Ok(idempotency_key);
     }
+    if idempotency_key.is_some_and(|key| key != signal_name) {
+        return Err(crate::HarvestError::Config(format!(
+            "a promise settlement must use its signal name '{signal_name}' as its idempotency key"
+        )));
+    }
+    if let Err(e) = PromiseSettlement::deserialize(payload) {
+        return Err(crate::HarvestError::Config(format!(
+            "the payload of '{signal_name}' is not a promise settlement: {e}"
+        )));
+    }
+    Ok(Some(signal_name))
 }
 
 /// Resolves a promise with `value`.
@@ -453,19 +516,64 @@ mod tests {
     }
 
     #[test]
-    fn decode_settlement_separates_values_and_rejections() {
+    fn decode_separates_values_and_rejections() {
         let resolved: Result<u32, PromiseRejected> =
-            decode_settlement(PromiseSettlement::resolved(serde_json::json!(7)).to_value())
+            PromiseSettlement::decode(PromiseSettlement::resolved(serde_json::json!(7)).to_value())
                 .expect("decodes");
         assert_eq!(resolved, Ok(7));
         let rejected: Result<u32, PromiseRejected> =
-            decode_settlement(PromiseSettlement::rejected("no").to_value()).expect("decodes");
+            PromiseSettlement::decode(PromiseSettlement::rejected("no").to_value())
+                .expect("decodes");
         assert_eq!(
             rejected,
             Err(PromiseRejected {
                 error: "no".to_string()
             })
         );
-        assert!(decode_settlement::<u32>(serde_json::json!({"id": 1})).is_err());
+        assert!(PromiseSettlement::decode::<u32>(serde_json::json!({"id": 1})).is_err());
+    }
+
+    #[test]
+    fn settlement_rules_force_the_promise_key() {
+        let name = "harvest.promise:k";
+        let ok = PromiseSettlement::resolved(serde_json::json!(1)).to_value();
+        assert_eq!(
+            settlement_idempotency_key(name, &ok, None).ok(),
+            Some(Some(name))
+        );
+        assert_eq!(
+            settlement_idempotency_key(name, &ok, Some(name)).ok(),
+            Some(Some(name))
+        );
+        assert!(settlement_idempotency_key(name, &ok, Some("other")).is_err());
+    }
+
+    #[test]
+    fn settlement_rules_reject_a_malformed_payload() {
+        let name = "harvest.promise:k";
+        for bad in [
+            serde_json::json!("ops"),
+            serde_json::json!({"value": 1}),
+            serde_json::json!({"outcome": "resolved"}),
+        ] {
+            assert!(
+                settlement_idempotency_key(name, &bad, None).is_err(),
+                "{bad} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn settlement_rules_reserve_the_key_prefix_and_pass_other_signals() {
+        let payload = serde_json::json!({"any": "thing"});
+        assert!(settlement_idempotency_key("order", &payload, Some("harvest.promise:k")).is_err());
+        assert_eq!(
+            settlement_idempotency_key("order", &payload, Some("key-1")).ok(),
+            Some(Some("key-1"))
+        );
+        assert_eq!(
+            settlement_idempotency_key("order", &payload, None).ok(),
+            Some(None)
+        );
     }
 }

@@ -27833,27 +27833,26 @@ async fn create_workflow_schedule(
 
     // Reject unknown overlap_policy strings with 400 before storing.
     // `from_db` is lenient for backward compat; user input is validated strictly.
-    let overlap_policy = match autumn_harvest::OverlapPolicy::from_user_input(
-        &request.overlap_policy,
-    ) {
-        Ok(p) => p,
-        Err(v) => {
-            let err_summary = format!(
-                "invalid overlap_policy '{v}'; valid values: {}",
-                autumn_harvest::OverlapPolicy::VALID_VALUES
-            );
-            schedule_create_audit_failed(
-                &api_state,
-                &actor,
-                &source,
-                request_id.as_deref(),
-                &request.workflow_name,
-                &err_summary,
-            )
-            .await;
-            return Err(AutumnError::bad_request_msg(err_summary));
-        }
-    };
+    let overlap_policy =
+        match autumn_harvest::OverlapPolicy::from_user_input(&request.overlap_policy) {
+            Ok(p) => p,
+            Err(v) => {
+                let err_summary = format!(
+                    "invalid overlap_policy '{v}'; valid values: {}",
+                    autumn_harvest::OverlapPolicy::VALID_VALUES
+                );
+                schedule_create_audit_failed(
+                    &api_state,
+                    &actor,
+                    &source,
+                    request_id.as_deref(),
+                    &request.workflow_name,
+                    &err_summary,
+                )
+                .await;
+                return Err(AutumnError::bad_request_msg(err_summary));
+            }
+        };
     let skip_policy = match SkipPolicy::from_user_input(&request.skip_policy) {
         Ok(p) => p,
         Err(v) => {
@@ -28548,7 +28547,7 @@ async fn update_schedule_handler(
             Err(v) => {
                 let err_summary = format!(
                     "invalid overlap_policy '{v}'; valid values: {}",
-                autumn_harvest::OverlapPolicy::VALID_VALUES
+                    autumn_harvest::OverlapPolicy::VALID_VALUES
                 );
                 schedule_update_audit_failed(
                     &api_state,

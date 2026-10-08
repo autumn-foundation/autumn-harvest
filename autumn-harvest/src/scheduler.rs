@@ -1589,7 +1589,10 @@ pub async fn trigger_unified_dag(
         // trigger must not double-dispatch a schedule whose active run has
         // already changed type mid-chain.
         let running: i64 = schedule_running_basis(conn, dag_name, schedule.id).await?;
-        if running >= i64::from(schedule.max_active_runs) {
+        // `AllowAll` ignores `max_active_runs` here too (issue #1985).
+        let allow_all =
+            OverlapPolicy::from_db(&schedule.overlap_policy) == OverlapPolicy::AllowAll;
+        if !allow_all && running >= i64::from(schedule.max_active_runs) {
             return Err(HarvestError::UpdateRejected {
                 reason: format!(
                     "DAG '{dag_name}' max_active_runs reached ({running}/{}); manual trigger is deferred",
@@ -4479,12 +4482,26 @@ async fn tick_one_workflow_schedule(
         };
         let scheduled_for = &effective_scheduled_for;
 
-        if !allow_all && running + i64::from(dispatched) >= i64::from(schedule.max_active_runs) {
+        // `AllowAll` ignores `max_active_runs`. Its own per-tick limit stops
+        // one tick from starting every slot of a long outage (issue #1985).
+        let (at_limit, limit_reason) = if allow_all {
+            (
+                dispatched >= ALLOW_ALL_MAX_STARTS_PER_TICK,
+                "allow_all_tick_limit",
+            )
+        } else {
+            (
+                running + i64::from(dispatched) >= i64::from(schedule.max_active_runs),
+                "max_active_runs_reached",
+            )
+        };
+        if at_limit {
             deferred_next_run_at = Some(*original_slot);
             tracing::info!(
                 workflow_name = %wf_name,
                 max_active_runs = schedule.max_active_runs,
-                "harvest workflow schedule: max_active_runs reached during catchup; deferring remaining"
+                reason = limit_reason,
+                "harvest workflow schedule: start limit reached during catchup; deferring remaining"
             );
             crate::schedule_decision::record_decision_graceful(
                 conn,
@@ -4493,7 +4510,7 @@ async fn tick_one_workflow_schedule(
                 wf_name,
                 "workflow",
                 "skipped",
-                "max_active_runs_reached",
+                limit_reason,
                 Some(serde_json::json!({
                     "running_runs": running,
                     "dispatched_runs": dispatched,
@@ -5291,8 +5308,8 @@ pub struct OverdueInputs<'a> {
 /// `retain_for_retry = catchup && reason == "max_active_runs_reached"`, and only
 /// `OverlapPolicy::Skip` produces that reason. Every other config *advances*
 /// `next_run_at`: non-catchup Skip drops-and-advances, BufferOne/BufferAll
-/// advance, CancelOther/TerminateOther cancel/terminate and proceed, AllowAll
-/// proceeds (issue #1985). So the
+/// advance, CancelOther/TerminateOther cancel/terminate and proceed. AllowAll
+/// proceeds too (issue #1985). So the
 /// `at_capacity` suppression applies **only** when
 /// `overlap_policy == Skip && catchup && at_capacity` — for every other config a
 /// past `next_run_at` while at capacity is a GENUINE stall the gauge must flag.
@@ -6216,6 +6233,15 @@ pub(crate) enum OverlapAction {
     /// Start the new firing and keep the in-flight runs (`AllowAll`).
     Proceed,
 }
+
+/// Most runs that one tick starts for an [`OverlapPolicy::AllowAll`] schedule
+/// (issue #1985).
+///
+/// `AllowAll` ignores `max_active_runs`. After an outage, an unbounded
+/// catch-up can list one slot per missed interval. This limit defers the
+/// rest to the next tick, as the `max_active_runs` gate does. The tick then
+/// stays well inside its fire-claim lease.
+pub const ALLOW_ALL_MAX_STARTS_PER_TICK: u32 = 100;
 
 /// Decide what to do with a new firing that can't run immediately.
 ///

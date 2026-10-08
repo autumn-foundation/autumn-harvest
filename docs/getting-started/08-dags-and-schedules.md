@@ -996,6 +996,8 @@ See `autumn-harvest/examples/incremental_etl_schedule.rs` for the full pattern.
   `max_active_runs > 1` a later slot can start while an earlier slot is still
   running and observe a stale cursor (re-processing that slot's range). Keep
   cursor-style incremental jobs at `max_active_runs = 1`.
+  `OverlapPolicy::AllowAll` (issue #1985) also lets slots overlap, so the same
+  stale-cursor risk applies.
 - **Backfills**: backfilled runs participate in the schedule's carryover lineage
   (they share the schedule's `schedule_id` and carry their own `scheduled_for`
   slot, so they slot into the lineage at the correct position).

@@ -113,8 +113,8 @@ lists four small primitives that peer engines ship. Each has a decision.
 |---|---|---|---|
 | Payload-matching event wait | Cloudflare `step.waitForEvent` | **Shipped.** `ctx.wait_for_signal_matching` and `ctx.receive_signal_matching` ([signals chapter](getting-started/04-signals.md)). | A signal that fails the predicate stays buffered. There is no timeout form yet. |
 | Durable promise | Restate awakeables | **Shipped.** `ctx.new_promise`, `ctx.promise` and `durable_promise::resolve` / `reject` ([durable promises](durable-promises.md)). | Built on signals, not external task tokens, so a promise can race a timer and settles once. |
-| Counting semaphore | Temporal-style N-permit lock | **Declined.** | See below. |
-| `AllowAll` overlap | Temporal Schedules | **Shipped.** `OverlapPolicy::AllowAll`. | It ignores `max_active_runs`, as Temporal does. |
+| Counting semaphore | No built-in peer primitive | **Declined.** | See below. |
+| `AllowAll` overlap | Temporal Schedules | **Shipped.** `OverlapPolicy::AllowAll`. | It ignores `max_active_runs`, as Temporal does. One tick starts at most 100 catch-up runs. |
 
 **Why the counting semaphore is declined.** Two shipped features cover the
 common needs. The per-key concurrency limit
@@ -123,7 +123,7 @@ how many runs of one key are active across the fleet. The durable mutex
 ([#691](https://github.com/autumn-foundation/autumn-harvest/issues/691)) gives
 one holder for a region of a workflow. An N-permit region lock needs its own
 permit tables, a new event, lease renewal and reclaim, a terminal sweep, and
-reset and rebalance hooks. That is the size of the mutex itself, and the
+reset and rebalance hooks. That work is the size of the mutex itself. The
 issue asks for small changes. Open a new issue with a use case that the two
 features above cannot serve.
 

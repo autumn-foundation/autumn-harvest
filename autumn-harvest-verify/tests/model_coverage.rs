@@ -185,8 +185,10 @@ fn builtin_model_parses() {
 fn dual_role_rows_are_exactly_the_recorded_primitive_family() {
     const EXPECTED_DUAL: &[&str] = &[
         "business_days_from_now",
+        "new_promise",
         "new_uuid",
         "patched",
+        "promise",
         "random_f64",
         "random_range",
         "random_u64",
@@ -604,8 +606,10 @@ fn every_dual_role_sink_that_checks_all_arguments_is_accounted_for() {
     // the two it is instead of inheriting "check everything" by accident.
     const CHECKS_EVERY_ARGUMENT: &[&str] = &[
         "business_days_from_now",
+        "new_promise",
         "new_uuid",
         "patched",
+        "promise",
         "random_f64",
         "random_range",
         "random_u64",

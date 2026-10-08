@@ -84,8 +84,8 @@ the claim yourself.
 | Blocking wait on many signals or a custom condition, `condition(predicate, timeout?)` | `ctx.await_condition` / `ctx.await_condition_timeout` | core primitive |
 | `SignalWithStart` | `signal_with_start_workflow_execution`, `POST /workflows/{name}/signal-with-start` | issue #244 |
 | Non-blocking signal check (no first-class Temporal equivalent) | `ctx.try_receive_signal` / `ctx.drain_signals` | issue #775 |
-| Wait for a signal whose payload matches a predicate (no first-class Temporal equivalent) | `ctx.wait_for_signal_matching` / `ctx.receive_signal_matching` | issue #1985 |
-| Wait on a handle that any caller settles once (Restate awakeable; no first-class Temporal equivalent) | `ctx.new_promise` / `ctx.promise`, settled by `durable_promise::resolve` / `reject` ([durable promises](durable-promises.md)) | issue #1985 |
+| Wait for a signal whose payload matches a predicate (no first-class Temporal equivalent) | `ctx.wait_for_signal_matching` / `ctx.receive_signal_matching` | [signals chapter](getting-started/04-signals.md) |
+| Wait on a handle that any caller settles once (Restate awakeable; no first-class Temporal equivalent) | `ctx.new_promise` / `ctx.promise`, settled by `durable_promise::resolve` / `reject` | [durable promises](durable-promises.md) |
 | Duplicate-safe signal delivery (Temporal has no first-class dedup key) | `Idempotency-Key` header on standalone signal delivery | issue #521, issue #753 |
 
 `condition()` in Temporal accepts any predicate over workflow state. It is
@@ -140,7 +140,7 @@ original timeout used.
 | Temporal primitive | Harvest equivalent | Reference |
 |---|---|---|
 | Temporal Schedules API (cron / interval spec) | `WorkflowSchedule` | Core scheduler |
-| Schedule Overlap Policy | `OverlapPolicy`, including `AllowAll` | issue #241, issue #1985 |
+| Schedule Overlap Policy | `OverlapPolicy`, including `AllowAll` | issue #241 |
 | Schedule catchup window | `CatchupPolicy` | issue #484 |
 | Bounded schedule actions (`end_at`, action limit) | `WorkflowSchedule::end_at` / `max_runs` (bounded schedule runs) | issue #478, issue #543 |
 | Calendar-aware skip / backfill | `Calendar`, the backfill runner | issue #337 |

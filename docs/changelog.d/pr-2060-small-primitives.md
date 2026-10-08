@@ -1,8 +1,8 @@
 ## Phase 6.x — Small primitives: matching wait, durable promise, `AllowAll` (issue #1985)
 
 Issue #1985 asked for a decision on four primitives that peer engines ship.
-Three shipped. The counting semaphore is declined, with the reason in
-`docs/comparison.md`. The design record is `DESIGN-1985.md`.
+Three shipped. This change declines the counting semaphore and gives the
+reason in `docs/comparison.md`. The design record is `DESIGN-1985.md`.
 
 **No migration. No new `WorkflowEvent` variant. No new route.**
 
@@ -19,6 +19,8 @@ first signal of a name whose payload satisfies the predicate.
 - The wait reuses `WaitForSignal`. A predicate wait marks its name as
   probed, so a resident (warm) workflow does not resume on a non-matching
   payload.
+- The predicate runs with no matcher lock held. It can call back into the
+  context, and a panic in it does not poison the lock.
 
 **Durable promise.** `ctx.new_promise()` and `ctx.promise(key)` return a
 `DurablePromise`. Its token is `<execution-id>/<key>`. Any caller settles it
@@ -30,14 +32,27 @@ once with `durable_promise::resolve` / `reject`, `ctx.resolve_promise` /
 - The token is recorded in a `SideEffectRecorded` event. Replay under a new
   execution id, as in a reset fork, returns the same token.
 - `wait` returns `HarvestResult<Result<T, PromiseRejected>>`. `wait_timeout`
-  races a durable timer.
+  races a durable timer. `PromiseSettlement::decode` decodes a raw race payload.
+- `signal::send_signal_idempotent` enforces the rules on every path. A
+  `harvest.promise:` signal gets its name as its idempotency key, and a
+  payload that is not a settlement is refused. No other signal can use a
+  `harvest.promise:` key.
+- `harvest-verify` classifies the six new `WorkflowContext` methods.
 
 **`AllowAll` overlap.** `OverlapPolicy::AllowAll` (`allow_all`) starts a new
-run on every firing. It ignores `max_active_runs` in both scheduler gates, as
-Temporal does. An older binary reads `allow_all` as `skip`.
-`OverlapPolicy::VALID_VALUES` now feeds the API error messages. The
-create-schedule contract description also named `allow_all` before it
-existed, and omitted `cancel_other` and `terminate_other`. It is corrected.
+run on every firing. It ignores `max_active_runs` in the tick and in the
+manual DAG trigger, as Temporal does.
+
+- One tick starts at most `ALLOW_ALL_MAX_STARTS_PER_TICK` (100) runs. The
+  next tick resumes deferred catch-up slots.
+- Throttles still apply. A throttle slower than the cadence lets its pending
+  backlog grow.
+- **Rollback.** An older binary reads `allow_all` as `skip`. An update
+  through an older binary then stores `skip`. Set the policy again after the
+  roll forward.
+- `OverlapPolicy::VALID_VALUES` now feeds the API error messages. The
+  create-schedule contract description named `allow_all` before it existed,
+  and omitted `cancel_other` and `terminate_other`. This change corrects it.
 
 **Tests.**
 
@@ -48,6 +63,8 @@ existed, and omitted `cancel_other` and `terminate_other`. It is corrected.
   changed predicate reports drift. A promise token replays under a new
   execution id.
 - DB: `tests/integration/small_primitives_db_tests.rs`. Two `AllowAll` runs
-  overlap, complete and replay clean. A matching wait ignores order 41. A
-  promise settles once, rejects, buffers an early settlement, and replays
-  clean.
+  overlap, complete and replay clean. The tick limit defers catch-up slots.
+  A manual DAG trigger passes the cap. A matching wait ignores order 41. A
+  promise settles once, rejects, buffers an early settlement, settles from
+  another workflow, and replays clean. The settlement rules hold on the plain
+  signal path.

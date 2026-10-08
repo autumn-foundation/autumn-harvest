@@ -28,7 +28,7 @@ async fn approve(ctx: &WorkflowContext, request: String) -> HarvestResult<String
 
 | Call | Result |
 |---|---|
-| `ctx.new_promise()` | A promise with a new `UUIDv7` key. Nobody can guess its token. |
+| `ctx.new_promise()` | A promise with a new `UUIDv7` key. A caller needs the token to settle it. |
 | `ctx.promise("approval")` | A promise with a fixed key. A caller that knows the run can build its token. |
 | `promise.wait::<T>()` | `HarvestResult<Result<T, PromiseRejected>>`. The outer error is an engine error. The inner error is a rejection. |
 | `promise.wait_timeout::<T>(d)` | `Ok(None)` when the durable timer fires first. |
@@ -36,10 +36,16 @@ async fn approve(ctx: &WorkflowContext, request: String) -> HarvestResult<String
 The token is `<execution-id>/<key>`. A key holds only `A-Z`, `a-z`, `0-9`,
 `.`, `_`, `:` and `-`, and is 128 bytes or fewer.
 
+The token is not a secret. History shows it. Any caller with access to the
+signal API or the database can settle any promise.
+
+To race a promise in `ctx.race().signal(promise.id().signal_name())`, decode
+the raw payload with `PromiseSettlement::decode::<T>(raw)`.
+
 ## Settle
 
-Each path below gives the same result. The first settlement wins. A later
-one is a no-op.
+Each path settles the promise once. The first settlement wins. A later one
+is a no-op.
 
 **Rust, with a connection to the shard that holds the run:**
 
@@ -54,8 +60,13 @@ durable_promise::reject(&mut conn, &id, "budget exceeded").await?;
 `ctx.reject_promise(&id, error)`.
 
 **Over HTTP:** send the settlement as a signal. The signal name and the
-`Idempotency-Key` header are both `harvest.promise:<key>`. This route follows
-the workflow retry chain.
+`Idempotency-Key` header are both `harvest.promise:<key>`. A missing header
+gets that value.
+
+The Rust call targets the exact run in the token. The HTTP route follows the
+workflow retry chain to the live attempt. A retry attempt replays from an
+empty history, so `new_promise` gets a new key there. Only a named promise
+gains from the retry chain.
 
 ```bash
 curl -s -X POST \
@@ -71,8 +82,11 @@ A rejection body is `{"outcome":"rejected","error":"budget exceeded"}`.
 
 - **No new storage.** A promise is a signal named `harvest.promise:<key>`.
   There is no new table, no new event variant and no migration.
-- **Settle once.** The promise key is the signal idempotency key. The
-  database drops a second settlement.
+- **Settle once, on every path.** `signal::send_signal_idempotent` stores
+  every signal. For a `harvest.promise:` name, it sets the idempotency key to
+  the name and refuses a payload that is not a settlement. It also refuses a
+  `harvest.promise:` key on any other signal. The database drops a second
+  settlement.
 - **Settle early.** A settlement that arrives before the wait stays buffered.
 - **Replay.** The token is recorded in a `SideEffectRecorded` event, and the
   settlement in a `SignalReceived` event. Replay under a new execution id
@@ -84,11 +98,15 @@ A rejection body is `{"outcome":"rejected","error":"budget exceeded"}`.
 
 - A promise belongs to the run that created it. A settlement for a terminal
   run fails, unless the promise already has a settlement.
-- Continue-as-new does not carry a promise. A named promise can be created
-  again in the next run with the same key.
+- A settlement for a key that the run never created is stored, and `resolve`
+  returns `true`. Nothing waits on it.
+- Continue-as-new moves an unconsumed settlement to the next run. A named
+  promise with the same key in the next run then receives it at once. Put
+  the run number in the key when a late settlement must not move forward.
 - A reset fork keeps the recorded token of a promise made before the reset
-  point. That token still names the source run. Create a new promise after
-  the reset point when a caller must settle it.
+  point. That token names the source run. To settle the promise in the fork,
+  use `PromiseId::new(fork_execution_id, id.key())`, or send the HTTP signal
+  to the fork.
 - Do not register a push signal handler for a `harvest.promise:` name.
 
 ## Why signals, not external task tokens
@@ -96,7 +114,7 @@ A rejection body is `{"outcome":"rejected","error":"budget exceeded"}`.
 External task tokens (`execute_activity_external`) were the first candidate.
 A token wait is a solo suspension, so it cannot race a timer. It needs a
 deadline. The token row exists only after the park commits. Signals have none
-of these limits, and they already give buffering, deduplication and replay.
+of these limits. They already give buffering, deduplication and replay.
 
 Issue #2006 (durable outbound MCP task calls) can settle a promise when a
 remote task completes. Issue #1975 (keyed entities) can use named promises

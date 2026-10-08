@@ -147,6 +147,24 @@ fn late_wait_promise_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFu
     })
 }
 
+/// Settles the promise named by `input.token` from another workflow.
+fn resolver_workflow(ctx: &WorkflowContext, input: Value) -> HandlerFuture<'_> {
+    Box::pin(async move {
+        let id: PromiseId = input["token"]
+            .as_str()
+            .ok_or("token must be a string")?
+            .parse()
+            .map_err(|e: autumn_harvest::durable_promise::PromiseIdError| e.to_string())?;
+        if input["reject"].as_bool() == Some(true) {
+            ctx.reject_promise(&id, "rejected by a workflow").await
+        } else {
+            ctx.resolve_promise(&id, "resolved by a workflow").await
+        }
+        .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
 /// Tokens that `publish_token` received, in arrival order.
 static PUBLISHED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
@@ -218,6 +236,7 @@ fn registry() -> Arc<HandlerRegistry> {
             wf("order_wf", order_workflow),
             wf("promise_wf", promise_workflow),
             wf("late_wait_promise_wf", late_wait_promise_workflow),
+            wf("resolver_wf", resolver_workflow),
         ],
         vec![act("publish_token", publish_token_activity)],
     ))
@@ -238,7 +257,7 @@ where
 }
 
 async fn start(url: &str, workflow_name: &str, workflow_id: &str) -> ExecutionId {
-    start_with_schedule(url, workflow_name, workflow_id, None).await
+    start_full(url, workflow_name, workflow_id, None, Value::Null).await
 }
 
 async fn start_with_schedule(
@@ -246,6 +265,16 @@ async fn start_with_schedule(
     workflow_name: &str,
     workflow_id: &str,
     schedule_id: Option<Uuid>,
+) -> ExecutionId {
+    start_full(url, workflow_name, workflow_id, schedule_id, Value::Null).await
+}
+
+async fn start_full(
+    url: &str,
+    workflow_name: &str,
+    workflow_id: &str,
+    schedule_id: Option<Uuid>,
+    input: Value,
 ) -> ExecutionId {
     let exec_id = ExecutionId::new();
     let mut conn = connect(url).await;
@@ -255,7 +284,7 @@ async fn start_with_schedule(
             workflow_name,
             workflow_id,
             exec_id,
-            input: Value::Null.into(),
+            input: input.into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -336,15 +365,28 @@ async fn assert_replays_clean(
 
 /// Inserts a due interval schedule with `max_active_runs = 1`.
 async fn insert_schedule(url: &str, wf_name: &str, overlap_policy: &str, catchup: bool) -> Uuid {
+    let lag = if catchup { 185 } else { 5 };
+    insert_schedule_with(url, wf_name, overlap_policy, catchup, "interval:60", lag).await
+}
+
+/// Inserts a due schedule whose first slot is `lag_secs` in the past.
+async fn insert_schedule_with(
+    url: &str,
+    wf_name: &str,
+    overlap_policy: &str,
+    catchup: bool,
+    schedule_expr: &str,
+    lag_secs: i64,
+) -> Uuid {
     use autumn_harvest::schema::harvest_schedules::dsl;
     let mut conn = connect(url).await;
     let id = Uuid::new_v4();
-    let lag = if catchup { 185 } else { 5 };
+    let lag = lag_secs;
     diesel::insert_into(dsl::harvest_schedules)
         .values((
             dsl::id.eq(id),
             dsl::workflow_name.eq(wf_name),
-            dsl::schedule_expr.eq("interval:60"),
+            dsl::schedule_expr.eq(schedule_expr),
             dsl::timezone.eq("UTC"),
             dsl::catchup.eq(catchup),
             dsl::max_active_runs.eq(1),
@@ -452,6 +494,46 @@ async fn skip_does_not_start_a_run_while_another_is_running() {
     assert_eq!(executions(&url, "overlap_wf").await.len(), 1);
 }
 
+/// Starts a manual trigger through the DAG trigger path.
+async fn manual_trigger(url: &str, name: &str) -> autumn_harvest::HarvestResult<ExecutionId> {
+    autumn_harvest::scheduler::trigger_unified_dag(
+        build_test_pool(url),
+        name,
+        None,
+        autumn_harvest::types::ShardId::new(0),
+        "default",
+        None,
+        None,
+        None,
+        &registry(),
+        StartSource::Api,
+        None,
+    )
+    .await
+    .map(|started| started.exec_id)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn allow_all_manual_trigger_ignores_max_active_runs() {
+    let (url, _c) = setup().await;
+    let schedule_id = insert_schedule(&url, "overlap_wf", "allow_all", false).await;
+    start_with_schedule(&url, "overlap_wf", "already-running", Some(schedule_id)).await;
+
+    manual_trigger(&url, "overlap_wf")
+        .await
+        .expect("AllowAll must accept a manual trigger at the cap");
+    assert_eq!(executions(&url, "overlap_wf").await.len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn skip_manual_trigger_is_rejected_at_max_active_runs() {
+    let (url, _c) = setup().await;
+    let schedule_id = insert_schedule(&url, "overlap_wf", "skip", false).await;
+    start_with_schedule(&url, "overlap_wf", "already-running", Some(schedule_id)).await;
+
+    assert!(manual_trigger(&url, "overlap_wf").await.is_err());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn allow_all_fires_every_catchup_slot_in_one_tick() {
     let (url, _c) = setup().await;
@@ -464,6 +546,28 @@ async fn allow_all_fires_every_catchup_slot_in_one_tick() {
         runs.len() >= 3,
         "AllowAll must dispatch each due catch-up slot, got {}",
         runs.len()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn allow_all_defers_catch_up_slots_past_the_tick_limit() {
+    let (url, _c) = setup().await;
+    let limit = usize::try_from(autumn_harvest::scheduler::ALLOW_ALL_MAX_STARTS_PER_TICK)
+        .expect("small limit");
+    let lag = i64::try_from(limit).expect("small limit") + 50;
+    insert_schedule_with(&url, "overlap_wf", "allow_all", true, "interval:1", lag).await;
+
+    tick(&url).await;
+    assert_eq!(
+        executions(&url, "overlap_wf").await.len(),
+        limit,
+        "one tick must start at most the AllowAll limit"
+    );
+
+    tick(&url).await;
+    assert!(
+        executions(&url, "overlap_wf").await.len() > limit,
+        "the next tick must resume the deferred catch-up slots"
     );
 }
 
@@ -648,4 +752,78 @@ async fn durable_promise_resolve_on_a_finished_run_is_an_error() {
         assert!(err.is_err(), "a finished run cannot take a new settlement");
     })
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn durable_promise_settles_from_another_workflow() {
+    let (url, _c) = setup().await;
+
+    with_worker(&url, || async {
+        for (n, reject, expected) in [
+            (5, false, json!({ "resolved": "resolved by a workflow" })),
+            (6, true, json!({ "rejected": "rejected by a workflow" })),
+        ] {
+            let exec_id = start(&url, "promise_wf", &format!("promise-{n}")).await;
+            let id = published_token(exec_id).await;
+            let input = json!({ "token": id.to_string(), "reject": reject });
+            let resolver =
+                start_full(&url, "resolver_wf", &format!("resolver-{n}"), None, input).await;
+
+            wait_for_execution_state_with_timeout(&url, resolver, "COMPLETED", WAIT).await;
+            let execution =
+                wait_for_execution_state_with_timeout(&url, exec_id, "COMPLETED", WAIT).await;
+            assert_eq!(execution.output, Some(expected));
+            assert_replays_clean(&url, exec_id, "promise_wf", promise_workflow).await;
+            assert_replays_clean(&url, resolver, "resolver_wf", resolver_workflow).await;
+        }
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn durable_promise_rules_hold_on_the_plain_signal_path() {
+    use autumn_harvest::durable_promise::PromiseSettlement;
+    use autumn_harvest::signal::send_signal_idempotent;
+
+    let (url, _c) = setup().await;
+    let exec_id = start(&url, "promise_wf", "promise-7").await;
+    let id = PromiseId::new(exec_id, "approval").expect("valid key");
+    let name = id.signal_name();
+    let settlement = PromiseSettlement::resolved(json!(1)).to_value();
+    let mut conn = connect(&url).await;
+
+    let first = send_signal_idempotent(&mut conn, exec_id, &name, settlement.clone(), None)
+        .await
+        .expect("first settlement");
+    let second = send_signal_idempotent(&mut conn, exec_id, &name, settlement.clone(), None)
+        .await
+        .expect("second settlement");
+    assert!(first, "a keyless settlement gets the promise key");
+    assert!(!second, "so a second keyless settlement is a no-op");
+
+    let malformed = PromiseId::new(exec_id, "other").expect("valid key");
+    assert!(
+        send_signal_idempotent(
+            &mut conn,
+            exec_id,
+            &malformed.signal_name(),
+            json!("ops"),
+            None
+        )
+        .await
+        .is_err(),
+        "a payload that is not a settlement is refused"
+    );
+    assert!(
+        send_signal_idempotent(&mut conn, exec_id, &name, settlement, Some("my-key"))
+            .await
+            .is_err(),
+        "a settlement with a different key is refused"
+    );
+    assert!(
+        send_signal_idempotent(&mut conn, exec_id, "order", json!(1), Some(&name))
+            .await
+            .is_err(),
+        "another signal cannot take the promise key"
+    );
 }

@@ -817,8 +817,10 @@ impl Schedule {
 /// `CancelOther` / `TerminateOther` require the cancellation contract from
 /// issue #238, which is implemented in this codebase.
 ///
-/// `AllowAll` ignores `max_active_runs`, as Temporal does. Per-workflow
-/// concurrency limits, throttles and admission gates still apply. Runs can
+/// `AllowAll` ignores `max_active_runs`, as Temporal does. One tick starts at
+/// most `scheduler::ALLOW_ALL_MAX_STARTS_PER_TICK` runs. Per-workflow
+/// concurrency limits, throttles and admission gates still apply. A throttle
+/// slower than the schedule cadence lets its pending backlog grow. Runs can
 /// overlap, so `last_completion_result` carryover can be stale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
