@@ -7530,7 +7530,7 @@ pub const fn management_api_request_fields()
         (
             "POST",
             "/admin/tokens",
-            Some(&["name", "scope", "expires_at"]),
+            Some(&["name", "scope", "expires_at", "tenant"]),
         ),
         ("DELETE", "/admin/tokens/{id}", Some(&[])),
         (
@@ -9048,6 +9048,7 @@ pub const fn management_api_response_fields()
                 "last_used_at",
                 "revoked_at",
                 "secret",
+                "tenant",
             ]),
         ),
         ("DELETE", "/admin/tokens/{id}", Some(&["revoked"])),
