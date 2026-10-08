@@ -40,6 +40,8 @@ mod backup_verify_tests;
 mod batch_executor_pool_exhaustion_tests;
 mod benchmarks_docs;
 #[cfg(feature = "db")]
+mod broken_session_scan_perf;
+#[cfg(feature = "db")]
 mod build_reachability_fanout_perf;
 #[cfg(feature = "db")]
 mod build_routing_tests;
