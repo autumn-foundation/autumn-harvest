@@ -156,10 +156,11 @@ Two attribution details:
 - `GET /dead-letters/aggregate` is unchanged: `failure_signature` groups over
   the stored (possibly ciphertext) error first-line. Counts and ids remain
   correct; signatures on an encrypted deployment group by ciphertext shape.
-- The engine's own write paths currently persist with identity codecs;
-  envelopes appear wherever a writer (e.g. the client handle path or a future
-  write-side integration) stored them. The read path decodes any envelope it
-  finds and passes everything else through untouched.
+- With column encoding on (issue #1979), the engine writes envelopes into
+  the execution `input`/`output`/`memo` columns, signal payloads and
+  dead-letter inputs. The surfaces above decode them under the same rules. A
+  non-admin caller, and the undecoded list surfaces, see the envelopes. See
+  the column coverage table in `docs/security-posture.md`.
 - Because the walk is envelope-driven, business data stored as plaintext that
   happens to be byte-for-byte a codec envelope — at any nesting depth — is
   transformed on the decoded view: decoded when its `codec_id` is registered,

@@ -361,9 +361,10 @@ deployment stores. It is the **activation** that must come last.
 
 ### ⚠️ What "zero" does and does not authorise
 
-The gate proves one specific thing: **no `harvest_events` row on any expected
-shard still references the key.** That is what the sweep converts, so that is
-what the census counts. It is *not* a licence to destroy the key material yet,
+The gate proves one specific thing: **no `harvest_events` row and no codec
+column cell on any expected shard still references the key.** That is what
+the sweep converts, so that is what the census counts. The codec columns are
+listed in `codec_rotation::CODEC_COLUMNS` (issue #1979). It is *not* a licence to destroy the key material yet,
 because a codec envelope can also be sitting in places this feature does not
 sweep:
 
@@ -372,13 +373,14 @@ sweep:
   row holds only a reference envelope. Those are the *large* payloads, and they
   are explicitly out of scope here (embedder-owned storage). Re-encrypt or
   re-key them yourself before retiring.
-- **Codec-encoded columns outside the event log**:
-  `harvest_workflow_executions.{input,output,memo,search_attrs,error}`,
-  `harvest_execution_summaries.{result,search_attrs}`,
-  `harvest_dead_letters.{input,error}`, `harvest_signals.payload`, and
-  `harvest_completion_deliveries.payload` are all decoded on the read path
-  (`decode_workflow_execution_fields` and friends) and are **not** swept or
-  censused.
+- **Columns outside `CODEC_COLUMNS`.** The sweep and the census cover the
+  codec columns (issue #1979): `harvest_workflow_executions.{input,output,memo}`,
+  `harvest_signals.payload`, `harvest_dead_letters.input`,
+  `harvest_execution_summaries.result` and `harvest_task_queue.{input,output}`.
+  Harvest writes no envelope to any other column. An envelope that a writer
+  outside Harvest put there is not swept or censused. A
+  `harvest_shard_migrations.staged_task` snapshot can hold a task row's
+  envelope during a shard move. Do not retire a key during a shard move.
 - **Nested envelopes.** The census and the sweep classify a payload field by its
   *top-level* envelope. A field whose decoded plaintext itself contains an
   envelope — e.g. an `ExternalAwaitResolved.output` frozen from another

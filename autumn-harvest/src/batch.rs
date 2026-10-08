@@ -519,6 +519,9 @@ mod db {
         /// than 10% p99 regression on unrelated workflows.
         pub concurrency: u32,
         pub metrics: Arc<dyn MetricsRecorder>,
+        /// The registry a signal action encodes its payload with (issue
+        /// #1979). The default is the identity registry.
+        pub payload_codecs: crate::payload_codec::PayloadCodecs,
     }
 
     impl std::fmt::Debug for BatchExecutorConfig {
@@ -534,6 +537,7 @@ mod db {
             Self {
                 concurrency: DEFAULT_BATCH_CONCURRENCY,
                 metrics: Arc::new(NoOpMetrics),
+                payload_codecs: crate::payload_codec::PayloadCodecs::default(),
             }
         }
     }
@@ -697,6 +701,7 @@ mod db {
         signal_payload: Option<&Value>,
         target: ExecutionId,
         metrics: &dyn MetricsRecorder,
+        codecs: &crate::payload_codec::PayloadCodecs,
     ) -> Result<(), String> {
         match action {
             BatchAction::Cancel => {
@@ -719,7 +724,7 @@ mod db {
                     "Signal action missing signal_name on batch job row".to_string()
                 })?;
                 let payload = signal_payload.cloned().unwrap_or(Value::Null);
-                signal::send_signal(conn, target, name, payload)
+                signal::send_signal_with_codecs(conn, target, name, payload, codecs)
                     .await
                     .map_err(|e| e.to_string())
             }
@@ -885,6 +890,7 @@ mod db {
         let signal_payload = job.signal_payload.clone();
         let concurrency = usize::try_from(config.concurrency.max(1)).unwrap_or(1);
         let metrics = Arc::clone(&config.metrics);
+        let codecs = &config.payload_codecs;
 
         // Dispatch in chunks of `concurrency` to bound in-flight ops.
         for chunk in targets_to_dispatch.chunks(concurrency) {
@@ -909,6 +915,7 @@ mod db {
                         signal_payload.as_ref(),
                         target,
                         metrics.as_ref(),
+                        codecs,
                     )
                     .await;
                     (target, result)

@@ -861,6 +861,18 @@ async fn load_child_states(
                 let mut typed =
                     load_child_typed_failures(&mut target_conn, &failed_ids, codecs, shard).await;
                 for (id, state, output, error) in pairs {
+                    // The output column can hold an envelope (issue #1979).
+                    // The parent's history gets the plaintext. A child this
+                    // registry cannot decode stays pending, so the next sweep
+                    // tries again. The codec error text is not logged.
+                    let Ok(output) = codecs.decode_column_opt(output.as_ref()) else {
+                        tracing::warn!(
+                            child_exec_id = %id,
+                            target_shard = shard,
+                            "cross-shard child relay: the child output could not be decoded"
+                        );
+                        continue;
+                    };
                     states.insert(
                         id,
                         TargetChildState {
@@ -1396,7 +1408,7 @@ async fn start_child_on_target(
                     // column would make every shard-filtered scanner query (timeouts,
                     // outboxes, the SLA sweep) skip it.
                     shard_id: row.target_shard,
-                    input: spec.input.clone().into(),
+                    input: codecs.encode_column(&spec.input)?.into(),
                     parent_id: Some(parent_exec_id.as_uuid()),
                     queue_name: &spec.queue_name,
                     execution_timeout: spec.execution_timeout_secs.map(chrono::Duration::seconds),
@@ -1588,7 +1600,7 @@ async fn start_child_on_target(
                 let mut params = queue::EnqueueParams::new(
                     spec.queue_name.clone(),
                     TaskType::Workflow,
-                    spec.input.clone(),
+                    codecs.encode_column(&spec.input)?,
                 );
                 params.workflow_exec_id = Some(child_exec_id.as_uuid());
                 params.required_build_id = spec.assigned_build_id.clone();

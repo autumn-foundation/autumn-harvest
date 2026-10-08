@@ -40,6 +40,14 @@
 //!   it never newly encrypts history that was written in the clear.
 //! - **Envelopes already on the active key** — which is what makes a re-run a
 //!   no-op and the sweep idempotent.
+//!
+//! ## Codec columns (issue #1979)
+//!
+//! The sweep and the census also cover the codec columns outside the event
+//! log. [`CODEC_COLUMNS`] lists them. These tables are not append-only, so
+//! this is not a sanctioned exception. The same rules apply all the same:
+//! only ciphertext changes, and a compare-and-swap loses to any concurrent
+//! write, an erasure included.
 
 use serde_json::Value;
 
@@ -89,6 +97,159 @@ impl ReencryptOutcome {
                 .fields_already_active
                 .saturating_add(other.fields_already_active),
         }
+    }
+}
+
+/// One codec column outside `harvest_events` (issue #1979).
+///
+/// The column holds a whole payload, so its envelope sits at the column root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodecColumn {
+    /// The table name.
+    pub table: &'static str,
+    /// The primary-key column. It is a `UUID` in every listed table.
+    pub id_column: &'static str,
+    /// The `JSONB` column that can hold a codec envelope.
+    pub column: &'static str,
+}
+
+/// Every codec column the sweep converts and the census counts (issue #1979).
+///
+/// Most are written through [`PayloadCodecs::encode_column`].
+/// `harvest_execution_summaries.result` is a verbatim copy of
+/// `harvest_workflow_executions.output`, so it holds the same ciphertext.
+/// `harvest_task_queue` holds the workflow task's input and output, encoded
+/// the same way. An activity task row stays in clear, but a column cannot be
+/// half swept, so the whole column is listed. The sweep skips plaintext.
+///
+/// A column belongs here exactly when `docs/security-posture.md` marks it
+/// Covered. A unit test checks both directions.
+pub const CODEC_COLUMNS: &[CodecColumn] = &[
+    CodecColumn {
+        table: "harvest_workflow_executions",
+        id_column: "id",
+        column: "input",
+    },
+    CodecColumn {
+        table: "harvest_workflow_executions",
+        id_column: "id",
+        column: "output",
+    },
+    CodecColumn {
+        table: "harvest_workflow_executions",
+        id_column: "id",
+        column: "memo",
+    },
+    CodecColumn {
+        table: "harvest_signals",
+        id_column: "id",
+        column: "payload",
+    },
+    CodecColumn {
+        table: "harvest_dead_letters",
+        id_column: "id",
+        column: "input",
+    },
+    CodecColumn {
+        table: "harvest_execution_summaries",
+        id_column: "execution_id",
+        column: "result",
+    },
+    CodecColumn {
+        table: "harvest_task_queue",
+        id_column: "id",
+        column: "input",
+    },
+    CodecColumn {
+        table: "harvest_task_queue",
+        id_column: "id",
+        column: "output",
+    },
+];
+
+/// What [`reencrypt_field_under`] found in one stored value.
+enum FieldStep {
+    /// An erasure tombstone. No ciphertext.
+    Erased,
+    /// An offload reference envelope. No ciphertext here.
+    Offloaded,
+    /// Not an envelope. The sweep never newly encrypts plaintext.
+    Plaintext,
+    /// Already under the target key.
+    AlreadyActive,
+    /// Re-encoded under the target key.
+    Reencrypted(Value),
+}
+
+/// Re-encode one stored payload value under `target_key_id` when it carries
+/// another key id.
+///
+/// The event walk and the column sweep share this, so the two cannot
+/// disagree about what to skip.
+fn reencrypt_field_under(
+    codecs: &PayloadCodecs,
+    target_key_id: &str,
+    field: &Value,
+) -> HarvestResult<FieldStep> {
+    if crate::erase::is_erasure_tombstone(field) {
+        return Ok(FieldStep::Erased);
+    }
+    // Discriminator-only, NOT the strict `extract_offload_ref` parser: a
+    // field bearing the offload marker is passed through whether or not its
+    // reference parses, because there is no ciphertext here to rotate and
+    // rewriting it would orphan the blob either way. A reference that does
+    // not parse can only be a row written before issue #1758.
+    if is_offload_envelope(field) {
+        return Ok(FieldStep::Offloaded);
+    }
+    let Some(key_id) = codec_envelope_key_id(field) else {
+        return Ok(FieldStep::Plaintext);
+    };
+    if key_id == target_key_id {
+        return Ok(FieldStep::AlreadyActive);
+    }
+    // `field` was just confirmed to be a codec envelope by
+    // `codec_envelope_key_id` above, so `decode_payload_bytes` always
+    // returns `Some` here. Re-encryption migrates ciphertext only and never
+    // needs the plaintext parsed as JSON, so it stays as raw bytes straight
+    // through to `encode_payload_bytes_under`. That skips the
+    // deserialize-then-reserialize round trip `decode_payload` +
+    // `encode_payload_under` would otherwise pay for every field.
+    let plaintext_bytes = codecs.decode_payload_bytes(field)?.ok_or_else(|| {
+        HarvestError::Config(
+            "field matched codec_envelope_key_id but decode_payload_bytes found no envelope"
+                .to_string(),
+        )
+    })?;
+    Ok(FieldStep::Reencrypted(codecs.encode_payload_bytes_under(
+        target_key_id,
+        &plaintext_bytes,
+    )?))
+}
+
+/// Re-encode one codec-column value under `target_key_id` (issue #1979).
+///
+/// Returns `None` when there is nothing to write: plaintext, an erasure
+/// tombstone, an offload reference, or a value already on the target key.
+/// Returns `None` too when no keyed codec is registered.
+///
+/// # Errors
+///
+/// As [`reencrypt_event_payload_fields_under`].
+pub fn reencrypt_column_value_under(
+    codecs: &PayloadCodecs,
+    target_key_id: &str,
+    value: &Value,
+) -> HarvestResult<Option<Value>> {
+    if !codecs.has_keyed_codecs() {
+        return Ok(None);
+    }
+    match reencrypt_field_under(codecs, target_key_id, value)? {
+        FieldStep::Reencrypted(candidate) => Ok(Some(candidate)),
+        FieldStep::Erased
+        | FieldStep::Offloaded
+        | FieldStep::Plaintext
+        | FieldStep::AlreadyActive => Ok(None),
     }
 }
 
@@ -212,45 +373,13 @@ pub fn reencrypt_event_payload_fields_under(
         let Some(field) = data.get(key) else {
             continue;
         };
-        if crate::erase::is_erasure_tombstone(field) {
-            outcome.fields_skipped_erased += 1;
-            continue;
+        match reencrypt_field_under(codecs, target_key_id, field)? {
+            FieldStep::Erased => outcome.fields_skipped_erased += 1,
+            FieldStep::Offloaded => outcome.fields_skipped_offloaded += 1,
+            FieldStep::AlreadyActive => outcome.fields_already_active += 1,
+            FieldStep::Plaintext => {}
+            FieldStep::Reencrypted(candidate) => staged.push((key, candidate)),
         }
-        // Discriminator-only, NOT the strict `extract_offload_ref` parser: a
-        // field bearing the offload marker is passed through whether or not its
-        // reference parses, because there is no ciphertext here to rotate and
-        // rewriting it would orphan the blob either way. A reference that does
-        // not parse can only be a row written before issue #1758.
-        if is_offload_envelope(field) {
-            outcome.fields_skipped_offloaded += 1;
-            continue;
-        }
-        let Some(key_id) = codec_envelope_key_id(field) else {
-            // Plaintext: no key id, so nothing to rotate. The sweep never
-            // newly encrypts history written in the clear.
-            continue;
-        };
-        if key_id == target_key_id {
-            outcome.fields_already_active += 1;
-            continue;
-        }
-        // `field` was just confirmed to be a codec envelope by
-        // `codec_envelope_key_id` above, so `decode_payload_bytes` always
-        // returns `Some` here. Re-encryption migrates ciphertext only and
-        // never needs the plaintext parsed as JSON, so it stays as raw bytes
-        // straight through to `encode_payload_bytes_under` -- skipping the
-        // deserialize-then-reserialize round trip `decode_payload` +
-        // `encode_payload_under` would otherwise pay for every field.
-        let plaintext_bytes = codecs.decode_payload_bytes(field)?.ok_or_else(|| {
-            HarvestError::Config(
-                "field matched codec_envelope_key_id but decode_payload_bytes found no envelope"
-                    .to_string(),
-            )
-        })?;
-        staged.push((
-            key,
-            codecs.encode_payload_bytes_under(target_key_id, &plaintext_bytes)?,
-        ));
     }
 
     if staged.is_empty() {
@@ -337,9 +466,9 @@ pub const CODEC_ROTATION_DEFAULT_BATCH: i64 = 200;
 #[cfg(feature = "db")]
 pub use db::{
     CodecRotationCursor, FleetWriteFence, ShardRotationProgress, activate_codec_key,
-    compare_and_swap_event, count_rows_by_key_id, load_shard_rotation_progress,
-    load_shard_rotation_progress_against, refresh_active_codec_key, retire_codec_key,
-    sweep_codec_reencryption, sweep_codec_reencryption_once, write_cursor,
+    compare_and_swap_column, compare_and_swap_event, count_rows_by_key_id,
+    load_shard_rotation_progress, load_shard_rotation_progress_against, refresh_active_codec_key,
+    retire_codec_key, sweep_codec_reencryption, sweep_codec_reencryption_once, write_cursor,
 };
 
 #[cfg(feature = "db")]
@@ -362,7 +491,8 @@ mod db {
     use crate::telemetry::MetricsRecorder;
 
     use super::{
-        active_key_would_decrypt, has_non_active_key, reencrypt_event_payload_fields_under,
+        CODEC_COLUMNS, CodecColumn, active_key_would_decrypt, has_non_active_key,
+        reencrypt_column_value_under, reencrypt_event_payload_fields_under,
     };
 
     /// The exact SQL mirror of
@@ -433,12 +563,28 @@ mod db {
                   )
               )";
 
+    /// The key id of an envelope in `f.value`. A kid-less envelope counts as
+    /// the legacy key, which the caller binds as `$legacy`.
+    fn key_id_expr(legacy: &str) -> String {
+        format!(
+            "COALESCE(f.value ->> 'kid', f.value -> '_harvest_codec_envelope' ->> 'kid', {legacy})"
+        )
+    }
+
     #[derive(diesel::QueryableByName)]
     struct KeyCountRow {
         #[diesel(sql_type = Text)]
         key_id: String,
         #[diesel(sql_type = BigInt)]
         row_count: i64,
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct ColumnCell {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: uuid::Uuid,
+        #[diesel(sql_type = Jsonb)]
+        value: Value,
     }
 
     #[derive(diesel::QueryableByName)]
@@ -512,8 +658,9 @@ mod db {
     pub struct ShardRotationProgress {
         /// The key id this process is currently encoding new writes under.
         pub active_key_id: String,
-        /// Rows carrying each observed key id, including the active one. A
-        /// kid-less (pre-rotation) envelope counts under
+        /// Event rows and codec-column cells carrying each observed key id,
+        /// including the active one (issue #1979). A kid-less (pre-rotation)
+        /// envelope counts under
         /// [`CODEC_LEGACY_KEY_ID`](crate::payload_codec::CODEC_LEGACY_KEY_ID).
         pub rows_by_key_id: BTreeMap<String, i64>,
         /// The resume cursor for the active key's pass, when one exists.
@@ -547,16 +694,18 @@ mod db {
         Ok(probe.present)
     }
 
-    /// Count `harvest_events` rows per codec key id on this connection's shard
-    /// (issue #948).
+    /// Count `harvest_events` rows and codec-column cells per codec key id on
+    /// this connection's shard (issue #948, issue #1979).
     ///
-    /// A row is counted once per distinct key id it references, so an event
-    /// whose `input` and `output` sit under different keys contributes to both.
-    /// Fields with no ciphertext — plaintext, offload reference envelopes
-    /// (#524), erasure tombstones (#495) — contribute nothing, which is what
-    /// keeps this census in agreement with what the sweep can actually convert.
+    /// An event row is counted once per distinct key id it references, so an
+    /// event whose `input` and `output` sit under different keys contributes to
+    /// both. A codec-column cell, one row's value in one of
+    /// [`CODEC_COLUMNS`], counts once. Values with no ciphertext — plaintext,
+    /// offload reference envelopes (#524), erasure tombstones (#495) —
+    /// contribute nothing, which is what keeps this census in agreement with
+    /// what the sweep can actually convert.
     ///
-    /// This is a sequential scan of the largest table in the schema. It backs an
+    /// This is a sequential scan of the largest tables in the schema. It backs an
     /// admin-gated, operator-invoked read and the retirement gate — both
     /// rotation-scoped, run a handful of times per rotation — not anything on a
     /// request or dispatch path.
@@ -570,18 +719,35 @@ mod db {
         // Targeted `->` lookups over the compile-time-constant field list,
         // rather than `jsonb_each` materialising a tuple for every key of
         // `data` (timestamps, ids, everything) only to discard most of them.
-        let sql = format!(
+        let key_id = key_id_expr("$2");
+        let mut sources = vec![format!(
             "SELECT key_id, COUNT(*)::BIGINT AS row_count \
              FROM ( \
-                 SELECT e.id AS event_row_id, \
-                        COALESCE(f.value ->> 'kid', f.value -> '_harvest_codec_envelope' ->> 'kid', $2) AS key_id \
+                 SELECT e.id AS event_row_id, {key_id} AS key_id \
                  FROM harvest_events e \
                  CROSS JOIN LATERAL unnest($1::TEXT[]) AS k(field) \
                  CROSS JOIN LATERAL (SELECT e.event_data -> 'data' -> k.field) AS f(value) \
                  WHERE f.value IS NOT NULL AND {ENVELOPE_PREDICATE} \
-                 GROUP BY e.id, COALESCE(f.value ->> 'kid', f.value -> '_harvest_codec_envelope' ->> 'kid', $2) \
+                 GROUP BY e.id, {key_id} \
              ) s \
              GROUP BY key_id"
+        )];
+        // The identifiers come from the compile-time `CODEC_COLUMNS` list,
+        // never from input.
+        for column in CODEC_COLUMNS {
+            sources.push(format!(
+                "SELECT {key_id} AS key_id, COUNT(*)::BIGINT AS row_count \
+                 FROM {table} t \
+                 CROSS JOIN LATERAL (SELECT t.{col}) AS f(value) \
+                 WHERE f.value IS NOT NULL AND {ENVELOPE_PREDICATE} \
+                 GROUP BY 1",
+                table = column.table,
+                col = column.column,
+            ));
+        }
+        let sql = format!(
+            "SELECT key_id, SUM(row_count)::BIGINT AS row_count FROM ({}) u GROUP BY key_id",
+            sources.join(" UNION ALL ")
         );
         let field_keys: Vec<String> = PAYLOAD_FIELD_KEYS
             .iter()
@@ -868,10 +1034,7 @@ mod db {
         let carried = resumed.map_or((0, 0), |cursor| {
             (cursor.rows_reencrypted, cursor.unresolved_rows)
         });
-        let rows_reencrypted_total = carried
-            .0
-            .saturating_add(i64::try_from(rewritten).unwrap_or(i64::MAX));
-        let unresolved_total = carried.1.saturating_add(unresolved);
+        let mut unresolved_total = carried.1.saturating_add(unresolved);
 
         // A pass that ran off the end of the shard having left something
         // unconverted must NOT be marked complete and must NOT leave those rows
@@ -918,15 +1081,28 @@ mod db {
         // when this worker wins the interval's claim. Skipping it in the steady
         // state is the whole point; skipping it forever is not, because a row
         // that commits below the cursor is only ever found this way.
-        let census_needed = if reached_end && unresolved_total == 0 {
-            if already_complete {
-                claim_completed_cursor_revalidation(conn, shard).await?
-            } else {
-                true
-            }
+        let revalidate = if reached_end && unresolved_total == 0 && already_complete {
+            claim_completed_cursor_revalidation(conn, shard).await?
         } else {
             false
         };
+        // The codec columns (issue #1979) have no cursor. Finding their work
+        // is a full scan, like the census. So the column sweep runs only at
+        // the end of an event pass that is not yet complete, or on a won
+        // revalidation claim. A converged shard pays nothing between claims.
+        // A column cell the sweep cannot convert counts as unresolved, so the
+        // pass starts again rather than completing over it.
+        if reached_end && (!already_complete || revalidate) {
+            let (column_rewritten, column_unresolved) =
+                sweep_codec_columns(conn, shard, codecs, &active_key_id, batch_limit).await?;
+            rewritten = rewritten.saturating_add(column_rewritten);
+            unresolved_total = unresolved_total.saturating_add(column_unresolved);
+        }
+        let census_needed =
+            reached_end && unresolved_total == 0 && (!already_complete || revalidate);
+        let rows_reencrypted_total = carried
+            .0
+            .saturating_add(i64::try_from(rewritten).unwrap_or(i64::MAX));
         let census_clean = if census_needed {
             let by_key = count_rows_by_key_id(conn).await?;
             by_key
@@ -1014,6 +1190,146 @@ mod db {
             );
         }
         Ok(rewritten)
+    }
+
+    /// Re-encrypt the codec columns onto `active_key_id` (issue #1979).
+    ///
+    /// Returns the cells rewritten and the cells left unconverted. It stops
+    /// once it has rewritten `batch_limit` cells. Each page selects only cells
+    /// that hold an envelope under another key, in primary-key order. A cell
+    /// that fails stays behind the page cursor, so it cannot starve the cells
+    /// after it.
+    async fn sweep_codec_columns(
+        conn: &mut AsyncPgConnection,
+        shard: crate::types::ShardId,
+        codecs: &PayloadCodecs,
+        active_key_id: &str,
+        batch_limit: i64,
+    ) -> HarvestResult<(usize, i64)> {
+        let budget = usize::try_from(batch_limit).unwrap_or(usize::MAX);
+        let key_id = key_id_expr("$1");
+        let mut rewritten = 0usize;
+        let mut unresolved = 0i64;
+        for column in CODEC_COLUMNS {
+            // The identifiers come from the compile-time `CODEC_COLUMNS` list.
+            let sql = format!(
+                "SELECT t.{id} AS id, t.{col} AS value \
+                 FROM {table} t \
+                 CROSS JOIN LATERAL (SELECT t.{col}) AS f(value) \
+                 WHERE f.value IS NOT NULL AND {ENVELOPE_PREDICATE} \
+                   AND {key_id} <> $2 \
+                   AND ($3::UUID IS NULL OR t.{id} > $3) \
+                 ORDER BY t.{id} LIMIT $4",
+                id = column.id_column,
+                col = column.column,
+                table = column.table,
+            );
+            let mut after: Option<uuid::Uuid> = None;
+            while rewritten < budget {
+                let cells: Vec<ColumnCell> = diesel::sql_query(&sql)
+                    .bind::<Text, _>(crate::payload_codec::CODEC_LEGACY_KEY_ID)
+                    .bind::<Text, _>(active_key_id)
+                    .bind::<Nullable<diesel::sql_types::Uuid>, _>(after)
+                    .bind::<BigInt, _>(batch_limit)
+                    .load(conn)
+                    .await
+                    .map_err(database_error)?;
+                let page_len = cells.len();
+                after = cells.last().map(|cell| cell.id);
+                for cell in cells {
+                    match reencrypt_column_value_under(codecs, active_key_id, &cell.value) {
+                        Ok(Some(candidate)) => {
+                            if compare_and_swap_column(
+                                conn,
+                                shard,
+                                column,
+                                cell.id,
+                                &cell.value,
+                                &candidate,
+                            )
+                            .await?
+                            {
+                                rewritten += 1;
+                            } else {
+                                // The cell changed under us, for example by an
+                                // erasure. We lose, by design.
+                                unresolved += 1;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            unresolved += 1;
+                            // Bounded and content-free, as for an event row.
+                            tracing::warn!(
+                                table = column.table,
+                                column = column.column,
+                                row_id = %cell.id,
+                                key_id = ?crate::payload_codec::codec_envelope_key_id(&cell.value),
+                                shard_id = shard.as_i32(),
+                                error_kind = super::sweep_error_kind(&error),
+                                "codec re-encryption skipped: the column cell could not be decoded"
+                            );
+                        }
+                    }
+                }
+                if i64::try_from(page_len).unwrap_or(i64::MAX) < batch_limit {
+                    break;
+                }
+            }
+        }
+        Ok((rewritten, unresolved))
+    }
+
+    /// Write `candidate` over one codec-column cell only if it still holds
+    /// `original` (issue #1979). Returns whether the swap took effect.
+    ///
+    /// The `WHERE` clause makes the sweep lose to any concurrent write, an
+    /// erasure tombstone included. These tables are not append-only, so no
+    /// sanction is needed. The shard fence still applies, for the reason
+    /// [`compare_and_swap_event`] gives.
+    ///
+    /// `#[doc(hidden)] pub` so an integration test can drive the race
+    /// directly. Not part of the semver-stable surface.
+    ///
+    /// # Errors
+    ///
+    /// Propagates database failures, and
+    /// [`crate::error::HarvestError::ShardFenced`] when this process is pinned
+    /// to a superseded generation.
+    #[doc(hidden)]
+    pub async fn compare_and_swap_column(
+        conn: &mut AsyncPgConnection,
+        shard: crate::types::ShardId,
+        column: &CodecColumn,
+        row_id: uuid::Uuid,
+        original: &Value,
+        candidate: &Value,
+    ) -> HarvestResult<bool> {
+        use diesel_async::AsyncConnection as _;
+
+        // The identifiers come from the compile-time `CODEC_COLUMNS` list.
+        let sql = format!(
+            "UPDATE {table} SET {col} = $1 WHERE {id} = $2 AND {col} = $3",
+            table = column.table,
+            col = column.column,
+            id = column.id_column,
+        );
+        let candidate = candidate.clone();
+        let original = original.clone();
+        Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
+            if crate::replication::FenceRegistry::is_enabled() {
+                crate::replication::assert_fence(conn, shard).await?;
+            }
+            let updated = diesel::sql_query(&sql)
+                .bind::<Jsonb, _>(&candidate)
+                .bind::<diesel::sql_types::Uuid, _>(row_id)
+                .bind::<Jsonb, _>(&original)
+                .execute(conn)
+                .await
+                .map_err(database_error)?;
+            Ok(updated > 0)
+        }))
+        .await
     }
 
     /// Write `candidate` over `original` only if the row still holds
@@ -2835,6 +3151,161 @@ mod tests {
                  wrong. An identity append writes cleartext that the sweep will \
                  never encrypt."
             );
+        }
+    }
+
+    /// Every JSONB column `schema.rs` declares, as `table.column`.
+    fn jsonb_columns(schema: &str) -> Vec<String> {
+        let mut table = "";
+        let mut out = Vec::new();
+        for line in schema.lines() {
+            let trimmed = line.trim();
+            if let Some(name) = trimmed.strip_suffix(" (id) {").or_else(|| {
+                trimmed
+                    .split_once(" (")
+                    .filter(|(_, rest)| rest.ends_with(") {"))
+                    .map(|(name, _)| name)
+            }) {
+                table = name;
+                continue;
+            }
+            if let Some((column, kind)) = trimmed.split_once("->") {
+                let kind = kind.trim().trim_end_matches(',');
+                if kind == "Jsonb" || kind == "Nullable<Jsonb>" {
+                    out.push(format!("{table}.{}", column.trim()));
+                }
+            }
+        }
+        out
+    }
+
+    /// The rows of the column-coverage table: `(column, codec cell, reason)`.
+    fn coverage_rows(doc: &str) -> Vec<(String, String, String)> {
+        const HEADING: &str = "### Column coverage";
+        let start = doc
+            .find(HEADING)
+            .expect("the column-coverage heading is missing");
+        let body = &doc[start + HEADING.len()..];
+        let end = ["\n## ", "\n### "]
+            .iter()
+            .filter_map(|h| body.find(h))
+            .min()
+            .unwrap_or(body.len());
+        body[..end]
+            .lines()
+            .filter(|line| line.starts_with("| `"))
+            .map(|line| {
+                let cells: Vec<&str> = line.trim_matches('|').split('|').map(str::trim).collect();
+                (
+                    cells[0].trim_matches('`').to_string(),
+                    cells.get(1).copied().unwrap_or("").to_string(),
+                    cells.get(2).copied().unwrap_or("").to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_security_posture_doc_has_a_row_for_every_jsonb_column() {
+        let rows = coverage_rows(include_str!("../../docs/security-posture.md"));
+        let columns = jsonb_columns(include_str!("schema.rs"));
+        assert!(
+            columns.len() > 40,
+            "the schema parser found {}",
+            columns.len()
+        );
+        for column in columns {
+            let row = rows.iter().find(|(name, _, _)| *name == column);
+            let Some((_, codec, reason)) = row else {
+                panic!("docs/security-posture.md has no coverage row for `{column}`");
+            };
+            assert!(
+                codec.starts_with("Covered") || codec.starts_with("Clear"),
+                "`{column}`: the codec cell must start with Covered or Clear"
+            );
+            assert!(!reason.is_empty(), "`{column}`: the row must give a reason");
+        }
+    }
+
+    #[test]
+    fn every_swept_column_is_covered_in_the_doc_and_nothing_else_is() {
+        let rows = coverage_rows(include_str!("../../docs/security-posture.md"));
+        for column in CODEC_COLUMNS {
+            let name = format!("{}.{}", column.table, column.column);
+            assert!(
+                rows.iter()
+                    .any(|(row, codec, _)| *row == name && codec.starts_with("Covered")),
+                "`{name}` is swept, so the doc must mark it Covered"
+            );
+        }
+        for (row, codec, _) in &rows {
+            if codec.starts_with("Covered") && row != "harvest_events.event_data" {
+                assert!(
+                    CODEC_COLUMNS
+                        .iter()
+                        .any(|c| format!("{}.{}", c.table, c.column) == *row),
+                    "`{row}` is marked Covered, so the rotation sweep must cover it"
+                );
+            }
+        }
+    }
+
+    /// An engine signal or dead-letter write without the registry stores the
+    /// payload in clear (issue #1979). The sweep never encrypts plaintext, so
+    /// that leak is permanent. An external-await read without the registry
+    /// cannot decode the target output, so the await never resolves. This
+    /// guard keeps every engine call on the codec-aware variant.
+    #[test]
+    fn engine_signal_and_dead_letter_writes_pass_the_registry() {
+        const PLAIN_WRITES: &[&str] = &[
+            "read_external_await_outcome(",
+            "send_signal(",
+            "send_signal_idempotent(",
+            "send_signal_to_live_attempt(",
+            "send_signal_from_resolved(",
+            "resolve_and_signal_by_workflow_id(",
+            "dlq::dead_letter(",
+        ];
+        // A completion-callback dead letter copies the delivery body, which
+        // stays in clear (see `docs/security-posture.md`). The count is pinned
+        // so it can only go down.
+        const KNOWN_PLAIN_WRITES: &[(&str, &str, usize)] =
+            &[("completion_callback.rs", "dlq::dead_letter(", 1)];
+        let engine_sources: &[(&str, &str)] = &[
+            ("worker.rs", include_str!("worker.rs")),
+            ("timeout.rs", include_str!("timeout.rs")),
+            ("execution.rs", include_str!("execution.rs")),
+            ("poison_pill.rs", include_str!("poison_pill.rs")),
+            ("batch.rs", include_str!("batch.rs")),
+            (
+                "completion_callback.rs",
+                include_str!("completion_callback.rs"),
+            ),
+            (
+                "completion_trigger.rs",
+                include_str!("completion_trigger.rs"),
+            ),
+            ("reset.rs", include_str!("reset.rs")),
+        ];
+        for (name, src) in engine_sources {
+            for call in PLAIN_WRITES {
+                let found = src
+                    .match_indices(call)
+                    .filter(|(at, _)| {
+                        let before = &src[..*at];
+                        !before.ends_with("fn ") && !before.ends_with('_')
+                    })
+                    .count();
+                let allowed = KNOWN_PLAIN_WRITES
+                    .iter()
+                    .find(|(file, known, _)| file == name && known == call)
+                    .map_or(0, |(_, _, n)| *n);
+                assert_eq!(
+                    found, allowed,
+                    "{name}: {found} call(s) to `{call}`, expected {allowed}. \
+                     Use the `_with_codecs` variant."
+                );
+            }
         }
     }
 }

@@ -2579,6 +2579,7 @@ pub async fn enqueue_completion_deliveries(
     execution: &crate::models::WorkflowExecution,
     exec_id: crate::types::ExecutionId,
     state: TerminalState,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<()> {
     use diesel_async::RunQueryDsl;
 
@@ -2601,6 +2602,9 @@ pub async fn enqueue_completion_deliveries(
     if matching.is_empty() {
         return Ok(());
     }
+    // The webhook receives the plaintext result. The output column can hold
+    // an envelope (issue #1979), so decode it once here.
+    let output = codecs.decode_column_opt(execution.output.as_ref())?;
 
     for (callback_index, target) in matching {
         // Defense-in-depth: re-validate against the *live* SSRF policy even
@@ -2632,7 +2636,7 @@ pub async fn enqueue_completion_deliveries(
             &execution.workflow_name,
             &execution.workflow_id,
             state,
-            execution.output.clone(),
+            output.clone(),
             execution.error.as_deref(),
             execution.completed_at,
         );

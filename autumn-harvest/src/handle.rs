@@ -369,6 +369,14 @@ impl WorkflowHandleClient {
         }
     }
 
+    /// The client's codec registry (issue #1979).
+    ///
+    /// Typed signal helpers use it to encode the payload column.
+    #[must_use]
+    pub fn payload_codecs(&self) -> &crate::payload_codec::PayloadCodecs {
+        &self.inner.payload_codecs
+    }
+
     /// Add shared state to the client.
     #[must_use]
     pub fn with_shared_state(self, shared_state: crate::context::SharedState) -> Self {
@@ -2298,6 +2306,13 @@ impl WorkflowHandle {
                 execution.state = state.to_string();
             }
         }
+        // Every caller reports the output to the user, so decode it here
+        // (issue #1979). No caller writes this row back.
+        execution.output = self
+            .client
+            .inner
+            .payload_codecs
+            .decode_column_opt(execution.output.as_ref())?;
         Ok(execution)
     }
 
@@ -2333,6 +2348,12 @@ impl WorkflowHandle {
                 target, execution.workflow_name, workflow_info.name
             )));
         }
+        // The replayed handler gets the plaintext input (issue #1979).
+        let query_input = self
+            .client
+            .inner
+            .payload_codecs
+            .decode_column(&execution.input)?;
         if WorkflowResultState::from_execution_state(&execution.state).is_terminal() {
             return Err(HarvestError::WorkflowNotRunning(target));
         }
@@ -2407,12 +2428,11 @@ impl WorkflowHandle {
         // returning its boxed future), mirroring the poll-time containment below.
         // Query replays emit no commands and append no events — map the caught
         // construction panic to a clean `QueryHandlerPanicked` (503).
-        let handler_fut = match crate::error::catch_construct(|| {
-            (workflow_info.handler)(&ctx, execution.input.clone())
-        }) {
-            Ok(fut) => fut,
-            Err(message) => return Err(HarvestError::QueryHandlerPanicked(message)),
-        };
+        let handler_fut =
+            match crate::error::catch_construct(|| (workflow_info.handler)(&ctx, query_input)) {
+                Ok(fut) => fut,
+                Err(message) => return Err(HarvestError::QueryHandlerPanicked(message)),
+            };
         tokio::pin!(handler_fut);
 
         let mut replay_result = None;

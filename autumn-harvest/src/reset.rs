@@ -1624,10 +1624,17 @@ async fn enqueue_fork_workflow_task(
     new_exec_id: ExecutionId,
     registry: Option<&HandlerRegistry>,
 ) -> Result<(), WorkflowResetError> {
+    // The fork row holds the source's stored input, which may be an envelope
+    // (issue #1979). The concurrency key needs the plaintext. The task stores
+    // the input encoded or not, as the switch says.
+    let codecs = registry.map_or(&*crate::store::DEFAULT_PAYLOAD_CODECS, |reg| {
+        reg.payload_codecs()
+    });
+    let input = codecs.decode_column(&fork.input)?;
     let mut enqueue = EnqueueParams::new(
         fork.queue_name.clone(),
         TaskType::Workflow,
-        fork.input.clone(),
+        codecs.encode_column(&input)?,
     );
     enqueue.workflow_exec_id = Some(new_exec_id.as_uuid());
     enqueue.required_build_id = fork.assigned_build_id.clone();
@@ -1636,7 +1643,7 @@ async fn enqueue_fork_workflow_task(
         && let Some(policy) = &info.concurrency
     {
         enqueue.concurrency_key =
-            crate::concurrency::resolve_concurrency_key(policy.key_expr, &fork.input);
+            crate::concurrency::resolve_concurrency_key(policy.key_expr, &input);
         enqueue.max_concurrent = Some(policy.limit);
     }
     queue::enqueue(conn, &enqueue).await?;

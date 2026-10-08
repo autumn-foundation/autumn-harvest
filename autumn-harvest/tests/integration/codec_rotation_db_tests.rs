@@ -793,6 +793,22 @@ async fn assert_replay_fidelity_across_a_sweep(codec_id: &str, codecs: PayloadCo
         ],
     )
     .await;
+    // Issue #1979: the execution row's codec columns ride the same sweep.
+    let column_plaintext = [
+        json!({"user": "alice", "amounts": [1, 2, 3]}),
+        json!({"ok": true, "nested": {"k": null}}),
+        json!({"note": "memo"}),
+    ];
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET input = $1, output = $2, memo = $3 WHERE id = $4",
+    )
+    .bind::<diesel::sql_types::Jsonb, _>(encode_under(&codecs, "k1", &column_plaintext[0]))
+    .bind::<diesel::sql_types::Jsonb, _>(encode_under(&codecs, "k1", &column_plaintext[1]))
+    .bind::<diesel::sql_types::Jsonb, _>(encode_under(&codecs, "k1", &column_plaintext[2]))
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("encode execution columns");
 
     let before = store::load_history_with_codecs(&mut conn, exec_id, &codecs)
         .await
@@ -815,10 +831,25 @@ async fn assert_replay_fidelity_across_a_sweep(codec_id: &str, codecs: PayloadCo
         sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
             .await
             .expect("sweep"),
-        2,
-        "{codec_id}: the sweep really did rewrite the stored bytes"
+        5,
+        "{codec_id}: the sweep rewrote two events and three execution columns"
     );
     assert_stored_fields(&mut conn, exec_id, codec_id, "k2").await;
+    let cells = codec_cells(&mut conn).await;
+    assert_eq!(cells.len(), 3, "{codec_id}: input, output and memo");
+    for ((column, value), plaintext) in cells.iter().zip(&column_plaintext) {
+        assert_eq!(value["codec_id"], codec_id, "{codec_id}: {column}");
+        assert_eq!(
+            autumn_harvest::payload_codec::codec_envelope_key_id(value),
+            Some("k2"),
+            "{codec_id}: {column}"
+        );
+        assert_eq!(
+            &codecs.decode_column(value).expect("decode column"),
+            plaintext,
+            "{codec_id}: {column} plaintext is byte-identical"
+        );
+    }
 
     let after = store::load_history_with_codecs(&mut conn, exec_id, &codecs)
         .await
@@ -3692,5 +3723,301 @@ async fn a_claimed_idle_revalidation_still_bumps_updated_at() {
         "the claim is the only write this idle tick makes, so it must be \
          the one that keeps updated_at from reading as stale forever on a \
          healthy, periodically-revalidated shard"
+    );
+}
+
+// ── issue #1979: the sweep and the census cover the codec columns ───────────
+
+/// The ids of the rows [`seed_codec_columns`] wrote.
+struct SeededColumns {
+    exec_id: ExecutionId,
+    signal_id: Uuid,
+}
+
+const COLUMN_INPUT: &str = "column-input-ssn";
+const COLUMN_OUTPUT: &str = "column-output-card";
+const COLUMN_MEMO: &str = "column-memo-note";
+const COLUMN_SIGNAL: &str = "column-signal-pin";
+const COLUMN_DLQ: &str = "column-dlq-email";
+const COLUMN_SUMMARY: &str = "column-summary-result";
+
+/// Write one envelope under `key_id` into every swept codec column.
+async fn seed_codec_columns(
+    conn: &mut AsyncPgConnection,
+    codecs: &PayloadCodecs,
+    key_id: &str,
+) -> SeededColumns {
+    let exec_id = insert_execution(conn, "column_rotation").await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET input = $1, output = $2, memo = $3 WHERE id = $4",
+    )
+    .bind::<diesel::sql_types::Jsonb, _>(encode_under(codecs, key_id, &json!(COLUMN_INPUT)))
+    .bind::<diesel::sql_types::Jsonb, _>(encode_under(codecs, key_id, &json!(COLUMN_OUTPUT)))
+    .bind::<diesel::sql_types::Jsonb, _>(encode_under(codecs, key_id, &json!(COLUMN_MEMO)))
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(conn)
+    .await
+    .expect("encode execution columns");
+
+    let signal_id = Uuid::new_v4();
+    diesel::sql_query(
+        "INSERT INTO harvest_signals (id, workflow_exec_id, signal_name, payload) \
+         VALUES ($1, $2, 'go', $3)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(signal_id)
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Jsonb, _>(encode_under(codecs, key_id, &json!(COLUMN_SIGNAL)))
+    .execute(conn)
+    .await
+    .expect("insert signal");
+
+    diesel::sql_query(
+        "INSERT INTO harvest_dead_letters \
+         (id, original_task_id, queue_name, task_type, workflow_exec_id, input, error, attempts) \
+         VALUES ($1, $2, 'default', 'ACTIVITY', $3, $4, 'boom', 1)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+    .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Jsonb, _>(encode_under(codecs, key_id, &json!(COLUMN_DLQ)))
+    .execute(conn)
+    .await
+    .expect("insert dead letter");
+
+    diesel::sql_query(
+        "INSERT INTO harvest_execution_summaries \
+         (execution_id, workflow_name, workflow_id, state, started_at, completed_at, shard_id, result) \
+         VALUES ($1, 'column_rotation', $2, 'COMPLETED', now(), now(), 0, $3)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+    .bind::<diesel::sql_types::Text, _>(Uuid::new_v4().to_string())
+    .bind::<diesel::sql_types::Jsonb, _>(encode_under(codecs, key_id, &json!(COLUMN_SUMMARY)))
+    .execute(conn)
+    .await
+    .expect("insert summary");
+
+    SeededColumns { exec_id, signal_id }
+}
+
+/// Every swept codec cell on the shard, as `(column, stored value)`.
+async fn codec_cells(conn: &mut AsyncPgConnection) -> Vec<(String, Value)> {
+    #[derive(diesel::QueryableByName)]
+    struct Cell {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        column_name: String,
+        #[diesel(sql_type = diesel::sql_types::Jsonb)]
+        value: Value,
+    }
+    let cells: Vec<Cell> = diesel::sql_query(
+        "SELECT 'input' AS column_name, input AS value FROM harvest_workflow_executions \
+         UNION ALL SELECT 'output', output FROM harvest_workflow_executions WHERE output IS NOT NULL \
+         UNION ALL SELECT 'memo', memo FROM harvest_workflow_executions WHERE memo IS NOT NULL \
+         UNION ALL SELECT 'payload', payload FROM harvest_signals \
+         UNION ALL SELECT 'dlq_input', input FROM harvest_dead_letters \
+         UNION ALL SELECT 'result', result FROM harvest_execution_summaries WHERE result IS NOT NULL",
+    )
+    .load(conn)
+    .await
+    .expect("load codec cells");
+    cells
+        .into_iter()
+        .filter(|cell| autumn_harvest::payload_codec::is_codec_envelope(&cell.value))
+        .map(|cell| (cell.column_name, cell.value))
+        .collect()
+}
+
+#[tokio::test]
+async fn the_census_counts_every_codec_column() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_aead_key_registry();
+    seed_codec_columns(&mut conn, &codecs, "k1").await;
+
+    let by_key = autumn_harvest::codec_rotation::count_rows_by_key_id(&mut conn)
+        .await
+        .expect("census");
+    assert_eq!(
+        by_key.get("k1").copied(),
+        Some(6),
+        "one cell each: input, output, memo, signal, dead letter, summary"
+    );
+}
+
+#[tokio::test]
+async fn the_sweep_re_encrypts_every_codec_column_without_changing_plaintext() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_aead_key_registry();
+    let seeded = seed_codec_columns(&mut conn, &codecs, "k1").await;
+    let before: Vec<(String, Value)> = codec_cells(&mut conn)
+        .await
+        .into_iter()
+        .map(|(column, value)| (column, codecs.decode_column(&value).expect("decode before")))
+        .collect();
+    assert_eq!(before.len(), 6);
+
+    codecs.set_active_key("k2").expect("flip");
+    let rewritten = sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+        .await
+        .expect("sweep");
+    assert_eq!(rewritten, 6, "the sweep rewrote one cell per column");
+
+    let after = codec_cells(&mut conn).await;
+    for (column, value) in &after {
+        assert_eq!(
+            autumn_harvest::payload_codec::codec_envelope_key_id(value),
+            Some("k2"),
+            "{column} is on the active key"
+        );
+    }
+    let decoded: Vec<(String, Value)> = after
+        .into_iter()
+        .map(|(column, value)| (column, codecs.decode_column(&value).expect("decode after")))
+        .collect();
+    assert_eq!(
+        before, decoded,
+        "the plaintext is byte-identical across the sweep"
+    );
+
+    let by_key = autumn_harvest::codec_rotation::count_rows_by_key_id(&mut conn)
+        .await
+        .expect("census");
+    assert_eq!(by_key.get("k1").copied().unwrap_or(0), 0);
+
+    // The engine read path still sees the original execution plaintext.
+    let mut execution: autumn_harvest::models::WorkflowExecution = {
+        use autumn_harvest::schema::harvest_workflow_executions;
+        harvest_workflow_executions::table
+            .find(seeded.exec_id.as_uuid())
+            .select(autumn_harvest::models::WorkflowExecution::as_select())
+            .first(&mut conn)
+            .await
+            .expect("load execution")
+    };
+    execution.decode_columns(&codecs).expect("decode columns");
+    assert_eq!(execution.input, json!(COLUMN_INPUT));
+    assert_eq!(execution.output, Some(json!(COLUMN_OUTPUT)));
+    assert_eq!(execution.memo, Some(json!(COLUMN_MEMO)));
+}
+
+#[tokio::test]
+async fn retirement_is_refused_while_a_codec_column_holds_the_key() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_key_registry();
+    seed_codec_columns(&mut conn, &codecs, "k1").await;
+    codecs.set_active_key("k2").expect("flip");
+
+    let sharded = ShardedDbPool::single(build_pool(&url));
+    let shards = [ShardId::new(0)];
+    let err = retire_codec_key(
+        &sharded,
+        &shards,
+        &codecs,
+        "k1",
+        FleetWriteFence::ConfirmedByOperator,
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
+    )
+    .await
+    .expect_err("a column still holds k1 ciphertext");
+    assert!(
+        matches!(err, HarvestError::CodecKeyRetirementBlocked { .. }),
+        "{err:?}"
+    );
+
+    sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+        .await
+        .expect("sweep");
+    retire_codec_key(
+        &sharded,
+        &shards,
+        &codecs,
+        "k1",
+        FleetWriteFence::ConfirmedByOperator,
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
+    )
+    .await
+    .expect("retirement succeeds once every column is converted");
+}
+
+#[tokio::test]
+async fn the_column_sweep_loses_to_an_erasure() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_key_registry();
+    let seeded = seed_codec_columns(&mut conn, &codecs, "k1").await;
+    let original: Value = {
+        use autumn_harvest::schema::harvest_signals;
+        harvest_signals::table
+            .find(seeded.signal_id)
+            .select(harvest_signals::payload)
+            .first(&mut conn)
+            .await
+            .expect("load signal")
+    };
+    diesel::sql_query("UPDATE harvest_signals SET payload = $1 WHERE id = $2")
+        .bind::<diesel::sql_types::Jsonb, _>(erasure_tombstone())
+        .bind::<diesel::sql_types::Uuid, _>(seeded.signal_id)
+        .execute(&mut conn)
+        .await
+        .expect("erase");
+
+    let column = autumn_harvest::codec_rotation::CODEC_COLUMNS
+        .iter()
+        .find(|c| c.table == "harvest_signals")
+        .expect("signals are swept");
+    let candidate = encode_under(&codecs, "k2", &json!(COLUMN_SIGNAL));
+    let swapped = autumn_harvest::codec_rotation::compare_and_swap_column(
+        &mut conn,
+        ShardId::new(0),
+        column,
+        seeded.signal_id,
+        &original,
+        &candidate,
+    )
+    .await
+    .expect("swap");
+    assert!(!swapped, "a stale original must lose");
+    let stored: Value = {
+        use autumn_harvest::schema::harvest_signals;
+        harvest_signals::table
+            .find(seeded.signal_id)
+            .select(harvest_signals::payload)
+            .first(&mut conn)
+            .await
+            .expect("load signal")
+    };
+    assert_eq!(stored, erasure_tombstone(), "the tombstone survives");
+}
+
+#[tokio::test]
+async fn an_undecodable_column_cell_blocks_completion_but_not_its_neighbours() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_key_registry();
+    seed_codec_columns(&mut conn, &codecs, "k1").await;
+    // A cell under a key this registry never held.
+    diesel::sql_query("UPDATE harvest_signals SET payload = $1")
+        .bind::<diesel::sql_types::Jsonb, _>(json!({
+            CODEC_ENVELOPE_KEY: {"codec_id": "xor", "kid": "gone", "data": "AAAA"}
+        }))
+        .execute(&mut conn)
+        .await
+        .expect("plant an orphan cell");
+    codecs.set_active_key("k2").expect("flip");
+
+    let rewritten = sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+        .await
+        .expect("a per-cell failure is not an error");
+    assert_eq!(rewritten, 5, "every other column still converts");
+    let progress = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("progress");
+    assert_eq!(progress.rows_by_key_id.get("gone").copied(), Some(1));
+    assert!(
+        progress.cursor.and_then(|c| c.completed_at).is_none(),
+        "the pass must not complete over an unconverted cell"
     );
 }

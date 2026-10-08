@@ -1304,4 +1304,56 @@ mod tests {
             );
         }
     }
+
+    // ── column coverage (issue #1979) ──────────────────────────────────
+
+    #[test]
+    fn column_encoding_is_off_by_default() {
+        let codecs = PayloadCodecs::default();
+        codec("k1", KEY_A).register_with(&codecs).unwrap();
+        let payload = json!({"ssn": PAYLOAD_SECRET});
+        assert!(!codecs.column_encoding());
+        assert_eq!(codecs.encode_column(&payload).unwrap(), payload);
+    }
+
+    #[test]
+    fn column_encoding_is_shared_by_every_clone() {
+        let codecs = PayloadCodecs::default();
+        codec("k1", KEY_A).register_with(&codecs).unwrap();
+        let clone = codecs.clone();
+        codecs.set_column_encoding(true);
+        assert!(clone.column_encoding());
+        let payload = json!({"ssn": PAYLOAD_SECRET});
+        let stored = clone.encode_column(&payload).unwrap();
+        assert!(!stored.to_string().contains(PAYLOAD_SECRET));
+        assert_eq!(codec_envelope_key_id(&stored), Some("k1"));
+        assert_eq!(codecs.decode_column(&stored).unwrap(), payload);
+    }
+
+    #[test]
+    fn decode_column_passes_plaintext_and_tombstones_through() {
+        let codecs = PayloadCodecs::default();
+        codec("k1", KEY_A).register_with(&codecs).unwrap();
+        codecs.set_column_encoding(true);
+        let plain = json!({"ssn": PAYLOAD_SECRET});
+        assert_eq!(codecs.decode_column(&plain).unwrap(), plain);
+        let tombstone = crate::erase::erasure_tombstone();
+        assert_eq!(codecs.decode_column(&tombstone).unwrap(), tombstone);
+    }
+
+    #[test]
+    fn decode_column_fails_closed_without_the_key() {
+        let writer = PayloadCodecs::default();
+        codec("k1", KEY_A).register_with(&writer).unwrap();
+        writer.set_column_encoding(true);
+        let stored = writer
+            .encode_column(&json!({"ssn": PAYLOAD_SECRET}))
+            .unwrap();
+        let reader = PayloadCodecs::default();
+        let err = reader.decode_column(&stored).unwrap_err();
+        assert!(
+            matches!(err, crate::error::HarvestError::UnknownCodecKey { .. }),
+            "{err}"
+        );
+    }
 }

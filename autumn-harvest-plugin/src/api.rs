@@ -13598,7 +13598,11 @@ pub(crate) async fn build_awaitables_report(
             {
                 ctx.register_declarative_update_handler(h);
             }
-            let input = std::mem::take(&mut execution.input);
+            // The replayed handler gets the plaintext input (issue #1979).
+            let input = api_state
+                .payload_codecs()
+                .decode_column(&std::mem::take(&mut execution.input))
+                .map_err(map_error)?;
             let outcome =
                 drive_query_replay_async(&ctx, workflow.handler, input, api_state.query_timeout())
                     .await;
@@ -23602,9 +23606,15 @@ async fn rerun_workflow(
             .into_response();
     }
 
-    let effective_input = input_override
-        .clone()
-        .unwrap_or_else(|| source.input.clone());
+    // The start path encodes the input itself, so it gets the plaintext
+    // (issue #1979).
+    let effective_input = match input_override.clone() {
+        Some(input) => input,
+        None => match api_state.payload_codecs().decode_column(&source.input) {
+            Ok(input) => input,
+            Err(e) => return map_error(e).into_response(),
+        },
+    };
 
     // Deferred-start policies are incompatible with a re-run: they admit the
     // start without creating an execution, so there is no execution_id to
@@ -26022,13 +26032,14 @@ pub(crate) async fn signal_workflow(
             Ok(b) => b,
             Err(e) => return map_error(e).into_response(),
         };
-        signal::send_signal_from_resolved(
+        signal::send_signal_from_resolved_with_codecs(
             bound.as_mut(),
             exec_id,
             target,
             &signal_name,
             payload,
             idempotency_key.as_deref(),
+            &api_state.payload_codecs(),
         )
         .await
     };
@@ -26237,13 +26248,13 @@ async fn hydrate_ctx_for_query(
     // resolve via pre-sent oneshot channels so the entire history replays
     // synchronously; this is read-only and appends no events / performs no
     // writes (issue #612 AC4).
-    let outcome = drive_query_replay_async(
-        &ctx,
-        workflow.handler,
-        execution.input.clone(),
-        api_state.query_timeout(),
-    )
-    .await;
+    // The replayed handler gets the plaintext input (issue #1979).
+    let input = api_state
+        .payload_codecs()
+        .decode_column(&execution.input)
+        .map_err(map_error)?;
+    let outcome =
+        drive_query_replay_async(&ctx, workflow.handler, input, api_state.query_timeout()).await;
 
     if terminal {
         // Drift guard (Codex P2, PR #986 follow-up): if the driven handler

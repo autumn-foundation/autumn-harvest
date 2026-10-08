@@ -439,6 +439,33 @@ pub async fn reconcile_quota_keys_from(
     after_id: Option<Uuid>,
     shard: Option<crate::types::ShardId>,
 ) -> HarvestResult<(ReconcileSummary, Option<Uuid>)> {
+    reconcile_quota_keys_from_with_codecs(
+        conn,
+        batch_size,
+        after_id,
+        shard,
+        &crate::store::DEFAULT_PAYLOAD_CODECS,
+    )
+    .await
+}
+
+/// [`reconcile_quota_keys_from`], decoding each input with `codecs` before
+/// it resolves the key (issue #1979).
+///
+/// An input this registry cannot decode resolves no key, so its row counts
+/// as unresolvable.
+///
+/// # Errors
+///
+/// As [`reconcile_quota_keys_from`].
+#[cfg(feature = "db")]
+pub async fn reconcile_quota_keys_from_with_codecs(
+    conn: &mut AsyncPgConnection,
+    batch_size: i64,
+    after_id: Option<Uuid>,
+    shard: Option<crate::types::ShardId>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<(ReconcileSummary, Option<Uuid>)> {
     let mut summary = ReconcileSummary::default();
     let workflow_names = registered_quota_workflow_names();
     if batch_size <= 0 || workflow_names.is_empty() {
@@ -462,7 +489,10 @@ pub async fn reconcile_quota_keys_from(
 
     for row in rows {
         let policy = registered_quota_policy(&row.workflow_name);
-        match resolve_backfill(policy, &row.input) {
+        let input = codecs
+            .decode_column(&row.input)
+            .unwrap_or_else(|_| row.input.clone());
+        match resolve_backfill(policy, &input) {
             ReconcileOutcome::Backfilled(key) => {
                 let workflow_name = row.workflow_name.clone();
                 // Same lock `enforce_quota_admission` takes around its own
@@ -562,7 +592,8 @@ pub async fn reconcile_quota_keys(
 ///
 /// `shard` is passed to every tick's [`reconcile_quota_keys_from`] call
 /// for its cross-region DR fence assertion (issue #954) -- see that
-/// function's doc comment.
+/// function's doc comment. `codecs` decodes each candidate's input (issue
+/// #1979).
 #[cfg(feature = "db")]
 #[must_use]
 pub fn spawn_quota_key_reconciler_for_shard(
@@ -571,6 +602,7 @@ pub fn spawn_quota_key_reconciler_for_shard(
     interval: std::time::Duration,
     batch_size: i64,
     shard: Option<crate::types::ShardId>,
+    codecs: crate::payload_codec::PayloadCodecs,
 ) -> tokio::task::JoinHandle<()> {
     // Keep the worker dispatch binding for hints (issue #1431).
     crate::dispatch::spawn_bound(async move {
@@ -599,7 +631,11 @@ pub fn spawn_quota_key_reconciler_for_shard(
             };
             match get_result {
                 Ok(mut conn) => {
-                    match reconcile_quota_keys_from(&mut conn, batch_size, cursor, shard).await {
+                    match reconcile_quota_keys_from_with_codecs(
+                        &mut conn, batch_size, cursor, shard, &codecs,
+                    )
+                    .await
+                    {
                         Ok((summary, next_cursor)) => {
                             cursor = next_cursor;
                             if summary.backfilled > 0 {
