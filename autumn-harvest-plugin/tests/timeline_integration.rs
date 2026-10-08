@@ -246,6 +246,9 @@ const INIT_SQL: &str = concat!(
     // orders by it and `TaskQueueItem` selects it, so each claim in this suite
     // needs it. Added inline for the same reason as the columns above.
     "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS new_start BOOLEAN NOT NULL DEFAULT FALSE;\n",
+    // issue #1976: the fairness key on harvest_task_queue. Every enqueue
+    // inserts it and `TaskQueueItem` selects it.
+    "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS fairness_key TEXT;\n",
 );
 
 type HarvestApiApp = axum::Router;
