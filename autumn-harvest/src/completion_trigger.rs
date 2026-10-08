@@ -1186,31 +1186,6 @@ async fn relay_gate_checked_start(
     Ok(())
 }
 
-/// The tenant of one source run, or `None` when the run has none or is gone
-/// (issue #1977).
-#[cfg(feature = "db")]
-async fn source_run_tenant(
-    conn: &mut diesel_async::AsyncPgConnection,
-    source_exec_id: Uuid,
-) -> Option<String> {
-    use crate::schema::harvest_workflow_executions::dsl as execs_dsl;
-    use diesel::prelude::*;
-    use diesel_async::RunQueryDsl;
-    match execs_dsl::harvest_workflow_executions
-        .find(source_exec_id)
-        .select(execs_dsl::tenant)
-        .first::<Option<String>>(conn)
-        .await
-    {
-        Ok(tenant) => tenant,
-        Err(diesel::result::Error::NotFound) => None,
-        Err(e) => {
-            tracing::warn!(error = %e, "harvest: completion trigger could not read source tenant");
-            None
-        }
-    }
-}
-
 #[cfg(feature = "db")]
 #[derive(Debug, Clone)]
 pub struct DeferredTriggerStart {
@@ -2562,13 +2537,10 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
 
         // Provenance ref is the triggering (source) execution id (#740).
         let source_exec_id_str = task.source_exec_id.to_string();
-        // The row keeps the source tenant (issue #1977). A row written before
-        // that column existed reads the source run instead. The outbox row
-        // lives on the source shard, so `conn` reaches it.
-        let source_tenant = match task.tenant.clone() {
-            Some(tenant) => Some(tenant),
-            None => source_run_tenant(conn, task.source_exec_id).await,
-        };
+        // The row keeps the source tenant (issue #1977). A row with no tenant
+        // starts an untenanted target. A missing source run is not read as an
+        // untenanted one.
+        let source_tenant = task.tenant.clone();
         let params = crate::execution::StartWorkflowParams {
             concurrency_key: task.concurrency_key,
             concurrency_limit: task
