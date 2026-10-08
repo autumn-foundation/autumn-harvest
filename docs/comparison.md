@@ -114,7 +114,7 @@ lists four small primitives that peer engines ship. Each has a decision.
 | Payload-matching event wait | Cloudflare `step.waitForEvent` | **Shipped.** `ctx.wait_for_signal_matching` and `ctx.receive_signal_matching` ([signals chapter](getting-started/04-signals.md)). | A signal that fails the predicate stays buffered. There is no timeout form yet. |
 | Durable promise | Restate awakeables | **Shipped.** `ctx.new_promise`, `ctx.promise` and `durable_promise::resolve` / `reject` ([durable promises](durable-promises.md)). | Built on signals, not external task tokens, so a promise can race a timer and settles once. |
 | Counting semaphore | No built-in peer primitive | **Declined.** | See below. |
-| `AllowAll` overlap | Temporal Schedules | **Shipped.** `OverlapPolicy::AllowAll`. | It ignores `max_active_runs`, as Temporal does. One tick starts at most 100 catch-up runs. |
+| `AllowAll` overlap | Temporal Schedules | **Shipped.** `OverlapPolicy::AllowAll`. | It ignores `max_active_runs`, as Temporal does. Each tick phase starts at most 100 catch-up runs. |
 
 **Why the counting semaphore is declined.** Two shipped features cover the
 common needs. The per-key concurrency limit

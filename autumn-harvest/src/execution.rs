@@ -7312,7 +7312,12 @@ pub async fn signal_with_start_workflow_execution_with_metrics_and_codecs(
 
             // Cross-execution dedupe: scope by (workflow_name, workflow_id, key)
             // so escalation/reset paths on a new exec_id don't re-queue the signal.
-            if let Some(key) = signal_key.as_deref()
+            // A promise belongs to one run, so its key dedupes per execution
+            // only, at the insert below (issue #1985).
+            let promise_signal = request
+                .signal_name
+                .starts_with(crate::durable_promise::PROMISE_SIGNAL_PREFIX);
+            if let Some(key) = signal_key.as_deref().filter(|_| !promise_signal)
                 && let Some(prior) = lookup_idempotent_signal_dedupe(
                     conn,
                     request.workflow_name,

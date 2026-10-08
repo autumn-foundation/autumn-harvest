@@ -6234,13 +6234,16 @@ pub(crate) enum OverlapAction {
     Proceed,
 }
 
-/// Most runs that one tick starts for an [`OverlapPolicy::AllowAll`] schedule
-/// (issue #1985).
+/// Most runs that one dispatch phase starts for an
+/// [`OverlapPolicy::AllowAll`] schedule (issue #1985).
 ///
 /// `AllowAll` ignores `max_active_runs`. After an outage, an unbounded
 /// catch-up can list one slot per missed interval. This limit defers the
-/// rest to the next tick, as the `max_active_runs` gate does. The tick then
-/// stays well inside its fire-claim lease.
+/// rest to the next tick, as the `max_active_runs` gate does.
+///
+/// A tick has two dispatch phases: the buffered drain and the fire. Each
+/// phase takes its own fire claim, and each applies this limit. The limit
+/// keeps each phase well inside its claim lease.
 pub const ALLOW_ALL_MAX_STARTS_PER_TICK: u32 = 100;
 
 /// Decide what to do with a new firing that can't run immediately.

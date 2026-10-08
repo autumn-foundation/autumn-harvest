@@ -128,8 +128,8 @@ needs a new storage shape.
 `OverlapPolicy::AllowAll` serialises as `allow_all`. `apply_overlap_policy`
 returns `OverlapAction::Proceed`. The dispatch loop and the manual DAG
 trigger skip their `max_active_runs` checks for `AllowAll`. So `AllowAll`
-ignores `max_active_runs`, as Temporal does. One tick starts at most
-`ALLOW_ALL_MAX_STARTS_PER_TICK` runs. Per-workflow concurrency limits,
+ignores `max_active_runs`, as Temporal does. Each dispatch phase of a tick
+starts at most `ALLOW_ALL_MAX_STARTS_PER_TICK` runs. Per-workflow concurrency limits,
 throttles and admission gates still apply.
 
 ### 1.4 Counting semaphore (item 3) — declined
