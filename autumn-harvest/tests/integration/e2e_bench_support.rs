@@ -103,7 +103,7 @@ pub const SHARD_COUNTS: [u32; 3] = [1, 2, 4];
 /// on every bump until somebody re-measured. Bump this constant in the same
 /// commit that adds a new results file and updates the baselines below; see
 /// "Publishing a new release's numbers" in `docs/benchmarks.md`.
-pub const PUBLISHED_RESULTS_VERSION: &str = "0.6.0";
+pub const PUBLISHED_RESULTS_VERSION: &str = "0.7.0";
 
 /// Published reproduction tolerance (issue #941 AC3): a fresh clone on the
 /// documented hardware should land within this percentage of the published

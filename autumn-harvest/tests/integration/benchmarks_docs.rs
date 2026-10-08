@@ -366,3 +366,28 @@ fn the_results_file_records_the_hardware_it_was_measured_on() {
         );
     }
 }
+
+#[test]
+fn the_headline_table_names_the_published_version() {
+    // Issue #1972: the headline must say which release it measured.
+    let heading = format!("### Headline numbers, v{PUBLISHED_RESULTS_VERSION}");
+    assert!(
+        benchmarks_doc().contains(&heading),
+        "docs/benchmarks.md must head its table with {heading:?}"
+    );
+}
+
+#[test]
+fn every_earlier_release_stays_published() {
+    // Issue #941 AC4 keeps each release's numbers. A new release adds a file.
+    // It does not replace one.
+    let doc = benchmarks_doc();
+    for version in ["0.6.0", PUBLISHED_RESULTS_VERSION] {
+        let file = format!("results-v{version}.md");
+        assert!(
+            doc.contains(&file),
+            "docs/benchmarks.md must keep linking {file}"
+        );
+        read(&format!("docs/benchmarks/{file}"));
+    }
+}
