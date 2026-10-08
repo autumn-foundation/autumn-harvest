@@ -364,6 +364,9 @@ impl<F: Future> ScopeRun<'_, F> {
         let result = if let Some((index, details)) = ctx.take_marker(&name) {
             parse_cancel_marker(ctx, &name, details).map(|marker| {
                 ctx.consume_scope_members(&marker.members, marker.horizon..index);
+                ctx.mark_scope_timers_cancelled(&marker.members.timers);
+                // The held commands are the commands that the live cycle withdrew.
+                ctx.mark_scope_timers_cancelled(&armed_timer_ids(&self.shared.lock().held));
                 marker.reason
             })
         } else if self.replay.is_some() || ctx.has_unconsumed_marker(&name) {
@@ -387,6 +390,8 @@ impl<F: Future> ScopeRun<'_, F> {
                 name,
                 details: serde_json::to_value(&marker).unwrap_or(Value::Null),
             });
+            ctx.mark_scope_timers_cancelled(&marker.members.timers);
+            ctx.mark_scope_timers_cancelled(&armed_timer_ids(&withdrawn));
             if !marker.members.is_empty() {
                 ctx.push_command(WorkflowCommand::CancelRaceLosers {
                     reason: LoserCancelReason::ScopeCancelled,
@@ -415,6 +420,16 @@ impl<F: Future> ScopeRun<'_, F> {
         };
         drop(held);
     }
+}
+
+/// The timer ids that `cmds` arm. A withdrawn arm never reaches the worker.
+fn armed_timer_ids(cmds: &[WorkflowCommand]) -> Vec<TimerId> {
+    cmds.iter()
+        .filter_map(|cmd| match cmd {
+            WorkflowCommand::ArmTimer { timer_id, .. } => Some(timer_id.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn parse_cancel_marker(
@@ -776,6 +791,88 @@ mod tests {
             0,
             "a cancelled timer must not be armed again: {commands:?}"
         );
+    }
+
+    /// Runs a handle timer in a scope, cancels it, then arms the id again.
+    async fn cancel_then_rearm(ctx: &WorkflowContext) -> Vec<WorkflowCommand> {
+        let result = bounded(run_then_cancel(ctx, async {
+            ctx.start_timer("deadline", 60).await_fire().await
+        }))
+        .await;
+        assert!(
+            matches!(result, Err(HarvestError::Cancelled(_))),
+            "{result:?}"
+        );
+        let _handle = ctx.start_timer("deadline", 60);
+        ctx.drain_commands()
+    }
+
+    fn arms(commands: &[WorkflowCommand]) -> usize {
+        count(commands, |c| matches!(c, WorkflowCommand::ArmTimer { .. }))
+    }
+
+    /// A scope cancel withdraws a handle timer that the same cycle arms.
+    /// A later arm of the id records a fresh arm, live and on replay.
+    #[tokio::test]
+    async fn scope_cancel_clears_the_armed_state_of_a_withdrawn_timer() {
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), vec![started()]);
+
+        let commands = cancel_then_rearm(&ctx).await;
+
+        assert_eq!(
+            arms(&commands),
+            1,
+            "the re-arm is not a no-op: {commands:?}"
+        );
+        let details = marker(&commands, "cancel_scope:1").expect("the cancel is recorded");
+        let replay = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started(),
+                WorkflowEvent::MarkerRecorded {
+                    name: "cancel_scope:1".into(),
+                    details,
+                },
+                WorkflowEvent::TimerStarted {
+                    timer_id: TimerId::new("deadline"),
+                    duration_secs: 60,
+                },
+            ],
+        );
+        let replayed = cancel_then_rearm(&replay).await;
+        assert_eq!(arms(&replayed), 0, "{replayed:?}");
+        assert!(!replay.history_has_unconsumed_events());
+    }
+
+    /// A scope cancel deletes the row of an awaited handle timer.
+    /// A later arm of the id records a fresh arm.
+    #[tokio::test]
+    async fn scope_cancel_clears_the_armed_state_of_a_member_timer() {
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started(),
+                WorkflowEvent::TimerStarted {
+                    timer_id: TimerId::new("deadline"),
+                    duration_secs: 60,
+                },
+            ],
+        );
+
+        let commands = cancel_then_rearm(&ctx).await;
+
+        let losers = losers(&commands).expect("the scope must cancel its members");
+        assert_eq!(losers.timers, vec![TimerId::new("deadline")]);
+        let rearm = commands.iter().rposition(|c| {
+            matches!(
+                c,
+                WorkflowCommand::ArmTimer {
+                    for_await: false,
+                    ..
+                }
+            )
+        });
+        assert!(rearm.is_some(), "the re-arm is not a no-op: {commands:?}");
     }
 
     #[tokio::test]

@@ -27139,6 +27139,7 @@ async fn process_workflow_task(
                 .await?;
                 // Issue #1984: a cancel is pending. When no block is open after
                 // this cycle, cancel the run in this same transaction.
+                let mut deferred_cancel_ended_run = false;
                 if check_deferred_cancel
                     && let Some((_, starts, checks, terminal_metric)) =
                         crate::execution::complete_deferred_cancel(
@@ -27148,6 +27149,7 @@ async fn process_workflow_task(
                         )
                         .await?
                 {
+                    deferred_cancel_ended_run = true;
                     race_deferred_triggers.extend(starts);
                     deferred_checks.extend(checks.into_iter().map(|(id, name)| (id, Some(name))));
                     if let Some((workflow_name, queue_name)) = terminal_metric {
@@ -27171,7 +27173,7 @@ async fn process_workflow_task(
                     race_deferred_triggers,
                     pending_cancel_metrics,
                     continue_as_new_redirected_to_failure,
-                    deferred_cancel_ended_run: false,
+                    deferred_cancel_ended_run,
                 })
             })
             .await
@@ -27249,7 +27251,7 @@ async fn process_workflow_task(
             store_cache_entry(
                 &workflow_cache,
                 prepared.exec_id.as_uuid(),
-                pending_cache_update,
+                cache_update_after_persist(pending_cache_update, deferred_cancel_ended_run),
                 crate::cache::CachedWorkflowState {
                     events: std::mem::take(&mut history_events),
                     next_event_id,
@@ -27479,6 +27481,20 @@ async fn process_workflow_task(
 /// An entry that the update displaces drops after the lock is released.
 /// Dropping a resident workflow frees its future, its context and a copy of
 /// the history, which other tasks must not wait for (issue #1798).
+/// The cache update for a persisted cycle (issue #1984).
+///
+/// A deferred cancel ends a run whose own outcome is `Suspended`. The run is
+/// then terminal, so the cache evicts it instead of keeping it warm.
+const fn cache_update_after_persist(
+    pending: Option<bool>,
+    deferred_cancel_ended_run: bool,
+) -> Option<bool> {
+    match pending {
+        Some(_) if deferred_cancel_ended_run => Some(false),
+        other => other,
+    }
+}
+
 async fn store_cache_entry(
     workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
     exec_uuid: uuid::Uuid,
@@ -27500,6 +27516,27 @@ async fn store_cache_entry(
         }
     };
     drop(displaced);
+}
+
+#[cfg(test)]
+mod cache_update_after_persist_tests {
+    use super::cache_update_after_persist;
+
+    #[test]
+    fn a_deferred_cancel_evicts_a_suspended_run() {
+        assert_eq!(cache_update_after_persist(Some(true), true), Some(false));
+    }
+
+    #[test]
+    fn a_plain_cycle_keeps_its_cache_update() {
+        assert_eq!(cache_update_after_persist(Some(true), false), Some(true));
+        assert_eq!(cache_update_after_persist(Some(false), false), Some(false));
+    }
+
+    #[test]
+    fn sticky_routing_off_never_touches_the_cache() {
+        assert_eq!(cache_update_after_persist(None, true), None);
+    }
 }
 
 /// What a dispatch actually did, so the poll loop can tell a task this worker

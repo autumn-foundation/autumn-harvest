@@ -7115,6 +7115,25 @@ impl WorkflowContext {
             .remove(timer_id);
     }
 
+    /// Mark each armed cancellable timer in `timer_ids` as cancelled (issue #1984).
+    ///
+    /// A scope cancel deletes the durable rows of its member timers. A later
+    /// await or re-arm of the same id must not treat the timer as still armed.
+    /// Live and replay call this with the same recorded list.
+    pub(crate) fn mark_scope_timers_cancelled(&self, timer_ids: &[TimerId]) {
+        let mut state = self
+            .cancellable_timer_state
+            .lock()
+            .expect("cancellable_timer_state lock poisoned");
+        for timer_id in timer_ids {
+            if let Some(entry) = state.get_mut(timer_id.as_str())
+                && matches!(entry, TimerLogicalState::Armed { .. })
+            {
+                *entry = TimerLogicalState::Cancelled;
+            }
+        }
+    }
+
     /// Whether the workflow logically cancelled `timer_id` this task without a
     /// subsequent re-arm. Consulted by [`Self::await_timer_fire`] only when
     /// recorded history holds no resolving event.
