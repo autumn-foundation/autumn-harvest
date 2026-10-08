@@ -25,13 +25,6 @@ pub const DEFAULT_BULK_LIMIT: u32 = 100;
 /// Maximum number of DLQ rows a single bulk operation can act on.
 pub const MAX_BULK_LIMIT: u32 = 1000;
 
-/// Default spread window for a full [`MAX_BULK_LIMIT`] redrive (issue #1832).
-///
-/// A smaller batch gets a smaller window. See [`redrive_spread_window`].
-pub const DEFAULT_REDRIVE_SPREAD: std::time::Duration = std::time::Duration::from_secs(60);
-/// Upper bound on an operator-set redrive spread, in seconds.
-pub const MAX_REDRIVE_SPREAD_SECS: u64 = 3600;
-
 /// Filter for bulk DLQ operations.
 ///
 /// At least one substantive criterion (any of `activity_name`, `workflow_name`,
@@ -76,10 +69,6 @@ pub struct BulkDlqFilter {
     /// When `true`, return matching rows and count without writing.
     #[serde(default)]
     pub dry_run: bool,
-    /// Replay only: the window, in seconds, over which replayed tasks
-    /// become due (issue #1832). See [`redrive_spread_window`].
-    #[serde(default)]
-    pub spread_secs: Option<u64>,
 }
 
 impl BulkDlqFilter {
@@ -194,10 +183,6 @@ pub struct RedriveFilter {
     /// When `true`, return matching rows and count without writing.
     #[serde(default)]
     pub dry_run: bool,
-    /// The window, in seconds, over which redriven tasks become due
-    /// (issue #1832). See [`redrive_spread_window`].
-    #[serde(default)]
-    pub spread_secs: Option<u64>,
 }
 
 impl RedriveFilter {
@@ -251,81 +236,6 @@ pub struct RedriveResult {
     pub failures: Vec<BulkDlqFailure>,
 }
 
-/// The window over which a bulk redrive of `rows` rows spreads its tasks
-/// (issue #1832).
-///
-/// `Some(secs)` sets the window, capped at [`MAX_REDRIVE_SPREAD_SECS`].
-/// `Some(0)` makes every task due at once. `None` scales
-/// [`DEFAULT_REDRIVE_SPREAD`] by `rows / MAX_BULK_LIMIT`. So a full batch
-/// spreads over 60 s, and one row waits at most 60 ms.
-#[must_use]
-pub fn redrive_spread_window(spread_secs: Option<u64>, rows: usize) -> std::time::Duration {
-    spread_secs.map_or_else(
-        || {
-            let rows = u32::try_from(rows)
-                .unwrap_or(MAX_BULK_LIMIT)
-                .min(MAX_BULK_LIMIT);
-            DEFAULT_REDRIVE_SPREAD * rows / MAX_BULK_LIMIT
-        },
-        |secs| std::time::Duration::from_secs(secs.min(MAX_REDRIVE_SPREAD_SECS)),
-    )
-}
-
-/// The offset of row `index` of `count` inside `window` (issue #1832).
-///
-/// The window has `count` equal slots. Row `index` lands in slot `index`,
-/// and `seed` sets its place inside that slot. So the rows cover the window
-/// evenly, and no two rows become due in lockstep.
-#[must_use]
-pub fn redrive_spread_offset(
-    index: usize,
-    count: usize,
-    window: std::time::Duration,
-    seed: u64,
-) -> std::time::Duration {
-    let count = u128::try_from(count.max(1)).unwrap_or(u128::MAX);
-    let index = u128::try_from(index).unwrap_or(u128::MAX);
-    let slot = window.as_nanos() / count;
-    // `mix64` is below 2^64, so the jitter is below one slot.
-    let jitter = (slot * u128::from(mix64(seed))) >> 64;
-    let nanos = slot.saturating_mul(index).saturating_add(jitter);
-    std::time::Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
-}
-
-/// The `scheduled_at` for each row of a bulk redrive (issue #1832).
-///
-/// Row `index` becomes due at `now` plus its [`redrive_spread_offset`]. The
-/// row id seeds the jitter. A zero window gives `None` for every row, so
-/// each task keeps the default, immediate `scheduled_at`.
-#[must_use]
-pub fn redrive_schedule(
-    now: DateTime<Utc>,
-    window: std::time::Duration,
-    ids: &[Uuid],
-) -> Vec<Option<DateTime<Utc>>> {
-    if window.is_zero() {
-        return vec![None; ids.len()];
-    }
-    ids.iter()
-        .enumerate()
-        .map(|(index, id)| {
-            let (high, low) = id.as_u64_pair();
-            let offset = redrive_spread_offset(index, ids.len(), window, high ^ low);
-            chrono::Duration::from_std(offset)
-                .ok()
-                .and_then(|offset| now.checked_add_signed(offset))
-        })
-        .collect()
-}
-
-/// The `SplitMix64` finalizer. It spreads close seeds over all of `u64`.
-const fn mix64(seed: u64) -> u64 {
-    let mut z = seed;
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    z ^ (z >> 31)
-}
-
 /// Outcome of redriving a single dead-letter entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RedriveOutcome {
@@ -356,14 +266,6 @@ pub enum DeadLetterReason {
     /// author code explicitly rotating via `continue_as_new`.
     HistoryCapExceeded {
         count: u64,
-        cap: u64,
-        workflow_type: String,
-    },
-    /// Stored workflow history reached the byte hard cap (issue #1804).
-    /// `bytes` is the sum of `pg_column_size(event_data)` for the run.
-    /// `cap` is the configured byte cap.
-    HistoryBytesCapExceeded {
-        bytes: u64,
         cap: u64,
         workflow_type: String,
     },
@@ -420,7 +322,6 @@ impl DeadLetterReason {
     pub const fn reason_class(&self) -> &'static str {
         match self {
             Self::HistoryCapExceeded { .. } => "history_cap_exceeded",
-            Self::HistoryBytesCapExceeded { .. } => "history_bytes_cap_exceeded",
             Self::PoisonPill { .. } => "poison_pill",
             Self::WorkflowTaskTimeout { .. } => "workflow_task_timeout",
             Self::CallbackDeliveryExhausted { .. } => "callback_delivery_exhausted",
@@ -433,7 +334,6 @@ impl DeadLetterReason {
     pub const fn type_tag(&self) -> &'static str {
         match self {
             Self::HistoryCapExceeded { .. } => "HistoryCapExceeded",
-            Self::HistoryBytesCapExceeded { .. } => "HistoryBytesCapExceeded",
             Self::PoisonPill { .. } => "PoisonPill",
             Self::WorkflowTaskTimeout { .. } => "WorkflowTaskTimeout",
             Self::CallbackDeliveryExhausted { .. } => "CallbackDeliveryExhausted",
@@ -459,7 +359,6 @@ async fn redrive_callback_dead_letter(
     dead_letter_id: Uuid,
     workflow_exec_id: Option<Uuid>,
     original_task_id: Uuid,
-    not_before: Option<DateTime<Utc>>,
 ) -> HarvestResult<Uuid> {
     let exec_id = workflow_exec_id
         .map(crate::types::ExecutionId::from_uuid)
@@ -469,17 +368,7 @@ async fn redrive_callback_dead_letter(
             ))
         })?;
 
-    // The callback scanner reads `next_attempt_at` on the host clock.
-    let not_before = slot_on_host_clock(conn, not_before).await?;
-
-    match crate::completion_callback::redrive_delivery_at(
-        conn,
-        exec_id,
-        original_task_id,
-        not_before,
-    )
-    .await?
-    {
+    match crate::completion_callback::redrive_delivery(conn, exec_id, original_task_id).await? {
         crate::completion_callback::DeliveryRedriveOutcome::Redriven => Ok(original_task_id),
         crate::completion_callback::DeliveryRedriveOutcome::NotFound => Err(
             HarvestError::NotFound(format!("dead-letter {dead_letter_id}")),
@@ -491,80 +380,6 @@ async fn redrive_callback_dead_letter(
             )))
         }
     }
-}
-
-/// Move a database-clock spread slot onto the host clock (issue #1832).
-///
-/// [`spread_schedule`] reads the database clock. The callback scanner
-/// compares `next_attempt_at` with the host clock.
-async fn slot_on_host_clock(
-    conn: &mut AsyncPgConnection,
-    not_before: Option<DateTime<Utc>>,
-) -> HarvestResult<Option<DateTime<Utc>>> {
-    let Some(at) = not_before else {
-        return Ok(None);
-    };
-    let db_now = crate::queue::db_now(conn).await?;
-    Ok(Some(to_host_clock(at, db_now, Utc::now())))
-}
-
-/// Where a redriven run's timeout window starts (issue #1832).
-///
-/// `slot` is on the database clock. Two checks read `deadline_at` on
-/// different clocks. The claim gate uses the database clock, and the timeout
-/// scanner uses the host clock. The later of the two slot readings is due on
-/// both clocks, so a window that starts there never expires before the task
-/// becomes due. Clock skew can only add time to the window.
-#[must_use]
-fn deadline_window_start(
-    slot: DateTime<Utc>,
-    db_now: DateTime<Utc>,
-    host_now: DateTime<Utc>,
-) -> DateTime<Utc> {
-    slot.max(to_host_clock(slot, db_now, host_now))
-}
-
-/// [`deadline_window_start`] for an optional slot, with the clocks read now.
-async fn deadline_slot(
-    conn: &mut AsyncPgConnection,
-    not_before: Option<DateTime<Utc>>,
-) -> HarvestResult<Option<DateTime<Utc>>> {
-    let Some(slot) = not_before else {
-        return Ok(None);
-    };
-    let db_now = crate::queue::db_now(conn).await?;
-    Ok(Some(deadline_window_start(slot, db_now, Utc::now())))
-}
-
-/// Move a database-clock instant onto the host clock (issue #1832).
-///
-/// The result is as far after `host_now` as `at` is after `db_now`.
-#[must_use]
-fn to_host_clock(
-    at: DateTime<Utc>,
-    db_now: DateTime<Utc>,
-    host_now: DateTime<Utc>,
-) -> DateTime<Utc> {
-    host_now + (at - db_now)
-}
-
-/// The enqueue parameters that put `entry` back on its queue.
-///
-/// Set `max_attempts` to the recorded attempt count, with a minimum of one.
-/// `not_before` sets `scheduled_at`. `None` keeps the immediate default.
-fn requeue_params(
-    entry: DeadLetter,
-    task_type: TaskType,
-    not_before: Option<DateTime<Utc>>,
-) -> EnqueueParams {
-    let mut params = EnqueueParams::new(entry.queue_name, task_type, entry.input);
-    params.workflow_exec_id = entry.workflow_exec_id;
-    params.activity_name = entry.activity_name;
-    params.max_attempts = entry.attempts.max(1);
-    if let Some(at) = not_before {
-        params.scheduled_at = at;
-    }
-    params
 }
 
 fn dead_letter_task_type(dead_letter_id: Uuid, task_type: &str) -> HarvestResult<TaskType> {
@@ -744,131 +559,107 @@ pub async fn replay_dead_letter(
     dead_letter_id: Uuid,
     registry: Option<&HandlerRegistry>,
 ) -> HarvestResult<Uuid> {
-    replay_dead_letter_at(conn, dead_letter_id, registry, None).await
-}
-
-/// [`replay_dead_letter`] with a `scheduled_at` for the new task (issue #1832).
-///
-/// `None` makes the task due at once. For a completion-callback entry,
-/// `not_before` sets the next delivery attempt instead.
-///
-/// # Errors
-///
-/// The same as [`replay_dead_letter`].
-pub async fn replay_dead_letter_at(
-    conn: &mut AsyncPgConnection,
-    dead_letter_id: Uuid,
-    registry: Option<&HandlerRegistry>,
-    not_before: Option<DateTime<Utc>>,
-) -> HarvestResult<Uuid> {
     use crate::schema::harvest_dead_letters::dsl;
 
-    // The re-enqueue below writes a `PENDING` task row, so it raises a dispatch
-    // hint (issue #1312). The buffering scope holds the hint until this
-    // transaction commits. `conn` may already be inside a caller's transaction.
-    // The scope does not nest. A nested call therefore leaves its hints with
-    // the outermost owner instead of publishing them early.
-    crate::dispatch::buffered_settled(Box::pin(conn.transaction::<Uuid, HarvestError, _>(
-        async |conn| {
-            let entry = dsl::harvest_dead_letters
-                .find(dead_letter_id)
-                .select(DeadLetter::as_select())
-                .for_update()
-                .first(conn)
-                .await
-                .optional()
-                .map_err(crate::error::database_error)?
-                .ok_or_else(|| HarvestError::NotFound(format!("dead-letter {dead_letter_id}")))?;
+    Box::pin(conn.transaction::<Uuid, HarvestError, _>(async |conn| {
+        let entry = dsl::harvest_dead_letters
+            .find(dead_letter_id)
+            .select(DeadLetter::as_select())
+            .for_update()
+            .first(conn)
+            .await
+            .optional()
+            .map_err(crate::error::database_error)?
+            .ok_or_else(|| HarvestError::NotFound(format!("dead-letter {dead_letter_id}")))?;
 
-            // A completion-callback dead letter (issue #605) is not a
-            // WORKFLOW/ACTIVITY task-queue row -- it represents an exhausted
-            // completion-delivery attempt, and "replay by re-enqueue" below
-            // has no meaning for it. Delegate to the delivery's own redrive
-            // primitive instead of erroring with "invalid task_type" (issue
-            // #921 review, Codex P2): the generic DLQ "replay" surface (API,
-            // bulk replay, UI) must actually redrive the delivery, not fail.
-            if entry.task_type.eq_ignore_ascii_case("callback") {
-                return redrive_callback_dead_letter(
-                    conn,
-                    dead_letter_id,
-                    entry.workflow_exec_id,
-                    entry.original_task_id,
-                    not_before,
-                )
-                .await;
-            }
+        // A completion-callback dead letter (issue #605) is not a
+        // WORKFLOW/ACTIVITY task-queue row -- it represents an exhausted
+        // completion-delivery attempt, and "replay by re-enqueue" below
+        // has no meaning for it. Delegate to the delivery's own redrive
+        // primitive instead of erroring with "invalid task_type" (issue
+        // #921 review, Codex P2): the generic DLQ "replay" surface (API,
+        // bulk replay, UI) must actually redrive the delivery, not fail.
+        if entry.task_type.eq_ignore_ascii_case("callback") {
+            return redrive_callback_dead_letter(
+                conn,
+                dead_letter_id,
+                entry.workflow_exec_id,
+                entry.original_task_id,
+            )
+            .await;
+        }
 
-            let task_type = dead_letter_task_type(dead_letter_id, &entry.task_type)?;
+        let task_type = dead_letter_task_type(dead_letter_id, &entry.task_type)?;
 
-            let mut params = requeue_params(entry, task_type, not_before);
+        let mut params = EnqueueParams::new(entry.queue_name, task_type, entry.input);
+        params.workflow_exec_id = entry.workflow_exec_id;
+        params.activity_name = entry.activity_name;
+        params.max_attempts = entry.attempts.max(1);
 
-            // Restore required_build_id and concurrency policy from the owning
-            // execution so the replayed task is subject to the same constraints.
-            if let Some(exec_id) = params.workflow_exec_id {
-                use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
-                let row: Option<(Option<String>, String, String)> =
-                    exec_dsl::harvest_workflow_executions
-                        .find(exec_id)
-                        .select((
-                            exec_dsl::assigned_build_id,
-                            exec_dsl::workflow_name,
-                            exec_dsl::state,
-                        ))
-                        .first(conn)
-                        .await
-                        .optional()
-                        .map_err(crate::error::database_error)?;
-                if let Some((build_id, workflow_name, state)) = row {
-                    // Refuse to revive a task into a workflow that has already
-                    // reached a terminal state. Re-running the activity/workflow
-                    // task would execute user code and append events against a
-                    // dead execution, corrupting its history (issue #367). This
-                    // is what makes a poison-pill activity DLQ entry — whose
-                    // owning workflow is failed at quarantine time —
-                    // non-replayable.
-                    if state != "RUNNING" {
-                        return Err(HarvestError::WorkflowNotRunning(
-                            exec_id.to_string().parse().map_err(|_| {
-                                HarvestError::Database(format!(
-                                    "execution id {exec_id} is not a valid ExecutionId"
-                                ))
-                            })?,
-                        ));
-                    }
-                    params.required_build_id = build_id;
-                    // Concurrency policy lives on WorkflowInfo and governs
-                    // workflow-task slots only.  Activity tasks are not subject
-                    // to the workflow-level cap (the claim query enforces caps
-                    // per task_type, so mixing them would throttle activities
-                    // against the wrong budget).
-                    if task_type == TaskType::Workflow
-                        && let Some(reg) = registry
-                        && let Some(info) = reg.workflows.get(&workflow_name)
-                        && let Some(policy) = &info.concurrency
-                    {
-                        params.concurrency_key = crate::concurrency::resolve_concurrency_key(
-                            policy.key_expr,
-                            &params.input,
-                        );
-                        params.max_concurrent = Some(policy.limit);
-                    }
+        // Restore required_build_id and concurrency policy from the owning
+        // execution so the replayed task is subject to the same constraints.
+        if let Some(exec_id) = params.workflow_exec_id {
+            use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
+            let row: Option<(Option<String>, String, String)> =
+                exec_dsl::harvest_workflow_executions
+                    .find(exec_id)
+                    .select((
+                        exec_dsl::assigned_build_id,
+                        exec_dsl::workflow_name,
+                        exec_dsl::state,
+                    ))
+                    .first(conn)
+                    .await
+                    .optional()
+                    .map_err(crate::error::database_error)?;
+            if let Some((build_id, workflow_name, state)) = row {
+                // Refuse to revive a task into a workflow that has already
+                // reached a terminal state. Re-running the activity/workflow
+                // task would execute user code and append events against a
+                // dead execution, corrupting its history (issue #367). This
+                // is what makes a poison-pill activity DLQ entry — whose
+                // owning workflow is failed at quarantine time —
+                // non-replayable.
+                if state != "RUNNING" {
+                    return Err(HarvestError::WorkflowNotRunning(
+                        exec_id.to_string().parse().map_err(|_| {
+                            HarvestError::Database(format!(
+                                "execution id {exec_id} is not a valid ExecutionId"
+                            ))
+                        })?,
+                    ));
+                }
+                params.required_build_id = build_id;
+                // Concurrency policy lives on WorkflowInfo and governs
+                // workflow-task slots only.  Activity tasks are not subject
+                // to the workflow-level cap (the claim query enforces caps
+                // per task_type, so mixing them would throttle activities
+                // against the wrong budget).
+                if task_type == TaskType::Workflow
+                    && let Some(reg) = registry
+                    && let Some(info) = reg.workflows.get(&workflow_name)
+                    && let Some(policy) = &info.concurrency
+                {
+                    params.concurrency_key =
+                        crate::concurrency::resolve_concurrency_key(policy.key_expr, &params.input);
+                    params.max_concurrent = Some(policy.limit);
                 }
             }
+        }
 
-            let task_id = crate::queue::enqueue(conn, &params).await?;
-            let deleted = diesel::delete(dsl::harvest_dead_letters.find(dead_letter_id))
-                .execute(conn)
-                .await
-                .map_err(crate::error::database_error)?;
-            if deleted == 0 {
-                return Err(HarvestError::NotFound(format!(
-                    "dead-letter {dead_letter_id}"
-                )));
-            }
+        let task_id = crate::queue::enqueue(conn, &params).await?;
+        let deleted = diesel::delete(dsl::harvest_dead_letters.find(dead_letter_id))
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+        if deleted == 0 {
+            return Err(HarvestError::NotFound(format!(
+                "dead-letter {dead_letter_id}"
+            )));
+        }
 
-            Ok(task_id)
-        },
-    )))
+        Ok(task_id)
+    }))
     .await
 }
 
@@ -1041,140 +832,58 @@ pub async fn bulk_replay_dead_letters(
         });
     }
 
-    let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
-    let mut result = replay_dead_letter_batch(conn, &ids, filter.spread_secs, registry).await?;
-    result.matched = matched;
-    Ok(result)
-}
+    let mut acted_on = 0usize;
+    let mut skipped = 0usize;
+    let mut acted_ids: Vec<String> = Vec::with_capacity(rows.len());
+    let mut failures: Vec<BulkDlqFailure> = Vec::with_capacity(rows.len());
 
-/// Replay the dead letters `ids`, spread over a window (issue #1832).
-///
-/// [`redrive_spread_window`] sets the window from `spread_secs`. Each row
-/// goes through [`replay_dead_letter_at`] on its own, so a per-row failure
-/// does not roll back other rows. A missing row counts as skipped. The
-/// result has `matched` at zero. The caller sets it.
-///
-/// # Errors
-///
-/// Returns [`HarvestError::Database`] if the database clock read fails.
-/// Per-row errors go into [`BulkDlqResult::failures`].
-pub async fn replay_dead_letter_batch(
-    conn: &mut AsyncPgConnection,
-    ids: &[Uuid],
-    spread_secs: Option<u64>,
-    registry: Option<&HandlerRegistry>,
-) -> HarvestResult<BulkDlqResult> {
-    let mut result = BulkDlqResult {
-        matched: 0,
-        acted_on: 0,
-        skipped: 0,
-        ids: Vec::with_capacity(ids.len()),
-        dry_run: false,
-        failures: Vec::new(),
-    };
-    let schedule = spread_schedule(conn, spread_secs, ids).await?;
-
-    for (&id, not_before) in ids.iter().zip(schedule) {
-        match replay_dead_letter_at(conn, id, registry, not_before).await {
+    for row in &rows {
+        match replay_dead_letter(conn, row.id, registry).await {
             Ok(_task_id) => {
-                result.acted_on += 1;
-                result.ids.push(id.to_string());
+                acted_on += 1;
+                acted_ids.push(row.id.to_string());
             }
-            Err(HarvestError::NotFound(_)) => result.skipped += 1,
-            Err(e) => result.failures.push(BulkDlqFailure {
-                id: id.to_string(),
-                reason: e.to_string(),
-            }),
+            Err(HarvestError::NotFound(_)) => {
+                skipped += 1;
+            }
+            Err(e) => {
+                failures.push(BulkDlqFailure {
+                    id: row.id.to_string(),
+                    reason: e.to_string(),
+                });
+            }
         }
     }
 
-    Ok(result)
-}
-
-/// The per-row `scheduled_at` for a bulk redrive of `ids` (issue #1832).
-///
-/// The base instant is the database clock, not the host clock. Workers
-/// compare `scheduled_at` with the database `NOW()` (issue #1807). A zero
-/// window reads no clock.
-async fn spread_schedule(
-    conn: &mut AsyncPgConnection,
-    spread_secs: Option<u64>,
-    ids: &[Uuid],
-) -> HarvestResult<Vec<Option<DateTime<Utc>>>> {
-    let window = redrive_spread_window(spread_secs, ids.len());
-    if window.is_zero() {
-        return Ok(vec![None; ids.len()]);
-    }
-    let now = crate::queue::db_now(conn).await?;
-    Ok(redrive_schedule(now, window, ids))
-}
-
-/// Delete several dead-letter rows by id in one statement.
-///
-/// Returns the ids that were actually deleted. An id already gone (raced
-/// discard, already replayed) is silently absent from the result, matching
-/// the per-row `deleted == 0` skip this replaces rather than erroring.
-///
-/// `id = ANY($1)` binds the id list as a single array parameter, not one
-/// bind per id. So there is no `PostgreSQL` bound-parameter ceiling to chunk
-/// against here. Contrast [`crate::audit::insert_audit_batch`], which binds
-/// a column per row via a multi-row `VALUES` list.
-///
-/// An empty slice never sends a statement.
-///
-/// # Errors
-///
-/// Returns [`HarvestError::Database`] if the delete fails. On failure the
-/// batch is atomic. No row is deleted where a per-row loop could have
-/// deleted an earlier id. It could then hit an error on a later one,
-/// leaving a mixed state. See `docs/performance-dlq-bulk-discard.md`'s
-/// "Equivalence" section for why this is a disclosed strengthening, not a
-/// weakening, of the prior guarantee.
-pub async fn discard_dead_letters_batch(
-    conn: &mut AsyncPgConnection,
-    ids: &[Uuid],
-) -> HarvestResult<Vec<Uuid>> {
-    use crate::schema::harvest_dead_letters::dsl;
-
-    if ids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    diesel::delete(dsl::harvest_dead_letters.filter(dsl::id.eq_any(ids)))
-        .returning(dsl::id)
-        .get_results(conn)
-        .await
-        .map_err(crate::error::database_error)
+    Ok(BulkDlqResult {
+        matched,
+        acted_on,
+        skipped,
+        ids: acted_ids,
+        dry_run: false,
+        failures,
+    })
 }
 
 /// Bulk discard dead-letter entries matching `filter`.
 ///
-/// All matching rows are deleted from `harvest_dead_letters` in one
-/// statement, without re-enqueueing. When `filter.dry_run` is `true`, no
-/// deletes are performed.
-///
-/// A failure of the batched delete itself (statement timeout, lock
-/// contention) is **not** returned as an `Err`. It is captured into the
-/// returned [`BulkDlqResult::failures`] instead, one [`BulkDlqFailure`] per
-/// selected id, with `acted_on` left at `0`.
-///
-/// Callers that only check the outer `Result` — including a bare `?` — will
-/// treat this as success. Inspect `failures` to detect it, exactly as
-/// callers of [`bulk_replay_dead_letters`] already must.
+/// Each matching row is deleted from `harvest_dead_letters` without
+/// re-enqueueing. A per-row failure does not affect other rows. When
+/// `filter.dry_run` is `true`, no deletes are performed.
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError::Database`] if the initial filter query (row
-/// selection or the `matched` count) fails, before any delete is
-/// attempted.
+/// Returns [`HarvestError::Database`] if the initial filter query fails.
+/// Per-row delete errors are captured in [`BulkDlqResult::failures`].
 pub async fn bulk_discard_dead_letters(
     conn: &mut AsyncPgConnection,
     filter: &BulkDlqFilter,
 ) -> HarvestResult<BulkDlqResult> {
+    use crate::schema::harvest_dead_letters::dsl;
+
     let matched = usize::try_from(count_bulk_filter_matches(conn, filter).await?).unwrap_or(0);
     let rows = query_dead_letters_for_bulk(conn, filter).await?;
-    let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
-    let preview_ids: Vec<String> = ids.iter().map(ToString::to_string).collect();
+    let preview_ids: Vec<String> = rows.iter().map(|r| r.id.to_string()).collect();
 
     if filter.dry_run {
         return Ok(BulkDlqResult {
@@ -1187,47 +896,41 @@ pub async fn bulk_discard_dead_letters(
         });
     }
 
-    // A batch failure is captured into `failures` for every selected id,
-    // rather than propagated. This matches the API layer's
-    // `bulk_discard_dead_letters_for_selector`, kept in sync per this
-    // module's own convention -- see that function's doc comment for why.
-    match discard_dead_letters_batch(conn, &ids).await {
-        Ok(deleted_ids) => {
-            let deleted: std::collections::HashSet<Uuid> = deleted_ids.into_iter().collect();
-            let acted_ids: Vec<String> = ids
-                .iter()
-                .filter(|id| deleted.contains(id))
-                .map(ToString::to_string)
-                .collect();
-            let acted_on = acted_ids.len();
-            let skipped = ids.len() - acted_on;
-            Ok(BulkDlqResult {
-                matched,
-                acted_on,
-                skipped,
-                ids: acted_ids,
-                dry_run: false,
-                failures: Vec::new(),
-            })
-        }
-        Err(e) => {
-            let reason = e.to_string();
-            Ok(BulkDlqResult {
-                matched,
-                acted_on: 0,
-                skipped: 0,
-                ids: Vec::new(),
-                dry_run: false,
-                failures: ids
-                    .iter()
-                    .map(|id| BulkDlqFailure {
-                        id: id.to_string(),
-                        reason: reason.clone(),
-                    })
-                    .collect(),
-            })
+    let mut acted_on = 0usize;
+    let mut skipped = 0usize;
+    let mut acted_ids: Vec<String> = Vec::with_capacity(rows.len());
+    let mut failures: Vec<BulkDlqFailure> = Vec::with_capacity(rows.len());
+
+    for row in &rows {
+        match diesel::delete(dsl::harvest_dead_letters.find(row.id))
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)
+        {
+            Ok(0) => {
+                skipped += 1;
+            }
+            Ok(_) => {
+                acted_on += 1;
+                acted_ids.push(row.id.to_string());
+            }
+            Err(e) => {
+                failures.push(BulkDlqFailure {
+                    id: row.id.to_string(),
+                    reason: e.to_string(),
+                });
+            }
         }
     }
+
+    Ok(BulkDlqResult {
+        matched,
+        acted_on,
+        skipped,
+        ids: acted_ids,
+        dry_run: false,
+        failures,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1341,29 +1044,9 @@ pub async fn redrive_dead_letter(
     registry: Option<&HandlerRegistry>,
     reason: Option<&str>,
 ) -> HarvestResult<RedriveOutcome> {
-    redrive_dead_letter_at(conn, dead_letter_id, registry, reason, None).await
-}
-
-/// [`redrive_dead_letter`] with a `scheduled_at` for the new task (issue #1832).
-///
-/// `None` makes the task due at once. For a completion-callback entry,
-/// `not_before` sets the next delivery attempt instead.
-///
-/// # Errors
-///
-/// The same as [`redrive_dead_letter`].
-pub async fn redrive_dead_letter_at(
-    conn: &mut AsyncPgConnection,
-    dead_letter_id: Uuid,
-    registry: Option<&HandlerRegistry>,
-    reason: Option<&str>,
-    not_before: Option<DateTime<Utc>>,
-) -> HarvestResult<RedriveOutcome> {
     use crate::schema::harvest_dead_letters::dsl;
 
-    // Same buffering scope as `replay_dead_letter`: the re-enqueue raises a
-    // dispatch hint, and the hint waits for the commit (issue #1312).
-    crate::dispatch::buffered_settled(Box::pin(
+    Box::pin(
         conn.transaction::<RedriveOutcome, HarvestError, _>(async |conn| {
             let Some(entry) = dsl::harvest_dead_letters
                 .find(dead_letter_id)
@@ -1388,7 +1071,6 @@ pub async fn redrive_dead_letter_at(
                     dead_letter_id,
                     entry.workflow_exec_id,
                     entry.original_task_id,
-                    not_before,
                 )
                 .await
                 {
@@ -1400,9 +1082,13 @@ pub async fn redrive_dead_letter_at(
 
             let task_type = dead_letter_task_type(dead_letter_id, &entry.task_type)?;
 
-            let mut params = requeue_params(entry, task_type, not_before);
+            let mut params =
+                EnqueueParams::new(entry.queue_name.clone(), task_type, entry.input.clone());
+            params.workflow_exec_id = entry.workflow_exec_id;
+            params.activity_name = entry.activity_name.clone();
+            params.max_attempts = entry.attempts.max(1);
 
-            if let Some(exec_uuid) = params.workflow_exec_id {
+            if let Some(exec_uuid) = entry.workflow_exec_id {
                 use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
                 let row: Option<(Option<String>, String, String)> =
                     exec_dsl::harvest_workflow_executions
@@ -1437,14 +1123,11 @@ pub async fn redrive_dead_letter_at(
                     // sealed FAILED at quarantine time so it can resume.
                     "FAILED" => {
                         let exec_id = crate::types::ExecutionId::from_uuid(exec_uuid);
-                        // The window must start after the slot on both clocks.
-                        let slot = deadline_slot(conn, not_before).await?;
-                        crate::execution::reactivate_failed_execution_at(
+                        crate::execution::reactivate_failed_execution(
                             conn,
                             exec_id,
                             dead_letter_id,
                             reason,
-                            slot,
                         )
                         .await?;
                     }
@@ -1477,7 +1160,7 @@ pub async fn redrive_dead_letter_at(
 
             Ok(RedriveOutcome::Redriven(task_id))
         }),
-    ))
+    )
     .await
 }
 
@@ -1519,11 +1202,9 @@ pub async fn redrive_dead_letters(
     let mut skipped = 0usize;
     let mut ids: Vec<String> = Vec::with_capacity(rows.len());
     let mut failures: Vec<BulkDlqFailure> = Vec::new();
-    let row_ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
-    let schedule = spread_schedule(conn, filter.spread_secs, &row_ids).await?;
 
-    for (row, not_before) in rows.iter().zip(schedule) {
-        match redrive_dead_letter_at(conn, row.id, registry, reason, not_before).await {
+    for row in &rows {
+        match redrive_dead_letter(conn, row.id, registry, reason).await {
             Ok(RedriveOutcome::Redriven(_task_id)) => {
                 redriven += 1;
                 ids.push(row.id.to_string());
@@ -2154,24 +1835,19 @@ pub fn merge_dlq_aggregates(
         total += partial.total;
         filtered_total += partial.filtered_total;
         for group in partial.groups {
-            let DlqRawGroup {
-                key,
-                count,
-                first_seen,
-                last_seen,
-                sample_ids,
-            } = group;
-            let entry = merged.entry(key.clone()).or_insert_with(|| DlqRawGroup {
-                key,
-                count: 0,
-                first_seen: None,
-                last_seen: None,
-                sample_ids: Vec::new(),
-            });
-            entry.count += count;
-            entry.first_seen = min_instant(entry.first_seen, first_seen);
-            entry.last_seen = max_instant(entry.last_seen, last_seen);
-            for id in sample_ids {
+            let entry = merged
+                .entry(group.key.clone())
+                .or_insert_with(|| DlqRawGroup {
+                    key: group.key.clone(),
+                    count: 0,
+                    first_seen: None,
+                    last_seen: None,
+                    sample_ids: Vec::new(),
+                });
+            entry.count += group.count;
+            entry.first_seen = min_instant(entry.first_seen, group.first_seen);
+            entry.last_seen = max_instant(entry.last_seen, group.last_seen);
+            for id in group.sample_ids {
                 if entry.sample_ids.len() < params.samples_per_group as usize {
                     entry.sample_ids.push(id);
                 }
@@ -2179,7 +1855,10 @@ pub fn merge_dlq_aggregates(
         }
     }
 
-    let groups: Vec<(Vec<Option<String>>, DlqRawGroup)> = merged.into_iter().collect();
+    let groups: Vec<(Vec<Option<String>>, DlqRawGroup)> = merged
+        .into_values()
+        .map(|group| (group.key.clone(), group))
+        .collect();
     let limit = params.limit_groups as usize;
 
     let (groups, truncated) = rollup_top_n(
@@ -2591,24 +2270,6 @@ mod tests {
     }
 
     #[test]
-    fn dead_letter_reason_history_bytes_cap_is_typed_json() {
-        // Issue #1804: the byte cap has its own typed reason.
-        let reason = DeadLetterReason::HistoryBytesCapExceeded {
-            bytes: 52_428_801,
-            cap: 52_428_800,
-            workflow_type: "billing_poll".into(),
-        };
-
-        let json = reason.to_string();
-        let back: DeadLetterReason =
-            serde_json::from_str(&json).expect("typed reason should deserialize");
-
-        assert_eq!(back, reason);
-        assert_eq!(dlq_reason(&json), "history_bytes_cap_exceeded");
-        assert_eq!(error_class(&json), "HistoryBytesCapExceeded");
-    }
-
-    #[test]
     fn dead_letter_reason_poison_pill_is_typed_json() {
         let reason = DeadLetterReason::PoisonPill {
             crash_strikes: 3,
@@ -2771,142 +2432,6 @@ mod tests {
         assert_eq!(filter.effective_limit(), 1);
     }
 
-    // ── Redrive spread (issue #1832) ─────────────────────────────────────
-
-    use std::time::Duration as StdDuration;
-
-    #[test]
-    fn spread_window_honours_an_explicit_value() {
-        assert_eq!(
-            redrive_spread_window(Some(60), 1000),
-            StdDuration::from_secs(60)
-        );
-        assert_eq!(
-            redrive_spread_window(Some(60), 1),
-            StdDuration::from_secs(60)
-        );
-        assert_eq!(redrive_spread_window(Some(0), 1000), StdDuration::ZERO);
-    }
-
-    #[test]
-    fn spread_window_caps_an_explicit_value() {
-        assert_eq!(
-            redrive_spread_window(Some(u64::MAX), 10),
-            StdDuration::from_secs(MAX_REDRIVE_SPREAD_SECS)
-        );
-    }
-
-    #[test]
-    fn spread_window_default_is_pro_rated_by_batch_size() {
-        assert_eq!(redrive_spread_window(None, 1000), DEFAULT_REDRIVE_SPREAD);
-        assert_eq!(redrive_spread_window(None, 100), StdDuration::from_secs(6));
-        assert_eq!(redrive_spread_window(None, 1), StdDuration::from_millis(60));
-        assert_eq!(redrive_spread_window(None, 0), StdDuration::ZERO);
-        // More rows than the bulk cap never exceed the default window.
-        assert_eq!(redrive_spread_window(None, 5000), DEFAULT_REDRIVE_SPREAD);
-    }
-
-    #[test]
-    fn spread_offset_stays_inside_its_slot() {
-        let window = StdDuration::from_secs(60);
-        let count = 1000;
-        let slot = window / 1000;
-        for index in 0..count {
-            for seed in [0, 1, u64::MAX / 2, u64::MAX] {
-                let offset = redrive_spread_offset(index, count, window, seed);
-                let start = slot * u32::try_from(index).unwrap();
-                assert!(
-                    offset >= start && offset < start + slot,
-                    "row {index} seed {seed}: {offset:?} outside slot {start:?}+{slot:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn spread_offset_jitters_by_seed() {
-        let window = StdDuration::from_secs(60);
-        let offsets: std::collections::HashSet<_> = (0..20_u64)
-            .map(|seed| redrive_spread_offset(3, 10, window, seed.wrapping_mul(0x9e37_79b9)))
-            .collect();
-        assert!(offsets.len() > 1, "seeds must move a row inside its slot");
-        assert_eq!(
-            redrive_spread_offset(3, 10, window, 42),
-            redrive_spread_offset(3, 10, window, 42),
-            "the offset is deterministic"
-        );
-    }
-
-    #[test]
-    fn spread_offset_is_zero_for_an_empty_window() {
-        assert_eq!(
-            redrive_spread_offset(5, 10, StdDuration::ZERO, 7),
-            StdDuration::ZERO
-        );
-    }
-
-    #[test]
-    fn deadline_window_starts_after_the_slot_on_both_clocks() {
-        let db_now = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let slot = db_now + chrono::Duration::seconds(45);
-        // Host 30 s behind the database: the database-clock slot is later.
-        let behind = db_now - chrono::Duration::seconds(30);
-        assert_eq!(deadline_window_start(slot, db_now, behind), slot);
-        // Host 30 s ahead: the host-clock slot is later.
-        let ahead = db_now + chrono::Duration::seconds(30);
-        assert_eq!(
-            deadline_window_start(slot, db_now, ahead),
-            ahead + chrono::Duration::seconds(45)
-        );
-    }
-
-    #[test]
-    fn to_host_clock_keeps_the_offset_across_clock_skew() {
-        let db_now = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        // The host runs 30 s ahead of the database.
-        let host_now = db_now + chrono::Duration::seconds(30);
-        let at = db_now + chrono::Duration::seconds(45);
-        assert_eq!(
-            to_host_clock(at, db_now, host_now),
-            host_now + chrono::Duration::seconds(45)
-        );
-    }
-
-    #[test]
-    fn schedule_with_no_window_is_immediate() {
-        let ids: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
-        assert_eq!(
-            redrive_schedule(Utc::now(), StdDuration::ZERO, &ids),
-            vec![None; 5]
-        );
-    }
-
-    #[test]
-    fn schedule_of_1000_rows_spreads_across_the_window() {
-        // Issue #1832 AC: 1000 redriven tasks spread across the window.
-        let now = Utc::now();
-        let window = StdDuration::from_secs(60);
-        let ids: Vec<Uuid> = (0..1000).map(|_| Uuid::new_v4()).collect();
-        let schedule = redrive_schedule(now, window, &ids);
-        assert_eq!(schedule.len(), 1000);
-
-        let mut buckets = [0_u32; 10];
-        let mut distinct = std::collections::HashSet::new();
-        for at in &schedule {
-            let at = at.expect("a non-zero window schedules every row");
-            let offset = (at - now).to_std().expect("never before now");
-            assert!(offset < window, "{offset:?} is past the window");
-            buckets[usize::try_from(offset.as_secs() / 6).unwrap()] += 1;
-            distinct.insert(at);
-        }
-        assert_eq!(distinct.len(), 1000, "no two rows share an instant");
-        assert_eq!(buckets, [100; 10], "each 6 s bucket gets 100 rows");
-    }
-
     #[test]
     fn bulk_filter_effective_limit_clamps_at_1000() {
         let filter = BulkDlqFilter {
@@ -2936,7 +2461,6 @@ mod tests {
             failure_signature: None,
             limit: Some(200),
             dry_run: true,
-            spread_secs: Some(30),
         };
         let json = serde_json::to_string(&filter).unwrap();
         let back: BulkDlqFilter = serde_json::from_str(&json).unwrap();

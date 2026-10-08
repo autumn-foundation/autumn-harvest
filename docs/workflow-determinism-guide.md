@@ -180,8 +180,6 @@ Direct sleeps block the worker task and write nothing to `harvest_events`. After
 | **Disallowed** | `tokio::spawn(async { do_work().await });` |
 | **Disallowed** | `std::thread::spawn(|| heavy_computation());` |
 | **Allowed** | `futures::join!(ctx.execute_activity_raw("a", input, "q"), ctx.execute_activity_raw("b", input, "q"))` |
-| **Allowed** | `futures::join!(ctx.execute_activity_raw("a", input, "q"), ctx.timer("deadline", 30))` — any mix of *durable* ctx awaitables: activities, timers, signal waits, child workflows (issue #950) |
-| **Disallowed** | `futures::join!(ctx.execute_local_activity_raw(..), ctx.timer(..))` — an inline local activity cannot share a durable suspension batch; rejected with a typed error (issue #950) |
 | **Allowed** | `#[activity(local = true)]` for lightweight in-process work |
 
 Spawned tasks run outside Harvest supervision: they are not retried, not recorded, and are silently abandoned on worker restart.
@@ -346,7 +344,6 @@ HVG009 is a **Warning** (not a HardBlocker): bare tracing calls do not break det
 | **Disallowed** | `futures::future::select(fut_a, fut_b).await` (also `select_all` / `select_ok` / `try_select`) |
 | **Allowed** | `ctx.race().timer(Duration::from_secs(60)).signal("approve").run().await?` |
 | **Allowed** | `ctx.race().activity_raw("fetch_a", input, "q").activity_raw("fetch_b", input, "q").run().await?` |
-| **Allowed** | `ctx.race().activity_raw("fetch", input, "q").timer(Duration::from_secs(30)).signal("abort").run().await?` |
 
 HVG010 flags both the select **macros** (`tokio::select!`, `futures::select!`, `futures::select_biased!`) and their function-call siblings, the `futures::future::{select, select_all, select_ok, try_select}` **combinators** (issue #799) — they carry the identical footgun. (Inside an `#[activity]` body `select!` is fine: only the activity's recorded *result* matters, not its internal control flow, so activities may race freely.)
 
@@ -383,7 +380,7 @@ async fn hedge_providers(ctx: &WorkflowContext, req: Value) -> Result<Value, Str
 }
 ```
 
-`ctx.race()` accepts **any combination** of ctx-managed awaitables in one call (issue #950): activities, child workflows, `.timer(..)` deadlines and `.signal(..)` waits compose freely, so hedging a slow activity against a deadline, awaiting a child under a timeout, and listening for an abort signal while an activity runs are all expressible directly. The whole heterogeneous batch is persisted by the worker in one transaction, and each branch resolves independently as its own event arrives. A losing timer's still-armed durable row is deleted by the same `CancelRaceLosers` teardown that cancels a losing activity or child; a losing signal needs no teardown (an undelivered signal stays observable to a later wait). An inline **local activity** cannot join a mixed batch at all: it resolves *within* the decision cycle rather than parking, so `futures::join!(ctx.execute_local_activity_raw(..), ctx.timer(..))` is rejected with a typed `HarvestError::Config` naming the sibling commands rather than silently dropping them (which is what happened before #950 — the deadline was armed a whole decision cycle late with no error anywhere). `ctx.race()` has no local-activity branch, so that rejection can only arise from `join!`/`try_join!`. The exactly-one-timer + exactly-one-signal pair keeps its dedicated pre-#950 implementation (a thin wrapper over `receive_signal_timeout`/`wait_for_signal_timeout`, issue #476) so histories recorded before #950 replay unchanged — it records the reserved `__signal_timeout:{seq}:{name}` timer id, no `race:{seq}` marker, and fixed role-based winner indices. See the `WorkflowContext::race` rustdoc for the full determinism contract.
+`ctx.race()` currently supports three shapes in one call: a homogeneous race of activity branches, a homogeneous race of child-workflow branches, or exactly one timer branch paired with exactly one signal branch (a thin wrapper over `receive_signal_timeout`/`wait_for_signal_timeout`, issue #476). Mixing branch kinds (e.g. an activity racing a timer in the same call) is out of scope for this slice and returns `HarvestError::Config` — bound an individual activity with its own `start_to_close`/`schedule_to_close` timeout, or compose a separate `receive_signal_timeout`, to express a deadline-bounded branch instead. See the `WorkflowContext::race` rustdoc for the full determinism contract.
 
 #### Guardrail severity
 
@@ -645,103 +642,6 @@ artifact so it lands in the same reviewable diff.
 Like `det-check`, it needs no database and no services, so it belongs in the
 same cheap lint job. See **[the schema-contract guide](workflow-schema-contract-guide.md)**
 for the full ruleset, the generator, the escape hatch, and CI/pre-commit recipes.
-
----
-
-## The semantic second line: `harvest-verify`
-
-Everything above this section is **syntactic**. The `#[workflow]` guardrails scan
-the annotated body for token patterns; `det-check` extends the same tables across
-exactly **one hop**, to a bare free-function call declared in the caller's own
-module. That is deliberate — it is what keeps the layer sub-second, always-on and
-free of false positives — and the "Known limitations" section above is an honest
-catalogue of what it costs: every limitation listed there is a false **negative**.
-
-Three of those false negatives are structural rather than incidental:
-
-- **Reach.** `Uuid::new_v4()` is listed verbatim by *both* HVG002 and DET003 — and
-  moving it one crate away turns two fully-covered rules into a miss. Rule coverage
-  is not protection.
-- **Values.** Neither layer tracks data, so a `static AtomicU64` read three helpers
-  deep, a `RefCell` cursor captured in a closure, or a `HashMap` arriving as a
-  *function parameter* (HVG011/DET010 track only local bindings) is invisible —
-  the last one even when written inline.
-- **A class with no rule at all.** `ctx.is_replaying()` and
-  `ctx.history_event_count()` return different values live and on replay. Branching
-  command-affecting logic on either diverges by construction, and no HVG or DET
-  rule mentions them.
-
-`cargo harvest-verify` ([issue #962](https://github.com/autumn-foundation/autumn-harvest/issues/962))
-is the **second line** that attacks the false-negative side. It asks stable rustc
-for the textual MIR of your workflow targets, resolves the call graph through
-helpers, closures, trait impls, generic instantiations and first-party crates, and
-runs a taint analysis from non-deterministic sources to command-emitting sinks.
-Each `#[workflow]` fn gets one of three verdicts — `proven-deterministic`,
-`nondeterminism-found` (with a source→sink trace naming every helper on the path),
-or `unknown` (with the analysis boundary named). It is an R&D prototype, opt-in,
-and a build-time tool with no engine footprint.
-
-**What it costs and what it catches, measured on this repository.** Over the 43
-example targets that build under `--no-default-features --features testing` — 57
-`#[workflow]` fns — the tool reports 56 proven, 0 unknown, 0 found and 1
-allowlisted entry: a 1.8% flag rate against its own 10% budget, in ~17 seconds
-warm (1 min 47 s cold). Against the seeded corpus of 29 non-deterministic
-workflows that the *entire* syntactic layer passes cleanly, it detects **29 of
-29**, each with a fully named cross-crate trace. It also runs over this repo's
-`#[workflow]` **test** corpus — `--test <NAME>` analyzes an integration-test
-target the same way `--example` analyzes an example — where 88 of 88 workflows
-come back `proven-deterministic` with no allowlist entry needed at all.
-
-**In CI it is two jobs, not one.** `harvest-verify` runs the crate's own tests,
-the false-positive metric over `examples/`, and a non-strict gate over
-`--all-examples`. `harvest-verify-tests` runs the same gate over
-`--test integration`; it is separate because it costs 478 s and a 7 GB target
-directory, which would blow the < 5 min budget the examples gate is measured
-against. Both are non-strict — `unknown` warns, only a finding fails — and both
-jobs' load-bearing steps are asserted by `autumn-harvest-verify/tests/ci_wiring.rs`,
-so deleting a step cannot leave a green, silent build.
-
-> **Before you trust a clean verdict, check the toolchain.** During this issue a
-> rustc upgrade (`1.94.1 → 1.98.0`) changed how one family of types is *spelled*
-> in MIR output, and five known-bad workflows quietly started reporting
-> `proven-deterministic` — no warning, no boundary raised, `unknown` count still
-> zero. The MIR parser handled the upgrade perfectly; the analyzer's model did
-> not, and nothing in the tool's output said so. It was caught only because the
-> seeded corpus is asserted in CI, and it is fixed — as are the two ratchets that
-> would have named it on the day it happened:
-> `corpus::every_seeded_case_is_detected` pins the exact seeded-case count rather
-> than a 90% threshold, and
-> `model_rowfire::every_model_row_either_fires_on_the_corpus_or_is_recorded_as_unfired`
-> diffs the model rows that match nothing against a checked-in list. The tool's
-> version warning no longer over-promises either: stable 1.94–1.98 are the
-> exercised set and do not warn at all, and anything outside it is told that
-> model rows may stop matching — not that a format change "never" produces a
-> wrong verdict.
-> **Re-run the corpus after any toolchain change**, and read
-> [§A measured instance of coverage rot](rnd/determinism-static-analysis.md#a-measured-instance-of-coverage-rot)
-> before treating this layer as a defence rather than an experiment. The
-> guardrails and `det-check` above are unaffected — they are compile-time and
-> token-based, which is exactly the tradeoff the two layers exist to make.
-
-- **[`harvest-verify.md`](harvest-verify.md)** — the user guide: how to run it,
-  every flag, the exit-code contract, how to read a trace, the allowlist format,
-  extending the model without a tool release, and a GitHub Actions recipe.
-- **[`rnd/determinism-static-analysis.md`](rnd/determinism-static-analysis.md)** —
-  the feasibility report: the substrates that were weighed, the taint model, the
-  **twelve named soundness boundaries**, the success metrics with the test that
-  asserts each, and the go/no-go. Read the boundaries section before quoting a
-  verdict: `proven-deterministic` means *"no non-determinism found, under model M,
-  up to boundaries B"*, and the tool prints the model and the boundary set with
-  every run for exactly that reason.
-
-**Nothing here retires.** The report answers that question rule by rule across all
-22 HVG and DET rules, and the answer is that the syntactic layer stays exactly as
-it is. Two reasons: `tokio::select!` leaves no residual token in MIR, so
-HVG010/DET011 remain the *only* defence against select-style racing; and trading
-an always-on, sub-second, compile-time hard blocker for an opt-in, build-heavy
-check would be a net safety regression. The layers compose — fast first line, deep
-second line — and both are still static analysis, with `WorkflowReplayer` and the
-live `HistoryMatcher` as the backstops once a history exists.
 
 ---
 

@@ -92,7 +92,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 static TEST_SERIAL: Mutex<()> = Mutex::new(());
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::test_init_sql().as_bytes().to_vec()
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
 }
 
 async fn setup_db() -> (String, Option<ContainerAsync<Postgres>>) {
@@ -163,7 +163,7 @@ fn start_params<'a>(
         workflow_name,
         workflow_id,
         exec_id,
-        input: json!(null).into(),
+        input: json!(null),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,

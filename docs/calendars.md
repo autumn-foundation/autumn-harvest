@@ -10,7 +10,7 @@ Three calendars are seeded by the `20260519000000_harvest_calendar_awareness` mi
 
 | Name | Description |
 |------|-------------|
-| `weekends-off` | Saturday and Sunday (rolling; no fixed exclusion rows — the `exclude_weekends` flag of `apply_skip_policy` covers it) |
+| `weekends-off` | Saturday and Sunday (rolling; no fixed exclusion rows — handled by day-of-week logic built into `apply_skip_policy`) |
 | `us-federal-holidays` | US federal public holidays for 2025–2026 |
 | `nyse` | NYSE market holidays for 2025–2026 |
 
@@ -23,8 +23,8 @@ Built-in calendars (`built_in = true`) cannot be deleted via `DELETE /calendars/
 | Value | Behaviour when fire date is excluded |
 |-------|--------------------------------------|
 | `skip` (default) | Drop the firing; record `harvest.schedule.skipped` metric with `reason = "calendar"`. The schedule advances to the next computed fire time. |
-| `run_next_business_day` | Advance to the nearest non-excluded weekday **after** the excluded date. The target is never a Saturday or Sunday. The scan covers up to 365 days. |
-| `run_prev_business_day` | Retreat to the nearest non-excluded weekday **before** the excluded date. The target is never a Saturday or Sunday. The scan covers up to 365 days. |
+| `run_next_business_day` | Advance to the nearest non-excluded weekday **after** the excluded date (scans forward up to 365 days). |
+| `run_prev_business_day` | Retreat to the nearest non-excluded weekday **before** the excluded date (scans backward up to 365 days). |
 
 ---
 
@@ -146,7 +146,7 @@ Response:
 Pure functions are available without the `db` feature:
 
 ```rust
-use autumn_harvest::calendar::{apply_skip_policy, calendar_excludes_weekends};
+use autumn_harvest::calendar::{is_excluded_date, apply_skip_policy};
 use autumn_harvest::policy::SkipPolicy;
 use chrono::NaiveDate;
 
@@ -154,27 +154,15 @@ let excluded = vec![
     NaiveDate::from_ymd_opt(2026, 1, 19).unwrap(), // MLK Day
 ];
 
-// The scheduler derives this flag from the calendar name.
-let exclude_weekends = calendar_excludes_weekends("us-federal-holidays");
-assert!(!exclude_weekends);
-
 let fire_date = NaiveDate::from_ymd_opt(2026, 1, 19).unwrap();
 
 // Returns None → skip
-assert!(apply_skip_policy(fire_date, SkipPolicy::Skip, &excluded, exclude_weekends).is_none());
+assert!(apply_skip_policy(fire_date, SkipPolicy::Skip, &excluded).is_none());
 
 // Returns Some(2026-01-20) → Tuesday after the holiday
-let next = apply_skip_policy(
-    fire_date,
-    SkipPolicy::RunNextBusinessDay,
-    &excluded,
-    exclude_weekends,
-);
+let next = apply_skip_policy(fire_date, SkipPolicy::RunNextBusinessDay, &excluded);
 assert_eq!(next, NaiveDate::from_ymd_opt(2026, 1, 20));
 ```
-
-Pass `calendar_excludes_weekends(name)` as the fourth argument to match the scheduler.
-That function returns `true` only for `weekends-off`.
 
 ---
 
@@ -182,7 +170,7 @@ That function returns `true` only for `weekends-off`.
 
 When a firing is suppressed by the calendar, the scheduler emits:
 
-```text
+```
 harvest.schedule.skipped{workflow="generate_payroll", queue="default", reason="calendar"}
 ```
 
@@ -193,6 +181,5 @@ This is separate from `reason="overlap"` skips (overlap policy) so dashboards ca
 ## Notes
 
 - Calendar filtering happens **after** jitter is applied and **before** overlap policy evaluation. The effective fire time shown in the preview already includes jitter.
-- `weekends-off` sets `exclude_weekends = true` in `apply_skip_policy`. Saturday and Sunday are then excluded whatever the exclusion rows say.
-- A shift target is a weekday for every calendar, not only `weekends-off`. A weekend slot that is not excluded keeps its date, because only the shift scan applies the weekday rule.
+- `weekends-off` is enforced by `apply_skip_policy` checking `weekday()` on the candidate date directly; Saturday and Sunday are never "business days" regardless of what exclusion rows say.
 - If a calendar is deleted while schedules still reference it, those schedules degrade gracefully to no filtering (the calendar lookup returns an empty exclusion set).

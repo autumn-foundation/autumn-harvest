@@ -91,13 +91,17 @@ To keep database queries fast and scalable, activity requirements are stored in 
 
 ## Monitoring and Triage
 
-When tasks seem stuck, you can inspect the fleet capability state using the dashboard or HTTP endpoints.
+When tasks seem stuck, you can inspect the fleet capability state using the dashboard, CLI, or HTTP endpoints.
 
 ### Query Capable Workers
-To find out which workers can run a specific activity, use the `capable_of` query parameter (the `harvest worker list` CLI command filters by queue, shard, status, and health, but has no capability filter of its own):
+To find out which workers can run a specific activity, use the `capable_of` parameter:
 
 ```bash
+# HTTP API
 curl -s "http://localhost:3000/api/harvest/workers?capable_of=transcode_video" | jq .
+
+# CLI
+harvest worker list --capable-of transcode_video
 ```
 
 ### Eligibility Triage
@@ -184,9 +188,8 @@ soon as all positive-weight queues are drained.
 ### Composition with within-queue priority (#249)
 
 Weights decide **which queue** to claim from. Once a queue is selected, the
-standard claim order picks the best row within that queue: `priority`, then
-the claim-order due time. See
-[`operations/claim-order.md`](../operations/claim-order.md).
+standard `ORDER BY priority DESC, scheduled_at ASC` SQL ordering picks the best
+row within that queue — fully unchanged.
 
 ### Observability
 

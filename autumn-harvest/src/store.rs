@@ -86,18 +86,6 @@ type WorkflowChildProjection = (
     Option<String>,
 );
 
-/// The identity codec registry used by every non-codec-aware call site.
-///
-/// A `PayloadCodecs::default()` now allocates an `Arc<RwLock<_>>` and a
-/// `String` for its rotation state (issue #948), and `append_events` /
-/// `events_to_insert_rows*` are on the worker's hot write path with 20+ call
-/// sites — constructing a throwaway registry per append would be a real, if
-/// small, regression for every deployment. One shared instance costs nothing
-/// and behaves identically: it registers no keyed codec, so its rotation state
-/// is inert.
-pub(crate) static DEFAULT_PAYLOAD_CODECS: std::sync::LazyLock<crate::payload_codec::PayloadCodecs> =
-    std::sync::LazyLock::new(crate::payload_codec::PayloadCodecs::default);
-
 /// Convert in-memory events to insertable rows with sequential event IDs
 /// starting from 0.
 ///
@@ -107,7 +95,12 @@ pub fn events_to_insert_rows(
     exec_id: ExecutionId,
     events: &[WorkflowEvent],
 ) -> Result<Vec<NewHarvestEvent<'_>>, crate::error::HarvestError> {
-    events_to_insert_rows_from_with_codecs(exec_id, events, 0, &DEFAULT_PAYLOAD_CODECS)
+    events_to_insert_rows_from_with_codecs(
+        exec_id,
+        events,
+        0,
+        &crate::payload_codec::PayloadCodecs::default(),
+    )
 }
 
 /// Convert in-memory events to insertable rows with sequential event IDs
@@ -125,7 +118,12 @@ pub fn events_to_insert_rows_from(
     events: &[WorkflowEvent],
     start_id: i32,
 ) -> Result<Vec<NewHarvestEvent<'_>>, crate::error::HarvestError> {
-    events_to_insert_rows_from_with_codecs(exec_id, events, start_id, &DEFAULT_PAYLOAD_CODECS)
+    events_to_insert_rows_from_with_codecs(
+        exec_id,
+        events,
+        start_id,
+        &crate::payload_codec::PayloadCodecs::default(),
+    )
 }
 
 pub fn events_to_insert_rows_from_with_codecs<'a>(
@@ -170,34 +168,17 @@ pub async fn append_events(
     events: &[WorkflowEvent],
     start_id: i32,
 ) -> HarvestResult<usize> {
-    append_events_with_codecs(conn, exec_id, events, start_id, &DEFAULT_PAYLOAD_CODECS).await
-}
-
-/// Append events, encoding payload-bearing fields through `codecs` (issue #948).
-///
-/// The codec-aware sibling of [`append_events`], which delegates here with the
-/// identity registry. Payloads are encoded under `codecs`' **active** key, so a
-/// write issued after a rotation lands under the new key even when the caller
-/// captured its registry clone before the flip — the rotation state is shared
-/// across clones for exactly this reason.
-///
-/// # Errors
-///
-/// Returns [`crate::error::HarvestError::Database`] if the INSERT fails, or a
-/// codec error if encoding a payload fails.
-pub async fn append_events_with_codecs(
-    conn: &mut AsyncPgConnection,
-    exec_id: ExecutionId,
-    events: &[WorkflowEvent],
-    start_id: i32,
-    codecs: &crate::payload_codec::PayloadCodecs,
-) -> HarvestResult<usize> {
     if events.is_empty() {
         return Ok(0);
     }
 
-    let rows = events_to_insert_rows_from_with_codecs(exec_id, events, start_id, codecs)?;
-    let inserted = insert_event_rows(conn, exec_id, &rows).await?;
+    let rows = events_to_insert_rows_from(exec_id, events, start_id)?;
+
+    let inserted = diesel::insert_into(harvest_events::table)
+        .values(&rows)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
 
     if let Some(last_event) = events.last() {
         crate::notify::notify_workflow_events_appended(
@@ -210,109 +191,6 @@ pub async fn append_events_with_codecs(
     }
 
     Ok(inserted)
-}
-
-/// Insert prepared event rows behind the DR write fence. Stages no NOTIFY.
-async fn insert_event_rows(
-    conn: &mut AsyncPgConnection,
-    exec_id: ExecutionId,
-    rows: &[NewHarvestEvent<'_>],
-) -> HarvestResult<usize> {
-    // Cross-region DR write-authority fence (issue #954).
-    //
-    // Callers skip an empty append — it writes nothing, so there is nothing to
-    // fence. When fencing is on, the fence runs in the **same
-    // transaction** as the INSERT. That pairing is the whole guarantee: the
-    // fence read's `ACCESS SHARE` is what blocks `bump_generation`'s
-    // `ACCESS EXCLUSIVE`, and a lock taken by an autocommit statement is
-    // released at statement end. Checked-then-inserted across two autocommit
-    // statements, a concurrent `harvest dr fence` could commit in between and
-    // the stale worker would still append history the operator had been told
-    // was fenced off.
-    //
-    // Most callers already hold a transaction, in which case `transaction()`
-    // opens a savepoint and the outer lock already covers this. The wrapper is
-    // skipped entirely when fencing is off, so the pre-#954 path is unchanged:
-    // no fence read, no savepoint, one INSERT.
-    if crate::replication::FenceRegistry::is_enabled() {
-        Box::pin(
-            conn.transaction::<usize, crate::error::HarvestError, _>(async |conn| {
-                crate::replication::assert_fence(conn, exec_id.shard()).await?;
-                diesel::insert_into(harvest_events::table)
-                    .values(rows)
-                    .execute(conn)
-                    .await
-                    .map_err(crate::error::database_error)
-            }),
-        )
-        .await
-    } else {
-        diesel::insert_into(harvest_events::table)
-            .values(rows)
-            .execute(conn)
-            .await
-            .map_err(crate::error::database_error)
-    }
-}
-
-/// Append a decision boundary when the decision grew the history (issue #1833).
-///
-/// Call it only for a decision that writes events of its own. As a second
-/// guard, the boundary goes in only when the history grew since
-/// `decision_start`, the next event id when the decision loaded its history.
-///
-/// Call it inside the transaction that persists the decision outcome. The
-/// `FOR UPDATE` lock in [`next_event_id_for`] keeps the id valid.
-///
-/// The insert adds a trailing note to the staged NOTIFY. The `event_count`
-/// of the wake counts the boundary. Its `last_event_type` stays the
-/// decision's outcome, so a listener still sees, say, `WorkflowCompleted`.
-///
-/// `running_cap` is the event hard cap when the run stays running. The
-/// boundary is skipped when it would bring the history to that cap.
-///
-/// Returns `true` when it appended the boundary.
-///
-/// # Errors
-///
-/// Returns [`crate::error::HarvestError::Database`] if a query fails, or a
-/// codec error if encoding fails.
-pub(crate) async fn append_decision_boundary(
-    conn: &mut AsyncPgConnection,
-    exec_id: ExecutionId,
-    decision_start: i32,
-    running_cap: Option<u64>,
-    boundary: &WorkflowEvent,
-    codecs: &crate::payload_codec::PayloadCodecs,
-) -> HarvestResult<bool> {
-    let next_id = next_event_id_for(conn, exec_id).await?;
-    if next_id <= decision_start {
-        return Ok(false);
-    }
-    // A boundary never brings a running history to its hard cap. The cap
-    // check counts rows before persistence, so it cannot foresee every row.
-    // A grant after a busy mutex frees is one example. Such a row can leave
-    // room for the decision but not for its boundary. That decision then
-    // has no boundary.
-    let after = u64::try_from(next_id).unwrap_or(0).saturating_add(1);
-    if running_cap.is_some_and(|cap| after >= cap) {
-        return Ok(false);
-    }
-    let rows = events_to_insert_rows_from_with_codecs(
-        exec_id,
-        std::slice::from_ref(boundary),
-        next_id,
-        codecs,
-    )?;
-    insert_event_rows(conn, exec_id, &rows).await?;
-    crate::notify::notify_trailing_events_appended(
-        conn,
-        exec_id.as_uuid(),
-        rows.len(),
-        boundary.type_name(),
-    )
-    .await?;
-    Ok(true)
 }
 
 /// Append events, offloading any over-threshold payload fields (issue #524).
@@ -338,47 +216,14 @@ pub async fn append_events_offloaded(
     start_id: i32,
     offloader: Option<&crate::payload_store::PayloadOffloader>,
 ) -> HarvestResult<usize> {
-    append_events_offloaded_with_codecs(
-        conn,
-        exec_id,
-        events,
-        start_id,
-        offloader,
-        &DEFAULT_PAYLOAD_CODECS,
-    )
-    .await
-}
-
-/// Append events through both the codec and the offloader (issues #948, #1243).
-///
-/// Composition order is the one ADR-0003 fixes and issue #524 assumes: **encode
-/// first, then offload.** The codec turns a payload into ciphertext; the
-/// offloader then decides whether that ciphertext is large enough to move out
-/// of line, leaving a reference envelope behind. Reversing the two would hand
-/// the codec a reference envelope to encrypt, orphaning the blob and leaving a
-/// row whose payload cannot be resolved without the key — which is why the
-/// rotation sweep skips offload envelopes rather than re-encoding them.
-///
-/// # Errors
-///
-/// Returns [`crate::error::HarvestError::Database`] if either INSERT fails, a
-/// codec error if encoding fails, or a payload-store error if offload fails.
-pub async fn append_events_offloaded_with_codecs(
-    conn: &mut AsyncPgConnection,
-    exec_id: ExecutionId,
-    events: &[WorkflowEvent],
-    start_id: i32,
-    offloader: Option<&crate::payload_store::PayloadOffloader>,
-    codecs: &crate::payload_codec::PayloadCodecs,
-) -> HarvestResult<usize> {
     let Some(offloader) = offloader else {
-        return append_events_with_codecs(conn, exec_id, events, start_id, codecs).await;
+        return append_events(conn, exec_id, events, start_id).await;
     };
     if events.is_empty() {
         return Ok(0);
     }
 
-    let mut rows = events_to_insert_rows_from_with_codecs(exec_id, events, start_id, codecs)?;
+    let mut rows = events_to_insert_rows_from(exec_id, events, start_id)?;
     let mut all_refs: Vec<crate::payload_store::OffloadedRef> = Vec::new();
     for row in &mut rows {
         let refs = offloader.offload_event_value(&mut row.event_data).await?;
@@ -391,15 +236,6 @@ pub async fn append_events_offloaded_with_codecs(
     // permanently invisible to the GC sweep).
     let inserted = Box::pin(conn.transaction::<usize, crate::error::HarvestError, _>(
         async |conn| {
-            // Cross-region DR write-authority fence (issue #954), inside the
-            // transaction and *after* the offload upload above. Checking before
-            // the upload was doubly wrong: the check's `ACCESS SHARE` was
-            // released before the INSERT ever began (so it was not a barrier at
-            // all on an autocommit caller), and on a transactional caller it
-            // held the lock across an unbounded network upload — so an operator
-            // fencing during an incident queued behind the slowest payload PUT.
-            crate::replication::assert_fence(conn, exec_id.shard()).await?;
-
             let inserted = diesel::insert_into(harvest_events::table)
                 .values(&rows)
                 .execute(conn)
@@ -424,336 +260,6 @@ pub async fn append_events_offloaded_with_codecs(
     }
 
     Ok(inserted)
-}
-
-/// Append events like [`append_events_offloaded_with_codecs`], but apply
-/// `patch` to the encoded rows before the INSERT.
-///
-/// Continue-as-new must carry the predecessor's stored `last_completion_result`
-/// into the successor's `WorkflowStarted` byte-identical. A second encode would
-/// wrap ciphertext in ciphertext (issue #1243). The value used to be patched in
-/// with an UPDATE after the INSERT. That was a third in-place writer of
-/// `harvest_events.event_data`, which the append-only invariant forbids. The
-/// patch now runs on the rows before they are written, so the row is inserted
-/// once, complete.
-///
-/// The patch runs after offload, so an offload envelope in the patched value
-/// is never offloaded again.
-///
-/// # Errors
-///
-/// Same as [`append_events_offloaded_with_codecs`].
-#[cfg(feature = "db")]
-pub(crate) async fn append_events_offloaded_with_codecs_and_patch(
-    conn: &mut AsyncPgConnection,
-    exec_id: ExecutionId,
-    events: &[WorkflowEvent],
-    start_id: i32,
-    offloader: Option<&crate::payload_store::PayloadOffloader>,
-    codecs: &crate::payload_codec::PayloadCodecs,
-    patch: impl FnOnce(&mut [NewHarvestEvent<'_>]),
-) -> HarvestResult<usize> {
-    if events.is_empty() {
-        return Ok(0);
-    }
-
-    let mut rows = events_to_insert_rows_from_with_codecs(exec_id, events, start_id, codecs)?;
-    let mut all_refs: Vec<crate::payload_store::OffloadedRef> = Vec::new();
-    if let Some(offloader) = offloader {
-        for row in &mut rows {
-            let refs = offloader.offload_event_value(&mut row.event_data).await?;
-            all_refs.extend(refs);
-        }
-    }
-    patch(&mut rows);
-
-    // One transaction for the fence, the events and the refs, for the reasons
-    // `append_events_offloaded_with_codecs` gives.
-    let inserted = Box::pin(conn.transaction::<usize, crate::error::HarvestError, _>(
-        async |conn| {
-            crate::replication::assert_fence(conn, exec_id.shard()).await?;
-            let inserted = diesel::insert_into(harvest_events::table)
-                .values(&rows)
-                .execute(conn)
-                .await
-                .map_err(crate::error::database_error)?;
-            if !all_refs.is_empty() {
-                insert_payload_refs(conn, exec_id, &all_refs).await?;
-            }
-            Ok(inserted)
-        },
-    ))
-    .await?;
-
-    if let Some(last_event) = events.last() {
-        crate::notify::notify_workflow_events_appended(
-            conn,
-            exec_id.as_uuid(),
-            inserted,
-            last_event.type_name(),
-        )
-        .await?;
-    }
-
-    Ok(inserted)
-}
-
-/// Postgres's per-statement bind-parameter ceiling (issue #1589). Mirrors
-/// `queue::enqueue_batch`'s identical constant -- kept as a separate copy
-/// here since the two chunkers bound different row shapes.
-#[cfg(feature = "db")]
-const POSTGRES_MAX_BIND_PARAMS: usize = 65_535;
-
-/// [`NewHarvestEvent`]'s field count. Pinned by a regression test below so
-/// an added column is caught, not silently under-counted.
-#[cfg(feature = "db")]
-const NEW_HARVEST_EVENT_COLUMNS: usize = 4;
-
-/// Rows per chunk, floored so `ROWS_PER_EVENT_INSERT_CHUNK *
-/// NEW_HARVEST_EVENT_COLUMNS` never reaches [`POSTGRES_MAX_BIND_PARAMS`].
-#[cfg(feature = "db")]
-const ROWS_PER_EVENT_INSERT_CHUNK: usize = POSTGRES_MAX_BIND_PARAMS / NEW_HARVEST_EVENT_COLUMNS;
-
-/// [`crate::models::NewHarvestPayloadRef`]'s field count (issue #1589
-/// Codex review: a batch's offloaded refs need their own chunk bound, not
-/// just the event rows). Pinned by a regression test below.
-#[cfg(feature = "db")]
-const NEW_HARVEST_PAYLOAD_REF_COLUMNS: usize = 4;
-
-/// Rows per chunk, floored so `ROWS_PER_PAYLOAD_REF_INSERT_CHUNK *
-/// NEW_HARVEST_PAYLOAD_REF_COLUMNS` never reaches [`POSTGRES_MAX_BIND_PARAMS`].
-#[cfg(feature = "db")]
-const ROWS_PER_PAYLOAD_REF_INSERT_CHUNK: usize =
-    POSTGRES_MAX_BIND_PARAMS / NEW_HARVEST_PAYLOAD_REF_COLUMNS;
-
-/// Byte budget on one chunk's summed `event_data` size. Mirrors
-/// `queue::enqueue_batch`'s identical-purpose `MAX_CHUNK_PAYLOAD_BYTES`.
-///
-/// [`ROWS_PER_EVENT_INSERT_CHUNK`] alone bounds parameter count, not
-/// memory. A `WorkflowStarted` input may validly reach
-/// [`crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES`] (2 MiB). Offload
-/// (issue #524) only shrinks it when a `PayloadOffloader` is configured,
-/// and only once the threshold is crossed. Without this bound, a fan-out
-/// of thousands of near-max-size children could still build one
-/// multi-gigabyte `INSERT`.
-#[cfg(feature = "db")]
-const MAX_EVENT_CHUNK_PAYLOAD_BYTES: usize = 8 * 1024 * 1024; // 4x DEFAULT_MAX_WORKFLOW_INPUT_BYTES
-
-#[cfg(feature = "db")]
-const _: () = assert!(
-    MAX_EVENT_CHUNK_PAYLOAD_BYTES as u64 == 4 * crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES
-);
-
-/// Exact byte length `serde_json::to_vec(value)` would produce, without
-/// allocating that `Vec`. Mirrors `queue.rs`'s identical helper, generic
-/// over anything `Serialize` (issue #1589 Codex review) so it can measure
-/// a `WorkflowEvent` directly, before that event is ever encoded.
-#[cfg(feature = "db")]
-fn json_byte_len<T: serde::Serialize>(value: &T) -> usize {
-    struct CountingWriter(usize);
-    impl std::io::Write for CountingWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0 += buf.len();
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut counter = CountingWriter(0);
-    let _ = serde_json::to_writer(&mut counter, value);
-    counter.0
-}
-
-/// Splits `events` into `[start, end)` index ranges, each within both
-/// [`ROWS_PER_EVENT_INSERT_CHUNK`] rows and
-/// [`MAX_EVENT_CHUNK_PAYLOAD_BYTES`] of summed event size.
-///
-/// Measured directly from each `WorkflowEvent` (Codex review, issue
-/// #1589), before any [`NewHarvestEvent`] row is built, encoded, or
-/// offloaded. Peak memory during that build therefore stays bounded by
-/// one chunk, not the whole `events` slice. This is a size ESTIMATE, not
-/// the exact post-encode/post-offload byte count -- a codec or an offload
-/// can shrink or grow a payload. The budget is wide enough to absorb that
-/// slack, the same way `queue.rs`'s own pre-transformation measurement
-/// does for `enqueue_batch`.
-///
-/// Mirrors `queue.rs`'s `compute_chunk_bounds` shape. A non-empty `events`
-/// always returns at least one range, and every event falls into exactly
-/// one of them, in order.
-#[cfg(feature = "db")]
-fn compute_event_chunk_bounds(events: &[(ExecutionId, WorkflowEvent)]) -> Vec<(usize, usize)> {
-    let mut chunk_bounds = Vec::new();
-    let mut chunk_start = 0_usize;
-    while chunk_start < events.len() {
-        let mut chunk_end = chunk_start + 1;
-        let mut payload_bytes = json_byte_len(&events[chunk_start].1);
-        while chunk_end < events.len() && chunk_end - chunk_start < ROWS_PER_EVENT_INSERT_CHUNK {
-            let next_bytes = json_byte_len(&events[chunk_end].1);
-            if payload_bytes + next_bytes > MAX_EVENT_CHUNK_PAYLOAD_BYTES {
-                break;
-            }
-            payload_bytes += next_bytes;
-            chunk_end += 1;
-        }
-        chunk_bounds.push((chunk_start, chunk_end));
-        chunk_start = chunk_end;
-    }
-    chunk_bounds
-}
-
-/// The distinct shards `events` represents, sorted and deduplicated.
-///
-/// Issue #1589: [`append_new_execution_started_events_batch`] is a `pub`
-/// helper. It must not assume every event shares one shard just because
-/// its only current caller happens to guarantee that. Every distinct
-/// shard here gets its own DR fence check.
-#[cfg(feature = "db")]
-fn distinct_shards(events: &[(ExecutionId, WorkflowEvent)]) -> Vec<crate::types::ShardId> {
-    let mut shards: Vec<crate::types::ShardId> =
-        events.iter().map(|(exec_id, _)| exec_id.shard()).collect();
-    shards.sort_unstable();
-    shards.dedup();
-    shards
-}
-
-/// Append one `WorkflowStarted` event per execution, batched.
-///
-/// One multi-row `INSERT` per chunk, instead of one `INSERT` per execution
-/// (issue #1589 -- the local awaited-child fan-out loop in `worker.rs`'s
-/// `persist_all_started_child_workflows`).
-///
-/// Every execution here is brand new, so its history is empty and every row
-/// uses `event_id = 0`. Unlike a single execution's own event append, no row
-/// here re-reads `MAX(event_id) FOR UPDATE` to serialize against a sibling.
-/// There is no sibling sharing an execution id to serialize against.
-///
-/// `events` is not required to share one shard. The only current
-/// caller's local children always land on the parent's shard (issue
-/// #956), and so happen to. This is a `pub` helper another caller could
-/// reach with mixed shards. So the DR write-authority fence (issue
-/// #954) is asserted for every DISTINCT shard a chunk represents, not
-/// just its first event's. Each check runs inside that chunk's own
-/// transaction, paired with its `INSERT`s. A single-shard chunk pays
-/// for exactly one fence check, same as before.
-///
-/// **Atomicity is per chunk, not across the whole call** (Codex review).
-/// Each chunk commits in its own transaction, opened after that chunk's
-/// offload upload. It is never one transaction wrapping every chunk,
-/// which would hold the DR fence lock across every chunk's upload. A
-/// caller that needs the whole batch to succeed or fail together, across
-/// chunk boundaries, must wrap this call in its own enclosing
-/// transaction. A failure then rolls back every chunk's savepoint too,
-/// not just the one that failed. The only current caller already does
-/// this. `events` here is always well under one chunk in practice.
-/// Even when it is not, `persist_all_started_child_workflows` calls this
-/// from inside its own outer transaction.
-///
-/// # Errors
-///
-/// Returns [`crate::error::HarvestError::Database`] on `INSERT` failure, a
-/// codec error on encode failure, or a payload-store error on offload
-/// failure.
-#[cfg(feature = "db")]
-pub async fn append_new_execution_started_events_batch(
-    conn: &mut AsyncPgConnection,
-    events: &[(ExecutionId, WorkflowEvent)],
-    offloader: Option<&crate::payload_store::PayloadOffloader>,
-    codecs: &crate::payload_codec::PayloadCodecs,
-) -> HarvestResult<()> {
-    use crate::models::NewHarvestPayloadRef;
-    use crate::schema::harvest_payload_refs;
-
-    if events.is_empty() {
-        return Ok(());
-    }
-
-    // Chunk boundaries are decided up front from `events` itself (Codex
-    // review, issue #1589), before any row is encoded or offloaded. Each
-    // chunk then builds, encodes, offloads, and inserts its own small row
-    // `Vec`s in turn. Peak memory therefore stays bounded by one chunk's
-    // payload, not the whole `events` slice.
-    //
-    // The DR write-authority fence (issue #954) is asserted separately,
-    // per chunk, in its OWN transaction. That transaction opens AFTER
-    // that chunk's offload upload -- never one transaction wrapping
-    // every chunk (issue #1589). `assert_fence`'s `FOR SHARE` row lock
-    // is held until its transaction commits, not released between
-    // statements. One transaction around the whole loop would hold that
-    // lock across every chunk's network upload. That would block a
-    // concurrent DR fencing operation for the whole batch.
-    // `append_events_offloaded_with_codecs` fixed this identical hazard
-    // for the single-execution append path by uploading before the
-    // fenced transaction opens. This mirrors it once per chunk.
-    for (start, end) in compute_event_chunk_bounds(events) {
-        let chunk_shards = distinct_shards(&events[start..end]);
-
-        let mut rows: Vec<NewHarvestEvent<'_>> = events[start..end]
-            .iter()
-            .map(|(exec_id, event)| {
-                Ok(NewHarvestEvent {
-                    workflow_exec_id: exec_id.as_uuid(),
-                    event_id: 0,
-                    event_type: event.type_name(),
-                    event_data: codecs.encode_event(event)?,
-                })
-            })
-            .collect::<Result<_, crate::error::HarvestError>>()?;
-
-        // Offload runs before the fenced transaction below, exactly like
-        // `append_events_offloaded_with_codecs` (encode-then-offload,
-        // ADR-0003).
-        let mut ref_rows: Vec<NewHarvestPayloadRef> = Vec::new();
-        if let Some(offloader) = offloader {
-            for row in &mut rows {
-                let refs = offloader.offload_event_value(&mut row.event_data).await?;
-                ref_rows.extend(refs.into_iter().map(|r| NewHarvestPayloadRef {
-                    blob_key: r.blob_key,
-                    workflow_exec_id: row.workflow_exec_id,
-                    store_id: r.store_id,
-                    byte_len: i64::try_from(r.byte_len).unwrap_or(i64::MAX),
-                }));
-            }
-        }
-
-        Box::pin(
-            conn.transaction::<(), crate::error::HarvestError, _>(async |conn| {
-                for shard in &chunk_shards {
-                    crate::replication::assert_fence(conn, *shard).await?;
-                }
-                diesel::insert_into(harvest_events::table)
-                    .values(&rows)
-                    .execute(conn)
-                    .await
-                    .map_err(crate::error::database_error)?;
-
-                for ref_chunk in ref_rows.chunks(ROWS_PER_PAYLOAD_REF_INSERT_CHUNK) {
-                    diesel::insert_into(harvest_payload_refs::table)
-                        .values(ref_chunk)
-                        .on_conflict_do_nothing()
-                        .execute(conn)
-                        .await
-                        .map_err(crate::error::database_error)?;
-                }
-                Ok(())
-            }),
-        )
-        .await?;
-        drop(rows);
-        drop(ref_rows);
-    }
-
-    for (exec_id, event) in events {
-        crate::notify::notify_workflow_events_appended(
-            conn,
-            exec_id.as_uuid(),
-            1,
-            event.type_name(),
-        )
-        .await?;
-    }
-
-    Ok(())
 }
 
 /// Record per-execution references to offloaded payload blobs (issue #524).
@@ -896,26 +402,6 @@ pub async fn load_raw_started_carryover(
 
 /// Append a single event to a workflow's history without loading the full log.
 ///
-/// Delegates to [`append_single_event_with_codecs`] under the identity
-/// registry (issue #1243). A payload-bearing call site should use the
-/// `_with_codecs` sibling instead. This wrapper exists for tests that do not
-/// exercise a configured codec.
-///
-/// # Errors
-///
-/// Returns [`crate::error::HarvestError::Database`] if the query or insert fails,
-/// or [`crate::error::HarvestError::NotFound`] if the execution does not exist.
-pub async fn append_single_event(
-    conn: &mut AsyncPgConnection,
-    exec_id: ExecutionId,
-    event: WorkflowEvent,
-) -> HarvestResult<()> {
-    append_single_event_with_codecs(conn, exec_id, event, &DEFAULT_PAYLOAD_CODECS).await
-}
-
-/// [`append_single_event`], encoding payload-bearing fields through `codecs`
-/// (issue #1243).
-///
 /// Acquires a row-level lock on the workflow execution before reading
 /// `MAX(event_id)`, serializing concurrent appenders (management API paths,
 /// timeout enforcement) so they never race to allocate the same event ID.
@@ -926,20 +412,14 @@ pub async fn append_single_event(
 ///
 /// Returns [`crate::error::HarvestError::Database`] if the query or insert fails,
 /// or [`crate::error::HarvestError::NotFound`] if the execution does not exist.
-pub async fn append_single_event_with_codecs(
+pub async fn append_single_event(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     event: WorkflowEvent,
-    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     use crate::models::WorkflowExecution;
     use crate::schema::harvest_workflow_executions;
     use diesel::dsl::max;
-
-    // Cross-region DR fence (see `replication::assert_fence`), before the
-    // execution row lock so a fenced worker releases immediately rather than
-    // holding a lock the region that now owns this data needs.
-    crate::replication::assert_fence(conn, exec_id.shard()).await?;
 
     // Lock the parent execution row so that concurrent callers serialise their
     // MAX(event_id) + INSERT pairs — preventing a duplicate-event-id collision
@@ -964,7 +444,7 @@ pub async fn append_single_event_with_codecs(
         .map_err(crate::error::database_error)?;
 
     let next_id = max_id.map_or(0, |id| id.saturating_add(1));
-    append_events_with_codecs(conn, exec_id, &[event], next_id, codecs).await?;
+    append_events(conn, exec_id, &[event], next_id).await?;
     Ok(())
 }
 
@@ -990,17 +470,15 @@ pub(crate) async fn next_event_id_for(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
 ) -> HarvestResult<i32> {
+    use crate::models::WorkflowExecution;
     use crate::schema::harvest_workflow_executions;
     use diesel::dsl::max;
 
-    // The row is read only to lock it and to prove it exists. Selecting the
-    // id alone skips the JSONB columns. Each decision runs this for its
-    // boundary (issue #1833).
     harvest_workflow_executions::table
         .find(exec_id.as_uuid())
         .for_update()
-        .select(harvest_workflow_executions::id)
-        .first::<uuid::Uuid>(conn)
+        .select(WorkflowExecution::as_select())
+        .first(conn)
         .await
         .optional()
         .map_err(crate::error::database_error)?
@@ -1048,41 +526,6 @@ pub(crate) async fn count_history_events(
     Ok(u64::try_from(count).unwrap_or(0))
 }
 
-/// Stored bytes of the events with `from <= event_id < to` (issue #1804).
-///
-/// The measure is `pg_column_size(event_data)`, the same as the tenant
-/// `max_history_bytes` quota. The upper bound keeps a concurrent append out of
-/// the sum, so an incremental caller never counts one event twice.
-///
-/// # Errors
-///
-/// Returns [`crate::error::HarvestError::Database`] if the query fails.
-pub(crate) async fn sum_history_bytes_between(
-    conn: &mut AsyncPgConnection,
-    exec_id: ExecutionId,
-    from_event_id: i32,
-    to_event_id: i32,
-) -> HarvestResult<u64> {
-    use diesel::dsl::sql;
-    use diesel::sql_types::BigInt;
-
-    if from_event_id >= to_event_id {
-        return Ok(0);
-    }
-    let bytes: i64 = harvest_events::table
-        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
-        .filter(harvest_events::event_id.ge(from_event_id))
-        .filter(harvest_events::event_id.lt(to_event_id))
-        .select(sql::<BigInt>(
-            "COALESCE(SUM(pg_column_size(event_data)), 0)::bigint",
-        ))
-        .first(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-
-    Ok(u64::try_from(bytes).unwrap_or(0))
-}
-
 /// Durably admit an update into a workflow's event history.
 ///
 /// Opens a transaction, acquires a row-level `FOR UPDATE` lock on the
@@ -1122,33 +565,6 @@ pub async fn admit_update_event(
     name: String,
     input: serde_json::Value,
     metrics: Option<&dyn crate::telemetry::MetricsRecorder>,
-) -> HarvestResult<()> {
-    admit_update_event_with_codecs(
-        conn,
-        exec_id,
-        update_id,
-        name,
-        input,
-        metrics,
-        &DEFAULT_PAYLOAD_CODECS,
-    )
-    .await
-}
-
-/// [`admit_update_event`], encoding `UpdateAdmitted.input` through `codecs`
-/// (issue #1243).
-///
-/// # Errors
-///
-/// Same as [`admit_update_event`].
-pub async fn admit_update_event_with_codecs(
-    conn: &mut AsyncPgConnection,
-    exec_id: ExecutionId,
-    update_id: crate::types::UpdateId,
-    name: String,
-    input: serde_json::Value,
-    metrics: Option<&dyn crate::telemetry::MetricsRecorder>,
-    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     use crate::models::WorkflowExecution;
     use crate::schema::harvest_workflow_executions;
@@ -1202,7 +618,7 @@ pub async fn admit_update_event_with_codecs(
                 input,
                 timestamp: chrono::Utc::now(),
             };
-            append_events_with_codecs(conn, exec_id, &[event], next_id, codecs).await?;
+            append_events(conn, exec_id, &[event], next_id).await?;
             Ok((execution.workflow_name, execution.queue_name))
         }),
     )
@@ -1234,20 +650,7 @@ pub async fn admit_update_event_with_codecs(
 /// Returns [`crate::error::HarvestError::NotFound`] when the execution row
 /// does not exist, and [`crate::error::HarvestError::Database`] on any other
 /// query failure.
-/// Take the execution row's `FOR UPDATE` lock, then load history **undecoded**.
-///
-/// Its one caller -- `ActivityContext::run_transactional` -- reads only
-/// `next_event_id`, to append the inline `ActivityCompleted` at the right
-/// position. It never looks at a payload field, so decoding buys it nothing
-/// and costs it correctness: decoding here would need the identity registry,
-/// which raises `UnknownCodecKey` on the first keyed envelope and would roll
-/// back **every** transactional activity commit on a deployment with a codec
-/// configured.
-///
-/// The name says `undecoded` so a future caller that does want decoded events
-/// has to notice it is asking the wrong function. See
-/// [`load_history_undecoded`] for the general rule.
-pub(crate) async fn lock_and_load_history_undecoded(
+pub(crate) async fn lock_and_load_history(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
 ) -> HarvestResult<EventHistory> {
@@ -1266,7 +669,7 @@ pub(crate) async fn lock_and_load_history_undecoded(
         .map_err(crate::error::database_error)?
         .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
 
-    load_history_undecoded(conn, exec_id).await
+    load_history(conn, exec_id).await
 }
 
 /// Deserializes each row's `event_data` JSON back into [`WorkflowEvent`].
@@ -1284,7 +687,12 @@ pub async fn load_history(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
 ) -> HarvestResult<EventHistory> {
-    load_history_with_codecs(conn, exec_id, &DEFAULT_PAYLOAD_CODECS).await
+    load_history_with_codecs(
+        conn,
+        exec_id,
+        &crate::payload_codec::PayloadCodecs::default(),
+    )
+    .await
 }
 
 pub async fn load_history_with_codecs(
@@ -1332,20 +740,9 @@ pub async fn load_history_with_codecs(
 /// default encodes payloads as plain JSON), so this returns byte-identical
 /// events to [`load_history`].
 ///
-/// **Never use this to feed workflow code** — replay must see decoded
-/// plaintext and uses the codec-aware loaders ([`load_history_inflated`] /
-/// [`load_history_with_codecs`]).
-///
-/// There is a second sanctioned use, distinct from the read surfaces above:
-/// **id arithmetic**. A caller that reads only `next_event_id` (to append at
-/// the right position) or matches on event *variants* and non-payload fields
-/// never looks at a payload, so decoding buys it nothing — and costs it
-/// correctness, because a codec-aware read needs a registry the caller may not
-/// have, and an identity read hard-errors `UnknownCodecKey` on the first keyed
-/// envelope. That would fail an append, a cancel, or a diagnostic scan over a
-/// payload none of them were going to read. `execution.rs`'s
-/// cancel/pause/resume/redrive paths and
-/// [`crate::execution::check_and_report_unfinished_handlers`] are this case.
+/// **Never use this for replay or any engine execution path** — replay must
+/// see decoded plaintext and uses the codec-aware loaders
+/// ([`load_history_inflated`] / [`load_history_with_codecs`]).
 ///
 /// # Errors
 ///
@@ -1380,101 +777,6 @@ pub async fn load_history_undecoded(
         events,
         next_event_id,
     })
-}
-
-/// Batched form of [`load_history_undecoded`] for many executions at once.
-///
-/// One `eq_any` query loads every requested execution's history. This
-/// replaces one `load_history_undecoded` call per execution. It shares the
-/// same `idx_harvest_events_exec (workflow_exec_id, event_id)` index
-/// `load_history_undecoded` relies on. Ordering by that same leading pair
-/// lets Postgres serve the whole batch as one ordered index scan. No extra
-/// sort node is needed, across every requested execution.
-///
-/// **Callers with an unbounded `exec_ids` count must chunk it themselves**,
-/// and should process and drop each chunk's result before requesting the
-/// next. This function holds every decoded history of the ids it is given
-/// in memory at once. An unchunked call over an unbounded id list makes
-/// peak memory proportional to the sum of every requested history. It is
-/// not proportional to any one of them alone.
-/// [`execution::check_and_report_unfinished_handlers_batch`] is this
-/// function's own chunking caller; its own doc comment records why (review
-/// findings on PR #1739).
-///
-/// An `exec_id` with no rows in `harvest_events` is simply absent from the
-/// returned map rather than an error. Every caller of this function already
-/// tolerates that outcome for the single-execution case. That case is a
-/// workflow with no appended event yet. The batched form preserves the
-/// outcome rather than inventing a new error path.
-///
-/// Same restriction as [`load_history_undecoded`]: **never use this to feed
-/// workflow code.** It is for callers that only need `next_event_id` or
-/// non-payload structural fields, exactly like the single-execution loader.
-///
-/// # Errors
-///
-/// Returns [`crate::error::HarvestError::Database`] on connection or query
-/// errors, or [`crate::error::HarvestError::Serialization`] if a stored JSON
-/// value cannot be deserialized into [`WorkflowEvent`].
-pub async fn load_histories_undecoded_batch(
-    conn: &mut AsyncPgConnection,
-    exec_ids: &[ExecutionId],
-) -> HarvestResult<std::collections::HashMap<ExecutionId, EventHistory>> {
-    use crate::models::HarvestEvent;
-    use std::collections::HashMap;
-
-    if exec_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let ids: Vec<uuid::Uuid> = exec_ids.iter().map(ExecutionId::as_uuid).collect();
-
-    let rows: Vec<HarvestEvent> = harvest_events::table
-        .filter(harvest_events::workflow_exec_id.eq_any(&ids))
-        .order((
-            harvest_events::workflow_exec_id.asc(),
-            harvest_events::event_id.asc(),
-        ))
-        .load(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-
-    // Grouped by the raw uuid column, not by `ExecutionId`. Reconstructing
-    // an `ExecutionId` from an arbitrary row's uuid needs the same
-    // string-round-trip `parse()` every other module uses. The shard bits
-    // live in a private field, so no cheaper conversion exists outside
-    // `types`. Every id this function could possibly need is already
-    // sitting in `exec_ids`. Keying by the input values avoids that
-    // round-trip entirely.
-    let mut grouped: HashMap<uuid::Uuid, Vec<HarvestEvent>> = HashMap::new();
-    for row in rows {
-        grouped.entry(row.workflow_exec_id).or_default().push(row);
-    }
-
-    let mut out = HashMap::with_capacity(exec_ids.len());
-    for &exec_id in exec_ids {
-        let Some(rows) = grouped.remove(&exec_id.as_uuid()) else {
-            continue;
-        };
-        let next_event_id = rows.last().map_or(0, |r| r.event_id.saturating_add(1));
-        let events = rows
-            .into_iter()
-            .map(|row| {
-                serde_json::from_value::<WorkflowEvent>(row.event_data)
-                    .map_err(crate::error::HarvestError::from)
-            })
-            .collect::<Result<Vec<WorkflowEvent>, _>>()?;
-        out.insert(
-            exec_id,
-            EventHistory {
-                exec_id,
-                events,
-                next_event_id,
-            },
-        );
-    }
-
-    Ok(out)
 }
 
 /// Load every event of an execution paired with its `harvest_events` row
@@ -1628,63 +930,6 @@ pub async fn load_history_inflated(
     })
 }
 
-/// [`load_history_inflated`] that also returns the stored history bytes
-/// (issue #1804).
-///
-/// The bytes are the sum of `pg_column_size(event_data)` over the loaded rows.
-/// The worker's cold path reads them here, so the byte cap needs no second
-/// scan of the history.
-///
-/// # Errors
-///
-/// Same as [`load_history_inflated`].
-#[cfg(feature = "db")]
-pub(crate) async fn load_history_inflated_with_bytes(
-    conn: &mut AsyncPgConnection,
-    exec_id: ExecutionId,
-    codecs: &crate::payload_codec::PayloadCodecs,
-    offloader: Option<&crate::payload_store::PayloadOffloader>,
-) -> HarvestResult<(EventHistory, u64)> {
-    use crate::models::HarvestEvent;
-    use diesel::dsl::sql;
-    use diesel::sql_types::Integer;
-
-    let rows: Vec<(HarvestEvent, i32)> = harvest_events::table
-        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
-        .order(harvest_events::event_id.asc())
-        .select((
-            HarvestEvent::as_select(),
-            sql::<Integer>("pg_column_size(event_data)"),
-        ))
-        .load(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-
-    let next_event_id = rows
-        .last()
-        .map_or(0, |(row, _)| row.event_id.saturating_add(1));
-
-    let mut bytes = 0_u64;
-    let mut events = Vec::with_capacity(rows.len());
-    for (row, size) in rows {
-        bytes = bytes.saturating_add(u64::try_from(size).unwrap_or(0));
-        let mut data = row.event_data;
-        if let Some(offloader) = offloader {
-            offloader.inflate_event_value(&mut data).await?;
-        }
-        events.push(codecs.decode_event(data)?);
-    }
-
-    Ok((
-        EventHistory {
-            exec_id,
-            events,
-            next_event_id,
-        },
-        bytes,
-    ))
-}
-
 /// Load only events appended since a known event-id cursor.
 ///
 /// Returns events where `event_id >= from_event_id`, ordered by `event_id ASC`.
@@ -1721,7 +966,7 @@ pub async fn load_history_since(
 
     let events = rows
         .into_iter()
-        .map(|row| (*DEFAULT_PAYLOAD_CODECS).decode_event(row.event_data))
+        .map(|row| crate::payload_codec::PayloadCodecs::default().decode_event(row.event_data))
         .collect::<Result<Vec<WorkflowEvent>, _>>()?;
 
     Ok(EventHistory {
@@ -1784,13 +1029,9 @@ pub async fn load_history_since_inflated(
 
 /// Load raw `harvest_events` rows for `exec_id` with `id > after_row_id`.
 ///
-/// Returns rows ordered by `id ASC`. The `id` column is the shard-local
-/// `BIGSERIAL` primary key. An SSE stream may resume across a shard
-/// migration. Its caller must first translate the wire cursor (`event_id`)
-/// to this connection's own `id`, via [`row_id_for_event_id`] (issue
-/// #1405). `id` itself is never a safe cursor to hand a client, since a
-/// migration does not copy it. Pass `-1` for `after_row_id` to load all
-/// events.
+/// Returns rows ordered by `id ASC`. The `id` column is the `BIGSERIAL` primary
+/// key and serves as the SSE resume cursor (`Last-Event-ID`). Pass `-1` for
+/// `after_row_id` to load all events.
 ///
 /// # Errors
 ///
@@ -1814,48 +1055,6 @@ pub async fn load_events_after_row_id(
         .select(crate::models::HarvestEvent::as_select())
         .load(conn)
         .await
-        .map_err(crate::error::database_error)
-}
-
-/// Translate a stable per-execution `event_id` to the `harvest_events.id`
-/// that names it on `conn`'s database (fresh review, P1 follow-up).
-///
-/// An SSE resume cursor (`Last-Event-ID`) is a `harvest_events.id` value,
-/// local to whichever database currently holds the row. `stage_copy`
-/// deliberately does not carry `id` across a shard-rebalance migration.
-/// The target assigns fresh values from its own `BIGSERIAL` sequence. A
-/// live stream that rebinds to a migrated execution's new shard
-/// mid-flight must therefore re-resolve its cursor here before its next
-/// [`load_events_after_row_id`] call. Otherwise that call compares the
-/// OLD database's `id` against the NEW one's. That silently drops every
-/// subsequent event if the target's ids happen to be lower, or replays
-/// already-seen history as duplicates if higher. `event_id` is copied
-/// byte-for-byte by `stage_copy`, so it is what identifies "the same event"
-/// across the move.
-///
-/// Returns `None` if `exec_id` has no event with this `event_id` on
-/// `conn`'s database. That case is normally unreachable once a migration
-/// has cut over, since the target holds the whole copied history. It is
-/// kept as an explicit `Option` rather than an error. That lets a
-/// caller fail open (e.g. resume from the start) instead of tearing
-/// down the stream over it.
-///
-/// # Errors
-///
-/// Returns [`crate::error::HarvestError::Database`] on query failure.
-#[cfg(feature = "db")]
-pub async fn row_id_for_event_id(
-    conn: &mut AsyncPgConnection,
-    exec_id: ExecutionId,
-    event_id: i32,
-) -> HarvestResult<Option<i64>> {
-    harvest_events::table
-        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
-        .filter(harvest_events::event_id.eq(event_id))
-        .select(harvest_events::id)
-        .first(conn)
-        .await
-        .optional()
         .map_err(crate::error::database_error)
 }
 
@@ -2009,15 +1208,6 @@ pub async fn load_history_page(
 /// Callers that need cross-shard discovery should call this once per shard and
 /// merge the rows after applying any global ordering/pagination.
 ///
-/// Clone-class note: the filter chain, the `.select(...)` list, and the row
-/// mapping below repeat verbatim in [`load_workflow_children_multi`]. Apply
-/// any change to the status, name, cursor, or limit filter to both
-/// functions.
-///
-/// Two instances only, introduced together in PR #1183. No missed-fix has
-/// occurred on either copy since. The merge-evidence bar (rule of three, or
-/// a missed-fix) is not met yet, so the duplication stays.
-///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on query failure.
@@ -2149,12 +1339,6 @@ fn workflow_child_row_from_parts(
 /// the whole set of matching rows.
 ///
 /// Returns an empty vec without querying when `parent_ids` is empty.
-///
-/// Clone-class note: the filter chain, the `.select(...)` list, and the row
-/// mapping below repeat verbatim in [`load_workflow_children`]. Apply any
-/// change to the status, name, cursor, or limit filter to both functions.
-/// Two instances only, introduced together in PR #1183, so the
-/// merge-evidence bar is not met yet. See the note on `load_workflow_children`.
 ///
 /// # Errors
 ///
@@ -2888,148 +2072,6 @@ mod tests {
         assert_eq!(rows[1].event_id, 1);
         assert_eq!(rows[0].event_type, "WorkflowStarted");
         assert_eq!(rows[1].event_type, "ActivityScheduled");
-    }
-
-    /// Pins [`NEW_HARVEST_EVENT_COLUMNS`], and therefore
-    /// [`ROWS_PER_EVENT_INSERT_CHUNK`], to `NewHarvestEvent`'s real field
-    /// count, by exhaustive destructure (issue #1589, mirrors
-    /// `queue.rs`'s identical regression test for `NewTaskQueueItem`).
-    /// Adding, removing, or renaming a field breaks this match at compile
-    /// time. The chunk size then cannot silently drift out of sync with the
-    /// row width it bounds.
-    #[cfg(feature = "db")]
-    #[test]
-    fn new_harvest_event_column_count_matches_the_constant() {
-        let sample = NewHarvestEvent {
-            workflow_exec_id: uuid::Uuid::nil(),
-            event_id: 0,
-            event_type: "WorkflowStarted",
-            event_data: serde_json::Value::Null,
-        };
-        let NewHarvestEvent {
-            workflow_exec_id: _,
-            event_id: _,
-            event_type: _,
-            event_data: _,
-        } = sample;
-        const {
-            assert!(NEW_HARVEST_EVENT_COLUMNS == 4);
-            assert!(
-                ROWS_PER_EVENT_INSERT_CHUNK * NEW_HARVEST_EVENT_COLUMNS <= POSTGRES_MAX_BIND_PARAMS
-            );
-        }
-    }
-
-    /// Pins [`NEW_HARVEST_PAYLOAD_REF_COLUMNS`], and therefore
-    /// [`ROWS_PER_PAYLOAD_REF_INSERT_CHUNK`], to `NewHarvestPayloadRef`'s
-    /// real field count, by exhaustive destructure (issue #1589). Adding,
-    /// removing, or renaming a field breaks this match at compile time.
-    #[cfg(feature = "db")]
-    #[test]
-    fn new_harvest_payload_ref_column_count_matches_the_constant() {
-        let sample = crate::models::NewHarvestPayloadRef {
-            blob_key: String::new(),
-            workflow_exec_id: uuid::Uuid::nil(),
-            store_id: String::new(),
-            byte_len: 0,
-        };
-        let crate::models::NewHarvestPayloadRef {
-            blob_key: _,
-            workflow_exec_id: _,
-            store_id: _,
-            byte_len: _,
-        } = sample;
-        const {
-            assert!(NEW_HARVEST_PAYLOAD_REF_COLUMNS == 4);
-            assert!(
-                ROWS_PER_PAYLOAD_REF_INSERT_CHUNK * NEW_HARVEST_PAYLOAD_REF_COLUMNS
-                    <= POSTGRES_MAX_BIND_PARAMS
-            );
-        }
-    }
-
-    /// Mirrors `queue.rs`'s `chunk_bounds_splits_near_max_size_inputs_into_many_small_chunks`
-    /// (issue #1589). A run of near-max-size `WorkflowStarted` inputs must
-    /// split into many small chunks under [`MAX_EVENT_CHUNK_PAYLOAD_BYTES`],
-    /// not all land in one chunk sized only by
-    /// [`ROWS_PER_EVENT_INSERT_CHUNK`].
-    #[cfg(feature = "db")]
-    #[test]
-    fn event_chunk_bounds_splits_near_max_size_inputs_into_many_small_chunks() {
-        let near_max_bytes =
-            usize::try_from(crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES).unwrap();
-        let events: Vec<(ExecutionId, WorkflowEvent)> = (0..200)
-            .map(|_| {
-                let payload = "x".repeat(near_max_bytes);
-                (
-                    ExecutionId::new(),
-                    WorkflowEvent::WorkflowStarted {
-                        input: serde_json::json!(payload),
-                        timestamp: Utc::now(),
-                        last_completion_result: None,
-                        last_error: None,
-                        scheduled_time: None,
-                    },
-                )
-            })
-            .collect();
-        let bounds = compute_event_chunk_bounds(&events);
-
-        assert!(
-            bounds.len() > 10,
-            "200 near-max-size events must split into many small chunks, got {} chunk(s)",
-            bounds.len()
-        );
-        for &(start, end) in &bounds {
-            let row_sizes: Vec<usize> = events[start..end]
-                .iter()
-                .map(|(_, event)| json_byte_len(event))
-                .collect();
-            let chunk_payload: usize = row_sizes.iter().sum();
-            let largest_row = row_sizes.iter().copied().max().unwrap_or(0);
-            assert!(
-                chunk_payload <= MAX_EVENT_CHUNK_PAYLOAD_BYTES + largest_row,
-                "chunk [{start}, {end}) carries {chunk_payload} bytes, over the \
-                 {MAX_EVENT_CHUNK_PAYLOAD_BYTES}-byte budget by more than one row's allowance"
-            );
-        }
-        let mut next_expected = 0;
-        for &(start, end) in &bounds {
-            assert_eq!(start, next_expected, "chunks must be contiguous, no gaps");
-            assert!(end > start, "every chunk must carry at least one event");
-            next_expected = end;
-        }
-        assert_eq!(
-            next_expected,
-            events.len(),
-            "every event must fall into a chunk"
-        );
-    }
-
-    /// Codex review, issue #1589: a `pub` helper must not silently fence
-    /// only the first event's shard. `distinct_shards` must report every
-    /// shard a batch represents, deduplicated, so the caller can fence
-    /// each one.
-    #[cfg(feature = "db")]
-    #[test]
-    fn distinct_shards_reports_every_shard_deduplicated() {
-        let shard_a = crate::types::ShardId::new(0);
-        let shard_b = crate::types::ShardId::new(1);
-        let started = |shard: crate::types::ShardId| {
-            (
-                ExecutionId::new_for_shard(shard),
-                WorkflowEvent::WorkflowStarted {
-                    input: serde_json::json!({}),
-                    timestamp: Utc::now(),
-                    last_completion_result: None,
-                    last_error: None,
-                    scheduled_time: None,
-                },
-            )
-        };
-        let events = vec![started(shard_a), started(shard_b), started(shard_a)];
-
-        assert_eq!(distinct_shards(&events), vec![shard_a, shard_b]);
     }
 
     #[test]

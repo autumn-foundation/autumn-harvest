@@ -1,10 +1,10 @@
 //! DAG scheduler and runtime execution.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use croner::Cron;
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
@@ -18,14 +18,16 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{HarvestError, HarvestResult};
-use crate::execution::{StartWorkflowParams, StartedWorkflowExecution};
+use crate::execution::{
+    StartWorkflowParams, StartedWorkflowExecution, start_or_load_workflow_execution,
+};
 use crate::info::DagInfo;
 use crate::models::{HarvestSchedule, NewHarvestSchedule};
 use crate::policy::{OverlapPolicy, Schedule, WorkflowSchedule, compute_jitter_offset};
 use crate::schema::{harvest_schedules, harvest_workflow_executions};
 use crate::shard::{ShardRouter, ShardedDbPool};
-use crate::types::{ExecutionId, ShardId, WorkflowIdReusePolicy};
-use crate::worker::{DbPool, DispatchDeadline, HandlerRegistry};
+use crate::types::{ExecutionId, Priority, ShardId, WorkflowIdReusePolicy};
+use crate::worker::{DbPool, HandlerRegistry};
 
 const DEFAULT_SCHEDULER_TICK_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -354,31 +356,31 @@ impl SchedulerMonitor {
     }
 
     /// Snapshot the current scheduler heartbeat state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal scheduler monitor mutex is poisoned.
     #[must_use]
     pub fn snapshot(&self) -> SchedulerSnapshot {
         self.inner
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+            .expect("scheduler monitor lock poisoned")
             .clone()
     }
 
     fn mark_tick(&self, dag_count: usize) {
-        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut guard = self.inner.lock().expect("scheduler monitor lock poisoned");
         guard.running = true;
         guard.dag_count = dag_count;
         guard.last_tick_at = Some(Utc::now());
     }
 
     fn mark_stopped(&self, dag_count: usize) {
-        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut guard = self.inner.lock().expect("scheduler monitor lock poisoned");
         guard.running = false;
         guard.dag_count = dag_count;
     }
 }
-
-/// How long a stopping scheduler waits for each notify sender to drain
-/// (issue #1796).
-const NOTIFY_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The background runtime that drives DAG and workflow scheduling.
 pub struct SchedulerRuntime {
@@ -431,12 +433,6 @@ impl SchedulerRuntime {
             if let Err(error) = reject_classic_dags_without_unified_execution(dags.as_ref()) {
                 panic!("{error}");
             }
-        }
-
-        // Start the post-commit notify sender for each pool, so schedule
-        // fires send their wakes after commit (issue #1796).
-        for (_, shard_pool) in pool.iter_shards() {
-            crate::notify::register_pool(shard_pool);
         }
 
         let shutdown = CancellationToken::new();
@@ -492,14 +488,6 @@ impl SchedulerRuntime {
 
             let total = dags.len() + workflow_schedules.len();
             monitor_for_task.mark_stopped(total);
-
-            // Send the wakes of the last fires before the runtime can stop
-            // the notify senders (issue #1796).
-            for (_, shard_pool) in pool.iter_shards() {
-                crate::notify::register_pool(shard_pool)
-                    .flush(NOTIFY_FLUSH_TIMEOUT)
-                    .await;
-            }
         });
 
         Self {
@@ -1169,14 +1157,12 @@ fn scheduled_fire_encodes_shard(wf_name: &str, is_dag: bool) -> bool {
 /// Mint the `ExecutionId` for one scheduled fire on `current_shard`.
 ///
 /// The **single** decision point for whether a fire's execution id encodes its
-/// home shard (issue #961, AC4). The main dispatch loop and the
-/// buffered-overlap drain (`drain_claimed_buffered_schedule`) both call this.
-/// Thus the two cannot drift.
-///
-/// They drifted before. The drain gated on `schedule.dag_name.is_some()` alone.
-/// A **canary** schedule is a non-DAG whose fire must land ON the shard it
-/// probes. The drain put its buffered slot on the *default* shard instead.
-/// That silently un-pinned the shard-coverage signal.
+/// home shard (issue #961, AC4). Both the main dispatch loop and the
+/// buffered-overlap drain (`drain_buffered_schedule_runs`) call this, so the two
+/// cannot drift — they previously did: the drain gated on
+/// `schedule.dag_name.is_some()` alone, so a **canary** schedule (a non-DAG
+/// whose fire must land ON the shard it probes) drained a buffered slot onto the
+/// *default* shard, silently un-pinning the shard-coverage signal.
 fn scheduled_fire_exec_id(wf_name: &str, is_dag: bool, current_shard: ShardId) -> ExecutionId {
     if scheduled_fire_encodes_shard(wf_name, is_dag) {
         ExecutionId::new_for_shard(current_shard)
@@ -1252,79 +1238,6 @@ pub async fn tick_once_sharded(
     .await
 }
 
-/// The fence a scheduler shard pass holds (issue #1823).
-#[cfg(feature = "db")]
-type PassFence = Vec<crate::replication::FencePassGuard>;
-#[cfg(not(feature = "db"))]
-type PassFence = ();
-
-/// Run one shard pass under its fence barrier (issue #1823), or `None` when
-/// the barrier is lost first. The pass then stops before its next write.
-/// The guard already logged the lost session. The pool discards a
-/// connection that the pass left in a transaction, so the server rolls the
-/// transaction back.
-#[cfg(feature = "db")]
-async fn under_pass_fence<T>(
-    fence: &PassFence,
-    pass: impl std::future::Future<Output = T>,
-) -> Option<T> {
-    crate::replication::run_fenced_pass(fence, pass).await.ok()
-}
-#[cfg(not(feature = "db"))]
-async fn under_pass_fence<T>(
-    _fence: &PassFence,
-    pass: impl std::future::Future<Output = T>,
-) -> Option<T> {
-    Some(pass.await)
-}
-
-/// The fence key of one scheduler shard pass (issue #1823). A single pool
-/// names its shard through the default pin.
-const fn scheduler_fence_key(shard: ShardId, single_pool: bool) -> ShardId {
-    if single_pool {
-        ShardId::UNENCODED
-    } else {
-        shard
-    }
-}
-
-/// Open the fence for one scheduler shard pass, or `None` to skip the shard
-/// (issue #1823).
-///
-/// A single pool names its shard through the default pin. A held shard may
-/// be an unpromoted standby, so it is skipped. A fenced shard belongs to
-/// another region, so it is skipped and logged. Otherwise the returned
-/// guard holds a commit-order barrier until the pass ends: a bump cannot
-/// commit while the pass writes. See [`crate::replication::FencePassGuard`].
-async fn scheduler_fence(pool: &DbPool, shard: ShardId, single_pool: bool) -> Option<PassFence> {
-    let fence_key = scheduler_fence_key(shard, single_pool);
-    if crate::replication::shard_writes_held(Some(fence_key)) {
-        return None;
-    }
-    #[cfg(feature = "db")]
-    {
-        // The firing pass is not filtered by shard, so the pass guards every
-        // pinned shard colocated on this database too.
-        match crate::replication::begin_fenced_group(pool, fence_key).await {
-            Ok(guards) => Some(guards),
-            Err(error) => {
-                tracing::error!(
-                    shard_id = shard.as_i32(),
-                    error = %error,
-                    "scheduler skips a fenced shard; restart this process against the region \
-                     that holds authority"
-                );
-                None
-            }
-        }
-    }
-    #[cfg(not(feature = "db"))]
-    {
-        let _ = pool;
-        Some(())
-    }
-}
-
 /// [`tick_once_sharded`], with a caller-owned per-schedule registration backoff
 /// (issue #1157, defect 2).
 ///
@@ -1392,112 +1305,82 @@ pub async fn tick_once_sharded_with_backoff(
     #[cfg(not(feature = "db"))]
     let active_gates: Vec<crate::admission_gate::AdmissionGate> = Vec::new();
 
-    let single_pool = pool.len() == 1;
     for (shard, shard_pool) in pool.iter_shards() {
-        // Issue #1823: a held shard is skipped before it takes a connection.
-        // It can be an unreachable standby, so a checkout could wait on it.
-        if crate::replication::shard_writes_held(Some(scheduler_fence_key(shard, single_pool))) {
-            continue;
-        }
-        let mut conn = crate::replication::fenced_checkout(shard_pool)
+        let mut conn = shard_pool
+            .get()
             .await
             .map_err(|error| HarvestError::Database(error.to_string()))?;
-        // Held until this shard's pass ends. See `scheduler_fence`. It opens
-        // only after the checkout, so pool pressure cannot block a bump.
-        let Some(fence) = scheduler_fence(shard_pool, shard, single_pool).await else {
-            continue;
-        };
 
-        // The whole pass runs under the barrier. A lost barrier stops it.
-        let pass = async {
-            // Issue #1823: the connection predates the pass, so it joins it.
-            // A lost guard then ends its backend.
-            #[cfg(feature = "db")]
-            let _member = crate::replication::join_fenced_pass(shard_pool, &mut conn).await;
-            // Issue #1157: on a converged shard this pass is read-only — no
-            // transaction, no advisory lock, no UPDATE. Only a schedule that
-            // genuinely needs a write opens a transaction and contends for the
-            // fleet-wide registration lock, and a per-schedule failure is collected
-            // and backed off rather than aborting the rest of the pass.
-            register_schedules_for_shard(&mut conn, dags.as_ref(), &router, shard, backoff).await?;
-            let firing = register_workflow_schedules_for_shard(
-                &mut conn,
-                workflow_schedules.as_ref(),
-                &router,
-                shard,
-                backoff,
-            )
-            .await?;
+        // Issue #1157: on a converged shard this pass is read-only — no
+        // transaction, no advisory lock, no UPDATE. Only a schedule that
+        // genuinely needs a write opens a transaction and contends for the
+        // fleet-wide registration lock, and a per-schedule failure is collected
+        // and backed off rather than aborting the rest of the pass.
+        register_schedules_for_shard(&mut conn, dags.as_ref(), &router, shard, backoff).await?;
+        let firing = register_workflow_schedules_for_shard(
+            &mut conn,
+            workflow_schedules.as_ref(),
+            &router,
+            shard,
+            backoff,
+        )
+        .await?;
 
-            // Issue #1157: neither firing pass below filters by target shard, so a
-            // stale row this pass could not collect would be fired here *and* by the
-            // shard that now owns it. Stand this shard down for the tick rather than
-            // duplicate the run; the owning shard is unaffected and still fires it
-            // exactly once, and the next tick re-attempts the collection.
-            if firing == ShardFiringDecision::SuppressedUncollectedStaleRows {
-                tracing::warn!(
-                    shard_id = shard.as_i32(),
-                    "harvest: suppressing schedule firing on this shard for this tick; \
+        // Issue #1157: neither firing pass below filters by target shard, so a
+        // stale row this pass could not collect would be fired here *and* by the
+        // shard that now owns it. Stand this shard down for the tick rather than
+        // duplicate the run; the owning shard is unaffected and still fires it
+        // exactly once, and the next tick re-attempts the collection.
+        if firing == ShardFiringDecision::SuppressedUncollectedStaleRows {
+            tracing::warn!(
+                shard_id = shard.as_i32(),
+                "harvest: suppressing schedule firing on this shard for this tick; \
                  stale schedule rows left behind by a routing change could not be \
                  collected, and firing them here would duplicate the owning shard's run"
-                );
-                return Ok(());
-            }
+            );
+            continue;
+        }
 
-            fire_shard_schedules(
-                &mut conn,
-                shard,
-                dags.as_ref(),
-                registry.as_ref(),
-                &metrics,
-                &active_gates,
-            )
-            .await;
-            Ok::<(), HarvestError>(())
-        };
-        // Boxed: the pass is large, and inline it would bloat this future.
-        if let Some(result) = under_pass_fence(&fence, Box::pin(pass)).await {
-            result?;
+        // Drain buffered slots BEFORE evaluating newly-due firings so that
+        // capacity freed by a just-completed run is consumed by the oldest
+        // pending slot first, not by the freshest next_run_at firing.
+        #[cfg(feature = "db")]
+        if let Err(error) = drain_buffered_schedule_runs(
+            &mut conn,
+            shard,
+            dags.as_ref(),
+            registry.as_ref(),
+            &metrics,
+            &active_gates,
+        )
+        .await
+        {
+            tracing::warn!(
+                error = %error,
+                shard_id = shard.as_i32(),
+                "harvest: buffered schedule drain error"
+            );
+        }
+
+        if let Err(error) = tick_workflow_schedules(
+            &mut conn,
+            shard,
+            dags.as_ref(),
+            registry.as_ref(),
+            &metrics,
+            &active_gates,
+        )
+        .await
+        {
+            tracing::warn!(
+                error = %error,
+                shard_id = shard.as_i32(),
+                "harvest workflow-schedule tick error"
+            );
         }
     }
 
     Ok(())
-}
-
-/// Fire one shard's due schedules: drain buffered slots, then tick.
-///
-/// Each step logs its own error, so one failure does not stop the other.
-async fn fire_shard_schedules(
-    conn: &mut AsyncPgConnection,
-    shard: ShardId,
-    dags: &DagCatalog,
-    registry: &HandlerRegistry,
-    metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
-    active_gates: &[crate::admission_gate::AdmissionGate],
-) {
-    // Drain buffered slots BEFORE evaluating newly-due firings so that
-    // capacity freed by a just-completed run is consumed by the oldest
-    // pending slot first, not by the freshest next_run_at firing.
-    #[cfg(feature = "db")]
-    if let Err(error) =
-        drain_buffered_schedule_runs(conn, shard, dags, registry, metrics, active_gates).await
-    {
-        tracing::warn!(
-            error = %error,
-            shard_id = shard.as_i32(),
-            "harvest: buffered schedule drain error"
-        );
-    }
-
-    if let Err(error) =
-        tick_workflow_schedules(conn, shard, dags, registry, metrics, active_gates).await
-    {
-        tracing::warn!(
-            error = %error,
-            shard_id = shard.as_i32(),
-            "harvest workflow-schedule tick error"
-        );
-    }
 }
 
 /// Trigger a DAG run as a workflow execution (issue #256 Step 5).
@@ -1535,9 +1418,8 @@ pub async fn trigger_unified_dag(
     start_source: crate::types::StartSource,
     started_by: Option<&str>,
 ) -> HarvestResult<StartedWorkflowExecution> {
-    use diesel_async::AsyncConnection;
-
-    let mut db = crate::replication::fenced_checkout(&pool)
+    let mut db = pool
+        .get()
         .await
         .map_err(|error| HarvestError::Database(error.to_string()))?;
 
@@ -1549,12 +1431,6 @@ pub async fn trigger_unified_dag(
     // Resolve the DAG schedule row by its DAG marker first. Some upgrade paths
     // can still have workflow-only rows, so use those as a fallback until
     // registration merges them.
-    //
-    // The pause and `max_active_runs` checks and the start run in one
-    // transaction, under a lock on the schedule rows. Two concurrent manual
-    // triggers once read the same count, and both started, so the DAG ran
-    // over its limit. The lock makes the second trigger count the first run.
-    let (collected, hints) = Box::pin(crate::dispatch::buffered(Box::pin(db.transaction::<_, HarvestError, _>(async |conn| {
     let schedule = {
         use crate::schema::harvest_schedules::dsl;
         let rows = dsl::harvest_schedules
@@ -1563,10 +1439,8 @@ pub async fn trigger_unified_dag(
                     .eq(dag_name)
                     .or(dsl::workflow_name.eq(dag_name)),
             )
-            .order(dsl::id)
             .select(HarvestSchedule::as_select())
-            .for_update()
-            .load::<HarvestSchedule>(conn)
+            .load::<HarvestSchedule>(&mut db)
             .await
             .map_err(crate::error::database_error)?;
         rows.iter()
@@ -1584,11 +1458,13 @@ pub async fn trigger_unified_dag(
             });
         }
 
-        // Tick-exact basis (issue #1160): counts a cross-type continue-as-new
-        // successor of this schedule too, not just same-named runs -- a manual
-        // trigger must not double-dispatch a schedule whose active run has
-        // already changed type mid-chain.
-        let running: i64 = schedule_running_basis(conn, dag_name, schedule.id).await?;
+        let running: i64 = harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::workflow_name.eq(dag_name))
+            .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
+            .count()
+            .get_result(&mut db)
+            .await
+            .map_err(crate::error::database_error)?;
         if running >= i64::from(schedule.max_active_runs) {
             return Err(HarvestError::UpdateRejected {
                 reason: format!(
@@ -1609,63 +1485,76 @@ pub async fn trigger_unified_dag(
     // schedule-associated (issue #740).
     let schedule_ref = schedule.as_ref().map(|s| s.id.to_string());
 
-    // Issue #1412: resolve the DAG's declared execution_timeout/sla/ceiling
-    // from its shadow WorkflowInfo. `tick_one_workflow_schedule`'s main
-    // dispatch path performs the SAME lookup. A manual/MCP trigger then
-    // gets the same deadline enforcement as a scheduled tick or a manual
-    // HTTP `/workflows/{name}/start`.
-    let DispatchDeadline {
-        execution_timeout,
-        sla,
-        max_execution_timeout_ceiling,
-    } = registry.resolve_dispatch_deadline(dag_name);
+    // Issue #743 review (PR #1141, Findings #1/#3): resolve the DAG's declared
+    // execution_timeout/sla from its shadow WorkflowInfo -- the SAME lookup
+    // `tick_one_workflow_schedule`'s main dispatch path performs -- and apply
+    // the fleet-wide ceiling, so a manual/MCP trigger gets the same deadline
+    // enforcement as a scheduled tick or a manual HTTP `/workflows/{name}/start`.
+    let wf_info = registry.workflows.get(dag_name);
+    let execution_timeout = wf_info
+        .and_then(|info| info.execution_timeout)
+        .and_then(|d| chrono::Duration::from_std(d).ok());
+    let sla = wf_info
+        .and_then(|info| info.sla)
+        .and_then(|d| chrono::Duration::from_std(d).ok());
+    let max_execution_timeout_ceiling = registry
+        .max_workflow_execution_timeout
+        .and_then(|d| chrono::Duration::from_std(d).ok());
 
-    crate::execution::start_or_load_workflow_execution_collect_with_codecs(
-        conn,
+    start_or_load_workflow_execution(
+        &mut db,
         StartWorkflowParams {
+            workflow_name: dag_name,
+            workflow_id: &workflow_id,
+            exec_id,
+            input,
+            parent_id: None,
+            queue_name: &queue_name,
             execution_timeout,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+            conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
+            trace_context: None,
             max_execution_timeout_ceiling,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            concurrency_on_conflict: crate::concurrency::ConcurrencyOnConflict::Defer,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
             owner,
             runbook_url,
             severity,
+            context_headers: None,
+
             sla,
             // Attribute the manual API trigger to the schedule so it appears in
             // GET /admin/schedules/{id}/runs with origin='manual_trigger'.
             // scheduled_for stays None so resolve_carryover (issue #488) still
             // short-circuits — NULL slot comparisons are false.
             schedule_id: schedule.as_ref().map(|s| s.id),
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
             origin: schedule
                 .as_ref()
                 .map(|_| crate::execution::ORIGIN_MANUAL_TRIGGER),
+            completion_callbacks: None,
             start_source,
             start_source_ref: schedule_ref.as_deref(),
             started_by,
-            ..StartWorkflowParams::new(dag_name, &workflow_id, exec_id, input, &queue_name)
         },
-        /* in_outer_transaction = */ true,
-        /* reject_fresh_if_debounced = */ false,
         None,
-        None,
-        registry.payload_codecs(),
     )
     .await
-    })))).await;
-    let (started, deferred_starts, deferred_checks, _cancel_metrics) = collected?;
-    // Side effects run only after the commit, so a rollback starts nothing.
-    crate::dispatch::publish_now(hints).await;
-    for start in deferred_starts {
-        start.spawn();
-    }
-    for (check_id, check_name) in deferred_checks {
-        let _ = crate::execution::check_and_report_unfinished_handlers(
-            &mut db,
-            check_id,
-            &check_name,
-            None,
-        )
-        .await;
-    }
-    Ok(started)
 }
 
 /// Upsert the durable schedule row for one registered DAG.
@@ -2103,10 +1992,6 @@ async fn find_reusable_dag_workflow_schedule(
     match classify_workflow_name_holder(dag_name, workflow_name, holder_shape) {
         WorkflowNameHolder::Vacant => Ok(dag_row),
         WorkflowNameHolder::WorkflowOnly => {
-            #[expect(
-                clippy::expect_used,
-                reason = "the classifier gives this variant only for a present holder"
-            )]
             let workflow_only_row = foreign_holder.expect("classified from a present holder");
             match dag_row {
                 Some(dag_row) => {
@@ -2123,10 +2008,6 @@ async fn find_reusable_dag_workflow_schedule(
             }
         }
         WorkflowNameHolder::Squatter => {
-            #[expect(
-                clippy::expect_used,
-                reason = "the classifier gives this variant only for a present holder"
-            )]
             let squatter = foreign_holder.expect("classified from a present holder");
             if !release_squatted_workflow_name(conn, squatter, workflow_name).await? {
                 // The holder stopped matching the squat we classified between
@@ -2148,10 +2029,6 @@ async fn find_reusable_dag_workflow_schedule(
             Ok(dag_row)
         }
         WorkflowNameHolder::Conflict => {
-            #[expect(
-                clippy::expect_used,
-                reason = "the classifier gives this variant only for a present holder"
-            )]
             let holder = foreign_holder.expect("classified from a present holder");
             Err(HarvestError::Config(format!(
                 "schedule registration conflict: workflow_name '{workflow_name}' requested by \
@@ -2871,17 +2748,6 @@ pub enum ScheduleUpdateOutcome {
 /// the stored `retry_policy` JSON does not deserialize as a `RetryPolicy` —
 /// erroring loudly instead of silently dropping the stored policy to NULL on
 /// an unrelated edit (repair by explicitly setting or clearing it).
-///
-/// # Jitter
-///
-/// The default fire jitter applies on create only (issue #1792). The stored
-/// row does not record whether its `jitter_secs` came from the default or
-/// from an explicit request. The merge therefore never re-derives jitter: a
-/// patch that changes `schedule` keeps the stored jitter unless the same
-/// patch sets `jitter`. A value equality check against the old cadence's
-/// default cannot tell an explicit `jitter_secs: 0` from the interval default.
-/// Such a check would turn that opt-out into 10 s on a move to a five-field
-/// cron. That breaks the partial-update contract.
 fn merge_schedule_patch(
     existing: &HarvestSchedule,
     patch: &WorkflowSchedulePatch,
@@ -2928,9 +2794,6 @@ fn merge_schedule_patch(
         },
     };
 
-    let jitter = patch
-        .jitter
-        .unwrap_or_else(|| Duration::from_secs(u64::try_from(existing.jitter_secs).unwrap_or(0)));
     Ok(WorkflowSchedule {
         workflow_name,
         dag_name: None,
@@ -2952,7 +2815,9 @@ fn merge_schedule_patch(
             .clone()
             .or_else(|| existing.queue_name.clone())
             .unwrap_or_else(|| "default".to_string()),
-        jitter,
+        jitter: patch.jitter.unwrap_or_else(|| {
+            Duration::from_secs(u64::try_from(existing.jitter_secs).unwrap_or(0))
+        }),
         overlap_policy: patch
             .overlap_policy
             .unwrap_or_else(|| OverlapPolicy::from_db(&existing.overlap_policy)),
@@ -3055,10 +2920,6 @@ pub async fn update_workflow_schedule(
         // before any write; a Config error rolls the transaction back.
         let merged = merge_schedule_patch(&existing, patch)?;
         crate::policy::validate_schedule(&merged.schedule).map_err(HarvestError::Config)?;
-        // The merge keeps the stored jitter on a cadence change (issue #1792).
-        // The new cadence must still hold it.
-        crate::policy::validate_jitter(&merged.schedule, merged.jitter)
-            .map_err(HarvestError::Config)?;
 
         match apply_workflow_schedule_update(conn, &merged, &existing, true).await? {
             AppliedScheduleUpdate::Updated(row) => Ok(ScheduleUpdateOutcome::Updated(row)),
@@ -3536,85 +3397,35 @@ pub async fn claim_and_fire_workflow_schedule(
             error = %error, workflow_name = %wf_name,
             "harvest: workflow schedule tick failed; continuing to next schedule"
         );
-        // Release this tick's claim on error, so a peer can retry promptly.
-        release_fire_claim(conn, schedule.id, my_claim_token).await;
+        // Clear our own claim on error so a peer can retry promptly. Guard
+        // on the token so a slow late-running tick doesn't clear a
+        // successor's live claim if the 30 s TTL has already expired.
+        let _ = diesel::sql_query(
+            "UPDATE harvest_schedules \
+             SET fire_claim_token = NULL, fire_claimed_until = NULL \
+             WHERE id = $1 AND fire_claim_token = $2",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(schedule.id)
+        .bind::<diesel::sql_types::Uuid, _>(my_claim_token)
+        .execute(conn)
+        .await;
     }
 
     Ok(())
 }
 
-/// Clear a fire claim, but only while `claim_token` still holds it.
+/// Cancel the oldest scheduled RUNNING executions for `workflow_name` under `schedule_id`,
+/// up to `max_to_cancel`.
 ///
-/// The token fence stops a late caller from clearing a peer's claim after the
-/// 30 s TTL. This is best effort: a claim that is not cleared expires.
-async fn release_fire_claim(
-    conn: &mut AsyncPgConnection,
-    schedule_id: uuid::Uuid,
-    claim_token: uuid::Uuid,
-) {
-    if let Err(error) = diesel::sql_query(
-        "UPDATE harvest_schedules \
-         SET fire_claim_token = NULL, fire_claimed_until = NULL \
-         WHERE id = $1 AND fire_claim_token = $2",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(schedule_id)
-    .bind::<diesel::sql_types::Uuid, _>(claim_token)
-    .execute(conn)
-    .await
-    {
-        tracing::debug!(
-            error = %error,
-            schedule_id = %schedule_id,
-            "harvest: could not release the fire claim; it expires after its TTL"
-        );
-    }
-}
-
-/// Load up to `limit` of the oldest scheduled RUNNING/PAUSED execution ids
-/// under `schedule_id`, shared by `cancel_in_flight_runs` and
-/// `terminate_in_flight_runs`.
-///
-/// Filters by `schedule_id` alone -- NOT also by `workflow_name` -- rather than the
-/// `sched:` workflow-id prefix, so that workflow-retry executions (which carry a UUID
-/// `workflow_id` but still link back to the originating schedule via the `schedule_id`
-/// FK) are included, while operator-triggered manual runs (which have `schedule_id =
-/// NULL`) are not inadvertently targeted. `schedule_id` is unique to one schedule, so
-/// it alone is already the correct, sufficient scope: a workflow-name filter on top of
-/// it is redundant for a same-type schedule and actively wrong for one whose
-/// `ctx.continue_as_new_as(...)` (#803) successor carries this `schedule_id` under a
-/// DIFFERENT `workflow_name` -- exactly the case a `workflow_name` filter would silently
-/// exclude from overlap cleanup (issue #1160).
-/// Orders by `started_at ASC` (oldest first) and pushes `limit` into the query
-/// itself rather than loading every match and truncating in Rust.
-#[cfg(feature = "db")]
-async fn load_overlap_cleanup_targets(
-    conn: &mut AsyncPgConnection,
-    schedule_id: uuid::Uuid,
-    limit: u32,
-) -> HarvestResult<Vec<uuid::Uuid>> {
-    harvest_workflow_executions::table
-        .filter(harvest_workflow_executions::schedule_id.eq(Some(schedule_id)))
-        .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
-        // Exclude manual-trigger runs: attributing them to the schedule (issue #534)
-        // must not make them targets for automatic overlap-cleanup. Scheduled and
-        // backfill runs remain eligible; NULL origin (pre-migration) is included for
-        // backward compatibility.
-        .filter(harvest_workflow_executions::origin.is_null().or(
-            harvest_workflow_executions::origin.ne(crate::execution::ORIGIN_MANUAL_TRIGGER),
-        ))
-        .order(harvest_workflow_executions::started_at.asc())
-        .limit(i64::from(limit))
-        .select(harvest_workflow_executions::id)
-        .load(conn)
-        .await
-        .map_err(crate::error::database_error)
-}
-
-/// Cancel up to `max_to_cancel` of the oldest in-flight runs under `schedule_id`
-/// (see [`load_overlap_cleanup_targets`] for selection).
+/// Filters by `schedule_id` rather than the `sched:` workflow-id prefix so that workflow-retry
+/// executions (which carry a UUID `workflow_id` but still link back to the originating schedule via
+/// the `schedule_id` FK) are included, while operator-triggered manual runs (which have
+/// `schedule_id = NULL`) are not inadvertently cancelled.
+/// Orders by `started_at ASC` so the oldest executions are cancelled first.
 #[cfg(feature = "db")]
 async fn cancel_in_flight_runs(
     conn: &mut AsyncPgConnection,
+    workflow_name: &str,
     schedule_id: uuid::Uuid,
     reason: &str,
     max_to_cancel: u32,
@@ -3622,10 +3433,29 @@ async fn cancel_in_flight_runs(
 ) -> HarvestResult<u32> {
     use crate::execution::cancel_workflow_execution;
 
-    let running_ids = load_overlap_cleanup_targets(conn, schedule_id, max_to_cancel).await?;
+    let running_ids: Vec<uuid::Uuid> =
+        harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
+            .filter(harvest_workflow_executions::schedule_id.eq(Some(schedule_id)))
+            .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
+            // Exclude manual-trigger runs: attributing them to the schedule (issue #534)
+            // must not make them targets for automatic overlap-cleanup. Scheduled and
+            // backfill runs remain eligible; NULL origin (pre-migration) is included for
+            // backward compatibility.
+            .filter(harvest_workflow_executions::origin.is_null().or(
+                harvest_workflow_executions::origin.ne(crate::execution::ORIGIN_MANUAL_TRIGGER),
+            ))
+            .order(harvest_workflow_executions::started_at.asc())
+            .select(harvest_workflow_executions::id)
+            .load(conn)
+            .await
+            .map_err(crate::error::database_error)?;
 
     let mut count: u32 = 0;
-    for raw_id in running_ids {
+    for raw_id in running_ids
+        .into_iter()
+        .take(usize::try_from(max_to_cancel).unwrap_or(usize::MAX))
+    {
         let exec_id = ExecutionId::from_uuid(raw_id);
         match cancel_workflow_execution(conn, exec_id, reason, metrics).await {
             Ok(_) => count += 1,
@@ -3641,11 +3471,16 @@ async fn cancel_in_flight_runs(
     Ok(count)
 }
 
-/// Terminate up to `max_to_terminate` of the oldest in-flight runs under
-/// `schedule_id` (see [`load_overlap_cleanup_targets`] for selection).
+/// Terminate the oldest scheduled RUNNING executions for `workflow_name` under `schedule_id`,
+/// up to `max_to_terminate`.
+///
+/// Filters by `schedule_id` (same rationale as `cancel_in_flight_runs`) so workflow-retry
+/// executions are included and manual-trigger runs (`schedule_id` = NULL) are excluded.
+/// Orders by `started_at ASC` so the oldest executions are terminated first.
 #[cfg(feature = "db")]
 async fn terminate_in_flight_runs(
     conn: &mut AsyncPgConnection,
+    workflow_name: &str,
     schedule_id: uuid::Uuid,
     reason: &str,
     max_to_terminate: u32,
@@ -3653,10 +3488,25 @@ async fn terminate_in_flight_runs(
 ) -> HarvestResult<u32> {
     use crate::execution::terminate_workflow_execution;
 
-    let active_ids = load_overlap_cleanup_targets(conn, schedule_id, max_to_terminate).await?;
+    let active_ids: Vec<uuid::Uuid> =
+        harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
+            .filter(harvest_workflow_executions::schedule_id.eq(Some(schedule_id)))
+            .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
+            .filter(harvest_workflow_executions::origin.is_null().or(
+                harvest_workflow_executions::origin.ne(crate::execution::ORIGIN_MANUAL_TRIGGER),
+            ))
+            .order(harvest_workflow_executions::started_at.asc())
+            .select(harvest_workflow_executions::id)
+            .load(conn)
+            .await
+            .map_err(crate::error::database_error)?;
 
     let mut count: u32 = 0;
-    for raw_id in active_ids {
+    for raw_id in active_ids
+        .into_iter()
+        .take(usize::try_from(max_to_terminate).unwrap_or(usize::MAX))
+    {
         let exec_id = ExecutionId::from_uuid(raw_id);
         match terminate_workflow_execution(conn, exec_id, reason, metrics).await {
             Ok(_) => count += 1,
@@ -4241,10 +4091,18 @@ async fn tick_one_workflow_schedule(
         return Ok(());
     }
 
-    // Tick-exact running basis (RUNNING/PAUSED count, `schedule_id`-scoped
-    // cross-type successors included per issue #1160, plus the #607 pending-
-    // throttle backlog) -- see `schedule_running_basis`.
-    let mut running: i64 = schedule_running_basis(conn, wf_name, schedule.id).await?;
+    let mut running: i64 = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(wf_name))
+        .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
+        .count()
+        .get_result(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    // A throttled fire (issue #607) durably defers before any execution row
+    // exists -- count it toward max_active_runs/overlap so a schedule can't
+    // dispatch past its own concurrency limit while an earlier fire is still
+    // sitting in the throttle queue (code review, issue #607).
+    running += crate::throttle::pending_throttle_count_for_workflow(conn, wf_name).await?;
 
     if running >= i64::from(schedule.max_active_runs) {
         let overlap_policy = OverlapPolicy::from_db(&schedule.overlap_policy);
@@ -4400,6 +4258,7 @@ async fn tick_one_workflow_schedule(
                         .unwrap_or(1);
                 let cancelled = cancel_in_flight_runs(
                     conn,
+                    wf_name,
                     schedule.id,
                     "overlap policy CancelOther: new firing",
                     needed,
@@ -4415,6 +4274,7 @@ async fn tick_one_workflow_schedule(
                         .unwrap_or(1);
                 let terminated = terminate_in_flight_runs(
                     conn,
+                    wf_name,
                     schedule.id,
                     "overlap policy TerminateOther: new firing",
                     needed,
@@ -4564,17 +4424,6 @@ async fn tick_one_workflow_schedule(
         {
             break;
         }
-        // Clone-class note: the concurrency-key resolution and the
-        // owner/runbook/severity merge below repeat verbatim in
-        // `drain_claimed_buffered_schedule`. Apply any change to either
-        // block to both functions.
-        //
-        // Two instances only. Commit 6b3fb18c (issue #372, PR #550)
-        // introduced both copies together. Commit f138c3b0 (issue #811,
-        // PR #1196) later updated both copies together again. No
-        // missed-fix has occurred on either copy since. The merge bar
-        // (rule of three, or a missed-fix) is not met yet, so the
-        // duplication stays.
         let workflow_id = scheduled_workflow_id(schedule.id, wf_name, *original_slot);
         let exec_id = scheduled_fire_exec_id(wf_name, schedule.dag_name.is_some(), current_shard);
         let input = schedule
@@ -4610,16 +4459,12 @@ async fn tick_one_workflow_schedule(
                 (None, None) => (None, None, None),
             }
         };
-        // Issue #1412: one shared lookup resolves the declared execution_timeout,
-        // sla, and fleet-wide ceiling for this fire. A DAG's own shadow
-        // `WorkflowInfo` carries these fields identically to a `#[workflow]`.
-        // `DagInfo::as_workflow_info()` registers that shadow entry under the
-        // DAG's own name, so this one lookup covers both kinds.
-        let DispatchDeadline {
-            execution_timeout,
-            sla,
-            max_execution_timeout_ceiling,
-        } = registry.resolve_dispatch_deadline(wf_name);
+        // Issue #743: a DAG's own shadow `WorkflowInfo` (registered under its
+        // name by `DagInfo::as_workflow_info()`) carries `sla` identically to
+        // a `#[workflow]`, so this ONE lookup covers both kinds.
+        let sla = wf_info
+            .and_then(|info| info.sla)
+            .and_then(|d| chrono::Duration::from_std(d).ok());
         tracing::info!(
             workflow_name = %wf_name, workflow_id = %workflow_id,
             scheduled_for = %scheduled_for, "harvest: dispatching scheduled workflow run"
@@ -4682,7 +4527,10 @@ async fn tick_one_workflow_schedule(
                     .and_then(|p| serde_json::to_value(&p).ok());
                 let start_options = crate::debounce::DebounceStartOptions {
                     reuse_policy: Some("reject_duplicate".to_string()),
-                    execution_timeout_secs: execution_timeout.map(|d| d.num_seconds()),
+                    execution_timeout_secs: wf_info
+                        .and_then(|info| info.execution_timeout)
+                        .and_then(|d| chrono::Duration::from_std(d).ok())
+                        .map(|d| d.num_seconds()),
                     memo: None,
                     search_attrs: None,
                     sla_secs: sla.map(|d| d.num_seconds()),
@@ -4694,11 +4542,13 @@ async fn tick_one_workflow_schedule(
                     owner: owner.map(str::to_string),
                     runbook_url: runbook_url.map(str::to_string),
                     severity: severity.map(str::to_string),
-                    // Fleet-wide execution_timeout ceiling (issue #1412): a throttled
-                    // scheduled fire must be capped by the same operator-configured
-                    // ceiling a manual/HTTP start applies. This is parity with the
-                    // chain-cap ceiling right below.
-                    max_execution_timeout_ceiling_secs: max_execution_timeout_ceiling
+                    // Fleet-wide execution_timeout ceiling (issue #743 review, PR
+                    // #1141 Finding #3): a throttled scheduled fire must be capped
+                    // by the same operator-configured ceiling a manual/HTTP start
+                    // applies -- parity with the chain-cap ceiling right below.
+                    max_execution_timeout_ceiling_secs: registry
+                        .max_workflow_execution_timeout
+                        .and_then(|d| chrono::Duration::from_std(d).ok())
                         .map(|d| d.num_seconds()),
                     // Chain-scoped lifetime cap (issue #617): workflow-type default
                     // + fleet-wide ceiling (via registry, since the core scheduler
@@ -4769,68 +4619,83 @@ async fn tick_one_workflow_schedule(
         // metrics-less wrapper discards the collected cancellations, so a
         // scheduled fire that sheds an incumbent emitted neither
         // `harvest.concurrency.superseded` nor the cancelled terminal.
-        let start_result =
-            crate::execution::start_or_load_workflow_execution_with_metrics_and_codecs(
-                conn,
-                StartWorkflowParams {
-                    execution_timeout,
-                    reuse_policy: scheduled_workflow_reuse_policy(),
-                    // Fleet-wide execution_timeout ceiling (issue #1412): parity with
-                    // the throttled branch above and with the chain-cap ceiling right
-                    // below.
-                    max_execution_timeout_ceiling,
-                    // Chain-scoped lifetime cap (issue #617): carry the workflow-type
-                    // default AND the fleet-wide chain ceiling-as-default, so a whole
-                    // scheduled continue-as-new chain is capped even when the workflow
-                    // under-specifies (AC4). The ceiling reaches the core scheduler via
-                    // the `HandlerRegistry` (it has no `api_state`), diverging from the
-                    // per-run `execution_timeout` ceiling which is a pure cap, not a
-                    // fleet-wide default.
-                    chain_execution_timeout: wf_info
-                        .and_then(|info| info.chain_execution_timeout)
-                        .and_then(|d| chrono::Duration::from_std(d).ok()),
-                    max_workflow_chain_timeout_ceiling: registry
-                        .max_workflow_chain_timeout
-                        .and_then(|d| chrono::Duration::from_std(d).ok()),
-                    concurrency_key,
-                    concurrency_limit,
-                    concurrency_on_conflict,
-                    max_workflow_input_bytes: wf_info
-                        .and_then(|info| info.max_input_bytes)
-                        .map_or(registry.max_workflow_input_bytes, |per| {
-                            per.max(registry.max_workflow_input_bytes)
-                        }),
-                    owner,
-                    runbook_url,
-                    severity,
-                    sla,
-                    schedule_id: Some(schedule.id),
-                    // Logical slot = the slot encoded in workflow_id (original_slot), so
-                    // carryover ordering and the migration backfill agree (issue #488).
-                    scheduled_for: Some(*original_slot),
-                    workflow_retry_policy: schedule
-                        .retry_policy
-                        .as_ref()
-                        .and_then(|v| serde_json::from_value(v.clone()).ok())
-                        .or_else(|| wf_info.and_then(|info| info.retry_policy.clone())),
-                    max_workflow_attempts_ceiling: registry.max_workflow_attempts_ceiling,
-                    // Normal scheduler-tick fire — attributed as the schedule's cadence (issue #534).
-                    origin: Some(crate::execution::ORIGIN_SCHEDULED),
-                    start_source: crate::types::StartSource::Schedule,
-                    start_source_ref: Some(schedule_id_str.as_str()),
-                    ..StartWorkflowParams::new(
-                        wf_name,
-                        &workflow_id,
-                        exec_id,
-                        input,
-                        dispatch_queue,
-                    )
-                },
-                Some(metrics.as_ref()),
-                None,
-                registry.payload_codecs(),
-            )
-            .await;
+        let start_result = crate::execution::start_or_load_workflow_execution_with_metrics(
+            conn,
+            StartWorkflowParams {
+                workflow_name: wf_name,
+                workflow_id: &workflow_id,
+                exec_id,
+                input,
+                parent_id: None,
+                queue_name: dispatch_queue,
+                execution_timeout: wf_info
+                    .and_then(|info| info.execution_timeout)
+                    .and_then(|d| chrono::Duration::from_std(d).ok()),
+                memo: None,
+                search_attrs: None,
+                reuse_policy: scheduled_workflow_reuse_policy(),
+                conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
+                trace_context: None,
+                // Fleet-wide execution_timeout ceiling (issue #743 review, PR
+                // #1141 Finding #3): parity with the throttled branch above and
+                // with the chain-cap ceiling right below.
+                max_execution_timeout_ceiling: registry
+                    .max_workflow_execution_timeout
+                    .and_then(|d| chrono::Duration::from_std(d).ok()),
+                // Chain-scoped lifetime cap (issue #617): carry the workflow-type
+                // default AND the fleet-wide chain ceiling-as-default, so a whole
+                // scheduled continue-as-new chain is capped even when the workflow
+                // under-specifies (AC4). The ceiling reaches the core scheduler via
+                // the `HandlerRegistry` (it has no `api_state`), diverging from the
+                // per-run `execution_timeout` ceiling which is a pure cap, not a
+                // fleet-wide default.
+                chain_execution_timeout: wf_info
+                    .and_then(|info| info.chain_execution_timeout)
+                    .and_then(|d| chrono::Duration::from_std(d).ok()),
+                max_workflow_chain_timeout_ceiling: registry
+                    .max_workflow_chain_timeout
+                    .and_then(|d| chrono::Duration::from_std(d).ok()),
+                inherited_chain_deadline_at: None,
+                concurrency_key,
+                concurrency_limit,
+                concurrency_on_conflict,
+                priority: Priority::default(),
+                max_workflow_input_bytes: wf_info
+                    .and_then(|info| info.max_input_bytes)
+                    .map_or(registry.max_workflow_input_bytes, |per| {
+                        per.max(registry.max_workflow_input_bytes)
+                    }),
+                start_at: None,
+                delay: None,
+                max_workflow_start_delay: None,
+                owner,
+                runbook_url,
+                severity,
+                context_headers: None,
+                sla,
+                schedule_id: Some(schedule.id),
+                // Logical slot = the slot encoded in workflow_id (original_slot), so
+                // carryover ordering and the migration backfill agree (issue #488).
+                scheduled_for: Some(*original_slot),
+                workflow_attempt: 1,
+                workflow_retry_policy: schedule
+                    .retry_policy
+                    .as_ref()
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .or_else(|| wf_info.and_then(|info| info.retry_policy.clone())),
+                retry_of_exec_id: None,
+                max_workflow_attempts_ceiling: registry.max_workflow_attempts_ceiling,
+                // Normal scheduler-tick fire — attributed as the schedule's cadence (issue #534).
+                origin: Some(crate::execution::ORIGIN_SCHEDULED),
+                completion_callbacks: None,
+                start_source: crate::types::StartSource::Schedule,
+                start_source_ref: Some(schedule_id_str.as_str()),
+                started_by: None,
+            },
+            Some(metrics.as_ref()),
+            None,
+        )
+        .await;
         match scheduled_start_outcome(start_result) {
             Ok(outcome) => {
                 dispatched += 1;
@@ -5068,14 +4933,11 @@ async fn tick_one_workflow_schedule(
 ///
 /// Returns `Err` if the schedule is a `Cron` variant whose expression cannot be
 /// parsed by `croner`. `Interval` and `Manual` schedules are always valid.
+///
 // Re-exported so callers can reach it via the `scheduler` module path, which
 // is where it lived before being moved to `policy` for feature-gate reasons.
 pub use crate::policy::validate_schedule;
 
-/// Return the stored form of `schedule`.
-///
-/// `validate_schedule` rejects a fractional period, so `as_secs` loses nothing
-/// (issue #1967).
 fn schedule_expr(schedule: Option<&Schedule>) -> Option<String> {
     match schedule {
         Some(Schedule::Cron(expr)) => Some(format!("cron:{expr}")),
@@ -5388,8 +5250,8 @@ pub struct OverdueSample {
 /// workflow (or DAG) name on **one shard** connection (issue #696).
 ///
 /// Replicates `tick_one_workflow_schedule`'s own count byte-for-byte: the
-/// shard-local `COUNT(state IN ('RUNNING','PAUSED') WHERE workflow_name = name OR
-/// schedule_id = schedule_id)` **plus** the #607 pending-throttle backlog
+/// shard-local `COUNT(state IN ('RUNNING','PAUSED') WHERE workflow_name = name)`
+/// **plus** the #607 pending-throttle backlog
 /// (`throttle::pending_throttle_count_for_workflow`) that the tick adds before
 /// comparing against `max_active_runs`. A DAG schedule's executions carry
 /// `workflow_name == dag_name`, and the DAG tick uses the same two-term basis,
@@ -5400,27 +5262,15 @@ pub struct OverdueSample {
 /// `overdue` *exactly* when the tick would deliberately hold `next_run_at` in
 /// the past.
 ///
-/// The `schedule_id` disjunct (issue #1160) additively counts a
-/// `ctx.continue_as_new_as(...)` (#803) successor, which carries this schedule's
-/// `schedule_id` under a DIFFERENT `workflow_name` a name-only count would miss --
-/// one `COUNT(*)`, so a same-type row matching both clauses is still counted once.
-/// See `docs/getting-started/08-dags-and-schedules.md`'s overlap-policy section for
-/// the full rationale and the rejected alternative.
-///
 /// # Errors
 ///
 /// Returns a database error if either count query fails.
 pub async fn schedule_running_basis(
     conn: &mut AsyncPgConnection,
     name: &str,
-    schedule_id: uuid::Uuid,
 ) -> HarvestResult<i64> {
     let running: i64 = harvest_workflow_executions::table
-        .filter(
-            harvest_workflow_executions::workflow_name
-                .eq(name)
-                .or(harvest_workflow_executions::schedule_id.eq(Some(schedule_id))),
-        )
+        .filter(harvest_workflow_executions::workflow_name.eq(name))
         .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
         .count()
         .get_result(conn)
@@ -5428,154 +5278,6 @@ pub async fn schedule_running_basis(
         .map_err(crate::error::database_error)?;
     let pending = crate::throttle::pending_throttle_count_for_workflow(conn, name).await?;
     Ok(running.saturating_add(pending))
-}
-
-/// Batched form of [`schedule_running_basis`] for many schedules at once.
-///
-/// One grouped `RUNNING`/`PAUSED` count query plus one grouped
-/// pending-throttle query ([`throttle::pending_throttle_counts_for_workflows`])
-/// covering every schedule in `schedules`, all on **one shard** connection,
-/// instead of the two queries *per schedule* `schedule_running_basis` issues
-/// when called in a loop over many schedules (Ledger perf pass on
-/// `GET /admin/schedules`).
-///
-/// Returns a map keyed by `schedule_id` rather than by name (issue #1160):
-/// `schedule_running_basis`'s `schedule_id` disjunct means two schedules can
-/// no longer be assumed to have independent, name-only bases, so the caller
-/// must look results up by the schedule it actually asked about. A schedule
-/// with zero total (same-type + cross-type) running/pending executions is
-/// absent from the returned map; callers should treat a missing key as `0`,
-/// matching what a per-schedule call to `schedule_running_basis` would have
-/// returned.
-///
-/// # Errors
-///
-/// Returns a database error if either grouped count query fails.
-pub async fn schedule_running_basis_batch(
-    conn: &mut AsyncPgConnection,
-    schedules: &[(uuid::Uuid, &str)],
-) -> HarvestResult<HashMap<uuid::Uuid, i64>> {
-    if schedules.is_empty() {
-        return Ok(HashMap::new());
-    }
-    // Dedupe by schedule id defensively: a duplicate `(id, name)` pair would
-    // otherwise double-add the pending-throttle term for that id below (each
-    // id's basis is looked up once from `by_name`/`cross_type_by_schedule`,
-    // which are already idempotent under a repeat, but the throttle map is
-    // merged with `+=`). No caller passes duplicates today, but the contract
-    // is cheap to hold unconditionally rather than document as a caller
-    // obligation.
-    let owner_name: HashMap<uuid::Uuid, &str> =
-        schedules.iter().map(|(id, name)| (*id, *name)).collect();
-    let ids: Vec<uuid::Uuid> = owner_name.keys().copied().collect();
-    let name_set: std::collections::HashSet<&str> = owner_name.values().copied().collect();
-    let names: Vec<&str> = name_set.iter().copied().collect();
-
-    // Grouped by (workflow_name, schedule_id): every RUNNING/PAUSED row that
-    // matches EITHER this batch's names or its schedule ids, bucketed by its
-    // own exact pair. A row can only ever land in one bucket, so summing
-    // buckets below never double-counts it even when a bucket's name AND
-    // schedule_id both belong to the same schedule in the batch.
-    let grouped: Vec<(String, Option<uuid::Uuid>, i64)> = harvest_workflow_executions::table
-        .filter(
-            harvest_workflow_executions::workflow_name
-                .eq_any(&names)
-                .or(harvest_workflow_executions::schedule_id.eq_any(&ids)),
-        )
-        .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
-        .group_by((
-            harvest_workflow_executions::workflow_name,
-            harvest_workflow_executions::schedule_id,
-        ))
-        .select((
-            harvest_workflow_executions::workflow_name,
-            harvest_workflow_executions::schedule_id,
-            diesel::dsl::count_star(),
-        ))
-        .load(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-
-    // Same-type count per name (identical semantics to the pre-#1160 batch:
-    // every RUNNING/PAUSED execution of that workflow type, manual runs
-    // included, regardless of which schedule_id -- if any -- it carries).
-    let mut by_name: HashMap<String, i64> = HashMap::new();
-    // Cross-type successor count per schedule id (issue #1160): rows carrying
-    // that schedule's `schedule_id` under a DIFFERENT `workflow_name`. Kept
-    // separate from `by_name` so the same row is never added to both.
-    let mut cross_type_by_schedule: HashMap<uuid::Uuid, i64> = HashMap::new();
-    for (row_name, row_schedule_id, count) in &grouped {
-        if name_set.contains(row_name.as_str()) {
-            *by_name.entry(row_name.clone()).or_insert(0) += count;
-        }
-        if let Some(sched_id) = row_schedule_id
-            && let Some(own_name) = owner_name.get(sched_id)
-            && *own_name != row_name.as_str()
-        {
-            *cross_type_by_schedule.entry(*sched_id).or_insert(0) += count;
-        }
-    }
-
-    let pending = crate::throttle::pending_throttle_counts_for_workflows(conn, &names).await?;
-    let mut basis: HashMap<uuid::Uuid, i64> = HashMap::new();
-    for (sched_id, name) in owner_name {
-        let total = by_name.get(name).copied().unwrap_or(0)
-            + cross_type_by_schedule.get(&sched_id).copied().unwrap_or(0)
-            + pending.get(name).copied().unwrap_or(0);
-        if total > 0 {
-            basis.insert(sched_id, total);
-        }
-    }
-    Ok(basis)
-}
-
-/// Pure (DB-free) core of [`resolve_effective_fire_at`]'s calendar-rebasing logic.
-///
-/// Parameterized on already-loaded calendar exclusions instead of loading
-/// them itself, so a caller resolving many schedules against a shared pool
-/// of calendars ([`crate::calendar::load_exclusions_for_calendars`]) can load
-/// each distinct calendar's exclusions once and reuse them across every
-/// schedule that references it, rather than re-querying per schedule.
-///
-/// Kept as a separate function rather than a shared refactor of
-/// `resolve_effective_fire_at` so this addition cannot change behavior for
-/// that function's existing (single-schedule) callers.
-///
-/// `excluded` should be the calendar's exclusion dates -- an empty slice is
-/// only correct when the calendar genuinely has no exclusion rows, **never**
-/// as a stand-in for "the load failed." `exclude_weekends` is a pure name
-/// check (`calendar_name == "weekends-off"`) independent of `excluded`, so
-/// an empty slice does **not** reliably degrade to "no rebasing": a
-/// `weekends-off` calendar still rebases a weekend slot on an empty slice
-/// (see `resolve_effective_fire_at_pure_rebases_a_weekend_slot_from_the_weekend_flag_alone_even_with_empty_exclusions`
-/// below), which can hide a genuinely overdue wedge. A caller whose
-/// exclusions load failed must skip calling this function entirely (fall
-/// back to the raw anchor) rather than pass `&[]` in its place -- see
-/// `load_schedule_overdue_aux_by_shard` in `autumn-harvest-plugin/src/api.rs`
-/// for the pattern (`Option<HashMap<..>>`, `None` on failure, short-circuits
-/// before this function is ever called).
-#[must_use]
-pub fn resolve_effective_fire_at_pure(
-    excluded: &[NaiveDate],
-    exclude_weekends: bool,
-    skip_policy_db: &str,
-    schedule_expr: Option<&str>,
-    next_run_at: Option<DateTime<Utc>>,
-) -> Option<DateTime<Utc>> {
-    let (Some(slot), Some(expr)) = (next_run_at, schedule_expr) else {
-        return None;
-    };
-    let parsed = parse_schedule_from_expr(expr)?;
-    let skip_policy = crate::policy::SkipPolicy::from_db(skip_policy_db);
-    let slot_date = slot.date_naive();
-    match crate::calendar::apply_skip_policy(slot_date, skip_policy, excluded, exclude_weekends) {
-        // `SkipPolicy::Skip` on an excluded day: no adjusted fire to defer to.
-        None => None,
-        // Not excluded: no rebasing.
-        Some(adjusted) if adjusted == slot_date => None,
-        // Rebased to a business day: the effective fire is at the adjusted slot.
-        Some(adjusted) => Some(rebase_logical_date(slot, adjusted, Some(&parsed))),
-    }
 }
 
 /// Resolve the calendar-adjusted effective fire time for a schedule's pinned
@@ -5656,69 +5358,22 @@ pub struct OverdueSamplePass {
     pub min_cadence_step: Option<Duration>,
 }
 
-/// Calendar names for the batched exclusions query, restricted to
-/// schedules that would actually reach the lookup.
-///
-/// Mirrors `resolve_effective_fire_at`'s original per-schedule
-/// short-circuit: a calendar name, a pending slot, and a parseable
-/// cadence must all be present. Not every calendar name any schedule
-/// carries reaches that check.
-///
-/// A calendar used only by manual or exhausted schedules
-/// (`next_run_at = None`), or by schedules with an unparseable cadence,
-/// was never queried by the old per-schedule loop. Including such a name
-/// here would let a failure on it abort the whole pass, when before it
-/// never surfaced.
-fn calendar_names_needing_exclusions(schedules: &[HarvestSchedule]) -> Vec<&str> {
-    schedules
-        .iter()
-        .filter(|s| s.next_run_at.is_some())
-        .filter_map(|s| {
-            let cal_name = s.calendar_name.as_deref()?;
-            let expr = s.schedule_expr.as_deref()?;
-            parse_schedule_from_expr(expr)?;
-            Some(cal_name)
-        })
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect()
-}
-
 /// Compute the overdue verdict for every schedule on one shard, plus the shard's
 /// fastest active cadence (issue #696).
 ///
-/// Loads all schedule rows on `conn`. It computes the tick's exact
-/// shard-local running basis via the batched [`schedule_running_basis_batch`]
-/// (`RUNNING`/`PAUSED` count + #607 pending-throttle backlog). It computes
-/// the calendar-adjusted fire time via [`resolve_effective_fire_at_pure`],
-/// fed by [`crate::calendar::load_exclusions_for_calendars`]. Each of those
-/// is one grouped query for every schedule on the shard, instead of up to
-/// three round trips *per schedule row*. The `at_capacity` suppression
-/// therefore fires *exactly* when the tick would hold `next_run_at`. The
-/// pure [`schedule_overdue`] predicate then runs against `now`. ALL
-/// schedules are returned (including paused/exhausted, which resolve to
-/// not-overdue) so the sampler can keep the gauge fresh. In the same pass it
-/// tracks the minimum cadence of active schedules. This feeds the adaptive
-/// sampler interval (issue #696) and is gathered here to avoid a second
-/// schedule load.
-///
-/// This mirrors the batching that `autumn-harvest-plugin/src/api.rs`'s
-/// `load_schedule_overdue_aux_by_shard` applies to the same three lookups
-/// for `GET /admin/schedules` (issue #696, Ledger perf pass). That
-/// investigation named this sampler as the identical N+1 shape on a
-/// periodic background pass, not a per-HTTP-request path. It left this as
-/// a follow-up. See `docs/performance-schedule-overdue-aux.md`'s "Known
-/// limitations". Unlike that endpoint, a failed batch here propagates as
-/// an `Err` (via `?`). This matches the function's pre-existing
-/// per-schedule error behavior: the old loop's
-/// `schedule_running_basis(..).await?` and
-/// `resolve_effective_fire_at(..).await?` calls already failed the whole
-/// pass on any query error. So batching does not change error semantics.
+/// Loads all schedule rows on `conn` and, per schedule, computes the tick's
+/// exact shard-local running basis via [`schedule_running_basis`]
+/// (`RUNNING`/`PAUSED` count + #607 pending-throttle backlog), so the
+/// `at_capacity` suppression fires *exactly* when the tick would hold
+/// `next_run_at`. Then runs the pure [`schedule_overdue`] predicate against
+/// `now`. ALL schedules are returned (including paused/exhausted, which resolve
+/// to not-overdue) so the sampler can keep the gauge fresh. In the same pass it
+/// tracks the minimum cadence of active schedules for the adaptive sampler
+/// interval (Codex round 4) — gathered here to avoid a second schedule load.
 ///
 /// # Errors
 ///
-/// Returns a database error if the schedule load, the batched running-basis
-/// query, or the batched calendar-exclusions query fails.
+/// Returns a database error if any schedule or count query fails.
 pub async fn overdue_schedule_pass(
     conn: &mut AsyncPgConnection,
     now: DateTime<Utc>,
@@ -5728,26 +5383,6 @@ pub async fn overdue_schedule_pass(
         .load(conn)
         .await
         .map_err(crate::error::database_error)?;
-
-    // Batched, once per shard (see the doc comment above). Replaces what
-    // used to be up to three DB round trips *per schedule row*. Now exactly
-    // two grouped queries cover every schedule on the shard at once.
-    let schedule_names: Vec<(uuid::Uuid, &str)> = schedules
-        .iter()
-        .map(|s| {
-            (
-                s.id,
-                s.dag_name
-                    .as_deref()
-                    .or(s.workflow_name.as_deref())
-                    .unwrap_or(""),
-            )
-        })
-        .collect();
-    let basis = schedule_running_basis_batch(conn, &schedule_names).await?;
-
-    let calendar_names = calendar_names_needing_exclusions(&schedules);
-    let exclusions = crate::calendar::load_exclusions_for_calendars(conn, &calendar_names).await?;
 
     let mut samples = Vec::with_capacity(schedules.len());
     let mut min_cadence_step: Option<Duration> = None;
@@ -5777,11 +5412,9 @@ pub async fn overdue_schedule_pass(
             min_cadence_step = Some(min_cadence_step.map_or(step, |cur| cur.min(step)));
         }
         let jitter = Duration::from_secs(u64::try_from(s.jitter_secs).unwrap_or(0));
-        // Shard-local + throttle-aware basis (matches the tick exactly),
-        // read from the batch loaded once above instead of a per-schedule
-        // query. A missing key means zero total running/pending executions
-        // (`schedule_running_basis_batch`'s documented contract).
-        let at_capacity = basis.get(&s.id).copied().unwrap_or(0) >= i64::from(s.max_active_runs);
+        // Shard-local + throttle-aware basis (matches the tick exactly).
+        let at_capacity =
+            schedule_running_basis(conn, &name).await? >= i64::from(s.max_active_runs);
         // Resolve overlap/catchup exactly as the tick does, so the gated
         // at-capacity suppression (Codex P2-B) matches when the tick retains.
         let overlap_policy = OverlapPolicy::from_db(&s.overlap_policy);
@@ -5791,22 +5424,16 @@ pub async fn overdue_schedule_pass(
             s.catchup,
         )
         .is_catchup_enabled();
-        // Calendar-adjusted fire time (issue #696): resolves the tick's own
-        // calendar rebasing in memory, against the exclusions batch loaded
-        // once above. A calendar-deferred future fire is therefore not
-        // flagged.
-        let effective_fire_at = s.calendar_name.as_deref().and_then(|cal_name| {
-            let empty: Vec<NaiveDate> = Vec::new();
-            let excluded = exclusions.get(cal_name).unwrap_or(&empty);
-            let exclude_weekends = crate::calendar::calendar_excludes_weekends(cal_name);
-            resolve_effective_fire_at_pure(
-                excluded,
-                exclude_weekends,
-                &s.skip_policy,
-                s.schedule_expr.as_deref(),
-                s.next_run_at,
-            )
-        });
+        // Calendar-adjusted fire time (Codex round 3): resolve the tick's own
+        // calendar rebasing so a calendar-deferred future fire is not flagged.
+        let effective_fire_at = resolve_effective_fire_at(
+            conn,
+            s.calendar_name.as_deref(),
+            &s.skip_policy,
+            s.schedule_expr.as_deref(),
+            s.next_run_at,
+        )
+        .await?;
         let verdict = schedule_overdue(&OverdueInputs {
             schedule: schedule.as_ref(),
             next_run_at: s.next_run_at,
@@ -6285,9 +5912,8 @@ pub(crate) fn buffered_runs_to_json(runs: &[DateTime<Utc>]) -> serde_json::Value
 /// Called on every scheduler tick. For each schedule with a non-empty
 /// `buffered_runs` column, dispatches buffered fire times in order until
 /// `max_active_runs` is reached, then updates the `buffered_runs` column.
-/// [`claim_and_drain_buffered_schedule`] drains each row under its fire claim
-/// (issue #1820).
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_lines)]
 async fn drain_buffered_schedule_runs(
     conn: &mut AsyncPgConnection,
     current_shard: ShardId,
@@ -6317,14 +5943,14 @@ async fn drain_buffered_schedule_runs(
         .await
         .map_err(crate::error::database_error)?;
 
-    for snapshot in pending {
-        let Some(ref wf_name) = snapshot.workflow_name else {
+    for schedule in pending {
+        let Some(ref wf_name) = schedule.workflow_name else {
             continue;
         };
 
         // Skip DAG-backed schedules whose DAG is no longer registered so that
         // removing a DAG does not cause its stale buffered slots to be dispatched.
-        if let Some(ref dag_name) = snapshot.dag_name
+        if let Some(ref dag_name) = schedule.dag_name
             && !registered_dags.contains_key(dag_name)
         {
             tracing::debug!(
@@ -6335,478 +5961,331 @@ async fn drain_buffered_schedule_runs(
             continue;
         }
 
-        // Run the skip checks on the snapshot before the claim. A row that
-        // cannot drain then costs no write, and a PATCH meets no claim.
-        // A stale result delays the drain by one tick. The claimed pass
-        // checks the capacity again.
-        if buffered_drain_capacity(conn, &snapshot, wf_name)
-            .await?
-            .is_none()
-            || buffered_drain_gated(
-                &snapshot,
-                wf_name,
-                current_shard,
-                registered_dags,
-                registry,
-                metrics,
-                active_gates,
-            )
-        {
+        let mut buffered = parse_buffered_runs(&schedule.buffered_runs);
+        if buffered.is_empty() {
             continue;
         }
 
-        claim_and_drain_buffered_schedule(
-            conn,
-            snapshot.id,
-            now,
-            current_shard,
-            registered_dags,
-            registry,
-            metrics,
-        )
-        .await?;
-    }
+        let mut running: i64 = harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::workflow_name.eq(wf_name))
+            .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
+            .count()
+            .get_result(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+        // A throttled fire durably defers before any execution row exists --
+        // count it toward max_active_runs so this loop can't drain more
+        // buffered slots than the schedule's true remaining capacity allows
+        // while an earlier fire is still sitting in the throttle queue
+        // (code review, issue #607).
+        running += crate::throttle::pending_throttle_count_for_workflow(conn, wf_name).await?;
 
-    Ok(())
-}
-
-/// Return the free run slots of a buffered row, or `None` if it cannot drain.
-///
-/// A row cannot drain when its buffer is empty or it is at `max_active_runs`.
-#[cfg(feature = "db")]
-async fn buffered_drain_capacity(
-    conn: &mut AsyncPgConnection,
-    schedule: &HarvestSchedule,
-    wf_name: &str,
-) -> HarvestResult<Option<i64>> {
-    if parse_buffered_runs(&schedule.buffered_runs).is_empty() {
-        return Ok(None);
-    }
-    // Tick-exact running basis (RUNNING/PAUSED count, `schedule_id`-scoped
-    // cross-type successors included per issue #1160, plus the #607
-    // pending-throttle backlog) -- see `schedule_running_basis`.
-    let running: i64 = schedule_running_basis(conn, wf_name, schedule.id).await?;
-    let available = i64::from(schedule.max_active_runs).saturating_sub(running);
-    Ok((available > 0).then_some(available))
-}
-
-/// Return `true` if an active admission gate blocks a buffered drain (#377).
-///
-/// A block records the skip metrics.
-#[cfg(feature = "db")]
-fn buffered_drain_gated(
-    schedule: &HarvestSchedule,
-    wf_name: &str,
-    current_shard: ShardId,
-    registered_dags: &DagCatalog,
-    registry: &crate::worker::HandlerRegistry,
-    metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
-    active_gates: &[crate::admission_gate::AdmissionGate],
-) -> bool {
-    let dispatch_queue = schedule.queue_name.as_deref().unwrap_or("default");
-    let dag_lookup_key = schedule.dag_name.as_deref().unwrap_or(wf_name);
-    let owner = registry
-        .workflows
-        .get(wf_name)
-        .and_then(|i| i.owner)
-        .or_else(|| {
-            registered_dags
-                .get(dag_lookup_key)
-                .and_then(|d| d.owner.as_deref())
-        });
-    let Some(gate) = crate::admission_gate::check_admission(
-        active_gates,
-        wf_name,
-        dispatch_queue,
-        current_shard.as_i32(),
-        owner,
-    ) else {
-        return false;
-    };
-    tracing::info!(
-        workflow_name = %wf_name,
-        gate_id = %gate.id,
-        reason = %gate.reason,
-        "harvest: buffered drain skipped due to admission gate"
-    );
-    metrics.record_schedule_skipped("workflow", wf_name, "admission_blocked");
-    // issue #618, F-round17: also count the block in
-    // harvest.admission.blocked (see the tick path above) so the
-    // scheduler's buffered/overlap drain blocks appear like every other
-    // gated producer's.
-    metrics.record_admission_blocked(gate.scope.kind_str(), &gate.reason);
-    true
-}
-
-/// Whether a buffered drain pass cleared its own fire claim.
-#[cfg(feature = "db")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DrainClaim {
-    /// The final write cleared the claim, or the row is gone.
-    Released,
-    /// This pass can still hold the claim. The caller must release it.
-    Held,
-}
-
-/// Claim one buffered row, drain it, then release the claim (issue #1820).
-///
-/// The drain takes the same fire claim as the tick fire path. If a peer holds
-/// a live claim, this call skips the row. Thus, while a claim is live, no other
-/// drain or fire uses that row.
-/// Without the claim, two replicas can start the same slot. Both then add it
-/// to `runs_started`. `RejectDuplicate` stops the second execution, but not the
-/// second count.
-///
-/// The claim lasts 30 s, and the drain does not renew it. A drain that runs
-/// longer can lose the claim to a peer. Its final write then matches no row,
-/// so `runs_started` still counts each slot once.
-///
-/// # Errors
-///
-/// Returns an error when the claim, the re-read, a start-path call or the
-/// final write fails. The call tries to release the claim first.
-#[cfg(feature = "db")]
-#[allow(clippy::too_many_arguments)]
-async fn claim_and_drain_buffered_schedule(
-    conn: &mut AsyncPgConnection,
-    schedule_id: uuid::Uuid,
-    now: DateTime<Utc>,
-    current_shard: ShardId,
-    registered_dags: &DagCatalog,
-    registry: &crate::worker::HandlerRegistry,
-    metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
-) -> HarvestResult<()> {
-    // Same claim SQL as `claim_and_fire_workflow_schedule`, without the
-    // `next_run_at` guard. A buffered slot is not the row's next cadence slot.
-    let my_claim_token = uuid::Uuid::new_v4();
-    let claimed: usize = diesel::sql_query(
-        "UPDATE harvest_schedules \
-         SET fire_claim_token = $1, \
-             fire_claimed_until = NOW() + INTERVAL '30 seconds' \
-         WHERE id = $2 \
-           AND (fire_claim_token IS NULL OR fire_claimed_until < NOW())",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(my_claim_token)
-    .bind::<diesel::sql_types::Uuid, _>(schedule_id)
-    .execute(conn)
-    .await
-    .map_err(crate::error::database_error)?;
-    if claimed == 0 {
-        tracing::debug!(
-            schedule_id = %schedule_id,
-            "harvest: buffered drain skipped; a peer holds the fire claim"
-        );
-        return Ok(());
-    }
-
-    let result = drain_claimed_buffered_schedule(
-        conn,
-        schedule_id,
-        my_claim_token,
-        now,
-        current_shard,
-        registered_dags,
-        registry,
-        metrics,
-    )
-    .await;
-    if !matches!(result, Ok(DrainClaim::Released)) {
-        release_fire_claim(conn, schedule_id, my_claim_token).await;
-    }
-    result.map(|_| ())
-}
-
-/// Drain the buffered slots of one row while `claim_token` holds its claim.
-///
-/// Reads the row again first, so the drain uses the current buffer, budget
-/// and capacity. The registered-DAG and admission-gate checks use the
-/// pre-claim snapshot.
-#[cfg(feature = "db")]
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-async fn drain_claimed_buffered_schedule(
-    conn: &mut AsyncPgConnection,
-    schedule_id: uuid::Uuid,
-    claim_token: uuid::Uuid,
-    now: DateTime<Utc>,
-    current_shard: ShardId,
-    registered_dags: &DagCatalog,
-    registry: &crate::worker::HandlerRegistry,
-    metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
-) -> HarvestResult<DrainClaim> {
-    use crate::schema::harvest_schedules::dsl;
-    use diesel_async::RunQueryDsl;
-
-    let fresh: Option<HarvestSchedule> = dsl::harvest_schedules
-        .find(schedule_id)
-        .select(HarvestSchedule::as_select())
-        .first(conn)
-        .await
-        .optional()
-        .map_err(crate::error::database_error)?;
-    let Some(schedule) = fresh else {
-        // The row is gone, and the claim went with it.
-        return Ok(DrainClaim::Released);
-    };
-    // The row can change between the pending SELECT and the claim.
-    if schedule.is_paused || schedule.auto_paused_at.is_some() || schedule.exhausted_at.is_some() {
-        return Ok(DrainClaim::Held);
-    }
-    let Some(ref wf_name) = schedule.workflow_name else {
-        return Ok(DrainClaim::Held);
-    };
-
-    let mut buffered = parse_buffered_runs(&schedule.buffered_runs);
-    let Some(available) = buffered_drain_capacity(conn, &schedule, wf_name).await? else {
-        return Ok(DrainClaim::Held);
-    };
-    let dispatch_queue = schedule.queue_name.as_deref().unwrap_or("default");
-
-    let mut dispatched: u32 = 0;
-    // Set to true when the whole buffer is cleared because the first slot is already
-    // past end_at. Used below to decide whether to exhaust the schedule even though
-    // `buffered` is empty after the clear (normal empty-after-drain must not exhaust).
-    let mut all_buffered_past_end_at = false;
-
-    while dispatched < u32::try_from(available).unwrap_or(u32::MAX) && !buffered.is_empty() {
-        let scheduled_for = buffered[0];
-
-        // Per-slot end_at guard (issue #478): skip buffered slots past the cutoff.
-        if let Some(end_at) = schedule.end_at
-            && scheduled_for >= end_at
-        {
-            buffered.clear(); // all remaining buffered slots are also past end_at
-            all_buffered_past_end_at = true;
-            break;
+        let available = i64::from(schedule.max_active_runs).saturating_sub(running);
+        if available <= 0 {
+            continue;
         }
-        // Budget cap (issue #478): don't let buffered drains exceed max_runs.
-        if let Some(max_runs) = schedule.max_runs {
-            let already = schedule
-                .runs_started
-                .saturating_add(i32::try_from(dispatched).unwrap_or(i32::MAX));
-            if max_runs > 0 && already >= max_runs {
+
+        let dispatch_queue = schedule.queue_name.as_deref().unwrap_or("default");
+
+        // issue #377: gate check — skip draining this schedule if any active gate matches.
+        {
+            let dag_lookup_key = schedule.dag_name.as_deref().unwrap_or(wf_name.as_str());
+            let owner = registry
+                .workflows
+                .get(wf_name.as_str())
+                .and_then(|i| i.owner)
+                .or_else(|| {
+                    registered_dags
+                        .get(dag_lookup_key)
+                        .and_then(|d| d.owner.as_deref())
+                });
+            if let Some(gate) = crate::admission_gate::check_admission(
+                active_gates,
+                wf_name,
+                dispatch_queue,
+                current_shard.as_i32(),
+                owner,
+            ) {
+                tracing::info!(
+                    workflow_name = %wf_name,
+                    gate_id = %gate.id,
+                    reason = %gate.reason,
+                    "harvest: buffered drain skipped due to admission gate"
+                );
+                metrics.record_schedule_skipped("workflow", wf_name, "admission_blocked");
+                // issue #618, F-round17: also count the block in
+                // harvest.admission.blocked (see the tick path above) so the
+                // scheduler's buffered/overlap drain blocks appear like every other
+                // gated producer's.
+                metrics.record_admission_blocked(gate.scope.kind_str(), &gate.reason);
+                continue;
+            }
+        }
+
+        let mut dispatched: u32 = 0;
+        // Set to true when the whole buffer is cleared because the first slot is already
+        // past end_at. Used below to decide whether to exhaust the schedule even though
+        // `buffered` is empty after the clear (normal empty-after-drain must not exhaust).
+        let mut all_buffered_past_end_at = false;
+
+        while dispatched < u32::try_from(available).unwrap_or(u32::MAX) && !buffered.is_empty() {
+            let scheduled_for = buffered[0];
+
+            // Per-slot end_at guard (issue #478): skip buffered slots past the cutoff.
+            if let Some(end_at) = schedule.end_at
+                && scheduled_for >= end_at
+            {
+                buffered.clear(); // all remaining buffered slots are also past end_at
+                all_buffered_past_end_at = true;
                 break;
             }
-        }
-
-        buffered.remove(0);
-        // Clone-class note: the concurrency-key resolution and the
-        // owner/runbook/severity merge below repeat verbatim in
-        // `tick_one_workflow_schedule`. Apply any change to either
-        // block to both functions. Two instances only, so the merge
-        // bar is not met yet. See the note in
-        // `tick_one_workflow_schedule`.
-        let workflow_id = scheduled_workflow_id(schedule.id, wf_name, scheduled_for);
-        let exec_id = scheduled_fire_exec_id(wf_name, schedule.dag_name.is_some(), current_shard);
-        let input = schedule
-            .workflow_input
-            .clone()
-            .unwrap_or(serde_json::Value::Null);
-        let wf_info = registry.workflows.get(wf_name);
-        let (concurrency_key, concurrency_limit, concurrency_on_conflict) =
-            wf_info.and_then(|info| info.concurrency.as_ref()).map_or(
-                (None, None, crate::concurrency::ConcurrencyOnConflict::Defer),
-                |policy| {
-                    let key = crate::concurrency::resolve_concurrency_key(policy.key_expr, &input);
-                    (key, Some(policy.limit), policy.on_conflict)
-                },
-            );
-        let (owner, runbook_url, severity) = {
-            let wf_meta = wf_info.map(|info| (info.owner, info.runbook_url, info.severity));
-            let dag_meta = registered_dags.get(wf_name).map(|dag| {
-                (
-                    dag.owner.as_deref(),
-                    dag.runbook_url.as_deref(),
-                    dag.severity.as_deref(),
-                )
-            });
-            match (wf_meta, dag_meta) {
-                (Some((o, r, s)), Some((dag_owner, dag_runbook, dag_severity))) => {
-                    (o.or(dag_owner), r.or(dag_runbook), s.or(dag_severity))
+            // Budget cap (issue #478): don't let buffered drains exceed max_runs.
+            if let Some(max_runs) = schedule.max_runs {
+                let already = schedule
+                    .runs_started
+                    .saturating_add(i32::try_from(dispatched).unwrap_or(i32::MAX));
+                if max_runs > 0 && already >= max_runs {
+                    break;
                 }
-                (Some((o, r, s)), None) => (o, r, s),
-                (None, Some((dag_owner, dag_runbook, dag_severity))) => {
-                    (dag_owner, dag_runbook, dag_severity)
-                }
-                (None, None) => (None, None, None),
             }
-        };
-        // Issue #1412: one shared lookup resolves the declared execution_timeout,
-        // sla, and fleet-wide ceiling. A buffered/overlap-drained fire then gets
-        // the same deadline enforcement as a normal tick dispatch or a manual
-        // trigger. A DAG's own shadow `WorkflowInfo` carries these fields
-        // identically to a `#[workflow]`. `DagInfo::as_workflow_info()` registers
-        // that shadow entry under the DAG's own name, so this covers both kinds.
-        let DispatchDeadline {
-            execution_timeout,
-            sla,
-            max_execution_timeout_ceiling,
-        } = registry.resolve_dispatch_deadline(wf_name);
 
-        tracing::info!(
-            workflow_name = %wf_name,
-            workflow_id = %workflow_id,
-            buffered_for = %scheduled_for,
-            "harvest: dispatching buffered scheduled workflow run"
-        );
-
-        // Effective per-workflow input cap (issue #607 code review): this
-        // loop previously enforced no cap at all on either the throttle or
-        // immediate path (`None`/`0` are both "no cap" sentinels to
-        // `StartWorkflowParams`/`DebounceStartOptions`). Mirrors the
-        // scheduler-tick path's `effective_cap` computation.
-        let effective_cap = wf_info
-            .and_then(|info| info.max_input_bytes)
-            .map_or(registry.max_workflow_input_bytes, |per| {
-                per.max(registry.max_workflow_input_bytes)
-            });
-
-        // Start-throttle admission (issue #607): pace buffered/backfilled fires,
-        // defer the excess. A deferred fire counts as dispatched (advances the
-        // slot) and is admitted later by the throttle scanner with its
-        // schedule_id/scheduled_for/origin preserved for carryover (#488).
-        let mut buffered_throttle_bucket: Option<String> = None;
-        if let Some(throttle_policy) = wf_info.and_then(|info| info.throttle) {
-            let throttle_key = throttle_policy.key_expr.map_or_else(
-                || Some(String::new()),
-                |k| crate::throttle::resolve_throttle_key(k, &input),
-            );
-            if let Some(resolved_throttle_key) = throttle_key {
-                // Fail fast on an oversized input rather than persisting a
-                // pending row that would fail at fire time on every
-                // scanner tick. `break` (not `return Err`) matches this
-                // loop's own failure-handling convention below: drop this
-                // and any remaining buffered slots this tick rather than
-                // retrying a permanently-failing input forever. Skipped
-                // when `reserve_or_defer` would resolve via `Bypassed` or
-                // an idempotent attach to an already-pending row.
-                let skip_cap_check = crate::throttle::skip_size_check(
-                    conn,
-                    wf_name,
-                    &workflow_id,
-                    Some("reject_duplicate"),
-                )
-                .await?;
-                if !skip_cap_check && effective_cap > 0 {
-                    let observed = serde_json::to_string(&input).map_or(0u64, |s| s.len() as u64);
-                    if observed > effective_cap {
-                        tracing::warn!(
-                            workflow_name = %wf_name,
-                            workflow_id = %workflow_id,
-                            buffered_for = %scheduled_for,
-                            observed_bytes = observed,
-                            cap_bytes = effective_cap,
-                            "harvest: buffered scheduled workflow input exceeds cap; dropping slot"
-                        );
-                        break;
-                    }
-                }
-                let effective_retry = schedule
-                    .retry_policy
-                    .as_ref()
-                    .and_then(|v| {
-                        serde_json::from_value::<crate::policy::RetryPolicy>(v.clone()).ok()
-                    })
-                    .or_else(|| wf_info.and_then(|info| info.retry_policy.clone()))
-                    .and_then(|p| serde_json::to_value(&p).ok());
-                let start_options = crate::debounce::DebounceStartOptions {
-                    reuse_policy: Some("reject_duplicate".to_string()),
-                    // Issue #1412: thread the DAG/workflow's declared
-                    // execution_timeout into a throttled buffered-drain fire,
-                    // mirroring the normal dispatch path just below.
-                    execution_timeout_secs: execution_timeout.map(|d| d.num_seconds()),
-                    memo: None,
-                    search_attrs: None,
-                    sla_secs: sla.map(|d| d.num_seconds()),
-                    context_headers: None,
-                    priority: None,
-                    concurrency_key: concurrency_key.clone(),
-                    concurrency_limit,
-                    concurrency_on_conflict: Some(concurrency_on_conflict),
-                    owner: owner.map(str::to_string),
-                    runbook_url: runbook_url.map(str::to_string),
-                    severity: severity.map(str::to_string),
-                    // Fleet-wide execution_timeout ceiling (issue #1412): parity
-                    // with the chain-cap ceiling right below.
-                    max_execution_timeout_ceiling_secs: max_execution_timeout_ceiling
-                        .map(|d| d.num_seconds()),
-                    // Chain-scoped lifetime cap (issue #617): workflow-type
-                    // default + fleet-wide ceiling (via registry) so a throttled
-                    // buffered-drain fire keeps the cap.
-                    chain_execution_timeout_secs: wf_info
-                        .and_then(|info| info.chain_execution_timeout)
-                        .and_then(|d| chrono::Duration::from_std(d).ok())
-                        .map(|d| d.num_seconds()),
-                    max_workflow_chain_timeout_ceiling_secs: registry
-                        .max_workflow_chain_timeout
-                        .and_then(|d| chrono::Duration::from_std(d).ok())
-                        .map(|d| d.num_seconds()),
-                    max_workflow_input_bytes: Some(effective_cap),
-                    trace_context: None,
-                    workflow_retry_policy: effective_retry,
-                    max_workflow_attempts_ceiling: registry.max_workflow_attempts_ceiling,
-                    completion_callbacks: None,
-                    schedule_id: Some(schedule.id),
-                    scheduled_for: Some(scheduled_for),
-                    origin: Some(crate::execution::ORIGIN_SCHEDULED.to_string()),
-                    // Buffered scheduled fire throttle admission (issue #740):
-                    // provenance is `schedule`, referencing the schedule id.
-                    start_source: Some(crate::types::StartSource::Schedule.as_str().to_string()),
-                    start_source_ref: Some(schedule.id.to_string()),
-                    started_by: None,
-                };
-                match crate::throttle::reserve_or_defer(
-                    conn,
-                    crate::throttle::AdmitThrottleParams {
-                        workflow_name: wf_name,
-                        throttle_key: &resolved_throttle_key,
-                        workflow_id: &workflow_id,
-                        queue_name: dispatch_queue,
-                        input: input.clone(),
-                        start_options,
-                        refill_per_sec: throttle_policy.refill_per_sec,
-                        burst: throttle_policy.burst,
-                        schedule_to_start: throttle_policy.schedule_to_start,
-                        shard_id: current_shard.as_i32(),
+            buffered.remove(0);
+            let workflow_id = scheduled_workflow_id(schedule.id, wf_name, scheduled_for);
+            let exec_id =
+                scheduled_fire_exec_id(wf_name, schedule.dag_name.is_some(), current_shard);
+            let input = schedule
+                .workflow_input
+                .clone()
+                .unwrap_or(serde_json::Value::Null);
+            let wf_info = registry.workflows.get(wf_name);
+            let (concurrency_key, concurrency_limit, concurrency_on_conflict) =
+                wf_info.and_then(|info| info.concurrency.as_ref()).map_or(
+                    (None, None, crate::concurrency::ConcurrencyOnConflict::Defer),
+                    |policy| {
+                        let key =
+                            crate::concurrency::resolve_concurrency_key(policy.key_expr, &input);
+                        (key, Some(policy.limit), policy.on_conflict)
                     },
-                )
-                .await
-                {
-                    Ok(crate::throttle::ThrottleAdmission::Deferred(_)) => {
-                        metrics.record_start_throttled(wf_name);
-                        dispatched += 1;
-                        continue;
+                );
+            let (owner, runbook_url, severity) = {
+                let wf_meta = wf_info.map(|info| (info.owner, info.runbook_url, info.severity));
+                let dag_meta = registered_dags.get(wf_name).map(|dag| {
+                    (
+                        dag.owner.as_deref(),
+                        dag.runbook_url.as_deref(),
+                        dag.severity.as_deref(),
+                    )
+                });
+                match (wf_meta, dag_meta) {
+                    (Some((o, r, s)), Some((dag_owner, dag_runbook, dag_severity))) => {
+                        (o.or(dag_owner), r.or(dag_runbook), s.or(dag_severity))
                     }
-                    Ok(crate::throttle::ThrottleAdmission::Reserved { bucket_key }) => {
-                        buffered_throttle_bucket = Some(bucket_key);
+                    (Some((o, r, s)), None) => (o, r, s),
+                    (None, Some((dag_owner, dag_runbook, dag_severity))) => {
+                        (dag_owner, dag_runbook, dag_severity)
                     }
-                    Ok(crate::throttle::ThrottleAdmission::Bypassed) => {
-                        // Active execution already resolves this reuse policy as a
-                        // no-op/immediate reject; no token reserved, fall through to
-                        // the normal start below.
+                    (None, None) => (None, None, None),
+                }
+            };
+            // Issue #743: a DAG's own shadow `WorkflowInfo` (registered under
+            // its name by `DagInfo::as_workflow_info()`) carries `sla`
+            // identically to a `#[workflow]`, so this ONE lookup covers both
+            // kinds.
+            let sla = wf_info
+                .and_then(|info| info.sla)
+                .and_then(|d| chrono::Duration::from_std(d).ok());
+
+            // Issue #743 review (PR #1141, Finding #2): the same shadow
+            // `WorkflowInfo` lookup also carries the DAG's declared
+            // `execution_timeout`, which must reach a buffered/overlap-drained
+            // fire identically to a normal tick dispatch or a manual trigger.
+            let execution_timeout = wf_info
+                .and_then(|info| info.execution_timeout)
+                .and_then(|d| chrono::Duration::from_std(d).ok());
+
+            tracing::info!(
+                workflow_name = %wf_name,
+                workflow_id = %workflow_id,
+                buffered_for = %scheduled_for,
+                "harvest: dispatching buffered scheduled workflow run"
+            );
+
+            // Effective per-workflow input cap (issue #607 code review): this
+            // loop previously enforced no cap at all on either the throttle or
+            // immediate path (`None`/`0` are both "no cap" sentinels to
+            // `StartWorkflowParams`/`DebounceStartOptions`). Mirrors the
+            // scheduler-tick path's `effective_cap` computation.
+            let effective_cap = wf_info
+                .and_then(|info| info.max_input_bytes)
+                .map_or(registry.max_workflow_input_bytes, |per| {
+                    per.max(registry.max_workflow_input_bytes)
+                });
+
+            // Start-throttle admission (issue #607): pace buffered/backfilled fires,
+            // defer the excess. A deferred fire counts as dispatched (advances the
+            // slot) and is admitted later by the throttle scanner with its
+            // schedule_id/scheduled_for/origin preserved for carryover (#488).
+            let mut buffered_throttle_bucket: Option<String> = None;
+            if let Some(throttle_policy) = wf_info.and_then(|info| info.throttle) {
+                let throttle_key = throttle_policy.key_expr.map_or_else(
+                    || Some(String::new()),
+                    |k| crate::throttle::resolve_throttle_key(k, &input),
+                );
+                if let Some(resolved_throttle_key) = throttle_key {
+                    // Fail fast on an oversized input rather than persisting a
+                    // pending row that would fail at fire time on every
+                    // scanner tick. `break` (not `return Err`) matches this
+                    // loop's own failure-handling convention below: drop this
+                    // and any remaining buffered slots this tick rather than
+                    // retrying a permanently-failing input forever. Skipped
+                    // when `reserve_or_defer` would resolve via `Bypassed` or
+                    // an idempotent attach to an already-pending row.
+                    let skip_cap_check = crate::throttle::skip_size_check(
+                        conn,
+                        wf_name,
+                        &workflow_id,
+                        Some("reject_duplicate"),
+                    )
+                    .await?;
+                    if !skip_cap_check && effective_cap > 0 {
+                        let observed =
+                            serde_json::to_string(&input).map_or(0u64, |s| s.len() as u64);
+                        if observed > effective_cap {
+                            tracing::warn!(
+                                workflow_name = %wf_name,
+                                workflow_id = %workflow_id,
+                                buffered_for = %scheduled_for,
+                                observed_bytes = observed,
+                                cap_bytes = effective_cap,
+                                "harvest: buffered scheduled workflow input exceeds cap; dropping slot"
+                            );
+                            break;
+                        }
                     }
-                    Err(e) => return Err(e),
+                    let effective_retry = schedule
+                        .retry_policy
+                        .as_ref()
+                        .and_then(|v| {
+                            serde_json::from_value::<crate::policy::RetryPolicy>(v.clone()).ok()
+                        })
+                        .or_else(|| wf_info.and_then(|info| info.retry_policy.clone()))
+                        .and_then(|p| serde_json::to_value(&p).ok());
+                    let start_options = crate::debounce::DebounceStartOptions {
+                        reuse_policy: Some("reject_duplicate".to_string()),
+                        // Issue #743 review (PR #1141, Finding #2): thread the
+                        // DAG/workflow's declared execution_timeout into a
+                        // throttled buffered-drain fire, mirroring the normal
+                        // dispatch path just below.
+                        execution_timeout_secs: execution_timeout.map(|d| d.num_seconds()),
+                        memo: None,
+                        search_attrs: None,
+                        sla_secs: sla.map(|d| d.num_seconds()),
+                        context_headers: None,
+                        priority: None,
+                        concurrency_key: concurrency_key.clone(),
+                        concurrency_limit,
+                        concurrency_on_conflict: Some(concurrency_on_conflict),
+                        owner: owner.map(str::to_string),
+                        runbook_url: runbook_url.map(str::to_string),
+                        severity: severity.map(str::to_string),
+                        // Fleet-wide execution_timeout ceiling (issue #743
+                        // review, PR #1141 Finding #3): parity with the
+                        // chain-cap ceiling right below.
+                        max_execution_timeout_ceiling_secs: registry
+                            .max_workflow_execution_timeout
+                            .and_then(|d| chrono::Duration::from_std(d).ok())
+                            .map(|d| d.num_seconds()),
+                        // Chain-scoped lifetime cap (issue #617): workflow-type
+                        // default + fleet-wide ceiling (via registry) so a throttled
+                        // buffered-drain fire keeps the cap.
+                        chain_execution_timeout_secs: wf_info
+                            .and_then(|info| info.chain_execution_timeout)
+                            .and_then(|d| chrono::Duration::from_std(d).ok())
+                            .map(|d| d.num_seconds()),
+                        max_workflow_chain_timeout_ceiling_secs: registry
+                            .max_workflow_chain_timeout
+                            .and_then(|d| chrono::Duration::from_std(d).ok())
+                            .map(|d| d.num_seconds()),
+                        max_workflow_input_bytes: Some(effective_cap),
+                        trace_context: None,
+                        workflow_retry_policy: effective_retry,
+                        max_workflow_attempts_ceiling: registry.max_workflow_attempts_ceiling,
+                        completion_callbacks: None,
+                        schedule_id: Some(schedule.id),
+                        scheduled_for: Some(scheduled_for),
+                        origin: Some(crate::execution::ORIGIN_SCHEDULED.to_string()),
+                        // Buffered scheduled fire throttle admission (issue #740):
+                        // provenance is `schedule`, referencing the schedule id.
+                        start_source: Some(
+                            crate::types::StartSource::Schedule.as_str().to_string(),
+                        ),
+                        start_source_ref: Some(schedule.id.to_string()),
+                        started_by: None,
+                    };
+                    match crate::throttle::reserve_or_defer(
+                        conn,
+                        crate::throttle::AdmitThrottleParams {
+                            workflow_name: wf_name,
+                            throttle_key: &resolved_throttle_key,
+                            workflow_id: &workflow_id,
+                            queue_name: dispatch_queue,
+                            input: input.clone(),
+                            start_options,
+                            refill_per_sec: throttle_policy.refill_per_sec,
+                            burst: throttle_policy.burst,
+                            schedule_to_start: throttle_policy.schedule_to_start,
+                            shard_id: current_shard.as_i32(),
+                        },
+                    )
+                    .await
+                    {
+                        Ok(crate::throttle::ThrottleAdmission::Deferred(_)) => {
+                            metrics.record_start_throttled(wf_name);
+                            dispatched += 1;
+                            continue;
+                        }
+                        Ok(crate::throttle::ThrottleAdmission::Reserved { bucket_key }) => {
+                            buffered_throttle_bucket = Some(bucket_key);
+                        }
+                        Ok(crate::throttle::ThrottleAdmission::Bypassed) => {
+                            // Active execution already resolves this reuse policy as a
+                            // no-op/immediate reject; no token reserved, fall through to
+                            // the normal start below.
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
             }
-        }
 
-        // Provenance ref for a buffered scheduled fire is the schedule id (#740).
-        let schedule_id_str = schedule.id.to_string();
-        // Latest-wins supersede counters (issue #811, Codex round 1) --
-        // the buffered drain shares the tick's gap.
-        let start_result =
-            crate::execution::start_or_load_workflow_execution_with_metrics_and_codecs(
+            // Provenance ref for a buffered scheduled fire is the schedule id (#740).
+            let schedule_id_str = schedule.id.to_string();
+            // Latest-wins supersede counters (issue #811, Codex round 1) --
+            // the buffered drain shares the tick's gap.
+            let start_result = crate::execution::start_or_load_workflow_execution_with_metrics(
                 conn,
                 crate::execution::StartWorkflowParams {
-                    // Issue #1412: thread the DAG/workflow's declared
-                    // execution_timeout into a buffered-drain fire, mirroring the
-                    // normal tick-direct dispatch path above and this site's
-                    // throttled sibling.
+                    workflow_name: wf_name,
+                    workflow_id: &workflow_id,
+                    exec_id,
+                    input,
+                    parent_id: None,
+                    queue_name: dispatch_queue,
+                    // Issue #743 review (PR #1141, Finding #2): thread the
+                    // DAG/workflow's declared execution_timeout into a
+                    // buffered-drain fire, mirroring the normal tick-direct
+                    // dispatch path above and this site's throttled sibling.
                     execution_timeout,
+                    memo: None,
+                    search_attrs: None,
                     reuse_policy: scheduled_workflow_reuse_policy(),
-                    // Fleet-wide execution_timeout ceiling (issue #1412): parity
-                    // with the throttled branch above and with the chain-cap
-                    // ceiling right below.
-                    max_execution_timeout_ceiling,
+                    conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
+                    trace_context: None,
+                    // Fleet-wide execution_timeout ceiling (issue #743
+                    // review, PR #1141 Finding #3): parity with the throttled
+                    // branch above and with the chain-cap ceiling right below.
+                    max_execution_timeout_ceiling: registry
+                        .max_workflow_execution_timeout
+                        .and_then(|d| chrono::Duration::from_std(d).ok()),
                     // Chain-scoped lifetime cap (issue #617): carry the
                     // workflow-type default AND the fleet-wide chain ceiling (via
                     // the registry, since the core scheduler has no api_state) so a
@@ -6820,236 +6299,212 @@ async fn drain_claimed_buffered_schedule(
                     max_workflow_chain_timeout_ceiling: registry
                         .max_workflow_chain_timeout
                         .and_then(|d| chrono::Duration::from_std(d).ok()),
+                    inherited_chain_deadline_at: None,
                     concurrency_key,
                     concurrency_limit,
                     concurrency_on_conflict,
+                    priority: Priority::default(),
                     max_workflow_input_bytes: effective_cap,
+                    start_at: None,
+                    delay: None,
+                    max_workflow_start_delay: None,
                     owner,
                     runbook_url,
                     severity,
+                    context_headers: None,
                     sla,
                     schedule_id: Some(schedule.id),
                     scheduled_for: Some(scheduled_for),
+                    workflow_attempt: 1,
                     workflow_retry_policy: schedule
                         .retry_policy
                         .as_ref()
                         .and_then(|v| serde_json::from_value(v.clone()).ok())
                         .or_else(|| wf_info.and_then(|info| info.retry_policy.clone())),
+                    retry_of_exec_id: None,
                     max_workflow_attempts_ceiling: registry.max_workflow_attempts_ceiling,
                     // Normal scheduler-tick fire — attributed as the schedule's cadence (issue #534).
                     origin: Some(crate::execution::ORIGIN_SCHEDULED),
+                    completion_callbacks: None,
                     start_source: crate::types::StartSource::Schedule,
                     start_source_ref: Some(schedule_id_str.as_str()),
-                    ..crate::execution::StartWorkflowParams::new(
-                        wf_name,
-                        &workflow_id,
-                        exec_id,
-                        input,
-                        dispatch_queue,
-                    )
+                    started_by: None,
                 },
                 Some(metrics.as_ref()),
                 None,
-                registry.payload_codecs(),
             )
             .await;
 
-        match scheduled_start_outcome(start_result) {
-            Ok(outcome) => {
-                dispatched += 1;
-                if outcome.created() {
-                    metrics.record_schedule_run("workflow", wf_name);
-                } else if let Some(ref bucket) = buffered_throttle_bucket {
-                    // AC-a: RejectDuplicate returned an existing run — refund.
-                    let _ = crate::queue::refund_rate_limit_token(conn, bucket).await;
+            match scheduled_start_outcome(start_result) {
+                Ok(outcome) => {
+                    dispatched += 1;
+                    if outcome.created() {
+                        metrics.record_schedule_run("workflow", wf_name);
+                    } else if let Some(ref bucket) = buffered_throttle_bucket {
+                        // AC-a: RejectDuplicate returned an existing run — refund.
+                        let _ = crate::queue::refund_rate_limit_token(conn, bucket).await;
+                    }
+                    tracing::info!(
+                        workflow_name = %wf_name,
+                        execution_id = %outcome.exec_id(),
+                        state = %outcome.state(),
+                        created = outcome.created(),
+                        "harvest: buffered scheduled workflow run dispatched"
+                    );
+                    crate::schedule_decision::record_decision_graceful(
+                        conn,
+                        Some(&**metrics),
+                        Some(schedule.id),
+                        wf_name,
+                        "workflow",
+                        "fired",
+                        "fired_ok",
+                        Some(serde_json::json!({
+                            "execution_id": outcome.exec_id(),
+                            "state": outcome.state().to_string(),
+                            "created": outcome.created(),
+                            "buffered": true,
+                        })),
+                        now,
+                        schedule.next_run_at.unwrap_or(now),
+                        i16::try_from(current_shard.as_i32()).unwrap_or(0),
+                    )
+                    .await;
                 }
-                tracing::info!(
-                    workflow_name = %wf_name,
-                    execution_id = %outcome.exec_id(),
-                    state = %outcome.state(),
-                    created = outcome.created(),
-                    "harvest: buffered scheduled workflow run dispatched"
-                );
-                crate::schedule_decision::record_decision_graceful(
-                    conn,
-                    Some(&**metrics),
-                    Some(schedule.id),
-                    wf_name,
-                    "workflow",
-                    "fired",
-                    "fired_ok",
-                    Some(serde_json::json!({
-                        "execution_id": outcome.exec_id(),
-                        "state": outcome.state().to_string(),
-                        "created": outcome.created(),
-                        "buffered": true,
-                    })),
-                    now,
-                    schedule.next_run_at.unwrap_or(now),
-                    i16::try_from(current_shard.as_i32()).unwrap_or(0),
-                )
-                .await;
-            }
-            Err(HarvestError::QuotaExceeded {
-                key,
-                resource,
-                limit,
-                current,
-                ..
-            }) => {
-                // issue #946 (Task #7 hardening): a declared per-tenant quota
-                // is exhausted. Unlike the generic `Err(error)` arm below
-                // (which permanently drops the slot -- correct for a request
-                // that can never succeed, e.g. a deleted workflow or a bad
-                // input) this is TEMPORARY: the tenant's usage frees up as an
-                // existing execution completes or is deleted. Re-insert the
-                // slot the loop already popped via `buffered.remove(0)` above
-                // so the persisted `buffered_runs` still carries it for the
-                // next tick's drain attempt, rather than silently discarding
-                // a buffered fire forever. Refund the throttle token first
-                // (mirrors the generic arm), then stop draining this
-                // schedule this tick -- every remaining slot for the same
-                // workflow is equally likely to hit the same tenant cap, so
-                // further attempts this tick would just repeat the block.
-                //
-                // `harvest.quota.rejected` was already recorded by
-                // `start_or_load_workflow_execution_with_metrics` itself
-                // (it was passed `Some(metrics.as_ref())` above) --
-                // mirrors the `Blocked`/`QuotaBlocked` no-double-count
-                // precedent in `completion_trigger.rs`.
-                if let Some(ref bucket) = buffered_throttle_bucket {
-                    let _ = crate::queue::refund_rate_limit_token(conn, bucket).await;
-                }
-                buffered.insert(0, scheduled_for);
-                tracing::debug!(
-                    workflow_name = %wf_name,
-                    workflow_id = %workflow_id,
-                    buffered_for = %scheduled_for,
-                    quota_key = %key,
-                    resource = %resource,
+                Err(HarvestError::QuotaExceeded {
+                    key,
+                    resource,
                     limit,
                     current,
-                    "harvest: buffered workflow run blocked by a per-tenant quota; \
-                     re-buffered for a later tick"
-                );
-                break;
-            }
-            Err(error) => {
-                // No run admitted — refund the reserved throttle token.
-                if let Some(ref bucket) = buffered_throttle_bucket {
-                    let _ = crate::queue::refund_rate_limit_token(conn, bucket).await;
+                    ..
+                }) => {
+                    // issue #946 (Task #7 hardening): a declared per-tenant quota
+                    // is exhausted. Unlike the generic `Err(error)` arm below
+                    // (which permanently drops the slot -- correct for a request
+                    // that can never succeed, e.g. a deleted workflow or a bad
+                    // input) this is TEMPORARY: the tenant's usage frees up as an
+                    // existing execution completes or is deleted. Re-insert the
+                    // slot the loop already popped via `buffered.remove(0)` above
+                    // so the persisted `buffered_runs` still carries it for the
+                    // next tick's drain attempt, rather than silently discarding
+                    // a buffered fire forever. Refund the throttle token first
+                    // (mirrors the generic arm), then stop draining this
+                    // schedule this tick -- every remaining slot for the same
+                    // workflow is equally likely to hit the same tenant cap, so
+                    // further attempts this tick would just repeat the block.
+                    //
+                    // `harvest.quota.rejected` was already recorded by
+                    // `start_or_load_workflow_execution_with_metrics` itself
+                    // (it was passed `Some(metrics.as_ref())` above) --
+                    // mirrors the `Blocked`/`QuotaBlocked` no-double-count
+                    // precedent in `completion_trigger.rs`.
+                    if let Some(ref bucket) = buffered_throttle_bucket {
+                        let _ = crate::queue::refund_rate_limit_token(conn, bucket).await;
+                    }
+                    buffered.insert(0, scheduled_for);
+                    tracing::debug!(
+                        workflow_name = %wf_name,
+                        workflow_id = %workflow_id,
+                        buffered_for = %scheduled_for,
+                        quota_key = %key,
+                        resource = %resource,
+                        limit,
+                        current,
+                        "harvest: buffered workflow run blocked by a per-tenant quota; \
+                         re-buffered for a later tick"
+                    );
+                    break;
                 }
-                // Drop the failing slot rather than re-inserting it. Re-queuing a
-                // permanently-failing slot (e.g. deleted workflow, bad input) would
-                // create an infinite retry loop on every scheduler tick. Transient
-                // failures are rare for buffered slots (same path as normal dispatch);
-                // if they occur the schedule's regular tick will generate fresh firings.
-                tracing::warn!(
-                    error = %error,
-                    workflow_name = %wf_name,
-                    workflow_id = %workflow_id,
-                    buffered_for = %scheduled_for,
-                    "harvest: failed to dispatch buffered workflow run; dropping slot"
-                );
-                break;
+                Err(error) => {
+                    // No run admitted — refund the reserved throttle token.
+                    if let Some(ref bucket) = buffered_throttle_bucket {
+                        let _ = crate::queue::refund_rate_limit_token(conn, bucket).await;
+                    }
+                    // Drop the failing slot rather than re-inserting it. Re-queuing a
+                    // permanently-failing slot (e.g. deleted workflow, bad input) would
+                    // create an infinite retry loop on every scheduler tick. Transient
+                    // failures are rare for buffered slots (same path as normal dispatch);
+                    // if they occur the schedule's regular tick will generate fresh firings.
+                    tracing::warn!(
+                        error = %error,
+                        workflow_name = %wf_name,
+                        workflow_id = %workflow_id,
+                        buffered_for = %scheduled_for,
+                        "harvest: failed to dispatch buffered workflow run; dropping slot"
+                    );
+                    break;
+                }
             }
         }
-    }
 
-    // Persist the updated buffer and budget accounting (issue #478).
-    let dispatched_i32 = i32::try_from(dispatched).unwrap_or(i32::MAX);
-    let new_runs_started = schedule.runs_started.saturating_add(dispatched_i32);
-    let budget_exhausted = dispatched > 0
-        && schedule
-            .max_runs
-            .is_some_and(|max| max > 0 && new_runs_started >= max);
-    let end_at_exhausted = schedule.end_at.is_some_and(|end| {
-        if all_buffered_past_end_at {
-            // The entire buffer was cleared because every slot was past end_at.
-            // Exhaust only when the schedule's regular next_run_at is also at/past
-            // the cutoff (or absent). If next_run_at is still before end_at, the
-            // regular tick fires inside the window and the drain must not exhaust.
-            schedule.next_run_at.is_none_or(|next| next >= end)
+        // Persist the updated buffer and budget accounting (issue #478).
+        let dispatched_i32 = i32::try_from(dispatched).unwrap_or(i32::MAX);
+        let new_runs_started = schedule.runs_started.saturating_add(dispatched_i32);
+        let budget_exhausted = dispatched > 0
+            && schedule
+                .max_runs
+                .is_some_and(|max| max > 0 && new_runs_started >= max);
+        let end_at_exhausted = schedule.end_at.is_some_and(|end| {
+            if all_buffered_past_end_at {
+                // The entire buffer was cleared because every slot was past end_at.
+                // Exhaust only when the schedule's regular next_run_at is also at/past
+                // the cutoff (or absent). If next_run_at is still before end_at, the
+                // regular tick fires inside the window and the drain must not exhaust.
+                schedule.next_run_at.is_none_or(|next| next >= end)
+            } else {
+                // Only exhaust from the drain when *remaining* buffered slots are all
+                // past the cutoff. An empty buffer means capacity opened and the drain
+                // completed normally — the regular tick detects end_at on next_run_at.
+                !buffered.is_empty() && buffered.iter().all(|&t| t >= end)
+            }
+        });
+        let any_drain_exhausted = budget_exhausted || end_at_exhausted;
+        let exhausted_reason: Option<&str> = if budget_exhausted {
+            Some("max_runs_exhausted")
+        } else if end_at_exhausted {
+            Some("end_at_reached")
         } else {
-            // Only exhaust from the drain when *remaining* buffered slots are all
-            // past the cutoff. An empty buffer means capacity opened and the drain
-            // completed normally — the regular tick detects end_at on next_run_at.
-            !buffered.is_empty() && buffered.iter().all(|&t| t >= end)
+            None
+        };
+        // Use two separate UPDATE paths so the non-exhausting path never writes
+        // NULL for exhausted_at/exhausted_reason, which would silently undo a
+        // concurrent exhaustion set by another HA replica (issue #478).
+        if any_drain_exhausted {
+            diesel::update(dsl::harvest_schedules.find(schedule.id))
+                .set((
+                    dsl::buffered_runs.eq(buffered_runs_to_json(&buffered)),
+                    dsl::runs_started.eq(new_runs_started),
+                    dsl::exhausted_at.eq(Some(now)),
+                    dsl::exhausted_reason.eq(exhausted_reason),
+                    dsl::next_run_at.eq(Option::<DateTime<Utc>>::None),
+                    dsl::updated_at.eq(now),
+                ))
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+        } else {
+            // Guard on exhausted_at IS NULL so a concurrent exhaustion is never
+            // overwritten. The row may have been exhausted by the regular tick or
+            // another drain between the SELECT above and this UPDATE.
+            // Use a DB-side increment so concurrent manual trigger pre-increments
+            // are preserved rather than overwritten by this stale in-memory value.
+            diesel::update(
+                dsl::harvest_schedules
+                    .find(schedule.id)
+                    .filter(dsl::exhausted_at.is_null()),
+            )
+            .set((
+                dsl::buffered_runs.eq(buffered_runs_to_json(&buffered)),
+                dsl::runs_started.eq(dsl::runs_started + dispatched_i32),
+                dsl::updated_at.eq(now),
+            ))
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
         }
-    });
-    let any_drain_exhausted = budget_exhausted || end_at_exhausted;
-    let exhausted_reason: Option<&str> = if budget_exhausted {
-        Some("max_runs_exhausted")
-    } else if end_at_exhausted {
-        Some("end_at_reached")
-    } else {
-        None
-    };
-    // Use two separate UPDATE paths so the non-exhausting path never writes
-    // NULL for exhausted_at/exhausted_reason, which would silently undo a
-    // concurrent exhaustion set by another HA replica (issue #478).
-    // Both paths match only while this drain holds the claim, and both clear it
-    // (issue #1820). Thus a drain whose claim expired cannot overwrite a peer.
-    let written = if any_drain_exhausted {
-        diesel::update(
-            dsl::harvest_schedules
-                .find(schedule.id)
-                .filter(dsl::fire_claim_token.eq(Some(claim_token))),
-        )
-        .set((
-            dsl::buffered_runs.eq(buffered_runs_to_json(&buffered)),
-            // DB-side increment, so a concurrent manual-trigger increment
-            // survives. The claim does not serialize manual triggers.
-            dsl::runs_started.eq(dsl::runs_started + dispatched_i32),
-            dsl::exhausted_at.eq(Some(now)),
-            dsl::exhausted_reason.eq(exhausted_reason),
-            dsl::next_run_at.eq(Option::<DateTime<Utc>>::None),
-            dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
-            dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
-            dsl::updated_at.eq(now),
-        ))
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?
-    } else {
-        // Guard on exhausted_at IS NULL so a concurrent exhaustion is never
-        // overwritten. The row may have been exhausted by the regular tick or
-        // another drain between the SELECT above and this UPDATE.
-        // Use a DB-side increment so concurrent manual trigger pre-increments
-        // are preserved rather than overwritten by this stale in-memory value.
-        diesel::update(
-            dsl::harvest_schedules
-                .find(schedule.id)
-                .filter(dsl::exhausted_at.is_null())
-                .filter(dsl::fire_claim_token.eq(Some(claim_token))),
-        )
-        .set((
-            dsl::buffered_runs.eq(buffered_runs_to_json(&buffered)),
-            dsl::runs_started.eq(dsl::runs_started + dispatched_i32),
-            dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
-            dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
-            dsl::updated_at.eq(now),
-        ))
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?
-    };
-    if written == 0 {
-        // The claim expired and a peer or a PATCH replaced it, or the row is
-        // exhausted. The stored buffer still holds the slots this pass started.
-        // The next drain starts them again, and `RejectDuplicate` returns the
-        // existing runs.
-        tracing::warn!(
-            schedule_id = %schedule.id,
-            workflow_name = %wf_name,
-            dispatched,
-            "harvest: buffered drain did not persist; it no longer holds the fire claim \
-             or the schedule is exhausted"
-        );
-        return Ok(DrainClaim::Held);
     }
 
-    Ok(DrainClaim::Released)
+    Ok(())
 }
 
 // ── Worker-completion helpers (issue #360) ────────────────────────────────────
@@ -7292,43 +6747,6 @@ pub(crate) async fn maybe_reset_schedule_failure_counter(
 mod tests {
     use super::*;
 
-    /// Documents (and pins) the exact hazard `load_schedule_overdue_aux_by_shard`
-    /// (in `autumn-harvest-plugin/src/api.rs`) must avoid when a batched
-    /// `calendar::load_exclusions_for_calendars` call fails: `exclude_weekends`
-    /// is a pure name check (`calendar_name == "weekends-off"`), independent of
-    /// whatever the exclusions query returned, so an EMPTY `excluded` slice is
-    /// **not** a safe stand-in for "the query failed" -- it still lets a
-    /// "weekends-off" calendar rebase a weekend slot away from its raw anchor,
-    /// which is exactly the wedge-hiding the caller's failure handling exists to
-    /// prevent (Codex review, PR #1314). The caller's fix is to treat a failed
-    /// batch as "skip calendar resolution for this shard" (`exclusions: None`),
-    /// never as "no exclusions" (`exclusions: Some(empty map)`) -- this test
-    /// pins why: with an empty `excluded` slice, the weekend flag alone is
-    /// sufficient to trigger a real rebase.
-    #[test]
-    fn resolve_effective_fire_at_pure_rebases_a_weekend_slot_from_the_weekend_flag_alone_even_with_empty_exclusions()
-     {
-        // 2026-06-13 is a fixed, independently-verified Saturday (not derived
-        // from `Utc::now()`, so this test's outcome never depends on what day
-        // it happens to run).
-        let saturday = Utc.with_ymd_and_hms(2026, 6, 13, 12, 0, 0).unwrap();
-
-        let rebased = resolve_effective_fire_at_pure(
-            &[],  // empty exclusions -- what an "unwrap_or_default() on failure" would produce
-            true, // exclude_weekends: true, i.e. calendar_name == "weekends-off"
-            "run_next_business_day",
-            Some("interval:3600"),
-            Some(saturday),
-        );
-
-        assert!(
-            rebased.is_some_and(|r| r.date_naive() != saturday.date_naive()),
-            "empty exclusions + exclude_weekends=true must still rebase a weekend slot -- \
-             proving a caller cannot treat a failed exclusions load as 'no exclusions' \
-             without risking exactly this silent rebase, got {rebased:?}"
-        );
-    }
-
     /// A representative workflow-schedule row for `merge_schedule_patch` unit
     /// tests (no database required).
     fn merge_base_row() -> HarvestSchedule {
@@ -7432,98 +6850,6 @@ mod tests {
         assert_eq!(merged.queue_name, "etl");
         assert_eq!(merged.overlap_policy, OverlapPolicy::BufferOne);
         assert_eq!(merged.calendar.as_deref(), Some("us-holidays"));
-    }
-
-    /// An explicit `jitter_secs: 0` on an interval schedule survives a patch
-    /// to a five-field cron (issue #1792). The stored row carries no
-    /// default-versus-explicit provenance, so the merge must not replace the
-    /// opt-out with the new cadence's 10 s default.
-    #[test]
-    fn merge_schedule_patch_cadence_change_keeps_explicit_zero_jitter() {
-        let row = HarvestSchedule {
-            schedule_expr: Some("interval:3600".to_string()),
-            jitter_secs: 0,
-            ..merge_base_row()
-        };
-        let patch = WorkflowSchedulePatch {
-            schedule: Some(Schedule::Cron("0 3 * * *".to_string())),
-            ..Default::default()
-        };
-        let merged = merge_schedule_patch(&row, &patch).expect("merge");
-        assert_eq!(merged.jitter, Duration::ZERO);
-    }
-
-    /// A stored 10 s jitter on a five-field cron survives a patch to another
-    /// five-field cron, to a seconds-field cron and to an interval. The merge
-    /// never re-derives jitter from the new cadence (issue #1792).
-    #[test]
-    fn merge_schedule_patch_cadence_change_keeps_stored_jitter() {
-        let row = HarvestSchedule {
-            schedule_expr: Some("cron:0 3 * * *".to_string()),
-            jitter_secs: 10,
-            ..merge_base_row()
-        };
-        let merge_to = |schedule: Schedule| {
-            let patch = WorkflowSchedulePatch {
-                schedule: Some(schedule),
-                ..Default::default()
-            };
-            merge_schedule_patch(&row, &patch).expect("merge").jitter
-        };
-        assert_eq!(
-            merge_to(Schedule::Cron("0 4 * * *".to_string())),
-            Duration::from_secs(10)
-        );
-        assert_eq!(
-            merge_to(Schedule::Cron("*/5 * * * * *".to_string())),
-            Duration::from_secs(10)
-        );
-        assert_eq!(
-            merge_to(Schedule::Interval(Duration::from_secs(3600))),
-            Duration::from_secs(10)
-        );
-    }
-
-    /// A non-default stored jitter also stays across a cadence change.
-    #[test]
-    fn merge_schedule_patch_cadence_change_keeps_explicit_jitter() {
-        let row = merge_base_row();
-        let patch = WorkflowSchedulePatch {
-            schedule: Some(Schedule::Cron("0 3 * * *".to_string())),
-            ..Default::default()
-        };
-        let merged = merge_schedule_patch(&row, &patch).expect("merge");
-        assert_eq!(merged.jitter, Duration::from_secs(30));
-    }
-
-    /// A patch that sets both the cadence and `jitter` applies the explicit
-    /// value, including an explicit zero (issue #1792).
-    #[test]
-    fn merge_schedule_patch_cadence_change_with_explicit_jitter_applies_it() {
-        let row = HarvestSchedule {
-            schedule_expr: Some("cron:0 3 * * *".to_string()),
-            jitter_secs: 10,
-            ..merge_base_row()
-        };
-        let merge_with = |schedule: Schedule, jitter: Duration| {
-            let patch = WorkflowSchedulePatch {
-                schedule: Some(schedule),
-                jitter: Some(jitter),
-                ..Default::default()
-            };
-            merge_schedule_patch(&row, &patch).expect("merge").jitter
-        };
-        assert_eq!(
-            merge_with(
-                Schedule::Interval(Duration::from_secs(60)),
-                Duration::from_secs(5)
-            ),
-            Duration::from_secs(5)
-        );
-        assert_eq!(
-            merge_with(Schedule::Cron("0 4 * * *".to_string()), Duration::ZERO),
-            Duration::ZERO
-        );
     }
 
     /// Tri-state fields: `Some(None)` clears, outer `None` preserves.
@@ -8174,7 +7500,7 @@ mod tests {
         let timestamps = plan_backfill_timestamps(Some(&schedule), from, to, 100)
             .expect("inverted window should return empty without error");
 
-        assert_eq!(timestamps, [] as [chrono::DateTime<chrono::Utc>; 0]);
+        assert!(timestamps.is_empty());
     }
 
     #[test]
@@ -8185,12 +7511,12 @@ mod tests {
         let timestamps = plan_backfill_timestamps(None, from, to, 100)
             .expect("unset schedule backfill should succeed with empty plan");
 
-        assert_eq!(timestamps, [] as [chrono::DateTime<chrono::Utc>; 0]);
+        assert!(timestamps.is_empty());
 
         let timestamps = plan_backfill_timestamps(Some(&Schedule::Manual), from, to, 100)
             .expect("manual schedule backfill should succeed with empty plan");
 
-        assert_eq!(timestamps, [] as [chrono::DateTime<chrono::Utc>; 0]);
+        assert!(timestamps.is_empty());
     }
 
     #[test]
@@ -8357,18 +7683,9 @@ mod tests {
 
     #[test]
     fn parse_buffered_runs_returns_empty_for_null_or_invalid() {
-        assert_eq!(
-            parse_buffered_runs(&serde_json::Value::Null),
-            [] as [chrono::DateTime<chrono::Utc>; 0]
-        );
-        assert_eq!(
-            parse_buffered_runs(&serde_json::json!([])),
-            [] as [chrono::DateTime<chrono::Utc>; 0]
-        );
-        assert_eq!(
-            parse_buffered_runs(&serde_json::json!("not-an-array")),
-            [] as [chrono::DateTime<chrono::Utc>; 0]
-        );
+        assert!(parse_buffered_runs(&serde_json::Value::Null).is_empty());
+        assert!(parse_buffered_runs(&serde_json::json!([])).is_empty());
+        assert!(parse_buffered_runs(&serde_json::json!("not-an-array")).is_empty());
     }
 
     #[test]
@@ -8451,33 +7768,6 @@ mod tests {
             matches!(&parsed, Schedule::CronInTimezone { tz, .. } if tz == "America/Los_Angeles"),
             "round-trip failed: {parsed:?}"
         );
-    }
-
-    #[test]
-    fn schedule_expr_round_trips_every_valid_interval() {
-        // Oracle (issue #1967): parse(write(x)) == x for each valid interval.
-        let mut checked = 0;
-        for interval in [
-            Duration::from_secs(1),
-            Duration::from_secs(60),
-            Duration::from_secs(u64::MAX),
-            Duration::from_nanos(1),
-            Duration::from_millis(500),
-            Duration::from_millis(1_500),
-        ] {
-            let schedule = Schedule::Interval(interval);
-            if crate::policy::validate_schedule(&schedule).is_err() {
-                continue;
-            }
-            let expr = schedule_expr(Some(&schedule)).expect("interval has expr");
-            let parsed = parse_schedule_from_expr(&expr);
-            assert!(
-                matches!(parsed, Some(Schedule::Interval(d)) if d == interval),
-                "{interval:?} is valid but {expr} reads back as {parsed:?}"
-            );
-            checked += 1;
-        }
-        assert_eq!(checked, 3, "the whole-second samples must be valid");
     }
 
     // ── Overdue-schedule detection (issue #696) ──────────────────────────────
@@ -9093,7 +8383,7 @@ mod tests {
 
             for signature in [
                 "async fn tick_one_workflow_schedule(",
-                "async fn drain_claimed_buffered_schedule(",
+                "async fn drain_buffered_schedule_runs(",
             ] {
                 let body = body_of(source, signature);
                 assert!(

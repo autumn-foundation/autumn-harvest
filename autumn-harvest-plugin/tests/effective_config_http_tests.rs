@@ -27,6 +27,7 @@ use autumn_harvest::worker::HandlerRegistry;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
+use autumn_web::AppState;
 use autumn_web::reexports::axum::body::Body;
 use autumn_web::reexports::http::{Method, Request, StatusCode};
 use autumn_web::session::Session;
@@ -40,7 +41,7 @@ fn app_with_api_state(
     Error = std::convert::Infallible,
     Future = impl std::future::Future,
 > + Clone {
-    harvest_api_router(api_state)
+    harvest_api_router(api_state).with_state(AppState::for_test())
 }
 
 fn get(uri: &str) -> Request<Body> {
@@ -95,7 +96,6 @@ fn sample_view() -> EffectiveConfigView {
             shard_pool_count: 1,
         },
         Duration::from_millis(500),
-        None,
         None,
     )
 }

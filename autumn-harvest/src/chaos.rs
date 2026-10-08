@@ -188,7 +188,7 @@ pub mod points {
         caps: CAP_ERROR,
     };
 
-    /// In `notify::notify_task_enqueued`, guarding the post-commit wake.
+    /// In `notify::notify_task_enqueued`, guarding the `pg_notify` send.
     ///
     /// A dropped wake (AC1(c)) means a listening worker never receives the
     /// `LISTEN`/`NOTIFY` and must fall back to its poll loop to claim the task.
@@ -198,29 +198,6 @@ pub mod points {
     pub const NOTIFY_TASK_ENQUEUED: ChaosPoint = ChaosPoint {
         name: "notify.task_enqueued",
         caps: CAP_DROP_NOTIFY,
-    };
-
-    /// In the worker's dispatch consume path, after the by-id claim
-    /// transaction commits and before the reference is acked.
-    ///
-    /// Race window for issue #1312: a worker that dies here leaves the row
-    /// `RUNNING` and the reference in the channel's pending list. The
-    /// poison-pill reclaim re-pends the row. The reconcile sweep republishes
-    /// it. The recovered stale reference is acked as a no-op. The crash
-    /// therefore neither loses nor duplicates work.
-    pub const DISPATCH_AFTER_CLAIM_BEFORE_ACK: ChaosPoint = ChaosPoint {
-        name: "dispatch.after_claim.before_ack",
-        caps: CAP_KILL | CAP_DELAY,
-    };
-
-    /// In the worker's dispatch task, after the claim and before the task
-    /// starts.
-    ///
-    /// Race window for issue #1813. A shutdown in this window finds a claimed
-    /// task that never started. The drain must give the claim back.
-    pub const WORKER_DISPATCH_BEFORE_START: ChaosPoint = ChaosPoint {
-        name: "worker.dispatch.before_start",
-        caps: CAP_KILL | CAP_DELAY,
     };
 
     /// Every catalogue point, in a stable order.
@@ -233,8 +210,6 @@ pub mod points {
         SCHED_AFTER_START_BEFORE_ADVANCE,
         POISON_RECLAIM_BEFORE_LOAD,
         NOTIFY_TASK_ENQUEUED,
-        DISPATCH_AFTER_CLAIM_BEFORE_ACK,
-        WORKER_DISPATCH_BEFORE_START,
     ];
 
     /// Ratchet on the catalogue size. Bump deliberately when adding points.
@@ -683,22 +658,26 @@ mod controller {
 
     /// Pick a seeded action for `p` from its declared caps (never `Hold`).
     fn pick_seeded_action(p: ChaosPoint, stream: u64) -> Option<Action> {
-        // A fixed array, not a `Vec`, keeps the Kani proof small. The order
-        // decides which action a stream picks, so it must not change.
         let caps = p.caps();
-        let candidates = [
-            (CAP_ERROR, Action::Error(ChaosError::Generic)),
-            (CAP_DROP_NOTIFY, Action::DropNotify),
-            (CAP_DELAY, Action::Delay(5)),
-            (CAP_KILL, Action::Kill),
-        ];
-        let eligible = candidates.iter().filter(|(cap, _)| caps & cap != 0);
-        let len = u64::try_from(eligible.clone().count()).unwrap_or(1);
-        if len == 0 {
+        let mut eligible: Vec<Action> = Vec::new();
+        if caps & CAP_ERROR != 0 {
+            eligible.push(Action::Error(ChaosError::Generic));
+        }
+        if caps & CAP_DROP_NOTIFY != 0 {
+            eligible.push(Action::DropNotify);
+        }
+        if caps & CAP_DELAY != 0 {
+            eligible.push(Action::Delay(5));
+        }
+        if caps & CAP_KILL != 0 {
+            eligible.push(Action::Kill);
+        }
+        if eligible.is_empty() {
             return None;
         }
+        let len = u64::try_from(eligible.len()).unwrap_or(1);
         let idx = usize::try_from((stream >> 16) % len).unwrap_or(0);
-        eligible.map(|(_, action)| action).nth(idx).cloned()
+        eligible.get(idx).cloned()
     }
 
     /// The armed, in-flight chaos state. One exists at a time (serialized by
@@ -1064,40 +1043,16 @@ mod controller {
     pub async fn arm(plan: ChaosPlan) -> ChaosGuard {
         install_quiet_hook_once();
         let serial = SERIAL.lock().await;
-        let state = install_armed_state(plan);
-        ChaosGuard {
-            _serial: serial,
-            state,
-        }
-    }
-
-    /// Publish `plan` as the armed state under a fresh generation. Callers
-    /// must already hold [`SERIAL`]; this is the arming half of that lock's
-    /// critical section, factored out so [`ChaosGuard::rearm_in_place`] runs
-    /// the identical sequence rather than a test-local copy of it.
-    fn install_armed_state(plan: ChaosPlan) -> Arc<ChaosState> {
         let generation = NEXT_GEN.fetch_add(1, Ordering::SeqCst);
         let state = Arc::new(ChaosState::from_plan(plan, generation));
         *STATE.write().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&state));
         // Publish STATE, then ARMED_GEN — the sole armed/disarmed signal a
         // reader checks (see `entry_snapshot`).
         ARMED_GEN.store(generation, Ordering::SeqCst);
-        state
-    }
-
-    /// Tear down `state` as the armed state. Callers must already hold
-    /// [`SERIAL`]; this is the disarming half of that lock's critical
-    /// section, shared by [`ChaosGuard`]'s `Drop` and
-    /// [`ChaosGuard::rearm_in_place`].
-    fn clear_armed_state(state: &ChaosState) {
-        // Clear armed state before the caller releases `SERIAL`, so another
-        // `arm()` can never observe a half-torn-down state. Disarm the
-        // generation (the sole armed/disarmed signal — see `entry_snapshot`)
-        // so any resolved action still in flight against this state is fenced
-        // by `fire_if_current`.
-        ARMED_GEN.store(0, Ordering::SeqCst);
-        *STATE.write().unwrap_or_else(PoisonError::into_inner) = None;
-        state.release_all_holds();
+        ChaosGuard {
+            _serial: serial,
+            state,
+        }
     }
 
     /// The RAII handle returned by [`arm`]. Disarms the harness and releases the
@@ -1162,31 +1117,14 @@ mod controller {
 
     impl Drop for ChaosGuard {
         fn drop(&mut self) {
-            // Clear armed state here, in the body, so it completes *before*
-            // `_serial` drops (fields drop after the body runs) and no other
-            // `arm()` can observe a half-torn-down state.
-            clear_armed_state(&self.state);
-        }
-    }
-
-    #[cfg(test)]
-    impl ChaosGuard {
-        /// Disarm this guard's plan, run `observe_disarmed`, then arm `plan`
-        /// in its place — all **without** releasing the process-wide
-        /// [`SERIAL`] lock this guard owns.
-        ///
-        /// A test that wants to observe the fully-disarmed window between two
-        /// armed plans cannot get there by dropping its guard: the guard owns
-        /// `SERIAL`, so dropping it hands the lock to whichever sibling test
-        /// is blocked in [`arm`], and that sibling can publish its own
-        /// `ARMED_GEN` before the observation runs. That is a race in the
-        /// test, not in the harness, and it is why this steps through the same
-        /// [`clear_armed_state`] / [`install_armed_state`] sequence the real
-        /// `Drop` and `arm` use while the lock stays put.
-        fn rearm_in_place(&mut self, plan: ChaosPlan, observe_disarmed: impl FnOnce()) {
-            clear_armed_state(&self.state);
-            observe_disarmed();
-            self.state = install_armed_state(plan);
+            // Clear armed state first, *then* let `_serial` drop (after this
+            // body) so another `arm()` can never observe a half-torn-down
+            // state. Disarm the generation (the sole armed/disarmed signal —
+            // see `entry_snapshot`) so any resolved action still in flight
+            // against this state is fenced by `fire_if_current`.
+            ARMED_GEN.store(0, Ordering::SeqCst);
+            *STATE.write().unwrap_or_else(PoisonError::into_inner) = None;
+            self.state.release_all_holds();
         }
     }
 
@@ -1371,41 +1309,6 @@ mod controller {
         hash
     }
 
-    /// Kani proofs of the seeded plan derivation (issue #1819).
-    ///
-    /// The `kani` CI job runs them. See `docs/testing/formal-methods.md`.
-    #[cfg(kani)]
-    mod kani_proofs {
-        use super::*;
-
-        /// A seeded plan picks only an action that the point's caps allow,
-        /// and never `Hold`. The stream is any `u64`, so the result holds for
-        /// every `splitmix64` output and every seed.
-        ///
-        /// The unit tests check streams that a loop can list. This proof
-        /// checks all 2^64 of them.
-        #[kani::proof]
-        #[kani::unwind(6)]
-        fn seeded_action_respects_caps_and_never_holds() {
-            let i: usize = kani::any();
-            kani::assume(i < ALL.len());
-            let point = ALL[i];
-            let caps = point.caps();
-            let Some(action) = pick_seeded_action(point, kani::any()) else {
-                return;
-            };
-            let allowed = match action {
-                Action::Kill => caps & CAP_KILL != 0,
-                Action::Error(_) => caps & CAP_ERROR != 0,
-                Action::DropNotify => caps & CAP_DROP_NOTIFY != 0,
-                Action::Delay(_) => caps & CAP_DELAY != 0,
-                Action::Hold => false,
-            };
-            assert!(allowed);
-            kani::cover!(matches!(action, Action::Kill));
-        }
-    }
-
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -1505,33 +1408,6 @@ mod controller {
                         "seeded action {:?} violates caps of {name} (seed {seed})",
                         d.action
                     );
-                }
-            }
-        }
-
-        /// Pins the candidate order for every index, so seeded plans stay
-        /// reproducible. `stream >> 16` selects the index.
-        #[test]
-        fn pick_seeded_action_keeps_the_caps_order_for_every_index() {
-            for &p in ALL {
-                let caps = p.caps();
-                let mut want = Vec::new();
-                if caps & CAP_ERROR != 0 {
-                    want.push(format!("{:?}", Action::Error(ChaosError::Generic)));
-                }
-                if caps & CAP_DROP_NOTIFY != 0 {
-                    want.push(format!("{:?}", Action::DropNotify));
-                }
-                if caps & CAP_DELAY != 0 {
-                    want.push(format!("{:?}", Action::Delay(5)));
-                }
-                if caps & CAP_KILL != 0 {
-                    want.push(format!("{:?}", Action::Kill));
-                }
-                for k in 0..8_usize {
-                    let got = pick_seeded_action(p, (k as u64) << 16).map(|a| format!("{a:?}"));
-                    let expect = (!want.is_empty()).then(|| want[k % want.len()].clone());
-                    assert_eq!(got, expect, "{} at index {k}", p.name());
                 }
             }
         }
@@ -1826,7 +1702,7 @@ mod controller {
 
         #[tokio::test]
         async fn entry_snapshot_transitions_cleanly_where_the_removed_two_read_shape_straddled() {
-            let mut guard = arm(ChaosPlan::scripted().kill_at(WORKER_PERSIST_BEFORE_COMMIT)).await;
+            let guard1 = arm(ChaosPlan::scripted().kill_at(WORKER_PERSIST_BEFORE_COMMIT)).await;
             let gen1 = ARMED_GEN.load(Ordering::SeqCst);
             assert_ne!(gen1, 0, "gen1 must be armed here");
             assert!(
@@ -1839,20 +1715,18 @@ mod controller {
             // generation and state next.
             let observed_armed_under_gen1 = true;
 
-            // The task is preempted here: a *full* disarm happens before it
-            // resumes, then a re-arm to a *different* plan completes, still
-            // before the preempted task resumes. `rearm_in_place` walks that
-            // disarm/re-arm without ever releasing `SERIAL` — dropping the
-            // guard to disarm would hand the lock to a sibling test, which
-            // could arm into the window the assertion below is about.
-            guard.rearm_in_place(ChaosPlan::scripted(), || {
-                // The real entry point, called fresh in this fully-disarmed
-                // window, correctly observes nothing armed.
-                assert!(
-                    entry_snapshot().is_none(),
-                    "a fresh call in the disarmed window observes nothing armed",
-                );
-            });
+            // The task is preempted here: a *full* disarm (guard1 drop)
+            // happens before it resumes. The real entry point, called fresh
+            // in this fully-disarmed window, correctly observes nothing armed.
+            drop(guard1);
+            assert!(
+                entry_snapshot().is_none(),
+                "a fresh call in the disarmed window observes nothing armed",
+            );
+
+            // ...then a re-arm to a *different* plan completes, still before
+            // the preempted task resumes.
+            let guard2 = arm(ChaosPlan::scripted()).await;
             let gen2 = ARMED_GEN.load(Ordering::SeqCst);
             assert_ne!(gen2, gen1, "gen2 must be a genuinely different generation");
             assert!(
@@ -1872,7 +1746,7 @@ mod controller {
                  gen2's state for a task whose entry belonged to gen1",
             );
 
-            drop(guard);
+            drop(guard2);
         }
 
         // ---- Codex review round 3 (issue #1202): the test above only proves
@@ -1896,7 +1770,7 @@ mod controller {
             // test's own (current-thread) tokio executor, which is fine: the
             // only thing it is waiting on is the separately-spawned
             // `std::thread`, not any other tokio task on this runtime.
-            let mut guard = arm(ChaosPlan::scripted().kill_at(WORKER_PERSIST_BEFORE_COMMIT)).await;
+            let guard1 = arm(ChaosPlan::scripted().kill_at(WORKER_PERSIST_BEFORE_COMMIT)).await;
             let gen1 = ARMED_GEN.load(Ordering::SeqCst);
             assert_ne!(gen1, 0, "gen1 must be armed here");
 
@@ -1910,11 +1784,8 @@ mod controller {
             // (having already captured entry_gen == gen1), perform a REAL
             // disarm + rearm to a different plan -- genuine concurrency, not
             // a simulated STATE poke like the Fix-3 test above.
-            // `rearm_in_place`, not drop-then-`arm`: dropping the guard would
-            // release `SERIAL` while this test still has a paused
-            // `entry_snapshot` in flight, letting a sibling test arm on top of
-            // the straddle this test is constructing.
-            guard.rearm_in_place(ChaosPlan::scripted(), || {});
+            drop(guard1);
+            let guard2 = arm(ChaosPlan::scripted()).await;
             let gen2 = ARMED_GEN.load(Ordering::SeqCst);
             assert_ne!(gen1, gen2, "gen2 must be a genuinely different generation");
 
@@ -1930,7 +1801,7 @@ mod controller {
                  gen2's state for an entry that began while gen1 was armed",
             );
 
-            drop(guard);
+            drop(guard2);
         }
 
         #[test]

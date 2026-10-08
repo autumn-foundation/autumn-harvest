@@ -48,7 +48,7 @@ use autumn_harvest::schema::{
 use autumn_harvest::telemetry::{MetricsRecorder, TelemetryConfig};
 use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
-use autumn_harvest::{JitterPolicy, RetryPolicy, WorkflowContext, store};
+use autumn_harvest::{RetryPolicy, WorkflowContext, store};
 
 use chrono::Utc;
 use diesel::prelude::*;
@@ -67,7 +67,7 @@ use uuid::Uuid;
 // ---------------------------------------------------------------------------
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::test_init_sql().as_bytes().to_vec()
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
 }
 
 /// Returns a live URL to a migrated Postgres, keeping the container (if any)
@@ -168,9 +168,6 @@ fn build_worker(
     Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
-                codec_rotation_batch_size: 0,
-                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
-                dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: worker_id.to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -186,7 +183,6 @@ fn build_worker(
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
-                resident_workflows: true,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
@@ -227,7 +223,7 @@ async fn seed_workflow(
         workflow_id: &format!("wf-{}", exec_id.as_uuid()),
         run_id: Uuid::new_v4(),
         shard_id: 0,
-        input: input.clone().into(),
+        input: input.clone(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -745,8 +741,7 @@ async fn workflow_handler_panic_is_re_dispatched_then_terminal_within_budget() {
     // (b/c) Observe the non-terminal re-dispatch: between the first and second
     // panic the workflow task is re-pended PENDING (state stays RUNNING, no
     // event appended, crash_strikes stays 0) with a future scheduled_at rather
-    // than wedged in RUNNING. The 0.5s to 1s backoff window makes this
-    // reliable (Equal jitter, issue #1792).
+    // than wedged in RUNNING. The ~1s backoff window makes this reliable.
     let observer_url = url.clone();
     let observer = tokio::spawn(async move {
         let mut saw_repended_pending = false;
@@ -1164,7 +1159,7 @@ async fn backing_off_activity_task_error_column_carries_the_panic_message() {
             "panic_activity",
             panic_activity,
             false,
-            Some(RetryPolicy::fixed(3, Duration::from_secs(3)).with_jitter(JitterPolicy::None)),
+            Some(RetryPolicy::fixed(3, Duration::from_secs(3))),
         )],
         Arc::clone(&metrics),
     );
@@ -1298,125 +1293,5 @@ async fn child_workflow_panic_surfaces_to_parent_as_typed_handler_panic() {
     assert_eq!(
         poison_dlq, 0,
         "no PoisonPill DLQ for a contained child panic"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Issue #1797 — a deadlocked cycle fails the workflow task, not the run.
-// ---------------------------------------------------------------------------
-
-/// Executions whose next cycle of [`deadlock_once_workflow`] deadlocks.
-static DEADLOCK_ARMED: std::sync::LazyLock<Mutex<std::collections::HashSet<Uuid>>> =
-    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
-
-/// Counts the cycles of [`deadlock_once_workflow`].
-static DEADLOCK_CYCLES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Records the cycle number as a side effect, then deadlocks once.
-///
-/// An armed cycle awaits a foreign 60 s sleep, which is not a Harvest
-/// future. The executor fails that task after `DEADLOCK_TIMEOUT`. The retry
-/// is not armed, so it completes. Only the retry's side effect may persist.
-fn deadlock_once_workflow(ctx: &WorkflowContext, _input: serde_json::Value) -> BoxFut<'_> {
-    Box::pin(async move {
-        let cycle: u64 = ctx
-            .side_effect("cycle", || {
-                DEADLOCK_CYCLES.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
-            })
-            .map_err(|e| e.to_string())?;
-        let armed = DEADLOCK_ARMED
-            .lock()
-            .unwrap()
-            .remove(&ctx.execution_id().as_uuid());
-        if armed {
-            tokio::time::sleep(Duration::from_secs(60)).await;
-        }
-        Ok(serde_json::json!(cycle))
-    })
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn deadlocked_workflow_task_is_re_pended_and_the_retry_completes_the_run() {
-    let (url, _container) = setup_db().await;
-    let mut conn = connect(&url).await;
-    let exec_id = seed_workflow(&mut conn, "deadlock_once_wf", serde_json::json!({})).await;
-    DEADLOCK_ARMED.lock().unwrap().insert(exec_id.as_uuid());
-    let first_cycle =
-        std::sync::atomic::AtomicU64::load(&DEADLOCK_CYCLES, std::sync::atomic::Ordering::SeqCst)
-            + 1;
-
-    let metrics = Arc::new(PanicMetrics::default());
-    let registry = build_registry(
-        vec![workflow_info("deadlock_once_wf", deadlock_once_workflow)],
-        vec![],
-        Arc::clone(&metrics),
-    );
-    let worker = build_worker("worker-workflow-deadlock", Arc::clone(&registry), 3);
-    let pool = build_pool(&url);
-    let runner = Arc::clone(&worker);
-    let pool_for_run = pool.clone();
-    let handle = tokio::spawn(async move { runner.run(&pool_for_run).await });
-
-    // Watch for the re-pend: the task is PENDING in the future and carries the
-    // deadlock error, while the execution stays RUNNING.
-    let observer_url = url.clone();
-    let observer = tokio::spawn(async move {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        while tokio::time::Instant::now() < deadline {
-            let exec = load_execution(&observer_url, exec_id).await;
-            for t in load_tasks(&observer_url, exec_id).await {
-                if t.task_type == "workflow"
-                    && t.state == "PENDING"
-                    && t.scheduled_at > Utc::now()
-                    && t.error
-                        .as_deref()
-                        .is_some_and(|e| e.contains("potential deadlock detected"))
-                {
-                    return Some(exec.state);
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        None
-    });
-
-    let execution = wait_for_state(&url, exec_id, "COMPLETED", Duration::from_secs(30)).await;
-    let state_during_backoff = observer.await.expect("observer joins");
-
-    worker.shutdown();
-    handle.await.expect("worker task joins cleanly");
-
-    assert_eq!(
-        state_during_backoff.as_deref(),
-        Some("RUNNING"),
-        "the deadlocked task must be re-pended with the deadlock error while the run stays RUNNING"
-    );
-    assert_eq!(execution.state, "COMPLETED");
-    assert_eq!(
-        metrics.workflow_panic_count(),
-        0,
-        "a deadlock is not a panic and must not use the panic budget"
-    );
-
-    // The deadlocked cycle recorded a side effect, but none of its commands
-    // persist. Only the retry's side effect is in history.
-    let history = load_history(&url, exec_id).await;
-    let side_effects: Vec<_> = history
-        .iter()
-        .filter_map(|e| match e {
-            WorkflowEvent::SideEffectRecorded { value, .. } => Some(value.clone()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        side_effects,
-        vec![serde_json::json!(first_cycle + 1)],
-        "only the retry's side effect may persist; history={history:?}"
-    );
-    assert!(
-        !history
-            .iter()
-            .any(|e| matches!(e, WorkflowEvent::WorkflowFailed { .. })),
-        "a failed workflow task must not fail the run; history={history:?}"
     );
 }

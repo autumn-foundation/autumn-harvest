@@ -9,8 +9,9 @@
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
+use autumn_web::AppState;
 use autumn_web::error::AutumnError;
 use autumn_web::extract::{Path, Query};
 use autumn_web::reexports::axum;
@@ -38,14 +39,13 @@ use autumn_harvest::audit::{
     OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE, OP_BUILD_POLICY_SET, OP_GATE_LIFT,
     OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER,
     OP_WORKFLOW_CANCEL, OP_WORKFLOW_PAUSE, OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME,
-    OP_WORKFLOW_SIGNAL, OP_WORKFLOW_TERMINATE, SOURCE_UI, STATUS_FAILED, STATUS_SUCCEEDED,
-    TARGET_BUILD_ROUTING, TARGET_DEAD_LETTER, TARGET_GATE, TARGET_SCHEDULE, TARGET_WORKFLOW,
-    insert_audit, insert_audit_batch,
+    OP_WORKFLOW_SIGNAL, OP_WORKFLOW_TERMINATE, SOURCE_API, SOURCE_UI, STATUS_FAILED,
+    STATUS_SUCCEEDED, TARGET_BUILD_ROUTING, TARGET_DEAD_LETTER, TARGET_GATE, TARGET_SCHEDULE,
+    TARGET_WORKFLOW, insert_audit,
 };
 use autumn_harvest::build_routing::{
     BuildCompatEntry, BuildPolicy, BuildReachability, all_build_reachability, declare_compat,
-    list_build_compat, list_build_policies, merge_reachability, revoke_compat,
-    set_build_policy_with_ramp_id,
+    list_build_compat, list_build_policies, merge_reachability, revoke_compat, set_build_policy,
 };
 use autumn_harvest::error::{HarvestResult, database_error};
 use autumn_harvest::execution::StartWorkflowParams;
@@ -63,10 +63,11 @@ use autumn_harvest::schema::{
     harvest_signals, harvest_task_queue, harvest_timers, harvest_workflow_executions,
 };
 use autumn_harvest::signal::send_signal;
-use autumn_harvest::start_or_load_workflow_execution_with_metrics_and_codecs;
-use autumn_harvest::store::admit_update_event_with_codecs;
-use autumn_harvest::types::{ExecutionId as HarvestExecutionId, ShardId, UpdateId};
-use autumn_harvest::worker::DispatchDeadline;
+use autumn_harvest::start_or_load_workflow_execution_with_metrics;
+use autumn_harvest::store::admit_update_event;
+use autumn_harvest::types::{
+    ExecutionId as HarvestExecutionId, Priority, ShardId, UpdateId, WorkflowIdReusePolicy,
+};
 use autumn_harvest::workers::{WorkerFilters, WorkerHealth, WorkerRow, list_workers};
 use autumn_harvest::{
     StepKind, StepOutcome, Timeline, TimelineRollup, TimelineStep, derive_timeline,
@@ -143,14 +144,14 @@ td code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;c
 .badge.RUNNING{background:#1d4ed8;color:#dbeafe}
 .badge.COMPLETED{background:#166534;color:#dcfce7}
 .badge.FAILED{background:#991b1b;color:#fee2e2}
-.badge.CANCELLED{background:#4b5563;color:#f3f4f6}
+.badge.CANCELLED{background:#6b7280;color:#f3f4f6}
 .badge.TERMINATED{background:#52525b;color:#f4f4f5}
 .badge.UNKNOWN{background:#334155;color:#e2e8f0}
 .badge.Active{background:#166534;color:#dcfce7}
 .badge.Draining{background:#92400e;color:#fef3c7}
 .badge.Stopped{background:#334155;color:#e2e8f0}
 .badge.timezone{background:#1e3a8a;color:#93c5fd;border:1px solid #3b82f6}
-.timezone-utc{color:#94a3b8;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px}
+.timezone-utc{color:#64748b;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px}
 .badge-owner{background:#312e81;color:#c7d2fe;border:1px solid #4338ca}
 .badge-sev-sev1{background:#7f1d1d;color:#fee2e2;border:1px solid #b91c1c}
 .badge-sev-sev2{background:#7c2d12;color:#ffedd5;border:1px solid #c2410c}
@@ -163,18 +164,6 @@ td code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;c
 .flash{background:#172554;color:#bfdbfe;border:1px solid #1d4ed8;padding:10px 14px;border-radius:6px;margin-bottom:16px;font-size:13px}
 .shard-header{margin:20px 0 8px;font-size:13px;color:#94a3b8;font-weight:600;text-transform:uppercase;letter-spacing:.06em;border-bottom:1px solid #1e293b;padding-bottom:6px}
 .shard-error{background:#1c1917;border:1px solid #57534e;border-radius:6px;padding:12px 16px;color:#a8a29e;font-size:13px;margin-bottom:12px}
-.degraded-banner{background:#422006;border:1px solid #a16207;border-radius:6px;padding:12px 16px;color:#fef3c7;font-size:13px;margin-bottom:16px}
-.degraded-banner strong{color:#fde68a}
-.unhealthy-summary{border-color:#b45309;background:#292524;color:#fed7aa;font-size:13px}
-.unhealthy-summary strong{color:#fdba74}
-.subtle{color:#94a3b8;font-size:11px;margin-top:2px}
-.table-scroll{overflow-x:auto;max-width:100%}
-.health-badges{display:flex;flex-direction:column;gap:4px;align-items:flex-start}
-tr.schedule-unhealthy td{background:#1c1917}
-a.drilldown{font-size:12px;color:#93c5fd;border:1px solid #334155;border-radius:6px;padding:5px 9px}
-a.drilldown:hover{background:#1e293b;text-decoration:none}
-.kv dt{color:#94a3b8}
-.kv dd{margin:0;color:#e2e8f0}
 .view-toggle{display:inline-flex;gap:2px;margin:0 0 16px;border:1px solid #334155;border-radius:6px;overflow:hidden;font-size:13px}
 .view-toggle a,.view-toggle span{padding:6px 14px;display:inline-block}
 .view-toggle a{color:#93c5fd;text-decoration:none}
@@ -198,16 +187,15 @@ code.sample{display:inline-block;margin:0 4px 2px 0;font-size:11px;color:#cbd5e1
 .kv .v{color:#e2e8f0;word-break:break-all}
 pre{background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:12px;overflow:auto;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;margin:0}
 .error-banner{background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:6px;margin-bottom:16px;font-size:13px}
-.field-error{display:block;background:#7f1d1d;color:#fee2e2;padding:2px 8px;border-radius:4px;font-size:11px;margin-top:4px}
 .empty{color:#94a3b8;font-style:italic;padding:24px;text-align:center}
 .detail-row{display:flex;gap:16px;align-items:center;margin-bottom:16px;flex-wrap:wrap}
 .detail-row .back{color:#93c5fd;font-size:13px}
 details{margin-top:8px}
 details summary{cursor:pointer;color:#93c5fd;font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 .detail-block{display:grid;gap:10px;margin-top:10px}
-footer{padding:20px 24px;color:#94a3b8;font-size:12px;text-align:center;border-top:1px solid #1e293b;margin-top:32px}
+footer{padding:20px 24px;color:#64748b;font-size:12px;text-align:center;border-top:1px solid #1e293b;margin-top:32px}
 .event-label{font-size:13px}
-.event-label code{font-size:11px;color:#94a3b8;margin-left:4px}
+.event-label code{font-size:11px;color:#64748b;margin-left:4px}
 .operator-actions{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}
 .operator-actions form{margin:0}
 .operator-actions button,.operator-actions a.btn{background:#1e3a5f;color:#93c5fd;border:1px solid #2563eb;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;text-decoration:none;display:inline-block}
@@ -222,13 +210,13 @@ footer{padding:20px 24px;color:#94a3b8;font-size:12px;text-align:center;border-t
 .dag-legend,.timeline-legend{display:flex;flex-wrap:wrap;gap:12px;margin:8px 0;font-size:.8rem;color:#cbd5e1}
 .dag-legend span,.timeline-legend span{display:inline-flex;align-items:center;gap:4px}
 .dag-legend .swatch,.timeline-legend .swatch{width:12px;height:12px;border-radius:3px;display:inline-block}
-.dag-run-current{color:#94a3b8;font-size:11px;margin-left:6px}
+.dag-run-current{color:#64748b;font-size:11px;margin-left:6px}
 .dag-run-detail{color:#94a3b8;font-size:11px;margin-left:8px}
 .gantt-scroll{overflow:auto;max-width:100%;max-height:75vh;border:1px solid #334155;border-radius:8px;background:#0f172a;padding:8px}
 .gantt-lane-label{fill:#cbd5e1;font:11px system-ui,-apple-system,sans-serif}
 .gantt-lane-group{fill:#93c5fd;font:600 11px system-ui,-apple-system,sans-serif}
 .gantt-axis-tick{stroke:#334155;stroke-width:1}
-.gantt-axis-label{fill:#94a3b8;font:10px system-ui,-apple-system,sans-serif}
+.gantt-axis-label{fill:#64748b;font:10px system-ui,-apple-system,sans-serif}
 .gantt-span{stroke:#0f172a;stroke-width:1}
 .gantt-span-open{stroke-dasharray:4 3;stroke:#94a3b8;stroke-width:1.5}
 .gantt-span-slowest{stroke:#f8fafc;stroke-width:2}
@@ -242,16 +230,16 @@ footer{padding:20px 24px;color:#94a3b8;font-size:12px;text-align:center;border-t
 .gantt-nd-label{fill:#f97316;font:10px system-ui,-apple-system,sans-serif}
 .timeline-rollup{display:flex;flex-wrap:wrap;gap:16px;margin:8px 0;font-size:.85rem;color:#cbd5e1}
 .timeline-rollup .stat{display:flex;flex-direction:column;gap:2px}
-.timeline-rollup .stat .label{font-size:.7rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.04em}
+.timeline-rollup .stat .label{font-size:.7rem;color:#64748b;text-transform:uppercase;letter-spacing:.04em}
 .timeline-rollup .stat .value{font-size:1rem;color:#e2e8f0}
 "#;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct WorkflowListParams {
     #[serde(default)]
-    page: Option<String>,
+    page: Option<i64>,
     #[serde(default)]
-    limit: Option<String>,
+    limit: Option<i64>,
     #[serde(default)]
     state: Option<String>,
     #[serde(default)]
@@ -273,59 +261,19 @@ pub(crate) struct WorkflowListParams {
 
 #[derive(Debug, Deserialize, Default)]
 pub(crate) struct WorkflowDetailParams {
-    // `event_page`/`jump_event` are `String`, not `i64`. This is the same
-    // fix as `page`/`limit` on the Workflows, Workers, DLQ and Schedules
-    // pages (#1540/#1560/#1588/#1619), and as `node`/`refresh` on the DAG
-    // detail page. An `i64`-typed field fails axum's query deserialization
-    // on non-numeric text with a bare 400 before this handler -- or the
-    // `log_level` filter -- ever runs. Unlike a list page, that also
-    // discards the whole execution view: status, blocked-on panel, activity
-    // attempts, signals panel and the event timeline (issue #1627).
     /// Zero-based page index for the event timeline.
     #[serde(default)]
-    event_page: Option<String>,
+    event_page: Option<i64>,
     /// Flash message to display at the top of the detail page.
     #[serde(default)]
     flash: Option<String>,
     /// Jump to the page containing this 1-based event number.
     #[serde(default)]
-    jump_event: Option<String>,
+    jump_event: Option<i64>,
     /// Level filter for the durable workflow-logs panel (issue #790):
     /// `info` | `warn` | `error`. Absent or unrecognised means "all levels".
     #[serde(default)]
     log_level: Option<String>,
-}
-
-/// Entered values and the validation error for the Send signal / Reset to
-/// event N / Trigger update forms. Passed in memory from a failed POST
-/// handler to [`render_workflow_detail_page`] (issue #1687).
-///
-/// Each of the three action forms on the workflow detail page is a
-/// `<details>`-collapsed form that POSTs back to this same page. Before
-/// this type existed, every failure branch of those handlers redirected to
-/// `?flash={error}` alone. The redirect re-rendered the form collapsed and
-/// empty. The operator's signal name, JSON payload, reset event
-/// number/reason, or update name/payload were gone. Only a generic
-/// top-of-page flash said something had failed.
-///
-/// A rejected submission never becomes a redirect at all now. See
-/// [`render_workflow_detail_page`]'s own doc comment for why a payload in
-/// the URL is itself a problem, not just a lost-data one. Instead the POST
-/// handler renders this page directly. It passes the rejected values here.
-/// `render_workflow_detail` uses them to keep the relevant `<details>`
-/// open, and to pre-fill the inputs with what was submitted. It shows the
-/// error inline next to the field that caused it.
-#[derive(Debug, Default)]
-struct WorkflowActionEcho {
-    signal_error: Option<String>,
-    signal_name: Option<String>,
-    signal_payload: Option<String>,
-    reset_error: Option<String>,
-    reset_event: Option<String>,
-    reset_reason: Option<String>,
-    update_error: Option<String>,
-    update_name: Option<String>,
-    update_payload: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -359,12 +307,7 @@ struct WorkflowSignalForm {
 
 #[derive(Debug, Deserialize)]
 struct WorkflowResetForm {
-    /// Raw submitted text, not `i64`. A malformed value must reach the
-    /// handler as text. It then redisplays as a flash error, instead of
-    /// aborting the request at the `Form` extractor. See
-    /// `parse_reset_to_event_id`.
-    #[serde(default)]
-    reset_to_event_id: String,
+    reset_to_event_id: i64,
     #[serde(default)]
     reason: Option<String>,
 }
@@ -408,32 +351,25 @@ struct BlockedOnData {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct WorkerListParams {
-    // `page`/`limit` are `String`, not `i64`. See `list_workers_ui`'s
-    // handling for why: an `i64`-typed field fails axum's query
-    // deserialization on non-numeric text with a bare 400 before this
-    // handler ever runs. That discards every other filter already on the
-    // URL.
     #[serde(default)]
-    page: Option<String>,
+    page: Option<i64>,
     #[serde(default)]
-    limit: Option<String>,
+    limit: Option<i64>,
     /// Filter by lifecycle status: `Active`, `Draining`, or `Stopped`.
     #[serde(default)]
     status: Option<String>,
     /// Filter by source shard id.
     #[serde(default)]
-    shard: Option<String>,
+    shard: Option<i32>,
     /// Set to `"true"` to show only stale workers.
     #[serde(default)]
     stale: Option<String>,
     /// Filter by build ID (exact match).
     #[serde(default)]
     build_id: Option<String>,
-    /// Auto-refresh interval in seconds (emits a `<meta http-equiv="refresh">`
-    /// tag). `String`, not `u64` — same fix as `page`/`limit` above (issue
-    /// #1604), reusing `parse_refresh_query_field` (issue #1630).
+    /// Auto-refresh interval in seconds (emits a `<meta http-equiv="refresh">` tag).
     #[serde(default)]
-    refresh: Option<String>,
+    refresh: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -444,63 +380,6 @@ pub(crate) struct BuildRoutingListParams {
     /// When set, filter tables to entries related to this build ID.
     #[serde(default)]
     build_id: Option<String>,
-    // The six `set_policy_*`/`compat_*` fields below carry a rejected
-    // submission's entered values and error text back through the redirect.
-    // Issue #1687 fixed this data-loss gap on the workflow detail page.
-    // This applies the same fix to the sibling forms it did not touch.
-    // Before this, a validation failure or a partial-shard failure
-    // re-rendered both forms empty. That discarded every field the operator
-    // had already typed, behind one generic top-of-page flash.
-    /// Error text for the "Set Build Policy" form, if its last submission failed.
-    #[serde(default)]
-    set_policy_error: Option<String>,
-    #[serde(default)]
-    set_policy_queue_name: Option<String>,
-    #[serde(default)]
-    set_policy_build_id: Option<String>,
-    #[serde(default)]
-    set_policy_deployment_name: Option<String>,
-    /// The operation id of a failed "Set Build Policy" submission, so a
-    /// retry reuses its ramp id (issue #1814).
-    #[serde(default)]
-    set_policy_operation_id: Option<String>,
-    /// Error text for the "Declare Compatibility" form, if its last submission failed.
-    #[serde(default)]
-    compat_error: Option<String>,
-    #[serde(default)]
-    compat_build_id: Option<String>,
-    #[serde(default)]
-    compat_compatible_with: Option<String>,
-}
-
-/// Entered values and error text echoed back into the build-routing action
-/// forms after a rejected submission. `None` on a field means render it
-/// empty, matching a fresh page load — see `BuildRoutingListParams` above.
-#[derive(Debug, Default)]
-struct BuildRoutingActionEcho {
-    set_policy_error: Option<String>,
-    set_policy_queue_name: Option<String>,
-    set_policy_build_id: Option<String>,
-    set_policy_deployment_name: Option<String>,
-    set_policy_operation_id: Option<String>,
-    compat_error: Option<String>,
-    compat_build_id: Option<String>,
-    compat_compatible_with: Option<String>,
-}
-
-impl From<&BuildRoutingListParams> for BuildRoutingActionEcho {
-    fn from(params: &BuildRoutingListParams) -> Self {
-        Self {
-            set_policy_error: params.set_policy_error.clone(),
-            set_policy_queue_name: params.set_policy_queue_name.clone(),
-            set_policy_build_id: params.set_policy_build_id.clone(),
-            set_policy_deployment_name: params.set_policy_deployment_name.clone(),
-            set_policy_operation_id: params.set_policy_operation_id.clone(),
-            compat_error: params.compat_error.clone(),
-            compat_build_id: params.compat_build_id.clone(),
-            compat_compatible_with: params.compat_compatible_with.clone(),
-        }
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -509,60 +388,6 @@ struct BuildRoutingSetPolicyForm {
     build_id: String,
     #[serde(default)]
     deployment_name: Option<String>,
-    /// The operation id that the form carries (issue #1814).
-    #[serde(default)]
-    operation_id: Option<String>,
-}
-
-/// The operation id of one "Set Build Policy" submission (issue #1814).
-///
-/// The form carries the id in a hidden field. A failed submission echoes it
-/// back, so a retry of the same form reuses it. The handler passes it to
-/// every shard as the caller ramp id, so a partial fan-out and its retry
-/// give a retained ramp one identity. A missing or malformed id gets a new
-/// one.
-fn set_policy_operation_id(raw: Option<&str>) -> uuid::Uuid {
-    raw.and_then(|id| uuid::Uuid::parse_str(id.trim()).ok())
-        .unwrap_or_else(uuid::Uuid::new_v4)
-}
-
-/// The caller `ramp_id` of one "Set Build Policy" submission (issue #1814).
-///
-/// It derives from the operation id and the request. A retry of the same
-/// form gets the same id. A changed request under the same operation id
-/// gets a new id, so every shard rewrites the ramp under that new id.
-fn set_policy_ramp_id(
-    operation_id: uuid::Uuid,
-    queue_name: &str,
-    build_id: &str,
-    deployment_name: Option<&str>,
-) -> uuid::Uuid {
-    let operation = operation_id.to_string();
-    crate::api::derived_ramp_id(&[
-        Some("ui-policy"),
-        Some(operation.as_str()),
-        Some(queue_name),
-        Some(build_id),
-        deployment_name,
-    ])
-}
-
-/// The redirect after a failed "Set Build Policy" submission. It echoes the
-/// entered values, the error and the operation id back into the form.
-fn set_policy_failure_redirect(
-    error: &str,
-    queue_name: &str,
-    build_id: &str,
-    deployment_name: &str,
-    operation_id: uuid::Uuid,
-) -> String {
-    format!(
-        "../build-routing?set_policy_error={}&set_policy_queue_name={}&set_policy_build_id={}&set_policy_deployment_name={}&set_policy_operation_id={operation_id}",
-        url_encode(error),
-        url_encode(queue_name),
-        url_encode(build_id),
-        url_encode(deployment_name),
-    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -578,15 +403,10 @@ struct BuildRoutingRetireForm {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct DeadLetterListParams {
-    // `page`/`limit` are `String`, not `i64` — same fix as
-    // `WorkerListParams` and `WorkflowListParams` (#1540/#1560). An
-    // `i64`-typed field fails axum's query deserialization on non-numeric
-    // text with a bare 400 before this handler ever runs. That discards
-    // every other filter already on the URL.
     #[serde(default)]
-    page: Option<String>,
+    page: Option<i64>,
     #[serde(default)]
-    limit: Option<String>,
+    limit: Option<i64>,
     #[serde(default)]
     workflow_name: Option<String>,
     #[serde(default)]
@@ -596,11 +416,9 @@ pub(crate) struct DeadLetterListParams {
     #[serde(default)]
     failed_before: Option<String>,
     #[serde(default)]
-    shard_id: Option<String>,
-    // `refresh` is `String`, not `u64` — same fix as `page`/`limit` above
-    // (issue #1604), reusing `parse_refresh_query_field` (issue #1630).
+    shard_id: Option<i32>,
     #[serde(default)]
-    refresh: Option<String>,
+    refresh: Option<u64>,
     #[serde(default)]
     flash: Option<String>,
     /// `summary` switches to the root-cause aggregation view (issue #385).
@@ -772,7 +590,7 @@ fn worker_sort_key(row: &WorkerRow) -> (u8, u8, &str) {
 }
 
 /// Build the Vantage dashboard router.
-pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<()> {
+pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<AppState> {
     let require_admin = middleware::from_fn_with_state(api_state.clone(), require_harvest_admin);
 
     Router::new()
@@ -833,41 +651,13 @@ pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<()> {
         .route("/schedules/{id}/resume", post(schedule_resume_ui))
         .route("/schedules/{id}/delete", post(schedule_delete_ui))
         .route("/schedules/{id}/trigger-now", post(schedule_trigger_now_ui))
-        // issue #951: schedule drill-downs. Each is a presentation slice over an
-        // already-shipped endpoint, and each mirrors that endpoint's admin-auth
-        // posture: `GET /admin/schedules/{id}/runs` is the one admin-gated
-        // schedule read route, so the run history is gated here too; preview and
-        // backfill are not gated, matching their ungated API routes.
-        .route("/schedules/{id}/preview", get(schedule_preview_ui))
-        .route(
-            "/schedules/{id}/runs",
-            get(schedule_runs_ui).route_layer(require_admin.clone()),
-        )
-        .route(
-            "/schedules/{id}/backfill",
-            get(schedule_backfill_form_ui).post(schedule_backfill_ui),
-        )
         // issue #377: admission gates UI page and one-click lift (lift requires admin)
         .route("/admin/gates", get(list_gates_ui))
         .route(
             "/admin/gates/{id}/lift",
             post(lift_gate_ui).route_layer(require_admin),
         )
-        // Issue #1802: outside `dev`, this gate refuses a form post with no
-        // credential. A declared boundary, a scoped token, an admin session or
-        // the opt-out admits it. The gate passes `GET`, `HEAD` and `OPTIONS`.
-        .route_layer(middleware::from_fn_with_state(
-            api_state.clone(),
-            crate::api::require_mutation_auth_by_method,
-        ))
         .layer(Extension(api_state))
-        // issue #1278: reject a cross-site POST before it reaches any
-        // handler or admin check. The guard then covers every mutation
-        // uniformly, admin-gated and ungated alike. The outermost `.layer()`
-        // call runs first, ahead of the per-route `require_admin` above.
-        .layer(axum::middleware::from_fn(
-            crate::same_origin::require_same_origin,
-        ))
 }
 
 async fn index() -> axum::response::Redirect {
@@ -889,16 +679,10 @@ struct DagUiSummary {
 struct DagDetailParams {
     #[serde(default)]
     run: Option<String>,
-    // `node`/`refresh` are `String`, not `usize`/`u64` — same fix as
-    // `page`/`limit` on the Workflows, Workers, DLQ and Schedules pages
-    // (#1540/#1560/#1588/#1619). A numeric-typed field fails axum's query
-    // deserialization on non-numeric text with a bare 400 before this
-    // handler ever runs. That discards the selected run and every other
-    // query param already on the URL.
     #[serde(default)]
-    node: Option<String>,
+    node: Option<usize>,
     #[serde(default)]
-    refresh: Option<String>,
+    refresh: Option<u64>,
     #[serde(default)]
     flash: Option<String>,
 }
@@ -1044,28 +828,14 @@ async fn dag_detail_ui(
         DagGraphView::NoRun
     };
 
-    let (node, node_error) = parse_dag_node_query_field(params.node.as_deref());
-    let (mut refresh, refresh_error) = parse_refresh_query_field(params.refresh.as_deref());
-    // A valid `refresh` alongside an invalid `node` must not auto-reload.
-    // `layout_dag_detail` emits `refresh` as a bare `meta http-equiv`, with
-    // no target URL to drop the bad `node` from. Reloading the same URL
-    // would repeat the error forever, redoing this page's DB reads on
-    // every tick. Suppress refresh instead; the flash still names the bad
-    // value so the operator can fix the URL by hand.
-    if node_error.is_some() {
-        refresh = None;
-    }
-
     Ok(render_dag_detail(
         &dag_name,
         &dag,
         &runs,
         selected_run,
-        node,
-        refresh,
+        params.node,
+        params.refresh,
         params.flash.as_deref(),
-        node_error.as_deref(),
-        refresh_error.as_deref(),
         view,
     ))
 }
@@ -1150,65 +920,6 @@ struct DagRetryCommitForm {
     reason: String,
 }
 
-/// The operator's submitted retry `reason` and a genuine commit failure.
-/// Echoed back into the confirm page's already-open form, instead of being
-/// lost on a redirect (issue #1723).
-///
-/// Both fields are `None` on the plain `GET`. Nothing has failed yet, so the
-/// auto-generated default reason applies. `dag_retry_commit_ui` fills them on
-/// a real commit failure. It then renders the confirm page directly, rather
-/// than redirecting. A redirect can only carry a flash string. That string
-/// has no slot for the reason the operator typed. Redirecting the reason
-/// would also put it in the browser's history and any proxy or server
-/// access log.
-#[derive(Debug, Default)]
-struct DagRetryEcho {
-    reason: Option<String>,
-    error: Option<String>,
-}
-
-/// Loads a fresh dry-run outcome and renders the retry confirm page.
-///
-/// Shared by the `GET` route and, on a genuine commit failure, by
-/// `dag_retry_commit_ui` (issue #1723). The dry run is re-run rather than
-/// reused, so the redisplayed node list reflects current state. The two-step
-/// confirm/commit split exists precisely because that state can change
-/// between the two requests.
-async fn render_dag_retry_confirm_page(
-    api_state: &HarvestApiState,
-    headers: &axum::http::HeaderMap,
-    dag_name: &str,
-    run_exec_id: &str,
-    from_node: &str,
-    echo: &DagRetryEcho,
-    route_or_command: &'static str,
-) -> Markup {
-    let actor = api_state.extract_actor(headers);
-    let default_reason = dag_retry_default_reason(from_node);
-    let reason = echo.reason.as_deref().unwrap_or(&default_reason);
-    let outcome = retry_dag_run_inner(
-        api_state,
-        dag_name,
-        run_exec_id,
-        headers,
-        vec![from_node.to_string()],
-        reason.to_string(),
-        actor,
-        true,
-        route_or_command,
-        Some(SOURCE_UI),
-    )
-    .await;
-    render_dag_retry_confirm(
-        dag_name,
-        run_exec_id,
-        from_node,
-        reason,
-        echo.error.as_deref(),
-        outcome,
-    )
-}
-
 /// GET the retry confirm page: run a **dry-run** retry through the shared,
 /// audited `retry_dag_run_inner` so the operator sees the authoritative widened
 /// node list (`nodes_to_re_execute`) before committing. On any endpoint error
@@ -1221,17 +932,28 @@ async fn dag_retry_confirm_ui(
     Query(params): Query<DagRetryConfirmParams>,
 ) -> Result<Markup, AutumnError> {
     let from_node = params.from_node.unwrap_or_default();
-    let markup = render_dag_retry_confirm_page(
+    let actor = api_state.extract_actor(&headers);
+    let reason = dag_retry_default_reason(&from_node);
+    let outcome = retry_dag_run_inner(
         &api_state,
+        &dag_name,
+        &run_exec_id,
         &headers,
+        vec![from_node.clone()],
+        reason.clone(),
+        actor,
+        true,
+        "GET /ui/dags/{dag_name}/runs/{run_exec_id}/retry",
+        Some(SOURCE_UI),
+    )
+    .await;
+    Ok(render_dag_retry_confirm(
         &dag_name,
         &run_exec_id,
         &from_node,
-        &DagRetryEcho::default(),
-        "GET /ui/dags/{dag_name}/runs/{run_exec_id}/retry",
-    )
-    .await;
-    Ok(markup)
+        &reason,
+        outcome,
+    ))
 }
 
 /// POST the retry commit: run the fork through `retry_dag_run_inner`
@@ -1239,10 +961,8 @@ async fn dag_retry_confirm_ui(
 /// `source = ui`. Redirects back to the DAG page with a success flash naming
 /// the new run. If the fork committed but the audit row failed to write
 /// (a partial success), redirects to the *new* run with a warning flash rather
-/// than misreporting it as a failure. A genuine failure (400/404/409) renders
-/// the confirm page in place instead of redirecting. The submitted reason and
-/// the failure itself are both preserved (issue #1723; see `DagRetryEcho`).
-/// Admin-gated at the router.
+/// than misreporting it as a failure. A genuine failure (400/404/409) redirects
+/// to the source run with a "Retry failed" flash. Admin-gated at the router.
 async fn dag_retry_commit_ui(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
@@ -1268,37 +988,6 @@ async fn dag_retry_commit_ui(
         Some(SOURCE_UI),
     )
     .await;
-
-    // A genuine failure is any outcome but a successful fork or the
-    // `AuditFailed` partial success. It used to redirect to the unrelated DAG
-    // detail page with only a generic "Retry failed" flash. The operator's
-    // edited `reason` had no slot to survive that redirect. The two-step
-    // confirm/commit split exists so a stale dry run can lose a race against
-    // a concurrent change. Issue #1723's repro: a competing retry seals the
-    // source run between the confirm page loading and this submit. A real
-    // failure here is the *expected* outcome of that race, not a rare edge.
-    // So losing the operator's typed input on it was common, not theoretical.
-    match &outcome {
-        Err(failure) if !matches!(failure, DagRetryFailure::AuditFailed { .. }) => {
-            let echo = DagRetryEcho {
-                reason: Some(form.reason.clone()),
-                error: Some(failure.human_message()),
-            };
-            let markup = render_dag_retry_confirm_page(
-                &api_state,
-                &headers,
-                &dag_name,
-                &run_exec_id,
-                &form.from_node,
-                &echo,
-                "POST /ui/dags/{dag_name}/runs/{run_exec_id}/retry",
-            )
-            .await;
-            return Ok(markup.into_response());
-        }
-        _ => {}
-    }
-
     let (target_run, flash_text) = dag_retry_commit_redirect(outcome, &run_exec_id);
     let flash = url_encode(&flash_text);
     let redirect_url = dag_detail_relative_url(&dag_name, &target_run, Some(&flash));
@@ -1321,18 +1010,11 @@ fn dag_detail_relative_url(dag_name: &str, run: &str, flash: Option<&str>) -> St
 /// Render the retry confirm page from a dry-run outcome: on success, the
 /// widened re-execute list + carried-over list + an editable required reason and
 /// a Confirm form (`POSTing` to the same URL); on failure, the human message.
-///
-/// `reason` pre-fills the textarea: either the auto-generated default (the
-/// first-visit `GET`), or the operator's own submission. That submission is
-/// echoed back after a genuine commit failure (issue #1723). `commit_error`,
-/// when present, is that failure's message, shown inline next to the field
-/// rather than lost on a redirect.
 fn render_dag_retry_confirm(
     dag_name: &str,
     run_exec_id: &str,
     from_node: &str,
-    reason: &str,
-    commit_error: Option<&str>,
+    default_reason: &str,
     outcome: Result<DagRetryResponse, DagRetryFailure>,
 ) -> Markup {
     let body = match outcome {
@@ -1365,52 +1047,20 @@ fn render_dag_retry_confirm(
                 p {
                     label {
                         "Reason (required) "
-                        textarea name="reason" required[true] rows="2" cols="60" { (reason) }
+                        textarea name="reason" required[true] rows="2" cols="60" { (default_reason) }
                     }
-                }
-                @if let Some(error) = commit_error {
-                    span.field-error role="alert" { "Retry failed: " (error) }
                 }
                 button type="submit" class="btn reset" { "Confirm retry" }
             }
         },
-        Err(dry_run_failure) => {
-            let dry_run_message = dry_run_failure.human_message();
-            html! {
-                div class="banner Warning" { (dry_run_message) }
-                // Codex review (issue #1723): the refreshed dry run this
-                // function's caller re-runs for redisplay can itself fail.
-                // That is exactly what happens in the race this fix targets,
-                // where a competing retry has already sealed the source run.
-                // Dropping `reason` here on that second failure would
-                // silently repeat the very bug this fix exists to close.
-                //
-                // Only shown when `commit_error` is `Some`. On the plain
-                // first-visit `GET` failure, nothing has been submitted yet,
-                // so `reason` is just the auto-generated default, not the
-                // operator's own input.
-                @if let Some(error) = commit_error {
-                    p {
-                        "Your submitted reason (preserved, but this run can \
-                         no longer be retried from here): "
-                        code { (reason) }
-                    }
-                    // Codex review (issue #1723): the banner above is the
-                    // *refreshed* dry run's own failure, not necessarily what
-                    // the operator's actual commit attempt failed with. Show
-                    // the original commit failure too, when it differs, so a
-                    // divergent diagnosis is never silently dropped.
-                    @if error != dry_run_message {
-                        p { "The retry attempt itself failed with: " (error) }
-                    }
-                }
-                p {
-                    a class="back" href=(dag_detail_relative_url(dag_name, run_exec_id, None)) {
-                        "← Back to run"
-                    }
+        Err(failure) => html! {
+            div class="banner Warning" { (failure.human_message()) }
+            p {
+                a class="back" href=(dag_detail_relative_url(dag_name, run_exec_id, None)) {
+                    "← Back to run"
                 }
             }
-        }
+        },
     };
     layout_dag_detail(
         &format!("Retry DAG {dag_name} · Vantage"),
@@ -1425,18 +1075,11 @@ async fn list_workflows_ui(
     Extension(api_state): Extension<HarvestApiState>,
     Query(params): Query<WorkflowListParams>,
 ) -> Result<Markup, AutumnError> {
-    // Issue: `page`/`limit` were still typed `Option<i64>` directly on this
-    // struct — the two fields left over after #1333 fixed every other
-    // filter here. A non-numeric value on either aborted the whole page
-    // with a bare, unstyled 400. That 400 landed before the filter form or
-    // any workflow row rendered. It discarded every filter the operator
-    // had entered. `parse_page_query_field`/`parse_limit_query_field`
-    // degrade to a default and report the bad value inline instead, the
-    // same "one field costs, not the page" contract as
-    // `parse_started_bound`.
-    let (limit, limit_raw, limit_error) =
-        parse_limit_query_field(params.limit.as_deref(), DEFAULT_PAGE_SIZE);
-    let (page, _page_raw, page_error) = parse_page_query_field(params.page.as_deref());
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_PAGE_SIZE)
+        .clamp(1, MAX_PAGE_SIZE);
+    let page = params.page.unwrap_or(0).max(0);
     let offset = page.saturating_mul(limit);
 
     let state_filter = params
@@ -1470,16 +1113,40 @@ async fn list_workflows_ui(
         .as_ref()
         .map(|key| (key.clone(), search_attr_value.clone()));
 
-    // Issue: a malformed started_after/started_before used to `?`-abort the
-    // whole page (bare 400, no HTML) before the filter form was ever
-    // rendered, discarding every other filter the operator had entered.
-    // `parse_started_bound` instead degrades to "filter not applied" and
-    // hands back the raw text plus an error to redisplay inline, so a typo
-    // costs one field, not the page.
-    let (started_after, started_after_raw, started_after_error) =
-        parse_started_bound(params.started_after.as_deref(), "started_after");
-    let (started_before, started_before_raw, started_before_error) =
-        parse_started_bound(params.started_before.as_deref(), "started_before");
+    let started_after = match params
+        .started_after
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        None => None,
+        Some(v) => Some(
+            DateTime::parse_from_rfc3339(v)
+                .map(|d| d.with_timezone(&Utc))
+                .map_err(|_| {
+                    AutumnError::bad_request_msg(format!(
+                        "invalid started_after: expected RFC 3339 (e.g. 2026-01-01T00:00:00Z), got '{v}'"
+                    ))
+                })?,
+        ),
+    };
+    let started_before = match params
+        .started_before
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        None => None,
+        Some(v) => Some(
+            DateTime::parse_from_rfc3339(v)
+                .map(|d| d.with_timezone(&Utc))
+                .map_err(|_| {
+                    AutumnError::bad_request_msg(format!(
+                        "invalid started_before: expected RFC 3339 (e.g. 2026-01-01T00:00:00Z), got '{v}'"
+                    ))
+                })?,
+        ),
+    };
     let exec_id_search = params
         .exec_id_search
         .as_deref()
@@ -1530,210 +1197,12 @@ async fn list_workflows_ui(
         state_filter.as_deref(),
         workflow_name_filter.as_deref(),
         search_attr_pair.as_ref(),
-        &started_after_raw,
-        started_after_error.as_deref(),
-        &started_before_raw,
-        started_before_error.as_deref(),
+        started_after,
+        started_before,
         exec_id_search.as_deref(),
         active_gate_count,
         &unavailable_shards,
-        &limit_raw,
-        limit_error.as_deref(),
-        page_error.as_deref(),
     ))
-}
-
-/// Parses the workflow list page's `page` query parameter (zero-based).
-///
-/// A non-numeric value falls back to page 0 and reports the bad value
-/// inline, instead of aborting the whole page render. Returns
-/// `(page, raw_display, error)`, the same contract as
-/// [`parse_shard_id_filter`].
-fn parse_page_query_field(raw: Option<&str>) -> (i64, String, Option<String>) {
-    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
-        return (0, String::new(), None);
-    };
-    trimmed.parse::<i64>().map_or_else(
-        |_| {
-            (
-                0,
-                trimmed.to_string(),
-                Some(format!(
-                    "Invalid page '{trimmed}'; expected a whole number. Showing page 1."
-                )),
-            )
-        },
-        // A well-formed but negative page number is clamped, not rejected.
-        // The raw text is left empty so a caller displays the clamped
-        // value, not the pre-clamp text. This matches the pre-fix
-        // `.unwrap_or(0).max(0)` display.
-        |parsed| (parsed.max(0), String::new(), None),
-    )
-}
-
-/// Parses a list page's `limit` ("Per page") query parameter.
-///
-/// Same contract as [`parse_page_query_field`], falling back to `default`
-/// instead of aborting the page. `default` lets callers keep their own
-/// per-page default on a parse failure. The DLQ page's default is 50, not
-/// the Workflows/Workers pages' 25, and this shared helper must not
-/// silently override that.
-fn parse_limit_query_field(raw: Option<&str>, default: i64) -> (i64, String, Option<String>) {
-    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
-        return (default, String::new(), None);
-    };
-    trimmed.parse::<i64>().map_or_else(
-        |_| {
-            (
-                default,
-                trimmed.to_string(),
-                Some(format!(
-                    "Invalid limit '{trimmed}'; expected a whole number. Showing {default} per page."
-                )),
-            )
-        },
-        // Same as `parse_page_query_field`: a well-formed but out-of-range
-        // limit is clamped silently, the pre-fix behavior. The raw text is
-        // left empty rather than displayed alongside a different effective
-        // value.
-        |parsed| (parsed.clamp(1, MAX_PAGE_SIZE), String::new(), None),
-    )
-}
-
-/// Parses the DAG detail page's `node` query parameter — a 0-based index
-/// into the rendered run graph.
-///
-/// A non-numeric value falls back to no node selected and reports the bad
-/// value inline, instead of aborting the whole page (see
-/// `parse_page_query_field`). An out-of-range but well-formed index is left
-/// as-is: `render_dag_run_graph_section` already looks it up with
-/// `nodes.get(idx)` and renders no panel when it misses.
-fn parse_dag_node_query_field(raw: Option<&str>) -> (Option<usize>, Option<String>) {
-    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
-        return (None, None);
-    };
-    trimmed.parse::<usize>().map_or_else(
-        |_| {
-            (
-                None,
-                Some(format!(
-                    "Invalid node '{trimmed}'; expected a whole number. No node selected."
-                )),
-            )
-        },
-        |parsed| (Some(parsed), None),
-    )
-}
-
-/// Parses a page's `refresh` (auto-refresh interval, in seconds) query
-/// parameter. Same contract as [`parse_dag_node_query_field`]: a
-/// non-numeric value falls back to auto-refresh disabled and reports the
-/// bad value inline, instead of aborting the whole page.
-fn parse_refresh_query_field(raw: Option<&str>) -> (Option<u64>, Option<String>) {
-    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
-        return (None, None);
-    };
-    trimmed.parse::<u64>().map_or_else(
-        |_| {
-            (
-                None,
-                Some(format!(
-                    "Invalid refresh '{trimmed}'; expected a whole number of seconds. Auto-refresh disabled."
-                )),
-            )
-        },
-        |parsed| (Some(parsed), None),
-    )
-}
-
-/// Parses an optional RFC 3339 `started_after`/`started_before` filter bound
-/// from a raw query-string value. Returns `(parsed, raw_display, error)`:
-/// on success `raw_display` echoes the canonical value and `error` is `None`;
-/// on a parse failure `parsed` is `None` (the bound is not applied to the
-/// query) while `raw_display` echoes exactly what the operator typed and
-/// `error` carries a message to render next to the field — so a typo drops
-/// one filter instead of the whole page (see `list_workflows_ui`).
-fn parse_started_bound(
-    raw: Option<&str>,
-    field: &str,
-) -> (Option<DateTime<Utc>>, String, Option<String>) {
-    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
-        return (None, String::new(), None);
-    };
-    DateTime::parse_from_rfc3339(trimmed).map_or_else(
-        |_| {
-            (
-                None,
-                trimmed.to_string(),
-                Some(format!(
-                    "Invalid {field} — expected RFC 3339, e.g. 2026-01-01T00:00:00Z. Filter not applied."
-                )),
-            )
-        },
-        |dt| (Some(dt.with_timezone(&Utc)), trimmed.to_string(), None),
-    )
-}
-
-/// Parses the workflow detail page's `jump_event` query parameter (a
-/// 1-based event number to jump to).
-///
-/// Same contract as [`parse_dag_node_query_field`]. A non-numeric value
-/// falls back to no jump; `event_page` applies instead. It reports the bad
-/// value inline, instead of aborting the whole page (issue #1627).
-fn parse_jump_event_query_field(raw: Option<&str>) -> (Option<i64>, Option<String>) {
-    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
-        return (None, None);
-    };
-    trimmed.parse::<i64>().map_or_else(
-        |_| {
-            (
-                None,
-                Some(format!(
-                    "Invalid jump_event '{trimmed}'; expected a whole number. Jump ignored."
-                )),
-            )
-        },
-        |parsed| (Some(parsed), None),
-    )
-}
-
-/// Resolves the workflow detail page's event-timeline page index from the
-/// raw `event_page`/`jump_event` query values.
-///
-/// A valid `jump_event` wins over `event_page`. A non-numeric `event_page`
-/// or `jump_event` does not abort the page (issue #1627). Each degrades on
-/// its own and reports the bad value. A typo in one field never costs the
-/// operator the other field, or the rest of the page.
-///
-/// A valid `jump_event` also suppresses a bad `event_page`'s error.
-/// `jump_event` alone decides the shown page in that case. Naming the
-/// `event_page` fallback would claim a page other than the one on screen
-/// (Codex review, PR #1652). `dag_detail_ui` applies the same suppression
-/// to `refresh` alongside a bad `node`.
-///
-/// Returns `(event_page, event_page_error, jump_event_error)`.
-fn resolve_workflow_detail_event_page(
-    event_page_raw: Option<&str>,
-    jump_event_raw: Option<&str>,
-    page_size: i64,
-) -> (i64, Option<String>, Option<String>) {
-    let (event_page_from_query, _event_page_raw, event_page_error) =
-        parse_page_query_field(event_page_raw);
-    let (jump_event, jump_event_error) = parse_jump_event_query_field(jump_event_raw);
-    let event_page = jump_event.map_or(event_page_from_query, |jump| {
-        // `saturating_sub`, not `-`: `jump` is unclamped user input, and
-        // `i64::MIN - 1` overflows. Saturating leaves `i64::MIN` itself,
-        // which `.max(0)` still clamps to 0 like any other very-negative
-        // jump_event (Snag repro, boundary tour on `jump_event`).
-        let jump_zero = jump.saturating_sub(1).max(0);
-        jump_zero / page_size
-    });
-    let event_page_error = if jump_event.is_some() {
-        None
-    } else {
-        event_page_error
-    };
-    (event_page, event_page_error, jump_event_error)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1744,66 +1213,21 @@ async fn workflow_detail_ui(
     headers: axum::http::HeaderMap,
     maybe_session: Option<Extension<Session>>,
 ) -> Result<Markup, AutumnError> {
-    render_workflow_detail_page(
-        &api_state,
-        &id,
-        params.event_page.as_deref(),
-        params.jump_event.as_deref(),
-        params.log_level.as_deref(),
-        params.flash.as_deref(),
-        WorkflowActionEcho::default(),
-        false,
-        "GET /ui/workflows/{id}",
-        &headers,
-        maybe_session,
-    )
-    .await
-}
-
-/// Loads and renders the workflow detail page.
-///
-/// Shared by the `GET` route and by the three action-form handlers. Those
-/// are Send signal, Reset to event N, and Trigger update, on a rejected
-/// submission (issue #1687 review). A rejected submission renders this
-/// page directly. It does not redirect with the entered values in the
-/// query string. Putting a signal or update payload in a redirect URL
-/// would put it in browser history, in proxy/server access logs, and in
-/// the same-origin referrer. A payload near the engine's own size cap
-/// could also push the URL past a typical request-line limit.
-/// `action_echo` carries the rejected values and error in memory instead.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-async fn render_workflow_detail_page(
-    api_state: &HarvestApiState,
-    id: &str,
-    event_page_raw: Option<&str>,
-    jump_event_raw: Option<&str>,
-    log_level_raw: Option<&str>,
-    flash: Option<&str>,
-    action_echo: WorkflowActionEcho,
-    rendered_at_action_url: bool,
-    // The caller's own route, for the payload-decode audit trail (issue
-    // #1687 review, Codex finding). Before this parameter existed, every
-    // caller's decoded-payload reads were attributed to the hard-coded
-    // `"GET /ui/workflows/{id}"`. That was wrong for the three POST
-    // handlers rendering this page directly on a rejected submission.
-    // A sensitive-read audit trail must name the request that actually
-    // triggered the read, not a different route that happens to share
-    // the same renderer.
-    route_or_command: &'static str,
-    headers: &axum::http::HeaderMap,
-    maybe_session: Option<Extension<Session>>,
-) -> Result<Markup, AutumnError> {
-    let exec_id = parse_execution_id(id)?;
+    let exec_id = parse_execution_id(&id)?;
     let exec_uuid = exec_id.as_uuid();
-    let mut conn = db_conn_for_execution(api_state, exec_id).await?;
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
     let execution = load_execution(&mut conn, exec_id)
         .await
         .map_err(map_error)?;
 
     // Resolve event_page before any DB queries so we can use OFFSET/LIMIT directly.
     let page_size = DETAIL_EVENT_PAGE_SIZE;
-    let (event_page, event_page_error, jump_event_error) =
-        resolve_workflow_detail_event_page(event_page_raw, jump_event_raw, page_size);
+    let event_page = if let Some(jump) = params.jump_event {
+        let jump_zero = (jump - 1).max(0);
+        jump_zero / page_size
+    } else {
+        params.event_page.unwrap_or(0).max(0)
+    };
 
     // Total event count — used for pagination controls.
     let total_events: i64 = harvest_events::table
@@ -1892,7 +1316,7 @@ async fn render_workflow_detail_page(
         heartbeat_details_cap,
     )
     .await?;
-    resolve_blocked_on_heartbeat_caps(api_state, &mut blocked_on);
+    resolve_blocked_on_heartbeat_caps(&api_state, &mut blocked_on);
 
     // Resolve the continue-as-new threshold from the runtime registry if available.
     // This is a lightweight read of an in-memory value — no extra DB query.
@@ -1911,15 +1335,14 @@ async fn render_workflow_detail_page(
     let mut page_events = page_events;
     let session = extension_session(maybe_session);
     decode_and_audit_workflow_detail(
-        api_state,
+        &api_state,
         &mut conn,
-        headers,
+        &headers,
         session.clone(),
         exec_id,
         &mut execution,
         &mut page_events,
         &mut blocked_on,
-        route_or_command,
     )
     .await;
 
@@ -1940,8 +1363,9 @@ async fn render_workflow_detail_page(
     // Loaded on the page's own connection before it is dropped. Best-effort: a
     // failure hides the panel rather than failing the page (logs are
     // observational, AC7), with a warn so a persistent failure is diagnosable.
-    let logs_admin = crate::api::has_harvest_admin_access(api_state, session.clone()).await;
-    let log_level_filter = autumn_harvest::WorkflowLogLevel::from_wire(log_level_raw.unwrap_or(""));
+    let logs_admin = crate::api::has_harvest_admin_access(&api_state, session.clone()).await;
+    let log_level_filter =
+        autumn_harvest::WorkflowLogLevel::from_wire(params.log_level.as_deref().unwrap_or(""));
     let mut log_read_failed = false;
     let mut log_truncated = false;
     let log_lines: Vec<autumn_harvest::models::HarvestWorkflowLog> = if logs_admin {
@@ -2008,9 +1432,9 @@ async fn render_workflow_detail_page(
 
     drop(conn);
     if !is_terminal_workflow_state(&execution.state)
-        && crate::api::has_harvest_admin_access(api_state, session).await
+        && crate::api::has_harvest_admin_access(&api_state, session).await
     {
-        blocked_on.awaitables = match crate::api::build_awaitables_report(api_state, exec_id).await
+        blocked_on.awaitables = match crate::api::build_awaitables_report(&api_state, exec_id).await
         {
             Ok(report) => Some(report),
             Err(err) => {
@@ -2034,9 +1458,7 @@ async fn render_workflow_detail_page(
         &children,
         event_page,
         &blocked_on,
-        flash,
-        event_page_error.as_deref(),
-        jump_event_error.as_deref(),
+        params.flash.as_deref(),
         continue_as_new_threshold,
         &WorkflowLogsPanelData {
             lines: &log_lines,
@@ -2045,8 +1467,6 @@ async fn render_workflow_detail_page(
             truncated: log_truncated,
             read_failed: log_read_failed,
         },
-        &action_echo,
-        rendered_at_action_url,
     ))
 }
 
@@ -2100,7 +1520,6 @@ async fn decode_and_audit_workflow_detail(
     execution: &mut WorkflowExecution,
     timeline_events: &mut [HarvestEvent],
     blocked_on: &mut BlockedOnData,
-    route_or_command: &'static str,
 ) {
     let Some(codecs) = read_path_decoder(api_state, session).await else {
         return;
@@ -2114,7 +1533,7 @@ async fn decode_and_audit_workflow_detail(
         headers,
         TARGET_WORKFLOW,
         Some(&target),
-        route_or_command,
+        "GET /ui/workflows/{id}",
         Some(exec_id.shard()),
         outcome,
         Some(SOURCE_UI),
@@ -2500,7 +1919,6 @@ async fn signal_workflow_ui(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
     Path(id): Path<String>,
-    maybe_session: Option<Extension<Session>>,
     Form(form): Form<WorkflowSignalForm>,
 ) -> Result<axum::response::Response, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
@@ -2564,80 +1982,14 @@ async fn signal_workflow_ui(
     )
     .await;
 
-    // On failure, render this page directly with the entered signal name
-    // and payload pre-filled (issue #1687 review). It does not redirect
-    // with them in the query string. A signal payload can carry credentials
-    // or other workflow data. A redirect would put it in browser history,
-    // in proxy/server access logs, and in the same-origin referrer. A
-    // large payload could also push the URL past a typical request-line
-    // limit. `conn` is dropped first: the render acquires its own
-    // connection, and holding two at once can deadlock a pool-size-one
-    // shard.
-    let Some(error) = error_summary else {
-        drop(conn);
-        let redirect_url = format!("../../workflows/{id}?flash={flash}");
-        return Ok(axum::response::Redirect::to(&redirect_url).into_response());
-    };
-    drop(conn);
-    let echo = WorkflowActionEcho {
-        signal_error: Some(error.clone()),
-        signal_name: Some(form.signal_name.clone()),
-        signal_payload: Some(payload_str.to_string()),
-        ..Default::default()
-    };
-    let markup = render_workflow_detail_page(
-        &api_state,
-        &id,
-        None,
-        None,
-        None,
-        Some(&error),
-        echo,
-        true,
-        "POST /workflows/{id}/signal",
-        &headers,
-        maybe_session,
-    )
-    .await?;
-    Ok(markup.into_response())
-}
-
-/// Parse the "Reset to event N" field (1-based, matching the timeline "#"
-/// column) from its raw submitted text.
-///
-/// `WorkflowResetForm` types this field as `String`, not `i64`. axum's
-/// `Form` extractor runs `serde` deserialization before the handler body
-/// executes. A field typed directly as `i64` therefore rejects the whole
-/// request with a bare, unstyled 400 on a non-numeric value. No HTML
-/// renders, and the operator's entered reason is never read. That is the
-/// same page-abort mechanism #1333/#1378/#1420/#1437 fixed for the list
-/// pages' filter fields.
-///
-/// This form differs from those filters. It is not a filter; it is the
-/// runbook's destructive recovery action. Operators use it for a stuck
-/// child workflow or a non-determinism failure (`docs/vantage-ui.md`
-/// scenarios 3 and 4). Parsing here keeps a malformed value inside the
-/// handler. It then renders as the same flash-redirect error
-/// `signal_workflow_ui` already produces for an invalid JSON payload.
-///
-/// Range and existence validation — does this event id exist on this
-/// execution — stays downstream in `validate_reset_point`. This function
-/// rejects only text that is not a whole number.
-fn parse_reset_to_event_id(raw: &str) -> Result<i64, String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err("event number is required".to_string());
-    }
-    trimmed
-        .parse::<i64>()
-        .map_err(|_| format!("invalid event number '{trimmed}'; expected a whole number"))
+    let redirect_url = format!("../../workflows/{id}?flash={flash}");
+    Ok(axum::response::Redirect::to(&redirect_url).into_response())
 }
 
 async fn reset_workflow_ui(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
     Path(id): Path<String>,
-    maybe_session: Option<Extension<Session>>,
     Form(form): Form<WorkflowResetForm>,
 ) -> Result<axum::response::Response, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
@@ -2653,29 +2005,22 @@ async fn reset_workflow_ui(
         .to_string();
 
     // The form shows 1-based event numbers (matching the timeline "#" column).
-    // The reset API accepts 0-based event IDs. A malformed value is rejected
-    // here, inside the handler, instead of guessing an event number the
-    // operator never typed. This mirrors the reject-rather-than-guess rule
-    // #1437's bulk-action fix applied to a mutating endpoint.
-    let reset_result = match parse_reset_to_event_id(&form.reset_to_event_id) {
-        Ok(event_number) => {
-            let request = WorkflowResetRequest {
-                reset_to_event_id: Some(event_number.saturating_sub(1)),
-                reset_point: None,
-                reason,
-                operator_id: actor.clone(),
-                signal_reapply: ResetSignalReapplyPolicy::default(),
-                allow_terminal_source: false,
-                refuse_erased_source: false,
-            };
-            let runtime = api_state.runtime().ok();
-            let registry = runtime.as_ref().map(|r| r.registry().as_ref());
-            reset_workflow_execution(&mut conn, exec_id, request, registry)
-                .await
-                .map_err(|e| e.to_string())
-        }
-        Err(e) => Err(e),
+    // The reset API accepts 0-based event IDs.
+    let reset_to_event_id = form.reset_to_event_id.saturating_sub(1);
+
+    let request = WorkflowResetRequest {
+        reset_to_event_id: Some(reset_to_event_id),
+        reset_point: None,
+        reason,
+        operator_id: actor.clone(),
+        signal_reapply: ResetSignalReapplyPolicy::default(),
+        allow_terminal_source: false,
+        refuse_erased_source: false,
     };
+
+    let runtime = api_state.runtime().ok();
+    let registry = runtime.as_ref().map(|r| r.registry().as_ref());
+    let reset_result = reset_workflow_execution(&mut conn, exec_id, request, registry).await;
     let (status, error_summary, flash) = match &reset_result {
         Ok(result) => (
             STATUS_SUCCEEDED,
@@ -2685,11 +2030,14 @@ async fn reset_workflow_ui(
                 result.new_exec_id
             )),
         ),
-        Err(msg) => (
-            STATUS_FAILED,
-            Some(msg.clone()),
-            url_encode(&format!("Reset failed: {msg}")),
-        ),
+        Err(e) => {
+            let msg = e.to_string();
+            (
+                STATUS_FAILED,
+                Some(msg.clone()),
+                url_encode(&format!("Reset failed: {msg}")),
+            )
+        }
     };
     let _ = insert_audit(
         &mut conn,
@@ -2709,44 +2057,14 @@ async fn reset_workflow_ui(
     )
     .await;
 
-    // On failure, render this page directly with the entered event number
-    // and reason pre-filled (issue #1687 review) — same reasoning as
-    // `signal_workflow_ui`.
-    let Some(error) = error_summary else {
-        drop(conn);
-        let redirect_url = format!("../../workflows/{id}?flash={flash}");
-        return Ok(axum::response::Redirect::to(&redirect_url).into_response());
-    };
-    drop(conn);
-    let echo = WorkflowActionEcho {
-        reset_error: Some(error.clone()),
-        reset_event: Some(form.reset_to_event_id.clone()),
-        reset_reason: Some(form.reason.clone().unwrap_or_default()),
-        ..Default::default()
-    };
-    let markup = render_workflow_detail_page(
-        &api_state,
-        &id,
-        None,
-        None,
-        None,
-        Some(&error),
-        echo,
-        true,
-        "POST /workflows/{id}/reset",
-        &headers,
-        maybe_session,
-    )
-    .await?;
-    Ok(markup.into_response())
+    let redirect_url = format!("../../workflows/{id}?flash={flash}");
+    Ok(axum::response::Redirect::to(&redirect_url).into_response())
 }
 
-#[allow(clippy::too_many_lines)]
 async fn trigger_update_ui(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
     Path(id): Path<String>,
-    maybe_session: Option<Extension<Session>>,
     Form(form): Form<WorkflowTriggerUpdateForm>,
 ) -> Result<axum::response::Response, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
@@ -2779,31 +2097,9 @@ async fn trigger_update_ui(
                     },
                 )
                 .await;
-                // Render this page directly with the entered update name
-                // and payload pre-filled (issue #1687 review) — same
-                // reasoning as `signal_workflow_ui`.
-                drop(conn);
-                let echo = WorkflowActionEcho {
-                    update_error: Some(err_msg.clone()),
-                    update_name: Some(form.update_name.clone()),
-                    update_payload: Some(payload_str.to_string()),
-                    ..Default::default()
-                };
-                let markup = render_workflow_detail_page(
-                    &api_state,
-                    &id,
-                    None,
-                    None,
-                    None,
-                    Some(&err_msg),
-                    echo,
-                    true,
-                    "POST /workflows/{id}/trigger-update",
-                    &headers,
-                    maybe_session,
-                )
-                .await?;
-                return Ok(markup.into_response());
+                let flash = url_encode(&err_msg);
+                let redirect_url = format!("../../workflows/{id}?flash={flash}");
+                return Ok(axum::response::Redirect::to(&redirect_url).into_response());
             }
         }
     };
@@ -2815,15 +2111,13 @@ async fn trigger_update_ui(
     let ui_metrics = ui_runtime
         .as_ref()
         .map(|r| r.registry().telemetry().metrics.as_ref());
-    let ui_codecs = api_state.payload_codecs();
-    let (status, error_summary, flash) = match admit_update_event_with_codecs(
+    let (status, error_summary, flash) = match admit_update_event(
         &mut conn,
         exec_id,
         update_id,
         form.update_name.clone(),
         payload_json,
         ui_metrics,
-        &ui_codecs,
     )
     .await
     {
@@ -2871,33 +2165,8 @@ async fn trigger_update_ui(
     )
     .await;
 
-    let Some(error) = error_summary else {
-        drop(conn);
-        let redirect_url = format!("../../workflows/{id}?flash={flash}");
-        return Ok(axum::response::Redirect::to(&redirect_url).into_response());
-    };
-    drop(conn);
-    let echo = WorkflowActionEcho {
-        update_error: Some(error.clone()),
-        update_name: Some(form.update_name.clone()),
-        update_payload: Some(payload_str.to_string()),
-        ..Default::default()
-    };
-    let markup = render_workflow_detail_page(
-        &api_state,
-        &id,
-        None,
-        None,
-        None,
-        Some(&error),
-        echo,
-        true,
-        "POST /workflows/{id}/trigger-update",
-        &headers,
-        maybe_session,
-    )
-    .await?;
-    Ok(markup.into_response())
+    let redirect_url = format!("../../workflows/{id}?flash={flash}");
+    Ok(axum::response::Redirect::to(&redirect_url).into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -2913,34 +2182,19 @@ async fn list_dead_letters_ui(
     // Read-path payload decoding (issue #608): the page is admin-gated, so an
     // arriving request passes the same predicate the decoder re-checks.
     let decoder = read_path_decoder(&api_state, extension_session(maybe_session)).await;
-    // Issue: `page`/`limit` were still typed `Option<i64>` directly on
-    // `DeadLetterListParams`. That is the same page-abort mechanism
-    // #1540/#1560 already fixed on the Workflows and Workers pages. A
-    // non-numeric value on either reaches this struct through a
-    // hand-edited URL, a bookmarked link, or a mistyped "Per page".
-    // Any of those failed axum's own query deserialization with a bare
-    // 400. That 400 landed before this handler, or the filter form, ever
-    // ran. It discarded every filter (`workflow_name`, `task_kind`,
-    // `failed_after`, `failed_before`, `shard_id`) the operator had
-    // already entered. This is the DLQ page an operator is
-    // mid-incident-triage on, per docs/runbooks/harvest-alerts.md and
-    // seven other runbooks that point here. Degrade to a default and
-    // report the bad value inline instead.
-    let (limit, limit_raw, limit_error) =
-        parse_limit_query_field(params.limit.as_deref(), DEFAULT_DLQ_PAGE_SIZE);
-    let (page, _page_raw, page_error) = parse_page_query_field(params.page.as_deref());
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_DLQ_PAGE_SIZE)
+        .clamp(1, MAX_PAGE_SIZE);
+    let page = params.page.unwrap_or(0).max(0);
     let offset = page.saturating_mul(limit);
-    let (filters, filter_raw) = parse_dead_letter_ui_filters(
+    let filters = parse_dead_letter_ui_filters(
         params.workflow_name.as_deref(),
         params.task_kind.as_deref(),
         params.failed_after.as_deref(),
         params.failed_before.as_deref(),
-        params.shard_id.as_deref(),
-    );
-
-    // Same fix, `refresh` (issue #1604): reuses the DAG-detail page's own
-    // `parse_refresh_query_field` (issue #1630).
-    let (refresh, refresh_error) = parse_refresh_query_field(params.refresh.as_deref());
+        params.shard_id,
+    )?;
 
     let pool = api_state.storage_pool().map_err(map_error)?;
 
@@ -2949,13 +2203,9 @@ async fn list_dead_letters_ui(
         return render_dead_letters_summary_view(
             &pool,
             &filters,
-            &filter_raw,
             params.group_by.as_deref(),
             limit,
-            &limit_raw,
-            limit_error.as_deref(),
-            refresh,
-            refresh_error.as_deref(),
+            params.refresh,
             params.flash.as_deref(),
         )
         .await;
@@ -3026,179 +2276,59 @@ async fn list_dead_letters_ui(
 
     Ok(render_dead_letters_page(
         &filters,
-        &filter_raw,
         &page_rows,
         &shard_errors,
         is_multi_shard,
         page,
         limit,
-        &limit_raw,
         has_next,
         total_for_pagination,
-        refresh,
-        refresh_error.as_deref(),
+        params.refresh,
         params.flash.as_deref(),
-        limit_error.as_deref(),
-        page_error.as_deref(),
     ))
 }
 
-/// Raw text and validation errors for the DLQ filter fields that can fail
-/// to parse: `task_kind`, `failed_after`, `failed_before`. Carried alongside
-/// `DeadLetterUiFilters`, which holds only the successfully parsed values.
-/// This lets an invalid value's inline error and its exact typed text
-/// persist. They survive the filter form, pagination, and the bulk-action
-/// forms. Without this, they would revert the moment the request moves past
-/// the initial submit. Same `(parsed, raw_display, error)` contract as
-/// `parse_worker_status_filter` uses on the Workers page (#1378).
-#[derive(Debug, Clone, Default)]
-struct DeadLetterUiFilterRaw {
-    task_kind: String,
-    task_kind_error: Option<String>,
-    failed_after: String,
-    failed_after_error: Option<String>,
-    failed_before: String,
-    failed_before_error: Option<String>,
-    shard_id: String,
-    shard_id_error: Option<String>,
-}
-
-/// Parses the DLQ page's filters from raw query-string values. An
-/// unrecognized `task_kind`, or an unparseable `failed_after`/`failed_before`,
-/// used to `?`-abort the whole page. This happened before the filter form
-/// ever rendered. It discarded whichever of the five filters the operator
-/// had already typed. This now degrades each bad field to "not applied"
-/// instead. It hands back the raw text plus an error to redisplay inline. A
-/// bad value now costs one field, not the page. Same fix as
-/// `parse_started_bound` (#1333) and `parse_worker_status_filter` (#1378)
-/// use on the sibling list pages.
 fn parse_dead_letter_ui_filters(
     workflow_name: Option<&str>,
     task_kind: Option<&str>,
     failed_after: Option<&str>,
     failed_before: Option<&str>,
-    shard_id: Option<&str>,
-) -> (DeadLetterUiFilters, DeadLetterUiFilterRaw) {
+    shard_id: Option<i32>,
+) -> Result<DeadLetterUiFilters, AutumnError> {
     let workflow_name = workflow_name
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    let (task_kind, task_kind_raw, task_kind_error) = parse_dead_letter_task_kind_filter(task_kind);
-    let (failed_after, failed_after_raw, failed_after_error) =
-        parse_dead_letter_time_filter("failed_after", failed_after);
-    let (failed_before, failed_before_raw, failed_before_error) =
-        parse_dead_letter_time_filter("failed_before", failed_before);
-    let (shard_id, shard_id_raw, shard_id_error) = parse_shard_id_filter("shard_id", shard_id);
+    let task_kind = task_kind
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(DeadLetterTaskKind::parse)
+        .transpose()?;
+    let failed_after = parse_dead_letter_time_filter("failed_after", failed_after)?;
+    let failed_before = parse_dead_letter_time_filter("failed_before", failed_before)?;
 
-    (
-        DeadLetterUiFilters {
-            workflow_name,
-            task_kind,
-            failed_after,
-            failed_before,
-            shard_id,
-        },
-        DeadLetterUiFilterRaw {
-            task_kind: task_kind_raw,
-            task_kind_error,
-            failed_after: failed_after_raw,
-            failed_after_error,
-            failed_before: failed_before_raw,
-            failed_before_error,
-            shard_id: shard_id_raw,
-            shard_id_error,
-        },
-    )
+    Ok(DeadLetterUiFilters {
+        workflow_name,
+        task_kind,
+        failed_after,
+        failed_before,
+        shard_id,
+    })
 }
 
-/// Parses the DLQ page's `task_kind` filter. Returns `(parsed, raw_display,
-/// error)`. On an unrecognized value, `parsed` is `None`, so the filter is
-/// not applied. `error` then carries a message to render next to the field.
-/// `raw_display` echoes the operator's exact trimmed input. The caller uses
-/// it to carry the value through pagination and resubmission.
-fn parse_dead_letter_task_kind_filter(
-    raw: Option<&str>,
-) -> (Option<DeadLetterTaskKind>, String, Option<String>) {
-    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
-        return (None, String::new(), None);
-    };
-    match trimmed.to_ascii_lowercase().as_str() {
-        "activity" => (
-            Some(DeadLetterTaskKind::Activity),
-            trimmed.to_string(),
-            None,
-        ),
-        "workflow" => (
-            Some(DeadLetterTaskKind::Workflow),
-            trimmed.to_string(),
-            None,
-        ),
-        other => (
-            None,
-            trimmed.to_string(),
-            Some(format!(
-                "Unknown task_kind '{other}'; expected Activity or Workflow. Filter not applied."
-            )),
-        ),
-    }
-}
-
-/// Parses one of the DLQ page's `failed_after`/`failed_before` filters with
-/// the same "filter not applied, raw input carried through, error
-/// redisplayed inline" contract as [`parse_dead_letter_task_kind_filter`].
 fn parse_dead_letter_time_filter(
     field: &str,
     raw: Option<&str>,
-) -> (Option<DateTime<Utc>>, String, Option<String>) {
-    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
-        return (None, String::new(), None);
+) -> Result<Option<DateTime<Utc>>, AutumnError> {
+    let Some(value) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
     };
-    let Ok(parsed) = DateTime::parse_from_rfc3339(trimmed) else {
-        return (
-            None,
-            trimmed.to_string(),
-            Some(format!(
-                "Invalid {field}; expected RFC 3339 timestamp. Filter not applied."
-            )),
-        );
-    };
-    (Some(parsed.with_timezone(&Utc)), trimmed.to_string(), None)
-}
-
-/// Parses a `shard`/`shard_id` filter shared by the Workers, Dead-Letters,
-/// and Schedules list pages. Returns `(parsed, raw_display, error)` with the
-/// same "filter not applied, raw input carried through, error redisplayed
-/// inline" contract as [`parse_dead_letter_time_filter`].
-///
-/// Issue: on all three pages this field used to be typed `Option<i32>`
-/// directly on the `Query<..>` extractor struct. Axum deserializes query
-/// structs before the handler body runs, so a non-numeric value never
-/// reached the page's own graceful-degradation code. It failed the
-/// extractor itself instead, aborting the request with a bare framework
-/// 400. That happened before any `HarvestApiState`, any HTML, or any of
-/// the operator's other filters were even looked at. It is the same
-/// page-abort defect the sibling string filters already fix, but one
-/// layer earlier and with no styled error at all.
-///
-/// The fix retypes the field `Option<String>` on the params struct and
-/// parses it here, like every other filter on these pages. That moves the
-/// failure from the extractor into the handler, where it can degrade
-/// gracefully. `field` names the query parameter in the error message,
-/// since the pages spell it `shard` or `shard_id`.
-fn parse_shard_id_filter(field: &str, raw: Option<&str>) -> (Option<i32>, String, Option<String>) {
-    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
-        return (None, String::new(), None);
-    };
-    let Ok(parsed) = trimmed.parse::<i32>() else {
-        return (
-            None,
-            trimmed.to_string(),
-            Some(format!(
-                "Invalid {field} '{trimmed}'; expected a whole number. Filter not applied."
-            )),
-        );
-    };
-    (Some(parsed), trimmed.to_string(), None)
+    let parsed = DateTime::parse_from_rfc3339(value)
+        .map_err(|_| {
+            AutumnError::bad_request_msg(format!("invalid {field}; expected RFC 3339 timestamp"))
+        })?
+        .with_timezone(&Utc);
+    Ok(Some(parsed))
 }
 
 async fn load_dead_letters_from_shards_for_ui(
@@ -3220,33 +2350,19 @@ async fn load_dead_letters_from_shards_for_ui(
                 let rows = query_dead_letters_for_ui(&mut conn, filters, limit)
                     .await
                     .map_err(|e| e.to_string())?;
-                // Deduplicated. Two dead letters can share one execution.
-                // An `unnest($1::uuid[])` id appearing twice would run the
-                // per-id LATERAL event lookup twice for that id. The rendered
-                // event count would double instead of staying capped at 10.
-                let exec_ids: Vec<uuid::Uuid> = rows
-                    .iter()
-                    .filter_map(|d| d.workflow_exec_id)
-                    .collect::<HashSet<_>>()
-                    .into_iter()
-                    .collect();
-                let (names, events) = load_dead_letter_details_batch(&mut conn, &exec_ids)
-                    .await
-                    .map_err(|e| e.to_string())?;
                 let mut out = Vec::with_capacity(rows.len());
                 for dead_letter in rows {
-                    let workflow_name = dead_letter
-                        .workflow_exec_id
-                        .and_then(|id| names.get(&id).cloned());
-                    let row_events = dead_letter
-                        .workflow_exec_id
-                        .and_then(|id| events.get(&id).cloned())
-                        .unwrap_or_default();
+                    let workflow_name = load_dead_letter_workflow_name(&mut conn, &dead_letter)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let events = load_dead_letter_events(&mut conn, &dead_letter)
+                        .await
+                        .map_err(|e| e.to_string())?;
                     out.push(DeadLetterUiRow {
                         shard_id,
                         dead_letter,
                         workflow_name,
-                        events: row_events,
+                        events,
                     });
                 }
                 Ok(out)
@@ -3335,71 +2451,39 @@ async fn count_dead_letters_for_ui(
     query.count().get_result(conn).await.map_err(database_error)
 }
 
-/// Batched replacement for two lookups this function used to run once per
-/// dead letter in a page (`load_dead_letter_workflow_name` and
-/// `load_dead_letter_events`). A page holds up to `MAX_PAGE_SIZE` (200) rows.
-/// The old shape issued up to 400 extra round trips per page load. Each
-/// round trip was cheap alone, an index lookup or less. The count stayed
-/// invisible in a buffer-ranked profile and dominant in a calls-ranked one.
-///
-/// Returns `(workflow_name_by_exec_id, last_10_events_by_exec_id)`. A dead
-/// letter absent from a map had no matching row. That matches the `None` or
-/// empty `Vec` the old per-row functions returned for the same case.
-async fn load_dead_letter_details_batch(
+async fn load_dead_letter_workflow_name(
     conn: &mut AsyncPgConnection,
-    exec_ids: &[uuid::Uuid],
-) -> HarvestResult<(
-    HashMap<uuid::Uuid, String>,
-    HashMap<uuid::Uuid, Vec<HarvestEvent>>,
-)> {
-    if exec_ids.is_empty() {
-        return Ok((HashMap::new(), HashMap::new()));
-    }
-
-    let names: HashMap<uuid::Uuid, String> = harvest_workflow_executions::table
-        .filter(harvest_workflow_executions::id.eq_any(exec_ids))
-        .select((
-            harvest_workflow_executions::id,
-            harvest_workflow_executions::workflow_name,
-        ))
-        .load::<(uuid::Uuid, String)>(conn)
+    dead_letter: &DeadLetter,
+) -> HarvestResult<Option<String>> {
+    let Some(exec_id) = dead_letter.workflow_exec_id else {
+        return Ok(None);
+    };
+    harvest_workflow_executions::table
+        .find(exec_id)
+        .select(harvest_workflow_executions::workflow_name)
+        .first(conn)
         .await
-        .map_err(database_error)?
-        .into_iter()
-        .collect();
+        .optional()
+        .map_err(database_error)
+}
 
-    // One `LATERAL`-per-id "last 10" query instead of N separate
-    // `ORDER BY ... LIMIT 10` queries. Each `LATERAL` subquery uses the
-    // same `idx_harvest_events_exec (workflow_exec_id, event_id)` index
-    // the old per-row query relied on. The outer `ORDER BY` groups each
-    // id's rows in ascending `event_id` order already, so no per-group
-    // reverse step is needed here. The old function fetched descending
-    // order and reversed each group in Rust instead.
-    let rows: Vec<HarvestEvent> = diesel::sql_query(
-        "SELECT e.id, e.workflow_exec_id, e.event_id, e.event_type, e.event_data, e.timestamp \
-         FROM unnest($1::uuid[]) AS w(exec_id) \
-         CROSS JOIN LATERAL ( \
-             SELECT * FROM harvest_events \
-             WHERE workflow_exec_id = w.exec_id \
-             ORDER BY event_id DESC \
-             LIMIT 10 \
-         ) e \
-         ORDER BY e.workflow_exec_id, e.event_id",
-    )
-    .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(exec_ids)
-    .load(conn)
-    .await
-    .map_err(database_error)?;
-
-    let mut events: HashMap<uuid::Uuid, Vec<HarvestEvent>> = HashMap::new();
-    for event in rows {
-        events
-            .entry(event.workflow_exec_id)
-            .or_default()
-            .push(event);
-    }
-
-    Ok((names, events))
+async fn load_dead_letter_events(
+    conn: &mut AsyncPgConnection,
+    dead_letter: &DeadLetter,
+) -> HarvestResult<Vec<HarvestEvent>> {
+    let Some(exec_id) = dead_letter.workflow_exec_id else {
+        return Ok(Vec::new());
+    };
+    let mut events = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id))
+        .order(harvest_events::event_id.desc())
+        .limit(10)
+        .select(HarvestEvent::as_select())
+        .load(conn)
+        .await
+        .map_err(database_error)?;
+    events.reverse();
+    Ok(events)
 }
 
 // ---------------------------------------------------------------------------
@@ -3410,44 +2494,13 @@ async fn list_workers_ui(
     Extension(api_state): Extension<HarvestApiState>,
     Query(params): Query<WorkerListParams>,
 ) -> Result<Markup, AutumnError> {
-    // Issue: an unrecognized status/stale value used to `?`-abort the whole
-    // page (bare 400, no HTML) before the filter form was ever rendered.
-    // That discarded the build_id/shard filters the operator had already
-    // entered. `parse_worker_status_filter`/`parse_worker_stale_filter`
-    // instead degrade to "filter not applied". They hand back an error to
-    // redisplay inline. So a bad value costs one field, not the page. This is
-    // the same fix as `parse_started_bound` on the Workflows page (#1333).
-    // The raw text is carried alongside the parsed value so pagination and
-    // form resubmission do not silently drop it (#1378).
-    let (status_filter, status_raw, status_error) =
-        parse_worker_status_filter(params.status.as_deref());
-    let (stale_only, stale_raw, stale_error) = parse_worker_stale_filter(params.stale.as_deref());
-    // Same fix, applied to the numeric `shard` filter. `shard` was still
-    // typed `Option<i32>` directly on the `Query<..>` extractor struct. A
-    // non-numeric value aborted with a bare framework 400 before this
-    // handler ever ran. That is one layer earlier than the page-abort bug
-    // status/stale already fix, with no styled error at all.
-    let (shard_filter, shard_raw, shard_error) =
-        parse_shard_id_filter("shard", params.shard.as_deref());
+    let (status_filter, stale_only) = parse_worker_ui_filters(&params)?;
 
-    // Issue: `page`/`limit` were still typed `Option<i64>` directly on
-    // `WorkerListParams` — the two fields left over after status/stale/shard
-    // above got this same fix. A non-numeric value on either reaches this
-    // struct through a hand-edited URL or a bookmarked link past the
-    // current worker count. A pasted "Per page" value reaches it too. Any
-    // of those failed axum's own query deserialization with a bare 400.
-    // That happened before the filter form or any worker row rendered. It
-    // discarded every other filter the operator had already entered. Same
-    // fix as `parse_page_query_field`/`parse_limit_query_field` on the
-    // Workflows page (#1540): degrade to a default and report the bad
-    // value inline instead of aborting the page.
-    let (limit, limit_raw, limit_error) =
-        parse_limit_query_field(params.limit.as_deref(), DEFAULT_PAGE_SIZE);
-    let (page, _page_raw, page_error) = parse_page_query_field(params.page.as_deref());
-
-    // Same fix, `refresh` (issue #1604): reuses the DAG-detail page's own
-    // `parse_refresh_query_field` (issue #1630).
-    let (refresh, refresh_error) = parse_refresh_query_field(params.refresh.as_deref());
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_PAGE_SIZE)
+        .clamp(1, MAX_PAGE_SIZE);
+    let page = params.page.unwrap_or(0).max(0);
     let offset = page.saturating_mul(limit);
 
     let stale_threshold = api_state.worker_stale_threshold();
@@ -3474,7 +2527,7 @@ async fn list_workers_ui(
                 .flat_map(move |rows| rows.iter().map(move |r| (shard_id, r.clone())))
         })
         .filter(|(shard_id, row)| {
-            if shard_filter.is_some_and(|f| shard_id.as_i32() != f) {
+            if params.shard.is_some_and(|f| shard_id.as_i32() != f) {
                 return false;
             }
             if let Some(sf) = status_filter
@@ -3537,72 +2590,39 @@ async fn list_workers_ui(
         limit,
         has_next,
         status_filter,
-        &status_raw,
-        status_error.as_deref(),
-        &shard_raw,
-        shard_error.as_deref(),
+        params.shard,
         stale_only,
-        &stale_raw,
-        stale_error.as_deref(),
         build_id_filter,
-        refresh,
-        refresh_error.as_deref(),
-        &limit_raw,
-        limit_error.as_deref(),
-        page_error.as_deref(),
+        params.refresh,
     ))
 }
 
-/// Parses the Workers page's `status` filter from a raw query-string value.
-/// Returns `(parsed, raw_display, error)`. On success `error` is `None`. On
-/// an unrecognized value `parsed` is `None`, so the filter is not applied.
-/// `error` then carries a message to render next to the field. So a bad
-/// value drops one filter instead of the whole page (see `list_workers_ui`).
-/// `raw_display` echoes the operator's exact trimmed input in both cases.
-/// On success this is a no-op, since the only valid inputs are the canonical
-/// labels modulo case. The caller carries it through pagination and
-/// resubmission (#1378). Without it, a bad value's error vanished on the
-/// next Next/Previous click or Apply resubmit. The `<select>` and the
-/// pagination query string were both built from the already-`None`d parsed
-/// value. That silently discarded the operator's input. The intent is to
-/// persist the error "until resolved".
-fn parse_worker_status_filter(raw: Option<&str>) -> (Option<&'static str>, String, Option<String>) {
-    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
-        return (None, String::new(), None);
+fn parse_worker_ui_filters(
+    params: &WorkerListParams,
+) -> Result<(Option<&'static str>, bool), AutumnError> {
+    let status_filter = match params.status.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(s) => Some(match s.to_lowercase().as_str() {
+            "active" => "Active",
+            "draining" => "Draining",
+            "stopped" => "Stopped",
+            other => {
+                return Err(AutumnError::bad_request_msg(format!(
+                    "unknown status '{other}'; expected one of Active, Draining, Stopped"
+                )));
+            }
+        }),
     };
-    match trimmed.to_lowercase().as_str() {
-        "active" => (Some("Active"), trimmed.to_string(), None),
-        "draining" => (Some("Draining"), trimmed.to_string(), None),
-        "stopped" => (Some("Stopped"), trimmed.to_string(), None),
-        other => (
-            None,
-            trimmed.to_string(),
-            Some(format!(
-                "Unknown status '{other}'; expected Active, Draining, or Stopped. Filter not applied."
-            )),
-        ),
-    }
-}
-
-/// Parses the Workers page's `stale` filter from a raw query-string value.
-/// Returns `(parsed, raw_display, error)` with the same "filter not
-/// applied, raw input carried through, error redisplayed inline" contract
-/// as [`parse_worker_status_filter`].
-fn parse_worker_stale_filter(raw: Option<&str>) -> (bool, String, Option<String>) {
-    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
-        return (false, String::new(), None);
+    let stale_only = match params.stale.as_deref().map(str::trim) {
+        None | Some("" | "false") => false,
+        Some("true") => true,
+        Some(other) => {
+            return Err(AutumnError::bad_request_msg(format!(
+                "unknown stale value '{other}'; expected 'true' or 'false'"
+            )));
+        }
     };
-    match trimmed {
-        "false" => (false, trimmed.to_string(), None),
-        "true" => (true, trimmed.to_string(), None),
-        other => (
-            false,
-            trimmed.to_string(),
-            Some(format!(
-                "Unknown stale value '{other}'; expected 'true' or 'false'. Filter not applied."
-            )),
-        ),
-    }
+    Ok((status_filter, stale_only))
 }
 
 /// A paused queue as rendered on the Workers page, merged across shards.
@@ -3694,7 +2714,6 @@ pub(crate) fn merge_paused_queue_banner_rows(
     by_queue
         .into_values()
         .map(|shard_rows| {
-            #[expect(clippy::expect_used, reason = "each group has at least one row")]
             let earliest = shard_rows
                 .iter()
                 .min_by_key(|(shard_id, row)| (row.paused_at, *shard_id))
@@ -3955,32 +2974,24 @@ async fn load_workers_from_shards(
 #[allow(clippy::too_many_arguments)]
 fn render_dead_letters_page(
     filters: &DeadLetterUiFilters,
-    filter_raw: &DeadLetterUiFilterRaw,
     rows: &[DeadLetterUiRow],
     shard_errors: &[(ShardId, &str)],
     is_multi_shard: bool,
     page: i64,
     limit: i64,
-    limit_raw: &str,
     has_next: bool,
     total_matching: usize,
     refresh: Option<u64>,
-    refresh_error: Option<&str>,
     flash: Option<&str>,
-    limit_error: Option<&str>,
-    page_error: Option<&str>,
 ) -> Markup {
     let body = html! {
         h2 { "Dead Letters" }
         @if let Some(message) = flash {
-            div.flash role="status" tabindex="-1" autofocus { (message) }
+            div.flash { (message) }
         }
-        @if let Some(error) = refresh_error {
-            span.field-error role="alert" { (error) }
-        }
-        (render_dead_letter_view_toggle(filters, filter_raw, limit, limit_raw, refresh, None, false))
-        (render_dead_letter_filters(filters, filter_raw, limit, limit_raw, limit_error, refresh))
-        (render_dead_letter_bulk_actions(filters, filter_raw, limit, limit_raw, refresh, total_matching))
+        (render_dead_letter_view_toggle(filters, limit, refresh, None, false))
+        (render_dead_letter_filters(filters, limit, refresh))
+        (render_dead_letter_bulk_actions(filters, limit, refresh, total_matching))
 
         @if rows.is_empty() && shard_errors.is_empty() {
             div.card.empty {
@@ -4002,25 +3013,13 @@ fn render_dead_letters_page(
                 }
             }
 
-            (render_dead_letter_table(rows, filters, filter_raw, limit, limit_raw, refresh))
+            (render_dead_letter_table(rows, filters, limit, refresh))
         }
 
-        (render_dead_letter_pagination(page, limit, limit_raw, has_next, filters, filter_raw, refresh, page_error))
+        (render_dead_letter_pagination(page, limit, has_next, filters, refresh))
     };
 
-    // `dead_letter_return_to_path` deliberately excludes `page`. It names
-    // the one-time redirect target after an action, and landing back on
-    // page 0 there is fine.
-    //
-    // Auto-refresh is different: it must keep the operator on the page
-    // they were reading. So it builds its own target here, matching
-    // `render_dead_letter_pagination`'s own link construction, instead of
-    // reusing that path (found in review, PR #1396).
-    let refresh_target = format!(
-        "../ui/dead-letters?page={page}{}",
-        build_dead_letter_query_string(limit, limit_raw, filters, filter_raw, refresh)
-    );
-    layout_dead_letters("Dead Letters · Vantage", &body, refresh, &refresh_target)
+    layout_dead_letters("Dead Letters · Vantage", &body, refresh)
 }
 
 // ---------------------------------------------------------------------------
@@ -4029,17 +3028,12 @@ fn render_dead_letters_page(
 
 /// Render the DLQ summary view: in-process root-cause aggregation, the same
 /// computation behind `GET /dead-letters/aggregate`, surfaced as a UI toggle.
-#[allow(clippy::too_many_arguments)]
 async fn render_dead_letters_summary_view(
     pool: &crate::HarvestDbPool,
     filters: &DeadLetterUiFilters,
-    filter_raw: &DeadLetterUiFilterRaw,
     group_by_raw: Option<&str>,
     limit: i64,
-    limit_raw: &str,
-    limit_error: Option<&str>,
     refresh: Option<u64>,
-    refresh_error: Option<&str>,
     flash: Option<&str>,
 ) -> Result<Markup, AutumnError> {
     let group_by = parse_dlq_summary_group_by(group_by_raw)?;
@@ -4069,14 +3063,11 @@ async fn render_dead_letters_summary_view(
     let body = html! {
         h2 { "Dead Letters" }
         @if let Some(message) = flash {
-            div.flash role="status" tabindex="-1" autofocus { (message) }
+            div.flash { (message) }
         }
-        @if let Some(error) = refresh_error {
-            span.field-error role="alert" { (error) }
-        }
-        (render_dead_letter_view_toggle(filters, filter_raw, limit, limit_raw, refresh, Some(&group_by_value), true))
-        (render_dead_letter_filters(filters, filter_raw, limit, limit_raw, limit_error, refresh))
-        (render_dlq_summary_group_by_form(filters, filter_raw, limit, limit_raw, refresh, &group_by))
+        (render_dead_letter_view_toggle(filters, limit, refresh, Some(&group_by_value), true))
+        (render_dead_letter_filters(filters, limit, refresh))
+        (render_dlq_summary_group_by_form(filters, limit, refresh, &group_by))
 
         @for (shard_id, error) in &shard_errors {
             div.shard-error {
@@ -4096,24 +3087,14 @@ async fn render_dead_letters_summary_view(
                 }
             }
         } @else {
-            (render_dlq_summary_table(&response, &group_by, filters, filter_raw, limit, limit_raw, refresh))
+            (render_dlq_summary_table(&response, &group_by, filters, limit, refresh))
         }
     };
 
-    let group_by_query = if group_by_value.is_empty() {
-        String::new()
-    } else {
-        format!("&group_by={}", url_encode(&group_by_value))
-    };
-    let refresh_target = format!(
-        "../ui/dead-letters?view=summary{}{group_by_query}",
-        build_dead_letter_query_string(limit, limit_raw, filters, filter_raw, refresh)
-    );
     Ok(layout_dead_letters(
         "Dead Letters · Summary · Vantage",
         &body,
         refresh,
-        &refresh_target,
     ))
 }
 
@@ -4200,14 +3181,12 @@ async fn aggregate_dead_letters_for_ui(
 
 fn render_dead_letter_view_toggle(
     filters: &DeadLetterUiFilters,
-    filter_raw: &DeadLetterUiFilterRaw,
     limit: i64,
-    limit_raw: &str,
     refresh: Option<u64>,
     group_by_value: Option<&str>,
     summary_active: bool,
 ) -> Markup {
-    let base = build_dead_letter_query_string(limit, limit_raw, filters, filter_raw, refresh);
+    let base = build_dead_letter_query_string(limit, filters, refresh);
     let list_href = if base.is_empty() {
         "dead-letters".to_string()
     } else {
@@ -4234,9 +3213,7 @@ fn render_dead_letter_view_toggle(
 
 fn render_dlq_summary_group_by_form(
     filters: &DeadLetterUiFilters,
-    filter_raw: &DeadLetterUiFilterRaw,
     limit: i64,
-    limit_raw: &str,
     refresh: Option<u64>,
     selected: &[autumn_harvest::dlq::DlqGroupDimension],
 ) -> Markup {
@@ -4262,14 +3239,8 @@ fn render_dlq_summary_group_by_form(
     html! {
         form.filters method="get" action="dead-letters" {
             input type="hidden" name="view" value="summary";
-            (render_dead_letter_hidden_filters_raw(filters, filter_raw))
-            // Prefer `limit_raw` (non-empty only on a genuine parse
-            // failure). An unresolved invalid limit then survives this
-            // resubmission instead of silently reverting. Same reasoning
-            // as `build_dead_letter_query_string`.
-            @if !limit_raw.is_empty() {
-                input type="hidden" name="limit" value=(limit_raw);
-            } @else if limit != DEFAULT_DLQ_PAGE_SIZE {
+            (render_dead_letter_hidden_filters(filters))
+            @if limit != DEFAULT_DLQ_PAGE_SIZE {
                 input type="hidden" name="limit" value=(limit);
             }
             @if let Some(refresh) = refresh {
@@ -4308,9 +3279,7 @@ fn render_dlq_summary_table(
     response: &autumn_harvest::dlq::DlqAggregateResponse,
     group_by: &[autumn_harvest::dlq::DlqGroupDimension],
     filters: &DeadLetterUiFilters,
-    filter_raw: &DeadLetterUiFilterRaw,
     limit: i64,
-    limit_raw: &str,
     refresh: Option<u64>,
 ) -> Markup {
     html! {
@@ -4358,7 +3327,7 @@ fn render_dlq_summary_table(
                             @if is_other {
                                 "—"
                             } @else {
-                                @let (href, partial) = dlq_summary_drilldown_href(&group.key, group_by, filters, filter_raw, limit, limit_raw, refresh);
+                                @let (href, partial) = dlq_summary_drilldown_href(&group.key, group_by, filters, limit, refresh);
                                 a href=(href) title=[partial.then_some("Some dimensions have no list-view filter — results may include extra rows from other groups")] {
                                     @if partial {
                                         "View entries (partial filter) →"
@@ -4394,24 +3363,14 @@ fn dlq_summary_drilldown_href(
     key: &serde_json::Value,
     group_by: &[autumn_harvest::dlq::DlqGroupDimension],
     filters: &DeadLetterUiFilters,
-    filter_raw: &DeadLetterUiFilterRaw,
     limit: i64,
-    limit_raw: &str,
     refresh: Option<u64>,
 ) -> (String, bool) {
     use autumn_harvest::dlq::DlqGroupDimension;
 
     // Start from the filters already applied to the summary so drill-down
-    // narrows rather than widens. `drill_raw` starts as a clone of the
-    // summary's own raw state, not a derivation from `drill`. Codex review
-    // on #1420 found the bug in a derived-only `drill_raw`: it silently
-    // dropped an invalid failed_after/failed_before, and its error, on
-    // every "View entries" link. This function never touches those two
-    // fields. The view toggle, refresh, and group-by form all preserve
-    // that same invalid value. The drilldown link must not be the one
-    // exception.
+    // narrows rather than widens.
     let mut drill = filters.clone();
-    let mut drill_raw = filter_raw.clone();
     let mut partial = false;
     for dim in group_by {
         match dim {
@@ -4422,17 +3381,7 @@ fn dlq_summary_drilldown_href(
             }
             DlqGroupDimension::TaskType => {
                 if let Some(serde_json::Value::String(task_type)) = key.get("task_type") {
-                    // This field IS synthesized fresh from the group's own
-                    // key, unlike failed_after/failed_before above. It is
-                    // always valid (or absent), so its raw text and error
-                    // are overwritten to match, not merely inherited.
                     drill.task_kind = DeadLetterTaskKind::parse(task_type).ok();
-                    drill_raw.task_kind = drill
-                        .task_kind
-                        .map(DeadLetterTaskKind::as_label)
-                        .unwrap_or_default()
-                        .to_string();
-                    drill_raw.task_kind_error = None;
                 }
             }
             // No list-view filter exists for these dimensions; the link will
@@ -4448,7 +3397,7 @@ fn dlq_summary_drilldown_href(
         }
     }
 
-    let query = build_dead_letter_query_string(limit, limit_raw, &drill, &drill_raw, refresh);
+    let query = build_dead_letter_query_string(limit, &drill, refresh);
     let href = if query.is_empty() {
         "dead-letters".to_string()
     } else {
@@ -4459,23 +3408,24 @@ fn dlq_summary_drilldown_href(
 
 fn render_dead_letter_filters(
     filters: &DeadLetterUiFilters,
-    filter_raw: &DeadLetterUiFilterRaw,
     limit: i64,
-    limit_raw: &str,
-    limit_error: Option<&str>,
     refresh: Option<u64>,
 ) -> Markup {
     let workflow_name = filters.workflow_name.as_deref().unwrap_or("");
     let task_kind = filters.task_kind.map(DeadLetterTaskKind::as_label);
+    let failed_after = filters
+        .failed_after
+        .map(|ts| ts.to_rfc3339())
+        .unwrap_or_default();
+    let failed_before = filters
+        .failed_before
+        .map(|ts| ts.to_rfc3339())
+        .unwrap_or_default();
+    let shard_id = filters
+        .shard_id
+        .map(|id| id.to_string())
+        .unwrap_or_default();
     let refresh_value = refresh.map(|secs| secs.to_string()).unwrap_or_default();
-    // Echo exactly what the operator typed on a parse failure, matching the
-    // Workflows and Workers pages' `render_filters`/`render_worker_filters`.
-    // Falls back to the resolved value when the field was absent or valid.
-    let limit_value = if limit_raw.is_empty() {
-        limit.to_string()
-    } else {
-        limit_raw.to_string()
-    };
 
     html! {
         form.filters method="get" action="dead-letters" {
@@ -4486,53 +3436,26 @@ fn render_dead_letter_filters(
             label {
                 "Task kind"
                 select name="task_kind" {
-                    option value="" selected[task_kind.is_none() && filter_raw.task_kind_error.is_none()] { "All" }
+                    option value="" selected[task_kind.is_none()] { "All" }
                     option value="Activity" selected[task_kind == Some("Activity")] { "Activity" }
                     option value="Workflow" selected[task_kind == Some("Workflow")] { "Workflow" }
-                    // An unrecognized value is rendered as its own option.
-                    // This makes the select echo it back instead of silently
-                    // reverting to "All" — same treatment as the Workers
-                    // page's status filter (#1378).
-                    @if filter_raw.task_kind_error.is_some() {
-                        option value=(filter_raw.task_kind) selected { (filter_raw.task_kind) }
-                    }
-                }
-                @if let Some(error) = &filter_raw.task_kind_error {
-                    span.field-error role="alert" { (error) }
                 }
             }
             label {
                 "Failed after"
-                input type="text" name="failed_after" value=(filter_raw.failed_after) placeholder="2026-05-10T00:00:00Z";
-                @if let Some(error) = &filter_raw.failed_after_error {
-                    span.field-error role="alert" { (error) }
-                }
+                input type="text" name="failed_after" value=(failed_after) placeholder="2026-05-10T00:00:00Z";
             }
             label {
                 "Failed before"
-                input type="text" name="failed_before" value=(filter_raw.failed_before) placeholder="2026-05-11T00:00:00Z";
-                @if let Some(error) = &filter_raw.failed_before_error {
-                    span.field-error role="alert" { (error) }
-                }
+                input type="text" name="failed_before" value=(failed_before) placeholder="2026-05-11T00:00:00Z";
             }
             label {
                 "Shard"
-                input type="text" inputmode="numeric" pattern="-?[0-9]*" name="shard_id" value=(filter_raw.shard_id) placeholder="e.g. 0";
-                @if let Some(error) = &filter_raw.shard_id_error {
-                    span.field-error role="alert" { (error) }
-                }
+                input type="number" name="shard_id" value=(shard_id) placeholder="e.g. 0";
             }
             label {
                 "Per page"
-                // `type="text"`, not `type="number"`. A number input
-                // sanitizes an invalid value (e.g. "not-a-number") to blank
-                // at render time. The operator could then never see or
-                // correct their own bad input. Matches the Workflows and
-                // Workers pages' "Per page" fields.
-                input type="text" inputmode="numeric" pattern="[0-9]*" name="limit" value=(limit_value);
-                @if let Some(error) = limit_error {
-                    span.field-error role="alert" { (error) }
-                }
+                input type="number" name="limit" min="1" max=(MAX_PAGE_SIZE) value=(limit);
             }
             label {
                 "Refresh"
@@ -4553,13 +3476,11 @@ fn render_dead_letter_filters(
 
 fn render_dead_letter_bulk_actions(
     filters: &DeadLetterUiFilters,
-    filter_raw: &DeadLetterUiFilterRaw,
     limit: i64,
-    limit_raw: &str,
     refresh: Option<u64>,
     total_matching: usize,
 ) -> Markup {
-    let return_to = dead_letter_return_to_path(filters, filter_raw, limit, limit_raw, refresh);
+    let return_to = dead_letter_return_to_path(filters, limit, refresh);
     let action_limit = dead_letter_bulk_action_limit(total_matching);
     let replay_label = dead_letter_bulk_action_label("Replay", action_limit, total_matching);
     let discard_label = dead_letter_bulk_action_label("Discard", action_limit, total_matching);
@@ -4614,12 +3535,10 @@ fn dead_letter_bulk_action_confirm(
 fn render_dead_letter_table(
     rows: &[DeadLetterUiRow],
     filters: &DeadLetterUiFilters,
-    filter_raw: &DeadLetterUiFilterRaw,
     limit: i64,
-    limit_raw: &str,
     refresh: Option<u64>,
 ) -> Markup {
-    let return_to = dead_letter_return_to_path(filters, filter_raw, limit, limit_raw, refresh);
+    let return_to = dead_letter_return_to_path(filters, limit, refresh);
     html! {
         table {
             thead {
@@ -4725,65 +3644,21 @@ fn render_dead_letter_detail(row: &DeadLetterUiRow) -> Markup {
     }
 }
 
-/// Hidden filter fields for the DLQ page's GET forms — the group-by
-/// resubmit form. It routes back through `list_dead_letters_ui`, so it
-/// handles an invalid value gracefully like every other GET on this page.
-/// Carries the raw text, not the parsed value. This lets an invalid value's
-/// inline error survive resubmission, instead of being silently dropped.
-/// Same reasoning as the Workers page's `build_worker_query_string` (Codex
-/// review, #1378 P2).
-///
-/// Do NOT use this for the bulk-action POST forms — see
-/// [`render_dead_letter_hidden_filters`], which those forms need instead.
-fn render_dead_letter_hidden_filters_raw(
-    filters: &DeadLetterUiFilters,
-    filter_raw: &DeadLetterUiFilterRaw,
-) -> Markup {
-    html! {
-        @if let Some(workflow_name) = filters.workflow_name.as_deref() {
-            input type="hidden" name="workflow_name" value=(workflow_name);
-        }
-        @if !filter_raw.task_kind.is_empty() {
-            input type="hidden" name="task_kind" value=(filter_raw.task_kind);
-        }
-        @if !filter_raw.failed_after.is_empty() {
-            input type="hidden" name="failed_after" value=(filter_raw.failed_after);
-        }
-        @if !filter_raw.failed_before.is_empty() {
-            input type="hidden" name="failed_before" value=(filter_raw.failed_before);
-        }
-        @if !filter_raw.shard_id.is_empty() {
-            input type="hidden" name="shard_id" value=(filter_raw.shard_id);
-        }
-    }
-}
-
-/// Hidden filter fields for the DLQ page's bulk-action POST forms
-/// (`../dead-letters/replay`, `../dead-letters/discard`). Carries only the
-/// successfully parsed values, never raw text.
-///
-/// `parse_bulk_dlq_form` (autumn-harvest-plugin/src/api.rs) re-validates
-/// `task_kind`/`failed_after`/`failed_before` strictly and 400s on a bad
-/// value. [`render_dead_letter_hidden_filters_raw`] submits an invalid raw
-/// value on the GET group-by form, which is safe there. Doing the same
-/// here would reintroduce the exact bug this PR fixes, one layer down. The
-/// bulk action would abort instead of running, or redisplaying the inline
-/// error (Codex review, #1420). An invalid field is "filter not applied"
-/// on this page, so it is simply omitted here. The operator's raw text and
-/// the error still redisplay from `return_to`, which is built from the raw
-/// query string.
 fn render_dead_letter_hidden_filters(filters: &DeadLetterUiFilters) -> Markup {
+    let task_kind = filters.task_kind.map(DeadLetterTaskKind::as_label);
+    let failed_after = filters.failed_after.map(|ts| ts.to_rfc3339());
+    let failed_before = filters.failed_before.map(|ts| ts.to_rfc3339());
     html! {
         @if let Some(workflow_name) = filters.workflow_name.as_deref() {
             input type="hidden" name="workflow_name" value=(workflow_name);
         }
-        @if let Some(task_kind) = filters.task_kind.map(DeadLetterTaskKind::as_label) {
+        @if let Some(task_kind) = task_kind {
             input type="hidden" name="task_kind" value=(task_kind);
         }
-        @if let Some(failed_after) = filters.failed_after.map(|ts| ts.to_rfc3339()) {
+        @if let Some(failed_after) = failed_after.as_deref() {
             input type="hidden" name="failed_after" value=(failed_after);
         }
-        @if let Some(failed_before) = filters.failed_before.map(|ts| ts.to_rfc3339()) {
+        @if let Some(failed_before) = failed_before.as_deref() {
             input type="hidden" name="failed_before" value=(failed_before);
         }
         @if let Some(shard_id) = filters.shard_id {
@@ -4792,22 +3667,15 @@ fn render_dead_letter_hidden_filters(filters: &DeadLetterUiFilters) -> Markup {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn render_dead_letter_pagination(
     page: i64,
     limit: i64,
-    limit_raw: &str,
     has_next: bool,
     filters: &DeadLetterUiFilters,
-    filter_raw: &DeadLetterUiFilterRaw,
     refresh: Option<u64>,
-    page_error: Option<&str>,
 ) -> Markup {
-    let base = build_dead_letter_query_string(limit, limit_raw, filters, filter_raw, refresh);
+    let base = build_dead_letter_query_string(limit, filters, refresh);
     html! {
-        @if let Some(error) = page_error {
-            span.field-error role="alert" { (error) }
-        }
         div.pagination {
             @if page > 0 {
                 a href={ "dead-letters?page=" (page - 1) (PreEscaped(&base)) } {
@@ -4832,49 +3700,35 @@ fn render_dead_letter_pagination(
 
 fn build_dead_letter_query_string(
     limit: i64,
-    limit_raw: &str,
     filters: &DeadLetterUiFilters,
-    filter_raw: &DeadLetterUiFilterRaw,
     refresh: Option<u64>,
 ) -> String {
     let mut out = String::new();
-    // `limit_raw` is non-empty only on a genuine parse failure (see
-    // `parse_limit_query_field`), never for a valid-but-clamped value. An
-    // invalid limit the operator has not yet corrected must not silently
-    // vanish from a Next/Previous link. Same as the Workflows/Workers
-    // pages' own query-string builders.
-    if !limit_raw.is_empty() {
-        let _ = write!(out, "&limit={}", url_encode(limit_raw));
-    } else if limit != DEFAULT_DLQ_PAGE_SIZE {
+    if limit != DEFAULT_DLQ_PAGE_SIZE {
         let _ = write!(out, "&limit={limit}");
     }
     if let Some(workflow_name) = filters.workflow_name.as_deref() {
         let _ = write!(out, "&workflow_name={}", url_encode(workflow_name));
     }
-    // Carry the raw text, not the parsed value. This lets an invalid
-    // value's inline error persist across pagination, instead of being
-    // silently dropped. Same reasoning as `build_query_string`'s
-    // started_after/started_before handling on the Workflows page (Codex
-    // review, #1378 P2).
-    if !filter_raw.task_kind.is_empty() {
-        let _ = write!(out, "&task_kind={}", url_encode(&filter_raw.task_kind));
+    if let Some(task_kind) = filters.task_kind {
+        let _ = write!(out, "&task_kind={}", task_kind.as_label());
     }
-    if !filter_raw.failed_after.is_empty() {
+    if let Some(failed_after) = filters.failed_after {
         let _ = write!(
             out,
             "&failed_after={}",
-            url_encode(&filter_raw.failed_after)
+            url_encode(&failed_after.to_rfc3339())
         );
     }
-    if !filter_raw.failed_before.is_empty() {
+    if let Some(failed_before) = filters.failed_before {
         let _ = write!(
             out,
             "&failed_before={}",
-            url_encode(&filter_raw.failed_before)
+            url_encode(&failed_before.to_rfc3339())
         );
     }
-    if !filter_raw.shard_id.is_empty() {
-        let _ = write!(out, "&shard_id={}", url_encode(&filter_raw.shard_id));
+    if let Some(shard_id) = filters.shard_id {
+        let _ = write!(out, "&shard_id={shard_id}");
     }
     if let Some(refresh) = refresh {
         let _ = write!(out, "&refresh={refresh}");
@@ -4884,12 +3738,10 @@ fn build_dead_letter_query_string(
 
 fn dead_letter_return_to_path(
     filters: &DeadLetterUiFilters,
-    filter_raw: &DeadLetterUiFilterRaw,
     limit: i64,
-    limit_raw: &str,
     refresh: Option<u64>,
 ) -> String {
-    let query = build_dead_letter_query_string(limit, limit_raw, filters, filter_raw, refresh);
+    let query = build_dead_letter_query_string(limit, filters, refresh);
     if query.is_empty() {
         "../ui/dead-letters".to_string()
     } else {
@@ -4925,25 +3777,7 @@ fn truncate_error(error: &str) -> String {
     }
 }
 
-/// `refresh_target` is the current filtered view's URL with no `flash`
-/// param. The caller builds it from the same filters, limit, and refresh
-/// already in its own scope.
-///
-/// A dead-letter action redirects here with `flash` appended to
-/// `return_to`. `return_to` itself preserves `refresh`. An operator with
-/// auto-refresh on would otherwise see this page's targetless `meta
-/// refresh` reload that same URL, flash included, on every interval. Each
-/// reload would re-announce and re-focus a stale message.
-///
-/// An explicit `url=` on the tag breaks that loop. The flash still shows
-/// and takes focus on the load right after the action. Every reload after
-/// that lands on the flash-free URL instead (found in review, PR #1396).
-fn layout_dead_letters(
-    title: &str,
-    body: &Markup,
-    refresh: Option<u64>,
-    refresh_target: &str,
-) -> Markup {
+fn layout_dead_letters(title: &str, body: &Markup, refresh: Option<u64>) -> Markup {
     html! {
         (PreEscaped("<!DOCTYPE html>"))
         html lang="en" {
@@ -4951,7 +3785,7 @@ fn layout_dead_letters(
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width,initial-scale=1";
                 @if let Some(secs) = refresh {
-                    meta http-equiv="refresh" content={ (secs) "; url=" (refresh_target) };
+                    meta http-equiv="refresh" content=(secs);
                 }
                 title { (title) }
                 style { (PreEscaped(STYLE)) }
@@ -4989,28 +3823,15 @@ fn render_workers_page(
     limit: i64,
     has_next: bool,
     status_filter: Option<&str>,
-    status_raw: &str,
-    status_error: Option<&str>,
-    shard_raw: &str,
-    shard_error: Option<&str>,
+    shard_filter: Option<i32>,
     stale_only: bool,
-    stale_raw: &str,
-    stale_error: Option<&str>,
     build_id_filter: Option<&str>,
     refresh: Option<u64>,
-    refresh_error: Option<&str>,
-    limit_raw: &str,
-    limit_error: Option<&str>,
-    page_error: Option<&str>,
 ) -> Markup {
     let total_workers: usize = grouped.iter().map(|(_, rows)| rows.len()).sum();
 
     let body = html! {
         h2 { "Workers" }
-
-        @if let Some(error) = refresh_error {
-            span.field-error role="alert" { (error) }
-        }
 
         // Fleet health banner
         (render_fleet_banner(stats, banner_state))
@@ -5019,7 +3840,7 @@ fn render_workers_page(
         (render_paused_queues_banner(&paused_queues.rows, &paused_queues.unreadable_shards))
 
         // Filters
-        (render_worker_filters(status_filter, status_raw, status_error, shard_raw, shard_error, stale_only, stale_raw, stale_error, build_id_filter, limit, limit_raw, limit_error))
+        (render_worker_filters(status_filter, shard_filter, stale_only, build_id_filter, limit))
 
         // Worker table (grouped by shard if multi-shard)
         @if total_workers == 0 && shard_errors.is_empty() {
@@ -5052,7 +3873,7 @@ fn render_workers_page(
             }
         }
 
-        (render_worker_pagination(page, limit, limit_raw, has_next, status_raw, shard_raw, stale_raw, build_id_filter, page_error))
+        (render_worker_pagination(page, limit, has_next, status_filter, shard_filter, stale_only, build_id_filter))
     };
 
     layout_workers("Workers · Vantage", &body, refresh)
@@ -5103,7 +3924,7 @@ fn render_worker_table(rows: &[WorkerRow], shard_id: ShardId) -> Markup {
                         td { (worker_status_badge(&row.worker.status, is_stale)) }
                         td {
                             @if row.worker.build_id.is_empty() {
-                                span style="color:#94a3b8" { "—" }
+                                span style="color:#475569" { "—" }
                             } @else {
                                 a href={ "build-routing?build_id=" (url_encode(&row.worker.build_id)) }
                                   title="View in Build Routing" {
@@ -5115,7 +3936,7 @@ fn render_worker_table(rows: &[WorkerRow], shard_id: ShardId) -> Markup {
                             @if let Some(ref dep) = row.worker.deployment_name {
                                 code { (dep) }
                             } @else {
-                                span style="color:#94a3b8" { "—" }
+                                span style="color:#475569" { "—" }
                             }
                         }
                         td {
@@ -5134,50 +3955,24 @@ fn render_worker_table(rows: &[WorkerRow], shard_id: ShardId) -> Markup {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn render_worker_filters(
     status_filter: Option<&str>,
-    status_raw: &str,
-    status_error: Option<&str>,
-    shard_raw: &str,
-    shard_error: Option<&str>,
+    shard_filter: Option<i32>,
     stale_only: bool,
-    stale_raw: &str,
-    stale_error: Option<&str>,
     build_id_filter: Option<&str>,
     limit: i64,
-    limit_raw: &str,
-    limit_error: Option<&str>,
 ) -> Markup {
+    let shard_value = shard_filter.map(|s| s.to_string()).unwrap_or_default();
     let build_id_value = build_id_filter.unwrap_or("");
-    // Echo exactly what the operator typed on a parse failure, matching the
-    // Workflows page's `render_filters`. Fall back to the resolved value
-    // when the field was absent or already valid.
-    let limit_value = if limit_raw.is_empty() {
-        limit.to_string()
-    } else {
-        limit_raw.to_string()
-    };
     html! {
         form.filters method="get" action="workers" {
             label {
                 "Status"
                 select name="status" {
-                    option value="" selected[status_filter.is_none() && status_error.is_none()] { "All" }
+                    option value="" selected[status_filter.is_none()] { "All" }
                     @for s in ["Active", "Draining", "Stopped"] {
                         option value=(s) selected[status_filter == Some(s)] { (s) }
                     }
-                    // An unrecognized value is rendered as its own option so
-                    // the select echoes it back until the operator picks a
-                    // valid one. It does not silently revert to "All". This
-                    // is the `<select>` equivalent of a text input's
-                    // `value=` (#1378).
-                    @if status_error.is_some() {
-                        option value=(status_raw) selected { (status_raw) }
-                    }
-                }
-                @if let Some(error) = status_error {
-                    span.field-error role="alert" { (error) }
                 }
             }
             label {
@@ -5186,36 +3981,18 @@ fn render_worker_filters(
             }
             label {
                 "Shard"
-                input type="text" inputmode="numeric" pattern="-?[0-9]*" name="shard" value=(shard_raw) placeholder="e.g. 0";
-                @if let Some(error) = shard_error {
-                    span.field-error role="alert" { (error) }
-                }
+                input type="number" name="shard" value=(shard_value) placeholder="e.g. 0";
             }
             label {
                 "Stale only"
                 select name="stale" {
-                    option value="" selected[!stale_only && stale_error.is_none()] { "All" }
+                    option value="" selected[!stale_only] { "All" }
                     option value="true" selected[stale_only] { "Stale only" }
-                    @if stale_error.is_some() {
-                        option value=(stale_raw) selected { (stale_raw) }
-                    }
-                }
-                @if let Some(error) = stale_error {
-                    span.field-error role="alert" { (error) }
                 }
             }
             label {
                 "Per page"
-                // `type="text"`, not `type="number"`. A number input
-                // sanitizes an invalid value (e.g. "not-a-number") to
-                // blank at render time. The operator could then never see
-                // or correct their own bad input. Matches the Workflows
-                // page's "Per page" field and this page's own `shard`
-                // filter.
-                input type="text" inputmode="numeric" pattern="[0-9]*" name="limit" value=(limit_value);
-                @if let Some(error) = limit_error {
-                    span.field-error role="alert" { (error) }
-                }
+                input type="number" name="limit" min="1" max=(MAX_PAGE_SIZE) value=(limit);
             }
             button type="submit" { "Apply" }
             a.reset href="workers" { "Reset" }
@@ -5223,30 +4000,23 @@ fn render_worker_filters(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn render_worker_pagination(
     page: i64,
     limit: i64,
-    limit_raw: &str,
     has_next: bool,
-    status_raw: &str,
-    shard_raw: &str,
-    stale_raw: &str,
+    status_filter: Option<&str>,
+    shard_filter: Option<i32>,
+    stale_only: bool,
     build_id_filter: Option<&str>,
-    page_error: Option<&str>,
 ) -> Markup {
     let base = build_worker_query_string(
         limit,
-        limit_raw,
-        status_raw,
-        shard_raw,
-        stale_raw,
+        status_filter,
+        shard_filter,
+        stale_only,
         build_id_filter,
     );
     html! {
-        @if let Some(error) = page_error {
-            span.field-error role="alert" { (error) }
-        }
         div.pagination {
             @if page > 0 {
                 a href={ "workers?page=" (page - 1) (PreEscaped(&base)) } {
@@ -5271,38 +4041,26 @@ fn render_worker_pagination(
 
 fn build_worker_query_string(
     limit: i64,
-    limit_raw: &str,
-    status_raw: &str,
-    shard_raw: &str,
-    stale_raw: &str,
+    status_filter: Option<&str>,
+    shard_filter: Option<i32>,
+    stale_only: bool,
     build_id_filter: Option<&str>,
 ) -> String {
     let mut out = String::new();
-    // `limit_raw` is non-empty only on a genuine parse failure (see
-    // `parse_limit_query_field`), never for a valid-but-clamped value. An
-    // invalid limit the operator has not yet corrected must not silently
-    // vanish from a Next/Previous link — same as the Workflows page's
-    // `build_query_string`.
-    if !limit_raw.is_empty() {
-        let _ = write!(out, "&limit={}", url_encode(limit_raw));
-    } else if limit != DEFAULT_PAGE_SIZE {
+    if limit != DEFAULT_PAGE_SIZE {
         let _ = write!(out, "&limit={limit}");
     }
-    // Carry the raw text (not the parsed value) so an invalid value's inline
-    // error persists across pagination instead of being silently dropped.
-    // The reasoning is the same as for `build_query_string`'s
-    // started_after/started_before handling on the Workflows page (#1378).
-    if !status_raw.is_empty() {
-        let _ = write!(out, "&status={}", url_encode(status_raw));
+    if let Some(status) = status_filter {
+        let _ = write!(out, "&status={}", url_encode(status));
     }
     if let Some(build_id) = build_id_filter {
         let _ = write!(out, "&build_id={}", url_encode(build_id));
     }
-    if !shard_raw.is_empty() {
-        let _ = write!(out, "&shard={}", url_encode(shard_raw));
+    if let Some(shard) = shard_filter {
+        let _ = write!(out, "&shard={shard}");
     }
-    if !stale_raw.is_empty() {
-        let _ = write!(out, "&stale={}", url_encode(stale_raw));
+    if stale_only {
+        let _ = write!(out, "&stale=true");
     }
     out
 }
@@ -5380,16 +4138,11 @@ fn render_workflow_list(
     state_filter: Option<&str>,
     workflow_name_filter: Option<&str>,
     search_attr_filter: Option<&(String, String)>,
-    started_after_raw: &str,
-    started_after_error: Option<&str>,
-    started_before_raw: &str,
-    started_before_error: Option<&str>,
+    started_after: Option<DateTime<Utc>>,
+    started_before: Option<DateTime<Utc>>,
     exec_id_search: Option<&str>,
     active_gate_count: usize,
     unavailable_shards: &[UnavailableShard],
-    limit_raw: &str,
-    limit_error: Option<&str>,
-    page_error: Option<&str>,
 ) -> Markup {
     // Issue #756: name the unreachable shard(s) so a partial list is not read
     // as the authoritative fleet state.
@@ -5426,7 +4179,7 @@ fn render_workflow_list(
             }
         }
 
-        (render_filters(state_filter, workflow_name_filter, search_attr_filter, started_after_raw, started_after_error, started_before_raw, started_before_error, exec_id_search, limit, limit_raw, limit_error))
+        (render_filters(state_filter, workflow_name_filter, search_attr_filter, started_after, started_before, exec_id_search, limit))
 
         @if workflows.is_empty() {
             div.card.empty { "No workflows match this filter." }
@@ -5460,10 +4213,10 @@ fn render_workflow_list(
             }
         }
 
-        (render_pagination(page, limit, limit_raw, has_next, state_filter, workflow_name_filter, search_attr_filter, started_after_raw, started_before_raw, exec_id_search, page_error))
+        (render_pagination(page, limit, has_next, state_filter, workflow_name_filter, search_attr_filter, started_after, started_before, exec_id_search))
     };
 
-    layout("Workflows · Vantage", &body, "", None)
+    layout("Workflows · Vantage", &body, "")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5471,27 +4224,17 @@ fn render_filters(
     state_filter: Option<&str>,
     workflow_name_filter: Option<&str>,
     search_attr_filter: Option<&(String, String)>,
-    started_after_raw: &str,
-    started_after_error: Option<&str>,
-    started_before_raw: &str,
-    started_before_error: Option<&str>,
+    started_after: Option<DateTime<Utc>>,
+    started_before: Option<DateTime<Utc>>,
     exec_id_search: Option<&str>,
     limit: i64,
-    limit_raw: &str,
-    limit_error: Option<&str>,
 ) -> Markup {
     let (attr_key, attr_value) =
         search_attr_filter.map_or(("", ""), |(k, v)| (k.as_str(), v.as_str()));
     let workflow_name_value = workflow_name_filter.unwrap_or("");
+    let started_after_value = started_after.map(|d| d.to_rfc3339()).unwrap_or_default();
+    let started_before_value = started_before.map(|d| d.to_rfc3339()).unwrap_or_default();
     let exec_id_search_value = exec_id_search.unwrap_or("");
-    // Echo exactly what the operator typed on a parse failure, matching
-    // `started_after`/`started_before`. Fall back to the resolved value
-    // when the field was absent or already valid.
-    let limit_value = if limit_raw.is_empty() {
-        limit.to_string()
-    } else {
-        limit_raw.to_string()
-    };
 
     html! {
         form.filters method="get" action="workflows" {
@@ -5515,17 +4258,11 @@ fn render_filters(
             }
             label {
                 "Started after"
-                input type="text" name="started_after" value=(started_after_raw) placeholder="2026-01-01T00:00:00Z";
-                @if let Some(error) = started_after_error {
-                    span.field-error role="alert" { (error) }
-                }
+                input type="text" name="started_after" value=(started_after_value) placeholder="2026-01-01T00:00:00Z";
             }
             label {
                 "Started before"
-                input type="text" name="started_before" value=(started_before_raw) placeholder="2026-12-31T23:59:59Z";
-                @if let Some(error) = started_before_error {
-                    span.field-error role="alert" { (error) }
-                }
+                input type="text" name="started_before" value=(started_before_value) placeholder="2026-12-31T23:59:59Z";
             }
             label {
                 "Exec ID search"
@@ -5541,16 +4278,7 @@ fn render_filters(
             }
             label {
                 "Per page"
-                // `type="text"`, not `type="number"`. A number input
-                // sanitizes an invalid value (e.g. "not-a-number") to
-                // blank at render time. The operator could then never see
-                // or correct their own bad input. This matches the Workers
-                // page's `shard` filter, the other redisplayable numeric
-                // field in this file.
-                input type="text" inputmode="numeric" pattern="[0-9]*" name="limit" value=(limit_value);
-                @if let Some(error) = limit_error {
-                    span.field-error role="alert" { (error) }
-                }
+                input type="number" name="limit" min="1" max=(MAX_PAGE_SIZE) value=(limit);
             }
             button type="submit" { "Apply" }
             a.reset href="workflows" { "Reset" }
@@ -5562,31 +4290,25 @@ fn render_filters(
 fn render_pagination(
     page: i64,
     limit: i64,
-    limit_raw: &str,
     has_next: bool,
     state_filter: Option<&str>,
     workflow_name_filter: Option<&str>,
     search_attr_filter: Option<&(String, String)>,
-    started_after_raw: &str,
-    started_before_raw: &str,
+    started_after: Option<DateTime<Utc>>,
+    started_before: Option<DateTime<Utc>>,
     exec_id_search: Option<&str>,
-    page_error: Option<&str>,
 ) -> Markup {
     let base_query = build_query_string(
         limit,
-        limit_raw,
         state_filter,
         workflow_name_filter,
         search_attr_filter,
-        started_after_raw,
-        started_before_raw,
+        started_after,
+        started_before,
         exec_id_search,
     );
 
     html! {
-        @if let Some(error) = page_error {
-            span.field-error role="alert" { (error) }
-        }
         div.pagination {
             @if page > 0 {
                 a href={ "workflows?page=" (page - 1) (PreEscaped(&base_query)) } {
@@ -5612,23 +4334,15 @@ fn render_pagination(
 #[allow(clippy::too_many_arguments)]
 fn build_query_string(
     limit: i64,
-    limit_raw: &str,
     state_filter: Option<&str>,
     workflow_name_filter: Option<&str>,
     search_attr_filter: Option<&(String, String)>,
-    started_after_raw: &str,
-    started_before_raw: &str,
+    started_after: Option<DateTime<Utc>>,
+    started_before: Option<DateTime<Utc>>,
     exec_id_search: Option<&str>,
 ) -> String {
     let mut out = String::new();
-    // `limit_raw` is non-empty only on a genuine parse failure (see
-    // `parse_limit_query_field`), never for a valid-but-clamped value. An
-    // invalid limit the operator has not yet corrected must not silently
-    // vanish from a Next/Previous link, the same carry-through as
-    // `started_after`/`started_before` below.
-    if !limit_raw.is_empty() {
-        let _ = write!(out, "&limit={}", url_encode(limit_raw));
-    } else if limit != DEFAULT_PAGE_SIZE {
+    if limit != DEFAULT_PAGE_SIZE {
         let _ = write!(out, "&limit={limit}");
     }
     if let Some(state) = state_filter {
@@ -5641,15 +4355,11 @@ fn build_query_string(
         let _ = write!(out, "&search_attr_key={}", url_encode(key));
         let _ = write!(out, "&search_attr_value={}", url_encode(value));
     }
-    // Carries the raw text through, valid or not — a bound the operator is
-    // still correcting (an invalid value with its inline error, see
-    // `parse_started_bound`) must not silently vanish from a Next/Previous
-    // link before they've resolved it.
-    if !started_after_raw.is_empty() {
-        let _ = write!(out, "&started_after={}", url_encode(started_after_raw));
+    if let Some(after) = started_after {
+        let _ = write!(out, "&started_after={}", url_encode(&after.to_rfc3339()));
     }
-    if !started_before_raw.is_empty() {
-        let _ = write!(out, "&started_before={}", url_encode(started_before_raw));
+    if let Some(before) = started_before {
+        let _ = write!(out, "&started_before={}", url_encode(&before.to_rfc3339()));
     }
     if let Some(search) = exec_id_search {
         let _ = write!(out, "&exec_id_search={}", url_encode(search));
@@ -5743,13 +4453,6 @@ fn event_human_label(event_type: &str, event_data: &Value, execution_state: &str
         "ActivityCompletedExternally" => "Activity completed externally".to_string(),
         "ActivityFailedExternally" => "Activity failed externally".to_string(),
         "ActivityExternalDeadlineExtended" => "External activity deadline extended".to_string(),
-        "DecisionCommitted" => {
-            let build = event_data_field(event_data, "build_id")
-                .filter(|build| !build.is_empty())
-                .unwrap_or("<none>");
-            let worker = event_data_field(event_data, "worker_id").unwrap_or("?");
-            format!("Decision committed: build {build}, worker {worker}")
-        }
         "TimerStarted" => "Timer started".to_string(),
         "TimerFired" => "Timer fired".to_string(),
         "TimerCancelled" => "Timer cancelled".to_string(),
@@ -5872,12 +4575,8 @@ fn render_workflow_detail(
     event_page: i64,
     blocked_on: &BlockedOnData,
     flash: Option<&str>,
-    event_page_error: Option<&str>,
-    jump_event_error: Option<&str>,
     continue_as_new_threshold: Option<u64>,
     logs: &WorkflowLogsPanelData<'_>,
-    action_echo: &WorkflowActionEcho,
-    rendered_at_action_url: bool,
 ) -> Markup {
     let exec_id_str = execution.id.to_string();
     let title = format!("{} · Vantage", execution.workflow_name);
@@ -5938,14 +4637,7 @@ fn render_workflow_detail(
         }
 
         @if let Some(message) = flash {
-            div.flash role="status" tabindex="-1" autofocus { (message) }
-        }
-
-        @if let Some(error) = event_page_error {
-            span.field-error role="alert" { (error) }
-        }
-        @if let Some(error) = jump_event_error {
-            span.field-error role="alert" { (error) }
+            div.flash { (message) }
         }
 
         @if let Some(error) = execution.error.as_deref() {
@@ -5982,78 +4674,44 @@ fn render_workflow_detail(
                 button.danger type="submit" disabled[terminal]
                     title=[terminal.then_some("Workflow is terminal")] { "Terminate" }
             }
-            details style="display:inline-block" open[action_echo.signal_error.is_some()] {
+            details style="display:inline-block" {
                 summary style="cursor:pointer;color:#93c5fd;font-size:12px;display:inline-block;padding:6px 12px;border:1px solid #2563eb;border-radius:6px" { "Send signal" }
                 form method="post" action={ (exec_id_str) "/signal" } style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
                     label style="font-size:12px;color:#94a3b8" {
                         "Signal name"
-                        input type="text" name="signal_name" required placeholder="e.g. approve"
-                            value=(action_echo.signal_name.as_deref().unwrap_or(""))
-                            style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
+                        input type="text" name="signal_name" required placeholder="e.g. approve" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
                     }
                     label style="font-size:12px;color:#94a3b8" {
                         "Payload (JSON)"
-                        textarea name="payload" placeholder="{}" rows="3" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-family:ui-monospace,monospace;font-size:12px" {
-                            (action_echo.signal_payload.as_deref().unwrap_or(""))
-                        }
-                    }
-                    @if let Some(error) = action_echo.signal_error.as_deref() {
-                        span.field-error role="alert" { (error) }
+                        textarea name="payload" placeholder="{}" rows="3" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-family:ui-monospace,monospace;font-size:12px" {}
                     }
                     button type="submit" style="background:#2563eb;color:#fff;border:0;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;align-self:flex-start" { "Send" }
                 }
             }
-            details style="display:inline-block" open[action_echo.reset_error.is_some()] {
+            details style="display:inline-block" {
                 summary style="cursor:pointer;color:#93c5fd;font-size:12px;display:inline-block;padding:6px 12px;border:1px solid #2563eb;border-radius:6px" { "Reset to event N" }
                 form method="post" action={ (exec_id_str) "/reset" } style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
                     label style="font-size:12px;color:#94a3b8" {
                         "Event # (1-based, as shown in timeline)"
-                        // `type="text"` with `inputmode`/`pattern`, not
-                        // `type="number"` (Codex review, issue #1687). A
-                        // browser's number-input value-sanitization
-                        // algorithm blanks a non-numeric value from the
-                        // visible control. This happens even though the raw
-                        // HTML attribute still carries it. On the exact
-                        // rejected-input case this field exists to
-                        // redisplay, `type="number"` would show an empty
-                        // box. The DOM attribute, and this file's own
-                        // tests, would say otherwise. `inputmode="numeric"`
-                        // still gives mobile browsers a numeric keypad.
-                        // `pattern` is a hint; the server-side parser
-                        // remains the authority, not a replacement for it.
-                        input type="text" inputmode="numeric" pattern="[0-9]*" name="reset_to_event_id" required placeholder="1"
-                            value=(action_echo.reset_event.as_deref().unwrap_or(""))
-                            style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
+                        input type="number" name="reset_to_event_id" min="1" required placeholder="1" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
                     }
                     label style="font-size:12px;color:#94a3b8" {
                         "Reason"
-                        input type="text" name="reason" placeholder="rollback"
-                            value=(action_echo.reset_reason.as_deref().unwrap_or(""))
-                            style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
-                    }
-                    @if let Some(error) = action_echo.reset_error.as_deref() {
-                        span.field-error role="alert" { (error) }
+                        input type="text" name="reason" placeholder="rollback" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
                     }
                     button type="submit" style="background:#92400e;color:#fff;border:0;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;align-self:flex-start" onclick="return confirm('Reset this workflow execution? This is destructive.')" { "Reset" }
                 }
             }
-            details style="display:inline-block" open[action_echo.update_error.is_some()] {
+            details style="display:inline-block" {
                 summary style="cursor:pointer;color:#93c5fd;font-size:12px;display:inline-block;padding:6px 12px;border:1px solid #2563eb;border-radius:6px" { "Trigger update" }
                 form method="post" action={ (exec_id_str) "/trigger-update" } style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
                     label style="font-size:12px;color:#94a3b8" {
                         "Update name"
-                        input type="text" name="update_name" required placeholder="e.g. set_priority"
-                            value=(action_echo.update_name.as_deref().unwrap_or(""))
-                            style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
+                        input type="text" name="update_name" required placeholder="e.g. set_priority" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
                     }
                     label style="font-size:12px;color:#94a3b8" {
                         "Payload (JSON)"
-                        textarea name="payload" placeholder="{}" rows="3" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-family:ui-monospace,monospace;font-size:12px" {
-                            (action_echo.update_payload.as_deref().unwrap_or(""))
-                        }
-                    }
-                    @if let Some(error) = action_echo.update_error.as_deref() {
-                        span.field-error role="alert" { (error) }
+                        textarea name="payload" placeholder="{}" rows="3" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-family:ui-monospace,monospace;font-size:12px" {}
                     }
                     button type="submit" style="background:#2563eb;color:#fff;border:0;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;align-self:flex-start" { "Submit" }
                 }
@@ -6266,7 +4924,7 @@ fn render_workflow_detail(
                 @if total_events > DETAIL_EVENT_PAGE_SIZE {
                     div.pagination style="margin-bottom:12px" {
                         @if has_prev_page {
-                            a href=(workflow_detail_href(&exec_id_str, event_page - 1, selected_log_level)) {
+                            a href=(workflow_detail_href(event_page - 1, selected_log_level)) {
                                 (PreEscaped("&larr;")) " Previous"
                             }
                         } @else {
@@ -6274,13 +4932,13 @@ fn render_workflow_detail(
                         }
                         span { " Events " (page_start + 1) "–" (page_end) " of " (total_events) " " }
                         @if has_next_page {
-                            a href=(workflow_detail_href(&exec_id_str, event_page + 1, selected_log_level)) {
+                            a href=(workflow_detail_href(event_page + 1, selected_log_level)) {
                                 "Next " (PreEscaped("&rarr;"))
                             }
                         } @else {
                             span.disabled { "Next " (PreEscaped("&rarr;")) }
                         }
-                        a href=(workflow_detail_href(&exec_id_str, last_page, selected_log_level)) { "Jump to latest" }
+                        a href=(workflow_detail_href(last_page, selected_log_level)) { "Jump to latest" }
                     }
                 }
                 table {
@@ -6320,7 +4978,7 @@ fn render_workflow_detail(
                 @if total_events > DETAIL_EVENT_PAGE_SIZE {
                     div.pagination style="margin-top:12px" {
                         @if has_prev_page {
-                            a href=(workflow_detail_href(&exec_id_str, event_page - 1, selected_log_level)) {
+                            a href=(workflow_detail_href(event_page - 1, selected_log_level)) {
                                 (PreEscaped("&larr;")) " Previous"
                             }
                         } @else {
@@ -6328,27 +4986,17 @@ fn render_workflow_detail(
                         }
                         span { "Page " (event_page + 1) }
                         @if has_next_page {
-                            a href=(workflow_detail_href(&exec_id_str, event_page + 1, selected_log_level)) {
+                            a href=(workflow_detail_href(event_page + 1, selected_log_level)) {
                                 "Next " (PreEscaped("&rarr;"))
                             }
                         } @else {
                             span.disabled { "Next " (PreEscaped("&rarr;")) }
                         }
-                        a href=(workflow_detail_href(&exec_id_str, last_page, selected_log_level)) { "Jump to latest" }
-                        // `action=(exec_id_str)`, not the default omitted
-                        // action (issue #1687 review, Codex finding). A GET
-                        // form with no `action` submits to the document's
-                        // base url with its query replaced. On this page's
-                        // `<base href="..">` fallback (see `layout`'s doc
-                        // comment) that base url is `/workflows/`, not
-                        // `/workflows/{id}`. It drops the execution id the
-                        // same way a bare `workflow_detail_href` link would.
-                        form method="get" action=(exec_id_str) style="display:inline-flex;gap:6px;align-items:center;margin-left:8px" {
-                            label style="font-size:12px;color:#94a3b8;display:inline-flex;align-items:center;gap:6px" {
-                                "Jump to event:"
-                                input type="number" name="jump_event" min="1" max=(total_events) placeholder="N"
-                                    style="width:70px;background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:4px 6px;font-size:12px";
-                            }
+                        a href=(workflow_detail_href(last_page, selected_log_level)) { "Jump to latest" }
+                        form method="get" style="display:inline-flex;gap:6px;align-items:center;margin-left:8px" {
+                            label style="font-size:12px;color:#94a3b8" { "Jump to event:" }
+                            input type="number" name="jump_event" min="1" max=(total_events) placeholder="N"
+                                style="width:70px;background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:4px 6px;font-size:12px";
                             button type="submit" style="background:#2563eb;color:#fff;border:0;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer" { "Go" }
                         }
                     }
@@ -6357,10 +5005,7 @@ fn render_workflow_detail(
         }
     };
 
-    // See `layout`'s own doc comment for why this is a real `<base>`
-    // element and not just a string prefix (issue #1687 review).
-    let html_base = rendered_at_action_url.then_some("..");
-    layout(&title, &body, "../", html_base)
+    layout(&title, &body, "../")
 }
 
 /// Per-row checkpoint rendering decision for the pending-activities table, after
@@ -6468,19 +5113,8 @@ fn render_heartbeat_checkpoint_cell(item: &TaskQueueItem, state: CheckpointCellS
 /// `jump_event` is deliberately NOT preserved: it is a one-shot "take me to
 /// event N" action that `event_page` already resolves to a concrete page, so
 /// carrying it would re-trigger the jump on every subsequent click.
-///
-/// Prefixed with `exec_id_str`, not a bare `?query` (issue #1687 review,
-/// Codex finding). A relative reference with an empty path inherits the
-/// browser's *entire* current base path, not just its directory. See
-/// `layout`'s doc comment for this page's `<base href="..">` fallback, on
-/// a direct-rendered rejected action. A bare `?event_page=1` there would
-/// resolve to `/workflows/?event_page=1`, dropping the execution id
-/// entirely. A path-relative reference merges against only the base's
-/// directory component instead, which `<base href="..">` already
-/// restores to the correct one. Prefixing here fixes it under both the
-/// base-tag case and the ordinary `GET` page load.
-fn workflow_detail_href(exec_id_str: &str, event_page: i64, log_level: Option<&str>) -> String {
-    let mut url = format!("{exec_id_str}?event_page={event_page}");
+fn workflow_detail_href(event_page: i64, log_level: Option<&str>) -> String {
+    let mut url = format!("?event_page={event_page}");
     if let Some(level) = log_level {
         url.push_str("&log_level=");
         url.push_str(level);
@@ -6556,12 +5190,12 @@ fn render_workflow_logs_panel(
             h3 { "Logs" }
             div.log-filters style="margin-bottom:12px" {
                 @let all_class = if selected.is_none() { "active" } else { "" };
-                a class=(all_class) href=(workflow_detail_href(exec_id_str, event_page, None)) { "All" }
+                a class=(all_class) href=(workflow_detail_href(event_page, None)) { "All" }
                 @for level in [WorkflowLogLevel::Info, WorkflowLogLevel::Warn, WorkflowLogLevel::Error] {
                     @let wire = level.as_str();
                     @let class = if selected == Some(wire) { "active" } else { "" };
                     " "
-                    a class=(class) href=(workflow_detail_href(exec_id_str, event_page, Some(wire))) { (wire) }
+                    a class=(class) href=(workflow_detail_href(event_page, Some(wire))) { (wire) }
                 }
             }
             @if truncated {
@@ -6885,36 +5519,13 @@ fn js_escape(s: &str) -> String {
         .replace('\u{2029}', "\\u2029")
 }
 
-/// `base_href` is a plain string prepended to the header nav's own links
-/// (`"../"`, `"../../"`, or `""` -- how many directories up the canonical
-/// page sits). `html_base` is a real `<base href>` element. It is `None`
-/// on every ordinary `GET` page load.
-///
-/// The two are unrelated. `base_href` never resolves in the browser on its
-/// own. Every nav link that uses it is itself parsed relative to the
-/// document's OWN url. `html_base` exists for exactly one caller (issue
-/// #1687 review). `render_workflow_detail_page` renders the workflow
-/// detail page directly, as a rejected POST's response body. That happens
-/// from a URL one path segment below the canonical detail page, such as
-/// `/workflows/{id}/signal`. The page's body has many relative links and
-/// form actions -- `{id}/signal`, `../workflows`,
-/// `../../workflows/{id}/history/export`, pagination hrefs, all of it.
-/// Each one is written assuming the document's own url IS the canonical
-/// detail page. Serving that body unchanged from one level deeper
-/// resolves every one of those wrong (issue #1687 review, Codex finding).
-/// `<base href="..">` there re-establishes the same directory context the
-/// canonical url would give. It fixes all of them at once, rather than
-/// rewriting each link to be mount-depth-aware.
-fn layout(title: &str, body: &Markup, base_href: &str, html_base: Option<&str>) -> Markup {
+fn layout(title: &str, body: &Markup, base_href: &str) -> Markup {
     html! {
         (PreEscaped("<!DOCTYPE html>"))
         html lang="en" {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width,initial-scale=1";
-                @if let Some(base) = html_base {
-                    base href=(base);
-                }
                 title { (title) }
                 style { (PreEscaped(STYLE)) }
             }
@@ -7903,7 +6514,7 @@ async fn workflow_timeline_ui(
     );
     let title = format!("Timeline · {} · Vantage", execution.workflow_name);
     let body = render_timeline_body(&timeline, &execution, now);
-    Ok(layout(&title, &body, "../../", None))
+    Ok(layout(&title, &body, "../../"))
 }
 
 /// Build the timeline page body (back link + heading + Gantt). Extracted from
@@ -7943,19 +6554,11 @@ fn render_dag_detail(
     selected_node: Option<usize>,
     refresh: Option<u64>,
     flash: Option<&str>,
-    node_error: Option<&str>,
-    refresh_error: Option<&str>,
     view: DagGraphView<'_>,
 ) -> Markup {
     let body = html! {
         @if let Some(message) = flash {
-            div class="flash" role="status" tabindex="-1" autofocus { (message) }
-        }
-        @if let Some(error) = node_error {
-            span.field-error role="alert" { (error) }
-        }
-        @if let Some(error) = refresh_error {
-            span.field-error role="alert" { (error) }
+            div class="flash" { (message) }
         }
         h2 { "DAG " code { (dag_name) } " runs" }
         @if let Some(run_id) = selected_run {
@@ -8258,7 +6861,6 @@ async fn list_build_routing_ui(
         reachability
     };
 
-    let action_echo = BuildRoutingActionEcho::from(&params);
     Ok(render_build_routing_page(
         &filtered_policies,
         &filtered_compat,
@@ -8269,7 +6871,6 @@ async fn list_build_routing_ui(
         is_multi_shard,
         params.flash.as_deref(),
         build_id_filter,
-        &action_echo,
     ))
 }
 
@@ -8279,23 +6880,15 @@ async fn build_routing_set_policy_ui(
 ) -> Result<axum::response::Response, AutumnError> {
     let queue_name = form.queue_name.trim().to_string();
     let build_id = form.build_id.trim().to_string();
-    let deployment_name_raw = form.deployment_name.clone().unwrap_or_default();
-    // A retry of the same form reuses the operation id (issue #1814).
-    let operation_id = set_policy_operation_id(form.operation_id.as_deref());
     if queue_name.is_empty() || build_id.is_empty() {
-        let redirect_url = set_policy_failure_redirect(
-            "queue_name and build_id must not be empty",
-            &queue_name,
-            &build_id,
-            &deployment_name_raw,
-            operation_id,
+        let flash = url_encode("queue_name and build_id must not be empty");
+        return Ok(
+            axum::response::Redirect::to(&format!("../build-routing?flash={flash}"))
+                .into_response(),
         );
-        return Ok(axum::response::Redirect::to(&redirect_url).into_response());
     }
     let pool = api_state.storage_pool().map_err(map_error)?;
     let deployment_name = form.deployment_name.as_deref().filter(|s| !s.is_empty());
-    // One ramp id for every shard, so a retained ramp keeps one identity.
-    let ramp_id = set_policy_ramp_id(operation_id, &queue_name, &build_id, deployment_name);
     // Fan out to all shards so every shard's get_build_policy() sees the new policy
     // when evaluating assigned_build_id at workflow start time.
     let mut last_policy = None;
@@ -8303,15 +6896,9 @@ async fn build_routing_set_policy_ui(
     for (shard_id, shard_pool) in pool.iter_shards() {
         match acquire_conn(shard_pool).await {
             Ok(mut conn) => {
-                match set_build_policy_with_ramp_id(
-                    &mut conn,
-                    &queue_name,
-                    &build_id,
-                    deployment_name,
-                    ramp_id,
-                )
-                .await
-                .map_err(map_error)
+                match set_build_policy(&mut conn, &queue_name, &build_id, deployment_name)
+                    .await
+                    .map_err(map_error)
                 {
                     Ok(p) => last_policy = Some(p),
                     Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
@@ -8349,30 +6936,21 @@ async fn build_routing_set_policy_ui(
         )
         .await;
     }
-    if shard_errors.is_empty() {
-        let flash = match last_policy {
+    let flash = if shard_errors.is_empty() {
+        match last_policy {
             Some(p) => url_encode(&format!(
                 "Build policy for queue '{}' set to '{}'",
                 p.queue_name, p.build_id
             )),
             None => url_encode("No shards configured"),
-        };
-        return Ok(
-            axum::response::Redirect::to(&format!("../build-routing?flash={flash}"))
-                .into_response(),
-        );
-    }
-    let redirect_url = set_policy_failure_redirect(
-        &format!(
+        }
+    } else {
+        url_encode(&format!(
             "Partial failure setting build policy: {}",
             shard_errors.join("; ")
-        ),
-        &queue_name,
-        &build_id,
-        &deployment_name_raw,
-        operation_id,
-    );
-    Ok(axum::response::Redirect::to(&redirect_url).into_response())
+        ))
+    };
+    Ok(axum::response::Redirect::to(&format!("../build-routing?flash={flash}")).into_response())
 }
 
 async fn build_routing_declare_compat_ui(
@@ -8382,13 +6960,11 @@ async fn build_routing_declare_compat_ui(
     let build_id = form.build_id.trim().to_string();
     let compatible_with = form.compatible_with.trim().to_string();
     if build_id.is_empty() || compatible_with.is_empty() {
-        let error = url_encode("build_id and compatible_with must not be empty");
-        let redirect_url = format!(
-            "../build-routing?compat_error={error}&compat_build_id={}&compat_compatible_with={}",
-            url_encode(&build_id),
-            url_encode(&compatible_with),
+        let flash = url_encode("build_id and compatible_with must not be empty");
+        return Ok(
+            axum::response::Redirect::to(&format!("../build-routing?flash={flash}"))
+                .into_response(),
         );
-        return Ok(axum::response::Redirect::to(&redirect_url).into_response());
     }
     let pool = api_state.storage_pool().map_err(map_error)?;
     // Fan out to all shards so load_compat_set() on each shard picks up the declaration.
@@ -8438,29 +7014,21 @@ async fn build_routing_declare_compat_ui(
         )
         .await;
     }
-    if shard_errors.is_empty() {
-        let flash = match last_entry {
+    let flash = if shard_errors.is_empty() {
+        match last_entry {
             Some(e) => url_encode(&format!(
                 "Declared: '{}' compatible with '{}'",
                 e.build_id, e.compatible_with
             )),
             None => url_encode("No shards configured"),
-        };
-        return Ok(
-            axum::response::Redirect::to(&format!("../build-routing?flash={flash}"))
-                .into_response(),
-        );
-    }
-    let error = url_encode(&format!(
-        "Partial failure declaring compat: {}",
-        shard_errors.join("; ")
-    ));
-    let redirect_url = format!(
-        "../build-routing?compat_error={error}&compat_build_id={}&compat_compatible_with={}",
-        url_encode(&build_id),
-        url_encode(&compatible_with),
-    );
-    Ok(axum::response::Redirect::to(&redirect_url).into_response())
+        }
+    } else {
+        url_encode(&format!(
+            "Partial failure declaring compat: {}",
+            shard_errors.join("; ")
+        ))
+    };
+    Ok(axum::response::Redirect::to(&format!("../build-routing?flash={flash}")).into_response())
 }
 
 async fn build_routing_revoke_compat_ui(
@@ -8600,7 +7168,7 @@ fn render_build_policies_card(policies: &[BuildPolicy]) -> Markup {
                                     @if let Some(ref dep) = policy.deployment_name {
                                         code { (dep) }
                                     } @else {
-                                        span style="color:#94a3b8" { "—" }
+                                        span style="color:#475569" { "—" }
                                     }
                                 }
                                 td { (format_timestamp(Some(policy.updated_at))) }
@@ -8650,7 +7218,7 @@ fn render_build_reachability_card(reachability: &[BuildReachability]) -> Markup 
                                             }
                                         }
                                     } @else {
-                                        span style="color:#94a3b8;font-size:12px" { "Not yet safe" }
+                                        span style="color:#475569;font-size:12px" { "Not yet safe" }
                                     }
                                 }
                             }
@@ -8702,19 +7270,10 @@ fn render_compat_card(all_compat: &[BuildCompatEntry]) -> Markup {
     }
 }
 
-fn render_build_routing_action_forms(echo: &BuildRoutingActionEcho) -> Markup {
+fn render_build_routing_action_forms() -> Markup {
     let input_style = "display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
     let btn_style = "background:#2563eb;color:#fff;border:0;border-radius:6px;padding:8px 14px;font-size:13px;cursor:pointer;align-self:flex-start";
     let label_style = "font-size:12px;color:#94a3b8";
-    let set_policy_queue_name = echo.set_policy_queue_name.as_deref().unwrap_or_default();
-    let set_policy_build_id = echo.set_policy_build_id.as_deref().unwrap_or_default();
-    let set_policy_deployment_name = echo
-        .set_policy_deployment_name
-        .as_deref()
-        .unwrap_or_default();
-    let operation_id = set_policy_operation_id(echo.set_policy_operation_id.as_deref());
-    let compat_build_id = echo.compat_build_id.as_deref().unwrap_or_default();
-    let compat_compatible_with = echo.compat_compatible_with.as_deref().unwrap_or_default();
     html! {
         div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px" {
             div.card {
@@ -8723,20 +7282,16 @@ fn render_build_routing_action_forms(echo: &BuildRoutingActionEcho) -> Markup {
                     "Sets which build ID is assigned to new workflow starts on a queue. "
                     "Does not affect in-flight executions."
                 }
-                @if let Some(error) = &echo.set_policy_error {
-                    p.field-error role="alert" tabindex="-1" autofocus style="margin:0 0 10px" { (error) }
-                }
                 form method="post" action="build-routing/set-policy"
                       style="display:flex;flex-direction:column;gap:10px" {
-                    input type="hidden" name="operation_id" value=(operation_id);
                     label style=(label_style) { "Queue name"
-                        input type="text" name="queue_name" required placeholder="e.g. default" style=(input_style) value=(set_policy_queue_name);
+                        input type="text" name="queue_name" required placeholder="e.g. default" style=(input_style);
                     }
                     label style=(label_style) { "Build ID"
-                        input type="text" name="build_id" required placeholder="e.g. sha-abc123" style=(input_style) value=(set_policy_build_id);
+                        input type="text" name="build_id" required placeholder="e.g. sha-abc123" style=(input_style);
                     }
                     label style=(label_style) { "Deployment name (optional)"
-                        input type="text" name="deployment_name" placeholder="e.g. prod-v2" style=(input_style) value=(set_policy_deployment_name);
+                        input type="text" name="deployment_name" placeholder="e.g. prod-v2" style=(input_style);
                     }
                     button type="submit" style=(btn_style)
                         onclick="return confirm('Set build policy? New executions on this queue will use the specified build ID.')" {
@@ -8751,16 +7306,13 @@ fn render_build_routing_action_forms(echo: &BuildRoutingActionEcho) -> Markup {
                     " can safely replay histories assigned to build " strong { "B" }
                     ". Only declare after replay tests confirm safety."
                 }
-                @if let Some(error) = &echo.compat_error {
-                    p.field-error role="alert" tabindex="-1" autofocus style="margin:0 0 10px" { (error) }
-                }
                 form method="post" action="build-routing/declare-compat"
                       style="display:flex;flex-direction:column;gap:10px" {
                     label style=(label_style) { "Worker build (A)"
-                        input type="text" name="build_id" required placeholder="e.g. sha-new" style=(input_style) value=(compat_build_id);
+                        input type="text" name="build_id" required placeholder="e.g. sha-new" style=(input_style);
                     }
                     label style=(label_style) { "Compatible with (B)"
-                        input type="text" name="compatible_with" required placeholder="e.g. sha-old" style=(input_style) value=(compat_compatible_with);
+                        input type="text" name="compatible_with" required placeholder="e.g. sha-old" style=(input_style);
                     }
                     button type="submit" style=(btn_style)
                         onclick="return confirm('Declare compatibility? Ensure replay tests have confirmed the new build can handle histories from the old build.')" {
@@ -8783,7 +7335,6 @@ fn render_build_routing_page(
     is_multi_shard: bool,
     flash: Option<&str>,
     build_id_filter: Option<&str>,
-    action_echo: &BuildRoutingActionEcho,
 ) -> Markup {
     let is_empty = policies.is_empty() && reachability.is_empty() && all_compat.is_empty();
 
@@ -8799,7 +7350,7 @@ fn render_build_routing_page(
         }
 
         @if let Some(msg) = flash {
-            div.flash role="status" tabindex="-1" autofocus { (msg) }
+            div.flash { (msg) }
         }
 
         @if !diverged_queues.is_empty() {
@@ -8864,7 +7415,7 @@ fn render_build_routing_page(
             (render_compat_card(all_compat))
         }
 
-        (render_build_routing_action_forms(action_echo))
+        (render_build_routing_action_forms())
     };
 
     layout_build_routing("Build Routing · Vantage", &body, None)
@@ -8914,16 +7465,10 @@ type ShardScheduleResult = (ShardId, Result<Vec<HarvestSchedule>, String>);
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ScheduleListParams {
-    // `page`/`limit` are `String`, not `i64` — same fix as
-    // `WorkerListParams`, `WorkflowListParams` and `DeadLetterListParams`
-    // (#1540/#1560/#1588). An `i64`-typed field fails axum's query
-    // deserialization on non-numeric text with a bare 400 before this
-    // handler ever runs. That discards every other filter already on the
-    // URL.
     #[serde(default)]
-    page: Option<String>,
+    page: Option<i64>,
     #[serde(default)]
-    limit: Option<String>,
+    limit: Option<i64>,
     #[serde(default)]
     target: Option<String>,
     /// "Workflow", "Dag", or empty/absent for All.
@@ -8932,15 +7477,10 @@ pub(crate) struct ScheduleListParams {
     /// "Paused", "Active", or empty/absent for All.
     #[serde(default)]
     paused: Option<String>,
-    /// "Unhealthy", "Healthy", or empty/absent for All (issue #951).
     #[serde(default)]
-    health: Option<String>,
+    shard_id: Option<i32>,
     #[serde(default)]
-    shard_id: Option<String>,
-    // `refresh` is `String`, not `u64` — same fix as `page`/`limit` above
-    // (issue #1604), reusing `parse_refresh_query_field` (issue #1630).
-    #[serde(default)]
-    refresh: Option<String>,
+    refresh: Option<u64>,
     #[serde(default)]
     flash: Option<String>,
 }
@@ -8953,18 +7493,8 @@ struct ScheduleBulkParams {
     kind: Option<String>,
     #[serde(default)]
     paused: Option<String>,
-    /// Health filter carried through a bulk action so "pause all matching"
-    /// means the same set the operator is looking at (issue #951).
     #[serde(default)]
-    health: Option<String>,
-    #[serde(default)]
-    shard_id: Option<String>,
-    /// The filtered list-page path to redirect back to after the action,
-    /// including an unresolved invalid value's raw text. Without it, the
-    /// redirect always lands on a bare, unfiltered `schedules?flash=…`
-    /// (Codex review, #1437 P2). See `schedule_bulk_redirect_to`.
-    #[serde(default)]
-    return_to: Option<String>,
+    shard_id: Option<i32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -8992,200 +7522,6 @@ impl ScheduleKindFilter {
             Self::All => "",
             Self::Workflow => "Workflow",
             Self::Dag => "Dag",
-        }
-    }
-}
-
-/// Which of the self-inflicted unhealthy states a schedule is currently in
-/// (issue #951 AC3).
-///
-/// These are the states that make an operator's 3 a.m. question — "did the
-/// nightly billing schedule fire, and if not, why not?" — answerable at a
-/// glance: a schedule that is *not* firing is almost always paused,
-/// auto-paused after repeated failures (#360), exhausted against its `end_at`
-/// or run budget (#478), or silently dropping missed slots under its catchup
-/// policy (#484). Anything else reads as one calm row.
-// The four flags are deliberately independent booleans rather than a state
-// enum: a schedule can be paused *and* exhausted *and* dropping catchup slots
-// at once, and an operator needs to see all of them.
-#[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct ScheduleHealth {
-    /// The schedule is paused (operator pause, or the auto-pause below).
-    paused: bool,
-    /// The pause was applied automatically after `consecutive_failure_limit`
-    /// failures (#360) — a louder signal than a hand pause.
-    auto_paused: bool,
-    /// `end_at` or the `max_runs` budget has been reached (#478); the schedule
-    /// will never fire again.
-    exhausted: bool,
-    /// The most recent recovery tick dropped missed slots (#484) — runs the
-    /// operator expected that never happened.
-    catchup_dropped: bool,
-}
-
-impl ScheduleHealth {
-    const fn is_healthy(self) -> bool {
-        !(self.paused || self.auto_paused || self.exhausted || self.catchup_dropped)
-    }
-
-    /// Sort rank: `0` for unhealthy, `1` for healthy, so unhealthy schedules
-    /// float to the top of the list (AC3) while healthy rows keep their
-    /// existing `next_run_at`-ascending order among themselves.
-    const fn rank(self) -> u8 {
-        if self.is_healthy() { 1 } else { 0 }
-    }
-}
-
-/// Whether a schedule is currently held back from firing, and so is offered
-/// **Resume** rather than **Pause**.
-///
-/// The scheduler's auto-pause (#360) sets `auto_paused_at` and deliberately
-/// does **not** set `is_paused` — so a row can be non-firing with
-/// `is_paused = false`. Keying the row actions on `is_paused` alone would show
-/// an "Auto-paused" badge next to a Pause button and leave the operator with no
-/// way to restore firing from this page at all.
-/// `POST /admin/schedules/{id}/resume` treats
-/// `is_paused = true OR auto_paused_at IS NOT NULL` as resumable; this mirrors it.
-const fn schedule_is_resumable(row: &HarvestSchedule) -> bool {
-    row.is_paused || row.auto_paused_at.is_some()
-}
-
-/// Whether the scheduler hashes jitter against the row's own `next_run_at`.
-///
-/// Two cases break this (issue #1568). A calendar can rebase an excluded slot
-/// to a business day first. The `MostRecent` and `Window` catchup policies can
-/// pick a later slot first. The row holds neither the calendar exclusions nor
-/// the catchup slot selection, so it cannot show either result.
-/// `SkipAll` and `Unbounded` both fire `next_run_at` first. An unknown policy
-/// string uses the legacy `catchup` bool, so it is one of those two.
-fn scheduler_slot_is_raw(row: &HarvestSchedule) -> bool {
-    use autumn_harvest::policy::CatchupPolicy;
-
-    row.calendar_name.is_none()
-        && matches!(
-            CatchupPolicy::from_db(
-                row.catchup_policy.as_deref(),
-                row.catchup_window_secs,
-                row.catchup,
-            ),
-            CatchupPolicy::SkipAll | CatchupPolicy::Unbounded
-        )
-}
-
-/// Whether a schedule has run out of budget or passed its cutoff, whether or
-/// not a scheduler tick has got round to stamping `exhausted_at`.
-///
-/// `exhausted_at` is written *asynchronously* by the tick that observes the
-/// bound. A tick that dies first leaves a row that is already terminal —
-/// `runs_started >= max_runs`, or `now >= end_at` — with the column still NULL.
-/// The engine never trusts the column alone: `schedule_backfill_inner` and
-/// `trigger_schedule_now` both reject on `exhausted_at.is_some() ||
-/// live_end_at_exceeded || live_budget_exhausted`, and the scheduler's own
-/// `schedule_overdue` derives the same thing from the raw fields for exactly
-/// this reason. Reading the column alone here would render such a row as a calm
-/// `Active` schedule, exclude it from `health=Unhealthy`, and sort it *below*
-/// the unhealthy rows — while this page's own preview for it correctly reports
-/// no upcoming fire times.
-///
-/// `max_runs = 0` is **unlimited**, not "spent": the `max > 0` guard is the
-/// engine's convention at every bound check (and is pinned by
-/// `backfill_max_runs_zero_is_treated_as_unlimited`).
-///
-/// This check judges the `end_at` bound against the jitter-adjusted pending
-/// fire time, not the raw slot (issue #1293). The scheduler's own secondary
-/// `end_at` guard in `scheduler.rs` rejects a fire whose `effective_fire_time`
-/// is at or past `end_at`. It rejects the fire even when the raw slot is
-/// still before `end_at`. Reading the raw slot here would call such a row
-/// healthy until a tick happens to stamp `exhausted_at`.
-///
-/// When [`scheduler_slot_is_raw`] is false, this check judges the raw slot
-/// instead (issue #1568). A raw slot before `end_at` is then never reported
-/// as exhausted, even if the scheduler later stops it.
-fn schedule_is_bounded_out(row: &HarvestSchedule, now: DateTime<Utc>) -> bool {
-    if row.exhausted_at.is_some() {
-        return true;
-    }
-    if row
-        .max_runs
-        .is_some_and(|max| max > 0 && row.runs_started >= max)
-    {
-        return true;
-    }
-    // The `end_at` bound is about the **pending slot**, not the wall clock —
-    // `schedule_overdue` tests `next_run_at >= end_at`, and the tick refuses a
-    // fire whose `effective_fire_time >= end_at`. Comparing `now` instead is
-    // wrong in both directions: a schedule whose next slot is already past the
-    // cutoff will never fire again while the clock is still short of it (we
-    // would call it healthy), and after downtime an overdue slot from *before*
-    // the cutoff is still legal and will be processed once the clock has passed
-    // it (we would call it exhausted). Fall back to the wall clock only when
-    // there is no pending slot to judge.
-    //
-    // `effective_fire_time` returns `None` for `jitter_secs <= 0`, so an
-    // unjittered schedule falls back to the raw slot below. It also falls back
-    // to the raw slot when the scheduler may hash a different slot (#1568).
-    let pending = scheduler_slot_is_raw(row)
-        .then(|| crate::api::effective_fire_time(row.id, row.next_run_at, row.jitter_secs))
-        .flatten()
-        .or(row.next_run_at);
-    row.end_at
-        .is_some_and(|end_at| pending.map_or(now >= end_at, |t| t >= end_at))
-}
-
-/// Derive a row's health flags. Pure: every badge, sort and summary decision on
-/// the page goes through this one function, so they can never disagree.
-///
-/// `now` is a parameter rather than read inside so the bounded-out branch is
-/// testable without sleeping.
-fn schedule_health_at(row: &HarvestSchedule, now: DateTime<Utc>) -> ScheduleHealth {
-    ScheduleHealth {
-        paused: row.is_paused,
-        auto_paused: row.auto_paused_at.is_some(),
-        exhausted: schedule_is_bounded_out(row, now),
-        catchup_dropped: row.last_catchup_dropped > 0,
-    }
-}
-
-/// [`schedule_health_at`] anchored to the current instant.
-fn schedule_health(row: &HarvestSchedule) -> ScheduleHealth {
-    schedule_health_at(row, Utc::now())
-}
-
-/// Filter the list by health (issue #951 AC3): "show me only what is wrong".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum ScheduleHealthFilter {
-    #[default]
-    All,
-    Unhealthy,
-    Healthy,
-}
-
-impl ScheduleHealthFilter {
-    fn parse(raw: &str) -> Result<Self, AutumnError> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "" => Ok(Self::All),
-            "unhealthy" => Ok(Self::Unhealthy),
-            "healthy" => Ok(Self::Healthy),
-            other => Err(AutumnError::bad_request_msg(format!(
-                "unknown health '{other}'; expected Unhealthy, Healthy, or empty"
-            ))),
-        }
-    }
-
-    const fn as_label(self) -> &'static str {
-        match self {
-            Self::All => "",
-            Self::Unhealthy => "Unhealthy",
-            Self::Healthy => "Healthy",
-        }
-    }
-
-    fn matches(self, row: &HarvestSchedule) -> bool {
-        match self {
-            Self::All => true,
-            Self::Unhealthy => !schedule_health(row).is_healthy(),
-            Self::Healthy => schedule_health(row).is_healthy(),
         }
     }
 }
@@ -9224,7 +7560,6 @@ struct ScheduleUiFilters {
     target: Option<String>,
     kind: ScheduleKindFilter,
     paused: SchedulePausedFilter,
-    health: ScheduleHealthFilter,
     shard_id: Option<i32>,
 }
 
@@ -9256,9 +7591,6 @@ impl ScheduleUiFilters {
         if self.shard_id.is_some_and(|sid| shard_id.as_i32() != sid) {
             return false;
         }
-        if !self.health.matches(row) {
-            return false;
-        }
         true
     }
 
@@ -9266,97 +7598,7 @@ impl ScheduleUiFilters {
         self.target.is_none()
             && matches!(self.kind, ScheduleKindFilter::All)
             && matches!(self.paused, SchedulePausedFilter::All)
-            && matches!(self.health, ScheduleHealthFilter::All)
             && self.shard_id.is_none()
-    }
-}
-
-/// Raw text and validation errors for the Schedules page's `kind`, `paused`,
-/// `health`, and `shard_id` filters. Carried alongside `ScheduleUiFilters`,
-/// which holds only the successfully parsed values. Same `(parsed,
-/// raw_display, error)` contract, and the same reason for existing, as
-/// `DeadLetterUiFilterRaw` on the DLQ page.
-#[derive(Debug, Clone, Default)]
-struct ScheduleUiFilterRaw {
-    kind: String,
-    kind_error: Option<String>,
-    paused: String,
-    paused_error: Option<String>,
-    health: String,
-    health_error: Option<String>,
-    shard_id: String,
-    shard_id_error: Option<String>,
-}
-
-/// Parses the Schedules page's `kind` filter from a raw query-string value.
-/// Returns `(parsed, raw_display, error)`. On success `error` is `None`.
-/// On an unrecognized value `parsed` is `ScheduleKindFilter::All`, so the
-/// filter is not applied, and `error` carries a message to render next to
-/// the field.
-///
-/// Issue: `list_schedules_ui` used to `?`-propagate `ScheduleKindFilter::
-/// parse`'s `Result` directly. A bad value aborted the whole page with a
-/// bare 400. That happened before the filter form, the table, or the
-/// operator's other filters ever rendered. It is the exact page-abort
-/// defect already fixed on this page's three sibling list pages: Workflows
-/// #1333, Workers #1378, Dead-Letters #1420. It is the one page those PRs
-/// never reached.
-fn parse_schedule_kind_filter(raw: Option<&str>) -> (ScheduleKindFilter, String, Option<String>) {
-    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
-        return (ScheduleKindFilter::All, String::new(), None);
-    };
-    match trimmed.to_ascii_lowercase().as_str() {
-        "workflow" => (ScheduleKindFilter::Workflow, trimmed.to_string(), None),
-        "dag" => (ScheduleKindFilter::Dag, trimmed.to_string(), None),
-        other => (
-            ScheduleKindFilter::All,
-            trimmed.to_string(),
-            Some(format!(
-                "Unknown kind '{other}'; expected Workflow, Dag, or empty. Filter not applied."
-            )),
-        ),
-    }
-}
-
-/// Parses the Schedules page's `paused` filter. Same contract and same fix
-/// as [`parse_schedule_kind_filter`].
-fn parse_schedule_paused_filter(
-    raw: Option<&str>,
-) -> (SchedulePausedFilter, String, Option<String>) {
-    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
-        return (SchedulePausedFilter::All, String::new(), None);
-    };
-    match trimmed.to_ascii_lowercase().as_str() {
-        "paused" => (SchedulePausedFilter::Paused, trimmed.to_string(), None),
-        "active" => (SchedulePausedFilter::Active, trimmed.to_string(), None),
-        other => (
-            SchedulePausedFilter::All,
-            trimmed.to_string(),
-            Some(format!(
-                "Unknown paused value '{other}'; expected Paused, Active, or empty. Filter not applied."
-            )),
-        ),
-    }
-}
-
-/// Parses the Schedules page's `health` filter. Same contract and same fix
-/// as [`parse_schedule_kind_filter`].
-fn parse_schedule_health_filter(
-    raw: Option<&str>,
-) -> (ScheduleHealthFilter, String, Option<String>) {
-    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
-        return (ScheduleHealthFilter::All, String::new(), None);
-    };
-    match trimmed.to_ascii_lowercase().as_str() {
-        "unhealthy" => (ScheduleHealthFilter::Unhealthy, trimmed.to_string(), None),
-        "healthy" => (ScheduleHealthFilter::Healthy, trimmed.to_string(), None),
-        other => (
-            ScheduleHealthFilter::All,
-            trimmed.to_string(),
-            Some(format!(
-                "Unknown health '{other}'; expected Unhealthy, Healthy, or empty. Filter not applied."
-            )),
-        ),
     }
 }
 
@@ -9438,73 +7680,29 @@ async fn load_recent_decisions(
     map
 }
 
-/// Order the schedules list: unhealthy first (issue #951 AC3), then the
-/// pre-existing `next_run_at`-ascending / name / id order.
-///
-/// The health rank is a *prefix* on the existing comparator rather than a
-/// replacement for it, so healthy rows keep exactly the relative order they had
-/// before this page grew a health column.
-fn sort_schedule_rows(rows: &mut [(ShardId, HarvestSchedule)]) {
-    rows.sort_by(|(_, a), (_, b)| {
-        schedule_health(a)
-            .rank()
-            .cmp(&schedule_health(b).rank())
-            .then_with(|| match (a.next_run_at, b.next_run_at) {
-                (Some(a_ts), Some(b_ts)) => a_ts.cmp(&b_ts),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => {
-                    let a_name = a
-                        .workflow_name
-                        .as_deref()
-                        .or(a.dag_name.as_deref())
-                        .unwrap_or("");
-                    let b_name = b
-                        .workflow_name
-                        .as_deref()
-                        .or(b.dag_name.as_deref())
-                        .unwrap_or("");
-                    a_name.cmp(b_name)
-                }
-            })
-            .then_with(|| a.id.cmp(&b.id))
-    });
-}
-
 async fn list_schedules_ui(
     Extension(api_state): Extension<HarvestApiState>,
     Query(params): Query<ScheduleListParams>,
 ) -> Result<Markup, AutumnError> {
-    // `page`/`limit` used to `?`-propagate a bare 400 on a non-numeric
-    // value. That aborted the whole request before the filter form ever
-    // rendered. It is the same mechanism #1540/#1560/#1588 already fixed
-    // on the Workflows, Workers and DLQ pages. Degrade to a default and
-    // report the bad value inline instead, matching those pages' own
-    // `parse_page_query_field`/`parse_limit_query_field` use.
-    let (limit, limit_raw, limit_error) =
-        parse_limit_query_field(params.limit.as_deref(), DEFAULT_SCHEDULE_PAGE_SIZE);
-    let (page, _page_raw, page_error) = parse_page_query_field(params.page.as_deref());
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_SCHEDULE_PAGE_SIZE)
+        .clamp(1, MAX_PAGE_SIZE);
+    let page = params.page.unwrap_or(0).max(0);
     let offset = page.saturating_mul(limit);
 
-    // Same fix, `refresh` (issue #1604): reuses the DAG-detail page's own
-    // `parse_refresh_query_field` (issue #1630).
-    let (refresh, refresh_error) = parse_refresh_query_field(params.refresh.as_deref());
-
-    // The page used to `?`-propagate each of these on a bad value. That
-    // aborted the whole request with a bare 400 before the filter form
-    // ever rendered. It discarded whichever of the five filters the
-    // operator had already typed. Each bad field now degrades to "not
-    // applied" instead, handing back the raw text plus an error to
-    // redisplay inline. Same fix as `parse_worker_status_filter` (#1378)
-    // and `parse_dead_letter_ui_filters` (#1420) use on the sibling list
-    // pages.
-    let (kind, kind_raw, kind_error) = parse_schedule_kind_filter(params.kind.as_deref());
-    let (paused_filter, paused_raw, paused_error) =
-        parse_schedule_paused_filter(params.paused.as_deref());
-    let (health_filter, health_raw, health_error) =
-        parse_schedule_health_filter(params.health.as_deref());
-    let (shard_id, shard_id_raw, shard_id_error) =
-        parse_shard_id_filter("shard_id", params.shard_id.as_deref());
+    let kind = params
+        .kind
+        .as_deref()
+        .map(ScheduleKindFilter::parse)
+        .transpose()?
+        .unwrap_or(ScheduleKindFilter::All);
+    let paused_filter = params
+        .paused
+        .as_deref()
+        .map(SchedulePausedFilter::parse)
+        .transpose()?
+        .unwrap_or(SchedulePausedFilter::All);
     let target = params
         .target
         .as_deref()
@@ -9516,18 +7714,7 @@ async fn list_schedules_ui(
         target,
         kind,
         paused: paused_filter,
-        health: health_filter,
-        shard_id,
-    };
-    let filter_raw = ScheduleUiFilterRaw {
-        kind: kind_raw,
-        kind_error,
-        paused: paused_raw,
-        paused_error,
-        health: health_raw,
-        health_error,
-        shard_id: shard_id_raw,
-        shard_id_error,
+        shard_id: params.shard_id,
     };
 
     let shard_results = load_schedules_from_shards_ui(&api_state).await;
@@ -9549,11 +7736,32 @@ async fn list_schedules_ui(
         .filter(|(sid, row)| filters.matches(*sid, row))
         .collect();
 
-    sort_schedule_rows(&mut all_rows);
+    // Secondary sort: by name for stability when next_run_at is NULL.
+    all_rows.sort_by(|(_, a), (_, b)| {
+        let a_next = a.next_run_at;
+        let b_next = b.next_run_at;
+        match (a_next, b_next) {
+            (Some(a_ts), Some(b_ts)) => a_ts.cmp(&b_ts),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => {
+                let a_name = a
+                    .workflow_name
+                    .as_deref()
+                    .or(a.dag_name.as_deref())
+                    .unwrap_or("");
+                let b_name = b
+                    .workflow_name
+                    .as_deref()
+                    .or(b.dag_name.as_deref())
+                    .unwrap_or("");
+                a_name.cmp(b_name)
+            }
+        }
+        .then_with(|| a.id.cmp(&b.id))
+    });
 
     let total_filtered = all_rows.len();
-    // Computed over the whole filtered set, before pagination slices it.
-    let unhealthy_summary = schedule_health_summary(&all_rows);
     let distribution = schedule_kind_distribution(&all_rows);
     let offset_usize = usize::try_from(offset).unwrap_or(usize::MAX);
     let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
@@ -9572,48 +7780,19 @@ async fn list_schedules_ui(
         &shard_errors,
         is_multi_shard,
         &filters,
-        &filter_raw,
         &decisions,
         page,
         limit,
-        &limit_raw,
         has_next,
         total_filtered,
-        &unhealthy_summary,
         &distribution,
-        refresh,
-        refresh_error.as_deref(),
+        params.refresh,
         params.flash.as_deref(),
-        limit_error.as_deref(),
-        page_error.as_deref(),
     ))
 }
 
 /// Parse a `ScheduleUiFilters` from optional string fields.
-/// Parses a `ScheduleUiFilters` for the bulk-action POST forms
-/// (`../schedules/bulk-pause`, `../schedules/bulk-resume`).
-///
-/// `kind`/`paused`/`health` keep the pre-existing "unrecognized value
-/// omits that filter" leniency. This PR does not touch that behavior. It
-/// matches the GET list page's "filter not applied" contract for a bad
-/// value.
-///
-/// `shard_id` does not keep that leniency. Unlike the other three
-/// fields, a broadened `shard_id` does not just show the operator a
-/// bigger table. It *pauses or resumes schedules on every shard*, not
-/// just the one they scoped the action to. Before this PR, `shard_id:
-/// Option<i32>` was typed directly on `ScheduleBulkParams`. A non-numeric
-/// value therefore failed axum's `Form<..>` extraction, and the whole
-/// request 400ed before any schedule was touched. Retyping it
-/// `Option<String>` fixes the GET-page 400 (see `parse_shard_id_filter`).
-/// Silently dropping a parse failure to `None` here would mean "no shard
-/// restriction". That would reopen the same gap one layer down. Here,
-/// "not applied" would mean "every shard", not "not this shard" (Codex
-/// review, P1). A malformed `shard_id` in a bulk form is therefore
-/// rejected outright, restoring the pre-PR behavior for this one field.
-fn parse_schedule_bulk_filters(
-    params: &ScheduleBulkParams,
-) -> Result<ScheduleUiFilters, AutumnError> {
+fn parse_schedule_bulk_filters(params: &ScheduleBulkParams) -> ScheduleUiFilters {
     let kind = params
         .kind
         .as_deref()
@@ -9624,32 +7803,18 @@ fn parse_schedule_bulk_filters(
         .as_deref()
         .and_then(|s| SchedulePausedFilter::parse(s).ok())
         .unwrap_or(SchedulePausedFilter::All);
-    let health = params
-        .health
-        .as_deref()
-        .and_then(|s| ScheduleHealthFilter::parse(s).ok())
-        .unwrap_or(ScheduleHealthFilter::All);
     let target = params
         .target
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
-    let shard_id = match params.shard_id.as_deref().map(str::trim) {
-        None | Some("") => None,
-        Some(raw) => Some(raw.parse::<i32>().map_err(|_| {
-            AutumnError::bad_request_msg(format!(
-                "invalid shard_id '{raw}'; expected a whole number"
-            ))
-        })?),
-    };
-    Ok(ScheduleUiFilters {
+    ScheduleUiFilters {
         target,
         kind,
         paused,
-        health,
-        shard_id,
-    })
+        shard_id: params.shard_id,
+    }
 }
 
 /// Find a schedule by id across all shards. Returns the row, the shard it lives
@@ -9742,7 +7907,7 @@ async fn schedule_pause_ui(
             status: STATUS_SUCCEEDED,
             error_summary: None,
             shard_id: None,
-            source: SOURCE_UI,
+            source: SOURCE_API,
         };
         let _ = insert_audit(&mut conn, &ar).await;
         format!("Paused {name}")
@@ -9766,24 +7931,16 @@ async fn schedule_resume_ui(
     let flash = if let Some((row, _shard, mut conn)) = found {
         let name = schedule_name(&row);
         let now = Utc::now();
-        // Mirrors `set_schedule_paused(.., false, ..)`: the predicate matches an
-        // auto-paused row (`is_paused = false`, `auto_paused_at` set), and the
-        // update clears the auto-pause state and resets the failure counter so
-        // the next tick does not immediately re-trigger auto-pause (#360).
         let _ = diesel::update(
-            dsl::harvest_schedules.find(row.id).filter(
-                dsl::is_paused
-                    .ne(false)
-                    .or(dsl::auto_paused_at.is_not_null()),
-            ),
+            dsl::harvest_schedules
+                .find(row.id)
+                .filter(dsl::is_paused.ne(false)),
         )
         .set((
             dsl::is_paused.eq(false),
             dsl::paused_at.eq(None::<chrono::DateTime<Utc>>),
             dsl::paused_by.eq(None::<&str>),
             dsl::pause_reason.eq(None::<&str>),
-            dsl::auto_paused_at.eq(None::<chrono::DateTime<Utc>>),
-            dsl::consecutive_failure_count.eq(0),
             dsl::updated_at.eq(now),
         ))
         .execute(&mut conn)
@@ -9799,7 +7956,7 @@ async fn schedule_resume_ui(
             status: STATUS_SUCCEEDED,
             error_summary: None,
             shard_id: None,
-            source: SOURCE_UI,
+            source: SOURCE_API,
         };
         let _ = insert_audit(&mut conn, &ar).await;
         format!("Resumed {name}")
@@ -9838,7 +7995,7 @@ async fn schedule_delete_ui(
                 status: STATUS_SUCCEEDED,
                 error_summary: None,
                 shard_id: None,
-                source: SOURCE_UI,
+                source: SOURCE_API,
             };
             let _ = insert_audit(&mut conn, &ar).await;
             format!("Deleted {name}")
@@ -9920,20 +8077,12 @@ async fn execute_schedule_trigger_ui(
     // still occupies an active slot for overlap/Skip enforcement (issue #383),
     // matching the scheduler and backfill counters. The async block returns None
     // if any shard is unreachable — used for fail-closed Skip enforcement.
-    // The `schedule_id` disjunct (issue #1160) also counts a cross-type
-    // continue-as-new successor of this schedule -- otherwise a manual trigger
-    // could double-dispatch a schedule whose active run has already changed
-    // type mid-chain, matching `scheduler::schedule_running_basis`.
     let running_count: Option<i64> = async {
         let mut total: i64 = 0;
         for (_, shard_pool) in pool.iter_shards() {
             let mut c = acquire_conn(shard_pool).await.ok()?;
             let n: i64 = harvest_workflow_executions::table
-                .filter(
-                    harvest_workflow_executions::workflow_name
-                        .eq(workflow_name)
-                        .or(harvest_workflow_executions::schedule_id.eq(Some(row.id))),
-                )
+                .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
                 .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
                 .count()
                 .get_result(&mut c)
@@ -10007,25 +8156,27 @@ async fn execute_schedule_trigger_ui(
     // `dag_name`, which is also the key `DagInfo::as_workflow_info()`
     // registers a DAG's shadow `WorkflowInfo` under in `registry.workflows`.
     // So this ONE lookup already resolves both a workflow's AND a DAG's
-    // declared `sla`/`execution_timeout`.
-    let (raw_sla, wf_default_retry_policy, raw_execution_timeout) = runtime
+    // declared `sla`/`execution_timeout` (issue #743 review, PR #1141
+    // finding #6) -- the previous "DAGs have no SLA concept" framing predates
+    // DAG-level `sla`/`execution_timeout` support and only ever described the
+    // caller's mental model, not an actual code gap; `execution_timeout`
+    // itself was genuinely never resolved here, unlike `sla`.
+    let (sla, wf_default_retry_policy, execution_timeout) = runtime
         .registry()
         .workflows
         .get(workflow_name)
         .map_or((None, None, None), |info| {
-            (info.sla, info.retry_policy.clone(), info.execution_timeout)
+            (
+                crate::api::clamp_info_default_sla(info.sla, info.execution_timeout),
+                info.retry_policy.clone(),
+                info.execution_timeout
+                    .and_then(|d| chrono::Duration::from_std(d).ok()),
+            )
         });
-    let sla = crate::api::clamp_info_default_sla(raw_sla, raw_execution_timeout);
-    // Issue #1412: thread the declared execution_timeout and the fleet-wide
-    // ceiling via the same shared lookup the scheduler and DAG-backfill paths
-    // use. `raw_sla`/`raw_execution_timeout` above still separately feed the
-    // `sla` clamp -- `resolve_dispatch_deadline` returns an unclamped `sla`
-    // too, so it is discarded here.
-    let DispatchDeadline {
-        execution_timeout,
-        max_execution_timeout_ceiling,
-        ..
-    } = runtime.registry().resolve_dispatch_deadline(workflow_name);
+    let max_execution_timeout_ceiling = runtime
+        .registry()
+        .max_workflow_execution_timeout
+        .and_then(|d| chrono::Duration::from_std(d).ok());
     // Schedule-level retry_policy takes precedence over the workflow-type default,
     // mirroring the automated tick, backfill, and API trigger-now paths.
     let ui_trigger_retry_policy = row
@@ -10036,15 +8187,37 @@ async fn execute_schedule_trigger_ui(
 
     // Provenance ref for a manual UI schedule trigger is the schedule id (#740).
     let ui_schedule_id_str = row.id.to_string();
-    let result = start_or_load_workflow_execution_with_metrics_and_codecs(
+    let result = start_or_load_workflow_execution_with_metrics(
         conn,
         StartWorkflowParams {
+            workflow_name,
+            workflow_id: &workflow_id,
+            exec_id,
+            input,
+            parent_id: None,
+            queue_name: queue,
             execution_timeout,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
+            trace_context: None,
             max_execution_timeout_ceiling,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
+            concurrency_key: None,
+            concurrency_limit: None,
             concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
             owner,
             runbook_url,
             severity,
+            context_headers: None,
             sla,
             // Manual trigger-now fires are attributed to the schedule (schedule_id is
             // set) so they appear in GET /admin/schedules/{id}/runs, but scheduled_for
@@ -10052,19 +8225,21 @@ async fn execute_schedule_trigger_ui(
             // this run — NULL slot comparisons are false, so carryover is never
             // resolved for a manual fire.
             schedule_id: Some(row.id),
+            scheduled_for: None,
+            workflow_attempt: 1,
             workflow_retry_policy: ui_trigger_retry_policy,
+            retry_of_exec_id: None,
             max_workflow_attempts_ceiling: runtime.registry().max_workflow_attempts_ceiling,
             origin: Some(autumn_harvest::execution::ORIGIN_MANUAL_TRIGGER),
+            completion_callbacks: None,
             // Manual UI schedule trigger (issue #740): provenance is `schedule`,
             // referencing the schedule id, attributed to the UI operator.
             start_source: autumn_harvest::StartSource::Schedule,
             start_source_ref: Some(ui_schedule_id_str.as_str()),
             started_by: Some("ui"),
-            ..StartWorkflowParams::new(workflow_name, &workflow_id, exec_id, input, queue)
         },
         Some(runtime.registry().telemetry().metrics.as_ref()),
         None,
-        runtime.registry().payload_codecs(),
     )
     .await;
     let (status, outcome) = if result.is_ok() {
@@ -10108,7 +8283,7 @@ const fn build_trigger_audit<'a>(
         status,
         error_summary,
         shard_id: None,
-        source: SOURCE_UI,
+        source: SOURCE_API,
     }
 }
 
@@ -10198,10 +8373,7 @@ async fn schedule_bulk_pause_ui(
     use autumn_harvest::schema::harvest_schedules::dsl;
     use axum::response::IntoResponse as _;
 
-    let filters = match parse_schedule_bulk_filters(&params) {
-        Ok(f) => f,
-        Err(e) => return e.into_response(),
-    };
+    let filters = parse_schedule_bulk_filters(&params);
 
     let pool = match api_state.storage_pool() {
         Ok(p) => p,
@@ -10218,22 +8390,28 @@ async fn schedule_bulk_pause_ui(
         let Ok(mut conn) = acquire_conn(shard_pool).await else {
             continue;
         };
-        // Select whole rows and reuse `ScheduleUiFilters::matches` — the *same*
-        // predicate the list page applies (issue #951). A partial projection
-        // cannot see the health filter, and the button's count and confirmation
-        // text come from the list's filtered total: a bulk action that matched a
-        // wider set than the operator was shown would pause schedules the dialog
-        // never mentioned.
-        let candidates: Vec<HarvestSchedule> = dsl::harvest_schedules
+        // Load just id + name fields to apply kind/target filters without N+1 updates.
+        let candidates: Vec<(uuid::Uuid, Option<String>, Option<String>)> = dsl::harvest_schedules
             .filter(dsl::is_paused.ne(true))
-            .select(HarvestSchedule::as_select())
+            .select((dsl::id, dsl::workflow_name, dsl::dag_name))
             .load(&mut conn)
             .await
             .unwrap_or_default();
         let matching_ids: Vec<uuid::Uuid> = candidates
             .into_iter()
-            .filter(|row| filters.matches(shard_id, row))
-            .map(|row| row.id)
+            .filter(|(_, wf, dag)| {
+                let name = wf.as_deref().or(dag.as_deref()).unwrap_or("");
+                match filters.kind {
+                    ScheduleKindFilter::Workflow if wf.is_none() => return false,
+                    ScheduleKindFilter::Dag if dag.is_none() => return false,
+                    _ => {}
+                }
+                filters
+                    .target
+                    .as_deref()
+                    .is_none_or(|t| name.to_lowercase().contains(&t.to_lowercase()))
+            })
+            .map(|(id, _, _)| id)
             .collect();
         if matching_ids.is_empty() {
             continue;
@@ -10254,14 +8432,9 @@ async fn schedule_bulk_pause_ui(
         .await
         .unwrap_or_default();
         acted_on += updated_ids.len();
-        // One multi-row insert per shard, not one round trip per updated
-        // schedule (issue #1399). Every record shares the same
-        // actor/operation/route/status/shard, so only the target id varies.
-        // `insert_audit_batch` preserves that shape exactly.
-        let id_strs: Vec<String> = updated_ids.iter().map(ToString::to_string).collect();
-        let records: Vec<NewAuditRecord<'_>> = id_strs
-            .iter()
-            .map(|id_str| NewAuditRecord {
+        for id in &updated_ids {
+            let id_str = id.to_string();
+            let ar = NewAuditRecord {
                 actor: "ui",
                 operation: OP_SCHEDULE_PAUSE,
                 target_type: TARGET_SCHEDULE,
@@ -10272,16 +8445,13 @@ async fn schedule_bulk_pause_ui(
                 status: STATUS_SUCCEEDED,
                 error_summary: None,
                 shard_id: Some(shard_id.as_i32()),
-                source: SOURCE_UI,
-            })
-            .collect();
-        let _ = insert_audit_batch(&mut conn, &records).await;
+                source: SOURCE_API,
+            };
+            let _ = insert_audit(&mut conn, &ar).await;
+        }
     }
 
-    schedule_bulk_redirect_to(
-        params.return_to.as_deref(),
-        &format!("Paused {acted_on} schedule(s)"),
-    )
+    schedule_redirect(&format!("Paused {acted_on} schedule(s)"))
 }
 
 async fn schedule_bulk_resume_ui(
@@ -10291,10 +8461,7 @@ async fn schedule_bulk_resume_ui(
     use autumn_harvest::schema::harvest_schedules::dsl;
     use axum::response::IntoResponse as _;
 
-    let filters = match parse_schedule_bulk_filters(&params) {
-        Ok(f) => f,
-        Err(e) => return e.into_response(),
-    };
+    let filters = parse_schedule_bulk_filters(&params);
 
     let pool = match api_state.storage_pool() {
         Ok(p) => p,
@@ -10311,25 +8478,27 @@ async fn schedule_bulk_resume_ui(
         let Ok(mut conn) = acquire_conn(shard_pool).await else {
             continue;
         };
-        // Whole rows + the list's own matcher, so the health filter applies and
-        // the acted-on set is exactly the set the confirmation counted (#951).
-        // `is_paused = true OR auto_paused_at IS NOT NULL`, matching the API's
-        // resume predicate — an auto-paused schedule has `is_paused = false`
-        // and would otherwise be unreachable from a bulk resume (#360).
-        let candidates: Vec<HarvestSchedule> = dsl::harvest_schedules
-            .filter(
-                dsl::is_paused
-                    .eq(true)
-                    .or(dsl::auto_paused_at.is_not_null()),
-            )
-            .select(HarvestSchedule::as_select())
+        let candidates: Vec<(uuid::Uuid, Option<String>, Option<String>)> = dsl::harvest_schedules
+            .filter(dsl::is_paused.eq(true))
+            .select((dsl::id, dsl::workflow_name, dsl::dag_name))
             .load(&mut conn)
             .await
             .unwrap_or_default();
         let matching_ids: Vec<uuid::Uuid> = candidates
             .into_iter()
-            .filter(|row| filters.matches(shard_id, row))
-            .map(|row| row.id)
+            .filter(|(_, wf, dag)| {
+                let name = wf.as_deref().or(dag.as_deref()).unwrap_or("");
+                match filters.kind {
+                    ScheduleKindFilter::Workflow if wf.is_none() => return false,
+                    ScheduleKindFilter::Dag if dag.is_none() => return false,
+                    _ => {}
+                }
+                filters
+                    .target
+                    .as_deref()
+                    .is_none_or(|t| name.to_lowercase().contains(&t.to_lowercase()))
+            })
+            .map(|(id, _, _)| id)
             .collect();
         if matching_ids.is_empty() {
             continue;
@@ -10337,19 +8506,13 @@ async fn schedule_bulk_resume_ui(
         let updated_ids: Vec<uuid::Uuid> = diesel::update(
             dsl::harvest_schedules
                 .filter(dsl::id.eq_any(&matching_ids))
-                .filter(
-                    dsl::is_paused
-                        .eq(true)
-                        .or(dsl::auto_paused_at.is_not_null()),
-                ),
+                .filter(dsl::is_paused.eq(true)),
         )
         .set((
             dsl::is_paused.eq(false),
             dsl::paused_at.eq(None::<chrono::DateTime<Utc>>),
             dsl::paused_by.eq(None::<&str>),
             dsl::pause_reason.eq(None::<&str>),
-            dsl::auto_paused_at.eq(None::<chrono::DateTime<Utc>>),
-            dsl::consecutive_failure_count.eq(0),
             dsl::updated_at.eq(now),
         ))
         .returning(dsl::id)
@@ -10357,12 +8520,9 @@ async fn schedule_bulk_resume_ui(
         .await
         .unwrap_or_default();
         acted_on += updated_ids.len();
-        // Same batching rationale as `schedule_bulk_pause_ui` above (issue
-        // #1399): one multi-row insert per shard, not one per resumed row.
-        let id_strs: Vec<String> = updated_ids.iter().map(ToString::to_string).collect();
-        let records: Vec<NewAuditRecord<'_>> = id_strs
-            .iter()
-            .map(|id_str| NewAuditRecord {
+        for id in &updated_ids {
+            let id_str = id.to_string();
+            let ar = NewAuditRecord {
                 actor: "ui",
                 operation: OP_SCHEDULE_RESUME,
                 target_type: TARGET_SCHEDULE,
@@ -10373,108 +8533,19 @@ async fn schedule_bulk_resume_ui(
                 status: STATUS_SUCCEEDED,
                 error_summary: None,
                 shard_id: Some(shard_id.as_i32()),
-                source: SOURCE_UI,
-            })
-            .collect();
-        let _ = insert_audit_batch(&mut conn, &records).await;
+                source: SOURCE_API,
+            };
+            let _ = insert_audit(&mut conn, &ar).await;
+        }
     }
 
-    schedule_bulk_redirect_to(
-        params.return_to.as_deref(),
-        &format!("Resumed {acted_on} schedule(s)"),
-    )
+    schedule_redirect(&format!("Resumed {acted_on} schedule(s)"))
 }
 
-/// Redirect back to the schedules list with a flash message.
-///
-/// `depth` is how many path segments below the UI mount point the *redirecting*
-/// route sits, because the `Location` header is resolved relative to the
-/// request URL. `/schedules/bulk-pause` is one segment deep, so a bare
-/// `schedules?flash=…` is right there; `/schedules/{id}/pause` is **two**, where
-/// the same string resolves to `<mount>/schedules/{id}/schedules` and 404s.
-fn schedule_redirect_from(depth: usize, flash: &str) -> axum::response::Response {
-    use axum::response::IntoResponse as _;
-    let up = "../".repeat(depth.saturating_sub(1));
-    let location = format!("{up}schedules?flash={}", url_encode(flash));
-    axum::response::Redirect::to(&location).into_response()
-}
-
-/// Redirect from a `/schedules/{id}/…` per-row action (two segments deep).
 fn schedule_redirect(flash: &str) -> axum::response::Response {
-    schedule_redirect_from(2, flash)
-}
-
-/// Redirect from a bulk-action POST (`/schedules/bulk-pause`,
-/// `/schedules/bulk-resume`) back to the operator's filtered view instead
-/// of always landing on a bare, unfiltered `schedules?flash=…`.
-///
-/// Before this fix, the bulk forms submitted only the parsed filters
-/// (`render_schedule_hidden_filters`). An operator with an unresolved
-/// invalid filter and its inline error lost both the moment they paused
-/// or resumed anything. That is the same "action discards what you were
-/// looking at" gap. #1420 already fixed it for the DLQ page's own bulk
-/// actions (Codex review, #1437 P2).
-///
-/// `return_to` is the bulk form's own hidden field. It is built by
-/// `schedule_return_to_path` from the same filters the list page just
-/// rendered — raw text, invalid values included. It is validated against
-/// the expected `../schedules[?...]` shape before use. That is the same
-/// guard `is_dead_letter_ui_return_path` applies to the DLQ page's
-/// `return_to`, so this operator-supplied field can never redirect
-/// anywhere else.
-///
-/// The `../` matters. The `Location` header resolves relative to the URL
-/// this handler was posted to (`.../schedules/bulk-pause`), not to the
-/// list page. A bare `schedules?...` would merge onto that path's own
-/// directory instead. It would land on `.../schedules/schedules?...` — a
-/// 404 after a mutation that otherwise succeeded (Codex review, #1437
-/// P2, verified against `urllib.parse.urljoin`).
-///
-/// `is_schedule_ui_return_path` also rejects a control character. A raw
-/// `\n` could reach it from a hand-crafted or malformed POST. The
-/// `Redirect`'s own `into_response` builds the `Location` header with
-/// `HeaderValue::try_from`, which rejects those bytes and falls back to
-/// a bare `500` (Codex review, #1437 P2). That is not a panic in this
-/// axum version, verified by reading `axum-0.8.9`'s own `Redirect::
-/// into_response`. It is still the wrong response after a mutation that
-/// already succeeded.
-fn schedule_bulk_redirect_to(return_to: Option<&str>, flash: &str) -> axum::response::Response {
     use axum::response::IntoResponse as _;
-    let base = return_to
-        .map(str::trim)
-        .filter(|value| is_schedule_ui_return_path(value))
-        .map_or_else(|| "../schedules".to_string(), str::to_string);
-    let separator = if base.contains('?') { '&' } else { '?' };
-    let location = format!("{base}{separator}flash={}", url_encode(flash));
+    let location = format!("schedules?flash={}", url_encode(flash));
     axum::response::Redirect::to(&location).into_response()
-}
-
-fn is_schedule_ui_return_path(value: &str) -> bool {
-    if value.bytes().any(|b| b.is_ascii_control()) {
-        return false;
-    }
-    match value.strip_prefix("../schedules") {
-        Some("") => true,
-        Some(rest) => rest.starts_with('?'),
-        None => false,
-    }
-}
-
-/// Built for the bulk-action forms' `return_to` hidden field, so its base
-/// carries the `../` those forms need — see `schedule_bulk_redirect_to`.
-fn schedule_return_to_path(
-    filters: &ScheduleUiFilters,
-    filter_raw: &ScheduleUiFilterRaw,
-    limit: i64,
-    limit_raw: &str,
-    refresh: Option<u64>,
-) -> String {
-    let query = build_schedule_query_string(limit, limit_raw, filters, filter_raw, refresh);
-    if query.is_empty() {
-        "../schedules".to_string()
-    } else {
-        format!("../schedules?{}", &query[1..])
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -10506,54 +8577,24 @@ fn render_schedules_page(
     shard_errors: &[(ShardId, String)],
     is_multi_shard: bool,
     filters: &ScheduleUiFilters,
-    filter_raw: &ScheduleUiFilterRaw,
     decisions: &std::collections::HashMap<uuid::Uuid, Vec<ScheduleDecision>>,
     page: i64,
     limit: i64,
-    limit_raw: &str,
     has_next: bool,
     total_filtered: usize,
-    // Unhealthy counts over the whole *filtered* set, not just this page: the
-    // strip is the first thing an operator reads, so a page-scoped count would
-    // understate a fleet-wide problem.
-    unhealthy_summary: &str,
     distribution: &str,
     refresh: Option<u64>,
-    refresh_error: Option<&str>,
     flash: Option<&str>,
-    limit_error: Option<&str>,
-    page_error: Option<&str>,
 ) -> Markup {
-    // The "show only unhealthy" link forces `health=Unhealthy`, so it clears
-    // any stale health error the same way it clears the parsed override.
-    let unhealthy_link_raw = ScheduleUiFilterRaw {
-        health: String::new(),
-        health_error: None,
-        ..filter_raw.clone()
-    };
     let body = html! {
         h2 { "Schedules" }
 
         @if let Some(message) = flash {
-            div.flash role="status" tabindex="-1" autofocus { (message) }
-        }
-        @if let Some(error) = refresh_error {
-            span.field-error role="alert" { (error) }
+            div.flash { (message) }
         }
 
-        @if !unhealthy_summary.is_empty() {
-            div.card.unhealthy-summary role="status" {
-                strong { "Needs attention: " }
-                (unhealthy_summary)
-                " — "
-                a href={ "schedules?health=Unhealthy" (PreEscaped(&build_schedule_query_string(limit, limit_raw, &ScheduleUiFilters { health: ScheduleHealthFilter::All, ..filters.clone() }, &unhealthy_link_raw, refresh))) } {
-                    "show only unhealthy"
-                }
-            }
-        }
-
-        (render_schedule_filters(filters, filter_raw, limit, limit_raw, limit_error, refresh))
-        (render_schedule_bulk_actions(filters, filter_raw, limit, limit_raw, refresh, total_filtered, distribution))
+        (render_schedule_filters(filters, limit, refresh))
+        (render_schedule_bulk_actions(filters, limit, refresh, total_filtered, distribution))
 
         @if rows.is_empty() && shard_errors.is_empty() {
             div.card.empty {
@@ -10574,45 +8615,25 @@ fn render_schedules_page(
                     (error)
                 }
             }
-            // 13 columns (14 multi-shard) overflow a narrow viewport; scroll the
-            // table rather than the page.
-            div."table-scroll" { (render_schedule_table(rows, is_multi_shard, decisions)) }
+            (render_schedule_table(rows, is_multi_shard, decisions))
         }
 
-        (render_schedule_pagination(page, limit, limit_raw, has_next, filters, filter_raw, refresh, page_error))
+        (render_schedule_pagination(page, limit, has_next, filters, refresh))
     };
 
-    // Auto-refresh must keep the operator on the page they were reading,
-    // with no `flash` carried forward — see `layout_schedules`'s own doc
-    // comment. It keeps `page`, unlike `schedule_return_to_path`, which
-    // deliberately excludes it (a one-time post-action redirect can land
-    // back on page 0 without harm; a repeating reload cannot).
-    let refresh_target = format!(
-        "schedules?page={page}{}",
-        build_schedule_query_string(limit, limit_raw, filters, filter_raw, refresh)
-    );
-    layout_schedules("Schedules · Vantage", &body, refresh, "", &refresh_target)
+    layout_schedules("Schedules · Vantage", &body, refresh)
 }
 
 fn render_schedule_filters(
     filters: &ScheduleUiFilters,
-    filter_raw: &ScheduleUiFilterRaw,
     limit: i64,
-    limit_raw: &str,
-    limit_error: Option<&str>,
     refresh: Option<u64>,
 ) -> Markup {
     let target_val = filters.target.as_deref().unwrap_or("");
+    let kind_val = filters.kind.as_label();
+    let paused_val = filters.paused.as_label();
+    let shard_val = filters.shard_id.map(|s| s.to_string()).unwrap_or_default();
     let refresh_value = refresh.map(|s| s.to_string()).unwrap_or_default();
-    // Echo exactly what the operator typed on a parse failure, matching the
-    // Workflows/Workers/DLQ pages' own `render_filters`/
-    // `render_worker_filters`/`render_dead_letter_filters`. Falls back to
-    // the resolved value when the field was absent or valid.
-    let limit_value = if limit_raw.is_empty() {
-        limit.to_string()
-    } else {
-        limit_raw.to_string()
-    };
 
     html! {
         form.filters method="get" action="schedules" {
@@ -10623,63 +8644,26 @@ fn render_schedule_filters(
             label {
                 "Kind"
                 select name="kind" {
-                    option value="" selected[filter_raw.kind.is_empty() && filter_raw.kind_error.is_none()] { "All" }
-                    option value="Workflow" selected[filters.kind == ScheduleKindFilter::Workflow] { "Workflow" }
-                    option value="Dag" selected[filters.kind == ScheduleKindFilter::Dag] { "Dag" }
-                    @if filter_raw.kind_error.is_some() {
-                        option value=(filter_raw.kind) selected { (filter_raw.kind) }
-                    }
-                }
-                @if let Some(error) = &filter_raw.kind_error {
-                    span.field-error role="alert" { (error) }
+                    option value="" selected[kind_val.is_empty()] { "All" }
+                    option value="Workflow" selected[kind_val == "Workflow"] { "Workflow" }
+                    option value="Dag" selected[kind_val == "Dag"] { "Dag" }
                 }
             }
             label {
                 "Paused"
                 select name="paused" {
-                    option value="" selected[filter_raw.paused.is_empty() && filter_raw.paused_error.is_none()] { "All" }
-                    option value="Paused" selected[filters.paused == SchedulePausedFilter::Paused] { "Paused" }
-                    option value="Active" selected[filters.paused == SchedulePausedFilter::Active] { "Active" }
-                    @if filter_raw.paused_error.is_some() {
-                        option value=(filter_raw.paused) selected { (filter_raw.paused) }
-                    }
-                }
-                @if let Some(error) = &filter_raw.paused_error {
-                    span.field-error role="alert" { (error) }
-                }
-            }
-            label {
-                "Health"
-                select name="health" {
-                    option value="" selected[filter_raw.health.is_empty() && filter_raw.health_error.is_none()] { "All" }
-                    option value="Unhealthy" selected[filters.health == ScheduleHealthFilter::Unhealthy] { "Unhealthy" }
-                    option value="Healthy" selected[filters.health == ScheduleHealthFilter::Healthy] { "Healthy" }
-                    @if filter_raw.health_error.is_some() {
-                        option value=(filter_raw.health) selected { (filter_raw.health) }
-                    }
-                }
-                @if let Some(error) = &filter_raw.health_error {
-                    span.field-error role="alert" { (error) }
+                    option value="" selected[paused_val.is_empty()] { "All" }
+                    option value="Paused" selected[paused_val == "Paused"] { "Paused" }
+                    option value="Active" selected[paused_val == "Active"] { "Active" }
                 }
             }
             label {
                 "Shard"
-                input type="text" inputmode="numeric" pattern="-?[0-9]*" name="shard_id" value=(filter_raw.shard_id) placeholder="e.g. 0";
-                @if let Some(error) = &filter_raw.shard_id_error {
-                    span.field-error role="alert" { (error) }
-                }
+                input type="number" name="shard_id" value=(shard_val) placeholder="e.g. 0";
             }
             label {
                 "Per page"
-                // `type="text"`, not `type="number"`. A number input
-                // sanitizes an invalid value (e.g. "not-a-number") to blank
-                // at render time. The operator could then never see or
-                // correct their own bad input. Matches the Workflows,
-                // Workers and DLQ pages' "Per page" fields.
-                input type="text" inputmode="numeric" pattern="[0-9]*" name="limit" value=(limit_value);
-                @if let Some(error) = limit_error {
-                    span.field-error role="alert" { (error) }
-                }
+                input type="number" name="limit" min="1" max=(MAX_PAGE_SIZE) value=(limit);
             }
             label {
                 "Refresh"
@@ -10700,15 +8684,12 @@ fn render_schedule_filters(
 
 fn render_schedule_bulk_actions(
     filters: &ScheduleUiFilters,
-    filter_raw: &ScheduleUiFilterRaw,
     limit: i64,
-    limit_raw: &str,
     refresh: Option<u64>,
     total_matching: usize,
     distribution: &str,
 ) -> Markup {
-    let return_qs = build_schedule_query_string(limit, limit_raw, filters, filter_raw, refresh);
-    let return_to = schedule_return_to_path(filters, filter_raw, limit, limit_raw, refresh);
+    let return_qs = build_schedule_query_string(limit, filters, refresh);
     let dist_suffix = if distribution.is_empty() {
         String::new()
     } else {
@@ -10719,7 +8700,6 @@ fn render_schedule_bulk_actions(
             form method="post" action="schedules/bulk-pause"
                 onsubmit={ "return confirm('Pause " (total_matching) " matching schedule(s)" (&dist_suffix) "?')" } {
                 (render_schedule_hidden_filters(filters))
-                input type="hidden" name="return_to" value=(return_to);
                 button type="submit" disabled[total_matching == 0] {
                     "Pause all matching (" (total_matching) ")"
                 }
@@ -10727,7 +8707,6 @@ fn render_schedule_bulk_actions(
             form method="post" action="schedules/bulk-resume"
                 onsubmit={ "return confirm('Resume " (total_matching) " matching schedule(s)" (&dist_suffix) "?')" } {
                 (render_schedule_hidden_filters(filters))
-                input type="hidden" name="return_to" value=(return_to);
                 button type="submit" disabled[total_matching == 0] {
                     "Resume all matching (" (total_matching) ")"
                 }
@@ -10749,9 +8728,6 @@ fn render_schedule_hidden_filters(filters: &ScheduleUiFilters) -> Markup {
         }
         @if !matches!(filters.paused, SchedulePausedFilter::All) {
             input type="hidden" name="paused" value=(filters.paused.as_label());
-        }
-        @if !matches!(filters.health, ScheduleHealthFilter::All) {
-            input type="hidden" name="health" value=(filters.health.as_label());
         }
         @if let Some(shard_id) = filters.shard_id {
             input type="hidden" name="shard_id" value=(shard_id);
@@ -10776,10 +8752,7 @@ fn render_schedule_table(
                     th { "Timezone" }
                     th { "Next Run" }
                     th { "Last Run" }
-                    th { "Health" }
-                    th { "Overlap" }
-                    th { "Catchup" }
-                    th { "Bounded runs" }
+                    th { "State" }
                     th { "Created" }
                     @if is_multi_shard { th { "Shard" } }
                     th { "Actions" }
@@ -10793,8 +8766,7 @@ fn render_schedule_table(
                         .or(row.dag_name.as_deref())
                         .unwrap_or("—");
                     @let expr = row.schedule_expr.as_deref().unwrap_or("—");
-                    @let health = schedule_health(row);
-                    tr class=[(!health.is_healthy()).then_some("schedule-unhealthy")] {
+                    tr {
                         td { code { (short_id(&id_str)) } }
                         td { (kind_label) }
                         td {
@@ -10816,7 +8788,7 @@ fn render_schedule_table(
                                                     div style="display: flex; align-items: center; justify-content: space-between; gap: 8px" {
                                                         span class=(dec_badge_class) style="font-size: 10px; padding: 1px 6px" { (dec.decision) }
                                                         span style="color: #cbd5e1; font-family: monospace" { (dec.reason_code) }
-                                                        span style="color: #94a3b8" { (format_timestamp(Some(dec.occurred_at))) }
+                                                        span style="color: #64748b" { (format_timestamp(Some(dec.occurred_at))) }
                                                     }
                                                 }
                                             }
@@ -10833,42 +8805,25 @@ fn render_schedule_table(
                                 span.badge.timezone { (row.timezone) }
                             }
                         }
-                        td { (schedule_next_fire_cell(row)) }
+                        td { (format_timestamp(row.next_run_at)) }
                         td { (format_timestamp(row.last_run_at)) }
-                        td {
-                            @if health.is_healthy() {
-                                (schedule_state_badge(false))
-                            } @else {
-                                div.health-badges { (render_schedule_health_badges(row)) }
-                            }
-                        }
-                        td { code { (schedule_overlap_label(row)) } }
-                        td { code { (schedule_catchup_label(row)) } }
-                        td { (schedule_bounded_runs_label(row)) }
+                        td { (schedule_state_badge(row.is_paused)) }
                         td { (format_timestamp(Some(row.created_at))) }
                         @if is_multi_shard { td { (shard_id.as_i32()) } }
                         td {
                             div.actions {
-                                a.drilldown href={ (schedule_leaf_path(&id_str, "preview")) } {
-                                    "Preview"
-                                }
-                                a.drilldown href={ (schedule_leaf_path(&id_str, "runs")) } {
-                                    "Runs"
-                                }
-                                a.drilldown href={ (schedule_leaf_path(&id_str, "backfill")) } {
-                                    "Backfill"
-                                }
-                                @if schedule_is_resumable(row) {
-                                    form method="post"
-                                        action={ "schedules/" (id_str) "/resume" }
-                                        onsubmit="return confirm('Resume this schedule?')" {
-                                        button type="submit" { "Resume" }
-                                    }
-                                } @else {
+                                @if !row.is_paused {
                                     form method="post"
                                         action={ "schedules/" (id_str) "/pause" }
                                         onsubmit="return confirm('Pause this schedule?')" {
                                         button type="submit" { "Pause" }
+                                    }
+                                }
+                                @if row.is_paused {
+                                    form method="post"
+                                        action={ "schedules/" (id_str) "/resume" }
+                                        onsubmit="return confirm('Resume this schedule?')" {
+                                        button type="submit" { "Resume" }
                                     }
                                 }
                                 form method="post"
@@ -10896,191 +8851,6 @@ fn render_schedule_table(
     }
 }
 
-// ── issue #951: schedule health, policy cells and drill-down links ───────────
-
-/// Badges for a row's unhealthy states (issue #951 AC3).
-///
-/// Renders **nothing** for a healthy schedule — the calm-row requirement — so
-/// the caller decides what a healthy row shows instead (the list shows the
-/// existing "Active" state badge).
-fn render_schedule_health_badges(row: &HarvestSchedule) -> Markup {
-    let health = schedule_health(row);
-    html! {
-        @if health.auto_paused {
-            span.badge.FAILED role="status"
-                aria-label="Health: auto-paused after consecutive failures" {
-                "Auto-paused"
-            }
-        } @else if health.paused {
-            span.badge.CANCELLED role="status" aria-label="Health: paused" { "Paused" }
-        }
-        @if health.exhausted {
-            // No `aria-label`: it would *replace* the accessible name, and the
-            // visible text already carries the reason. `state_badge`'s label is
-            // a superset of its text; here it would be a subset.
-            span.badge.TERMINATED role="status" {
-                "Exhausted"
-                @match row.exhausted_reason {
-                    Some(ref reason) => { ": " (reason) }
-                    // Bounded out on the live fields, before a tick stamped
-                    // `exhausted_at`/`exhausted_reason` — say which bound.
-                    None => {
-                        @if row.max_runs.is_some_and(|max| max > 0 && row.runs_started >= max) {
-                            ": run budget spent"
-                        } @else if row.end_at.is_some() {
-                            ": past end_at"
-                        }
-                    }
-                }
-            }
-        }
-        @if health.catchup_dropped {
-            span.badge.FAILED role="status" {
-                "Catchup dropped ×" (row.last_catchup_dropped)
-            }
-        }
-    }
-}
-
-/// The effective catchup policy (#484) plus its window and most-recent drop
-/// count, as one compact cell.
-fn schedule_catchup_label(row: &HarvestSchedule) -> String {
-    let policy = autumn_harvest::policy::CatchupPolicy::from_db(
-        row.catchup_policy.as_deref(),
-        row.catchup_window_secs,
-        row.catchup,
-    );
-    let mut out = policy.as_str().to_string();
-    if matches!(policy, autumn_harvest::policy::CatchupPolicy::Window(_)) {
-        let secs = row.catchup_window_secs.unwrap_or(0);
-        let _ = write!(out, " ({secs}s)");
-    }
-    if row.last_catchup_dropped > 0 {
-        let _ = write!(out, " · dropped {}", row.last_catchup_dropped);
-    }
-    out
-}
-
-/// The bounded-run state (#478): remaining budget, `end_at` cutoff, and the
-/// machine-readable exhaustion reason once it has fired for the last time.
-fn schedule_bounded_runs_label(row: &HarvestSchedule) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    // `max_runs = 0` is the engine's "unlimited", not a spent budget — every
-    // bound check guards on `max > 0`. Rendering it as "0 of 0 left" would tell
-    // an operator a schedule that fires forever has stopped.
-    if let Some(max) = row.max_runs.filter(|max| *max > 0) {
-        let remaining = crate::api::remaining_runs_budget(max, row.runs_started);
-        parts.push(format!("{remaining} of {max} left"));
-    }
-    if let Some(end_at) = row.end_at {
-        parts.push(format!("ends {}", format_timestamp(Some(end_at))));
-    }
-    if let Some(ref reason) = row.exhausted_reason {
-        parts.push(format!("exhausted: {reason}"));
-    }
-    if parts.is_empty() {
-        "—".to_string()
-    } else {
-        parts.join(" · ")
-    }
-}
-
-/// The overlap policy (#241), with the buffered depth (and cap) when the policy
-/// is one that buffers.
-fn schedule_overlap_label(row: &HarvestSchedule) -> String {
-    let mut out = row.overlap_policy.clone();
-    match row.overlap_policy.as_str() {
-        "buffer_one" | "buffer_all" => {
-            let depth =
-                autumn_harvest::scheduler::parse_buffered_runs_pub(&row.buffered_runs).len();
-            let _ = write!(out, " · buffered {depth}");
-            if row.overlap_policy == "buffer_all" {
-                let _ = write!(out, "/{}", row.buffer_all_max);
-            }
-        }
-        _ => {}
-    }
-    out
-}
-
-/// The next-fire cell: `next_run_at`, plus the jitter-adjusted
-/// `effective_fire_time` (#240) when — and only when — jitter is configured.
-///
-/// Delegates to `api::effective_fire_time` rather than recomputing the jitter
-/// offset, so the page can never disagree with `GET /admin/schedules`.
-fn schedule_next_fire_cell(row: &HarvestSchedule) -> Markup {
-    let effective = crate::api::effective_fire_time(row.id, row.next_run_at, row.jitter_secs);
-    html! {
-        (format_timestamp(row.next_run_at))
-        @if let Some(effective_at) = effective {
-            div.subtle {
-                "effective " (format_timestamp(Some(effective_at)))
-                " (jitter ≤ " (row.jitter_secs) "s)"
-            }
-        }
-    }
-}
-
-/// One-line count of the unhealthy schedules in the current result set, or the
-/// empty string when everything is healthy (AC3: nothing to shout about).
-fn schedule_health_summary(rows: &[(ShardId, HarvestSchedule)]) -> String {
-    let (mut paused, mut exhausted, mut dropped) = (0usize, 0usize, 0usize);
-    for (_, row) in rows {
-        let health = schedule_health(row);
-        if health.paused || health.auto_paused {
-            paused += 1;
-        }
-        if health.exhausted {
-            exhausted += 1;
-        }
-        if health.catchup_dropped {
-            dropped += 1;
-        }
-    }
-    let mut parts: Vec<String> = Vec::new();
-    if paused > 0 {
-        parts.push(format!("{paused} paused"));
-    }
-    if exhausted > 0 {
-        parts.push(format!("{exhausted} exhausted"));
-    }
-    if dropped > 0 {
-        parts.push(format!("{dropped} catchup-dropped"));
-    }
-    parts.join(" · ")
-}
-
-/// The schedule's display name (workflow or DAG target), or `—`.
-fn schedule_target_name(row: &HarvestSchedule) -> &str {
-    row.workflow_name
-        .as_deref()
-        .or(row.dag_name.as_deref())
-        .unwrap_or("—")
-}
-
-/// Relative prefix reaching the UI mount point from a `/schedules/{id}/{leaf}`
-/// drill-down.
-///
-/// Vantage mounts under a caller-configured prefix, so every link is relative.
-/// A drill-down is served at `<mount>/schedules/{id}/{leaf}`, whose RFC 3986
-/// base directory is `<mount>/schedules/{id}/` — two segments below the mount
-/// point. Every link *out* of a drill-down (nav chrome included) must carry
-/// this prefix; a link that forgets it silently resolves under the schedule id
-/// and 404s.
-const SCHEDULE_DRILLDOWN_BASE: &str = "../../";
-
-/// Href from a drill-down page to another `schedules/{id}/{leaf}` page.
-fn schedule_drilldown_href(id: &str, leaf: &str) -> String {
-    format!("{SCHEDULE_DRILLDOWN_BASE}{}", schedule_leaf_path(id, leaf))
-}
-
-/// The `schedules/{id}/{leaf}` path fragment. Correct as-is from the list page
-/// (base `<mount>/`); prefix it with [`SCHEDULE_DRILLDOWN_BASE`] from a
-/// drill-down.
-fn schedule_leaf_path(id: &str, leaf: &str) -> String {
-    format!("schedules/{id}/{leaf}")
-}
-
 fn schedule_state_badge(is_paused: bool) -> Markup {
     if is_paused {
         html! { span.badge.CANCELLED { "Paused" } }
@@ -11089,22 +8859,15 @@ fn schedule_state_badge(is_paused: bool) -> Markup {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn render_schedule_pagination(
     page: i64,
     limit: i64,
-    limit_raw: &str,
     has_next: bool,
     filters: &ScheduleUiFilters,
-    filter_raw: &ScheduleUiFilterRaw,
     refresh: Option<u64>,
-    page_error: Option<&str>,
 ) -> Markup {
-    let base = build_schedule_query_string(limit, limit_raw, filters, filter_raw, refresh);
+    let base = build_schedule_query_string(limit, filters, refresh);
     html! {
-        @if let Some(error) = page_error {
-            span.field-error role="alert" { (error) }
-        }
         div.pagination {
             @if page > 0 {
                 a href={ "schedules?page=" (page - 1) (PreEscaped(&base)) } {
@@ -11127,1184 +8890,30 @@ fn render_schedule_pagination(
 
 fn build_schedule_query_string(
     limit: i64,
-    limit_raw: &str,
     filters: &ScheduleUiFilters,
-    filter_raw: &ScheduleUiFilterRaw,
     refresh: Option<u64>,
 ) -> String {
     let mut out = String::new();
-    // `limit_raw` is non-empty only on a genuine parse failure (see
-    // `parse_limit_query_field`), never for a valid-but-clamped value. An
-    // invalid limit the operator has not yet corrected must not silently
-    // vanish from a Next/Previous link. Same as the Workflows/Workers/DLQ
-    // pages' own query-string builders.
-    if !limit_raw.is_empty() {
-        let _ = write!(out, "&limit={}", url_encode(limit_raw));
-    } else if limit != DEFAULT_SCHEDULE_PAGE_SIZE {
+    if limit != DEFAULT_SCHEDULE_PAGE_SIZE {
         let _ = write!(out, "&limit={limit}");
     }
     if let Some(ref target) = filters.target {
         let _ = write!(out, "&target={}", url_encode(target));
     }
-    // Carry the raw text, not the parsed value. This lets an invalid
-    // value's inline error persist across pagination, instead of being
-    // silently dropped. Same reasoning as `build_dead_letter_query_string`'s
-    // task_kind/failed_after/failed_before handling on the DLQ page (Codex
-    // review, #1378 P2, #1420).
-    if !filter_raw.kind.is_empty() {
-        let _ = write!(out, "&kind={}", url_encode(&filter_raw.kind));
+    if !matches!(filters.kind, ScheduleKindFilter::All) {
+        let _ = write!(out, "&kind={}", filters.kind.as_label());
     }
-    if !filter_raw.paused.is_empty() {
-        let _ = write!(out, "&paused={}", url_encode(&filter_raw.paused));
+    if !matches!(filters.paused, SchedulePausedFilter::All) {
+        let _ = write!(out, "&paused={}", filters.paused.as_label());
     }
-    if !filter_raw.health.is_empty() {
-        let _ = write!(out, "&health={}", url_encode(&filter_raw.health));
-    }
-    if !filter_raw.shard_id.is_empty() {
-        let _ = write!(out, "&shard_id={}", url_encode(&filter_raw.shard_id));
+    if let Some(shard_id) = filters.shard_id {
+        let _ = write!(out, "&shard_id={shard_id}");
     }
     if let Some(secs) = refresh {
         let _ = write!(out, "&refresh={secs}");
     }
     out
 }
-
-// ── issue #951: schedule drill-downs — preview, run history, backfill ────────
-//
-// Every one of these is a *presentation* slice over an already-shipped,
-// already-audited API:
-//
-//   * preview      → `api::compute_schedule_preview_for` (`GET /admin/schedules/{id}/preview`, #348/#543)
-//   * run history  → `api::load_schedule_runs`        (`GET /admin/schedules/{id}/runs`, #534/#762)
-//   * backfill     → `api::schedule_backfill`         (`POST /admin/schedules/{id}/backfill`, #337)
-//
-// They call those functions directly rather than reimplementing them, so the
-// page cannot drift from the API on bounded-run truncation, cross-shard
-// partial results, or the audit trail. No new endpoint, no new event variant,
-// no migration.
-
-/// Query parameters for the preview drill-down.
-#[derive(Debug, Deserialize)]
-pub(crate) struct SchedulePreviewUiParams {
-    // `count` is `String`, not `usize`. Same fix as `page`/`limit` on the
-    // Workflows, Workers, DLQ and Schedules pages. Same fix as `node`/
-    // `refresh` on the DAG detail page (#1333/#1378/#1420/#1437/#1540/
-    // #1560/#1588/#1619/#1630). A numeric-typed field fails axum's query
-    // deserialization on non-numeric text. It fails with a bare 400 before
-    // this handler ever runs. That discards the whole preview page for a
-    // bookmarked or hand-edited `?count=` value. Clamped to 1..=100 by the
-    // API.
-    #[serde(default)]
-    count: Option<String>,
-}
-
-/// Query parameters for the run-history drill-down.
-#[derive(Debug, Deserialize)]
-pub(crate) struct ScheduleRunsUiParams {
-    // `limit` is `String`, not `i64`. Same fix as `count` above and as
-    // `page`/`limit` on the list pages (#1333/#1378/#1420/#1437/#1540/
-    // #1560/#1588/#1619). A numeric-typed field fails axum's query
-    // deserialization on non-numeric text. It fails with a bare 400 before
-    // this handler ever runs. That discards the `origin`/`state` filters
-    // already on the URL, along with everything else on the page.
-    #[serde(default)]
-    limit: Option<String>,
-    #[serde(default)]
-    cursor: Option<String>,
-    #[serde(default)]
-    origin: Option<String>,
-    #[serde(default)]
-    state: Option<String>,
-    /// Flash message carried over from a committed backfill's redirect.
-    #[serde(default)]
-    flash: Option<String>,
-}
-
-/// The run-history view's own filter state, kept so the page can re-emit it on
-/// its "Next" link — a keyset cursor is only meaningful under the filters it
-/// was computed with, so dropping them would silently page into different data.
-#[derive(Debug, Clone, Default)]
-struct ScheduleRunsView {
-    limit: Option<i64>,
-    /// The raw, unparsed `limit` text on a parse failure. Echoed back into
-    /// the "Rows" field so the operator's own bad input stays visible,
-    /// instead of silently reverting to blank. Empty when `limit` parsed
-    /// cleanly or was omitted.
-    limit_raw: String,
-    origin: Option<String>,
-    state: Option<String>,
-}
-
-impl ScheduleRunsView {
-    /// Query-string suffix (leading `&`) carrying the filters, for the next-page link.
-    fn query_suffix(&self) -> String {
-        let mut out = String::new();
-        // Codex review finding on this PR: prefer `limit_raw` over `limit`
-        // when a parse failure left it set. Otherwise the Next link would
-        // drop the operator's bad text, and its `role="alert"` context,
-        // on the very click meant to keep their place. It would silently
-        // revert to the default instead of carrying the correction
-        // forward.
-        if !self.limit_raw.is_empty() {
-            let _ = write!(out, "&limit={}", url_encode(&self.limit_raw));
-        } else if let Some(limit) = self.limit {
-            let _ = write!(out, "&limit={limit}");
-        }
-        if let Some(ref origin) = self.origin {
-            let _ = write!(out, "&origin={}", url_encode(origin));
-        }
-        if let Some(ref state) = self.state {
-            let _ = write!(out, "&state={}", url_encode(state));
-        }
-        out
-    }
-}
-
-/// Resolve the schedule row for a drill-down page.
-///
-/// Delegates to the API's own `resolve_schedule_with_shard` rather than the
-/// list page's `find_schedule_row`, so the three outcomes stay distinct and
-/// match the endpoints these pages render:
-///
-/// * an unparseable id is a `400`;
-/// * "checked every expected shard, no such row" is a `404`;
-/// * "a shard could not be checked, so existence is indeterminate" is a `503`.
-///
-/// `find_schedule_row` collapses the last two into "not found", which during a
-/// shard outage would tell an operator that a schedule they can see on the list
-/// page has been deleted — the precise false negative the API's `503` exists to
-/// prevent.
-async fn load_schedule_for_drilldown(
-    api_state: &HarvestApiState,
-    id_str: &str,
-) -> Result<(HarvestSchedule, ShardId), AutumnError> {
-    let id = uuid::Uuid::parse_str(id_str.trim()).map_err(|_| {
-        AutumnError::bad_request_msg(format!("invalid schedule id '{id_str}'; expected a UUID"))
-    })?;
-    crate::api::resolve_schedule_with_shard(api_state, id).await
-}
-
-/// `GET /schedules/{id}/preview` — the next N fire times for one schedule
-/// (issue #951 AC5, over the #348 preview endpoint).
-///
-/// Read-only and ungated, matching `GET /admin/schedules/{id}/preview`.
-async fn schedule_preview_ui(
-    Extension(api_state): Extension<HarvestApiState>,
-    Path(id_str): Path<String>,
-    Query(params): Query<SchedulePreviewUiParams>,
-) -> Result<Markup, AutumnError> {
-    let (row, shard_id) = load_schedule_for_drilldown(&api_state, &id_str).await?;
-    let (count, count_error) = parse_schedule_preview_count_query_field(params.count.as_deref());
-    // Pass the row through rather than the id: `compute_schedule_preview`'s own
-    // lookup stops at the first unreachable shard, which would fail a preview
-    // for a schedule the resilient resolver above already found on a later one.
-    let preview = crate::api::compute_schedule_preview_for(
-        &api_state,
-        row.clone(),
-        count,
-        chrono::Utc::now(),
-    )
-    .await?;
-    Ok(render_schedule_preview_page(
-        &row,
-        shard_id,
-        &preview,
-        count,
-        count_error.as_deref(),
-    ))
-}
-
-/// Default number of projected fire times on the preview drill-down.
-const SCHEDULE_PREVIEW_DEFAULT_COUNT: usize = 10;
-
-/// Parses the preview page's `count` query parameter — how many fire times
-/// to project.
-///
-/// A non-numeric value falls back to [`SCHEDULE_PREVIEW_DEFAULT_COUNT`] and
-/// reports the bad value inline, instead of aborting the whole page. Same
-/// contract as [`parse_dag_node_query_field`]. This page has no form field
-/// backing `count` — it is link/URL-driven only. So the caller renders the
-/// error as a page-level notice, rather than next to a control.
-fn parse_schedule_preview_count_query_field(raw: Option<&str>) -> (usize, Option<String>) {
-    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
-        return (SCHEDULE_PREVIEW_DEFAULT_COUNT, None);
-    };
-    trimmed.parse::<usize>().map_or_else(
-        |_| {
-            (
-                SCHEDULE_PREVIEW_DEFAULT_COUNT,
-                Some(format!(
-                    "Invalid count '{trimmed}'; expected a whole number. \
-                     Showing {SCHEDULE_PREVIEW_DEFAULT_COUNT} entries."
-                )),
-            )
-        },
-        |parsed| (parsed.clamp(1, 100), None),
-    )
-}
-
-#[allow(clippy::too_many_lines)]
-fn render_schedule_preview_page(
-    row: &HarvestSchedule,
-    shard_id: ShardId,
-    preview: &crate::api::SchedulePreview,
-    count: usize,
-    count_error: Option<&str>,
-) -> Markup {
-    let id_str = row.id.to_string();
-    let body = html! {
-        @if let Some(error) = count_error {
-            span.field-error role="alert" { (error) }
-        }
-        h2 { "Fire-time preview — " code { (schedule_target_name(row)) } }
-        (render_schedule_drilldown_header(row, shard_id, "preview"))
-
-        @if preview.is_paused || row.auto_paused_at.is_some() {
-            div.degraded-banner role="status" tabindex="-1" autofocus {
-                @if row.auto_paused_at.is_some() && !preview.is_paused {
-                    strong { "Schedule is auto-paused. " }
-                    "The scheduler excludes auto-paused schedules from firing (#360), "
-                    "so no fire times are projected until it is resumed."
-                } @else {
-                    strong { "Schedule is paused. " }
-                    "No fire times are projected while a schedule is paused."
-                }
-                @if let Some(ref reason) = preview.pause_reason {
-                    " Reason: " (reason)
-                }
-            }
-        }
-        @if let Some(ref reason) = preview.exhausted_reason {
-            div.degraded-banner role="status" tabindex="-1" autofocus {
-                strong { "Schedule is exhausted. " }
-                "It will never fire again (" (reason) ")."
-            }
-        }
-        @if preview.entries.is_empty() {
-            div.card.empty {
-                "No upcoming fire times."
-                @if preview.remaining_runs == Some(0) {
-                    " The run budget is spent."
-                } @else if row.auto_paused_at.is_some() {
-                    " The schedule is auto-paused."
-                } @else if let Some(end_at) = preview.end_at {
-                    " The window ends " (format_timestamp(Some(end_at))) "."
-                } @else if !preview.is_paused && preview.exhausted_reason.is_none() {
-                    " The schedule expression produces no future firings "
-                    "(a manual-only or unparseable expression)."
-                }
-            }
-        } @else {
-            div.card {
-                dl.kv {
-                    dt { "Projected from" } dd { (format_timestamp(Some(preview.from))) }
-                    dt { "Entries requested" } dd { (count) }
-                    @if let Some(remaining) = preview.remaining_runs {
-                        dt { "Remaining run budget" } dd { (remaining) }
-                    }
-                    @if let Some(end_at) = preview.end_at {
-                        dt { "Ends at" } dd { (format_timestamp(Some(end_at))) }
-                    }
-                }
-            }
-            table {
-                thead {
-                    tr {
-                        th { "#" }
-                        th { "Scheduled (UTC)" }
-                        th { "Local (" (row.timezone) ")" }
-                        th { "Effective (UTC)" }
-                        th { "Reason" }
-                        th { "Jitter window" }
-                        th { "Overlap risk" }
-                    }
-                }
-                tbody {
-                    @for (idx, entry) in preview.entries.iter().enumerate() {
-                        tr {
-                            td { (idx + 1) }
-                            td { (format_timestamp(Some(entry.scheduled_at))) }
-                            td { code { (entry.local_at) } }
-                            td {
-                                @match entry.effective_at {
-                                    Some(effective_at) => {
-                                        (format_timestamp(Some(effective_at)))
-                                    }
-                                    None => {
-                                        span.badge.CANCELLED role="status"
-                                            aria-label="Firing suppressed" { "suppressed" }
-                                    }
-                                }
-                            }
-                            td { code { (entry.reason) } }
-                            td {
-                                @match (entry.jitter_earliest_at, entry.jitter_latest_at) {
-                                    (Some(earliest), Some(latest)) => {
-                                        (format_timestamp(Some(earliest)))
-                                        " → "
-                                        (format_timestamp(Some(latest)))
-                                    }
-                                    _ => { "—" }
-                                }
-                            }
-                            td {
-                                @if entry.would_skip_if_active {
-                                    span.badge.FAILED role="status"
-                                        aria-label="May be skipped by the overlap policy" {
-                                        "may be skipped"
-                                    }
-                                } @else {
-                                    "—"
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            p.note {
-                "\"Overlap risk\" is advisory: the preview is stateless and cannot know how "
-                "many runs will be active when the slot arrives."
-            }
-        }
-
-        div.actions {
-            a.drilldown href=(schedule_drilldown_href(&id_str, "runs")) { "Run history" }
-            a.drilldown href=(schedule_drilldown_href(&id_str, "backfill")) { "Backfill" }
-        }
-    };
-    layout_schedules(
-        "Schedule preview · Vantage",
-        &body,
-        None,
-        SCHEDULE_DRILLDOWN_BASE,
-        "",
-    )
-}
-
-/// `GET /schedules/{id}/runs` — per-schedule run history (issue #951 AC7, over
-/// the #534/#762 runs endpoint).
-///
-/// Admin-gated to match `GET /admin/schedules/{id}/runs`, which is the only
-/// schedule read route the API gates.
-async fn schedule_runs_ui(
-    Extension(api_state): Extension<HarvestApiState>,
-    Path(id_str): Path<String>,
-    Query(params): Query<ScheduleRunsUiParams>,
-) -> Result<Markup, AutumnError> {
-    let (row, shard_id) = load_schedule_for_drilldown(&api_state, &id_str).await?;
-
-    // `limit` is parsed here, ahead of the endpoint's own parser below. A
-    // non-numeric value then degrades to the default, instead of ever
-    // reaching `from_query_pairs` as bad input. This matches how the list
-    // pages' `page`/`limit` fields are parsed before their own filters are
-    // built.
-    let (limit, limit_raw, limit_error) =
-        parse_schedule_runs_limit_query_field(params.limit.as_deref());
-
-    // Build the rest of the query through the endpoint's own parser. The UI
-    // then applies the same clamping, vocabulary validation and cursor
-    // format as the API.
-    let mut pairs: Vec<(String, String)> = Vec::new();
-    if let Some(limit) = limit {
-        pairs.push(("limit".to_string(), limit.to_string()));
-    }
-    if let Some(ref cursor) = params.cursor {
-        pairs.push(("cursor".to_string(), cursor.clone()));
-    }
-    if let Some(ref origin) = params.origin
-        && !origin.trim().is_empty()
-    {
-        pairs.push(("origin".to_string(), origin.clone()));
-    }
-    if let Some(ref state) = params.state
-        && !state.trim().is_empty()
-    {
-        pairs.push(("state".to_string(), state.clone()));
-    }
-    let runs_params =
-        crate::schedule_runs::ScheduleRunsParams::from_query_pairs(&pairs, chrono::Utc::now())
-            .map_err(AutumnError::bad_request_msg)?;
-
-    let view = ScheduleRunsView {
-        limit,
-        limit_raw,
-        origin: params
-            .origin
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string),
-        state: params
-            .state
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string),
-    };
-
-    let response = crate::api::load_schedule_runs(&api_state, row.id, runs_params).await?;
-    Ok(render_schedule_runs_page(
-        &row,
-        shard_id,
-        &response,
-        &view,
-        params.flash.as_deref(),
-        limit_error.as_deref(),
-    ))
-}
-
-/// Parses the run-history page's `limit` query parameter.
-///
-/// A non-numeric value falls back to no limit — the endpoint's own default,
-/// [`crate::schedule_runs::DEFAULT_LIMIT`]. It reports the bad value
-/// inline, next to the "Rows" field, instead of aborting the whole page.
-/// Same contract as [`parse_limit_query_field`] on the list pages,
-/// including echoing the raw text back for redisplay.
-///
-/// A numeric-but-out-of-range value (`limit=0`, `limit=100000`) is clamped
-/// silently to `[1, MAX_LIMIT]`, matching [`parse_limit_query_field`]'s own
-/// contract. It is not left for
-/// [`crate::schedule_runs::ScheduleRunsParams::from_query_pairs`] to
-/// reject.
-///
-/// Codex review finding on this PR: the "Rows" field used to be
-/// `type="number" min="1"`, which a browser refuses to submit below 1.
-/// The fix below switched it to a text control, to keep bad text visible
-/// (see `per_page_input_is_a_text_control_that_can_hold_invalid_text`).
-/// That drops the browser-side floor. Without clamping here, a `0` typed
-/// into the now-unconstrained field reaches `from_query_pairs`. It then
-/// rejects the value and aborts the whole page — reintroducing the exact
-/// defect class this PR exists to close.
-fn parse_schedule_runs_limit_query_field(
-    raw: Option<&str>,
-) -> (Option<i64>, String, Option<String>) {
-    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
-        return (None, String::new(), None);
-    };
-    trimmed.parse::<i64>().map_or_else(
-        |_| {
-            (
-                None,
-                trimmed.to_string(),
-                Some(format!(
-                    "Invalid limit '{trimmed}'; expected a whole number. \
-                     Showing {} per page.",
-                    crate::schedule_runs::DEFAULT_LIMIT
-                )),
-            )
-        },
-        |parsed| {
-            (
-                Some(parsed.clamp(1, crate::schedule_runs::MAX_LIMIT)),
-                String::new(),
-                None,
-            )
-        },
-    )
-}
-
-#[allow(clippy::too_many_lines)]
-fn render_schedule_runs_page(
-    row: &HarvestSchedule,
-    shard_id: ShardId,
-    response: &crate::schedule_runs::ScheduleRunsResponse,
-    view: &ScheduleRunsView,
-    flash: Option<&str>,
-    limit_error: Option<&str>,
-) -> Markup {
-    use crate::shard_fanout::FanoutStatus;
-
-    let id_str = row.id.to_string();
-    let unavailable: Vec<&crate::schedule_runs::RunsShardInspection> = response
-        .shards
-        .iter()
-        .filter(|s| s.status != "inspected")
-        .collect();
-    let any_shard_inspected = !matches!(response.status, FanoutStatus::Unavailable);
-
-    let body = html! {
-        h2 { "Run history — " code { (schedule_target_name(row)) } }
-
-        // A committed backfill redirects here with its dispatch counts; the
-        // "failed" count is the only place the operator is told about a partial
-        // dispatch, so the message must not be dropped.
-        @if let Some(message) = flash {
-            div.flash role="status" tabindex="-1" autofocus { (message) }
-        }
-
-        (render_schedule_drilldown_header(row, shard_id, "runs"))
-        (render_schedule_runs_filters(&id_str, view, limit_error))
-
-        // AC7: a partial cross-shard answer is always visible, never silently
-        // truncated data.
-        @match response.status {
-            FanoutStatus::Partial => {
-                div.degraded-banner role="status" tabindex="-1" autofocus {
-                    strong { "Some shards unreachable. " }
-                    "This history and its summary cover only the shards that answered; "
-                    "counts may be understated."
-                    (render_unavailable_shard_list(&unavailable))
-                }
-            }
-            FanoutStatus::Unavailable => {
-                div.degraded-banner role="status" tabindex="-1" autofocus {
-                    strong { "No shard could be reached. " }
-                    "No run history could be read, so this page shows nothing rather "
-                    "than an empty history — retry once shards recover."
-                    (render_unavailable_shard_list(&unavailable))
-                }
-            }
-            FanoutStatus::Complete => {}
-        }
-
-        div.card {
-            h3 { "Scheduled-run summary" }
-            p.note {
-                "Counts " strong { "scheduled-origin" } " runs only, so a backfill storm "
-                "or an ad-hoc trigger never inflates the failure ratio."
-            }
-            dl.kv {
-                dt { "Succeeded" } dd { (response.summary.succeeded) }
-                dt { "Failed" } dd { (response.summary.failed) }
-                dt { "Timed out" } dd { (response.summary.timed_out) }
-                dt { "Cancelled" } dd { (response.summary.cancelled) }
-                dt { "Terminated" } dd { (response.summary.terminated) }
-                dt { "Running" } dd { (response.summary.running) }
-                dt { "Total" } dd { (response.summary.total) }
-                dt { "Next run" } dd { (format_timestamp(response.next_run_at)) }
-            }
-            @if !response.summary.summary_complete {
-                p.note { "Some shards were unavailable, so these counts may be understated." }
-            }
-        }
-
-        @if response.runs.is_empty() {
-            @if any_shard_inspected {
-                div.card.empty {
-                    "No runs yet. This schedule has not started an execution "
-                    "in the queried window."
-                }
-            }
-        } @else {
-            table {
-                thead {
-                    tr {
-                        th { "Nominal fire time" }
-                        th { "Started" }
-                        th { "Completed" }
-                        th { "State" }
-                        th { "Origin" }
-                        th { "Error" }
-                        th { "Execution" }
-                    }
-                }
-                tbody {
-                    @for run in &response.runs {
-                        @let exec_id = run.execution_id.to_string();
-                        tr {
-                            td {
-                                @match run.nominal_fire_time {
-                                    Some(fire_time) => { (format_timestamp(Some(fire_time))) }
-                                    // A manual trigger has no logical slot (#534).
-                                    None => { span.subtle { "— (no slot)" } }
-                                }
-                            }
-                            td { (format_timestamp(Some(run.started_at))) }
-                            td { (format_timestamp(run.completed_at)) }
-                            td { (state_badge(&run.state)) }
-                            td { code { (run.origin.as_deref().unwrap_or("—")) } }
-                            td {
-                                @match run.error {
-                                    Some(ref error) => { span.subtle { (error) } }
-                                    None => { "—" }
-                                }
-                            }
-                            td {
-                                a href={ "../../workflows/" (exec_id) } {
-                                    code { (short_id(&exec_id)) }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            div.pagination {
-                span { "Showing " (response.runs.len()) " of at most " (response.limit) }
-                @if let Some(ref cursor) = response.next_cursor {
-                    // `schedule_drilldown_href`, not the bare leaf path: this
-                    // page is itself a drill-down, so the link needs the
-                    // `../../` prefix. The filters ride along because the
-                    // cursor is only meaningful under them.
-                    a href={ (schedule_drilldown_href(&id_str, "runs"))
-                             "?cursor=" (url_encode(cursor))
-                             (PreEscaped(&view.query_suffix())) } {
-                        "Next " (PreEscaped("&rarr;"))
-                    }
-                } @else {
-                    span.disabled { "Next " (PreEscaped("&rarr;")) }
-                }
-            }
-        }
-
-        div.actions {
-            a.drilldown href=(schedule_drilldown_href(&id_str, "preview")) { "Fire-time preview" }
-            a.drilldown href=(schedule_drilldown_href(&id_str, "backfill")) { "Backfill" }
-        }
-    };
-    layout_schedules(
-        "Schedule runs · Vantage",
-        &body,
-        None,
-        SCHEDULE_DRILLDOWN_BASE,
-        "",
-    )
-}
-
-/// Filter/limit controls for the run history. The endpoint has always accepted
-/// `limit`/`origin`/`state`; without a form they were reachable only by editing
-/// the URL by hand.
-fn render_schedule_runs_filters(
-    id_str: &str,
-    view: &ScheduleRunsView,
-    limit_error: Option<&str>,
-) -> Markup {
-    // Echo exactly what the operator typed on a parse failure, matching the
-    // Workers page's `render_worker_filters`. Fall back to the resolved
-    // value when the field was absent or already valid.
-    let limit_val = if view.limit_raw.is_empty() {
-        view.limit.map(|l| l.to_string()).unwrap_or_default()
-    } else {
-        view.limit_raw.clone()
-    };
-    let origin_val = view.origin.as_deref().unwrap_or("");
-    let state_val = view.state.as_deref().unwrap_or("");
-    html! {
-        form.filters method="get" action=(schedule_drilldown_href(id_str, "runs")) {
-            label {
-                "Rows"
-                // `type="text"`, not `type="number"`. A number input
-                // sanitizes an invalid value (e.g. "not-a-number") to
-                // blank at render time. The operator could then never see
-                // or correct their own bad input. Matches the Workers
-                // page's "Per page" field.
-                input type="text" inputmode="numeric" pattern="[0-9]*" name="limit"
-                    value=(limit_val) placeholder=(crate::schedule_runs::DEFAULT_LIMIT);
-                @if let Some(error) = limit_error {
-                    span.field-error role="alert" { (error) }
-                }
-            }
-            label {
-                "Origin"
-                select name="origin" {
-                    option value="" selected[origin_val.is_empty()] { "All" }
-                    @for origin in ["scheduled", "backfill", "manual_trigger"] {
-                        option value=(origin) selected[origin_val == origin] { (origin) }
-                    }
-                }
-            }
-            label {
-                "State"
-                select name="state" {
-                    option value="" selected[state_val.is_empty()] { "All" }
-                    @for state in KNOWN_STATES {
-                        option value=(state) selected[state_val == *state] { (state) }
-                    }
-                }
-            }
-            button type="submit" { "Apply" }
-            a.reset href=(schedule_drilldown_href(id_str, "runs")) { "Reset" }
-        }
-    }
-}
-
-fn render_unavailable_shard_list(
-    unavailable: &[&crate::schedule_runs::RunsShardInspection],
-) -> Markup {
-    html! {
-        @if !unavailable.is_empty() {
-            ul {
-                @for shard in unavailable {
-                    li {
-                        "Shard " (shard.shard_id) ": "
-                        (shard.error.as_deref().unwrap_or("unavailable"))
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Identity strip shared by the three drill-down pages, so an operator always
-/// knows which schedule they are looking at and can get back to the list.
-fn render_schedule_drilldown_header(
-    row: &HarvestSchedule,
-    shard_id: ShardId,
-    current: &str,
-) -> Markup {
-    let id_str = row.id.to_string();
-    let health = schedule_health(row);
-    html! {
-        div.card {
-            dl.kv {
-                dt { "Schedule" } dd { code { (id_str) } }
-                dt { "Kind" }
-                dd { (if row.dag_name.is_some() { "Dag" } else { "Workflow" }) }
-                dt { "Target" } dd { code { (schedule_target_name(row)) } }
-                dt { "Expression" }
-                dd { code { (row.schedule_expr.as_deref().unwrap_or("—")) } }
-                dt { "Timezone" } dd { (row.timezone) }
-                dt { "Shard" } dd { (shard_id.as_i32()) }
-                dt { "Health" }
-                dd {
-                    @if health.is_healthy() {
-                        (schedule_state_badge(false))
-                    } @else {
-                        div.health-badges { (render_schedule_health_badges(row)) }
-                    }
-                }
-            }
-            p.note {
-                a href="../../schedules" { (PreEscaped("&larr;")) " All schedules" }
-                " · viewing " (current)
-            }
-        }
-    }
-}
-
-// ── Backfill launcher (issue #951 AC6) ──────────────────────────────────────
-
-/// The backfill window an operator typed, normalised and re-checked.
-///
-/// Kept as strings so the confirmation step can round-trip the *exact* window
-/// that was previewed into its hidden fields — the committed backfill is then
-/// provably the one whose counts the operator was shown.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct BackfillFormParams {
-    from: String,
-    to: String,
-    max_count: Option<usize>,
-    include_paused: bool,
-}
-
-impl BackfillFormParams {
-    /// Validate and normalise a submitted window.
-    ///
-    /// # Errors
-    ///
-    /// Returns a human-readable message for an unparseable instant or an
-    /// inverted window, which the caller renders as a form error — never a 500.
-    fn parse(
-        from: &str,
-        to: &str,
-        max_count: Option<usize>,
-        include_paused: bool,
-    ) -> Result<Self, String> {
-        let parse_one = |label: &str, raw: &str| {
-            chrono::DateTime::parse_from_rfc3339(raw.trim())
-                .map(|d| d.with_timezone(&chrono::Utc))
-                .map_err(|_| {
-                    format!(
-                        "invalid {label} '{raw}': expected an RFC 3339 instant, \
-                         e.g. 2026-08-01T00:00:00Z"
-                    )
-                })
-        };
-        let from_at = parse_one("start", from)?;
-        let to_at = parse_one("end", to)?;
-        if to_at < from_at {
-            return Err("the backfill end must be at or after its start".to_string());
-        }
-        // `AutoSi`, not `Secs`: truncating to whole seconds would change the
-        // *window*, not merely its spelling. An `interval:` backfill treats
-        // `from` as its first slot, so a submitted `…00.900Z` normalised to
-        // `…00Z` shifts every slot in the plan. `AutoSi` keeps a whole-second
-        // window spelled `…:00Z` and preserves fractional digits when present.
-        Ok(Self {
-            from: from_at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
-            to: to_at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
-            max_count,
-            include_paused,
-        })
-    }
-
-    /// Build the request for the shared backfill implementation.
-    ///
-    /// `dry_run` is the API's own flag: `true` projects, `false` dispatches. It
-    /// is deliberately *not* the same polarity as the UI's `commit` stage —
-    /// `commit` must map to `dry_run: false` — so callers pass `!commit`.
-    fn to_request(&self, dry_run: bool) -> Result<crate::api::ScheduleBackfillRequest, String> {
-        let parse_one = |raw: &str| {
-            chrono::DateTime::parse_from_rfc3339(raw)
-                .map(|d| d.with_timezone(&chrono::Utc))
-                .map_err(|_| "the backfill window is no longer parseable".to_string())
-        };
-        Ok(crate::api::ScheduleBackfillRequest {
-            from: parse_one(&self.from)?,
-            to: parse_one(&self.to)?,
-            dry_run,
-            include_paused: self.include_paused,
-            max_count: self.max_count,
-        })
-    }
-}
-
-/// Submitted backfill form. `stage` decides what happens, and **defaults to the
-/// dry run**: a POST that omits it can never dispatch work.
-#[derive(Debug, Deserialize)]
-pub(crate) struct ScheduleBackfillForm {
-    #[serde(default)]
-    from: String,
-    #[serde(default)]
-    to: String,
-    #[serde(default)]
-    max_count: Option<String>,
-    #[serde(default)]
-    include_paused: Option<String>,
-    #[serde(default)]
-    stage: Option<String>,
-}
-
-/// `GET /schedules/{id}/backfill` — the empty launcher form.
-///
-/// Purely a read: the dry run itself writes a `harvest_backfill_log` row and an
-/// audit record, so it may not sit on a GET (issue #951 AC9, "read path stays
-/// read-only and side-effect-free").
-async fn schedule_backfill_form_ui(
-    Extension(api_state): Extension<HarvestApiState>,
-    Path(id_str): Path<String>,
-) -> Result<Markup, AutumnError> {
-    let (row, shard_id) = load_schedule_for_drilldown(&api_state, &id_str).await?;
-    Ok(render_schedule_backfill_form(
-        &row,
-        shard_id,
-        None,
-        &BackfillFormEcho::default(),
-    ))
-}
-
-/// `POST /schedules/{id}/backfill` — the two-stage backfill launcher.
-///
-/// `stage=commit` dispatches; anything else (including an absent `stage`) runs
-/// the dry run and renders the preview-count confirmation. Both stages go
-/// through `api::schedule_backfill`, so the audit record, the backfill log row
-/// and every guard (paused, exhausted, `max_active_runs`, `max_runs`) are the
-/// API's, not a second copy.
-async fn schedule_backfill_ui(
-    Extension(api_state): Extension<HarvestApiState>,
-    Path(id_str): Path<String>,
-    headers: axum::http::HeaderMap,
-    Form(form): Form<ScheduleBackfillForm>,
-) -> axum::response::Response {
-    let (row, shard_id) = match load_schedule_for_drilldown(&api_state, &id_str).await {
-        Ok(found) => found,
-        Err(e) => return e.into_response(),
-    };
-
-    // Echoed back verbatim on every rejection below, so a typo in one field
-    // does not cost the operator the whole window.
-    let echo = BackfillFormEcho::from(&form);
-
-    let max_count = match form
-        .max_count
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        // Clamped: `max_count` *replaces* the endpoint's default planning
-        // guard rather than being capped by it, so an unbounded value from a
-        // form would let a wide window enumerate millions of timestamps.
-        Some(raw) => match raw.parse::<usize>() {
-            Ok(n) if n > 0 => Some(n.min(SCHEDULE_BACKFILL_MAX_SLOTS)),
-            _ => {
-                return render_schedule_backfill_form(
-                    &row,
-                    shard_id,
-                    Some(&format!(
-                        "invalid max count '{raw}': expected a positive integer"
-                    )),
-                    &echo,
-                )
-                .into_response();
-            }
-        },
-        None => None,
-    };
-    let include_paused = form.include_paused.is_some();
-
-    let params = match BackfillFormParams::parse(&form.from, &form.to, max_count, include_paused) {
-        Ok(params) => params,
-        Err(message) => {
-            return render_schedule_backfill_form(&row, shard_id, Some(&message), &echo)
-                .into_response();
-        }
-    };
-
-    // Default to the dry run: only an explicit `stage=commit` dispatches.
-    let commit = form.stage.as_deref() == Some("commit");
-
-    // `dry_run` is the inverse of `commit`: the preview stage projects, the
-    // commit stage dispatches.
-    let request = match params.to_request(!commit) {
-        Ok(request) => request,
-        Err(message) => {
-            return render_schedule_backfill_form(&row, shard_id, Some(&message), &echo)
-                .into_response();
-        }
-    };
-
-    // Attribute the audit record to the UI, exactly as the pause/resume actions do.
-    let mut headers = headers;
-    headers.insert(
-        autumn_harvest::audit::HEADER_SOURCE,
-        axum::http::HeaderValue::from_static(SOURCE_UI),
-    );
-
-    // Shares the endpoint's body (every guard, the backfill log row and the
-    // audit record) but labels the audit with the UI's own route, so a
-    // dashboard-initiated backfill is not recorded as an API call. Mirrors
-    // `dag_retry_commit_ui`.
-    let result = crate::api::schedule_backfill_inner(
-        &api_state,
-        &id_str,
-        &headers,
-        request,
-        "POST /ui/schedules/{id}/backfill",
-    )
-    .await;
-
-    match result {
-        Ok(response) => {
-            if commit {
-                // AC6: land the operator on this schedule's run history so the
-                // runs they just launched are one click from the confirmation.
-                let flash = format!(
-                    "Backfill dispatched {} of {} planned run(s); {} skipped, {} failed.",
-                    response.dispatched, response.total, response.skipped, response.failed
-                );
-                axum::response::Redirect::to(&format!(
-                    "../../{}?flash={}",
-                    schedule_leaf_path(&id_str, "runs"),
-                    url_encode(&flash)
-                ))
-                .into_response()
-            } else {
-                render_schedule_backfill_confirm(&row, shard_id, &response, &params).into_response()
-            }
-        }
-        // A rejected backfill (paused, exhausted, window too large, unknown DAG)
-        // comes back as the API's own message, rendered on the form rather than
-        // as a bare error page.
-        Err(e) => render_schedule_backfill_form(&row, shard_id, Some(&e.to_string()), &echo)
-            .into_response(),
-    }
-}
-
-/// Raw, unvalidated form values echoed back when a submission is rejected, so
-/// the operator does not have to retype two RFC 3339 instants.
-#[derive(Debug, Clone, Default)]
-struct BackfillFormEcho {
-    from: String,
-    to: String,
-    max_count: String,
-    include_paused: bool,
-}
-
-impl From<&ScheduleBackfillForm> for BackfillFormEcho {
-    fn from(form: &ScheduleBackfillForm) -> Self {
-        Self {
-            from: form.from.clone(),
-            to: form.to.clone(),
-            max_count: form.max_count.clone().unwrap_or_default(),
-            include_paused: form.include_paused.is_some(),
-        }
-    }
-}
-
-fn render_schedule_backfill_form(
-    row: &HarvestSchedule,
-    shard_id: ShardId,
-    error: Option<&str>,
-    echo: &BackfillFormEcho,
-) -> Markup {
-    let id_str = row.id.to_string();
-    let body = html! {
-        h2 { "Backfill — " code { (schedule_target_name(row)) } }
-        (render_schedule_drilldown_header(row, shard_id, "backfill"))
-
-        @if let Some(message) = error {
-            div.degraded-banner role="status" tabindex="-1" autofocus {
-                strong { "Backfill not started. " } (message)
-            }
-        }
-
-        div.card {
-            p.note {
-                "A backfill replays this schedule's missed slots over a window. "
-                "Submitting runs a "
-                strong { "dry run" }
-                " first: nothing is dispatched until you confirm the planned count."
-            }
-            form method="post" action={ "../../" (schedule_leaf_path(&id_str, "backfill")) } {
-                input type="hidden" name="stage" value="preview";
-                div.filters {
-                    label {
-                        "Start (RFC 3339 UTC)"
-                        input type="text" name="from" required value=(echo.from)
-                            placeholder="2026-08-01T00:00:00Z";
-                    }
-                    label {
-                        "End (RFC 3339 UTC)"
-                        input type="text" name="to" required value=(echo.to)
-                            placeholder="2026-08-02T00:00:00Z";
-                    }
-                    label {
-                        "Max slots"
-                        input type="number" name="max_count" min="1"
-                            max=(SCHEDULE_BACKFILL_MAX_SLOTS) value=(echo.max_count)
-                            placeholder=(SCHEDULE_BACKFILL_MAX_SLOTS);
-                    }
-                    label {
-                        "Include paused"
-                        input type="checkbox" name="include_paused" value="1"
-                            checked[echo.include_paused];
-                    }
-                }
-                div.actions { button type="submit" { "Preview backfill" } }
-            }
-        }
-
-        div.actions {
-            a.drilldown href=(schedule_drilldown_href(&id_str, "preview")) { "Fire-time preview" }
-            a.drilldown href=(schedule_drilldown_href(&id_str, "runs")) { "Run history" }
-        }
-    };
-    layout_schedules(
-        "Schedule backfill · Vantage",
-        &body,
-        None,
-        SCHEDULE_DRILLDOWN_BASE,
-        "",
-    )
-}
-
-fn render_schedule_backfill_confirm(
-    row: &HarvestSchedule,
-    shard_id: ShardId,
-    dry_run: &crate::api::ScheduleBackfillResponse,
-    form: &BackfillFormParams,
-) -> Markup {
-    let id_str = row.id.to_string();
-    // `schedule_backfill` rejects a paused *DAG* schedule in non-dry-run mode
-    // outright, so the dry run can report a healthy `dispatched` count for a
-    // commit that can only ever 400. Say so instead of offering a button that
-    // cannot succeed.
-    let paused_dag = row.is_paused && row.dag_name.is_some();
-    let nothing_to_do = dry_run.total == 0 || dry_run.dispatched == 0;
-    let mut skip_reasons: Vec<(&String, &usize)> = dry_run.skipped_reasons.iter().collect();
-    skip_reasons.sort_by(|a, b| a.0.cmp(b.0));
-
-    let body = html! {
-        h2 { "Confirm backfill — " code { (schedule_target_name(row)) } }
-        (render_schedule_drilldown_header(row, shard_id, "backfill"))
-
-        div.card {
-            h3 { "Dry run" }
-            p.note { "Nothing has been dispatched yet." }
-            dl.kv {
-                dt { "Window" }
-                dd { code { (form.from) } " → " code { (form.to) } }
-                dt { "Planned slots" } dd { (dry_run.total) }
-                dt { "Would dispatch" } dd { (dry_run.dispatched) }
-                dt { "Would skip" } dd { (dry_run.skipped) }
-                @if let Some(max_count) = form.max_count {
-                    dt { "Max slots" } dd { (max_count) }
-                }
-                dt { "Include paused" }
-                dd { (if form.include_paused { "yes" } else { "no" }) }
-            }
-            @if !skip_reasons.is_empty() {
-                h3 { "Skip reasons" }
-                ul {
-                    @for (reason, count) in &skip_reasons {
-                        li { code { (reason) } ": " (count) }
-                    }
-                }
-            }
-            @if let Some(ref warning) = dry_run.paused_schedule_warning {
-                div.degraded-banner role="status" tabindex="-1" autofocus { (warning) }
-            }
-            @if !dry_run.planned_timestamps.is_empty() {
-                h3 { "Planned fire times" }
-                ul {
-                    @for ts in dry_run.planned_timestamps.iter().take(SCHEDULE_BACKFILL_PREVIEW_ROWS) {
-                        li { (format_timestamp(Some(*ts))) }
-                    }
-                }
-                @if dry_run.planned_timestamps.len() > SCHEDULE_BACKFILL_PREVIEW_ROWS {
-                    p.note {
-                        "… and " (dry_run.planned_timestamps.len() - SCHEDULE_BACKFILL_PREVIEW_ROWS)
-                        " more."
-                    }
-                }
-            }
-        }
-
-        @if paused_dag {
-            div.card.empty {
-                "This DAG schedule is paused, so a backfill cannot be dispatched: "
-                "backfilled runs would sit QUEUED and never execute. "
-                "Resume the schedule first, then preview again."
-            }
-        } @else if nothing_to_do {
-            div.card.empty {
-                "Nothing to backfill in this window — no slot would be dispatched. "
-                "Widen the window, or clear whatever is skipping these slots, and preview again."
-            }
-        } @else {
-            div.card {
-                form method="post" action={ "../../" (schedule_leaf_path(&id_str, "backfill")) }
-                    onsubmit={
-                        "return confirm('Dispatch " (dry_run.dispatched)
-                        " backfill run(s) for schedule " (js_escape(&id_str)) "?')"
-                    } {
-                    input type="hidden" name="stage" value="commit";
-                    input type="hidden" name="from" value=(form.from);
-                    input type="hidden" name="to" value=(form.to);
-                    @if let Some(max_count) = form.max_count {
-                        input type="hidden" name="max_count" value=(max_count);
-                    }
-                    @if form.include_paused {
-                        input type="hidden" name="include_paused" value="1";
-                    }
-                    div.actions {
-                        button type="submit" { "Dispatch " (dry_run.dispatched) " run(s)" }
-                        a.drilldown href=(schedule_drilldown_href(&id_str, "backfill")) {
-                            "Cancel"
-                        }
-                    }
-                }
-            }
-        }
-    };
-    layout_schedules(
-        "Confirm backfill · Vantage",
-        &body,
-        None,
-        SCHEDULE_DRILLDOWN_BASE,
-        "",
-    )
-}
-
-/// How many planned fire times the confirmation lists before rolling up.
-const SCHEDULE_BACKFILL_PREVIEW_ROWS: usize = 20;
-
-/// Ceiling on the launcher's `max_count`.
-///
-/// The endpoint treats `max_count` as the *planning* limit — supplying one
-/// replaces `DEFAULT_BACKFILL_MAX_COUNT` rather than being capped by it — so an
-/// unbounded value from a browser form could enumerate millions of timestamps
-/// in one request. The UI caps it at the endpoint's own default.
-const SCHEDULE_BACKFILL_MAX_SLOTS: usize = autumn_harvest::scheduler::DEFAULT_BACKFILL_MAX_COUNT;
 
 // ── Admission gates UI (issue #377) ──────────────────────────────────────────
 
@@ -12391,7 +9000,7 @@ fn render_gates_page(rows: &[autumn_harvest::models::AdmissionGateRow]) -> Marku
                         strong { code { (id_short) } }
                         " "
                         @if is_expired {
-                            span.badge style="background:#374151;color:#e2e8f0" { "EXPIRED" }
+                            span.badge style="background:#374151;color:#9ca3af" { "EXPIRED" }
                         } @else {
                             span.badge.FAILED { "ACTIVE" }
                         }
@@ -12442,7 +9051,7 @@ fn render_gates_page(rows: &[autumn_harvest::models::AdmissionGateRow]) -> Marku
                 }
                 @for row in &lifted {
                     @let id_short = &row.id.to_string()[..8];
-                    div.card style="opacity:0.8" {
+                    div.card style="opacity:0.6" {
                         code { (id_short) }
                         " "
                         span.badge.COMPLETED { "LIFTED" }
@@ -12492,34 +9101,7 @@ fn layout_gates(title: &str, body: &Markup) -> Markup {
     }
 }
 
-/// Chrome for the schedules pages.
-///
-/// `base_href` is the relative prefix that reaches the UI mount point from the
-/// page being rendered, exactly as [`layout`] takes one: the list at
-/// `/schedules` passes `""`, and the `/schedules/{id}/{leaf}` drill-downs pass
-/// [`SCHEDULE_DRILLDOWN_BASE`] (`../../`). Without it every nav link on a
-/// drill-down resolves relative to `/schedules/{id}/` and 404s.
-/// `refresh_target` is the current filtered list view's URL, page
-/// included, with no `flash` param. Only the list page passes a real
-/// one. The drill-down pages never enable `refresh`, so an empty string
-/// is fine there. The `@if let Some(secs)` guard below never renders the
-/// tag in that case.
-///
-/// A bulk action redirects here with `flash` appended to `return_to`.
-/// `return_to` itself preserves `refresh`. Without an explicit target,
-/// an operator with auto-refresh on would see this page's meta refresh
-/// reload that same flash-bearing URL on every interval. Each reload
-/// would re-announce and re-focus a stale message. Same fix as
-/// `layout_dead_letters` already applies, found in review there as PR
-/// #1396. Codex review on #1437 P2: newly reachable once the bulk
-/// actions started preserving `refresh` through `return_to`.
-fn layout_schedules(
-    title: &str,
-    body: &Markup,
-    refresh: Option<u64>,
-    base_href: &str,
-    refresh_target: &str,
-) -> Markup {
+fn layout_schedules(title: &str, body: &Markup, refresh: Option<u64>) -> Markup {
     html! {
         (PreEscaped("<!DOCTYPE html>"))
         html lang="en" {
@@ -12527,7 +9109,7 @@ fn layout_schedules(
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width,initial-scale=1";
                 @if let Some(secs) = refresh {
-                    meta http-equiv="refresh" content={ (secs) "; url=" (refresh_target) };
+                    meta http-equiv="refresh" content=(secs);
                 }
                 title { (title) }
                 style { (PreEscaped(STYLE)) }
@@ -12535,15 +9117,15 @@ fn layout_schedules(
             body {
                 header {
                     h1 {
-                        a href={ (base_href) "workflows" } { "🔭 Vantage" }
+                        a href="workflows" { "🔭 Vantage" }
                         span.subtitle { "Harvest dashboard" }
                     }
                     nav {
-                        a href={ (base_href) "workflows" } { "Workflows" }
-                        a href={ (base_href) "workers" } { "Workers" }
-                        a.active href={ (base_href) "schedules" } { "Schedules" }
-                        a href={ (base_href) "dead-letters" } { "Dead Letters" }
-                        a href={ (base_href) "build-routing" } { "Build Routing" }
+                        a href="workflows" { "Workflows" }
+                        a href="workers" { "Workers" }
+                        a.active href="schedules" { "Schedules" }
+                        a href="dead-letters" { "Dead Letters" }
+                        a href="build-routing" { "Build Routing" }
                     }
                 }
                 main { (body) }
@@ -12556,566 +9138,6 @@ fn layout_schedules(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// GREEN -- the fix under test (Snag repro, boundary tour on
-    /// `jump_event`). The fix in #1627 handles a non-numeric `jump_event`.
-    /// It also handles a small negative one (`-5`, see
-    /// `resolve_workflow_detail_event_page_clamps_a_negative_jump_event_to_zero`).
-    /// But `resolve_workflow_detail_event_page`'s prior `(jump - 1).max(0)`
-    /// still overflowed on `i64::MIN`. `i64::MIN - 1` cannot be
-    /// represented. A debug build panicked on that instead of degrading,
-    /// the default for `cargo test` and `cargo dev`. A GET to
-    /// `/ui/workflows/{exec_id}?jump_event=-9223372036854775808` reached
-    /// this exact call in `workflow_detail_ui`, with no other validation
-    /// in front of it. `saturating_sub` degrades it like any other
-    /// very-negative value instead: page 0, no error.
-    #[test]
-    fn resolve_workflow_detail_event_page_does_not_overflow_on_i64_min_jump_event() {
-        let (page, page_error, jump_error) =
-            resolve_workflow_detail_event_page(None, Some("-9223372036854775808"), 100);
-        assert_eq!(page, 0);
-        assert_eq!(page_error, None);
-        assert_eq!(jump_error, None);
-    }
-
-    /// GREEN: a valid bound parses, and the raw display echoes the
-    /// caller-supplied text (not a re-formatted RFC 3339 string) with no error.
-    #[test]
-    fn parse_started_bound_accepts_valid_rfc3339() {
-        let (parsed, raw, error) =
-            parse_started_bound(Some("2026-01-01T00:00:00Z"), "started_after");
-        assert_eq!(raw, "2026-01-01T00:00:00Z");
-        assert!(error.is_none());
-        assert_eq!(
-            parsed.map(|d| d.to_rfc3339()),
-            Some("2026-01-01T00:00:00+00:00".to_string())
-        );
-    }
-
-    /// GREEN — the fix under test: a malformed bound no longer aborts the
-    /// caller. It degrades to "filter not applied" (`parsed` is `None`) while
-    /// echoing the operator's exact raw input and a recovery message, so the
-    /// caller can redisplay the field inline instead of discarding the page.
-    /// Before this change, `list_workflows_ui` `?`-propagated a bare
-    /// `AutumnError` here, which aborted the whole `/workflows` response
-    /// before the filter form (or any other filter the operator had typed)
-    /// was ever rendered — see the RED baseline in
-    /// `tests/ui_integration.rs::ui_workflows_invalid_started_after_*`.
-    #[test]
-    fn parse_started_bound_rejects_invalid_value_without_erroring() {
-        let (parsed, raw, error) = parse_started_bound(Some("yesterday"), "started_after");
-        assert_eq!(
-            parsed, None,
-            "an invalid bound must not be applied to the query"
-        );
-        assert_eq!(
-            raw, "yesterday",
-            "the operator's exact raw input is echoed back"
-        );
-        let error = error.expect("an invalid bound must carry a redisplayable error");
-        assert!(
-            error.contains("started_after") && error.contains("RFC 3339"),
-            "error names the field and the expected format: {error}"
-        );
-    }
-
-    #[test]
-    fn parse_started_bound_blank_or_missing_is_not_an_error() {
-        assert_eq!(
-            parse_started_bound(None, "started_after"),
-            (None, String::new(), None)
-        );
-        assert_eq!(
-            parse_started_bound(Some("   "), "started_after"),
-            (None, String::new(), None)
-        );
-    }
-
-    /// Codex review finding on this PR: on a successful parse, `raw` must be
-    /// empty, not an echo of the input. `render_filters`/`build_query_string`
-    /// treat a non-empty raw as "still invalid, keep displaying the bad
-    /// text". Echoing valid text there is harmless when it already matches
-    /// the resolved value. See the clamping test below for where it is not.
-    #[test]
-    fn parse_page_query_field_accepts_valid_values() {
-        assert_eq!(parse_page_query_field(Some("3")), (3, String::new(), None));
-        assert_eq!(
-            parse_page_query_field(Some("  7  ")),
-            (7, String::new(), None)
-        );
-    }
-
-    /// Codex review finding on this PR: a negative page number parses. It is
-    /// a well-formed whole number, and is clamped, matching the pre-fix
-    /// `.unwrap_or(0).max(0)` behavior. `raw` must stay empty, though, so a
-    /// caller displays the clamped `0`, not the pre-clamp `"-5"` alongside
-    /// it.
-    #[test]
-    fn parse_page_query_field_clamps_negative_values_to_zero() {
-        assert_eq!(parse_page_query_field(Some("-5")), (0, String::new(), None));
-    }
-
-    /// GREEN -- the fix under test: a non-numeric `page` no longer aborts
-    /// the whole `/workflows` response. It degrades to page 0 while naming
-    /// the bad value, so every other filter the operator entered survives.
-    #[test]
-    fn parse_page_query_field_rejects_non_numeric_text_without_erroring() {
-        let (page, raw, error) = parse_page_query_field(Some("not-a-number"));
-        assert_eq!(page, 0, "an invalid page falls back to page 0");
-        assert_eq!(raw, "not-a-number", "the raw text is echoed back");
-        let message = error.expect("an invalid page must carry a redisplayable error");
-        assert!(
-            message.contains("not-a-number") && message.contains("page"),
-            "the error names the bad value and the field: {message}"
-        );
-    }
-
-    #[test]
-    fn parse_page_query_field_blank_or_missing_is_not_an_error() {
-        assert_eq!(parse_page_query_field(None), (0, String::new(), None));
-        assert_eq!(
-            parse_page_query_field(Some("   ")),
-            (0, String::new(), None)
-        );
-    }
-
-    #[test]
-    fn parse_limit_query_field_accepts_valid_values() {
-        assert_eq!(
-            parse_limit_query_field(Some("50"), DEFAULT_PAGE_SIZE),
-            (50, String::new(), None)
-        );
-    }
-
-    /// Codex review finding on this PR: a well-formed but out-of-range limit
-    /// (`0`, `100000`) is clamped, matching the pre-fix `.clamp(1,
-    /// MAX_PAGE_SIZE)` behavior. `raw` must stay empty here. Before this
-    /// fix, `render_filters` preferred a non-empty `raw` over the resolved
-    /// `limit`. The "Per page" field then displayed the pre-clamp text
-    /// (`"100000"`). Pagination actually used the clamped value (`200`) —
-    /// a silent mismatch with no error explaining it.
-    #[test]
-    fn parse_limit_query_field_clamps_out_of_range_values() {
-        assert_eq!(
-            parse_limit_query_field(Some("0"), DEFAULT_PAGE_SIZE),
-            (1, String::new(), None)
-        );
-        assert_eq!(
-            parse_limit_query_field(Some("100000"), DEFAULT_PAGE_SIZE),
-            (MAX_PAGE_SIZE, String::new(), None)
-        );
-    }
-
-    /// GREEN -- the fix under test: a non-numeric `limit` no longer aborts
-    /// the whole `/workflows` response. It degrades to `DEFAULT_PAGE_SIZE`
-    /// while naming the bad value, matching `parse_page_query_field`.
-    #[test]
-    fn parse_limit_query_field_rejects_non_numeric_text_without_erroring() {
-        let (limit, raw, error) = parse_limit_query_field(Some("a-lot"), DEFAULT_PAGE_SIZE);
-        assert_eq!(
-            limit, DEFAULT_PAGE_SIZE,
-            "an invalid limit falls back to the default page size"
-        );
-        assert_eq!(raw, "a-lot", "the raw text is echoed back");
-        let message = error.expect("an invalid limit must carry a redisplayable error");
-        assert!(
-            message.contains("a-lot") && message.contains("limit"),
-            "the error names the bad value and the field: {message}"
-        );
-    }
-
-    /// The DLQ page's default page size (50) differs from the
-    /// Workflows/Workers pages' (25). `parse_limit_query_field`'s `default`
-    /// parameter must fall back to the caller's own default on a parse
-    /// failure, not silently substitute `DEFAULT_PAGE_SIZE`.
-    #[test]
-    fn parse_limit_query_field_uses_the_callers_default_not_a_hardcoded_one() {
-        assert_eq!(
-            parse_limit_query_field(None, DEFAULT_DLQ_PAGE_SIZE),
-            (DEFAULT_DLQ_PAGE_SIZE, String::new(), None)
-        );
-        let (limit, raw, error) = parse_limit_query_field(Some("a-lot"), DEFAULT_DLQ_PAGE_SIZE);
-        assert_eq!(
-            limit, DEFAULT_DLQ_PAGE_SIZE,
-            "an invalid limit falls back to the DLQ page's own default, not 25"
-        );
-        assert_eq!(raw, "a-lot");
-        assert!(
-            error.is_some_and(|message| message.contains(&DEFAULT_DLQ_PAGE_SIZE.to_string())),
-            "the error should name the DLQ page's own default"
-        );
-    }
-
-    #[test]
-    fn parse_dag_node_query_field_accepts_valid_values() {
-        assert_eq!(parse_dag_node_query_field(Some("3")), (Some(3), None));
-        assert_eq!(parse_dag_node_query_field(Some("  7  ")), (Some(7), None));
-    }
-
-    #[test]
-    fn parse_dag_node_query_field_blank_or_missing_is_not_an_error() {
-        assert_eq!(parse_dag_node_query_field(None), (None, None));
-        assert_eq!(parse_dag_node_query_field(Some("   ")), (None, None));
-    }
-
-    /// GREEN -- the fix under test: a non-numeric `node` no longer aborts
-    /// the whole `/dags/{name}` response with axum's bare 400. It degrades
-    /// to no node selected while naming the bad value, matching
-    /// `parse_page_query_field`.
-    #[test]
-    fn parse_dag_node_query_field_rejects_non_numeric_text_without_erroring() {
-        let (node, error) = parse_dag_node_query_field(Some("not-a-number"));
-        assert_eq!(node, None, "an invalid node falls back to no selection");
-        let message = error.expect("an invalid node must carry a redisplayable error");
-        assert!(
-            message.contains("not-a-number") && message.contains("node"),
-            "the error names the bad value and the field: {message}"
-        );
-    }
-
-    /// A well-formed but out-of-range node index is left as-is, not
-    /// rejected. `render_dag_run_graph_section` already looks it up with
-    /// `nodes.get(idx)` and renders no panel on a miss.
-    #[test]
-    fn parse_dag_node_query_field_leaves_out_of_range_values_for_the_caller() {
-        assert_eq!(parse_dag_node_query_field(Some("9999")), (Some(9999), None));
-    }
-
-    #[test]
-    fn parse_refresh_query_field_accepts_valid_values() {
-        assert_eq!(parse_refresh_query_field(Some("30")), (Some(30), None));
-    }
-
-    #[test]
-    fn parse_refresh_query_field_blank_or_missing_is_not_an_error() {
-        assert_eq!(parse_refresh_query_field(None), (None, None));
-        assert_eq!(parse_refresh_query_field(Some("   ")), (None, None));
-    }
-
-    /// GREEN -- the fix under test: a non-numeric `refresh` no longer
-    /// aborts the whole `/dags/{name}` response with axum's bare 400. It
-    /// degrades to auto-refresh disabled while naming the bad value.
-    #[test]
-    fn parse_refresh_query_field_rejects_non_numeric_text_without_erroring() {
-        let (refresh, error) = parse_refresh_query_field(Some("not-a-number"));
-        assert_eq!(refresh, None, "an invalid refresh disables auto-refresh");
-        let message = error.expect("an invalid refresh must carry a redisplayable error");
-        assert!(
-            message.contains("not-a-number") && message.contains("refresh"),
-            "the error names the bad value and the field: {message}"
-        );
-    }
-
-    // ── issue #1627: Workflow Detail page 400-aborts on a non-numeric
-    // `event_page`/`jump_event` ──
-
-    #[test]
-    fn parse_jump_event_query_field_accepts_valid_values() {
-        assert_eq!(parse_jump_event_query_field(Some("12")), (Some(12), None));
-        assert_eq!(parse_jump_event_query_field(Some("  7  ")), (Some(7), None));
-    }
-
-    #[test]
-    fn parse_jump_event_query_field_blank_or_missing_is_not_an_error() {
-        assert_eq!(parse_jump_event_query_field(None), (None, None));
-        assert_eq!(parse_jump_event_query_field(Some("   ")), (None, None));
-    }
-
-    /// GREEN -- the fix under test: a non-numeric `jump_event` no longer
-    /// aborts the whole `/workflows/{id}` response with axum's bare 400
-    /// (issue #1627). It degrades to no jump -- `event_page` applies
-    /// instead -- while naming the bad value, matching
-    /// `parse_dag_node_query_field`.
-    #[test]
-    fn parse_jump_event_query_field_rejects_non_numeric_text_without_erroring() {
-        let (jump_event, error) = parse_jump_event_query_field(Some("not-a-number"));
-        assert_eq!(
-            jump_event, None,
-            "an invalid jump_event falls back to no jump"
-        );
-        let message = error.expect("an invalid jump_event must carry a redisplayable error");
-        assert!(
-            message.contains("not-a-number") && message.contains("jump_event"),
-            "the error names the bad value and the field: {message}"
-        );
-    }
-
-    /// A negative `jump_event` parses -- it is a well-formed whole number --
-    /// and is clamped to page 0 downstream, not rejected. Matches
-    /// `parse_page_query_field_clamps_negative_values_to_zero`.
-    #[test]
-    fn parse_jump_event_query_field_accepts_negative_values() {
-        assert_eq!(parse_jump_event_query_field(Some("-5")), (Some(-5), None));
-    }
-
-    /// `jump_event` wins over `event_page` when both are present and valid.
-    #[test]
-    fn resolve_workflow_detail_event_page_prefers_a_valid_jump_event() {
-        let (page, page_error, jump_error) =
-            resolve_workflow_detail_event_page(Some("5"), Some("101"), 100);
-        assert_eq!(page, 1, "event 101 (1-based) falls on page index 1");
-        assert_eq!(page_error, None);
-        assert_eq!(jump_error, None);
-    }
-
-    /// Codex review, PR #1652: a valid `jump_event` must suppress a bad
-    /// `event_page`'s error. `event_page` plays no part in the shown page
-    /// once `jump_event` wins, so naming its fallback ("Showing page 1")
-    /// would contradict the page actually on screen.
-    #[test]
-    fn resolve_workflow_detail_event_page_suppresses_a_moot_event_page_error() {
-        let (page, page_error, jump_error) =
-            resolve_workflow_detail_event_page(Some("not-a-number"), Some("501"), 100);
-        assert_eq!(page, 5, "the valid jump_event alone decides the page");
-        assert_eq!(
-            page_error, None,
-            "a bad event_page must not report once jump_event overrides it"
-        );
-        assert_eq!(jump_error, None);
-    }
-
-    /// GREEN -- the fix under test: a non-numeric `event_page` no longer
-    /// aborts the page. It degrades to page 0 and reports the bad value,
-    /// exactly like the four already-fixed sibling list pages.
-    #[test]
-    fn resolve_workflow_detail_event_page_rejects_non_numeric_event_page_without_erroring() {
-        let (page, page_error, jump_error) =
-            resolve_workflow_detail_event_page(Some("not-a-number"), None, 100);
-        assert_eq!(page, 0);
-        assert!(page_error.is_some_and(|e| e.contains("not-a-number")));
-        assert_eq!(jump_error, None);
-    }
-
-    /// GREEN -- the fix under test: a non-numeric `jump_event` no longer
-    /// aborts the page. It degrades to `event_page`'s own value (or 0)
-    /// instead, and reports the bad `jump_event` value.
-    #[test]
-    fn resolve_workflow_detail_event_page_rejects_non_numeric_jump_event_without_erroring() {
-        let (page, page_error, jump_error) =
-            resolve_workflow_detail_event_page(Some("2"), Some("not-a-number"), 100);
-        assert_eq!(page, 2, "falls back to the valid event_page");
-        assert_eq!(page_error, None);
-        assert!(jump_error.is_some_and(|e| e.contains("not-a-number")));
-    }
-
-    /// A bad `event_page` and a bad `jump_event` at the same time must both
-    /// report, not hide one another. The page still degrades to 0.
-    #[test]
-    fn resolve_workflow_detail_event_page_reports_both_errors_when_both_are_invalid() {
-        let (page, page_error, jump_error) =
-            resolve_workflow_detail_event_page(Some("nope"), Some("also-nope"), 100);
-        assert_eq!(page, 0);
-        assert!(page_error.is_some_and(|e| e.contains("nope")));
-        assert!(jump_error.is_some_and(|e| e.contains("also-nope")));
-    }
-
-    /// A negative `jump_event` degrades to page 0 with no error -- the same
-    /// pre-fix behavior `.max(0)` already gave a negative computed index.
-    #[test]
-    fn resolve_workflow_detail_event_page_clamps_a_negative_jump_event_to_zero() {
-        let (page, page_error, jump_error) =
-            resolve_workflow_detail_event_page(None, Some("-5"), 100);
-        assert_eq!(page, 0);
-        assert_eq!(page_error, None);
-        assert_eq!(jump_error, None);
-    }
-
-    /// `jump_event=0` is out of the documented 1-based range. It is left as
-    /// a lenient alias for the first page, not rejected. This matches the
-    /// pre-fix `(0 - 1).max(0)` arithmetic exactly.
-    #[test]
-    fn resolve_workflow_detail_event_page_treats_jump_event_zero_as_page_zero() {
-        let (page, page_error, jump_error) =
-            resolve_workflow_detail_event_page(None, Some("0"), 100);
-        assert_eq!(page, 0);
-        assert_eq!(page_error, None);
-        assert_eq!(jump_error, None);
-    }
-
-    #[test]
-    fn parse_schedule_preview_count_query_field_accepts_valid_values() {
-        assert_eq!(
-            parse_schedule_preview_count_query_field(Some("25")),
-            (25, None)
-        );
-    }
-
-    #[test]
-    fn parse_schedule_preview_count_query_field_blank_or_missing_is_not_an_error() {
-        assert_eq!(
-            parse_schedule_preview_count_query_field(None),
-            (SCHEDULE_PREVIEW_DEFAULT_COUNT, None)
-        );
-        assert_eq!(
-            parse_schedule_preview_count_query_field(Some("   ")),
-            (SCHEDULE_PREVIEW_DEFAULT_COUNT, None)
-        );
-    }
-
-    /// A well-formed but out-of-range count is clamped, matching the
-    /// pre-fix `.clamp(1, 100)` behavior.
-    #[test]
-    fn parse_schedule_preview_count_query_field_clamps_out_of_range_values() {
-        assert_eq!(
-            parse_schedule_preview_count_query_field(Some("0")),
-            (1, None)
-        );
-        assert_eq!(
-            parse_schedule_preview_count_query_field(Some("1000")),
-            (100, None)
-        );
-    }
-
-    /// GREEN -- the fix under test: `count` was typed `Option<usize>`
-    /// directly on `SchedulePreviewUiParams`. A non-numeric value then
-    /// failed axum's own query deserialization with a bare 400. That
-    /// happened before `schedule_preview_ui` ever ran, aborting the whole
-    /// preview page. It now degrades to `SCHEDULE_PREVIEW_DEFAULT_COUNT`
-    /// while naming the bad value, matching `parse_dag_node_query_field`.
-    #[test]
-    fn parse_schedule_preview_count_query_field_rejects_non_numeric_text_without_erroring() {
-        let (count, error) = parse_schedule_preview_count_query_field(Some("not-a-number"));
-        assert_eq!(
-            count, SCHEDULE_PREVIEW_DEFAULT_COUNT,
-            "an invalid count falls back to the page's default"
-        );
-        let message = error.expect("an invalid count must carry a redisplayable error");
-        assert!(
-            message.contains("not-a-number") && message.contains("count"),
-            "the error names the bad value and the field: {message}"
-        );
-    }
-
-    #[test]
-    fn parse_schedule_runs_limit_query_field_accepts_valid_values() {
-        assert_eq!(
-            parse_schedule_runs_limit_query_field(Some("50")),
-            (Some(50), String::new(), None)
-        );
-    }
-
-    #[test]
-    fn parse_schedule_runs_limit_query_field_blank_or_missing_is_not_an_error() {
-        assert_eq!(
-            parse_schedule_runs_limit_query_field(None),
-            (None, String::new(), None)
-        );
-        assert_eq!(
-            parse_schedule_runs_limit_query_field(Some("   ")),
-            (None, String::new(), None)
-        );
-    }
-
-    /// Codex review finding on this PR: a well-formed but out-of-range
-    /// limit (`0`, `100000`) is clamped here, not left for
-    /// `ScheduleRunsParams::from_query_pairs` to reject. The "Rows" field
-    /// is a text control with no browser-side floor. An unclamped `0`
-    /// would reach `from_query_pairs` and abort the whole page — the
-    /// exact defect class this PR exists to close.
-    #[test]
-    fn parse_schedule_runs_limit_query_field_clamps_out_of_range_values() {
-        assert_eq!(
-            parse_schedule_runs_limit_query_field(Some("0")),
-            (Some(1), String::new(), None)
-        );
-        assert_eq!(
-            parse_schedule_runs_limit_query_field(Some("100000")),
-            (Some(crate::schedule_runs::MAX_LIMIT), String::new(), None)
-        );
-    }
-
-    /// GREEN -- the fix under test: `limit` was typed `Option<i64>` directly
-    /// on `ScheduleRunsUiParams`. A non-numeric value then failed axum's
-    /// own query deserialization with a bare 400. That happened before
-    /// `schedule_runs_ui` ever ran, discarding the `origin`/`state`
-    /// filters already on the URL along with the rest of the page. It now
-    /// degrades to no limit (the endpoint's own default) while naming the
-    /// bad value. It also echoes the raw text back for redisplay, matching
-    /// `parse_limit_query_field`.
-    #[test]
-    fn parse_schedule_runs_limit_query_field_rejects_non_numeric_text_without_erroring() {
-        let (limit, raw, error) = parse_schedule_runs_limit_query_field(Some("not-a-number"));
-        assert_eq!(limit, None, "an invalid limit falls back to no override");
-        assert_eq!(raw, "not-a-number", "the raw text is echoed for redisplay");
-        let message = error.expect("an invalid limit must carry a redisplayable error");
-        assert!(
-            message.contains("not-a-number") && message.contains("limit"),
-            "the error names the bad value and the field: {message}"
-        );
-    }
-
-    /// Codex review finding on this PR: the Next link used to be built
-    /// from `limit` alone. A parse failure leaves `limit` at `None`. The
-    /// operator's bad text — and the error naming it — then silently
-    /// vanished on the very click meant to preserve their place.
-    #[test]
-    fn schedule_runs_view_query_suffix_carries_the_invalid_raw_limit() {
-        let view = ScheduleRunsView {
-            limit: None,
-            limit_raw: "not-a-number".to_string(),
-            origin: Some("scheduled".to_string()),
-            state: None,
-        };
-        assert_eq!(view.query_suffix(), "&limit=not-a-number&origin=scheduled");
-    }
-
-    /// A clean, already-resolved `limit` still round-trips as before.
-    #[test]
-    fn schedule_runs_view_query_suffix_carries_the_resolved_limit_when_valid() {
-        let view = ScheduleRunsView {
-            limit: Some(5),
-            limit_raw: String::new(),
-            origin: None,
-            state: None,
-        };
-        assert_eq!(view.query_suffix(), "&limit=5");
-    }
-
-    /// Codex review finding on this PR: a `type="number"` input sanitizes an
-    /// invalid value to blank at render time in a real browser. The
-    /// operator could then never see or edit the exact text they typed.
-    /// That holds even though the HTML source already carried it — and
-    /// thus this test, if it only checked `contains("not-a-number")`. The
-    /// "Per page" field must be a text control, matching the Workers page's
-    /// `shard` filter.
-    #[test]
-    fn per_page_input_is_a_text_control_that_can_hold_invalid_text() {
-        let markup = render_filters(
-            None,
-            None,
-            None,
-            "",
-            None,
-            "",
-            None,
-            None,
-            DEFAULT_PAGE_SIZE,
-            "not-a-number",
-            Some("invalid limit 'not-a-number'"),
-        )
-        .into_string();
-        assert!(
-            markup
-                .contains(r#"input type="text" inputmode="numeric" pattern="[0-9]*" name="limit""#),
-            "the Per page field must be a text control, not type=\"number\": {markup}"
-        );
-        assert!(
-            markup.contains("value=\"not-a-number\""),
-            "the operator's invalid input must be preserved: {markup}"
-        );
-    }
-
-    #[test]
-    fn parse_limit_query_field_blank_or_missing_is_not_an_error() {
-        assert_eq!(
-            parse_limit_query_field(None, DEFAULT_PAGE_SIZE),
-            (DEFAULT_PAGE_SIZE, String::new(), None)
-        );
-        assert_eq!(
-            parse_limit_query_field(Some("   "), DEFAULT_PAGE_SIZE),
-            (DEFAULT_PAGE_SIZE, String::new(), None)
-        );
-    }
 
     /// Issue #619: with nothing paused **and** every shard readable, the banner
     /// must render nothing at all, so a healthy Workers page is byte-identical to
@@ -13564,29 +9586,9 @@ mod tests {
     }
 
     #[test]
-    fn event_label_shows_build_and_worker_per_decision() {
-        let data = serde_json::json!({
-            "type": "DecisionCommitted",
-            "data": {"build_id": "build-7", "worker_id": "worker-eu-1"},
-        });
-        assert_eq!(
-            event_human_label("DecisionCommitted", &data, "RUNNING"),
-            "Decision committed: build build-7, worker worker-eu-1"
-        );
-        let legacy = serde_json::json!({
-            "type": "DecisionCommitted",
-            "data": {"build_id": "", "worker_id": "w"},
-        });
-        assert_eq!(
-            event_human_label("DecisionCommitted", &legacy, "RUNNING"),
-            "Decision committed: build <none>, worker w"
-        );
-    }
-
-    #[test]
     fn layout_escapes_title_but_keeps_body_markup() {
         let body = html! { p { "hello" } };
-        let html = layout("<evil>", &body, "", None).into_string();
+        let html = layout("<evil>", &body, "").into_string();
         assert!(html.contains("<title>&lt;evil&gt;</title>"));
         assert!(html.contains("<p>hello</p>"));
         assert!(html.contains("🔭 Vantage"));
@@ -13595,28 +9597,27 @@ mod tests {
     #[test]
     fn build_query_string_omits_default_limit() {
         assert_eq!(
-            build_query_string(DEFAULT_PAGE_SIZE, "", None, None, None, "", "", None),
+            build_query_string(DEFAULT_PAGE_SIZE, None, None, None, None, None, None),
             ""
         );
         assert_eq!(
-            build_query_string(10, "", None, None, None, "", "", None),
+            build_query_string(10, None, None, None, None, None, None),
             "&limit=10"
         );
         assert_eq!(
             build_query_string(
                 DEFAULT_PAGE_SIZE,
-                "",
                 Some("FAILED"),
                 None,
                 None,
-                "",
-                "",
+                None,
+                None,
                 None
             ),
             "&state=FAILED"
         );
         assert_eq!(
-            build_query_string(50, "", Some("with space"), None, None, "", "", None),
+            build_query_string(50, Some("with space"), None, None, None, None, None),
             "&limit=50&state=with%20space"
         );
     }
@@ -13626,97 +9627,19 @@ mod tests {
         assert_eq!(
             build_query_string(
                 DEFAULT_PAGE_SIZE,
-                "",
                 None,
                 Some("onboarding"),
                 None,
-                "",
-                "",
+                None,
+                None,
                 None
             ),
             "&workflow_name=onboarding"
         );
         let pair = ("tenant".to_string(), "acme".to_string());
         assert_eq!(
-            build_query_string(DEFAULT_PAGE_SIZE, "", None, None, Some(&pair), "", "", None),
+            build_query_string(DEFAULT_PAGE_SIZE, None, None, Some(&pair), None, None, None),
             "&search_attr_key=tenant&search_attr_value=acme"
-        );
-    }
-
-    /// The Codex review finding on this PR: a Next/Previous link must not
-    /// silently drop an invalid `started_after`/`started_before` an operator
-    /// is still correcting — that would clear the value and its inline error
-    /// (see `parse_started_bound`) via a click that looks unrelated to the
-    /// filter form, one page after the operator typed it.
-    #[test]
-    fn build_query_string_preserves_invalid_date_text_for_pagination() {
-        assert_eq!(
-            build_query_string(
-                DEFAULT_PAGE_SIZE,
-                "",
-                None,
-                None,
-                None,
-                "yesterday",
-                "",
-                None
-            ),
-            "&started_after=yesterday"
-        );
-        assert_eq!(
-            build_query_string(
-                DEFAULT_PAGE_SIZE,
-                "",
-                None,
-                None,
-                None,
-                "",
-                "not-a-date",
-                None
-            ),
-            "&started_before=not-a-date"
-        );
-    }
-
-    /// Same Codex finding, the `limit` field. `limit_raw` is non-empty only
-    /// on a genuine parse failure (`parse_limit_query_field`). It must
-    /// override the resolved `limit` in the link, rather than being
-    /// dropped alongside it.
-    #[test]
-    fn build_query_string_preserves_invalid_limit_text_for_pagination() {
-        assert_eq!(
-            build_query_string(
-                DEFAULT_PAGE_SIZE,
-                "not-a-number",
-                None,
-                None,
-                None,
-                "",
-                "",
-                None
-            ),
-            "&limit=not-a-number"
-        );
-    }
-
-    /// `started_after_raw`/`started_before_raw` is the operator's exact typed
-    /// text on success too (`parse_started_bound` returns `trimmed`, not a
-    /// reformatted `DateTime`), so a link preserves e.g. the `Z` suffix as
-    /// typed rather than normalizing it to `+00:00`.
-    #[test]
-    fn build_query_string_includes_valid_started_after_before() {
-        assert_eq!(
-            build_query_string(
-                DEFAULT_PAGE_SIZE,
-                "",
-                None,
-                None,
-                None,
-                "2026-01-01T00:00:00Z",
-                "2026-12-31T23:59:59Z",
-                None
-            ),
-            "&started_after=2026-01-01T00%3A00%3A00Z&started_before=2026-12-31T23%3A59%3A59Z"
         );
     }
 
@@ -13727,76 +9650,14 @@ mod tests {
             ..DeadLetterUiFilters::default()
         };
 
-        let filter_raw = DeadLetterUiFilterRaw::default();
-        let html = render_dead_letter_bulk_actions(
-            &filters,
-            &filter_raw,
-            DEFAULT_DLQ_PAGE_SIZE,
-            "",
-            None,
-            250,
-        )
-        .into_string();
+        let html = render_dead_letter_bulk_actions(&filters, DEFAULT_DLQ_PAGE_SIZE, None, 250)
+            .into_string();
 
         assert!(html.contains("name=\"limit\" value=\"250\""));
         assert!(html.contains("Replay all matching (250)"));
         assert!(html.contains("Discard all matching (250)"));
         assert!(html.contains("Replay 250 matching dead-letter entries?"));
         assert!(html.contains("Discard 250 matching dead-letter entries?"));
-    }
-
-    /// Codex review on #1420: `parse_bulk_dlq_form` (autumn-harvest-plugin/
-    /// src/api.rs) re-validates `task_kind`/`failed_after`/`failed_before`
-    /// strictly and 400s on a bad value. The bulk-action forms must never
-    /// submit an invalid raw value as a hidden field. Otherwise
-    /// replay/discard aborts instead of running — the exact bug this PR
-    /// fixes, one layer down. An invalid field is "filter not applied"
-    /// here, so it must be omitted, not echoed with its raw, unparseable
-    /// text.
-    #[test]
-    fn dead_letter_bulk_actions_omit_invalid_filter_instead_of_submitting_raw_value() {
-        let filters = DeadLetterUiFilters {
-            workflow_name: Some("invoice_workflow".to_string()),
-            ..DeadLetterUiFilters::default()
-        };
-        let filter_raw = DeadLetterUiFilterRaw {
-            task_kind: "zombie".to_string(),
-            task_kind_error: Some("bad task_kind".to_string()),
-            failed_after: "not-a-date".to_string(),
-            failed_after_error: Some("bad failed_after".to_string()),
-            failed_before: String::new(),
-            failed_before_error: None,
-            shard_id: String::new(),
-            shard_id_error: None,
-        };
-        let html = render_dead_letter_bulk_actions(
-            &filters,
-            &filter_raw,
-            DEFAULT_DLQ_PAGE_SIZE,
-            "",
-            None,
-            5,
-        )
-        .into_string();
-        assert!(
-            !html.contains("name=\"task_kind\""),
-            "the invalid task_kind must never be submitted as a bulk-action selector: {html}"
-        );
-        assert!(
-            !html.contains("name=\"failed_after\""),
-            "the invalid failed_after must never be submitted as a bulk-action selector: {html}"
-        );
-        assert!(
-            html.contains("value=\"invoice_workflow\""),
-            "the valid workflow_name filter must still be carried: {html}"
-        );
-        // The raw invalid text may still appear in `return_to`. It is a
-        // GET redirect target, not a bulk selector field. Carrying it there
-        // is how the inline error redisplays after the action completes.
-        assert!(
-            html.contains("return_to") && html.contains("zombie"),
-            "the raw value is expected to survive in return_to, just not as a selector field: {html}"
-        );
     }
 
     #[test]
@@ -13806,457 +9667,14 @@ mod tests {
             ..DeadLetterUiFilters::default()
         };
 
-        let filter_raw = DeadLetterUiFilterRaw::default();
-        let html = render_dead_letter_bulk_actions(
-            &filters,
-            &filter_raw,
-            DEFAULT_DLQ_PAGE_SIZE,
-            "",
-            None,
-            1_200,
-        )
-        .into_string();
+        let html = render_dead_letter_bulk_actions(&filters, DEFAULT_DLQ_PAGE_SIZE, None, 1_200)
+            .into_string();
 
         assert!(html.contains("name=\"limit\" value=\"1000\""));
         assert!(html.contains("Replay first 1000 matching (1200 total)"));
         assert!(html.contains("Discard first 1000 matching (1200 total)"));
         assert!(html.contains("Replay first 1000 of 1200 matching dead-letter entries?"));
         assert!(html.contains("Discard first 1000 of 1200 matching dead-letter entries?"));
-    }
-
-    #[test]
-    fn parse_dead_letter_task_kind_filter_accepts_known_values_case_insensitively() {
-        assert_eq!(
-            parse_dead_letter_task_kind_filter(Some("Activity")),
-            (
-                Some(DeadLetterTaskKind::Activity),
-                "Activity".to_string(),
-                None
-            )
-        );
-        assert_eq!(
-            parse_dead_letter_task_kind_filter(Some("workflow")),
-            (
-                Some(DeadLetterTaskKind::Workflow),
-                "workflow".to_string(),
-                None
-            )
-        );
-    }
-
-    /// GREEN — the fix under test: an unrecognized `task_kind` no longer
-    /// aborts `list_dead_letters_ui`. It degrades to "filter not applied"
-    /// (parsed is `None`) while carrying the raw text and a recovery
-    /// message. The page can then redisplay the form inline, instead of
-    /// discarding it. Same contract as `parse_worker_status_filter` on the
-    /// Workers page (#1378). Before this change, `parse_dead_letter_ui_filters`
-    /// `?`-propagated `DeadLetterTaskKind::parse`'s bare
-    /// `AutumnError::bad_request_msg` here. That aborted the whole
-    /// `/dead-letters` response before the filter form was ever rendered —
-    /// along with the `workflow_name`/`shard_id` filters the operator had
-    /// already typed.
-    #[test]
-    fn parse_dead_letter_task_kind_filter_rejects_unknown_value_without_erroring() {
-        let (parsed, raw, error) = parse_dead_letter_task_kind_filter(Some("zombie"));
-        assert_eq!(parsed, None, "an invalid task_kind must not be applied");
-        assert_eq!(
-            raw, "zombie",
-            "the operator's exact raw input is echoed back"
-        );
-        let error = error.expect("an invalid task_kind must carry a redisplayable error");
-        assert!(
-            error.contains("zombie") && error.contains("Activity"),
-            "error names the bad value and a valid option: {error}"
-        );
-    }
-
-    #[test]
-    fn parse_dead_letter_task_kind_filter_blank_or_missing_is_not_an_error() {
-        assert_eq!(
-            parse_dead_letter_task_kind_filter(None),
-            (None, String::new(), None)
-        );
-        assert_eq!(
-            parse_dead_letter_task_kind_filter(Some("   ")),
-            (None, String::new(), None)
-        );
-    }
-
-    #[test]
-    fn parse_dead_letter_time_filter_accepts_rfc3339() {
-        let (parsed, raw, error) =
-            parse_dead_letter_time_filter("failed_after", Some("2026-05-10T00:00:00Z"));
-        assert!(parsed.is_some());
-        assert_eq!(raw, "2026-05-10T00:00:00Z");
-        assert_eq!(error, None);
-    }
-
-    /// GREEN — the fix under test: a malformed `failed_after`/`failed_before`
-    /// no longer aborts the page. Before this change,
-    /// `parse_dead_letter_time_filter` returned `Result<_, AutumnError>`.
-    /// `parse_dead_letter_ui_filters` then propagated it with a bare `?`.
-    /// That matched the same discard-the-page-on-bad-filter pattern already
-    /// fixed on the Workflows page's `started_after`/`started_before` (#1333).
-    #[test]
-    fn parse_dead_letter_time_filter_rejects_malformed_value_without_erroring() {
-        let (parsed, raw, error) =
-            parse_dead_letter_time_filter("failed_after", Some("not-a-date"));
-        assert_eq!(parsed, None, "an invalid timestamp must not be applied");
-        assert_eq!(
-            raw, "not-a-date",
-            "the operator's exact raw input is echoed back"
-        );
-        let error = error.expect("an invalid timestamp must carry a redisplayable error");
-        assert!(
-            error.contains("failed_after") && error.contains("RFC 3339"),
-            "error names the field and the expected format: {error}"
-        );
-    }
-
-    #[test]
-    fn parse_dead_letter_time_filter_blank_or_missing_is_not_an_error() {
-        assert_eq!(
-            parse_dead_letter_time_filter("failed_after", None),
-            (None, String::new(), None)
-        );
-        assert_eq!(
-            parse_dead_letter_time_filter("failed_after", Some("   ")),
-            (None, String::new(), None)
-        );
-    }
-
-    /// GREEN — the fix under test. `reset_to_event_id` used to be typed
-    /// `i64` straight on the `Form<..>` extractor struct for the "Reset to
-    /// event N" action. A non-numeric value failed axum's own form
-    /// deserialization. That aborted the request with a bare framework 400.
-    /// The handler never ran. The operator's reason was never read, and no
-    /// flash message could render. Reset is not a filter; it is the
-    /// runbook's destructive recovery action for a stuck child workflow or
-    /// a non-determinism failure. A malformed value must be rejected with a
-    /// clear error. It must never be silently defaulted to some other
-    /// event.
-    #[test]
-    fn parse_reset_to_event_id_accepts_valid_values() {
-        assert_eq!(parse_reset_to_event_id("1"), Ok(1));
-        assert_eq!(parse_reset_to_event_id("  42  "), Ok(42));
-        assert_eq!(parse_reset_to_event_id("0"), Ok(0));
-        assert_eq!(parse_reset_to_event_id("-3"), Ok(-3));
-    }
-
-    #[test]
-    fn parse_reset_to_event_id_rejects_non_numeric_text() {
-        let err = parse_reset_to_event_id("abc").expect_err("must reject non-numeric text");
-        assert!(
-            err.contains("abc"),
-            "the error must name the bad value: {err}"
-        );
-    }
-
-    #[test]
-    fn parse_reset_to_event_id_rejects_a_fraction() {
-        // A `type="number"` input's `step="1"` default blocks this in a
-        // real browser. A bare `Form` POST from any other client is still a
-        // reachable path. It must not 400 before the handler runs.
-        assert!(parse_reset_to_event_id("1.5").is_err());
-    }
-
-    #[test]
-    fn parse_reset_to_event_id_rejects_i64_overflow() {
-        assert!(parse_reset_to_event_id("99999999999999999999").is_err());
-    }
-
-    #[test]
-    fn parse_reset_to_event_id_rejects_blank_or_missing() {
-        let err = parse_reset_to_event_id("").expect_err("empty text must be rejected");
-        assert!(err.contains("required"), "error must explain why: {err}");
-        assert!(parse_reset_to_event_id("   ").is_err());
-    }
-
-    /// GREEN — the fix under test: `shard`/`shard_id` used to be typed
-    /// `Option<i32>` straight on the `Query<..>` extractor struct on all
-    /// three list pages. A non-numeric value failed axum's own query
-    /// deserialization, aborting the request with a bare framework 400.
-    /// That happened before any handler, filter form, or the operator's
-    /// other filters ever rendered. It is one layer earlier than the
-    /// page-abort bug the `task_kind`/`failed_after`/`failed_before`/
-    /// `status`/`stale` filters already fix, and with no styled error at
-    /// all.
-    #[test]
-    fn parse_shard_id_filter_accepts_valid_values() {
-        assert_eq!(
-            parse_shard_id_filter("shard_id", Some("0")),
-            (Some(0), "0".to_string(), None)
-        );
-        assert_eq!(
-            parse_shard_id_filter("shard_id", Some("  3  ")),
-            (Some(3), "3".to_string(), None)
-        );
-        assert_eq!(
-            parse_shard_id_filter("shard_id", Some("-1")),
-            (Some(-1), "-1".to_string(), None)
-        );
-    }
-
-    #[test]
-    fn parse_shard_id_filter_rejects_invalid_value_without_erroring() {
-        let (parsed, raw, error) = parse_shard_id_filter("shard_id", Some("north"));
-        assert_eq!(parsed, None, "an invalid shard_id must not be applied");
-        assert_eq!(raw, "north", "the raw text must echo the operator's input");
-        let message = error.expect("an invalid shard_id must carry a redisplayable error");
-        assert!(
-            message.contains("north") && message.contains("shard_id"),
-            "the error must name the bad value and the field: {message}"
-        );
-    }
-
-    #[test]
-    fn parse_shard_id_filter_blank_or_missing_is_not_an_error() {
-        assert_eq!(
-            parse_shard_id_filter("shard_id", None),
-            (None, String::new(), None)
-        );
-        assert_eq!(
-            parse_shard_id_filter("shard_id", Some("   ")),
-            (None, String::new(), None)
-        );
-    }
-
-    #[test]
-    fn render_dead_letter_filters_shows_inline_errors() {
-        let filters = DeadLetterUiFilters::default();
-        let filter_raw = DeadLetterUiFilterRaw {
-            task_kind: "zombie".to_string(),
-            task_kind_error: Some(
-                "Unknown task_kind 'zombie'; expected Activity or Workflow. Filter not applied."
-                    .to_string(),
-            ),
-            failed_after: "not-a-date".to_string(),
-            failed_after_error: Some(
-                "Invalid failed_after; expected RFC 3339 timestamp. Filter not applied."
-                    .to_string(),
-            ),
-            failed_before: String::new(),
-            failed_before_error: None,
-            shard_id: "north".to_string(),
-            shard_id_error: Some(
-                "Invalid shard_id 'north'; expected a whole number. Filter not applied."
-                    .to_string(),
-            ),
-        };
-        let html = render_dead_letter_filters(
-            &filters,
-            &filter_raw,
-            DEFAULT_DLQ_PAGE_SIZE,
-            "",
-            None,
-            None,
-        )
-        .into_string();
-        assert!(
-            html.contains("field-error") && html.contains("zombie"),
-            "task_kind error must render inline: {html}"
-        );
-        assert!(
-            html.contains("option value=\"zombie\" selected"),
-            "the invalid task_kind must be echoed back as the selected option: {html}"
-        );
-        assert!(
-            html.contains("not-a-date"),
-            "failed_after error and raw text must render inline: {html}"
-        );
-        assert!(
-            html.contains("north") && html.contains("Invalid shard_id"),
-            "shard_id error and raw text must render inline: {html}"
-        );
-    }
-
-    /// Codex-review-class regression guard, matching #1378 P2/#1333's own
-    /// follow-up. An invalid filter's raw text — not the parsed value,
-    /// always `None` — must survive into pagination and bulk-action hidden
-    /// fields. Otherwise the inline error vanishes on the very next click.
-    #[test]
-    fn build_dead_letter_query_string_carries_invalid_raw_values() {
-        let filters = DeadLetterUiFilters::default();
-        let filter_raw = DeadLetterUiFilterRaw {
-            task_kind: "zombie".to_string(),
-            task_kind_error: Some("bad task_kind".to_string()),
-            failed_after: "not-a-date".to_string(),
-            failed_after_error: Some("bad failed_after".to_string()),
-            failed_before: String::new(),
-            failed_before_error: None,
-            shard_id: "north".to_string(),
-            shard_id_error: Some("bad shard_id".to_string()),
-        };
-        let query =
-            build_dead_letter_query_string(DEFAULT_DLQ_PAGE_SIZE, "", &filters, &filter_raw, None);
-        assert!(
-            query.contains("task_kind=zombie"),
-            "invalid task_kind must round-trip: {query}"
-        );
-        assert!(
-            query.contains("failed_after=not-a-date"),
-            "invalid failed_after must round-trip: {query}"
-        );
-        assert!(
-            query.contains("shard_id=north"),
-            "invalid shard_id must round-trip: {query}"
-        );
-    }
-
-    /// Same fix as the Workers page's own
-    /// `render_worker_pagination_shows_page_error`. An invalid `page` value
-    /// must render its error inline, above the Previous/Next controls.
-    /// This page has no backing form field for `page`.
-    #[test]
-    fn render_dead_letter_pagination_shows_page_error() {
-        let filters = DeadLetterUiFilters::default();
-        let filter_raw = DeadLetterUiFilterRaw::default();
-        let html = render_dead_letter_pagination(
-            0,
-            DEFAULT_DLQ_PAGE_SIZE,
-            "",
-            false,
-            &filters,
-            &filter_raw,
-            None,
-            Some("Invalid page 'nope'; expected a whole number. Showing page 1."),
-        )
-        .into_string();
-        assert!(
-            html.contains("field-error") && html.contains("Invalid page 'nope'"),
-            "the page error must render inline: {html}"
-        );
-    }
-
-    /// Same fix as the Workflows/Workers pages' own
-    /// `build_query_string_preserves_invalid_limit_text_for_pagination`/
-    /// `build_worker_query_string_preserves_invalid_limit_text_for_pagination`:
-    /// `limit_raw` is non-empty only on a genuine parse failure. It must
-    /// override the resolved `limit` in the Next/Previous link instead of
-    /// being silently dropped alongside it.
-    #[test]
-    fn build_dead_letter_query_string_preserves_invalid_limit_text_for_pagination() {
-        let filters = DeadLetterUiFilters::default();
-        let filter_raw = DeadLetterUiFilterRaw::default();
-        assert_eq!(
-            build_dead_letter_query_string(
-                DEFAULT_DLQ_PAGE_SIZE,
-                "not-a-number",
-                &filters,
-                &filter_raw,
-                None
-            ),
-            "&limit=not-a-number"
-        );
-    }
-
-    /// Same "browser sanitizes an invalid number input to blank" defect the
-    /// Workflows/Workers pages already fixed
-    /// (`per_page_input_is_a_text_control_that_can_hold_invalid_text`). The
-    /// DLQ page's "Per page" field must be a text control too.
-    #[test]
-    fn dead_letter_per_page_input_is_a_text_control_that_can_hold_invalid_text() {
-        let filters = DeadLetterUiFilters::default();
-        let filter_raw = DeadLetterUiFilterRaw::default();
-        let html = render_dead_letter_filters(
-            &filters,
-            &filter_raw,
-            DEFAULT_DLQ_PAGE_SIZE,
-            "not-a-number",
-            Some("invalid limit 'not-a-number'"),
-            None,
-        )
-        .into_string();
-        assert!(
-            html.contains(r#"input type="text" inputmode="numeric" pattern="[0-9]*" name="limit""#),
-            "the Per page field must be a text control, not type=\"number\": {html}"
-        );
-        assert!(
-            html.contains("value=\"not-a-number\""),
-            "the operator's invalid input must be preserved: {html}"
-        );
-        assert!(
-            html.contains("field-error") && html.contains("invalid limit"),
-            "the limit error must render inline: {html}"
-        );
-    }
-
-    /// Codex review on #1420: a summary drilldown's "View entries" link
-    /// used to derive its `drill_raw` solely from the successfully parsed
-    /// filters. This silently dropped an invalid `failed_after`/
-    /// `failed_before` and its error, even though this function never
-    /// touches those two fields. The view toggle, refresh, and group-by
-    /// form all preserve that same invalid value. The drilldown link must
-    /// not be the one exception.
-    #[test]
-    fn dlq_summary_drilldown_href_preserves_invalid_failed_after() {
-        use autumn_harvest::dlq::DlqGroupDimension;
-
-        let filters = DeadLetterUiFilters {
-            workflow_name: Some("invoice_workflow".to_string()),
-            ..DeadLetterUiFilters::default()
-        };
-        let filter_raw = DeadLetterUiFilterRaw {
-            task_kind: String::new(),
-            task_kind_error: None,
-            failed_after: "not-a-date".to_string(),
-            failed_after_error: Some("bad failed_after".to_string()),
-            failed_before: String::new(),
-            failed_before_error: None,
-            shard_id: String::new(),
-            shard_id_error: None,
-        };
-        let key = serde_json::json!({"workflow_name": "invoice_workflow"});
-        let (href, _partial) = dlq_summary_drilldown_href(
-            &key,
-            &[DlqGroupDimension::WorkflowName],
-            &filters,
-            &filter_raw,
-            DEFAULT_DLQ_PAGE_SIZE,
-            "",
-            None,
-        );
-        assert!(
-            href.contains("failed_after=not-a-date"),
-            "the drilldown link must preserve the invalid failed_after the \
-             summary view had, not silently drop it: {href}"
-        );
-    }
-
-    /// Same review: the `task_kind` field IS synthesized by this function,
-    /// for the `TaskType` group-by dimension. Its raw text is overwritten
-    /// to match the group's own key. It must not inherit a stale, unrelated
-    /// error the summary view happened to be showing.
-    #[test]
-    fn dlq_summary_drilldown_href_overwrites_task_kind_synthesized_from_group() {
-        use autumn_harvest::dlq::DlqGroupDimension;
-
-        let filters = DeadLetterUiFilters::default();
-        let filter_raw = DeadLetterUiFilterRaw {
-            task_kind: "zombie".to_string(),
-            task_kind_error: Some("stale error from an unrelated typo".to_string()),
-            failed_after: String::new(),
-            failed_after_error: None,
-            failed_before: String::new(),
-            failed_before_error: None,
-            shard_id: String::new(),
-            shard_id_error: None,
-        };
-        let key = serde_json::json!({"task_type": "ACTIVITY"});
-        let (href, _partial) = dlq_summary_drilldown_href(
-            &key,
-            &[DlqGroupDimension::TaskType],
-            &filters,
-            &filter_raw,
-            DEFAULT_DLQ_PAGE_SIZE,
-            "",
-            None,
-        );
-        assert!(
-            href.contains("task_kind=Activity"),
-            "the drilldown must use the group's own task_type, not the \
-             stale raw value: {href}"
-        );
     }
 
     #[test]
@@ -14359,58 +9777,24 @@ mod tests {
     #[test]
     fn build_worker_query_string_empty_defaults() {
         assert_eq!(
-            build_worker_query_string(DEFAULT_PAGE_SIZE, "", "", "", "", None),
+            build_worker_query_string(DEFAULT_PAGE_SIZE, None, None, false, None),
             ""
         );
     }
 
     #[test]
     fn build_worker_query_string_includes_all_params() {
-        let q = build_worker_query_string(10, "", "Active", "1", "true", None);
+        let q = build_worker_query_string(10, Some("Active"), Some(1), true, None);
         assert!(q.contains("limit=10"));
         assert!(q.contains("status=Active"));
         assert!(q.contains("shard=1"));
         assert!(q.contains("stale=true"));
     }
 
-    /// GREEN — the fix under test: an invalid raw value is carried through
-    /// verbatim. A caller would otherwise have parsed it to `None`/`false`
-    /// and lost it. So a Next/Previous click does not drop the
-    /// still-unresolved filter and its inline error (#1378).
-    #[test]
-    fn build_worker_query_string_carries_invalid_raw_values() {
-        let q = build_worker_query_string(DEFAULT_PAGE_SIZE, "", "zombie", "north", "True", None);
-        assert!(
-            q.contains("status=zombie"),
-            "an invalid status must still round-trip through pagination: {q}"
-        );
-        assert!(
-            q.contains("shard=north"),
-            "an invalid shard must still round-trip through pagination: {q}"
-        );
-        assert!(
-            q.contains("stale=True"),
-            "an invalid stale value must still round-trip through pagination: {q}"
-        );
-    }
-
-    /// Same Codex finding as the Workflows page's
-    /// `build_query_string_preserves_invalid_limit_text_for_pagination`.
-    /// `limit_raw` is non-empty only on a genuine parse failure. It must
-    /// override the resolved `limit` in the Next/Previous link rather than
-    /// being silently dropped alongside it.
-    #[test]
-    fn build_worker_query_string_preserves_invalid_limit_text_for_pagination() {
-        assert_eq!(
-            build_worker_query_string(DEFAULT_PAGE_SIZE, "not-a-number", "", "", "", None),
-            "&limit=not-a-number"
-        );
-    }
-
     #[test]
     fn layout_includes_workers_nav_link() {
         let body = html! { p { "test" } };
-        let html = layout("Test", &body, "", None).into_string();
+        let html = layout("Test", &body, "").into_string();
         assert!(
             html.contains("workers"),
             "layout must include a Workers nav link"
@@ -14621,15 +10005,8 @@ mod tests {
     #[test]
     fn build_schedule_query_string_omits_defaults() {
         let filters = ScheduleUiFilters::default();
-        let filter_raw = ScheduleUiFilterRaw::default();
         assert_eq!(
-            build_schedule_query_string(
-                DEFAULT_SCHEDULE_PAGE_SIZE,
-                "",
-                &filters,
-                &filter_raw,
-                None
-            ),
+            build_schedule_query_string(DEFAULT_SCHEDULE_PAGE_SIZE, &filters, None),
             ""
         );
     }
@@ -14640,18 +10017,9 @@ mod tests {
             target: Some("payment".to_string()),
             kind: ScheduleKindFilter::Workflow,
             paused: SchedulePausedFilter::Paused,
-            health: ScheduleHealthFilter::Unhealthy,
             shard_id: Some(2),
         };
-        let filter_raw = ScheduleUiFilterRaw {
-            kind: "Workflow".to_string(),
-            paused: "Paused".to_string(),
-            health: "Unhealthy".to_string(),
-            shard_id: "2".to_string(),
-            ..ScheduleUiFilterRaw::default()
-        };
-        let q = build_schedule_query_string(10, "", &filters, &filter_raw, Some(30));
-        assert!(q.contains("health=Unhealthy"), "missing health: {q}");
+        let q = build_schedule_query_string(10, &filters, Some(30));
         assert!(q.contains("limit=10"), "missing limit: {q}");
         assert!(q.contains("target=payment"), "missing target: {q}");
         assert!(q.contains("kind=Workflow"), "missing kind: {q}");
@@ -14660,65 +10028,10 @@ mod tests {
         assert!(q.contains("refresh=30"), "missing refresh: {q}");
     }
 
-    /// GREEN — the fix under test: an invalid raw value is carried through
-    /// verbatim. A caller would otherwise have parsed it to `All`/`None`
-    /// and lost it. A Next/Previous click or bulk-action resubmit must not
-    /// drop the still-unresolved filter and its inline error. Same
-    /// contract as `build_dead_letter_query_string` on the DLQ page.
-    #[test]
-    fn build_schedule_query_string_carries_invalid_raw_values() {
-        let filters = ScheduleUiFilters::default();
-        let filter_raw = ScheduleUiFilterRaw {
-            kind: "zombie".to_string(),
-            kind_error: Some("bad kind".to_string()),
-            shard_id: "north".to_string(),
-            shard_id_error: Some("bad shard_id".to_string()),
-            ..ScheduleUiFilterRaw::default()
-        };
-        let q = build_schedule_query_string(
-            DEFAULT_SCHEDULE_PAGE_SIZE,
-            "",
-            &filters,
-            &filter_raw,
-            None,
-        );
-        assert!(
-            q.contains("kind=zombie"),
-            "an invalid kind must still round-trip through pagination: {q}"
-        );
-        assert!(
-            q.contains("shard_id=north"),
-            "an invalid shard_id must still round-trip through pagination: {q}"
-        );
-    }
-
-    /// Same fix as the Workflows/Workers/DLQ pages' own
-    /// `build_query_string_preserves_invalid_limit_text_for_pagination`/
-    /// `build_worker_query_string_preserves_invalid_limit_text_for_pagination`/
-    /// `build_dead_letter_query_string_preserves_invalid_limit_text_for_pagination`:
-    /// `limit_raw` is non-empty only on a genuine parse failure. It must
-    /// override the resolved `limit` in the Next/Previous link instead of
-    /// being silently dropped alongside it.
-    #[test]
-    fn build_schedule_query_string_preserves_invalid_limit_text_for_pagination() {
-        let filters = ScheduleUiFilters::default();
-        let filter_raw = ScheduleUiFilterRaw::default();
-        assert_eq!(
-            build_schedule_query_string(
-                DEFAULT_SCHEDULE_PAGE_SIZE,
-                "not-a-number",
-                &filters,
-                &filter_raw,
-                None
-            ),
-            "&limit=not-a-number"
-        );
-    }
-
     #[test]
     fn layout_schedules_has_nav_link() {
         let body = html! { p { "test" } };
-        let html = layout_schedules("Test", &body, None, "", "").into_string();
+        let html = layout_schedules("Test", &body, None).into_string();
         assert!(
             html.contains("schedules"),
             "layout_schedules must include schedules link"
@@ -14736,126 +10049,17 @@ mod tests {
     #[test]
     fn layout_schedules_auto_refresh_tag() {
         let body = html! { p { "test" } };
-        let html_with =
-            layout_schedules("T", &body, Some(30), "", "schedules?page=0").into_string();
+        let html_with = layout_schedules("T", &body, Some(30)).into_string();
         assert!(html_with.contains("http-equiv=\"refresh\""));
-        assert!(html_with.contains(r#"content="30; url=schedules?page=0""#));
-        let html_without = layout_schedules("T", &body, None, "", "").into_string();
+        assert!(html_with.contains("content=\"30\""));
+        let html_without = layout_schedules("T", &body, None).into_string();
         assert!(!html_without.contains("http-equiv=\"refresh\""));
-    }
-
-    /// Codex review on #1437 (P2): a targetless `meta refresh` would
-    /// reload this page's own URL. If that URL still carries `flash=...`
-    /// (as it does right after a bulk pause/resume redirect), every
-    /// auto-refresh interval re-announces and re-focuses the same stale
-    /// message. The tag must instead point `url=` at the flash-free
-    /// target the caller supplies — same fix as `layout_dead_letters`
-    /// already applies (PR #1396).
-    #[test]
-    fn layout_schedules_refresh_tag_targets_flash_free_url() {
-        let body = html! { p { "test" } };
-        let html =
-            layout_schedules("Test", &body, Some(30), "", "schedules?kind=Workflow").into_string();
-        assert!(
-            html.contains(r#"content="30; url=schedules?kind=Workflow""#),
-            "refresh tag must target the flash-free URL: {html}"
-        );
-    }
-
-    /// PR #1396's own review class, applied to the Schedules page. The
-    /// auto-refresh target must keep the operator on the page they were
-    /// reading, not bounce them to page 0.
-    #[test]
-    fn schedules_page_refresh_target_preserves_current_page() {
-        let filters = ScheduleUiFilters::default();
-        let filter_raw = ScheduleUiFilterRaw::default();
-        let html = render_schedules_page(
-            &[],
-            &[],
-            false,
-            &filters,
-            &filter_raw,
-            &std::collections::HashMap::new(),
-            2,
-            50,
-            "",
-            false,
-            0,
-            "",
-            "",
-            Some(30),
-            None,
-            None,
-            None,
-            None,
-        )
-        .into_string();
-        assert!(
-            html.contains("url=schedules?page=2"),
-            "refresh target must preserve page=2: {html}"
-        );
-    }
-
-    /// Same fix as the DLQ page's own
-    /// `render_dead_letter_pagination_shows_page_error`. An invalid `page`
-    /// value must render its error inline, above the Previous/Next
-    /// controls. This page has no backing form field for `page`.
-    #[test]
-    fn render_schedule_pagination_shows_page_error() {
-        let filters = ScheduleUiFilters::default();
-        let filter_raw = ScheduleUiFilterRaw::default();
-        let html = render_schedule_pagination(
-            0,
-            DEFAULT_SCHEDULE_PAGE_SIZE,
-            "",
-            false,
-            &filters,
-            &filter_raw,
-            None,
-            Some("Invalid page 'nope'; expected a whole number. Showing page 1."),
-        )
-        .into_string();
-        assert!(
-            html.contains("field-error") && html.contains("Invalid page 'nope'"),
-            "the page error must render inline: {html}"
-        );
-    }
-
-    /// Same "browser sanitizes an invalid number input to blank" defect the
-    /// Workflows/Workers/DLQ pages already fixed
-    /// (`per_page_input_is_a_text_control_that_can_hold_invalid_text`). The
-    /// Schedules page's "Per page" field must be a text control too.
-    #[test]
-    fn schedule_per_page_input_is_a_text_control_that_can_hold_invalid_text() {
-        let filters = ScheduleUiFilters::default();
-        let filter_raw = ScheduleUiFilterRaw::default();
-        let html = render_schedule_filters(
-            &filters,
-            &filter_raw,
-            DEFAULT_SCHEDULE_PAGE_SIZE,
-            "not-a-number",
-            Some("invalid limit 'not-a-number'"),
-            None,
-        )
-        .into_string();
-        assert!(
-            html.contains(r#"input type="text" inputmode="numeric" pattern="[0-9]*" name="limit""#),
-            "the Per page field must be a text control, not type=\"number\": {html}"
-        );
-        assert!(
-            html.contains("value=\"not-a-number\""),
-            "the operator's invalid input must be preserved: {html}"
-        );
-        assert!(
-            html.contains("field-error") && html.contains("invalid limit"),
-            "the limit error must render inline: {html}"
-        );
     }
 
     #[test]
     fn layout_includes_schedules_nav_link() {
         let body = html! { p { "test" } };
-        let html = layout("Test", &body, "", None).into_string();
+        let html = layout("Test", &body, "").into_string();
         assert!(
             html.contains("schedules"),
             "layout must include schedules nav link"
@@ -15088,11 +10292,6 @@ mod tests {
             capability_misses: 0,
             capability_miss_workers: Vec::new(),
             capability_miss_handler: None,
-            timer_fires_at: None,
-            handler_started_attempt: None,
-            timed_out_claims: None,
-            handler_started_at: None,
-            new_start: false,
         }
     }
 
@@ -15151,9 +10350,6 @@ mod tests {
         use chrono::Utc;
         use uuid::Uuid;
         autumn_harvest::models::WorkflowExecution {
-            migrated_to_shard: None,
-            migrated_at: None,
-            migrated_from_shards: None,
             quota_key: None,
             id: Uuid::new_v4(),
             workflow_name: "test_workflow".to_string(),
@@ -15211,10 +10407,6 @@ mod tests {
             started_by: None,
             history_bloat_warned_at: None,
             triage_note: None,
-            migrated_run_terminal_at: None,
-            migrated_run_terminal_state: None,
-            staging_vacated_state: None,
-            staging_vacated_by: None,
         }
     }
 
@@ -15409,12 +10601,8 @@ mod tests {
             0,
             &blocked,
             None,
-            None,
-            None,
             Some(10_000),
             &WorkflowLogsPanelData::default(),
-            &WorkflowActionEcho::default(),
-            false,
         )
         .into_string();
 
@@ -15448,11 +10636,7 @@ mod tests {
             &blocked,
             None,
             None,
-            None,
-            None,
             &WorkflowLogsPanelData::default(),
-            &WorkflowActionEcho::default(),
-            false,
         )
         .into_string();
 
@@ -15481,12 +10665,8 @@ mod tests {
             0,
             &blocked,
             None,
-            None,
-            None,
             Some(500),
             &WorkflowLogsPanelData::default(),
-            &WorkflowActionEcho::default(),
-            false,
         )
         .into_string();
 
@@ -15517,7 +10697,7 @@ mod tests {
     #[test]
     fn layout_includes_build_routing_nav_link() {
         let body = html! { p { "test" } };
-        let html = layout("Test", &body, "", None).into_string();
+        let html = layout("Test", &body, "").into_string();
         assert!(
             html.contains("build-routing"),
             "base layout must include a Build Routing nav link"
@@ -15537,7 +10717,7 @@ mod tests {
     #[test]
     fn layout_dead_letters_includes_build_routing_nav_link() {
         let body = html! { p { "test" } };
-        let html = layout_dead_letters("Test", &body, None, "").into_string();
+        let html = layout_dead_letters("Test", &body, None).into_string();
         assert!(
             html.contains("build-routing"),
             "layout_dead_letters must include a Build Routing nav link"
@@ -15545,55 +10725,9 @@ mod tests {
     }
 
     #[test]
-    fn layout_dead_letters_refresh_tag_targets_flash_free_url() {
-        // A targetless `meta refresh` would reload this page's own URL.
-        // If that URL still carries `flash=...`, every auto-refresh
-        // interval re-announces and re-focuses the same stale message.
-        // The tag must instead point `url=` at the flash-free target the
-        // caller supplies.
-        let body = html! { p { "test" } };
-        let html = layout_dead_letters("Test", &body, Some(30), "../ui/dead-letters?limit=50")
-            .into_string();
-        assert!(
-            html.contains(r#"content="30; url=../ui/dead-letters?limit=50""#),
-            "refresh tag must target the flash-free URL: {html}"
-        );
-    }
-
-    #[test]
-    fn dead_letters_page_refresh_target_preserves_current_page() {
-        // PR #1396 review: the auto-refresh target must keep the operator
-        // on the page they were reading, not bounce them to page 0.
-        let filters = DeadLetterUiFilters::default();
-        let filter_raw = DeadLetterUiFilterRaw::default();
-        let html = render_dead_letters_page(
-            &filters,
-            &filter_raw,
-            &[],
-            &[],
-            false,
-            2,
-            50,
-            "",
-            false,
-            0,
-            Some(30),
-            None,
-            None,
-            None,
-            None,
-        )
-        .into_string();
-        assert!(
-            html.contains(r"url=../ui/dead-letters?page=2"),
-            "refresh target must preserve page=2: {html}"
-        );
-    }
-
-    #[test]
     fn layout_schedules_includes_build_routing_nav_link() {
         let body = html! { p { "test" } };
-        let html = layout_schedules("Test", &body, None, "", "").into_string();
+        let html = layout_schedules("Test", &body, None).into_string();
         assert!(
             html.contains("build-routing"),
             "layout_schedules must include a Build Routing nav link"
@@ -15602,19 +10736,8 @@ mod tests {
 
     #[test]
     fn render_build_routing_page_empty_state_shows_docs_link() {
-        let html = render_build_routing_page(
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            false,
-            None,
-            None,
-            &BuildRoutingActionEcho::default(),
-        )
-        .into_string();
+        let html = render_build_routing_page(&[], &[], &[], &[], &[], &[], false, None, None)
+            .into_string();
         assert!(
             html.contains("No build routing configured") || html.contains("No build policies"),
             "empty state must show a 'no policies' message"
@@ -15637,19 +10760,8 @@ mod tests {
             target_build_id: None,
             ramp_percent: None,
         };
-        let html = render_build_routing_page(
-            &[policy],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            false,
-            None,
-            None,
-            &BuildRoutingActionEcho::default(),
-        )
-        .into_string();
+        let html = render_build_routing_page(&[policy], &[], &[], &[], &[], &[], false, None, None)
+            .into_string();
         assert!(html.contains("test-queue"), "must show queue name");
         assert!(html.contains("abc123"), "must show build_id");
         assert!(html.contains("prod-v2"), "must show deployment name");
@@ -15665,19 +10777,8 @@ mod tests {
             stale_workers: 1,
             safe_to_retire: false,
         };
-        let html = render_build_routing_page(
-            &[],
-            &[],
-            &[reach],
-            &[],
-            &[],
-            &[],
-            false,
-            None,
-            None,
-            &BuildRoutingActionEcho::default(),
-        )
-        .into_string();
+        let html = render_build_routing_page(&[], &[], &[reach], &[], &[], &[], false, None, None)
+            .into_string();
         assert!(html.contains("sha-old"), "must show build_id");
         assert!(html.contains("42"), "must show open_executions count");
         assert!(
@@ -15696,19 +10797,8 @@ mod tests {
             stale_workers: 0,
             safe_to_retire: true,
         };
-        let html = render_build_routing_page(
-            &[],
-            &[],
-            &[reach],
-            &[],
-            &[],
-            &[],
-            false,
-            None,
-            None,
-            &BuildRoutingActionEcho::default(),
-        )
-        .into_string();
+        let html = render_build_routing_page(&[], &[], &[reach], &[], &[], &[], false, None, None)
+            .into_string();
         assert!(
             html.contains("Retire"),
             "retire button must appear when safe_to_retire"
@@ -15727,19 +10817,8 @@ mod tests {
             compatible_with: "sha-old".to_string(),
             declared_at: chrono::Utc::now(),
         };
-        let html = render_build_routing_page(
-            &[],
-            &[entry],
-            &[],
-            &[],
-            &[],
-            &[],
-            false,
-            None,
-            None,
-            &BuildRoutingActionEcho::default(),
-        )
-        .into_string();
+        let html = render_build_routing_page(&[], &[entry], &[], &[], &[], &[], false, None, None)
+            .into_string();
         assert!(
             html.contains("sha-new"),
             "must show worker build in compat table"
@@ -15766,7 +10845,6 @@ mod tests {
             false,
             Some("Policy updated"),
             None,
-            &BuildRoutingActionEcho::default(),
         )
         .into_string();
         assert!(
@@ -15777,19 +10855,8 @@ mod tests {
 
     #[test]
     fn render_build_routing_page_has_set_policy_form() {
-        let html = render_build_routing_page(
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            false,
-            None,
-            None,
-            &BuildRoutingActionEcho::default(),
-        )
-        .into_string();
+        let html = render_build_routing_page(&[], &[], &[], &[], &[], &[], false, None, None)
+            .into_string();
         assert!(
             html.contains("set-policy"),
             "page must include Set Policy form action"
@@ -15806,19 +10873,8 @@ mod tests {
 
     #[test]
     fn render_build_routing_page_has_declare_compat_form() {
-        let html = render_build_routing_page(
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            false,
-            None,
-            None,
-            &BuildRoutingActionEcho::default(),
-        )
-        .into_string();
+        let html = render_build_routing_page(&[], &[], &[], &[], &[], &[], false, None, None)
+            .into_string();
         assert!(
             html.contains("declare-compat"),
             "page must include Declare Compat form action"
@@ -15826,170 +10882,6 @@ mod tests {
         assert!(
             html.contains("compatible_with"),
             "Declare Compat form must include compatible_with field"
-        );
-    }
-
-    /// Wayfinder error-path fix — issue #1687's sibling gap on this page.
-    /// `build_routing_set_policy_ui` and `build_routing_declare_compat_ui`
-    /// used to redirect on every failure with only a flash message. A
-    /// rejected submission then redisplayed both forms empty. Both handlers
-    /// now carry the entered values and an inline error back through the
-    /// redirect's query params, which `list_build_routing_ui` turns into a
-    /// `BuildRoutingActionEcho`.
-    /// A failed submission echoes its operation id into a hidden field, so a
-    /// retry of the form reuses its ramp id (issue #1814).
-    #[test]
-    fn render_build_routing_page_set_policy_keeps_the_operation_id() {
-        let id = uuid::Uuid::new_v4();
-        let echo = BuildRoutingActionEcho {
-            set_policy_operation_id: Some(id.to_string()),
-            ..BuildRoutingActionEcho::default()
-        };
-        let html =
-            render_build_routing_page(&[], &[], &[], &[], &[], &[], false, None, None, &echo)
-                .into_string();
-        assert!(
-            html.contains(&format!(
-                r#"type="hidden" name="operation_id" value="{id}""#
-            )),
-            "the form must carry the echoed operation id: {html}"
-        );
-    }
-
-    /// A fresh page gives the form a new, valid operation id.
-    #[test]
-    fn render_build_routing_page_set_policy_has_a_fresh_operation_id() {
-        let html = render_build_routing_page(
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            false,
-            None,
-            None,
-            &BuildRoutingActionEcho::default(),
-        )
-        .into_string();
-        let marker = r#"type="hidden" name="operation_id" value=""#;
-        let start = html.find(marker).expect("hidden operation_id field") + marker.len();
-        let value = &html[start..start + 36];
-        assert!(uuid::Uuid::parse_str(value).is_ok(), "{value}");
-    }
-
-    /// A valid echoed id is kept. A missing or malformed one gets a new id.
-    #[test]
-    fn set_policy_operation_id_reuses_only_a_valid_id() {
-        let id = uuid::Uuid::new_v4();
-        assert_eq!(set_policy_operation_id(Some(&id.to_string())), id);
-        assert_ne!(set_policy_operation_id(None), set_policy_operation_id(None));
-        assert_ne!(
-            set_policy_operation_id(Some("not-a-uuid")),
-            set_policy_operation_id(Some("not-a-uuid"))
-        );
-    }
-
-    /// A retry of the same form keeps its ramp id. A changed request under
-    /// the same operation id gets a new one.
-    #[test]
-    fn set_policy_ramp_id_depends_on_the_request() {
-        let op = uuid::Uuid::new_v4();
-        let id = |build: &str, deployment: Option<&str>| {
-            set_policy_ramp_id(op, "default", build, deployment)
-        };
-        assert_eq!(id("sha-1", Some("prod")), id("sha-1", Some("prod")));
-        assert_ne!(id("sha-1", Some("prod")), id("sha-1", Some("prod-v2")));
-        assert_ne!(id("sha-1", None), id("sha-2", None));
-        assert_ne!(
-            id("sha-1", None),
-            set_policy_ramp_id(uuid::Uuid::new_v4(), "default", "sha-1", None)
-        );
-    }
-
-    /// The failure redirect carries the operation id back to the form.
-    #[test]
-    fn set_policy_failure_redirect_echoes_the_operation_id() {
-        let id = uuid::Uuid::new_v4();
-        let url = set_policy_failure_redirect("shard 1: down", "default", "sha-1", "", id);
-        assert!(
-            url.contains(&format!("&set_policy_operation_id={id}")),
-            "{url}"
-        );
-        assert!(url.contains("set_policy_queue_name=default"), "{url}");
-    }
-
-    #[test]
-    fn render_build_routing_page_set_policy_error_echoes_entered_values() {
-        let echo = BuildRoutingActionEcho {
-            set_policy_error: Some("queue_name and build_id must not be empty".to_string()),
-            set_policy_queue_name: Some("payment_workflow".to_string()),
-            set_policy_build_id: Some(String::new()),
-            set_policy_deployment_name: Some("prod-v2".to_string()),
-            ..BuildRoutingActionEcho::default()
-        };
-        let html =
-            render_build_routing_page(&[], &[], &[], &[], &[], &[], false, None, None, &echo)
-                .into_string();
-        assert!(
-            html.contains("queue_name and build_id must not be empty"),
-            "Set Policy error must render inline: {html}"
-        );
-        assert!(
-            html.contains(r#"name="queue_name" required placeholder="e.g. default" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px" value="payment_workflow""#),
-            "Set Policy form must re-fill the entered queue name: {html}"
-        );
-        assert!(
-            html.contains("prod-v2"),
-            "Set Policy form must re-fill the entered deployment name: {html}"
-        );
-        assert!(
-            html.contains(r#"p class="field-error" role="alert" tabindex="-1" autofocus"#),
-            "Set Policy error must grab focus on load — Codex review on #1715: the \
-             action forms sit below the policy/reachability/compat tables, so an \
-             unfocused error can be missed below the fold: {html}"
-        );
-    }
-
-    #[test]
-    fn render_build_routing_page_compat_error_echoes_entered_values() {
-        let echo = BuildRoutingActionEcho {
-            compat_error: Some("build_id and compatible_with must not be empty".to_string()),
-            compat_build_id: Some("sha-new123".to_string()),
-            compat_compatible_with: Some(String::new()),
-            ..BuildRoutingActionEcho::default()
-        };
-        let html =
-            render_build_routing_page(&[], &[], &[], &[], &[], &[], false, None, None, &echo)
-                .into_string();
-        assert!(
-            html.contains("build_id and compatible_with must not be empty"),
-            "Declare Compat error must render inline: {html}"
-        );
-        assert!(
-            html.contains("sha-new123"),
-            "Declare Compat form must re-fill the entered build id: {html}"
-        );
-    }
-
-    #[test]
-    fn render_build_routing_page_no_error_leaves_action_forms_blank() {
-        let html = render_build_routing_page(
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            false,
-            None,
-            None,
-            &BuildRoutingActionEcho::default(),
-        )
-        .into_string();
-        assert!(
-            !html.contains(r#"class="field-error""#),
-            "a fresh page load must not render a stale action-form error: {html}"
         );
     }
 
@@ -16008,21 +10900,7 @@ mod tests {
 
     #[test]
     fn render_worker_filters_includes_build_id_filter() {
-        let html = render_worker_filters(
-            None,
-            "",
-            None,
-            "",
-            None,
-            false,
-            "",
-            None,
-            None,
-            DEFAULT_PAGE_SIZE,
-            "",
-            None,
-        )
-        .into_string();
+        let html = render_worker_filters(None, None, false, None, DEFAULT_PAGE_SIZE).into_string();
         assert!(
             html.contains("build_id"),
             "worker filters must include build_id input"
@@ -16030,222 +10908,8 @@ mod tests {
     }
 
     #[test]
-    fn render_worker_filters_shows_inline_errors() {
-        let html = render_worker_filters(
-            None,
-            "zombie",
-            Some("Unknown status 'zombie'; expected Active, Draining, or Stopped. Filter not applied."),
-            "north",
-            Some("Invalid shard 'north'; expected a whole number. Filter not applied."),
-            false,
-            "True",
-            Some("Unknown stale value 'True'; expected 'true' or 'false'. Filter not applied."),
-            None,
-            DEFAULT_PAGE_SIZE,
-            "",
-            None,
-        )
-        .into_string();
-        assert!(
-            html.contains("field-error") && html.contains("zombie"),
-            "status error must render inline: {html}"
-        );
-        assert!(
-            html.contains("north") && html.contains("Invalid shard"),
-            "shard error must render inline: {html}"
-        );
-        assert!(
-            html.contains("True"),
-            "stale error must render inline: {html}"
-        );
-    }
-
-    /// GREEN — the fix under test: the invalid raw value is echoed back as
-    /// the `<select>`'s selected option. It is not silently reverted to
-    /// "All". So resubmitting the form unchanged resends the same bad value.
-    /// The operator sees the same error again rather than it vanishing
-    /// (#1378).
-    #[test]
-    fn render_worker_filters_echoes_invalid_raw_value_as_selected_option() {
-        let html = render_worker_filters(
-            None,
-            "zombie",
-            Some("Unknown status 'zombie'; expected Active, Draining, or Stopped. Filter not applied."),
-            "",
-            None,
-            false,
-            "",
-            None,
-            None,
-            DEFAULT_PAGE_SIZE,
-            "",
-            None,
-        )
-        .into_string();
-        assert!(
-            html.contains("option value=\"zombie\" selected"),
-            "the invalid status must be echoed back as the selected option: {html}"
-        );
-    }
-
-    /// GREEN — the fix under test: the Workers page's "Per page" field is
-    /// a text control. This matches the Workflows page's own fix (Codex
-    /// review on #1540). A `type="number"` input sanitizes an invalid
-    /// value to blank at render time. The operator could then never see
-    /// or correct their own bad input, even though the HTML source
-    /// already carried it.
-    #[test]
-    fn worker_per_page_input_is_a_text_control_that_can_hold_invalid_text() {
-        let html = render_worker_filters(
-            None,
-            "",
-            None,
-            "",
-            None,
-            false,
-            "",
-            None,
-            None,
-            DEFAULT_PAGE_SIZE,
-            "not-a-number",
-            Some("Invalid limit 'not-a-number'; expected a whole number. Showing 50 per page."),
-        )
-        .into_string();
-        assert!(
-            html.contains(r#"input type="text" inputmode="numeric" pattern="[0-9]*" name="limit""#),
-            "the Per page field must be a text control, not type=\"number\": {html}"
-        );
-        assert!(
-            html.contains("value=\"not-a-number\""),
-            "the operator's invalid input must be preserved: {html}"
-        );
-        assert!(
-            html.contains("field-error") && html.contains("not-a-number"),
-            "the limit error must render inline: {html}"
-        );
-    }
-
-    /// GREEN — the fix under test: an invalid `page` value renders a
-    /// `field-error` above the pagination controls. Those controls have no
-    /// backing form field of their own, matching the Workflows page's
-    /// `render_pagination`.
-    #[test]
-    fn render_worker_pagination_shows_page_error() {
-        let html = render_worker_pagination(
-            0,
-            DEFAULT_PAGE_SIZE,
-            "",
-            false,
-            "",
-            "",
-            "",
-            None,
-            Some("Invalid page 'nope'; expected a whole number. Showing page 1."),
-        )
-        .into_string();
-        assert!(
-            html.contains("field-error") && html.contains("Invalid page 'nope'"),
-            "the page error must render inline: {html}"
-        );
-    }
-
-    #[test]
-    fn parse_worker_status_filter_accepts_known_values_case_insensitively() {
-        assert_eq!(
-            parse_worker_status_filter(Some("Active")),
-            (Some("Active"), "Active".to_string(), None)
-        );
-        assert_eq!(
-            parse_worker_status_filter(Some("draining")),
-            (Some("Draining"), "draining".to_string(), None)
-        );
-        assert_eq!(
-            parse_worker_status_filter(Some("STOPPED")),
-            (Some("Stopped"), "STOPPED".to_string(), None)
-        );
-    }
-
-    /// GREEN — the fix under test: an unrecognized status no longer aborts
-    /// `list_workers_ui`. It degrades to "filter not applied" (parsed is
-    /// `None`). It carries the raw text and a recovery message, so the page
-    /// can redisplay the form inline instead of discarding it. This is the
-    /// same contract as `parse_started_bound` on the Workflows page (#1333).
-    /// Before this change, `parse_worker_ui_filters` `?`-propagated a bare
-    /// `AutumnError::bad_request_msg` here. That aborted the whole
-    /// `/workers` response before the filter form, or the `build_id`/`shard`
-    /// filters the operator had already typed, was ever rendered. See the
-    /// RED baseline in
-    /// `tests/ui_integration.rs::ui_workers_unknown_status_value_redisplays_form_instead_of_aborting_page`.
-    #[test]
-    fn parse_worker_status_filter_rejects_unknown_value_without_erroring() {
-        let (parsed, raw, error) = parse_worker_status_filter(Some("zombie"));
-        assert_eq!(parsed, None, "an invalid status must not be applied");
-        assert_eq!(
-            raw, "zombie",
-            "the operator's exact raw input is echoed back"
-        );
-        let error = error.expect("an invalid status must carry a redisplayable error");
-        assert!(
-            error.contains("zombie") && error.contains("Active"),
-            "error names the bad value and a valid option: {error}"
-        );
-    }
-
-    #[test]
-    fn parse_worker_status_filter_blank_or_missing_is_not_an_error() {
-        assert_eq!(
-            parse_worker_status_filter(None),
-            (None, String::new(), None)
-        );
-        assert_eq!(
-            parse_worker_status_filter(Some("   ")),
-            (None, String::new(), None)
-        );
-    }
-
-    #[test]
-    fn parse_worker_stale_filter_accepts_true_and_false() {
-        assert_eq!(
-            parse_worker_stale_filter(Some("true")),
-            (true, "true".to_string(), None)
-        );
-        assert_eq!(
-            parse_worker_stale_filter(Some("false")),
-            (false, "false".to_string(), None)
-        );
-    }
-
-    /// Same fix, applied to the `stale` field: an unrecognized value no
-    /// longer `?`-aborts the page. An example is the very plausible `True`,
-    /// since matching is case-sensitive by design (see the field's existing
-    /// semantics).
-    #[test]
-    fn parse_worker_stale_filter_rejects_unknown_value_without_erroring() {
-        let (parsed, raw, error) = parse_worker_stale_filter(Some("True"));
-        assert!(!parsed, "an invalid stale value must not be applied");
-        assert_eq!(raw, "True", "the operator's exact raw input is echoed back");
-        let error = error.expect("an invalid stale value must carry a redisplayable error");
-        assert!(
-            error.contains("True") && error.contains("true"),
-            "error names the bad value and the expected values: {error}"
-        );
-    }
-
-    #[test]
-    fn parse_worker_stale_filter_blank_or_missing_is_not_an_error() {
-        assert_eq!(
-            parse_worker_stale_filter(None),
-            (false, String::new(), None)
-        );
-        assert_eq!(
-            parse_worker_stale_filter(Some("   ")),
-            (false, String::new(), None)
-        );
-    }
-
-    #[test]
     fn build_worker_query_string_includes_build_id() {
-        let q = build_worker_query_string(DEFAULT_PAGE_SIZE, "", "", "", "", Some("abc123"));
+        let q = build_worker_query_string(DEFAULT_PAGE_SIZE, None, None, false, Some("abc123"));
         assert!(
             q.contains("build_id=abc123"),
             "query string must include build_id"
@@ -16607,156 +11271,6 @@ mod tests {
         assert!(
             flash.contains("Retry failed"),
             "a real failure must use the hard failure message: {flash}"
-        );
-    }
-
-    // Issue #1723 fix: a submitted reason and a commit-failure message must
-    // both reach the redisplayed confirm page. They replace the
-    // auto-generated default reason and the earlier no-error state.
-    #[test]
-    fn render_dag_retry_confirm_echoes_submitted_reason_and_commit_error() {
-        let plan = DagRetryResponse {
-            dry_run: true,
-            dag_name: "graph_linear".to_string(),
-            source_run_exec_id: "source-run".to_string(),
-            reset_to_event_id: 3,
-            nodes_to_re_execute: vec!["step_b".to_string()],
-            nodes_carried_over: vec![],
-            new_run_exec_id: None,
-            events_carried_over: None,
-        };
-        let markup = render_dag_retry_confirm(
-            "graph_linear",
-            "source-run",
-            "step_b",
-            "retrying after upstream API fix, ticket JIRA-4521",
-            Some("DAG run succeeded"),
-            Ok(plan),
-        )
-        .into_string();
-        assert!(
-            markup.contains("retrying after upstream API fix, ticket JIRA-4521"),
-            "the operator's submitted reason must survive a redisplay: {markup}"
-        );
-        assert!(
-            !markup.contains("retry from node step_b via Vantage"),
-            "the auto-generated default reason must not silently replace the \
-             operator's own submission: {markup}"
-        );
-        assert!(
-            markup.contains("DAG run succeeded"),
-            "the commit failure must be shown inline on the redisplayed \
-             form, not only in a since-vanished redirect flash: {markup}"
-        );
-    }
-
-    // The plain first-visit GET has nothing to echo: no commit has happened
-    // yet. So no error renders, and the textarea carries the auto-generated
-    // default reason unchanged.
-    #[test]
-    fn render_dag_retry_confirm_shows_no_error_when_nothing_failed_yet() {
-        let plan = DagRetryResponse {
-            dry_run: true,
-            dag_name: "graph_linear".to_string(),
-            source_run_exec_id: "source-run".to_string(),
-            reset_to_event_id: 3,
-            nodes_to_re_execute: vec!["step_b".to_string()],
-            nodes_carried_over: vec![],
-            new_run_exec_id: None,
-            events_carried_over: None,
-        };
-        let markup = render_dag_retry_confirm(
-            "graph_linear",
-            "source-run",
-            "step_b",
-            "retry from node step_b via Vantage",
-            None,
-            Ok(plan),
-        )
-        .into_string();
-        // Not `!markup.contains("field-error")`: that substring also
-        // appears in the page's shared, always-embedded stylesheet
-        // (`.field-error{...}`). So it is true on every page, regardless of
-        // whether the error span itself renders. `role="alert"` only ever
-        // appears on that span.
-        assert!(
-            !markup.contains(r#"role="alert""#),
-            "a first-visit confirm page must show no error banner: {markup}"
-        );
-    }
-
-    // Codex review (issue #1723): the confirm page's caller re-runs the dry
-    // run for a current node list on a commit failure. That refreshed dry
-    // run can itself fail — exactly the race this fix targets, where a
-    // competing retry has already sealed the source run. The `Err` branch
-    // must still preserve the operator's submitted reason in that case,
-    // not just on the `Ok` branch covered by the sibling test above.
-    #[test]
-    fn render_dag_retry_confirm_preserves_reason_when_the_refreshed_dry_run_also_fails() {
-        let failure = DagRetryFailure::StateConflict("DAG run terminated".to_string());
-        let markup = render_dag_retry_confirm(
-            "graph_linear",
-            "source-run",
-            "step_b",
-            "retrying after upstream API fix, ticket JIRA-4521",
-            Some("DAG run terminated"),
-            Err(failure),
-        )
-        .into_string();
-        assert!(
-            markup.contains("retrying after upstream API fix, ticket JIRA-4521"),
-            "the operator's submitted reason must survive even when the \
-             redisplay's own fresh dry run also fails: {markup}"
-        );
-    }
-
-    // Codex review (issue #1723): the banner shows the *refreshed* dry run's
-    // own failure, which is not necessarily what the operator's actual
-    // commit attempt failed with. When the two diagnoses differ, both must
-    // reach the operator, not just the redisplay's own fresh failure.
-    #[test]
-    fn render_dag_retry_confirm_shows_original_commit_error_when_it_differs_from_the_refreshed_dry_run()
-     {
-        let refreshed_failure =
-            DagRetryFailure::StateConflict("DAG run terminated by a competing retry".to_string());
-        let markup = render_dag_retry_confirm(
-            "graph_linear",
-            "source-run",
-            "step_b",
-            "retrying after upstream API fix, ticket JIRA-4521",
-            Some("node step_b already retried by another operator"),
-            Err(refreshed_failure),
-        )
-        .into_string();
-        assert!(
-            markup.contains("DAG run terminated by a competing retry"),
-            "the refreshed dry run's own failure must still show: {markup}"
-        );
-        assert!(
-            markup.contains("node step_b already retried by another operator"),
-            "a diverging original commit failure must not be silently \
-             dropped in favour of the refreshed dry run's own message: \
-             {markup}"
-        );
-    }
-
-    // The plain first-visit `GET` failure (no prior submission) must not
-    // claim to be preserving a reason that was never the operator's own.
-    #[test]
-    fn render_dag_retry_confirm_shows_no_preserved_reason_on_first_visit_dry_run_failure() {
-        let failure = DagRetryFailure::StateConflict("DAG run succeeded".to_string());
-        let markup = render_dag_retry_confirm(
-            "graph_linear",
-            "source-run",
-            "step_b",
-            "retry from node step_b via Vantage",
-            None,
-            Err(failure),
-        )
-        .into_string();
-        assert!(
-            !markup.contains("Your submitted reason"),
-            "a first-visit dry-run failure has nothing to preserve: {markup}"
         );
     }
 
@@ -17627,11 +12141,7 @@ mod tests {
             &blocked,
             None,
             None,
-            None,
-            None,
             logs,
-            &WorkflowActionEcho::default(),
-            false,
         )
         .into_string()
     }
@@ -17748,15 +12258,11 @@ mod tests {
             &blocked,
             None,
             None,
-            None,
-            None,
             &WorkflowLogsPanelData {
                 lines: &[],
                 admin: true,
                 ..Default::default()
             },
-            &WorkflowActionEcho::default(),
-            false,
         )
         .into_string();
         // maud escapes `&` inside an attribute value, which is the correct
@@ -17764,313 +12270,6 @@ mod tests {
         assert!(
             html.contains("?event_page=3&amp;log_level=warn"),
             "a level-filter link must carry the current event page"
-        );
-    }
-
-    #[test]
-    fn jump_to_event_control_has_a_programmatically_associated_label() {
-        // Every other `label`/control pair in this file relies on the
-        // dashboard's own convention: a `<label>` wraps its control. The
-        // browser associates the two even with no `for`/`id` pair. This
-        // control alone rendered the label and the input as siblings, so a
-        // screen reader announced the field with no accessible name at all.
-        // Assert the wrapping structurally: the `jump_event` input must sit
-        // between the `<label>` carrying "Jump to event:" and its close tag.
-        let execution = stub_execution();
-        let blocked = stub_blocked_on();
-        let html = render_workflow_detail(
-            &execution,
-            150, // total_events, past DETAIL_EVENT_PAGE_SIZE so the control renders
-            &[],
-            &[],
-            &[],
-            false,
-            &[],
-            0,
-            &blocked,
-            None,
-            None,
-            None,
-            None,
-            &WorkflowLogsPanelData {
-                lines: &[],
-                admin: true,
-                ..Default::default()
-            },
-            &WorkflowActionEcho::default(),
-            false,
-        )
-        .into_string();
-
-        let label_text_pos = html
-            .find("Jump to event:")
-            .expect("the jump-to-event control must render past the pagination threshold");
-        let label_open = html[..label_text_pos]
-            .rfind("<label")
-            .expect("\"Jump to event:\" must be inside a <label>");
-        let label_close = label_text_pos
-            + html[label_text_pos..]
-                .find("</label>")
-                .expect("the label must be closed");
-        let input_pos = html
-            .find("name=\"jump_event\"")
-            .expect("the jump_event input must render");
-        assert!(
-            label_open < input_pos && input_pos < label_close,
-            "the jump_event input must be a descendant of its <label>, not a \
-             sibling -- otherwise it has no programmatic accessible name"
-        );
-    }
-
-    /// GREEN -- the fix under test (issue #1627): `event_page_error` and
-    /// `jump_event_error` must render inline, matching
-    /// `render_dead_letter_pagination_shows_page_error`/
-    /// `render_worker_pagination_shows_page_error`.
-    #[test]
-    fn render_workflow_detail_shows_event_page_and_jump_event_errors() {
-        let execution = stub_execution();
-        let blocked = stub_blocked_on();
-        let html = render_workflow_detail(
-            &execution,
-            0,
-            &[],
-            &[],
-            &[],
-            false,
-            &[],
-            0,
-            &blocked,
-            None,
-            Some("Invalid page 'nope'; expected a whole number. Showing page 1."),
-            Some("Invalid jump_event 'zap'; expected a whole number. Jump ignored."),
-            None,
-            &WorkflowLogsPanelData::default(),
-            &WorkflowActionEcho::default(),
-            false,
-        )
-        .into_string();
-        assert!(
-            html.contains("field-error") && html.contains("Invalid page 'nope'"),
-            "the event_page error must render inline: {html}"
-        );
-        assert!(
-            html.contains("Invalid jump_event 'zap'"),
-            "the jump_event error must render inline: {html}"
-        );
-    }
-
-    /// RED before this fix (issue #1687): a failed Send signal / Reset to
-    /// event N / Trigger update submission redirected to `?flash={error}`
-    /// alone. The collapsed `<details>` re-rendered closed and empty.
-    /// The operator's signal name, JSON payload, reset event number/reason,
-    /// or update name/payload were gone. Only a generic top-of-page flash
-    /// remained. GREEN: `WorkflowActionEcho` keeps the relevant `<details>`
-    /// open, and pre-fills its inputs with what was submitted. It shows the
-    /// error next to the field that rejected it, matching the
-    /// `BackfillFormEcho` mechanism the backfill launcher already uses.
-    #[test]
-    fn render_workflow_detail_echoes_entered_values_on_action_form_errors() {
-        let execution = stub_execution();
-        let blocked = stub_blocked_on();
-        let echo = WorkflowActionEcho {
-            signal_error: Some("Invalid JSON payload: expected value".to_string()),
-            signal_name: Some("approve".to_string()),
-            signal_payload: Some("{not json".to_string()),
-            reset_error: Some("invalid event number 'zz'; expected a whole number".to_string()),
-            reset_event: Some("zz".to_string()),
-            reset_reason: Some("rollback after incident".to_string()),
-            update_error: Some("Invalid JSON payload: expected value".to_string()),
-            update_name: Some("set_priority".to_string()),
-            update_payload: Some("{also not json".to_string()),
-        };
-        let html = render_workflow_detail(
-            &execution,
-            0,
-            &[],
-            &[],
-            &[],
-            false,
-            &[],
-            0,
-            &blocked,
-            None,
-            None,
-            None,
-            None,
-            &WorkflowLogsPanelData::default(),
-            &echo,
-            false,
-        )
-        .into_string();
-
-        assert!(
-            html.contains("Invalid JSON payload: expected value"),
-            "the signal form's error must render inline: {html}"
-        );
-        assert!(
-            html.contains(
-                r#"name="signal_name" required placeholder="e.g. approve" value="approve""#
-            ),
-            "the signal name the operator typed must be redisplayed, not blanked: {html}"
-        );
-        assert!(
-            html.contains("{not json"),
-            "the signal payload the operator typed must be redisplayed, not blanked: {html}"
-        );
-
-        assert!(
-            html.contains("invalid event number") && html.contains("expected a whole number"),
-            "the reset form's error must render inline: {html}"
-        );
-        assert!(
-            html.contains(r#"name="reset_to_event_id" required placeholder="1" value="zz""#),
-            "the reset event number the operator typed must be redisplayed, not blanked: {html}"
-        );
-        assert!(
-            html.contains("rollback after incident"),
-            "the reset reason the operator typed must be redisplayed, not blanked: {html}"
-        );
-
-        assert!(
-            html.contains(r#"name="update_name" required placeholder="e.g. set_priority" value="set_priority""#),
-            "the update name the operator typed must be redisplayed, not blanked: {html}"
-        );
-        assert!(
-            html.contains("{also not json"),
-            "the update payload the operator typed must be redisplayed, not blanked: {html}"
-        );
-    }
-
-    /// Companion to the echo test above. With no error, none of the three
-    /// action forms should be forced open. They stay collapsed by default,
-    /// same as every prior page load.
-    #[test]
-    fn render_workflow_detail_leaves_action_forms_collapsed_with_no_error() {
-        let execution = stub_execution();
-        let blocked = stub_blocked_on();
-        let html = render_workflow_detail(
-            &execution,
-            0,
-            &[],
-            &[],
-            &[],
-            false,
-            &[],
-            0,
-            &blocked,
-            None,
-            None,
-            None,
-            None,
-            &WorkflowLogsPanelData::default(),
-            &WorkflowActionEcho::default(),
-            false,
-        )
-        .into_string();
-
-        assert!(
-            !html.contains("<details style=\"display:inline-block\" open"),
-            "no action form should be forced open absent an error: {html}"
-        );
-    }
-
-    /// RED before this fix (issue #1687 review, Codex finding). Serving the
-    /// detail page's markup directly as a rejected POST's response body
-    /// left every relative link and form action wrong. The body assumed
-    /// the document's own url was the canonical `/workflows/{id}` page.
-    /// The browser stays at `/workflows/{id}/signal` (or `/reset`,
-    /// `/trigger-update`) on a direct render. So `{id}/signal` would
-    /// resolve to the nonexistent `/workflows/{id}/{id}/signal`. Every
-    /// other relative link and pagination href would be wrong the same
-    /// way. GREEN: `rendered_at_action_url: true` emits a real `<base
-    /// href="..">` element. It re-establishes the same directory context
-    /// the canonical url gives, so every existing relative link resolves
-    /// correctly without being rewritten.
-    #[test]
-    fn render_workflow_detail_emits_a_base_tag_only_when_rendered_at_an_action_url() {
-        let execution = stub_execution();
-        let blocked = stub_blocked_on();
-        let render = |rendered_at_action_url: bool| {
-            render_workflow_detail(
-                &execution,
-                0,
-                &[],
-                &[],
-                &[],
-                false,
-                &[],
-                0,
-                &blocked,
-                None,
-                None,
-                None,
-                None,
-                &WorkflowLogsPanelData::default(),
-                &WorkflowActionEcho::default(),
-                rendered_at_action_url,
-            )
-            .into_string()
-        };
-
-        let from_get = render(false);
-        assert!(
-            !from_get.contains("<base "),
-            "an ordinary GET page load must not carry a <base> element: {from_get}"
-        );
-
-        let from_post = render(true);
-        assert!(
-            from_post.contains(r#"<base href="..">"#),
-            "a page rendered directly from a rejected action POST must carry <base href=\"..\">: {from_post}"
-        );
-    }
-
-    /// RED before this fix (issue #1687 review, second Codex finding).
-    /// Take a relative reference with an empty path: a bare
-    /// `?event_page=1` link, or a GET `<form>` with no `action`. It
-    /// inherits the browser's *entire* current base path, not just its
-    /// directory. That differs
-    /// from a path-relative reference like `{id}/signal`, which merges
-    /// against only the base's directory. `<base href="..">` restores the
-    /// right directory for path-relative references. But a query-only one
-    /// under that base would still resolve to `/workflows/?event_page=1`,
-    /// dropping the execution id. GREEN: every pagination link and the
-    /// jump-to-event form's `action` are prefixed with the execution id
-    /// explicitly. They no longer depend on that distinction at all.
-    #[test]
-    fn render_workflow_detail_pagination_and_jump_form_are_execution_specific() {
-        let execution = stub_execution();
-        let exec_id_str = execution.id.to_string();
-        let blocked = stub_blocked_on();
-        let page_events: Vec<HarvestEvent> = Vec::new();
-        let html = render_workflow_detail(
-            &execution,
-            150, // past DETAIL_EVENT_PAGE_SIZE so pagination and the jump form render
-            &page_events,
-            &[],
-            &[],
-            false,
-            &[],
-            1, // event_page, so both Previous and Next render
-            &blocked,
-            None,
-            None,
-            None,
-            None,
-            &WorkflowLogsPanelData::default(),
-            &WorkflowActionEcho::default(),
-            true, // rendered_at_action_url — the case the base-tag fix affects
-        )
-        .into_string();
-
-        assert!(
-            html.contains(&format!("href=\"{exec_id_str}?event_page=")),
-            "pagination links must carry the execution id, not a bare '?event_page=': {html}"
-        );
-        assert!(
-            html.contains(&format!(r#"form method="get" action="{exec_id_str}""#)),
-            "the jump-to-event form must have an explicit execution-id action, \
-             not rely on the browser's default form-submission target: {html}"
         );
     }
 
@@ -18137,2034 +12336,10 @@ mod tests {
 
     #[test]
     fn workflow_detail_href_preserves_both_dimensions() {
+        assert_eq!(workflow_detail_href(0, None), "?event_page=0");
         assert_eq!(
-            workflow_detail_href("abc-123", 0, None),
-            "abc-123?event_page=0"
+            workflow_detail_href(2, Some("error")),
+            "?event_page=2&log_level=error"
         );
-        assert_eq!(
-            workflow_detail_href("abc-123", 2, Some("error")),
-            "abc-123?event_page=2&log_level=error"
-        );
-    }
-
-    // ── issue #951: schedules management page — health, policy and drill-downs ──
-
-    /// A schedule with nothing wrong reports no health flags, so a healthy row
-    /// stays calm (AC3: "a healthy schedule reads as one calm row").
-    #[test]
-    fn schedule_health_healthy_row_has_no_flags() {
-        let row = make_schedule(Some("payments"), None, false);
-        let health = schedule_health(&row);
-        assert!(
-            health.is_healthy(),
-            "an untouched schedule must read healthy"
-        );
-        assert_eq!(
-            render_schedule_health_badges(&row).into_string(),
-            "",
-            "a healthy row must render no health badges"
-        );
-    }
-
-    /// Each unhealthy condition the AC names gets its own flag + badge.
-    #[test]
-    fn schedule_health_flags_paused_exhausted_and_catchup_dropped() {
-        let paused = make_schedule(Some("wf"), None, true);
-        assert!(schedule_health(&paused).paused);
-        assert!(!schedule_health(&paused).is_healthy());
-        assert!(
-            render_schedule_health_badges(&paused)
-                .into_string()
-                .contains("Paused")
-        );
-
-        let exhausted = HarvestSchedule {
-            exhausted_at: Some(chrono::Utc::now()),
-            exhausted_reason: Some("max_runs_exhausted".to_string()),
-            ..make_schedule(Some("wf"), None, false)
-        };
-        assert!(schedule_health(&exhausted).exhausted);
-        let html = render_schedule_health_badges(&exhausted).into_string();
-        assert!(
-            html.contains("Exhausted"),
-            "exhausted badge missing: {html}"
-        );
-        assert!(
-            html.contains("max_runs_exhausted"),
-            "exhaustion reason must be surfaced: {html}"
-        );
-
-        let dropped = HarvestSchedule {
-            last_catchup_dropped: 7,
-            last_catchup_at: Some(chrono::Utc::now()),
-            ..make_schedule(Some("wf"), None, false)
-        };
-        assert!(schedule_health(&dropped).catchup_dropped);
-        let html = render_schedule_health_badges(&dropped).into_string();
-        assert!(
-            html.contains("Catchup dropped"),
-            "catchup-dropped badge missing: {html}"
-        );
-        assert!(html.contains('7'), "dropped count must be shown: {html}");
-    }
-
-    /// An auto-paused schedule (#360) is unhealthy and distinguishable from a
-    /// hand-paused one.
-    #[test]
-    fn schedule_health_flags_auto_paused_distinctly() {
-        let row = HarvestSchedule {
-            is_paused: true,
-            auto_paused_at: Some(chrono::Utc::now()),
-            consecutive_failure_count: 3,
-            ..make_schedule(Some("wf"), None, true)
-        };
-        let health = schedule_health(&row);
-        assert!(health.auto_paused && health.paused);
-        let html = render_schedule_health_badges(&row).into_string();
-        assert!(
-            html.contains("Auto-paused"),
-            "auto-paused badge missing: {html}"
-        );
-    }
-
-    /// AC3: unhealthy rows sort above healthy ones, and healthy rows keep their
-    /// existing `next_run_at`-ascending relative order.
-    #[test]
-    fn schedule_sort_puts_unhealthy_first_without_reordering_healthy_rows() {
-        let t = |mins: i64| Some(chrono::Utc::now() + chrono::Duration::minutes(mins));
-        let healthy_soon = HarvestSchedule {
-            next_run_at: t(1),
-            ..make_schedule(Some("a_soon"), None, false)
-        };
-        let healthy_later = HarvestSchedule {
-            next_run_at: t(60),
-            ..make_schedule(Some("b_later"), None, false)
-        };
-        let paused = HarvestSchedule {
-            next_run_at: t(600),
-            ..make_schedule(Some("z_paused"), None, true)
-        };
-        let mut rows = vec![
-            (ShardId::new(0), healthy_soon.clone()),
-            (ShardId::new(0), healthy_later.clone()),
-            (ShardId::new(0), paused.clone()),
-        ];
-        sort_schedule_rows(&mut rows);
-        assert_eq!(
-            rows[0].1.id, paused.id,
-            "unhealthy row must sort to the top"
-        );
-        assert_eq!(rows[1].1.id, healthy_soon.id);
-        assert_eq!(rows[2].1.id, healthy_later.id);
-    }
-
-    /// The health filter narrows to unhealthy-only / healthy-only rows.
-    #[test]
-    fn schedule_health_filter_selects_unhealthy_rows() {
-        let healthy = make_schedule(Some("ok"), None, false);
-        let paused = make_schedule(Some("bad"), None, true);
-        let filters = ScheduleUiFilters {
-            health: ScheduleHealthFilter::Unhealthy,
-            ..Default::default()
-        };
-        assert!(!filters.matches(ShardId::new(0), &healthy));
-        assert!(filters.matches(ShardId::new(0), &paused));
-
-        let filters = ScheduleUiFilters {
-            health: ScheduleHealthFilter::Healthy,
-            ..Default::default()
-        };
-        assert!(filters.matches(ShardId::new(0), &healthy));
-        assert!(!filters.matches(ShardId::new(0), &paused));
-    }
-
-    #[test]
-    fn schedule_health_filter_parses_and_rejects_unknown_values() {
-        assert_eq!(
-            ScheduleHealthFilter::parse("Unhealthy").unwrap(),
-            ScheduleHealthFilter::Unhealthy
-        );
-        assert_eq!(
-            ScheduleHealthFilter::parse("Healthy").unwrap(),
-            ScheduleHealthFilter::Healthy
-        );
-        assert_eq!(
-            ScheduleHealthFilter::parse("").unwrap(),
-            ScheduleHealthFilter::All
-        );
-        assert!(ScheduleHealthFilter::parse("bogus").is_err());
-    }
-
-    /// AC2: the catchup cell shows the effective policy (#484), its window, and
-    /// the drop count from the most recent recovery.
-    #[test]
-    fn schedule_catchup_label_reports_effective_policy_and_drops() {
-        let skip_all = make_schedule(Some("wf"), None, false);
-        assert!(schedule_catchup_label(&skip_all).contains("skip_all"));
-
-        let windowed = HarvestSchedule {
-            catchup_policy: Some("window".to_string()),
-            catchup_window_secs: Some(3600),
-            last_catchup_dropped: 4,
-            ..make_schedule(Some("wf"), None, false)
-        };
-        let label = schedule_catchup_label(&windowed);
-        assert!(label.contains("window"), "policy missing: {label}");
-        assert!(label.contains("3600"), "window seconds missing: {label}");
-        assert!(label.contains('4'), "drop count missing: {label}");
-
-        // Legacy bool fallback: catchup = true with no policy column.
-        let legacy = HarvestSchedule {
-            catchup: true,
-            ..make_schedule(Some("wf"), None, false)
-        };
-        assert!(schedule_catchup_label(&legacy).contains("unbounded"));
-    }
-
-    /// AC2: bounded-run state — remaining budget, `end_at`, and exhaustion reason.
-    #[test]
-    fn schedule_bounded_runs_label_reports_budget_end_at_and_reason() {
-        let unbounded = make_schedule(Some("wf"), None, false);
-        assert_eq!(schedule_bounded_runs_label(&unbounded), "—");
-
-        let bounded = HarvestSchedule {
-            max_runs: Some(10),
-            runs_started: 4,
-            ..make_schedule(Some("wf"), None, false)
-        };
-        let label = schedule_bounded_runs_label(&bounded);
-        assert!(label.contains('6'), "remaining budget missing: {label}");
-        assert!(label.contains("10"), "max_runs missing: {label}");
-
-        let ends = HarvestSchedule {
-            end_at: chrono::DateTime::parse_from_rfc3339("2027-01-01T00:00:00Z")
-                .ok()
-                .map(|d| d.with_timezone(&chrono::Utc)),
-            ..make_schedule(Some("wf"), None, false)
-        };
-        assert!(schedule_bounded_runs_label(&ends).contains("2027-01-01"));
-
-        let spent = HarvestSchedule {
-            max_runs: Some(3),
-            runs_started: 3,
-            exhausted_at: Some(chrono::Utc::now()),
-            exhausted_reason: Some("max_runs_exhausted".to_string()),
-            ..make_schedule(Some("wf"), None, false)
-        };
-        let label = schedule_bounded_runs_label(&spent);
-        assert!(
-            label.contains("max_runs_exhausted"),
-            "exhausted reason missing: {label}"
-        );
-    }
-
-    /// AC2: the next-fire cell shows the jitter-adjusted effective fire time when
-    /// jitter is configured, and only `next_run_at` when it is not.
-    #[test]
-    fn schedule_next_fire_cell_shows_effective_time_only_with_jitter() {
-        let at = chrono::DateTime::parse_from_rfc3339("2026-09-01T12:00:00Z")
-            .expect("valid fixture timestamp")
-            .with_timezone(&chrono::Utc);
-
-        let no_jitter = HarvestSchedule {
-            next_run_at: Some(at),
-            jitter_secs: 0,
-            ..make_schedule(Some("wf"), None, false)
-        };
-        let html = schedule_next_fire_cell(&no_jitter).into_string();
-        assert!(
-            html.contains("2026-09-01 12:00:00"),
-            "next_run_at missing: {html}"
-        );
-        assert!(
-            !html.contains("effective"),
-            "no effective line without jitter: {html}"
-        );
-
-        let jittered = HarvestSchedule {
-            next_run_at: Some(at),
-            jitter_secs: 300,
-            ..make_schedule(Some("wf"), None, false)
-        };
-        let html = schedule_next_fire_cell(&jittered).into_string();
-        assert!(
-            html.contains("effective"),
-            "jittered row must show the effective fire time: {html}"
-        );
-        assert!(html.contains("300s"), "jitter window missing: {html}");
-    }
-
-    /// AC2: the overlap policy (#241) is rendered, with the buffered depth when
-    /// the policy buffers.
-    #[test]
-    fn schedule_overlap_label_reports_policy_and_buffer_depth() {
-        let skip = make_schedule(Some("wf"), None, false);
-        assert!(schedule_overlap_label(&skip).contains("skip"));
-
-        let buffered = HarvestSchedule {
-            overlap_policy: "buffer_all".to_string(),
-            buffered_runs: serde_json::json!(["2026-01-01T00:00:00Z", "2026-01-01T01:00:00Z"]),
-            buffer_all_max: 50,
-            ..make_schedule(Some("wf"), None, false)
-        };
-        let label = schedule_overlap_label(&buffered);
-        assert!(label.contains("buffer_all"), "policy missing: {label}");
-        assert!(label.contains('2'), "buffered depth missing: {label}");
-        assert!(label.contains("50"), "buffer cap missing: {label}");
-    }
-
-    /// AC3: the page header counts unhealthy schedules so triage starts before
-    /// the operator reads a single row.
-    #[test]
-    fn schedule_health_summary_counts_each_unhealthy_bucket() {
-        let rows = vec![
-            (ShardId::new(0), make_schedule(Some("ok"), None, false)),
-            (ShardId::new(0), make_schedule(Some("p"), None, true)),
-            (
-                ShardId::new(0),
-                HarvestSchedule {
-                    exhausted_at: Some(chrono::Utc::now()),
-                    ..make_schedule(Some("e"), None, false)
-                },
-            ),
-            (
-                ShardId::new(0),
-                HarvestSchedule {
-                    last_catchup_dropped: 2,
-                    ..make_schedule(Some("c"), None, false)
-                },
-            ),
-        ];
-        let summary = schedule_health_summary(&rows);
-        assert!(
-            summary.contains("1 paused"),
-            "paused count missing: {summary}"
-        );
-        assert!(
-            summary.contains("1 exhausted"),
-            "exhausted count missing: {summary}"
-        );
-        assert!(
-            summary.contains("1 catchup-dropped"),
-            "catchup-dropped count missing: {summary}"
-        );
-
-        let all_healthy = vec![(ShardId::new(0), make_schedule(Some("ok"), None, false))];
-        assert_eq!(
-            schedule_health_summary(&all_healthy),
-            "",
-            "a healthy fleet needs no unhealthy summary"
-        );
-    }
-
-    /// AC2/AC5/AC6/AC7: each row links to its preview, backfill and run-history
-    /// drill-downs.
-    #[test]
-    fn schedule_table_row_links_to_every_drill_down() {
-        let row = make_schedule(Some("payments"), None, false);
-        let id = row.id.to_string();
-        let html = render_schedule_table(
-            &[(ShardId::new(0), row)],
-            false,
-            &std::collections::HashMap::new(),
-        )
-        .into_string();
-        for suffix in ["preview", "runs", "backfill"] {
-            assert!(
-                html.contains(&format!("schedules/{id}/{suffix}")),
-                "row must link to the {suffix} drill-down: {html}"
-            );
-        }
-    }
-
-    // -- Preview drill-down (AC5) --
-
-    fn preview_entry(
-        scheduled_at: &str,
-        effective_at: Option<&str>,
-        reason: &str,
-    ) -> crate::api::ScheduleFirePreviewEntry {
-        let parse = |s: &str| {
-            chrono::DateTime::parse_from_rfc3339(s)
-                .expect("valid fixture timestamp")
-                .with_timezone(&chrono::Utc)
-        };
-        let effective = effective_at.map(parse);
-        crate::api::ScheduleFirePreviewEntry {
-            scheduled_at: parse(scheduled_at),
-            local_at: scheduled_at.to_string(),
-            effective_at: effective,
-            effective_local_at: effective_at.map(str::to_string),
-            reason: reason.to_string(),
-            jitter_earliest_at: None,
-            jitter_latest_at: None,
-            would_skip_if_active: false,
-        }
-    }
-
-    /// AC5: the preview shows effective vs. original vs. calendar-skipped entries.
-    #[test]
-    fn preview_page_distinguishes_effective_original_and_skipped_entries() {
-        let row = make_schedule(Some("payments"), None, false);
-        let preview = crate::api::SchedulePreview {
-            entries: vec![
-                preview_entry(
-                    "2026-09-01T12:00:00Z",
-                    Some("2026-09-01T12:02:00Z"),
-                    "cron+jitter",
-                ),
-                preview_entry("2026-09-02T12:00:00Z", None, "skipped:calendar-excluded"),
-                preview_entry("2026-09-03T12:00:00Z", Some("2026-09-03T12:00:00Z"), "cron"),
-            ],
-            is_paused: false,
-            pause_reason: None,
-            from: chrono::Utc::now(),
-            count_requested: 10,
-            end_at: None,
-            remaining_runs: None,
-            exhausted_reason: None,
-        };
-        let html =
-            render_schedule_preview_page(&row, ShardId::new(0), &preview, 10, None).into_string();
-        assert!(
-            html.contains("2026-09-01 12:00:00"),
-            "original instant missing: {html}"
-        );
-        assert!(
-            html.contains("2026-09-01 12:02:00"),
-            "effective instant missing: {html}"
-        );
-        assert!(
-            html.contains("cron+jitter"),
-            "jitter reason missing: {html}"
-        );
-        assert!(
-            html.contains("skipped:calendar-excluded"),
-            "calendar-skip reason missing: {html}"
-        );
-        assert!(!html.contains("<script"), "no script tags: {html}");
-    }
-
-    /// AC5 (#543): a bounded schedule whose preview truncates to zero entries must
-    /// say *why*, not render a blank panel (AC8).
-    #[test]
-    fn preview_page_explains_zero_entries_for_a_bounded_schedule() {
-        let row = HarvestSchedule {
-            max_runs: Some(5),
-            runs_started: 5,
-            exhausted_at: Some(chrono::Utc::now()),
-            exhausted_reason: Some("max_runs_exhausted".to_string()),
-            ..make_schedule(Some("payments"), None, false)
-        };
-        let preview = crate::api::SchedulePreview {
-            entries: vec![],
-            is_paused: false,
-            pause_reason: None,
-            from: chrono::Utc::now(),
-            count_requested: 10,
-            end_at: None,
-            remaining_runs: Some(0),
-            exhausted_reason: Some("max_runs_exhausted".to_string()),
-        };
-        let html =
-            render_schedule_preview_page(&row, ShardId::new(0), &preview, 10, None).into_string();
-        assert!(
-            html.contains("max_runs_exhausted"),
-            "must name the exhaustion reason: {html}"
-        );
-        assert!(
-            html.contains("no upcoming fire times") || html.contains("No upcoming fire times"),
-            "must render an explicit empty state: {html}"
-        );
-    }
-
-    /// A paused schedule's preview says so rather than rendering an empty table.
-    #[test]
-    fn preview_page_explains_zero_entries_for_a_paused_schedule() {
-        let row = make_schedule(Some("payments"), None, true);
-        let preview = crate::api::SchedulePreview {
-            entries: vec![],
-            is_paused: true,
-            pause_reason: Some("operator hold".to_string()),
-            from: chrono::Utc::now(),
-            count_requested: 10,
-            end_at: None,
-            remaining_runs: None,
-            exhausted_reason: None,
-        };
-        let html =
-            render_schedule_preview_page(&row, ShardId::new(0), &preview, 10, None).into_string();
-        assert!(html.contains("paused") || html.contains("Paused"));
-        assert!(
-            html.contains("operator hold"),
-            "pause reason missing: {html}"
-        );
-    }
-
-    // -- Run history drill-down (AC7) --
-
-    fn run_entry(
-        state: &str,
-        origin: &str,
-        nominal: Option<&str>,
-    ) -> crate::schedule_runs::ScheduleRunEntry {
-        let parse = |s: &str| {
-            chrono::DateTime::parse_from_rfc3339(s)
-                .expect("valid fixture timestamp")
-                .with_timezone(&chrono::Utc)
-        };
-        crate::schedule_runs::ScheduleRunEntry {
-            execution_id: uuid::Uuid::new_v4(),
-            nominal_fire_time: nominal.map(parse),
-            started_at: parse("2026-09-01T12:00:00Z"),
-            completed_at: Some(parse("2026-09-01T12:01:00Z")),
-            state: state.to_string(),
-            outcome: crate::schedule_runs::collapse_outcome(state),
-            error: None,
-            origin: Some(origin.to_string()),
-        }
-    }
-
-    fn runs_response(
-        runs: Vec<crate::schedule_runs::ScheduleRunEntry>,
-        status: crate::shard_fanout::FanoutStatus,
-        shards: Vec<crate::schedule_runs::RunsShardInspection>,
-    ) -> crate::schedule_runs::ScheduleRunsResponse {
-        crate::schedule_runs::ScheduleRunsResponse {
-            schedule_id: uuid::Uuid::new_v4(),
-            status,
-            next_run_at: None,
-            runs,
-            summary: crate::schedule_runs::ScheduleRunSummary {
-                succeeded: 3,
-                failed: 1,
-                total: 4,
-                summary_complete: matches!(status, crate::shard_fanout::FanoutStatus::Complete),
-                ..Default::default()
-            },
-            limit: 20,
-            next_cursor: None,
-            shards,
-        }
-    }
-
-    /// AC7: newest-first rows carry nominal fire time, origin, a terminal state
-    /// badge, and link to the execution detail view.
-    #[test]
-    fn runs_page_renders_rows_with_origin_state_and_execution_links() {
-        let row = make_schedule(Some("payments"), None, false);
-        let runs = vec![
-            run_entry("COMPLETED", "scheduled", Some("2026-09-01T12:00:00Z")),
-            run_entry("FAILED", "backfill", Some("2026-08-31T12:00:00Z")),
-            run_entry("RUNNING", "manual_trigger", None),
-        ];
-        let exec_ids: Vec<_> = runs.iter().map(|r| r.execution_id).collect();
-        let response = runs_response(runs, crate::shard_fanout::FanoutStatus::Complete, vec![]);
-        let html = render_schedule_runs_page(
-            &row,
-            ShardId::new(0),
-            &response,
-            &ScheduleRunsView::default(),
-            None,
-            None,
-        )
-        .into_string();
-
-        for id in &exec_ids {
-            assert!(
-                html.contains(&format!("workflows/{id}")),
-                "run must link to the execution detail view: {html}"
-            );
-        }
-        // Origin names and state names also appear in the page chrome (the
-        // summary note, the footer's "Backfill" link) and in the inlined
-        // stylesheet's `.COMPLETED` / `.FAILED` rules, so assert on the actual
-        // table cells.
-        for origin in ["scheduled", "backfill", "manual_trigger"] {
-            assert!(
-                html.contains(&format!("<td><code>{origin}</code></td>")),
-                "{origin} origin cell missing: {html}"
-            );
-        }
-        for state in ["COMPLETED", "FAILED", "RUNNING"] {
-            assert!(
-                html.contains(&format!(">{state}</span>")),
-                "{state} badge missing: {html}"
-            );
-        }
-        assert!(
-            html.contains("2026-09-01 12:00:00"),
-            "nominal fire time missing: {html}"
-        );
-        // Scheduled-only cadence summary.
-        assert!(
-            html.contains("Scheduled-run summary") || html.contains("scheduled-run summary"),
-            "cadence summary heading missing: {html}"
-        );
-    }
-
-    /// AC7: a `status: partial` response renders a visible "some shards
-    /// unreachable" banner rather than silently truncated data.
-    #[test]
-    fn runs_page_renders_partial_shard_banner() {
-        let row = make_schedule(Some("payments"), None, false);
-        let response = runs_response(
-            vec![run_entry(
-                "COMPLETED",
-                "scheduled",
-                Some("2026-09-01T12:00:00Z"),
-            )],
-            crate::shard_fanout::FanoutStatus::Partial,
-            vec![
-                crate::schedule_runs::RunsShardInspection {
-                    shard_id: 0,
-                    status: "inspected",
-                    error: None,
-                },
-                crate::schedule_runs::RunsShardInspection {
-                    shard_id: 1,
-                    status: "unavailable",
-                    error: Some("connection refused".to_string()),
-                },
-            ],
-        );
-        let html = render_schedule_runs_page(
-            &row,
-            ShardId::new(0),
-            &response,
-            &ScheduleRunsView::default(),
-            None,
-            None,
-        )
-        .into_string();
-        assert!(
-            html.contains("some shards unreachable") || html.contains("Some shards unreachable"),
-            "partial-shard banner missing: {html}"
-        );
-        assert!(
-            html.contains("connection refused"),
-            "shard error detail missing: {html}"
-        );
-        assert!(
-            html.contains("counts may be understated") || html.contains("may be understated"),
-            "summary must be flagged as possibly understated: {html}"
-        );
-    }
-
-    /// AC8: a schedule that has never run renders an explicit message, not a
-    /// blank panel.
-    #[test]
-    fn runs_page_renders_no_runs_yet_empty_state() {
-        let row = make_schedule(Some("payments"), None, false);
-        let response = runs_response(vec![], crate::shard_fanout::FanoutStatus::Complete, vec![]);
-        let html = render_schedule_runs_page(
-            &row,
-            ShardId::new(0),
-            &response,
-            &ScheduleRunsView::default(),
-            None,
-            None,
-        )
-        .into_string();
-        assert!(
-            html.contains("no runs yet") || html.contains("No runs yet"),
-            "no-runs empty state missing: {html}"
-        );
-    }
-
-    /// AC7: an `unavailable` status is louder still — no shard could be inspected.
-    #[test]
-    fn runs_page_renders_unavailable_banner_when_no_shard_answered() {
-        let row = make_schedule(Some("payments"), None, false);
-        let response = runs_response(
-            vec![],
-            crate::shard_fanout::FanoutStatus::Unavailable,
-            vec![crate::schedule_runs::RunsShardInspection {
-                shard_id: 0,
-                status: "unavailable",
-                error: Some("pool timeout".to_string()),
-            }],
-        );
-        let html = render_schedule_runs_page(
-            &row,
-            ShardId::new(0),
-            &response,
-            &ScheduleRunsView::default(),
-            None,
-            None,
-        )
-        .into_string();
-        assert!(
-            html.contains("No shard could be reached")
-                || html.contains("no shard could be reached"),
-            "unavailable banner missing: {html}"
-        );
-        assert!(
-            !html.contains("No runs yet"),
-            "must not claim 'no runs' when nothing could be read: {html}"
-        );
-    }
-
-    // -- Backfill launcher (AC6) --
-
-    /// AC6: the form collects a start/end window and posts to the dry-run preview
-    /// step, never straight to the dispatching endpoint.
-    #[test]
-    fn backfill_form_posts_to_the_preview_step_first() {
-        let row = make_schedule(Some("payments"), None, false);
-        let id = row.id.to_string();
-        let html = render_schedule_backfill_form(
-            &row,
-            ShardId::new(0),
-            None,
-            &BackfillFormEcho::default(),
-        )
-        .into_string();
-        assert!(
-            html.contains(&format!("schedules/{id}/backfill")),
-            "form must post to the backfill route: {html}"
-        );
-        assert!(
-            html.contains("name=\"stage\" value=\"preview\""),
-            "the form must submit the dry-run stage, never a bare commit: {html}"
-        );
-        assert!(
-            !html.contains("value=\"commit\""),
-            "the launcher form must never offer a direct commit: {html}"
-        );
-        assert!(
-            html.contains("name=\"from\""),
-            "start field missing: {html}"
-        );
-        assert!(html.contains("name=\"to\""), "end field missing: {html}");
-        assert!(!html.contains("<script"), "no script tags: {html}");
-    }
-
-    /// AC6: the confirmation step shows the dry-run's planned count before the
-    /// operator can dispatch anything.
-    #[test]
-    fn backfill_confirm_shows_planned_count_before_dispatch() {
-        let row = make_schedule(Some("payments"), None, false);
-        let id = row.id.to_string();
-        let parse = |s: &str| {
-            chrono::DateTime::parse_from_rfc3339(s)
-                .expect("valid fixture timestamp")
-                .with_timezone(&chrono::Utc)
-        };
-        let dry_run = crate::api::ScheduleBackfillResponse {
-            status: "dry_run".to_string(),
-            schedule_id: row.id,
-            kind: crate::api::ScheduleKind::Workflow,
-            name: "payments".to_string(),
-            from: parse("2026-08-01T00:00:00Z"),
-            to: parse("2026-08-02T00:00:00Z"),
-            planned_timestamps: vec![parse("2026-08-01T00:00:00Z"), parse("2026-08-01T01:00:00Z")],
-            total: 24,
-            dispatched: 20,
-            skipped: 4,
-            failed: 0,
-            skipped_reasons: std::collections::HashMap::from([(
-                "already_exists".to_string(),
-                4usize,
-            )]),
-            partial_shard_failures: vec![],
-            paused_schedule_warning: None,
-        };
-        let form = BackfillFormParams {
-            from: "2026-08-01T00:00:00Z".to_string(),
-            to: "2026-08-02T00:00:00Z".to_string(),
-            max_count: Some(100),
-            include_paused: false,
-        };
-        let html =
-            render_schedule_backfill_confirm(&row, ShardId::new(0), &dry_run, &form).into_string();
-        // Assert on the labelled cells: the inlined stylesheet contains bare
-        // "24"/"20" on several lines, so a plain `contains` proves nothing.
-        assert!(
-            html.contains("<dt>Planned slots</dt><dd>24</dd>"),
-            "planned total missing: {html}"
-        );
-        assert!(
-            html.contains("<dt>Would dispatch</dt><dd>20</dd>"),
-            "would-dispatch count missing: {html}"
-        );
-        assert!(
-            html.contains("already_exists"),
-            "skip reasons must be shown: {html}"
-        );
-        assert!(
-            html.contains(&format!("action=\"../../schedules/{id}/backfill\"")),
-            "confirm must post to the dispatching endpoint: {html}"
-        );
-        assert!(
-            html.contains("name=\"stage\" value=\"commit\""),
-            "confirm must carry the explicit commit stage: {html}"
-        );
-        // The window must round-trip so the committed backfill is the one previewed.
-        assert!(html.contains("2026-08-01T00:00:00Z"));
-        assert!(html.contains("2026-08-02T00:00:00Z"));
-    }
-
-    /// A backfill window with nothing in it must not offer a dispatch button.
-    #[test]
-    fn backfill_confirm_disables_dispatch_for_an_empty_window() {
-        let row = make_schedule(Some("payments"), None, false);
-        let parse = |s: &str| {
-            chrono::DateTime::parse_from_rfc3339(s)
-                .expect("valid fixture timestamp")
-                .with_timezone(&chrono::Utc)
-        };
-        let dry_run = crate::api::ScheduleBackfillResponse {
-            status: "dry_run".to_string(),
-            schedule_id: row.id,
-            kind: crate::api::ScheduleKind::Workflow,
-            name: "payments".to_string(),
-            from: parse("2026-08-01T00:00:00Z"),
-            to: parse("2026-08-01T00:00:01Z"),
-            planned_timestamps: vec![],
-            total: 0,
-            dispatched: 0,
-            skipped: 0,
-            failed: 0,
-            skipped_reasons: std::collections::HashMap::new(),
-            partial_shard_failures: vec![],
-            paused_schedule_warning: None,
-        };
-        let form = BackfillFormParams {
-            from: "2026-08-01T00:00:00Z".to_string(),
-            to: "2026-08-01T00:00:01Z".to_string(),
-            max_count: None,
-            include_paused: false,
-        };
-        let html =
-            render_schedule_backfill_confirm(&row, ShardId::new(0), &dry_run, &form).into_string();
-        assert!(
-            html.contains("Nothing to backfill"),
-            "empty window must render an explicit message: {html}"
-        );
-        // The page inlines the stylesheet, so a bare `contains("disabled")`
-        // would be satisfied by a CSS rule. Assert the button is simply absent.
-        assert!(
-            !html.contains("type=\"submit\""),
-            "an empty window must not offer a dispatch button at all: {html}"
-        );
-        assert!(
-            !html.contains("value=\"commit\""),
-            "an empty window must not carry a commit stage: {html}"
-        );
-    }
-
-    /// The backfill form parses its own inputs; a malformed window is a rendered
-    /// error, never a 500.
-    #[test]
-    fn backfill_form_params_reject_a_malformed_window() {
-        assert!(
-            BackfillFormParams::parse("not-a-date", "2026-08-02T00:00:00Z", None, false).is_err()
-        );
-        assert!(
-            BackfillFormParams::parse("2026-08-02T00:00:00Z", "2026-08-01T00:00:00Z", None, false)
-                .is_err()
-        );
-        let ok = BackfillFormParams::parse(
-            "2026-08-01T00:00:00Z",
-            "2026-08-02T00:00:00Z",
-            Some(50),
-            true,
-        )
-        .expect("a well-formed window parses");
-        assert_eq!(ok.max_count, Some(50));
-        assert!(ok.include_paused);
-    }
-
-    /// Collect the contents of every `onsubmit="…"` attribute in a document, so a
-    /// test can assert on what actually reaches the inline JavaScript context
-    /// rather than on the document as a whole (where an escaped name is harmless
-    /// display text).
-    fn onsubmit_attribute_values(html: &str) -> Vec<String> {
-        html.match_indices("onsubmit=\"")
-            .filter_map(|(start, marker)| {
-                let value_start = start + marker.len();
-                html[value_start..]
-                    .find('"')
-                    .map(|end| html[value_start..value_start + end].to_string())
-            })
-            .collect()
-    }
-
-    /// Names never reach a JavaScript string literal: confirmations interpolate
-    /// only the schedule UUID, so a hostile workflow name cannot break out of the
-    /// inline `confirm('...')` handler.
-    #[test]
-    fn schedule_row_confirmations_never_interpolate_names() {
-        let hostile = "evil'); alert(1);//";
-        let row = make_schedule(Some(hostile), None, false);
-        let html = render_schedule_table(
-            &[(ShardId::new(0), row)],
-            false,
-            &std::collections::HashMap::new(),
-        )
-        .into_string();
-
-        let handlers = onsubmit_attribute_values(&html);
-        assert!(
-            !handlers.is_empty(),
-            "the row is expected to carry confirmation handlers: {html}"
-        );
-        for handler in &handlers {
-            assert!(
-                !handler.contains("alert"),
-                "a workflow name must never be interpolated into an inline handler: {handler}"
-            );
-            assert!(
-                !handler.contains("evil"),
-                "a workflow name must never be interpolated into an inline handler: {handler}"
-            );
-        }
-        // A markup-bearing name is escaped into display text, never rendered raw.
-        let markup_name = "</code><script>alert(1)</script>";
-        let markup_row = make_schedule(Some(markup_name), None, false);
-        let markup_html = render_schedule_table(
-            &[(ShardId::new(0), markup_row)],
-            false,
-            &std::collections::HashMap::new(),
-        )
-        .into_string();
-        assert!(
-            !markup_html.contains("<script"),
-            "a markup-bearing name must be escaped, not rendered: {markup_html}"
-        );
-        assert!(
-            markup_html.contains("&lt;script&gt;"),
-            "the name must appear escaped as display text: {markup_html}"
-        );
-    }
-
-    // -- issue #951 review follow-ups: bugs the first round shipped --
-
-    /// The polarity of `dry_run` versus the UI's `commit` stage.
-    ///
-    /// These are opposites, and getting them the same way round makes the
-    /// "Preview backfill" button *dispatch* while the confirmation button only
-    /// projects — with the confirmation page still reading "Nothing has been
-    /// dispatched yet." over the counts of runs it just launched. Pinned here as
-    /// a pure test because the end-to-end version needs a database.
-    #[test]
-    fn backfill_request_dry_run_is_the_inverse_of_the_commit_stage() {
-        let params = BackfillFormParams {
-            from: "2026-08-01T00:00:00Z".to_string(),
-            to: "2026-08-02T00:00:00Z".to_string(),
-            max_count: None,
-            include_paused: false,
-        };
-        // The preview stage must project.
-        let commit = false;
-        let request = params
-            .to_request(!commit)
-            .expect("a normalised window converts");
-        assert!(
-            request.dry_run,
-            "the preview stage must send dry_run = true"
-        );
-        // The commit stage must dispatch.
-        let commit = true;
-        let request = params
-            .to_request(!commit)
-            .expect("a normalised window converts");
-        assert!(
-            !request.dry_run,
-            "the commit stage must send dry_run = false"
-        );
-    }
-
-    /// `to_request` carries the window and options through unchanged, so the
-    /// committed backfill is provably the one that was previewed.
-    #[test]
-    fn backfill_request_round_trips_the_previewed_window() {
-        let params = BackfillFormParams::parse(
-            "2026-08-01T00:00:00Z",
-            "2026-08-02T06:30:00Z",
-            Some(42),
-            true,
-        )
-        .expect("a well-formed window parses");
-        let request = params.to_request(true).expect("converts");
-        assert_eq!(request.from.to_rfc3339(), "2026-08-01T00:00:00+00:00");
-        assert_eq!(request.to.to_rfc3339(), "2026-08-02T06:30:00+00:00");
-        assert_eq!(request.max_count, Some(42));
-        assert!(request.include_paused);
-        // And the normalised strings the confirmation round-trips are the same
-        // instants, so a re-parse cannot drift.
-        let reparsed = BackfillFormParams::parse(
-            &params.from,
-            &params.to,
-            params.max_count,
-            params.include_paused,
-        )
-        .expect("normalised values re-parse");
-        assert_eq!(reparsed, params);
-    }
-
-    /// Every link out of a drill-down page carries the `../../` that reaches the
-    /// UI mount point. A link that forgets it resolves under the schedule id and
-    /// 404s — which is invisible to a `contains` assertion on the path itself.
-    #[test]
-    fn drilldown_pages_link_out_with_the_mount_point_prefix() {
-        let row = make_schedule(Some("payments"), None, false);
-        let id = row.id.to_string();
-        let response = runs_response(
-            vec![run_entry(
-                "COMPLETED",
-                "scheduled",
-                Some("2026-09-01T12:00:00Z"),
-            )],
-            crate::shard_fanout::FanoutStatus::Complete,
-            vec![],
-        );
-        let response = crate::schedule_runs::ScheduleRunsResponse {
-            next_cursor: Some(
-                "2026-09-01T12:00:00.000000Z|00000000-0000-0000-0000-000000000001".to_string(),
-            ),
-            ..response
-        };
-        let html = render_schedule_runs_page(
-            &row,
-            ShardId::new(0),
-            &response,
-            &ScheduleRunsView {
-                limit: Some(5),
-                limit_raw: String::new(),
-                origin: Some("scheduled".to_string()),
-                state: None,
-            },
-            None,
-            None,
-        )
-        .into_string();
-
-        // Nav chrome.
-        for leaf in [
-            "workflows",
-            "workers",
-            "schedules",
-            "dead-letters",
-            "build-routing",
-        ] {
-            assert!(
-                html.contains(&format!("href=\"../../{leaf}\"")),
-                "nav link to {leaf} must be mount-relative: {html}"
-            );
-        }
-        assert!(
-            !html.contains("href=\"workflows\""),
-            "a bare depth-0 nav href would 404 from a drill-down: {html}"
-        );
-        // The next-page link, and the filters it must preserve.
-        assert!(
-            html.contains(&format!("href=\"../../schedules/{id}/runs?cursor=")),
-            "the next-page link must be mount-relative: {html}"
-        );
-        assert!(
-            html.contains("&limit=5") && html.contains("&origin=scheduled"),
-            "the next-page link must carry the filters the cursor was computed under: {html}"
-        );
-    }
-
-    /// A committed backfill's flash reaches the run-history page it redirects to.
-    #[test]
-    fn runs_page_renders_the_backfill_flash() {
-        let row = make_schedule(Some("payments"), None, false);
-        let response = runs_response(vec![], crate::shard_fanout::FanoutStatus::Complete, vec![]);
-        let html = render_schedule_runs_page(
-            &row,
-            ShardId::new(0),
-            &response,
-            &ScheduleRunsView::default(),
-            Some("Backfill dispatched 6 of 6 planned run(s); 0 skipped, 1 failed."),
-            None,
-        )
-        .into_string();
-        assert!(
-            html.contains("Backfill dispatched 6 of 6 planned run(s); 0 skipped, 1 failed."),
-            "the flash must be rendered, not silently dropped: {html}"
-        );
-    }
-
-    /// A per-row action redirects to the list, not to a path nested under the
-    /// schedule id.
-    #[test]
-    fn schedule_redirect_depth_resolves_to_the_list() {
-        let per_row = schedule_redirect_from(2, "Paused it");
-        let location = per_row
-            .headers()
-            .get("location")
-            .and_then(|v| v.to_str().ok())
-            .expect("a redirect carries a location");
-        assert!(
-            location.starts_with("../schedules?flash="),
-            "a /schedules/{{id}}/pause redirect must climb one segment: {location}"
-        );
-
-        let bulk = schedule_redirect_from(1, "Paused 3");
-        let location = bulk
-            .headers()
-            .get("location")
-            .and_then(|v| v.to_str().ok())
-            .expect("a redirect carries a location");
-        assert!(
-            location.starts_with("schedules?flash="),
-            "a /schedules/bulk-pause redirect is already at the right depth: {location}"
-        );
-    }
-
-    /// The bulk actions must act on exactly the set the list counted, health
-    /// filter included — the confirmation dialog quotes that count.
-    #[test]
-    fn bulk_filters_apply_the_health_filter() {
-        let healthy = make_schedule(Some("healthy"), None, false);
-        let unhealthy = HarvestSchedule {
-            last_catchup_dropped: 3,
-            ..make_schedule(Some("dropping"), None, false)
-        };
-        let filters = parse_schedule_bulk_filters(&ScheduleBulkParams {
-            target: None,
-            kind: None,
-            paused: None,
-            health: Some("Unhealthy".to_string()),
-            shard_id: None,
-            return_to: None,
-        })
-        .unwrap();
-        assert!(
-            !filters.matches(ShardId::new(0), &healthy),
-            "a healthy schedule must not be swept up by a health=Unhealthy bulk action"
-        );
-        assert!(filters.matches(ShardId::new(0), &unhealthy));
-    }
-
-    /// Codex review on #1437 (P1): a malformed `shard_id` in a bulk-action
-    /// POST must reject the request. It must not silently drop to "no
-    /// shard restriction" and pause/resume schedules on every shard,
-    /// instead of the one the operator scoped the action to.
-    #[test]
-    fn parse_schedule_bulk_filters_rejects_invalid_shard_id() {
-        let result = parse_schedule_bulk_filters(&ScheduleBulkParams {
-            target: None,
-            kind: None,
-            paused: None,
-            health: None,
-            shard_id: Some("north".to_string()),
-            return_to: None,
-        });
-        assert!(
-            result.is_err(),
-            "an invalid shard_id must reject the bulk action, not broaden it to all shards"
-        );
-    }
-
-    #[test]
-    fn parse_schedule_bulk_filters_accepts_valid_shard_id() {
-        let filters = parse_schedule_bulk_filters(&ScheduleBulkParams {
-            target: None,
-            kind: None,
-            paused: None,
-            health: None,
-            shard_id: Some("2".to_string()),
-            return_to: None,
-        })
-        .unwrap();
-        assert_eq!(filters.shard_id, Some(2));
-    }
-
-    #[test]
-    fn parse_schedule_bulk_filters_blank_or_missing_shard_id_is_not_an_error() {
-        let filters = parse_schedule_bulk_filters(&ScheduleBulkParams {
-            target: None,
-            kind: None,
-            paused: None,
-            health: None,
-            shard_id: None,
-            return_to: None,
-        })
-        .unwrap();
-        assert_eq!(filters.shard_id, None);
-
-        let filters = parse_schedule_bulk_filters(&ScheduleBulkParams {
-            target: None,
-            kind: None,
-            paused: None,
-            health: None,
-            shard_id: Some("   ".to_string()),
-            return_to: None,
-        })
-        .unwrap();
-        assert_eq!(filters.shard_id, None);
-    }
-
-    /// Codex review on #1437 (P2): a bulk-action redirect used to always
-    /// land on a bare, unfiltered `schedules?flash=…`. That dropped
-    /// whatever the operator was filtered to, including an unresolved
-    /// invalid value and its inline error. `schedule_bulk_redirect_to`
-    /// must preserve a valid `return_to` instead.
-    #[test]
-    fn schedule_bulk_redirect_to_preserves_a_valid_return_to() {
-        let response =
-            schedule_bulk_redirect_to(Some("../schedules?kind=zombie&target=billing"), "Paused 3");
-        let location = response
-            .headers()
-            .get(axum::http::header::LOCATION)
-            .expect("redirect must set Location")
-            .to_str()
-            .unwrap();
-        assert!(
-            location.starts_with("../schedules?kind=zombie&target=billing&flash="),
-            "the operator's filtered view, invalid value included, must survive \
-             the redirect: {location}"
-        );
-    }
-
-    /// A `return_to` that does not match the Schedules page's own path
-    /// shape must never be trusted as a redirect target. It is an
-    /// operator-supplied form field, so a hand-crafted or foreign value
-    /// falls back to the safe default instead of an open redirect.
-    #[test]
-    fn schedule_bulk_redirect_to_rejects_a_foreign_return_to() {
-        for unsafe_value in [
-            "https://evil.example/phish",
-            "//evil.example",
-            "workflows",
-            "schedulesXYZ",
-            // Bare "schedules" (no "../") is the pre-fix shape. It 404s
-            // when resolved against the bulk-action POST URL, so it must
-            // not be trusted either — see `schedule_bulk_redirect_to`'s
-            // own doc comment.
-            "schedules?kind=Workflow",
-            // A form-decoded control character (a raw newline, here)
-            // would make `HeaderValue::try_from` reject the `Location`
-            // header. That is an internal error after a mutation that
-            // already succeeded (Codex review, #1437 P2).
-            "../schedules?x=a\nb",
-        ] {
-            let response = schedule_bulk_redirect_to(Some(unsafe_value), "Paused 1");
-            let location = response
-                .headers()
-                .get(axum::http::header::LOCATION)
-                .expect("redirect must set Location")
-                .to_str()
-                .unwrap();
-            assert!(
-                location.starts_with("../schedules?flash="),
-                "an unrecognized return_to ({unsafe_value:?}) must fall back to the \
-                 safe default, not redirect off the Schedules page: {location}"
-            );
-        }
-    }
-
-    #[test]
-    fn schedule_bulk_redirect_to_falls_back_when_return_to_is_absent() {
-        let response = schedule_bulk_redirect_to(None, "Resumed 2");
-        let location = response
-            .headers()
-            .get(axum::http::header::LOCATION)
-            .expect("redirect must set Location")
-            .to_str()
-            .unwrap();
-        assert!(location.starts_with("../schedules?flash="), "{location}");
-    }
-
-    #[test]
-    fn schedule_return_to_path_round_trips_invalid_filters() {
-        let filters = ScheduleUiFilters::default();
-        let filter_raw = ScheduleUiFilterRaw {
-            kind: "zombie".to_string(),
-            kind_error: Some("bad kind".to_string()),
-            ..ScheduleUiFilterRaw::default()
-        };
-        let path =
-            schedule_return_to_path(&filters, &filter_raw, DEFAULT_SCHEDULE_PAGE_SIZE, "", None);
-        assert_eq!(path, "../schedules?kind=zombie");
-    }
-
-    #[test]
-    fn schedule_return_to_path_is_bare_schedules_when_no_filters_are_set() {
-        let filters = ScheduleUiFilters::default();
-        let filter_raw = ScheduleUiFilterRaw::default();
-        let path =
-            schedule_return_to_path(&filters, &filter_raw, DEFAULT_SCHEDULE_PAGE_SIZE, "", None);
-        assert_eq!(path, "../schedules");
-    }
-
-    #[test]
-    fn render_schedule_bulk_actions_includes_return_to_for_both_forms() {
-        let filters = ScheduleUiFilters {
-            target: Some("billing".to_string()),
-            ..ScheduleUiFilters::default()
-        };
-        let filter_raw = ScheduleUiFilterRaw::default();
-        let html = render_schedule_bulk_actions(
-            &filters,
-            &filter_raw,
-            DEFAULT_SCHEDULE_PAGE_SIZE,
-            "",
-            None,
-            3,
-            "3 Workflow",
-        )
-        .into_string();
-        assert_eq!(
-            html.matches("name=\"return_to\" value=\"../schedules?target=billing\"")
-                .count(),
-            2,
-            "both the pause and resume forms must carry the filtered return_to: {html}"
-        );
-    }
-
-    /// A paused DAG schedule cannot be committed (the endpoint rejects it), so
-    /// the confirmation must not offer a button that can only fail.
-    #[test]
-    fn backfill_confirm_refuses_to_offer_a_commit_for_a_paused_dag() {
-        let row = make_schedule(None, Some("nightly_etl"), true);
-        let parse = |s: &str| {
-            chrono::DateTime::parse_from_rfc3339(s)
-                .expect("valid fixture timestamp")
-                .with_timezone(&chrono::Utc)
-        };
-        let dry_run = crate::api::ScheduleBackfillResponse {
-            status: "dry_run".to_string(),
-            schedule_id: row.id,
-            kind: crate::api::ScheduleKind::Dag,
-            name: "nightly_etl".to_string(),
-            from: parse("2026-08-01T00:00:00Z"),
-            to: parse("2026-08-02T00:00:00Z"),
-            planned_timestamps: vec![parse("2026-08-01T00:00:00Z")],
-            total: 24,
-            dispatched: 24,
-            skipped: 0,
-            failed: 0,
-            skipped_reasons: std::collections::HashMap::new(),
-            partial_shard_failures: vec![],
-            paused_schedule_warning: Some("Schedule is paused; …".to_string()),
-        };
-        let form = BackfillFormParams {
-            from: "2026-08-01T00:00:00Z".to_string(),
-            to: "2026-08-02T00:00:00Z".to_string(),
-            max_count: None,
-            include_paused: true,
-        };
-        let html =
-            render_schedule_backfill_confirm(&row, ShardId::new(0), &dry_run, &form).into_string();
-        assert!(
-            html.contains("paused, so a backfill cannot be dispatched"),
-            "must explain why the commit is unavailable: {html}"
-        );
-        assert!(
-            !html.contains("value=\"commit\""),
-            "must not offer a commit that the endpoint will reject: {html}"
-        );
-    }
-
-    /// The rejection path echoes the operator's window back into the form.
-    #[test]
-    fn backfill_form_echoes_submitted_values_on_rejection() {
-        let row = make_schedule(Some("payments"), None, false);
-        let echo = BackfillFormEcho {
-            from: "2026-08-01T00:00:00Z".to_string(),
-            to: "not-a-date".to_string(),
-            max_count: "50".to_string(),
-            include_paused: true,
-        };
-        let html = render_schedule_backfill_form(
-            &row,
-            ShardId::new(0),
-            Some("invalid end 'not-a-date'"),
-            &echo,
-        )
-        .into_string();
-        assert!(
-            html.contains("value=\"2026-08-01T00:00:00Z\""),
-            "start lost: {html}"
-        );
-        assert!(html.contains("value=\"not-a-date\""), "end lost: {html}");
-        assert!(html.contains("value=\"50\""), "max count lost: {html}");
-        assert!(html.contains("checked"), "include-paused lost: {html}");
-        assert!(
-            html.contains("Backfill not started"),
-            "error missing: {html}"
-        );
-    }
-
-    /// The "Needs attention" strip counts the whole filtered set, so it cannot
-    /// under-report a fleet-wide problem when the page is one of many.
-    #[test]
-    fn health_summary_is_computed_over_the_filtered_set_not_the_page() {
-        let all: Vec<(ShardId, HarvestSchedule)> = (0..30)
-            .map(|i| {
-                (
-                    ShardId::new(0),
-                    make_schedule(Some(&format!("wf_{i}")), None, true),
-                )
-            })
-            .collect();
-        let summary = schedule_health_summary(&all);
-        assert!(
-            summary.contains("30 paused"),
-            "the summary must count every filtered row: {summary}"
-        );
-        // A page slice would report 25 with the default page size; the page
-        // renderer is handed the full-set summary, so the value it displays is
-        // the one computed here.
-        let page: Vec<(ShardId, HarvestSchedule)> = all.iter().take(25).cloned().collect();
-        assert!(schedule_health_summary(&page).contains("25 paused"));
-    }
-
-    /// An exhausted schedule with no recorded reason still gets a badge.
-    #[test]
-    fn health_badges_render_bare_exhausted_without_a_reason() {
-        let row = HarvestSchedule {
-            exhausted_at: Some(chrono::Utc::now()),
-            exhausted_reason: None,
-            ..make_schedule(Some("wf"), None, false)
-        };
-        let html = render_schedule_health_badges(&row).into_string();
-        assert!(
-            html.contains("Exhausted"),
-            "bare exhausted badge missing: {html}"
-        );
-        assert!(
-            !html.contains("Exhausted:"),
-            "no dangling separator: {html}"
-        );
-    }
-
-    /// `next_run_at` absent but jitter configured: nothing to offset, so no
-    /// effective line.
-    #[test]
-    fn next_fire_cell_has_no_effective_line_without_a_next_run() {
-        let row = HarvestSchedule {
-            next_run_at: None,
-            jitter_secs: 600,
-            ..make_schedule(Some("wf"), None, false)
-        };
-        let html = schedule_next_fire_cell(&row).into_string();
-        assert!(
-            !html.contains("effective"),
-            "no next_run_at means no effective fire time: {html}"
-        );
-    }
-
-    /// The "show only unhealthy" shortcut keeps the other active filters and
-    /// does not stack a second `health=` param.
-    #[test]
-    fn unhealthy_shortcut_link_preserves_other_filters() {
-        let filters = ScheduleUiFilters {
-            target: Some("billing".to_string()),
-            kind: ScheduleKindFilter::Workflow,
-            paused: SchedulePausedFilter::All,
-            health: ScheduleHealthFilter::All,
-            shard_id: Some(1),
-        };
-        let filter_raw = ScheduleUiFilterRaw {
-            kind: "Workflow".to_string(),
-            shard_id: "1".to_string(),
-            ..ScheduleUiFilterRaw::default()
-        };
-        let qs = build_schedule_query_string(
-            DEFAULT_SCHEDULE_PAGE_SIZE,
-            "",
-            &ScheduleUiFilters {
-                health: ScheduleHealthFilter::All,
-                ..filters
-            },
-            &filter_raw,
-            None,
-        );
-        assert!(qs.contains("target=billing"), "target lost: {qs}");
-        assert!(qs.contains("kind=Workflow"), "kind lost: {qs}");
-        assert!(qs.contains("shard_id=1"), "shard lost: {qs}");
-        assert!(
-            !qs.contains("health="),
-            "the shortcut supplies health itself; the suffix must not repeat it: {qs}"
-        );
-    }
-
-    // -- Codex round 1 regressions --
-
-    /// Codex #1: a submitted window with sub-second precision must reach the API
-    /// unchanged. `SecondsFormat::Secs` truncated both bounds, and an `interval:`
-    /// backfill treats `from` as its first slot — so `…00.900Z` normalised to
-    /// `…00Z` shifts every slot in the plan rather than merely respelling it.
-    #[test]
-    fn backfill_window_preserves_sub_second_precision() {
-        let params = BackfillFormParams::parse(
-            "2026-08-01T00:00:00.900Z",
-            "2026-08-01T06:00:00.250Z",
-            None,
-            false,
-        )
-        .expect("a fractional-second window parses");
-        assert_eq!(
-            params.from, "2026-08-01T00:00:00.900Z",
-            "the start must not be truncated to whole seconds"
-        );
-        assert_eq!(params.to, "2026-08-01T06:00:00.250Z");
-
-        let request = params.to_request(true).expect("converts");
-        assert_eq!(
-            request.from.timestamp_subsec_millis(),
-            900,
-            "the request must carry the submitted precision"
-        );
-        assert_eq!(request.to.timestamp_subsec_millis(), 250);
-
-        // A whole-second window still normalises to the clean spelling.
-        let whole =
-            BackfillFormParams::parse("2026-08-01T00:00:00Z", "2026-08-02T00:00:00Z", None, false)
-                .expect("parses");
-        assert_eq!(whole.from, "2026-08-01T00:00:00Z");
-        assert_eq!(whole.to, "2026-08-02T00:00:00Z");
-    }
-
-    /// Codex #3: the scheduler's auto-pause (#360) sets `auto_paused_at` without
-    /// setting `is_paused`, so a row can be non-firing with `is_paused = false`.
-    /// Keying the row actions on `is_paused` alone showed an "Auto-paused" badge
-    /// next to a **Pause** button, leaving no way to restore firing.
-    #[test]
-    fn an_auto_paused_schedule_is_offered_resume_not_pause() {
-        let auto_paused = HarvestSchedule {
-            is_paused: false,
-            auto_paused_at: Some(chrono::Utc::now()),
-            consecutive_failure_count: 5,
-            ..make_schedule(Some("flaky_wf"), None, false)
-        };
-        assert!(
-            schedule_is_resumable(&auto_paused),
-            "an auto-paused schedule must be treated as resumable"
-        );
-
-        let id = auto_paused.id.to_string();
-        let html = render_schedule_table(
-            &[(ShardId::new(0), auto_paused)],
-            false,
-            &std::collections::HashMap::new(),
-        )
-        .into_string();
-        assert!(
-            html.contains(&format!("schedules/{id}/resume")),
-            "an auto-paused row must offer Resume: {html}"
-        );
-        assert!(
-            !html.contains(&format!("schedules/{id}/pause")),
-            "an auto-paused row must not offer Pause: {html}"
-        );
-        assert!(
-            html.contains("Auto-paused"),
-            "the badge must still say why: {html}"
-        );
-    }
-
-    /// A plainly active schedule is still offered Pause, and a hand-paused one
-    /// Resume — the fix must not invert the ordinary cases.
-    #[test]
-    fn resumability_is_unchanged_for_ordinary_schedules() {
-        let active = make_schedule(Some("active_wf"), None, false);
-        assert!(!schedule_is_resumable(&active));
-
-        let paused = make_schedule(Some("paused_wf"), None, true);
-        assert!(schedule_is_resumable(&paused));
-
-        let active_id = active.id.to_string();
-        let html = render_schedule_table(
-            &[(ShardId::new(0), active)],
-            false,
-            &std::collections::HashMap::new(),
-        )
-        .into_string();
-        assert!(html.contains(&format!("schedules/{active_id}/pause")));
-        assert!(!html.contains(&format!("schedules/{active_id}/resume")));
-    }
-
-    // -- Codex round 2 regressions --
-
-    /// Codex #1: `max_runs = 0` is the engine's "unlimited" (every bound check
-    /// guards on `max > 0`, pinned by `backfill_max_runs_zero_is_treated_as_unlimited`),
-    /// so it must not render as a spent budget.
-    #[test]
-    fn a_zero_run_cap_reads_as_unlimited_not_spent() {
-        let unlimited_by_zero = HarvestSchedule {
-            max_runs: Some(0),
-            runs_started: 12,
-            ..make_schedule(Some("legacy_wf"), None, false)
-        };
-        assert_eq!(
-            schedule_bounded_runs_label(&unlimited_by_zero),
-            "—",
-            "max_runs = 0 must not render a budget at all"
-        );
-        assert!(
-            !schedule_is_bounded_out(&unlimited_by_zero, chrono::Utc::now()),
-            "max_runs = 0 must never count as bounded out"
-        );
-        assert!(
-            schedule_health(&unlimited_by_zero).is_healthy(),
-            "a zero-cap schedule is unlimited, so it reads healthy"
-        );
-    }
-
-    /// Codex #3: `exhausted_at` is stamped asynchronously, so a row can be
-    /// terminal on its live bounds while the column is still NULL. Reading the
-    /// column alone rendered such a row as a calm Active schedule that the
-    /// health filter excluded and the sort put below the unhealthy rows.
-    #[test]
-    fn a_row_bounded_out_before_its_tick_stamped_it_reads_exhausted() {
-        let now = chrono::Utc::now();
-
-        let budget_spent = HarvestSchedule {
-            max_runs: Some(5),
-            runs_started: 5,
-            exhausted_at: None,
-            ..make_schedule(Some("spent_wf"), None, false)
-        };
-        assert!(schedule_is_bounded_out(&budget_spent, now));
-        assert!(schedule_health_at(&budget_spent, now).exhausted);
-        let html = render_schedule_health_badges(&budget_spent).into_string();
-        assert!(html.contains("Exhausted"), "badge missing: {html}");
-        assert!(
-            html.contains("run budget spent"),
-            "an unstamped exhaustion must still name its bound: {html}"
-        );
-
-        let past_cutoff = HarvestSchedule {
-            end_at: Some(now - chrono::Duration::hours(1)),
-            exhausted_at: None,
-            ..make_schedule(Some("cutoff_wf"), None, false)
-        };
-        assert!(schedule_is_bounded_out(&past_cutoff, now));
-        let html = render_schedule_health_badges(&past_cutoff).into_string();
-        assert!(html.contains("past end_at"), "cutoff bound missing: {html}");
-
-        // A cutoff still in the future is not bounded out.
-        let future_cutoff = HarvestSchedule {
-            end_at: Some(now + chrono::Duration::hours(1)),
-            ..make_schedule(Some("future_wf"), None, false)
-        };
-        assert!(!schedule_is_bounded_out(&future_cutoff, now));
-        assert!(schedule_health_at(&future_cutoff, now).is_healthy());
-    }
-
-    /// The live-bounds derivation must also drive the filter and the sort, not
-    /// just the badge — that was the substance of the finding.
-    #[test]
-    fn a_live_bounded_out_row_is_filtered_and_sorted_as_unhealthy() {
-        let now = chrono::Utc::now();
-        let bounded_out = HarvestSchedule {
-            max_runs: Some(3),
-            runs_started: 3,
-            exhausted_at: None,
-            next_run_at: Some(now + chrono::Duration::hours(10)),
-            ..make_schedule(Some("z_bounded"), None, false)
-        };
-        let healthy = HarvestSchedule {
-            next_run_at: Some(now + chrono::Duration::minutes(1)),
-            ..make_schedule(Some("a_healthy"), None, false)
-        };
-
-        let filters = ScheduleUiFilters {
-            health: ScheduleHealthFilter::Unhealthy,
-            ..Default::default()
-        };
-        assert!(
-            filters.matches(ShardId::new(0), &bounded_out),
-            "health=Unhealthy must include a row bounded out on live fields"
-        );
-        assert!(!filters.matches(ShardId::new(0), &healthy));
-
-        let mut rows = vec![
-            (ShardId::new(0), healthy),
-            (ShardId::new(0), bounded_out.clone()),
-        ];
-        sort_schedule_rows(&mut rows);
-        assert_eq!(
-            rows[0].1.id, bounded_out.id,
-            "a live-bounded-out row must sort above a healthy one despite firing later"
-        );
-    }
-
-    // -- Codex round 3 regressions --
-
-    /// Codex r3 #1: the `end_at` bound is about the pending slot, not the wall
-    /// clock. `schedule_overdue` tests `next_run_at >= end_at`; comparing `now`
-    /// is wrong in both directions.
-    #[test]
-    fn end_at_exhaustion_is_judged_on_the_pending_slot() {
-        let now = chrono::Utc::now();
-        let cutoff = now + chrono::Duration::hours(2);
-
-        // Next slot is already past the cutoff, but the clock is not: the
-        // scheduler will never fire this again, so it is bounded out.
-        let slot_past_cutoff = HarvestSchedule {
-            end_at: Some(cutoff),
-            next_run_at: Some(cutoff + chrono::Duration::minutes(1)),
-            ..make_schedule(Some("slot_past"), None, false)
-        };
-        assert!(
-            schedule_is_bounded_out(&slot_past_cutoff, now),
-            "a next slot at/past end_at means no legal slot remains"
-        );
-
-        // The clock has passed the cutoff, but an overdue slot from before it is
-        // still legal and the tick will process it: NOT bounded out.
-        let overdue_legal_slot = HarvestSchedule {
-            end_at: Some(now - chrono::Duration::hours(1)),
-            next_run_at: Some(now - chrono::Duration::hours(2)),
-            ..make_schedule(Some("overdue_legal"), None, false)
-        };
-        assert!(
-            !schedule_is_bounded_out(&overdue_legal_slot, now),
-            "an overdue slot from before the cutoff is still fireable"
-        );
-
-        // A slot comfortably before the cutoff is fine.
-        let healthy = HarvestSchedule {
-            end_at: Some(cutoff),
-            next_run_at: Some(now + chrono::Duration::minutes(5)),
-            ..make_schedule(Some("healthy"), None, false)
-        };
-        assert!(!schedule_is_bounded_out(&healthy, now));
-
-        // No pending slot at all: fall back to the wall clock.
-        let no_slot_past_cutoff = HarvestSchedule {
-            end_at: Some(now - chrono::Duration::hours(1)),
-            next_run_at: None,
-            ..make_schedule(Some("no_slot"), None, false)
-        };
-        assert!(schedule_is_bounded_out(&no_slot_past_cutoff, now));
-
-        let no_slot_before_cutoff = HarvestSchedule {
-            end_at: Some(cutoff),
-            next_run_at: None,
-            ..make_schedule(Some("no_slot_ok"), None, false)
-        };
-        assert!(!schedule_is_bounded_out(&no_slot_before_cutoff, now));
-    }
-
-    /// Codex r3 #2: `max_runs = 0` is unlimited, so the *preview* must not report
-    /// a spent budget either. The list cell was corrected in round 2 while the
-    /// shared computation still mapped the raw cap.
-    #[test]
-    fn a_zero_run_cap_is_unlimited_in_the_shared_budget_helper() {
-        assert_eq!(
-            crate::api::schedule_remaining_runs(Some(0), 12),
-            None,
-            "max_runs = 0 is unlimited, not a spent budget"
-        );
-        assert_eq!(crate::api::schedule_remaining_runs(Some(-1), 3), None);
-        assert_eq!(crate::api::schedule_remaining_runs(None, 3), None);
-        assert_eq!(crate::api::schedule_remaining_runs(Some(10), 4), Some(6));
-        assert_eq!(
-            crate::api::schedule_remaining_runs(Some(3), 9),
-            Some(0),
-            "a genuinely spent positive cap still reports zero"
-        );
-    }
-
-    /// Codex r3 #3: an auto-paused schedule previews empty, and the page says
-    /// why rather than blaming the expression.
-    #[test]
-    fn preview_page_explains_an_auto_paused_schedule() {
-        let row = HarvestSchedule {
-            is_paused: false,
-            auto_paused_at: Some(chrono::Utc::now()),
-            consecutive_failure_count: 4,
-            ..make_schedule(Some("flaky_wf"), None, false)
-        };
-        let preview = crate::api::SchedulePreview {
-            entries: vec![],
-            is_paused: false,
-            pause_reason: Some(
-                "auto-paused after 4 consecutive failures; resume to restore firing".to_string(),
-            ),
-            from: chrono::Utc::now(),
-            count_requested: 10,
-            end_at: None,
-            remaining_runs: None,
-            exhausted_reason: None,
-        };
-        let html =
-            render_schedule_preview_page(&row, ShardId::new(0), &preview, 10, None).into_string();
-        assert!(
-            html.contains("auto-paused"),
-            "the banner must name auto-pause: {html}"
-        );
-        assert!(
-            html.contains("4 consecutive failures"),
-            "the reason must be surfaced: {html}"
-        );
-        assert!(
-            !html.contains("produces no future firings"),
-            "must not blame the expression for an auto-pause: {html}"
-        );
-    }
-
-    // -- issue #1293 regression --
-
-    /// The scheduler's secondary `end_at` guard in `scheduler.rs` rejects a
-    /// fire when the jitter-adjusted `effective_fire_time` is at or past
-    /// `end_at`. It rejects the fire even when the raw slot is still before
-    /// `end_at`. This predicate must judge the same pending time. Otherwise
-    /// the badge, the filter and the sort report the schedule as healthy. The
-    /// tick never fires it again.
-    #[test]
-    fn end_at_exhaustion_accounts_for_jitter() {
-        let now = chrono::Utc::now();
-        let id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000001293")
-            .expect("valid fixture uuid");
-        let next_run_at = chrono::DateTime::parse_from_rfc3339("2026-09-01T12:00:00Z")
-            .expect("valid fixture timestamp")
-            .with_timezone(&chrono::Utc);
-        let jitter_secs = 300i64;
-
-        let offset = autumn_harvest::policy::compute_jitter_offset(
-            id,
-            next_run_at,
-            std::time::Duration::from_secs(jitter_secs.cast_unsigned()),
-        );
-        let effective_fire_time = next_run_at
-            + chrono::Duration::from_std(offset).expect("offset fits in a chrono duration");
-        assert!(
-            effective_fire_time > next_run_at,
-            "fixture needs a non-zero offset to exercise the jitter path"
-        );
-
-        // The raw slot is still before end_at. Its jitter-adjusted fire time
-        // is not. The tick never dispatches this slot.
-        let row = HarvestSchedule {
-            id,
-            next_run_at: Some(next_run_at),
-            jitter_secs,
-            end_at: Some(effective_fire_time),
-            ..make_schedule(Some("jittered_wf"), None, false)
-        };
-        assert!(
-            schedule_is_bounded_out(&row, now),
-            "a slot whose jitter-adjusted fire time is at/past end_at is bounded out"
-        );
-
-        // An unjittered schedule still judges the raw slot only. The common
-        // case must not regress.
-        let unjittered = HarvestSchedule {
-            next_run_at: Some(next_run_at),
-            jitter_secs: 0,
-            end_at: Some(next_run_at + chrono::Duration::minutes(1)),
-            ..make_schedule(Some("plain_wf"), None, false)
-        };
-        assert!(!schedule_is_bounded_out(&unjittered, now));
-    }
-
-    // -- issue #1568 regression --
-
-    /// Build a jittered row whose raw slot is before `end_at` but whose
-    /// jitter-adjusted fire time is not. Only the raw slot is legal for a
-    /// caller that cannot see the scheduler's real candidate slot.
-    fn jitter_past_cutoff_row() -> HarvestSchedule {
-        let id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000001568")
-            .expect("valid fixture uuid");
-        let next_run_at = chrono::DateTime::parse_from_rfc3339("2026-09-01T12:00:00Z")
-            .expect("valid fixture timestamp")
-            .with_timezone(&chrono::Utc);
-        let jitter_secs = 300i64;
-        let effective = crate::api::effective_fire_time(id, Some(next_run_at), jitter_secs)
-            .expect("jittered schedule has an effective fire time");
-        assert!(effective > next_run_at, "fixture needs a non-zero offset");
-        HarvestSchedule {
-            id,
-            next_run_at: Some(next_run_at),
-            jitter_secs,
-            end_at: Some(effective),
-            ..make_schedule(Some("jitter_cutoff_wf"), None, false)
-        }
-    }
-
-    /// A calendar can rebase the slot before jitter. The row cannot show the
-    /// rebased slot, so the check must judge the raw slot only.
-    #[test]
-    fn end_at_exhaustion_ignores_jitter_when_calendar_is_set() {
-        let now = chrono::Utc::now();
-        let row = HarvestSchedule {
-            calendar_name: Some("us_holidays".to_string()),
-            ..jitter_past_cutoff_row()
-        };
-        assert!(
-            !schedule_is_bounded_out(&row, now),
-            "an unknown rebased slot must not be reported as exhausted"
-        );
-
-        let raw_past_cutoff = HarvestSchedule {
-            end_at: row.next_run_at,
-            ..row
-        };
-        assert!(
-            schedule_is_bounded_out(&raw_past_cutoff, now),
-            "a raw slot at or past end_at is still exhausted"
-        );
-    }
-
-    /// `MostRecent` and `Window` can pick a later slot than `next_run_at`.
-    #[test]
-    fn end_at_exhaustion_ignores_jitter_for_slot_selecting_catchup() {
-        let now = chrono::Utc::now();
-        for (policy, window_secs) in [("most_recent", None), ("window", Some(3600))] {
-            let row = HarvestSchedule {
-                catchup: true,
-                catchup_policy: Some(policy.to_string()),
-                catchup_window_secs: window_secs,
-                ..jitter_past_cutoff_row()
-            };
-            assert!(
-                !schedule_is_bounded_out(&row, now),
-                "{policy}: the selected slot is unknown, so judge the raw slot"
-            );
-        }
-    }
-
-    /// `SkipAll`, `Unbounded` and no policy all fire `next_run_at` first. They
-    /// keep the jitter-adjusted judgement from issue #1293.
-    #[test]
-    fn end_at_exhaustion_keeps_jitter_for_first_slot_catchup() {
-        let now = chrono::Utc::now();
-        for (policy, catchup) in [
-            (Some("skip_all"), false),
-            (Some("unbounded"), true),
-            (None, false),
-            (None, true),
-        ] {
-            let row = HarvestSchedule {
-                catchup,
-                catchup_policy: policy.map(str::to_string),
-                ..jitter_past_cutoff_row()
-            };
-            assert!(
-                schedule_is_bounded_out(&row, now),
-                "{policy:?}/{catchup}: the first slot is exact, so jitter applies"
-            );
-        }
-    }
-
-    /// A calendar alone forces the raw slot, whatever the catchup policy is.
-    #[test]
-    fn end_at_exhaustion_calendar_overrides_first_slot_catchup() {
-        let now = chrono::Utc::now();
-        for policy in ["skip_all", "unbounded"] {
-            let row = HarvestSchedule {
-                calendar_name: Some("us_holidays".to_string()),
-                catchup_policy: Some(policy.to_string()),
-                ..jitter_past_cutoff_row()
-            };
-            assert!(
-                !schedule_is_bounded_out(&row, now),
-                "{policy}: a calendar can rebase the slot, so judge the raw slot"
-            );
-        }
-    }
-
-    /// An unknown policy string uses the legacy `catchup` bool, as the
-    /// scheduler does. `Window` with no seconds still selects a slot.
-    #[test]
-    fn end_at_exhaustion_catchup_fallbacks_match_the_scheduler() {
-        let now = chrono::Utc::now();
-        for catchup in [false, true] {
-            let unknown = HarvestSchedule {
-                catchup,
-                catchup_policy: Some("future_mode".to_string()),
-                ..jitter_past_cutoff_row()
-            };
-            assert!(
-                schedule_is_bounded_out(&unknown, now),
-                "unknown/{catchup}: the bool fallback fires the first slot"
-            );
-        }
-        let window_no_secs = HarvestSchedule {
-            catchup_policy: Some("window".to_string()),
-            catchup_window_secs: None,
-            ..jitter_past_cutoff_row()
-        };
-        assert!(!schedule_is_bounded_out(&window_no_secs, now));
-    }
-
-    /// A calendar with no pending slot still falls back to the wall clock.
-    #[test]
-    fn end_at_exhaustion_calendar_with_no_slot_uses_wall_clock() {
-        let now = chrono::Utc::now();
-        let row = HarvestSchedule {
-            next_run_at: None,
-            calendar_name: Some("us_holidays".to_string()),
-            end_at: Some(now - chrono::Duration::hours(1)),
-            ..jitter_past_cutoff_row()
-        };
-        assert!(schedule_is_bounded_out(&row, now));
-    }
-
-    /// A jittered schedule with no pending slot still falls back to the wall
-    /// clock. `effective_fire_time` returns `None` when `next_run_at` is
-    /// `None`, regardless of `jitter_secs`.
-    #[test]
-    fn end_at_exhaustion_falls_back_to_wall_clock_with_no_pending_slot() {
-        let now = chrono::Utc::now();
-
-        let no_slot_past_cutoff = HarvestSchedule {
-            next_run_at: None,
-            jitter_secs: 300,
-            end_at: Some(now - chrono::Duration::hours(1)),
-            ..make_schedule(Some("no_slot_jittered"), None, false)
-        };
-        assert!(schedule_is_bounded_out(&no_slot_past_cutoff, now));
-
-        let no_slot_before_cutoff = HarvestSchedule {
-            next_run_at: None,
-            jitter_secs: 300,
-            end_at: Some(now + chrono::Duration::hours(1)),
-            ..make_schedule(Some("no_slot_jittered_ok"), None, false)
-        };
-        assert!(!schedule_is_bounded_out(&no_slot_before_cutoff, now));
-    }
-
-    /// The backfill confirmation interpolates the schedule UUID into its
-    /// `confirm(...)` string, and passes it through `js_escape` on the way.
-    #[test]
-    fn backfill_confirm_handler_carries_only_escaped_identifiers() {
-        let row = make_schedule(Some("evil'); alert(1);//"), None, false);
-        let parse = |s: &str| {
-            chrono::DateTime::parse_from_rfc3339(s)
-                .expect("valid fixture timestamp")
-                .with_timezone(&chrono::Utc)
-        };
-        let dry_run = crate::api::ScheduleBackfillResponse {
-            status: "dry_run".to_string(),
-            schedule_id: row.id,
-            kind: crate::api::ScheduleKind::Workflow,
-            name: "evil'); alert(1);//".to_string(),
-            from: parse("2026-08-01T00:00:00Z"),
-            to: parse("2026-08-02T00:00:00Z"),
-            planned_timestamps: vec![parse("2026-08-01T00:00:00Z")],
-            total: 1,
-            dispatched: 1,
-            skipped: 0,
-            failed: 0,
-            skipped_reasons: std::collections::HashMap::new(),
-            partial_shard_failures: vec![],
-            paused_schedule_warning: None,
-        };
-        let form = BackfillFormParams {
-            from: "2026-08-01T00:00:00Z".to_string(),
-            to: "2026-08-02T00:00:00Z".to_string(),
-            max_count: None,
-            include_paused: false,
-        };
-        let html =
-            render_schedule_backfill_confirm(&row, ShardId::new(0), &dry_run, &form).into_string();
-        for handler in onsubmit_attribute_values(&html) {
-            assert!(
-                !handler.contains("alert") && !handler.contains("evil"),
-                "the schedule name must never reach the inline handler: {handler}"
-            );
-        }
     }
 }

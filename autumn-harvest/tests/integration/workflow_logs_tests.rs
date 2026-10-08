@@ -22,7 +22,7 @@
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
 //! against it directly; otherwise a fresh testcontainers Postgres is booted with
-//! the full migration bundle (`autumn_harvest::test_init_sql()`).
+//! the full migration bundle (`autumn_harvest::full_migrations_sql()`).
 
 use autumn_harvest::store::{
     self, WORKFLOW_LOG_TRUNCATION_MESSAGE, WORKFLOW_LOG_TRUNCATION_SEQ, WorkflowLogLine,
@@ -36,7 +36,7 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::test_init_sql().as_bytes().to_vec()
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
 }
 
 async fn setup_database() -> (String, Option<ContainerAsync<Postgres>>) {
@@ -1092,7 +1092,7 @@ async fn drive_once(
     autumn_harvest::WorkflowOutcome,
     Vec<autumn_harvest::context::WorkflowCommand>,
 ) {
-    let (outcome, pending, _span, _resolved_router) =
+    let (outcome, pending, _span) =
         autumn_harvest::executor::run_workflow_with_state_history_policy_and_caps(
             exec_id,
             history.to_vec(),

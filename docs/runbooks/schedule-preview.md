@@ -135,7 +135,6 @@ curl -s -X POST https://your-app/api/harvest/admin/schedules/preview \
   -d '{
     "schedule_expr": "0 9 * * 1-5",
     "timezone": "America/Los_Angeles",
-    "jitter_secs": 0,
     "count": 5
   }' | jq '.entries[] | {scheduled_at, local_at, reason}'
 ```
@@ -187,7 +186,6 @@ curl -s -X POST https://your-app/api/harvest/admin/schedules/preview \
     "schedule_expr": "0 9 * * *",
     "calendar": "us-federal-holidays",
     "skip_policy": "run_next_business_day",
-    "jitter_secs": 0,
     "count": 5,
     "from": "2026-07-03T00:00:00Z"
   }' | jq '.entries[] | {scheduled_at, effective_at, reason}'
@@ -226,7 +224,6 @@ The preview endpoints are read-only and require the same auth posture as `GET /a
 ## Determinism contract
 
 - **Jitter disabled** (`jitter_secs = 0`): responses are fully deterministic for a given `(schedule_config, from)` pair.
-- **`jitter_secs` omitted**: a cron with no seconds field gets the 10 s default, as on create (issue #1792). Other schedules get 0. The examples above send `"jitter_secs": 0` to show the exact slots.
 - **Jitter enabled**: `effective_at` is deterministic (seahash of `schedule_id ‖ fire_time`). The `jitter_earliest_at` and `jitter_latest_at` bounds describe the full window so operators can reason about worst-case timing.
 - **`POST /admin/schedules/preview`**: uses `uuid::Uuid::nil()` as a placeholder `schedule_id` for jitter hashing, so repeated calls with the same body produce identical `effective_at` values.
 

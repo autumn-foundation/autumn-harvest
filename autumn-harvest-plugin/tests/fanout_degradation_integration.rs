@@ -23,6 +23,7 @@ use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::DbPool;
 use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
+use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -124,7 +125,7 @@ async fn setup_two_shards() -> ((String, String), Option<ContainerAsync<Postgres
         let mut conn = <AsyncPgConnection as AsyncConnection>::establish(url)
             .await
             .expect("shard connect");
-        conn.batch_execute(&autumn_harvest::test_init_sql())
+        conn.batch_execute(autumn_harvest::full_migrations_sql())
             .await
             .expect("migrate shard");
     }
@@ -160,7 +161,7 @@ fn build_app(url0: &str, url1: &str, shard1_down: bool) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(storage);
-    harvest_api_router(api_state)
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
 
 async fn get_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
@@ -214,7 +215,7 @@ async fn seed_execution(url: &str, shard: i32, workflow_name: &str, state: &str)
         workflow_id: &wf_id,
         run_id: Uuid::new_v4(),
         shard_id: shard,
-        input: serde_json::json!({}).into(),
+        input: serde_json::json!({}),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -273,13 +274,6 @@ async fn seed_dead_letter(url: &str) {
 }
 
 async fn seed_worker(url: &str, worker_id: &str) {
-    seed_worker_with_assignments(url, worker_id, "[0]").await;
-}
-
-/// Seed a worker row with a caller-controlled `shard_assignments` JSON
-/// literal (e.g. `"[]"` for the empty auto/legacy shape, `"[1]"` for an
-/// explicit narrow assignment).
-async fn seed_worker_with_assignments(url: &str, worker_id: &str, shard_assignments_json: &str) {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(url)
         .await
         .expect("connect");
@@ -287,7 +281,7 @@ async fn seed_worker_with_assignments(url: &str, worker_id: &str, shard_assignme
         "INSERT INTO harvest_workers \
             (worker_id, last_heartbeat_at, status, queues, shard_assignments, max_concurrency, host) \
          VALUES \
-            ('{worker_id}', NOW(), 'Active', '[]'::jsonb, '{shard_assignments_json}'::jsonb, 10, 'test-host') \
+            ('{worker_id}', NOW(), 'Active', '[]'::jsonb, '[0]'::jsonb, 10, 'test-host') \
          ON CONFLICT (worker_id) DO NOTHING"
     );
     conn.batch_execute(&sql).await.expect("seed worker");
@@ -307,160 +301,6 @@ fn assert_names_down_shard(body: &Value) {
         "the down shard must carry a non-empty reason"
     );
     assert_eq!(body["status"], "partial", "status must be partial");
-}
-
-/// Seed a child execution under `parent` on `shard`.
-///
-/// `GET /workflows/{id}/children` traverses `parent_id` across every shard, so a
-/// cross-shard child (issue #956) is discoverable only through that fan-out —
-/// which is exactly why the endpoint has to degrade rather than `500` when one
-/// shard is down.
-async fn seed_child_execution(
-    url: &str,
-    shard: i32,
-    parent: Uuid,
-    workflow_name: &str,
-    state: &str,
-) -> Uuid {
-    use autumn_harvest::schema::harvest_workflow_executions::dsl;
-
-    let exec_id = ExecutionId::new_for_shard(ShardId::new(shard));
-    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(url)
-        .await
-        .expect("connect");
-    let wf_id = format!("{workflow_name}-{}", Uuid::new_v4().simple());
-    let row = NewWorkflowExecution {
-        quota_key: None,
-        id: exec_id.as_uuid(),
-        workflow_name,
-        workflow_id: &wf_id,
-        run_id: Uuid::new_v4(),
-        shard_id: shard,
-        input: serde_json::json!({}).into(),
-        parent_id: Some(parent),
-        queue_name: "default",
-        execution_timeout: None,
-        deadline_at: None,
-        chain_execution_timeout: None,
-        chain_deadline_at: None,
-        memo: None,
-        search_attrs: None,
-        assigned_build_id: None,
-        parent_close_policy: None,
-        owner: None,
-        runbook_url: None,
-        severity: None,
-        context_headers: None,
-        sla: None,
-        sla_deadline_at: None,
-        schedule_id: None,
-        scheduled_for: None,
-        workflow_attempt: 1,
-        workflow_retry_policy: None,
-        retry_of_exec_id: None,
-        origin: None,
-        completion_callbacks: None,
-        continued_from_exec_id: None,
-        first_exec_id: None,
-        start_source: None,
-        start_source_ref: None,
-        started_by: None,
-    };
-    diesel::insert_into(autumn_harvest::schema::harvest_workflow_executions::table)
-        .values(&row)
-        .execute(&mut conn)
-        .await
-        .expect("insert child");
-    diesel::update(dsl::harvest_workflow_executions.filter(dsl::id.eq(exec_id.as_uuid())))
-        .set(dsl::state.eq(state))
-        .execute(&mut conn)
-        .await
-        .expect("force child state");
-    exec_id.as_uuid()
-}
-
-// ── #956 AC7: GET /workflows/{id}/children degrades to a partial 200 ─────────
-
-/// A parent's children view must report an unreachable shard rather than `500`.
-///
-/// This traversal always spanned every shard — a child could live anywhere
-/// because it follows `parent_id` across the fleet — but it propagated a pool
-/// error with `?`, so one unreachable shard turned the whole call into a `500`.
-/// Cross-shard child *placement* (issue #956) makes that failure routine rather
-/// than exotic: a fan-out deliberately puts children on other shards, so a
-/// single shard being down is now the expected reason a parent's children view
-/// is incomplete.
-#[tokio::test]
-async fn get_workflow_children_partial_names_down_shard_and_returns_reachable_children() {
-    let ((url0, url1), _guard) = setup_two_shards().await;
-    let (parent, _wf) = seed_execution(&url0, 0, "orchestrator", "RUNNING").await;
-    let child = seed_child_execution(&url0, 0, parent, "process_one", "COMPLETED").await;
-    let app = build_app(&url0, &url1, true);
-
-    let (status, body) = get_json(&app, &format!("/workflows/{parent}/children")).await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "a down shard must not 500 a parent's children view; got {body}"
-    );
-    assert_names_down_shard(&body);
-
-    let items = body["items"]
-        .as_array()
-        .expect("children response carries an items array");
-    assert_eq!(
-        items.len(),
-        1,
-        "the reachable shard's child must be present"
-    );
-    assert_eq!(items[0]["exec_id"], child.to_string());
-}
-
-/// With every shard reachable the response is `complete` and names nothing —
-/// the additive-field contract (#756 AC3) applied to this endpoint.
-#[tokio::test]
-async fn get_workflow_children_happy_path_reports_complete() {
-    let ((url0, url1), _guard) = setup_two_shards().await;
-    let (parent, _wf) = seed_execution(&url0, 0, "orchestrator", "RUNNING").await;
-    seed_child_execution(&url0, 0, parent, "process_one", "COMPLETED").await;
-    let app = build_app(&url0, &url1, false);
-
-    let (status, body) = get_json(&app, &format!("/workflows/{parent}/children")).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["status"], "complete", "got {body}");
-    assert_eq!(
-        body["unavailable_shards"]
-            .as_array()
-            .expect("unavailable_shards is always present")
-            .len(),
-        0
-    );
-    assert_eq!(body["items"].as_array().expect("items").len(), 1);
-}
-
-/// The depth-traversal variant degrades too: a shard that fails at *any* depth
-/// level is degraded for the whole walk, because a missed level's children are
-/// missed descendants.
-#[tokio::test]
-async fn get_workflow_children_tree_traversal_also_degrades() {
-    let ((url0, url1), _guard) = setup_two_shards().await;
-    let (parent, _wf) = seed_execution(&url0, 0, "orchestrator", "RUNNING").await;
-    let child = seed_child_execution(&url0, 0, parent, "process_one", "COMPLETED").await;
-    seed_child_execution(&url0, 0, child, "grandchild", "COMPLETED").await;
-    let app = build_app(&url0, &url1, true);
-
-    let (status, body) = get_json(&app, &format!("/workflows/{parent}/children?depth=2")).await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "a down shard must not 500 the depth traversal; got {body}"
-    );
-    assert_names_down_shard(&body);
-    assert_eq!(
-        body["items"].as_array().expect("items").len(),
-        2,
-        "both reachable descendants must still be returned"
-    );
 }
 
 // ── AC7: GET /workflows degrades to a partial 200 ────────────────────────────
@@ -573,76 +413,6 @@ async fn workers_health_partial_carries_status() {
     // Additive: the FleetHealth fields stay at the top level.
     assert!(body["healthy"].is_number());
     assert!(body["by_queue"].is_object());
-}
-
-/// Issue #1208: a worker advertising the empty (auto/legacy)
-/// `shard_assignments` shape must be counted in `by_shard[N]`. N is the shard
-/// its row was actually read from, not dropped for naming no bucket.
-#[tokio::test]
-async fn workers_health_by_shard_counts_an_empty_assignment_worker_under_its_source_shard() {
-    let ((url0, url1), _guard) = setup_two_shards().await;
-    // `auto` is read from shard 1 and advertises no explicit assignment.
-    seed_worker_with_assignments(&url1, "auto", "[]").await;
-    // `narrow` is read from shard 0 but explicitly claims shard 1 — its
-    // literal claim must win regardless of the shard it was read from.
-    seed_worker_with_assignments(&url0, "narrow", "[1]").await;
-    let app = build_app(&url0, &url1, false);
-
-    let (status, body) = get_json(&app, "/workers/health").await;
-    assert_eq!(status, StatusCode::OK, "got {body}");
-    assert_eq!(body["status"], "complete", "got {body}");
-
-    let by_shard = &body["by_shard"];
-    assert_eq!(
-        by_shard["1"], 2,
-        "both the empty-assignment worker (by source) and the explicit \
-         worker (by claim) must land in shard 1's bucket: {body}"
-    );
-    assert!(
-        by_shard.get("0").is_none(),
-        "shard 0 must gain no phantom count from either worker: {body}"
-    );
-}
-
-/// A malformed (non-array) `shard_assignments` value is corrupt, not legacy,
-/// and must not be attributed to any shard.
-#[tokio::test]
-async fn workers_health_by_shard_ignores_a_malformed_assignment() {
-    let ((url0, url1), _guard) = setup_two_shards().await;
-    seed_worker_with_assignments(&url0, "corrupt", "\"not-an-array\"").await;
-    let app = build_app(&url0, &url1, false);
-
-    let (status, body) = get_json(&app, "/workers/health").await;
-    assert_eq!(status, StatusCode::OK, "got {body}");
-    assert_eq!(
-        body["by_shard"].as_object().map(serde_json::Map::len),
-        Some(0),
-        "a malformed shard_assignments value must not populate by_shard: {body}"
-    );
-    // The worker still counts toward the plain healthy total.
-    assert_eq!(body["healthy"], 1);
-}
-
-/// A worker that legitimately covers two shards registers a replicated row
-/// in each shard's own database (same `worker_id`, same explicit claim).
-/// Dedup must collapse those replicas to one before the literal tally runs,
-/// so the worker is not double-counted in either shard's bucket.
-#[tokio::test]
-async fn workers_health_by_shard_does_not_double_count_a_multi_shard_worker() {
-    let ((url0, url1), _guard) = setup_two_shards().await;
-    seed_worker_with_assignments(&url0, "multi", "[0, 1]").await;
-    seed_worker_with_assignments(&url1, "multi", "[0, 1]").await;
-    let app = build_app(&url0, &url1, false);
-
-    let (status, body) = get_json(&app, "/workers/health").await;
-    assert_eq!(status, StatusCode::OK, "got {body}");
-    assert_eq!(
-        body["healthy"], 1,
-        "the two replicas must dedup to one worker: {body}"
-    );
-    let by_shard = &body["by_shard"];
-    assert_eq!(by_shard["0"], 1, "got {body}");
-    assert_eq!(by_shard["1"], 1, "got {body}");
 }
 
 // ── AC4: writes still fail hard on a down shard ──────────────────────────────

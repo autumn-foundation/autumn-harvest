@@ -278,7 +278,6 @@ pub struct WasmModuleStore {
     modules: RwLock<LruCache<String, Arc<Module>>>,
     ticker_stop: Arc<AtomicBool>,
     ticker: Option<JoinHandle<()>>,
-    trust: RwLock<Option<Arc<crate::wasm_signing::WasmTrustPolicy>>>,
 }
 
 impl WasmModuleStore {
@@ -359,20 +358,12 @@ impl WasmModuleStore {
         // via `Config::operator_cost`: fuel would still not be length-proportional
         // (the cost is per instruction either way), so it would buy no real bound
         // while silently changing what `DEFAULT_FUEL` means for every guest.
-        #[expect(
-            clippy::expect_used,
-            reason = "the fixed engine configuration is valid"
-        )]
         let engine = Engine::new(&config)
             .expect("wasmtime engine construction from a fixed valid config never fails");
 
         let ticker_stop = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::clone(&ticker_stop);
         let ticker_engine = engine.clone();
-        #[expect(
-            clippy::expect_used,
-            reason = "documented panic: the store needs the epoch ticker"
-        )]
         let ticker = std::thread::Builder::new()
             .name("harvest-wasm-epoch".to_string())
             .spawn(move || {
@@ -394,25 +385,7 @@ impl WasmModuleStore {
             modules: RwLock::new(LruCache::new(cap)),
             ticker_stop,
             ticker: Some(ticker),
-            trust: RwLock::new(None),
         }
-    }
-
-    /// Install the publisher trust policy (issue #1838).
-    ///
-    /// With a policy, dispatch runs a module only if a trusted key signed it.
-    /// `None` removes the check. See [`crate::wasm_signing`].
-    pub fn set_trust_policy(&self, policy: Option<crate::wasm_signing::WasmTrustPolicy>) {
-        *self.trust.write().unwrap_or_else(PoisonError::into_inner) = policy.map(Arc::new);
-    }
-
-    /// The installed publisher trust policy, if any.
-    #[must_use]
-    pub fn trust_policy(&self) -> Option<Arc<crate::wasm_signing::WasmTrustPolicy>> {
-        self.trust
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
     }
 
     /// Borrow the underlying wasmtime engine.
@@ -774,82 +747,16 @@ pub fn invoke_wasm_activity_cancellable(
     dispatch_start: Option<Instant>,
     cancel: Option<&CancellationToken>,
 ) -> Result<serde_json::Value, ActivityFailure> {
-    // Serialized here, outside the `catch_unwind`, so a serialization failure
-    // stays the typed error it always was rather than becoming a panic payload.
-    let input_bytes = match serde_json::to_vec(input) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            return Err(ActivityFailure::wasm_trap(format!(
-                "failed to serialize activity input as JSON: {e}"
-            )));
-        }
-    };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         invoke_wasm_activity_inner(
             store,
             module,
-            &input_bytes,
+            input,
             caps,
             limits,
             deadline,
             dispatch_start,
             cancel,
-        )
-    }));
-    match result {
-        Ok(inner) => inner.map(|(value, _fuel_consumed)| value),
-        Err(payload) => Err(ActivityFailure::wasm_trap(format!(
-            "host glue panicked during wasm invocation: {}",
-            crate::error::panic_message(payload)
-        ))),
-    }
-}
-
-/// Invoke a guest with **pre-serialized** input bytes, contained the same way
-/// [`invoke_wasm_activity_cancellable`] contains a host-glue panic.
-///
-/// The activity path always serializes a [`serde_json::Value`], and a `Value`'s
-/// object is a `BTreeMap`, so its keys reach the guest in *alphabetical* order.
-/// That is invisible to an activity guest (it parses JSON), but issue #967's
-/// workflow-module ABI deliberately pins one field to a fixed byte offset so a
-/// hand-written WAT guest can read its step without a JSON parser — which only
-/// holds if the bytes carry the *struct's* declaration order. This entry point
-/// hands the caller's exact bytes to the guest, unmediated by `Value`.
-///
-/// Identical to the activity path in every other respect: same engine, same
-/// fresh per-invocation store, same fuel / epoch / memory bounding, same
-/// bounds-checked linear-memory ABI, same output ceiling.
-///
-/// # Errors
-///
-/// Returns an [`ActivityFailure`] classifying any sandbox denial, resource
-/// exhaustion, guest trap, ABI violation, or contained host-glue panic.
-///
-/// # Returns
-///
-/// The guest's decoded output, paired with the fuel it consumed. The caller
-/// (`hot_swap::decide_encoded`) charges the fuel figure to a cache entry's
-/// cost. That charge is deterministic: the same guest on the same input
-/// consumes the same fuel on every host, unlike wall-clock time.
-#[cfg(feature = "hot-code-swap")]
-pub(crate) fn invoke_wasm_guest_bytes(
-    store: &WasmModuleStore,
-    module: &Module,
-    input_bytes: &[u8],
-    caps: &WasmCapabilities,
-    limits: &WasmLimits,
-    deadline: Option<Duration>,
-) -> Result<(serde_json::Value, u64), ActivityFailure> {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        invoke_wasm_activity_inner(
-            store,
-            module,
-            input_bytes,
-            caps,
-            limits,
-            deadline,
-            None,
-            None,
         )
     }));
     match result {
@@ -865,14 +772,18 @@ pub(crate) fn invoke_wasm_guest_bytes(
 fn invoke_wasm_activity_inner(
     store: &WasmModuleStore,
     module: &Module,
-    input_bytes: &[u8],
+    input: &serde_json::Value,
     caps: &WasmCapabilities,
     limits: &WasmLimits,
     deadline: Option<Duration>,
     dispatch_start: Option<Instant>,
     cancel: Option<&CancellationToken>,
-) -> Result<(serde_json::Value, u64), ActivityFailure> {
+) -> Result<serde_json::Value, ActivityFailure> {
     let engine = store.engine();
+
+    let input_bytes = serde_json::to_vec(input).map_err(|e| {
+        ActivityFailure::wasm_trap(format!("failed to serialize activity input as JSON: {e}"))
+    })?;
 
     // Per-attempt fresh store with an independent limiter, fuel budget, and
     // wall-clock epoch deadline.
@@ -1037,7 +948,7 @@ fn invoke_wasm_activity_inner(
         .map_err(|_| ActivityFailure::wasm_trap("alloc returned a negative pointer"))?;
     // memory.write is itself bounds-checked against live guest memory.
     memory
-        .write(&mut wasm_store, in_ptr_usize, input_bytes)
+        .write(&mut wasm_store, in_ptr_usize, &input_bytes)
         .map_err(|_| {
             ActivityFailure::wasm_trap("alloc returned an out-of-bounds pointer for the input")
         })?;
@@ -1074,15 +985,7 @@ fn invoke_wasm_activity_inner(
         .get(out_ptr..end)
         .ok_or_else(|| ActivityFailure::wasm_trap("wasm output range is out of bounds"))?;
 
-    // Fuel consumed is deterministic for a given guest and request, unlike
-    // wall-clock time. That is why the decision cache charges this rather
-    // than an `Instant::elapsed()` measurement (issue #1345 finding 5).
-    let fuel_consumed = limits
-        .fuel
-        .saturating_sub(wasm_store.get_fuel().unwrap_or(0));
-
     serde_json::from_slice(out_bytes)
-        .map(|value| (value, fuel_consumed))
         .map_err(|e| ActivityFailure::wasm_trap(format!("wasm output is not valid JSON: {e}")))
 }
 

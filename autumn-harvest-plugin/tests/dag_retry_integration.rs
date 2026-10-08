@@ -34,6 +34,7 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
+use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -92,7 +93,7 @@ fn fanout_retry_dag(dag: &mut DagBuilder) {
 }
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::test_init_sql().as_bytes().to_vec()
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
 }
 
 type HarvestApiApp = axum::Router;
@@ -129,8 +130,6 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
     let catalog = compile_dag_catalog(dags![linear_retry_dag, fanout_retry_dag])
         .expect("dag catalog compiles");
     let api_state = HarvestApiState::new();
-    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
-    api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
         registry(),
@@ -142,16 +141,13 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::default(),
     ));
-    harvest_api_router(api_state)
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
 
 fn build_worker() -> Arc<Worker> {
     Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
-                codec_rotation_batch_size: 0,
-                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
-                dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "dag-retry-worker".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -168,7 +164,6 @@ fn build_worker() -> Arc<Worker> {
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
-                resident_workflows: true,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
@@ -257,7 +252,7 @@ async fn seed_run(
             workflow_name: dag_name,
             workflow_id,
             exec_id,
-            input: json!({}).into(),
+            input: json!({}),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -758,10 +753,8 @@ async fn reset_refuses_an_erased_source_under_its_own_row_lock() {
         "fixture must actually erase something: {outcome:?}"
     );
 
-    // Event 4 follows `step_b`, the boundary a `step_c` retry uses. Event 1
-    // has an open `step_a` schedule, so the reset-point check refuses it.
     let request = WorkflowResetRequest {
-        reset_to_event_id: Some(4),
+        reset_to_event_id: Some(1),
         reset_point: None,
         reason: "dag_retry: nodes=[step_c]".to_string(),
         operator_id: "oncall".to_string(),
@@ -813,10 +806,8 @@ async fn reset_without_the_flag_still_forks_an_erased_source() {
         .await
         .expect("erase payloads");
 
-    // Event 4 follows `step_b`, the boundary a `step_c` retry uses. Event 1
-    // has an open `step_a` schedule, so the reset-point check refuses it.
     let request = WorkflowResetRequest {
-        reset_to_event_id: Some(4),
+        reset_to_event_id: Some(1),
         reset_point: None,
         reason: "plain reset".to_string(),
         operator_id: "oncall".to_string(),

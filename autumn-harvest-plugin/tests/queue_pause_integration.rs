@@ -48,6 +48,7 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
+use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -117,9 +118,12 @@ async fn setup_database() -> (String, Option<ContainerAsync<Postgres>>) {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&db_url)
         .await
         .expect("connect to fresh test database");
-    diesel_async::SimpleAsyncConnection::batch_execute(&mut conn, &autumn_harvest::test_init_sql())
-        .await
-        .expect("apply migrations to fresh test database");
+    diesel_async::SimpleAsyncConnection::batch_execute(
+        &mut conn,
+        autumn_harvest::full_migrations_sql(),
+    )
+    .await
+    .expect("apply migrations to fresh test database");
 
     (db_url, container)
 }
@@ -159,7 +163,7 @@ fn build_app_with_admin_boundary(pool: &DbPool, boundary: bool) -> HarvestApiApp
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::default(),
     ));
-    harvest_api_router(api_state)
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
 
 async fn read_json(response: axum::response::Response) -> (StatusCode, Value) {
@@ -707,7 +711,7 @@ fn build_two_shard_app(pool: &DbPool) -> HarvestApiApp {
             ShardId::new(0),
         ),
     ));
-    harvest_api_router(api_state)
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
 
 /// AC7, the write half: `shard_id` scopes the hold to one shard, and the read

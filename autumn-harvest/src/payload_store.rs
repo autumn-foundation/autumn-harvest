@@ -26,18 +26,6 @@
 //! the inverse on read (fetch-then-decode). The offload envelope is keyed on a
 //! distinct `_harvest_offload_envelope` discriminator so it never collides with
 //! the codec's `_harvest_codec_envelope`.
-//!
-//! ## Business data that looks like a reference (issue #1758)
-//!
-//! A reference is recognised by its discriminator. Business data can carry the
-//! same key. To keep the two apart, the write path offloads any fresh field that
-//! carries the discriminator, even when the field is small. A field written
-//! through the offloader therefore never stores a bare look-alike. The stored
-//! shape does not change, so an older binary still reads every new row.
-//!
-//! Some writers do not use the offloader, for example the workflow start input.
-//! A rolling deploy and a node without a store also skip it. A look-alike written
-//! that way, or before this fix, still fails on read.
 
 use std::sync::Arc;
 
@@ -112,54 +100,6 @@ pub trait PayloadStore: Send + Sync + 'static {
 
     /// Delete the blob stored under `key`.
     fn delete(&self, key: &str) -> PayloadStoreFuture<'_, ()>;
-}
-
-/// The number of blob uploads that one counting offloader starts.
-///
-/// See [`PayloadOffloader::counting_uploads`]. Only the worker's result write
-/// uses it, so it exists with the `db` feature only.
-#[cfg(feature = "db")]
-#[derive(Clone, Default)]
-pub(crate) struct UploadCount(Arc<std::sync::atomic::AtomicUsize>);
-
-#[cfg(feature = "db")]
-impl UploadCount {
-    /// Whether the offloader started at least one upload.
-    pub(crate) fn any(&self) -> bool {
-        self.0.load(std::sync::atomic::Ordering::SeqCst) > 0
-    }
-}
-
-/// A store that counts each `put` before it passes it to the inner store.
-///
-/// A `put` counts when it starts. A `put` that fails can still leave a blob
-/// in the store, so it counts too.
-#[cfg(feature = "db")]
-struct CountingStore {
-    inner: Arc<dyn PayloadStore>,
-    uploads: UploadCount,
-}
-
-#[cfg(feature = "db")]
-impl PayloadStore for CountingStore {
-    fn store_id(&self) -> &str {
-        self.inner.store_id()
-    }
-
-    fn put(&self, bytes: &[u8]) -> PayloadStoreFuture<'_, String> {
-        self.uploads
-            .0
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.inner.put(bytes)
-    }
-
-    fn get(&self, key: &str) -> PayloadStoreFuture<'_, Vec<u8>> {
-        self.inner.get(key)
-    }
-
-    fn delete(&self, key: &str) -> PayloadStoreFuture<'_, ()> {
-        self.inner.delete(key)
-    }
 }
 
 /// A reference to an offloaded blob, recorded per execution so the retention
@@ -246,11 +186,9 @@ impl PayloadOffloader {
     ///
     /// Operates on the **already codec-encoded** event value, so offload
     /// composes after [`PayloadCodec::encode`](crate::payload_codec::PayloadCodec::encode).
-    /// Input is always a fresh value, never a stored row. A field that carries
-    /// [`OFFLOAD_ENVELOPE_KEY`] is business data that looks like a reference
-    /// (issue #1758). It is offloaded whatever its size, so this path never
-    /// stores a bare look-alike. Returns the set of blobs created so the caller
-    /// can record per-execution references.
+    /// Fields that are already offload envelopes (carry-forward / idempotent
+    /// re-persist) are left untouched. Returns the set of blobs created so the
+    /// caller can record per-execution references.
     ///
     /// # Errors
     ///
@@ -265,13 +203,11 @@ impl PayloadOffloader {
             let Some(field) = data.get_mut(key) else {
                 continue;
             };
-            if field.is_null() {
+            if field.is_null() || is_offload_envelope(field) {
                 continue;
             }
             let bytes = serde_json::to_vec(field)?;
-            // A fresh value that carries the discriminator is business data.
-            // Store it as a blob so no bare look-alike reaches the log.
-            if !is_offload_envelope(field) && bytes.len() as u64 <= self.threshold {
+            if bytes.len() as u64 <= self.threshold {
                 continue;
             }
             let byte_len = bytes.len() as u64;
@@ -291,25 +227,6 @@ impl PayloadOffloader {
             });
         }
         Ok(refs)
-    }
-
-    /// A copy of this offloader that counts the blobs it uploads.
-    ///
-    /// The copy writes to the same store under the same store id. Only its
-    /// own uploads are counted. A caller makes one copy per write and so
-    /// learns if that write uploaded a blob (issue #1788).
-    #[cfg(feature = "db")]
-    pub(crate) fn counting_uploads(&self) -> (Self, UploadCount) {
-        let uploads = UploadCount::default();
-        let store = CountingStore {
-            inner: Arc::clone(&self.store),
-            uploads: uploads.clone(),
-        };
-        let copy = Self {
-            store: Arc::new(store),
-            ..self.clone()
-        };
-        (copy, uploads)
     }
 
     /// Reconstruct any offloaded payload field inside a serialized event's
@@ -398,21 +315,7 @@ pub fn refs_in_event_value(value: &Value) -> Vec<OffloadedRef> {
         .collect()
 }
 
-/// `true` when `field` carries the offload discriminator
-/// [`OFFLOAD_ENVELOPE_KEY`] — i.e. the field holds a claim-check *reference*,
-/// not inline content.
-///
-/// Discriminator-only, and deliberately looser than [`extract_offload_ref`]:
-/// that one is the strict PARSER and returns `None` for a malformed envelope,
-/// which is the wrong question for a caller asking "may I rewrite this field?".
-/// The re-encryption sweep (issue #948) asks exactly that — a field bearing the
-/// offload discriminator must be passed through untouched whether or not its
-/// reference parses, because offload composes *after* codec encode so there is
-/// no ciphertext here to rotate and rewriting it would orphan the blob.
-///
-/// The codec sibling is [`crate::payload_codec::is_codec_envelope`].
-#[must_use]
-pub fn is_offload_envelope(field: &Value) -> bool {
+fn is_offload_envelope(field: &Value) -> bool {
     field
         .as_object()
         .is_some_and(|obj| obj.get(OFFLOAD_ENVELOPE_KEY).and_then(Value::as_i64) == Some(1))
@@ -515,35 +418,6 @@ mod tests {
         serde_json::json!({ "type": "WorkflowCompleted", "data": { "output": output } })
     }
 
-    /// A counting copy counts the blobs it uploads and nothing else.
-    #[cfg(feature = "db")]
-    #[tokio::test]
-    async fn a_counting_copy_counts_its_own_uploads() {
-        let store = MemStore::new();
-        let off = offloader(store.clone(), 16);
-        let (counting, uploads) = off.counting_uploads();
-
-        let mut small = event_with_output(serde_json::json!("x"));
-        counting
-            .offload_event_value(&mut small)
-            .await
-            .expect("offload");
-        assert!(!uploads.any(), "an inline field uploads nothing");
-
-        let mut other = event_with_output(serde_json::json!("y".repeat(64)));
-        off.offload_event_value(&mut other).await.expect("offload");
-        assert!(!uploads.any(), "the original handle is not counted");
-
-        let mut large = event_with_output(serde_json::json!("x".repeat(64)));
-        let refs = counting
-            .offload_event_value(&mut large)
-            .await
-            .expect("offload");
-        assert!(uploads.any(), "a blob upload is counted");
-        assert_eq!(refs[0].store_id, "mem", "the store id is unchanged");
-        assert_eq!(store.puts.load(Ordering::SeqCst), 2);
-    }
-
     #[tokio::test]
     async fn offload_then_inflate_round_trips_byte_identical() {
         let store = MemStore::new();
@@ -588,12 +462,12 @@ mod tests {
         let exact = serde_json::to_vec(&payload).unwrap().len() as u64; // 32
         // At threshold == exact -> stays inline (uses <=).
         let mut e1 = event_with_output(payload.clone());
-        assert_eq!(
+        assert!(
             offloader(store.clone(), exact)
                 .offload_event_value(&mut e1)
                 .await
-                .unwrap(),
-            [] as [crate::payload_store::OffloadedRef; 0]
+                .unwrap()
+                .is_empty()
         );
         // One below -> offloaded.
         let mut e2 = event_with_output(payload);
@@ -607,119 +481,18 @@ mod tests {
         );
     }
 
-    /// Business data that carries the discriminator is stored as a real blob.
-    /// Issue #1758.
-    async fn assert_look_alike_round_trips(threshold: u64, original: Value) {
+    #[tokio::test]
+    async fn already_offloaded_field_is_not_reuploaded() {
         let store = MemStore::new();
-        let off = offloader(store.clone(), threshold);
-        let mut event = event_with_output(original.clone());
-
-        let refs = off.offload_event_value(&mut event).await.unwrap();
-        assert_eq!(refs.len(), 1, "look-alike is escaped into a blob");
-        assert_eq!(refs[0].store_id, "mem");
-        assert_ne!(
-            event["data"]["output"], original,
-            "no bare look-alike stored"
-        );
-        assert_eq!(
-            extract_offload_ref(&event["data"]["output"]).unwrap(),
-            refs[0]
-        );
-
-        off.inflate_event_value(&mut event).await.unwrap();
-        assert_eq!(event["data"]["output"], original, "100% byte fidelity");
-    }
-
-    #[tokio::test]
-    async fn business_data_shaped_like_offload_envelope_round_trips() {
-        // The exact value from issue #1758, far below the threshold.
-        assert_look_alike_round_trips(
-            1_000_000,
-            serde_json::json!({
-                "_harvest_offload_envelope": 1,
-                "store_id": "s3-prod",
-                "key": "customer-42/invoice.pdf",
-                "len": 1234,
-                "checksum": "abc123",
-            }),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn discriminator_only_business_data_round_trips() {
-        assert_look_alike_round_trips(
-            1_000_000,
-            serde_json::json!({ "_harvest_offload_envelope": 1 }),
-        )
-        .await;
-        assert_look_alike_round_trips(
-            1_000_000,
-            serde_json::json!({ "_harvest_offload_envelope": 1, "note": "malformed" }),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn oversized_look_alike_is_still_offloaded() {
-        assert_look_alike_round_trips(
-            16,
-            serde_json::json!({ "_harvest_offload_envelope": 1, "pad": "x".repeat(5_000) }),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn non_one_discriminator_stays_inline() {
-        for marker in [
-            serde_json::json!("yes"),
-            serde_json::json!("1"),
-            serde_json::json!(2),
-            serde_json::json!(1.0),
-        ] {
-            let store = MemStore::new();
-            let off = offloader(store.clone(), 1_000_000);
-            let original = serde_json::json!({ "_harvest_offload_envelope": marker });
-            let mut event = event_with_output(original.clone());
-            assert_eq!(
-                off.offload_event_value(&mut event).await.unwrap(),
-                [] as [crate::payload_store::OffloadedRef; 0]
-            );
-            assert_eq!(event["data"]["output"], original);
-        }
-    }
-
-    #[tokio::test]
-    async fn look_alike_in_every_payload_field_round_trips() {
-        let store = MemStore::new();
-        let off = offloader(store.clone(), 1_000_000);
-        let look_alike = serde_json::json!({ "_harvest_offload_envelope": 1 });
-        let mut data = serde_json::Map::new();
-        for key in PAYLOAD_FIELD_KEYS {
-            data.insert(key.to_string(), look_alike.clone());
-        }
-        let mut event = serde_json::json!({ "type": "T", "data": data });
-        let refs = off.offload_event_value(&mut event).await.unwrap();
-        assert_eq!(refs.len(), PAYLOAD_FIELD_KEYS.len());
-        off.inflate_event_value(&mut event).await.unwrap();
-        for key in PAYLOAD_FIELD_KEYS {
-            assert_eq!(event["data"][key], look_alike, "field {key}");
-        }
-    }
-
-    #[tokio::test]
-    async fn escaped_look_alike_is_not_reescaped_after_inflate() {
-        let store = MemStore::new();
-        let off = offloader(store.clone(), 1_000_000);
-        let mut event = event_with_output(serde_json::json!({ "_harvest_offload_envelope": 1 }));
+        let off = offloader(store.clone(), 16);
+        let mut event = event_with_output(serde_json::json!({ "blob": "y".repeat(5_000) }));
         off.offload_event_value(&mut event).await.unwrap();
-        off.inflate_event_value(&mut event).await.unwrap();
-        // Inflate must stop after one level, not chase the restored look-alike.
-        assert_eq!(
-            event["data"]["output"],
-            serde_json::json!({ "_harvest_offload_envelope": 1 })
-        );
-        assert_eq!(store.gets.load(Ordering::SeqCst), 1);
+        assert_eq!(store.puts.load(Ordering::SeqCst), 1);
+        // Re-running offload on an already-enveloped value must not re-upload
+        // (carry-forward / idempotent re-persist).
+        let refs = off.offload_event_value(&mut event).await.unwrap();
+        assert!(refs.is_empty());
+        assert_eq!(store.puts.load(Ordering::SeqCst), 1, "no second put");
     }
 
     #[tokio::test]

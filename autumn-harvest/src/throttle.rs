@@ -515,13 +515,9 @@ fn resolve_backlog_bucket_state(
 
 /// Ensure a token bucket exists for `key`, preserving any operator override.
 ///
-/// Delegates to [`crate::queue::ensure_rate_limit_bucket`] rather than
-/// re-issuing the same `INSERT`: the two paths write the *same* table with the
-/// same "never reset a live bucket" contract, and since issue #1127 that
-/// statement also carries the stale-row touch that interlocks a registration
-/// against the idle-bucket GC. A second copy of it here would silently miss
-/// that interlock, and a deferred start whose bucket was collected mid-flight
-/// can never debit a token again.
+/// Mirrors the activity limiter's `register_rate_limit_buckets`
+/// (`INSERT … ON CONFLICT (key) DO NOTHING`, initial `tokens = burst`), so a
+/// rate change across a deploy does not silently reset a live bucket.
 #[cfg(feature = "db")]
 async fn ensure_throttle_bucket(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -529,7 +525,19 @@ async fn ensure_throttle_bucket(
     refill_per_sec: f64,
     burst: f64,
 ) -> crate::error::HarvestResult<()> {
-    crate::queue::ensure_rate_limit_bucket(conn, key, refill_per_sec, burst).await
+    use diesel_async::RunQueryDsl;
+    diesel::sql_query(
+        "INSERT INTO harvest_rate_limit_buckets (key, refill_rate, burst, tokens, last_refilled_at) \
+         VALUES ($1, $2, $3, $3, NOW()) \
+         ON CONFLICT (key) DO NOTHING",
+    )
+    .bind::<diesel::sql_types::Text, _>(key)
+    .bind::<diesel::sql_types::Double, _>(refill_per_sec)
+    .bind::<diesel::sql_types::Double, _>(burst)
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    Ok(())
 }
 
 /// Whether any pending-start row already exists for a bucket key.
@@ -785,50 +793,6 @@ pub async fn reserve_or_defer(
     conn: &mut diesel_async::AsyncPgConnection,
     params: AdmitThrottleParams<'_>,
 ) -> crate::error::HarvestResult<ThrottleAdmission> {
-    admit(conn, params, false).await
-}
-
-/// [`reserve_or_defer`] for an HTTP start, which load shedding governs
-/// (issue #1794).
-///
-/// The steps are the same. A start that would write a fresh pending row is
-/// shed instead while its queue sheds. The check runs after every await of the
-/// admission and right before the write. A queue that trips during the
-/// admission therefore cannot defer a start past every shed check. A deferred
-/// row is exempt when it fires, so this is the last check it meets.
-///
-/// A bypass, an attach to a pending row and a reserved token are not shed
-/// here. A bypass and a reserved token continue to the start primitive, which
-/// sheds a fresh create itself.
-///
-/// Scheduler and backfill fires keep [`reserve_or_defer`]. They cannot act on
-/// `Retry-After`, so load shedding exempts them.
-///
-/// # Errors
-/// As [`reserve_or_defer`], plus [`crate::error::HarvestError::LoadShed`]
-/// when the queue sheds a fresh deferral.
-#[cfg(feature = "db")]
-pub async fn reserve_or_defer_or_shed(
-    conn: &mut diesel_async::AsyncPgConnection,
-    params: AdmitThrottleParams<'_>,
-) -> crate::error::HarvestResult<ThrottleAdmission> {
-    admit(conn, params, true).await
-}
-
-/// The shared body of [`reserve_or_defer`] and [`reserve_or_defer_or_shed`].
-#[cfg(feature = "db")]
-async fn admit(
-    conn: &mut diesel_async::AsyncPgConnection,
-    params: AdmitThrottleParams<'_>,
-    shed_fresh_deferral: bool,
-) -> crate::error::HarvestResult<ThrottleAdmission> {
-    // Reject an empty id before any lookup, reservation, or persisted row
-    // (issue #1353). A reserved token or deferred row with no id could only
-    // be discarded on fire, not started.
-    if params.workflow_id.is_empty() {
-        return Err(crate::error::HarvestError::EmptyWorkflowId);
-    }
-
     // (0) Bypass entirely when an active execution already makes this
     // admission a no-op or an immediate reject under the caller's reuse
     // policy. TerminateIfRunning always starts fresh (cancel + replace), so
@@ -876,52 +840,14 @@ async fn admit(
     let key = bucket_key(params.workflow_name, params.throttle_key);
     let now = Utc::now();
 
-    // (2) Ensure the bucket BEFORE either outcome below, backlog or not.
-    //
-    // It has to be before the FIFO guard, not inside its no-backlog branch
-    // (issue #1127, Codex review round 1 P1). Every path from here persists a
-    // dependent on this bucket — a reserved token, or a pending row the scanner
-    // will later debit — and the idle-bucket GC's anti-join can only see
-    // dependents that were already COMMITTED when it took its snapshot. On the
-    // append path the old code touched the bucket not at all: an observed
-    // backlog row that the scanner drops (a `schedule_to_start` stale-out
-    // debits no token) between the check and this insert leaves the sweep
-    // seeing an idle, full, dependent-free bucket, and the pending row we then
-    // commit references a bucket that no longer exists. `fire_claimed_throttle_row`
-    // fails closed on a missing bucket, so that start would sit deferred
-    // forever.
-    //
-    // Ensuring here closes it the same way the enqueue path does: the
-    // registration touch locks any GC-eligible row for the rest of this
-    // transaction, so the sweep skips it (and an ensure that lost the race
-    // re-inserts the bucket). It is also a robustness win in its own right —
-    // the append path previously appended to a backlog whose bucket might not
-    // exist at all, which nothing would ever have created.
-    ensure_throttle_bucket(conn, &key, params.refill_per_sec, params.burst).await?;
-
-    // (3) FIFO fast-path guard: an existing backlog means we must append, not
+    // (2) FIFO fast-path guard: an existing backlog means we must append, not
     // jump the queue.
-    if !pending_backlog_exists(conn, &key).await?
-        && crate::queue::try_consume_rate_limit_token(conn, &key).await?
-    {
-        return Ok(ThrottleAdmission::Reserved { bucket_key: key });
-    }
-
-    // Load shedding (issue #1794): no await follows this check before the
-    // write, so the decision is the freshest the admission can take.
-    if shed_fresh_deferral
-        && let Some(decision) =
-            crate::admission_gate::global_admission_gate_cache().and_then(|cache| {
-                cache
-                    .load_shedder()
-                    .check(params.queue_name, std::time::Instant::now())
-            })
-    {
-        return Err(crate::error::HarvestError::LoadShed {
-            queue: decision.queue,
-            oldest_pending_age_secs: decision.oldest_pending_age_secs,
-            retry_after_secs: decision.retry_after_secs,
-        });
+    if !pending_backlog_exists(conn, &key).await? {
+        // (3) No backlog — ensure the bucket and try to reserve a token.
+        ensure_throttle_bucket(conn, &key, params.refill_per_sec, params.burst).await?;
+        if crate::queue::try_consume_rate_limit_token(conn, &key).await? {
+            return Ok(ThrottleAdmission::Reserved { bucket_key: key });
+        }
     }
 
     // Defer: durably persist the start before any WorkflowStarted event exists.
@@ -958,16 +884,6 @@ struct FireDueRow {
     expires_at: Option<DateTime<Utc>>,
     #[diesel(sql_type = diesel::sql_types::Integer)]
     shard_id: i32,
-}
-
-#[cfg(feature = "db")]
-impl crate::quota_lock_order::QuotaLockRow for FireDueRow {
-    fn workflow_name(&self) -> &str {
-        &self.workflow_name
-    }
-    fn quota_input(&self) -> &serde_json::Value {
-        &self.input
-    }
 }
 
 #[cfg(feature = "db")]
@@ -1051,7 +967,6 @@ async fn fire_claimed_throttle_row(
     row: FireDueRow,
     now: DateTime<Utc>,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
-    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<Option<FiredThrottle>> {
     // AC-c: a start deferred past its schedule_to_start deadline times out
     // rather than running stale.
@@ -1097,15 +1012,30 @@ async fn fire_claimed_throttle_row(
     let shard = crate::types::ShardId::new(row.shard_id);
     let exec_id = crate::types::ExecutionId::new_for_shard(shard);
 
-    let crate::debounce::DeferredAdmissionFields {
-        reuse_policy,
-        execution_timeout,
-        sla,
-        max_execution_timeout_ceiling,
-        chain_execution_timeout,
-        max_workflow_chain_timeout_ceiling,
-        priority,
-    } = crate::debounce::decode_deferred_admission_fields(&opts);
+    let reuse_policy = opts
+        .reuse_policy
+        .as_deref()
+        .and_then(crate::debounce::parse_reuse_policy)
+        .unwrap_or(crate::types::WorkflowIdReusePolicy::AllowDuplicate);
+    let execution_timeout = opts
+        .execution_timeout_secs
+        .and_then(chrono::Duration::try_seconds);
+    let sla = opts.sla_secs.and_then(chrono::Duration::try_seconds);
+    let max_execution_timeout_ceiling = opts
+        .max_execution_timeout_ceiling_secs
+        .and_then(chrono::Duration::try_seconds);
+    // Chain-scoped lifetime cap captured at admission (issue #617), so a throttled
+    // start of a chain-capped workflow does not silently drop the declared cap.
+    let chain_execution_timeout = opts
+        .chain_execution_timeout_secs
+        .and_then(chrono::Duration::try_seconds);
+    let max_workflow_chain_timeout_ceiling = opts
+        .max_workflow_chain_timeout_ceiling_secs
+        .and_then(chrono::Duration::try_seconds);
+    let priority = opts
+        .priority
+        .and_then(crate::types::Priority::from_i32)
+        .unwrap_or_default();
 
     let workflow_name = row.workflow_name;
     let workflow_id = row.workflow_id;
@@ -1146,19 +1076,30 @@ async fn fire_claimed_throttle_row(
     let is_scheduled_fire = opts.origin.as_deref() == Some(crate::execution::ORIGIN_SCHEDULED);
 
     let params = crate::execution::StartWorkflowParams {
+        workflow_name: &workflow_name,
+        workflow_id: &workflow_id,
+        exec_id,
+        input: row.input,
+        parent_id: None,
+        queue_name: &queue_name,
         execution_timeout,
         memo: opts.memo,
         search_attrs: opts.search_attrs,
         reuse_policy,
+        conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
         trace_context: opts.trace_context,
         max_execution_timeout_ceiling,
         chain_execution_timeout,
         max_workflow_chain_timeout_ceiling,
+        inherited_chain_deadline_at: None,
         concurrency_key: opts.concurrency_key,
         concurrency_limit: opts.concurrency_limit,
         concurrency_on_conflict: opts.concurrency_on_conflict.unwrap_or_default(),
         priority,
         max_workflow_input_bytes: opts.max_workflow_input_bytes.unwrap_or(u64::MAX),
+        start_at: None,
+        delay: None,
+        max_workflow_start_delay: None,
         owner: owner.as_deref(),
         runbook_url: runbook_url.as_deref(),
         severity: severity.as_deref(),
@@ -1170,22 +1111,17 @@ async fn fire_claimed_throttle_row(
         // the schedule exactly as an immediate fire would be.
         schedule_id: opts.schedule_id,
         scheduled_for: opts.scheduled_for,
+        workflow_attempt: 1,
         workflow_retry_policy: opts
             .workflow_retry_policy
             .and_then(|v| serde_json::from_value(v).ok()),
+        retry_of_exec_id: None,
         max_workflow_attempts_ceiling: opts.max_workflow_attempts_ceiling,
         origin: opts.origin.as_deref(),
         completion_callbacks: opts.completion_callbacks,
         start_source,
         start_source_ref: start_source_ref.as_deref(),
         started_by: started_by.as_deref(),
-        ..crate::execution::StartWorkflowParams::new(
-            &workflow_name,
-            &workflow_id,
-            exec_id,
-            row.input,
-            &queue_name,
-        )
     };
 
     // `in_outer_transaction = true`: runs inside the scanner's fire transaction,
@@ -1196,14 +1132,13 @@ async fn fire_claimed_throttle_row(
     // time", not merely "will run when tokens allow". `_collect` applies the
     // gate iff the start will CREATE and records `harvest.admission.blocked` on
     // the passed recorder when it blocks.
-    match crate::execution::start_or_load_workflow_execution_collect_with_codecs(
+    match crate::execution::start_or_load_workflow_execution_collect(
         conn,
         params,
         true,
         false,
         Some(metrics),
         Some(crate::admission_gate::GateMode::CheckCached),
-        codecs,
     )
     .await
     {
@@ -1241,24 +1176,6 @@ async fn fire_claimed_throttle_row(
                 throttle_key = %throttle_key,
                 workflow_id = %workflow_id,
                 "throttled start skipped: workflow_id already exists under reuse policy",
-            );
-            Ok(None)
-        }
-        // Mirrors the identical arm in `debounce.rs::fire_claimed_debounce_row`
-        // (issue #1353). An empty workflow_id
-        // here can only be a LEGACY row. The admission path now rejects an
-        // empty id before a throttle row can ever be written. Such a row
-        // can never start. An un-caught `?` would abort this whole batch's
-        // fire transaction and repeat the same failure every scanner tick,
-        // starving every later scanner duty. Drop the row and refund its
-        // reserved token, the same as the `AlreadyExists` arm.
-        Err(crate::error::HarvestError::EmptyWorkflowId) => {
-            delete_throttle_row(conn, row_id).await?;
-            crate::queue::refund_rate_limit_token(conn, &bucket).await?;
-            tracing::warn!(
-                workflow_name = %workflow_name,
-                throttle_key = %throttle_key,
-                "throttled start skipped: legacy row has an empty workflow_id (issue #1353)",
             );
             Ok(None)
         }
@@ -1346,104 +1263,11 @@ async fn fire_claimed_throttle_row(
     }
 }
 
-/// Pre-acquire every distinct rate-limit bucket row a claimed due-row batch
-/// needs, in one deterministic (sorted) order, before any row fires (issue
-/// #1230 Finding 2 review).
-///
-/// [`fire_claimed_throttle_row`] debits a bucket's token with a plain
-/// `UPDATE harvest_rate_limit_buckets ... WHERE key = $1`. Postgres holds
-/// that row's lock for the rest of this transaction, exactly like a quota
-/// advisory lock. Two independent scanner transactions can therefore
-/// deadlock on BUCKET locks alone (review). It is the same ABBA shape as
-/// the original quota-lock hazard, but on a dimension
-/// [`crate::quota_lock_order::order_rows_by_quota_lock_id`] never looks at. Batch A fires (bucket X,
-/// quota 1) then (bucket Y, quota 2). Batch B fires (bucket Y, quota 1)
-/// then (bucket X, quota 2).
-///
-/// Bucket locks and quota locks need a JOINT global order, not two
-/// separate ones. This uses tiering. Every row's bucket lock is acquired
-/// before its own execution-row lock and quota lock. That ordering is
-/// already fixed, unconditionally, by [`fire_claimed_throttle_row`]'s own
-/// code. So this defines "every bucket lock in the batch" as one tier,
-/// acquired in sorted order before any row starts its
-/// execution-row-then-quota-key work. That keeps every row's own
-/// bucket-before-quota order intact. It adds bucket-vs-bucket
-/// deadlock-freedom on top of the already-proven quota-vs-quota and
-/// execution-row-vs-quota-lock safety, instead of competing with them.
-///
-/// This is safe where the equivalent pre-lock for QUOTA keys was NOT
-/// (issue #1230 Finding 2 follow-up, P1 -- see
-/// [`crate::quota_lock_order`]'s module docs). That
-/// pre-lock inverted lock order against a concurrent DIRECT start, which
-/// also touches quota locks. Nothing outside this scanner ever touches a
-/// rate-limit bucket row. `reserve_or_defer` only ever INSERTs the
-/// pending throttle row; it never debits a token itself. So there is no
-/// external caller whose acquisition order this pre-lock could invert.
-///
-/// Locking (not debiting) a bucket row ahead of time is also safe on its
-/// own terms. `reserve_or_defer` calls `ensure_throttle_bucket` before
-/// `insert_pending_throttle_row`, so the bucket row this pre-lock targets
-/// already exists by the time any throttle row can reference it. This
-/// takes a bare `FOR UPDATE` read lock, not the debit itself.
-/// [`fire_claimed_throttle_row`]'s later `try_consume_rate_limit_token`
-/// re-acquires the SAME already-held row lock. Postgres row locks are
-/// re-entrant within one session. It still does the actual
-/// debit-if-available check then, unchanged.
-///
-/// One round trip locks the whole batch. An earlier cut issued one
-/// `FOR UPDATE` statement per distinct bucket key. A claimed batch of
-/// [`THROTTLE_FIRE_BATCH_SIZE`] rows from that many tenants paid that
-/// many extra round trips on every scanner tick.
-///
-/// `ORDER BY key` on the batched query preserves the sorted-order
-/// requirement above. Postgres plans a `LockRows` node above the `Sort`.
-/// Rows lock in the sorted order the query returns them, not in scan
-/// order. `EXPLAIN (ANALYZE, BUFFERS)` on this exact shape confirms this
-/// (`docs/perf-artifacts/rate-limit-bucket-prelock-batch/`).
-///
-/// `COLLATE "C"` pins that order to a plain byte comparison. Rust's
-/// `BTreeSet<String>` -- [`collect_distinct_bucket_keys`]'s own type --
-/// always sorts by byte value, never by locale. A database with a
-/// locale-aware collation (`en_US.UTF-8` and similar) would otherwise
-/// lock in a different order. A peer still running the pre-fix per-key
-/// loop locks in Rust's byte order. During a rolling upgrade that
-/// mismatch reopens the same ABBA hazard this function exists to close.
-#[cfg(feature = "db")]
-async fn pre_lock_rate_limit_buckets_for_claimed_batch(
-    conn: &mut diesel_async::AsyncPgConnection,
-    due_rows: &[FireDueRow],
-) -> crate::error::HarvestResult<()> {
-    use diesel_async::RunQueryDsl;
-    let bucket_keys: Vec<String> = collect_distinct_bucket_keys(due_rows).into_iter().collect();
-    if bucket_keys.is_empty() {
-        return Ok(());
-    }
-    diesel::sql_query(
-        "SELECT key FROM harvest_rate_limit_buckets WHERE key = ANY($1) \
-         ORDER BY key COLLATE \"C\" FOR UPDATE",
-    )
-    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&bucket_keys)
-    .execute(conn)
-    .await
-    .map_err(crate::error::database_error)?;
-    Ok(())
-}
-
-/// Pure half of [`pre_lock_rate_limit_buckets_for_claimed_batch`]: the
-/// distinct, sorted bucket keys a claimed batch needs locked. Split out so
-/// the ordering invariant is unit-testable without a database (issue #1230
-/// Finding 2 review).
-#[cfg(feature = "db")]
-fn collect_distinct_bucket_keys(due_rows: &[FireDueRow]) -> std::collections::BTreeSet<String> {
-    due_rows.iter().map(|row| row.bucket_key.clone()).collect()
-}
-
 /// Scan and fire due throttle rows on a single shard connection.
 #[cfg(feature = "db")]
 async fn fire_due_on_conn(
     conn: &mut diesel_async::AsyncPgConnection,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
-    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<Vec<FiredThrottle>> {
     use diesel_async::{AsyncConnection, RunQueryDsl};
 
@@ -1481,72 +1305,62 @@ async fn fire_due_on_conn(
 
     // Claim + fire + delete the whole due batch in one transaction so each
     // `FOR UPDATE SKIP LOCKED` lock is held until its row is deleted (or left).
-    //
-    // Issue #1822: a deadlock or serialization abort runs the batch again.
-    // The rollback releases every claimed row and debited token.
-    let fired: Vec<FiredThrottle> = Box::pin(crate::tx_retry::run_with_conflict_retry(
-        conn,
-        crate::tx_retry::SITE_SCANNER,
-        metrics,
-        crate::tx_retry::TxRetryPolicy::DEFAULT,
-        async |conn| {
-            Box::pin(
-                conn.transaction::<Vec<FiredThrottle>, crate::error::HarvestError, _>(
-                    async |conn| {
-                        let now = Utc::now();
-                        // Per-key-fair claim (code review P1, issue #607): a flat
-                        // `ORDER BY deferred_at ASC LIMIT N` lets one throttle key with a
-                        // large backlog monopolize every scanner tick (its rows are
-                        // always the globally oldest), starving newer rows under other
-                        // keys indefinitely. The `candidates` CTE caps how many rows a
-                        // single `bucket_key` can contribute (THROTTLE_FIRE_PER_KEY_CAP)
-                        // before the outer LIMIT applies. Postgres forbids `FOR UPDATE`
-                        // in the same query block as a window function, so the lock
-                        // must be taken on the outer, window-function-free SELECT
-                        // (`FOR UPDATE OF t`, not a bare `FOR UPDATE`).
-                        // `candidates` is pre-filtered to rows that are actually
-                        // examinable this tick -- either already past their
-                        // `schedule_to_start` deadline (must be examined so AC-c can
-                        // time them out), or whose bucket's *effective* token level
-                        // (`effective_available_tokens_expr`, issue #945 -- honors a
-                        // live TTL'd rate-limit override, not just the declared
-                        // baseline `refill_rate`/`burst`) currently shows >= 1.0
-                        // available (a genuinely exhausted bucket is excluded from the
-                        // candidate set entirely, at any scale -- code review, issue
-                        // #607). Using the baseline-only formula here would silently
-                        // defeat an operator's own override: raising a throttled
-                        // workflow's rate specifically to unstick its already-deferred
-                        // backlog (the whole point of an override on this bucket
-                        // family) would never make the pre-filter admit those rows,
-                        // even though the debit below (`fire_claimed_throttle_row` ->
-                        // `try_consume_rate_limit_token`) is already override-aware and
-                        // would happily fire them if only they reached it (issue #945
-                        // review, P1). Without this pre-filter, enough
-                        // concurrently-exhausted keys can permanently occupy the
-                        // entire batch with rows that can never fire regardless of
-                        // ordering: this round's earlier fix (rank-then-date
-                        // ordering) only bounded the damage to the first
-                        // `THROTTLE_FIRE_BATCH_SIZE` distinct exhausted keys --
-                        // beyond that many, their rank-1 rows alone still fill the
-                        // whole budget on every tick, starving a ready key forever.
-                        // A row whose bucket happens to be missing (a data anomaly;
-                        // `reserve_or_defer` always creates the bucket before
-                        // inserting the pending row, so this should not occur in
-                        // practice) is conservatively still treated as a candidate,
-                        // matching this query's pre-existing behavior for that case
-                        // -- `try_consume_rate_limit_token` naturally leaves it
-                        // parked (not deleted) when there is truly no bucket to debit.
-                        // `selected` then orders the *pre-filtered* candidates by
-                        // per-key rank first, `deferred_at` second, still capping
-                        // one key at `THROTTLE_FIRE_PER_KEY_CAP` so several
-                        // simultaneously-ready keys share the batch fairly. Postgres
-                        // forbids `FOR UPDATE` in the same query block as a window
-                        // function, so the lock must be taken on the outer,
-                        // window-function-free SELECT (`FOR UPDATE OF t`, not a bare
-                        // `FOR UPDATE`).
-                        let effective_tokens = crate::queue::effective_available_tokens_expr("b");
-                        let due_sql = format!(
-                            "
+    let fired: Vec<FiredThrottle> = Box::pin(
+        conn.transaction::<Vec<FiredThrottle>, crate::error::HarvestError, _>(async |conn| {
+            let now = Utc::now();
+            // Per-key-fair claim (code review P1, issue #607): a flat
+            // `ORDER BY deferred_at ASC LIMIT N` lets one throttle key with a
+            // large backlog monopolize every scanner tick (its rows are
+            // always the globally oldest), starving newer rows under other
+            // keys indefinitely. The `candidates` CTE caps how many rows a
+            // single `bucket_key` can contribute (THROTTLE_FIRE_PER_KEY_CAP)
+            // before the outer LIMIT applies. Postgres forbids `FOR UPDATE`
+            // in the same query block as a window function, so the lock
+            // must be taken on the outer, window-function-free SELECT
+            // (`FOR UPDATE OF t`, not a bare `FOR UPDATE`).
+            // `candidates` is pre-filtered to rows that are actually
+            // examinable this tick -- either already past their
+            // `schedule_to_start` deadline (must be examined so AC-c can
+            // time them out), or whose bucket's *effective* token level
+            // (`effective_available_tokens_expr`, issue #945 -- honors a
+            // live TTL'd rate-limit override, not just the declared
+            // baseline `refill_rate`/`burst`) currently shows >= 1.0
+            // available (a genuinely exhausted bucket is excluded from the
+            // candidate set entirely, at any scale -- code review, issue
+            // #607). Using the baseline-only formula here would silently
+            // defeat an operator's own override: raising a throttled
+            // workflow's rate specifically to unstick its already-deferred
+            // backlog (the whole point of an override on this bucket
+            // family) would never make the pre-filter admit those rows,
+            // even though the debit below (`fire_claimed_throttle_row` ->
+            // `try_consume_rate_limit_token`) is already override-aware and
+            // would happily fire them if only they reached it (issue #945
+            // review, P1). Without this pre-filter, enough
+            // concurrently-exhausted keys can permanently occupy the
+            // entire batch with rows that can never fire regardless of
+            // ordering: this round's earlier fix (rank-then-date
+            // ordering) only bounded the damage to the first
+            // `THROTTLE_FIRE_BATCH_SIZE` distinct exhausted keys --
+            // beyond that many, their rank-1 rows alone still fill the
+            // whole budget on every tick, starving a ready key forever.
+            // A row whose bucket happens to be missing (a data anomaly;
+            // `reserve_or_defer` always creates the bucket before
+            // inserting the pending row, so this should not occur in
+            // practice) is conservatively still treated as a candidate,
+            // matching this query's pre-existing behavior for that case
+            // -- `try_consume_rate_limit_token` naturally leaves it
+            // parked (not deleted) when there is truly no bucket to debit.
+            // `selected` then orders the *pre-filtered* candidates by
+            // per-key rank first, `deferred_at` second, still capping
+            // one key at `THROTTLE_FIRE_PER_KEY_CAP` so several
+            // simultaneously-ready keys share the batch fairly. Postgres
+            // forbids `FOR UPDATE` in the same query block as a window
+            // function, so the lock must be taken on the outer,
+            // window-function-free SELECT (`FOR UPDATE OF t`, not a bare
+            // `FOR UPDATE`).
+            let effective_tokens = crate::queue::effective_available_tokens_expr("b");
+            let due_sql = format!(
+                "
                 WITH candidates AS (
                     SELECT t.id, t.deferred_at,
                            ROW_NUMBER() OVER (
@@ -1569,40 +1383,23 @@ async fn fire_due_on_conn(
                 ORDER BY t.deferred_at ASC
                 FOR UPDATE OF t SKIP LOCKED
             "
-                        );
-                        let due_rows: Vec<FireDueRow> = diesel::sql_query(due_sql)
-                            .bind::<diesel::sql_types::BigInt, _>(THROTTLE_FIRE_PER_KEY_CAP)
-                            .bind::<diesel::sql_types::BigInt, _>(THROTTLE_FIRE_BATCH_SIZE)
-                            .load(conn)
-                            .await
-                            .map_err(crate::error::database_error)?;
+            );
+            let due_rows: Vec<FireDueRow> = diesel::sql_query(due_sql)
+                .bind::<diesel::sql_types::BigInt, _>(THROTTLE_FIRE_PER_KEY_CAP)
+                .bind::<diesel::sql_types::BigInt, _>(THROTTLE_FIRE_BATCH_SIZE)
+                .load(conn)
+                .await
+                .map_err(crate::error::database_error)?;
 
-                        pre_lock_rate_limit_buckets_for_claimed_batch(conn, &due_rows).await?;
-                        // The sort uses the quota key, not `bucket_key`. A bucket that
-                        // mixes quota keys can fire a newer row before an older one in
-                        // one tick. Deadlock freedom has priority over that order. The
-                        // delayed row fires on the next scan (issue #607).
-                        let due_rows =
-                            crate::quota_lock_order::order_due_rows_for_deadlock_free_firing(
-                                conn, due_rows,
-                            )
-                            .await?;
-
-                        let mut results = Vec::with_capacity(due_rows.len());
-                        for row in due_rows {
-                            if let Some(item) =
-                                fire_claimed_throttle_row(conn, row, now, metrics, codecs).await?
-                            {
-                                results.push(item);
-                            }
-                        }
-                        Ok(results)
-                    },
-                ),
-            )
-            .await
-        },
-    ))
+            let mut results = Vec::with_capacity(due_rows.len());
+            for row in due_rows {
+                if let Some(item) = fire_claimed_throttle_row(conn, row, now, metrics).await? {
+                    results.push(item);
+                }
+            }
+            Ok(results)
+        }),
+    )
     .await?;
 
     Ok(fired)
@@ -1623,52 +1420,6 @@ pub async fn fire_due_throttled_starts(
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
     shard_assignments: &[crate::types::ShardId],
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
-) -> crate::error::HarvestResult<usize> {
-    fire_due_throttled_starts_with_codecs(
-        conn,
-        sharded_pool,
-        shard_assignments,
-        metrics,
-        &crate::store::DEFAULT_PAYLOAD_CODECS,
-    )
-    .await
-}
-
-/// [`fire_due_throttled_starts`], encoding a flushed `WorkflowStarted.input`
-/// through `codecs` (issue #1243).
-///
-/// # Errors
-///
-/// Same as [`fire_due_throttled_starts`].
-#[cfg(feature = "db")]
-pub async fn fire_due_throttled_starts_with_codecs(
-    conn: &mut diesel_async::AsyncPgConnection,
-    sharded_pool: &Option<crate::shard::ShardedDbPool>,
-    shard_assignments: &[crate::types::ShardId],
-    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
-    codecs: &crate::payload_codec::PayloadCodecs,
-) -> crate::error::HarvestResult<usize> {
-    fire_due_throttled_starts_on_conn_shard(
-        conn,
-        None,
-        sharded_pool.as_ref(),
-        shard_assignments,
-        metrics,
-        codecs,
-    )
-    .await
-}
-
-/// [`fire_due_throttled_starts_with_codecs`] for a caller that knows `conn`'s
-/// shard. See [`crate::shard::connect_or_reuse`].
-#[cfg(feature = "db")]
-pub(crate) async fn fire_due_throttled_starts_on_conn_shard(
-    conn: &mut diesel_async::AsyncPgConnection,
-    conn_shard: Option<crate::types::ShardId>,
-    sharded_pool: Option<&crate::shard::ShardedDbPool>,
-    shard_assignments: &[crate::types::ShardId],
-    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
-    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<usize> {
     async fn spawn_fired(
         fired: Vec<FiredThrottle>,
@@ -1728,24 +1479,24 @@ pub(crate) async fn fire_due_throttled_starts_on_conn_shard(
     match sharded_pool {
         Some(sp) if !shard_assignments.is_empty() => {
             for shard in shard_assignments {
-                let Some(mut shard_conn) = crate::shard::connect_or_reuse(
-                    conn,
-                    conn_shard,
-                    sp,
-                    *shard,
-                    "throttle",
-                    crate::shard::ShardConnectError::LogAndSkip,
-                )
-                .await?
-                else {
+                let Some(pool) = sp.exact_pool_for(*shard).cloned() else {
                     continue;
                 };
-                let fired = fire_due_on_conn(&mut shard_conn, metrics, codecs).await?;
+                let mut shard_conn = match pool.get().await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!(
+                            "[throttle] failed to get connection to shard {shard:?}: {e:?}"
+                        );
+                        continue;
+                    }
+                };
+                let fired = fire_due_on_conn(&mut shard_conn, metrics).await?;
                 fired_count += spawn_fired(fired, metrics, &mut shard_conn).await;
             }
         }
         _ => {
-            let fired = fire_due_on_conn(conn, metrics, codecs).await?;
+            let fired = fire_due_on_conn(conn, metrics).await?;
             fired_count += spawn_fired(fired, metrics, conn).await;
         }
     }
@@ -1952,68 +1703,6 @@ pub async fn pending_throttle_count_for_workflow(
     Ok(row.n)
 }
 
-/// Batched form of [`pending_throttle_count_for_workflow`] for many names at once.
-///
-/// One `to_regclass` existence check and one grouped
-/// `COUNT(*) ... GROUP BY workflow_name` query covering every name in
-/// `workflow_names`, instead of one existence check plus one count query per
-/// name (Ledger perf pass on `GET /admin/schedules`, called once per schedule
-/// row via `scheduler::schedule_running_basis`).
-///
-/// A name with no pending throttle rows is absent from the returned map,
-/// matching what [`pending_throttle_count_for_workflow`] returns for it (`0`)
-/// -- callers should treat a missing key as zero.
-///
-/// # Errors
-///
-/// Returns a database error if either the existence check or the grouped
-/// count query fails.
-#[cfg(feature = "db")]
-pub async fn pending_throttle_counts_for_workflows(
-    conn: &mut diesel_async::AsyncPgConnection,
-    workflow_names: &[&str],
-) -> crate::error::HarvestResult<std::collections::HashMap<String, i64>> {
-    #[derive(diesel::QueryableByName)]
-    struct Present {
-        #[diesel(sql_type = diesel::sql_types::Bool)]
-        present: bool,
-    }
-    #[derive(diesel::QueryableByName)]
-    struct Count {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        workflow_name: String,
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        n: i64,
-    }
-
-    use diesel_async::RunQueryDsl;
-
-    if workflow_names.is_empty() {
-        return Ok(std::collections::HashMap::new());
-    }
-
-    let exists: Present =
-        diesel::sql_query("SELECT to_regclass('harvest_start_throttle') IS NOT NULL AS present")
-            .get_result(conn)
-            .await
-            .map_err(crate::error::database_error)?;
-    if !exists.present {
-        return Ok(std::collections::HashMap::new());
-    }
-
-    let names: Vec<String> = workflow_names.iter().map(|s| (*s).to_string()).collect();
-    let rows: Vec<Count> = diesel::sql_query(
-        "SELECT workflow_name, COUNT(*) AS n FROM harvest_start_throttle \
-         WHERE workflow_name = ANY($1) GROUP BY workflow_name",
-    )
-    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(names)
-    .load(conn)
-    .await
-    .map_err(crate::error::database_error)?;
-
-    Ok(rows.into_iter().map(|r| (r.workflow_name, r.n)).collect())
-}
-
 // ---------------------------------------------------------------------------
 // Unit tests (no DB required)
 // ---------------------------------------------------------------------------
@@ -2022,26 +1711,6 @@ pub async fn pending_throttle_counts_for_workflows(
 mod tests {
     use super::*;
     use chrono::TimeZone as _;
-
-    #[cfg(feature = "db")]
-    #[test]
-    fn fire_due_row_gives_the_quota_lock_inputs() {
-        use crate::quota_lock_order::QuotaLockRow;
-        let row = FireDueRow {
-            id: uuid::Uuid::new_v4(),
-            workflow_name: "wf_a".to_string(),
-            throttle_key: "k".to_string(),
-            bucket_key: "b".to_string(),
-            workflow_id: "w".to_string(),
-            queue_name: "default".to_string(),
-            input: serde_json::json!({ "tenant_id": "t1" }),
-            start_options: serde_json::json!({ "tenant_id": "wrong" }),
-            expires_at: None,
-            shard_id: 0,
-        };
-        assert_eq!(row.workflow_name(), "wf_a");
-        assert_eq!(row.quota_input()["tenant_id"], "t1");
-    }
 
     fn ts(h: u32, m: u32, s: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 7, 6, h, m, s).unwrap()
@@ -2345,53 +2014,5 @@ mod tests {
         assert!(!active);
         assert_eq!(refill, None);
         assert_eq!(burst, None);
-    }
-
-    // ── collect_distinct_bucket_keys (issue #1230 Finding 2 review) ──────────
-
-    #[cfg(feature = "db")]
-    mod bucket_lock_ordering {
-        use super::*;
-
-        fn row(bucket_key: &str) -> FireDueRow {
-            FireDueRow {
-                id: uuid::Uuid::new_v4(),
-                workflow_name: "wf_a".to_string(),
-                throttle_key: "irrelevant".to_string(),
-                bucket_key: bucket_key.to_string(),
-                workflow_id: uuid::Uuid::new_v4().to_string(),
-                queue_name: "default".to_string(),
-                input: serde_json::json!({}),
-                start_options: serde_json::json!({}),
-                expires_at: None,
-                shard_id: 0,
-            }
-        }
-
-        #[test]
-        fn dedupes_and_sorts_the_same_regardless_of_claim_order() {
-            // The exact invariant that closes the bucket-vs-bucket ABBA
-            // hazard. Two claimed batches need the SAME two bucket keys,
-            // presented in OPPOSITE claim order. They must still lock
-            // those keys in the SAME order.
-            let forward: Vec<_> = collect_distinct_bucket_keys(&[row("bucket-a"), row("bucket-b")])
-                .into_iter()
-                .collect();
-            let reverse: Vec<_> = collect_distinct_bucket_keys(&[row("bucket-b"), row("bucket-a")])
-                .into_iter()
-                .collect();
-
-            assert_eq!(forward, reverse);
-            assert_eq!(
-                forward,
-                vec!["bucket-a".to_string(), "bucket-b".to_string()]
-            );
-        }
-
-        #[test]
-        fn dedupes_repeated_bucket_within_one_batch() {
-            let rows = [row("bucket-a"), row("bucket-a"), row("bucket-a")];
-            assert_eq!(collect_distinct_bucket_keys(&rows).len(), 1);
-        }
     }
 }

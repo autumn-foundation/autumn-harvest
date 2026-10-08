@@ -9,13 +9,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use autumn_harvest::types::ShardId;
 use autumn_harvest::worker::DbPool;
 use autumn_harvest::workers::WorkerRow;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use crate::api::{HarvestApiRuntime, HarvestApiState, PoolConn, acquire_conn};
+use crate::api::HarvestApiState;
 
 /// Outcome of a single-shard query: either a successful row set or an error.
 #[derive(Debug)]
@@ -26,41 +25,6 @@ pub struct ShardObservation<R> {
     pub rows: Vec<R>,
     /// Error description when the shard could not be queried.
     pub error: Option<String>,
-}
-
-/// Resolve `pool` to a live connection for `shard_id`, or the
-/// [`ShardObservation`] error a fan-out read should record for this shard.
-///
-/// Every per-shard fan-out query starts the same way: a shard the router has
-/// no pool for is `"has no configured storage pool"`; a pool that fails to
-/// hand out a connection is `"could not be acquired"`. Centralising that
-/// prelude here means a new fan-out read model implements only its own query
-/// against the returned connection, not this guard by hand — it was
-/// hand-copied into eight read models before this extraction.
-///
-/// # Errors
-///
-/// Returns the [`ShardObservation`] the caller should record for this shard
-/// when no pool is configured for it, or when a connection could not be
-/// acquired from the pool.
-pub async fn acquire_shard_conn<R>(
-    shard_id: i32,
-    pool: Option<DbPool>,
-) -> Result<PoolConn, ShardObservation<R>> {
-    let Some(pool) = pool else {
-        return Err(ShardObservation {
-            shard_id,
-            rows: Vec::new(),
-            error: Some(format!("shard {shard_id} has no configured storage pool")),
-        });
-    };
-    acquire_conn(&pool).await.map_err(|_| ShardObservation {
-        shard_id,
-        rows: Vec::new(),
-        error: Some(format!(
-            "database connection for shard {shard_id} could not be acquired"
-        )),
-    })
 }
 
 /// Collect per-shard connection pools available in `api_state`.
@@ -78,64 +42,32 @@ pub fn pools_by_shard(api_state: &HarvestApiState) -> BTreeMap<i32, DbPool> {
     )
 }
 
-/// Build the full set of shard ids a fan-out read should attempt to inspect.
+/// Build the full set of shard ids a fan-out read should attempt to inspect:
+/// every shard with a live connection pool, plus every shard the router
+/// already knows about (`readable_shards`/`default_shard`).
 ///
-/// The set is every shard with a live connection pool, plus every shard the
-/// router already knows about (`readable_shards`/`default_shard`).
-///
-/// A shard-add rollout widens the router's `readable_shards` before every
-/// process gets the new shard's pool wired up. See the workspace
-/// `docs/architecture.md` "add a shard" procedure. During that window the
-/// router knows about a shard this process has no pool for yet.
-///
-/// That shard must still appear in the returned set. A caller then reports
-/// it `unavailable` instead of silently omitting it from the fan-out. An
-/// omitted shard would let a completeness `status` read `complete` even
-/// though the caller never queried that shard.
+/// A shard the router knows about but for which this process has no pool yet
+/// (e.g. mid a shard-add rollout — the router's `readable_shards` is widened
+/// before every process has the new shard's pool wired up, see the workspace
+/// CLAUDE.md "add a shard" procedure) must still appear in the returned set so
+/// callers report it `unavailable` rather than silently omitting it from the
+/// fan-out — an omitted shard would let a completeness `status` read
+/// `complete` even though that shard was never queried.
 #[must_use]
 pub fn expected_shards(
     api_state: &HarvestApiState,
     pools: &BTreeMap<i32, DbPool>,
 ) -> BTreeSet<i32> {
-    expected_shards_for(api_state.runtime().ok().as_ref(), pools)
-}
-
-/// Like [`expected_shards`], but against a runtime the caller already holds.
-///
-/// A handler validates a request against `runtime` first -- an activity's
-/// declared rate limit, or a workflow's declared throttle. The handler
-/// must reuse that same `runtime` snapshot here. Do not pass `api_state`
-/// and let this function re-read it.
-///
-/// `HarvestApiState::runtime()` and `storage_pool()` guard independent
-/// locks. Plugin shutdown clears them one after the other
-/// (`HarvestApiState::clear()`).
-///
-/// A second, independent re-read here can race that clear. It can then
-/// fall back to pool-only shards, silently, for this one request. That
-/// resurrects the exact omission [`expected_shards`] exists to prevent
-/// (issue #1229 finding 1), only in that narrow window.
-#[must_use]
-pub fn expected_shards_for(
-    runtime: Option<&HarvestApiRuntime>,
-    pools: &BTreeMap<i32, DbPool>,
-) -> BTreeSet<i32> {
-    // Delegates to the canonical core rule (issue #1146). The engine's own
-    // by-business-key resolution
-    // (`external_target_location::resolve_location_by_workflow_id`) fans out
-    // over exactly this set, and a management-API read that inspected a
-    // different set of shards than the engine would answer differently about
-    // the same key. Keeping one definition removes that drift by construction,
-    // the way `select_resolved_run` already does for the ranking.
-    let pool_shards: Vec<ShardId> = pools.keys().copied().map(ShardId::new).collect();
-    let router_parts = runtime.map(|runtime| {
+    let mut shards: BTreeSet<i32> = pools.keys().copied().collect();
+    if let Ok(runtime) = api_state.runtime() {
         let router = runtime.router();
-        (router.readable_shards(), router.default_shard())
-    });
-    autumn_harvest::external_target_location::fanout_shards_from_parts(&pool_shards, router_parts)
-        .into_iter()
-        .map(ShardId::as_i32)
-        .collect()
+        shards.extend(router.readable_shards().iter().map(|s| s.as_i32()));
+        shards.insert(router.default_shard().as_i32());
+    }
+    if shards.is_empty() {
+        shards.insert(0);
+    }
+    shards
 }
 
 /// Seconds elapsed from `started_at` to `observed_at`, clamped to zero.
@@ -328,119 +260,7 @@ pub fn collect_fanout_rows<R>(observations: Vec<ShardObservation<R>>) -> FanoutR
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use autumn_harvest::RetentionConfig;
-    use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
-    use autumn_harvest::shard::ShardRouter;
-    use autumn_harvest::worker::HandlerRegistry;
-
     use super::*;
-    use crate::api::HarvestRetentionRuntime;
-
-    // ── expected_shards_for (issue #1229 review) ────────────────────────────
-
-    /// A `DbPool` that never connects. Standing in for a real pool is enough
-    /// here -- these tests only check which shard ids `expected_shards_for`
-    /// selects, never the pool's connections.
-    fn unreachable_test_pool() -> DbPool {
-        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
-            diesel_async::AsyncPgConnection,
-        >::new("postgres://user:pass@127.0.0.1:1/db");
-        deadpool::managed::Pool::builder(manager)
-            .max_size(1)
-            .build()
-            .expect("failed to build unreachable test pool")
-    }
-
-    fn runtime_with_router(router: ShardRouter) -> HarvestApiRuntime {
-        HarvestApiRuntime::new(
-            Arc::new(HandlerRegistry::new(Vec::new(), Vec::new())),
-            Arc::new(DagCatalog::default()),
-            Arc::new(Vec::new()),
-            None,
-            Vec::new(),
-            SchedulerMonitor::offline(),
-            HarvestRetentionRuntime::disabled(RetentionConfig::default()),
-            router,
-        )
-    }
-
-    #[test]
-    fn expected_shards_for_adds_router_known_shard_with_no_pool() {
-        // The router already advertises shard 0, but this process has no
-        // pool for it (issue #1229 finding 1). Uses `ShardRouter::single()`,
-        // not a distinct multi-shard router. `HarvestApiRuntime::new`
-        // installs its router into the process-global `GLOBAL_SHARD_ROUTER`.
-        // That is a real side effect. A `cargo test` run shares this global
-        // across every concurrently running test in this crate. `single()`
-        // is the same router every other such test in this crate already
-        // installs, so this test adds no new cross-test hazard.
-        let runtime = runtime_with_router(ShardRouter::single());
-        let pools: BTreeMap<i32, DbPool> = BTreeMap::new();
-
-        let expected = expected_shards_for(Some(&runtime), &pools);
-
-        assert_eq!(expected, BTreeSet::from([0]));
-    }
-
-    #[test]
-    fn expected_shards_for_falls_back_to_pool_shards_without_a_runtime() {
-        // A caller with no runtime snapshot at all (mirrors the old
-        // `api_state.runtime()` lookup failing) still sees its own pools.
-        // Builds no `HarvestApiRuntime`, so this test installs no global
-        // router.
-        let mut pools: BTreeMap<i32, DbPool> = BTreeMap::new();
-        pools.insert(0, unreachable_test_pool());
-
-        let expected = expected_shards_for(None, &pools);
-
-        assert_eq!(expected, BTreeSet::from([0]));
-    }
-
-    // ── acquire_shard_conn (characterizes the prelude previously hand-copied
-    //    into canary.rs, status_summary.rs, usage.rs, workflow_count.rs,
-    //    workflow_reachability.rs, queue_coverage.rs, version_gate_retirement.rs
-    //    and version_usage.rs) ───────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn acquire_shard_conn_no_pool_reports_shard_id_and_message() {
-        let result: Result<PoolConn, ShardObservation<i64>> = acquire_shard_conn(7, None).await;
-        let Err(observation) = result else {
-            panic!("no pool must be an error observation");
-        };
-        assert_eq!(observation.shard_id, 7);
-        assert_eq!(observation.rows, [] as [i64; 0]);
-        assert_eq!(
-            observation.error.as_deref(),
-            Some("shard 7 has no configured storage pool")
-        );
-    }
-
-    #[tokio::test]
-    async fn acquire_shard_conn_unreachable_pool_reports_shard_id_and_message() {
-        // Nothing listens on this port, so `pool.get()` fails fast (connection
-        // refused) without needing a live database.
-        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
-            diesel_async::AsyncPgConnection,
-        >::new("postgres://user:pass@127.0.0.1:1/db");
-        let pool: DbPool = deadpool::managed::Pool::builder(manager)
-            .max_size(1)
-            .build()
-            .expect("failed to build unreachable test pool");
-
-        let result: Result<PoolConn, ShardObservation<i64>> =
-            acquire_shard_conn(3, Some(pool)).await;
-        let Err(observation) = result else {
-            panic!("unreachable pool must be an error observation");
-        };
-        assert_eq!(observation.shard_id, 3);
-        assert_eq!(observation.rows, [] as [i64; 0]);
-        assert_eq!(
-            observation.error.as_deref(),
-            Some("database connection for shard 3 could not be acquired")
-        );
-    }
 
     fn obs<R>(shard_id: i32, rows: Vec<R>, error: Option<&str>) -> ShardObservation<R> {
         ShardObservation {
@@ -525,7 +345,7 @@ mod tests {
         ]);
         assert_eq!(merged.status, FanoutStatus::Unavailable);
         assert!(!merged.is_complete());
-        assert_eq!(merged.rows, [] as [i64; 0]);
+        assert!(merged.rows.is_empty());
         // Unavailable shards are sorted by shard_id.
         let ids: Vec<i32> = merged
             .unavailable_shards
@@ -539,7 +359,7 @@ mod tests {
     fn collect_fanout_rows_empty_observations_is_unavailable() {
         let merged: FanoutRows<i64> = collect_fanout_rows(Vec::new());
         assert_eq!(merged.status, FanoutStatus::Unavailable);
-        assert_eq!(merged.rows, [] as [i64; 0]);
+        assert!(merged.rows.is_empty());
         assert!(merged.unavailable_shards.is_empty());
     }
 }

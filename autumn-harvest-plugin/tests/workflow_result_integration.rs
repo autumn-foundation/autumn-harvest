@@ -23,6 +23,7 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
+use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -38,7 +39,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::test_init_sql().as_bytes().to_vec()
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
 }
 
 type HarvestApiApp = axum::Router;
@@ -78,7 +79,7 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::default(),
     ));
-    harvest_api_router(api_state)
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
 
 async fn get_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
@@ -123,7 +124,7 @@ async fn seed_running(conn: &mut AsyncPgConnection, workflow_id: &str) -> Execut
             workflow_name: "result-wf",
             workflow_id,
             exec_id,
-            input: json!({"n": 1}).into(),
+            input: json!({"n": 1}),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -384,14 +385,7 @@ async fn test_poll_update_result_orphaned() {
         .expect("append completed event");
 
     // Poll the result — it should immediately resolve with 409 Conflict
-    let response = poll_update_result(
-        &harvest_pool,
-        exec_id,
-        update_id,
-        1,
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
-    )
-    .await;
+    let response = poll_update_result(&harvest_pool, exec_id, update_id, 1).await;
     assert_eq!(response.status(), StatusCode::CONFLICT);
 
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)

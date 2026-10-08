@@ -1551,10 +1551,7 @@ mod tests {
             "only the partition whose commit landed is retired"
         );
         anchors.mark_durable(1);
-        assert_eq!(
-            anchors_needing_durability(OffsetReset::Latest, &anchors),
-            [] as [(i32, i64); 0]
-        );
+        assert!(anchors_needing_durability(OffsetReset::Latest, &anchors).is_empty());
     }
 
     /// Only a partition the commit pass actually spoke for is retired.

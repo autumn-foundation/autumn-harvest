@@ -15,7 +15,7 @@
 name: CI
 
 on:
-  # Manual trigger. Fuzzing has its own workflow: fuzz-nightly.yml (issue #1835).
+  # Manual trigger for the opt-in fuzz-smoke job (see the `fuzz-smoke` job).
   workflow_dispatch:
   push:
     branches: [trunk, trunk-dev]
@@ -44,14 +44,13 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     outputs:
       code: ${{ steps.filter.outputs.code }}
-      chapter: ${{ steps.filter.outputs.chapter }}
       # Resolved base revision, exported so the issue #794 schema gate can
       # compare the checked-in artifact against its PREVIOUS revision. This job
       # is the only one with `fetch-depth: 0`, so it is the only place the base
       # can be resolved reliably.
       base_sha: ${{ steps.filter.outputs.base_sha }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - id: filter
@@ -87,22 +86,11 @@ jobs:
           # against the freshly generated contract, so a baseline-only PR must
           # still run the matrix — otherwise a hand-edited, stale, or malformed
           # baseline merges with no comparison at all, defeating the gate.
-          #
-          # Same carve-out for the API contract and the OpenAPI document
-          # generated from it. Both live under `docs/`, so without this a
-          # contract-only PR skips the tests that compare them.
           if echo "$changed" | grep -qvE '^(docs/|.*\.md$)' \
-            || echo "$changed" | grep -qxE 'docs/(workflow-schema-contract|api-contract|openapi)\.json'; then
+            || echo "$changed" | grep -qxF 'docs/workflow-schema-contract.json'; then
             echo "code=true" >> "$GITHUB_OUTPUT"
           else
             echo "code=false" >> "$GITHUB_OUTPUT"
-          fi
-          # Issue #1614: a docs-only change to the standalone chapter, its
-          # reference or its crate still runs the `standalone-chapter` job.
-          if echo "$changed" | grep -qE '^(docs/embedding\.md|docs/getting-started/(standalone-axum|02-first-workflow)\.md|examples/standalone-quickstart/|scripts/run-standalone-chapter\.sh)'; then
-            echo "chapter=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "chapter=false" >> "$GITHUB_OUTPUT"
           fi
 
   lint:
@@ -116,260 +104,11 @@ jobs:
     # below additionally gate on the `changes` guard.
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     steps:
-      # Full history: the comment-hygiene step below diffs against the merge
-      # base with the target branch, and a shallow clone has no merge base to
-      # find. Without it that step silently degrades to report-only and stops
-      # gating. This is the cheap job, so the extra fetch is affordable here.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
-        with:
-          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: Check default-run for multi-binary packages
-        # Guards the defect class that silently broke `cargo run -p
-        # quickstart` and `cargo run -p autumn-harvest-cli -- ...` (the
-        # documented command in 50+ places, including the quickstart's own
-        # "Step 3 — Run preflight") for weeks with fully green CI, because
-        # the `quickstart`/build-only CI jobs run `cargo build`, which can't
-        # itself be ambiguous. See scripts/check-default-run.sh.
-        run: ./scripts/check-default-run.sh
-      - name: Check cargo-dev root caveat is documented
-        # Guards a real, reproduced-live defect: `cargo dev` is the flagship
-        # "no database, no Docker, nothing to configure" front door
-        # (README.md's Quick example, Chapter 1's fastest path), and it
-        # deliberately refuses to run as `root` — a real situation for Docker
-        # devcontainers and many CI base images, not a hypothetical, per the
-        # dev runtime's own doc comment (autumn-harvest-plugin/src/dev/postgres.rs,
-        # refuse_to_run_as_root). Neither front-door doc used to say so, so a
-        # newcomer in one of those environments hit an undocumented hard stop
-        # on the very first command. See scripts/check-dev-runtime-root-caveat.sh.
-        run: ./scripts/check-dev-runtime-root-caveat.sh
-      - name: Check HARVEST_DEV_DATABASE_URL placeholder caveat is documented
-        # Guards a real, reproduced-live defect: Chapter 1 gives
-        # `HARVEST_DEV_DATABASE_URL=postgres://me@localhost:5432/harvest_dev
-        # cargo dev` as a directly-runnable command, twice, with nothing
-        # marking `me` as a placeholder. Copied verbatim against an ordinary
-        # password-authenticated Postgres it fails with Postgres's own
-        # "fe_sendauth: no password supplied", which names neither the env
-        # var nor the doc. See
-        # scripts/check-dev-database-url-placeholder-caveat.sh.
-        run: ./scripts/check-dev-database-url-placeholder-caveat.sh
-      - name: Check README upgrade-guide pointer is current
-        # Guards a real, reproduced-live defect: README.md's own top-level
-        # "Upgrading an existing deployment?" pointer is a hand-written link
-        # that nothing keeps in sync with docs/upgrading/. After 0.6.0.md
-        # shipped and docs/getting-started/README.md was updated to call it
-        # "the current" guide, README.md's front-door pointer still linked to
-        # the superseded 0.4.0 -> 0.5.0 guide. See
-        # scripts/check-readme-upgrade-guide-current.sh.
-        run: ./scripts/check-readme-upgrade-guide-current.sh
-      - name: Check search_attr query-string syntax in docs
-        # Guards a real, reproduced-live defect: examples/billing-autumn-web's
-        # README — the repository's own reference example for a real
-        # integration, the first thing README.md points a reader at past the
-        # tiny hello-world path — gave `search_attr=tenant_id=acme` in the
-        # curl it tells a reader to run right after starting a checkout.
-        # parse_workflow_filters splits the value on ':', not '=', so that
-        # exact command 400s: "invalid search_attr 'tenant_id=acme'; expected
-        # 'key:value'". No CI job runs this example, so nothing else catches
-        # this class of drift. See
-        # scripts/check-search-attr-query-syntax.sh.
-        run: ./scripts/check-search-attr-query-syntax.sh
-      - name: Check README testing-dependency version pin
-        # Guards a real, reproduced-live defect: README.md's "Testing
-        # workflow code changes with the replayer" section pinned
-        # `autumn-harvest = { version = "0.2", features = ["testing"] }` as
-        # a dev-dependency, four minor versions behind the `"0.6"` pin the
-        # reader already added in the same manifest per Chapter 1, and
-        # nothing keeps the two pins in sync as releases ship. See
-        # scripts/check-readme-testing-dep-version.sh.
-        run: ./scripts/check-readme-testing-dep-version.sh
-      - name: Check for PowerShell env-var syntax in bash blocks
-        # Guards a real, reproduced-live defect: examples/standalone-runner's
-        # README fenced its "Run" section ```bash, matching every sibling
-        # example, but the two lines setting DATABASE_URL and AUTUMN_PROFILE
-        # used PowerShell's `$env:NAME = "value"` assignment instead of bash's
-        # `NAME=value`. Pasted verbatim into bash, each line is silently
-        # skipped ("command not found") and neither variable ends up set. See
-        # scripts/check-no-powershell-env-syntax.sh.
-        run: ./scripts/check-no-powershell-env-syntax.sh
-      - name: Check CHANGELOG connector migration version
-        # Guards a real, reproduced-live defect: CHANGELOG.md's [0.6.0]
-        # "Add broker event-source connectors" entry (issue #944) cited
-        # migration `20260719000000` for harvest_connector_dead_letters,
-        # but that version belongs to a different, already-shipped core
-        # migration (harvest_workflow_logs, issue #790, correctly cited two
-        # entries below in the same section). The connector migration's
-        # real on-disk version is `20260719900000`, deliberately bumped to
-        # avoid colliding with core under Diesel's single, source-blind
-        # __diesel_schema_migrations keyspace. docs/upgrading/0.6.0.md sends
-        # an upgrading operator straight to this CHANGELOG.md section to
-        # find 0.6.0's migrations. See
-        # scripts/check-changelog-connector-migration-version.sh.
-        run: ./scripts/check-changelog-connector-migration-version.sh
-      - name: Check broker-connectors dead-letter-sink example
-        # Guards a real, reproduced-live defect: chapter 13's "(a) record
-        # into harvest -- the default mode" example -- the option for a
-        # directly-constructed ConnectorRuntime, the exact audience the
-        # section addresses -- installed RecordingDeadLetterSink, an
-        # in-memory, test-only sink per its own doc comment
-        # (autumn-harvest-plugin/src/connector/dead_letter.rs). It never
-        # writes harvest_connector_dead_letters -- that is
-        # PostgresDeadLetterSink, which is what HarvestPlugin itself
-        # installs as the real default (autumn-harvest-plugin/src/plugin.rs).
-        # A newcomer who copies the example gets a runtime that compiles,
-        # runs, and acknowledges poison messages with no error, but never
-        # durably records them: they vanish on restart. See
-        # scripts/check-broker-connector-dead-letter-sink-example.sh.
-        run: ./scripts/check-broker-connector-dead-letter-sink-example.sh
-      - name: Check broker-connectors cutover example
-        # Guards a real, reproduced-live defect: chapter 13's "Cutting a
-        # binding over to a new cluster or a recreated topic" example called
-        # .map_json(|order: OrderPlaced| Ok(WorkflowId::new(order.order_id))),
-        # a single-argument closure returning a bare WorkflowId.
-        # SourceBinding::map_json requires
-        # Fn(&MessageCtx, T) -> Result<MappedMessage, E>
-        # (autumn-harvest-plugin/src/connector/binding.rs) -- every other
-        # mapping closure in this chapter, and both shipped examples, take
-        # the message context plus the typed body and return a
-        # MappedMessage. A newcomer following the cutover recipe -- the one
-        # place in the chapter that tells an operator how to rotate a
-        # binding's dedupe namespace during a production cutover -- copies
-        # code that does not type-check. See
-        # scripts/check-broker-connector-cutover-example.sh.
-        run: ./scripts/check-broker-connector-cutover-example.sh
-      - name: Check claude-agent-daemon runtime artifacts are git-ignored
-        # Guards a real, reproduced-live defect: examples/claude-agent-daemon's
-        # README tells the reader to run every `agentd` command "from the
-        # repository root", and the daemon's own defaults (`agentd.db`,
-        # `agentd.sock`) write relative to the current directory. Nothing
-        # excluded them, so following the "Try it in one minute" walkthrough
-        # verbatim from a clean checkout leaves `git status` dirty — and,
-        # against a real API key, parks an actual conversation transcript
-        # (the doc's own words: "every prompt, tool input, and tool result")
-        # as an untracked file one `git add -A` away from being committed.
-        # See scripts/check-agentd-runtime-artifacts-ignored.sh.
-        run: ./scripts/check-agentd-runtime-artifacts-ignored.sh
-      - name: Check signals chapter's clean await_condition example
-        # Guards two real, reproduced-live compile failures an Onramp
-        # clean-room pass found in chapter 4's "Clean Declarative
-        # await_condition" example (collect_approvals_clean) -- the pattern
-        # the chapter explicitly recommends over the "tedious" manual loop
-        # right above it. Neither is a syntax error, so
-        # docs/audits/doc-snippet-syntax.py's rustfmt-only check passed both
-        # blocks clean: (1) racing wait_for_signal against
-        # await_condition_timeout with futures::future::select needs
-        # #[workflow(allow_nondeterministic_apis)], or HVG010 hard-blocks
-        # the build; (2) a plain `let mut approvals` captured by the
-        # condition closure can never also be reassigned by the loop body
-        # while that borrow is live (E0506). E0506 is a borrow-checker
-        # property, not a syntax shape, so this actually compiles the
-        # pinned block with `cargo check` (see the script's own docstring
-        # for why a text heuristic proved gameable in review) rather than
-        # pattern-matching stand-in text -- one extra `cargo check
-        # --example` in a job that already builds this crate for clippy
-        # below. See scripts/check-signals-clean-approval-example-determinism.sh.
-        run: ./scripts/check-signals-clean-approval-example-determinism.sh
-      - name: Check reliability-knobs continue_as_new checkpoint example
-        # Guards a real, reproduced-live compile failure an Onramp
-        # clean-room pass found in chapter 7's flagship deadline-aware
-        # checkpoint example: `ctx.continue_as_new(...).await?` inside a
-        # `Result<_, String>` workflow, with no real conversion from the
-        # `HarvestError` continue_as_new returns first (E0277, no
-        # `From<HarvestError> for String`). Not a syntax error, so
-        # doc-snippet-syntax.py's rustfmt-only check passed it clean. The
-        # same broken snippet also lived, unenforced, inside
-        # autumn-harvest/examples/long_lived_entity_deadline.rs's own
-        # ```rust,ignore``` module-doc illustration, so this checks both.
-        # Whether a `.map_err(...)` closure actually produces `String` is a
-        # type-checker property, not a text shape (review found two
-        # text-heuristic attempts gameable in a row -- a loose window, then
-        # an `.await.map_err(|e| e)?` identity closure), so this compiles
-        # each pinned snippet with `cargo check` rather than pattern-
-        # matching stand-in text. See
-        # scripts/check-continue-as-new-checkpoint-example.sh.
-        run: ./scripts/check-continue-as-new-checkpoint-example.sh
-      - name: Check operations chapter's preflight declared-deps example
-        # Guards two real, reproduced-live compile failures an Onramp
-        # clean-room pass found in chapter 10's flagship
-        # "Catching a forgotten registration before rollout" example: (1)
-        # `ctx.execute_activity(...).await?` and the spawn_child_workflow
-        # call below it are `HarvestResult<_>`, but the workflow returns
-        # `Result<_, String>` with no `From<HarvestError> for String` --
-        # same defect class as chapter 7's continue_as_new example (PR
-        # #1700); (2) even with `.map_err(...)` added, execute_activity's
-        # generic output type is left unconstrained by a discarded bare
-        # statement, which current stable rustc denies by default on every
-        # edition (`dependency_on_unit_never_type_fallback`), confirmed
-        # live against a standalone edition-2021 crate matching chapter 1's
-        # own pinned tutorial edition. Neither is a syntax error, so
-        # doc-snippet-syntax.py's rustfmt-only check passes this block
-        # clean. This actually compiles the pinned block with `cargo check`
-        # rather than pattern-matching stand-in text, matching the sibling
-        # guards above. See
-        # scripts/check-preflight-declared-deps-example.sh.
-        run: ./scripts/check-preflight-declared-deps-example.sh
-      - name: Check sqlite-backend guide's outcome-match example
-        # Guards a real, reproduced-live compile failure in
-        # docs/sqlite-backend.md's §7 "drive model" example:
-        # `ExecutionOutcome::Terminated` and this doc were both added in the
-        # same commit (3abb5b6, issue #1348), but the guide's own
-        # `match rt.outcome(exec)? { ... }` never got the new arm, so it has
-        # been non-exhaustive (E0004) since the day it was written. This
-        # file is outside doc-snippet-syntax.py's corpus (getting-started/
-        # and README.md only), and E0004 is a type-checker property, not a
-        # syntax error, so nothing else in CI ever compiled it --
-        # examples/quickstart.rs has the correct four-arm match, which is
-        # why the crate's own tests stayed green throughout. This actually
-        # compiles the pinned block with `cargo check` rather than counting
-        # match arms textually. See
-        # scripts/check-sqlite-outcome-match-example.sh.
-        run: ./scripts/check-sqlite-outcome-match-example.sh
-      - name: Check chapter 8 and 11 snippets compile
-        # Guards two getting-started snippets that declared the workflow
-        # input as `_: ()`. `#[workflow]` silently dropped the `_` pattern,
-        # so the generated call passed one argument to a two-argument
-        # function. rustc reported E0061 "takes 5 arguments" on the
-        # attribute line. See scripts/check-underscore-input-snippets.sh.
-        run: ./scripts/check-underscore-input-snippets.sh
-      - name: Check README schedule and retry snippets compile
-        # Guards two front-door README snippets. The cron-schedule block
-        # called `.workflows(..)` and `.workflow_schedule(..)` on
-        # `autumn_web::app()`, which has neither method. The retry block
-        # used `Duration` without importing it. See
-        # scripts/check-readme-front-door-snippets.sh.
-        run: ./scripts/check-readme-front-door-snippets.sh
-      - name: Check webhooks chapter documents the webhooks feature
-        # Guards a real, reproduced-live defect an Onramp clean-room pass
-        # found in chapter 12: it showed the `#[webhook]` mapping function
-        # and `.webhooks(webhooks![...])` plugin wiring with no mention
-        # that `autumn-harvest-plugin` needs `features = ["webhooks"]` --
-        # unlike the sibling chapter 13 (broker connectors), which states
-        # its `connectors` feature requirement up front in its own
-        # "Features:" table. A newcomer who scaffolds per chapter 1 (no
-        # extra features) and pastes chapter 12's code verbatim hits, at
-        # the .webhooks(...) call:
-        #   error[E0599]: no method named `webhooks` found for struct
-        #   `HarvestPlugin`
-        # which names neither "webhooks" nor this chapter. This compiles
-        # the doc's own snippets with `cargo check` twice -- once with
-        # default features (must fail, proving the feature really is
-        # required) and once with `--features webhooks` (must pass) --
-        # and greps for the fix's own "Enable the feature" note landing
-        # before step 3, so neither the code nor the note can regress
-        # silently. See scripts/check-webhooks-feature-example.sh.
-        run: ./scripts/check-webhooks-feature-example.sh
-      - name: Check chapter 5 and 6 flagship examples compile
-        # Guards two hard compile failures a clean-room pass found on the
-        # getting-started path: chapter 5 passed a workflow id to
-        # `spawn_child_workflow_raw` (E0061; the method takes name + input),
-        # and chapter 6's `charge_card` used `.map_err(|e| e.to_string())?`
-        # in a `HarvestResult` function (E0277; no `From<String>`).
-        # See scripts/check-child-idempotency-examples.sh.
-        run: ./scripts/check-child-idempotency-examples.sh
+      - uses: Swatinem/rust-cache@v2
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy autumn-harvest
@@ -382,12 +121,6 @@ jobs:
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features metrics -- -D warnings
       - name: Clippy autumn-harvest-plugin (webhooks feature)
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features webhooks -- -D warnings
-      # issue #525. Both tiers are linted: `dev-runtime-managed` compiles the
-      # archive-download path, which `dev-runtime` alone `cfg`s out entirely.
-      - name: Clippy autumn-harvest-plugin (dev-runtime feature)
-        run: cargo clippy -p autumn-harvest-plugin --all-targets --features dev-runtime -- -D warnings
-      - name: Clippy autumn-harvest-plugin (dev-runtime-managed feature)
-        run: cargo clippy -p autumn-harvest-plugin --all-targets --features dev-runtime-managed -- -D warnings
       # issue #944. `connectors` alone is the broker-agnostic layer (no broker
       # client), so it lints without any system dependency. `kafka` needs the
       # libcurl headers vendored librdkafka's cmake build looks for.
@@ -395,12 +128,6 @@ jobs:
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features connectors -- -D warnings
       - name: Clippy autumn-harvest-plugin (sqs feature)
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features sqs -- -D warnings
-      - name: Clippy autumn-harvest-plugin (aws-kms feature, issue #1825)
-        run: cargo clippy -p autumn-harvest-plugin --all-targets --features aws-kms -- -D warnings
-      # Issue #1312: the runtime wiring for the Redis dispatch channel is
-      # `cfg`d out of the default build, so only this step compiles it.
-      - name: Clippy autumn-harvest-plugin (redis feature)
-        run: cargo clippy -p autumn-harvest-plugin --all-targets --features redis -- -D warnings
       - name: Install librdkafka build deps
         run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
       - name: Clippy autumn-harvest-plugin (kafka feature)
@@ -411,47 +138,6 @@ jobs:
         run: cargo clippy -p autumn-harvest-cli --all-targets -- -D warnings
       - name: Clippy autumn-harvest-sqlite
         run: cargo clippy -p autumn-harvest-sqlite --all-targets -- -D warnings
-      # Same issue #962 rule as every other crate on this page: a workspace
-      # member gets NO clippy coverage without its own step, and these three
-      # standalone example crates (each its own `examples/*/Cargo.toml`
-      # workspace member, not a `--example` target under `autumn-harvest`)
-      # never got one. Unlike claude-agent-daemon/autumn-harvest-redis below,
-      # no `--no-deps` is needed: all three use `autumn-harvest`'s default
-      # features (plus `db`/`testing`), so they do not inherit that crate's
-      # no-default-features warnings.
-      - name: Clippy saga-choreography example
-        run: cargo clippy -p saga-choreography --all-targets -- -D warnings
-      - name: Clippy billing-autumn-web example
-        run: cargo clippy -p billing-autumn-web --all-targets -- -D warnings
-      - name: Clippy standalone-runner example
-        run: cargo clippy -p standalone-runner --all-targets -- -D warnings
-      - name: "Clippy standalone-quickstart example (issue #1614)"
-        run: cargo clippy -p standalone-quickstart --all-targets -- -D warnings
-      # Same issue #962 rule as the verify and redis crates below: a new
-      # workspace member gets NO clippy coverage without its own step here.
-      # `--no-deps` scopes the deny to the example, because it depends on
-      # `autumn-harvest` with `default-features = false`, and the core crate
-      # carries pre-existing warnings in that configuration.
-      - name: Clippy claude-agent-daemon example
-        run: cargo clippy -p claude-agent-daemon --all-targets --no-deps -- -D warnings
-      # Issue #1312: the Redis dispatch channel. Same issue #962 rule as the
-      # verify crate below -- a workspace member gets NO clippy coverage
-      # without its own step here.
-      #
-      # `--no-deps` scopes the deny to this crate. `autumn-harvest-redis`
-      # depends on `autumn-harvest` with `default-features = false`, and the
-      # core crate carries pre-existing lint warnings in that configuration
-      # (dead code behind the `db` feature, and pedantic suggestions). Without
-      # `--no-deps` this step would deny those, so it would report the core
-      # crate's no-default-features debt as a redis-crate failure.
-      - name: Clippy autumn-harvest-redis
-        run: cargo clippy -p autumn-harvest-redis --all-targets --no-deps -- -D warnings
-      # Issue #962: a new workspace member gets NO clippy coverage unless a step
-      # is added here — there is no `--workspace` clippy invocation in this job,
-      # only per-crate ones. The verify crate opts into the workspace's pedantic
-      # + nursery lints, which `-D warnings` makes effectively deny.
-      - name: Clippy autumn-harvest-verify
-        run: cargo clippy -p autumn-harvest-verify --all-targets -- -D warnings
       # Issue #786: the `docs/performance.md` prose-vs-table guards must run on
       # DOCS-ONLY pull requests — which is the change class most likely to break
       # them, and the one the `test` matrix below skips entirely (every step
@@ -475,11 +161,6 @@ jobs:
       - name: Run docs/performance.md guards (also on docs-only PRs)
         run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration performance_docs::"
 
-      # Issue #1783: the `docs/calendars.md` Rust fences compile as doctests.
-      # A docs-only PR skips the `test` matrix, so the doctests run here, ungated.
-      - name: Run docs/calendars.md doctests (also on docs-only PRs)
-        run: "cargo test -p autumn-harvest --no-default-features --doc calendar::CalendarsDocSnippets"
-
       # Issue #966: same reasoning as the step above, for the R&D report's
       # coupling-inventory guards. `docs/rnd/sqlite-feasibility.md` matches BOTH
       # clauses of the docs-only filter (`^(docs/|.*\.md$)`), so a PR that edits
@@ -493,29 +174,6 @@ jobs:
       # the same trailing-`::` YAML reason as above.
       - name: Run docs/rnd/sqlite-feasibility.md guards (also on docs-only PRs)
         run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration sqlite_feasibility_docs::"
-
-      # Issue #1816: the SLO burn-rate pack lives under `docs/`, so a PR
-      # that edits only the pack skips the `test` matrix. These guards pin
-      # what promtool cannot see. Quoted for the trailing-`::` reason above.
-      - name: Run docs/alerts SLO pack guards (also on docs-only PRs)
-        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration slo_pack_docs::"
-
-      # Issue #1816: load and unit-test the SLO burn-rate rules. The pinned
-      # tarball and its checksum keep a new promtool release from reddening
-      # lint, and a tampered download fails the checksum.
-      - name: SLO burn-rate rules (promtool check and test)
-        env:
-          PROMETHEUS_VERSION: "3.5.0"
-          PROMETHEUS_SHA256: "e811827af26d822afb09a4f28314f61b618b12cff5369835a67f674d8b46f39a"
-        run: |
-          set -euo pipefail
-          name="prometheus-${PROMETHEUS_VERSION}.linux-amd64"
-          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/$name.tar.gz" \
-            "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/$name.tar.gz"
-          echo "${PROMETHEUS_SHA256}  ${RUNNER_TEMP}/$name.tar.gz" | sha256sum -c -
-          tar -xzf "${RUNNER_TEMP}/$name.tar.gz" -C "${RUNNER_TEMP}" --strip-components=1 "$name/promtool"
-          "${RUNNER_TEMP}/promtool" check rules docs/alerts/slo-pack-v0.1.0.rules.yml
-          "${RUNNER_TEMP}/promtool" test rules docs/alerts/slo-pack-v0.1.0.test.yml
 
       # Issue #1202: same reasoning as the two steps above, for
       # docs/testing/chaos.md's worked local-iteration example. It lives
@@ -548,260 +206,6 @@ jobs:
       - name: Run docs/migrating-from-temporal.md guards (also on docs-only PRs)
         run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration migrating_from_temporal_docs::"
 
-      # Issue #962: same reasoning as the four steps above, for the R&D report's
-      # boundary-table, rule-subsumption and metric-citation guards.
-      # `docs/rnd/determinism-static-analysis.md` matches BOTH clauses of the
-      # docs-only filter (`^(docs/|.*\.md$)`), so a PR that edits only the
-      # report — dropping a boundary row, staling the 22-rule matrix, citing a
-      # test that does not exist — sets `code=false` and skips the entire `test`
-      # matrix. That is precisely the change class these guards exist to catch,
-      # so they run here in the ungated `lint` job.
-      #
-      # Guarded by `determinism_static_analysis_docs::guards_run_on_docs_only_changes`,
-      # which fails if this step is removed or becomes conditional. Quoted for
-      # the same trailing-`::` YAML reason as above: a trailing colon in an
-      # unquoted scalar is a mapping indicator, and unquoted this line makes the
-      # whole workflow unparseable.
-      - name: Run docs/rnd/determinism-static-analysis.md guards (also on docs-only PRs)
-        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration determinism_static_analysis_docs::"
-
-      # Issue #1272: same reasoning as the five steps above, for the
-      # audit-export "opt-in, one cost is not zero" caveat. `docs/audit-export.md`
-      # and `docs/changelog.d/pr-953-audit-export.md` both match the docs-only
-      # filter, so a PR that edits only one of them — dropping the partial-index
-      # cost caveat, restoring the retracted "zero-cost when unconfigured"
-      # wording — sets `code=false` and skips the entire `test` matrix. That is
-      # precisely the change class these guards exist to catch, so they run
-      # here in the ungated `lint` job.
-      #
-      # Guarded by `audit_export_docs::guards_run_on_docs_only_changes`, which
-      # fails if this step is removed or becomes conditional. Quoted for the
-      # same trailing-`::` YAML reason as above.
-      - name: Run audit-export opt-in-cost guards (also on docs-only PRs)
-        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration audit_export_docs::"
-
-      # Issue #1810: online-migration lock safety. A migration after the
-      # cutoff must have a non-zero `lock_timeout` in force when it locks a
-      # hot table. It must build or drop a hot-table index with CONCURRENTLY.
-      # The lint reads `up.sql` files only and needs no database. It reuses
-      # the test binary that the steps above build.
-      #
-      # Guarded by `migration_lock_safety::the_lint_runs_in_the_ci_lint_job`.
-      # That test fails if this step leaves the `lint` job or gains an `if:`.
-      # See docs/upgrading/online-migrations.md.
-      - name: "Online-migration lock-safety lint (issue #1810)"
-        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration migration_lock_safety::"
-
-      # Folio corpus harness: internal link check across all of docs/ (see
-      # docs/audits/corpus-link-check.py). Same reasoning as the docs-only
-      # guards above — a broken link is exactly the change class a docs-only
-      # PR is most likely to introduce, and the `test` matrix below skips
-      # entirely on docs-only changes. Pure Python stdlib, no deps, no
-      # network — costs a couple of seconds. Exits 1 only on a broken link
-      # inside the reader corpus; a broken link inside docs/plans/,
-      # docs/changelog.d/, docs/rnd/, docs/assays/, or docs/perf-artifacts/
-      # (historical/process records, not indexed reference pages) is
-      # reported but does not fail the build. Orphan pages are reported,
-      # not gated — an orphan is a findability defect to triage, not a hard
-      # error the way a dead link is.
-      - name: Folio corpus link check (docs/audits/corpus-link-check.py)
-        run: python3 docs/audits/corpus-link-check.py
-
-      # Folio corpus harness: config-key / env-var / CLI-flag drift scan (see
-      # docs/audits/config-cli-drift.py). Ground truth is extracted
-      # mechanically from autumn-harvest-plugin/src/config.rs and
-      # autumn-harvest-cli/src/lib.rs, so this stays accurate as the config
-      # schema and CLI evolve without hand-maintaining a list here. Pure
-      # Python stdlib, no deps, no network. Exits 1 only on a drift hit
-      # inside the reader corpus; a hit inside docs/plans/,
-      # docs/changelog.d/, docs/rnd/, docs/assays/, or docs/perf-artifacts/
-      # is reported but does not fail the build, matching the link-check
-      # convention above.
-      - name: Folio config/CLI drift scan (docs/audits/config-cli-drift.py)
-        run: python3 docs/audits/config-cli-drift.py
-
-      # Folio corpus harness: audit-catalog coverage scan (see
-      # docs/audits/audit-catalog-coverage.py). docs/audits/README.md is
-      # itself a docs page — the catalog a contributor reads to find out
-      # which audit scripts exist and whether each is wired into CI. This
-      # fails the build if a script lands in docs/audits/ without a row
-      # naming it there, so the catalog cannot silently fall behind the
-      # directory it describes. Pure Python stdlib, no deps, no network.
-      - name: Folio audit-catalog coverage (docs/audits/audit-catalog-coverage.py)
-        run: python3 docs/audits/audit-catalog-coverage.py
-
-      # Issue #1831: a tracked binary or a patch leftover fails the build.
-      # The script lists the binaries that the repository needs.
-      - name: Tracked artifacts (docs/audits/tracked-artifacts.py)
-        run: |
-          python3 docs/audits/tracked-artifacts.py --self-test
-          python3 docs/audits/tracked-artifacts.py
-
-      # Issue #1831: a doc claim that shipped code made false fails the build.
-      - name: Doc claim drift (docs/audits/doc-claim-drift.py)
-        run: |
-          python3 docs/audits/doc-claim-drift.py --self-test
-          python3 docs/audits/doc-claim-drift.py
-
-      # Issue #1614: the standalone getting-started chapter shows the files of
-      # examples/standalone-quickstart byte for byte, and keeps the markers
-      # that the `standalone-chapter` job runs.
-      - name: Standalone chapter sync (docs/audits/standalone-chapter-sync.py)
-        run: |
-          python3 docs/audits/standalone-chapter-sync.py --self-test
-          python3 docs/audits/standalone-chapter-sync.py
-
-      # Folio corpus harness: Rust syntax check for every ```rust fence in
-      # docs/getting-started/*.md and README.md (see
-      # docs/audits/doc-snippet-syntax.py). These are the front-door
-      # snippets — the fastest documented path promises "nothing to
-      # configure", and every later chapter's fenced block is something a
-      # reader on that path copies into their own editor. Uses only
-      # `rustfmt` (installed above via `components: rustfmt`), never
-      # `cargo`, so it costs a couple of seconds and needs no network or
-      # `target/`. It is a syntax check, not a compile check — see the
-      # script's own docstring for why that scope is deliberate. Exits 1
-      # only on a block that fails to parse and is not a documented
-      # fragment exception (a bare `.method(...)` continuation line, listed
-      # by name in the script).
-      - name: Folio doc-snippet syntax check (docs/audits/doc-snippet-syntax.py)
-        run: python3 docs/audits/doc-snippet-syntax.py
-
-      # Comment hygiene across the Rust sources (see
-      # docs/audits/comment-hygiene.py). Two tiers, and the split is the
-      # point: Tier A (commented-out code, an unreferenced TODO, a narrative
-      # aside, a blank comment line at a block edge) is at zero and must stay
-      # there; Tier B (review-round archaeology, contractions, sentences over
-      # ASD-STE100's 25-word ceiling) is ratcheted against the merge base --
-      # a change may not ADD one to a file it touches, and the legacy
-      # population stays until someone chooses to fix it.
-      #
-      # This deliberately does NOT cap comment length. The long rationale
-      # blocks in this tree are load-bearing — the ABBA lock-ordering argument
-      # at `materialize_due_child_timeout_deadlines`, the `cohort`-key
-      # argument in `partition.rs`, the codec-rotation scope guarantee
-      # CLAUDE.md cites — and a word budget would reward deleting exactly
-      # those. Tier B is per-SENTENCE, so a long block passes once it is
-      # written as several sentences.
-      #
-      # Runs here, in the ungated `lint` job, for the same reason as the
-      # guards above: it is pure Python stdlib (no deps, no network, a couple
-      # of seconds), and it must not be skipped by the docs-only filter.
-      # Pure filesystem — it never builds the crates, so it stays cheap.
-      #
-      # The self-test runs first: the rules are only as good as the lexer that
-      # finds the comments, and it must keep handling raw strings, nested block
-      # comments, lifetime ticks and backslash-newline continuations. A silent
-      # regression there would quietly stop gating rather than fail loudly.
-      #
-      # `--base` scopes Tier B to the files this change actually touched.
-      # That is what makes the ratchet usable rather than a softening: a
-      # whole-corpus count is a shared mutable number, so one merge adding a
-      # long comment anywhere turns every open PR red for a file its author
-      # never opened. (Observed on this PR's own first run: trunk-dev gained
-      # 4 long sentences in cross_region_dr_tests.rs and failed the gate.)
-      # The predictable response is to regenerate the baseline, which defeats
-      # the ratchet entirely. Tier A is never scoped -- it gates everywhere.
-      # Both copies: the crate one is served, the docs one is read. Runs here
-      # because a hand-edit of either is a docs-only change, which skips the
-      # test matrix. Freshness is checked there, by `openapi_spec`.
-      #
-      # `setup-python` because the image's system Python refuses `pip install`
-      # (PEP 668). The validator is pinned so its releases cannot redden lint.
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.12"
-      - name: Validate the OpenAPI document
-        run: |
-          python3 -m pip install --quiet --disable-pip-version-check \
-            "openapi-spec-validator==0.9.0"
-          python3 -m openapi_spec_validator docs/openapi.json
-          python3 -m openapi_spec_validator autumn-harvest-plugin/openapi.json
-
-      # Workflow YAML parse check (see docs/audits/workflow-yaml-parse.py).
-      # GitHub runs an unparsable workflow file as a zero-job failed run on
-      # every push and never fires its triggers. chaos.yml sat in that state
-      # from its first commit, so its nightly suite never ran. Runs after
-      # `setup-python` above, which is where PyYAML can be installed. The pin
-      # keeps a PyYAML release from reddening lint.
-      - name: Workflow YAML parses (docs/audits/workflow-yaml-parse.py)
-        run: |
-          python3 -m pip install --quiet --disable-pip-version-check "PyYAML==6.0.2"
-          python3 docs/audits/workflow-yaml-parse.py
-
-      # Supply-chain pin lint (issue #1826, docs/audits/action-sha-pin.py).
-      # A tag or branch ref can move to new code. Each `uses:` must pin a
-      # commit SHA with a `# <tag>` comment. The self-test runs first. Runs
-      # after the PyYAML install above, because the script parses YAML.
-      - name: Action SHA pins (docs/audits/action-sha-pin.py)
-        run: |
-          python3 docs/audits/action-sha-pin.py --self-test
-          python3 docs/audits/action-sha-pin.py
-
-      # Issue #1828. The rolling-deploy contract page and the
-      # `mixed-version-smoke` job must both exist and name each other.
-      - name: Mixed-version contract guard (docs/audits/mixed-version-contract.py)
-        run: |
-          python3 docs/audits/mixed-version-contract.py --self-test
-          python3 docs/audits/mixed-version-contract.py
-      # The smoke crate is not a workspace member, so `cargo fmt --all` skips it.
-      - name: Format check of the mixed-version smoke crate
-        run: rustfmt --edition 2024 --check scripts/mixed-version-smoke/src/*.rs
-
-      # The contract is what the OpenAPI document is generated from, so a
-      # status or a mandatory field missing there is missing from every
-      # generated client. Reads api.rs and the contract, builds nothing.
-      # The self-test runs first. It runs each fixture through the checks.
-      # A change to the parser that breaks a check fails CI.
-      - name: OpenAPI contract coverage (docs/audits/openapi-response-coverage.py)
-        run: |
-          python3 docs/audits/openapi-response-coverage.py --self-test
-          python3 docs/audits/openapi-response-coverage.py
-
-      # Comment hygiene. A PR ratchets against its merge base, or against
-      # the commit that added this gate if the merge base predates it. Only
-      # the release PR (trunk-dev into trunk) hits the second case, and only
-      # while trunk is older than the gate. Its merge base is then the last
-      # release. That counts the legacy debt from before the gate as new.
-      # The gate commit still checks the whole release cumulatively. That
-      # matters because a push run on trunk-dev can be cancelled, and two
-      # clean PRs can merge into a new finding.
-      - name: Comment hygiene (docs/audits/comment-hygiene.py)
-        env:
-          BASE_REF: ${{ github.base_ref }}
-        run: |
-          python3 docs/audits/comment-hygiene.py --self-test
-          BEFORE="${{ github.event.before }}"
-          if [ -n "$BASE_REF" ]; then
-            git fetch --no-tags origin "$BASE_REF"
-            BASE=FETCH_HEAD
-            GATE=$(git log --diff-filter=A --format=%H -1 -- docs/audits/comment-hygiene.py)
-            MB=$(git merge-base FETCH_HEAD HEAD || true)
-            if [ -n "$GATE" ] && [ -n "$MB" ] \
-              && ! git merge-base --is-ancestor "$GATE" "$MB"; then
-              BASE="$GATE"
-            fi
-            python3 docs/audits/comment-hygiene.py --base "$BASE"
-          elif [ -n "$BEFORE" ] \
-            && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
-            # The whole push, not just its last commit. `HEAD~1` would let a
-            # violation introduced by an earlier commit of a multi-commit push
-            # through, in any file the final commit did not also touch.
-            python3 docs/audits/comment-hygiene.py --base "$BEFORE"
-          else
-            # A branch's first push has no before-SHA to diff against. Tier A
-            # still gates; Tier B reports.
-            python3 docs/audits/comment-hygiene.py
-          fi
-
-      # Folio corpus harness: test-db-linux per-shard weight drift report
-      # (see docs/audits/shard-weight-drift.py). Report-only (always exits
-      # 0): the script's own docstring explains why gating now would redden
-      # every open PR on a pre-existing collision this step cannot itself
-      # fix. Pure Python stdlib, no deps, no network, no cargo build.
-      - name: Shard-weight drift report (docs/audits/shard-weight-drift.py)
-        run: python3 docs/audits/shard-weight-drift.py
-
   test:
     name: Test (${{ matrix.os }})
     needs: [lint, changes]
@@ -824,347 +228,135 @@ jobs:
       # conclusion. The expensive cargo steps below carry the docs-only guard;
       # when they all skip, the leg reports success — keeping the required
       # `Test (<os>)` contexts satisfied without running the matrix work.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Run no-db tests
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features
       - name: Run classic (non-unified) DAG tests
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features db --lib
-      # Everything else non-DB used to run here too: ~30 individual crate/example
-      # `cargo test`/`build` steps plus the manifest-driven `compile`/`run allos`
-      # steps, all serial in this one leg. Split into the `test-nodb` job below,
-      # sharded 4-way per OS (docs/rnd/2026-09-04-ci-health-semaphore-followup.md
-      # measured the manifest `compile`+`run allos` pair alone at ~38% of the
-      # `windows-latest` leg) — see that job's comment for the full rationale,
-      # matching the `test-db-linux` split below it for the Docker-backed rows.
-      # `Run no-db tests` and `Run classic (non-unified) DAG tests` above stay
-      # here as this leg's own fast smoke check.
-      # Issue #684's signal/update-metric run targets SPECIFIC test paths across
-      # two modules (a multi-token `--` filter), which the single-`filter`-column
-      # manifest schema cannot represent; it stays a literal Docker-backed step.
-      - name: Run Docker-backed signal/update metric integration tests (issue #684)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest --test integration -- metrics_integration::update_completed_metric_fires_on_the_suspend_path nd_block_tests::genuine_terminal_with_undrained_signal_emits_signal_unhandled nd_block_tests::nd_blocked_cycle_does_not_emit_signal_unhandled --test-threads=1
-      # Issue #944's Kafka broker suite stays a literal Linux-only step rather
-      # than a manifest row: it needs the apt install below first, and the
-      # manifest's `compile` mode would try to build vendored librdkafka on the
-      # macOS and Windows legs too. Its ALLOWLIST entry in `ci_run_coverage.rs`
-      # points here. (The SQS broker suite IS a manifest row — `aws-sdk-sqs` is
-      # pure Rust and compiles everywhere.)
-      - name: Install librdkafka build deps (Linux)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
-      - name: Run plugin Kafka broker connector tests (issue #944)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo test -p autumn-harvest-plugin --features kafka --test connector_kafka_broker -- --test-threads=1
-
-  # Split out of `test`'s three OS legs (docs/rnd/2026-09-04-ci-health-semaphore-followup.md):
-  # with the `linux`/`linuxpart` Docker-backed rows already moved to
-  # `test-db-linux` below, the next-largest cost on the still-serial `test` leg
-  # was the REST of its non-DB work -- ~30 individual crate/example
-  # `cargo test`/`cargo build` steps plus the two manifest-driven
-  # `run-suites.sh compile` / `run-suites.sh run allos` steps -- measured on
-  # `windows-latest` (the leg that split left as the long pole) at ~38% of that
-  # leg's wall time for the manifest pair alone (28.3 + 13.8 of 110.9 minutes),
-  # with `Compile db-backed tests` and `Run all-features lib tests` adding
-  # more. None of it needs a live database, so it shards freely: every shard
-  # gets its own checkout and its own slice of the work, in parallel, on every
-  # OS `test` itself runs on.
-  #
-  # Two sharding mechanisms meet here:
-  #   * The manifest-driven steps (`compile`, `run allos`) use `run-suites.sh`'s
-  #     OWN row-ordinal sharding (SEMAPHORE_SHARD_COUNT/INDEX below) -- every
-  #     shard runs the SAME two steps, each processing a disjoint slice of the
-  #     manifest rows. See run-suites.sh's header comment for why a filtered,
-  #     already-sorted row list still batches correctly.
-  #   * The ~30 individual steps carried over from `test` have no such
-  #     mechanism (each is its own crate/example, not a manifest row), so they
-  #     are round-robin assigned to one shard each via `matrix.shard == N` --
-  #     by COUNT, not by measured per-step time (no such measurement exists for
-  #     macOS/Windows), so the four shards are approximately, not exactly, even.
-  #
-  # A SEPARATE job, not a matrix dimension added to `test`, for the same reason
-  # `test-db-linux` is one: `test`'s three legs are branch-protection required
-  # checks BY NAME, and adding a dimension to that job would change those
-  # checks' identities. This job runs alongside `test` instead.
-  #
-  # IMPORTANT — not yet enforced: like `test-db-linux` below, this job is NOT a
-  # required status check. Branch protection must be updated by a repo admin
-  # (Settings -> Branches) to require `Test (no-db, <os>, shard N)` for every
-  # OS x shard combination below, or a red shard will not block merging -- see
-  # the `test-db-linux` job's comment and
-  # docs/rnd/2026-09-04-ci-health-semaphore-followup.md for the same gap,
-  # already open for that job's 10 shards.
-  test-nodb:
-    name: "Test (no-db, ${{ matrix.os }}, shard ${{ matrix.shard }})"
-    needs: [lint, changes]
-    # Same draft-skip / step-level docs-only gating pattern as `test` and
-    # `test-db-linux` (see their comments): job-level `if:` only gates draft-PR
-    # pushes, so every OS x shard leg still spins up and reports a conclusion;
-    # `needs.changes.outputs.code` gates the actual work per step.
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        # Must stay length 4 to match SEMAPHORE_SHARD_COUNT below (see
-        # `test-db-linux`'s identical caveat -- GitHub Actions matrix
-        # expressions can't derive one count from the other).
-        shard: [0, 1, 2, 3]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          # Shared across a given OS's 4 shards (they build the same
-          # Cargo.lock), so a shard needing a binary another shard already
-          # built doesn't start cold -- same reasoning as `test-db-linux`'s
-          # `shared-key`, but per-OS since these three OSes don't share a cache.
-          shared-key: test-nodb-${{ matrix.os }}
-      # Same disk-pressure guard as the pre-split `test` job carried
-      # immediately before this step; every shard on Linux gets its own runner,
-      # so it's cheap (a few seconds) to run per shard rather than build a
-      # cross-shard skip mechanism for it.
-      - name: Free runner disk before heavy plugin link (Linux)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
-          sudo docker image prune --all --force > /dev/null 2>&1 || true
-          df -h /
-      # ── Manifest-driven, self-sharded (every shard runs both, each on its
-      # own slice of the matching rows) ───────────────────────────────────
-      - name: Compile plugin integration test suites (manifest, all OSes)
-        if: needs.changes.outputs.code == 'true'
-        shell: bash
-        env:
-          SEMAPHORE_SHARD_COUNT: "4"
-          SEMAPHORE_SHARD_INDEX: ${{ matrix.shard }}
-        run: bash .github/ci/run-suites.sh compile
-      - name: Run all-OS manifest suites (no live DB)
-        if: needs.changes.outputs.code == 'true'
-        shell: bash
-        env:
-          SEMAPHORE_SHARD_COUNT: "4"
-          SEMAPHORE_SHARD_INDEX: ${{ matrix.shard }}
-        run: bash .github/ci/run-suites.sh run allos
-      # ── Individual crate/example steps carried over from `test`, round-robin
-      # assigned one shard each (see the job comment above) ─────────────────
       - name: Compile db-backed tests
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 0
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --all-features --tests --no-run
       # Issue #786: the claim/enqueue benchmark shares its harness with the
       # CI-gated budget assertion (`claim_budget_tests`, run Docker-backed via
-      # the manifest in `test-db-linux`). Compile-checking it here keeps the
-      # published `docs/performance.md` report from bit-rotting; `cargo bench`
-      # itself is deliberately NOT run per-PR, since the measurement is
-      # minutes-long and the *gate* is the test, not the report.
+      # the manifest below). Compile-checking it here keeps the published
+      # `docs/performance.md` report from bit-rotting; `cargo bench` itself is
+      # deliberately NOT run per-PR, since the measurement is minutes-long and
+      # the *gate* is the test, not the report.
       #
-      # Linux-only: bit-rot protection needs exactly one OS, and the benchmark
-      # is only ever *run* on Linux (see the manifest). `Compile db-backed
-      # tests` above compiles the same harness module on every OS, so
-      # restricting this one costs no coverage.
-      # The task-queue hygiene bench (issue #1811) shares the claim harness
-      # and includes the hygiene migration by path, so it rots with either.
+      # Linux-only: bit-rot protection needs exactly one OS, and the benchmark is
+      # only ever *run* on Linux (see the manifest). The macOS and Windows legs
+      # already compile the same harness module through the `--all-features
+      # --tests --no-run` step above, so restricting this one costs no coverage
+      # and saves two legs' worth of minutes.
       - name: Compile claim/enqueue benchmark (issue #786)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 1
-        run: |
-          cargo bench -p autumn-harvest --features db --bench claim_bench --no-run
-          cargo bench -p autumn-harvest --features db --bench task_queue_hygiene_bench --no-run
-      # Same bit-rot protection for the end-to-end suite (issue #941), and for
-      # the same reason: nothing else compiles a bench TARGET. `--tests` above
-      # covers the shared harness module, but not `e2e_bench.rs` itself -- and
-      # not `replay_bench.rs`, which now pulls that harness in and so acquired
-      # a real build break under default features that no CI step would have
-      # caught. Two invocations because the two benches enable different
-      # feature sets.
-      - name: Compile end-to-end benchmark (issue #941)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 2
-        run: |
-          cargo bench -p autumn-harvest --features db,testing --bench e2e_bench --no-run
-          cargo bench -p autumn-harvest --features testing --bench replay_bench --no-run
-      # Same bit-rot protection for the diagnose-latency benchmark (issue
-      # #1194, following up on issue #809's unverified `p95 < 500 ms` claim).
-      # `cargo bench` itself is not run per-PR for the same reason as #786:
-      # the measurement is minutes-long against a real Postgres, and the gate
-      # here is that the bench still compiles, not that it runs. No
-      # `--features`: `autumn-harvest-plugin` unconditionally depends on
-      # `autumn-harvest` with `db`/`testing` already enabled.
-      - name: Compile diagnose benchmark (issue #1194)
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: cargo bench -p autumn-harvest-plugin --bench diagnose_bench --no-run
+        run: cargo bench -p autumn-harvest --features db --bench claim_bench --no-run
       - name: Run all-features lib tests
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --all-features --lib
+      - name: Free disk space
+        if: needs.changes.outputs.code == 'true'
+        run: cargo clean
       - name: Run plugin lib tests
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 0
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --lib
       - name: Run plugin lib tests (webhooks feature, issue #618 outbound-delegate gating)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --features webhooks --lib
       - name: Run plugin connector tests (issue #944)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --features connectors --lib connector
-      # Issue #1287 review: the manifest's `dev_runtime_tests` row (features
-      # `dev-runtime`) and `dev_runtime_managed` row (`compileonly`, so
-      # `--no-run` only) never exercise this crate's `--lib` target, so the
-      # inline `#[cfg(test)]` unit tests inside `src/dev/reaper.rs` and
-      # `src/dev/acquire.rs` — including the Windows-specific
-      # `directory_is_ours` regression tests this issue added — were never
-      # actually built or run on any OS. `dev-runtime-managed` (a superset of
-      # `dev-runtime`) covers both files' tests in one step, on every OS this
-      # job's matrix runs, `windows-latest` included.
-      - name: Run plugin lib tests (dev-runtime-managed feature, issue #1287)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
-        run: cargo test -p autumn-harvest-plugin --features dev-runtime-managed --lib
-      # Issue #1312. The `redis` feature changes two config paths: it accepts
-      # `[harvest.redis] url` instead of rejecting it, and it compiles the
-      # channel install. `--lib` without the feature covers neither, so the
-      # feature needs its own lib-test leg beside the other per-feature ones.
-      - name: Run plugin lib tests (redis feature, issue #1312)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
-        run: cargo test -p autumn-harvest-plugin --features redis --lib
-      # Issue #1825. The AWS KMS binding for the AEAD codec key provider runs
-      # against a local fake KMS endpoint, so it needs no AWS account.
-      - name: Run plugin lib tests (aws-kms feature, issue #1825)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
-        run: cargo test -p autumn-harvest-plugin --features aws-kms --lib aws_kms
       # No CI step ran the plugin's doctests, so a broken `///` example landed
       # silently (issue #944 review found exactly that). These are compile-only
       # (`no_run`), so they cost seconds and need no database.
       - name: Run plugin doctests (issue #944 review)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
+        if: needs.changes.outputs.code == 'true'
         run: cargo test --doc -p autumn-harvest-plugin --features connectors
       - name: Run plugin MCP tool tests (issue #597, DAG MCP tools issue #601 follow-up)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 0
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --features mcp,unified-dag-execution --lib --test mcp_tools_http_tests
       - name: Run plugin metrics scrape tests (issue #355)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --features metrics --lib --test metrics_scrape_http_tests
       - name: Compile plugin metrics scrape example
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
+        if: needs.changes.outputs.code == 'true'
         run: cargo build -p autumn-harvest-plugin --example metrics_scrape_quickstart --features metrics
       # `aws-sdk-sqs` is pure Rust, so the SQS example builds on every OS.
       - name: Compile plugin SQS connector example (issue #944)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
+        if: needs.changes.outputs.code == 'true'
         run: cargo build -p autumn-harvest-plugin --example sqs_connector_quickstart --features sqs
       # issue #944: the Kafka example is the success metric's measured artifact
       # (see tests/connector_example_budget.rs), so it must keep compiling.
       # Linux-only for the same librdkafka reason as the broker suite.
       - name: Compile plugin Kafka connector example (issue #944, Linux)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 0
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: |
           sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
           cargo build -p autumn-harvest-plugin --example kafka_connector_quickstart --features kafka
       - name: Run macros tests
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-macros
       - name: Run CLI tests (issue #753)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-cli
       - name: Run autumn-harvest-sqlite tests (issue #1068)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-sqlite
-      # The agent-daemon example's suite is offline: a scripted stub model, no
-      # API key, and no network. Linux only, because the daemon's control
-      # surface is a Unix domain socket.
-      - name: Run claude-agent-daemon example tests
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 3
-        run: cargo test -p claude-agent-daemon
-      # Issue #1312. `--lib` only: the crate's integration suites need a live
-      # Redis (and, for the end-to-end suite, a live Postgres), so they run on
-      # the Docker-backed `test-db-linux` job through the manifest instead.
-      - name: Run autumn-harvest-redis unit tests (issue #1312)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
-        run: cargo test -p autumn-harvest-redis --lib
-      # No CI job ever built or ran these three example crates' own test
-      # suites. Each ships real, in-memory (`WorkflowSimulator`) tests for the
-      # documented pattern it exists to demonstrate -- saga-choreography's
-      # signal/child-workflow saga (docs/getting-started/04-signals.md tells a
-      # reader to run `cargo test -p saga-choreography` directly),
-      # billing-autumn-web's checkout saga (README.md's first pointer past
-      # hello-world), and standalone-runner's plain-Axum embedding -- but
-      # nothing before this step exercised any of them beyond `cargo build`.
-      # The only existing coverage was narrow grep guards for specific past
-      # docs defects (check-search-attr-query-syntax.sh,
-      # check-readme-testing-dep-version.sh, check-no-powershell-env-syntax.sh),
-      # none of which touch the crates' own assertions. None need a live
-      # database, so they run here rather than on `test-db-linux`.
-      - name: Run saga-choreography example tests
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 0
-        run: cargo test -p saga-choreography
-      - name: Run billing-autumn-web example tests
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
-        run: cargo test -p billing-autumn-web
-      # Issue #1615. `--bins` runs the unit tests, including the guards that
-      # fail when the manifest or the source names autumn-web. The
-      # `acceptance` suite needs Postgres, so it runs from the manifest on
-      # `test-db-linux`.
-      - name: Run standalone-runner example tests
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
-        run: cargo test -p standalone-runner --bins
-      - name: "Run standalone-quickstart example tests (issue #1614)"
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
-        run: cargo test -p standalone-quickstart
       - name: Run business_metrics example tests (issue #758)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 0
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example business_metrics
       - name: Run typed_workflow_failure example tests (issue #767)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example typed_workflow_failure
       - name: Run activity_ctx_info example tests (issue #783)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example activity_ctx_info
       - name: Run activity_interceptor example tests (issue #680)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example activity_interceptor
       - name: Run child_with_timeout example tests (issue #779)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 0
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example child_with_timeout
       - name: Run replay_debugger example tests (issue #949)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features debugger --example replay_debugger
       - name: Run long_lived_entity_deadline example tests (issue #772)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example long_lived_entity_deadline
       # Quoted: an unquoted `#` after whitespace starts a YAML comment, which
       # would silently truncate the step name at "(issue".
       - name: "Run temporal_port_subscription_renewal example tests (issue #947)"
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example temporal_port_subscription_renewal
       - name: Run dag_data_flow example tests (issue #702)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 0
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing,unified-dag-execution --example dag_data_flow
       # Quoted: an unquoted `#` after whitespace starts a YAML comment, which
       # would silently truncate the step name at "(issue".
       - name: "Run dag_compensation example tests (issue #780)"
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing,unified-dag-execution --example dag_compensation
       - name: Run interface_schema_workflow example tests (issue #610)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing,schema --example interface_schema_workflow
       - name: Run entity_phase_transition example tests (issue #803)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example entity_phase_transition
       - name: Run mutex_ledger example tests (issue #691)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 0
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example mutex_ledger
       - name: Run workflow_logs example tests (issue #790)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example workflow_logs
       - name: Run fanout_batch example tests (issue #750)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example fanout_batch
       - name: Run business_day_escalation example tests (issue #806)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
+        if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example business_day_escalation
       # The WASM example is a `main()` that self-asserts the sandbox contract
       # (echo round-trip, a granted capability, and an ungranted import denied as
@@ -1173,7 +365,7 @@ jobs:
       # which drags in wasmtime — a multi-minute build not worth paying on three
       # legs, and the macOS/Windows legs never build core examples at all.
       - name: Run wasm_activity example (issue #965)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 0
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo run -p autumn-harvest --features wasm-activities --example wasm_activity
       # Issue #794: the schema-contract gate, end to end. Generates the
       # currently-published schemas from the example registry, then diffs them
@@ -1184,10 +376,10 @@ jobs:
       # Linux-only, matching the benchmark bit-rot guard above: schema drift is
       # a property of the checked-in artifact, not of the OS, so one leg proves
       # it. The step builds twice (`--features schema` pulls schemars; the CLI
-      # links the whole `harvest` binary), so restricting it saves runner
-      # minutes for zero added coverage.
+      # links the whole `harvest` binary), so restricting it saves two legs'
+      # worth of minutes for zero added coverage.
       - name: "Gate workflow payload-schema changes (issue #794)"
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 1
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         shell: bash
         env:
           BASE_SHA: ${{ needs.changes.outputs.base_sha }}
@@ -1231,655 +423,66 @@ jobs:
           else
             echo "no artifact at ${BASE_SHA} — first introduction, nothing to compare"
           fi
-
-  # Split out of `test`'s `ubuntu-latest` leg (docs/rnd/2026-09-03-ci-health-semaphore.md):
-  # the `linux`/`linuxpart` Docker-backed manifest rows used to run there as one
-  # serial step, consistently ~55-58% of that leg's wall time across three
-  # sampled runs. Sharded across parallel jobs here instead, each processing
-  # row_ordinal % SEMAPHORE_SHARD_COUNT == SEMAPHORE_SHARD_INDEX of the
-  # matching manifest rows (see `run-suites.sh`'s header comment). Safe to
-  # shard freely: the few suites needing in-process serialization
-  # (`mutex_tests.rs`, `transactional_start_tests.rs` -- process-global state,
-  # not shared-database state) still get their own `--test-threads=1`
-  # regardless of which shard runs them; sharding only changes which manifest
-  # ROWS a given job processes, never the ordering of tests WITHIN one row's
-  # own `cargo test` invocation.
-  #
-  # A SEPARATE job, not a matrix dimension added to `test`: `test`'s
-  # `ubuntu-latest` leg is a branch-protection required check BY NAME, and
-  # restructuring it would leave that required check permanently unsatisfied
-  # until someone updates branch protection by hand. This job runs alongside
-  # `test` instead, without touching that name or its contents beyond removing
-  # the two steps that moved here.
-  #
-  # IMPORTANT — not yet enforced: this job is NOT a required status check.
-  # Branch protection must be updated by a repo admin (Settings -> Branches)
-  # to require `Test DB (linux, shard N)` for every N below, or a red shard
-  # will not block merging. Changing branch protection is outside what a CI
-  # config change can do on its own.
-  test-db-linux:
-    name: Test DB (linux, shard ${{ matrix.shard }})
-    needs: [lint, changes]
-    # Same draft-skip pattern as `test` (see its comment above): job-level
-    # `if:` only gates draft-PR pushes, so every shard leg still spins up and
-    # reports a conclusion; the step-level `needs.changes.outputs.code` guard
-    # below skips the actual work on docs-only changes without leaving the leg
-    # context un-created (a job-level `if:` on a matrix job that evaluates
-    # false prevents matrix expansion entirely -- see `test`'s comment).
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
-    strategy:
-      fail-fast: false
-      # SEMAPHORE_SHARD_COUNT below MUST equal this list's length -- GitHub
-      # Actions matrix expressions can't derive one from the other, so keep
-      # them in sync by hand when changing the shard count.
-      #
-      # 21, not 11 (issue #1685 review; see also PR #1703's
-      # `docs/audits/shard-weight-drift.py`, a report-only harness that
-      # independently reaches the same "no N is collision-free" finding
-      # below with a more careful count -- it resolves substring-matched
-      # manifest filters and plugin-crate rows this comment's own earlier
-      # drafts undercounted). 11 was chosen (issue #1267) to break a 10-row
-      # gap between `integration_e2e` and `quota_enforcement_tests`, the
-      # manifest's two largest suites at the time. The manifest keeps
-      # growing alphabetically, and their gap silently drifted back onto a
-      # value 11 cannot tolerate either. That drift is real and confirmed.
-      #
-      # This comment went through eight rounds of correction (kept here
-      # rather than silently rewritten, since a later commit's diff is not
-      # where a future reader will look for this history):
-      #
-      # Round 1 computed weight from `autumn-harvest/integration` rows
-      # only, flattening every `autumn-harvest-plugin` row to weight 1
-      # (`ui_integration` alone is 148 tests) -- and separately mislabeled
-      # which shard was heaviest under that undercount (claimed shard 0 at
-      # 323). Chose 17.
-      #
-      # Round 2 (Codex review) fixed the mislabeling -- shard 7, not shard
-      # 0, was actually heaviest (323 vs shard 0's 268) -- but left the
-      # plugin-row undercount itself in place. Still chose 17.
-      #
-      # Round 3 (Codex review) found the real bug behind both: five
-      # manifest `filter` values are Cargo substring/prefix matches, not
-      # filenames, so the naive per-row weight lookup silently scored them
-      # 0. Switched to PR #1703's `docs/audits/shard-weight-drift.py`, a
-      # harness that resolves plugin-crate rows and substring filters
-      # correctly, and re-swept N=9-24 with it. 20 came out best in that
-      # range (max 247, versus 17's true max, which is higher than round
-      # 2 ever computed). Chose 20.
-      #
-      # Round 4: this PR's own live CI reproduced the
-      # `quota_enforcement_tests` hang again, on shard 4 under the new
-      # N=20 layout -- a shard confirmed isolated from every other heavy
-      # (>=30-test) suite. An earlier draft of this history claimed that
-      # recurrence "confirms shard load is not the cause"; Codex review
-      # correctly narrowed that to "rules out heavy-suite collision as a
-      # necessary condition," since one occurrence on a shard still running
-      # seven smaller suites cannot rule out load-sensitivity in general.
-      # No shard-count change.
-      #
-      # Round 5 (this one, Codex review): the N=9-24 sweep behind round 3's
-      # choice only covered the sharded `run linux` step. The same job also
-      # runs `Integration suites (partitioned harvest_events layout)`
-      # unconditionally on `matrix.shard == 0` (below), re-running 9 more
-      # rows -- including a full second pass of `integration_e2e`, 118
-      # tests -- worth a fixed +188 that ALWAYS lands on shard 0 regardless
-      # of N. Under round 3's N=20, shard 0's own sharded rows already
-      # totaled 247 (`ui_integration` landed there); adding the fixed +188
-      # makes shard 0's true total 435 -- worse than the original N=11's
-      # own true max of 426. N=20 was, corrected, one of the WORST choices
-      # in the swept range, not the best.
-      #
-      # Re-swept N=9-24 with the fixed +188 correctly added to shard 0's
-      # total for every candidate. Best true max in that range: N=24 (261)
-      # and N=23 (262), essentially tied. Chose N=21 (true max 287, ~13%
-      # worse than the N=24/23 optimum) instead, for one reason with any
-      # independent merit left: `quota_enforcement_tests` lands on shard 2
-      # at N=21 with no co-resident heavy (>=30-test) suite, versus a
-      # 3-way collision at N=23 and a 2-way collision with `ui_integration`
-      # at N=24. That isolation is NOT established to help the actual hang
-      # (see below) -- it is the one property this fix can still honestly
-      # claim, at a real but small cost in overall balance.
-      #
-      # Round 6 (Codex review): round 5's own "426" figure for N=11 was
-      # never re-derived with the same +188 addition -- it was carried over
-      # from the ORIGINAL (pre-linuxpart-fix) sweep, where 426 was a
-      # different shard's total (shard 7), not shard 0's. Actually running
-      # the harness at N=11 finds shard 0 alone already totals 417 on the
-      # sharded rows -- nearly the old "max" by itself, before the fixed
-      # pass is even added. With it: shard 0's true total at N=11 is 605,
-      # not 426. That retracts round 5's claim that N=20 (435) was worse
-      # than doing nothing: N=20 is still better than N=11, just not the
-      # best available. Full corrected sweep (all of N=9-24, not a spot
-      # check): true max ranges from N=24's 261 (best) through N=11's 605
-      # (worst); N=21's 287 is third-best overall, ~53% below the true
-      # N=11 baseline (605), not the ~13%-worse-than-optimum framing round
-      # 5 gave in isolation. The N=21 choice itself is unchanged -- it
-      # remains the best option that also keeps `quota_enforcement_tests`
-      # isolated (checked directly: N=18, the next lower true-max candidate
-      # that also isolates it, is 316, still worse than N=21's 287).
-      #
-      # Round 7 (Codex review): round 6's isolation check above named only
-      # N=18 and N=20 as the other isolating candidates. Testing every
-      # N=9-24 directly against the harness's own heavy-collision function,
-      # rather than the two that had already come up in conversation, finds
-      # THREE more: N=9, N=10, N=14 all isolate `quota_enforcement_tests`
-      # too. None beats N=21 (their true maxima are 472, 520, and 429 --
-      # all worse than 287), so the shipped shard count does not change.
-      # Only the claim of an exhaustive check was wrong; it is exhaustive
-      # now (see the report's "🔍 Sixth correction" for the full N=9-24
-      # isolation table).
-      #
-      # No shard count in 9-24 is collision-free (confirmed, this round,
-      # under the corrected accounting too) -- a durable fix needs a
-      # weight-aware assignment that also accounts for the linuxpart pass,
-      # not a bigger modulus, and that is a bigger change than this fix
-      # attempts.
-      #
-      # Round 8 (Codex review): every round above measured test-WEIGHT
-      # redistribution and called the result a "CI-cost improvement." It
-      # isn't one. Ten more matrix jobs (11 -> 21) each pay their own fixed
-      # setup cost -- checkout, toolchain install, `rust-cache` restore,
-      # disk pruning, four Docker pulls -- regardless of how many tests
-      # they run; the 151 manifest rows are only redistributed, not
-      # reduced. Total GitHub Actions runner-minutes per run almost
-      # certainly goes UP, not down. Fitting `duration = fixed + rate *
-      # weight` against ten real `Test DB (linux, shard N)` job timings
-      # (from an unrelated PR's N=11 run, so uncontaminated by this PR's
-      # own changes) gives a rough fixed cost of ~16 min/job -- noisy, but
-      # not negligible: ~160 extra runner-minutes per CI run for the ten
-      # new jobs. The wall-clock benefit for the slowest shard specifically
-      # is real but smaller than the weight ratio implies once that fixed
-      # cost is included: ~30% (about 37.7 -> 26.5 min by the same fit),
-      # not 52.6%. That benefit also assumes the runner pool has spare
-      # concurrency for the extra jobs -- unverified this session; a
-      # constrained pool could queue the new shards and erode or eliminate
-      # the latency win while still paying the extra fixed cost. See the
-      # report's "🔍 Seventh correction" for the full derivation.
-      #
-      # Issue #1799 added 49 rows, so every later row ordinal moved. The
-      # isolation claim above no longer holds: at N=21,
-      # `quota_enforcement_tests` shares shard 9 with `integration_e2e`.
-      # Isolation did not fix the hang (see below), so N stays 21.
-      #
-      # Whether shard load explains `quota_enforcement_tests`'s recurring,
-      # exactly-at-the-configured-timeout hang at all -- named by the "🚦
-      # Semaphore" CI-health report series
-      # (docs/rnd/2026-09-*-ci-health-semaphore-quota-outbox-*.md) and
-      # multiple concurrent PRs (#1697, #1698, #1699, #1706 at the time of
-      # this fix) -- is NOT established, and this PR's own first CI run
-      # (see the report) reproduced the hang on an isolated shard, which
-      # rules out heavy-suite collision as a NECESSARY condition (not shard
-      # load or probabilistic causes in general -- see the report for that
-      # distinction). This change is offered as a real, measured
-      # worst-case wall-clock latency improvement for the slowest shard,
-      # traded against higher total compute cost -- not a CI-cost
-      # improvement, and not a claimed fix for the hang.
-      matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
-    runs-on: ubuntu-latest
-    # The shard count and index live here once. The pre-pull step and the
-    # suite step both read them, so a re-shard cannot leave the pre-pull
-    # asking about a different assignment than the suites run under. Keep
-    # the count equal to the `matrix.shard` list above. The partitioned pass
-    # at the end of this job overrides the count to run whole.
-    env:
-      SEMAPHORE_SHARD_COUNT: "21"
-      SEMAPHORE_SHARD_INDEX: ${{ matrix.shard }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          # One cache shared across all shards (they all build against the
-          # same Cargo.lock) rather than rust-cache's default per-job-name
-          # key, so a shard that needs a binary another shard already built
-          # doesn't start cold.
-          shared-key: test-db-linux
+      # ── Manifest-driven integration suites ──────────────────────────────
+      # The per-suite `cargo test` steps that used to live here are now data in
+      # `.github/ci/integration-suites.txt`, executed by `.github/ci/run-suites.sh`.
+      # Adding a suite is one sorted manifest line — no edit to this file. See
+      # `autumn-harvest/tests/integration/ci_run_coverage.rs` for the coverage
+      # guard that keeps the manifest honest. Per-step `if:` gating is preserved
+      # exactly (NOT hoisted to a job-level `if:` — see the note on the `test`
+      # job above); `shell: bash` resolves to Git Bash on Windows.
       - name: Free runner disk before heavy plugin link (Linux)
-        if: needs.changes.outputs.code == 'true'
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
             /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
           sudo docker image prune --all --force > /dev/null 2>&1 || true
           df -h /
-      # The prune above guarantees every shard pulls its testcontainer images
-      # from a cold cache. `testcontainers` itself retries nothing on a pull,
-      # so a transient registry blip (a real one: "bytes remaining on stream"
-      # failed this exact job on issue #1287's PR) fails whichever live-DB
-      # test happened to trigger the pull -- not a real test bug. Retrying
-      # the pull here, in its own step with its own budget, turns that into a
-      # retried infrastructure step instead of a flaky test.
-      #
-      # Every tag this job's suites actually request, not just the
-      # testcontainers-modules default (Codex review: the default alone left
-      # the suites that override it just as exposed as before):
-      # `postgres:11-alpine` (the unoverridden default -- `autumn-web`'s own
-      # `TestDb`, used by e.g. the webhook suites), `postgres:16` (the tag
-      # ~220 of this repo's own DB suites request via `.with_tag("16")`),
-      # `postgres:16-alpine` (one outlier suite's override), `redis:5.0`
-      # (Redis's default, un-overridden anywhere; needed by the issue #1312
-      # dispatch suites this job also forces via HARVEST_TEST_REQUIRE_REDIS
-      # below), `redis:7.4-alpine` (the TLS-only server of the issue #1834
-      # `tls_redis` suite; Redis 5 has no TLS), and
-      # `softwaremill/elasticmq:1.5.2` on the one shard that runs the
-      # `connector_sqs_broker` suite (its ElasticMQ default, which "bytes
-      # remaining on stream" failed on PR #1773 because it was not pre-pulled).
-      - name: Pre-pull Docker test images (retry transient pull failures)
+      - name: Compile plugin integration test suites (manifest, all OSes)
         if: needs.changes.outputs.code == 'true'
         shell: bash
-        run: |
-          images="postgres:11-alpine postgres:16 postgres:16-alpine redis:5.0 redis:7.4-alpine"
-          # Pull ElasticMQ only on the shard that runs `connector_sqs_broker`.
-          # The dry run prints this shard's cargo invocations without running
-          # them, so no shard number is hardcoded here. It is captured first:
-          # `grep -q` closing a pipe early would trip `pipefail`.
-          plan="$(DRY_RUN=1 bash .github/ci/run-suites.sh run linux)"
-          if grep -q -- '--test connector_sqs_broker' <<<"$plan"; then
-            images="$images softwaremill/elasticmq:1.5.2"
-          fi
-          for image in $images; do
-            for attempt in 1 2 3 4 5; do
-              if docker pull "$image"; then
-                continue 2
-              fi
-              echo "pull of $image failed (attempt $attempt/5)"
-              sleep $((attempt * 5))
-            done
-            echo "::error::failed to pull $image after 5 attempts"
-            exit 1
-          done
-      - name: Run Linux Docker-backed manifest suites (shard)
+        run: bash .github/ci/run-suites.sh compile
+      - name: Run all-OS manifest suites (no live DB)
         if: needs.changes.outputs.code == 'true'
         shell: bash
-        # Issue #525: `dev_runtime_lifecycle` skips itself when no PostgreSQL
-        # server binaries are discoverable. That skip is invisible to
-        # `ci_run_coverage.rs` (the suite uses no live-DB token), so without
-        # this the suite could silently stop testing anything and still report
-        # green. The Linux runner image ships them, so demanding them here
-        # turns "the image changed" into a red build. Applies regardless of
-        # which shard `dev_runtime_lifecycle`'s row lands in.
-        env:
-          HARVEST_DEV_REQUIRE_POSTGRES: "1"
-          # Issue #1312, contract C3. The Redis suites obtain a fixture from
-          # `HARVEST_REDIS_TEST_URL` or from a testcontainers Redis. Either
-          # source can go away without a test failing, because the suites skip
-          # themselves when no fixture is reachable. This flag turns that skip
-          # into a panic, so "the Redis suites stopped testing anything" is a
-          # red build here rather than a silent green.
-          HARVEST_TEST_REQUIRE_REDIS: "1"
+        run: bash .github/ci/run-suites.sh run allos
+      - name: Run Linux Docker-backed manifest suites (serial)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        shell: bash
         run: bash .github/ci/run-suites.sh run linux
-      # Issue #958, AC2: re-run the store/replay/retention suites against the
-      # opt-in PARTITIONED `harvest_events` layout. Same suites, same
-      # assertions, `HARVEST_TEST_PARTITIONED=1` -- so "per-execution event
-      # semantics are byte-identical between layouts" is asserted by the
-      # existing tests rather than by a separate set that could drift from
-      # them. Only 10 rows (~6 minutes unsharded) -- not worth splitting, so it
-      # runs whole, once, on shard 0 only.
-      - name: Integration suites (partitioned harvest_events layout)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 0
-        shell: bash
-        env:
-          # Empty count: run-suites.sh treats it as unsharded, so this pass
-          # runs all its rows on this one shard.
-          SEMAPHORE_SHARD_COUNT: ""
-        run: bash .github/ci/run-suites.sh run linuxpart
+      # Issue #684's signal/update-metric run targets SPECIFIC test paths across
+      # two modules (a multi-token `--` filter), which the single-`filter`-column
+      # manifest schema cannot represent; it stays a literal Docker-backed step.
+      - name: Run Docker-backed signal/update metric integration tests (issue #684)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest --test integration -- metrics_integration::update_completed_metric_fires_on_the_suspend_path nd_block_tests::genuine_terminal_with_undrained_signal_emits_signal_unhandled nd_block_tests::nd_blocked_cycle_does_not_emit_signal_unhandled --test-threads=1
+      # Issue #944's Kafka broker suite stays a literal Linux-only step rather
+      # than a manifest row: it needs the apt install below first, and the
+      # manifest's `compile` mode would try to build vendored librdkafka on the
+      # macOS and Windows legs too. Its ALLOWLIST entry in `ci_run_coverage.rs`
+      # points here. (The SQS broker suite IS a manifest row — `aws-sdk-sqs` is
+      # pure Rust and compiles everywhere.)
+      - name: Install librdkafka build deps (Linux)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+      - name: Run plugin Kafka broker connector tests (issue #944)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest-plugin --features kafka --test connector_kafka_broker -- --test-threads=1
 
   quickstart:
-    name: Quickstart example builds and runs (clean-room, README steps)
+    name: Quickstart example builds
     needs: changes
     # Draft-skip (see lint) + docs-only skip via the `changes` guard.
     if: >-
       (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
       needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    # Matches examples/quickstart/compose.yaml so AUTUMN_MANIFEST_DIR's autumn.toml
-    # connects verbatim, same as `docker compose -f examples/quickstart/compose.yaml up -d`.
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: quickstart
-          POSTGRES_PASSWORD: quickstart
-          POSTGRES_DB: quickstart
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U quickstart"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Build quickstart
         run: cargo build -p quickstart
-      - name: Run the exact README quickstart command and assert a workflow reaches COMPLETED
-        # `cargo build -p quickstart` alone never exercises this: the crate has
-        # two [[bin]] targets (quickstart, retry-jitter-example), and `cargo
-        # build` compiles both regardless of which one `cargo run` would pick.
-        # Only invoking the bare README command — the literal 5-minute-quickstart
-        # front door in README.md and examples/quickstart/README.md step 2 —
-        # catches an ambiguous-binary regression here. This step reproduces
-        # examples/quickstart/README.md steps 2 and 4 verbatim.
-        env:
-          AUTUMN_PROFILE: dev
-          AUTUMN_MANIFEST_DIR: examples/quickstart
-        run: |
-          set -uo pipefail
-          cargo run -p quickstart &
-          APP_PID=$!
-          trap 'kill "${APP_PID}" 2>/dev/null || true' EXIT
-
-          # 1. Wait for the app to become healthy (fail fast if it exits early).
-          healthy=false
-          for i in $(seq 1 60); do
-            if curl -sf -o /dev/null http://localhost:3000/api/harvest/health; then
-              echo "app healthy after ${i}s"; healthy=true; break
-            fi
-            if ! kill -0 "${APP_PID}" 2>/dev/null; then
-              echo "::error::quickstart app exited before becoming healthy"; exit 1
-            fi
-            sleep 1
-          done
-          if [ "${healthy}" != "true" ]; then
-            echo "::error::quickstart app never became healthy"; exit 1
-          fi
-
-          # 2. README step 3 — run preflight with the EXACT documented command.
-          #
-          # Two regression classes meet here, from two issues:
-          #
-          #   * #1319 — the bare `cargo run -p autumn-harvest-cli -- …` form the
-          #     docs use everywhere must resolve to a binary at all. Without
-          #     `default-run` cargo exits 101 ("could not determine which binary
-          #     to run") before the CLI parses a single argument.
-          #   * #1284 — the admin route behind it must actually answer. It 401'd
-          #     for every cookieless caller until the dev profile was taught to
-          #     admit one; only this step pins that against a REAL autumn-web
-          #     app, whose unconditional session layer inserts an empty
-          #     non-cookie-backed `Session` before the harvest router ever sees
-          #     the request — the shape that made the bug survive a plausible
-          #     fix.
-          #
-          # #1284 is FIXED as of this commit, so the 401 tolerance this step
-          # carried while that issue was open is deliberately GONE: a 401 here
-          # is now a regression, not a known outcome. Assert the raw status
-          # first so it reads as "401 came back" rather than as an opaque CLI
-          # exit code.
-          code="$(curl -s -o /dev/null -w '%{http_code}' \
-            http://localhost:3000/api/harvest/admin/preflight)"
-          echo "GET /admin/preflight -> ${code}"
-          if [ "${code}" = "401" ] || [ "${code}" = "403" ]; then
-            echo "::error::regression of issue #1284: the documented dev-profile preflight call is gated (${code}); AUTUMN_PROFILE=dev must serve the management API to an unauthenticated caller"
-            exit 1
-          fi
-          if [ "${code}" != "200" ]; then
-            echo "::error::preflight returned ${code}, expected 200"; exit 1
-          fi
-
-          # Then the documented command itself. Exit codes are deploy-gate
-          # friendly: 0 = pass, 2 = warn, 1 = fail or a transport/API error.
-          # Both 0 and 2 are accepted (a single-worker CI app can legitimately
-          # warn); 1 is not.
-          #
-          # Capturing the status is load-bearing: this step declares no
-          # `shell:`, so GitHub runs it with errexit already on, and the
-          # script's own `set -uo pipefail` adds `-u`/`pipefail` WITHOUT
-          # clearing it. A bare assignment from a command that exits nonzero
-          # would abort the step before the status could be read. An `if`
-          # condition is explicitly exempt from errexit, and capturing combined
-          # output also feeds the #1319 ambiguity check below.
-          if cli_out="$(cargo run -p autumn-harvest-cli -- \
-            --base-url http://localhost:3000/api/harvest preflight 2>&1)"; then
-            cli_status=0
-          else
-            cli_status=$?
-          fi
-          echo "${cli_out}"
-          echo "harvest preflight exit=${cli_status}"
-          if echo "${cli_out}" | grep -q "could not determine which binary to run"; then
-            echo "::error::regression of issue #1319: cargo run -p autumn-harvest-cli -- … is ambiguous (missing default-run)"; exit 1
-          fi
-          if [ "${cli_status}" != "0" ] && [ "${cli_status}" != "2" ]; then
-            echo "::error::harvest preflight exited ${cli_status}; README step 3 must pass (0) or warn (2), never fail"
-            exit 1
-          fi
-
-          # 3. Trigger the `greeting` workflow (README step 4) and capture its execution_id.
-          resp="$(curl -sf -X POST \
-            http://localhost:3000/api/harvest/workflows/greeting/start \
-            -H 'Content-Type: application/json' \
-            -d '{"workflow_id":"ci-1","input":"World"}')" || {
-              echo "::error::start request failed"; exit 1; }
-          echo "start response: ${resp}"
-          eid="$(echo "${resp}" | jq -r '.execution_id // empty')"
-          if [ -z "${eid}" ]; then
-            echo "::error::no execution_id in start response"; exit 1
-          fi
-
-          # 4. Poll until COMPLETED. The workflow has a 30s durable timer between
-          # its two activities, so this needs headroom well past 30s.
-          for i in $(seq 1 90); do
-            state="$(curl -s "http://localhost:3000/api/harvest/workflows/${eid}" \
-              | jq -r '.execution.state // empty' 2>/dev/null || true)"
-            echo "t=${i}s state=${state:-<none>}"
-            case "${state}" in
-              COMPLETED)
-                echo "workflow reached COMPLETED — quickstart runs end to end"; exit 0 ;;
-              FAILED|TIMED_OUT|TERMINATED|CANCELLED)
-                echo "::error::workflow reached terminal-but-not-completed state: ${state}"
-                exit 1 ;;
-            esac
-            sleep 1
-          done
-          echo "::error::workflow did not reach COMPLETED within the timeout"; exit 1
-
-  standalone-chapter:
-    name: "Standalone chapter runs as written (issue #1614)"
-    needs: changes
-    # Draft-skip (see lint). A code change runs this job. A docs-only change
-    # runs it only when it touches the chapter, its reference or its crate.
-    if: >-
-      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
-      (needs.changes.outputs.code == 'true' || needs.changes.outputs.chapter == 'true')
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    # Matches examples/standalone-quickstart/compose.yaml, so the chapter's
-    # DATABASE_URL connects as written.
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: harvest
-          POSTGRES_PASSWORD: harvest
-          POSTGRES_DB: harvest
-        ports:
-          - 5435:5432
-        options: >-
-          --health-cmd "pg_isready -U harvest"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # One package per command. The chapter runs each with `cargo run -p`,
-      # and a joint build resolves other features, so it would not be reused.
-      - name: Build the chapter's crate and the CLI
-        run: |
-          cargo build -p autumn-harvest-cli
-          cargo build -p standalone-quickstart
-      - name: Run the bash blocks of docs/getting-started/standalone-axum.md
-        run: ./scripts/run-standalone-chapter.sh
-      # The `docs/embedding.md` Rust fences compile as doctests. This job, not
-      # `lint`, runs them, because it already builds the plugin. A filter that
-      # matches nothing passes with "0 passed", so the step requires a pass.
-      - name: Compile the docs/embedding.md Rust blocks as doctests
-        run: |
-          set -o pipefail
-          cargo test -p autumn-harvest-plugin --features metrics,webhooks --doc EmbeddingDocSnippets 2>&1 | tee embedding-doctests.log
-          grep -Eq 'test result: ok\. [1-9][0-9]* passed' embedding-doctests.log
-
-  mixed-version-smoke:
-    name: "Mixed-version smoke: this tree and the previous release (issue #1828)"
-    needs: changes
-    # Draft-skip (see lint) + docs-only skip via the `changes` guard.
-    if: >-
-      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
-      needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: mvsmoke
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-    steps:
-      # Full history: the script finds the previous release by its tag.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # Two trees build here, so free the disk as the `test` job does.
-      - name: Free runner disk before two builds
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
-          sudo docker image prune --all --force > /dev/null 2>&1 || true
-          df -h /
-      # See docs/upgrading/README.md, "How CI proves the contract".
-      - name: Run the previous release and this tree on one database
-        env:
-          DATABASE_URL: postgres://postgres:postgres@localhost:5432/mvsmoke
-          # No debug info: it halves the size of two debug builds.
-          CARGO_PROFILE_DEV_DEBUG: "0"
-        run: ./scripts/run-mixed-version-smoke.sh
-
-  openapi-client-smoke:
-    name: Generated TypeScript client drives a running plugin
-    # IMPORTANT -- not yet enforced. Branch protection matches required checks
-    # by name, so this job blocks nothing until a repository admin adds it to
-    # the required set. Same caveat as `test-nodb` and `test-db-linux` above.
-    needs: changes
-    # Draft-skip (see lint) + docs-only skip via the `changes` guard.
-    if: >-
-      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
-      needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
-    # Matches examples/quickstart/autumn.toml, same as the `quickstart` job.
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: quickstart
-          POSTGRES_PASSWORD: quickstart
-          POSTGRES_DB: quickstart
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U quickstart"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "22"
-      - name: Build quickstart
-        run: cargo build -p quickstart
-      # Generated from the SERVED document, so this also proves the endpoint
-      # answers a real generator over real HTTP.
-      - name: Generate a typed client from the served document and drive it
-        env:
-          AUTUMN_PROFILE: dev
-          AUTUMN_MANIFEST_DIR: examples/quickstart
-          HARVEST_OPENAPI_URL: http://localhost:3000/api/harvest/openapi.json
-          HARVEST_BASE_URL: http://localhost:3000/api/harvest
-        run: |
-          set -uo pipefail
-          cargo run -p quickstart &
-          APP_PID=$!
-          trap 'kill "${APP_PID}" 2>/dev/null || true' EXIT
-
-          healthy=false
-          for i in $(seq 1 60); do
-            if curl -sf -o /dev/null http://localhost:3000/api/harvest/health; then
-              echo "app healthy after ${i}s"; healthy=true; break
-            fi
-            if ! kill -0 "${APP_PID}" 2>/dev/null; then
-              echo "::error::quickstart app exited before becoming healthy"; exit 1
-            fi
-            sleep 1
-          done
-          if [ "${healthy}" != "true" ]; then
-            echo "::error::quickstart app never became healthy"; exit 1
-          fi
-
-          # Served document must equal the checked-in artifact. `openapi_spec`
-          # proves it in process; this proves it over the wire.
-          curl -sf "${HARVEST_OPENAPI_URL}" | jq -S . > "${RUNNER_TEMP}/served.json"
-          jq -S . docs/openapi.json > "${RUNNER_TEMP}/artifact.json"
-          if ! diff -u "${RUNNER_TEMP}/artifact.json" "${RUNNER_TEMP}/served.json"; then
-            echo "::error::the served OpenAPI document differs from docs/openapi.json"
-            exit 1
-          fi
-
-          cd examples/typescript-client
-          # The registry is the one thing here that fails for unrelated
-          # reasons. Two tries, then it is real.
-          npm ci --no-audit --no-fund || (sleep 10 && npm ci --no-audit --no-fund)
-          npm run generate
-          npm run typecheck
-          npm start
-
-  typescript-client-package:
-    name: Published TypeScript client builds from docs/openapi.json
-    # Issue #1616. The release attaches this package, so a break must show
-    # here first. The job needs no app and no database.
-    # IMPORTANT -- not yet enforced. Branch protection matches required checks
-    # by name, so this job blocks nothing until a repository admin adds it to
-    # the required set.
-    needs: changes
-    # The job skips draft pull requests and docs-only changes. A contract or
-    # document change counts as code; see the `changes` job.
-    if: >-
-      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
-      needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "22"
-      # The script retries each npm registry call once. A type or test error
-      # fails at once.
-      - name: Generate, type-check, test, build and pack
-        run: scripts/build-typescript-client.sh
 
   scaffold-smoke:
     name: Scaffold builds and runs (harvest new)
@@ -1909,16 +512,14 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Scaffold a project with `harvest new`
         run: cargo run -p autumn-harvest-cli --bin harvest -- new demo_app --path "${RUNNER_TEMP}/scaffold"
       - name: Build the scaffolded project against the release candidates
-        # Harvest 0.7 is not available on crates.io until this release lands.
-        # Patch only the two workspace crates under test; autumn-web 0.8 still
+        # Harvest 0.6 is not available on crates.io until this release lands.
+        # Patch only the two workspace crates under test; autumn-web 0.7 still
         # resolves from crates.io, just as it will for users of `harvest new`.
         run: |
           cargo build --manifest-path "${RUNNER_TEMP}/scaffold/Cargo.toml" \
@@ -1988,279 +589,12 @@ jobs:
       (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
       needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    # `rust-toolchain.toml` pins the workspace to the current stable release,
-    # and rustup gives that file precedence over the `rustup default` the
-    # action sets. The environment variable outranks the file, so every
-    # cargo call in this job really compiles with the MSRV.
-    env:
-      RUSTUP_TOOLCHAIN: 1.88.0
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
-        with:
-          toolchain: "1.88.0"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
       - name: Check MSRV compiles
         run: cargo check --workspace
-      # `cargo check --workspace` builds default features only, so the
-      # optional `autumn-harvest-redis` dependency and the channel install in
-      # `runner.rs` never reach the MSRV compiler. Issue #1312.
-      - name: Check MSRV compiles (autumn-harvest-plugin redis feature, issue #1312)
-        run: cargo check -p autumn-harvest-plugin --features redis
-
-  # Concurrency model checking (issue #1800). The loom and Shuttle targets
-  # compile to empty crates unless RUSTFLAGS sets their cfg, so a normal
-  # `cargo test` never runs them. Each cfg rebuilds the crate, so each target
-  # has its own job and its own cache. Both use --no-default-features: under
-  # --cfg loom, tokio drops its `net` module, which `tokio-postgres` needs.
-  # Under --cfg shuttle, `slot_tuner` takes the Shuttle semaphore, which the
-  # db-gated `worker.rs` does not pass. See docs/testing/loom.md and
-  # docs/testing/shuttle.md. The guard in
-  # autumn-harvest/tests/integration/concurrency_model_ci.rs asserts this
-  # wiring.
-  #
-  # Branch protection lists required checks by name. Add "Loom models" and
-  # "Shuttle models" there to make these jobs required. A job that `if:`
-  # skips reports success, so a docs-only PR does not wait on them.
-  loom:
-    name: Loom models
-    needs: changes
-    # Draft-skip (see lint) + docs-only skip via the `changes` guard.
-    if: >-
-      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
-      needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
-    # The models run in under a second. The compile under --cfg loom is the
-    # bulk of the time.
-    timeout-minutes: 30
-    env:
-      RUSTFLAGS: "--cfg loom"
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: Run loom models
-        run: cargo test -p autumn-harvest --no-default-features --test loom_models --release
-
-  shuttle:
-    name: Shuttle models
-    needs: changes
-    # Draft-skip (see lint) + docs-only skip via the `changes` guard.
-    if: >-
-      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
-      needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
-    # The models run in under a second. The compile under --cfg shuttle is
-    # the bulk of the time.
-    timeout-minutes: 30
-    env:
-      RUSTFLAGS: "--cfg shuttle"
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: Run Shuttle models (random and PCT schedulers)
-        run: cargo test -p autumn-harvest --no-default-features --test shuttle_models --release
-
-  # TLA+ models of the core protocols (issue #1819). The runner checks each
-  # row of formal/tla/models.txt. A `violation:` row is a counter-example, and
-  # it must fail on its named invariant. See docs/testing/formal-methods.md.
-  formal-models:
-    name: TLA+ models
-    needs: changes
-    # Draft-skip (see lint) + docs-only skip via the `changes` guard.
-    if: >-
-      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
-      needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
-    # A full run takes about 40 seconds. The runner image has Java.
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Model-check every manifest row with TLC
-        run: scripts/check-formal-models.sh
-
-  # Kani proofs of the pure kernels (issue #1819). The script fails when Kani
-  # verifies fewer proofs than the source holds, or when a cover check fails.
-  kani:
-    name: Kani proofs
-    needs: changes
-    # Draft-skip (see lint) + docs-only skip via the `changes` guard.
-    if: >-
-      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
-      needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: Install Kani
-        run: |
-          cargo install --locked kani-verifier --version 0.68.0
-          cargo kani setup
-      - name: Run Kani proofs
-        run: scripts/check-kani-proofs.sh
-
-  # Dependency ledger harness (Ballast). Runs `cargo deny check` against
-  # `deny.toml`: advisories (RUSTSEC, joined against the lockfile — every
-  # `ignore` entry in deny.toml carries a reachability verdict and a revisit
-  # trigger, not a blanket suppression), licenses (an explicit allowlist plus
-  # narrowly-scoped exceptions), bans (wildcard/git-ref rejection; duplicate
-  # versions are tracked but non-blocking — see deny.toml's [bans] comment),
-  # and sources (registry/git origin pinning). Pure metadata + advisory-DB
-  # checks against Cargo.lock, so it needs neither the DB/Docker services nor
-  # the build/test matrix below.
-  #
-  # cargo-deny comes from `taiki-e/install-action` at an exact version, not
-  # from `cargo-deny-action`. The daily scan (advisory-scan.yml, issue #1826)
-  # installs the same version, and `supply_chain_ci` checks that the two
-  # agree. 0.20.2 is the version that `cargo-deny-action` v2.1.1 bundles.
-  dependency-audit:
-    name: Dependency ledger (cargo-deny)
-    needs: changes
-    # Draft-skip (see lint) + docs-only skip via the `changes` guard.
-    if: >-
-      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
-      needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2.87.25
-        with:
-          tool: cargo-deny@0.20.2
-      - name: cargo deny check (advisories, licenses, bans, sources)
-        run: cargo deny --all-features check
-
-  # Issue #962: the semantic (MIR-level) determinism analyzer, `harvest-verify`.
-  # This is the SECOND line behind the syntactic HVG/DET guardrails — opt-in, and
-  # deliberately NON-STRICT here: `unknown` verdicts warn, only a
-  # `nondeterminism-found` fails the job (exit 1). A tool/build error is exit 2,
-  # so "the tool broke" never reads as "your workflow is broken".
-  #
-  # Linux-only, like the other single-OS steps: the analysis is
-  # platform-independent and a three-OS matrix would triple the cost for no
-  # coverage. Gated on the `changes` filter exactly like `test`, plus the usual
-  # draft-skip.
-  #
-  # PERFORMANCE NOTE: the `< 5 min` success metric in
-  # docs/rnd/determinism-static-analysis.md is a WARM-CACHE number. A cold
-  # `--target-dir` rebuilds the whole dependency graph before the first `.mir`
-  # file exists (measured at minutes on its own), so `Swatinem/rust-cache` is
-  # load-bearing here, not a nicety, and `target/harvest-verify` — the analyzer's
-  # own emit directory — is cached alongside the normal workspace target dir.
-  # The gate run is wrapped in `time` so the wall clock of both phases (MIR emit
-  # and analysis) lands in the job log rather than in a claim. There is no phase
-  # split: `--report` prints only the analyzed/proven/unknown/found/allowed
-  # counts on stderr, so `time` measures emit + analysis as one wall clock.
-  #
-  # Every step below is asserted by `autumn-harvest-verify/tests/ci_wiring.rs`,
-  # which fails if one is deleted or renamed. Two of them are env-gated or
-  # non-strict and would go quiet rather than red if they simply stopped
-  # running.
-  harvest-verify:
-    name: Semantic determinism analysis (harvest-verify)
-    needs: changes
-    # Draft-skip (see lint) + docs-only skip via the `changes` guard.
-    if: >-
-      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
-      needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          workspaces: ". -> target"
-          cache-directories: target/harvest-verify
-      # Corpus + engine tests. The corpus test builds MIR into
-      # `target/harvest-verify/corpus`, which the cache above preserves between
-      # runs. (Each test binary and each gate owns a subdirectory of
-      # `target/harvest-verify`: they drive cargo over the same workspace with
-      # different feature sets, and one shared directory makes each invalidate
-      # the others' units.)
-      - name: Analyzer, corpus and boundary tests
-        run: cargo test -p autumn-harvest-verify
-      # The false-positive metric, over this repo's own examples — the only
-      # number in issue #962 produced by code the analyzer's author did not
-      # write, and the one the go/no-go hinges on. Env-gated because it needs a
-      # full example build; `--nocapture` so the proven/unknown/found triple and
-      # the per-workflow table land in the log.
-      - name: False-positive metric over the examples corpus
-        run: HARVEST_VERIFY_EXAMPLES=1 cargo test -p autumn-harvest-verify --test examples_metrics -- --nocapture
-      # The gate itself. Non-strict: exit 1 only on a finding.
-      - name: harvest-verify gate over autumn-harvest examples (non-strict)
-        run: |
-          time cargo run -p autumn-harvest-verify --bin cargo-harvest-verify -- \
-            harvest-verify -p autumn-harvest --all-examples \
-            --no-default-features --features testing \
-            --allowlist harvest-verify.allow.toml --report
-
-  # Issue #962, AC6's *second* corpus: "the repo's own examples/ + test workflow
-  # corpus". The job above covers `examples/`. This one covers
-  # `autumn-harvest/tests/`, whose `#[workflow]` fns are the largest body of
-  # workflow code in the repository that the analyzer's author did not write —
-  # i.e. the highest-value false-positive sample after the examples.
-  #
-  # A SEPARATE JOB, not a fourth step above, because of what it costs. Measured
-  # cold on a 4-core dev box at the audited revision: 478 s wall (almost all of
-  # it the `cargo rustc --test integration` build), a 175 MB `.mir`, a 7.0 GB
-  # target directory, and ~6 GB peak rustc RSS. Folded into `harvest-verify`
-  # that pushes the job well past the < 5 min budget the examples gate is
-  # measured against, and the two numbers stop being comparable. As its own job
-  # it runs in parallel and carries its own cache entry.
-  #
-  # Result at the audited revision: `analyzed 88: proven 88, unknown 0, found 0,
-  # allowed 0`. No allowlist entry was needed for any of the 88 — which is the
-  # precision claim this corpus exists to test, on code the analyzer's author
-  # did not write. The `unused allowlist entry` warning for the examples-only
-  # entry is expected here and is not a failure; see harvest-verify.allow.toml.
-  #
-  # Non-strict, like the examples gate: `unknown` warns, only a
-  # `nondeterminism-found` fails. Asserted by
-  # `autumn-harvest-verify/tests/ci_wiring.rs::tests_corpus_step_is_wired_into_ci`.
-  harvest-verify-tests:
-    name: Semantic determinism analysis (test workflow corpus)
-    needs: changes
-    # Draft-skip (see lint) + docs-only skip via the `changes` guard.
-    if: >-
-      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
-      needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          workspaces: ". -> target"
-          cache-directories: target/harvest-verify
-      # Same reasoning as the `test` job's free-disk step, and more acute here:
-      # `--emit=mir` for the `integration` test binary writes a ~175 MB `.mir`
-      # on top of a multi-GB target directory, and a runner image that grows
-      # would make this the first job to fail on disk rather than on a verdict.
-      - name: Free runner disk before the MIR emit
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
-          sudo docker image prune --all --force > /dev/null 2>&1 || true
-          df -h /
-      - name: harvest-verify gate over the autumn-harvest test workflow corpus (non-strict)
-        run: |
-          time cargo run -p autumn-harvest-verify --bin cargo-harvest-verify -- \
-            harvest-verify -p autumn-harvest --test integration \
-            --features db,testing,schema,debugger,unified-dag-execution \
-            --allowlist harvest-verify.allow.toml --report \
-            --target-dir target/harvest-verify/tests
 
   # Opt-in fuzz smoke. NEVER runs on push/PR — GitHub Actions minutes are tight
   # and fuzzing needs nightly + libFuzzer. Trigger manually from the Actions tab
@@ -2272,11 +606,9 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
-        with:
-          toolchain: nightly
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz
       - name: Install cargo-fuzz

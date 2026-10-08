@@ -125,7 +125,7 @@ fn build_api_app(pool: HarvestDbPool, router: ShardRouter) -> HarvestApiApp {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         router,
     ));
-    harvest_api_router(api_state)
+    harvest_api_router(api_state).with_state(autumn_web::AppState::for_test())
 }
 
 async fn read_json_response(response: axum::response::Response) -> Value {
@@ -170,7 +170,7 @@ async fn insert_versioned_execution(
         workflow_id,
         run_id: uuid::Uuid::new_v4(),
         shard_id: shard.as_i32(),
-        input: json!({}).into(),
+        input: json!({}),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -263,7 +263,7 @@ async fn insert_execution_without_marker(
         workflow_id,
         run_id: uuid::Uuid::new_v4(),
         shard_id: shard.as_i32(),
-        input: json!({}).into(),
+        input: json!({}),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -498,10 +498,7 @@ async fn retirement_check_state_group_active_hides_terminal_rows() {
 
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["status"], "safe");
-    assert_eq!(
-        body["blockers"].as_array().unwrap().as_slice(),
-        [] as [serde_json::Value; 0]
-    );
+    assert!(body["blockers"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]

@@ -189,37 +189,6 @@ pub struct ReplayReport {
     pub status: ReplayStatus,
     /// Human-readable one-line summary of the mismatch (set for non-determinism).
     pub mismatched_command_summary: Option<String>,
-    /// The failure the replayed run reproduced, when the recorded history ends
-    /// in a terminal `WorkflowFailed` and this replay failed the same way
-    /// (issue #952).
-    ///
-    /// Such a replay reports [`ReplayStatus::ReplaySucceeded`] — the recorded
-    /// run failed and the code failed again, which is exactly what a determinism
-    /// gate asks — so this field is where the reproduced error string (including
-    /// a typed [`crate::failure::WorkflowFailure`] envelope) remains readable.
-    /// `None` for every other outcome, including a replay that reported
-    /// [`ReplayStatus::WorkflowFailed`] (its error is in the status itself).
-    pub reproduced_failure: Option<String>,
-}
-
-impl ReplayReport {
-    /// The failure this replay reproduced, if it failed at all.
-    ///
-    /// Reads the two places a reproduced failure can live: the
-    /// [`reproduced_failure`](Self::reproduced_failure) of a
-    /// [`ReplayStatus::ReplaySucceeded`] replay of a history that ends in a
-    /// terminal `WorkflowFailed` (issue #952), and the error carried by a
-    /// [`ReplayStatus::WorkflowFailed`] status. `None` when the replay did not
-    /// reproduce a failure — including a non-determinism report, whose mismatch
-    /// is described by `expected`/`actual` rather than a workflow error.
-    #[must_use]
-    pub fn failure_message(&self) -> Option<&str> {
-        match &self.status {
-            ReplayStatus::WorkflowFailed { error, .. } => Some(error.as_str()),
-            ReplayStatus::ReplaySucceeded => self.reproduced_failure.as_deref(),
-            ReplayStatus::NonDeterminismDetected { .. } => None,
-        }
-    }
 }
 
 impl std::fmt::Display for ReplayReport {
@@ -252,9 +221,6 @@ impl std::fmt::Display for ReplayReport {
         }
         if let Some(summary) = &self.mismatched_command_summary {
             write!(f, " [{summary}]")?;
-        }
-        if let Some(failure) = &self.reproduced_failure {
-            write!(f, " [reproduced failure: {failure}]")?;
         }
         Ok(())
     }
@@ -1144,7 +1110,6 @@ impl WorkflowReplayer {
                     event_index: 0,
                 },
                 mismatched_command_summary: None,
-                reproduced_failure: None,
             };
         };
 
@@ -1170,13 +1135,10 @@ impl WorkflowReplayer {
                         event_index: 0,
                     },
                     mismatched_command_summary: None,
-                    reproduced_failure: None,
                 };
             }
         };
         let total_events = events.len();
-        // Issue #952: computed before `events` is moved into the runner.
-        let failing_tail = history_ends_in_terminal_failure(&events);
         let input = extract_input(&events);
 
         let headers = snapshot
@@ -1255,7 +1217,7 @@ impl WorkflowReplayer {
             )
             .await
         };
-        outcome_to_report(exec_id, total_events, outcome, false, failing_tail)
+        outcome_to_report(exec_id, total_events, outcome, false)
     }
 
     /// Replay a snapshot in canary mode (used for deploy-time verify).
@@ -1315,7 +1277,6 @@ impl WorkflowReplayer {
                     event_index: 0,
                 },
                 mismatched_command_summary: None,
-                reproduced_failure: None,
             };
         };
 
@@ -1328,8 +1289,6 @@ impl WorkflowReplayer {
         // Issue #798 (Codex round 22): per-workflow-type cap; see the strict path.
         let payload_limits = self.payload_limits_for(&workflow_name);
         let total_events = snapshot.events.len();
-        // Issue #952: computed before `snapshot.events` is moved into the runner.
-        let failing_tail = history_ends_in_terminal_failure(&snapshot.events);
         let input = extract_input(&snapshot.events);
 
         let headers = snapshot
@@ -1369,7 +1328,7 @@ impl WorkflowReplayer {
             declarative.as_params(),
         )
         .await;
-        outcome_to_report(exec_id, total_events, outcome, true, failing_tail)
+        outcome_to_report(exec_id, total_events, outcome, true)
     }
 
     /// Replay a raw event list against the **single** registered handler.
@@ -1430,7 +1389,6 @@ impl WorkflowReplayer {
                     event_index: 0,
                 },
                 mismatched_command_summary: None,
-                reproduced_failure: None,
             };
         }
 
@@ -1466,13 +1424,10 @@ impl WorkflowReplayer {
                         event_index: 0,
                     },
                     mismatched_command_summary: None,
-                    reproduced_failure: None,
                 };
             }
         };
         let total_events = events.len();
-        // Issue #952: computed before `events` is moved into the runner.
-        let failing_tail = history_ends_in_terminal_failure(&events);
         let input = extract_input(&events);
 
         let outcome = if self.use_advancing_clock {
@@ -1551,7 +1506,7 @@ impl WorkflowReplayer {
             )
             .await
         };
-        outcome_to_report(exec_id, total_events, outcome, false, failing_tail)
+        outcome_to_report(exec_id, total_events, outcome, false)
     }
 
     /// Replay as if the workflow history were reset at `reset_to_event_id`.
@@ -1574,7 +1529,6 @@ impl WorkflowReplayer {
                     event_index: 0,
                 },
                 mismatched_command_summary: None,
-                reproduced_failure: None,
             };
         }
 
@@ -1587,7 +1541,6 @@ impl WorkflowReplayer {
                     event_index: 0,
                 },
                 mismatched_command_summary: None,
-                reproduced_failure: None,
             };
         };
         if target >= history.len() {
@@ -1601,7 +1554,6 @@ impl WorkflowReplayer {
                     event_index: history.len(),
                 },
                 mismatched_command_summary: None,
-                reproduced_failure: None,
             };
         }
 
@@ -1900,7 +1852,6 @@ impl WorkflowReplayer {
                                     event_index: 0,
                                 },
                                 mismatched_command_summary: None,
-                                reproduced_failure: None,
                             },
                         }
                     }
@@ -1912,7 +1863,6 @@ impl WorkflowReplayer {
                             event_index: 0,
                         },
                         mismatched_command_summary: None,
-                        reproduced_failure: None,
                     },
                 };
 
@@ -2277,23 +2227,11 @@ fn extract_input(events: &[WorkflowEvent]) -> Value {
 }
 
 /// Convert a `WorkflowOutcome` into a `ReplayReport`.
-/// Whether a snapshot's events end in a terminal `WorkflowFailed` — the
-/// **failing-tail** histories issue #952 makes replay-clean.
-///
-/// One definition, shared with the matcher: `HistoryMatcher::new` uses the same
-/// function to decide which trailing events become transparent, so the report
-/// mapping below can never disagree with what the replay actually did.
-fn history_ends_in_terminal_failure(events: &[WorkflowEvent]) -> bool {
-    crate::replay::HistoryMatcher::terminal_failure_tail_start(events).is_some()
-}
-
 fn outcome_to_report(
     exec_id: ExecutionId,
     total_events: usize,
     outcome: WorkflowOutcome,
     canary_mode: bool,
-    // Issue #952: the replayed history ends in a terminal `WorkflowFailed`.
-    failing_tail: bool,
 ) -> ReplayReport {
     match outcome {
         WorkflowOutcome::Completed { .. } | WorkflowOutcome::ContinuedAsNew { .. } => {
@@ -2302,30 +2240,19 @@ fn outcome_to_report(
                 events_replayed: total_events,
                 status: ReplayStatus::ReplaySucceeded,
                 mismatched_command_summary: None,
-                reproduced_failure: None,
             }
         }
 
         // Suspension during strict replay means the workflow tried to issue a
-        // new command with no matching history event. The oneshot never
-        // resolves in replay mode, so the cycle parks on it.
+        // new command with no matching history event (the oneshot is never
+        // resolved in replay mode, so the 100 ms timeout fires).
         WorkflowOutcome::Suspended { .. } => {
-            // Issue #952: replaying a run that was sealed FAILED. The failing
-            // cycle never suspended — it returned `Err` with its dispatches
-            // still pending — so a replay that parks at exactly that point has
-            // reproduced the recorded run faithfully, not drifted from it. The
-            // history stops at the failure and has nothing further to verify
-            // against. Divergence BEFORE the failure point still reports:
-            // `history_has_unconsumed_events` turns a suspension that skipped a
-            // recorded event into an ND `Failed` outcome, which is classified by
-            // the arm below and never reaches here.
-            if canary_mode || failing_tail {
+            if canary_mode {
                 ReplayReport {
                     execution_id: exec_id,
                     events_replayed: total_events,
                     status: ReplayStatus::ReplaySucceeded,
                     mismatched_command_summary: None,
-                    reproduced_failure: None,
                 }
             } else {
                 ReplayReport {
@@ -2342,28 +2269,13 @@ fn outcome_to_report(
                         "workflow suspended during replay (new command beyond recorded history)"
                             .to_string(),
                     ),
-                    reproduced_failure: None,
                 }
             }
         }
 
-        // Issue #1797: a deadlocked replay made no decision. It is not drift,
-        // but a gate must not pass it, so it reports as a failed replay.
-        WorkflowOutcome::TaskFailed { error } => ReplayReport {
-            execution_id: exec_id,
-            events_replayed: total_events,
-            status: ReplayStatus::WorkflowFailed {
-                error,
-                event_index: total_events,
-            },
-            mismatched_command_summary: None,
-            reproduced_failure: None,
-        },
-
         WorkflowOutcome::Failed {
             error,
             non_deterministic_details,
-            handler_panic,
             ..
         } => try_parse_non_determinism(
             &error,
@@ -2371,47 +2283,14 @@ fn outcome_to_report(
             total_events,
             non_deterministic_details.as_ref(),
         )
-        .unwrap_or_else(|| {
-            // Issue #952: the recorded run FAILED and this replay failed too —
-            // the run reproduced, which is exactly what a determinism gate is
-            // asking about. Reporting `WorkflowFailed` here is what forced teams
-            // to allowlist or ignore failed-run histories, weakening the gate.
-            //
-            // Deliberately NOT gated on the error message matching the recorded
-            // `WorkflowFailed`: a failing cycle's own dispatches are recorded as
-            // abandoned (see `event::ABANDONED_DISPATCH_REASON`), so the replayed
-            // run legitimately surfaces the first abandoned branch's failure
-            // rather than the sibling error that sealed the run. The determinism
-            // question is "did the code diverge from the recorded events", and
-            // every recorded event was matched positionally above.
-            //
-            // A handler PANIC is never absorbed: it is a defect in the candidate
-            // build, not a reproduced outcome. Nor is a non-determinism failure:
-            // `try_parse_non_determinism` classifies it from the error string's
-            // `"non-deterministic replay: "` prefix, but a workflow body that
-            // wraps the engine error (`.map_err(|e| format!("step failed: {e}"))`)
-            // loses that prefix — so the authoritative
-            // `non_deterministic_details`, which every divergence latches through
-            // `WorkflowContext::nd_error`, is what gates the absorption here.
-            if failing_tail && !handler_panic && non_deterministic_details.is_none() {
-                return ReplayReport {
-                    execution_id: exec_id,
-                    events_replayed: total_events,
-                    status: ReplayStatus::ReplaySucceeded,
-                    mismatched_command_summary: None,
-                    reproduced_failure: Some(error),
-                };
-            }
-            ReplayReport {
-                execution_id: exec_id,
-                events_replayed: total_events,
-                status: ReplayStatus::WorkflowFailed {
-                    error,
-                    event_index: total_events,
-                },
-                mismatched_command_summary: None,
-                reproduced_failure: None,
-            }
+        .unwrap_or(ReplayReport {
+            execution_id: exec_id,
+            events_replayed: total_events,
+            status: ReplayStatus::WorkflowFailed {
+                error,
+                event_index: total_events,
+            },
+            mismatched_command_summary: None,
         }),
     }
 }
@@ -2458,7 +2337,6 @@ fn try_parse_non_determinism(
             event_index,
         },
         mismatched_command_summary: Some(summary),
-        reproduced_failure: None,
     })
 }
 
@@ -4344,34 +4222,36 @@ async fn read_bundle_manifest(dir: &std::path::Path) -> BundleManifest {
 
 /// Recursively collect `*.json` files under `dir`.
 ///
-/// Returns `Err` on the first unreadable directory, entry, or file type, at
-/// any depth (issue #1174). The caller then reports a harness error instead
-/// of a silently short list.
+/// Returns `Err` if the top-level `dir` cannot be read so the caller can
+/// surface it as a harness error rather than silently returning zero fixtures.
 async fn collect_json_files(
     dir: &std::path::Path,
 ) -> Result<Vec<std::path::PathBuf>, std::io::Error> {
     let mut files = Vec::new();
     let mut dirs_to_visit = vec![dir.to_path_buf()];
 
+    // Probe the top-level directory explicitly so a missing/unreadable path
+    // is distinguishable from a legitimately empty directory.
+    let _ = tokio::fs::read_dir(dir).await?;
+
     while let Some(current_dir) = dirs_to_visit.pop() {
-        let mut entries = tokio::fs::read_dir(&current_dir).await?;
-        // `next_entry` returns `Ok(None)` at end of stream and `Err` on a
-        // read failure mid-iteration. `?` propagates only the latter, so a
-        // failure does not read like a clean end of stream.
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            let file_type = entry.file_type().await?;
-            if file_type.is_dir() {
-                dirs_to_visit.push(path);
-            } else if path.extension().and_then(|s| s.to_str()) == Some("json")
-                // A replay-drift bundle (issue #798) carries its coverage
-                // manifest alongside the fixtures. It is not a history, so
-                // replaying it would produce a spurious harness error and
-                // fail the gate for a well-formed bundle.
-                && path.file_name().and_then(|s| s.to_str())
-                    != Some(crate::replay_sample::SampleManifest::FILE_NAME)
-            {
-                files.push(path);
+        if let Ok(mut entries) = tokio::fs::read_dir(&current_dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if let Ok(file_type) = entry.file_type().await {
+                    if file_type.is_dir() {
+                        dirs_to_visit.push(path);
+                    } else if path.extension().and_then(|s| s.to_str()) == Some("json")
+                        // A replay-drift bundle (issue #798) carries its coverage
+                        // manifest alongside the fixtures. It is not a history, so
+                        // replaying it would produce a spurious harness error and
+                        // fail the gate for a well-formed bundle.
+                        && path.file_name().and_then(|s| s.to_str())
+                            != Some(crate::replay_sample::SampleManifest::FILE_NAME)
+                    {
+                        files.push(path);
+                    }
+                }
             }
         }
     }
@@ -4449,8 +4329,8 @@ fn offloaded_fixture_reason(json: &str, snapshot: &HistorySnapshot) -> Option<St
         .map(|reference| reference.blob_key)
         .collect();
     if offloaded.is_empty() {
-        // The key appeared in payload *data* rather than as a real envelope.
-        // A partial look-alike, for example. Nothing to inflate.
+        // The key appeared in payload *data* rather than as a real envelope
+        // (e.g. a workflow whose own JSON mentions it). Nothing to inflate.
         return None;
     }
 
@@ -5954,20 +5834,19 @@ impl WorkflowTestEnv {
                 });
             }
 
-            let (outcome, pending_cmds, _span, _resolved_router) =
-                run_workflow_with_state_advancing_clock(
-                    exec_id,
-                    history.clone(),
-                    handler,
-                    input.clone(),
-                    self.state.clone(),
-                    span_meta.as_ref(),
-                    self.metrics.clone(),
-                    // Issue #790: the durable-log policy this env was configured
-                    // with (`None` = the sink disabled, the default).
-                    self.workflow_log_policy,
-                )
-                .await;
+            let (outcome, pending_cmds, _span) = run_workflow_with_state_advancing_clock(
+                exec_id,
+                history.clone(),
+                handler,
+                input.clone(),
+                self.state.clone(),
+                span_meta.as_ref(),
+                self.metrics.clone(),
+                // Issue #790: the durable-log policy this env was configured
+                // with (`None` = the sink disabled, the default).
+                self.workflow_log_policy,
+            )
+            .await;
 
             // Issue #790: harvest this cycle's durable-log commands before the
             // outcome is consumed. A suspension carries them on
@@ -6123,10 +6002,6 @@ impl WorkflowTestEnv {
                 });
                 Ok(input)
             }
-            // Issue #1797: a deadlocked cycle fails the task, not the run. A
-            // retry would deadlock again, so the harness stops with the error
-            // and records no terminal event, as the worker does.
-            WorkflowOutcome::TaskFailed { error } => Err(error),
             WorkflowOutcome::Suspended { .. } => {
                 unreachable!("suspended outcomes are handled in run")
             }
@@ -7022,39 +6897,6 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
 
-    /// Awaits a foreign 3 s sleep, past the deadlock timeout (issue #1797).
-    fn deadlocking_workflow(
-        _ctx: &crate::context::WorkflowContext,
-        _input: Value,
-    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>> {
-        Box::pin(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-            Ok(Value::Null)
-        })
-    }
-
-    /// Issue #1797: the harness stops with the task error and records no
-    /// terminal event, as the worker does.
-    #[tokio::test(start_paused = true)]
-    async fn a_deadlocked_cycle_stops_the_harness_without_a_terminal_event() {
-        let outcome = WorkflowTestEnv::new()
-            .run(deadlocking_workflow, Value::Null)
-            .await;
-        let error = outcome
-            .result
-            .clone()
-            .expect_err("a deadlock must surface as an error");
-        assert!(error.contains("potential deadlock detected"), "{error}");
-        assert!(
-            !outcome.events().iter().any(|e| matches!(
-                e,
-                WorkflowEvent::WorkflowFailed { .. } | WorkflowEvent::WorkflowCompleted { .. }
-            )),
-            "a failed task must record no terminal event: {:?}",
-            outcome.events()
-        );
-    }
-
     fn ts(id: &str, secs: u64) -> WorkflowEvent {
         WorkflowEvent::TimerStarted {
             timer_id: TimerId::new(id),
@@ -7313,7 +7155,7 @@ mod tests {
     fn parse_nd_message_unknown_format() {
         let (kind, expected, _) = parse_nd_message("signal history contains unexpected failure");
         assert_eq!(kind, NonDeterminismKind::Unknown);
-        assert_ne!(expected, "");
+        assert!(!expected.is_empty());
     }
 
     #[test]
@@ -7337,142 +7179,6 @@ mod tests {
         assert_eq!(kind, NonDeterminismKind::PatchMarkerMismatch);
         assert_eq!(expected, "ActivityScheduled(step)");
         assert_eq!(actual, "MarkerRecorded(patch:gate_old)");
-    }
-
-    // ── Issue #952: failing-tail report mapping ───────────────────────────
-
-    fn failed_outcome(error: &str) -> WorkflowOutcome {
-        WorkflowOutcome::Failed {
-            error: error.to_string(),
-            non_deterministic_details: None,
-            handler_panic: false,
-            unhandled_signals: std::collections::BTreeMap::new(),
-        }
-    }
-
-    #[test]
-    fn a_reproduced_failure_on_a_failing_tail_history_reports_success() {
-        let report = outcome_to_report(
-            ExecutionId::new(),
-            4,
-            failed_outcome("budget exceeded"),
-            false,
-            true,
-        );
-        assert!(matches!(report.status, ReplayStatus::ReplaySucceeded));
-        assert_eq!(
-            report.failure_message(),
-            Some("budget exceeded"),
-            "the reproduced error must stay readable"
-        );
-    }
-
-    #[test]
-    fn a_failure_without_a_failing_tail_history_still_reports_workflow_failed() {
-        let report = outcome_to_report(
-            ExecutionId::new(),
-            4,
-            failed_outcome("budget exceeded"),
-            false,
-            false,
-        );
-        assert!(matches!(report.status, ReplayStatus::WorkflowFailed { .. }));
-        assert_eq!(report.reproduced_failure, None);
-    }
-
-    /// Issue #603's nd-block semantics are unchanged: an engine-detected
-    /// non-determinism is never absorbed by the failing tail, only an author
-    /// `Err` is.
-    #[test]
-    fn a_non_determinism_failure_is_never_absorbed_by_a_failing_tail() {
-        let outcome = WorkflowOutcome::Failed {
-            error: "non-deterministic replay: activity mismatch: expected a, got b".to_string(),
-            non_deterministic_details: Some(crate::error::NonDeterministicDetails {
-                event_index: Some(2),
-                expected: Some("a".to_string()),
-                actual: Some("b".to_string()),
-                workflow_type: None,
-                build_id: None,
-            }),
-            handler_panic: false,
-            unhandled_signals: std::collections::BTreeMap::new(),
-        };
-        let report = outcome_to_report(ExecutionId::new(), 4, outcome, false, true);
-        assert!(matches!(
-            report.status,
-            ReplayStatus::NonDeterminismDetected { .. }
-        ));
-    }
-
-    /// A handler PANIC is a defect in the candidate build, not a reproduced
-    /// outcome — it still reports even on a failing-tail history.
-    #[test]
-    fn a_handler_panic_is_never_absorbed_by_a_failing_tail() {
-        let outcome = WorkflowOutcome::Failed {
-            error: "panicked at 'boom'".to_string(),
-            non_deterministic_details: None,
-            handler_panic: true,
-            unhandled_signals: std::collections::BTreeMap::new(),
-        };
-        let report = outcome_to_report(ExecutionId::new(), 4, outcome, false, true);
-        assert!(matches!(report.status, ReplayStatus::WorkflowFailed { .. }));
-    }
-
-    #[test]
-    fn a_park_at_the_failing_frontier_reports_success() {
-        let report = outcome_to_report(
-            ExecutionId::new(),
-            4,
-            WorkflowOutcome::Suspended {
-                commands: Vec::new(),
-            },
-            false,
-            true,
-        );
-        assert!(matches!(report.status, ReplayStatus::ReplaySucceeded));
-        assert_eq!(report.reproduced_failure, None);
-    }
-
-    #[test]
-    fn a_park_on_a_completed_history_still_reports_non_determinism() {
-        let report = outcome_to_report(
-            ExecutionId::new(),
-            4,
-            WorkflowOutcome::Suspended {
-                commands: Vec::new(),
-            },
-            false,
-            false,
-        );
-        assert!(matches!(
-            report.status,
-            ReplayStatus::NonDeterminismDetected { .. }
-        ));
-    }
-
-    #[test]
-    fn history_ends_in_terminal_failure_only_for_a_failure_tail() {
-        let failed = vec![
-            WorkflowEvent::WorkflowStarted {
-                input: serde_json::Value::Null,
-                timestamp: chrono::Utc::now(),
-                last_completion_result: None,
-                last_error: None,
-                scheduled_time: None,
-            },
-            WorkflowEvent::workflow_failed("boom"),
-        ];
-        assert!(history_ends_in_terminal_failure(&failed));
-        // A bare terminal with nothing before it is a truncated/corrupt export,
-        // not a run that failed after doing something: it keeps strict treatment.
-        assert!(!history_ends_in_terminal_failure(&[
-            WorkflowEvent::workflow_failed("boom")
-        ]));
-        let completed = vec![WorkflowEvent::WorkflowCompleted {
-            output: serde_json::Value::Null,
-        }];
-        assert!(!history_ends_in_terminal_failure(&completed));
-        assert!(!history_ends_in_terminal_failure(&[]));
     }
 
     #[test]
@@ -7549,7 +7255,6 @@ mod tests {
                 event_index: 3,
             },
             mismatched_command_summary: Some("expected X, got Y".into()),
-            reproduced_failure: None,
         };
         let s = format!("{report}");
         assert!(s.contains("NonDeterminism"));

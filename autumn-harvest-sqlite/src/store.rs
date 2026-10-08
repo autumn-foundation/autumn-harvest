@@ -73,19 +73,12 @@ pub fn execution_input(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<
     Ok(serde_json::from_str(&raw)?)
 }
 
-/// The stored state of `exec_id`.
-///
-/// An unknown id is [`SqliteError::ExecutionNotFound`], not a bare
-/// `QueryReturnedNoRows` (issue #1735). One query does the lookup and the
-/// existence check.
 pub fn execution_state(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<String> {
-    conn.query_row(
+    Ok(conn.query_row(
         "SELECT state FROM harvest_executions WHERE exec_id = ?1",
         params![exec_id.to_string()],
         |row| row.get(0),
-    )
-    .optional()?
-    .ok_or(SqliteError::ExecutionNotFound(exec_id))
+    )?)
 }
 
 pub fn execution_output(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<Option<Value>> {

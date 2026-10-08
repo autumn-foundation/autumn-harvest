@@ -300,224 +300,8 @@ pub const METRIC_WORKER_SLOT_TARGET: &str = "harvest.worker.slot_target";
 /// the live target rather than what the controller requested.
 pub const METRIC_WORKER_TUNER_DECISIONS: &str = "harvest.worker.tuner_decisions";
 
-/// Gauge: database connections that a worker's pool lends out now (issue #1815).
-///
-/// An in-process sampler reads the deadpool status. No query runs. Labelled
-/// `{shard}`. Each replica owns its pool, so a sum across replicas is valid.
-/// Colocated shards that share one pool report the same value. Runtimes in one
-/// process that share a sink report the sum of their distinct pools.
-pub const METRIC_DB_POOL_IN_USE: &str = "harvest.db.pool.in_use";
-
-/// Gauge: open database connections that wait idle in a worker's pool (issue
-/// #1815). Companion to [`METRIC_DB_POOL_IN_USE`], with the same labels.
-pub const METRIC_DB_POOL_IDLE: &str = "harvest.db.pool.idle";
-
-/// Histogram: seconds a caller waits to get a pooled connection (issue #1815).
-///
-/// Labelled `{shard}`. The claim path, the timeout scanner and the activity
-/// heartbeat flush record it. A high value with no idle connection shows that
-/// the pool is too small for the load.
-pub const METRIC_DB_POOL_WAIT: &str = "harvest.db.pool.wait_duration";
-
-/// Histogram: seconds that one database operation takes (issue #1815).
-///
-/// Labelled `{op}`, one of [`DbOp::as_str`]. Each op times one unit of work,
-/// not one SQL statement. Do not mix this up with [`METRIC_QUERY_DURATION`],
-/// which times workflow query handlers.
-pub const METRIC_DB_QUERY_DURATION: &str = "harvest.db.query.duration";
-
-/// Gauge: poll loops that claim work from a queue on this worker (issue #1815).
-///
-/// Labelled `{queue}`. One poll loop claims from all the worker's queues, so
-/// each queue reports the same count. The count covers every worker that
-/// shares the metrics recorder. It drops when a worker drains. This is the Harvest form of
-/// `temporal_num_pollers`.
-pub const METRIC_WORKER_POLLERS: &str = "harvest.worker.pollers";
-
-/// Gauge: 1 when this worker is an outlier against its peers, else 0 (issue
-/// #1815).
-///
-/// Labelled `{dimension}`, one of
-/// [`OutlierDimension::as_str`](crate::worker_outlier::OutlierDimension::as_str).
-/// Each worker reports itself, so the series has no worker label. The scrape
-/// `instance` label tells the workers apart. See [`crate::worker_outlier`].
-pub const METRIC_WORKER_OUTLIER: &str = "harvest.worker.outlier";
-
-/// Gauge: measured RPO for a shard — how many seconds of acknowledged work a
-/// failover to the standby region would lose right now (issue #954).
-///
-/// Sourced from replication positions: the age of the newest
-/// `harvest_replication_heartbeat` watermark whose WAL position the slowest
-/// standby of this shard's database has already confirmed.
-///
-/// **The series is absent, not zero, when the RPO is unknown** — no standby
-/// connected, no slot, or the standby further behind than the retained
-/// watermark trail. That is deliberate and load-bearing: a dead standby
-/// reported as `0` reads as a perfect RPO, which is the most dangerous number
-/// this metric could publish. Alert on a
-/// [`METRIC_REPLICATION_STANDBYS`] value of `0` for "replication is down";
-/// alert on this gauge only for "replication is slow".
-///
-/// Labelled `{shard}` only. A standby's `application_name` is operator-chosen
-/// and unbounded, so it is not a label (ADR-0001 §7); per-standby detail is
-/// available from `pg_stat_replication` directly.
-pub const METRIC_REPLICATION_LAG_SECONDS: &str = "harvest.replication.lag_seconds";
-
-/// Gauge: `1` while a shard's replication views are readable, `0` when they
-/// are not (issue #954).
-///
-/// Exists because **a Prometheus gauge keeps exporting its last value until it
-/// is changed** — so simply declining to emit the RPO and standby gauges when
-/// the views become unreadable does not make those series stale, it freezes
-/// them at their last healthy reading and an unobservable shard goes on looking
-/// fine indefinitely.
-///
-/// The two options that do not work: emitting `0` standbys on an unreadable
-/// view pages on-call for what is almost always a missing `GRANT pg_monitor`,
-/// and emitting nothing leaves the stale value in place. So availability is
-/// published as its own signal, and the other DR gauges are withheld while it
-/// is `0`.
-///
-/// Alerting: require `harvest_replication_observable == 1` on the
-/// replication-down rule so it cannot fire on a stale reading, and alert on
-/// `== 0` separately — that is a configuration problem, not an outage.
-/// Labelled `{shard}`.
-pub const METRIC_REPLICATION_OBSERVABLE: &str = "harvest.replication.observable";
-
-/// Gauge: worst-case WAL backlog in bytes for a shard (issue #954).
-///
-/// The byte companion to [`METRIC_REPLICATION_LAG_SECONDS`], and the signal
-/// that survives a disconnected standby: a slot with no walsender still pins
-/// WAL, so the backlog stays knowable when the time lag is not. Also the
-/// disk-pressure signal — an abandoned slot grows this without bound until the
-/// primary runs out of WAL space. Labelled `{shard}`.
-pub const METRIC_REPLICATION_LAG_BYTES: &str = "harvest.replication.lag_bytes";
-
-/// Gauge: number of standbys with a live walsender for a shard (issue #954).
-///
-/// `0` means replication is **down** for that shard — the RPO is unbounded and
-/// growing, and a failover now would lose everything since the standby stopped
-/// consuming. This, not a lag threshold, is the "replication broken" alert:
-/// a standby that is not connected produces no lag reading to threshold.
-/// Labelled `{shard}`.
-pub const METRIC_REPLICATION_STANDBYS: &str = "harvest.replication.standbys";
-
-/// Gauge: `1` while a shard's measured RPO is known. `0` when the
-/// replication views are readable but the RPO itself is not (issue #954,
-/// finding 2).
-///
-/// [`METRIC_REPLICATION_OBSERVABLE`] covers the views-unreadable case. It
-/// does not cover a shard whose views read fine but whose RPO has no
-/// source yet. That happens for a physical standby attached with no DR
-/// slot, before it has reported its first `replay_lag`.
-///
-/// A Prometheus gauge keeps exporting its last value. So simply skipping
-/// [`METRIC_REPLICATION_LAG_SECONDS`] in that case does not make the
-/// series stale; it freezes the dashboard at the last healthy reading.
-/// This gauge is emitted on every sampler tick the views are readable, `0`
-/// included, so it cannot go stale the same way.
-///
-/// Alerting: ticket when this is `0` while
-/// [`METRIC_REPLICATION_OBSERVABLE`] is `1` (readable but unmeasurable) — see
-/// `harvest_replication_rpo_unknown` in the starter alert pack. Labelled
-/// `{shard}`.
-pub const METRIC_REPLICATION_RPO_KNOWN: &str = "harvest.replication.rpo_known";
-
-/// Gauge: the write-authority epoch a shard's database currently reports
-/// (issue #954).
-///
-/// Monotonic per shard. Its value is uninteresting; its *skew* is the point —
-/// shards fail over independently, so
-/// `max(harvest_shard_generation) by () != min(...)` is the machine-readable
-/// form of "some shards were failed over and some were not", the hazard
-/// `docs/cross-region-dr.md` describes. Labelled `{shard}`.
-pub const METRIC_SHARD_GENERATION: &str = "harvest.shard.generation";
-
-/// Gauge: audit-export delivery lag for a shard, in seconds (issue #953).
-///
-/// The **age of the oldest audit record the sink has not acknowledged** — the
-/// answer to "how far behind is the SIEM right now?". `0` means every audit
-/// record on the shard has been acknowledged at least once.
-///
-/// Note the deliberate choice of *oldest*, not newest, unacknowledged record:
-/// under sustained mutating load a stuck exporter always has a brand-new
-/// unexported record, so a newest-based gauge would read ~0 during exactly the
-/// outage an operator needs to see. Oldest-based lag is what the issue's own
-/// success metric ("export lag stays < 30s p99") is measurable against.
-///
-/// Emitted on **every** exporter tick, including ticks that deliver nothing —
-/// the signal must not go stale precisely when delivery has stopped.
-///
-/// Labelled `{shard}` only: bounded cardinality per ADR-0001 §7. The audit
-/// `actor`, `operation`, and `target_id` are deliberately never labels — they
-/// are unbounded, user-supplied, and tenant-identifying.
-pub const METRIC_AUDIT_EXPORT_LAG: &str = "harvest.audit.export_lag";
-
-/// Gauge: `1` when the exporter observed a shard's cursor and lag this tick,
-/// `0` when it could not (issue #1268).
-///
-/// A Prometheus gauge keeps its last value. Without this signal, a shard the
-/// exporter cannot observe freezes [`METRIC_AUDIT_EXPORT_LAG`] at its last
-/// reading, commonly `0`. The threshold alert then stays silent, and
-/// `absent()` never fires, because the series still exists.
-///
-/// Covers a connection the scanner cannot acquire, a failed cursor read, and
-/// a failed lag query. It does not cover a shard missing from
-/// `shard_assignments` altogether, since no code path ever runs for it.
-/// Template a per-shard `absent()` rule from your own inventory for that
-/// case.
-///
-/// Emitted on every exporter tick that reaches a shard, delivery outcome
-/// aside. Labelled `{shard}` only, for the same cardinality reason as
-/// [`METRIC_AUDIT_EXPORT_LAG`].
-pub const METRIC_AUDIT_EXPORT_OBSERVED: &str = "harvest.audit.export_observed";
-
-/// Counter: audit records acknowledged by the sink for a shard (issue #953).
-///
-/// Incremented by the batch size only after the cursor has actually advanced,
-/// so `rate(harvest_audit_exported)` is a true delivery rate, not an attempt
-/// rate. At-least-once delivery means a redelivered batch counts again;
-/// receiver-side `(shard, seq)` accounting, not this counter, is the
-/// completeness proof.
-///
-/// Labelled `{shard}` only, for the same cardinality reason as above.
-pub const METRIC_AUDIT_EXPORTED: &str = "harvest.audit.exported";
-
-/// Counter: this worker was fenced off a shard it is pinned to (issue #954).
-///
-/// Incremented once, immediately before the worker stops. A non-zero value in
-/// the *promoted* region means a fleet was left pinned to a pre-failover epoch
-/// and must be restarted; a non-zero value with no failover in progress means
-/// someone bumped a generation on a healthy shard. Both are page-worthy and
-/// neither is self-healing. Labelled `{shard}`.
-pub const METRIC_SHARD_FENCED: &str = "harvest.shard.fenced";
-
 /// Gauge: current number of entries in the dead letter queue.
 pub const METRIC_DLQ_ENTRIES: &str = "harvest.dlq.entries";
-
-/// Gauge: cumulative hints the dispatch background publisher has dropped
-/// because its bounded queue was full (issue #1429).
-///
-/// A dropped hint costs latency, not correctness: the row stays `PENDING`
-/// and the reconcile sweep republishes it. A sustained non-zero rate means
-/// the publisher queue is undersized for the enqueue rate.
-pub const METRIC_DISPATCH_DROPPED_HINTS: &str = "harvest.dispatch.dropped_hints";
-
-/// Gauge: cumulative notifications this process has lost to an error
-/// (issue #1796).
-///
-/// A failed send counts once for each merged wake. A dropped or rejected note
-/// counts once. A lost notification costs latency, not work. Polling finds
-/// the row.
-/// A sustained non-zero rate means the post-commit notify path is unhealthy.
-pub const METRIC_NOTIFY_SEND_FAILURES: &str = "harvest.notify.send_failures";
-
-/// Gauge: the largest `pg_notification_queue_usage()` that a live notify
-/// sender read last, from `0.0` to `1.0` (issue #1796).
-///
-/// Postgres rejects a `NOTIFY` when this queue is full. A value that stays
-/// high means a listener does not drain its notifications.
-pub const METRIC_NOTIFY_QUEUE_USAGE: &str = "harvest.notify.queue_usage";
 
 /// Gauge: `1` while a task queue is paused by an operator, `0` once it resumes
 /// (issue #619).
@@ -533,11 +317,6 @@ pub const METRIC_NOTIFY_QUEUE_USAGE: &str = "harvest.notify.queue_usage";
 /// signal; pairing it with Prometheus' own `for:` duration is how an operator
 /// alerts on a pause that was left on too long.
 pub const METRIC_QUEUE_PAUSED: &str = "harvest.queue.paused";
-
-/// Gauge: `1` per queue where this worker has an empty `build_id` and the
-/// queue has a build policy (issue #1805). Such a worker cannot claim pinned
-/// runs. Label: `queue`.
-pub const METRIC_WORKER_EMPTY_BUILD_POLICY: &str = "harvest.worker.empty_build_policy";
 
 /// Counter: incremented once per dead-letter entry processed by an operator
 /// redrive (issue #510). Labelled `{queue, outcome}` where `outcome` is one of
@@ -586,26 +365,6 @@ pub const METRIC_RETENTION_DELETED: &str = "harvest.retention.deleted";
 /// two tiers. Labeled by the low-cardinality `workflow` registry key.
 pub const METRIC_SUMMARY_DELETED: &str = "harvest.retention.summary_deleted";
 
-/// Counter: inert per-tenant rate-limit buckets collected by the idle-bucket GC
-/// pass (issue #1127).
-///
-/// Labeled by [`METRIC_LABEL_RATE_LIMIT_FAMILY`] — `dyn-rate` or
-/// `start-throttle` — and **never** by the bucket key. The key is the very
-/// thing whose cardinality is unbounded (one value per tenant, forever), which
-/// is why these buckets need collecting at all; labelling by it would trade an
-/// unbounded table for an unbounded metric series. Per-key bucket state stays
-/// observable through `GET /admin/rate-limits`, matching the same decision made
-/// for the per-key gauges (issue #699) and for `harvest.codec.reencrypted`
-/// (issue #948).
-pub const METRIC_RATE_LIMIT_BUCKETS_DELETED: &str = "harvest.retention.rate_limit_buckets_deleted";
-
-/// Counter: terminal `harvest_task_queue` rows deleted by the terminal-task
-/// janitor (issue #1811).
-///
-/// Labeled by [`METRIC_LABEL_STATE`]: `COMPLETED`, `FAILED` or `CANCELLED`.
-/// Real deletes only, never a `dry_run` preview.
-pub const METRIC_TERMINAL_TASKS_DELETED: &str = "harvest.retention.terminal_tasks_deleted";
-
 /// Histogram: wall-clock latency of query handler invocations (seconds).
 ///
 /// Labelled with `query.name` (low-cardinality handler name registered by the
@@ -637,82 +396,6 @@ pub const METRIC_WORKFLOW_CACHE_MISS: &str = "harvest.workflow.cache_miss";
 /// Per ADR-0001 §7, `harvest.target.execution.id` and `harvest.signal.id` are
 /// **span-only** and must never appear as metric labels.
 pub const METRIC_EXTERNAL_SIGNAL_SENT: &str = "harvest.workflow.external_signal.sent";
-
-/// Counter: incremented once per `cancel_external_workflow` call after the
-/// terminal outcome is recorded in `harvest_events`.
-///
-/// Labels: `outcome` (`"delivered"` or `"failed"`), `reason_code` (only set
-/// when `outcome == "failed"`; values: `"target_terminal"`, `"target_unknown"`).
-/// [`METRIC_EXTERNAL_SIGNAL_SENT`]'s cancel twin.
-pub const METRIC_EXTERNAL_CANCEL_SENT: &str = "harvest.workflow.external_cancel.sent";
-
-/// Counter: a by-id fan-out could not inspect every expected shard. Its
-/// answer is `Indeterminate`, and the outbox row it was resolving stays
-/// pending (issue #1307).
-///
-/// Incremented once per uninspected shard named in the retry outcome. A row
-/// whose fan-out missed two shards increments this twice, once per shard.
-/// Labels: `shard`, `kind`
-/// ([`crate::external_target_location::UninspectedReasonKind::as_label`]).
-///
-/// This is the counter twin of the `"by-id target resolution inconclusive"`
-/// warning both outbox sweeps already log. See
-/// [`METRIC_EXTERNAL_SIGNAL_BY_ID_OLDEST_PENDING_AGE`] for the companion
-/// gauge that answers "how long has this been stuck". A rate on this counter
-/// alone cannot answer that.
-pub const METRIC_EXTERNAL_BY_ID_INDETERMINATE_SHARD: &str =
-    "harvest.external_signal.by_id_indeterminate_shard";
-
-/// Gauge: age in seconds of the oldest pending by-id **signal** outbox row a
-/// sweep left retrying because its target shard fan-out was incomplete
-/// (issue #1307).
-///
-/// `0` when the sweep left no such row pending, matching
-/// [`METRIC_QUEUE_OLDEST_PENDING_AGE`]'s convention so a drained backlog does
-/// not leave a stale reading behind. Distinguishes "retrying, will resolve"
-/// from "stuck since Tuesday" without reasoning about shard topology. Both
-/// `docs/sharding.md` and the backup-restore runbook used to name this gap
-/// as open.
-pub const METRIC_EXTERNAL_SIGNAL_BY_ID_OLDEST_PENDING_AGE: &str =
-    "harvest.external_signal.by_id_oldest_pending_indeterminate_age";
-
-/// Gauge: [`METRIC_EXTERNAL_SIGNAL_BY_ID_OLDEST_PENDING_AGE`]'s **cancel**
-/// outbox twin (issue #1307).
-pub const METRIC_EXTERNAL_CANCEL_BY_ID_OLDEST_PENDING_AGE: &str =
-    "harvest.external_cancel.by_id_oldest_pending_indeterminate_age";
-
-/// Counter: a by-id fan-out delivered over an incomplete shard fan-out — a
-/// silently ambiguous success, never surfaced before this counter (issue
-/// #1307).
-///
-/// Distinct from [`METRIC_EXTERNAL_BY_ID_INDETERMINATE_SHARD`]: that counter
-/// is a stall, where the row stays pending. This one is a delivery that went
-/// ahead on a partial view. Labelled `shard` (the shard the run was found on)
-/// only, per ADR-0001 §7.
-pub const METRIC_EXTERNAL_BY_ID_FOUND_OVER_INCOMPLETE_FANOUT: &str =
-    "harvest.external_signal.by_id_found_over_incomplete_fanout";
-
-/// Counter: a by-id fan-out completed and found more than one live run
-/// of the same business key (issue #1146). Issue #1313 records the
-/// residual bound this counter is evidence for.
-///
-/// `(workflow_name, workflow_id)` uniqueness is shard-local. Two paths
-/// make this fire. A key pinned to one shard while an unpinned start of
-/// it hashes to another is one. Draining a shard, so a later unpinned
-/// start of the same key rehashes elsewhere while the old run stays
-/// live, is the other. Neither pinning is required.
-///
-/// It is the observable proxy for the precondition behind issue
-/// #1313's race. The race itself is a run that starts mid fan-out. No
-/// counter can see that instant. Two live runs surviving a complete
-/// fan-out is different: it is real, and it is countable. Labelled
-/// `shard` (the winning run's shard) only, per ADR-0001 §7.
-///
-/// Distinct from [`METRIC_EXTERNAL_BY_ID_FOUND_OVER_INCOMPLETE_FANOUT`]:
-/// that counter fires over a partial view, a shard that could not be
-/// read. This one fires over a complete view that is still ambiguous.
-pub const METRIC_EXTERNAL_BY_ID_OTHER_LIVE_OBSERVED: &str =
-    "harvest.external_signal.by_id_other_live_observed";
 
 /// OpenTelemetry span attribute: the signal name for `signal_external_workflow` spans.
 ///
@@ -972,12 +655,6 @@ pub const METRIC_CIRCUIT_TRIPPED: &str = "harvest.activity.circuit.tripped";
 /// Labeled by `activity.name`. `execution.id` stays span-only per ADR-0001 §7.
 pub const METRIC_CIRCUIT_CLOSED: &str = "harvest.activity.circuit.closed";
 
-/// Counter: incremented each time an open circuit breaker defers a claimed
-/// task back to `PENDING` (issue #1809, `CircuitOpenMode::Defer`).
-///
-/// Labeled by `activity.name`. `execution.id` stays span-only per ADR-0001 §7.
-pub const METRIC_CIRCUIT_DEFERRED: &str = "harvest.activity.circuit.deferred";
-
 /// Counter: incremented each time an activity handler **panics** (unwinds)
 /// instead of returning a clean `Err`, and the engine contains the panic as a
 /// retryable typed `HandlerPanic` failure (issue #782).
@@ -1039,58 +716,6 @@ pub const METRIC_WORKFLOW_START_THROTTLED: &str = "harvest.workflow.start_thrott
 /// `GET /admin/concurrency` admin read instead. `execution.id` is span-only and
 /// must never appear here.
 pub const METRIC_CONCURRENCY_SUPERSEDED: &str = "harvest.concurrency.superseded";
-
-/// Counter: a latest-wins admission left a key transiently over its limit
-/// (issue #1197, item 2).
-///
-/// Incremented once per admission that could not shed its full computed
-/// overflow because every remaining over-limit run was a protected in-flight
-/// (nested) admission. This is the nested self-referential-trigger residual
-/// described in issue #1197: cancelling an incumbent can synchronously start
-/// a completion-trigger target that also declares `cancel_running` on the
-/// same key, and that
-/// nested admission is protected from being shed by the very outer admission
-/// it is nested inside (see [`crate::concurrency::supersede_plan`]'s
-/// `protected` parameter). The key is left transiently over its declared
-/// limit; the population self-heals on the next ordinary admission for the
-/// key, which sees every run unprotected. This counter is the promotion of
-/// the pre-existing `tracing::warn!` in
-/// [`crate::concurrency::supersede_running_for_key`] to an alertable signal —
-/// the issue's chosen resolution for a key that stays over limit, rather than
-/// the (more invasive, higher-lock-contention) alternatives of registration-time
-/// rejection or a post-commit reconcile sweep.
-///
-/// Labeled by `workflow` (workflow type name) only, matching
-/// [`METRIC_CONCURRENCY_SUPERSEDED`]'s cardinality rule — the concurrency key
-/// is never a label (ADR-0001 §7). `execution.id` must never appear here.
-pub const METRIC_CONCURRENCY_RESIDUAL_OVER_LIMIT: &str = "harvest.concurrency.residual_over_limit";
-
-/// Counter: a `cancel_running` admission's quota credit assumed a run would
-/// be shed, and the real supersede pass skipped it instead (issue #1228
-/// review, P2).
-///
-/// `crate::concurrency::dry_run_supersede_credit` credits an admission for
-/// the exact runs it expects `supersede_inner` to cancel a moment later.
-/// `supersede_inner` can skip one of those runs on an unexpected error and
-/// leave it running instead. A candidate's own corrupted
-/// `parent_close_policy` is one cause. A `Config` error from its terminal
-/// chokepoint, that is not the benign already-terminal race, is another.
-/// Either way, one corrupt neighbor must never wedge every future
-/// admission for the key. The admission already committed on the
-/// assumption that run was gone. So the key is now genuinely over its
-/// declared cap, not merely transiently the way
-/// [`METRIC_CONCURRENCY_RESIDUAL_OVER_LIMIT`] describes. There is no way
-/// to retract that admission by the time this is detected. Its
-/// `WorkflowStarted` event is already durable. So this counter is the
-/// alertable signal, not a rejection.
-///
-/// Incremented once per admission whose real supersede pass left at least
-/// one credited run unshed, with the count of unshed runs as its value.
-///
-/// Labeled by `workflow` (workflow type name) only, matching
-/// [`METRIC_CONCURRENCY_RESIDUAL_OVER_LIMIT`]'s cardinality rule — neither
-/// the quota key nor `execution.id` is ever a label (ADR-0001 §7).
-pub const METRIC_QUOTA_SUPERSEDE_CREDIT_NOT_SHED: &str = "harvest.quota.supersede_credit_not_shed";
 
 /// Counter: incremented exactly once per real saga compensation sequence
 /// (issue #801).
@@ -1255,24 +880,6 @@ pub const METRIC_ADMISSION_GATES_ACTIVE: &str = "harvest.admission.gates_active"
 /// `execution.id` is never a label here either.
 pub const METRIC_QUOTA_REJECTED: &str = "harvest.quota.rejected";
 
-/// Counter: incremented by the number of `harvest_events` rows the lazy
-/// payload-codec re-encryption sweep rewrote onto the active key (issue #948).
-///
-/// Label:
-///   - `"shard"` (= [`METRIC_LABEL_SHARD`]) — the shard swept.
-///
-/// The **codec key id is deliberately not a label.** Key ids are
-/// operator-chosen and accumulate over a deployment's life, so labelling by key
-/// would grow a new series on every rotation and never retire the old ones.
-/// Per-key rows-remaining is instead surfaced by `GET /admin/codec/rotation`,
-/// mirroring how `harvest.quota.rejected` (#946) keeps its per-key detail on the
-/// equivalent admin read.
-///
-/// `rate(harvest_codec_reencrypted_total{shard="..."}[5m]) == 0` while
-/// `GET /admin/codec/rotation` still reports rows remaining under a retired key
-/// is the alerting shape for "the rotation has stalled".
-pub const METRIC_CODEC_REENCRYPTED: &str = "harvest.codec.reencrypted";
-
 /// Counter: incremented each time a start producer that is **exempt-by-design**
 /// from the admission gate relays a workflow start (issue #618).
 ///
@@ -1286,41 +893,6 @@ pub const METRIC_CODEC_REENCRYPTED: &str = "harvest.codec.reencrypted";
 /// `execution.id` is never a metric label.
 pub const METRIC_ADMISSION_BYPASSED: &str = "harvest.admission.bypassed";
 
-/// Gauge: 1 while a queue sheds new starts, 0 otherwise (issue #1794).
-///
-/// Label:
-///   - `"queue"` (= [`METRIC_LABEL_QUEUE`]) — a queue with a load-shed policy.
-///
-/// The sampler sets it for every configured queue on every successful sample.
-pub const METRIC_LOAD_SHED_ACTIVE: &str = "harvest.load_shed.active";
-
-/// Counter: one per new start that load shedding refused (issue #1794).
-///
-/// Label:
-///   - `"queue"` (= [`METRIC_LABEL_QUEUE`]) — the shed queue.
-pub const METRIC_LOAD_SHED_REJECTED: &str = "harvest.load_shed.rejected";
-
-/// Counter: one per build ramp that the ramp guard aborted (issue #1814).
-///
-/// Labels:
-///   - `"queue"` (= [`METRIC_LABEL_QUEUE`]) — the queue of the ramp.
-///   - `"reason"` (= [`METRIC_LABEL_REASON`]) — `"failure_rate"`,
-///     `"nd_block_rate"` or `"unreported"`, from
-///     `ramp_guard::RampAbortReason::as_str`.
-pub const METRIC_BUILD_RAMP_ABORTED: &str = "harvest.build.ramp_aborted";
-
-/// Counter: one per request the API rate limiter refused with `429` (issue
-/// #1827).
-///
-/// Labels:
-///   - `"route_class"` (= [`METRIC_LABEL_ROUTE_CLASS`]) — `"mutating"` or
-///     `"read"`.
-///   - `"client_kind"` (= [`METRIC_LABEL_CLIENT_KIND`]) — `"token"`, `"ip"`,
-///     `"unknown"` or `"overflow"`.
-///
-/// The token id and the client address are never labels.
-pub const METRIC_API_RATE_LIMITED: &str = "harvest.api.rate_limited";
-
 /// Gauge: current available tokens in a rate limit bucket.
 pub const METRIC_RATE_LIMIT_TOKENS_AVAILABLE: &str = "harvest.rate_limit.tokens_available";
 
@@ -1329,47 +901,6 @@ pub const METRIC_RATE_LIMIT_REFILL_RATE: &str = "harvest.rate_limit.refill_rate"
 
 /// Counter: incremented when a task claim is throttled/skipped due to rate limiting.
 pub const METRIC_RATE_LIMIT_THROTTLED: &str = "harvest.rate_limit.throttled";
-
-/// Gauge: tokens left in the retry budget of one activity type (issue #1793).
-///
-/// Labeled by `activity`. The budget registry sets it after every bucket
-/// access, under the bucket lock. It does not follow the time refill between
-/// accesses.
-pub const METRIC_RETRY_BUDGET_AVAILABLE: &str = "harvest.retry.budget.available";
-
-/// Counter: retries that the retry budget deferred (issue #1793).
-///
-/// Labeled by `activity`. Prometheus exports it as
-/// `harvest_retry_budget_exhausted_total`.
-pub const METRIC_RETRY_BUDGET_EXHAUSTED: &str = "harvest.retry.budget.exhausted";
-
-/// Gauge: the adaptive concurrency limit of one activity type (issue #1836).
-///
-/// Labeled by `activity`. It is the cap on in-flight attempts on one worker.
-/// The limit registry sets it after every change, under its lock.
-pub const METRIC_ACTIVITY_CONCURRENCY_LIMIT: &str = "harvest.activity.concurrency_limit";
-
-/// Gauge: in-flight attempts of one activity type that hold an adaptive
-/// limit slot (issue #1836).
-///
-/// Labeled by `activity`. When it equals the limit, the worker claims no
-/// more tasks of that type.
-pub const METRIC_ACTIVITY_CONCURRENCY_IN_FLIGHT: &str = "harvest.activity.concurrency_in_flight";
-
-/// Gauge: the no-load handler latency estimate of one activity type, in
-/// seconds (issue #1836).
-///
-/// Labeled by `activity`. The adaptive limit compares the mean latency of
-/// each window with it. A probe clears it. The gauge keeps its last value
-/// until the probe window closes.
-pub const METRIC_ACTIVITY_LATENCY_BASELINE: &str = "harvest.activity.latency_baseline_seconds";
-
-/// Counter: claimed attempts that the adaptive limit deferred (issue #1836).
-///
-/// Labeled by `activity`. The claim skips a type at its cap, so this counts
-/// only the claims that raced past the cap. A steady rate means churn.
-/// Prometheus exports it as `harvest_activity_concurrency_deferred_total`.
-pub const METRIC_ACTIVITY_CONCURRENCY_DEFERRED: &str = "harvest.activity.concurrency_deferred";
 
 /// Counter: incremented on each scheduler tick-loop fire attempt for a due schedule slot.
 ///
@@ -1546,51 +1077,6 @@ pub const METRIC_SESSION_ACQUISITION: &str = "harvest.session.acquisition";
 /// last-tick registry is surfaced by the `scanner_liveness` check in
 /// `GET /admin/preflight` for deployments without a metrics pipeline.
 pub const METRIC_SCANNER_TICK: &str = "harvest.scanner.tick";
-
-/// Counter: one per-shard scanner tick that reached the database, by role
-/// (issue #1795).
-///
-/// Labels: `scanner`, `shard`, and `role`. A `role` is one of:
-///
-/// - `leader`: this replica holds the lease and ran the pass.
-/// - `standby`: another replica holds the lease. This replica skipped the
-///   pass.
-/// - `unelected`: election is off. This replica ran the pass.
-/// - `fail_open`: the lease query failed. This replica ran the pass anyway.
-///
-/// The sum of the three running roles across the fleet is the scan load.
-/// The `role` label is [`METRIC_LABEL_ROLE`].
-pub const METRIC_SCANNER_PASS: &str = "harvest.scanner.pass";
-
-/// Counter: a pool acquire hit its bound (issue #1788).
-///
-/// Labelled `{site}`: `claim` or `heartbeat_flush`. A steady rate means the
-/// pool is too small or a connection is stuck. See
-/// `docs/operations/postgres-timeouts.md`.
-pub const METRIC_DB_POOL_ACQUIRE_TIMEOUT: &str = "harvest.db.pool_acquire_timeout";
-
-/// Counter: Postgres aborted a transaction and the engine ran it again
-/// (issue #1822).
-///
-/// Labelled `{site, reason}`. `site` is `persist`, `workflow_task`, `claim`
-/// or `scanner`. `reason` is `deadlock` (`40P01`) or `serialization_failure`
-/// (`40001`). A steady `deadlock` rate points to a lock-order defect. See the
-/// lock-order table in `docs/architecture.md`.
-pub const METRIC_DB_TRANSACTION_RETRY: &str = "harvest.db.transaction_retry";
-
-/// Counter: a transaction still hit a conflict abort after its last retry
-/// (issue #1822).
-///
-/// Labelled `{site, reason}` like [`METRIC_DB_TRANSACTION_RETRY`]. The error
-/// then reaches the caller, so any non-zero rate needs attention.
-pub const METRIC_DB_TRANSACTION_RETRY_EXHAUSTED: &str = "harvest.db.transaction_retry_exhausted";
-
-/// Counter: an activity heartbeat flush failed (issue #1788).
-///
-/// Labelled `{reason}`: `acquire_timeout`, `acquire_error` or `write_error`.
-/// The flusher keeps the payload and tries again on the next tick. A run of
-/// failures can let `heartbeat_timeout` fire on a healthy activity.
-pub const METRIC_HEARTBEAT_FLUSH_FAILED: &str = "harvest.heartbeat.flush_failed";
 
 /// Counter: a `SignalReceived` event was durably delivered into a workflow's
 /// history and promoted to a live workflow-task wake (issue #684).
@@ -1959,11 +1445,6 @@ pub const METRIC_LABEL_SOURCE: &str = "source";
 
 /// Metric label: the workflow name.
 pub const METRIC_LABEL_WORKFLOW: &str = "workflow";
-
-/// Label: the bounded rate-limit key *family* (`dyn-rate` / `start-throttle`),
-/// used by [`METRIC_RATE_LIMIT_BUCKETS_DELETED`] in place of the unbounded
-/// bucket key (issue #1127).
-pub const METRIC_LABEL_RATE_LIMIT_FAMILY: &str = "family";
 /// Metric label: the low-cardinality workflow type.
 pub const METRIC_LABEL_WORKFLOW_TYPE: &str = "workflow.type";
 /// Metric label: the activity name.
@@ -1978,11 +1459,8 @@ pub const METRIC_LABEL_QUEUE: &str = "queue";
 pub const METRIC_LABEL_TASK_TYPE: &str = "task_type";
 /// Metric label: terminal outcome status (e.g. `"completed"`, `"failed"`).
 pub const METRIC_LABEL_STATUS: &str = "status";
-/// Metric label: lifecycle state.
-///
-/// `harvest.workflow.active` uses `"running"` / `"paused"` (issue #770).
-/// `harvest.retention.terminal_tasks_deleted` uses the task states
-/// `COMPLETED` / `FAILED` / `CANCELLED` (issue #1811).
+/// Metric label: active workflow lifecycle state (issue #770) — one of the
+/// bounded values `"running"` / `"paused"`.
 pub const METRIC_LABEL_STATE: &str = "state";
 /// Metric label: low-cardinality error class on failed activity records.
 pub const METRIC_LABEL_ERROR_TYPE: &str = "error.type";
@@ -2007,60 +1485,19 @@ pub const METRIC_LABEL_QUERY: &str = "query.name";
 pub const METRIC_LABEL_OUTCOME: &str = "outcome";
 /// Metric label: reason code for external signal failure.
 pub const METRIC_LABEL_REASON_CODE: &str = "reason_code";
-/// Metric label: how many runs a key is over its declared concurrency limit
-/// (issue #1197, item 2), bounded by `concurrency::SUPERSEDE_SCAN_LIMIT`.
-pub const METRIC_LABEL_GAP: &str = "gap";
 /// Metric label: the completion trigger ID (issue #517).
 pub const METRIC_LABEL_TRIGGER: &str = "trigger";
 /// Metric label: admission gate scope kind (issue #377).
 pub const METRIC_LABEL_SCOPE: &str = "scope";
-/// Metric label: the route class an API rate-limit bucket counts (issue #1827).
-pub const METRIC_LABEL_ROUTE_CLASS: &str = "route_class";
-/// Metric label: what identifies an API rate-limit client (issue #1827).
-pub const METRIC_LABEL_CLIENT_KIND: &str = "client_kind";
 /// Metric label: the in-process start producer (issue #618).
 pub const METRIC_LABEL_PRODUCER: &str = "producer";
 /// Metric label: the build ID of the worker.
-///
-/// The worker passes each value through [`build_id_label`], which caps the
-/// cardinality (issue #1814). A custom recorder that forwards to another
-/// recorder must forward the `*_for_build` methods too, or the build is lost.
 pub const METRIC_LABEL_BUILD_ID: &str = "build_id";
-/// `build_id` label value when the build is not known or is empty
-/// (issue #1814).
-pub const BUILD_ID_LABEL_NONE: &str = "none";
-/// `build_id` label value for a build over the cap (issue #1814).
-///
-/// [`build_id_label`] uses it for a build after the first
-/// [`MAX_BUILD_ID_LABELS`] distinct builds, and for a build id longer than
-/// [`MAX_BUILD_ID_LABEL_LEN`] bytes.
-pub const BUILD_ID_LABEL_OTHER: &str = "__other__";
-/// The escape prefix of a `build_id` label value (issue #1814).
-///
-/// [`build_id_label`] adds it to a real build id that equals a sentinel, and
-/// to a real build id that already starts with it. So `none` reports
-/// `build:none`, and `build:none` reports `build:build:none`. The encoding is
-/// one-to-one, so no two real builds share a series, and no real build shares
-/// a sentinel series.
-pub const BUILD_ID_LABEL_ESCAPE_PREFIX: &str = "build:";
-/// The maximum number of distinct `build_id` label values in one process
-/// (issue #1814).
-///
-/// A worker process normally reports one build, its own. The cap is a safety
-/// limit for a process that reports many builds.
-pub const MAX_BUILD_ID_LABELS: usize = 16;
-/// The maximum byte length of a `build_id` label value (issue #1814).
-pub const MAX_BUILD_ID_LABEL_LEN: usize = 128;
 /// Metric label: worker dispatch-slot type (`"workflow"` or `"activity"`).
 pub const METRIC_LABEL_SLOT_TYPE: &str = "slot_type";
 /// Metric label: adaptive slot-tuner decision (`"grow"` / `"shrink"` / `"hold"`,
 /// issue #548).
 pub const METRIC_LABEL_DECISION: &str = "decision";
-/// Metric label: the database operation, bounded by [`DbOp`] (issue #1815).
-pub const METRIC_LABEL_OP: &str = "op";
-/// Metric label: the outlier dimension, bounded by
-/// [`OutlierDimension`](crate::worker_outlier::OutlierDimension) (issue #1815).
-pub const METRIC_LABEL_DIMENSION: &str = "dimension";
 /// Metric label: the operator action taken on an activity-type pause
 /// (`"pause"` / `"resume"`, issue #807).
 ///
@@ -2073,17 +1510,6 @@ pub const METRIC_LABEL_ACTION: &str = "action";
 /// Bounded by construction to the [`Scanner`](crate::scanner_health::Scanner)
 /// variants — a call site passes the enum's `as_str()`, never a free string.
 pub const METRIC_LABEL_SCANNER: &str = "scanner";
-/// Metric label: what a scanner tick did under election (issue #1795).
-///
-/// Bounded by construction to the
-/// [`ScannerRole`](crate::scanner_lease::ScannerRole) variants.
-pub const METRIC_LABEL_ROLE: &str = "role";
-
-/// Metric label: the code path that hit a pool acquire bound (issue #1788).
-///
-/// Bounded: `claim` or `heartbeat_flush`.
-pub const METRIC_LABEL_SITE: &str = "site";
-
 /// `shard` label value for a control loop that is **not** per-shard (issue #797).
 ///
 /// The `retention` and `schedule` loops run once per process rather than once
@@ -2092,154 +1518,6 @@ pub const METRIC_LABEL_SITE: &str = "site";
 /// [`METRIC_SCANNER_TICK`] series carries the same label set — a family with a
 /// sometimes-present label is awkward to query and easy to mis-aggregate.
 pub const SCANNER_SHARD_LABEL_NONE: &str = "none";
-
-/// The `messaging.system` value for Harvest's own task queues (issue #1838).
-pub const SEMCONV_MESSAGING_SYSTEM: &str = "harvest";
-
-/// The kind of instrument a [`SemconvMapping`] copies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SemconvInstrument {
-    /// A monotonic counter. Prometheus exposes it with a `_total` suffix.
-    Counter,
-    /// A histogram in seconds.
-    Histogram,
-}
-
-/// One `harvest.*` metric that has an OpenTelemetry messaging semantic
-/// convention equivalent (issue #1838).
-///
-/// Harvest keeps its own names. The OpenTelemetry Collector recipe in
-/// `docs/operations/otel-collector.md` copies each mapped series under the
-/// semconv name. A test renders that recipe from this table, so the two
-/// cannot drift.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SemconvMapping {
-    /// The Harvest metric name.
-    pub source: &'static str,
-    /// The instrument kind of the source.
-    pub instrument: SemconvInstrument,
-    /// The semantic convention metric name.
-    pub target: &'static str,
-    /// The `messaging.operation.name` value.
-    pub operation_name: &'static str,
-    /// The `messaging.operation.type` value.
-    pub operation_type: &'static str,
-    /// The Harvest label that becomes `messaging.destination.name`.
-    pub destination_label: &'static str,
-    /// The UCUM unit the semconv metric requires. The Collector recipe sets
-    /// it, because the source carries no unit.
-    pub unit: &'static str,
-}
-
-/// Every `harvest.*` metric with a messaging semconv equivalent (issue #1838).
-///
-/// See ADR 0004 for the metrics that stay unmapped, and why.
-pub const SEMCONV_METRIC_MAPPINGS: &[SemconvMapping] = &[
-    // A worker claims a task from a queue: one consumed message.
-    SemconvMapping {
-        source: METRIC_QUEUE_DISPATCHED,
-        instrument: SemconvInstrument::Counter,
-        target: "messaging.client.consumed.messages",
-        operation_name: "claim",
-        operation_type: "receive",
-        destination_label: METRIC_LABEL_QUEUE,
-        unit: "{message}",
-    },
-    // An activity attempt runs a claimed task: the processing duration.
-    SemconvMapping {
-        source: METRIC_ACTIVITY_DURATION,
-        instrument: SemconvInstrument::Histogram,
-        target: "messaging.process.duration",
-        operation_name: "process",
-        operation_type: "process",
-        destination_label: METRIC_LABEL_QUEUE,
-        unit: "s",
-    },
-];
-
-// ---------------------------------------------------------------------------
-// Bounded `build_id` label (issue #1814)
-// ---------------------------------------------------------------------------
-
-/// A cap on the distinct `build_id` label values (issue #1814).
-///
-/// The cap admits the first `max` distinct build ids. A later build id gets
-/// [`BUILD_ID_LABEL_OTHER`].
-#[derive(Debug)]
-pub struct BuildIdLabelCap {
-    max: usize,
-    admitted: std::sync::RwLock<std::collections::HashSet<Box<str>>>,
-}
-
-impl BuildIdLabelCap {
-    /// Make a cap that admits `max` distinct build ids.
-    #[must_use]
-    pub fn new(max: usize) -> Self {
-        Self {
-            max,
-            admitted: std::sync::RwLock::default(),
-        }
-    }
-
-    /// Return the label value for `raw`.
-    ///
-    /// An empty `raw` gets [`BUILD_ID_LABEL_NONE`]. A real build id that
-    /// equals a sentinel, or starts with [`BUILD_ID_LABEL_ESCAPE_PREFIX`],
-    /// gets that prefix added, so the encoding is one-to-one. A label longer
-    /// than [`MAX_BUILD_ID_LABEL_LEN`] bytes gets [`BUILD_ID_LABEL_OTHER`].
-    #[must_use]
-    pub fn label<'a>(&self, raw: &'a str) -> std::borrow::Cow<'a, str> {
-        use std::borrow::Cow;
-
-        if raw.is_empty() {
-            return Cow::Borrowed(BUILD_ID_LABEL_NONE);
-        }
-        let escape = raw == BUILD_ID_LABEL_NONE
-            || raw == BUILD_ID_LABEL_OTHER
-            || raw.starts_with(BUILD_ID_LABEL_ESCAPE_PREFIX);
-        let label: Cow<'a, str> = if escape {
-            Cow::Owned(format!("{BUILD_ID_LABEL_ESCAPE_PREFIX}{raw}"))
-        } else {
-            Cow::Borrowed(raw)
-        };
-        if label.len() > MAX_BUILD_ID_LABEL_LEN {
-            return Cow::Borrowed(BUILD_ID_LABEL_OTHER);
-        }
-        let admitted = self
-            .admitted
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(label.as_ref());
-        if admitted {
-            return label;
-        }
-        let mut set = self
-            .admitted
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Check again under the write lock: another thread can admit the
-        // label between the two locks.
-        if set.contains(label.as_ref()) {
-            return label;
-        }
-        if set.len() >= self.max {
-            return Cow::Borrowed(BUILD_ID_LABEL_OTHER);
-        }
-        set.insert(label.as_ref().into());
-        label
-    }
-}
-
-/// Return the capped `build_id` label value for `raw` (issue #1814).
-///
-/// One process-wide [`BuildIdLabelCap`] of [`MAX_BUILD_ID_LABELS`] holds the
-/// admitted values.
-#[must_use]
-pub fn build_id_label(raw: &str) -> std::borrow::Cow<'_, str> {
-    static CAP: std::sync::LazyLock<BuildIdLabelCap> =
-        std::sync::LazyLock::new(|| BuildIdLabelCap::new(MAX_BUILD_ID_LABELS));
-    CAP.label(raw)
-}
 
 // ---------------------------------------------------------------------------
 // Custom (user) metric constants and validation (issue #532)
@@ -2650,52 +1928,6 @@ impl TunerDecision {
     }
 }
 
-/// A key for the sink one metrics recorder writes to (issue #1815).
-///
-/// It is [`MetricsRecorder::sink_key`] when the recorder names its sink, else
-/// the address of the recorder's shared allocation. An aggregate that feeds an
-/// unlabelled gauge, such as the poller count, is kept per key. Workers that
-/// feed one sink then share the aggregate, and a runtime with its own sink
-/// stays apart. A holder of an address key must also hold a clone of the
-/// `Arc`, so the address is not reused.
-#[cfg(feature = "db")]
-#[must_use]
-pub(crate) fn recorder_key(metrics: &Arc<dyn MetricsRecorder>) -> usize {
-    metrics
-        .sink_key()
-        .unwrap_or_else(|| Arc::as_ptr(metrics).cast::<()>() as usize)
-}
-
-/// A timed database operation (issue #1815), used as the bounded `op` label on
-/// [`METRIC_DB_QUERY_DURATION`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DbOp {
-    /// One task claim on the poll path.
-    Claim,
-    /// The commit of one workflow-task outcome.
-    Persist,
-    /// One timeout-scanner pass on one shard.
-    Scan,
-    /// One activity heartbeat write.
-    Heartbeat,
-}
-
-impl DbOp {
-    /// Every op, in a stable order.
-    pub const ALL: [Self; 4] = [Self::Claim, Self::Persist, Self::Scan, Self::Heartbeat];
-
-    /// Stable string representation, suitable for metric tag values.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Claim => "claim",
-            Self::Persist => "persist",
-            Self::Scan => "scan",
-            Self::Heartbeat => "heartbeat",
-        }
-    }
-}
-
 /// The operator action taken on an activity-type pause (issue #807), used as
 /// the bounded `action` label on [`METRIC_ACTIVITY_PAUSE_ACTIONS`].
 ///
@@ -2772,35 +2004,6 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = producer;
     }
 
-    /// The API rate limiter refused one request with `429` (issue #1827).
-    ///
-    /// `route_class` is `"mutating"` or `"read"`. `client_kind` is
-    /// `"token"`, `"ip"`, `"unknown"` or `"overflow"`.
-    fn record_api_rate_limited(&self, route_class: &str, client_kind: &str) {
-        let _ = (route_class, client_kind);
-    }
-
-    /// The load-shed state of `queue` after one sample (issue #1794).
-    ///
-    /// `active` is `true` while the queue sheds new starts. The sampler calls
-    /// this for every configured queue on every successful sample.
-    fn record_load_shed_active(&self, queue: &str, active: bool) {
-        let _ = (queue, active);
-    }
-
-    /// Load shedding rejected one new start on `queue` (issue #1794).
-    fn record_load_shed_rejected(&self, queue: &str) {
-        let _ = queue;
-    }
-
-    /// The ramp guard aborted the build ramp of `queue` (issue #1814).
-    ///
-    /// Maps to [`METRIC_BUILD_RAMP_ABORTED`]. `reason` is
-    /// `ramp_guard::RampAbortReason::as_str`.
-    fn record_build_ramp_aborted(&self, queue: &str, reason: &str) {
-        let _ = (queue, reason);
-    }
-
     /// A fresh workflow start was rejected because its resolved per-tenant
     /// quota key is at or over a declared cap (issue #946).
     ///
@@ -2810,19 +2013,6 @@ pub trait MetricsRecorder: Send + Sync {
     /// [`METRIC_QUOTA_REJECTED`] for why.
     fn record_quota_rejected(&self, workflow: &str, resource: &str) {
         let _ = (workflow, resource);
-    }
-
-    /// The lazy payload-codec re-encryption sweep (issue #948) rewrote `count`
-    /// `harvest_events` rows on `shard` onto the active key.
-    ///
-    /// `shard` is the shard id rendered as a string — a bounded label, one
-    /// series per shard. The key id is intentionally not passed here; see
-    /// [`METRIC_CODEC_REENCRYPTED`] for why.
-    ///
-    /// Additive with a no-op default: implementing it is optional and no
-    /// existing implementor breaks.
-    fn record_codec_reencrypted(&self, shard: &str, count: u64) {
-        let _ = (shard, count);
     }
 
     /// A workflow task entered the executor on a worker.
@@ -2874,38 +2064,6 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (workflow_name, queue, outcome);
     }
 
-    /// [`record_workflow_terminal`](Self::record_workflow_terminal) with the
-    /// build of the worker that ran the task (issue #1814).
-    ///
-    /// `build_id` is a value from [`build_id_label`]. The default drops it, so
-    /// an existing recorder stays correct with no change.
-    fn record_workflow_terminal_for_build(
-        &self,
-        workflow_name: &str,
-        queue: &str,
-        build_id: &str,
-        outcome: WorkflowStatus,
-    ) {
-        let _ = build_id;
-        self.record_workflow_terminal(workflow_name, queue, outcome);
-    }
-
-    /// [`record_workflow_completed`](Self::record_workflow_completed) with the
-    /// build of the worker that ran the task (issue #1814).
-    ///
-    /// The default drops `build_id`.
-    fn record_workflow_completed_for_build(
-        &self,
-        workflow_name: &str,
-        queue: &str,
-        build_id: &str,
-        duration_secs: f64,
-        status: WorkflowStatus,
-    ) {
-        let _ = build_id;
-        self.record_workflow_completed(workflow_name, queue, duration_secs, status);
-    }
-
     /// A workflow execution rotated using continue-as-new.
     fn record_workflow_continue_as_new(&self, workflow_name: &str) {
         let _ = workflow_name;
@@ -2925,20 +2083,6 @@ pub trait MetricsRecorder: Send + Sync {
     /// Per ADR-0001 §7, `execution.id` must never be a label here.
     fn record_workflow_nondeterministic_block(&self, workflow_name: &str, queue: &str) {
         let _ = (workflow_name, queue);
-    }
-
-    /// [`record_workflow_nondeterministic_block`](Self::record_workflow_nondeterministic_block)
-    /// with the build of the worker that hit the divergence (issue #1814).
-    ///
-    /// The default drops `build_id`.
-    fn record_workflow_nondeterministic_block_for_build(
-        &self,
-        workflow_name: &str,
-        queue: &str,
-        build_id: &str,
-    ) {
-        let _ = build_id;
-        self.record_workflow_nondeterministic_block(workflow_name, queue);
     }
 
     /// An activity handler panicked (unwound) and the engine contained the
@@ -3063,44 +2207,6 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (activity_name, queue, outcome);
     }
 
-    /// [`record_activity_attempt`](Self::record_activity_attempt) with the
-    /// build of the worker that ran the attempt (issue #1814).
-    ///
-    /// The default drops `build_id`.
-    fn record_activity_attempt_for_build(
-        &self,
-        activity_name: &str,
-        queue: &str,
-        build_id: &str,
-        outcome: ActivityStatus,
-    ) {
-        let _ = build_id;
-        self.record_activity_attempt(activity_name, queue, outcome);
-    }
-
-    /// [`record_activity_completed_with_error_type`](Self::record_activity_completed_with_error_type)
-    /// with the build of the worker that ran the attempt (issue #1814).
-    ///
-    /// The default drops `build_id`.
-    fn record_activity_completed_for_build(
-        &self,
-        activity_name: &str,
-        queue: &str,
-        build_id: &str,
-        duration_secs: f64,
-        status: ActivityStatus,
-        error_type: Option<&str>,
-    ) {
-        let _ = build_id;
-        self.record_activity_completed_with_error_type(
-            activity_name,
-            queue,
-            duration_secs,
-            status,
-            error_type,
-        );
-    }
-
     /// A retry was scheduled for an activity (one per retry actually enqueued).
     ///
     /// Increments [`METRIC_ACTIVITY_RETRIES`] with labels `activity` and `queue`.
@@ -3183,14 +2289,6 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (scanner, shard);
     }
 
-    /// A per-shard scanner tick ended in `role` (issue #1795).
-    ///
-    /// See [`METRIC_SCANNER_PASS`] for the role values. All labels are
-    /// bounded. Additive with a no-op default.
-    fn record_scanner_pass(&self, scanner: &str, shard: &str, role: &str) {
-        let _ = (scanner, shard, role);
-    }
-
     /// A background control loop registered itself, before its first
     /// iteration (issue #797).
     ///
@@ -3216,39 +2314,6 @@ pub trait MetricsRecorder: Send + Sync {
     /// existing implementor breaks.
     fn record_scanner_registered(&self, scanner: &str, shard: &str) {
         let _ = (scanner, shard);
-    }
-
-    /// A pool acquire hit its bound (issue #1788).
-    ///
-    /// `site` is `claim` or `heartbeat_flush`. Additive with a no-op default.
-    fn record_db_pool_acquire_timeout(&self, site: &str) {
-        let _ = site;
-    }
-
-    /// Postgres aborted a transaction and the engine runs it again
-    /// (issue #1822).
-    ///
-    /// `site` is `persist`, `workflow_task`, `claim` or `scanner`. `reason`
-    /// is `deadlock` or `serialization_failure`. Additive with a no-op default.
-    fn record_db_transaction_retry(&self, site: &str, reason: &str) {
-        let _ = (site, reason);
-    }
-
-    /// A transaction still hit a conflict abort after its last retry
-    /// (issue #1822).
-    ///
-    /// Labels as [`Self::record_db_transaction_retry`]. Additive with a no-op
-    /// default.
-    fn record_db_transaction_retry_exhausted(&self, site: &str, reason: &str) {
-        let _ = (site, reason);
-    }
-
-    /// An activity heartbeat flush failed (issue #1788).
-    ///
-    /// `reason` is `acquire_timeout`, `acquire_error` or `write_error`.
-    /// Additive with a no-op default.
-    fn record_heartbeat_flush_failed(&self, reason: &str) {
-        let _ = reason;
     }
 
     /// Results of one retention-janitor tick on a shard.
@@ -3289,24 +2354,6 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (workflow, count);
     }
 
-    /// Number of inert per-tenant rate-limit buckets the idle-bucket GC pass
-    /// collected on one shard in one tick, per key family (issue #1127).
-    ///
-    /// Maps to the counter [`METRIC_RATE_LIMIT_BUCKETS_DELETED`], labeled with
-    /// the bounded `family` (`dyn-rate` / `start-throttle`) and never with the
-    /// unbounded bucket key. Emitted for real deletes only (never dry-run).
-    fn record_rate_limit_buckets_deleted(&self, family: &str, count: u64) {
-        let _ = (family, count);
-    }
-
-    /// Number of terminal task rows the terminal-task janitor deleted on one
-    /// shard in one tick, per task state (issue #1811).
-    ///
-    /// Maps to [`METRIC_TERMINAL_TASKS_DELETED`]. Real deletes only.
-    fn record_terminal_tasks_deleted(&self, state: &str, count: u64) {
-        let _ = (state, count);
-    }
-
     /// Current number of RUNNING tasks for a concurrency group key.
     ///
     /// Emitted by the concurrency sampler on every sample interval. The value
@@ -3333,34 +2380,6 @@ pub trait MetricsRecorder: Send + Sync {
     /// (ADR-0001 §7 cardinality rule).
     fn record_concurrency_superseded(&self, workflow: &str) {
         let _ = workflow;
-    }
-
-    /// A latest-wins supersede pass left `gap` runs over the key's declared
-    /// limit because they were all protected in-flight (nested) admissions it
-    /// may never shed (issue #1197, item 2).
-    ///
-    /// Maps to the counter [`METRIC_CONCURRENCY_RESIDUAL_OVER_LIMIT`]. The key
-    /// is transiently over its limit and self-heals on the next ordinary
-    /// admission; this counter is the alertable signal for operators who want
-    /// to know when that happens. Additive with a no-op default: implementing
-    /// it is optional and no existing implementor breaks.
-    fn record_concurrency_residual_over_limit(&self, workflow: &str, gap: u64) {
-        let _ = (workflow, gap);
-    }
-
-    /// A `cancel_running` admission's quota credit assumed `gap` runs would
-    /// be shed, and the real supersede pass skipped them instead (issue
-    /// #1228 review, P2).
-    ///
-    /// Maps to the counter [`METRIC_QUOTA_SUPERSEDE_CREDIT_NOT_SHED`].
-    /// Unlike [`Self::record_concurrency_residual_over_limit`], the key
-    /// here is not merely transient. The admission that spent this credit
-    /// is already committed. So the key is genuinely over its declared cap
-    /// until an operator intervenes or the corrupt candidate is fixed.
-    /// Additive with a no-op default: implementing it is optional and no
-    /// existing implementor breaks.
-    fn record_quota_supersede_credit_not_shed(&self, workflow: &str, gap: u64) {
-        let _ = (workflow, gap);
     }
 
     /// Record the current available tokens for a rate limit bucket key.
@@ -3391,48 +2410,6 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = activity;
     }
 
-    /// Record the tokens left in the retry budget of one activity type
-    /// (issue #1793).
-    ///
-    /// Maps to the gauge `harvest.retry.budget.available{activity}`. The
-    /// `activity` argument is the registered activity name.
-    fn record_retry_budget_available(&self, activity: &str, tokens: f64) {
-        let _ = (activity, tokens);
-    }
-
-    /// Record one retry that the retry budget deferred (issue #1793).
-    ///
-    /// Maps to the counter `harvest.retry.budget.exhausted{activity}`. The
-    /// `activity` argument is the registered activity name.
-    fn record_retry_budget_exhausted(&self, activity: &str) {
-        let _ = activity;
-    }
-
-    /// Record the adaptive concurrency limit state of one activity type
-    /// (issue #1836). The registry calls it only when the state changes.
-    ///
-    /// Maps to three gauges, each labeled by `activity`:
-    /// `harvest.activity.concurrency_limit`,
-    /// `harvest.activity.concurrency_in_flight` and
-    /// `harvest.activity.latency_baseline_seconds`. A `baseline` of `None`
-    /// means no estimate yet. The baseline gauge then keeps its last value.
-    fn record_activity_concurrency_limit(
-        &self,
-        activity: &str,
-        state: &crate::adaptive_limit::LimitSnapshot,
-    ) {
-        let _ = (activity, state);
-    }
-
-    /// Record one claimed attempt that the adaptive limit deferred (issue
-    /// #1836).
-    ///
-    /// Maps to the counter `harvest.activity.concurrency_deferred{activity}`.
-    /// The `activity` argument is the registered activity name.
-    fn record_activity_concurrency_deferred(&self, activity: &str) {
-        let _ = activity;
-    }
-
     /// Current number of entries in the dead-letter queue on one shard.
     ///
     /// Emitted by a periodic background sampler on the same cadence as
@@ -3444,37 +2421,6 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (shard, depth);
     }
 
-    /// Cumulative hints the dispatch background publisher has dropped because
-    /// its bounded queue was full (issue #1429).
-    ///
-    /// Emitted by a periodic in-process sampler, no label. Maps to the gauge
-    /// `harvest_dispatch_dropped_hints`. Not incremental: each call carries
-    /// the running total from [`crate::dispatch::dropped_hints`].
-    fn record_dispatch_dropped_hints(&self, total: u64) {
-        let _ = total;
-    }
-
-    /// Cumulative notifications this process has lost to an error
-    /// (issue #1796).
-    ///
-    /// Emitted by a periodic in-process sampler, no label. Maps to the gauge
-    /// `harvest_notify_send_failures`. Not incremental: each call carries the
-    /// running total from `crate::notify::send_failures`.
-    fn record_notify_send_failures(&self, total: u64) {
-        let _ = total;
-    }
-
-    /// The largest Postgres notification queue usage that a live notify
-    /// sender read last, from `0.0` to `1.0` (issue #1796).
-    ///
-    /// Emitted by a periodic in-process sampler, no label. Maps to the gauge
-    /// `harvest_notify_queue_usage`. The sampler skips the call until a
-    /// sender has read the queue usage. It reports `0.0` after the last live
-    /// sender stops.
-    fn record_notify_queue_usage(&self, ratio: f64) {
-        let _ = ratio;
-    }
-
     /// Whether a task queue is currently held by an operator queue pause
     /// (issue #619): `paused = true` while the hold is in effect, `false` for
     /// one cycle after it is released so the series drops rather than going
@@ -3484,15 +2430,6 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to the gauge `harvest_queue_paused{queue}`.
     fn record_queue_paused(&self, queue: &str, paused: bool) {
         let _ = (queue, paused);
-    }
-
-    /// A worker with an empty `build_id` serves a queue that has a build
-    /// policy (issue #1805). Emitted once at registration, value `1`.
-    /// The series is never cleared while the worker runs.
-    ///
-    /// Maps to the gauge `harvest_worker_empty_build_policy{queue}`.
-    fn record_worker_empty_build_policy(&self, queue: &str) {
-        let _ = queue;
     }
 
     /// An operator paused or resumed dispatch for a whole activity type
@@ -3526,47 +2463,6 @@ pub trait MetricsRecorder: Send + Sync {
     /// `harvest_worker_slots_available{slot_type}`.
     fn record_worker_slots(&self, slot_type: SlotType, in_use: u64, available: u64) {
         let _ = (slot_type, in_use, available);
-    }
-
-    /// A periodic snapshot of one shard pool (issue #1815).
-    ///
-    /// Maps to the gauges `harvest_db_pool_in_use{shard}` and
-    /// `harvest_db_pool_idle{shard}`.
-    fn record_db_pool(&self, shard: u16, in_use: u64, idle: u64) {
-        let _ = (shard, in_use, idle);
-    }
-
-    /// The wait for one pooled connection (issue #1815).
-    ///
-    /// Maps to the histogram `harvest_db_pool_wait_duration{shard}`.
-    fn record_db_pool_wait(&self, shard: u16, seconds: f64) {
-        let _ = (shard, seconds);
-    }
-
-    /// The duration of one database operation (issue #1815).
-    ///
-    /// Maps to the histogram `harvest_db_query_duration{op, shard}`. The
-    /// shard keeps a slow shard of a multi-shard worker visible.
-    fn record_db_query_duration(&self, op: DbOp, shard: u16, seconds: f64) {
-        let _ = (op, shard, seconds);
-    }
-
-    /// The poll loops on this worker that claim from `queue` (issue #1815).
-    ///
-    /// Maps to the gauge `harvest_worker_pollers{queue}`.
-    fn record_worker_pollers(&self, queue: &str, pollers: u64) {
-        let _ = (queue, pollers);
-    }
-
-    /// Whether this worker is an outlier on one dimension (issue #1815).
-    ///
-    /// Maps to the gauge `harvest_worker_outlier{dimension}`, 1 or 0.
-    fn record_worker_outlier(
-        &self,
-        dimension: crate::worker_outlier::OutlierDimension,
-        flagged: bool,
-    ) {
-        let _ = (dimension, flagged);
     }
 
     /// The adaptive slot tuner's current resize target for one slot type
@@ -3603,105 +2499,6 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to the gauge `METRIC_SHARD_STRANDED_PENDING{shard}`.
     fn record_shard_stranded_pending(&self, shard: u16, count: u64) {
         let _ = (shard, count);
-    }
-
-    /// Measured RPO for a shard in seconds (issue #954).
-    ///
-    /// Emitted per shard by the replication sampler, and **only when the RPO is
-    /// actually known**: the sampler skips this call entirely when it is not,
-    /// so the series goes stale rather than reporting a false `0`. Pair with
-    /// [`Self::record_replication_standbys`] to tell "slow" from "down".
-    ///
-    /// Maps to the gauge [`METRIC_REPLICATION_LAG_SECONDS`].
-    fn record_replication_lag_seconds(&self, shard: u16, seconds: f64) {
-        let _ = (shard, seconds);
-    }
-
-    /// Whether a shard's replication views are readable (issue #954).
-    ///
-    /// Emitted on **every** sampler tick, `0` included — it is the one DR
-    /// signal that must never go stale, because it is what tells a dashboard
-    /// that the others have.
-    ///
-    /// Maps to the gauge [`METRIC_REPLICATION_OBSERVABLE`].
-    fn record_replication_observable(&self, shard: u16, observable: bool) {
-        let _ = (shard, observable);
-    }
-
-    /// Worst-case WAL backlog in bytes for a shard (issue #954).
-    ///
-    /// Maps to the gauge [`METRIC_REPLICATION_LAG_BYTES`].
-    fn record_replication_lag_bytes(&self, shard: u16, bytes: i64) {
-        let _ = (shard, bytes);
-    }
-
-    /// Number of standbys with a live walsender for a shard (issue #954).
-    ///
-    /// Always emitted, `0` included — `0` is the signal.
-    ///
-    /// Maps to the gauge [`METRIC_REPLICATION_STANDBYS`].
-    fn record_replication_standbys(&self, shard: u16, count: u64) {
-        let _ = (shard, count);
-    }
-
-    /// Whether a shard's measured RPO is known (issue #954, finding 2).
-    ///
-    /// Emitted on every sampler tick the views are readable, `0` included —
-    /// like [`Self::record_replication_observable`], it must never go stale.
-    ///
-    /// Maps to the gauge [`METRIC_REPLICATION_RPO_KNOWN`].
-    fn record_replication_rpo_known(&self, shard: u16, known: bool) {
-        let _ = (shard, known);
-    }
-
-    /// The write-authority epoch a shard's database currently reports
-    /// (issue #954).
-    ///
-    /// Maps to the gauge [`METRIC_SHARD_GENERATION`].
-    fn record_shard_generation(&self, shard: u16, generation: i64) {
-        let _ = (shard, generation);
-    }
-
-    /// Audit-export delivery lag for a shard, in seconds (issue #953).
-    ///
-    /// Emitted on every exporter tick, delivering or not — see
-    /// [`METRIC_AUDIT_EXPORT_LAG`] for why it is the *oldest* unacknowledged
-    /// record's age rather than the newest.
-    ///
-    /// Maps to the gauge [`METRIC_AUDIT_EXPORT_LAG`].
-    fn record_audit_export_lag(&self, shard: u16, seconds: f64) {
-        let _ = (shard, seconds);
-    }
-
-    /// The exporter did, or did not, observe a shard's cursor and lag this
-    /// tick (issue #1268).
-    ///
-    /// Call this on **every** exporter tick that reaches a shard, whether or
-    /// not it delivers a batch. `true` when the cursor read and the lag query
-    /// both succeeded; `false` on a connection failure, a cursor read
-    /// failure, or a lag query failure. See [`METRIC_AUDIT_EXPORT_OBSERVED`]
-    /// for why this signal exists.
-    ///
-    /// Maps to the gauge [`METRIC_AUDIT_EXPORT_OBSERVED`].
-    fn record_audit_export_observed(&self, shard: u16, observed: bool) {
-        let _ = (shard, observed);
-    }
-
-    /// Audit records the sink acknowledged for a shard (issue #953).
-    ///
-    /// Called once per acknowledged batch with that batch's record count,
-    /// only after the cursor advanced.
-    ///
-    /// Maps to the counter [`METRIC_AUDIT_EXPORTED`].
-    fn record_audit_exported(&self, shard: u16, count: u64) {
-        let _ = (shard, count);
-    }
-
-    /// This worker was fenced off `shard` and is stopping (issue #954).
-    ///
-    /// Maps to the counter [`METRIC_SHARD_FENCED`].
-    fn record_shard_fenced(&self, shard: u16) {
-        let _ = shard;
     }
 
     /// A task was dispatched from the given shard (issue #961).
@@ -3980,14 +2777,6 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = activity_name;
     }
 
-    /// An open circuit breaker deferred a claimed task back to `PENDING`
-    /// (issue #1809).
-    ///
-    /// Maps to the counter `harvest.activity.circuit.deferred{activity.name}`.
-    fn record_circuit_deferred(&self, activity_name: &str) {
-        let _ = activity_name;
-    }
-
     /// A payload was observed at a write boundary (issue #252).
     ///
     /// Called for every payload written (accepted or rejected) to
@@ -4041,57 +2830,8 @@ pub trait MetricsRecorder: Send + Sync {
     }
 
     /// Record one external cancel dispatch outcome (`outcome`: `"delivered"` / `"failed"`).
-    ///
-    /// Maps to the counter [`METRIC_EXTERNAL_CANCEL_SENT`].
     fn record_external_cancel_sent(&self, outcome: &str, reason_code: Option<&str>) {
         let _ = (outcome, reason_code);
-    }
-
-    /// A by-id fan-out left one shard uninspected, on a row a sweep is
-    /// therefore leaving pending (issue #1307).
-    ///
-    /// Call once per uninspected shard, `kind` from
-    /// [`crate::external_target_location::UninspectedReasonKind::as_label`].
-    ///
-    /// Maps to the counter [`METRIC_EXTERNAL_BY_ID_INDETERMINATE_SHARD`].
-    fn record_external_by_id_indeterminate_shard(&self, shard: u16, kind: &str) {
-        let _ = (shard, kind);
-    }
-
-    /// Age in seconds of the oldest pending by-id **signal** outbox row this
-    /// sweep left retrying; `0` when none did (issue #1307).
-    ///
-    /// Call once per sweep, from [`crate::timeout::enforce_external_signals_outbox`].
-    ///
-    /// Maps to the gauge [`METRIC_EXTERNAL_SIGNAL_BY_ID_OLDEST_PENDING_AGE`].
-    fn record_external_signal_by_id_oldest_pending_indeterminate_age(&self, age_secs: f64) {
-        let _ = age_secs;
-    }
-
-    /// [`Self::record_external_signal_by_id_oldest_pending_indeterminate_age`]'s
-    /// **cancel** outbox twin (issue #1307).
-    ///
-    /// Maps to the gauge [`METRIC_EXTERNAL_CANCEL_BY_ID_OLDEST_PENDING_AGE`].
-    fn record_external_cancel_by_id_oldest_pending_indeterminate_age(&self, age_secs: f64) {
-        let _ = age_secs;
-    }
-
-    /// A by-id fan-out found a live/terminal run and delivered. One or more
-    /// expected shards could not be inspected — a silently ambiguous success
-    /// (issue #1307). `shard` is the shard the run was found on.
-    ///
-    /// Maps to the counter [`METRIC_EXTERNAL_BY_ID_FOUND_OVER_INCOMPLETE_FANOUT`].
-    fn record_external_by_id_found_over_incomplete_fanout(&self, shard: u16) {
-        let _ = shard;
-    }
-
-    /// A by-id fan-out completed and found more than one live run of the
-    /// same business key (issue #1146; issue #1313). `shard` is the
-    /// winning run's shard.
-    ///
-    /// Maps to the counter [`METRIC_EXTERNAL_BY_ID_OTHER_LIVE_OBSERVED`].
-    fn record_external_by_id_other_live_observed(&self, shard: u16) {
-        let _ = shard;
     }
 
     /// A start request was absorbed by a debounce pending record (issue #499).
@@ -4370,17 +3110,6 @@ pub trait MetricsRecorder: Send + Sync {
         true
     }
 
-    /// The identity of the sink this recorder writes to (issue #1815).
-    ///
-    /// Two recorders that feed one sink must return the same value, even when
-    /// they are separate allocations. For example, every metrics-rs recorder
-    /// writes to the one global registry. The engine keeps unlabelled
-    /// aggregates, such as the poller count, per sink. The default `None`
-    /// treats each recorder allocation as its own sink.
-    fn sink_key(&self) -> Option<usize> {
-        None
-    }
-
     // ── Custom / user-emitted metrics (issue #532) ────────────────────────
 
     /// Record a custom counter emitted by workflow or activity author code.
@@ -4450,24 +3179,6 @@ pub fn emit_workflow_terminal<M: MetricsRecorder + ?Sized>(
     metrics.record_workflow_terminal(workflow_name, queue, outcome);
 }
 
-/// [`emit_workflow_terminal`] with the build of the worker that ran the task
-/// (issue #1814).
-///
-/// It skips canary probes in the same way. `build_id` is a value from
-/// [`build_id_label`].
-pub fn emit_workflow_terminal_for_build<M: MetricsRecorder + ?Sized>(
-    metrics: &M,
-    workflow_name: &str,
-    queue: &str,
-    build_id: &str,
-    outcome: WorkflowStatus,
-) {
-    if crate::canary::is_canary_workflow(workflow_name) {
-        return;
-    }
-    metrics.record_workflow_terminal_for_build(workflow_name, queue, build_id, outcome);
-}
-
 /// Emit [`METRIC_CONCURRENCY_SUPERSEDED`] once per superseded run (issue #811).
 ///
 /// Callers reach this through [`crate::execution::emit_start_cancel_metrics`],
@@ -4490,62 +3201,6 @@ pub fn emit_concurrency_superseded<M: MetricsRecorder + ?Sized>(
         }
         metrics.record_concurrency_superseded(workflow_name);
     }
-}
-
-/// Emit [`METRIC_CONCURRENCY_RESIDUAL_OVER_LIMIT`] for a latest-wins pass that
-/// could not shed its full computed overflow (issue #1197, item 2).
-///
-/// Unlike [`emit_concurrency_superseded`], this is called INLINE from
-/// [`crate::concurrency::supersede_running_for_key`] rather than deferred to a
-/// post-commit point: it is a brand-new counter with no pre-existing
-/// post-commit convention to violate (unlike the `StartCancelledRun` samples
-/// [`crate::execution::emit_start_cancel_metrics`] emits), and the condition
-/// it reports — a key transiently over its declared limit — is itself already
-/// a rare, self-healing edge case (a nested self-referential
-/// `cancel_running` trigger admission), so an occasional phantom sample from a
-/// rolled-back terminal transaction is an accepted, documented simplification
-/// rather than the residual issue #1197 exists to close.
-///
-/// Canary probe workflows (issue #796) are excluded, mirroring
-/// [`emit_workflow_terminal`].
-pub fn emit_concurrency_residual_over_limit<M: MetricsRecorder + ?Sized>(
-    metrics: &M,
-    workflow_name: &str,
-    gap: u64,
-) {
-    if crate::canary::is_canary_workflow(workflow_name) {
-        return;
-    }
-    metrics.record_concurrency_residual_over_limit(workflow_name, gap);
-}
-
-/// Emit [`METRIC_QUOTA_SUPERSEDE_CREDIT_NOT_SHED`] for a skipped credited run.
-///
-/// A `cancel_running` admission's quota credit assumed `gap` runs would be
-/// shed. Its real supersede pass skipped them instead (issue #1228 review,
-/// P2).
-///
-/// Called INLINE from [`crate::execution::run_latest_wins_supersede`],
-/// right after the real supersede pass returns. Same convention as
-/// [`emit_concurrency_residual_over_limit`], and for the same reason: this
-/// is a brand-new counter with no pre-existing post-commit convention to
-/// violate. The condition it reports is itself already a rare edge case,
-/// like a corrupted `parent_close_policy` or an unexpected `Config` error
-/// on one candidate. An occasional phantom sample from a rolled-back
-/// transaction is an accepted, documented simplification, not the gap
-/// this counter exists to close.
-///
-/// Canary probe workflows (issue #796) are excluded, mirroring
-/// [`emit_workflow_terminal`].
-pub fn emit_quota_supersede_credit_not_shed<M: MetricsRecorder + ?Sized>(
-    metrics: &M,
-    workflow_name: &str,
-    gap: u64,
-) {
-    if crate::canary::is_canary_workflow(workflow_name) {
-        return;
-    }
-    metrics.record_quota_supersede_credit_not_shed(workflow_name, gap);
 }
 
 /// Default metrics recorder that discards every sample.
@@ -4832,14 +3487,6 @@ mod tests {
             "harvest.concurrency.superseded"
         );
         assert_eq!(METRIC_SUMMARY_DELETED, "harvest.retention.summary_deleted");
-        assert_eq!(
-            METRIC_RATE_LIMIT_BUCKETS_DELETED,
-            "harvest.retention.rate_limit_buckets_deleted"
-        );
-        assert_eq!(
-            METRIC_TERMINAL_TASKS_DELETED,
-            "harvest.retention.terminal_tasks_deleted"
-        );
         // issue #618: exempt-by-design start producers increment this counter.
         assert_eq!(METRIC_ADMISSION_BYPASSED, "harvest.admission.bypassed");
         assert_eq!(METRIC_LABEL_PRODUCER, "producer");
@@ -4883,33 +3530,6 @@ mod tests {
         assert_eq!(METRIC_CANARY_ROUNDTRIP, "harvest.canary.roundtrip");
         assert_eq!(METRIC_CANARY_SUCCESS, "harvest.canary.success");
         assert_eq!(METRIC_CANARY_FAILURE, "harvest.canary.failure");
-    }
-
-    /// Issue #1815: DB-pool, query-latency, poller and outlier metric names.
-    #[test]
-    fn saturation_metric_constants_have_correct_names() {
-        assert_eq!(METRIC_DB_POOL_IN_USE, "harvest.db.pool.in_use");
-        assert_eq!(METRIC_DB_POOL_IDLE, "harvest.db.pool.idle");
-        assert_eq!(METRIC_DB_POOL_WAIT, "harvest.db.pool.wait_duration");
-        assert_eq!(METRIC_DB_QUERY_DURATION, "harvest.db.query.duration");
-        assert_eq!(METRIC_WORKER_POLLERS, "harvest.worker.pollers");
-        assert_eq!(METRIC_WORKER_OUTLIER, "harvest.worker.outlier");
-        assert_eq!(METRIC_LABEL_OP, "op");
-        assert_eq!(METRIC_LABEL_DIMENSION, "dimension");
-        let ops: Vec<&str> = DbOp::ALL.iter().map(|op| op.as_str()).collect();
-        assert_eq!(ops, ["claim", "persist", "scan", "heartbeat"]);
-    }
-
-    /// Issue #1815: the new recorder methods have no-op defaults, so every
-    /// existing `MetricsRecorder` still compiles.
-    #[test]
-    fn record_saturation_metrics_have_noop_defaults() {
-        let rec = NoOpMetrics;
-        rec.record_db_pool(0, 3, 7);
-        rec.record_db_pool_wait(0, 0.01);
-        rec.record_db_query_duration(DbOp::Claim, 0, 0.002);
-        rec.record_worker_pollers("default", 1);
-        rec.record_worker_outlier(crate::worker_outlier::OutlierDimension::FailureRatio, true);
     }
 
     #[test]
@@ -5447,75 +4067,6 @@ mod tests {
     }
 
     #[test]
-    fn replication_gauges_have_default_noop_impls_and_stable_names() {
-        // Issue #954 AC4. Labelled `{shard}` only: the standby's
-        // `application_name` is operator-chosen and therefore unbounded, so it
-        // is deliberately NOT a label (ADR-0001 §7).
-        let rec = NoOpMetrics;
-        rec.record_replication_lag_seconds(0, 12.5);
-        rec.record_replication_observable(0, false);
-        rec.record_replication_lag_bytes(0, 4_096);
-        rec.record_replication_standbys(0, 1);
-        rec.record_replication_rpo_known(0, false);
-        rec.record_shard_generation(0, 7);
-        rec.record_shard_fenced(0);
-        assert_eq!(
-            METRIC_REPLICATION_LAG_SECONDS,
-            "harvest.replication.lag_seconds"
-        );
-        assert_eq!(
-            METRIC_REPLICATION_LAG_BYTES,
-            "harvest.replication.lag_bytes"
-        );
-        assert_eq!(METRIC_REPLICATION_STANDBYS, "harvest.replication.standbys");
-        assert_eq!(
-            METRIC_REPLICATION_RPO_KNOWN,
-            "harvest.replication.rpo_known"
-        );
-        assert_eq!(METRIC_SHARD_GENERATION, "harvest.shard.generation");
-        assert_eq!(METRIC_SHARD_FENCED, "harvest.shard.fenced");
-    }
-
-    #[test]
-    fn by_id_indeterminate_fanout_observability_has_default_noop_impls_and_stable_names() {
-        // Issue #1307: the outbox sweeps could not previously distinguish
-        // "retrying, will resolve" from "stuck since Tuesday" except by
-        // grepping the `by-id target resolution inconclusive` warning.
-        let rec = NoOpMetrics;
-        rec.record_external_cancel_sent("delivered", None);
-        rec.record_external_cancel_sent("failed", Some("target_unknown"));
-        rec.record_external_by_id_indeterminate_shard(0, "no_pool");
-        rec.record_external_signal_by_id_oldest_pending_indeterminate_age(0.0);
-        rec.record_external_cancel_by_id_oldest_pending_indeterminate_age(30.5);
-        rec.record_external_by_id_found_over_incomplete_fanout(2);
-        rec.record_external_by_id_other_live_observed(1);
-        assert_eq!(
-            METRIC_EXTERNAL_CANCEL_SENT,
-            "harvest.workflow.external_cancel.sent"
-        );
-        assert_eq!(
-            METRIC_EXTERNAL_BY_ID_INDETERMINATE_SHARD,
-            "harvest.external_signal.by_id_indeterminate_shard"
-        );
-        assert_eq!(
-            METRIC_EXTERNAL_SIGNAL_BY_ID_OLDEST_PENDING_AGE,
-            "harvest.external_signal.by_id_oldest_pending_indeterminate_age"
-        );
-        assert_eq!(
-            METRIC_EXTERNAL_CANCEL_BY_ID_OLDEST_PENDING_AGE,
-            "harvest.external_cancel.by_id_oldest_pending_indeterminate_age"
-        );
-        assert_eq!(
-            METRIC_EXTERNAL_BY_ID_FOUND_OVER_INCOMPLETE_FANOUT,
-            "harvest.external_signal.by_id_found_over_incomplete_fanout"
-        );
-        assert_eq!(
-            METRIC_EXTERNAL_BY_ID_OTHER_LIVE_OBSERVED,
-            "harvest.external_signal.by_id_other_live_observed"
-        );
-    }
-
-    #[test]
     fn shard_dispatched_counter_has_default_noop_impl() {
         // AC5 (issue #961): the shard-dimension twin of #515's
         // `harvest.queue.dispatched{queue}`, so an operator can confirm the
@@ -5673,8 +4224,6 @@ mod tests {
         rec.record_retention_tick(0, 100, 50, 0.02);
         rec.record_retention_deleted("onboarding", 50);
         rec.record_summary_deleted("onboarding", 50);
-        rec.record_rate_limit_buckets_deleted("dyn-rate", 12);
-        rec.record_terminal_tasks_deleted("COMPLETED", 12);
         rec.record_workflow_non_determinism("onboarding", "v1.0.0");
         rec.record_workflow_nondeterministic_block("onboarding", "default");
         rec.record_workflow_history_bloat("onboarding");
@@ -6260,175 +4809,5 @@ mod tests {
         // construction.
         let rec: Arc<dyn MetricsRecorder> = Arc::new(NoOpMetrics);
         rec.record_task_capability_miss("default", "workflow", "released");
-    }
-
-    // ── Bounded build_id label (issue #1814) ────────────────────────────
-
-    #[test]
-    fn build_id_label_cap_admits_up_to_max_then_buckets() {
-        let cap = BuildIdLabelCap::new(2);
-        assert_eq!(cap.label("a"), "a");
-        assert_eq!(cap.label("b"), "b");
-        assert_eq!(cap.label("c"), BUILD_ID_LABEL_OTHER, "over the cap");
-        assert_eq!(cap.label("a"), "a", "an admitted build stays admitted");
-        assert_eq!(cap.label("b"), "b");
-    }
-
-    #[test]
-    fn build_id_label_cap_maps_empty_to_none_and_long_to_other() {
-        let cap = BuildIdLabelCap::new(4);
-        assert_eq!(cap.label(""), BUILD_ID_LABEL_NONE);
-        let long = "x".repeat(MAX_BUILD_ID_LABEL_LEN + 1);
-        assert_eq!(cap.label(&long), BUILD_ID_LABEL_OTHER);
-        let edge = "y".repeat(MAX_BUILD_ID_LABEL_LEN);
-        assert_eq!(
-            cap.label(&edge),
-            edge.as_str(),
-            "the length bound is inclusive"
-        );
-        // Neither sentinel uses an admission slot.
-        for build in ["p", "q", "r"] {
-            assert_eq!(cap.label(build), build);
-        }
-    }
-
-    #[test]
-    fn the_label_encoding_is_one_to_one_and_keeps_sentinels_apart() {
-        let cap = BuildIdLabelCap::new(16);
-        assert_eq!(cap.label(BUILD_ID_LABEL_NONE), "build:none");
-        assert_eq!(cap.label(BUILD_ID_LABEL_OTHER), "build:__other__");
-        assert_eq!(cap.label("build:none"), "build:build:none");
-        assert_eq!(cap.label("build:x"), "build:build:x");
-        assert_eq!(cap.label("v1"), "v1");
-        // Distinct real ids give distinct labels, none of them a sentinel.
-        let ids = [
-            "none",
-            "build:none",
-            "build:build:none",
-            "__other__",
-            "build:__other__",
-            "v1",
-        ];
-        let labels: std::collections::HashSet<String> =
-            ids.iter().map(|id| cap.label(id).into_owned()).collect();
-        assert_eq!(labels.len(), ids.len());
-        assert!(!labels.contains(BUILD_ID_LABEL_NONE));
-        assert!(!labels.contains(BUILD_ID_LABEL_OTHER));
-        // The sentinels still mean "no build" and "over the cap" only.
-        assert_eq!(cap.label(""), BUILD_ID_LABEL_NONE);
-    }
-
-    #[test]
-    fn an_escaped_label_over_the_length_bound_is_bucketed() {
-        let cap = BuildIdLabelCap::new(4);
-        let id = format!("build:{}", "y".repeat(MAX_BUILD_ID_LABEL_LEN - 6));
-        assert_eq!(id.len(), MAX_BUILD_ID_LABEL_LEN);
-        assert_eq!(
-            cap.label(&id),
-            BUILD_ID_LABEL_OTHER,
-            "the prefix pushes it over"
-        );
-    }
-
-    #[test]
-    fn build_id_label_cap_of_zero_buckets_every_build() {
-        let cap = BuildIdLabelCap::new(0);
-        assert_eq!(cap.label("v1"), BUILD_ID_LABEL_OTHER);
-        assert_eq!(cap.label(""), BUILD_ID_LABEL_NONE);
-    }
-
-    #[test]
-    fn global_build_id_label_applies_the_sentinel_rules() {
-        // This test admits no build, so it cannot fill the process-wide cap
-        // that other tests in this binary share.
-        assert_eq!(build_id_label(""), BUILD_ID_LABEL_NONE);
-        let long = "z".repeat(MAX_BUILD_ID_LABEL_LEN + 1);
-        assert_eq!(build_id_label(&long), BUILD_ID_LABEL_OTHER);
-    }
-
-    #[test]
-    fn build_labelled_defaults_forward_to_the_unlabelled_methods() {
-        #[derive(Default)]
-        struct Rec(std::sync::Mutex<Vec<&'static str>>);
-        impl MetricsRecorder for Rec {
-            fn record_workflow_terminal(&self, _: &str, _: &str, _: WorkflowStatus) {
-                self.0.lock().unwrap().push("terminal");
-            }
-            fn record_workflow_completed(&self, _: &str, _: &str, _: f64, _: WorkflowStatus) {
-                self.0.lock().unwrap().push("wf_duration");
-            }
-            fn record_workflow_nondeterministic_block(&self, _: &str, _: &str) {
-                self.0.lock().unwrap().push("nd_block");
-            }
-            fn record_activity_attempt(&self, _: &str, _: &str, _: ActivityStatus) {
-                self.0.lock().unwrap().push("attempt");
-            }
-            fn record_activity_completed(&self, _: &str, _: &str, _: f64, _: ActivityStatus) {
-                self.0.lock().unwrap().push("act_duration");
-            }
-        }
-        let rec = Rec::default();
-        rec.record_workflow_terminal_for_build("wf", "q", "b", WorkflowStatus::Failed);
-        rec.record_workflow_completed_for_build("wf", "q", "b", 1.0, WorkflowStatus::Completed);
-        rec.record_workflow_nondeterministic_block_for_build("wf", "q", "b");
-        rec.record_activity_attempt_for_build("a", "q", "b", ActivityStatus::Failed);
-        rec.record_activity_completed_for_build("a", "q", "b", 1.0, ActivityStatus::Failed, None);
-        rec.record_build_ramp_aborted("q", "failure_rate");
-        assert_eq!(
-            rec.0.lock().unwrap().as_slice(),
-            &[
-                "terminal",
-                "wf_duration",
-                "nd_block",
-                "attempt",
-                "act_duration"
-            ]
-        );
-    }
-
-    #[test]
-    fn emit_workflow_terminal_for_build_skips_canary_and_passes_the_label() {
-        #[derive(Default)]
-        struct Rec(std::sync::Mutex<Vec<(String, String)>>);
-        impl MetricsRecorder for Rec {
-            fn record_workflow_terminal_for_build(
-                &self,
-                wf: &str,
-                _: &str,
-                build_id: &str,
-                _: WorkflowStatus,
-            ) {
-                self.0
-                    .lock()
-                    .unwrap()
-                    .push((wf.to_owned(), build_id.to_owned()));
-            }
-        }
-        let rec = Rec::default();
-        emit_workflow_terminal_for_build(
-            &rec,
-            "__harvest_canary_probe__default",
-            "default",
-            "b1",
-            WorkflowStatus::Completed,
-        );
-        emit_workflow_terminal_for_build(
-            &rec,
-            "orders",
-            "default",
-            &build_id_label(""),
-            WorkflowStatus::Failed,
-        );
-        assert_eq!(
-            rec.0.lock().unwrap().as_slice(),
-            &[("orders".to_owned(), BUILD_ID_LABEL_NONE.to_owned())]
-        );
-    }
-
-    #[test]
-    fn metric_build_ramp_aborted_name_is_stable() {
-        assert_eq!(METRIC_BUILD_RAMP_ABORTED, "harvest.build.ramp_aborted");
-        assert_eq!(BUILD_ID_LABEL_NONE, "none");
-        assert_eq!(BUILD_ID_LABEL_OTHER, "__other__");
     }
 }

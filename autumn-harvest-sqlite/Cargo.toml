@@ -18,7 +18,7 @@ default = []
 # The pure, backend-neutral determinism core: `default-features = false` drops
 # `db` (Diesel/Postgres) so only `run_workflow`, `WorkflowEvent`, the replay
 # engine, and `WorkflowContext` are pulled in.
-autumn-harvest = { version = "0.7.0", path = "../autumn-harvest", default-features = false }
+autumn-harvest = { version = "0.6.0", path = "../autumn-harvest", default-features = false }
 rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -26,13 +26,10 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-# The single-writer lock (issue #1834): an exclusive OS file lock that dies
-# with its process. std `File::try_lock` needs Rust 1.89, above the MSRV.
-fs4 = { version = "1.1", default-features = false, features = ["sync"] }
 
 [dev-dependencies]
 # `testing` gives the cross-backend replay harness (`WorkflowReplayer`).
-autumn-harvest = { version = "0.7.0", path = "../autumn-harvest", default-features = false, features = ["testing"] }
+autumn-harvest = { path = "../autumn-harvest", default-features = false, features = ["testing"] }
 # Used directly by the orphan-reclaim test to inspect raw `harvest_tasks` state.
 rusqlite = { workspace = true }
 tempfile = "3"

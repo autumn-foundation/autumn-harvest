@@ -21,7 +21,7 @@ Key attribute options:
 
 | Attribute | Default | Notes |
 |---|---|---|
-| `start_to_close` | `WorkerConfig::default_activity_start_to_close` (10 min) | Wall-clock cap for a single attempt. The worker default applies only when the activity sets no `start_to_close`, `schedule_to_close` or `heartbeat_timeout` (issue #1808). |
+| `start_to_close` | none (no limit) | Wall-clock cap for a single attempt. |
 | `heartbeat_timeout` | none | Fail the attempt if no heartbeat arrives within this window. |
 | `schedule_to_start` | none | Fail if no worker claims the task within this window. |
 | `queue` | `"default"` | Route the task to a named worker pool. |
@@ -84,10 +84,6 @@ it to a named local (`let _hb = ...`); binding to `_` drops it immediately and
 stops the ticker. Manual `ctx.heartbeat(payload)` calls still work alongside it
 and take over the checkpoint payload.
 
-An activity with a `heartbeat_timeout` gets no default `start_to_close`
-(issue #1808). An auto-heartbeat keeps a stuck attempt alive, so the heartbeat
-timeout cannot stop it. Give such an activity its own `start_to_close`.
-
 ## Cooperative cancellation
 
 When an operator calls `cancel_workflow_execution`, harvest:
@@ -149,31 +145,13 @@ async fn poll_external_status(ctx: &ActivityContext, task_id: String) -> Result<
 
 An activity that never calls `heartbeat()` or `check_cancellation()` will not
 receive the cooperative cancellation signal.  The worker will wait for the
-configured `cancellation_grace_period` (default 5 s) after triggering the
+configured `cancellation_grace_period` (default 30 s) after triggering the
 cancellation token; if the activity has still not exited by then the worker
 hard-aborts the future.  The activity task is recorded as `FAILED` in the task
 queue.
 
 This means cooperative cancellation is *opt-in*: existing activities continue
 to work unchanged after upgrading.
-
-### Cancellation by a worker drain
-
-A worker drain also cancels running activities, one join window before its
-deadline (issue #1813). The same checks see it: `is_cancelled()` turns true,
-and `heartbeat()` returns `ActivityCancelled`. The drain never aborts the
-handler.
-
-- A handler that returns a retryable error goes back to `PENDING` at once,
-  and a peer runs the next attempt. `previous_failure()` then starts with
-  `worker shutdown:`. The heartbeat details stay, so the next attempt can
-  resume from the last checkpoint.
-- A handler that returns `Ok` completes as usual.
-- A handler that ignores the cancel keeps its claim until it returns. The
-  worker keeps its lease alive meanwhile. The cancel stops the handler's own
-  heartbeats, so the worker re-sends the last checkpoint at
-  `heartbeat_timeout / 3`. If the process exits, orphan reclaim recovers the
-  task.
 
 ### `heartbeat_details` across a cancel signal
 

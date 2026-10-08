@@ -34,6 +34,7 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
+use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -75,13 +76,13 @@ async fn setup_database() -> (String, DbGuard) {
         let mut conn = AsyncPgConnection::establish(&url)
             .await
             .expect("connect test db");
-        conn.batch_execute(&autumn_harvest::test_init_sql())
+        conn.batch_execute(autumn_harvest::full_migrations_sql())
             .await
             .expect("run migrations");
         (url, DbGuard::LocalPg)
     } else {
         let container = Postgres::default()
-            .with_init_sql(autumn_harvest::test_init_sql().as_bytes().to_vec())
+            .with_init_sql(autumn_harvest::full_migrations_sql().as_bytes().to_vec())
             .with_tag("16")
             .start()
             .await
@@ -193,7 +194,7 @@ fn build_app(pool: &DbPool) -> axum::Router {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::default(),
     ));
-    harvest_api_router(api_state)
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
 
 fn start_params(exec_id: ExecutionId) -> StartWorkflowParams<'static> {
@@ -201,7 +202,7 @@ fn start_params(exec_id: ExecutionId) -> StartWorkflowParams<'static> {
         workflow_name: "correlate_wf",
         workflow_id: "activity-info-correlation",
         exec_id,
-        input: json!({"ok": true}).into(),
+        input: json!({"ok": true}),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,

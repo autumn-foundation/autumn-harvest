@@ -152,6 +152,7 @@ fn build_api_app(
     registered: Vec<&'static str>,
 ) -> HarvestApiApp {
     harvest_api_router(build_api_state(pool, router, registered))
+        .with_state(autumn_web::AppState::for_test())
 }
 
 async fn read_json_response(response: axum::response::Response) -> Value {
@@ -193,7 +194,7 @@ async fn insert_execution(
         workflow_id,
         run_id: uuid::Uuid::new_v4(),
         shard_id: shard.as_i32(),
-        input: json!({}).into(),
+        input: json!({}),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -536,7 +537,8 @@ async fn endpoint_exposes_top_level_orphaned_and_total() {
 #[tokio::test]
 async fn reachability_requires_admin_auth() {
     // No admin boundary set -> the shared `/admin/*` guard must reject.
-    let app = harvest_api_router(HarvestApiState::new());
+    let app =
+        harvest_api_router(HarvestApiState::new()).with_state(autumn_web::AppState::for_test());
     let (status, _) = get_json(&app, "/admin/workflow-types/reachability").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }

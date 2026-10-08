@@ -76,7 +76,6 @@ use serde::Serialize;
 
 use crate::context::WorkflowCommand;
 use crate::event::WorkflowEvent;
-use crate::types::{ActivityExecId, ExecutionId};
 
 /// Default per-category bound applied by the management endpoint.
 ///
@@ -258,38 +257,28 @@ struct OpenTimerArm {
 
 /// History-derived indexes consulted by both projection modes. Built in one
 /// O(n) pass over the timestamped rows.
+#[derive(Default)]
 struct HistoryIndex {
     /// `activity_id` → (name, scheduled-at) for regular activities.
-    ///
-    /// Keyed by the native `ActivityExecId` (a `Copy` newtype over `Uuid`,
-    /// not `String`): every insert/lookup on this history-derived index sees
-    /// each activity id at least twice (open, then closed), so keying by the
-    /// 16-byte `Copy` id instead of a formatted 36-byte hyphenated string
-    /// avoids a `Uuid::to_string()` allocation-plus-format AND a
-    /// variable-length `SipHash` pass on every touch — a wide fan-out's
-    /// history scan is the whole cost of this index, so both add up.
-    activities: HashMap<ActivityExecId, (String, DateTime<Utc>)>,
+    activities: HashMap<String, (String, DateTime<Utc>)>,
     /// activity ids with a recorded terminal (completed/failed/timed out/
     /// externally resolved).
-    closed_activities: HashSet<ActivityExecId>,
+    closed_activities: HashSet<String>,
     /// `activity_id` → (name, scheduled-at) for local activities.
-    local_activities: HashMap<ActivityExecId, (String, DateTime<Utc>)>,
+    local_activities: HashMap<String, (String, DateTime<Utc>)>,
     /// local activity ids with a recorded terminal (completed/exhausted).
-    closed_local_activities: HashSet<ActivityExecId>,
+    closed_local_activities: HashSet<String>,
     /// `activity_id` → (name, awaiting-since, deadline) for external handoffs.
-    external_activities: HashMap<ActivityExecId, ExternalActivityMeta>,
+    external_activities: HashMap<String, ExternalActivityMeta>,
     /// Per-timer-id FIFO of open (unpaired) arms: `TimerFired`/`TimerCancelled`
     /// closes the oldest open arm (the poll-loop re-arm idiom).
     open_timer_arms: HashMap<String, VecDeque<OpenTimerArm>>,
     /// Insertion order of timer ids (stable reporting order).
     timer_order: Vec<String>,
     /// Child exec id → (workflow name, started-at) for open awaited children.
-    ///
-    /// Keyed by the native `ExecutionId` (`Copy`, same rationale as
-    /// `activities` above).
-    children: HashMap<ExecutionId, (String, DateTime<Utc>)>,
+    children: HashMap<String, (String, DateTime<Utc>)>,
     /// Insertion order of open children.
-    child_order: Vec<ExecutionId>,
+    child_order: Vec<String>,
     /// Update id → (handler name, admitted-at) for unresolved updates,
     /// in admission order.
     pending_updates: Vec<(String, String, DateTime<Utc>)>,
@@ -310,130 +299,9 @@ struct HistoryIndex {
     last_event_at: Option<DateTime<Utc>>,
 }
 
-/// Per-category row counts used to pre-size [`HistoryIndex`]'s collections.
-/// Each field is an exact count of the event variants that insert into the
-/// same-named collection. Sizing from these counts, rather than from
-/// `rows.len()` for every field alike, gives each collection the capacity
-/// it will actually fill. No collection then takes a growth step. No
-/// collection is over-allocated either, even the several that always hold
-/// only a fraction of the full row count.
-#[derive(Default)]
-struct HistoryCounts {
-    activities: usize,
-    closed_activities: usize,
-    local_activities: usize,
-    closed_local_activities: usize,
-    children: usize,
-}
-
-/// Counts, in one cheap pass over `rows`, how many entries each
-/// [`HistoryIndex`] collection will hold. The pass is a discriminant match
-/// with no cloning, formatting or hashing, so it costs far less than the
-/// indexing pass it precedes. There is no `timers` or `external_activities`
-/// field: see [`HistoryIndex::with_capacity`] for why those rows are not
-/// counted here.
-fn count_history_categories(rows: &[(DateTime<Utc>, WorkflowEvent)]) -> HistoryCounts {
-    let mut counts = HistoryCounts::default();
-    for (_, event) in rows {
-        match event {
-            WorkflowEvent::ActivityScheduled { .. } => counts.activities += 1,
-            WorkflowEvent::ActivityCompleted { .. }
-            | WorkflowEvent::ActivityFailed { .. }
-            | WorkflowEvent::ActivityTimedOut { .. }
-            | WorkflowEvent::ActivityCompletedExternally { .. }
-            | WorkflowEvent::ActivityFailedExternally { .. } => counts.closed_activities += 1,
-            WorkflowEvent::LocalActivityScheduled { .. } => counts.local_activities += 1,
-            WorkflowEvent::LocalActivityCompleted { .. }
-            | WorkflowEvent::LocalActivityExhausted { .. } => {
-                counts.closed_local_activities += 1;
-            }
-            WorkflowEvent::ChildWorkflowStarted { .. } => counts.children += 1,
-            _ => {}
-        }
-    }
-    counts
-}
-
-impl HistoryIndex {
-    /// Pre-sizes every per-row collection from `counts`. Most fields get an
-    /// exact fit; the rest get a safe upper bound (see
-    /// [`count_history_categories`]).
-    ///
-    /// This type used to derive `Default`, so every collection started at
-    /// zero capacity and grew incrementally. Growing an empty, unsized
-    /// `HashMap`/`HashSet` forces `hashbrown` to rehash every
-    /// already-inserted key on each growth step — a `SipHash` pass apiece.
-    /// So a wide-fan-out history rehashed the same keys repeatedly on the
-    /// way up. Sizing every collection from its own count up front means no
-    /// growth step is ever taken, not just fewer of them.
-    ///
-    /// This also avoids over-allocating the collections that only ever hold
-    /// a fraction of the history. An earlier cut of this fix sized every
-    /// collection at `rows.len()` alike. That cost 5x the allocated bytes
-    /// (see the PR this landed in).
-    ///
-    /// `pending_updates`, `open_external_awaits` and `open_external_ops` are
-    /// excluded. Each is fully overwritten by a `.collect()` below, before
-    /// `build_history_index` returns. Any capacity given here would just be
-    /// dropped unused.
-    ///
-    /// `children` is excluded too, for a different reason. It is the one
-    /// collection this scan calls `.remove()` on, closing a child when its
-    /// terminal event arrives. `counts.children` counts every
-    /// `ChildWorkflowStarted` row in the whole history, not the peak number
-    /// open at once. A workflow that starts and completes many children in
-    /// sequence, not concurrently, can see those two numbers differ widely.
-    /// Sizing from the
-    /// former would allocate a table for children this scan is about to
-    /// remove again. That trades the growth-step cost this fix targets for
-    /// a bigger, one-time over-allocation. It is the same failure mode an
-    /// earlier, reverted cut of this fix hit for every field at once.
-    /// `child_order` has no such removal, so it stays sized from
-    /// `counts.children`.
-    ///
-    /// `open_timer_arms` and `timer_order` are excluded for a related
-    /// reason. `counts.timers` counts every `TimerStarted` row, but
-    /// `reset_timer`'s sliding-window pattern re-arms the same timer id
-    /// repeatedly (`docs`, `context.rs`'s `reset_timer`). Both collections
-    /// key or index by distinct timer id, guarded by
-    /// `open_timer_arms.contains_key`, so re-arms grow a `VecDeque` inside
-    /// an existing entry rather than adding one. A history that resets one
-    /// timer 100,000 times would size both for 100,000 entries and use one.
-    /// This benchmark gives every timer a unique id, so it never hits that
-    /// case.
-    ///
-    /// `external_activities` is excluded for the same duplicate-row reason.
-    /// `replay.rs`'s external-activity scan documents a second
-    /// `ActivityAwaitingExternal` row for the same activity id. A signal can
-    /// wake the workflow while an external activity is pending. The worker
-    /// then re-runs its scheduling code, appending another row for an id
-    /// already in history. `external_activities.insert` overwrites
-    /// the existing entry on a repeat id, rather than growing the map. So a
-    /// long-lived external activity with many such wakeups would size this
-    /// map for every wakeup, and use one entry. This benchmark gives every
-    /// external row a unique id, so it never hits that case either.
-    fn with_capacity(counts: &HistoryCounts) -> Self {
-        Self {
-            activities: HashMap::with_capacity(counts.activities),
-            closed_activities: HashSet::with_capacity(counts.closed_activities),
-            local_activities: HashMap::with_capacity(counts.local_activities),
-            closed_local_activities: HashSet::with_capacity(counts.closed_local_activities),
-            external_activities: HashMap::new(),
-            open_timer_arms: HashMap::new(),
-            timer_order: Vec::new(),
-            children: HashMap::new(),
-            child_order: Vec::with_capacity(counts.children),
-            pending_updates: Vec::new(),
-            open_external_awaits: Vec::new(),
-            open_external_ops: Vec::new(),
-            last_event_at: None,
-        }
-    }
-}
-
 #[allow(clippy::too_many_lines)]
 fn build_history_index(rows: &[(DateTime<Utc>, WorkflowEvent)]) -> HistoryIndex {
-    let mut index = HistoryIndex::with_capacity(&count_history_categories(rows));
+    let mut index = HistoryIndex::default();
     let mut resolved_updates: HashSet<String> = HashSet::new();
     let mut admitted_updates: Vec<(String, String, DateTime<Utc>)> = Vec::new();
     let mut external_awaits: Vec<(String, String, DateTime<Utc>)> = Vec::new();
@@ -450,14 +318,16 @@ fn build_history_index(rows: &[(DateTime<Utc>, WorkflowEvent)]) -> HistoryIndex 
             WorkflowEvent::ActivityScheduled {
                 activity_id, name, ..
             } => {
-                index.activities.insert(*activity_id, (name.clone(), *at));
+                index
+                    .activities
+                    .insert(activity_id.to_string(), (name.clone(), *at));
             }
             WorkflowEvent::ActivityCompleted { activity_id, .. }
             | WorkflowEvent::ActivityFailed { activity_id, .. }
             | WorkflowEvent::ActivityTimedOut { activity_id, .. }
             | WorkflowEvent::ActivityCompletedExternally { activity_id, .. }
             | WorkflowEvent::ActivityFailedExternally { activity_id, .. } => {
-                index.closed_activities.insert(*activity_id);
+                index.closed_activities.insert(activity_id.to_string());
             }
             WorkflowEvent::ActivityAwaitingExternal {
                 activity_id,
@@ -470,7 +340,7 @@ fn build_history_index(rows: &[(DateTime<Utc>, WorkflowEvent)]) -> HistoryIndex 
                     .and_then(|secs| at.checked_add_signed(ChronoDuration::seconds(secs)));
                 index
                     .external_activities
-                    .insert(*activity_id, (name.clone(), *at, deadline));
+                    .insert(activity_id.to_string(), (name.clone(), *at, deadline));
             }
             WorkflowEvent::ActivityExternalDeadlineExtended { activity_id, .. } => {
                 // The extension event carries no new deadline value (the real
@@ -478,7 +348,7 @@ fn build_history_index(rows: &[(DateTime<Utc>, WorkflowEvent)]) -> HistoryIndex 
                 // clear the recorded one: reporting the ORIGINAL
                 // schedule-to-close as still due after an operator extended it
                 // would be actively misleading (replay review).
-                if let Some(meta) = index.external_activities.get_mut(activity_id) {
+                if let Some(meta) = index.external_activities.get_mut(&activity_id.to_string()) {
                     meta.2 = None;
                 }
             }
@@ -487,11 +357,13 @@ fn build_history_index(rows: &[(DateTime<Utc>, WorkflowEvent)]) -> HistoryIndex 
             } => {
                 index
                     .local_activities
-                    .insert(*activity_id, (name.clone(), *at));
+                    .insert(activity_id.to_string(), (name.clone(), *at));
             }
             WorkflowEvent::LocalActivityCompleted { activity_id, .. }
             | WorkflowEvent::LocalActivityExhausted { activity_id, .. } => {
-                index.closed_local_activities.insert(*activity_id);
+                index
+                    .closed_local_activities
+                    .insert(activity_id.to_string());
             }
             WorkflowEvent::TimerStarted {
                 timer_id,
@@ -532,10 +404,9 @@ fn build_history_index(rows: &[(DateTime<Utc>, WorkflowEvent)]) -> HistoryIndex 
                 workflow_name,
                 ..
             } => {
-                index.child_order.push(*child_id);
-                index
-                    .children
-                    .insert(*child_id, (workflow_name.clone(), *at));
+                let id = child_id.to_string();
+                index.child_order.push(id.clone());
+                index.children.insert(id, (workflow_name.clone(), *at));
             }
             WorkflowEvent::ChildWorkflowCompleted { child_id, .. }
             | WorkflowEvent::ChildWorkflowFailed { child_id, .. } => {
@@ -545,7 +416,7 @@ fn build_history_index(rows: &[(DateTime<Utc>, WorkflowEvent)]) -> HistoryIndex 
                 // oldest open reserved arm matching the child's workflow name
                 // at its terminal. On a timer-win the fired arm was already
                 // closed and the loser's synthetic terminal is a no-op here.
-                if let Some((child_name, _)) = index.children.remove(child_id) {
+                if let Some((child_name, _)) = index.children.remove(&child_id.to_string()) {
                     close_race_arm_for(&mut index, reserved_child_race_name, &child_name);
                 }
             }
@@ -693,18 +564,18 @@ fn timer_arm_metadata(
     (since, deadline)
 }
 
-fn activity_awaitable_by_id(index: &HistoryIndex, activity_id: ActivityExecId) -> Awaitable {
+fn activity_awaitable_by_id(index: &HistoryIndex, activity_id: &str) -> Awaitable {
     let mut awaitable = Awaitable::new(AwaitableKind::Activity);
     awaitable.id = Some(activity_id.to_string());
-    if let Some((name, since)) = index.activities.get(&activity_id) {
+    if let Some((name, since)) = index.activities.get(activity_id) {
         awaitable.name = Some(name.clone());
         awaitable.since = Some(*since);
-    } else if let Some((name, since, deadline)) = index.external_activities.get(&activity_id) {
+    } else if let Some((name, since, deadline)) = index.external_activities.get(activity_id) {
         awaitable.name = Some(name.clone());
         awaitable.since = Some(*since);
         awaitable.deadline = *deadline;
         awaitable.external = true;
-    } else if let Some((name, since)) = index.local_activities.get(&activity_id) {
+    } else if let Some((name, since)) = index.local_activities.get(activity_id) {
         awaitable.name = Some(name.clone());
         awaitable.since = Some(*since);
         awaitable.local = true;
@@ -731,19 +602,19 @@ fn project_replayed(index: &HistoryIndex, commands: &[WorkflowCommand]) -> Vec<A
             WorkflowCommand::ScheduleActivity {
                 activity_id, name, ..
             } => {
-                let mut awaitable = activity_awaitable_by_id(index, *activity_id);
+                let mut awaitable = activity_awaitable_by_id(index, &activity_id.to_string());
                 if awaitable.name.is_none() {
                     awaitable.name = Some(name.clone());
                 }
                 awaitables.push(awaitable);
             }
             WorkflowCommand::WaitForActivity { activity_id, .. } => {
-                awaitables.push(activity_awaitable_by_id(index, *activity_id));
+                awaitables.push(activity_awaitable_by_id(index, &activity_id.to_string()));
             }
             WorkflowCommand::RunLocalActivity {
                 activity_id, name, ..
             } => {
-                let mut awaitable = activity_awaitable_by_id(index, *activity_id);
+                let mut awaitable = activity_awaitable_by_id(index, &activity_id.to_string());
                 awaitable.local = true;
                 if awaitable.name.is_none() {
                     awaitable.name = Some(name.clone());
@@ -756,7 +627,7 @@ fn project_replayed(index: &HistoryIndex, commands: &[WorkflowCommand]) -> Vec<A
                 schedule_to_close_secs,
                 ..
             } => {
-                let mut awaitable = activity_awaitable_by_id(index, *activity_id);
+                let mut awaitable = activity_awaitable_by_id(index, &activity_id.to_string());
                 awaitable.external = true;
                 if awaitable.name.is_none() {
                     awaitable.name = Some(name.clone());
@@ -819,13 +690,14 @@ fn project_replayed(index: &HistoryIndex, commands: &[WorkflowCommand]) -> Vec<A
                 ..
             } => {
                 let mut awaitable = Awaitable::new(AwaitableKind::ChildWorkflow);
-                if let Some((name, since)) = index.children.get(child_id) {
+                let id = child_id.to_string();
+                if let Some((name, since)) = index.children.get(&id) {
                     awaitable.name = Some(name.clone());
                     awaitable.since = Some(*since);
                 } else {
                     awaitable.name = Some(workflow_name.clone());
                 }
-                awaitable.id = Some(child_id.to_string());
+                awaitable.id = Some(id);
                 awaitables.push(awaitable);
             }
             WorkflowCommand::AwaitExternalWorkflow { target, .. } => {
@@ -994,7 +866,7 @@ fn project_history_only(
     let mut awaitables: Vec<Awaitable> = Vec::new();
 
     // Open regular activities, in scheduling order.
-    let mut open_activities: Vec<(&ActivityExecId, &(String, DateTime<Utc>))> = index
+    let mut open_activities: Vec<(&String, &(String, DateTime<Utc>))> = index
         .activities
         .iter()
         .filter(|(id, _)| !index.closed_activities.contains(*id))
@@ -1002,14 +874,14 @@ fn project_history_only(
     open_activities.sort_by_key(|(_, (_, at))| *at);
     for (id, (name, since)) in open_activities {
         let mut awaitable = Awaitable::new(AwaitableKind::Activity);
-        awaitable.id = Some(id.to_string());
+        awaitable.id = Some(id.clone());
         awaitable.name = Some(name.clone());
         awaitable.since = Some(*since);
         awaitables.push(awaitable);
     }
 
     // Open external-handoff activities.
-    let mut open_external: Vec<(&ActivityExecId, &ExternalActivityMeta)> = index
+    let mut open_external: Vec<(&String, &ExternalActivityMeta)> = index
         .external_activities
         .iter()
         .filter(|(id, _)| !index.closed_activities.contains(*id))
@@ -1017,7 +889,7 @@ fn project_history_only(
     open_external.sort_by_key(|(_, (_, at, _))| *at);
     for (id, (name, since, deadline)) in open_external {
         let mut awaitable = Awaitable::new(AwaitableKind::Activity);
-        awaitable.id = Some(id.to_string());
+        awaitable.id = Some(id.clone());
         awaitable.name = Some(name.clone());
         awaitable.since = Some(*since);
         awaitable.deadline = *deadline;
@@ -1026,7 +898,7 @@ fn project_history_only(
     }
 
     // Open local activities (scheduled, possibly mid-retry, no terminal).
-    let mut open_local: Vec<(&ActivityExecId, &(String, DateTime<Utc>))> = index
+    let mut open_local: Vec<(&String, &(String, DateTime<Utc>))> = index
         .local_activities
         .iter()
         .filter(|(id, _)| !index.closed_local_activities.contains(*id))
@@ -1034,7 +906,7 @@ fn project_history_only(
     open_local.sort_by_key(|(_, (_, at))| *at);
     for (id, (name, since)) in open_local {
         let mut awaitable = Awaitable::new(AwaitableKind::Activity);
-        awaitable.id = Some(id.to_string());
+        awaitable.id = Some(id.clone());
         awaitable.name = Some(name.clone());
         awaitable.since = Some(*since);
         awaitable.local = true;
@@ -1105,7 +977,7 @@ fn project_history_only(
     for child_id in &index.child_order {
         if let Some((name, since)) = index.children.get(child_id) {
             let mut awaitable = Awaitable::new(AwaitableKind::ChildWorkflow);
-            awaitable.id = Some(child_id.to_string());
+            awaitable.id = Some(child_id.clone());
             awaitable.name = Some(name.clone());
             awaitable.since = Some(*since);
             awaitable.deadline = child_race_deadlines

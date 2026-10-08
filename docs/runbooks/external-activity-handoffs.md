@@ -1,9 +1,7 @@
 # External Activity Handoff Runbook
 
 Use this when a workflow is waiting on `execute_activity_external`, such as a
-manager approval or webhook callback — the design rationale for this pattern
-is [`docs/adr/0002-rust-native-execution-boundary.md`](../adr/0002-rust-native-execution-boundary.md).
-Handoff list/detail responses expose
+manager approval or webhook callback. Handoff list/detail responses expose
 identity, state, token, and timing metadata only; raw workflow inputs, activity
 inputs, outputs, signal bodies, and secrets stay redacted.
 
@@ -75,7 +73,7 @@ Output from stdin:
 printf '{"approved":true}' | harvest handoff complete <TOKEN> --output-file -
 ```
 
-API (outside `dev`, the caller needs a credential, issue #1802):
+API:
 
 ```text
 POST /activities/external/<TOKEN>/complete

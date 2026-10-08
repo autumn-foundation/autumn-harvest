@@ -14,30 +14,13 @@ use uuid::Uuid;
 
 use crate::error::TimeoutType;
 use crate::types::{
-    ActivityExecId, BuildId, ExecutionId, ExternalActivityToken, ExternalAwaitId, ExternalCancelId,
+    ActivityExecId, ExecutionId, ExternalActivityToken, ExternalAwaitId, ExternalCancelId,
     ExternalSignalId, TimerId, UpdateId, WorkerId,
 };
 
 fn default_error_type() -> String {
     "Error".to_string()
 }
-
-/// Failure reason recorded on the synthetic terminal event of a dispatch that a
-/// **failing decision cycle abandoned** (issue #952).
-///
-/// A workflow that dispatches awaited work (a child workflow, an activity) and
-/// then returns `Err` from a sibling branch in the same decision cycle never
-/// suspends, so the dispatch never becomes a queue row or an execution row. The
-/// terminal persist path records what the code actually did — a
-/// `ChildWorkflowStarted`/`ActivityScheduled` at the command's emission position
-/// — immediately followed by a terminal carrying this reason, so the audit trail
-/// neither drops the dispatch nor claims work that is still in flight.
-///
-/// Deliberately a plain message on the **existing** `ChildWorkflowFailed` /
-/// `ActivityFailed` variants: issue #952 adds no `WorkflowEvent` variant, no
-/// migration, and no new `reason_code` vocabulary.
-pub const ABANDONED_DISPATCH_REASON: &str =
-    "dispatch abandoned: the workflow failed in the same decision cycle";
 
 /// Which deterministic built-in produced a [`WorkflowEvent::SideEffectRecorded`]
 /// event (issue #384).
@@ -53,7 +36,6 @@ pub const ABANDONED_DISPATCH_REASON: &str =
 /// form is the bare variant name (`"Now"`, `"Uuid"`, …); stored events depend on
 /// it. New helper kinds are added at the end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub enum SideEffectKind {
     /// `ctx.system_now()` / `ctx.system_time_now()` — a captured wall-clock instant.
     Now,
@@ -84,13 +66,11 @@ impl SideEffectKind {
 /// All possible events in a workflow's history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
-#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub enum WorkflowEvent {
     // ── Lifecycle ──────────────────────────────────────────────────
     /// A new workflow execution has started.
     WorkflowStarted {
         /// The JSON payload used to start the workflow.
-        #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::value))]
         input: serde_json::Value,
         /// Time when the workflow was initiated.
         timestamp: DateTime<Utc>,
@@ -98,7 +78,6 @@ pub enum WorkflowEvent {
         /// `None` for the first run, for manual (non-scheduled) starts, and when no prior
         /// run succeeded. Frozen at workflow start time; replay always returns this value.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::opt_value))]
         last_completion_result: Option<serde_json::Value>,
         /// Failure summary of the most recent terminal run if it ended `FAILED` or `TIMED_OUT`
         /// (issue #488). `None` when the most recent terminal run `COMPLETED` (i.e. recovered),
@@ -116,7 +95,6 @@ pub enum WorkflowEvent {
     /// The workflow ran to completion without an error.
     WorkflowCompleted {
         /// The JSON result returned by the workflow function.
-        #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::value))]
         output: serde_json::Value,
     },
     /// The workflow panicked or returned a non-recoverable error.
@@ -145,7 +123,6 @@ pub enum WorkflowEvent {
         /// `None` for untyped or pre-#767 failures. Omitted from the serialised
         /// form when `None`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::opt_value))]
         details: Option<serde_json::Value>,
         /// Advisory non-retryable classification hint from a typed
         /// [`WorkflowFailure`](crate::failure::WorkflowFailure).
@@ -171,7 +148,6 @@ pub enum WorkflowEvent {
         /// The name of the registered activity handler.
         name: String,
         /// JSON input for the activity.
-        #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::value))]
         input: serde_json::Value,
         /// Target worker queue.
         queue: String,
@@ -188,7 +164,6 @@ pub enum WorkflowEvent {
         /// Unique ID for this specific activity attempt.
         activity_id: ActivityExecId,
         /// The JSON result returned by the activity.
-        #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::value))]
         output: serde_json::Value,
     },
     /// The activity returned an error or panicked.
@@ -224,7 +199,6 @@ pub enum WorkflowEvent {
         /// failures returned via the legacy `Err(String)` path. Omitted from
         /// the serialised form when `None`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::opt_value))]
         details: Option<serde_json::Value>,
     },
     /// The activity exceeded its allocated `start_to_close` or `heartbeat` timeout.
@@ -239,7 +213,6 @@ pub enum WorkflowEvent {
         /// Unique ID for this specific activity attempt.
         activity_id: ActivityExecId,
         /// JSON payload attached to the heartbeat, used to resume progress after failures.
-        #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::value))]
         details: serde_json::Value,
     },
 
@@ -263,7 +236,6 @@ pub enum WorkflowEvent {
         /// Name of the signal channel.
         signal_name: String,
         /// JSON payload delivered by the signal.
-        #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::value))]
         payload: serde_json::Value,
     },
 
@@ -275,7 +247,6 @@ pub enum WorkflowEvent {
         /// The target child workflow handler.
         workflow_name: String,
         /// The input passed to the child workflow.
-        #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::value))]
         input: serde_json::Value,
     },
     /// The spawned sub-workflow completed successfully.
@@ -283,7 +254,6 @@ pub enum WorkflowEvent {
         /// The ID of the spawned execution.
         child_id: ExecutionId,
         /// Result of the completed workflow.
-        #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::value))]
         output: serde_json::Value,
     },
     /// The spawned sub-workflow encountered a fatal error.
@@ -309,7 +279,6 @@ pub enum WorkflowEvent {
         ///
         /// `None` for pre-#767 or untyped child failures.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::opt_value))]
         details: Option<serde_json::Value>,
         /// Advisory non-retryable classification hint from a typed
         /// [`WorkflowFailure`](crate::failure::WorkflowFailure).
@@ -328,7 +297,6 @@ pub enum WorkflowEvent {
         /// The name of the recorded side effect (e.g. version block name).
         name: String,
         /// Arbitrary data recorded with the marker.
-        #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::value))]
         details: serde_json::Value,
     },
 
@@ -340,7 +308,6 @@ pub enum WorkflowEvent {
         /// The execution ID of the freshly started run that succeeds this one.
         new_exec_id: ExecutionId,
         /// The JSON payload passed to the next iteration of the workflow.
-        #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::value))]
         input: serde_json::Value,
         /// Registered workflow type the successor runs as (issue #803).
         ///
@@ -373,7 +340,6 @@ pub enum WorkflowEvent {
         /// The name of the registered activity handler.
         name: String,
         /// JSON input for the activity.
-        #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::value))]
         input: serde_json::Value,
         /// Disambiguation marker distinguishing a #620+ event whose defaults were
         /// fully resolved at first schedule from a genuine pre-#620 legacy event
@@ -427,7 +393,6 @@ pub enum WorkflowEvent {
         /// Unique ID matching the corresponding `LocalActivityScheduled`.
         activity_id: ActivityExecId,
         /// The JSON result returned by the activity handler.
-        #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::value))]
         output: serde_json::Value,
     },
     /// A local activity attempt returned an error or the handler panicked.
@@ -457,7 +422,6 @@ pub enum WorkflowEvent {
         /// The name of the registered activity handler.
         name: String,
         /// JSON input for the activity.
-        #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::value))]
         input: serde_json::Value,
         /// Target worker queue (informational; external activities don't occupy a slot).
         queue: String,
@@ -471,7 +435,6 @@ pub enum WorkflowEvent {
         /// Token that was used to complete the activity.
         token: ExternalActivityToken,
         /// The JSON result returned by the external system.
-        #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::value))]
         output: serde_json::Value,
     },
     /// An external system reported a failure via the management API.
@@ -507,7 +470,6 @@ pub enum WorkflowEvent {
         /// The name of the registered update handler.
         name: String,
         /// JSON payload delivered with the update request.
-        #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::value))]
         input: serde_json::Value,
         /// Time when the update was admitted.
         timestamp: DateTime<Utc>,
@@ -517,7 +479,6 @@ pub enum WorkflowEvent {
         /// Unique ID matching the corresponding `UpdateAdmitted`.
         update_id: UpdateId,
         /// The JSON result returned by the update handler.
-        #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::value))]
         output: serde_json::Value,
     },
     /// The update handler returned an error.
@@ -593,7 +554,6 @@ pub enum WorkflowEvent {
         /// Name of the signal channel on the receiving workflow.
         signal_name: String,
         /// JSON payload to deliver to the receiving workflow.
-        #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::value))]
         payload: serde_json::Value,
         /// Additive optional exactly-once delivery key; dedups re-issued
         /// requests against `uq_harvest_signals_idem`. Older events load as `None`.
@@ -638,7 +598,6 @@ pub enum WorkflowEvent {
         /// The name of the child workflow handler.
         workflow_name: String,
         /// The input passed to the child workflow.
-        #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::value))]
         input: serde_json::Value,
         /// Policy applied to this child when the parent reaches a terminal state.
         parent_close_policy: crate::types::ParentClosePolicy,
@@ -704,7 +663,6 @@ pub enum WorkflowEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
         /// The recorded JSON value, replayed verbatim on every subsequent pass.
-        #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::value))]
         value: serde_json::Value,
     },
 
@@ -801,13 +759,6 @@ pub enum WorkflowEvent {
     /// command sequence advances past the reopened terminal instead of
     /// diverging against it. A bare trailing `WorkflowFailed` with no following
     /// `WorkflowRedriven` stays non-transparent (a genuinely failed run).
-    ///
-    /// The same superseded cycle can leave other records behind its last
-    /// dispatch. Those are a marker, a side effect, a detached spawn, or
-    /// a timer arm or cancel.
-    /// [`crate::replay::HistoryMatcher::superseded_cycle_tail_indices`]
-    /// marks those transparent too (issue #1262). A re-issued dispatch
-    /// still advances past them instead of diverging.
     WorkflowRedriven {
         /// Wall-clock time the redrive reactivation was applied.
         redriven_at: DateTime<Utc>,
@@ -887,7 +838,6 @@ pub enum WorkflowEvent {
         /// Correlation ID matching the corresponding `ExternalAwaitRequested`.
         await_id: ExternalAwaitId,
         /// The target workflow's terminal output value.
-        #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::value))]
         output: serde_json::Value,
     },
     /// The awaited target reached a non-`COMPLETED` terminal state
@@ -919,7 +869,6 @@ pub enum WorkflowEvent {
         error_type: Option<String>,
         /// Structured details from a typed target failure; `None` otherwise.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::opt_value))]
         details: Option<serde_json::Value>,
         /// Advisory non-retryable flag from a typed target failure; `None` otherwise.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -939,23 +888,6 @@ pub enum WorkflowEvent {
         lock_seq: i64,
         /// Wall-clock instant the lock was granted.
         acquired_at: DateTime<Utc>,
-    },
-
-    // ── Decision boundary (issue #1833) ───────────────────────────────────────
-    /// A worker committed one decision. This event closes that decision.
-    ///
-    /// The worker writes it in the transaction that persists the decision
-    /// outcome, just after the outcome events. Other writers also add events
-    /// between two boundaries, for example activity results and signals. The
-    /// boundary does not attribute those events.
-    ///
-    /// Replay never matches this event. The matcher marks it consumed, as it
-    /// does for pause and resume. It still counts toward the history length.
-    DecisionCommitted {
-        /// Build id of the worker. Empty when the worker has no build id.
-        build_id: BuildId,
-        /// Id of the worker that made the decision.
-        worker_id: WorkerId,
     },
 }
 
@@ -1086,14 +1018,7 @@ impl WorkflowEvent {
             Self::ExternalAwaitResolved { .. } => "ExternalAwaitResolved",
             Self::ExternalAwaitFailed { .. } => "ExternalAwaitFailed",
             Self::MutexGranted { .. } => "MutexGranted",
-            Self::DecisionCommitted { .. } => "DecisionCommitted",
         }
-    }
-
-    /// Returns `true` for a [`Self::DecisionCommitted`] boundary (issue #1833).
-    #[must_use]
-    pub const fn is_decision_boundary(&self) -> bool {
-        matches!(self, Self::DecisionCommitted { .. })
     }
 
     /// Returns `true` for terminal lifecycle events that are appended by the
@@ -1753,15 +1678,11 @@ mod tests {
                 details: None,
                 non_retryable: None,
             },
-            WorkflowEvent::DecisionCommitted {
-                build_id: crate::types::BuildId::new("b-1"),
-                worker_id: WorkerId::new("w-1"),
-            },
         ];
 
-        assert_eq!(events.len(), 50);
+        assert_eq!(events.len(), 49);
         let names: HashSet<_> = events.iter().map(WorkflowEvent::type_name).collect();
-        assert_eq!(names.len(), 50, "duplicate type names detected");
+        assert_eq!(names.len(), 49, "duplicate type names detected");
     }
 
     // ── TimerCancelled tests (issue #768) ─────────────────────────────────────
@@ -2614,49 +2535,5 @@ mod tests {
             other => panic!("wrong variant: {}", other.type_name()),
         }
         Ok(())
-    }
-
-    // ── DecisionCommitted tests (issue #1833) ────────────────────────────────
-
-    #[test]
-    fn decision_committed_round_trips() -> Result<(), serde_json::Error> {
-        let event = WorkflowEvent::DecisionCommitted {
-            build_id: crate::types::BuildId::new("build-7"),
-            worker_id: WorkerId::new("node-a-pid-12"),
-        };
-        let value = serde_json::to_value(&event)?;
-        assert_eq!(
-            value,
-            serde_json::json!({
-                "type": "DecisionCommitted",
-                "data": {"build_id": "build-7", "worker_id": "node-a-pid-12"},
-            })
-        );
-        assert_eq!(event.type_name(), "DecisionCommitted");
-        let back: WorkflowEvent = serde_json::from_value(value)?;
-        let WorkflowEvent::DecisionCommitted {
-            build_id,
-            worker_id,
-        } = back
-        else {
-            panic!("expected DecisionCommitted, got {}", back.type_name());
-        };
-        assert_eq!(build_id.as_str(), "build-7");
-        assert_eq!(worker_id.as_str(), "node-a-pid-12");
-        Ok(())
-    }
-
-    #[test]
-    fn decision_committed_is_a_boundary_and_not_terminal() {
-        let event = WorkflowEvent::DecisionCommitted {
-            build_id: crate::types::BuildId::legacy(),
-            worker_id: WorkerId::new("w"),
-        };
-        assert!(event.is_decision_boundary());
-        assert!(!event.is_terminal_lifecycle());
-        let other = WorkflowEvent::WorkflowCompleted {
-            output: serde_json::Value::Null,
-        };
-        assert!(!other.is_decision_boundary());
     }
 }

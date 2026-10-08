@@ -34,7 +34,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 static TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::test_init_sql().as_bytes().to_vec()
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
 }
 
 async fn setup_test_database_url() -> (String, Option<ContainerAsync<Postgres>>) {
@@ -190,7 +190,7 @@ fn default_start_params(
         exec_id,
         workflow_name,
         workflow_id,
-        input: input.into(),
+        input,
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -908,7 +908,6 @@ async fn test_await_outbox_does_not_duplicate_a_present_terminal() {
         Duration::from_secs(30),
         &None,
         &[ShardId::new(0)],
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await
     .unwrap();
@@ -923,7 +922,6 @@ async fn test_await_outbox_does_not_duplicate_a_present_terminal() {
         Duration::from_secs(30),
         &None,
         &[ShardId::new(0)],
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await
     .unwrap();

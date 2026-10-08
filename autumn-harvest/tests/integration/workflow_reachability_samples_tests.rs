@@ -26,7 +26,7 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::test_init_sql().as_bytes().to_vec()
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
 }
 
 async fn setup_db() -> (String, Option<ContainerAsync<Postgres>>) {
@@ -64,7 +64,7 @@ async fn insert_execution(
         workflow_id,
         run_id: uuid::Uuid::new_v4(),
         shard_id: 0,
-        input: json!({}).into(),
+        input: json!({}),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,

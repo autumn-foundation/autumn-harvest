@@ -28,6 +28,7 @@ use autumn_harvest::types::{ActivityExecId, ExecutionId, ShardId};
 use autumn_harvest::worker::DbPool;
 use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
+use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -100,7 +101,7 @@ async fn setup_shards(count: usize) -> (Vec<String>, Option<ContainerAsync<Postg
         let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
             .await
             .expect("shard connect");
-        conn.batch_execute(&autumn_harvest::test_init_sql())
+        conn.batch_execute(autumn_harvest::full_migrations_sql())
             .await
             .expect("migrate shard");
         urls.push(url);
@@ -131,11 +132,11 @@ fn build_app(urls: &[String]) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(storage);
-    harvest_api_router(api_state)
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
 
 /// Build an app whose **router** knows about more shards than this process has
-/// pools for — the mid-rollout topology from the `docs/architecture.md` "add a shard"
+/// pools for — the mid-rollout topology from the CLAUDE.md "add a shard"
 /// procedure, where `readable_shards` is widened before every process has the
 /// new shard's pool wired up.
 fn build_app_with_router_knowing_extra_shard(
@@ -173,7 +174,7 @@ fn build_app_with_router_knowing_extra_shard(
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         router,
     ));
-    harvest_api_router(api_state)
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
 
 async fn get_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
@@ -221,7 +222,7 @@ async fn seed_execution(
         workflow_id,
         run_id: Uuid::new_v4(),
         shard_id: shard.as_i32(),
-        input: json!({ "secret": "plaintext-payload" }).into(),
+        input: json!({ "secret": "plaintext-payload" }),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -633,8 +634,7 @@ async fn two_logical_shards_sharing_one_database_do_not_double_count() {
 /// A shard the **router** knows about but this process has no pool for must be
 /// reported `unavailable`, never silently omitted (Codex round-19 P1).
 ///
-/// This is the mid-rollout topology from the `docs/architecture.md` "add a shard"
-/// procedure:
+/// This is the mid-rollout topology from the CLAUDE.md "add a shard" procedure:
 /// `readable_shards` is widened *before* every process has the new shard's pool
 /// wired up. Enumerating only `pool.iter_shards()` omits that shard from BOTH
 /// `inspected_shards` and `unavailable_shards` — and `SampleStatus::from_counts`
@@ -931,7 +931,7 @@ async fn sample_export_requires_admin() {
     // No `set_admin_auth_boundary(true)` and no session: an unauthenticated
     // caller must be rejected.
     api_state.install_storage_pool(storage);
-    let app = harvest_api_router(api_state);
+    let app = harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"));
 
     let (status, _) = get_json(&app, SAMPLE_ROUTE).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -975,19 +975,13 @@ async fn idle_fleet_yields_an_empty_but_complete_manifest() {
 
     let (status, body) = get_json(&app, SAMPLE_ROUTE).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(
-        body["exports"].as_array().expect("array").as_slice(),
-        [] as [serde_json::Value; 0]
-    );
+    assert!(body["exports"].as_array().expect("array").is_empty());
     let manifest = manifest_of(&body);
     assert!(manifest.is_complete());
     assert!(!manifest.is_truncated());
     assert_eq!(manifest.sampled_total, 0);
     assert_eq!(manifest.in_flight_total, 0);
-    assert_eq!(
-        manifest.per_workflow,
-        [] as [autumn_harvest::replay_sample::SampleWorkflowCoverage; 0]
-    );
+    assert!(manifest.per_workflow.is_empty());
 }
 
 // ---------------------------------------------------------------------------

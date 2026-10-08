@@ -1,0 +1,41 @@
+# Loom concurrency model checking — MANUAL ONLY.
+#
+# This workflow is triggered exclusively by `workflow_dispatch`, so it is never
+# part of the required-status matrix in ci.yml and adds zero cost to normal
+# PR/push runs (respecting the #999 CI cost controls). Run it on demand from the
+# GitHub Actions tab ("Loom model checking" -> "Run workflow") or with:
+#
+#   gh workflow run loom.yml --ref <branch>
+#
+# It exhaustively explores the thread interleavings of harvest's in-process,
+# Mutex-guarded state machines (circuit breaker + session slots). See
+# docs/testing/loom.md. No database is required.
+name: Loom model checking
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: loom-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  loom:
+    name: Loom models
+    runs-on: ubuntu-latest
+    # Generous but bounded: the four models are tiny (two threads, <=2 ops each)
+    # and run in well under a second combined; the bulk of the time is the
+    # one-off crate compile under --cfg loom.
+    timeout-minutes: 30
+    env:
+      # tokio's `net` module is compiled out under --cfg loom, so the build must
+      # avoid every tokio::net consumer: --no-default-features drops the `db`
+      # feature (tokio-postgres), and testcontainers is gated to cfg(not(loom))
+      # in autumn-harvest/Cargo.toml. See docs/testing/loom.md.
+      RUSTFLAGS: "--cfg loom"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run loom models
+        run: cargo test -p autumn-harvest --no-default-features --test loom_models --release

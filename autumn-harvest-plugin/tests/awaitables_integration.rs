@@ -45,6 +45,7 @@ use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
 use autumn_harvest_plugin::ui::harvest_ui_router;
+use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -198,7 +199,7 @@ async fn setup_database() -> (String, Option<ContainerAsync<Postgres>>) {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
         .await
         .expect("db connect");
-    conn.batch_execute(&autumn_harvest::test_init_sql())
+    conn.batch_execute(autumn_harvest::full_migrations_sql())
         .await
         .expect("migrate db");
     (url, guard)
@@ -256,11 +257,11 @@ fn build_api_state(pool: &DbPool) -> HarvestApiState {
 }
 
 fn build_api_app(pool: &DbPool) -> axum::Router {
-    harvest_api_router(build_api_state(pool))
+    harvest_api_router(build_api_state(pool)).with_state(AppState::for_test().with_profile("test"))
 }
 
 fn build_ui_app(pool: &DbPool) -> axum::Router {
-    harvest_ui_router(build_api_state(pool))
+    harvest_ui_router(build_api_state(pool)).with_state(AppState::for_test().with_profile("test"))
 }
 
 async fn get_json(app: &axum::Router, uri: &str, admin: bool) -> (StatusCode, Value) {

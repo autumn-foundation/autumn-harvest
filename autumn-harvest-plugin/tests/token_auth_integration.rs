@@ -35,9 +35,9 @@ use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
-    HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, StandaloneAdminAuth,
-    harvest_api_router,
+    HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
+use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -53,7 +53,7 @@ use tower::ServiceExt;
 type HarvestApiApp = axum::Router;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::test_init_sql().as_bytes().to_vec()
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
 }
 
 async fn setup_database() -> (String, Option<ContainerAsync<Postgres>>) {
@@ -80,8 +80,11 @@ fn build_pool(url: &str) -> DbPool {
         .expect("pool should build")
 }
 
-fn api_state(pool: &DbPool) -> HarvestApiState {
+fn api_state(pool: &DbPool, admin_boundary: bool) -> HarvestApiState {
     let api_state = HarvestApiState::new();
+    if admin_boundary {
+        api_state.set_admin_auth_boundary(true);
+    }
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
         Arc::new(HandlerRegistry::new(vec![], vec![])),
@@ -96,29 +99,30 @@ fn api_state(pool: &DbPool) -> HarvestApiState {
     api_state
 }
 
-/// App with the embedder admin boundary declared (mints/verifies under
-/// boundary) AND the token scope layer installed. This is the `api_with_auth`
-/// plus tokens composition.
-///
-/// Assembled through the exported [`StandaloneAdminAuth`] mount (issue #1608),
-/// not a hand-written layer stack, so this suite exercises the composition an
-/// embedder actually writes.
+/// App with the embedder admin boundary set (mints/verifies under boundary) AND
+/// the token scope layer installed. This is the `api_with_auth` + tokens
+/// composition.
 fn build_app_boundary(pool: &DbPool) -> HarvestApiApp {
-    let state = api_state(pool);
-    StandaloneAdminAuth::new()
-        .with_api_tokens()
-        .with_admin_auth_boundary()
-        .mount(harvest_api_router(state.clone()), &state)
+    let state = api_state(pool, true);
+    harvest_api_router(state.clone())
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            autumn_harvest_plugin::api_token::enforce_token_scope,
+        ))
+        .with_state(AppState::for_test().with_profile("test"))
 }
 
 /// App with NO embedder boundary and the token scope layer installed. This is
 /// the standalone-token mode: a verified `mutate` token must satisfy
 /// `require_admin` via the `TokenPrincipal` extension.
 fn build_app_standalone(pool: &DbPool) -> HarvestApiApp {
-    let state = api_state(pool);
-    StandaloneAdminAuth::new()
-        .with_api_tokens()
-        .mount(harvest_api_router(state.clone()), &state)
+    let state = api_state(pool, false);
+    harvest_api_router(state.clone())
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            autumn_harvest_plugin::api_token::enforce_token_scope,
+        ))
+        .with_state(AppState::for_test().with_profile("test"))
 }
 
 async fn scrub(conn: &mut AsyncPgConnection) {
@@ -497,15 +501,16 @@ async fn token_authed_mutation_audit_actor_is_token_id() {
     scrub(&mut conn).await;
     let app = build_app_boundary(&pool);
 
-    // Mint a token WITH the admin scope. Only admin may revoke (issue #1803).
-    let secret = mint(&app, "actor-test", "admin", None).await;
+    // Mint a second token WITH the mutate scope (creating a token is itself an
+    // audited mutation — but we assert on a revoke below to get a clean id).
+    let secret = mint(&app, "actor-test", "mutate", None).await;
     let (_, list) = send(&app, "GET", "/admin/tokens", None, None, true, None).await;
     let id = list[0]["id"].as_str().unwrap().to_string();
 
-    // Clear the mint audit rows for a clean assertion. KEEP the api token rows.
-    // The admin token (`secret`) authenticates the revoke below. The two-table
-    // `scrub` also wipes `harvest_api_tokens`. It would delete that token, and
-    // the revoke would 401 before the actor assertion runs.
+    // Clear the mint audit rows for a clean assertion, but KEEP the api token
+    // rows — the mutate token (`secret`) authenticates the revoke below, so the
+    // two-table `scrub` (which also wipes `harvest_api_tokens`) would delete the
+    // very token we authenticate with and 401 before the actor assertion runs.
     let _ = diesel::sql_query("DELETE FROM harvest_audit_log")
         .execute(&mut conn)
         .await;
@@ -524,7 +529,7 @@ async fn token_authed_mutation_audit_actor_is_token_id() {
         .unwrap()
         .to_string();
 
-    // Revoke the throwaway, authenticating with the admin token, and try to
+    // Revoke the throwaway, authenticating with the mutate token, and try to
     // spoof a different actor via the header — the server must ignore it.
     let (status, _) = send(
         &app,
@@ -538,7 +543,7 @@ async fn token_authed_mutation_audit_actor_is_token_id() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    // The revoke audit row's actor is token:{id-of-the-admin-token}.
+    // The revoke audit row's actor is token:{id-of-the-mutate-token}.
     #[derive(diesel::QueryableByName)]
     struct A {
         #[diesel(sql_type = diesel::sql_types::Text)]
@@ -713,11 +718,10 @@ async fn bootstrap_seeded_token_authenticates_identically_to_route_minted() {
     );
 
     // ── Part B: a bootstrap-seeded row authenticates + audits identically ─────
-    //
-    // Seed an `admin` token EXACTLY as `harvest token bootstrap` does. Mint the
-    // secret and compute the hash with the shared helpers. Then INSERT the row
-    // directly, as the operator runs the printed SQL. The SQL stores ONLY the
-    // hash, never the secret.
+    // Seed a `mutate` token EXACTLY as `harvest token bootstrap` does: mint the
+    // secret and compute the hash via the shared helpers, then INSERT the row
+    // directly (as the operator runs the printed SQL). The SQL stores ONLY the
+    // hash — never the secret.
     let seed_secret = autumn_harvest::api_token::mint_secret();
     let seed_hash = autumn_harvest::api_token::hash_secret(&seed_secret);
     assert!(seed_secret.starts_with("hvst_"));
@@ -733,7 +737,7 @@ async fn bootstrap_seeded_token_authenticates_identically_to_route_minted() {
     }
     let seeded: IdRow = diesel::sql_query(
         "INSERT INTO harvest_api_tokens (name, token_hash, scope, created_by) \
-         VALUES ('bootstrap-seed', $1, 'admin', 'bootstrap') RETURNING id::text AS id",
+         VALUES ('bootstrap-seed', $1, 'mutate', 'bootstrap') RETURNING id::text AS id",
     )
     .bind::<diesel::sql_types::Text, _>(&seed_hash)
     .get_result(&mut conn)
@@ -742,7 +746,7 @@ async fn bootstrap_seeded_token_authenticates_identically_to_route_minted() {
     let seed_id = seeded.id;
 
     // B1: parity with `mutate_token_reaches_admin_route_standalone` — the seeded
-    // admin token satisfies `require_admin` on the standalone (no-boundary) app.
+    // mutate token satisfies `require_admin` on the standalone (no-boundary) app.
     let standalone = build_app_standalone(&pool);
     let (authed, _) = send(
         &standalone,
@@ -757,12 +761,12 @@ async fn bootstrap_seeded_token_authenticates_identically_to_route_minted() {
     assert_ne!(
         authed,
         StatusCode::UNAUTHORIZED,
-        "bootstrap-seeded admin token must pass require_admin standalone"
+        "bootstrap-seeded mutate token must pass require_admin standalone"
     );
     assert_ne!(
         authed,
         StatusCode::FORBIDDEN,
-        "bootstrap-seeded admin token is not read-scoped"
+        "bootstrap-seeded mutate token is not read-scoped"
     );
 
     // B2: parity with `token_authed_mutation_audit_actor_is_token_id` — a

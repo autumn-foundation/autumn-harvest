@@ -132,7 +132,5 @@ async fn main() {
         );
     });
 
-    // The `run` future is large in autumn-web 0.8, so it is boxed.
-    // That keeps it off the stack and satisfies `clippy::large_futures`.
-    Box::pin(app.run()).await;
+    app.run().await;
 }

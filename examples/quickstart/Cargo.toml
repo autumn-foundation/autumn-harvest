@@ -4,12 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
-default-run = "quickstart"
 
 [dependencies]
-autumn-harvest = { version = "0.7.0", path = "../../autumn-harvest", features = ["db"] }
-autumn-harvest-plugin = { version = "0.7.0", path = "../../autumn-harvest-plugin" }
-autumn-web = "0.8"
+autumn-harvest = { version = "0.6.0", path = "../../autumn-harvest", features = ["db"] }
+autumn-harvest-plugin = { version = "0.6.0", path = "../../autumn-harvest-plugin" }
+autumn-web = "0.7"
 serde_json = { workspace = true }
 tracing = { workspace = true }
 

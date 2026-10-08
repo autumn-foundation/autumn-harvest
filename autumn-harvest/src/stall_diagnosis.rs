@@ -34,13 +34,7 @@
 //! 1. terminal execution — nothing to diagnose
 //! 2. [`BlockedOn::Paused`] — an operator deliberately parked this run
 //! 3. the **worst** verdict across every pending activity (see
-//!    [`activity_precedence`]) — with one narrow exception (issue #1193
-//!    Codex round-3 P1): a [`Degraded`](ExecutionHealth::Degraded) activity
-//!    verdict yields to the run's OWN workflow task if THAT is hard-blocked
-//!    (an operator-paused queue or no live poller), because a frozen
-//!    decision cycle is worse than one activity self-resolving into
-//!    failure. Every other activity health keeps the established,
-//!    deliberately-activity-first behavior.
+//!    [`activity_precedence`])
 //! 4. an external handoff, then a pending child, then an awaited signal, then a
 //!    sleeping timer — mirroring issue #486's own `StallReason` ordering so the
 //!    two surfaces agree about which category "wins"
@@ -51,19 +45,8 @@
 //! than the thing that happens to self-heal soonest:
 //!
 //! `queue_paused` > `activity_paused` > `no_worker` >
-//! `rate_limit_bucket_missing` > `circuit_open` (forced-open) >
-//! `circuit_open` (organic) > `circuit_open` (half-open) >
-//! `concurrency_deferred` > `rate_limited` > `retrying` > healthy.
-//!
-//! The three circuit-open shapes are deliberately ranked by health severity
-//! rather than sharing one tier (issue #1193): a forced-open breaker
-//! outranks an organically-tripped one (Codex round-1 P1), which in turn
-//! outranks a half-open one (Codex round-2 P1). Each pair used to share a
-//! tier while also sharing a health value, so a tie was inconsequential —
-//! but once `Degraded` split `Stalled` from `Healthy` down the middle, a
-//! same-rank tie between two now-differently-healthed shapes could let the
-//! fold silently pick the milder one over a genuinely worse condition
-//! elsewhere in the same fan-out, purely by row order.
+//! `rate_limit_bucket_missing` > `circuit_open` > `concurrency_deferred` >
+//! `rate_limited` > `retrying` > healthy.
 //!
 //! In particular `no_worker` deliberately outranks `retrying`: a task in retry
 //! backoff on a queue with no live poller will **never** run, so reporting
@@ -81,20 +64,8 @@
 //!   outside the engine: a human signal, an external-handoff callback, or an
 //!   operator's own pause. Expected, not a page.
 //! - [`Stalled`](ExecutionHealth::Stalled) — needs a human now: no worker polls
-//!   the queue, an operator-forced circuit breaker is open, or a `RUNNING`
-//!   execution has no pending work at all (the executor-loss / lost-task
-//!   indicator).
-//! - [`Degraded`](ExecutionHealth::Degraded) — will move on its own, but not
-//!   toward success: an organically-tripped circuit breaker (issue #1193).
-//!   The cooldown admits a recovery probe with no human involved, but no
-//!   dispatch runs until then. By default each one waits in `PENDING` (issue
-//!   #1809). In fail-fast mode each one fails **non-retryably** (issue #369).
-//!   Neither is progress. Distinct from
-//!   `Stalled` (which stays reserved for the operator-forced open, where a
-//!   human genuinely must `force-close` it) and from `Healthy` (an operator
-//!   must not be told "healthy" about a run heading for a terminal
-//!   `ActivityFailed`). See [`BlockedOn::health`] for the full three-way
-//!   phase split this decides between.
+//!   the queue, a circuit breaker is open, or a `RUNNING` execution has no
+//!   pending work at all (the executor-loss / lost-task indicator).
 //! - [`Terminal`](ExecutionHealth::Terminal) — the run already finished.
 //!
 //! A long sleep is **not** a stall: health is derived purely from the verdict,
@@ -120,29 +91,6 @@ pub enum ExecutionHealth {
     BlockedExternal,
     /// The execution already reached a terminal state.
     Terminal,
-    /// **Will move forward without a human, but not toward success.** Issue
-    /// #1193's third case, distinct from both neighbors on purpose:
-    ///
-    /// - Not [`Self::Healthy`], because no dispatch of the blocking activity
-    ///   runs until the condition clears. By default each one waits in
-    ///   `PENDING` (issue #1809). In fail-fast mode each one fails
-    ///   **non-retryably** (issue #369's `ActivityFailure::circuit_open`), and
-    ///   the activity heads for a terminal `ActivityFailed`. An
-    ///   operator reading `healthy` here would not know to expect that.
-    ///   `NonRetryableFailure` is terminal for the *activity*, not the whole
-    ///   run: the workflow itself keeps running and can still catch the
-    ///   failure, retry it at the workflow level, or fail the run — none of
-    ///   that requires an operator.
-    /// - Not [`Self::Stalled`], because no human action clears it faster than
-    ///   the timer already running: an organically-tripped circuit breaker
-    ///   (`cooldown_until: Some(..)`) admits a recovery probe on its own
-    ///   cooldown, unlike an operator-forced one (`cooldown_until: None`),
-    ///   which stays [`Self::Stalled`] and genuinely needs `force-close`.
-    ///
-    /// Currently reached only by [`BlockedOn::ActivityCircuitOpen`] in the
-    /// `Open` phase with a `cooldown_until`. See [`BlockedOn::health`] for the
-    /// full rationale and the three-way phase split.
-    Degraded,
 }
 
 impl ExecutionHealth {
@@ -154,7 +102,6 @@ impl ExecutionHealth {
             Self::Stalled => "stalled",
             Self::BlockedExternal => "blocked_external",
             Self::Terminal => "terminal",
-            Self::Degraded => "degraded",
         }
     }
 }
@@ -231,39 +178,22 @@ pub enum BlockedOn {
         activity_name: Option<String>,
     },
     /// The activity's per-activity circuit breaker is open (or half-open), so
-    /// dispatch short-circuits until it recovers. It defers by default, or
-    /// fails in fail-fast mode (issue #1809).
+    /// dispatch fast-fails until it recovers.
     ActivityCircuitOpen {
         /// The activity whose breaker is tripped.
         activity_name: String,
         /// The observed phase. Load-bearing for triage: a `half_open` breaker is
         /// already recovering (a probe is admitted, or one is in flight) and
         /// closes on success with no operator action, whereas an `open` breaker
-        /// that is operator-forced needs a manual `force-close`.
+        /// with no cooldown is operator-forced and needs a manual `force-close`.
+        /// Without this the two collapse to the same `cooldown_until: None`
+        /// shape and a self-recovering breaker is misreported as needing manual
+        /// intervention.
         phase: BlockingCircuitPhase,
-        /// **Authoritative**: `true` when an operator explicitly forced this
-        /// breaker open (`CircuitBreakerRegistry::force_open`), sourced directly
-        /// from `CircuitSnapshot::forced_open` — never inferred from whether
-        /// `cooldown_until` could be computed. Always `false` when `phase` is
-        /// `half_open` (a forced-open breaker's phase never leaves `Open` until
-        /// an explicit `force_close`, so the two never coexist).
-        ///
-        /// Issue #1193 Codex round-1 P2: `cooldown_until` alone is NOT a safe
-        /// discriminator. `CircuitBreakerPolicy::new` accepts any
-        /// `std::time::Duration` for its cooldown, and an organically-tripped
-        /// breaker configured with one outside `chrono`'s representable range
-        /// also reports `cooldown_until: None` (see `circuit_cooldown_until` in
-        /// `api.rs`) — indistinguishable, by that field alone, from a genuinely
-        /// forced-open breaker. This field is the fix: it is set from the
-        /// registry's own flag, so it is correct even when the display deadline
-        /// cannot be constructed.
-        forced_open: bool,
         /// When a half-open probe becomes admissible. `None` for a `half_open`
-        /// breaker (a probe is admissible *now*), for one that is
-        /// operator-forced open (no probe is admitted on any timer), and for an
-        /// organically-tripped one whose cooldown could not be represented as a
-        /// `DateTime` (informational only — read `forced_open` for the
-        /// authoritative origin, not the presence of this field).
+        /// breaker (a probe is admissible *now*) and for one that is
+        /// operator-forced open — no probe is admitted on any timer, so recovery
+        /// requires an explicit `force-close`. Read it together with `phase`.
         #[serde(skip_serializing_if = "Option::is_none")]
         cooldown_until: Option<DateTime<Utc>>,
     },
@@ -474,35 +404,7 @@ impl BlockedOn {
             | Self::ActivityQueuePaused { .. }
             | Self::ActivityPaused { .. }
             | Self::WorkflowQueuePaused { .. } => ExecutionHealth::BlockedExternal,
-            // Issue #1193: an ORGANICALLY-TRIPPED open breaker admits a
-            // recovery probe on its own cooldown timer -- no human clears it
-            // faster. But it is not `Healthy` either: no dispatch runs
-            // until then. In fail-fast mode each one fails NON-RETRYABLY
-            // (issue #369's `ActivityFailure::circuit_open`). In defer mode
-            // (the default since issue #1809) each one waits in `PENDING`.
-            // Neither is progress. This arm MUST stay
-            // above the `ActivityCircuitOpen { .. }` catch-all below for the
-            // split to bind, and below the HalfOpen arm above (HalfOpen is
-            // the one case that clears with no fast-fail at all).
-            //
-            // Keyed on `forced_open`, NOT on `cooldown_until.is_some()`
-            // (Codex round-1 P2 on PR #1365): `CircuitBreakerPolicy::new`
-            // accepts any `std::time::Duration`, and an organically-tripped
-            // breaker configured with a cooldown outside `chrono`'s
-            // representable range ALSO reports `cooldown_until: None` --
-            // indistinguishable from a forced-open one by that field alone.
-            // `forced_open` is sourced straight from the registry's own flag,
-            // so it stays correct even when the display deadline cannot be
-            // constructed.
-            Self::ActivityCircuitOpen {
-                phase: BlockingCircuitPhase::Open,
-                forced_open: false,
-                ..
-            } => ExecutionHealth::Degraded,
-            // Nothing will move this forward without a human. The remaining
-            // `ActivityCircuitOpen` shape reaching this catch-all is
-            // `Open { forced_open: true }` -- operator-forced, admits no
-            // probe on any timer, and needs an explicit `force-close`.
+            // Nothing will move this forward without a human.
             Self::ActivityNoWorker { .. }
             | Self::ActivityRateLimitBucketMissing { .. }
             | Self::WorkflowNoWorker { .. }
@@ -523,7 +425,7 @@ impl BlockedOn {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum BlockingCircuitPhase {
-    /// Tripped: dispatch short-circuits until the cooldown elapses.
+    /// Tripped: dispatch fast-fails until the cooldown elapses.
     Open,
     /// Cooldown elapsed: a single probe dispatch is admitted.
     HalfOpen,
@@ -590,14 +492,6 @@ pub struct PendingActivityFacts {
     pub circuit_phase: Option<BlockingCircuitPhase>,
     /// When a half-open probe becomes admissible, if that is knowable.
     pub circuit_cooldown_until: Option<DateTime<Utc>>,
-    /// **Authoritative**: `true` when an operator explicitly forced this
-    /// breaker open, sourced from `CircuitSnapshot::forced_open` directly.
-    /// Meaningful only when `circuit_phase` is `Some(Open)`; always `false`
-    /// otherwise. Must NOT be inferred from `circuit_cooldown_until.is_none()`
-    /// -- an organically-tripped breaker with an unrepresentable cooldown ALSO
-    /// reports no `circuit_cooldown_until`, which is indistinguishable from a
-    /// forced-open one by that field alone (issue #1193 Codex round-1 P2).
-    pub circuit_forced_open: bool,
     /// `true` when the rate-limit bucket has fewer than one token.
     ///
     /// Transient: the bucket refills. Distinct from
@@ -691,49 +585,6 @@ pub struct WorkflowTaskFacts {
     /// progressing, even though that worker claims nothing new. `None` falls
     /// back to [`Self::has_live_worker`].
     pub claimant_is_live: Option<bool>,
-    /// The row's `created_at` (issue #1191). `None` for a pre-`#501`
-    /// legacy row that predates the column.
-    ///
-    /// Three writers touch this column on a workflow task row: `queue`'s
-    /// `primary_repend_workflow_task_query` and
-    /// `release_suspended_workflow_claim_query`, plus
-    /// `shard_rebalance::activate_target`'s signal re-pend. All three set
-    /// `created_at = clock_timestamp()` in the same statement that resets
-    /// `scheduled_at` for a fresh dispatch attempt. Every other production
-    /// write path, `queue::reschedule_task` included, leaves it alone. So
-    /// `created_at` proves something timestamp proximity to an armed
-    /// timer's `fires_at` cannot: whether one of THOSE THREE write paths
-    /// produced the row's current shape. See
-    /// [`wake_source_repended_this_row`].
-    pub created_at: Option<DateTime<Utc>>,
-    /// The `fires_at` of the durable timer this row is currently armed for
-    /// (issue #1402). `None` when no timer owns this row.
-    ///
-    /// Set only by `queue::reschedule_task`, from the identical value it
-    /// writes to `scheduled_at`. Unlike `scheduled_at`, this column
-    /// survives a later same-reason drift. Three kinds of drift leave it
-    /// alone on purpose: a queue-pause resume credit
-    /// (`queue_pause::resume_shift_scheduled_at_query`), an orphan reclaim
-    /// (`poison_pill::requeue_orphan_stmt`), and a capability-miss release
-    /// (`queue::release_task_for_capability_miss_query`). Each can move
-    /// `scheduled_at` an unbounded distance from `fires_at` without
-    /// changing WHY the row is due. This field is how
-    /// [`is_the_missed_timer_wake`] tells that drift apart from a
-    /// coincidence.
-    ///
-    /// Cleared to `None` by every path that hands the row to a genuinely
-    /// different wake reason. `queue`'s `primary_repend_workflow_task_query`
-    /// and `release_suspended_workflow_claim_query` clear it when a
-    /// signal, a child, or an external handoff resolves.
-    /// `shard_rebalance::activate_target`'s signal re-pend clears it too.
-    /// So do the three backoff retries:
-    /// `requeue_workflow_task_for_quota_retry`,
-    /// `requeue_workflow_task_nd_blocked`, and
-    /// `requeue_workflow_task_after_panic`. None of those retries owes its
-    /// `scheduled_at` to the originally-armed timer either. The first two
-    /// clearers also stamp `created_at` fresh; see
-    /// [`wake_source_repended_this_row`] for that fingerprint.
-    pub timer_fires_at: Option<DateTime<Utc>>,
 }
 
 /// A durable wait that replay named but no side table this endpoint reads can
@@ -782,40 +633,6 @@ pub struct DiagnosisInputs {
     pub nd_block: Option<NdBlockFacts>,
 }
 
-/// Does the activity's circuit breaker block dispatch right now?
-///
-/// `true` for a half-open breaker: a probe is admissible now.
-///
-/// `true` for an open breaker whose cooldown will not clear by the row's
-/// effective dispatch instant (`max(now, scheduled_at)`).
-///
-/// `false` for a closed or absent breaker, and for an organically-tripped
-/// open breaker whose cooldown clears by then.
-/// `CircuitBreakerRegistry::on_dispatch` then admits the row's own next
-/// attempt as the recovery probe, so nothing fast-fails it (issue #1193).
-///
-/// A forced-open breaker ignores its cooldown field and always blocks;
-/// only `force-close` clears it (issue #1193).
-///
-/// Shared by [`classify_pending_activity`], [`activity_precedence_for_facts`]
-/// and the diagnose endpoint's reason-code builder, so all three name the
-/// same set of currently-blocking rows (issue #1371).
-#[must_use]
-pub fn activity_circuit_currently_blocks(facts: &PendingActivityFacts, now: DateTime<Utc>) -> bool {
-    match facts.circuit_phase {
-        None => false,
-        Some(BlockingCircuitPhase::HalfOpen) => true,
-        Some(BlockingCircuitPhase::Open) => {
-            let effective_dispatch_instant = facts.scheduled_at.max(now);
-            let organic_cooldown_clears_by_dispatch = !facts.circuit_forced_open
-                && facts
-                    .circuit_cooldown_until
-                    .is_some_and(|deadline| effective_dispatch_instant >= deadline);
-            !organic_cooldown_clears_by_dispatch
-        }
-    }
-}
-
 /// Rank a pending-activity verdict by how hard its impediment is to clear.
 ///
 /// Higher wins. Used to pick the **worst** verdict across a fan-out so a single
@@ -826,50 +643,16 @@ pub fn activity_circuit_currently_blocks(facts: &PendingActivityFacts, now: Date
 #[must_use]
 pub const fn activity_precedence(blocked: &BlockedOn) -> u8 {
     match blocked {
-        BlockedOn::ActivityQueuePaused { .. } => 11,
+        BlockedOn::ActivityQueuePaused { .. } => 9,
         // The narrower operator hold. Ranked just under the queue pause because
         // that is the broader lever -- lifting this one alone still leaves a
         // queue-held row blocked -- and above everything below because an
         // operator's deliberate hold is what a triaging operator must see first.
-        BlockedOn::ActivityPaused { .. } => 10,
-        BlockedOn::ActivityNoWorker { .. } => 9,
+        BlockedOn::ActivityPaused { .. } => 8,
+        BlockedOn::ActivityNoWorker { .. } => 7,
         // Permanent, like the two above it: a bucket row that does not exist
         // never refills, so this outranks every self-healing gate below.
-        BlockedOn::ActivityRateLimitBucketMissing { .. } => 8,
-        // Issue #1193: the three observable circuit shapes are ranked by
-        // health severity, not lumped into one tier, because a same-rank tie
-        // between two DIFFERENT healths lets `classify_execution`'s
-        // keep-the-first-max fold silently pick the milder one purely by row
-        // order, masking a genuinely worse condition elsewhere in the fan-out.
-        //
-        // - FORCED-open (`Stalled`): a Codex round-1 P1 finding. It used to
-        //   share a tier with organic-open (both were `Stalled`), so the tie
-        //   was inconsequential; once they diverged (`Stalled` vs
-        //   `Degraded`) a tie could mask the genuine stall behind the
-        //   self-healing one.
-        // - ORGANIC-open (`Degraded`): a Codex round-2 P1 finding. It used to
-        //   share a tier with `HalfOpen` (both were, at the time, considered
-        //   together), and once `HalfOpen` stayed `Healthy` while organic-open
-        //   became `Degraded`, the same masking risk applied in the opposite
-        //   direction -- a `HalfOpen` row ordered first could report the
-        //   execution `healthy` while a DIFFERENT activity's organically
-        //   tripped breaker was heading toward a terminal, non-retryable
-        //   failure.
-        // - HALF-OPEN (`Healthy`): admits a probe right now and closes on
-        //   success, so it is the least severe of the three -- but still
-        //   ranked above the plainly-healthy self-healing gates below it,
-        //   preserving the pre-#1193 relative order between them (a purely
-        //   cosmetic tie, since every rank below this one is also `Healthy`).
-        BlockedOn::ActivityCircuitOpen {
-            phase: BlockingCircuitPhase::Open,
-            forced_open: true,
-            ..
-        } => 7,
-        BlockedOn::ActivityCircuitOpen {
-            phase: BlockingCircuitPhase::Open,
-            forced_open: false,
-            ..
-        } => 6,
+        BlockedOn::ActivityRateLimitBucketMissing { .. } => 6,
         BlockedOn::ActivityCircuitOpen { .. } => 5,
         BlockedOn::ActivityConcurrencyDeferred { .. } => 4,
         BlockedOn::ActivityRateLimited { .. } => 3,
@@ -910,40 +693,23 @@ fn activity_precedence_for_facts(facts: &PendingActivityFacts, now: DateTime<Utc
         return if facts.claimant_is_live.unwrap_or(facts.has_live_worker) {
             0 // HealthyInProgress
         } else {
-            9 // ActivityNoWorker
+            7 // ActivityNoWorker
         };
     }
     if facts.queue_paused {
-        return 11; // ActivityQueuePaused
+        return 9; // ActivityQueuePaused
     }
     if facts.activity_paused && facts.activity_name.is_some() {
-        return 10; // ActivityPaused
+        return 8; // ActivityPaused
     }
     if !facts.has_live_worker {
-        return 9; // ActivityNoWorker
+        return 7; // ActivityNoWorker
     }
     if facts.rate_limit_bucket_missing && facts.rate_limit_key.is_some() {
-        return 8; // ActivityRateLimitBucketMissing
+        return 6; // ActivityRateLimitBucketMissing
     }
-    // Uses `activity_circuit_currently_blocks` (issue #1193). A row whose
-    // breaker no longer blocks by the effective dispatch instant is not a
-    // circuit-open verdict. It falls through to the not-due-yet ranks below.
-    if activity_circuit_currently_blocks(facts, now) && facts.activity_name.is_some() {
-        // Issue #1193: the three circuit shapes are ranked by health severity
-        // (forced > organic > half-open), mirroring `activity_precedence`, so
-        // a same-rank tie between two DIFFERENTLY-healthed shapes can never
-        // let the fold pick the milder one over a worse condition elsewhere
-        // in the fan-out (round-1 P1: forced vs organic; round-2 P1: organic
-        // vs half-open).
-        return if facts.circuit_phase == Some(BlockingCircuitPhase::Open) {
-            if facts.circuit_forced_open {
-                7 // ActivityCircuitOpen (forced)
-            } else {
-                6 // ActivityCircuitOpen (organic)
-            }
-        } else {
-            5 // ActivityCircuitOpen (half-open)
-        };
+    if facts.circuit_phase.is_some() && facts.activity_name.is_some() {
+        return 5; // ActivityCircuitOpen
     }
     if facts.scheduled_at > now {
         return if facts.last_error.is_some() {
@@ -1045,33 +811,15 @@ pub fn classify_pending_activity(facts: &PendingActivityFacts, now: DateTime<Utc
         };
     }
 
-    // 5. The breaker fast-fails dispatch. Only an activity the task row
-    //    actually names can carry one, so an unnamed row can never reach
-    //    here.
-    //
-    //    `activity_circuit_currently_blocks` (issue #1371) holds the
-    //    exception. An organic trip whose cooldown clears by the row's own
-    //    effective dispatch instant admits that row's own next attempt as
-    //    the recovery probe. It does not fast-fail. Falling through then
-    //    reports the same verdict a not-yet-due row gets. An already-due,
-    //    otherwise-unimpeded row instead gets `HealthyInProgress`, exactly
-    //    as if there were no breaker in the way. See that function's doc
-    //    comment for the full rationale (issue #1193).
-    if activity_circuit_currently_blocks(facts, now)
-        && let (Some(phase), Some(name)) = (facts.circuit_phase, facts.activity_name.as_ref())
-    {
+    // 5. The breaker fast-fails dispatch. Only an activity the task row actually
+    //    names can carry one, so an unnamed row can never reach here.
+    if let (Some(phase), Some(name)) = (facts.circuit_phase, facts.activity_name.as_ref()) {
         return BlockedOn::ActivityCircuitOpen {
             activity_name: name.clone(),
             // Preserved so a half-open breaker (recovering on its own) is
             // distinguishable from an operator-forced-open one; both carry no
             // cooldown, for opposite reasons.
             phase,
-            // Authoritative origin, straight from the registry's own flag --
-            // never inferred from `cooldown_until` (issue #1193 Codex P2). A
-            // forced-open breaker's phase never leaves `Open`, so this is
-            // always `false` for `HalfOpen` by construction upstream; asserted
-            // here too rather than trusted blindly.
-            forced_open: phase == BlockingCircuitPhase::Open && facts.circuit_forced_open,
             // A forced-open breaker admits no probe on any timer, and a
             // half-open one admits its probe immediately: neither has a
             // meaningful future cooldown to advertise.
@@ -1252,32 +1000,19 @@ pub fn classify_workflow_task(facts: &WorkflowTaskFacts) -> Option<BlockedOn> {
 /// `persist_activity_wait_park`, `persist_scheduled_activities`,
 /// `persist_all_started_child_workflows` and `persist_scheduled_external_activity`
 /// — discards the armed deadline (`_min_fires_at`) and parks the task on the
-/// thing being awaited. Only a call to [`crate::queue::reschedule_task`]
-/// hands a timer ownership of the wake — `persist_started_timer` and its
-/// mixed-signal/child-race siblings, never a plain park. A timer armed
-/// alongside any of the park paths above therefore goes overdue *as a
-/// matter of course* while the wait runs. It fires on that wait's
-/// completion wake instead — a healthy run, not a stall.
+/// thing being awaited. Only `persist_started_timer` calls
+/// [`crate::queue::reschedule_task`] with the deadline, handing the timer
+/// ownership of the wake. A timer armed alongside any of those other waits
+/// therefore goes overdue *as a matter of course* while the wait runs, and fires
+/// on that wait's completion wake — a healthy run, not a stall.
 ///
 /// The distinguishing fact is the workflow task row itself:
 ///   * **claimed** — the handler is executing right now, so nothing was missed.
 ///   * **parked** (`RUNNING`, NULL worker) — some other wake owns this run; the
 ///     timer is a passenger and its overdue row is expected.
 ///   * **`PENDING`** — the row is due to be claimed at `scheduled_at`. Only
-///     [`crate::queue::reschedule_task`] sets that to a deadline, so a
-///     `PENDING` row whose own `scheduled_at` is past the grace window is
-///     USUALLY a genuinely missed wake.
-///
-/// That last case is necessary but not sufficient (issue #1191).
-/// `wake_workflow_task` also re-pends a PARKED row to this same `PENDING`
-/// shape, on a signal, child, or external-handoff completion. It sets
-/// `scheduled_at` to the wake instant, not to any timer's deadline.
-/// Saturated workflow dispatch slots can age that row past the grace window
-/// too. This function alone cannot then tell the two `PENDING` causes
-/// apart. A caller that also holds candidate timers must additionally
-/// check [`timer_owns_the_wake`] against each one. This function only
-/// answers whether some wake was missed, not whether this specific timer's
-/// wake was missed.
+///     `persist_started_timer` sets that to a deadline, so a `PENDING` row whose
+///     own `scheduled_at` is past the grace window is a genuinely missed wake.
 ///
 /// Absent facts (`None`) resolve to `true`, preserving the pre-gate behaviour
 /// for callers that do not supply a workflow task row.
@@ -1293,170 +1028,6 @@ pub fn workflow_wake_was_missed(task: Option<&WorkflowTaskFacts>, now: DateTime<
         return false;
     }
     (now - task.scheduled_at).num_seconds() >= TIMER_OVERDUE_GRACE_SECONDS
-}
-
-/// Tolerance for matching the workflow task's `scheduled_at` against a
-/// timer's `fires_at` (issue #1191).
-///
-/// `queue::reschedule_task` sets `scheduled_at` to the exact deadline it is
-/// given, with no skew applied. `wake_workflow_task`'s re-pend backdates
-/// `scheduled_at` from the wake instant instead
-/// (`queue::IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE`, 5 seconds) — an unrelated
-/// timestamp. That skew is also 5 seconds. So this tolerance is kept
-/// strictly smaller than it, not merely equal to it. An exact match still
-/// passes. A wake-instant repend needs an armed timer within roughly a
-/// `2 * TIMER_OWNERSHIP_TOLERANCE_SECONDS` window of the true wake instant
-/// to be confused for one. That is an implausible coincidence, not a
-/// structural one.
-const TIMER_OWNERSHIP_TOLERANCE_SECONDS: i64 = 2;
-
-/// Does the timer at `fires_at` own the workflow task's current wake?
-///
-/// The proof [`workflow_wake_was_missed`] cannot give on its own. Task
-/// state and `scheduled_at` are identical whether a timer or an unrelated
-/// wake source re-pended the row. Only [`crate::queue::reschedule_task`]
-/// sets `scheduled_at` to a timer's own deadline. A close match is
-/// therefore evidence this timer set it. It is evidence only, not proof:
-/// an unrelated wake instant sits `IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE` (5s)
-/// before `scheduled_at`. So an armed timer within roughly that same
-/// window of that instant also passes this check (issue #1191).
-/// [`wake_source_repended_this_row`] is the proof that closes that gap.
-/// Callers MUST also consult it, never this function alone.
-#[must_use]
-fn timer_owns_the_wake(scheduled_at: DateTime<Utc>, fires_at: DateTime<Utc>) -> bool {
-    (scheduled_at - fires_at).num_seconds().abs() <= TIMER_OWNERSHIP_TOLERANCE_SECONDS
-}
-
-/// How far NEGATIVE `created_at - scheduled_at` can go and still count as
-/// "reset for redispatch," not a genuine timer deadline (issue #1191
-/// review).
-///
-/// More than one production write path resets a workflow task row for a
-/// fresh dispatch attempt. Each sets `created_at` and `scheduled_at`
-/// from approximately the current instant, in one statement. Two
-/// examples: `wake_workflow_task`'s `primary_repend_workflow_task_query`
-/// (gap roughly 5s, `scheduled_at` backdated by
-/// `queue::IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE`). And
-/// `release_suspended_workflow_claim_query` (gap roughly 0s, no
-/// backdating at all). [`wake_source_repended_this_row`] does not try to
-/// enumerate every such path's own backdating constant. A future one
-/// could pick a different value again. It tests the one invariant every
-/// one of them shares instead. A genuine timer-owned reschedule never
-/// can: `created_at` lands at or after `scheduled_at`, not meaningfully
-/// before it. This tolerance is the only slack given to that boundary,
-/// purely for ordinary clock skew between the Rust host and the
-/// Postgres server.
-const WAKE_REPEND_MIN_GAP_SECONDS: i64 = -2;
-
-/// Did some OTHER re-pend or release path, not an armed timer, set this
-/// row's current `scheduled_at` (issue #1191)?
-///
-/// `queue::reschedule_task` -- the one genuinely timer-owned path -- never
-/// touches `created_at`. A genuinely timer-owned row's `created_at` is
-/// therefore the row's ORIGINAL, untouched creation time. That time
-/// always precedes `scheduled_at`: a timer's own `fires_at` is always
-/// some positive duration after the row existed to arm it. So a
-/// genuinely timer-owned row's gap is always meaningfully negative.
-///
-/// Every OTHER production path that resets a row for a fresh dispatch
-/// attempt does the opposite. It resets `created_at` to approximately
-/// the current instant. That lands at or after whatever it sets
-/// `scheduled_at` to in the same statement, regardless of that path's
-/// own backdating constant. So `created_at` at or after `scheduled_at`,
-/// within [`WAKE_REPEND_MIN_GAP_SECONDS`]'s clock-skew slack, is direct
-/// provenance evidence. It is not a coincidence that one of those paths
-/// produced the row's current `PENDING` shape. It settles the case
-/// [`timer_owns_the_wake`] cannot: a coincidental timestamp match
-/// between an armed timer's `fires_at` and an unrelated repend instant.
-///
-/// A very short-lived genuine timer's own `created_at`-to-`scheduled_at`
-/// gap CAN land inside this small negative slack (issue #1191 review).
-/// This function alone cannot rule that out. It does not have to.
-/// [`is_the_missed_timer_wake`] never calls it for an EXACT
-/// `scheduled_at == fires_at` match. That is what a genuine
-/// `queue::reschedule_task` write always produces, whatever the timer's
-/// duration. This function still gets to veto a marker match, though.
-/// See that function's own doc (issue #1402 review, Codex finding) for
-/// why the marker alone is not exempted the way the exact match is.
-///
-/// A pre-`#501` legacy row has no `created_at` at all. `None` answers
-/// `false` here -- no evidence either way. So [`is_the_missed_timer_wake`]
-/// falls back to [`timer_owns_the_wake`] alone for it, as every caller
-/// behaved before this round.
-#[must_use]
-fn wake_source_repended_this_row(task: &WorkflowTaskFacts) -> bool {
-    let Some(created_at) = task.created_at else {
-        return false;
-    };
-    let gap_seconds = (created_at - task.scheduled_at).num_seconds();
-    gap_seconds >= WAKE_REPEND_MIN_GAP_SECONDS
-}
-
-/// Is this timer both overdue and the run's own missed wake (issue #1191,
-/// widened by issue #1402)?
-///
-/// Split out of [`classify_execution`] to name the conditions together:
-/// grace-window overdue and, when a workflow task is known, timer-owned.
-///
-/// "Timer-owned" is any of three, checked in this order:
-///
-/// 1. An EXACT match on `scheduled_at == fires_at`. `queue::reschedule_task`
-///    writes `scheduled_at` from the identical value already stored in
-///    `harvest_timers.fires_at`, so a genuine timer-owned row matches
-///    EXACTLY, regardless of the timer's own duration. That exact match is
-///    stronger evidence than [`wake_source_repended_this_row`]'s
-///    `created_at` heuristic can ever contradict, so it is trusted
-///    outright. A genuinely SHORT timer needs exactly this: its own
-///    `created_at`-to-`scheduled_at` gap can otherwise land inside that
-///    heuristic's small negative slack. Without this exact-match fast path
-///    it would be vetoed as a false re-pend, rather than reported as the
-///    missed wake it is.
-/// 2. `task.timer_fires_at == Some(fires_at)`, cleared by
-///    [`wake_source_repended_this_row`] (issue #1402). `reschedule_task`
-///    is also the one writer of `timer_fires_at`, from that same value.
-///    Unlike `scheduled_at`, nothing else ever moves it. A queue-pause
-///    resume credit, an orphan reclaim, or a capability-miss release can
-///    each drift `scheduled_at` an UNBOUNDED distance from `fires_at`
-///    without changing the wake reason. That defeats both this match and
-///    `timer_owns_the_wake`'s tolerance below. The preserved marker
-///    survives that drift, so it is what proves the row is still this
-///    timer's even once `scheduled_at` no longer says so. Still deferred
-///    to `wake_source_repended_this_row`, same as the tolerance match
-///    below. NOT exempted the way the exact match above is (issue #1402
-///    review, Codex finding, second round). An earlier draft of this fix
-///    exempted it too. That draft reasoned the marker is written and
-///    cleared only by code that knows about the column. The reasoning
-///    breaks during a mixed-version rollout of this very column. An
-///    old-binary worker's repend for a genuinely different wake reason
-///    does not know to clear a marker a new-binary worker already wrote.
-///    It still resets `created_at` alongside `scheduled_at`, the same
-///    way every repend always has. `wake_source_repended_this_row`
-///    catches that regardless of which binary version wrote it. It only
-///    ever looks at the shape those writes leave behind, never at the
-///    marker itself. Losing that protection costs a near-guaranteed
-///    false `timer_overdue` on every rolling deploy of this column.
-///    Keeping it costs a narrower false `sleeping_timer` instead. That
-///    one is reachable only for a genuinely short timer that ALSO
-///    survives a same-reason drift small enough to still land inside the
-///    heuristic's slack. The narrower failure mode is the accepted one.
-/// 3. A merely CLOSE match cleared by [`wake_source_repended_this_row`] --
-///    never a close match alone (issue #1191 review). This is
-///    [`timer_owns_the_wake`]'s tolerance: an unrelated timer landing near
-///    a wake instant coincidentally, with no marker to settle it either
-///    way.
-#[must_use]
-fn is_the_missed_timer_wake(
-    timer: &PendingTimerFacts,
-    task: Option<&WorkflowTaskFacts>,
-    now: DateTime<Utc>,
-) -> bool {
-    (now - timer.fires_at).num_seconds() >= TIMER_OVERDUE_GRACE_SECONDS
-        && task.is_none_or(|task| {
-            task.scheduled_at == timer.fires_at
-                || ((task.timer_fires_at == Some(timer.fires_at)
-                    || timer_owns_the_wake(task.scheduled_at, timer.fires_at))
-                    && !wake_source_repended_this_row(task))
-        })
 }
 
 /// Collapse an execution's whole fact set into one root-cause verdict.
@@ -1530,32 +1101,7 @@ pub fn classify_execution(inputs: &DiagnosisInputs, now: DateTime<Utc>) -> Optio
         },
     );
     if let Some((idx, _)) = worst_activity_index {
-        let verdict = classify_pending_activity(&inputs.activities[idx], now);
-        // Issue #1193 Codex round-3 P1: a `Degraded` activity verdict
-        // promises "no human needed, this clears on its own (even if only
-        // into a terminal failure)". But if the run's OWN workflow task
-        // cannot be claimed AT ALL -- an operator-paused queue or no live
-        // poller, `workflow_task_hard_impediment`'s two shapes -- the
-        // decision cycle itself is frozen, which is strictly worse: even
-        // the activities that DO complete can never be processed into
-        // follow-up work or a terminal outcome. That is worth surfacing
-        // instead of the milder, already-heading-nowhere activity cause.
-        //
-        // Scoped to ONLY the `Degraded` verdict on purpose: every other
-        // activity health (`Stalled`, `BlockedExternal`, `Healthy`) keeps
-        // the established, deliberately-activity-first behavior pinned by
-        // `wedged_activity_still_outranks_a_workflow_queue_impediment` --
-        // widening this further is a separate, pre-existing question this
-        // issue does not touch.
-        if verdict.health() == ExecutionHealth::Degraded
-            && let Some(hard) = inputs
-                .workflow_task
-                .as_ref()
-                .and_then(workflow_task_hard_impediment)
-        {
-            return Some(hard);
-        }
-        return Some(verdict);
+        return Some(classify_pending_activity(&inputs.activities[idx], now));
     }
 
     // Category ladder below the activity bucket. Mirrors issue #486's own
@@ -1568,14 +1114,14 @@ pub fn classify_execution(inputs: &DiagnosisInputs, now: DateTime<Utc>) -> Optio
     // an unfired timer past its deadline is only a wedge when that timer is what
     // the workflow task is actually scheduled to wake for.
     //
-    // Only a call to `queue::reschedule_task(task_id, fires_at)` hands a
-    // timer that ownership. Six paths never call it: `persist_signal_wait_park`,
-    // `persist_mutex_acquire_park`, `persist_activity_wait_park`,
-    // `persist_scheduled_activities`, `persist_all_started_child_workflows`,
-    // `persist_scheduled_external_activity`. Each discards the armed deadline
-    // (`_min_fires_at`) instead, and parks the task on the thing being
-    // awaited. So a timer armed alongside that wait goes overdue as a matter
-    // of course. It fires on the wait's completion wake. Reporting such a
+    // Only `persist_started_timer` hands a timer that ownership, by calling
+    // `queue::reschedule_task(task_id, fires_at)`. Every other persist path —
+    // `persist_signal_wait_park`, `persist_mutex_acquire_park`,
+    // `persist_activity_wait_park`, `persist_scheduled_activities`,
+    // `persist_all_started_child_workflows`, `persist_scheduled_external_activity`
+    // — discards the armed deadline (`_min_fires_at`) and parks the task on the
+    // thing being awaited, so a timer armed alongside that wait goes overdue as a
+    // matter of course and fires on the wait's completion wake. Reporting such a
     // healthy run as `timer_overdue`/`stalled` would be a false positive, the one
     // failure mode this endpoint must never have: it sends an operator chasing a
     // non-problem.
@@ -1588,39 +1134,17 @@ pub fn classify_execution(inputs: &DiagnosisInputs, now: DateTime<Utc>) -> Optio
     // from a missed timer wake. Pinned by
     // `healthy_activity_alongside_an_overdue_timer_is_not_a_stall`.
     //
-    // What survives both guards is USUALLY a hard fact. Timers fire only
-    // when a worker claims the owning workflow task
-    // (`worker::ingest_due_timers_and_signals`). There is no independent timer
-    // scanner. So a PENDING task long past its own `scheduled_at`, with an
-    // overdue timer, means the engine failed to act. That must outrank the
+    // What survives both guards is a hard fact, not an inference: timers fire
+    // only when a worker claims the owning workflow task
+    // (`worker::ingest_due_timers_and_signals`), and there is no independent
+    // timer scanner — so a PENDING task long past its own `scheduled_at` with an
+    // overdue timer means the engine failed to act. That must outrank the
     // legitimate-looking waits below, or a signal-or-deadline race (issue #476)
     // whose deadline the engine missed would report the healthy-looking
     // `awaiting_signal` instead of the wedge (pinned by
     // `overdue_timer_wins_when_the_workflow_wake_was_genuinely_missed`). This is
     // NOT the event-age heuristic AC4 forbids: a future deadline still reports
     // `sleeping_timer` however old the run is.
-    //
-    // "Usually", not always (issue #1191). `wake_workflow_task` re-pends a
-    // PARKED row to this identical PENDING shape too, on a signal, child, or
-    // external-handoff completion. It sets `scheduled_at` to the wake
-    // instant, not to any timer's deadline. Saturated workflow dispatch
-    // slots can age that row past the grace window too. So
-    // `workflow_wake_was_missed` alone cannot tell the two causes apart.
-    // Each overdue candidate is therefore also checked against
-    // [`timer_owns_the_wake`]. Only a timer whose OWN deadline set
-    // `scheduled_at` can win here. So this check can only narrow the match
-    // established above; it can never widen it (pinned by
-    // `overdue_timer_suppressed_when_a_different_wake_source_re_pended_the_task`).
-    //
-    // Issue #1402: `scheduled_at` is not the only source of that proof.
-    // `queue_pause`'s resume credit, `poison_pill`'s orphan reclaim, and a
-    // capability-miss release can each move `scheduled_at` an unbounded
-    // distance from `fires_at` for the SAME wake reason. No different
-    // wake source repended the row. Dispatch just stayed saturated (or
-    // the queue stayed paused) long enough to drift it past both the
-    // exact match and the tolerance. `timer_fires_at` survives that
-    // drift, so [`is_the_missed_timer_wake`] also checks it. See that
-    // function's doc comment for the full three-way match it runs.
     // A durable side-table wait does not advance on its own: a timer fires only
     // when a worker claims the owning workflow task. So a HARD impediment on
     // that task — an operator queue pause (issue #619) or no live poller —
@@ -1648,7 +1172,7 @@ pub fn classify_execution(inputs: &DiagnosisInputs, now: DateTime<Utc>) -> Optio
         && let Some(overdue) = inputs
             .timers
             .iter()
-            .filter(|timer| is_the_missed_timer_wake(timer, inputs.workflow_task.as_ref(), now))
+            .filter(|timer| (now - timer.fires_at).num_seconds() >= TIMER_OVERDUE_GRACE_SECONDS)
             .min_by_key(|timer| timer.fires_at)
     {
         return Some(BlockedOn::TimerOverdue {
@@ -1740,11 +1264,6 @@ fn activity_phrase(activity_name: Option<&String>) -> String {
 ///
 /// Split out purely so [`summarize`] stays within the function-length lint
 /// budget; the two together are exhaustive over [`BlockedOn`].
-/// What an organically open breaker does to dispatch until its cooldown ends.
-const CIRCUIT_OPEN_EFFECT: &str = "no dispatch of this activity runs until then -- by \
-     default each one waits in PENDING (issue #1809), and in fail-fast mode each one fails \
-     as non-retryable (issue #369) -- so this is not progress";
-
 fn summarize_activity_cause(blocked: &BlockedOn) -> Option<String> {
     Some(match blocked {
         BlockedOn::ActivityRetrying {
@@ -1789,20 +1308,6 @@ fn summarize_activity_cause(blocked: &BlockedOn) -> Option<String> {
             "the circuit breaker for activity '{activity_name}' is half-open; a probe is \
                  admitted now and it closes on success, with no operator action"
         ),
-        // Forced vs organic is decided by `forced_open` -- the registry's own
-        // flag -- NOT by whether `cooldown_until` could be computed. An
-        // organically-tripped breaker configured with a cooldown outside
-        // `chrono`'s representable range also reports no `cooldown_until`
-        // (issue #1193 Codex round-1 P2), so that field alone cannot tell the
-        // two apart; the messages below still land on the right one.
-        BlockedOn::ActivityCircuitOpen {
-            activity_name,
-            forced_open: true,
-            ..
-        } => format!(
-            "the circuit breaker for activity '{activity_name}' is open and \
-                 operator-forced; it needs an explicit force-close"
-        ),
         BlockedOn::ActivityCircuitOpen {
             activity_name,
             cooldown_until,
@@ -1810,17 +1315,14 @@ fn summarize_activity_cause(blocked: &BlockedOn) -> Option<String> {
         } => cooldown_until.map_or_else(
             || {
                 format!(
-                    "the circuit breaker for activity '{activity_name}' is open and will \
-                         automatically admit a recovery probe once its cooldown elapses -- no \
-                         operator action needed to clear it faster (its exact deadline could \
-                         not be computed); but {CIRCUIT_OPEN_EFFECT}"
+                    "the circuit breaker for activity '{activity_name}' is open and \
+                         operator-forced; it needs an explicit force-close"
                 )
             },
             |until| {
                 format!(
-                    "the circuit breaker for activity '{activity_name}' is open and will \
-                         automatically admit a recovery probe at {until} -- no operator action \
-                         needed to clear it faster; but {CIRCUIT_OPEN_EFFECT}"
+                    "the circuit breaker for activity '{activity_name}' is open; a probe is \
+                         admitted at {until}"
                 )
             },
         ),
@@ -2036,7 +1538,6 @@ mod tests {
             has_live_worker: true,
             circuit_phase: None,
             circuit_cooldown_until: None,
-            circuit_forced_open: false,
             rate_limit_saturated: false,
             rate_limit_bucket_missing: false,
             concurrency_saturated: false,
@@ -2171,7 +1672,6 @@ mod tests {
         let half_open = BlockedOn::ActivityCircuitOpen {
             activity_name: "charge_card".to_string(),
             phase: BlockingCircuitPhase::HalfOpen,
-            forced_open: false,
             cooldown_until: None,
         };
         let text = summarize(&half_open);
@@ -2188,7 +1688,6 @@ mod tests {
         let forced = BlockedOn::ActivityCircuitOpen {
             activity_name: "charge_card".to_string(),
             phase: BlockingCircuitPhase::Open,
-            forced_open: true,
             cooldown_until: None,
         };
         assert!(summarize(&forced).contains("force-close"));
@@ -2203,23 +1702,11 @@ mod tests {
     /// Reporting `stalled` ("needs a human: nothing will move this run forward
     /// on its own") contradicts both that contract and this verdict's own
     /// summary, which explicitly says no operator action is required.
-    ///
-    /// Issue #1193: an OPEN breaker's two shapes diverge. A FORCED open
-    /// (`forced_open: true`) genuinely needs a human -- `stalled`. An
-    /// ORGANICALLY-TRIPPED open (`forced_open: false`) admits a recovery
-    /// probe on a timer with no human involved, but every dispatch until then
-    /// fast-fails non-retryably (issue #369's `ActivityFailure::circuit_open`),
-    /// so it is neither a clean `healthy` nor a human-needed `stalled` --
-    /// `degraded`. The split is keyed on `forced_open`, NOT `cooldown_until`
-    /// (Codex round-1 P2 on PR #1365): an organic trip with an unrepresentable
-    /// cooldown also has `cooldown_until: None`, so that field alone cannot
-    /// discriminate.
     #[test]
     fn half_open_circuit_health_is_healthy_not_stalled() {
         let half_open = BlockedOn::ActivityCircuitOpen {
             activity_name: "charge_card".to_string(),
             phase: BlockingCircuitPhase::HalfOpen,
-            forced_open: false,
             cooldown_until: None,
         };
         assert_eq!(
@@ -2228,97 +1715,21 @@ mod tests {
             "a half-open breaker recovers without a human, so it is not a stall"
         );
 
-        // Operator-forced: no probe is admitted on any timer, so this
-        // genuinely needs a human (`force-close`).
+        // An OPEN breaker still fast-fails every dispatch, so it stays a stall
+        // -- whether it is operator-forced (no cooldown) or organically tripped.
         let forced_open = BlockedOn::ActivityCircuitOpen {
             activity_name: "charge_card".to_string(),
             phase: BlockingCircuitPhase::Open,
-            forced_open: true,
             cooldown_until: None,
         };
         assert_eq!(forced_open.health(), ExecutionHealth::Stalled);
 
-        // Organically tripped: self-heals on a timer, but fast-fails every
-        // dispatch until then -- neither `healthy` nor `stalled`.
         let organic_open = BlockedOn::ActivityCircuitOpen {
             activity_name: "charge_card".to_string(),
             phase: BlockingCircuitPhase::Open,
-            forced_open: false,
             cooldown_until: Some(chrono::Utc::now()),
         };
-        assert_eq!(organic_open.health(), ExecutionHealth::Degraded);
-
-        // AC (issue #1193 Codex round-1 P2): an organic trip whose cooldown
-        // could not be represented (see `circuit_cooldown_until` in `api.rs`)
-        // is STILL `degraded`, not `stalled` -- `forced_open` is what decides
-        // it, and it stays `false` regardless of whether the display
-        // deadline could be constructed.
-        let organic_open_unrepresentable_cooldown = BlockedOn::ActivityCircuitOpen {
-            activity_name: "charge_card".to_string(),
-            phase: BlockingCircuitPhase::Open,
-            forced_open: false,
-            cooldown_until: None,
-        };
-        assert_eq!(
-            organic_open_unrepresentable_cooldown.health(),
-            ExecutionHealth::Degraded,
-            "an organic trip must stay degraded even when its cooldown deadline \
-             could not be computed -- cooldown_until: None must not be conflated \
-             with forced_open: true"
-        );
-    }
-
-    /// AC (issue #1193): pin the timed-vs-forced split across all three
-    /// observable circuit phases in one place, as the definitive reference.
-    ///
-    /// Includes the Codex round-1 P2 regression case: an organic trip whose
-    /// cooldown could not be represented as a `DateTime` (`cooldown_until:
-    /// None`) must still resolve to `Degraded`, distinguishing it from the
-    /// truly forced-open case that shares the same `cooldown_until: None`
-    /// shape for the opposite reason.
-    #[test]
-    fn circuit_health_pins_the_timed_vs_forced_split_across_all_three_phases() {
-        let cases = [
-            (
-                "operator-forced open has no cooldown and needs a human",
-                BlockingCircuitPhase::Open,
-                true, // forced_open
-                None,
-                ExecutionHealth::Stalled,
-            ),
-            (
-                "organically-tripped open self-heals on the cooldown timer, \
-                 but fast-fails every dispatch until then",
-                BlockingCircuitPhase::Open,
-                false,
-                Some(t(30)),
-                ExecutionHealth::Degraded,
-            ),
-            (
-                "organically-tripped open with an unrepresentable cooldown is \
-                 still degraded, not stalled (Codex round-1 P2)",
-                BlockingCircuitPhase::Open,
-                false,
-                None,
-                ExecutionHealth::Degraded,
-            ),
-            (
-                "half-open admits a probe right now and closes on success",
-                BlockingCircuitPhase::HalfOpen,
-                false,
-                None,
-                ExecutionHealth::Healthy,
-            ),
-        ];
-        for (why, phase, forced_open, cooldown_until, expected) in cases {
-            let verdict = BlockedOn::ActivityCircuitOpen {
-                activity_name: "charge_card".to_string(),
-                phase,
-                forced_open,
-                cooldown_until,
-            };
-            assert_eq!(verdict.health(), expected, "{why}");
-        }
+        assert_eq!(organic_open.health(), ExecutionHealth::Stalled);
     }
 
     /// The classifier preserves the observed phase, so the two shapes above are
@@ -2335,7 +1746,6 @@ mod tests {
             BlockedOn::ActivityCircuitOpen {
                 activity_name: "send_email".to_string(),
                 phase: BlockingCircuitPhase::HalfOpen,
-                forced_open: false,
                 cooldown_until: None,
             }
         );
@@ -2417,10 +1827,6 @@ mod tests {
     }
 
     /// AC5 (first half): an open breaker carries `cooldown_until`.
-    ///
-    /// Issue #1193: a `cooldown_until` present means the trip was organic and
-    /// self-heals on a timer, so the health is `degraded` (fast-fails until
-    /// then, but no human needed) rather than `stalled`.
     #[test]
     fn open_circuit_is_activity_circuit_open_with_cooldown() {
         let mut facts = healthy_activity();
@@ -2433,146 +1839,9 @@ mod tests {
                 activity_name: "send_email".to_string(),
                 cooldown_until: Some(t(30)),
                 phase: BlockingCircuitPhase::Open,
-                forced_open: false,
             }
         );
-        assert_eq!(verdict.health(), ExecutionHealth::Degraded);
-    }
-
-    /// AC (issue #1193 Codex round-4 P2): an organic trip whose cooldown will
-    /// have already elapsed by the time this row is even due is not "heading
-    /// for a terminal failure" -- `CircuitBreakerRegistry::on_dispatch`
-    /// checks the elapsed cooldown at the ACTUAL dispatch instant, so this
-    /// row's own future attempt is what gets admitted as the probe (or
-    /// dispatches normally once closed), not fast-failed. Falls through to
-    /// the ordinary retry/deferral verdict instead.
-    #[test]
-    fn organic_open_falls_through_to_retrying_when_cooldown_clears_before_due() {
-        let mut facts = healthy_activity();
-        facts.circuit_phase = Some(BlockingCircuitPhase::Open);
-        facts.circuit_forced_open = false;
-        facts.circuit_cooldown_until = Some(t(30));
-        facts.scheduled_at = t(45); // due AFTER the cooldown elapses
-        facts.attempt = 3;
-        facts.last_error = Some("gateway 503".to_string());
-
-        let verdict = classify_pending_activity(&facts, t(0));
-        assert_eq!(
-            verdict,
-            BlockedOn::ActivityRetrying {
-                activity_name: Some("send_email".to_string()),
-                attempt: 3,
-                last_error: Some("gateway 503".to_string()),
-                next_attempt_at: Some(t(45)),
-            },
-            "must fall through to the ordinary retry verdict, not \
-             activity_circuit_open: {verdict:?}"
-        );
-        assert_eq!(verdict.health(), ExecutionHealth::Healthy);
-
-        // Without failure evidence it is a clean deferral instead.
-        facts.last_error = None;
-        assert_eq!(
-            classify_pending_activity(&facts, t(0)),
-            BlockedOn::ActivityDeferred {
-                activity_name: Some("send_email".to_string()),
-                next_attempt_at: t(45),
-            }
-        );
-    }
-
-    /// The boundary: `scheduled_at == cooldown_until` counts as "clears
-    /// before due" (the cooldown has fully elapsed by the instant this row
-    /// is attempted), consistent with `CircuitBreakerRegistry::on_dispatch`'s
-    /// own `elapsed >= policy.cooldown` check.
-    #[test]
-    fn organic_cooldown_clearing_exactly_at_the_due_instant_still_falls_through() {
-        let mut facts = healthy_activity();
-        facts.circuit_phase = Some(BlockingCircuitPhase::Open);
-        facts.circuit_forced_open = false;
-        facts.circuit_cooldown_until = Some(t(30));
-        facts.scheduled_at = t(30);
-        assert_eq!(
-            classify_pending_activity(&facts, t(0)).kind(),
-            "activity_deferred",
-            "scheduled_at == cooldown_until must still fall through"
-        );
-    }
-
-    /// The converse of the round-4 P2 fix: when the row is due WHILE the
-    /// breaker is still certainly open (cooldown ahead of `scheduled_at`),
-    /// the fast-fail is real and `degraded` is the correct, unchanged verdict.
-    #[test]
-    fn organic_open_still_wins_when_cooldown_has_not_cleared_by_due_time() {
-        let mut facts = healthy_activity();
-        facts.circuit_phase = Some(BlockingCircuitPhase::Open);
-        facts.circuit_forced_open = false;
-        facts.circuit_cooldown_until = Some(t(30));
-        facts.scheduled_at = t(20); // due BEFORE the cooldown elapses
-        let verdict = classify_pending_activity(&facts, t(0));
-        assert_eq!(verdict.kind(), "activity_circuit_open", "{verdict:?}");
-        assert_eq!(verdict.health(), ExecutionHealth::Degraded);
-    }
-
-    /// Forced-open has no cooldown to compare against at all, so the round-4
-    /// P2 exception can never apply to it: it stays `stalled` however far in
-    /// the future `scheduled_at` is.
-    #[test]
-    fn forced_open_circuit_wins_regardless_of_how_far_in_the_future_the_task_is() {
-        let mut facts = healthy_activity();
-        facts.circuit_phase = Some(BlockingCircuitPhase::Open);
-        facts.circuit_forced_open = true;
-        facts.circuit_cooldown_until = None;
-        facts.scheduled_at = t(999_999);
-        let verdict = classify_pending_activity(&facts, t(0));
-        assert_eq!(verdict.kind(), "activity_circuit_open", "{verdict:?}");
         assert_eq!(verdict.health(), ExecutionHealth::Stalled);
-    }
-
-    /// AC (issue #1193 Codex round-5 P2): the round-4 fix compared only
-    /// `scheduled_at` against `cooldown_until`, so it never applied to a row
-    /// that is ALREADY due. But a read-only breaker snapshot deliberately
-    /// keeps reporting `open` with a *past* `cooldown_until` until some
-    /// dispatch actually admits the probe -- so an already-due row whose
-    /// cooldown has already elapsed is exactly as "probe-ready" as a
-    /// not-yet-due one whose cooldown will clear before it's due. The
-    /// comparison must use the effective dispatch instant
-    /// (`max(now, scheduled_at)`), which for an already-due row is `now`.
-    #[test]
-    fn organic_open_falls_through_when_already_due_and_cooldown_already_cleared() {
-        let mut facts = healthy_activity();
-        facts.circuit_phase = Some(BlockingCircuitPhase::Open);
-        facts.circuit_forced_open = false;
-        facts.circuit_cooldown_until = Some(t(-5)); // elapsed before `now`
-        facts.scheduled_at = t(-10); // already due (healthy_activity()'s default)
-        facts.last_error = Some("gateway 503".to_string());
-
-        let verdict = classify_pending_activity(&facts, t(0));
-        assert_ne!(
-            verdict.kind(),
-            "activity_circuit_open",
-            "an already-due row whose cooldown already cleared is probe-ready, \
-             not fast-failing: {verdict:?}"
-        );
-        // Due, unimpeded otherwise, with no failure evidence blocking a claim:
-        // genuinely progressing, exactly as it would with no breaker at all.
-        assert_eq!(verdict, BlockedOn::HealthyInProgress, "{verdict:?}");
-        assert_eq!(verdict.health(), ExecutionHealth::Healthy);
-    }
-
-    /// The converse: an already-due row whose organic cooldown has NOT yet
-    /// elapsed is still certainly fast-failing right now, so `degraded`
-    /// remains correct.
-    #[test]
-    fn organic_open_still_wins_when_already_due_but_cooldown_has_not_cleared() {
-        let mut facts = healthy_activity();
-        facts.circuit_phase = Some(BlockingCircuitPhase::Open);
-        facts.circuit_forced_open = false;
-        facts.circuit_cooldown_until = Some(t(5)); // still ahead of `now`
-        facts.scheduled_at = t(-10); // already due
-        let verdict = classify_pending_activity(&facts, t(0));
-        assert_eq!(verdict.kind(), "activity_circuit_open", "{verdict:?}");
-        assert_eq!(verdict.health(), ExecutionHealth::Degraded);
     }
 
     #[test]
@@ -2585,123 +1854,24 @@ mod tests {
                 activity_name: "send_email".to_string(),
                 cooldown_until: None,
                 phase: BlockingCircuitPhase::HalfOpen,
-                forced_open: false,
             }
         );
     }
 
-    /// A `HalfOpen` breaker never carries `circuit_forced_open: true` in
-    /// practice (a forced-open breaker's phase never leaves `Open`), but the
-    /// classifier must not simply trust that invariant blindly -- it forces
-    /// `forced_open: false` for `HalfOpen` regardless of what the fact says.
-    #[test]
-    fn half_open_forced_open_fact_is_ignored_for_half_open_phase() {
-        let mut facts = healthy_activity();
-        facts.circuit_phase = Some(BlockingCircuitPhase::HalfOpen);
-        facts.circuit_forced_open = true; // should never happen upstream
-        assert_eq!(
-            classify_pending_activity(&facts, t(0)),
-            BlockedOn::ActivityCircuitOpen {
-                activity_name: "send_email".to_string(),
-                cooldown_until: None,
-                phase: BlockingCircuitPhase::HalfOpen,
-                forced_open: false,
-            },
-            "a half-open verdict must never report forced_open: true"
-        );
-    }
-
-    /// Direct coverage of the shared predicate (issue #1371). It must agree
-    /// with `classify_pending_activity`'s own guard on every shape swept by
-    /// the organic-cooldown tests above, since both now share one
-    /// implementation.
-    #[test]
-    fn activity_circuit_currently_blocks_matches_each_shape() {
-        // No breaker at all.
-        let facts = healthy_activity();
-        assert!(!activity_circuit_currently_blocks(&facts, t(0)));
-
-        // Half-open: a probe is admissible now, so it always blocks.
-        let mut facts = healthy_activity();
-        facts.circuit_phase = Some(BlockingCircuitPhase::HalfOpen);
-        assert!(activity_circuit_currently_blocks(&facts, t(0)));
-
-        // Organic open, cooldown already cleared by the effective dispatch
-        // instant: the row's own next attempt is the recovery probe.
-        let mut facts = healthy_activity();
-        facts.circuit_phase = Some(BlockingCircuitPhase::Open);
-        facts.circuit_cooldown_until = Some(t(-5));
-        assert!(!activity_circuit_currently_blocks(&facts, t(0)));
-
-        // Organic open, cooldown still ahead: still fast-fails.
-        let mut facts = healthy_activity();
-        facts.circuit_phase = Some(BlockingCircuitPhase::Open);
-        facts.circuit_cooldown_until = Some(t(5));
-        assert!(activity_circuit_currently_blocks(&facts, t(0)));
-
-        // Organic open, unrepresentable cooldown: no evidence it clears.
-        let mut facts = healthy_activity();
-        facts.circuit_phase = Some(BlockingCircuitPhase::Open);
-        facts.circuit_cooldown_until = None;
-        assert!(activity_circuit_currently_blocks(&facts, t(0)));
-
-        // Forced open ignores a past cooldown entirely; only force-close
-        // clears it.
-        let mut facts = healthy_activity();
-        facts.circuit_phase = Some(BlockingCircuitPhase::Open);
-        facts.circuit_forced_open = true;
-        facts.circuit_cooldown_until = Some(t(-5));
-        assert!(activity_circuit_currently_blocks(&facts, t(0)));
-    }
-
-    /// An operator-forced-open breaker admits no probe on any timer, so it
-    /// has no meaningful cooldown to advertise. Its `forced_open` flag is
-    /// authoritative (issue #1193): sourced from the registry directly, not
-    /// inferred from the absent cooldown.
+    /// An operator-forced-open breaker admits no probe on any timer, so it has
+    /// no meaningful cooldown to advertise.
     #[test]
     fn forced_open_circuit_reports_no_cooldown() {
         let mut facts = healthy_activity();
         facts.circuit_phase = Some(BlockingCircuitPhase::Open);
         facts.circuit_cooldown_until = None;
-        facts.circuit_forced_open = true;
-        let verdict = classify_pending_activity(&facts, t(0));
         assert_eq!(
-            verdict,
+            classify_pending_activity(&facts, t(0)),
             BlockedOn::ActivityCircuitOpen {
                 activity_name: "send_email".to_string(),
                 cooldown_until: None,
                 phase: BlockingCircuitPhase::Open,
-                forced_open: true,
             }
-        );
-        assert_eq!(verdict.health(), ExecutionHealth::Stalled);
-    }
-
-    /// AC (issue #1193 Codex round-1 P2): an ORGANIC trip whose cooldown could
-    /// not be represented (e.g. a policy cooldown outside `chrono`'s range)
-    /// looks identical to a forced-open breaker by `cooldown_until` alone --
-    /// both are `None`. `circuit_forced_open: false` is what keeps it
-    /// `degraded` instead of being misreported as `stalled`.
-    #[test]
-    fn organic_open_with_unrepresentable_cooldown_is_still_degraded() {
-        let mut facts = healthy_activity();
-        facts.circuit_phase = Some(BlockingCircuitPhase::Open);
-        facts.circuit_cooldown_until = None;
-        facts.circuit_forced_open = false;
-        let verdict = classify_pending_activity(&facts, t(0));
-        assert_eq!(
-            verdict,
-            BlockedOn::ActivityCircuitOpen {
-                activity_name: "send_email".to_string(),
-                cooldown_until: None,
-                phase: BlockingCircuitPhase::Open,
-                forced_open: false,
-            }
-        );
-        assert_eq!(
-            verdict.health(),
-            ExecutionHealth::Degraded,
-            "an organic trip must stay degraded even when cooldown_until is None"
         );
     }
 
@@ -3408,98 +2578,6 @@ mod tests {
         assert_eq!(verdict.kind(), "activity_no_worker", "{verdict:?}");
     }
 
-    /// AC (issue #1193 Codex round-3 P1): the one exception to
-    /// `wedged_activity_still_outranks_a_workflow_queue_impediment` above.
-    /// A `Degraded` activity verdict promises "no human needed", but if the
-    /// run's own workflow task can never be claimed at all, the decision
-    /// cycle itself is frozen -- even activities that DO complete can never
-    /// be turned into follow-up work. That must win over the milder,
-    /// already-doomed activity cause.
-    #[test]
-    fn degraded_organic_circuit_yields_to_a_frozen_workflow_task_no_worker() {
-        let inputs = DiagnosisInputs {
-            activities: vec![PendingActivityFacts {
-                circuit_phase: Some(BlockingCircuitPhase::Open),
-                circuit_cooldown_until: Some(t(30)),
-                circuit_forced_open: false,
-                ..healthy_activity()
-            }],
-            workflow_task: Some(WorkflowTaskFacts {
-                has_live_worker: false,
-                ..wf_task()
-            }),
-            ..Default::default()
-        };
-        // The activity alone would be `degraded` (organic circuit open).
-        assert_eq!(
-            classify_pending_activity(&inputs.activities[0], t(0)).health(),
-            ExecutionHealth::Degraded
-        );
-        let verdict =
-            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
-        assert_eq!(
-            verdict.kind(),
-            "workflow_no_worker",
-            "a frozen decision cycle must win over a self-healing-but-doomed \
-             activity: {verdict:?}"
-        );
-        assert_eq!(verdict.health(), ExecutionHealth::Stalled);
-    }
-
-    /// The other `workflow_task_hard_impediment` shape: an operator-paused
-    /// workflow queue. Same override, different remedy (`blocked_external`,
-    /// resume the queue, not a code fix).
-    #[test]
-    fn degraded_organic_circuit_yields_to_a_paused_workflow_queue() {
-        let inputs = DiagnosisInputs {
-            activities: vec![PendingActivityFacts {
-                circuit_phase: Some(BlockingCircuitPhase::Open),
-                circuit_cooldown_until: Some(t(30)),
-                circuit_forced_open: false,
-                ..healthy_activity()
-            }],
-            workflow_task: Some(WorkflowTaskFacts {
-                queue_paused: true,
-                has_live_worker: false,
-                ..wf_task()
-            }),
-            ..Default::default()
-        };
-        let verdict =
-            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
-        assert_eq!(verdict.kind(), "workflow_queue_paused", "{verdict:?}");
-        assert_eq!(verdict.health(), ExecutionHealth::BlockedExternal);
-    }
-
-    /// The override is scoped to `Degraded` only. A forced-open (`Stalled`)
-    /// activity verdict keeps winning over a frozen workflow task exactly as
-    /// `wedged_activity_still_outranks_a_workflow_queue_impediment` pins --
-    /// this just adds the circuit-specific case to that same guarantee.
-    #[test]
-    fn forced_open_circuit_still_outranks_a_frozen_workflow_task() {
-        let inputs = DiagnosisInputs {
-            activities: vec![PendingActivityFacts {
-                circuit_phase: Some(BlockingCircuitPhase::Open),
-                circuit_cooldown_until: None,
-                circuit_forced_open: true,
-                ..healthy_activity()
-            }],
-            workflow_task: Some(WorkflowTaskFacts {
-                has_live_worker: false,
-                ..wf_task()
-            }),
-            ..Default::default()
-        };
-        let verdict =
-            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
-        assert_eq!(
-            verdict.kind(),
-            "activity_circuit_open",
-            "a Stalled activity verdict is unaffected by this override: {verdict:?}"
-        );
-        assert_eq!(verdict.health(), ExecutionHealth::Stalled);
-    }
-
     #[test]
     fn workflow_task_hard_impediment_truth_table() {
         // Claimed + live poller: executing, no claim-time gate applies.
@@ -3649,517 +2727,6 @@ mod tests {
         assert_eq!(verdict.health(), ExecutionHealth::Stalled);
     }
 
-    /// Issue #1191. `wake_workflow_task` re-pends a PARKED row to PENDING
-    /// with `scheduled_at` set to the wake instant, not to any timer's
-    /// deadline. That row shape is identical to `persist_started_timer`'s:
-    /// PENDING, unclaimed, `scheduled_at` in the past. Under saturated
-    /// workflow dispatch slots, the row ages past the grace window before a
-    /// worker claims it. So `workflow_wake_was_missed` alone reports a
-    /// missed wake. But this run was already woken by a signal, child, or
-    /// handoff completion, not by the timer. The timer's `fires_at` must
-    /// not match `scheduled_at`, so the verdict must not be `timer_overdue`.
-    #[test]
-    fn overdue_timer_suppressed_when_a_different_wake_source_re_pended_the_task() {
-        let inputs = DiagnosisInputs {
-            timers: vec![PendingTimerFacts {
-                // Armed long before the wake, unrelated to it.
-                fires_at: t(-1_200),
-            }],
-            workflow_task: Some(WorkflowTaskFacts {
-                // The wake instant, not the timer's deadline. Aged past the
-                // grace window by saturated dispatch slots.
-                scheduled_at: t(-90),
-                ..wf_task()
-            }),
-            ..Default::default()
-        };
-        let verdict =
-            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
-        // Nothing else is pending, so the run falls to the plain
-        // sleeping-timer bucket. That is healthy, and correctly so: the timer
-        // fires whenever the task is next claimed.
-        assert_eq!(
-            verdict.kind(),
-            "sleeping_timer",
-            "the timer did not own this wake, so it must not be reported as the stall: {verdict:?}"
-        );
-        assert_eq!(verdict.health(), ExecutionHealth::Healthy, "{verdict:?}");
-    }
-
-    /// Wiring-level pin: `classify_execution` must use the real
-    /// `TIMER_OWNERSHIP_TOLERANCE_SECONDS` constant, not some looser
-    /// threshold, and must accept a match exactly at its boundary.
-    #[test]
-    fn overdue_timer_correlates_at_exactly_the_tolerance_boundary() {
-        let inputs = DiagnosisInputs {
-            timers: vec![PendingTimerFacts {
-                fires_at: t(-600 - TIMER_OWNERSHIP_TOLERANCE_SECONDS),
-            }],
-            workflow_task: Some(WorkflowTaskFacts {
-                scheduled_at: t(-600),
-                ..wf_task()
-            }),
-            ..Default::default()
-        };
-        let verdict =
-            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
-        assert_eq!(verdict.kind(), "timer_overdue", "{verdict:?}");
-        assert_eq!(verdict.health(), ExecutionHealth::Stalled, "{verdict:?}");
-    }
-
-    /// The complement: one second past the tolerance, wired end to end, not
-    /// only in [`timer_owns_the_wake_truth_table`]'s isolated check.
-    #[test]
-    fn overdue_timer_does_not_correlate_one_second_past_the_tolerance() {
-        let inputs = DiagnosisInputs {
-            timers: vec![PendingTimerFacts {
-                fires_at: t(-600 - TIMER_OWNERSHIP_TOLERANCE_SECONDS - 1),
-            }],
-            workflow_task: Some(WorkflowTaskFacts {
-                scheduled_at: t(-600),
-                ..wf_task()
-            }),
-            ..Default::default()
-        };
-        let verdict =
-            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
-        assert_ne!(verdict.kind(), "timer_overdue", "{verdict:?}");
-    }
-
-    /// Two armed timers: an EARLIER one that does not own the wake, and a
-    /// LATER one that does. `classify_execution` must filter by ownership
-    /// before picking the earliest overdue candidate. Otherwise the earlier,
-    /// non-owning timer would win by `min_by_key(fires_at)` alone, and
-    /// reintroduce the issue #1191 false positive.
-    #[test]
-    fn overdue_timer_correlation_wins_over_an_earlier_non_owning_timer() {
-        let inputs = DiagnosisInputs {
-            timers: vec![
-                // Earlier, and overdue, but unrelated to this wake.
-                PendingTimerFacts {
-                    fires_at: t(-1_200),
-                },
-                // Later, but the one that actually owns the wake.
-                PendingTimerFacts { fires_at: t(-600) },
-            ],
-            workflow_task: Some(WorkflowTaskFacts {
-                scheduled_at: t(-600),
-                ..wf_task()
-            }),
-            ..Default::default()
-        };
-        let verdict =
-            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
-        match verdict {
-            BlockedOn::TimerOverdue { fires_at, .. } => {
-                assert_eq!(
-                    fires_at,
-                    t(-600),
-                    "must report the OWNING timer: {fires_at:?}"
-                );
-            }
-            other => panic!("expected timer_overdue naming the owning timer, got {other:?}"),
-        }
-    }
-
-    /// `timer_owns_the_wake`'s timestamp proximity ALONE can be
-    /// coincidentally satisfied by an unrelated armed timer landing near
-    /// the wake instant. That reintroduces the issue #1191 false positive
-    /// in a narrower window. `wake_source_repended_this_row`'s
-    /// `created_at` fingerprint must veto it even when the coincidence
-    /// lands.
-    #[test]
-    fn overdue_timer_does_not_correlate_via_coincidental_proximity_alone() {
-        let inputs = DiagnosisInputs {
-            timers: vec![PendingTimerFacts {
-                // Within `timer_owns_the_wake`'s tolerance of scheduled_at
-                // below, purely by coincidence -- an unrelated, separately
-                // armed timer, not the one that woke this run.
-                fires_at: t(-99),
-            }],
-            workflow_task: Some(WorkflowTaskFacts {
-                // `wake_workflow_task`'s re-pend: scheduled_at = wake
-                // instant - 5s, created_at = the wake instant itself.
-                scheduled_at: t(-98),
-                created_at: Some(t(-93)),
-                ..wf_task()
-            }),
-            ..Default::default()
-        };
-        let verdict =
-            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
-        assert_eq!(
-            verdict.kind(),
-            "sleeping_timer",
-            "created_at proves a different wake source re-pended this row: {verdict:?}"
-        );
-        assert_eq!(verdict.health(), ExecutionHealth::Healthy, "{verdict:?}");
-    }
-
-    /// Issue #1191 review. A wake-source re-pend can be delayed well
-    /// past `WAKE_REPEND_SKEW_SECONDS` by database or network saturation
-    /// between the Rust bind and the server executing the `UPDATE`. It
-    /// must still be recognized, even while an unrelated armed timer
-    /// coincidentally sits within `timer_owns_the_wake`'s tolerance of
-    /// `scheduled_at`.
-    #[test]
-    fn overdue_timer_does_not_correlate_when_the_wake_repend_was_delayed() {
-        let inputs = DiagnosisInputs {
-            timers: vec![PendingTimerFacts {
-                // Still within `timer_owns_the_wake`'s tolerance of
-                // scheduled_at below, by coincidence.
-                fires_at: t(-99),
-            }],
-            workflow_task: Some(WorkflowTaskFacts {
-                scheduled_at: t(-98),
-                // A 20-second bind-to-execute delay under saturation:
-                // `created_at` lands well past the ordinary ~5-second
-                // gap, but the check has no upper bound to exceed.
-                created_at: Some(t(-98 + 20)),
-                ..wf_task()
-            }),
-            ..Default::default()
-        };
-        let verdict =
-            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
-        assert_eq!(
-            verdict.kind(),
-            "sleeping_timer",
-            "a delayed wake re-pend must still be recognized: {verdict:?}"
-        );
-        assert_eq!(verdict.health(), ExecutionHealth::Healthy, "{verdict:?}");
-    }
-
-    /// Issue #1191 review. `release_suspended_workflow_claim_query`
-    /// (issue #1182) is a SECOND production path that resets a workflow
-    /// task row for redispatch. Its fingerprint differs:
-    /// `scheduled_at = NOW()`, no backdating at all, so the gap is ~0,
-    /// not ~5. It must be recognized too, even while an unrelated armed
-    /// timer coincidentally sits within `timer_owns_the_wake`'s
-    /// tolerance of that near-zero `scheduled_at`.
-    #[test]
-    fn overdue_timer_does_not_correlate_after_a_suspended_claim_release() {
-        let inputs = DiagnosisInputs {
-            timers: vec![PendingTimerFacts {
-                // Within `timer_owns_the_wake`'s tolerance of scheduled_at
-                // below, purely by coincidence.
-                fires_at: t(-99),
-            }],
-            workflow_task: Some(WorkflowTaskFacts {
-                // `release_suspended_workflow_claim_query`'s re-pend:
-                // scheduled_at = NOW(), created_at = clock_timestamp(),
-                // both from the same statement -- gap ~0.
-                scheduled_at: t(-98),
-                created_at: Some(t(-98)),
-                ..wf_task()
-            }),
-            ..Default::default()
-        };
-        let verdict =
-            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
-        assert_eq!(
-            verdict.kind(),
-            "sleeping_timer",
-            "a claim-release re-pend must be recognized too: {verdict:?}"
-        );
-        assert_eq!(verdict.health(), ExecutionHealth::Healthy, "{verdict:?}");
-    }
-
-    /// Issue #1191 review. A genuinely SHORT timer's own
-    /// `created_at`-to-`scheduled_at` gap can land inside
-    /// `wake_source_repended_this_row`'s small negative slack. That is
-    /// because `created_at` (the row's original creation) sat only
-    /// moments before the timer's own near-immediate deadline. An EXACT
-    /// `scheduled_at == fires_at` match must still win regardless.
-    /// `queue::reschedule_task` produces that exact match for any timer
-    /// duration, short or long.
-    #[test]
-    fn overdue_timer_wins_for_a_genuinely_short_timer_despite_a_small_created_at_gap() {
-        let inputs = DiagnosisInputs {
-            timers: vec![PendingTimerFacts { fires_at: t(-65) }],
-            workflow_task: Some(WorkflowTaskFacts {
-                // A 1-second timer: created_at sits 1 second before its
-                // own deadline, inside the small negative slack.
-                scheduled_at: t(-65),
-                created_at: Some(t(-66)),
-                ..wf_task()
-            }),
-            ..Default::default()
-        };
-        let verdict =
-            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
-        assert_eq!(verdict.kind(), "timer_overdue", "{verdict:?}");
-        assert_eq!(verdict.health(), ExecutionHealth::Stalled, "{verdict:?}");
-    }
-
-    /// Issue #1402. A queue-pause resume credits held time back onto
-    /// `scheduled_at` (`queue_pause::resume_shift_scheduled_at_query`).
-    /// That can drift it an UNBOUNDED distance from the timer's own
-    /// `fires_at` — long past both the exact match and
-    /// `timer_owns_the_wake`'s tolerance. Neither discriminator fires.
-    /// Without the preserved marker this falls through to a healthy
-    /// `sleeping_timer`, masking a genuinely missed wake. `timer_fires_at`
-    /// is untouched by that shift (the `UPDATE` never mentions it), so it
-    /// still proves this row is that timer's.
-    #[test]
-    fn overdue_timer_correlates_via_the_preserved_marker_after_a_resume_shift() {
-        let inputs = DiagnosisInputs {
-            timers: vec![PendingTimerFacts {
-                fires_at: t(-3_600),
-            }],
-            workflow_task: Some(WorkflowTaskFacts {
-                // Paused for an hour past the timer's own deadline, then
-                // resumed: scheduled_at credits the hour forward, landing
-                // nowhere near fires_at or within any fixed tolerance.
-                scheduled_at: t(-90),
-                // Untouched by the resume shift -- the row's real, original
-                // creation time, same as any other timer-owned row.
-                created_at: Some(t(-7_200)),
-                timer_fires_at: Some(t(-3_600)),
-                ..wf_task()
-            }),
-            ..Default::default()
-        };
-        let verdict =
-            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
-        assert_eq!(verdict.kind(), "timer_overdue", "{verdict:?}");
-        assert_eq!(verdict.health(), ExecutionHealth::Stalled, "{verdict:?}");
-        match verdict {
-            BlockedOn::TimerOverdue { fires_at, .. } => {
-                assert_eq!(
-                    fires_at,
-                    t(-3_600),
-                    "must name the owning timer: {fires_at:?}"
-                );
-            }
-            other => panic!("expected timer_overdue, got {other:?}"),
-        }
-    }
-
-    /// The preserved marker is evidence, not proof on its own: it must
-    /// still defer to `wake_source_repended_this_row` (issue #1402). A
-    /// row whose wake reason genuinely changed (a signal, a child, or a
-    /// handoff resolved) always goes through a path that clears
-    /// `timer_fires_at` in production. That is PROVIDED the code doing
-    /// the repending knows about that column. It might not. During a
-    /// rolling deploy of this very column, an old-binary worker's repend
-    /// clears nothing it has never heard of. This is issue #1402 review,
-    /// Codex finding, second round. This pins the classifier's own behavior
-    /// for that case. It is indistinguishable at read time from a future
-    /// write-path bug that forgets to clear it. Both must fail safe, not
-    /// misattribute the row to a stale, unrelated timer.
-    #[test]
-    fn overdue_timer_marker_is_vetoed_by_real_repend_evidence() {
-        let inputs = DiagnosisInputs {
-            timers: vec![PendingTimerFacts {
-                fires_at: t(-3_600),
-            }],
-            workflow_task: Some(WorkflowTaskFacts {
-                scheduled_at: t(-98),
-                // `wake_workflow_task`'s repend fingerprint: created_at
-                // lands ~5s after scheduled_at. An old-binary worker's
-                // repend leaves this identical shape, whether or not its
-                // binary version even knows `timer_fires_at` exists.
-                created_at: Some(t(-98 + 5)),
-                // A stale marker: either a hypothetical bug, or a
-                // pre-upgrade binary that repended the row without
-                // knowing to clear it.
-                timer_fires_at: Some(t(-3_600)),
-                ..wf_task()
-            }),
-            ..Default::default()
-        };
-        let verdict =
-            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
-        assert_eq!(
-            verdict.kind(),
-            "sleeping_timer",
-            "created_at proves a different wake source re-pended this row, \
-             so a stale timer_fires_at must not override it: {verdict:?}"
-        );
-        assert_eq!(verdict.health(), ExecutionHealth::Healthy, "{verdict:?}");
-    }
-
-    /// Issue #1402 review (Codex finding, second round). A near-zero-
-    /// duration timer whose row later drifts through one of the three
-    /// marker-preserving paths. Modeled here after
-    /// `release_task_for_capability_miss_query`, a short backoff that
-    /// moves `scheduled_at` without touching `created_at` or
-    /// `timer_fires_at`. The row's own `created_at`-to-`fires_at` gap
-    /// already sits inside `wake_source_repended_this_row`'s small
-    /// negative slack, purely because the timer was so short-lived.
-    ///
-    /// This IS a real false negative. A narrower fix was tried and
-    /// reverted (see this file's own history): exempting the marker from
-    /// the veto entirely fixes this case. But that reopens a WORSE one.
-    /// During a mixed-version rollout of this column, an old-binary
-    /// repend leaves an unaware marker uncleared. An unconditionally
-    /// trusted marker then reports a false `timer_overdue` on a row that
-    /// is not actually stalled at all. That failure is near-guaranteed on
-    /// every rolling deploy of this fix. This one needs a genuinely short
-    /// timer AND a same-reason drift small enough to still land inside
-    /// the slack. This pins the accepted, narrower failure mode: a false
-    /// `sleeping_timer`, not a false `timer_overdue`.
-    #[test]
-    fn overdue_timer_short_timer_marker_is_vetoed_by_a_small_capability_miss_style_drift() {
-        let inputs = DiagnosisInputs {
-            timers: vec![PendingTimerFacts {
-                fires_at: t(-3_600),
-            }],
-            workflow_task: Some(WorkflowTaskFacts {
-                // A one-second capability-miss backoff nudged scheduled_at
-                // past the timer's own deadline.
-                scheduled_at: t(-3_599),
-                // Untouched by that backoff -- a zero-duration timer's
-                // own creation instant, identical to its deadline.
-                created_at: Some(t(-3_600)),
-                timer_fires_at: Some(t(-3_600)),
-                ..wf_task()
-            }),
-            ..Default::default()
-        };
-        let verdict =
-            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
-        assert_eq!(
-            verdict.kind(),
-            "sleeping_timer",
-            "the accepted, narrower failure mode: a short timer's own gap read as a re-pend \
-             rather than trusting the marker unconditionally: {verdict:?}"
-        );
-        assert_eq!(verdict.health(), ExecutionHealth::Healthy, "{verdict:?}");
-    }
-
-    /// A row with no marker at all keeps the pre-#1402 ladder
-    /// byte-identical. That covers a pre-#1402 legacy row, or one this
-    /// endpoint's own writes never armed a timer for.
-    /// `timer_owns_the_wake`'s tolerance is still what decides it.
-    #[test]
-    fn overdue_timer_without_a_marker_falls_back_to_timer_owns_the_wake() {
-        let inputs = DiagnosisInputs {
-            timers: vec![PendingTimerFacts {
-                fires_at: t(-3_600),
-            }],
-            workflow_task: Some(WorkflowTaskFacts {
-                scheduled_at: t(-90),
-                created_at: Some(t(-7_200)),
-                timer_fires_at: None,
-                ..wf_task()
-            }),
-            ..Default::default()
-        };
-        let verdict =
-            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
-        assert_eq!(
-            verdict.kind(),
-            "sleeping_timer",
-            "no marker and no timestamp proximity -- must not attribute the \
-             overdue task to an unrelated timer: {verdict:?}"
-        );
-    }
-
-    /// Issue #1402 review. Two overdue timers: an OLD, unrelated one that
-    /// happens to sort first by `fires_at`, and the row's genuine owner.
-    /// `classify_execution` picks `min_by_key(fires_at)` among every
-    /// candidate `is_the_missed_timer_wake` accepts. The marker match
-    /// must be the only thing that decides which timer is a candidate at
-    /// all. Otherwise the older, unrelated timer would win the tie-break
-    /// and report the wrong deadline.
-    #[test]
-    fn overdue_timer_marker_picks_the_owning_timer_not_the_earliest_one() {
-        let inputs = DiagnosisInputs {
-            timers: vec![
-                // Unrelated, older, and NOT the marker match -- must be
-                // rejected as a candidate entirely, not merely lose a tie.
-                PendingTimerFacts {
-                    fires_at: t(-9_000),
-                },
-                PendingTimerFacts {
-                    fires_at: t(-3_600),
-                },
-            ],
-            workflow_task: Some(WorkflowTaskFacts {
-                scheduled_at: t(-90),
-                created_at: Some(t(-10_800)),
-                timer_fires_at: Some(t(-3_600)),
-                ..wf_task()
-            }),
-            ..Default::default()
-        };
-        let verdict =
-            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
-        match verdict {
-            BlockedOn::TimerOverdue { fires_at, .. } => {
-                assert_eq!(
-                    fires_at,
-                    t(-3_600),
-                    "must name the marker-matched timer, not the older \
-                     unrelated one: {fires_at:?}"
-                );
-            }
-            other => panic!("expected timer_overdue, got {other:?}"),
-        }
-    }
-
-    /// Issue #1402 review. A stale `timer_fires_at` left on a PARKED row
-    /// is already safe by construction. `workflow_wake_was_missed` gates
-    /// on `state == "PENDING"` before `is_the_missed_timer_wake` ever
-    /// runs. So a parked row's own wait (a signal here) always wins. This
-    /// pins that behavior. A future reordering of the two checks must not
-    /// silently reintroduce the misattribution.
-    #[test]
-    fn overdue_timer_marker_on_a_parked_row_never_masks_its_own_wait() {
-        let inputs = DiagnosisInputs {
-            awaited_signals: vec![AwaitedSignalFacts {
-                signal_name: "approval".to_string(),
-                since: None,
-            }],
-            timers: vec![PendingTimerFacts {
-                fires_at: t(-3_600),
-            }],
-            workflow_task: Some(WorkflowTaskFacts {
-                // A leftover marker a hypothetical bug failed to clear
-                // when this row was parked on the signal below.
-                timer_fires_at: Some(t(-3_600)),
-                ..parked_wf_task()
-            }),
-            ..Default::default()
-        };
-        let verdict =
-            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
-        assert_eq!(
-            verdict.kind(),
-            "awaiting_signal",
-            "a parked row's own wait must win regardless of a stale \
-             marker: {verdict:?}"
-        );
-    }
-
-    /// Issue #1402 review. `wake_source_repended_this_row` answers `false`
-    /// (no evidence either way) for a pre-`#501` legacy row with no
-    /// `created_at`. It cannot veto a marker match there. That is safe,
-    /// not a hole. The marker itself is only ever set by
-    /// `queue::reschedule_task`, from the same value as `fires_at`. So a
-    /// `Some` marker is current, positive evidence on its own. This pins
-    /// that the ladder still resolves correctly without the veto's help.
-    #[test]
-    fn overdue_timer_marker_wins_without_a_created_at_veto_available() {
-        let inputs = DiagnosisInputs {
-            timers: vec![PendingTimerFacts {
-                fires_at: t(-3_600),
-            }],
-            workflow_task: Some(WorkflowTaskFacts {
-                scheduled_at: t(-90),
-                created_at: None,
-                timer_fires_at: Some(t(-3_600)),
-                ..wf_task()
-            }),
-            ..Default::default()
-        };
-        let verdict =
-            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
-        assert_eq!(verdict.kind(), "timer_overdue", "{verdict:?}");
-    }
-
     #[test]
     fn overdue_timer_suppressed_while_a_worker_holds_the_claim() {
         // A worker is on the decision cycle right now; it ingests due timers
@@ -4248,83 +2815,6 @@ mod tests {
         ));
     }
 
-    /// Issue #1191's new discriminator, in isolation from the ladder it feeds.
-    #[test]
-    fn timer_owns_the_wake_truth_table() {
-        // Exact match: `queue::reschedule_task` sets scheduled_at = fires_at.
-        assert!(timer_owns_the_wake(t(-600), t(-600)));
-        // Within tolerance either side -- DB round-trip precision, not a
-        // different wake source.
-        assert!(timer_owns_the_wake(
-            t(-600),
-            t(-600 + TIMER_OWNERSHIP_TOLERANCE_SECONDS)
-        ));
-        assert!(timer_owns_the_wake(
-            t(-600),
-            t(-600 - TIMER_OWNERSHIP_TOLERANCE_SECONDS)
-        ));
-        // Just outside tolerance: a different wake source re-pended the task.
-        assert!(!timer_owns_the_wake(
-            t(-600),
-            t(-600 + TIMER_OWNERSHIP_TOLERANCE_SECONDS + 1)
-        ));
-        // Wildly unrelated timestamps: the real-world shape of a signal,
-        // child, or handoff wake beside an unrelated armed timer (#1191).
-        assert!(!timer_owns_the_wake(t(-90), t(-1_200)));
-    }
-
-    /// Issue #1191, in isolation from the ladder it feeds.
-    #[test]
-    fn wake_source_repended_this_row_truth_table() {
-        // `wake_workflow_task`'s fingerprint: created_at lands ~5s after
-        // scheduled_at (the wake instant vs. its backdated scheduled_at).
-        assert!(wake_source_repended_this_row(&WorkflowTaskFacts {
-            scheduled_at: t(-98),
-            created_at: Some(t(-98 + 5)),
-            ..wf_task()
-        }));
-        // `release_suspended_workflow_claim_query`'s fingerprint: no
-        // backdating at all, so the gap is ~0, not ~5. A different
-        // production path, a different constant -- both must pass.
-        assert!(wake_source_repended_this_row(&WorkflowTaskFacts {
-            scheduled_at: t(-98),
-            created_at: Some(t(-98)),
-            ..wf_task()
-        }));
-        // A large gap, from a re-pend delayed well past its own
-        // backdating constant under saturation (issue #1191 review).
-        // This is the same saturated-dispatch condition this whole
-        // diagnosis exists to classify correctly.
-        assert!(wake_source_repended_this_row(&WorkflowTaskFacts {
-            scheduled_at: t(-98),
-            created_at: Some(t(-98 + 60)),
-            ..wf_task()
-        }));
-        // At the negative floor: ordinary clock skew between the Rust
-        // host and the Postgres server.
-        assert!(wake_source_repended_this_row(&WorkflowTaskFacts {
-            scheduled_at: t(-98),
-            created_at: Some(t(-98 + WAKE_REPEND_MIN_GAP_SECONDS)),
-            ..wf_task()
-        }));
-        // Just past the negative floor.
-        assert!(!wake_source_repended_this_row(&WorkflowTaskFacts {
-            scheduled_at: t(-98),
-            created_at: Some(t(-98 + WAKE_REPEND_MIN_GAP_SECONDS - 1)),
-            ..wf_task()
-        }));
-        // A genuine timer-owned reschedule: created_at is untouched, far
-        // OLDER than scheduled_at -- `wf_task()`'s own ordinary shape.
-        assert!(!wake_source_repended_this_row(&wf_task()));
-        // A pre-`#501` legacy row: no `created_at` at all. No evidence
-        // either way, so this reports `false` -- never a false positive.
-        assert!(!wake_source_repended_this_row(&WorkflowTaskFacts {
-            scheduled_at: t(-98),
-            created_at: None,
-            ..wf_task()
-        }));
-    }
-
     #[test]
     fn retrying_outranks_a_clean_deferral_across_rows() {
         // Cross-task worst-of: recorded failure evidence is the more
@@ -4350,27 +2840,10 @@ mod tests {
                 queue: "q".into(),
                 activity_name: None,
             },
-            // Issue #1193: the three circuit-open shapes are ranked by health
-            // severity (Codex round-1 P1: forced > organic; round-2 P1:
-            // organic > half-open), so no two differently-healthed shapes
-            // ever share a tier.
             BlockedOn::ActivityCircuitOpen {
                 activity_name: "a".into(),
                 cooldown_until: None,
                 phase: BlockingCircuitPhase::Open,
-                forced_open: true,
-            },
-            BlockedOn::ActivityCircuitOpen {
-                activity_name: "a".into(),
-                cooldown_until: Some(t(30)),
-                phase: BlockingCircuitPhase::Open,
-                forced_open: false,
-            },
-            BlockedOn::ActivityCircuitOpen {
-                activity_name: "a".into(),
-                cooldown_until: None,
-                phase: BlockingCircuitPhase::HalfOpen,
-                forced_open: false,
             },
             BlockedOn::ActivityConcurrencyDeferred {
                 key: "k".into(),
@@ -4623,110 +3096,6 @@ mod tests {
         );
     }
 
-    /// AC (issue #1193 Codex round-1 P1): a forced-open breaker elsewhere in
-    /// the same fan-out must never be masked by an organically-tripped one.
-    /// Before the precedence split both mapped to the SAME health (`Stalled`),
-    /// so a tie here was inconsequential; once they diverge (`Stalled` vs
-    /// `Degraded`), the old flat `ActivityCircuitOpen => 5` precedence let
-    /// `classify_execution`'s keep-the-first-max fold silently pick whichever
-    /// one happened to come first, hiding a genuinely actionable stall behind
-    /// a self-healing one. Pinned in BOTH row orders so the fix is not an
-    /// artifact of list order.
-    #[test]
-    fn forced_open_circuit_outranks_an_organic_one_in_the_same_fan_out() {
-        let mut organic = healthy_activity();
-        organic.activity_name = Some("organic_activity".to_string());
-        organic.circuit_phase = Some(BlockingCircuitPhase::Open);
-        organic.circuit_cooldown_until = Some(t(30));
-        organic.circuit_forced_open = false;
-
-        let mut forced = healthy_activity();
-        forced.activity_name = Some("forced_activity".to_string());
-        forced.circuit_phase = Some(BlockingCircuitPhase::Open);
-        forced.circuit_cooldown_until = None;
-        forced.circuit_forced_open = true;
-
-        let organic_first =
-            classify_execution(&inputs_with(vec![organic.clone(), forced.clone()]), t(0))
-                .expect("non-terminal");
-        assert_eq!(
-            organic_first,
-            BlockedOn::ActivityCircuitOpen {
-                activity_name: "forced_activity".to_string(),
-                phase: BlockingCircuitPhase::Open,
-                forced_open: true,
-                cooldown_until: None,
-            },
-            "the forced-open row must win even when the organic row is listed first"
-        );
-        assert_eq!(organic_first.health(), ExecutionHealth::Stalled);
-
-        let forced_first =
-            classify_execution(&inputs_with(vec![forced, organic]), t(0)).expect("non-terminal");
-        assert_eq!(
-            forced_first,
-            BlockedOn::ActivityCircuitOpen {
-                activity_name: "forced_activity".to_string(),
-                phase: BlockingCircuitPhase::Open,
-                forced_open: true,
-                cooldown_until: None,
-            },
-            "and must win when listed first too -- the ladder decides, not row order"
-        );
-        assert_eq!(forced_first.health(), ExecutionHealth::Stalled);
-    }
-
-    /// AC (issue #1193 Codex round-2 P1): the same masking risk, one tier
-    /// down. An organically-tripped breaker elsewhere in the same fan-out
-    /// must never be masked by a half-open one. Before this fix both shared
-    /// precedence 5, so a half-open row ordered first would win the fold and
-    /// report the execution `healthy` while a DIFFERENT activity's
-    /// organically-tripped breaker was heading toward a terminal,
-    /// non-retryable failure. Pinned in BOTH row orders.
-    #[test]
-    fn organic_circuit_outranks_a_half_open_one_in_the_same_fan_out() {
-        let mut half_open = healthy_activity();
-        half_open.activity_name = Some("half_open_activity".to_string());
-        half_open.circuit_phase = Some(BlockingCircuitPhase::HalfOpen);
-        half_open.circuit_cooldown_until = None;
-        half_open.circuit_forced_open = false;
-
-        let mut organic = healthy_activity();
-        organic.activity_name = Some("organic_activity".to_string());
-        organic.circuit_phase = Some(BlockingCircuitPhase::Open);
-        organic.circuit_cooldown_until = Some(t(30));
-        organic.circuit_forced_open = false;
-
-        let half_open_first =
-            classify_execution(&inputs_with(vec![half_open.clone(), organic.clone()]), t(0))
-                .expect("non-terminal");
-        assert_eq!(
-            half_open_first,
-            BlockedOn::ActivityCircuitOpen {
-                activity_name: "organic_activity".to_string(),
-                phase: BlockingCircuitPhase::Open,
-                forced_open: false,
-                cooldown_until: Some(t(30)),
-            },
-            "the organic-open row must win even when the half-open row is listed first"
-        );
-        assert_eq!(half_open_first.health(), ExecutionHealth::Degraded);
-
-        let organic_first =
-            classify_execution(&inputs_with(vec![organic, half_open]), t(0)).expect("non-terminal");
-        assert_eq!(
-            organic_first,
-            BlockedOn::ActivityCircuitOpen {
-                activity_name: "organic_activity".to_string(),
-                phase: BlockingCircuitPhase::Open,
-                forced_open: false,
-                cooldown_until: Some(t(30)),
-            },
-            "and must win when listed first too -- the ladder decides, not row order"
-        );
-        assert_eq!(organic_first.health(), ExecutionHealth::Degraded);
-    }
-
     #[test]
     fn all_healthy_activities_report_healthy_in_progress() {
         let activities: Vec<PendingActivityFacts> = (0..5).map(|_| healthy_activity()).collect();
@@ -4821,7 +3190,6 @@ mod tests {
                 activity_name: "a".into(),
                 cooldown_until: Some(t(4)),
                 phase: BlockingCircuitPhase::Open,
-                forced_open: false,
             },
             BlockedOn::ActivityRateLimited {
                 key: "k".into(),
@@ -4881,85 +3249,17 @@ mod tests {
             "blocked_external"
         );
         assert_eq!(ExecutionHealth::Terminal.as_str(), "terminal");
-        assert_eq!(ExecutionHealth::Degraded.as_str(), "degraded");
         for health in [
             ExecutionHealth::Healthy,
             ExecutionHealth::Stalled,
             ExecutionHealth::BlockedExternal,
             ExecutionHealth::Terminal,
-            ExecutionHealth::Degraded,
         ] {
             assert_eq!(serde_json::to_value(health).unwrap(), health.as_str());
         }
     }
 
     // ── Summaries ──────────────────────────────────────────────────────────
-
-    /// AC (issue #1193): an organically-tripped open breaker's summary must
-    /// state the automatic-recovery deadline (not imply human action) AND
-    /// name the non-retryable fast-fail interaction (issue #369), so an
-    /// operator reading `degraded` never mistakes it for a clean wait. A
-    /// forced-open breaker's summary keeps naming `force-close` as the
-    /// remedy and must not claim an automatic deadline.
-    #[test]
-    fn organic_open_summary_states_deadline_and_fast_fail_not_force_close() {
-        let until = t(30);
-        let organic = BlockedOn::ActivityCircuitOpen {
-            activity_name: "charge_card".to_string(),
-            phase: BlockingCircuitPhase::Open,
-            forced_open: false,
-            cooldown_until: Some(until),
-        };
-        let summary = summarize(&organic);
-        assert!(
-            !summary.contains("force-close"),
-            "an organically-tripped breaker self-heals; it must not tell an \
-             operator to force-close it: {summary}"
-        );
-        assert!(
-            summary.contains(&until.to_string()),
-            "the summary must state the automatic-recovery deadline: {summary}"
-        );
-        assert!(
-            summary.contains("fast-fail") || summary.contains("non-retryable"),
-            "the summary must name the non-retryable fast-fail interaction \
-             (issue #369) so a `degraded` verdict is never mistaken for a \
-             clean wait: {summary}"
-        );
-
-        // AC (issue #1193 Codex round-1 P2): organic + unrepresentable
-        // cooldown must still read like the organic case above (deadline
-        // language, no force-close), not like the forced case below.
-        let organic_unrepresentable = BlockedOn::ActivityCircuitOpen {
-            activity_name: "charge_card".to_string(),
-            phase: BlockingCircuitPhase::Open,
-            forced_open: false,
-            cooldown_until: None,
-        };
-        let organic_unrepresentable_summary = summarize(&organic_unrepresentable);
-        assert!(
-            !organic_unrepresentable_summary.contains("force-close"),
-            "forced_open: false must never read as operator-forced, even with \
-             no cooldown_until: {organic_unrepresentable_summary}"
-        );
-        assert!(
-            organic_unrepresentable_summary.contains("fast-fail")
-                || organic_unrepresentable_summary.contains("non-retryable"),
-            "must still name the fast-fail interaction: {organic_unrepresentable_summary}"
-        );
-
-        let forced = BlockedOn::ActivityCircuitOpen {
-            activity_name: "charge_card".to_string(),
-            phase: BlockingCircuitPhase::Open,
-            forced_open: true,
-            cooldown_until: None,
-        };
-        let forced_summary = summarize(&forced);
-        assert!(
-            forced_summary.contains("force-close"),
-            "a forced-open breaker genuinely needs a human: {forced_summary}"
-        );
-    }
 
     #[test]
     fn summary_names_the_actionable_root_cause() {
@@ -5002,17 +3302,6 @@ mod tests {
                 activity_name: "a".into(),
                 cooldown_until: None,
                 phase: BlockingCircuitPhase::Open,
-                forced_open: true,
-            },
-            // Issue #1193: the organic-open (`cooldown_until: Some(_)`) shape
-            // has its own summary branch, distinct from the forced-open one
-            // above -- exercise it here too rather than relying on the
-            // dedicated summary-text test to be the only non-emptiness proof.
-            BlockedOn::ActivityCircuitOpen {
-                activity_name: "a".into(),
-                cooldown_until: Some(t(30)),
-                phase: BlockingCircuitPhase::Open,
-                forced_open: false,
             },
             BlockedOn::ActivityRateLimited {
                 key: "k".into(),
@@ -5301,10 +3590,6 @@ mod tests {
     // ── The run's own workflow task row (issue #809, PR #1188 review) ──────
 
     /// A PENDING, due, unimpeded workflow task on a covered queue.
-    ///
-    /// `created_at` is fixed well before every `scheduled_at` this suite's
-    /// call sites override it to. So `wake_source_repended_this_row` never
-    /// fires by accident for a fixture not testing it (issue #1191).
     fn wf_task() -> WorkflowTaskFacts {
         WorkflowTaskFacts {
             state: "PENDING".to_string(),
@@ -5312,10 +3597,8 @@ mod tests {
             has_worker: false,
             queue_name: "default".to_string(),
             scheduled_at: t(-10),
-            created_at: Some(t(-3_600)),
             queue_paused: false,
             has_live_worker: true,
-            timer_fires_at: None,
         }
     }
 
@@ -5774,27 +4057,9 @@ mod tests {
             ]
         }
 
-        /// `None` (unrepresentable/forced); a deadline already in the past
-        /// relative to `now` (`t(0)`), covering an already-due row whose
-        /// cooldown has already cleared (round-5 P2); one BEFORE the
-        /// "due later" `scheduled_at` (`t(10)`); or one AFTER it -- so the
-        /// `organic_cooldown_clears_by_dispatch` guard's boundary is actually
-        /// exercised by the sweep in every case, not left at a single
-        /// hardcoded `None`.
-        fn circuit_cooldown_until() -> impl Strategy<Value = Option<chrono::DateTime<chrono::Utc>>>
-        {
-            prop_oneof![
-                Just(None),
-                Just(Some(t(-5))),
-                Just(Some(t(5))),
-                Just(Some(t(15))),
-            ]
-        }
-
         // proptest implements `Strategy` for tuples only up to a bounded
-        // arity, well under the 16 fields swept here -- grouped into two
-        // 7-tuples plus a 2-tuple (each safely under that limit) composed as
-        // one 3-tuple.
+        // arity, well under the 14 fields swept here -- grouped into two
+        // 7-tuples (each safely under that limit) composed as one 2-tuple.
         #[allow(clippy::type_complexity)]
         fn facts() -> impl Strategy<Value = PendingActivityFacts> {
             let group_a = (
@@ -5815,15 +4080,7 @@ mod tests {
                 opt_string(),  // concurrency_key
                 any::<bool>(), // rate_limit_saturated
             );
-            // Varied independently of `circuit_phase` on purpose (issue #1193
-            // Codex round-1 P1): the "flag set but its companion field says
-            // HalfOpen/absent" shape must be swept too, since `forced_open`
-            // is meaningful only when `circuit_phase == Some(Open)` and the
-            // guard in both `activity_precedence_for_facts` and
-            // `classify_pending_activity` must handle it being `true`
-            // regardless of phase without desyncing from each other.
-            let group_c = (any::<bool>(), circuit_cooldown_until()); // circuit_forced_open, circuit_cooldown_until
-            (group_a, group_b, group_c).prop_map(
+            (group_a, group_b).prop_map(
                 |(
                     (
                         task_state,
@@ -5843,7 +4100,6 @@ mod tests {
                         concurrency_key,
                         rate_limit_saturated,
                     ),
-                    (circuit_forced_open, circuit_cooldown_until),
                 )| PendingActivityFacts {
                     activity_name,
                     queue: "q".to_string(),
@@ -5858,8 +4114,7 @@ mod tests {
                     has_live_worker,
                     claimant_is_live,
                     circuit_phase,
-                    circuit_cooldown_until,
-                    circuit_forced_open,
+                    circuit_cooldown_until: None,
                     rate_limit_saturated,
                     rate_limit_bucket_missing,
                     concurrency_saturated,

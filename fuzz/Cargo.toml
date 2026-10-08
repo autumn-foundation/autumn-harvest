@@ -27,11 +27,10 @@ serde_json = "1"
 
 # The `db` feature is required by the `fuzz_failure_signature` target
 # (`dlq` is a `#[cfg(feature = "db")]` module). It also pulls diesel in, which
-# is harmless for the other targets. The `fuzzing` feature adds the replay
-# harness that `fuzz_replay` uses (issue #1835).
+# is harmless for the other three targets.
 [dependencies.autumn-harvest]
 path = "../autumn-harvest"
-features = ["db", "fuzzing"]
+features = ["db"]
 
 # Keep line-level debug info so libFuzzer crash reports symbolicate, but keep
 # optimizations on so the fuzzer covers ground quickly.
@@ -62,13 +61,6 @@ bench = false
 [[bin]]
 name = "fuzz_failure_signature"
 path = "fuzz_targets/fuzz_failure_signature.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "fuzz_replay"
-path = "fuzz_targets/fuzz_replay.rs"
 test = false
 doc = false
 bench = false

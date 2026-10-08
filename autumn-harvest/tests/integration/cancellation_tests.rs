@@ -32,7 +32,7 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::test_init_sql().as_bytes().to_vec()
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
 }
 
 async fn setup_test_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
@@ -96,7 +96,7 @@ async fn start_test_workflow(conn: &mut AsyncPgConnection) -> autumn_harvest::Ex
             workflow_name: "cancel_me",
             workflow_id: "cancel-me-001",
             exec_id: autumn_harvest::ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0)),
-            input: serde_json::json!({ "request_id": "cancel-me-001" }).into(),
+            input: serde_json::json!({ "request_id": "cancel-me-001" }),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -476,9 +476,6 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
-                codec_rotation_batch_size: 0,
-                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
-                dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "heartbeat-cancel-worker".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -494,7 +491,6 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
-                resident_workflows: true,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
@@ -532,7 +528,7 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
             workflow_name: "heartbeat_workflow",
             workflow_id: "heartbeat-cancel-001",
             exec_id: autumn_harvest::ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0)),
-            input: serde_json::json!({ "request_id": "heartbeat-cancel-001" }).into(),
+            input: serde_json::json!({ "request_id": "heartbeat-cancel-001" }),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -718,9 +714,6 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
-                codec_rotation_batch_size: 0,
-                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
-                dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "uncooperative-worker".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -737,7 +730,6 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
-                resident_workflows: true,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
@@ -775,7 +767,7 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
             workflow_name: "uncooperative_workflow",
             workflow_id: "uncooperative-001",
             exec_id: autumn_harvest::ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0)),
-            input: serde_json::json!({ "request_id": "uncooperative-001" }).into(),
+            input: serde_json::json!({ "request_id": "uncooperative-001" }),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -895,9 +887,6 @@ async fn activity_exits_early_on_workflow_cancellation() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
-                codec_rotation_batch_size: 0,
-                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
-                dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "ac-cancel-worker".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -913,7 +902,6 @@ async fn activity_exits_early_on_workflow_cancellation() {
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
-                resident_workflows: true,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
@@ -949,7 +937,7 @@ async fn activity_exits_early_on_workflow_cancellation() {
             workflow_name: "heartbeat_workflow",
             workflow_id: "ac-cancel-exits-early-001",
             exec_id: autumn_harvest::ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0)),
-            input: serde_json::json!({}).into(),
+            input: serde_json::json!({}),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -1066,9 +1054,6 @@ async fn activity_without_cancellation_check_completes_normally() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
-                codec_rotation_batch_size: 0,
-                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
-                dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "no-hb-worker".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -1084,7 +1069,6 @@ async fn activity_without_cancellation_check_completes_normally() {
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
-                resident_workflows: true,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
@@ -1120,7 +1104,7 @@ async fn activity_without_cancellation_check_completes_normally() {
             workflow_name: "uncooperative_workflow",
             workflow_id: "no-hb-completes-normally-001",
             exec_id: autumn_harvest::ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0)),
-            input: serde_json::json!({}).into(),
+            input: serde_json::json!({}),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -1230,22 +1214,16 @@ async fn heartbeat_checkpoint_preserved_across_cancel_signal() {
         .expect("enqueue should succeed");
 
     diesel::update(dsl::harvest_task_queue.find(task_id))
-        .set((
-            dsl::state.eq("RUNNING"),
-            dsl::worker_id.eq("checkpoint-worker"),
-            dsl::attempt.eq(1),
-        ))
+        .set(dsl::state.eq("RUNNING"))
         .execute(&mut conn)
         .await
         .expect("set RUNNING");
 
     // Flush a checkpoint (simulates the heartbeat flusher writing mid-run).
     let checkpoint = serde_json::json!({"offset": 42, "batch": "2026-05"});
-    let claim = queue::TaskClaim::new(task_id, "checkpoint-worker", 1);
-    let write = queue::record_heartbeat(&mut conn, &claim, checkpoint.clone())
+    queue::record_heartbeat(&mut conn, task_id, checkpoint.clone())
         .await
         .expect("record heartbeat should succeed");
-    assert_eq!(write, queue::ClaimWrite::Applied);
 
     // Read checkpoint the way the worker does at dispatch time — this is the
     // value that goes into ActivityContext::heartbeat_details.

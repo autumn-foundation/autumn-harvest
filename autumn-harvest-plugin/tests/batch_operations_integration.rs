@@ -21,6 +21,7 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
+use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -90,9 +91,12 @@ async fn setup_database() -> (String, Option<ContainerAsync<Postgres>>) {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&db_url)
         .await
         .expect("connect to fresh test database");
-    diesel_async::SimpleAsyncConnection::batch_execute(&mut conn, &autumn_harvest::test_init_sql())
-        .await
-        .expect("apply migrations to fresh test database");
+    diesel_async::SimpleAsyncConnection::batch_execute(
+        &mut conn,
+        autumn_harvest::full_migrations_sql(),
+    )
+    .await
+    .expect("apply migrations to fresh test database");
 
     (db_url, container)
 }
@@ -103,6 +107,10 @@ fn build_pool(url: &str) -> DbPool {
         .max_size(8)
         .build()
         .expect("pool should build")
+}
+
+fn test_app_state() -> AppState {
+    AppState::for_test().with_profile("test")
 }
 
 fn build_app(pool: &DbPool) -> HarvestApiApp {
@@ -127,7 +135,7 @@ fn build_app_with_router(pool: &DbPool, router: ShardRouter) -> HarvestApiApp {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         router,
     ));
-    harvest_api_router(api_state)
+    harvest_api_router(api_state).with_state(test_app_state())
 }
 
 async fn post_json(app: &HarvestApiApp, uri: &str, body: Value) -> (StatusCode, Value) {
@@ -186,7 +194,7 @@ async fn seed_workflows(database_url: &str, workflow_name: &str, count: usize) -
                 workflow_name,
                 workflow_id: &format!("wf-{index}"),
                 exec_id,
-                input: json!({"i": index}).into(),
+                input: json!({"i": index}),
                 parent_id: None,
                 queue_name: "default",
                 execution_timeout: None,

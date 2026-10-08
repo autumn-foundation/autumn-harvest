@@ -347,21 +347,9 @@ pub struct DebugStep {
     /// The signal name, when this step consumed a `SignalReceived` event.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signal_name: Option<String>,
-    /// The build and worker, when this step consumed a decision boundary.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub decision: Option<DecisionAttribution>,
     /// A non-determinism divergence detected while replaying this prefix.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub divergence: Option<StepDivergence>,
-}
-
-/// The build and worker that committed one decision (issue #1833).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct DecisionAttribution {
-    /// Build id of the worker. Empty when the worker has no build id.
-    pub build_id: String,
-    /// Id of the worker that made the decision.
-    pub worker_id: String,
 }
 
 /// The full stepped trace of one recorded history.
@@ -423,7 +411,6 @@ impl ReplayTrace {
                 resolved_payload: resolved_payload(event),
                 event_facts: normalized_event_facts(event),
                 signal_name: signal_name_of(event),
-                decision: decision_of(event),
                 divergence: None,
             });
         }
@@ -593,20 +580,6 @@ fn signal_name_of(event: &WorkflowEvent) -> Option<String> {
     }
 }
 
-/// The build and worker, when `event` is a `DecisionCommitted`.
-fn decision_of(event: &WorkflowEvent) -> Option<DecisionAttribution> {
-    match event {
-        WorkflowEvent::DecisionCommitted {
-            build_id,
-            worker_id,
-        } => Some(DecisionAttribution {
-            build_id: build_id.to_string(),
-            worker_id: worker_id.to_string(),
-        }),
-        _ => None,
-    }
-}
-
 /// The activity name a frontier command dispatches, when it dispatches one.
 ///
 /// **Strips the one known qualifier rather than tokenizing.** Only
@@ -727,9 +700,7 @@ pub enum DiffKind {
 /// The first point at which two traces diverge, with both sides' snapshots.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct TraceDivergence {
-    /// The position at which the two traces first differ. The walk skips
-    /// decision boundaries (issue #1833), so this counts the compared steps.
-    /// Each step's own `index` locates it in its history.
+    /// The step index at which the two traces first differ.
     pub step_index: usize,
     /// How they differ.
     pub kind: DiffKind,
@@ -818,13 +789,7 @@ impl TraceDiff {
 #[must_use]
 pub fn diff_traces(left: &ReplayTrace, right: &ReplayTrace) -> TraceDiff {
     let truncated = left.truncated || right.truncated;
-    // Decision boundaries (issue #1833) are attribution, not behavior. One
-    // side can lack them, for example a recording from before the upgrade.
-    // So the walk compares the other steps only. Each step keeps its own
-    // `index` into its history.
-    let left_steps = boundary_free_steps(left);
-    let right_steps = boundary_free_steps(right);
-    let shared = left_steps.len().min(right_steps.len());
+    let shared = left.steps.len().min(right.steps.len());
     // The first compared index where *neither* side replayed successfully. Both
     // sides failing the same way compares equal at every field, so the walk
     // below reports no divergence — but "they agree" would be a claim about two
@@ -835,9 +800,8 @@ pub fn diff_traces(left: &ReplayTrace, right: &ReplayTrace) -> TraceDiff {
     // (AC3's fixture-vs-fixture mode) is fully conclusive — the history facts
     // it compares are determined entirely by the two histories. Only a replay
     // that was attempted and did not finish makes agreement meaningless.
-    let inconclusive_step = (0..shared).find(|&i| {
-        left_steps[i].raw.outcome.replay_failed() && right_steps[i].raw.outcome.replay_failed()
-    });
+    let inconclusive_step = (0..shared)
+        .find(|&i| left.steps[i].outcome.replay_failed() && right.steps[i].outcome.replay_failed());
     let finish = |divergence| TraceDiff {
         divergence,
         left_steps: left.steps.len(),
@@ -870,78 +834,31 @@ pub fn diff_traces(left: &ReplayTrace, right: &ReplayTrace) -> TraceDiff {
     }
 
     for i in 0..shared {
-        let l = &left_steps[i];
-        let r = &right_steps[i];
+        let l = &left.steps[i];
+        let r = &right.steps[i];
 
-        // Compare the renumbered copies. Report the steps as recorded.
-        if let Some(kind) = step_diff_kind(&l.compared, &r.compared) {
+        if let Some(kind) = step_diff_kind(l, r) {
             return finish(Some(TraceDivergence {
                 step_index: i,
                 kind,
-                left: Some(l.raw.clone()),
-                right: Some(r.raw.clone()),
+                left: Some(l.clone()),
+                right: Some(r.clone()),
             }));
         }
     }
 
     finish(
-        (left_steps.len() != right_steps.len()).then(|| TraceDivergence {
+        (left.steps.len() != right.steps.len()).then(|| TraceDivergence {
             step_index: shared,
             kind: DiffKind::TraceLength {
-                left: left_steps.len(),
-                right: right_steps.len(),
+                left: left.steps.len(),
+                right: right.steps.len(),
                 capped: truncated,
             },
-            left: left_steps.get(shared).map(|step| step.raw.clone()),
-            right: right_steps.get(shared).map(|step| step.raw.clone()),
+            left: left.steps.get(shared).cloned(),
+            right: right.steps.get(shared).cloned(),
         }),
     )
-}
-
-/// One non-boundary step, as recorded and as compared.
-struct ComparedStep<'a> {
-    /// The step as recorded. A divergence reports this one.
-    raw: &'a DebugStep,
-    /// A copy whose history positions count non-boundary events only.
-    compared: DebugStep,
-}
-
-/// The non-boundary steps of `trace`, with history positions renumbered.
-///
-/// Snapshots carry history positions: where an awaitable opened, and where a
-/// side effect, marker or divergence landed. Each boundary before a position
-/// moves it by one (issue #1833). So the copy maps each position to its
-/// ordinal among the non-boundary events. A history without boundaries maps
-/// every position to itself.
-fn boundary_free_steps(trace: &ReplayTrace) -> Vec<ComparedStep<'_>> {
-    let boundaries: Vec<usize> = trace
-        .steps
-        .iter()
-        .filter(|step| step.decision.is_some())
-        .map(|step| step.index)
-        .collect();
-    let ordinal = |position: usize| position - boundaries.partition_point(|&b| b < position);
-    trace
-        .steps
-        .iter()
-        .filter(|step| step.decision.is_none())
-        .map(|raw| {
-            let mut compared = raw.clone();
-            for awaitable in &mut compared.open_awaitables {
-                awaitable.opened_at = ordinal(awaitable.opened_at);
-            }
-            for effect in &mut compared.side_effects {
-                effect.event_index = ordinal(effect.event_index);
-            }
-            for marker in &mut compared.markers {
-                marker.event_index = ordinal(marker.event_index);
-            }
-            if let Some(divergence) = &mut compared.divergence {
-                divergence.event_index = ordinal(divergence.event_index);
-            }
-            ComparedStep { raw, compared }
-        })
-        .collect()
 }
 
 /// How a single pair of steps differs, if at all.
@@ -1038,8 +955,6 @@ fn history_fact_diff(l: &DebugStep, r: &DebugStep) -> Option<&'static str> {
         resolved_payload: _,
         event_facts: l_facts,
         signal_name: l_signal,
-        // Attribution only. `event_facts` normalizes it, so a diff ignores it.
-        decision: _,
         // Code-derived: a divergence is a code-vs-history mismatch, not a
         // property of the recording. `step_diff_kind` owns it.
         divergence: _,
@@ -1263,8 +1178,6 @@ pub struct ReplayDebugger {
     history_policy: WorkflowHistoryPolicy,
     build_id: Option<String>,
     payload_limits: crate::executor::ReplayPayloadLimits,
-    default_activity_retry_policy: Option<crate::policy::RetryPolicy>,
-    default_activity_start_to_close: Option<Duration>,
     declarative_queries: Vec<crate::info::QueryHandlerInfo>,
     declarative_updates: Vec<crate::info::UpdateHandlerInfo>,
     payload_offloader: Option<std::sync::Arc<crate::payload_store::PayloadOffloader>>,
@@ -1300,8 +1213,6 @@ impl ReplayDebugger {
             history_policy: WorkflowHistoryPolicy::default(),
             build_id: None,
             payload_limits: crate::executor::ReplayPayloadLimits::default(),
-            default_activity_retry_policy: None,
-            default_activity_start_to_close: None,
             declarative_queries: Vec::new(),
             declarative_updates: Vec::new(),
             payload_offloader: None,
@@ -1459,26 +1370,6 @@ impl ReplayDebugger {
     #[must_use]
     pub const fn payload_offload_threshold(mut self, threshold: Option<u64>) -> Self {
         self.payload_limits.offload_threshold = threshold;
-        self
-    }
-
-    /// Apply the candidate build's local-activity defaults (#620).
-    ///
-    /// These defaults live in worker configuration, not history. Pass `retry`
-    /// then `start_to_close` from
-    /// [`WorkerConfig::with_default_activity_retry_policy`](crate::worker::WorkerConfig::with_default_activity_retry_policy)
-    /// and
-    /// [`WorkerConfig::with_default_activity_start_to_close`](crate::worker::WorkerConfig::with_default_activity_start_to_close).
-    /// Both are `None` here by default. A worker on `WorkerConfig::default()`
-    /// uses `Some(DEFAULT_ACTIVITY_START_TO_CLOSE)` (issue #1808).
-    #[must_use]
-    pub fn activity_defaults(
-        mut self,
-        retry: Option<crate::policy::RetryPolicy>,
-        start_to_close: Option<Duration>,
-    ) -> Self {
-        self.default_activity_retry_policy = retry;
-        self.default_activity_start_to_close = start_to_close;
         self
     }
 
@@ -1642,11 +1533,6 @@ impl ReplayDebugger {
             self.payload_limits.max_workflow_input,
         )
         .with_payload_offload_threshold(self.payload_limits.offload_threshold);
-
-        ctx = ctx.with_activity_defaults(
-            self.default_activity_retry_policy.clone(),
-            self.default_activity_start_to_close,
-        );
 
         if let Some(workflow_id) = snapshot.workflow_id.clone() {
             ctx = ctx.with_workflow_id(workflow_id);
@@ -2151,9 +2037,7 @@ const ENGINE_MINTED_ID_FIELDS: &[&str] = &[
 ///   **field name**, not by "looks like a UUID";
 /// * `timestamp`;
 /// * the recorded `value` of a non-deterministic side-effect draw
-///   (`Now`/`Uuid`/`Random`, issue #384) — its `kind` and `name` still compare;
-/// * every field of a `DecisionCommitted` (issue #1833). Its event type still
-///   compares.
+///   (`Now`/`Uuid`/`Random`, issue #384) — its `kind` and `name` still compare.
 ///
 /// Field-name matching is load-bearing. A purely value-based test ("normalize
 /// anything that parses as a UUID") also eats
@@ -2180,9 +2064,6 @@ fn normalized_event_facts(event: &WorkflowEvent) -> Value {
         .get("kind")
         .and_then(Value::as_str)
         .is_some_and(|kind| kind != "Custom");
-    // A boundary names the build and worker of a decision (issue #1833).
-    // That is attribution, not behavior. A cross-build diff must not flag it.
-    let boundary = event.is_decision_boundary();
 
     for (key, slot) in data.iter_mut() {
         // The UUID parse is kept *in addition to* the name match, not instead
@@ -2191,7 +2072,6 @@ fn normalized_event_facts(event: &WorkflowEvent) -> Value {
         // serializes as an object that must compare verbatim.
         let is_per_run = key == "timestamp"
             || (nondeterministic_draw && key == "value")
-            || boundary
             || (ENGINE_MINTED_ID_FIELDS.contains(&key.as_str())
                 && slot
                     .as_str()

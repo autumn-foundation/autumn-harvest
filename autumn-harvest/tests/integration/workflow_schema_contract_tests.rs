@@ -1088,12 +1088,9 @@ fn a_compatible_update_needs_no_acknowledgement() {
     let updated = baseline
         .compatible_update(&current)
         .expect("a compatible update needs no acknowledgement");
-    assert_eq!(
-        updated.acknowledged_breaking_changes,
-        [] as [autumn_harvest::AcknowledgedBreakingChange; 0]
-    );
+    assert!(updated.acknowledged_breaking_changes.is_empty());
     let diff = autumn_harvest::schema_contract::diff_schema_contracts(&updated, &current);
-    assert_eq!(diff.deltas, [] as [autumn_harvest::SchemaDelta; 0]);
+    assert!(diff.deltas.is_empty());
 }
 
 #[test]

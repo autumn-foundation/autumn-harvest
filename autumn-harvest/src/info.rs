@@ -798,72 +798,6 @@ impl WorkflowInfo {
         self
     }
 
-    /// Reject a typed-client start-or-attach call whose admission a
-    /// debounce, start-throttle, or event-batching policy could defer
-    /// (issues #499, #607, #518).
-    ///
-    /// Debounce, start-throttle, and event-batching policies may defer the
-    /// actual admission of a start past the caller's own transaction. That
-    /// deferral requires the debounce-key shard, the registry, and the
-    /// HTTP-only admission gate. A typed-client caller (`start_with_options`,
-    /// `signal_with_start`, `update_with_start_*`) has none of those. It
-    /// rejects early with a pointer to the HTTP start route, instead of
-    /// silently bypassing the policy.
-    ///
-    /// Checked in debounce, throttle, batch order; returns on the first
-    /// policy whose key resolves against `input` (an unkeyed throttle
-    /// always resolves).
-    ///
-    /// Shared by every typed-client start-or-attach stub `#[workflow]` and
-    /// `#[update]` generate. Before this method existed, each stub carried
-    /// its own hand-copied check. `update_with_start_*`'s copy omitted the
-    /// throttle case for a time -- the same missed-fix class as commit
-    /// 896978eb (issue #617).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err(HarvestError::Config(_))` naming the first deferring
-    /// policy found.
-    pub fn reject_if_admission_may_defer(
-        &self,
-        input: &serde_json::Value,
-    ) -> crate::error::HarvestResult<()> {
-        if let Some(policy) = self.debounce
-            && crate::debounce::resolve_debounce_key(policy.key_expr, input).is_some()
-        {
-            return Err(crate::error::HarvestError::Config(format!(
-                "workflow '{0}' has a debounce policy; debounced starts \
-                 must use the HTTP start route POST /workflows/{0}/start \
-                 (the typed client cannot express a deferred debounced start)",
-                self.name,
-            )));
-        }
-        if let Some(policy) = self.throttle {
-            let throttle_applies = policy
-                .key_expr
-                .is_none_or(|k| crate::throttle::resolve_throttle_key(k, input).is_some());
-            if throttle_applies {
-                return Err(crate::error::HarvestError::Config(format!(
-                    "workflow '{0}' has a start-throttle policy; throttled starts \
-                     must use the HTTP start route POST /workflows/{0}/start \
-                     (the typed client cannot express a deferred throttled start)",
-                    self.name,
-                )));
-            }
-        }
-        if let Some(policy) = self.batch.as_ref()
-            && crate::concurrency::resolve_concurrency_key(&policy.key_expr, input).is_some()
-        {
-            return Err(crate::error::HarvestError::Config(format!(
-                "workflow '{0}' has an event batching policy; batched starts \
-                 must use the HTTP start route POST /workflows/{0}/start \
-                 (the typed client cannot express a deferred batched start)",
-                self.name,
-            )));
-        }
-        Ok(())
-    }
-
     /// Validate a JSON value against this workflow's `input_schema` (if any).
     ///
     /// Returns `Ok(())` when:
@@ -1115,11 +1049,10 @@ fn validate_node(
     }
 
     // required fields
-    // Keyword lookups are gated on the value's kind: a map lookup against a
-    // non-matching value is wasted work on the leaf-heavy common case.
-    if let Some(obj) = value.as_object()
-        && let Some(required) = schema_obj.get("required").and_then(|v| v.as_array())
-    {
+    if let (Some(required), Some(obj)) = (
+        schema_obj.get("required").and_then(|v| v.as_array()),
+        value.as_object(),
+    ) {
         for req in required {
             if let Some(field) = req.as_str()
                 && !obj.contains_key(field)
@@ -1137,9 +1070,10 @@ fn validate_node(
     }
 
     // properties — recurse
-    if let Some(obj) = value.as_object()
-        && let Some(properties) = schema_obj.get("properties").and_then(|v| v.as_object())
-    {
+    if let (Some(properties), Some(obj)) = (
+        schema_obj.get("properties").and_then(|v| v.as_object()),
+        value.as_object(),
+    ) {
         for (prop_name, prop_schema) in properties {
             if let Some(prop_value) = obj.get(prop_name) {
                 let child_path = JsonPointerPath::Prop {
@@ -1162,9 +1096,7 @@ fn validate_node(
     }
 
     // array items — recurse into each element
-    if let Some(arr) = value.as_array()
-        && let Some(items_schema) = schema_obj.get("items")
-    {
+    if let (Some(items_schema), Some(arr)) = (schema_obj.get("items"), value.as_array()) {
         for (i, elem) in arr.iter().enumerate() {
             let child_path = JsonPointerPath::Index {
                 parent: path,
@@ -1224,8 +1156,8 @@ fn validate_node(
     }
 
     // additionalProperties — reject unknown keys (false) or validate them against a sub-schema
-    if let Some(obj) = value.as_object()
-        && let Some(add_props) = schema_obj.get("additionalProperties")
+    if let (Some(add_props), Some(obj)) =
+        (schema_obj.get("additionalProperties"), value.as_object())
     {
         // Known-property membership is checked directly against the schema's
         // own `properties` map (already a `BTreeMap`) rather than collecting
@@ -1452,10 +1384,8 @@ pub struct ActivityInfo {
     /// `rate_limit(...)` form at compile time.
     pub rate_limit_key_expr: Option<&'static str>,
     /// Optional circuit-breaker policy (issue #369). When set, the worker
-    /// short-circuits dispatches of this activity while the breaker is open.
-    /// The policy's `open_mode` decides how (issue #1809). `Defer` (default)
-    /// puts the task back to `PENDING`. `FailFast` fails it with a
-    /// non-retryable `"CircuitOpen"` failure. `None` retains
+    /// fast-fails dispatches of this activity with a non-retryable
+    /// `"CircuitOpen"` failure while the breaker is open. `None` retains
     /// today's behaviour (no breaker; the full retry policy applies). Declared
     /// via `#[activity(circuit_breaker = CircuitBreakerPolicy::new(...))]`.
     pub circuit_breaker: Option<crate::policy::CircuitBreakerPolicy>,
@@ -1488,20 +1418,6 @@ fn wasm_activity_stub_handler(
         )
         .into_error_payload())
     })
-}
-
-impl ActivityInfo {
-    /// Return `true` when the activity declares its own bound on a running attempt.
-    ///
-    /// A `start_to_close`, a `schedule_to_close` or a `heartbeat_timeout` is such
-    /// a bound. The builder default `start_to_close` applies only to an
-    /// activity with none of the three (issue #1808).
-    #[must_use]
-    pub const fn declares_attempt_bound(&self) -> bool {
-        self.default_start_to_close.is_some()
-            || self.default_schedule_to_close.is_some()
-            || self.default_heartbeat_timeout.is_some()
-    }
 }
 
 #[cfg(feature = "wasm-activities")]
@@ -1588,8 +1504,7 @@ pub struct DagInfo {
     /// without needing to look up the companion by name.
     pub workflow_handler: Option<WorkflowHandlerFn>,
     /// Maximum spread window for staggering schedule fires. `Duration::ZERO`
-    /// disables jitter. `#[dag(schedule = ...)]` defaults to
-    /// [`default_schedule_jitter`](crate::policy::default_schedule_jitter).
+    /// disables jitter (default — today's behaviour).
     pub jitter: Duration,
     /// What to do when a new firing collides with a still-running execution.
     /// Defaults to [`OverlapPolicy::Skip`].

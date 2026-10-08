@@ -89,20 +89,6 @@ pub const ERROR_TYPE_OPERATOR_FORCE_FAILED: &str = "OperatorForceFailed";
 /// author cannot use it to manufacture extra retries.
 pub const ERROR_TYPE_HANDLER_PANIC: &str = "HandlerPanic";
 
-/// Stable error-type name for a workflow task that timed out.
-///
-/// The workflow-task timeout enforcer seals the run `TIMED_OUT`. Its terminal
-/// event is a `WorkflowFailed` that carries this type. A start-replace later
-/// seals the row `CONTINUED_AS_NEW`, so only this type keeps the timeout
-/// visible to [`crate::execution::replaced_run_outcome`]. A workflow that
-/// fails with an activity timeout writes the same error text, so the text
-/// alone cannot tell the two apart.
-///
-/// This error type is **engine-reserved**, like [`ERROR_TYPE_HANDLER_PANIC`].
-/// A workflow that fails with this type itself reads as `TIMED_OUT` once a
-/// later start replaces it.
-pub const ERROR_TYPE_WORKFLOW_TASK_TIMED_OUT: &str = "WorkflowTaskTimedOut";
-
 /// Stable error-type name for a WASM activity denied a host capability
 /// (issue #965).
 ///

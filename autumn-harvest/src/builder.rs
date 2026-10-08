@@ -66,23 +66,6 @@ pub const DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD: u64 = 256 * 1024;
 /// an error. Configurable via [`WorkerConfig::with_retry_after_ceiling`].
 pub const DEFAULT_RETRY_AFTER_CEILING: Duration = Duration::from_secs(15 * 60);
 
-/// Default activity `start_to_close` timeout (issue #1808): 10 minutes.
-pub const DEFAULT_ACTIVITY_START_TO_CLOSE: Duration = Duration::from_secs(10 * 60);
-
-/// Default worker drain budget (issue #1813): 25 seconds.
-///
-/// It ends 5 seconds before the Kubernetes default
-/// `terminationGracePeriodSeconds` (30 seconds). The worker can then mark
-/// itself stopped before the platform sends `SIGKILL`.
-pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
-
-/// Default sticky routing window (issue #1798): 5 seconds.
-///
-/// A follow-up task of a suspended execution waits up to this long for the
-/// worker that holds its cache. After the window, any eligible worker can
-/// claim it.
-pub const DEFAULT_STICKY_TIMEOUT: Duration = Duration::from_secs(5);
-
 pub struct HarvestBuilder {
     workflows: Vec<WorkflowInfo>,
     activities: Vec<ActivityInfo>,
@@ -154,12 +137,6 @@ pub struct HarvestBuilder {
     unknown_target_grace_window: Option<Duration>,
     /// Hard caps for `POST /workflows/batch_start` (issue #357).
     batch_start_config: BatchStartConfig,
-    /// Automatic per-queue load shedding (issue #1794). An empty config turns
-    /// it off.
-    load_shed: crate::load_shed::LoadShedConfig,
-    /// Metric-gated automatic build-ramp abort (issue #1814). The default
-    /// config is disabled.
-    ramp_guard: crate::ramp_guard::RampGuardConfig,
     /// Declarative completion triggers (issue #517).
     completion_triggers: Vec<crate::completion_trigger::CompletionTrigger>,
     /// Server-side ceiling on `workflow_attempt` (issue #523).
@@ -176,7 +153,6 @@ pub struct HarvestBuilder {
     /// targets, SSRF host allowlist, HMAC secret, retry policy, and an
     /// optional custom deliverer.
     completion_callback_config: crate::completion_callback::CompletionCallbackBuilderConfig,
-    audit_export_config: crate::audit_export::AuditExportBuilderConfig,
     /// Retention window for request-scoped start idempotency keys (issue #808).
     /// A repeated `idempotency_key` within this window deduplicates onto the same
     /// execution; after it elapses the key is reusable. `None` uses
@@ -189,13 +165,10 @@ pub struct HarvestBuilder {
     /// `wasm_activity(...)` call (issue #965). `None` = no WASM activities.
     #[cfg(feature = "wasm-activities")]
     wasm_store: Option<Arc<crate::wasm_activities::WasmModuleStore>>,
-    /// `(activity_name, module_bytes, signature)` entries published to each
-    /// worker's shard DB at startup (issue #965, issue #1838).
+    /// `(activity_name, module_bytes)` pairs published to each worker's shard DB
+    /// at startup (issue #965).
     #[cfg(feature = "wasm-activities")]
-    wasm_module_registrations: Vec<(String, Vec<u8>, Option<String>)>,
-    /// Raw Ed25519 public keys of trusted WASM publishers (issue #1838).
-    #[cfg(feature = "wasm-activities")]
-    wasm_trusted_keys: Vec<[u8; 32]>,
+    wasm_module_registrations: Vec<(String, Vec<u8>)>,
 }
 
 impl Default for HarvestBuilder {
@@ -231,15 +204,12 @@ impl Default for HarvestBuilder {
             max_workflow_start_delay: None,
             unknown_target_grace_window: None,
             batch_start_config: BatchStartConfig::default(),
-            load_shed: crate::load_shed::LoadShedConfig::new(),
-            ramp_guard: crate::ramp_guard::RampGuardConfig::default(),
             completion_triggers: Vec::new(),
             max_workflow_attempts: None,
             usage_window_ceiling: None,
             usage_max_groups: None,
             completion_callback_config:
                 crate::completion_callback::CompletionCallbackBuilderConfig::default(),
-            audit_export_config: crate::audit_export::AuditExportBuilderConfig::default(),
             start_idempotency_window: None,
             #[cfg(feature = "wasm-activities")]
             wasm_bindings: std::collections::HashMap::new(),
@@ -247,8 +217,6 @@ impl Default for HarvestBuilder {
             wasm_store: None,
             #[cfg(feature = "wasm-activities")]
             wasm_module_registrations: Vec::new(),
-            #[cfg(feature = "wasm-activities")]
-            wasm_trusted_keys: Vec::new(),
         }
     }
 }
@@ -295,8 +263,6 @@ impl std::fmt::Debug for HarvestBuilder {
                 &self.unknown_target_grace_window,
             )
             .field("batch_start_config", &self.batch_start_config)
-            .field("load_shed", &self.load_shed)
-            .field("ramp_guard", &self.ramp_guard)
             .field("max_workflow_attempts", &self.max_workflow_attempts)
             .field("usage_window_ceiling", &self.usage_window_ceiling)
             .field("usage_max_groups", &self.usage_max_groups)
@@ -304,55 +270,8 @@ impl std::fmt::Debug for HarvestBuilder {
                 "completion_callback_default_target_count",
                 &self.completion_callback_config.default_targets.len(),
             )
-            .field(
-                "audit_export_enabled",
-                &self.audit_export_config.is_enabled(),
-            )
             .finish_non_exhaustive()
     }
-}
-
-/// Log a warning when a history cap undercuts the soft `continue_as_new`
-/// threshold (issue #1804).
-///
-/// A cap at or below the threshold fails runs before `should_continue_as_new`
-/// turns true. A warning point at or below the threshold pages healthy runs.
-/// These are warnings, not errors: a small cap is a valid choice in tests.
-fn warn_if_history_cap_preempts_continue_as_new(policy: WorkflowHistoryPolicy) {
-    if history_cap_preempts_continue_as_new(policy) {
-        tracing::warn!(
-            event_hard_cap = ?policy.event_hard_cap(),
-            continue_as_new_threshold = policy.continue_as_new_threshold(),
-            "history_event_hard_cap is at or below history_continue_as_new_threshold; \
-             runs fail at the cap before should_continue_as_new turns true"
-        );
-    } else if history_warning_precedes_continue_as_new(policy) {
-        tracing::warn!(
-            history_bloat_warn_threshold = ?policy.history_bloat_warn_threshold(),
-            continue_as_new_threshold = policy.continue_as_new_threshold(),
-            "the history-bloat warning fires at or below history_continue_as_new_threshold; \
-             healthy runs warn before should_continue_as_new turns true"
-        );
-    }
-}
-
-/// `true` when the history-bloat warning fires at or below the soft threshold
-/// (issue #1804).
-///
-/// A tie counts. `should_continue_as_new` turns true only past the threshold,
-/// so a warning at the threshold pages a run that has not yet been told to
-/// rotate. Under the defaults the warning sits at 10,240, above 10,000.
-fn history_warning_precedes_continue_as_new(policy: WorkflowHistoryPolicy) -> bool {
-    policy
-        .history_bloat_warn_threshold()
-        .is_some_and(|threshold| threshold <= policy.continue_as_new_threshold())
-}
-
-/// `true` when the event hard cap fires before the soft threshold can.
-fn history_cap_preempts_continue_as_new(policy: WorkflowHistoryPolicy) -> bool {
-    policy
-        .event_hard_cap()
-        .is_some_and(|cap| cap <= policy.continue_as_new_threshold())
 }
 
 /// Built harvest registration set produced by [`HarvestBuilder::build`].
@@ -409,12 +328,6 @@ pub struct BuiltHarvest {
     pub unknown_target_grace_window: Duration,
     /// Hard caps for `POST /workflows/batch_start` (issue #357).
     pub batch_start_config: BatchStartConfig,
-    /// Automatic per-queue load shedding (issue #1794). An empty config turns
-    /// it off.
-    pub load_shed: crate::load_shed::LoadShedConfig,
-    /// Metric-gated automatic build-ramp abort (issue #1814). The default
-    /// config is disabled.
-    pub ramp_guard: crate::ramp_guard::RampGuardConfig,
     /// Declarative completion triggers (issue #517).
     completion_triggers: Vec<crate::completion_trigger::CompletionTrigger>,
     /// Server-side ceiling on workflow retry attempts (issue #523). `None` = no ceiling.
@@ -430,20 +343,6 @@ pub struct BuiltHarvest {
     /// custom one — the plugin substitutes its default `reqwest`-based
     /// implementation at runtime startup.
     completion_callback_config: crate::completion_callback::CompletionCallbackBuilderConfig,
-    audit_export_config: crate::audit_export::AuditExportBuilderConfig,
-    /// When set, `into_worker_parts*` does **not** install the process-global
-    /// audit-export config (issue #953, Codex review round 5 P1).
-    ///
-    /// The plugin runner publishes it itself, once its whole build has
-    /// succeeded. Without this, the conversion installs the config partway
-    /// through a still-fallible build, and a scanner belonging to a runtime
-    /// already running in this process can tick inside that window and ship
-    /// audit records to a sink that never came into service — or, for a
-    /// webhook-only build, stop exporting entirely, since the direct-worker
-    /// path writes `None` when it finds no embedder sink. Restoring the value
-    /// afterwards repairs the config but cannot un-send those records, so the
-    /// write is suppressed rather than compensated.
-    defer_audit_export_install: bool,
     /// Retention window for request-scoped start idempotency keys (issue #808).
     /// Defaults to [`crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW`]
     /// (24h) when unset on the builder.
@@ -458,7 +357,7 @@ pub struct BuiltHarvest {
     /// `(activity_name, module_bytes)` pairs published to each worker's shard DB
     /// at startup (issue #965).
     #[cfg(feature = "wasm-activities")]
-    wasm_module_registrations: Vec<(String, Vec<u8>, Option<String>)>,
+    wasm_module_registrations: Vec<(String, Vec<u8>)>,
 }
 
 impl std::fmt::Debug for BuiltHarvest {
@@ -501,18 +400,12 @@ impl std::fmt::Debug for BuiltHarvest {
                 &self.unknown_target_grace_window,
             )
             .field("batch_start_config", &self.batch_start_config)
-            .field("load_shed", &self.load_shed)
-            .field("ramp_guard", &self.ramp_guard)
             .field("max_workflow_attempts", &self.max_workflow_attempts)
             .field("usage_window_ceiling", &self.usage_window_ceiling)
             .field("usage_max_groups", &self.usage_max_groups)
             .field(
                 "completion_callback_default_target_count",
                 &self.completion_callback_config.default_targets.len(),
-            )
-            .field(
-                "audit_export_enabled",
-                &self.audit_export_config.is_enabled(),
             )
             .finish_non_exhaustive()
     }
@@ -668,18 +561,6 @@ pub enum HarvestBuilderError {
         name: String,
     },
 
-    /// A registered DAG definition does not compile: it has a cycle, a bad
-    /// input binding or a bad compensator. Without this check the other DAG
-    /// validators skip such a DAG. The error then appears only when the
-    /// plugin compiles its DAG catalog, or at run time as a FAILED run.
-    #[error("DAG '{dag}' does not compile: {error}")]
-    InvalidDagDefinition {
-        /// DAG whose definition failed to compile.
-        dag: String,
-        /// The build error, as its display text.
-        error: String,
-    },
-
     /// A DAG references an activity registered as local-only. Local activities
     /// run inline on the workflow worker and cannot be scheduled through the
     /// DAG activity queue lowering.
@@ -767,38 +648,6 @@ pub enum HarvestBuilderError {
         reason: String,
     },
 
-    /// A workflow's `execution_timeout`, `chain_execution_timeout`, or `sla`
-    /// (issue #1163) is a `std::time::Duration` that cannot convert to a
-    /// `chrono::Duration`.
-    ///
-    /// Every start path resolves these fields via
-    /// `chrono::Duration::from_std(d).ok()`; on overflow that silently
-    /// discards the declared value rather than erroring, so the hard
-    /// runaway cap (or chain cap, or SLA budget) simply never applies —
-    /// with no error and no log line. `task_duration` accepts up to 20
-    /// digits with checked `u64` arithmetic, so a value past what
-    /// `chrono::Duration` can represent is reachable through the macro, e.g.
-    /// `#[workflow(execution_timeout = "999999999999d")]`. Caught once
-    /// here, at build time, so every start path (including the #617 chain
-    /// cap and the #743 DAG shadow `WorkflowInfo`) benefits uniformly
-    /// instead of each silently accepting a declaration it can never honor.
-    #[error(
-        "workflow '{workflow}' field '{field}' is {actual:?}, which cannot be represented as a \
-         chrono::Duration (ceiling: {ceiling:?}); lower the declared value"
-    )]
-    UnrepresentableWorkflowDuration {
-        /// The workflow name.
-        workflow: String,
-        /// Which field was unrepresentable: `"execution_timeout"`,
-        /// `"chain_execution_timeout"`, or `"sla"`.
-        field: &'static str,
-        /// The declared value that failed to convert.
-        actual: Duration,
-        /// The largest `std::time::Duration` representable as a
-        /// `chrono::Duration` (derived from `chrono::Duration::MAX`).
-        ceiling: Duration,
-    },
-
     /// A [`WorkerConfig`] field has an invalid value.
     #[error("invalid worker configuration: {0}")]
     InvalidWorkerConfig(String),
@@ -855,23 +704,14 @@ pub enum HarvestBuilderError {
         key: String,
     },
 
-    /// A static `rate_limit_key` begins with a reserved bucket-namespace prefix
-    /// — `dyn-rate:` (issue #699) or `start-throttle:` (issue #607).
-    ///
-    /// Those prefixes namespace the *caller-keyed* bucket families: per-key
-    /// dynamic rate limits and workflow-start throttles. A static key beginning
-    /// with one could collide with a generated bucket, so it is rejected to
-    /// keep the static and generated namespaces provably disjoint.
-    ///
-    /// Since issue #1127 this is load-bearing beyond collision avoidance: the
-    /// idle-bucket GC collects exactly those two namespaces, on the guarantee
-    /// that both re-register in the same transaction as the work that needs
-    /// them. A *static* key inside one would be collected and then re-registered
-    /// only at the next worker startup, leaving every task enqueued in between
-    /// stalled behind the fail-closed claim gate.
+    /// A static `rate_limit_key` begins with the reserved `dyn-rate:` prefix
+    /// (issue #699). That prefix namespaces per-key/dynamic rate-limit buckets;
+    /// a static key beginning with it could collide with a generated dynamic
+    /// bucket, so it is rejected to keep the static and dynamic bucket
+    /// namespaces provably disjoint.
     #[error(
         "activity '{activity}' sets rate_limit_key = \"{key}\", which begins with the reserved \
-         `{prefix}` prefix (reserved for caller-keyed rate-limit/throttle buckets); \
+         `dyn-rate:` prefix (reserved for per-key/dynamic rate-limit buckets); \
          choose a different rate_limit_key"
     )]
     RateLimitKeyReservedPrefix {
@@ -879,8 +719,6 @@ pub enum HarvestBuilderError {
         activity: String,
         /// The offending static key.
         key: String,
-        /// The reserved prefix it squats.
-        prefix: &'static str,
     },
 
     /// A local activity declares a dynamic per-key rate limit
@@ -992,67 +830,10 @@ pub enum HarvestBuilderError {
     /// [`crate::completion_callback::SsrfPolicy`] host allowlist.
     #[error("completion-callback default target '{url}' rejected: {rejection}")]
     CallbackTargetRejected {
-        /// The rejected target URL, **redacted to its origin**
-        /// (`https://host/<redacted>`) by
-        /// [`crate::completion_callback::CompletionCallbackBuilderConfig::validate_default_targets`]
-        /// (issue #1274).
-        ///
-        /// A startup failure's `Display` goes straight to the logs. A
-        /// completion-callback target often carries a bearer token in the
-        /// path or query, the same way a SIEM ingest URL does (issue #953).
-        /// Every `SsrfRejection` variant discriminates on an origin
-        /// property, so the origin explains the rejection, and the redacted
-        /// remainder is exactly the secret.
+        /// The rejected target URL.
         url: String,
         /// The machine-readable SSRF rejection reason.
         rejection: crate::completion_callback::SsrfRejection,
-    },
-
-    /// An `audit_export_webhook(...)` sink URL failed SSRF validation against
-    /// the configured audit-export host allowlist (issue #953).
-    ///
-    /// Fails the build rather than warning: an audit export that silently
-    /// never delivers is a compliance gap that surfaces only at audit time.
-    #[error("audit-export sink URL '{url}' rejected: {rejection}")]
-    AuditSinkRejected {
-        /// The rejected sink URL, **redacted to its origin**
-        /// (`https://host/<redacted>`) by
-        /// [`crate::audit_export::AuditExportBuilderConfig::validate_webhook_url`].
-        ///
-        /// A startup failure's `Display` goes straight to the logs, and a SIEM
-        /// ingest URL carries its credential in the path or query. Every
-        /// `SsrfRejection` variant discriminates on an origin property, so the
-        /// origin is what explains the rejection and the redacted remainder is
-        /// exactly the secret.
-        url: String,
-        /// The machine-readable SSRF rejection reason.
-        rejection: crate::completion_callback::SsrfRejection,
-    },
-
-    /// `audit_export_webhook(...)` was configured without
-    /// `audit_export_secret(...)` (issue #953).
-    ///
-    /// Fails the build rather than warning: HMAC-SHA256 accepts a zero-length
-    /// key and produces a well-formed, trivially reproducible signature, so an
-    /// unconfigured secret does not yield a *missing* `X-Harvest-Signature` —
-    /// it yields one any third party can forge, which is worse than none for a
-    /// receiver that verifies it. The signature is the tamper-evidence control
-    /// this feature exists to provide.
-    #[error(
-        "audit_export_webhook(...) requires audit_export_secret(...): batches would \
-         otherwise be signed with an empty HMAC key, which any third party can \
-         reproduce, defeating the X-Harvest-Signature tamper-evidence guarantee"
-    )]
-    AuditSinkSecretMissing,
-
-    /// An audit-chain key or accepted key is shorter than
-    /// [`crate::audit_chain::MIN_CHAIN_KEY_BYTES`] (issue #1838).
-    #[error("an audit chain key is {len} bytes; the chain needs at least {min} bytes")]
-    AuditChainKeyTooShort {
-        /// The configured key length.
-        len: usize,
-        /// The minimum key length.
-        min: usize,
     },
 
     /// A native `#[activity]` registration shares its name with a WASM activity
@@ -1070,26 +851,6 @@ pub enum HarvestBuilderError {
         /// The name registered as both native and WASM.
         activity: String,
     },
-
-    /// A trusted WASM publisher key is not a valid Ed25519 public key
-    /// (issue #1838).
-    #[cfg(feature = "wasm-activities")]
-    #[error("trusted wasm publisher key {index} is not a valid ed25519 public key")]
-    WasmTrustedKeyInvalid {
-        /// Position of the key, in the order the builder received it.
-        index: usize,
-    },
-
-    /// A trusted publisher key is set, and a registered WASM module has no
-    /// valid signature from it (issue #1838).
-    #[cfg(feature = "wasm-activities")]
-    #[error("wasm activity '{activity}' has no trusted publisher signature: {reason}")]
-    WasmModuleSignatureRejected {
-        /// The activity whose module was refused.
-        activity: String,
-        /// Why the signature was refused.
-        reason: String,
-    },
 }
 
 impl BuiltHarvest {
@@ -1104,21 +865,12 @@ impl BuiltHarvest {
         &self.payload_codecs
     }
 
-    /// The `(activity_name, module_bytes, signature)` WASM module registrations
-    /// to publish at worker startup (issue #965). Empty when no WASM activity is
-    /// registered.
+    /// The `(activity_name, module_bytes)` WASM module registrations to publish
+    /// at worker startup (issue #965). Empty when no WASM activity is registered.
     #[cfg(feature = "wasm-activities")]
     #[must_use]
-    pub fn wasm_module_registrations(&self) -> &[(String, Vec<u8>, Option<String>)] {
+    pub fn wasm_module_registrations(&self) -> &[(String, Vec<u8>)] {
         &self.wasm_module_registrations
-    }
-
-    /// The shared WASM module store, if a WASM activity is registered
-    /// (issue #965).
-    #[cfg(feature = "wasm-activities")]
-    #[must_use]
-    pub const fn wasm_store(&self) -> Option<&Arc<crate::wasm_activities::WasmModuleStore>> {
-        self.wasm_store.as_ref()
     }
 
     /// The configured large-payload offloader, if a [`PayloadStore`] is
@@ -1291,34 +1043,6 @@ impl BuiltHarvest {
         &self.completion_callback_config
     }
 
-    /// Resolved builder-wide audit-export configuration (issue #953).
-    #[must_use]
-    pub const fn audit_export_config(&self) -> &crate::audit_export::AuditExportBuilderConfig {
-        &self.audit_export_config
-    }
-
-    /// Suppress the process-global audit-export install that
-    /// [`Self::into_worker_parts`] and [`Self::into_worker_parts_with_extra_state`]
-    /// otherwise perform (issue #953, Codex review round 5 P1).
-    ///
-    /// For a caller that publishes the config itself **after** its whole build
-    /// has succeeded — the plugin runner does exactly this. The conversion
-    /// happens partway through a still-fallible build, and a runtime already
-    /// running in this process has a live scanner that can tick inside that
-    /// window: it would ship audit records to a sink that never came into
-    /// service, or (for a webhook-only build, where the direct-worker path
-    /// installs `None`) stop exporting during it. Repairing the global
-    /// afterwards cannot un-send those records, so the write is suppressed
-    /// rather than compensated.
-    ///
-    /// A caller that sets this **must** install the config itself, or audit
-    /// export silently never starts.
-    #[must_use]
-    pub const fn deferring_audit_export_install(mut self) -> Self {
-        self.defer_audit_export_install = true;
-        self
-    }
-
     /// Override the audit log retention window after the build step.
     ///
     /// Use this to apply a runtime-configured value (e.g. from `HarvestApiState`)
@@ -1328,17 +1052,6 @@ impl BuiltHarvest {
     }
 
     /// Convert the built harvest registration into worker-ready parts.
-    ///
-    /// Clone-class note: the three `install_global_*_for_direct_worker` and
-    /// `set_purge_window_secs` calls, and the registry-builder chain below,
-    /// repeat verbatim in [`Self::into_worker_parts_with_extra_state`].
-    /// Apply any change to either block to both functions.
-    ///
-    /// Two instances only. Three separate features (issue #605, issue
-    /// #808, issue #953) each added one new install call here. Each
-    /// landed in both copies in the same change. No copy has ever shipped
-    /// the call alone. The merge bar (rule of three, or a missed-fix) is
-    /// not met yet, so the duplication stays.
     #[cfg(feature = "db")]
     #[must_use]
     pub fn into_worker_parts(
@@ -1357,17 +1070,6 @@ impl BuiltHarvest {
         crate::completion_callback::install_global_callback_config_for_direct_worker(
             &self.completion_callback_config,
         );
-        // Same reasoning for audit export (issue #953): a direct core embedder
-        // never routes through the plugin runner, so without this an
-        // `audit_export_sink(...)` registration would silently never deliver.
-        // Only an embedder-supplied sink can be installed here — core ships no
-        // HTTP client, so `audit_export_webhook(...)` alone has nothing to
-        // deliver with on this path and is reported rather than ignored.
-        if !self.defer_audit_export_install {
-            crate::audit_export::install_global_audit_export_config_for_direct_worker(
-                &self.audit_export_config,
-            );
-        }
         // issue #808 review (Codex P2): the start-idempotency expiry sweep
         // (`enforce_timeouts_once` -> `sweep_expired_start_idempotency`) reads
         // its retention window from a process-global static, mirroring the
@@ -1419,15 +1121,12 @@ impl BuiltHarvest {
                 .map(|d| d.name.to_string()),
         )
         .with_payload_offloader(self.payload_offloader.clone())
-        .with_payload_codecs(self.payload_codecs.clone())
         .with_activity_interceptors(self.activity_interceptors.clone())
         .with_activity_defaults(
             self.worker_config.default_activity_retry_policy.clone(),
             self.worker_config.default_activity_start_to_close,
         )
-        .with_retry_after_ceiling(self.worker_config.retry_after_ceiling)
-        .with_retry_budget(self.worker_config.retry_budget.clone())
-        .with_adaptive_limit(self.worker_config.adaptive_limit.clone());
+        .with_retry_after_ceiling(self.worker_config.retry_after_ceiling);
         #[cfg(feature = "wasm-activities")]
         if let Some(store) = self.wasm_store {
             registry = registry.with_wasm_activities(
@@ -1446,12 +1145,6 @@ impl BuiltHarvest {
 
     /// Convert the built harvest registration into worker-ready parts while
     /// injecting additional typed runtime state.
-    ///
-    /// Clone-class note: the three `install_global_*_for_direct_worker` and
-    /// `set_purge_window_secs` calls, and the registry-builder chain below,
-    /// repeat verbatim in [`Self::into_worker_parts`]. Apply any change to
-    /// either block to both functions. Two instances only, so the merge
-    /// bar is not met yet. See the note on `into_worker_parts`.
     #[cfg(feature = "db")]
     #[must_use]
     pub fn into_worker_parts_with_extra_state(
@@ -1470,17 +1163,6 @@ impl BuiltHarvest {
         crate::completion_callback::install_global_callback_config_for_direct_worker(
             &self.completion_callback_config,
         );
-        // Same reasoning for audit export (issue #953): a direct core embedder
-        // never routes through the plugin runner, so without this an
-        // `audit_export_sink(...)` registration would silently never deliver.
-        // Only an embedder-supplied sink can be installed here — core ships no
-        // HTTP client, so `audit_export_webhook(...)` alone has nothing to
-        // deliver with on this path and is reported rather than ignored.
-        if !self.defer_audit_export_install {
-            crate::audit_export::install_global_audit_export_config_for_direct_worker(
-                &self.audit_export_config,
-            );
-        }
         crate::start_idempotency::set_purge_window_secs(self.start_idempotency_window);
         self.state.extend(extra_state);
         #[cfg_attr(not(feature = "wasm-activities"), allow(unused_mut))]
@@ -1521,15 +1203,12 @@ impl BuiltHarvest {
                 .map(|d| d.name.to_string()),
         )
         .with_payload_offloader(self.payload_offloader.clone())
-        .with_payload_codecs(self.payload_codecs.clone())
         .with_activity_interceptors(self.activity_interceptors.clone())
         .with_activity_defaults(
             self.worker_config.default_activity_retry_policy.clone(),
             self.worker_config.default_activity_start_to_close,
         )
-        .with_retry_after_ceiling(self.worker_config.retry_after_ceiling)
-        .with_retry_budget(self.worker_config.retry_budget.clone())
-        .with_adaptive_limit(self.worker_config.adaptive_limit.clone());
+        .with_retry_after_ceiling(self.worker_config.retry_after_ceiling);
         #[cfg(feature = "wasm-activities")]
         if let Some(store) = self.wasm_store {
             registry = registry.with_wasm_activities(
@@ -1843,75 +1522,6 @@ impl HarvestBuilder {
         self
     }
 
-    /// Register a **keyed** payload codec under `key_id` for key rotation
-    /// (issue #948).
-    ///
-    /// Unlike [`HarvestBuilder::payload_codec`], which installs one default
-    /// codec, this builds a registry of codecs distinguished by *key material*:
-    /// during a rotation two codecs share a `codec_id` (`"aes-gcm"`) and differ
-    /// only in the key they hold, so `codec_id` cannot tell them apart and the
-    /// stored envelope carries a `kid` instead.
-    ///
-    /// The **first** key registered becomes the active key (the one new writes
-    /// are encoded under); rotate with
-    /// [`HarvestBuilder::active_payload_codec_key`].
-    ///
-    /// Registering your pre-rotation codec under
-    /// [`CODEC_LEGACY_KEY_ID`](crate::payload_codec::CODEC_LEGACY_KEY_ID) is
-    /// what lets already-stored, `kid`-less history keep decoding.
-    ///
-    /// # Panics
-    ///
-    /// Panics when `key_id` is empty, longer than
-    /// [`MAX_CODEC_KEY_ID_BYTES`](crate::payload_codec::MAX_CODEC_KEY_ID_BYTES),
-    /// or contains anything outside ASCII alphanumerics and `-_.:`. A codec key
-    /// id is a compile-time-constant deployment decision, not runtime input, so
-    /// a malformed one is a configuration bug that must not boot.
-    #[must_use]
-    #[expect(clippy::expect_used, reason = "documented panic on a bad key id")]
-    pub fn payload_codec_key(self, key_id: &str, codec: impl PayloadCodec + 'static) -> Self {
-        self.payload_codecs
-            .register_key(key_id, Arc::new(codec))
-            .expect("invalid payload codec key id");
-        self
-    }
-
-    /// Register an AES-256-GCM [`AeadCodec`](crate::aead_codec::AeadCodec)
-    /// under its own key id (issue #1825).
-    ///
-    /// This is [`HarvestBuilder::payload_codec_key`] with the key id taken
-    /// from the codec. The envelope `kid` and the codec header then agree.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the key id is already registered. A duplicate key id is a
-    /// configuration bug that must not boot.
-    #[must_use]
-    #[expect(clippy::expect_used, reason = "documented panic on a duplicate key id")]
-    pub fn aead_payload_codec_key(self, codec: crate::aead_codec::AeadCodec) -> Self {
-        codec
-            .register_with(&self.payload_codecs)
-            .expect("invalid AEAD payload codec key");
-        self
-    }
-
-    /// Make an already-registered payload-codec key the **active** one — every
-    /// new write encodes under it (issue #948).
-    ///
-    /// # Panics
-    ///
-    /// Panics when `key_id` was not registered with
-    /// [`HarvestBuilder::payload_codec_key`]. Activating a key this process
-    /// cannot encode with must not boot.
-    #[must_use]
-    #[expect(clippy::expect_used, reason = "documented panic on an unknown key id")]
-    pub fn active_payload_codec_key(self, key_id: &str) -> Self {
-        self.payload_codecs
-            .set_active_key(key_id)
-            .expect("unregistered payload codec key id");
-        self
-    }
-
     /// Register an external [`PayloadStore`](crate::payload_store::PayloadStore)
     /// for large-payload offloading via claim-check (issue #524).
     ///
@@ -2029,36 +1639,13 @@ impl HarvestBuilder {
         if let Some(existing) = self
             .wasm_module_registrations
             .iter_mut()
-            .find(|(existing_name, _, _)| *existing_name == registration.name)
+            .find(|(existing_name, _)| *existing_name == registration.name)
         {
             existing.1 = registration.wasm_bytes;
-            existing.2 = registration.signature;
         } else {
-            self.wasm_module_registrations.push((
-                registration.name,
-                registration.wasm_bytes,
-                registration.signature,
-            ));
+            self.wasm_module_registrations
+                .push((registration.name, registration.wasm_bytes));
         }
-        self
-    }
-
-    /// Trust WASM modules signed by this Ed25519 public key (issue #1838).
-    ///
-    /// Call it once per key. With one or more keys, every registered WASM
-    /// module needs a signature from a trusted key, or
-    /// [`try_build`](Self::try_build) fails. The worker also checks the
-    /// signature of each module before it runs it. See
-    /// [`crate::wasm_signing`].
-    ///
-    /// The policy covers WASM activity modules on the store this builder
-    /// creates. A `HandlerRegistry` built by hand needs
-    /// `WasmModuleStore::set_trust_policy` instead. Hot-swap workflow modules
-    /// keep their own HMAC check.
-    #[cfg(feature = "wasm-activities")]
-    #[must_use]
-    pub fn wasm_trusted_publisher_key(mut self, public_key: [u8; 32]) -> Self {
-        self.wasm_trusted_keys.push(public_key);
         self
     }
 
@@ -2144,139 +1731,6 @@ impl HarvestBuilder {
         self
     }
 
-    // ── Audit export to an external sink (issue #953) ────────────────────
-
-    /// Ship every management-API audit record to an operator-run
-    /// signed-webhook endpoint (issue #953).
-    ///
-    /// Enables the exporter. Batches are `POSTed` as JSON lines, HMAC-signed
-    /// with the same `X-Harvest-Signature` scheme as completion callbacks;
-    /// see `docs/audit-export.md` for the receiver contract and the
-    /// OTLP-logs mapping.
-    ///
-    /// The URL is SSRF-validated at [`try_build`](Self::try_build) time
-    /// against the audit-export allowlist — call
-    /// [`audit_export_allowlist`](Self::audit_export_allowlist) first, or
-    /// `try_build` returns [`HarvestBuilderError::AuditSinkRejected`].
-    ///
-    /// The `reqwest` transport lives in `autumn-harvest-plugin`; a direct
-    /// core embedder must supply
-    /// [`audit_export_sink`](Self::audit_export_sink) instead.
-    #[must_use]
-    pub fn audit_export_webhook(mut self, url: impl Into<String>) -> Self {
-        self.audit_export_config.webhook_url = Some(url.into());
-        self
-    }
-
-    /// Supply a custom [`crate::audit_export::AuditSink`] — a Kinesis writer,
-    /// an OTLP-logs bridge, a file appender — instead of the plugin's default
-    /// signed webhook. Takes precedence over
-    /// [`audit_export_webhook`](Self::audit_export_webhook).
-    #[must_use]
-    pub fn audit_export_sink(mut self, sink: impl crate::audit_export::AuditSink) -> Self {
-        self.audit_export_config.sink = Some(Arc::new(sink));
-        self
-    }
-
-    /// Allowlist of hosts an audit-export webhook URL may point at.
-    #[must_use]
-    pub fn audit_export_allowlist(
-        mut self,
-        allowlist: crate::completion_callback::HostAllowlist,
-    ) -> Self {
-        self.audit_export_config.allowlist = allowlist;
-        self
-    }
-
-    /// Permit `http://` audit-export sink URLs (default: HTTPS only).
-    ///
-    /// Audit records name who acted on which tenant; shipping them in
-    /// cleartext is itself a finding, so this is opt-in.
-    #[must_use]
-    pub const fn audit_export_allow_http(mut self, allow: bool) -> Self {
-        self.audit_export_config.allow_http = allow;
-        self
-    }
-
-    /// Permit IP-literal audit-export sink hosts (default: rejected).
-    #[must_use]
-    pub const fn audit_export_allow_ip_literals(mut self, allow: bool) -> Self {
-        self.audit_export_config.allow_ip_literals = allow;
-        self
-    }
-
-    /// HMAC key for the `X-Harvest-Signature` header on exported batches.
-    #[must_use]
-    pub fn audit_export_secret(mut self, secret: impl Into<Vec<u8>>) -> Self {
-        self.audit_export_config.secret =
-            Some(crate::completion_callback::CallbackSecret::new(secret));
-        self
-    }
-
-    /// Turn on the keyed audit hash chain (issue #1838).
-    ///
-    /// The exporter stamps each row it sequences with an HMAC-SHA256 link to
-    /// the row before it. Keep the key outside the database. A key shorter than
-    /// [`crate::audit_chain::MIN_CHAIN_KEY_BYTES`] fails
-    /// [`try_build`](Self::try_build). See `docs/audit-export.md`.
-    #[must_use]
-    pub fn audit_export_chain_key(mut self, key: impl Into<Vec<u8>>) -> Self {
-        self.audit_export_config.chain_key =
-            Some(crate::completion_callback::CallbackSecret::new(key));
-        self
-    }
-
-    /// Accept `key` on a stored audit chain checkpoint (issue #1838).
-    ///
-    /// The exporter extends only a checkpoint that a known key signed. Add the
-    /// old key here during a key rotation. The exporter never signs with it.
-    /// A short key fails [`try_build`](Self::try_build). See
-    /// `docs/audit-export.md`.
-    #[must_use]
-    pub fn audit_export_chain_accept_key(mut self, key: impl Into<Vec<u8>>) -> Self {
-        self.audit_export_config
-            .chain_accept_keys
-            .push(crate::completion_callback::CallbackSecret::new(key));
-        self
-    }
-
-    /// Records per exported batch. Clamped to
-    /// `[1, crate::audit_export::MAX_EXPORT_BATCH_SIZE]`; defaults to
-    /// [`crate::audit_export::DEFAULT_EXPORT_BATCH_SIZE`].
-    #[must_use]
-    pub const fn audit_export_batch_size(mut self, size: i64) -> Self {
-        self.audit_export_config.batch_size = size;
-        self
-    }
-
-    /// Capped exponential backoff applied after a sink failure.
-    ///
-    /// There is deliberately no attempt ceiling: an audit record is a
-    /// compliance artifact and is retried until the sink accepts it.
-    #[must_use]
-    pub const fn audit_export_backoff(
-        mut self,
-        backoff: crate::audit_export::ExportBackoff,
-    ) -> Self {
-        self.audit_export_config.backoff = backoff;
-        self
-    }
-
-    /// How long one exporter holds a shard's cursor while a batch is in
-    /// flight — and the timeout applied to the sink call itself. Defaults to
-    /// [`crate::audit_export::DEFAULT_EXPORT_LEASE`] (60s); floored at 1s.
-    ///
-    /// **Set this above your sink's own per-request timeout.** A sink that
-    /// can outlive its lease would have every attempt superseded by the next
-    /// tick's claim, so the cursor would never advance while the sink received
-    /// the same batch forever. The bundled `ReqwestAuditSink` defaults to a
-    /// 30s request timeout against this 60s lease.
-    #[must_use]
-    pub const fn audit_export_lease(mut self, lease: std::time::Duration) -> Self {
-        self.audit_export_config.lease = lease;
-        self
-    }
-
     /// Override the soft history-size threshold used by
     /// [`crate::context::WorkflowContext::should_continue_as_new`].
     #[must_use]
@@ -2302,45 +1756,10 @@ impl HarvestBuilder {
         self
     }
 
-    /// Override the hard cap on durable history events per run.
-    ///
-    /// Defaults to
-    /// [`DEFAULT_HISTORY_EVENT_HARD_CAP`](crate::context::DEFAULT_HISTORY_EVENT_HARD_CAP)
-    /// (50,000) since issue #1804. A run that reaches the cap fails and moves
-    /// to the DLQ with `HistoryCapExceeded`.
+    /// Configure an opt-in hard cap for workflow history event counts.
     #[must_use]
     pub const fn history_event_hard_cap(mut self, cap: u64) -> Self {
         self.history_policy = self.history_policy.with_event_hard_cap(cap);
-        self
-    }
-
-    /// Remove the history event hard cap (issue #1804).
-    ///
-    /// This also turns off the history-bloat warning, because the warning
-    /// is a fraction of the cap.
-    #[must_use]
-    pub const fn history_event_hard_cap_unlimited(mut self) -> Self {
-        self.history_policy = self.history_policy.without_event_hard_cap();
-        self
-    }
-
-    /// Override the hard cap on stored history bytes per run (issue #1804).
-    ///
-    /// Defaults to
-    /// [`DEFAULT_HISTORY_BYTE_HARD_CAP`](crate::context::DEFAULT_HISTORY_BYTE_HARD_CAP)
-    /// (50 MiB). The worker sums `pg_column_size(event_data)` once per
-    /// decision. A run that reaches the cap fails and moves to the DLQ with
-    /// `HistoryBytesCapExceeded`.
-    #[must_use]
-    pub const fn history_byte_hard_cap(mut self, cap: u64) -> Self {
-        self.history_policy = self.history_policy.with_byte_hard_cap(cap);
-        self
-    }
-
-    /// Remove the stored-history byte cap (issue #1804).
-    #[must_use]
-    pub const fn history_byte_hard_cap_unlimited(mut self) -> Self {
-        self.history_policy = self.history_policy.without_byte_hard_cap();
         self
     }
 
@@ -2348,28 +1767,17 @@ impl HarvestBuilder {
     /// at which the operator early-warning soft threshold fires (issue #704).
     /// Clamped into `[0.0, 1.0]`; `0.0` disables the signal entirely (AC4).
     ///
-    /// The signal is off when the event cap is unlimited. With no cap there
-    /// is nothing to warn about approaching.
+    /// Has no effect unless a hard cap is also configured -- with no hard
+    /// cap there is nothing to warn about approaching.
     ///
     /// Defaults to
     /// [`DEFAULT_HISTORY_BLOAT_WARN_FRACTION`](crate::context::DEFAULT_HISTORY_BLOAT_WARN_FRACTION)
-    /// (`0.2048`, so 10,240 events under the default cap).
+    /// (`0.75`).
     #[must_use]
     pub const fn history_bloat_warn_fraction(mut self, fraction: f64) -> Self {
         self.history_policy = self
             .history_policy
             .with_history_bloat_warn_fraction(fraction);
-        self
-    }
-
-    /// Record a `DecisionCommitted` boundary after each decision (issue #1833).
-    ///
-    /// Off by default. A worker older than this release fails an execution
-    /// whose history holds a boundary. Pass `true` only when no older
-    /// process runs. See `docs/decision-boundaries.md`.
-    #[must_use]
-    pub const fn record_decision_boundaries(mut self, enabled: bool) -> Self {
-        self.history_policy = self.history_policy.with_decision_boundaries(enabled);
         self
     }
 
@@ -2610,30 +2018,6 @@ impl HarvestBuilder {
         self
     }
 
-    /// Turn on automatic load shedding for the queues in `config` (issue #1794).
-    ///
-    /// A queue with an old backlog then refuses new starts with `429` and
-    /// `Retry-After`. See `docs/operations/load-shedding.md`. The default
-    /// config is empty, so no queue sheds and no sampler runs.
-    #[must_use]
-    pub fn load_shed(mut self, config: crate::load_shed::LoadShedConfig) -> Self {
-        self.load_shed = config;
-        self
-    }
-
-    /// Turn on the build ramp guard (issue #1814).
-    ///
-    /// The guard aborts a build ramp when the target build fails or ND-blocks
-    /// more runs than the base build. See
-    /// `docs/operations/build-ramp-guard.md`. The default config is disabled.
-    /// The plugin boot spawns the guard loop. A bare builder only stores the
-    /// config, so call `ramp_guard::run_ramp_guard` without the plugin.
-    #[must_use]
-    pub const fn ramp_guard(mut self, config: crate::ramp_guard::RampGuardConfig) -> Self {
-        self.ramp_guard = config;
-        self
-    }
-
     /// Number of registered workflows (used in tests and diagnostics).
     #[must_use]
     pub const fn workflow_count(&self) -> usize {
@@ -2665,10 +2049,6 @@ impl HarvestBuilder {
     /// Panics when retention settings are invalid. Prefer [`Self::try_build`]
     /// if you want startup errors instead.
     #[must_use]
-    #[expect(
-        clippy::expect_used,
-        reason = "documented panic: `try_build` returns the error"
-    )]
     pub fn build(self) -> BuiltHarvest {
         self.try_build()
             .expect("HarvestBuilder::build failed validation")
@@ -2707,7 +2087,6 @@ impl HarvestBuilder {
         validate_concurrency_keys(&self.activities)?;
         validate_workflow_concurrency_limits(&self.workflows)?;
         validate_workflow_throttle_policies(&self.workflows)?;
-        validate_workflow_duration_fields(&self.workflows)?;
         validate_dag_workflow_name_collisions(
             &self.workflows,
             &self.auto_registered_dag_workflows,
@@ -2726,7 +2105,6 @@ impl HarvestBuilder {
             &self.activities,
             self.worker_config.max_local_activity_start_to_close,
         )?;
-        validate_dag_definitions_compile(&self.dags)?;
         validate_dags_do_not_use_local_activities(&self.dags, &self.activities)?;
         validate_classic_dags_have_no_signal_gates(&self.dags)?;
         validate_classic_dags_have_no_compensators(&self.dags)?;
@@ -2734,35 +2112,9 @@ impl HarvestBuilder {
         validate_activity_rate_limits(&self.activities)?;
         #[cfg(feature = "wasm-activities")]
         validate_wasm_activity_name_collisions(&self.wasm_bindings, &self.activities)?;
-        #[cfg(feature = "wasm-activities")]
-        install_wasm_trust_policy(
-            &self.wasm_trusted_keys,
-            &self.wasm_module_registrations,
-            self.wasm_store.as_deref(),
-        )?;
         if let Err((url, rejection)) = self.completion_callback_config.validate_default_targets() {
             return Err(HarvestBuilderError::CallbackTargetRejected { url, rejection });
         }
-        if let Err((url, rejection)) = self.audit_export_config.validate_webhook_url() {
-            return Err(HarvestBuilderError::AuditSinkRejected { url, rejection });
-        }
-        if self.audit_export_config.webhook_is_missing_a_secret() {
-            return Err(HarvestBuilderError::AuditSinkSecretMissing);
-        }
-        if let Some(key) = self
-            .audit_export_config
-            .chain_key
-            .iter()
-            .chain(&self.audit_export_config.chain_accept_keys)
-            .find(|key| key.as_bytes().len() < crate::audit_chain::MIN_CHAIN_KEY_BYTES)
-        {
-            return Err(HarvestBuilderError::AuditChainKeyTooShort {
-                len: key.as_bytes().len(),
-                min: crate::audit_chain::MIN_CHAIN_KEY_BYTES,
-            });
-        }
-
-        warn_if_history_cap_preempts_continue_as_new(self.history_policy);
 
         if let Some(ceiling) = self.max_workflow_history_events {
             let threshold = self.history_policy.continue_as_new_threshold();
@@ -2773,19 +2125,6 @@ impl HarvestBuilder {
                 });
             }
         }
-
-        // Issue #1808: warn about each activity type that has no timeout.
-        // A WASM guest has a runtime wall-clock ceiling. Skip WASM activity types.
-        let unbounded = activities_without_timeout(&self.activities);
-        #[cfg(feature = "wasm-activities")]
-        let unbounded: Vec<&str> = unbounded
-            .into_iter()
-            .filter(|name| !self.wasm_bindings.contains_key(*name))
-            .collect();
-        warn_on_activities_without_timeout(
-            &unbounded,
-            self.worker_config.default_activity_start_to_close,
-        );
 
         let mut worker_config = self.worker_config;
         let max_workflow_start_delay = self
@@ -2814,7 +2153,6 @@ impl HarvestBuilder {
             ))
         });
         Ok(BuiltHarvest {
-            defer_audit_export_install: false,
             workflows: self.workflows,
             activities: self.activities,
             dags: self.dags,
@@ -2843,14 +2181,11 @@ impl HarvestBuilder {
             max_workflow_start_delay,
             unknown_target_grace_window,
             batch_start_config: self.batch_start_config,
-            load_shed: self.load_shed,
-            ramp_guard: self.ramp_guard,
             completion_triggers: self.completion_triggers,
             max_workflow_attempts: self.max_workflow_attempts,
             usage_window_ceiling,
             usage_max_groups,
             completion_callback_config: self.completion_callback_config,
-            audit_export_config: self.audit_export_config,
             start_idempotency_window: self
                 .start_idempotency_window
                 .unwrap_or(crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW),
@@ -2862,22 +2197,6 @@ impl HarvestBuilder {
             wasm_module_registrations: self.wasm_module_registrations,
         })
     }
-}
-
-/// Reject a registered DAG whose definition does not compile.
-///
-/// The DAG validators below skip a definition that fails to build. This check
-/// runs first, so no invalid definition passes `try_build` unreported.
-fn validate_dag_definitions_compile(dags: &[DagInfo]) -> Result<(), HarvestBuilderError> {
-    for dag in dags {
-        if let Err(error) = dag.build_definition() {
-            return Err(HarvestBuilderError::InvalidDagDefinition {
-                dag: dag.name.to_string(),
-                error: error.to_string(),
-            });
-        }
-    }
-    Ok(())
 }
 
 fn validate_dags_do_not_use_local_activities(
@@ -3106,53 +2425,6 @@ fn warn_if_heartbeat_outruns_fleet_liveness(interval: Duration) -> bool {
     true
 }
 
-/// Name each regular activity type that declares no attempt bound (issue #1808).
-///
-/// These are the types that the default `start_to_close` governs. See
-/// [`ActivityInfo::declares_attempt_bound`]. The local cap always bounds a
-/// local activity. The registry keeps the last registration of a name, so
-/// this function does too.
-fn activities_without_timeout(activities: &[ActivityInfo]) -> Vec<&'static str> {
-    let mut last: Vec<&ActivityInfo> = Vec::new();
-    for activity in activities {
-        last.retain(|seen| seen.name != activity.name);
-        last.push(activity);
-    }
-    last.into_iter()
-        .filter(|a| !a.is_local && !a.declares_attempt_bound())
-        .map(|a| a.name)
-        .collect()
-}
-
-/// Log one startup warning that names activity types with no bound (issue #1808).
-///
-/// With a default timeout, the default stops each attempt of these types. With
-/// no default, an attempt can run forever and hold a worker slot. The warning
-/// never blocks the build.
-fn warn_on_activities_without_timeout(names: &[&str], default_start_to_close: Option<Duration>) {
-    if names.is_empty() {
-        return;
-    }
-    let activity_types = names.join(", ");
-    if let Some(default) = default_start_to_close {
-        tracing::warn!(
-            activity_types = %activity_types,
-            default_activity_start_to_close = ?default,
-            "harvest: these activity types declare no start_to_close, schedule_to_close or \
-             heartbeat_timeout (issue #1808). The default activity start_to_close fails each \
-             attempt that runs longer. Set #[activity(start_to_close = \"...\")] on each type."
-        );
-    } else {
-        tracing::warn!(
-            activity_types = %activity_types,
-            "harvest: these activity types declare no start_to_close, schedule_to_close or \
-             heartbeat_timeout (issue #1808). The default activity start_to_close is off, so an \
-             attempt can run forever and hold a worker slot. Set \
-             #[activity(start_to_close = \"...\")] on each type."
-        );
-    }
-}
-
 /// Validates that every per-workflow-type retention override (issue #737)
 /// names a registered workflow type — either an explicitly registered
 /// `#[workflow]` or an auto-registered DAG workflow. Catches typos at build
@@ -3222,20 +2494,29 @@ fn validate_workflow_schedules(
                 workflow_name: schedule.workflow_name.clone(),
             });
         }
-        // Validate timezone names early so operators get a typed error rather
-        // than a silent bad-timezone panic at first scheduler tick.
-        if let crate::policy::Schedule::CronInTimezone { tz, .. } = &schedule.schedule
-            && tz.parse::<chrono_tz::Tz>().is_err()
-        {
-            return Err(HarvestBuilderError::UnknownTimezone { name: tz.clone() });
-        }
-        // Reject a bad cron expression, a zero interval and a fractional interval
-        // (issue #1967).
-        if let Err(reason) = crate::policy::validate_schedule(&schedule.schedule) {
-            return Err(HarvestBuilderError::InvalidWorkflowSchedule {
-                workflow_name: schedule.workflow_name.clone(),
-                reason,
-            });
+        // Reject zero-length intervals (would cause infinite loops in due_run_plan
+        // with catchup=true) and invalid cron expressions (would silently never fire).
+        if let crate::policy::Schedule::Interval(dur) = &schedule.schedule {
+            if dur.is_zero() {
+                return Err(HarvestBuilderError::InvalidWorkflowSchedule {
+                    workflow_name: schedule.workflow_name.clone(),
+                    reason: "interval must be at least 1 second".to_string(),
+                });
+            }
+        } else {
+            // Validate timezone names early so operators get a typed error rather
+            // than a silent bad-timezone panic at first scheduler tick.
+            if let crate::policy::Schedule::CronInTimezone { tz, .. } = &schedule.schedule
+                && tz.parse::<chrono_tz::Tz>().is_err()
+            {
+                return Err(HarvestBuilderError::UnknownTimezone { name: tz.clone() });
+            }
+            if let Err(reason) = crate::policy::validate_schedule(&schedule.schedule) {
+                return Err(HarvestBuilderError::InvalidWorkflowSchedule {
+                    workflow_name: schedule.workflow_name.clone(),
+                    reason,
+                });
+            }
         }
         if let Err(reason) = crate::policy::validate_jitter(&schedule.schedule, schedule.jitter) {
             return Err(HarvestBuilderError::InvalidWorkflowSchedule {
@@ -3366,14 +2647,6 @@ fn check_rate_limit_positive(
 }
 
 /// Verify that rate limiting attributes on activities are consistent and valid.
-/// Bucket-key namespaces reserved against a static `rate_limit_key`.
-///
-/// Mirrors `crate::queue::UNBOUNDED_RATE_LIMIT_KEY_PREFIXES` — the `queue`
-/// module is `db`-gated while this validation runs in every build, so the two
-/// are kept in step by `reserved_prefixes_match_the_collectable_families` in
-/// `queue.rs` rather than by a shared constant.
-pub(crate) const RESERVED_RATE_LIMIT_KEY_PREFIXES: [&str; 2] = ["dyn-rate:", "start-throttle:"];
-
 /// Validate every activity's rate-limit configuration (issue #699).
 ///
 /// This is the single, comprehensive rate-limit gate. It is called from
@@ -3482,6 +2755,27 @@ pub(crate) fn validate_activity_rate_limits<'a>(
             continue;
         }
 
+        // A static `rate_limit_key` must not squat the `dyn-rate:` namespace
+        // reserved for per-key/dynamic buckets (issue #699). Both static and
+        // dynamic keys register `ON CONFLICT DO NOTHING` against the shared
+        // `harvest_rate_limit_buckets` table, so a static key colliding with a
+        // generated `dyn-rate:{expr}:{tenant}` string would race
+        // first-writer-wins on the bucket's rate/burst. Reject it up front.
+        // (The `start-throttle:` prefix from #607 is a separate pre-existing
+        // namespace; this validation reserves `dyn-rate:` — the one this PR
+        // generates — and leaves `start-throttle:` as a follow-up.)
+        // The literal mirrors `crate::queue::DYNAMIC_RATE_PREFIX` (the `queue`
+        // module is `db`-gated, but this validation runs in every build) and the
+        // macro's own compile-time reject in `autumn-harvest-macros`.
+        if let Some(key) = activity.rate_limit_key
+            && key.starts_with("dyn-rate:")
+        {
+            return Err(HarvestBuilderError::RateLimitKeyReservedPrefix {
+                activity: activity.name.to_string(),
+                key: key.to_string(),
+            });
+        }
+
         // rate_limit_key without rate_limit_rps silently bypasses or breaks — reject it.
         if let (Some(key), None) = (activity.rate_limit_key, activity.rate_limit_rps) {
             return Err(HarvestBuilderError::RateLimitKeyWithoutCap {
@@ -3504,49 +2798,6 @@ pub(crate) fn validate_activity_rate_limits<'a>(
 
         let effective_burst = activity.rate_limit_burst.unwrap_or(rps);
         let effective_key: &str = activity.rate_limit_key.unwrap_or(activity.name);
-
-        // A static bucket key must not squat either caller-keyed namespace:
-        // `dyn-rate:` (per-key/dynamic buckets, issue #699) or
-        // `start-throttle:` (workflow-start throttles, issue #607). Both static
-        // and generated keys register `ON CONFLICT DO NOTHING` against the
-        // shared `harvest_rate_limit_buckets` table, so a static key colliding
-        // with a generated string would race first-writer-wins on the bucket's
-        // rate/burst.
-        //
-        // Checked on the EFFECTIVE key, not on `rate_limit_key` alone (issue
-        // #1127, Codex review round 1 P2): the static bucket a worker registers
-        // falls back to the activity NAME when no key is given, so a hand-built
-        // `ActivityInfo` named `start-throttle:reports` would otherwise pass
-        // validation and register a squatting bucket. (The `#[activity]` macro
-        // cannot produce such a name — a Rust identifier holds neither `-` nor
-        // `:` — so this reaches only a directly-constructed `ActivityInfo`.)
-        //
-        // Scoped to activities that actually declare a limit, since that is
-        // exactly when a bucket is registered; an activity merely NAMED like
-        // one, with no rate limit, registers nothing and is left alone.
-        //
-        // `start-throttle:` was left as a follow-up when #699 reserved
-        // `dyn-rate:`, because a squat was then merely a namespace nit. Issue
-        // #1127 made it a stranding bug: the idle-bucket GC collects exactly
-        // these two namespaces, on the guarantee that everything in them
-        // re-registers in the same transaction as the work that needs it — true
-        // for a generated key, false for a static one, which is re-registered
-        // only at worker startup. So the follow-up is done here.
-        //
-        // The literals mirror `crate::queue::UNBOUNDED_RATE_LIMIT_KEY_PREFIXES`
-        // (the `queue` module is `db`-gated, but this validation runs in every
-        // build) and the macro's own compile-time reject in
-        // `autumn-harvest-macros`.
-        if let Some(prefix) = RESERVED_RATE_LIMIT_KEY_PREFIXES
-            .into_iter()
-            .find(|prefix| effective_key.starts_with(prefix))
-        {
-            return Err(HarvestBuilderError::RateLimitKeyReservedPrefix {
-                activity: activity.name.to_string(),
-                key: effective_key.to_string(),
-                prefix,
-            });
-        }
         let entry = seen
             .entry(effective_key)
             .or_insert_with(|| RateLimitKeyEntry {
@@ -3605,34 +2856,6 @@ fn validate_wasm_activity_name_collisions(
     Ok(())
 }
 
-/// Build the WASM trust policy, check every registered module against it,
-/// and install it on the shared store (issue #1838).
-#[cfg(feature = "wasm-activities")]
-fn install_wasm_trust_policy(
-    keys: &[[u8; 32]],
-    registrations: &[(String, Vec<u8>, Option<String>)],
-    store: Option<&crate::wasm_activities::WasmModuleStore>,
-) -> Result<(), HarvestBuilderError> {
-    if keys.is_empty() {
-        return Ok(());
-    }
-    let policy = crate::wasm_signing::WasmTrustPolicy::from_public_keys(keys)
-        .map_err(|e| HarvestBuilderError::WasmTrustedKeyInvalid { index: e.index })?;
-    for (name, bytes, signature) in registrations {
-        let hash = crate::wasm_activities::WasmModuleStore::compute_hash(bytes);
-        policy
-            .verify(name, &hash, signature.as_deref())
-            .map_err(|e| HarvestBuilderError::WasmModuleSignatureRejected {
-                activity: name.clone(),
-                reason: e.to_string(),
-            })?;
-    }
-    if let Some(store) = store {
-        store.set_trust_policy(Some(policy));
-    }
-    Ok(())
-}
-
 /// Reject local activities whose `default_start_to_close` exceeds the worker
 /// cap. Failing early gives operators a clear error instead of a runtime surprise.
 fn validate_local_activity_timeouts(
@@ -3643,10 +2866,10 @@ fn validate_local_activity_timeouts(
         if !activity.is_local {
             continue;
         }
-        if let Some(actual) = activity.default_start_to_close.filter(|stc| *stc > cap) {
+        if activity.default_start_to_close.is_some_and(|stc| stc > cap) {
             return Err(HarvestBuilderError::LocalActivityStartToCloseExceedsCap {
                 activity: activity.name.to_string(),
-                actual,
+                actual: activity.default_start_to_close.unwrap(),
                 cap,
             });
         }
@@ -3716,60 +2939,14 @@ fn validate_workflow_throttle_policies(
     Ok(())
 }
 
-/// Reject a workflow whose `execution_timeout`, `chain_execution_timeout`,
-/// or `sla` cannot convert to `chrono::Duration` (issue #1163).
-///
-/// Every start path resolves these fields via
-/// `chrono::Duration::from_std(d).ok()`, which silently maps an
-/// out-of-range `Duration` to `None` — indistinguishable from "no timeout
-/// declared". `task_duration` accepts up to 20 digits with checked `u64`
-/// arithmetic, so a declaration like
-/// `#[workflow(execution_timeout = "999999999999d")]` parses fine but is
-/// well past chrono's representable range, silently dropping the intended
-/// hard runaway cap. Validated once here, at build time, against every
-/// registered [`WorkflowInfo`] — including the #743 DAG shadow
-/// `WorkflowInfo` produced by `DagInfo::as_workflow_info` and pushed into
-/// `self.workflows` by [`HarvestBuilder::dags`] before `try_build` runs —
-/// so every start path benefits uniformly rather than each accepting a
-/// declaration it can never honor.
-fn validate_workflow_duration_fields(
-    workflows: &[crate::info::WorkflowInfo],
-) -> Result<(), HarvestBuilderError> {
-    // chrono::Duration::MAX is positive, so `to_std()` cannot fail; the
-    // `unwrap_or` fallback only guards against a future chrono change we
-    // cannot foresee, never observed in practice.
-    let ceiling = chrono::Duration::MAX.to_std().unwrap_or(Duration::MAX);
-    for wf in workflows {
-        let fields: [(&'static str, Option<Duration>); 3] = [
-            ("execution_timeout", wf.execution_timeout),
-            ("chain_execution_timeout", wf.chain_execution_timeout),
-            ("sla", wf.sla),
-        ];
-        for (field, value) in fields {
-            if let Some(actual) = value
-                && chrono::Duration::from_std(actual).is_err()
-            {
-                return Err(HarvestBuilderError::UnrepresentableWorkflowDuration {
-                    workflow: wf.name.to_string(),
-                    field,
-                    actual,
-                    ceiling,
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Configuration for sticky cross-worker routing (issue #235).
 ///
 /// Sticky routing keeps follow-up tasks for a workflow execution on the worker
 /// that already has that execution's event history in its in-process LRU cache,
 /// reducing cold event-history reloads from Postgres.
 ///
-/// Sticky routing is **on by default** with a [`DEFAULT_STICKY_TIMEOUT`]
-/// window (issue #1798). Change the window with
-/// [`WorkerConfig::with_sticky_routing`]. A zero `lease_ttl` disables it.
+/// Sticky routing is **off by default**. Enable it via
+/// [`WorkerConfig::with_sticky_routing`].
 ///
 /// ## Trade-offs
 ///
@@ -3779,8 +2956,8 @@ fn validate_workflow_duration_fields(
 /// | Failover latency | Fast (expired window → any eligible worker claims) | Slower |
 /// | Load distribution | Better (sticky windows expire quickly) | Skewed toward hot workers |
 ///
-/// Keep `lease_ttl` short. After a crash, each pinned execution waits up to
-/// one window. See `docs/sticky-routing.md` for the full operator guide.
+/// A 5–30 second `lease_ttl` is a reasonable starting point for most
+/// deployments. See `docs/sticky-routing.md` for the full operator guide.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StickyRoutingConfig {
     /// How long to prefer the owning worker for follow-up tasks after a
@@ -3828,36 +3005,17 @@ pub struct WorkerConfig {
     pub max_concurrent_workflows: usize,
     /// Maximum concurrent activity executions on this worker.
     pub max_concurrent_activities: usize,
-    /// The drain budget on shutdown or on a remote drain without a deadline.
-    ///
-    /// Default: [`DEFAULT_SHUTDOWN_TIMEOUT`] (25 s). Keep it at least 5 s
-    /// below the platform grace period, for example Kubernetes
-    /// `terminationGracePeriodSeconds`. The drain cancels running activities
-    /// one join window before it ends. The join window is
-    /// [`Self::cancellation_grace_period`], capped at half the drain. See
-    /// `docs/getting-started/10-operations.md`.
+    /// Graceful shutdown timeout.
     pub shutdown_timeout: Duration,
     /// Maximum cached in-memory workflow states (LRU eviction).
     pub workflow_cache_size: usize,
-    /// Whether a cache entry keeps the suspended workflow resident, so a warm
-    /// decision skips replay (issue #1798).
-    ///
-    /// Default: `true`. It has no effect when sticky routing is off. See
-    /// [`Self::with_resident_workflows`].
-    pub resident_workflows: bool,
     /// How long to offer sticky tasks to the sticky worker before fallback.
-    ///
-    /// Default: [`DEFAULT_STICKY_TIMEOUT`] (5 s). Zero disables sticky
-    /// routing and the warm workflow cache.
     pub sticky_timeout: Duration,
     /// Grace period for an activity to finish cooperatively after its workflow
     /// is cancelled before the worker hard-aborts the handler task. Cancellation
     /// is cooperative -- activities should poll [`crate::context::ActivityContext::is_cancelled`]
     /// or call [`crate::context::ActivityContext::heartbeat`], but an uncooperative handler must
     /// not block a worker slot indefinitely.
-    ///
-    /// It is also the drain's join window (issue #1813). A drain never aborts
-    /// the handler. See [`Self::shutdown_timeout`].
     pub cancellation_grace_period: Duration,
     /// Shards this worker is responsible for polling.
     ///
@@ -3893,10 +3051,7 @@ pub struct WorkerConfig {
     ///
     /// Same precedence as [`WorkerConfig::default_activity_retry_policy`]:
     /// call-site override → activity default → this builder default → no
-    /// timeout. The default is [`DEFAULT_ACTIVITY_START_TO_CLOSE`] (issue #1808).
-    /// A hung activity then cannot hold a worker slot forever. The default
-    /// skips an activity that declares a `schedule_to_close` or a heartbeat
-    /// timeout. `None` removes the default. For *local* activities the
+    /// timeout. `None` (the default) is opt-in. For *local* activities the
     /// resolved value is still clamped by
     /// [`WorkerConfig::max_local_activity_start_to_close`]. Set via
     /// [`WorkerConfig::with_default_activity_start_to_close`].
@@ -3908,8 +3063,9 @@ pub struct WorkerConfig {
     /// downstream's `Retry-After` response header). This ceiling bounds that
     /// hint so a misbehaving/malicious downstream cannot park a task for an
     /// unbounded duration — an over-ceiling hint is clamped down, never
-    /// rejected. This ceiling always applies. It has no `None` form.
-    /// The default is [`DEFAULT_RETRY_AFTER_CEILING`]. Set via
+    /// rejected. Unlike the two builder-default floors above this is **not**
+    /// opt-in: it always applies, with the sane default
+    /// [`DEFAULT_RETRY_AFTER_CEILING`]. Set via
     /// [`WorkerConfig::with_retry_after_ceiling`].
     pub retry_after_ceiling: Duration,
     /// How often the worker upserts its liveness row in `harvest_workers`.
@@ -3927,8 +3083,8 @@ pub struct WorkerConfig {
     /// Immutable build identifier for this worker binary (issue #171).
     ///
     /// Set to a stable per-build token (Git SHA, semver tag, CI job ID, etc.)
-    /// to enable build-aware task routing. Empty string = no build identity:
-    /// the worker cannot claim a task with a `required_build_id` (issue #1805).
+    /// to enable build-aware task routing. Empty string = legacy behaviour
+    /// where the worker can claim any task regardless of `required_build_id`.
     pub build_id: String,
     /// Optional human-readable deployment name for operator observability
     /// (issue #171), e.g. `"prod-blue"` or `"canary"`.
@@ -3949,57 +3105,6 @@ pub struct WorkerConfig {
     /// A value of `0` is normalized to `None` (no aging). `None` is the
     /// default — existing deployments are unaffected.
     pub priority_aging_secs: Option<u32>,
-    /// How this worker decides whether to fence its writes for cross-region
-    /// DR (issues #954, #1823).
-    ///
-    /// **[`DrFencing::Auto`] by default.** At startup the worker probes each
-    /// shard database for a DR marker: a `harvest_shard_generation` row, a DR
-    /// replication slot or a DR subscription. With a marker it fences. With
-    /// none it runs the byte-for-byte pre-#954 claim and persist paths, and
-    /// spawns no replication sampler. [`DrFencing::Disabled`] on a database
-    /// with a marker refuses to start.
-    ///
-    /// [`DrFencing::Auto`]: crate::replication::DrFencing::Auto
-    /// [`DrFencing::Disabled`]: crate::replication::DrFencing::Disabled
-    ///
-    /// When fenced, at startup the worker provisions and *pins* each assigned
-    /// shard's `harvest_shard_generation` epoch. From then on it can only claim
-    /// tasks and append events while the database still reports that epoch. If
-    /// an operator bumps it — the failover fence — this worker stops with
-    /// [`crate::error::HarvestError::ShardFenced`] rather than writing into a
-    /// database another region now owns.
-    ///
-    /// The pin is never refreshed. A fenced worker is recovered by restarting
-    /// it, never by adopting the new epoch: adopting is precisely the
-    /// split-brain the epoch exists to prevent. See
-    /// `docs/runbooks/cross-region-failover.md`.
-    pub dr_fencing: crate::replication::DrFencing,
-    /// How often the DR sampler writes a replication watermark, reads the
-    /// replication views, and re-checks this worker's fence (issue #954).
-    ///
-    /// Also the **resolution floor of the reported RPO** — a healthy
-    /// deployment reports somewhere between zero and one interval — and the
-    /// bound on how long a fenced worker keeps running before it notices. Only
-    /// used when the worker is fenced; see [`Self::dr_fencing`]. Default: 15
-    /// seconds.
-    pub replication_sample_interval: Duration,
-    /// How much trailing watermark history the DR sampler keeps
-    /// (issue #954).
-    ///
-    /// The ceiling on the lag that can be *measured*: a standby further behind
-    /// than the oldest retained watermark reports an unknown RPO rather than a
-    /// floor value that would understate the loss. Only used when the worker is
-    /// fenced; see [`Self::dr_fencing`]. Default: 1 hour.
-    pub replication_watermark_retain: Duration,
-    /// Slot-name prefix identifying this shard's DR replication (issue #954).
-    ///
-    /// Defaults to `harvest_dr`, matching the setup SQL in
-    /// `docs/cross-region-dr.md`. Without a prefix filter every walsender for
-    /// the shard's database counts as a DR standby — including an unrelated
-    /// logical-decoding consumer such as a CDC pipeline — and a shard whose
-    /// real cross-region subscriber had disconnected would report itself
-    /// protected. The startup DR-marker probe uses it too (issue #1823).
-    pub replication_slot_prefix: String,
     /// Maximum allowed start delay for a workflow (issue #322).
     /// Default: 365 days.
     pub max_workflow_start_delay: Duration,
@@ -4013,12 +3118,6 @@ pub struct WorkerConfig {
     /// increments the task's `crash_strikes`. Once `crash_strikes` reaches this
     /// threshold the task is moved to the DLQ and its owning workflow is failed
     /// terminally, rather than being re-dispatched to crash another worker.
-    ///
-    /// The last strike waits until the reclaimer confirms the death of the
-    /// worker (issue #1879). Two sweeps in a row must see the orphan, and the
-    /// worker must write no heartbeat for two stale windows. Until then the
-    /// task stays `RUNNING`. A late worker that heartbeats again keeps its
-    /// task.
     ///
     /// Defaults to **3**. Set to `0` to disable quarantine entirely (reclaimed
     /// poison pills are re-queued indefinitely — the legacy retry-loop
@@ -4206,7 +3305,7 @@ pub struct WorkerConfig {
     /// `max_concurrent_activities`) are auto-resized within
     /// `[SlotTunerConfig::min_slots, SlotTunerConfig::max_slots]`, driven by
     /// in-process slot utilization, worker DB-pool pressure, and recent
-    /// dispatch-wait latency. The controller never resizes
+    /// claim-to-dispatch permit-wait latency. The controller never resizes
     /// below `min_slots` (liveness floor) or above `max_slots` (hard safety
     /// cap); a shrink decision only withholds *new* permits and never cancels
     /// or reclaims an already-dispatched task, so graceful shutdown and
@@ -4229,44 +3328,6 @@ pub struct WorkerConfig {
     /// **Defaults to `0`: sessions disabled, zero behavior change** for
     /// existing deployments. Set via `with_max_concurrent_sessions`.
     pub max_concurrent_sessions: i32,
-    /// Rows examined per shard, per scanner tick, by the lazy payload-codec
-    /// re-encryption sweep (issue #948).
-    ///
-    /// This is the sweep's **rate limiter**: raise it to convert stored history
-    /// faster, lower it to reduce the load a rotation puts on the scanner
-    /// connection, or set it to `0` to stop the sweep entirely without a
-    /// redeploy. The sweep is a no-op — not one statement issued — unless a
-    /// keyed codec is registered, so this costs nothing on a deployment that has
-    /// not adopted key rotation. Set via `with_codec_rotation_batch_size`.
-    pub codec_rotation_batch_size: i64,
-    /// Per-shard scanner election, cadence, and batch size (issue #1795).
-    ///
-    /// By default one replica per shard runs the timeout checker. The others
-    /// stand by and take over within the lease TTL. Set via
-    /// `with_scanner_config`.
-    pub scanner: crate::scanner_lease::ScannerConfig,
-    /// Per-activity-type retry budgets (issue #1793).
-    ///
-    /// **On by default.** Every activity type gets the default
-    /// [`RetryBudgetPolicy`](crate::policy::RetryBudgetPolicy). The default
-    /// has a 10 % ratio, 10 tokens of capacity and 1 refill token each second.
-    /// An empty budget defers a retry and never drops it. Use
-    /// [`RetryBudgetConfig::disabled`](crate::retry_budget::RetryBudgetConfig::disabled)
-    /// to turn it off. Set via `with_retry_budget`.
-    ///
-    /// The Postgres worker enforces the budget. Local activities and the
-    /// `autumn-harvest-sqlite` backend do not use it.
-    pub retry_budget: crate::retry_budget::RetryBudgetConfig,
-    /// Per-activity-type adaptive concurrency limits (issue #1836).
-    ///
-    /// **Off by default.** A limited type has a cap on its in-flight
-    /// attempts on this worker. The cap follows the handler latency and the
-    /// retryable failures. At the cap, the worker claims no more tasks of
-    /// that type. Set via `with_adaptive_limit`.
-    ///
-    /// The Postgres worker enforces the limit. Local activities and the
-    /// `autumn-harvest-sqlite` backend do not use it.
-    pub adaptive_limit: crate::adaptive_limit::AdaptiveLimitConfig,
 }
 
 /// Drop duplicate shard ids, preserving first-occurrence order (issue #797).
@@ -4380,25 +3441,20 @@ impl Default for WorkerConfig {
             shard_notification_database_urls: Vec::new(),
             max_concurrent_workflows: 20,
             max_concurrent_activities: 50,
-            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
+            shutdown_timeout: Duration::from_secs(30),
             workflow_cache_size: 1000,
-            resident_workflows: true,
-            sticky_timeout: DEFAULT_STICKY_TIMEOUT,
+            sticky_timeout: Duration::ZERO,
             cancellation_grace_period: Duration::from_secs(5),
             shard_assignments: Vec::new(),
             max_local_activity_start_to_close: Duration::from_secs(60),
             default_activity_retry_policy: None,
-            default_activity_start_to_close: Some(DEFAULT_ACTIVITY_START_TO_CLOSE),
+            default_activity_start_to_close: None,
             retry_after_ceiling: DEFAULT_RETRY_AFTER_CEILING,
             worker_heartbeat_interval: Duration::from_secs(5),
             build_id: String::new(),
             deployment_name: None,
             query_timeout: Duration::from_secs(5),
             priority_aging_secs: None,
-            dr_fencing: crate::replication::DrFencing::Auto,
-            replication_sample_interval: Duration::from_secs(15),
-            replication_watermark_retain: Duration::from_secs(3600),
-            replication_slot_prefix: crate::replication::DEFAULT_DR_SLOT_PREFIX.to_string(),
             max_workflow_start_delay: DEFAULT_MAX_WORKFLOW_START_DELAY,
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
@@ -4414,10 +3470,6 @@ impl Default for WorkerConfig {
             #[cfg(feature = "db")]
             sharded_pool: None,
             max_concurrent_sessions: 0,
-            codec_rotation_batch_size: crate::codec_rotation::CODEC_ROTATION_DEFAULT_BATCH,
-            scanner: crate::scanner_lease::ScannerConfig::default(),
-            retry_budget: crate::retry_budget::RetryBudgetConfig::default(),
-            adaptive_limit: crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
         }
     }
 }
@@ -4496,12 +3548,6 @@ impl WorkerConfig {
     /// or [`crate::context::ActivityContext::heartbeat`]) and unwind cleanly. If it is still
     /// running at the end of the grace period the worker aborts the handler
     /// task and marks the activity as cancelled.
-    ///
-    /// It also sets the drain's join window. A drain never aborts the
-    /// handler. See [`WorkerConfig::shutdown_timeout`].
-    ///
-    /// A worker rejects a grace above
-    /// [`crate::worker::MAX_CANCELLATION_GRACE_PERIOD`] (24 h) at startup.
     #[must_use]
     pub const fn with_cancellation_grace_period(mut self, grace_period: Duration) -> Self {
         self.cancellation_grace_period = grace_period;
@@ -4534,8 +3580,8 @@ impl WorkerConfig {
     /// Set the immutable build identifier for this worker (issue #171).
     ///
     /// Use a stable per-build token — a Git SHA, semver tag, or CI job ID.
-    /// A worker without a build ID (the default empty string) cannot claim a
-    /// task pinned to a build (issue #1805).
+    /// Workers without a build ID (the default empty string) behave as legacy
+    /// workers and can claim any task regardless of build routing policy.
     #[must_use]
     pub fn with_build_id(mut self, build_id: impl Into<String>) -> Self {
         self.build_id = build_id.into();
@@ -4560,123 +3606,6 @@ impl WorkerConfig {
     #[must_use]
     pub const fn with_query_timeout(mut self, timeout: Duration) -> Self {
         self.query_timeout = timeout;
-        self
-    }
-    /// Force cross-region DR write-authority fencing on or off (issue #954).
-    ///
-    /// `true` sets [`DrFencing::Enabled`]. `false` sets [`DrFencing::Disabled`],
-    /// which refuses to start on a database that carries a DR marker. Leave
-    /// the default [`DrFencing::Auto`] unless you need one of those. See
-    /// [`WorkerConfig::dr_fencing`].
-    ///
-    /// [`DrFencing::Enabled`]: crate::replication::DrFencing::Enabled
-    /// [`DrFencing::Disabled`]: crate::replication::DrFencing::Disabled
-    /// [`DrFencing::Auto`]: crate::replication::DrFencing::Auto
-    ///
-    /// ## Examples
-    ///
-    /// ```rust
-    /// use autumn_harvest::builder::WorkerConfig;
-    /// use autumn_harvest::replication::DrFencing;
-    ///
-    /// let config = WorkerConfig::default().with_dr_fencing(true);
-    /// assert_eq!(config.dr_fencing, DrFencing::Enabled);
-    /// ```
-    #[must_use]
-    pub const fn with_dr_fencing(mut self, enabled: bool) -> Self {
-        self.dr_fencing = if enabled {
-            crate::replication::DrFencing::Enabled
-        } else {
-            crate::replication::DrFencing::Disabled
-        };
-        self
-    }
-
-    /// Set the cross-region DR fencing mode (issue #1823).
-    ///
-    /// See [`WorkerConfig::dr_fencing`].
-    ///
-    /// ## Examples
-    ///
-    /// ```rust
-    /// use autumn_harvest::builder::WorkerConfig;
-    /// use autumn_harvest::replication::DrFencing;
-    ///
-    /// assert_eq!(WorkerConfig::default().dr_fencing, DrFencing::Auto);
-    /// let config = WorkerConfig::default().with_dr_fencing_mode(DrFencing::Disabled);
-    /// assert_eq!(config.dr_fencing, DrFencing::Disabled);
-    /// ```
-    #[must_use]
-    pub const fn with_dr_fencing_mode(mut self, mode: crate::replication::DrFencing) -> Self {
-        self.dr_fencing = mode;
-        self
-    }
-
-    /// Set how much trailing watermark history the DR sampler keeps
-    /// (issue #954).
-    ///
-    /// See [`WorkerConfig::replication_watermark_retain`] — this is the ceiling
-    /// on the replication lag that can be *measured*, so a deployment expecting
-    /// to ride out long standby stalls should raise it.
-    ///
-    /// ## Examples
-    ///
-    /// ```rust
-    /// use std::time::Duration;
-    /// use autumn_harvest::builder::WorkerConfig;
-    ///
-    /// let config = WorkerConfig::default()
-    ///     .with_replication_watermark_retain(Duration::from_secs(6 * 3600));
-    /// assert_eq!(
-    ///     config.replication_watermark_retain,
-    ///     Duration::from_secs(6 * 3600)
-    /// );
-    /// ```
-    #[must_use]
-    pub const fn with_replication_watermark_retain(mut self, retain: Duration) -> Self {
-        self.replication_watermark_retain = retain;
-        self
-    }
-
-    /// Set the slot-name prefix identifying this shard's DR replication
-    /// (issue #954).
-    ///
-    /// See [`WorkerConfig::replication_slot_prefix`]. Set this when your slots
-    /// are not named `harvest_dr*`; leaving it wrong makes an unrelated
-    /// walsender read as a healthy DR standby.
-    ///
-    /// ## Examples
-    ///
-    /// ```rust
-    /// use autumn_harvest::builder::WorkerConfig;
-    ///
-    /// let config = WorkerConfig::default().with_replication_slot_prefix("dr_eu");
-    /// assert_eq!(config.replication_slot_prefix, "dr_eu");
-    /// ```
-    #[must_use]
-    pub fn with_replication_slot_prefix(mut self, prefix: impl Into<String>) -> Self {
-        self.replication_slot_prefix = prefix.into();
-        self
-    }
-
-    /// Set the DR sampler cadence (issue #954).
-    ///
-    /// See [`WorkerConfig::replication_sample_interval`] — this is both the
-    /// RPO's resolution floor and the bound on fence-detection latency.
-    ///
-    /// ## Examples
-    ///
-    /// ```rust
-    /// use std::time::Duration;
-    /// use autumn_harvest::builder::WorkerConfig;
-    ///
-    /// let config =
-    ///     WorkerConfig::default().with_replication_sample_interval(Duration::from_secs(5));
-    /// assert_eq!(config.replication_sample_interval, Duration::from_secs(5));
-    /// ```
-    #[must_use]
-    pub const fn with_replication_sample_interval(mut self, interval: Duration) -> Self {
-        self.replication_sample_interval = interval;
         self
     }
 
@@ -4848,21 +3777,18 @@ impl WorkerConfig {
         self
     }
 
-    /// Configure sticky cross-worker routing (issue #235).
+    /// Enable sticky cross-worker routing (issue #235).
     ///
-    /// Sticky routing is **on by default** with a [`DEFAULT_STICKY_TIMEOUT`]
-    /// lease (issue #1798). Each time a workflow suspends, the task queue
-    /// records a lease that points at the current worker. Until the lease
-    /// expires, only the owning worker can claim the next task for that
-    /// execution. Its in-process LRU cache stays warm, so the worker loads
-    /// only new events from Postgres.
+    /// Sticky routing is **off by default**. When enabled, each time a workflow
+    /// suspends the task queue records a soft affinity lease pointing at the
+    /// current worker. Subsequent tasks for that execution are offered to the
+    /// owning worker first so its in-process LRU cache stays warm, reducing
+    /// full event-history reloads from Postgres.
     ///
-    /// When the lease expires (after `config.lease_ttl`), any eligible worker
-    /// can claim the task, so sticky routing never blocks progress. A graceful
-    /// shutdown releases the leases of the worker when the drain starts. A
-    /// crash or an unhealthy status does **not** release them. Only the TTL
-    /// does.
-    /// A zero `lease_ttl` disables sticky routing.
+    /// When the lease expires (after `config.lease_ttl`) the task becomes
+    /// claimable by any eligible worker — sticky routing never blocks progress.
+    /// Note: worker drain or unhealthy status does **not** trigger early lease
+    /// expiry; only the TTL controls when other workers can claim the task.
     ///
     /// See `docs/sticky-routing.md` for the full operator guide including
     /// the lease-TTL trade-off and interaction with shard assignments and
@@ -4882,35 +3808,6 @@ impl WorkerConfig {
     #[must_use]
     pub const fn with_sticky_routing(mut self, config: StickyRoutingConfig) -> Self {
         self.sticky_timeout = config.lease_ttl;
-        self
-    }
-
-    /// Turn resident workflow state on or off (issue #1798).
-    ///
-    /// Resident state is **on by default**. A warm cache entry then keeps the
-    /// suspended workflow itself, not only its events. The next decision on
-    /// this worker sends the new result to the parked future. It does not
-    /// replay history, so its cost does not grow with history length.
-    ///
-    /// A resident entry also holds the parked future and its context, which
-    /// keeps a second copy of the history. Turn this off to save that memory.
-    ///
-    /// Only some suspensions stay resident, and any other delta falls back to
-    /// a cold replay. See `docs/sticky-routing.md`. Turn it off to replay
-    /// every decision while the event cache stays warm. It has no effect
-    /// when sticky routing is off.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use autumn_harvest::builder::WorkerConfig;
-    ///
-    /// let config = WorkerConfig::default().with_resident_workflows(false);
-    /// assert!(!config.resident_workflows);
-    /// ```
-    #[must_use]
-    pub const fn with_resident_workflows(mut self, enabled: bool) -> Self {
-        self.resident_workflows = enabled;
         self
     }
 
@@ -4971,8 +3868,8 @@ impl WorkerConfig {
     /// behaviour is byte-for-byte identical to today.
     ///
     /// See [`crate::slot_tuner`] for the default controller's signals
-    /// (slot utilization, worker DB-pool pressure, dispatch wait) and
-    /// `docs/operations/adaptive-slot-tuner.md` for the operator
+    /// (slot utilization, worker DB-pool pressure, claim-to-dispatch permit
+    /// wait) and `docs/operations/adaptive-slot-tuner.md` for the operator
     /// guide.
     #[must_use]
     pub fn with_slot_tuner(mut self, cfg: crate::slot_tuner::SlotTunerConfig) -> Self {
@@ -5000,28 +3897,6 @@ impl WorkerConfig {
         self
     }
 
-    /// Set the lazy payload-codec re-encryption sweep's per-shard batch size
-    /// (issue #948).
-    ///
-    /// `0` disables the sweep. See
-    /// [`WorkerConfig::codec_rotation_batch_size`].
-    #[must_use]
-    pub const fn with_codec_rotation_batch_size(mut self, rows: i64) -> Self {
-        self.codec_rotation_batch_size = rows;
-        self
-    }
-
-    /// Set the per-shard scanner election, cadence, and batch size (issue
-    /// #1795). See [`WorkerConfig::scanner`].
-    #[must_use]
-    pub const fn with_scanner_config(
-        mut self,
-        scanner: crate::scanner_lease::ScannerConfig,
-    ) -> Self {
-        self.scanner = scanner;
-        self
-    }
-
     /// Set the builder-level default activity retry policy (issue #620).
     ///
     /// Resolved at schedule time as the lowest-priority fallback: a call-site
@@ -5040,23 +3915,11 @@ impl WorkerConfig {
     /// Set the builder-level default activity `start_to_close` timeout (issue #620).
     ///
     /// Same precedence as [`WorkerConfig::with_default_activity_retry_policy`].
-    /// The value replaces [`DEFAULT_ACTIVITY_START_TO_CLOSE`] (issue #1808).
-    /// It skips an activity with a `schedule_to_close` or a `heartbeat_timeout`.
     /// For *local* activities the resolved value is still clamped by
     /// [`WorkerConfig::max_local_activity_start_to_close`].
     #[must_use]
     pub const fn with_default_activity_start_to_close(mut self, timeout: Duration) -> Self {
         self.default_activity_start_to_close = Some(timeout);
-        self
-    }
-
-    /// Remove the default activity `start_to_close` timeout (issue #1808).
-    ///
-    /// An activity with no timeout of its own can then run forever and hold a
-    /// worker slot. `try_build` logs a warning that names each such type.
-    #[must_use]
-    pub const fn without_default_activity_start_to_close(mut self) -> Self {
-        self.default_activity_start_to_close = None;
         self
     }
 
@@ -5066,25 +3929,6 @@ impl WorkerConfig {
     #[must_use]
     pub const fn with_retry_after_ceiling(mut self, ceiling: Duration) -> Self {
         self.retry_after_ceiling = ceiling;
-        self
-    }
-
-    /// Set the per-activity-type retry budgets (issue #1793). See
-    /// [`WorkerConfig::retry_budget`].
-    #[must_use]
-    pub fn with_retry_budget(mut self, config: crate::retry_budget::RetryBudgetConfig) -> Self {
-        self.retry_budget = config;
-        self
-    }
-
-    /// Set the per-activity-type adaptive concurrency limits (issue #1836).
-    /// See [`WorkerConfig::adaptive_limit`].
-    #[must_use]
-    pub fn with_adaptive_limit(
-        mut self,
-        config: crate::adaptive_limit::AdaptiveLimitConfig,
-    ) -> Self {
-        self.adaptive_limit = config;
         self
     }
 }
@@ -5235,10 +4079,7 @@ mod tests {
     /// touches `shard_assignments` gets full coverage.
     #[test]
     fn default_worker_config_shard_assignments_are_auto() {
-        assert_eq!(
-            WorkerConfig::default().shard_assignments,
-            [] as [crate::types::ShardId; 0]
-        );
+        assert!(WorkerConfig::default().shard_assignments.is_empty());
     }
 
     /// An all-duplicates list must still leave a usable assignment rather than
@@ -5450,16 +4291,6 @@ mod tests {
     }
 
     #[test]
-    fn worker_config_default_enables_sticky_routing_with_a_5s_fallback() {
-        let config = WorkerConfig::default();
-        assert_eq!(DEFAULT_STICKY_TIMEOUT, Duration::from_secs(5));
-        assert_eq!(
-            config.sticky_timeout, DEFAULT_STICKY_TIMEOUT,
-            "sticky routing must be on by default (issue #1798)"
-        );
-    }
-
-    #[test]
     fn worker_config_default_max_pause_duration_is_24h() {
         let config = WorkerConfig::default();
         assert_eq!(
@@ -5479,7 +4310,7 @@ mod tests {
     #[test]
     fn worker_config_with_empty_queues_clears_list() {
         let config = WorkerConfig::default().with_queues(Vec::<&str>::new());
-        assert_eq!(config.queues, [] as [std::string::String; 0]);
+        assert!(config.queues.is_empty());
     }
 
     #[test]
@@ -5496,50 +4327,6 @@ mod tests {
     fn harvest_builder_collects_dags() {
         let builder = HarvestBuilder::new().dags(vec![fake_dag_info()]);
         assert_eq!(builder.dag_count(), 1);
-    }
-
-    /// A DAG whose definition does not compile fails `try_build`. The other
-    /// DAG validators skip such a definition, so without this check a cycle
-    /// passed the build and surfaced only at run time.
-    #[test]
-    fn a_cyclic_dag_is_rejected_by_the_builder() {
-        fn forward() {}
-
-        let cyclic_dag = DagInfo {
-            name: "cyclic_dag",
-            module: "test",
-            schedule: None,
-            catchup: false,
-            max_active_runs: 1,
-            default_queue: None,
-            builder: |dag: &mut DagBuilder| {
-                let node = dag.activity(forward);
-                let same = node.clone();
-                let _ = node.upstream(&same);
-            },
-            workflow_handler: Some(|_ctx, input| Box::pin(async move { Ok(input) })),
-            jitter: ::std::time::Duration::ZERO,
-            overlap_policy: crate::policy::OverlapPolicy::Skip,
-            buffer_all_max: 100,
-            owner: None,
-            runbook_url: None,
-            severity: None,
-            mcp: false,
-            execution_timeout: None,
-            sla: None,
-        };
-
-        let err = HarvestBuilder::new()
-            .dags(vec![cyclic_dag])
-            .try_build()
-            .expect_err("a cyclic DAG must be rejected");
-        assert!(
-            matches!(
-                err,
-                HarvestBuilderError::InvalidDagDefinition { ref dag, .. } if dag == "cyclic_dag"
-            ),
-            "the rejection must name the DAG, got: {err:?}"
-        );
     }
 
     // ── Issue #780 — declarative DAG node compensation validations ──────────
@@ -5677,27 +4464,6 @@ mod tests {
     }
 
     #[test]
-    fn harvest_builder_rejects_subsecond_workflow_schedule() {
-        // Issue #1967: the stored form would drop the fraction.
-        let err = HarvestBuilder::new()
-            .workflows(vec![fake_workflow_info()])
-            .workflow_schedule(WorkflowSchedule::new(
-                "test",
-                Schedule::Interval(Duration::from_millis(500)),
-            ))
-            .try_build()
-            .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                HarvestBuilderError::InvalidWorkflowSchedule { ref workflow_name, ref reason }
-                    if workflow_name == "test" && reason.contains("whole number of seconds")
-            ),
-            "got: {err:?}"
-        );
-    }
-
-    #[test]
     fn harvest_builder_build_registers_shared_state() {
         let built = HarvestBuilder::new().state(String::from("hello")).build();
 
@@ -5721,61 +4487,7 @@ mod tests {
         let policy = built.history_policy();
 
         assert_eq!(policy.continue_as_new_threshold(), 10_000);
-        // Issue #1804: both hard caps are on by default.
-        assert_eq!(policy.event_hard_cap(), Some(50_000));
-        assert_eq!(policy.byte_hard_cap(), Some(50 * 1024 * 1024));
-    }
-
-    #[test]
-    fn harvest_builder_history_caps_accept_explicit_unlimited() {
-        // Issue #1804: an explicit "unlimited" turns each default cap off.
-        let built = HarvestBuilder::new()
-            .history_event_hard_cap_unlimited()
-            .history_byte_hard_cap_unlimited()
-            .build();
-        let policy = built.history_policy();
         assert_eq!(policy.event_hard_cap(), None);
-        assert_eq!(policy.byte_hard_cap(), None);
-    }
-
-    #[test]
-    fn history_cap_preempts_continue_as_new_only_at_or_below_the_threshold() {
-        let policy = WorkflowHistoryPolicy::default();
-        assert!(!history_cap_preempts_continue_as_new(policy));
-        assert!(history_cap_preempts_continue_as_new(
-            policy.with_continue_as_new_threshold(50_000)
-        ));
-        assert!(!history_cap_preempts_continue_as_new(
-            policy
-                .with_continue_as_new_threshold(60_000)
-                .without_event_hard_cap()
-        ));
-    }
-
-    #[test]
-    fn history_warning_precedes_continue_as_new_at_or_below_the_threshold() {
-        let policy = WorkflowHistoryPolicy::default();
-        // Defaults: the warning at 10,240 sits above the 10,000 threshold.
-        assert!(!history_warning_precedes_continue_as_new(policy));
-        // A tie precedes. The advisory turns true only past the threshold.
-        assert!(history_warning_precedes_continue_as_new(
-            policy.with_history_bloat_warn_fraction(0.2)
-        ));
-        // Cap 20,000 warns at 4,096, below the 10,000 threshold.
-        assert!(history_warning_precedes_continue_as_new(
-            policy.with_event_hard_cap(20_000)
-        ));
-        assert!(!history_warning_precedes_continue_as_new(
-            policy
-                .with_event_hard_cap(20_000)
-                .with_history_bloat_warn_fraction(0.75)
-        ));
-    }
-
-    #[test]
-    fn harvest_builder_accepts_history_byte_hard_cap_override() {
-        let built = HarvestBuilder::new().history_byte_hard_cap(4_096).build();
-        assert_eq!(built.history_policy().byte_hard_cap(), Some(4_096));
     }
 
     #[test]
@@ -6014,80 +4726,6 @@ mod tests {
         assert_eq!(registry.retry_after_ceiling, Duration::from_secs(77));
     }
 
-    /// The worker registry enforces the configured retry budget (issue #1793).
-    #[cfg(feature = "db")]
-    #[test]
-    fn harvest_builder_wires_retry_budget_into_worker_registry() {
-        use crate::policy::RetryBudgetPolicy;
-        use crate::retry_budget::RetryBudgetConfig;
-
-        let _guard = crate::start_idempotency::PURGE_WINDOW_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        let config = RetryBudgetConfig::default()
-            .with_activity("charge_card", Some(RetryBudgetPolicy::new(0.5, 3.0, 0.0)))
-            .with_activity("send_email", None);
-        let built = HarvestBuilder::new()
-            .worker(WorkerConfig::default().with_retry_budget(config.clone()))
-            .build();
-        let (registry, _dags, _schedules, _worker_config) = built.into_worker_parts();
-        assert_eq!(registry.retry_budgets().config(), &config);
-
-        let built = HarvestBuilder::new()
-            .worker(WorkerConfig::default().with_retry_budget(config.clone()))
-            .build();
-        let (registry, _dags, _schedules, _worker_config) =
-            built.into_worker_parts_with_extra_state(crate::context::SharedStateMap::new());
-        assert_eq!(registry.retry_budgets().config(), &config);
-    }
-
-    /// The worker registry enforces the configured adaptive limit (issue
-    /// #1836).
-    #[cfg(feature = "db")]
-    #[test]
-    fn harvest_builder_wires_adaptive_limit_into_worker_registry() {
-        use crate::adaptive_limit::AdaptiveLimitConfig;
-        use crate::policy::AdaptiveLimitPolicy;
-
-        let _guard = crate::start_idempotency::PURGE_WINDOW_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        let config = AdaptiveLimitConfig::disabled()
-            .with_activity("charge_card", Some(AdaptiveLimitPolicy::new(2, 32)));
-        let built = HarvestBuilder::new()
-            .worker(WorkerConfig::default().with_adaptive_limit(config.clone()))
-            .build();
-        let (registry, _dags, _schedules, _worker_config) = built.into_worker_parts();
-        assert_eq!(registry.adaptive_limits().config(), &config);
-
-        let built = HarvestBuilder::new()
-            .worker(WorkerConfig::default().with_adaptive_limit(config.clone()))
-            .build();
-        let (registry, _dags, _schedules, _worker_config) =
-            built.into_worker_parts_with_extra_state(crate::context::SharedStateMap::new());
-        assert_eq!(registry.adaptive_limits().config(), &config);
-    }
-
-    /// The adaptive limit is off by default (issue #1836).
-    #[test]
-    fn worker_config_adaptive_limit_is_off_by_default() {
-        let config = WorkerConfig::default();
-        assert_eq!(config.adaptive_limit.default_policy(), None);
-        assert!(config.adaptive_limit.overrides().is_empty());
-    }
-
-    /// The retry budget is on by default (issue #1793).
-    #[test]
-    fn worker_config_retry_budget_is_on_by_default() {
-        let config = WorkerConfig::default();
-        assert_eq!(
-            config.retry_budget.default_policy(),
-            Some(crate::policy::RetryBudgetPolicy::default())
-        );
-    }
-
     #[test]
     fn harvest_builder_telemetry_override_is_propagated() {
         use crate::telemetry::{TelemetryConfig, TraceContextCarrier, TraceContextPropagator};
@@ -6160,68 +4798,6 @@ mod tests {
 
         assert_eq!(registry.state::<String>(), Some(&String::from("haunted")));
         assert!(worker_config.queues.contains(&"default".to_string()));
-    }
-
-    /// The worker has exactly ONE codec registry, and it is the handler
-    /// registry's (issues #948, #1243).
-    ///
-    /// There were briefly two: `WorkerRuntimeConfig::payload_codecs` drove the
-    /// re-encryption sweep while `HandlerRegistry::payload_codecs` drove writes
-    /// and replay, and `Worker::new` reconciled nothing. Configuring only the
-    /// handler registry silently disabled rotation; configuring only the config
-    /// let the sweep rewrite ciphertext that replay could not then read, which
-    /// surfaces to workflow code as raw envelope data. Neither failure is loud.
-    ///
-    /// The config field is gone, so the two cannot disagree by construction.
-    /// This pins that the builder's codecs reach the registry, which is now the
-    /// single source for both responsibilities.
-    #[cfg(feature = "db")]
-    #[test]
-    fn the_builder_installs_one_codec_registry_on_the_handler_registry() {
-        use crate::payload_codec::IdentityCodec;
-
-        let built = HarvestBuilder::new()
-            .payload_codec_key("k1", IdentityCodec)
-            .build();
-
-        let (registry, _dags, _schedules, _worker_config) = built.into_worker_parts();
-        assert!(
-            registry
-                .payload_codecs()
-                .registered_key_ids()
-                .contains(&"k1".to_string()),
-            "the builder's registry must reach the handler registry, which is \
-             what the sweep, the writes and replay all read"
-        );
-    }
-
-    /// The AEAD builder hook registers the codec under its own key id
-    /// (issue #1825).
-    #[test]
-    fn aead_payload_codec_key_registers_under_the_codec_key_id() {
-        use crate::aead_codec::{AEAD_CODEC_ID, AeadCodec, DataKey};
-
-        let codec = AeadCodec::new("2026-10", &DataKey::generate()).expect("codec");
-        let builder = HarvestBuilder::new().aead_payload_codec_key(codec);
-        let codecs = builder.payload_codecs();
-        assert_eq!(codecs.active_key_id(), "2026-10");
-        assert_eq!(
-            codecs.codec_for_key("2026-10").map(|c| c.codec_id()),
-            Some(AEAD_CODEC_ID)
-        );
-    }
-
-    /// A duplicate AEAD key id must not boot (issue #1825).
-    #[test]
-    #[should_panic(expected = "invalid AEAD payload codec key")]
-    fn aead_payload_codec_key_panics_on_a_duplicate_key_id() {
-        use crate::aead_codec::{AeadCodec, DataKey};
-
-        let first = AeadCodec::new("k1", &DataKey::generate()).expect("codec");
-        let second = AeadCodec::new("k1", &DataKey::generate()).expect("codec");
-        let _ = HarvestBuilder::new()
-            .aead_payload_codec_key(first)
-            .aead_payload_codec_key(second);
     }
 
     /// Both worker-parts hops must thread the configured durable-log policy
@@ -6335,7 +4911,7 @@ mod tests {
     #[test]
     fn worker_config_with_empty_iterator_clears_queues() {
         let config = WorkerConfig::default().with_queues(Vec::<&str>::new());
-        assert_eq!(config.queues, [] as [std::string::String; 0]);
+        assert!(config.queues.is_empty());
     }
 
     fn make_activity(
@@ -6650,201 +5226,6 @@ mod tests {
         assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
     }
 
-    /// Minimal `WorkflowInfo` carrying only the three duration fields
-    /// `validate_workflow_duration_fields` (issue #1163) checks, for the
-    /// tests below.
-    fn wf_info_with_durations(
-        execution_timeout: Option<Duration>,
-        chain_execution_timeout: Option<Duration>,
-        sla: Option<Duration>,
-    ) -> WorkflowInfo {
-        WorkflowInfo {
-            quota: None,
-            declared_activities: None,
-            declared_children: None,
-            mcp: false,
-            name: "report_wf",
-            module: "test",
-            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
-            execution_timeout,
-            chain_execution_timeout,
-            sla,
-            concurrency: None,
-            debounce: None,
-            batch: None,
-            throttle: None,
-            max_input_bytes: None,
-            owner: None,
-            runbook_url: None,
-            severity: None,
-            description: None,
-            input_schema: None,
-            output_schema: None,
-            error_schema: None,
-            retry_policy: None,
-        }
-    }
-
-    /// The largest `std::time::Duration` `chrono::Duration::from_std` can
-    /// still convert. One nanosecond past this must be rejected.
-    fn chrono_duration_ceiling() -> Duration {
-        chrono::Duration::MAX
-            .to_std()
-            .expect("chrono::Duration::MAX is positive and must convert to std::time::Duration")
-    }
-
-    #[test]
-    fn validate_workflow_duration_fields_accepts_none_and_the_exact_ceiling() {
-        let ceiling = chrono_duration_ceiling();
-        let workflows = vec![wf_info_with_durations(
-            Some(ceiling),
-            Some(ceiling),
-            Some(ceiling),
-        )];
-        assert!(
-            validate_workflow_duration_fields(&workflows).is_ok(),
-            "expected the exact chrono::Duration ceiling to be accepted"
-        );
-        assert!(
-            validate_workflow_duration_fields(&[wf_info_with_durations(None, None, None)]).is_ok()
-        );
-    }
-
-    #[test]
-    fn validate_workflow_duration_fields_rejects_execution_timeout_past_the_ceiling() {
-        let over = chrono_duration_ceiling() + Duration::from_nanos(1);
-        let err =
-            validate_workflow_duration_fields(&[wf_info_with_durations(Some(over), None, None)])
-                .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                HarvestBuilderError::UnrepresentableWorkflowDuration {
-                    ref workflow,
-                    field: "execution_timeout",
-                    actual,
-                    ..
-                } if workflow == "report_wf" && actual == over
-            ),
-            "expected UnrepresentableWorkflowDuration naming execution_timeout, got: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_workflow_duration_fields_rejects_chain_execution_timeout_past_the_ceiling() {
-        let over = chrono_duration_ceiling() + Duration::from_nanos(1);
-        let err =
-            validate_workflow_duration_fields(&[wf_info_with_durations(None, Some(over), None)])
-                .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                HarvestBuilderError::UnrepresentableWorkflowDuration {
-                    ref workflow,
-                    field: "chain_execution_timeout",
-                    ..
-                } if workflow == "report_wf"
-            ),
-            "expected UnrepresentableWorkflowDuration naming chain_execution_timeout, got: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_workflow_duration_fields_rejects_sla_past_the_ceiling() {
-        let over = chrono_duration_ceiling() + Duration::from_nanos(1);
-        let err =
-            validate_workflow_duration_fields(&[wf_info_with_durations(None, None, Some(over))])
-                .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                HarvestBuilderError::UnrepresentableWorkflowDuration {
-                    ref workflow,
-                    field: "sla",
-                    ..
-                } if workflow == "report_wf"
-            ),
-            "expected UnrepresentableWorkflowDuration naming sla, got: {err}"
-        );
-    }
-
-    /// The `999999999999d` repro from the issue: expressible through
-    /// `task_duration`'s checked `u64` arithmetic (well under `u64::MAX`
-    /// seconds) but far past chrono's ceiling.
-    #[test]
-    fn validate_workflow_duration_fields_rejects_the_issue_repro_value() {
-        let almost_2_7_billion_years = Duration::from_secs(999_999_999_999 * 86_400);
-        let err = validate_workflow_duration_fields(&[wf_info_with_durations(
-            Some(almost_2_7_billion_years),
-            None,
-            None,
-        )])
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            HarvestBuilderError::UnrepresentableWorkflowDuration { .. }
-        ));
-    }
-
-    #[test]
-    fn harvest_builder_rejects_workflow_with_unrepresentable_execution_timeout() {
-        let over = chrono_duration_ceiling() + Duration::from_secs(1);
-        let result = HarvestBuilder::new()
-            .workflows(vec![wf_info_with_durations(Some(over), None, None)])
-            .try_build();
-        let err = result.unwrap_err();
-        assert!(
-            matches!(
-                err,
-                HarvestBuilderError::UnrepresentableWorkflowDuration {
-                    ref workflow,
-                    field: "execution_timeout",
-                    ..
-                } if workflow == "report_wf"
-            ),
-            "expected UnrepresentableWorkflowDuration, got: {err}"
-        );
-        let msg = err.to_string();
-        assert!(
-            msg.contains("report_wf"),
-            "message should name the workflow: {msg}"
-        );
-        assert!(
-            msg.contains("execution_timeout"),
-            "message should name the field: {msg}"
-        );
-        assert!(
-            msg.contains("ceiling"),
-            "message should name the representable ceiling: {msg}"
-        );
-    }
-
-    /// The #743 DAG shadow `WorkflowInfo` (`DagInfo::as_workflow_info`, pushed
-    /// into `self.workflows` by `HarvestBuilder::dags` before `try_build` runs)
-    /// must be covered by the same validation as a `#[workflow]`-declared one —
-    /// otherwise a DAG's `#[dag(execution_timeout = "...")]` could silently
-    /// vanish exactly like the bug this issue fixes for plain workflows.
-    #[cfg(feature = "unified-dag-execution")]
-    #[test]
-    fn harvest_builder_rejects_dag_with_unrepresentable_execution_timeout() {
-        let over = chrono_duration_ceiling() + Duration::from_secs(1);
-        let mut dag = fake_unified_dag_info();
-        dag.execution_timeout = Some(over);
-        let result = HarvestBuilder::new().dags(vec![dag]).try_build();
-        let err = result.unwrap_err();
-        assert!(
-            matches!(
-                err,
-                HarvestBuilderError::UnrepresentableWorkflowDuration {
-                    ref workflow,
-                    field: "execution_timeout",
-                    ..
-                } if workflow == "daily_etl"
-            ),
-            "expected UnrepresentableWorkflowDuration for the DAG's shadow WorkflowInfo, got: {err}"
-        );
-    }
-
     #[test]
     fn builder_accepts_workflow_with_nonzero_concurrency_limit() {
         use crate::concurrency::ConcurrencyPolicy;
@@ -6896,11 +5277,9 @@ mod tests {
             config.default_activity_retry_policy.is_none(),
             "default activity retry policy must be unset by default (opt-in)"
         );
-        // Issue #1808 replaces the opt-in start_to_close floor with a shipped
-        // default. The retry floor stays opt-in.
-        assert_eq!(
-            config.default_activity_start_to_close,
-            Some(DEFAULT_ACTIVITY_START_TO_CLOSE),
+        assert!(
+            config.default_activity_start_to_close.is_none(),
+            "default activity start_to_close must be unset by default (opt-in)"
         );
 
         // The two builder methods set the floors and are chainable.
@@ -6918,173 +5297,6 @@ mod tests {
             configured.default_activity_start_to_close,
             Some(Duration::from_secs(300)),
         );
-    }
-
-    // ── Shutdown timeout default (issue #1813) ────────────────────────────
-
-    /// The default drain ends before the Kubernetes default grace period. The
-    /// headroom lets the worker mark itself stopped before a `SIGKILL`.
-    #[test]
-    fn default_shutdown_timeout_ends_before_the_kubernetes_grace_period() {
-        let kubernetes_grace_period = Duration::from_secs(30);
-        let headroom = Duration::from_secs(5);
-        assert_eq!(
-            WorkerConfig::default().shutdown_timeout,
-            DEFAULT_SHUTDOWN_TIMEOUT
-        );
-        assert!(
-            WorkerConfig::default().shutdown_timeout + headroom <= kubernetes_grace_period,
-            "shutdown_timeout {:?} leaves less than {headroom:?} before SIGKILL",
-            WorkerConfig::default().shutdown_timeout,
-        );
-    }
-
-    // ── Shipped activity start-to-close default (issue #1808) ─────────────
-
-    #[test]
-    fn worker_config_default_activity_start_to_close_is_ten_minutes() {
-        assert_eq!(DEFAULT_ACTIVITY_START_TO_CLOSE, Duration::from_secs(600));
-        assert_eq!(
-            WorkerConfig::default().default_activity_start_to_close,
-            Some(DEFAULT_ACTIVITY_START_TO_CLOSE),
-        );
-    }
-
-    #[test]
-    fn without_default_activity_start_to_close_clears_the_default() {
-        let config = WorkerConfig::default().without_default_activity_start_to_close();
-        assert_eq!(config.default_activity_start_to_close, None);
-    }
-
-    /// One regular activity type per bound, two with no bound, and one local type.
-    fn timeout_matrix() -> Vec<ActivityInfo> {
-        let mut stc = make_activity("has_stc", None, None);
-        stc.default_start_to_close = Some(Duration::from_secs(30));
-        let mut s2c = make_activity("has_s2c", None, None);
-        s2c.default_schedule_to_close = Some(Duration::from_secs(30));
-        let mut hb = make_activity("has_heartbeat", None, None);
-        hb.default_heartbeat_timeout = Some(Duration::from_secs(30));
-        vec![
-            make_activity("bare_one", None, None),
-            stc,
-            s2c,
-            hb,
-            make_local_activity("bare_local", None),
-            make_activity("bare_two", None, None),
-        ]
-    }
-
-    #[test]
-    fn activities_without_timeout_names_only_unbounded_regular_types() {
-        // The local cap always bounds a local activity.
-        assert_eq!(
-            activities_without_timeout(&timeout_matrix()),
-            vec!["bare_one", "bare_two"],
-        );
-    }
-
-    #[test]
-    fn activities_without_timeout_uses_the_last_registration_of_a_name() {
-        let mut bounded = make_activity("twice", None, None);
-        bounded.default_start_to_close = Some(Duration::from_secs(30));
-        // The registry keeps the last registration, so the name is bounded.
-        let first_bare = vec![make_activity("twice", None, None), bounded];
-        assert_eq!(activities_without_timeout(&first_bare), Vec::<&str>::new());
-        // A name registered twice with no bound is listed once.
-        let both_bare = vec![
-            make_activity("twice", None, None),
-            make_activity("twice", None, None),
-        ];
-        assert_eq!(activities_without_timeout(&both_bare), vec!["twice"]);
-    }
-
-    /// A writer that keeps every formatted log line in memory.
-    #[derive(Clone, Default)]
-    struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for LogBuf {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
-        type Writer = Self;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    /// Run `f` and return the WARN lines that it logs.
-    fn capture_warnings(f: impl FnOnce()) -> String {
-        let buf = LogBuf::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::WARN)
-            .finish();
-        tracing::subscriber::with_default(subscriber, f);
-        let bytes = buf.0.lock().unwrap().clone();
-        String::from_utf8(bytes).unwrap()
-    }
-
-    /// The log line that names the activity types with no bound.
-    fn timeout_warning(logs: &str) -> Option<&str> {
-        logs.lines().find(|l| l.contains("issue #1808"))
-    }
-
-    #[test]
-    fn startup_warning_lists_offending_activity_types() {
-        let logs = capture_warnings(|| {
-            HarvestBuilder::new()
-                .activities(timeout_matrix())
-                .try_build()
-                .expect("a missing timeout never blocks the build");
-        });
-        let line = timeout_warning(&logs).expect("try_build logs the warning");
-        assert!(line.contains("WARN"), "{line}");
-        assert!(line.contains("bare_one, bare_two"), "{line}");
-        for bounded in ["has_stc", "has_s2c", "has_heartbeat", "bare_local"] {
-            assert!(!line.contains(bounded), "{bounded} is bounded: {line}");
-        }
-        // The line names the default that bounds these types.
-        assert!(
-            line.contains("default_activity_start_to_close=600s"),
-            "{line}"
-        );
-    }
-
-    #[test]
-    fn startup_warning_says_unbounded_when_the_default_is_off() {
-        let logs = capture_warnings(|| {
-            HarvestBuilder::new()
-                .activities(timeout_matrix())
-                .worker(WorkerConfig::default().without_default_activity_start_to_close())
-                .try_build()
-                .expect("a missing timeout never blocks the build");
-        });
-        let line = timeout_warning(&logs).expect("try_build logs the warning");
-        assert!(line.contains("bare_one, bare_two"), "{line}");
-        assert!(line.contains("can run forever"), "{line}");
-    }
-
-    #[test]
-    fn startup_warning_is_silent_when_every_activity_type_is_bounded() {
-        let mut matrix = timeout_matrix();
-        matrix.retain(|a| !a.name.starts_with("bare_") || a.is_local);
-        let logs = capture_warnings(|| {
-            HarvestBuilder::new()
-                .activities(matrix)
-                .try_build()
-                .expect("build");
-        });
-        assert_eq!(timeout_warning(&logs), None, "{logs}");
     }
 
     // ── Retry-After ceiling (issue #744) ───────────────────────────────────
@@ -7740,141 +5952,8 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(HarvestBuilderError::RateLimitKeyReservedPrefix {
-                    ref activity,
-                    ref key,
-                    prefix,
-                }) if activity == "act1"
-                    && key == "dyn-rate:9:tenant_id:acme"
-                    && prefix == "dyn-rate:"
-            ),
-            "expected RateLimitKeyReservedPrefix, got: {result:?}"
-        );
-    }
-
-    /// The reserved-prefix check runs on the EFFECTIVE static key, which falls
-    /// back to the activity NAME when no `rate_limit_key` is given (issue
-    /// #1127, Codex review round 1 P2). A hand-built `ActivityInfo` named like
-    /// a generated bucket would otherwise register a squatting static bucket
-    /// that the idle-bucket GC then collects, stranding its tasks until a
-    /// worker restart.
-    #[test]
-    fn build_rejects_an_activity_whose_name_squats_a_reserved_prefix() {
-        let act = ActivityInfo {
-            name: "start-throttle:reports",
-            module: "test",
-            default_retry_policy: None,
-            default_start_to_close: None,
-            default_heartbeat_timeout: None,
-            default_schedule_to_start: None,
-            default_schedule_to_close: None,
-            default_queue: None,
-            max_concurrent: None,
-            concurrency_key: None,
-            rate_limit_rps: Some(5.0),
-            rate_limit_burst: None,
-            rate_limit_key: None,
-            rate_limit_key_expr: None,
-            circuit_breaker: None,
-            is_local: false,
-            max_input_bytes: None,
-            max_result_bytes: None,
-            requires: None,
-            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
-        };
-        let result = HarvestBuilder::new().activities(vec![act]).try_build();
-        assert!(
-            matches!(
-                result,
-                Err(HarvestBuilderError::RateLimitKeyReservedPrefix {
-                    ref activity,
-                    ref key,
-                    prefix,
-                }) if activity == "start-throttle:reports"
-                    && key == "start-throttle:reports"
-                    && prefix == "start-throttle:"
-            ),
-            "expected RateLimitKeyReservedPrefix, got: {result:?}"
-        );
-    }
-
-    /// ...but an activity merely NAMED like one, declaring no rate limit at
-    /// all, registers no bucket and must build fine.
-    #[test]
-    fn build_accepts_a_reserved_looking_name_that_declares_no_rate_limit() {
-        let act = ActivityInfo {
-            name: "dyn-rate:not-a-bucket",
-            module: "test",
-            default_retry_policy: None,
-            default_start_to_close: None,
-            default_heartbeat_timeout: None,
-            default_schedule_to_start: None,
-            default_schedule_to_close: None,
-            default_queue: None,
-            max_concurrent: None,
-            concurrency_key: None,
-            rate_limit_rps: None,
-            rate_limit_burst: None,
-            rate_limit_key: None,
-            rate_limit_key_expr: None,
-            circuit_breaker: None,
-            is_local: false,
-            max_input_bytes: None,
-            max_result_bytes: None,
-            requires: None,
-            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
-        };
-        assert!(
-            HarvestBuilder::new()
-                .activities(vec![act])
-                .try_build()
-                .is_ok(),
-            "an activity that registers no bucket squats nothing"
-        );
-    }
-
-    /// A static `rate_limit_key` in the `start-throttle:` namespace (issue #607)
-    /// is rejected for the same reason as `dyn-rate:` — and since issue #1127
-    /// the reason is stronger than namespace hygiene. The idle-bucket GC
-    /// collects that namespace on the guarantee that everything in it
-    /// re-registers with the work that needs it; a static key does not, so a
-    /// collected one would strand every task enqueued before the next worker
-    /// startup behind the fail-closed claim gate.
-    #[test]
-    fn build_rejects_static_rate_limit_key_squatting_the_start_throttle_prefix() {
-        let act = ActivityInfo {
-            name: "act1",
-            module: "test",
-            default_retry_policy: None,
-            default_start_to_close: None,
-            default_heartbeat_timeout: None,
-            default_schedule_to_start: None,
-            default_schedule_to_close: None,
-            default_queue: None,
-            max_concurrent: None,
-            concurrency_key: None,
-            rate_limit_rps: Some(50.0),
-            rate_limit_burst: None,
-            rate_limit_key: Some("start-throttle:onboarding:acme"),
-            rate_limit_key_expr: None,
-            circuit_breaker: None,
-            is_local: false,
-            max_input_bytes: None,
-            max_result_bytes: None,
-            requires: None,
-            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
-        };
-        let result = HarvestBuilder::new().activities(vec![act]).try_build();
-        assert!(
-            matches!(
-                result,
-                Err(HarvestBuilderError::RateLimitKeyReservedPrefix {
-                    ref activity,
-                    ref key,
-                    prefix,
-                }) if activity == "act1"
-                    && key == "start-throttle:onboarding:acme"
-                    && prefix == "start-throttle:"
+                Err(HarvestBuilderError::RateLimitKeyReservedPrefix { ref activity, ref key })
+                    if activity == "act1" && key == "dyn-rate:9:tenant_id:acme"
             ),
             "expected RateLimitKeyReservedPrefix, got: {result:?}"
         );
@@ -8369,336 +6448,13 @@ mod tests {
         let result = HarvestBuilder::new()
             .completion_callback_default("https://evil.com/hook", EventFilter::AnyTerminal)
             .try_build();
-        // The URL is carried REDACTED to its origin (issue #1274).
-        // A completion-callback target often carries a bearer token in its
-        // path or query, and this error's `Display` goes to startup logs.
         assert!(
             matches!(
                 result,
                 Err(HarvestBuilderError::CallbackTargetRejected { ref url, .. })
-                    if url == "https://evil.com/<redacted>"
+                    if url == "https://evil.com/hook"
             ),
-            "expected CallbackTargetRejected with a redacted origin, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn builder_redacts_a_credential_bearing_completion_callback_target_in_startup_error() {
-        use crate::completion_callback::EventFilter;
-        // No allowlist configured -> every domain host is rejected.
-        let result = HarvestBuilder::new()
-            .completion_callback_default(
-                "https://evil.com/hook?token=s3cr3t",
-                EventFilter::AnyTerminal,
-            )
-            .try_build();
-        let rendered = result.unwrap_err().to_string();
-        assert!(
-            rendered.contains("evil.com"),
-            "expected the host in the rendered error, got {rendered:?}"
-        );
-        assert!(
-            !rendered.contains("s3cr3t"),
-            "credential-bearing query must not reach the rendered error, got {rendered:?}"
-        );
-    }
-
-    // ── Audit export (issue #953) ────────────────────────────────────────
-
-    #[test]
-    fn builder_rejects_a_non_allowlisted_audit_export_webhook() {
-        // No allowlist configured -> every domain host is rejected. The build
-        // FAILS rather than warning: an audit export that silently never
-        // delivers is a compliance gap discovered at audit time.
-        let result = HarvestBuilder::new()
-            .audit_export_webhook("https://evil.com/audit")
-            .audit_export_secret(b"k".to_vec())
-            .try_build();
-        // The URL is carried REDACTED to its origin: a SIEM ingest endpoint's
-        // path can be its credential, and this error's Display goes to the
-        // startup log (issue #953, Codex review round 24 P1). The host still
-        // identifies what was rejected, which is all the rejection is about.
-        assert!(
-            matches!(
-                result,
-                Err(HarvestBuilderError::AuditSinkRejected { ref url, .. })
-                    if url == "https://evil.com/<redacted>"
-            ),
-            "expected AuditSinkRejected with a redacted origin, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn builder_rejects_a_plain_http_audit_export_webhook_by_default() {
-        let result = HarvestBuilder::new()
-            .audit_export_allowlist(
-                crate::completion_callback::HostAllowlist::new().with_pattern("siem.example.com"),
-            )
-            .audit_export_webhook("http://siem.example.com/audit")
-            .audit_export_secret(b"k".to_vec())
-            .try_build();
-        assert!(
-            matches!(result, Err(HarvestBuilderError::AuditSinkRejected { .. })),
-            "audit records name who acted on which tenant; cleartext must be \
-             opt-in, got {result:?}"
-        );
-
-        // ...and the documented escape hatch works.
-        let allowed = HarvestBuilder::new()
-            .audit_export_allowlist(
-                crate::completion_callback::HostAllowlist::new().with_pattern("siem.example.com"),
-            )
-            .audit_export_allow_http(true)
-            .audit_export_webhook("http://siem.example.com/audit")
-            .audit_export_secret(b"k".to_vec())
-            .try_build();
-        assert!(allowed.is_ok(), "got {allowed:?}");
-    }
-
-    #[test]
-    fn builder_rejects_an_audit_export_webhook_with_no_hmac_secret() {
-        let result = HarvestBuilder::new()
-            .audit_export_allowlist(
-                crate::completion_callback::HostAllowlist::new().with_pattern("siem.example.com"),
-            )
-            .audit_export_webhook("https://siem.example.com/audit")
-            .try_build();
-        assert!(
-            matches!(result, Err(HarvestBuilderError::AuditSinkSecretMissing)),
-            "HMAC-SHA256 accepts an empty key and emits a signature anyone can \
-             recompute, so an unconfigured secret is worse than none -- it must \
-             fail the build, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn builder_rejects_a_short_audit_chain_key() {
-        let result = HarvestBuilder::new()
-            .audit_export_chain_key(vec![1_u8; crate::audit_chain::MIN_CHAIN_KEY_BYTES - 1])
-            .try_build();
-        assert!(
-            matches!(
-                result,
-                Err(HarvestBuilderError::AuditChainKeyTooShort { len: 31, min: 32 })
-            ),
-            "got {result:?}"
-        );
-    }
-
-    #[test]
-    fn builder_rejects_a_short_audit_chain_accept_key() {
-        let result = HarvestBuilder::new()
-            .audit_export_chain_key(vec![1_u8; crate::audit_chain::MIN_CHAIN_KEY_BYTES])
-            .audit_export_chain_accept_key(vec![2_u8; 8])
-            .try_build();
-        assert!(
-            matches!(
-                result,
-                Err(HarvestBuilderError::AuditChainKeyTooShort { len: 8, min: 32 })
-            ),
-            "got {result:?}"
-        );
-    }
-
-    #[test]
-    fn builder_keeps_a_full_length_audit_chain_key() {
-        let built = HarvestBuilder::new()
-            .audit_export_chain_key(vec![1_u8; crate::audit_chain::MIN_CHAIN_KEY_BYTES])
-            .try_build()
-            .expect("a full-length chain key builds");
-        assert_eq!(
-            built
-                .audit_export_config()
-                .chain_key
-                .as_ref()
-                .map(|k| k.as_bytes().len()),
-            Some(crate::audit_chain::MIN_CHAIN_KEY_BYTES)
-        );
-    }
-
-    #[test]
-    fn builder_accepts_an_allowlisted_audit_export_webhook() {
-        let built = HarvestBuilder::new()
-            .audit_export_allowlist(
-                crate::completion_callback::HostAllowlist::new().with_pattern("*.example.com"),
-            )
-            .audit_export_webhook("https://siem.example.com/harvest/audit")
-            .audit_export_secret(b"k".to_vec())
-            .audit_export_batch_size(250)
-            .try_build()
-            .expect("an allowlisted https webhook with a secret must build");
-        let config = built.audit_export_config();
-        assert!(config.is_enabled());
-        assert_eq!(config.effective_batch_size(), 250);
-    }
-
-    #[test]
-    fn builder_with_no_audit_export_config_is_inert() {
-        // AC8: an embedder who never touches the audit-export API gets a
-        // config that installs nothing at all.
-        let built = HarvestBuilder::new().build();
-        let config = built.audit_export_config();
-        assert!(!config.is_enabled());
-        assert!(config.sink.is_none());
-        assert!(config.webhook_url.is_none());
-        assert!(config.secret.is_none());
-    }
-
-    /// A custom sink takes precedence over a webhook, so the webhook is dead
-    /// config that no request can ever reach. Validating it anyway blocked
-    /// startup on a URL nothing would call (issue #953, Codex review P2).
-    #[test]
-    fn a_custom_sink_makes_the_webhook_checks_moot() {
-        struct Noop;
-        impl crate::audit_export::AuditSink for Noop {
-            fn deliver<'a>(
-                &'a self,
-                _batch: &'a crate::audit_export::AuditBatch<'a>,
-            ) -> crate::audit_export::SinkFuture<'a> {
-                Box::pin(async { crate::audit_export::SinkAttempt::success(200) })
-            }
-        }
-
-        // A URL that fails the SSRF policy outright, and no secret: both
-        // webhook checks would reject this build on their own.
-        let built = HarvestBuilder::new()
-            .audit_export_webhook("http://169.254.169.254/latest/meta-data")
-            .audit_export_sink(Noop)
-            .try_build()
-            .expect(
-                "a custom sink wins, so neither webhook check may block the \
-                 build on a URL that can never be called",
-            );
-        let config = built.audit_export_config();
-        assert!(config.sink.is_some());
-        assert!(config.validate_webhook_url().is_ok());
-        assert!(!config.webhook_is_missing_a_secret());
-    }
-
-    /// A rejected sink URL must not carry its credential into the error, which
-    /// a startup failure writes straight to the logs (issue #953, Codex review
-    /// round 24 P1).
-    #[test]
-    fn a_rejected_sink_url_is_redacted_in_the_build_error() {
-        let err = HarvestBuilder::new()
-            .audit_export_webhook(
-                "https://http-inputs.attacker.example.com/services/collector/\
-                 B5A79AAD-D822-46CC-80D1-819F80D7BFB0?index=audit",
-            )
-            .audit_export_secret(b"k".to_vec())
-            .try_build()
-            .expect_err("a non-allowlisted host must be rejected");
-
-        let rendered = err.to_string();
-        assert!(
-            !rendered.contains("B5A79AAD"),
-            "the collector token must not reach the startup log: {rendered}"
-        );
-        assert!(
-            !rendered.contains("index=audit"),
-            "nor the query string: {rendered}"
-        );
-        assert!(
-            rendered.contains("http-inputs.attacker.example.com"),
-            "the host must survive -- it is what the rejection is ABOUT, and \
-             an operator cannot act without it: {rendered}"
-        );
-    }
-
-    /// The same URL without a sink must still be rejected — the guard above is
-    /// precedence, not a way to disable SSRF validation.
-    #[test]
-    fn the_webhook_checks_still_bite_without_a_sink() {
-        let err = HarvestBuilder::new()
-            .audit_export_webhook("http://169.254.169.254/latest/meta-data")
-            .audit_export_secret(b"k".to_vec())
-            .try_build()
-            .expect_err("a link-local webhook with no sink must be rejected");
-        assert!(
-            matches!(err, HarvestBuilderError::AuditSinkRejected { .. }),
-            "expected AuditSinkRejected, got {err:?}"
-        );
-
-        let err = HarvestBuilder::new()
-            .audit_export_allowlist(
-                crate::completion_callback::HostAllowlist::new().with_pattern("siem.example.com"),
-            )
-            .audit_export_webhook("https://siem.example.com/ingest")
-            .try_build()
-            .expect_err("a webhook with no secret and no sink must be rejected");
-        assert!(
-            matches!(err, HarvestBuilderError::AuditSinkSecretMissing),
-            "expected AuditSinkSecretMissing, got {err:?}"
-        );
-    }
-
-    /// The plugin runner publishes the global itself after its build succeeds,
-    /// so the conversion must not write it at all — not write it and have it
-    /// repaired later (issue #953, Codex review round 5 P1). A live runtime's
-    /// scanner ticking mid-build would otherwise export records to a sink that
-    /// never came into service, and no restore un-sends those.
-    ///
-    /// Asserts an **absence**, deliberately. `GLOBAL_AUDIT_EXPORT_CONFIG` is a
-    /// process-wide static and 33 other tests in this binary call
-    /// `into_worker_parts*`, each of which writes it; a test that asserted some
-    /// particular config was still installed afterwards would race them and
-    /// fail intermittently — which is exactly how the first version of this
-    /// test failed on CI while passing locally. "The global does not hold *this
-    /// builder's* uniquely identifiable config" cannot be made false by another
-    /// test installing something else, so it is stable under any interleaving.
-    ///
-    /// The complement — that a direct core embedder, having no later publish
-    /// step, still gets their sink installed — is deliberately NOT asserted
-    /// here. It is inherently a *presence* claim about that same global, and a
-    /// serial mutex does not help because the 33 contending tests do not take
-    /// it; an attempt at it failed under
-    /// `--no-default-features --features db --lib` while passing under
-    /// `--all-features --lib`, purely on interleaving. A dedicated test binary
-    /// would isolate it, but no CI command actually *runs* the crate's
-    /// standalone test binaries with `db` enabled, so that would be coverage in
-    /// name only. The behaviour is exercised through the runner's
-    /// `DeferredAuditExportInstall` tests and the production path instead.
-    #[cfg(feature = "db")]
-    #[test]
-    fn deferring_the_install_leaves_the_global_untouched_through_conversion() {
-        struct Marker;
-        impl crate::audit_export::AuditSink for Marker {
-            fn deliver<'a>(
-                &'a self,
-                _batch: &'a crate::audit_export::AuditBatch<'a>,
-            ) -> crate::audit_export::SinkFuture<'a> {
-                Box::pin(async { crate::audit_export::SinkAttempt::success(200) })
-            }
-        }
-
-        // A batch size no other test uses, so its presence in the global could
-        // only have come from this conversion.
-        const FINGERPRINT: i64 = 4_242;
-
-        let built = HarvestBuilder::new()
-            .audit_export_sink(Marker)
-            .audit_export_secret(b"deferred".to_vec())
-            .audit_export_batch_size(FINGERPRINT)
-            .build()
-            .deferring_audit_export_install();
-        assert!(
-            built.defer_audit_export_install,
-            "the opt-out must set the flag the conversion reads"
-        );
-
-        let _parts = built.into_worker_parts_with_extra_state(SharedStateMap::default());
-
-        let installed_batch_size = crate::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG
-            .read()
-            .expect("lock")
-            .as_ref()
-            .map(|config| config.batch_size);
-        assert_ne!(
-            installed_batch_size,
-            Some(FINGERPRINT),
-            "the conversion must not publish this runtime's sink: a live \
-             scanner ticking here would export to a runtime that may never \
-             start, and the runner publishes it itself once startup succeeds"
+            "expected CallbackTargetRejected, got {result:?}"
         );
     }
 
@@ -8707,9 +6463,11 @@ mod tests {
         // Identical-behavior guarantee: an embedder who never touches the
         // completion-callback API gets an empty default-target list.
         let built = HarvestBuilder::new().build();
-        assert_eq!(
-            built.completion_callback_config().default_targets,
-            [] as [crate::completion_callback::CallbackTarget; 0]
+        assert!(
+            built
+                .completion_callback_config()
+                .default_targets
+                .is_empty()
         );
         assert!(built.completion_callback_config().deliverer.is_none());
     }
@@ -8781,135 +6539,12 @@ mod tests {
             );
 
         // Exactly one registration entry for the name, carrying the LATER bytes.
-        let regs: Vec<&(String, Vec<u8>, Option<String>)> = builder
+        let regs: Vec<&(String, Vec<u8>)> = builder
             .wasm_module_registrations
             .iter()
-            .filter(|(n, _, _)| n == "checksum")
+            .filter(|(n, _)| n == "checksum")
             .collect();
         assert_eq!(regs.len(), 1, "duplicate name must not keep both blobs");
         assert_eq!(regs[0].1, vec![2, 2, 2], "must retain the later bytes");
-    }
-
-    #[cfg(feature = "wasm-activities")]
-    fn wasm_publisher() -> ed25519_dalek::SigningKey {
-        ed25519_dalek::SigningKey::from_bytes(&[9; 32])
-    }
-
-    #[cfg(feature = "wasm-activities")]
-    #[test]
-    fn a_trusted_key_rejects_an_unsigned_wasm_registration() {
-        use crate::wasm_store::WasmActivityRegistration;
-
-        let result = HarvestBuilder::new()
-            .wasm_trusted_publisher_key(wasm_publisher().verifying_key().to_bytes())
-            .wasm_activity(WasmActivityRegistration::new("checksum", vec![1, 2, 3]))
-            .try_build();
-        assert!(
-            matches!(
-                result,
-                Err(HarvestBuilderError::WasmModuleSignatureRejected { ref activity, .. })
-                    if activity == "checksum"
-            ),
-            "got {result:?}"
-        );
-    }
-
-    #[cfg(feature = "wasm-activities")]
-    #[test]
-    fn a_trusted_key_rejects_an_invalid_public_key() {
-        let bad = (0_u8..=255)
-            .map(|b| [b; 32])
-            .find(|k| ed25519_dalek::VerifyingKey::from_bytes(k).is_err())
-            .expect("an invalid point");
-        let result = HarvestBuilder::new()
-            .wasm_trusted_publisher_key(wasm_publisher().verifying_key().to_bytes())
-            .wasm_trusted_publisher_key(bad)
-            .try_build();
-        assert!(
-            matches!(
-                result,
-                Err(HarvestBuilderError::WasmTrustedKeyInvalid { index: 1 })
-            ),
-            "got {result:?}"
-        );
-    }
-
-    #[cfg(feature = "wasm-activities")]
-    #[test]
-    fn a_signed_wasm_registration_builds_and_installs_the_policy() {
-        use crate::wasm_store::WasmActivityRegistration;
-
-        let bytes = vec![1, 2, 3];
-        let signature =
-            crate::wasm_signing::sign_wasm_module(&wasm_publisher(), "checksum", &bytes);
-        let built = HarvestBuilder::new()
-            .wasm_trusted_publisher_key(wasm_publisher().verifying_key().to_bytes())
-            .wasm_activity(
-                WasmActivityRegistration::new("checksum", bytes).with_signature(signature),
-            )
-            .try_build()
-            .expect("a signed module builds");
-        let policy = built
-            .wasm_store()
-            .and_then(|store| store.trust_policy())
-            .expect("the store carries the trust policy");
-        assert_eq!(policy.len(), 1);
-    }
-
-    #[cfg(feature = "wasm-activities")]
-    #[test]
-    fn a_trusted_key_set_after_the_registration_still_applies() {
-        use crate::wasm_store::WasmActivityRegistration;
-
-        let result = HarvestBuilder::new()
-            .wasm_activity(WasmActivityRegistration::new("checksum", vec![1, 2, 3]))
-            .wasm_trusted_publisher_key(wasm_publisher().verifying_key().to_bytes())
-            .try_build();
-        assert!(
-            matches!(
-                result,
-                Err(HarvestBuilderError::WasmModuleSignatureRejected { .. })
-            ),
-            "got {result:?}"
-        );
-    }
-
-    #[cfg(feature = "wasm-activities")]
-    #[test]
-    fn a_re_registration_keeps_the_later_signature() {
-        use crate::wasm_store::WasmActivityRegistration;
-
-        let later = vec![4, 5, 6];
-        let signature =
-            crate::wasm_signing::sign_wasm_module(&wasm_publisher(), "checksum", &later);
-        let built = HarvestBuilder::new()
-            .wasm_trusted_publisher_key(wasm_publisher().verifying_key().to_bytes())
-            .wasm_activity(WasmActivityRegistration::new("checksum", vec![1, 2, 3]))
-            .wasm_activity(
-                WasmActivityRegistration::new("checksum", later).with_signature(signature.clone()),
-            )
-            .try_build()
-            .expect("the later, signed registration builds");
-        assert_eq!(
-            built.wasm_module_registrations()[0].2.as_deref(),
-            Some(signature.as_str())
-        );
-    }
-
-    #[cfg(feature = "wasm-activities")]
-    #[test]
-    fn without_a_trusted_key_no_policy_is_installed() {
-        use crate::wasm_store::WasmActivityRegistration;
-
-        let built = HarvestBuilder::new()
-            .wasm_activity(WasmActivityRegistration::new("checksum", vec![1, 2, 3]))
-            .try_build()
-            .expect("an unsigned module builds without a policy");
-        assert!(
-            built
-                .wasm_store()
-                .and_then(|store| store.trust_policy())
-                .is_none()
-        );
     }
 }

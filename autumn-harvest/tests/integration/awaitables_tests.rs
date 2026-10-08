@@ -849,10 +849,7 @@ fn terminal_history_projection_is_empty() {
         },
         AWAITABLE_CATEGORY_CAP,
     );
-    assert_eq!(
-        projection.awaitables,
-        [] as [autumn_harvest::awaitables::Awaitable; 0]
-    );
+    assert!(projection.awaitables.is_empty());
     assert!(!projection.truncated);
 }
 
@@ -2032,10 +2029,7 @@ fn exactly_cap_entries_are_not_truncated() {
     );
     assert_eq!(projection.awaitables.len(), AWAITABLE_CATEGORY_CAP);
     assert!(!projection.truncated, "exactly-cap is NOT truncation");
-    assert_eq!(
-        projection.truncated_kinds,
-        [] as [autumn_harvest::awaitables::AwaitableKind; 0]
-    );
+    assert!(projection.truncated_kinds.is_empty());
 }
 
 #[test]

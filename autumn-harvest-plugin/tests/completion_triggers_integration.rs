@@ -31,6 +31,7 @@ use autumn_harvest_plugin::api::{
 
 static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 use autumn_harvest_plugin::HarvestDbPool;
+use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -48,7 +49,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::test_init_sql().as_bytes().to_vec()
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
 }
 
 type HarvestApiApp = axum::Router;
@@ -94,7 +95,7 @@ async fn setup_sharded_databases() -> ((String, String), ContainerAsync<Postgres
 
     for url in [&shard0_url, &shard1_url] {
         let mut conn = AsyncPgConnection::establish(url).await.unwrap();
-        conn.batch_execute(&autumn_harvest::test_init_sql())
+        conn.batch_execute(autumn_harvest::full_migrations_sql())
             .await
             .unwrap();
     }
@@ -308,7 +309,7 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::default(),
     ));
-    harvest_api_router(api_state)
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
 
 async fn get_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
@@ -445,7 +446,7 @@ async fn test_trigger_evaluations_same_shard() {
             workflow_name: "source_wf",
             workflow_id: "source-1",
             exec_id: source_exec_id,
-            input: json!({"hello": "world"}).into(),
+            input: json!({"hello": "world"}),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -575,7 +576,7 @@ async fn test_terminate_fires_terminated_trigger_not_cancelled() {
             workflow_name: "term_source_wf",
             workflow_id: "term-source-1",
             exec_id: source_exec_id,
-            input: json!({"hello": "world"}).into(),
+            input: json!({"hello": "world"}),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -698,7 +699,7 @@ async fn test_trigger_input_mapping_static_and_projection() {
             workflow_name: "source_wf",
             workflow_id: "source-static",
             exec_id: source_exec_id,
-            input: json!({}).into(),
+            input: json!({}),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -789,7 +790,7 @@ async fn test_trigger_input_mapping_static_and_projection() {
             workflow_name: "source_wf",
             workflow_id: "source-proj",
             exec_id: source_exec_id_proj,
-            input: json!({}).into(),
+            input: json!({}),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -911,7 +912,7 @@ async fn test_outcome_mapping_delivers_failure_cause_to_target() {
             workflow_name: "source_wf",
             workflow_id: "source-outcome",
             exec_id: source_exec_id,
-            input: json!({}).into(),
+            input: json!({}),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -1077,7 +1078,7 @@ async fn test_outcome_mapping_delivers_output_on_completed_source() {
             workflow_name: "source_wf",
             workflow_id: "source-outcome-ok",
             exec_id: source_exec_id,
-            input: json!({}).into(),
+            input: json!({}),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -1197,7 +1198,7 @@ async fn test_trigger_state_matching_and_deduplication() {
             workflow_name: "source_wf",
             workflow_id: "source-matching",
             exec_id: source_exec_id,
-            input: json!({}).into(),
+            input: json!({}),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -1338,7 +1339,7 @@ async fn test_trigger_cross_shard() {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         router.clone(),
     ));
-    let app = harvest_api_router(api_state);
+    let app = harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"));
 
     let mut trigger_id = uuid::Uuid::new_v4();
     let mut source_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
@@ -1387,7 +1388,7 @@ async fn test_trigger_cross_shard() {
             workflow_name: "source_wf",
             workflow_id: "source-sharded",
             exec_id: source_exec_id,
-            input: json!({"data": "sharded"}).into(),
+            input: json!({"data": "sharded"}),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -1505,7 +1506,7 @@ async fn test_completion_trigger_via_worker_run() {
             workflow_name: "source_wf",
             workflow_id: "source-worker",
             exec_id: source_exec_id,
-            input: json!({"worker": "processed"}).into(),
+            input: json!({"worker": "processed"}),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -1637,7 +1638,7 @@ async fn test_trigger_with_custom_queue() {
             workflow_name: "source_wf",
             workflow_id: "source-queue-test",
             exec_id: source_exec_id,
-            input: json!({}).into(),
+            input: json!({}),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -1796,7 +1797,7 @@ async fn test_trigger_outbox_retry_and_sweep() {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         router.clone(),
     ));
-    let app = harvest_api_router(api_state);
+    let app = harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"));
 
     let mut trigger_id = uuid::Uuid::new_v4();
     let mut source_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
@@ -1838,7 +1839,7 @@ async fn test_trigger_outbox_retry_and_sweep() {
             workflow_name: "source_wf",
             workflow_id: "source-outbox",
             exec_id: source_exec_id,
-            input: json!({"key": "val"}).into(),
+            input: json!({"key": "val"}),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -1936,24 +1937,6 @@ async fn test_trigger_outbox_retry_and_sweep() {
         .is_some();
     assert!(outbox_still_exists);
 
-    // Issue #1227 Finding 4 (PR #1386): a missing target-shard pool now stamps
-    // `next_attempt_at` with a backoff (`OUTBOX_RELAY_FAILURE_BACKOFF`). So a
-    // durably-unreachable shard cannot dominate every claim batch forever. The
-    // failed sweep just stamped the row above. So the very next sweep call, with
-    // no time elapsed, would not yet reclaim it. Back the timestamp into the past
-    // to simulate that the backoff has elapsed. This test exercises "the
-    // connection issue clears and a LATER scan retries successfully". It does not
-    // exercise "retried on the very next tick with zero delay". That zero-delay
-    // retry is the hot-spin that issue #1227 itself fixed.
-    diesel::update(
-        outbox_dsl::harvest_completion_trigger_outbox
-            .filter(outbox_dsl::source_exec_id.eq(source_exec_id.as_uuid())),
-    )
-    .set(outbox_dsl::next_attempt_at.eq(chrono::Utc::now() - chrono::Duration::seconds(1)))
-    .execute(&mut conn0)
-    .await
-    .unwrap();
-
     // 2. Now run outbox sweep with the correct/working sharded pool
     let sweep_res_success = autumn_harvest::completion_trigger::enforce_completion_triggers_outbox(
         &mut conn0,
@@ -2018,7 +2001,7 @@ async fn test_trigger_cross_shard_queue_preservation() {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         router.clone(),
     ));
-    let app = harvest_api_router(api_state);
+    let app = harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"));
 
     let mut trigger_id = uuid::Uuid::new_v4();
     let mut source_exec_id = ExecutionId::new_for_shard(ShardId::new(1)); // Source runs on Shard 1
@@ -2089,7 +2072,7 @@ async fn test_trigger_cross_shard_queue_preservation() {
             workflow_name: "source_wf",
             workflow_id: "source-queue-lookup",
             exec_id: source_exec_id,
-            input: json!({}).into(),
+            input: json!({}),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -2172,8 +2155,7 @@ async fn test_trigger_compensating_rollback() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let ((shard0_url, _shard1_url), _container) = setup_sharded_databases().await;
     let pool0 = build_pool(&shard0_url);
-    // Shard 1 pool: point it at a non-existent host to force a connection
-    // failure.
+    // shard 1 pool: we'll create a bad pool pointing to a non-existent port/host to trigger connection failure
     let bad_pool1 = build_pool("postgres://postgres:postgres@localhost:12345/non_existent");
 
     let mut pools = BTreeMap::new();
@@ -2200,7 +2182,7 @@ async fn test_trigger_compensating_rollback() {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         router.clone(),
     ));
-    let app = harvest_api_router(api_state);
+    let app = harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"));
 
     let trigger_id = uuid::Uuid::new_v4();
 
@@ -2292,7 +2274,7 @@ async fn test_trigger_compensating_rollback_restores_existing() {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         router.clone(),
     ));
-    let app = harvest_api_router(api_state);
+    let app = harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"));
 
     // 2. Post to /admin/completion-triggers with updated values.
     // Shard 0 will succeed to update, but Shard 1 will fail.
@@ -2541,22 +2523,17 @@ async fn test_runner_startup_fails_on_sync_failure() {
             batch: autumn_harvest_plugin::HarvestBatchConfig::default(),
             readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
             startup: autumn_harvest_plugin::HarvestStartupConfig::default(),
-            redis: autumn_harvest_plugin::HarvestRedisConfig::default(),
         },
         HarvestRunnerResources::new(bad_pool),
     )
     .await;
 
-    // Verify it failed to start. Since issue #1823 the DR fence probe runs
-    // first, before any write, so an unreachable database now refuses there.
-    // Trigger sync never runs against a database the runner cannot probe.
+    // Verify it failed to start
     assert!(result.is_err());
     let err_str = result.err().unwrap().to_string();
     assert!(
         err_str.contains("Failed to get DB connection")
             || err_str.contains("sync completion triggers")
-            || err_str.contains("cross-region DR fencing could not be resolved"),
-        "{err_str}"
     );
 }
 
@@ -2592,7 +2569,7 @@ async fn test_trigger_evaluations_schema_validation() {
             workflow_name: "source_wf",
             workflow_id: "source-valid",
             exec_id: source_exec_id_valid,
-            input: Value::Null.into(),
+            input: Value::Null,
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -2678,7 +2655,7 @@ async fn test_trigger_evaluations_schema_validation() {
             workflow_name: "source_wf",
             workflow_id: "source-invalid",
             exec_id: source_exec_id_invalid,
-            input: Value::Null.into(),
+            input: Value::Null,
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -2807,7 +2784,7 @@ async fn test_trigger_emits_fire_metric_outcomes() {
             workflow_name: "source_wf",
             workflow_id: "source-metric",
             exec_id: source_exec_id,
-            input: json!({"hello": "metric"}).into(),
+            input: json!({"hello": "metric"}),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -2941,7 +2918,7 @@ async fn start_and_complete_source(
             workflow_name: "source_wf",
             workflow_id,
             exec_id,
-            input: json!({}).into(),
+            input: json!({}),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,

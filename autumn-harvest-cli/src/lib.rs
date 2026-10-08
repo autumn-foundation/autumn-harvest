@@ -10,9 +10,6 @@ use autumn_harvest::backup_verify::{
     Finding, FindingSeverity, RestoreVerifyReport, ShardTarget, VerifyOptions, VerifyStatus,
     dsn_targets_same_database, redact_dsn, verify_restore,
 };
-use autumn_harvest::migrate::{
-    MigrationPlan, MigrationReport, MigrationScript, UnserializedReason,
-};
 use autumn_harvest::testing::WorkflowReplayer;
 use autumn_harvest::{
     AcknowledgedBreakingChange, DetCheckReport, DetSeverity, SchemaContractDiff, SchemaDelta,
@@ -20,32 +17,11 @@ use autumn_harvest::{
     dropped_acknowledgements, unacknowledged_breaking,
 };
 use clap::{Parser, Subcommand, ValueEnum};
-use diesel_async::AsyncPgConnection;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
 const DEFAULT_BASE_URL: &str = "http://localhost:3000/api/harvest";
-/// Default for `--http-timeout-secs` (issue #1832).
-const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 30;
-/// Upper bound on the TCP and TLS connect phase (issue #1832).
-const MAX_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-/// Minimum idle limit between two SSE reads (issue #1832).
-///
-/// The server sends a keepalive every 15 s by default. So 60 s is four
-/// missed keepalives, and a dead stream fails instead of hanging. A larger
-/// `--http-timeout-secs` raises the limit.
-const SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-/// Server-side wait of `workflow update --wait completed` when the command
-/// sets no `--timeout-secs`.
-const UPDATE_WAIT_DEFAULT_SECS: u64 = 30;
-/// Time added to a server-side wait, so the server answers first.
-const SERVER_WAIT_SLACK_SECS: u64 = 10;
-/// Minimum timeout for a bulk DLQ command that writes (issue #1832).
-///
-/// One call acts on up to 1000 rows across all shards. A client timeout
-/// does not stop the server. It only hides the result and the row counts.
-const BULK_DLQ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 /// Characters percent-encoded when a caller-supplied value becomes one URL path
 /// segment.
 ///
@@ -106,19 +82,6 @@ pub struct Cli {
     #[arg(long, global = true, value_enum, default_value = "pretty-json")]
     output: OutputFormat,
 
-    /// Seconds an HTTP request to the management API may take (issue #1832).
-    ///
-    /// A request that gets no full response in this time fails. For
-    /// `events tail`, it bounds the wait for the response headers only.
-    #[arg(
-        long,
-        global = true,
-        env = "HARVEST_HTTP_TIMEOUT_SECS",
-        default_value_t = DEFAULT_HTTP_TIMEOUT_SECS,
-        value_parser = clap::value_parser!(u64).range(1..=3600)
-    )]
-    http_timeout_secs: u64,
-
     #[command(subcommand)]
     command: Commands,
 }
@@ -130,323 +93,6 @@ pub enum OutputFormat {
     PrettyJson,
     /// Compact JSON for scripts.
     Json,
-}
-
-/// Cross-region disaster-recovery operator commands (issue #954).
-///
-/// All three talk to shard databases directly, never to the management API:
-/// during a regional failover the management API may be exactly what is down,
-/// and the whole point of the fence is to be reachable when the region is not.
-#[derive(Subcommand, Debug)]
-pub enum DrCommand {
-    /// Report each shard's write-authority epoch and measured RPO.
-    ///
-    /// Read-only, safe at any time, and the first thing to run when deciding
-    /// whether to fail over: it shows the RPO you would be accepting.
-    Status {
-        /// A shard database DSN. Repeat once per shard. Accepts a bare DSN or
-        /// an explicit `<shard_id>=<dsn>` pair; an unprefixed DSN takes its
-        /// POSITIONAL index as its shard id.
-        #[arg(long = "shard", value_name = "DSN", required = true)]
-        shards: Vec<String>,
-
-        /// Slot-name prefix identifying this shard's DR replication.
-        ///
-        /// Must match the workers' `replication_slot_prefix`. Without a prefix
-        /// every walsender for the database would count as a DR standby —
-        /// including an unrelated logical-decoding consumer such as a CDC
-        /// pipeline — so a shard whose real cross-region subscriber had
-        /// disconnected would report itself protected.
-        #[arg(long, value_name = "PREFIX", default_value = "harvest_dr")]
-        slot_prefix: String,
-
-        /// Output format.
-        #[arg(long, short = 'o', value_enum, default_value = "text")]
-        format: DrFormat,
-    },
-
-    /// **Revoke the old region's write authority**: bump each shard's epoch.
-    ///
-    /// This is the fence. Every worker pinned to the previous epoch — in
-    /// EITHER region — stops. Run it on the promoted primary, on every shard,
-    /// before starting any workers.
-    Fence {
-        /// A shard database DSN. Repeat once per shard.
-        ///
-        /// Supply EVERY shard. Fencing a subset leaves a half-failed-over
-        /// cluster taking live cross-shard traffic, which converts bounded,
-        /// known skew into unbounded skew (see docs/cross-region-dr.md).
-        #[arg(long = "shard", value_name = "DSN", required = true)]
-        shards: Vec<String>,
-
-        /// Why this fence is being applied. Recorded in
-        /// `harvest_shard_generation.fenced_reason`.
-        ///
-        /// Required, not optional: an unattributable epoch bump found three
-        /// months later is indistinguishable from a mistake.
-        #[arg(long, value_name = "TEXT", required = true)]
-        reason: String,
-
-        /// Who is applying it. Recorded in `fenced_by`.
-        #[arg(
-            long,
-            value_name = "NAME",
-            env = "HARVEST_ACTOR",
-            default_value = "unknown"
-        )]
-        actor: String,
-
-        /// Acknowledge that this stops every worker pinned to the old epoch.
-        ///
-        /// Deliberately long and unpleasant to type. A fence during a healthy
-        /// week is a fleet-wide outage recovered only by restarting the fleet.
-        #[arg(long = "i-understand-this-stops-the-fleet", required = true)]
-        confirm: bool,
-
-        /// Fence a shard that has no fencing row yet, creating one.
-        ///
-        /// Off by default, and that default is a safety guard rather than
-        /// tidiness. A shard with no row has never been pinned by a worker, so
-        /// there is nothing to fence — and the overwhelmingly likely cause of
-        /// an absent row is a **wrong shard id**: `--shard <dsn>` with no
-        /// `<id>=` prefix takes its *positional index* as the shard id, so one
-        /// mis-ordered DSN silently creates a phantom row, bumps it, prints
-        /// success, and fences nobody while the operator believes the region is
-        /// fenced. Refusing is the loud outcome.
-        #[arg(long)]
-        provision: bool,
-
-        /// Fence a database that still looks like a live primary.
-        ///
-        /// By default this refuses a target that is not in recovery **and**
-        /// still has connected standbys — i.e. a healthy primary rather than
-        /// the standby you just promoted. That combination is the signature of
-        /// a mis-typed DSN, and the cost of getting it wrong is a self-inflicted
-        /// fleet-wide outage on a region that was fine.
-        #[arg(long)]
-        force: bool,
-
-        /// Output format.
-        #[arg(long, short = 'o', value_enum, default_value = "text")]
-        format: DrFormat,
-    },
-
-    /// Finish promoting a standby: advance every sequence to match the data.
-    ///
-    /// **Required after promoting a LOGICAL standby.** Logical replication
-    /// copies rows but not sequence values, so a promoted logical standby holds
-    /// every replicated `harvest_events` row while `harvest_events_id_seq`
-    /// still sits where it started — and the new primary's first append dies on
-    /// a duplicate key.
-    ///
-    /// A separate verb from `fence` on purpose: folding it in would let an
-    /// operator fence a shard and never advance its sequences, and discover it
-    /// only when the first workflow tried to make progress. Harmless and
-    /// idempotent on a physical replica, which replicates sequences already.
-    Promote {
-        /// A promoted shard database DSN. Repeat once per shard.
-        #[arg(long = "shard", value_name = "DSN", required = true)]
-        shards: Vec<String>,
-
-        /// Output format.
-        #[arg(long, short = 'o', value_enum, default_value = "text")]
-        format: DrFormat,
-    },
-}
-
-/// Output format for `harvest dr`.
-///
-/// This is a **local** flag (`--format` / `-o`); it is deliberately distinct
-/// from the global `--output`, which formats management-API responses that
-/// these commands never make.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
-pub enum DrFormat {
-    /// Human-readable table.
-    #[default]
-    Text,
-    /// Machine-readable JSON.
-    Json,
-}
-
-/// `harvest partition` — inspect and manage the opt-in partitioned
-/// `harvest_events` layout (issue #958).
-///
-/// Every subcommand is shard-local by construction: a shard is a database, so
-/// each `--shard` DSN is acted on independently and one shard's outcome never
-/// depends on another's.
-#[derive(Debug, Subcommand)]
-pub enum PartitionCommand {
-    /// Report each shard's layout, partitions, and what the sweeper would do.
-    ///
-    /// Read-only and safe at any time. This is the first thing to run when
-    /// asking "why has space not come back?": the `blocked` column names each
-    /// cohort the sweeper considered and the reason it was left alone.
-    Status {
-        /// A shard database DSN. Repeat once per shard. Accepts a bare DSN or
-        /// an explicit `<shard_id>=<dsn>` pair; an unprefixed DSN takes its
-        /// POSITIONAL index as its shard id.
-        #[arg(long = "shard", value_name = "DSN", required = true)]
-        shards: Vec<String>,
-
-        /// Output format.
-        #[arg(long, short = 'o', value_enum, default_value = "text")]
-        format: DrFormat,
-    },
-
-    /// Print the SQL that converts a **large live** table, without running it.
-    ///
-    /// Emits the operator-run plan whose expensive steps sit OUTSIDE the
-    /// exclusive lock window (`CREATE INDEX CONCURRENTLY`, `NOT VALID` +
-    /// `VALIDATE CONSTRAINT`), leaving a metadata-only swap. Use this instead
-    /// of `enable` on any table big enough that an index build inside a
-    /// transaction would hold `ACCESS EXCLUSIVE` longer than you can afford.
-    ///
-    /// Needs no database connection: it prints a plan for you to review.
-    Plan {
-        /// Cohort width in seconds. Governs both reclamation granularity and
-        /// the live partition count (retention horizon / width + lookahead).
-        #[arg(long, value_name = "SECONDS", default_value_t = autumn_harvest::partition::DEFAULT_COHORT_WIDTH_SECS)]
-        cohort_width_secs: i64,
-
-        /// How many cohorts ahead of "now" the engine keeps pre-created.
-        #[arg(long, value_name = "N", default_value_t = autumn_harvest::partition::DEFAULT_LOOKAHEAD_COHORTS)]
-        lookahead_cohorts: u32,
-
-        /// Omit the phase-1 guard that refuses when a logical-replication
-        /// publication covers `harvest_events` without
-        /// `publish_via_partition_root`.
-        ///
-        /// Set this only when the subscriber runs the partitioned layout too.
-        /// Without it, an operator who has done exactly that could use this
-        /// override on `enable`. They could not use it on the large-table
-        /// plan — the only path large deployments are told to use.
-        #[arg(long = "allow-incompatible-publications")]
-        allow_incompatible_publications: bool,
-    },
-
-    /// **Convert this shard to the partitioned layout.**
-    ///
-    /// One transaction under a bounded `lock_timeout`, so a failure leaves the
-    /// deployment exactly as it was. Instant on an empty table; on a populated
-    /// one the existing table is attached WHOLE as the pre-cutover partition,
-    /// so no row is copied or rewritten — but the index builds and constraint
-    /// validation happen inside the lock window.
-    ///
-    /// On a large live table use `plan` instead.
-    Enable {
-        /// A shard database DSN. Repeat once per shard.
-        #[arg(long = "shard", value_name = "DSN", required = true)]
-        shards: Vec<String>,
-
-        /// Cohort width in seconds.
-        #[arg(long, value_name = "SECONDS", default_value_t = autumn_harvest::partition::DEFAULT_COHORT_WIDTH_SECS)]
-        cohort_width_secs: i64,
-
-        /// How many cohorts ahead of "now" to pre-create.
-        #[arg(long, value_name = "N", default_value_t = autumn_harvest::partition::DEFAULT_LOOKAHEAD_COHORTS)]
-        lookahead_cohorts: u32,
-
-        /// Seconds to wait for `ACCESS EXCLUSIVE` on `harvest_events` before
-        /// giving up. Failing fast is correct: a conversion that queues behind
-        /// a long transaction blocks every append behind it.
-        #[arg(long, value_name = "SECONDS", default_value_t = 5)]
-        lock_timeout_secs: u64,
-
-        /// Acknowledge that this takes a brief exclusive lock on
-        /// `harvest_events`, during which appends wait.
-        ///
-        /// Deliberately unpleasant to type: on a populated table the window
-        /// covers two index builds and a full-table constraint validation.
-        #[arg(long = "i-understand-the-lock-window")]
-        confirm: bool,
-
-        /// The DR generation that holds write authority (issue #1823).
-        ///
-        /// Required on a shard database that carries a DR marker. Read it
-        /// from `harvest dr status` against the promoted primary. `N` applies
-        /// to every shard. `<ID>=<N>` applies to one shard and overrides `N`.
-        /// Repeat it once per shard. The command refuses a shard at any other
-        /// generation, so a stale DSN to a demoted primary writes nothing.
-        #[arg(long = "expect-generation", value_name = "[ID=]N", value_parser = parse_expect_generation)]
-        expect_generation: Vec<ExpectGeneration>,
-
-        /// Convert even when a logical-replication publication covers
-        /// `harvest_events` without `publish_via_partition_root`.
-        ///
-        /// Such a publication would send the partitioned table's rows under
-        /// leaf partition names the standby has no tables for, stopping the
-        /// subscription. Set this only when the subscriber runs the
-        /// partitioned layout too.
-        #[arg(long = "allow-incompatible-publications")]
-        allow_incompatible_publications: bool,
-
-        /// Output format.
-        #[arg(long, short = 'o', value_enum, default_value = "text")]
-        format: DrFormat,
-    },
-
-    /// Run one maintenance pass now instead of waiting for a retention tick.
-    ///
-    /// Drains the `DEFAULT` partition, extends the lookahead window, then
-    /// sweeps droppable cohorts. The retention janitor does exactly this every
-    /// tick; this exists for incident response and for a deployment that runs
-    /// with history retention disabled (where no janitor is running to do it).
-    Maintain {
-        /// A shard database DSN. Repeat once per shard.
-        #[arg(long = "shard", value_name = "DSN", required = true)]
-        shards: Vec<String>,
-
-        /// How many cohorts ahead of "now" to keep pre-created.
-        #[arg(long, value_name = "N", default_value_t = autumn_harvest::partition::DEFAULT_LOOKAHEAD_COHORTS)]
-        lookahead_cohorts: u32,
-
-        /// Maximum partitions to drop in this pass.
-        #[arg(long, value_name = "N", default_value_t = 32)]
-        max_drops: usize,
-
-        /// The DR generation that holds write authority (issue #1823).
-        ///
-        /// Required on a shard database that carries a DR marker. Read it
-        /// from `harvest dr status` against the promoted primary. `N` applies
-        /// to every shard. `<ID>=<N>` applies to one shard and overrides `N`.
-        /// Repeat it once per shard. The command refuses a shard at any other
-        /// generation, so a stale DSN to a demoted primary writes nothing.
-        #[arg(long = "expect-generation", value_name = "[ID=]N", value_parser = parse_expect_generation)]
-        expect_generation: Vec<ExpectGeneration>,
-
-        /// Output format.
-        #[arg(long, short = 'o', value_enum, default_value = "text")]
-        format: DrFormat,
-    },
-
-    /// **Revert this shard to the ordinary unpartitioned table.**
-    ///
-    /// The escape hatch. Copies every surviving row back into a plain table and
-    /// restores the foreign key, so it REWRITES THE WHOLE TABLE — schedule a
-    /// window for it on anything large.
-    Disable {
-        /// A shard database DSN. Repeat once per shard.
-        #[arg(long = "shard", value_name = "DSN", required = true)]
-        shards: Vec<String>,
-
-        /// Acknowledge that this rewrites `harvest_events` in full.
-        #[arg(long = "i-understand-this-rewrites-the-table")]
-        confirm: bool,
-
-        /// The DR generation that holds write authority (issue #1823).
-        ///
-        /// Required on a shard database that carries a DR marker. Read it
-        /// from `harvest dr status` against the promoted primary. `N` applies
-        /// to every shard. `<ID>=<N>` applies to one shard and overrides `N`.
-        /// Repeat it once per shard. The command refuses a shard at any other
-        /// generation, so a stale DSN to a demoted primary writes nothing.
-        #[arg(long = "expect-generation", value_name = "[ID=]N", value_parser = parse_expect_generation)]
-        expect_generation: Vec<ExpectGeneration>,
-
-        /// Output format.
-        #[arg(long, short = 'o', value_enum, default_value = "text")]
-        format: DrFormat,
-    },
 }
 
 /// `harvest backup` subcommands (issue #943).
@@ -506,18 +152,6 @@ pub enum BackupCommand {
         /// execution carries more reference events than one page.
         #[arg(long, default_value_t = 1000)]
         probe_limit: i64,
-
-        /// The shard a pre-sharding (unencoded) target id resolves to.
-        ///
-        /// Must match the fleet's configured default shard (`ShardRouter`'s
-        /// `default_shard`), not whichever `--shard` happens to observe the
-        /// reference. Every runtime routing path falls back to the fleet
-        /// default for an unencoded id. This check must agree with them, or
-        /// it reports a false `child_execution_missing` /
-        /// `external_target_missing` on a fleet migrated from pre-sharding
-        /// ids. Defaults to `0`, the overwhelmingly common configuration.
-        #[arg(long, default_value_t = 0)]
-        default_shard: i32,
     },
 }
 
@@ -545,19 +179,6 @@ pub enum SchemaCheckFormat {
     #[default]
     Text,
     /// Machine-readable diff JSON for CI consumption.
-    Json,
-}
-
-/// Output format for the `migrate` subcommands (issue #1240).
-///
-/// This is a **local** flag (`--format`); it is deliberately distinct from the
-/// global `--output` used for API responses.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
-pub enum MigrateFormat {
-    /// Human-readable per-database summary (default).
-    #[default]
-    Text,
-    /// Machine-readable JSON for deploy pipelines.
     Json,
 }
 
@@ -721,23 +342,6 @@ pub enum CliError {
     /// HTTP transport failed.
     #[error("request failed: {0}")]
     Request(#[from] reqwest::Error),
-
-    /// The management API did not answer in time (issue #1832).
-    #[error(
-        "request timed out after {seconds} s; raise --http-timeout-secs \
-         (HARVEST_HTTP_TIMEOUT_SECS) for a slow link"
-    )]
-    Timeout {
-        /// The timeout that expired, in seconds.
-        seconds: u64,
-    },
-
-    /// No connection to the management API in time (issue #1832).
-    #[error("could not connect within {seconds} s; check --base-url and the network")]
-    ConnectTimeout {
-        /// The connect timeout that expired, in seconds.
-        seconds: u64,
-    },
 
     /// The Harvest API returned a non-success status.
     #[error("harvest API returned {status}: {body}")]
@@ -1026,40 +630,6 @@ pub enum CliError {
         op: &'static str,
         /// The underlying error, rendered.
         reason: String,
-    },
-
-    /// A `migrate` operation failed against one database (issue #1240).
-    ///
-    /// The DSN is redacted before it reaches this message: a migration command
-    /// is run from deploy pipelines whose logs are far more widely readable
-    /// than the credential in `harvest.database.url`. Exit code is `1`.
-    #[error("migrate: {database}: {reason}")]
-    Migrate {
-        /// Redacted DSN of the database the operation was pointed at.
-        database: String,
-        /// The underlying failure, rendered.
-        reason: String,
-    },
-
-    /// `migrate status --check` found a pending migration (issue #1240).
-    ///
-    /// The report itself is already printed; this only signals the exit code.
-    /// Exit code is `1` — "determined: not migrated", as distinct from the
-    /// exit-`2` gates that mean "could not determine".
-    // The remedy names the flags on purpose: this gate reports on exactly the
-    // sets it was handed, so a bare `harvest migrate run` after a `--check`
-    // that carried `--include-dir` would apply the embedded set only, exit 0,
-    // and leave the very migration that failed the gate unapplied.
-    #[error(
-        "migrate status: {pending} pending migration(s) across {databases} database(s) — \
-         run `harvest migrate run` with the SAME --database-url and --include-dir \
-         flags you passed here, before rolling replicas"
-    )]
-    MigrationsPending {
-        /// Total pending migrations across every inspected database.
-        pending: usize,
-        /// How many databases still have at least one pending migration.
-        databases: usize,
     },
 }
 
@@ -1400,28 +970,6 @@ enum Commands {
         #[command(subcommand)]
         command: BuildRoutingCommand,
     },
-    /// Cross-region disaster-recovery operations: inspect the RPO, apply the
-    /// failover fence, finish a promotion (issue #954).
-    ///
-    /// Talks to shard databases directly, never to the management API — during
-    /// a regional failover the management API may be exactly what is down.
-    /// See `docs/runbooks/cross-region-failover.md`.
-    Dr {
-        #[command(subcommand)]
-        command: DrCommand,
-    },
-
-    /// Inspect and manage the opt-in partitioned `harvest_events` layout
-    /// (issue #958).
-    ///
-    /// Talks to shard databases directly, never to the management API: the
-    /// layout is a property of each shard's own schema, and `enable`/`disable`
-    /// are DDL that no HTTP surface should be able to trigger.
-    Partition {
-        #[command(subcommand)]
-        command: PartitionCommand,
-    },
-
     /// Verify that a restored backup/PITR snapshot is resumable (issue #943).
     ///
     /// Read-only against every supplied scratch database: each connection is
@@ -1481,28 +1029,6 @@ enum Commands {
         command: DebugCommand,
     },
 
-    /// Apply Harvest's schema migrations to a dedicated Harvest database
-    /// (issue #1240).
-    ///
-    /// For `harvest.mode = "split"` / `"external"` deployments, where Harvest
-    /// storage is a database Autumn has no handle on: `autumn migrate` reaches
-    /// the application database only, and outside the `dev` profile the plugin
-    /// warns about pending Harvest migrations rather than applying them.
-    ///
-    /// Talks to Postgres directly — no management API, no running app — and
-    /// uses the same `__diesel_schema_migrations` ledger Autumn and Diesel use,
-    /// so a migration is applied exactly once no matter which of them applies
-    /// it. Under `embedded` mode use `autumn migrate` instead; the two Harvest
-    /// sets are Autumn's there.
-    ///
-    /// Harvest's own migrations are embedded in this binary. Sets that are not
-    /// (the plugin's connector dead-letter table, an application's own) are
-    /// applied by pointing `--include-dir` at their migration directories.
-    Migrate {
-        #[command(subcommand)]
-        command: MigrateCommand,
-    },
-
     /// Gate backward-incompatible workflow payload-schema changes (issue #794).
     ///
     /// Read-only file comparison: no database, no network.
@@ -1536,84 +1062,6 @@ enum Commands {
         /// Template to emit. Currently only `minimal` ships.
         #[arg(long, value_enum, default_value_t)]
         template: ScaffoldTemplate,
-    },
-}
-
-/// `harvest migrate` subcommands (issue #1240).
-///
-/// Both talk to Postgres directly and never to the management API. `status` is
-/// strictly read-only — it does not even create the migration ledger — so it is
-/// safe to point at a database you are only inspecting.
-#[derive(Debug, Subcommand)]
-enum MigrateCommand {
-    /// Report applied and pending migrations without changing anything.
-    ///
-    /// Exits `0` normally, and `1` with `--check` when any target still has a
-    /// pending migration (the deploy-gate form: run it before rolling
-    /// replicas).
-    Status {
-        /// Harvest database to inspect: the value of `harvest.database.url`.
-        ///
-        /// Repeat once per shard database for a multi-shard deployment; each
-        /// one needs the full set.
-        #[arg(
-            long = "database-url",
-            env = "HARVEST_DATABASE_URL",
-            hide_env_values = true,
-            value_name = "URL",
-            required = true
-        )]
-        database_url: Vec<String>,
-        /// Additional migration directory to include, e.g.
-        /// `autumn-harvest-plugin/migrations/harvest` for the connector
-        /// dead-letter table. Repeatable; each is a directory of
-        /// `<version>_<description>/up.sql` migrations.
-        #[arg(long = "include-dir", value_name = "DIR")]
-        include_dir: Vec<PathBuf>,
-        /// Output format: human-readable `text` (default) or machine-readable
-        /// `json`.
-        #[arg(long, value_enum, default_value_t)]
-        format: MigrateFormat,
-        /// Exit non-zero while any target has a pending migration.
-        #[arg(long, default_value_t = false)]
-        check: bool,
-    },
-    /// Apply every pending migration, in version order.
-    ///
-    /// Each migration runs inside one transaction together with its ledger row,
-    /// so a failure leaves neither the schema change nor the record of it —
-    /// with one exception, which the report names when it happens: a migration
-    /// whose `metadata.toml` sets `run_in_transaction = false` (what `CREATE
-    /// INDEX CONCURRENTLY` requires) has no transaction to roll back, so any
-    /// statement of it that already succeeded still stands. A failing target
-    /// stops the run: remaining targets are left untouched rather than
-    /// half-migrated behind a database that already failed.
-    Run {
-        /// Harvest database to migrate: the value of `harvest.database.url`.
-        ///
-        /// Repeat once per shard database for a multi-shard deployment; they
-        /// are migrated in the order given.
-        #[arg(
-            long = "database-url",
-            env = "HARVEST_DATABASE_URL",
-            hide_env_values = true,
-            value_name = "URL",
-            required = true
-        )]
-        database_url: Vec<String>,
-        /// Additional migration directory to include, e.g.
-        /// `autumn-harvest-plugin/migrations/harvest` for the connector
-        /// dead-letter table. Repeatable; each is a directory of
-        /// `<version>_<description>/up.sql` migrations.
-        #[arg(long = "include-dir", value_name = "DIR")]
-        include_dir: Vec<PathBuf>,
-        /// Output format: human-readable `text` (default) or machine-readable
-        /// `json`.
-        #[arg(long, value_enum, default_value_t)]
-        format: MigrateFormat,
-        /// Report what would be applied and exit without applying it.
-        #[arg(long, default_value_t = false)]
-        dry_run: bool,
     },
 }
 
@@ -1877,13 +1325,6 @@ enum AuditCommand {
         /// Upper bound (exclusive), RFC 3339.
         #[arg(long)]
         before: Option<String>,
-        /// Row id tiebreaker for `--before` (issue #1408).
-        ///
-        /// Pass the prior page's last row id, alongside `--before`, to page
-        /// past rows tied on that timestamp. Has no effect without
-        /// `--before`.
-        #[arg(long)]
-        before_id: Option<String>,
         /// Maximum number of records to return [1–500].
         #[arg(long, value_parser = clap::value_parser!(i64).range(1..=500))]
         limit: Option<i64>,
@@ -1927,8 +1368,8 @@ enum TokenCommand {
     Create {
         /// Human-readable label for the caller (CI job, dashboard, on-call, SDK).
         name: String,
-        /// Verb-level scope: `read` (read-only routes), `mutate` (all but token
-        /// mint and revoke) or `admin` (everything). Defaults to `read`.
+        /// Verb-level scope: `read` (read-only routes) or `mutate` (everything).
+        /// Defaults to `read` (least privilege).
         #[arg(long, default_value = "read")]
         scope: String,
         /// Optional RFC 3339 expiry after which the token is rejected 401.
@@ -1946,7 +1387,6 @@ enum TokenCommand {
     },
     /// Rotate a token: mint a replacement via the create route. Revoking the
     /// old token is a documented second step (`harvest token revoke <old-id>`).
-    /// Minting needs an `admin` token (issue #1803).
     Rotate {
         /// The existing token ID being rotated out (used to name the replacement).
         old_id: String,
@@ -1962,7 +1402,7 @@ enum TokenCommand {
     /// against your database — no API call and no DB connection is made.
     ///
     /// Standalone (tokens-only) deployments use this to mint their first
-    /// `admin` token. With tokens as the only auth, no admin caller exists
+    /// `mutate` token: with tokens as the only auth there is no admin caller
     /// yet to mint one via `POST /admin/tokens`. Run the printed SQL once (you
     /// already have DB access — the trust anchor), then mint every further
     /// token through the API. The printed SQL contains ONLY the hash; the
@@ -1971,10 +1411,9 @@ enum TokenCommand {
         /// Human-readable label for the seed token.
         #[arg(long, default_value = "bootstrap")]
         name: String,
-        /// Verb-level scope: `admin` (can mint further tokens via the API),
-        /// `mutate` or `read`. Defaults to `admin` so the seed token can mint
-        /// the rest (issue #1803).
-        #[arg(long, default_value = "admin", value_parser = ["read", "mutate", "admin"])]
+        /// Verb-level scope: `mutate` (can mint further tokens via the API) or
+        /// `read`. Defaults to `mutate` so the seed token can bootstrap the rest.
+        #[arg(long, default_value = "mutate", value_parser = ["read", "mutate"])]
         scope: String,
         /// Optional RFC 3339 expiry after which the token is rejected 401.
         #[arg(long)]
@@ -1987,128 +1426,6 @@ enum TokenCommand {
 
 #[derive(Debug, Subcommand)]
 enum ShardCommand {
-    /// Migrate quiescent workflow executions from one shard to another (issue #964).
-    ///
-    /// Connects to the shard databases DIRECTLY rather than through the
-    /// management API: a rebalance is a two-database operation, and the node
-    /// serving the API has no reason to hold a pool for both. Supply each shard
-    /// with `--shard <ID>=<DSN>`.
-    ///
-    /// Always dry-run first. `--dry-run` walks the same code path up to the
-    /// first write and reports exactly the population a real run would move.
-    Rebalance {
-        /// Shard to migrate executions OFF, as `<ID>=<DSN>`. Repeat for the
-        /// target; both must be supplied.
-        #[arg(long = "shard", value_name = "ID=DSN", required = true)]
-        shards: Vec<String>,
-        /// The shard id to migrate off.
-        #[arg(long)]
-        from: i32,
-        /// The shard id to migrate to.
-        #[arg(long)]
-        to: i32,
-        /// Maximum executions to move in this run.
-        #[arg(long, default_value_t = 50)]
-        limit: usize,
-        /// Report what would move without writing anything.
-        #[arg(long)]
-        dry_run: bool,
-        /// Resume a prior call's candidate scan past this cursor (issue
-        /// #1317), instead of always starting at the shard's oldest
-        /// `RUNNING` row. Copy both fields verbatim from a prior report's
-        /// `next_scan_cursor`. Without this, a shard whose oldest rows are
-        /// permanently blocked (an active session, a parked child) makes
-        /// every repeated call re-examine the same rows forever.
-        #[arg(long, requires = "after_execution_id")]
-        after_created_at: Option<autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>>,
-        /// See `--after-created-at`; both must be supplied together.
-        #[arg(long, requires = "after_created_at")]
-        after_execution_id: Option<autumn_harvest::uuid::Uuid>,
-        /// The DR generation that holds write authority (issue #1823).
-        ///
-        /// Required on a shard database that carries a DR marker. Read it
-        /// from `harvest dr status` against the promoted primary. `N` applies
-        /// to every shard. `<ID>=<N>` applies to one shard and overrides `N`.
-        /// Repeat it once per shard. The command refuses a shard at any other
-        /// generation, so a stale DSN to a demoted primary writes nothing.
-        #[arg(long = "expect-generation", value_name = "[ID=]N", value_parser = parse_expect_generation)]
-        expect_generation: Vec<ExpectGeneration>,
-        /// Print the raw JSON report instead of a human table.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Drive any migration left unfinished by a crash forward one step (issue #964).
-    ///
-    /// Idempotent and safe to re-run. A migration killed after its cutover is
-    /// completed; one killed before it is either finished or cleanly abandoned,
-    /// depending on whether the source woke up in the meantime.
-    RebalanceResume {
-        /// Shard databases, as `<ID>=<DSN>`. Supply every shard any unfinished
-        /// migration touches.
-        #[arg(long = "shard", value_name = "ID=DSN", required = true)]
-        shards: Vec<String>,
-        /// The shard whose migration records to drive.
-        #[arg(long)]
-        from: i32,
-        /// Maximum records to advance in this run.
-        #[arg(long, default_value_t = 100)]
-        limit: i64,
-        /// The DR generation that holds write authority (issue #1823).
-        ///
-        /// Required on a shard database that carries a DR marker. Read it
-        /// from `harvest dr status` against the promoted primary. `N` applies
-        /// to every shard. `<ID>=<N>` applies to one shard and overrides `N`.
-        /// Repeat it once per shard. The command refuses a shard at any other
-        /// generation, so a stale DSN to a demoted primary writes nothing.
-        #[arg(long = "expect-generation", value_name = "[ID=]N", value_parser = parse_expect_generation)]
-        expect_generation: Vec<ExpectGeneration>,
-        /// Print the raw JSON report instead of a human table.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Release a rebalanced source seal's business key once its live copy
-    /// has finished (issue #1317).
-    ///
-    /// Without this, `migrated_run_terminal_at` is never populated in a
-    /// deployment that does not run its own maintenance driver. A finished
-    /// migration then keeps blocking a same-key restart forever. Safe
-    /// to run on a schedule: idempotent, and a no-op once every eligible
-    /// seal on the shard is already marked.
-    ReconcileMigratedSeals {
-        /// Shard databases, as `<ID>=<DSN>`. Supply the shard whose seals to
-        /// reconcile, plus every shard any of those seals' live copies (or
-        /// forwarding chains) may currently reside on.
-        #[arg(long = "shard", value_name = "ID=DSN", required = true)]
-        shards: Vec<String>,
-        /// The shard whose `MIGRATED` seals to sweep.
-        #[arg(long)]
-        from: i32,
-        /// Maximum seals to examine in this run.
-        #[arg(long, default_value_t = 100)]
-        limit: i64,
-        /// Resume a prior call's scan past this cursor (issue #1317 review),
-        /// instead of always starting at the shard's oldest seal. Without
-        /// this, a shard whose oldest seals are permanently still-live or
-        /// unreachable makes every repeated call re-examine the same rows
-        /// forever. Copy both fields verbatim from a prior run's resume hint.
-        #[arg(long, requires = "after_execution_id")]
-        after_migrated_at: Option<autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>>,
-        /// See `--after-migrated-at`; both must be supplied together.
-        #[arg(long, requires = "after_migrated_at")]
-        after_execution_id: Option<autumn_harvest::uuid::Uuid>,
-        /// The DR generation that holds write authority (issue #1823).
-        ///
-        /// Required on a shard database that carries a DR marker. Read it
-        /// from `harvest dr status` against the promoted primary. `N` applies
-        /// to every shard. `<ID>=<N>` applies to one shard and overrides `N`.
-        /// Repeat it once per shard. The command refuses a shard at any other
-        /// generation, so a stale DSN to a demoted primary writes nothing.
-        #[arg(long = "expect-generation", value_name = "[ID=]N", value_parser = parse_expect_generation)]
-        expect_generation: Vec<ExpectGeneration>,
-        /// Print the raw JSON count instead of a human summary.
-        #[arg(long)]
-        json: bool,
-    },
     /// Show per-shard readiness and rollout blockers.
     Health {
         /// Evaluate this readable shard as a promotion candidate.
@@ -2828,10 +2145,6 @@ enum ScheduleCommand {
         /// Create the schedule in a paused state.
         #[arg(long)]
         paused: bool,
-        /// Jitter window in seconds. 0 disables jitter. If you omit it, a cron
-        /// with no seconds field gets 10 seconds (issue #1792).
-        #[arg(long)]
-        jitter_secs: Option<u64>,
     },
     /// Edit an existing schedule in place — partial update, `schedule_id` preserved (issue #771).
     Update {
@@ -3288,8 +2601,7 @@ enum DeadLetterCommand {
         #[arg(long)]
         error_class: Option<String>,
         /// Filter by derived DLQ reason class (exact, `snake_case`; e.g.
-        /// `poison_pill`, `workflow_task_timeout`, `history_cap_exceeded`,
-        /// `history_bytes_cap_exceeded`, `retry_exhaustion`). Exact-equality.
+        /// `poison_pill`, `workflow_task_timeout`, `retry_exhaustion`). Exact-equality.
         #[arg(long)]
         dlq_reason: Option<String>,
         /// Filter by derived failure signature (exact match on the normalized
@@ -3302,11 +2614,6 @@ enum DeadLetterCommand {
         /// Preview matching rows without performing any writes.
         #[arg(long)]
         dry_run: bool,
-        /// Spread the replayed tasks over this many seconds (issue #1832).
-        /// 0 makes every task due at once. Default: 60 s for 1000 rows,
-        /// scaled down for fewer rows. Maximum: 3600.
-        #[arg(long, value_parser = clap::value_parser!(u64).range(0..=3600))]
-        spread_secs: Option<u64>,
     },
     /// Aggregate dead-lettered tasks by dimension for fast root-cause triage.
     ///
@@ -3380,8 +2687,7 @@ enum DeadLetterCommand {
         #[arg(long)]
         error_class: Option<String>,
         /// Filter by derived DLQ reason class (exact, `snake_case`; e.g.
-        /// `poison_pill`, `workflow_task_timeout`, `history_cap_exceeded`,
-        /// `history_bytes_cap_exceeded`, `retry_exhaustion`). Exact-equality.
+        /// `poison_pill`, `workflow_task_timeout`, `retry_exhaustion`). Exact-equality.
         #[arg(long)]
         dlq_reason: Option<String>,
         /// Filter by derived failure signature (exact match on the normalized
@@ -3430,11 +2736,6 @@ enum DeadLetterCommand {
         /// Preview matching rows without re-enqueuing.
         #[arg(long)]
         dry_run: bool,
-        /// Spread the redriven tasks over this many seconds (issue #1832).
-        /// 0 makes every task due at once. Default: 60 s for 1000 rows,
-        /// scaled down for fewer rows. Maximum: 3600.
-        #[arg(long, value_parser = clap::value_parser!(u64).range(0..=3600))]
-        spread_secs: Option<u64>,
     },
 }
 
@@ -3542,53 +2843,14 @@ enum EventsCommand {
     Tail {
         /// Workflow execution ID to watch.
         execution_id: String,
-        /// Resume from this `event_id` (issue #1405), sent as the
-        /// Last-Event-ID header. NOT the shard-local `harvest_events.id` --
-        /// this is the per-execution sequence number the server's `id:`
-        /// SSE field carries. Events after it are replayed before entering
-        /// live-tail mode.
+        /// Resume from this event row ID (Last-Event-ID header).
+        /// Events with id > this value are replayed before entering live-tail mode.
         #[arg(long)]
-        last_event_id: Option<i32>,
+        last_event_id: Option<i64>,
     },
 }
 
 impl Cli {
-    /// The `--http-timeout-secs` value (issue #1832).
-    #[must_use]
-    pub const fn http_timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.http_timeout_secs)
-    }
-
-    /// The timeout for this command's API request (issue #1832).
-    ///
-    /// It is [`Self::http_timeout`], raised for a command that is slow by
-    /// design. `workflow update --wait completed` waits on the server for its
-    /// `--timeout-secs`. A bulk DLQ command that writes gets at least
-    /// [`BULK_DLQ_TIMEOUT`].
-    #[must_use]
-    pub fn request_timeout(&self) -> std::time::Duration {
-        let floor = match &self.command {
-            Commands::Workflow {
-                command:
-                    WorkflowCommand::Update {
-                        wait, timeout_secs, ..
-                    },
-            } if wait != "admitted" => std::time::Duration::from_secs(
-                timeout_secs
-                    .unwrap_or(UPDATE_WAIT_DEFAULT_SECS)
-                    .saturating_add(SERVER_WAIT_SLACK_SECS),
-            ),
-            Commands::Dlq {
-                command:
-                    DeadLetterCommand::Redrive { dry_run: false, .. }
-                    | DeadLetterCommand::BulkReplay { dry_run: false, .. }
-                    | DeadLetterCommand::BulkDiscard { dry_run: false, .. },
-            } => BULK_DLQ_TIMEOUT,
-            _ => std::time::Duration::ZERO,
-        };
-        self.http_timeout().max(floor)
-    }
-
     /// Build the management API request represented by these CLI arguments.
     ///
     /// # Errors
@@ -3673,20 +2935,20 @@ impl Cli {
                 queue.as_deref(),
             )),
             Commands::Build { command } => Ok(build_routing_request(command)),
-            // Locally-executed commands: each returns from `run` before the
-            // API-request mapper is reached, so none of them can arrive here.
-            // Grouped rather than listed one arm apiece -- a three-line arm per
-            // command is what pushed this function past `too_many_lines`, and
-            // it would do so again on the next local command.
-            cmd @ (Commands::Backup { .. }
-            | Commands::Dr { .. }
-            | Commands::Partition { .. }
-            | Commands::DetCheck { .. }
-            | Commands::Debug { .. }
-            | Commands::Schema { .. }
-            | Commands::Migrate { .. }
-            | Commands::New { .. }) => {
-                unreachable!("{cmd:?} handles its own execution locally")
+            Commands::Backup { .. } => {
+                unreachable!("Backup handles its own execution locally")
+            }
+            Commands::DetCheck { .. } => {
+                unreachable!("DetCheck handles its own execution locally")
+            }
+            Commands::Debug { .. } => {
+                unreachable!("Debug handles its own execution locally")
+            }
+            Commands::Schema { .. } => {
+                unreachable!("Schema handles its own execution locally")
+            }
+            Commands::New { .. } => {
+                unreachable!("New handles its own execution locally")
             }
         }
     }
@@ -3771,7 +3033,6 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
                 replay_sample,
                 worker_stale_secs,
                 probe_limit,
-                default_shard,
             },
     } = &cli.command
     {
@@ -3783,37 +3044,8 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
             *replay_sample,
             *worker_stale_secs,
             *probe_limit,
-            *default_shard,
         )
         .await;
-    }
-
-    // `dr` talks to shard databases directly, not to the management API: a
-    // regional failover is precisely when the management API may be
-    // unreachable (mirrors `backup verify`).
-    if let Commands::Dr { command } = &cli.command {
-        return run_dr(command).await;
-    }
-
-    // `shard rebalance` moves rows between two shard databases, so like `dr` and
-    // `partition` it connects to them directly rather than through the
-    // management API -- which would need a pool for both shards on one node.
-    if let Commands::Shard { command } = &cli.command
-        && matches!(
-            command,
-            ShardCommand::Rebalance { .. }
-                | ShardCommand::RebalanceResume { .. }
-                | ShardCommand::ReconcileMigratedSeals { .. }
-        )
-    {
-        return run_shard_rebalance(command, cli.actor.as_deref()).await;
-    }
-
-    // `partition` is shard-local DDL and inspection: it connects to each shard
-    // database directly, so it is handled in-process before the API execute
-    // path, exactly like `dr`.
-    if let Commands::Partition { command } = &cli.command {
-        return run_partition(command).await;
     }
 
     // det-check is read-only local source analysis: no HTTP, handled entirely
@@ -3889,26 +3121,6 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
                 acknowledge.as_deref(),
                 recorded_in.as_deref(),
             ),
-        };
-    }
-
-    // `migrate` talks to the Harvest database directly (issue #1240): no HTTP,
-    // and deliberately no running app — it is the step that happens *before*
-    // replicas roll (mirrors `backup verify`).
-    if let Commands::Migrate { command } = &cli.command {
-        return match command {
-            MigrateCommand::Status {
-                database_url,
-                include_dir,
-                format,
-                check,
-            } => run_migrate_status(database_url, include_dir, *format, *check).await,
-            MigrateCommand::Run {
-                database_url,
-                include_dir,
-                format,
-                dry_run,
-            } => run_migrate_run(database_url, include_dir, *format, *dry_run).await,
         };
     }
 
@@ -4748,30 +3960,6 @@ pub fn parse_shard_targets(raw: &[String]) -> Result<Vec<ShardTarget>, CliError>
     Ok(out)
 }
 
-/// Validate `--default-shard` with the same rule [`parse_shard_targets`] uses
-/// for `--shard`.
-///
-/// An out-of-range value can never match a `--shard` target. Every unencoded
-/// reference would then fall to the advisory `uninspected_shard_reference`
-/// path, instead of the coherence check this flag exists to enable (issue
-/// #1205).
-///
-/// # Errors
-///
-/// [`CliError::InvalidInput`] when `default_shard` cannot be encoded into an
-/// execution id.
-pub fn validate_default_shard(default_shard: i32) -> Result<(), CliError> {
-    if autumn_harvest::shard::is_encodable_shard(autumn_harvest::ShardId::new(default_shard)) {
-        Ok(())
-    } else {
-        Err(CliError::InvalidInput(format!(
-            "--default-shard: shard id `{default_shard}` cannot be encoded into an \
-             execution id (valid range is 0..={})",
-            autumn_harvest::shard::MAX_ENCODABLE_SHARD
-        )))
-    }
-}
-
 /// AC4: refuse to run against a DSN that resolves to the same database as the
 /// live configuration, unless the operator explicitly acknowledges otherwise.
 ///
@@ -4875,60 +4063,6 @@ pub fn format_backup_verify_text(report: &RestoreVerifyReport) -> String {
             replay.failed,
             replay.skipped_no_handler,
             replay.unreadable
-        );
-    } else if replay.unreadable > 0
-        && (replay.clean > 0 || replay.divergent > 0 || replay.failed > 0)
-    {
-        // Distinct from the "nothing replayed" branch below. Some histories
-        // DID replay here, but at least one selected for replay was never
-        // read at all, so the coverage this run reports is incomplete. The
-        // "register handlers" advice below does not apply. Handlers ARE
-        // registered, since something replayed.
-        let _ = writeln!(
-            out,
-            "  replay: PARTIALLY VERIFIED — {} sampled, {} clean, {} divergent, \
-             {} workflow-failed, {} skipped (no handler), {} unreadable. \
-             Coverage is incomplete: {} history/histories were never read, so a \
-             clean verdict here does not cover them.",
-            replay.sampled,
-            replay.clean,
-            replay.divergent,
-            replay.failed,
-            replay.skipped_no_handler,
-            replay.unreadable,
-            replay.unreadable
-        );
-    } else if replay.unreadable > 0 && replay.skipped_no_handler == 0 {
-        // Every sample that reached this check was unreadable, and none
-        // replayed at all. This is distinct from the branch below, where
-        // nothing replayed because no handler was registered. Handlers may
-        // well BE registered here. The "register handlers" advice would
-        // send an operator chasing the wrong cause. The `history_unreadable`
-        // finding above names the actual one (a malformed, legacy, or
-        // newer-version payload; a missing row).
-        let _ = writeln!(
-            out,
-            "  replay: NOT VERIFIED — {} sampled, {} unreadable, 0 replayed. Every sampled \
-             history failed to read; see the history_unreadable finding above for the cause. \
-             Registering workflow handlers will not fix this.",
-            replay.sampled, replay.unreadable
-        );
-    } else if replay.unreadable > 0 {
-        // Nothing replayed, for two separate reasons at once: some samples
-        // were unreadable, others had no registered handler. A fleet-wide
-        // merge across shards can produce this mix (issue #1410). Name both
-        // counts. Registering handlers fixes only the second group.
-        let _ = writeln!(
-            out,
-            "  replay: NOT VERIFIED — {} sampled, {} unreadable, {} skipped (no handler), \
-             0 replayed. {} history/histories failed to read; see the history_unreadable \
-             finding above for the cause. {} had no registered handler. Registering \
-             handlers may fix part of this, not all of it.",
-            replay.sampled,
-            replay.unreadable,
-            replay.skipped_no_handler,
-            replay.unreadable,
-            replay.skipped_no_handler
         );
     } else {
         let _ = writeln!(
@@ -5047,7 +4181,6 @@ pub fn backup_verify_gate(report: &RestoreVerifyReport) -> Option<CliError> {
 /// [`CliError::InvalidInput`] on bad arguments or a refused live DSN;
 /// [`CliError::RestoreIncoherent`] / [`CliError::RestoreUndetermined`] when the
 /// report fails the gate. The report itself is always printed first.
-#[allow(clippy::too_many_arguments)]
 pub async fn run_backup_verify(
     shards: &[String],
     live_dsn: &[String],
@@ -5056,7 +4189,6 @@ pub async fn run_backup_verify(
     replay_sample: usize,
     worker_stale_secs: i64,
     probe_limit: i64,
-    default_shard: i32,
 ) -> Result<(), CliError> {
     scratch_guard(shards, live_dsn, ack)?;
     // Say out loud when the guard could not protect anything -- an operator
@@ -5066,13 +4198,11 @@ pub async fn run_backup_verify(
         eprintln!("{w}");
     }
     let targets = parse_shard_targets(shards)?;
-    validate_default_shard(default_shard)?;
 
     let options = VerifyOptions::default()
         .with_replay_sample(replay_sample)
         .with_worker_stale_secs(worker_stale_secs)
         .with_probe_limit(probe_limit)
-        .with_default_shard(default_shard)
         .with_scratch_ack(ack);
 
     // The CLI ships no application workflow handlers, so replay coverage is
@@ -5088,2449 +4218,6 @@ pub async fn run_backup_verify(
     }
 
     backup_verify_gate(&report).map_or(Ok(()), Err)
-}
-
-// ── harvest migrate: dedicated Harvest-database migrations (issue #1240) ────
-
-/// Assemble the migration set to apply: Harvest's own, embedded in this binary,
-/// plus every `--include-dir` set in the order given.
-///
-/// The combined set is validated for duplicate versions here rather than per
-/// directory, because that is exactly where a collision arises — two
-/// independently authored sets that picked the same version. Diesel's ledger is
-/// keyed by version alone, so one of them would otherwise be recorded and never
-/// run.
-///
-/// # Errors
-///
-/// [`CliError::InvalidInput`] when a directory cannot be read, when a migration
-/// in it has no readable `up.sql`, or when two migrations share a version.
-fn migration_set(include_dir: &[PathBuf]) -> Result<Vec<MigrationScript>, CliError> {
-    let mut scripts = autumn_harvest::migrate::embedded();
-    for dir in include_dir {
-        let extra = autumn_harvest::migrate::from_directory(dir).map_err(|error| {
-            CliError::InvalidInput(format!("--include-dir `{}`: {error}", dir.display()))
-        })?;
-        scripts.extend(extra);
-    }
-    autumn_harvest::migrate::validate_versions(&scripts)
-        .map_err(|error| CliError::InvalidInput(error.to_string()))?;
-    Ok(scripts)
-}
-
-/// Establish the connection `harvest migrate` works over.
-///
-/// Deliberately not [`autumn_harvest::migrate::connect`]: that is
-/// `AsyncPgConnection::establish`, which is `NoTls` and so cannot reach a
-/// database whose `sslmode` demands TLS — the common shape of a managed
-/// Harvest database, and exactly the production case this command exists for
-/// (issue #1240). This builds the same rustls-backed connector autumn-web's
-/// own migration path uses, so the two agree about which databases are
-/// reachable.
-///
-/// **TLS is always verified** — certificate chain *and* hostname, against the
-/// platform's trust store. That is stricter than libpq, whose `require` and
-/// `prefer` encrypt without authenticating: a certificate this cannot verify is
-/// refused here, where libpq would connect.
-///
-/// What that means per mode, precisely:
-///
-/// * `disable` — plaintext, no trust store consulted.
-/// * `prefer` (the default) — TLS is attempted; tokio-postgres falls back to
-///   plaintext only when the **server declines** TLS, not when the handshake
-///   fails. So an untrusted or hostname-mismatched certificate is an error
-///   here rather than a silent downgrade to an unauthenticated connection.
-///   Deliberate: this command carries a database password and applies schema
-///   changes, and "the certificate was wrong so we sent the credential in
-///   clear" is not a fallback worth having. Use `sslmode=disable` to say
-///   plaintext out loud, or put the CA in the trust store.
-/// * `require` / `verify-ca` / `verify-full` — TLS, verified. An empty trust
-///   store is a named error rather than a downgrade.
-///
-/// # Errors
-///
-/// [`CliError::Migrate`] when the DSN cannot be parsed, when the platform has
-/// no usable trust store, or when the connection cannot be established.
-async fn connect_for_migration(
-    database_url: &str,
-    redacted: &str,
-) -> Result<AsyncPgConnection, CliError> {
-    let dsn = normalize_sslmode(database_url);
-    let config: tokio_postgres::Config = dsn
-        .parse()
-        .map_err(|error: tokio_postgres::Error| migrate_error(database_url, redacted, &error))?;
-
-    // `sslmode=disable` never touches the TLS configuration, so it must not be
-    // gated on one: a minimal container with no CA bundle is a perfectly good
-    // place to migrate a plaintext database, and failing there would contradict
-    // what this command promises.
-    if config.get_ssl_mode() == tokio_postgres::config::SslMode::Disable {
-        return autumn_harvest::migrate::connect(database_url)
-            .await
-            .map_err(|error| migrate_error(database_url, redacted, &error));
-    }
-
-    let mut roots = rustls::RootCertStore::empty();
-    let native = rustls_native_certs::load_native_certs();
-    for cert in native.certs {
-        // A malformed certificate in the system store is not a reason to fail:
-        // rustls rejects it, the rest still anchor the chain.
-        let _ = roots.add(cert);
-    }
-    if roots.is_empty() {
-        // With no anchors, every TLS handshake would fail verification. What
-        // that should mean depends on whether the operator asked for TLS:
-        // under `require` it is a hard error, and under `prefer` -- which is
-        // libpq's "TLS if it works, plaintext otherwise" -- plaintext is the
-        // documented degradation. Never the reverse: a `require` DSN is never
-        // quietly downgraded.
-        if config.get_ssl_mode() == tokio_postgres::config::SslMode::Prefer {
-            eprintln!(
-                "warning: {redacted}: no usable certificates in the platform trust \
-                 store, so no TLS connection could be verified; sslmode=prefer \
-                 therefore connects in PLAINTEXT. Install your distribution's \
-                 ca-certificates package, or pass sslmode=require to fail instead. \
-                 (With a trust store present, a certificate that fails to verify \
-                 is an error, not a downgrade.)"
-            );
-            return autumn_harvest::migrate::connect(database_url)
-                .await
-                .map_err(|error| migrate_error(database_url, redacted, &error));
-        }
-        return Err(CliError::Migrate {
-            database: redacted.to_string(),
-            reason: format!(
-                "no usable certificates in the platform trust store, so a TLS \
-                 connection cannot be verified (install your distribution's \
-                 ca-certificates package). Loader errors: {:?}",
-                native.errors
-            ),
-        });
-    }
-
-    // An explicit provider rather than the process-wide default: nothing else
-    // in this binary installs one, and `ClientConfig::builder()` panics when
-    // there is none.
-    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
-    let tls_config = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|error| migrate_error(database_url, redacted, &error))?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-
-    let (client, connection) = config
-        .connect(tokio_postgres_rustls::MakeRustlsConnect::new(tls_config))
-        .await
-        .map_err(|error| migrate_error(database_url, redacted, &error))?;
-
-    // `try_from_client_and_connection` drives the connection task itself and
-    // surfaces its errors on the connection, so a dropped socket mid-migration
-    // is reported rather than hanging.
-    AsyncPgConnection::try_from_client_and_connection(client, connection)
-        .await
-        .map_err(|error| migrate_error(database_url, redacted, &error))
-}
-
-/// Rewrite `sslmode=verify-ca` / `verify-full` to `require`.
-///
-/// tokio-postgres 0.7 accepts only `disable`, `prefer` and `require`, and
-/// **fails to parse** the DSN otherwise — so a `verify-full` DSN that libpq and
-/// the `diesel` CLI accept would be rejected before a connection is attempted.
-///
-/// Substituting `require` is not a downgrade: verification is the rustls
-/// connector's job here, and it always checks the chain and the hostname. The
-/// two verify modes therefore describe what [`connect_for_migration`] already
-/// does unconditionally.
-///
-/// Handles both DSN spellings — a URL (`postgres://…?sslmode=verify-full`) and
-/// libpq keyword form (`host=… sslmode=verify-full`) — and leaves anything else
-/// byte-identical.
-#[must_use]
-pub fn normalize_sslmode(dsn: &str) -> String {
-    const VERIFY_MODES: [&str; 2] = ["verify-ca", "verify-full"];
-
-    if let Ok(mut url) = url::Url::parse(dsn) {
-        let needs_rewrite = url
-            .query_pairs()
-            .any(|(k, v)| k == "sslmode" && VERIFY_MODES.contains(&v.as_ref()));
-        if !needs_rewrite {
-            return dsn.to_string();
-        }
-        let rewritten: Vec<(String, String)> = url
-            .query_pairs()
-            .map(|(k, v)| {
-                if k == "sslmode" && VERIFY_MODES.contains(&v.as_ref()) {
-                    (k.into_owned(), "require".to_string())
-                } else {
-                    (k.into_owned(), v.into_owned())
-                }
-            })
-            .collect();
-        url.query_pairs_mut()
-            .clear()
-            .extend_pairs(rewritten)
-            .finish();
-        return url.to_string();
-    }
-
-    rewrite_keyword_dsn(dsn, &VERIFY_MODES)
-}
-
-/// Rewrite the top-level `sslmode` option of a libpq **keyword/value** DSN
-/// (`host=… sslmode=verify-full`), leaving every other byte alone.
-///
-/// Scans the DSN the way libpq reads it — options separated by whitespace,
-/// optional whitespace around `=`, values optionally single-quoted with `\`
-/// escapes — rather than splitting on whitespace. A whitespace split cannot see
-/// quoting, so `password='abc sslmode=verify-full def'` would have had the text
-/// *inside the password* rewritten, corrupting the credential and failing
-/// authentication. It also could not see `sslmode = verify-full`, which libpq
-/// accepts and this now rewrites.
-///
-/// A DSN this cannot scan (an unterminated quote, a missing `=`) is returned
-/// **unchanged**, so tokio-postgres reports its own parse error rather than
-/// this mangling the input first.
-fn rewrite_keyword_dsn(dsn: &str, verify_modes: &[&str]) -> String {
-    scan_keyword_dsn(dsn, |key, value| {
-        (key == "sslmode" && verify_modes.contains(&value)).then(|| "require".to_string())
-    })
-    .unwrap_or_else(|| dsn.to_string())
-}
-
-/// Redact the secrets in a libpq **keyword/value** DSN, leaving the rest legible.
-///
-/// [`redact_dsn`] parses URLs, and answers `<unparseable dsn>` for the keyword
-/// form. That is safe but useless as a *label*: repeat `--database-url` with
-/// three keyword-form shards and every line of the report reads the same, which
-/// is exactly the "which databases did we already migrate?" question a partial
-/// report exists to answer.
-///
-/// Returns `None` when the DSN cannot be scanned, so a caller can fall back
-/// rather than print something it has not actually inspected.
-fn redact_keyword_dsn(dsn: &str) -> Option<String> {
-    // Any key whose name carries `password` — `password`, and a future
-    // `sslpassword` — loses its value. Everything else (host, dbname, user,
-    // port) is what makes one target tellable from another.
-    scan_keyword_dsn(dsn, |key, _| {
-        key.to_ascii_lowercase()
-            .contains("password")
-            .then(|| "***".to_string())
-    })
-}
-
-/// The char starting at byte offset `i`, or `None` past the end of `dsn`.
-fn peek_char(dsn: &str, i: usize) -> Option<char> {
-    dsn[i..].chars().next()
-}
-
-/// Advance `*i` past a run of Unicode whitespace, if any starts there.
-fn skip_whitespace(dsn: &str, i: &mut usize) {
-    while let Some(c) = peek_char(dsn, *i) {
-        if !c.is_whitespace() {
-            break;
-        }
-        *i += c.len_utf8();
-    }
-}
-
-/// Scan a libpq keyword/value DSN, replacing the values `replace` returns
-/// `Some` for and copying every other byte verbatim.
-///
-/// Reads the DSN the way libpq does — options separated by whitespace, optional
-/// whitespace around `=`, values optionally single-quoted, backslash escaping
-/// the next character in either form. A whitespace split cannot see quoting, so
-/// `password='abc sslmode=verify-full def'` would otherwise have the text
-/// *inside the password* rewritten.
-///
-/// "Whitespace" is Unicode `White_Space` (`char::is_whitespace`), matching
-/// `tokio_postgres::config`'s own `skip_ws`. It is not ASCII only.
-///
-/// The client treats a no-break space or a vertical tab as an option
-/// separator. This scan must too. Otherwise it reads two options as one
-/// and a `password` key past the separator goes unseen (issue #1321).
-///
-/// Returns `None` for a DSN this cannot scan — an unterminated quote, a missing
-/// `=`, a value that never arrives — leaving the caller to pass the original
-/// through so tokio-postgres reports its own parse error rather than this
-/// mangling the input first.
-fn scan_keyword_dsn(
-    dsn: &str,
-    mut replace: impl FnMut(&str, &str) -> Option<String>,
-) -> Option<String> {
-    let bytes = dsn.as_bytes();
-    let mut out = String::with_capacity(dsn.len());
-    let mut i = 0;
-
-    while i < bytes.len() {
-        // Whitespace between options, copied verbatim. See the Unicode
-        // whitespace note on this function's doc comment.
-        let start = i;
-        skip_whitespace(dsn, &mut i);
-        out.push_str(&dsn[start..i]);
-        if i >= bytes.len() {
-            break;
-        }
-
-        // Keyword, then `=` with optional whitespace on either side.
-        let key_start = i;
-        while let Some(c) = peek_char(dsn, i) {
-            if c == '=' || c.is_whitespace() {
-                break;
-            }
-            i += c.len_utf8();
-        }
-        let key = &dsn[key_start..i];
-        // The key must be a keyword libpq actually recognizes, not merely
-        // keyword-SHAPED. Checking only the character set is not enough: a
-        // mistyped URL that keeps a credential but loses the `://`
-        // (`postgres=//alice:hunter2@db/harvest`) scans as the "keyword"
-        // `postgres`, needs no redaction because there is no `password=`, and
-        // comes back whole -- password included -- as if it had been examined.
-        // Rejecting here yields the caller's `<unparseable dsn>` label, which
-        // is what an input tokio-postgres will also reject should produce.
-        if !is_connection_keyword(key) {
-            return None;
-        }
-        let spacing_start = i;
-        skip_whitespace(dsn, &mut i);
-        if i >= bytes.len() || bytes[i] != b'=' {
-            return None;
-        }
-        i += 1;
-        skip_whitespace(dsn, &mut i);
-        // A DSN that ends after `=` (`host=db password=`) has no value to read;
-        // indexing here would panic before tokio-postgres could say so.
-        if i >= bytes.len() {
-            return None;
-        }
-        out.push_str(key);
-        out.push_str(&dsn[spacing_start..i]);
-
-        // Value: single-quoted or bare, `\` escaping the next character in both.
-        let value_start = i;
-        let mut value = String::new();
-        if bytes[i] == b'\'' {
-            i += 1;
-            loop {
-                if i >= bytes.len() {
-                    // Unterminated quote: not ours to interpret.
-                    return None;
-                }
-                match bytes[i] {
-                    b'\\' if i + 1 < bytes.len() => {
-                        // Advance past the WHOLE escaped character: `\é` is
-                        // three bytes, and `i += 2` would leave `i` inside it,
-                        // so the next `dsn[i..]` slice panics on a non-char
-                        // boundary instead of connecting.
-                        let escaped = dsn[i + 1..].chars().next().unwrap_or_default();
-                        value.push(escaped);
-                        i += 1 + escaped.len_utf8();
-                    }
-                    b'\'' => {
-                        i += 1;
-                        break;
-                    }
-                    _ => {
-                        let c = dsn[i..].chars().next().unwrap_or_default();
-                        value.push(c);
-                        i += c.len_utf8();
-                    }
-                }
-            }
-        } else {
-            while peek_char(dsn, i).is_some_and(|c| !c.is_whitespace()) {
-                if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                    let escaped = dsn[i + 1..].chars().next().unwrap_or_default();
-                    value.push(escaped);
-                    i += 1 + escaped.len_utf8();
-                } else {
-                    let c = dsn[i..].chars().next().unwrap_or_default();
-                    value.push(c);
-                    i += c.len_utf8();
-                }
-            }
-        }
-
-        match replace(key, &value) {
-            Some(replacement) => out.push_str(&replacement),
-            // Verbatim, quotes and escapes included: only the options the
-            // caller asked about are ever touched.
-            None => out.push_str(&dsn[value_start..i]),
-        }
-    }
-
-    Some(out)
-}
-
-/// The label a migration target is reported under: its DSN with the credential
-/// removed, and — when it cannot be redacted at all — an ordinal, so repeated
-/// targets stay tellable apart.
-///
-/// `ordinal` is the target's 1-based position on the command line.
-#[must_use]
-pub fn migrate_target_label(dsn: &str, ordinal: usize) -> String {
-    const UNPARSEABLE: &str = "<unparseable dsn>";
-    /// `redact_dsn`'s other whole-DSN withholding: a URL carrying its password
-    /// in the query string cannot be rewritten safely, so it returns this
-    /// instead. Like the unparseable case it is the same for every target.
-    const WITHHELD: &str = "<redacted dsn>";
-
-    // Decide the FORM first, then redact with the reader for that form. The
-    // other order leaks: `redact_dsn` parses with a general URL parser, and
-    // `alice:hunter2@db.internal/harvest` is a syntactically fine URL whose
-    // scheme is `alice` and whose password is nowhere the parser looks — so it
-    // came back unredacted and went into the log. libpq's own rule is the
-    // scheme prefix, so use exactly that.
-    let trimmed = dsn.trim_start();
-    let is_url_form = ["postgres://", "postgresql://"].iter().any(|scheme| {
-        trimmed
-            .get(..scheme.len())
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
-    });
-
-    if is_url_form {
-        let redacted = redact_dsn(dsn);
-        // A URL is a URL, malformed or not: if the URL reader cannot read it,
-        // the keyword scanner has no business trying. Whenever the reader
-        // withholds the WHOLE DSN -- unparseable, or a password in the query
-        // string it cannot rewrite -- the label carries no identity, so every
-        // target would report the same. Keep the reason and add the ordinal.
-        return if redacted == UNPARSEABLE || redacted == WITHHELD {
-            format!("{redacted} #{ordinal}")
-        } else {
-            redacted
-        };
-    }
-
-    redact_keyword_dsn(dsn).unwrap_or_else(|| format!("{UNPARSEABLE} #{ordinal}"))
-}
-
-/// Whether `key` is a libpq connection keyword.
-///
-/// Deliberately a superset of what tokio-postgres itself accepts. Erring wide
-/// only risks handing back a redacted label for a DSN the driver will reject
-/// anyway; erring narrow would downgrade a legitimate DSN's label to
-/// `<unparseable dsn>` and cost an operator the identity of the failing shard.
-/// What it must not admit is a token that is keyword-shaped but not a keyword,
-/// which is how a mistyped URL smuggles a password past redaction.
-fn is_connection_keyword(key: &str) -> bool {
-    const KEYWORDS: &[&str] = &[
-        "application_name",
-        "channel_binding",
-        "client_encoding",
-        "connect_timeout",
-        "dbname",
-        "fallback_application_name",
-        "gssdelegation",
-        "gssencmode",
-        "gsslib",
-        "host",
-        "hostaddr",
-        "keepalives",
-        "keepalives_count",
-        "keepalives_idle",
-        "keepalives_interval",
-        "krbsrvname",
-        "load_balance_hosts",
-        "options",
-        "passfile",
-        "password",
-        "port",
-        "replication",
-        "require_auth",
-        "requirepeer",
-        "requiressl",
-        "scram_client_key",
-        "scram_server_key",
-        "service",
-        "ssl_max_protocol_version",
-        "ssl_min_protocol_version",
-        "sslcert",
-        "sslcertmode",
-        "sslcompression",
-        "sslcrl",
-        "sslcrldir",
-        "sslkey",
-        "sslmode",
-        "sslnegotiation",
-        "sslpassword",
-        "sslrootcert",
-        "sslsni",
-        "target_session_attrs",
-        "tcp_user_timeout",
-        "user",
-    ];
-    // libpq keywords are lowercase; compare case-insensitively so a DSN
-    // written `Host=db` keeps its label rather than being called unparseable.
-    KEYWORDS
-        .iter()
-        .any(|keyword| key.eq_ignore_ascii_case(keyword))
-}
-
-/// Render a migration failure without leaking the DSN.
-///
-/// A migration command runs from deploy pipelines whose logs are read far more
-/// widely than the credential in `harvest.database.url`, and a driver is free
-/// to quote the connection string it was handed. Substituting the redacted form
-/// costs nothing and removes the whole class.
-fn migrate_error(database_url: &str, redacted: &str, error: &impl std::fmt::Display) -> CliError {
-    CliError::Migrate {
-        database: redacted.to_string(),
-        reason: error.to_string().replace(database_url, redacted),
-    }
-}
-
-/// Human-readable `migrate status` report: one block per database.
-///
-/// `heading` distinguishes a plain status report from `run --dry-run`, which
-/// renders the same plan under a different promise.
-#[must_use]
-pub fn format_migrate_plan_text(heading: &str, targets: &[(String, MigrationPlan)]) -> String {
-    let mut out = String::new();
-    let _ = writeln!(out, "{heading}");
-    for (database, plan) in targets {
-        let _ = writeln!(out, "  {database}");
-        if !plan.ledger_exists {
-            let _ = writeln!(
-                out,
-                "    ledger:  absent — this database has never been migrated"
-            );
-        }
-        let _ = writeln!(out, "    applied: {}", plan.already_applied.len());
-        let _ = writeln!(out, "    pending: {}", plan.pending.len());
-        for script in &plan.pending {
-            let _ = writeln!(out, "      {}", script.name);
-        }
-        // Reported, never removed: the usual cause is a newer build having
-        // already migrated this database, but it also catches a DSN pointed at
-        // the wrong one.
-        if !plan.unrecognized.is_empty() {
-            let _ = writeln!(
-                out,
-                "    unrecognized: {} ledger row(s) this binary does not know \
-                 (is it older than the deployed schema?)",
-                plan.unrecognized.len()
-            );
-            for version in &plan.unrecognized {
-                let _ = writeln!(out, "      {version}");
-            }
-        }
-    }
-    let pending: usize = targets.iter().map(|(_, plan)| plan.pending.len()).sum();
-    let _ = write!(
-        out,
-        "{pending} pending migration(s) across {} database(s)",
-        targets.len()
-    );
-    out
-}
-
-/// A report for a target the run could not even inspect.
-const fn empty_migration_report() -> MigrationReport {
-    MigrationReport {
-        applied: Vec::new(),
-        already_applied: Vec::new(),
-        applied_concurrently: Vec::new(),
-        unrecognized: Vec::new(),
-        // Nothing ran, so nothing ran unserialized.
-        ledger_lock_available: true,
-        applied_unserialized: Vec::new(),
-        failed: None,
-    }
-}
-
-/// One database's outcome in a `migrate run` report.
-#[derive(Debug)]
-pub struct MigrateRunTarget {
-    /// Redacted DSN, or an ordinal label when it could not be redacted.
-    pub database: String,
-    /// What the run did here.
-    pub report: MigrationReport,
-    /// The run never reached a migration on this target: connecting, creating
-    /// the ledger, or reading it failed.
-    ///
-    /// Distinguished because an empty report is otherwise indistinguishable
-    /// from "finished, nothing to do" — a JSON consumer would read `applied:
-    /// []`, `failed: null` on a database the run could not even inspect and
-    /// call it done.
-    pub setup_failed: bool,
-}
-
-/// Human-readable `migrate run` report: one block per database.
-#[must_use]
-pub fn format_migrate_run_text(targets: &[MigrateRunTarget]) -> String {
-    let mut out = String::new();
-    let _ = writeln!(out, "harvest migrate run");
-    for MigrateRunTarget {
-        database,
-        report,
-        setup_failed,
-    } in targets
-    {
-        let _ = writeln!(out, "  {database}");
-        let _ = writeln!(out, "    applied: {}", report.applied.len());
-        for name in &report.applied {
-            let _ = writeln!(out, "      {name}");
-        }
-        let _ = writeln!(out, "    already applied: {}", report.already_applied.len());
-        // Another migrator committed these between the plan and the apply. Said
-        // out loud because "applied: 0" on the database an operator is watching
-        // otherwise looks like the command did nothing.
-        if !report.applied_concurrently.is_empty() {
-            let _ = writeln!(
-                out,
-                "    applied by a concurrent migrator: {}",
-                report.applied_concurrently.len()
-            );
-            for name in &report.applied_concurrently {
-                let _ = writeln!(out, "      {name}");
-            }
-        }
-        if !report.unrecognized.is_empty() {
-            let _ = writeln!(
-                out,
-                "    unrecognized: {} ledger row(s) this binary does not know \
-                 (is it older than the deployed schema?)",
-                report.unrecognized.len()
-            );
-        }
-        // The `harvest` binary installs no tracing subscriber, so the engine's
-        // own warning about this goes nowhere. An operator only learns that
-        // concurrent runs are unsafe here if the report says so.
-        if !report.applied_unserialized.is_empty() {
-            let _ = writeln!(
-                out,
-                "    WARNING: {} migration(s) applied WITHOUT the ledger lock, so a \
-                 concurrent migrator was not serialized against them:",
-                report.applied_unserialized.len()
-            );
-            // Per migration, not per run: a run can contain both reasons, and
-            // they take different remedies. Naming one cause for the whole
-            // list would send an operator to change a grant that cannot help
-            // the non-transactional entries.
-            for entry in &report.applied_unserialized {
-                let cause = match entry.reason {
-                    UnserializedReason::LedgerLockUnavailable => {
-                        "this role lacks UPDATE/DELETE/TRUNCATE on __diesel_schema_migrations"
-                    }
-                    UnserializedReason::NoTransaction => {
-                        "declares run_in_transaction = false, so there is no transaction \
-                         to hold the lock in -- no grant changes this"
-                    }
-                };
-                let _ = writeln!(out, "      {} -- {cause}", entry.name);
-            }
-            let _ = writeln!(
-                out,
-                "      Run migrators one at a time against this database."
-            );
-        }
-        if *setup_failed {
-            let _ = writeln!(
-                out,
-                "    FAILED: before any migration ran -- this database could not \
-                 be prepared (see the error below); nothing was applied here"
-            );
-        }
-        if let Some(failed) = &report.failed {
-            let _ = writeln!(out, "    FAILED: {}", failed.name);
-            let _ = writeln!(
-                out,
-                "      {}",
-                if failed.rolled_back {
-                    "rolled back -- this database is as it was before that migration"
-                } else {
-                    "NOT rolled back (run_in_transaction = false) -- any statement \
-                     of it that already succeeded still stands. Inspect what it \
-                     left behind and repair it before deciding whether a re-run \
-                     is safe: nothing here can know the body is idempotent"
-                }
-            );
-        }
-    }
-    let applied: usize = targets.iter().map(|t| t.report.applied.len()).sum();
-    let _ = write!(
-        out,
-        "{applied} migration(s) applied across {} database(s)",
-        targets.len()
-    );
-    out
-}
-
-/// Machine-readable `migrate status` / `run --dry-run` report.
-///
-/// # Errors
-///
-/// [`CliError::SerializeResponse`] if the report cannot be serialized.
-pub fn migrate_plan_json(
-    command: &str,
-    targets: &[(String, MigrationPlan)],
-) -> Result<String, CliError> {
-    let body = json!({
-        "command": command,
-        "targets": targets
-            .iter()
-            .map(|(database, plan)| json!({
-                "database": database,
-                "ledger_exists": plan.ledger_exists,
-                "already_applied": plan.already_applied,
-                "pending": plan.pending.iter().map(|s| &s.name).collect::<Vec<_>>(),
-                "unrecognized": plan.unrecognized,
-            }))
-            .collect::<Vec<_>>(),
-        "pending_total": targets.iter().map(|(_, plan)| plan.pending.len()).sum::<usize>(),
-    });
-    serde_json::to_string_pretty(&body).map_err(CliError::SerializeResponse)
-}
-
-/// Machine-readable `migrate run` report.
-///
-/// # Errors
-///
-/// [`CliError::SerializeResponse`] if the report cannot be serialized.
-pub fn migrate_run_json(targets: &[MigrateRunTarget]) -> Result<String, CliError> {
-    let body = json!({
-        "command": "migrate run",
-        "targets": targets
-            .iter()
-            .map(|target| json!({
-                "database": target.database,
-                "applied": target.report.applied,
-                "already_applied": target.report.already_applied,
-                "applied_concurrently": target.report.applied_concurrently,
-                "unrecognized": target.report.unrecognized,
-                "ledger_lock_available": target.report.ledger_lock_available,
-                "applied_unserialized": target.report.applied_unserialized,
-                // The run could not prepare this database at all. Without it an
-                // empty report reads as "finished with nothing to do".
-                "setup_failed": target.setup_failed,
-                // `null` on a target that finished. On one that did not, the
-                // migration it stopped on and whether that rolled back -- the
-                // difference between "nothing changed" and "something changed
-                // and the run cannot say what".
-                "failed": target.report.failed.as_ref().map(|failed| json!({
-                    "name": failed.name,
-                    "rolled_back": failed.rolled_back,
-                })),
-            }))
-            .collect::<Vec<_>>(),
-        "applied_total": targets.iter().map(|t| t.report.applied.len()).sum::<usize>(),
-    });
-    serde_json::to_string_pretty(&body).map_err(CliError::SerializeResponse)
-}
-
-/// The `--check` deploy gate: pending migrations anywhere fail the command.
-#[must_use]
-pub fn migrate_pending_gate(targets: &[(String, MigrationPlan)]) -> Option<CliError> {
-    let pending: usize = targets.iter().map(|(_, plan)| plan.pending.len()).sum();
-    if pending == 0 {
-        return None;
-    }
-    Some(CliError::MigrationsPending {
-        pending,
-        databases: targets
-            .iter()
-            .filter(|(_, plan)| plan.has_pending())
-            .count(),
-    })
-}
-
-/// Read every target's migration plan, leaving all of them untouched.
-async fn migrate_plans(
-    database_url: &[String],
-    scripts: &[MigrationScript],
-) -> Result<Vec<(String, MigrationPlan)>, CliError> {
-    let mut targets = Vec::with_capacity(database_url.len());
-    for (ordinal, url) in database_url.iter().enumerate() {
-        let redacted = migrate_target_label(url, ordinal + 1);
-        let mut conn = connect_for_migration(url, &redacted).await?;
-        let plan = autumn_harvest::migrate::plan_on_connection(&mut conn, scripts)
-            .await
-            .map_err(|error| migrate_error(url, &redacted, &error))?;
-        targets.push((redacted, plan));
-    }
-    Ok(targets)
-}
-
-/// Print the targets a `run` finished before it failed, then return the
-/// failure.
-///
-/// A multi-shard run stops at the first failing target, so what came before it
-/// is already migrated and what comes after is untouched. Reporting that split
-/// is the difference between "re-run the command" and "work out by hand which
-/// databases moved".
-fn report_and_fail(
-    targets: &[MigrateRunTarget],
-    format: MigrateFormat,
-    failure: CliError,
-) -> Result<(), CliError> {
-    if !targets.is_empty() {
-        match format {
-            MigrateFormat::Text => println!("{}", format_migrate_run_text(targets)),
-            MigrateFormat::Json => println!("{}", migrate_run_json(targets)?),
-        }
-    }
-    Err(failure)
-}
-
-/// Run `harvest migrate status` end to end.
-///
-/// # Errors
-///
-/// [`CliError::InvalidInput`] on an unreadable `--include-dir` or a duplicate
-/// migration version; [`CliError::Migrate`] when a database cannot be reached;
-/// [`CliError::MigrationsPending`] when `--check` is set and any target still
-/// has a pending migration. The report is printed before the gate fires.
-pub async fn run_migrate_status(
-    database_url: &[String],
-    include_dir: &[PathBuf],
-    format: MigrateFormat,
-    check: bool,
-) -> Result<(), CliError> {
-    let scripts = migration_set(include_dir)?;
-    let targets = migrate_plans(database_url, &scripts).await?;
-
-    match format {
-        MigrateFormat::Text => println!(
-            "{}",
-            format_migrate_plan_text("harvest migrate status", &targets)
-        ),
-        MigrateFormat::Json => println!("{}", migrate_plan_json("migrate status", &targets)?),
-    }
-
-    if let Some(error) = check.then(|| migrate_pending_gate(&targets)).flatten() {
-        return Err(error);
-    }
-    Ok(())
-}
-
-/// Run `harvest migrate run` end to end.
-///
-/// Databases are migrated in the order given and a failure stops the run: the
-/// remaining targets are left untouched rather than migrated behind a database
-/// that already failed. Whatever completed first is still reported, so an
-/// operator can see exactly how far the deploy step got.
-///
-/// # Errors
-///
-/// [`CliError::InvalidInput`] on an unreadable `--include-dir` or a duplicate
-/// migration version; [`CliError::Migrate`] when a database cannot be reached
-/// or a migration fails.
-pub async fn run_migrate_run(
-    database_url: &[String],
-    include_dir: &[PathBuf],
-    format: MigrateFormat,
-    dry_run: bool,
-) -> Result<(), CliError> {
-    let scripts = migration_set(include_dir)?;
-
-    if dry_run {
-        let targets = migrate_plans(database_url, &scripts).await?;
-        match format {
-            MigrateFormat::Text => println!(
-                "{}",
-                format_migrate_plan_text("harvest migrate run --dry-run", &targets)
-            ),
-            MigrateFormat::Json => {
-                println!("{}", migrate_plan_json("migrate run --dry-run", &targets)?);
-            }
-        }
-        return Ok(());
-    }
-
-    let mut targets = Vec::with_capacity(database_url.len());
-    for (ordinal, url) in database_url.iter().enumerate() {
-        let redacted = migrate_target_label(url, ordinal + 1);
-        // Every failure past the first target -- connecting to it as much as
-        // migrating it -- goes through `report_and_fail`: on a multi-shard run
-        // the operator needs to know which databases are already migrated
-        // before deciding what to do next, and an unreachable third shard says
-        // nothing about the two behind it.
-        let mut conn = match connect_for_migration(url, &redacted).await {
-            Ok(conn) => conn,
-            Err(failure) => {
-                // Named as a target that never started, rather than omitted:
-                // "absent" would be indistinguishable from the targets after it
-                // that the run simply never reached.
-                targets.push(MigrateRunTarget {
-                    database: redacted,
-                    report: empty_migration_report(),
-                    setup_failed: true,
-                });
-                return report_and_fail(&targets, format, failure);
-            }
-        };
-        match autumn_harvest::migrate::apply_to_connection(&mut conn, &scripts).await {
-            Ok(report) => targets.push(MigrateRunTarget {
-                database: redacted,
-                report,
-                setup_failed: false,
-            }),
-            Err(partial) => {
-                let failure = migrate_error(url, &redacted, &partial.error);
-                // The failing target always joins the report, even with nothing
-                // applied: a `run_in_transaction = false` migration that failed
-                // part-way leaves changes it cannot list, and "no report at
-                // all" and "nothing happened" must not look the same to the
-                // tooling reading this.
-                //
-                // `failed: None` means no migration failed, so the run never
-                // got that far -- the ledger could not be created or read.
-                // Flagged, or an empty report would read as a clean finish.
-                let setup_failed = partial.report.failed.is_none();
-                targets.push(MigrateRunTarget {
-                    database: redacted,
-                    report: partial.report,
-                    setup_failed,
-                });
-                return report_and_fail(&targets, format, failure);
-            }
-        }
-    }
-
-    match format {
-        MigrateFormat::Text => println!("{}", format_migrate_run_text(&targets)),
-        MigrateFormat::Json => println!("{}", migrate_run_json(&targets)?),
-    }
-    Ok(())
-}
-
-// ── harvest dr: cross-region disaster recovery (issue #954) ─────────────────
-
-/// One shard's DR state, as `harvest dr status` reports it.
-///
-/// Serialized by hand rather than by `serde::Serialize`: this crate depends on
-/// `serde_json` but not on `serde` itself, and one small projection is a better
-/// trade than a new dependency.
-#[derive(Debug)]
-struct DrShardStatus {
-    shard_id: i32,
-    /// Redacted — a DSN can embed a password.
-    dsn: String,
-    reachable: bool,
-    unreachable_reason: Option<String>,
-    /// `None` when this shard has never been provisioned, which means fencing
-    /// is not yet in force there. Distinct from `generation_error`: "there is
-    /// no fence here" and "we could not tell" are different answers, and the
-    /// runbook's verification step ("every shard's generation must have
-    /// increased") reads the second as the first if they are collapsed.
-    generation: Option<String>,
-    /// Why the generation could not be read, when it could not be.
-    generation_error: Option<String>,
-    /// The measured RPO. **`None` means UNKNOWN, not zero** — see
-    /// `docs/cross-region-dr.md`. Serialized as an explicit JSON `null` so a
-    /// consumer cannot mistake absence for a value of `0`.
-    rpo_seconds: Option<f64>,
-    /// Whether `rpo_seconds` is an exact reading or only a **lower bound**.
-    ///
-    /// `true` when the standby has fallen behind the whole retained watermark
-    /// trail: the RPO is at least the reported value and unbounded above.
-    /// "42 seconds" and "at least an hour, we cannot see how much more" are
-    /// different failover decisions, so the table renders the second as `≥`.
-    rpo_is_lower_bound: bool,
-    lag_bytes: Option<i64>,
-    /// `None` when the replication views could not be read at all.
-    ///
-    /// Distinct from `Some(0)`, and the distinction is the point: `0` is the
-    /// definitive "this shard has no standby, its RPO is unbounded", while
-    /// `None` is "the role cannot read `pg_stat_replication` — most likely a
-    /// missing `GRANT pg_monitor`". Collapsing the second into the first
-    /// printed a categorical no-standby warning for a permissions gap, to an
-    /// operator deciding whether to fail over.
-    connected_standbys: Option<usize>,
-    inactive_slots: Option<usize>,
-    /// Why the replication views were unreadable, when they were.
-    replication_error: Option<String>,
-}
-
-impl DrShardStatus {
-    fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "shard_id": self.shard_id,
-            "dsn": self.dsn,
-            "reachable": self.reachable,
-            "unreachable_reason": self.unreachable_reason,
-            "generation": self.generation,
-            "generation_error": self.generation_error,
-            // Explicit null, never 0: see the field docs.
-            "rpo_seconds": self.rpo_seconds,
-            "rpo_is_lower_bound": self.rpo_is_lower_bound,
-            "lag_bytes": self.lag_bytes,
-            "connected_standbys": self.connected_standbys,
-            "inactive_slots": self.inactive_slots,
-            "replication_error": self.replication_error,
-        })
-    }
-}
-
-/// Connect for a DR command. [`autumn_harvest::pg_tls`] picks the transport
-/// from the `sslmode`, so a managed Postgres that refuses plaintext is
-/// reachable.
-async fn dr_connect(
-    dsn: &str,
-) -> Result<autumn_harvest::diesel_async::AsyncPgConnection, CliError> {
-    autumn_harvest::pg_tls::connect(dsn).await.map_err(|e| {
-        CliError::InvalidInput(format!(
-            "cannot connect to {}: {e}",
-            autumn_harvest::backup_verify::redact_dsn(dsn)
-        ))
-    })
-}
-
-/// Connect for a read-only DR command, with the session pinned read-only.
-///
-/// `harvest dr status` is documented as "read-only, safe at any time" and is
-/// pointed at a **production primary** during an incident. `backup verify`
-/// backs the same promise with `SET SESSION CHARACTERISTICS AS TRANSACTION
-/// READ ONLY` rather than with care; this does too, so Postgres itself enforces
-/// it. `fence` and `promote` deliberately do not use this.
-async fn dr_connect_read_only(
-    dsn: &str,
-) -> Result<autumn_harvest::diesel_async::AsyncPgConnection, CliError> {
-    use autumn_harvest::diesel_async::SimpleAsyncConnection as _;
-
-    let mut conn = dr_connect(dsn).await?;
-    conn.batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
-        .await
-        .map_err(|e| {
-            CliError::InvalidInput(format!(
-                "could not pin {} read-only: {e}",
-                autumn_harvest::backup_verify::redact_dsn(dsn)
-            ))
-        })?;
-    Ok(conn)
-}
-
-// ── `harvest partition` (issue #958) ───────────────────────────────────────
-
-/// One `--expect-generation` value: `N` for every shard, or `<ID>=<N>` for
-/// one shard (issue #1823).
-///
-/// Generations are per shard. After a partial or independent fence, the two
-/// shards of a rebalance can hold different valid generations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExpectGeneration {
-    /// The shard this value covers, or `None` for every shard.
-    pub shard: Option<i32>,
-    /// The generation that holds write authority there.
-    pub generation: i64,
-}
-
-/// Parse one `--expect-generation` value.
-fn parse_expect_generation(raw: &str) -> Result<ExpectGeneration, String> {
-    let number = |text: &str, what: &str| {
-        text.trim()
-            .parse::<i64>()
-            .map_err(|_| format!("--expect-generation: `{text}` is not a valid {what}"))
-    };
-    match raw.split_once('=') {
-        Some((shard, generation)) => {
-            Ok(ExpectGeneration {
-                shard: Some(i32::try_from(number(shard, "shard id")?).map_err(|_| {
-                    format!("--expect-generation: shard id `{shard}` is out of range")
-                })?),
-                generation: number(generation, "generation")?,
-            })
-        }
-        None => Ok(ExpectGeneration {
-            shard: None,
-            generation: number(raw, "generation")?,
-        }),
-    }
-}
-
-/// The generation stated for `shard`. A per-shard value overrides `N`.
-///
-/// # Errors
-///
-/// [`CliError::InvalidInput`] when the values name the same scope twice.
-fn expected_generation_for(
-    values: &[ExpectGeneration],
-    shard: i32,
-) -> Result<Option<i64>, CliError> {
-    let pick = |scope: Option<i32>| -> Result<Option<i64>, CliError> {
-        let mut found = values.iter().filter(|v| v.shard == scope);
-        let first = found.next().map(|v| v.generation);
-        if found.next().is_some() {
-            return Err(CliError::InvalidInput(format!(
-                "--expect-generation names {} more than once",
-                scope.map_or_else(|| "every shard".to_string(), |s| format!("shard {s}"))
-            )));
-        }
-        Ok(first)
-    };
-    let all = pick(None)?;
-    Ok(pick(Some(shard))?.or(all))
-}
-
-#[cfg(test)]
-mod expect_generation_tests {
-    use super::{ExpectGeneration, expected_generation_for, parse_expect_generation};
-
-    #[test]
-    fn a_per_shard_value_overrides_the_value_for_every_shard() {
-        let values = [
-            parse_expect_generation("5").unwrap(),
-            parse_expect_generation("1=7").unwrap(),
-        ];
-        assert_eq!(expected_generation_for(&values, 1).unwrap(), Some(7));
-        assert_eq!(expected_generation_for(&values, 0).unwrap(), Some(5));
-        assert_eq!(expected_generation_for(&[], 0).unwrap(), None);
-    }
-
-    #[test]
-    fn a_scope_named_twice_is_rejected() {
-        let twice = [
-            ExpectGeneration {
-                shard: Some(1),
-                generation: 2,
-            },
-            ExpectGeneration {
-                shard: Some(1),
-                generation: 3,
-            },
-        ];
-        assert!(expected_generation_for(&twice, 1).is_err());
-        let bare_twice = [
-            parse_expect_generation("2").unwrap(),
-            parse_expect_generation("3").unwrap(),
-        ];
-        assert!(expected_generation_for(&bare_twice, 0).is_err());
-    }
-
-    #[test]
-    fn malformed_values_are_rejected() {
-        assert!(parse_expect_generation("x").is_err());
-        assert!(parse_expect_generation("1=x").is_err());
-        assert!(parse_expect_generation("99999999999=1").is_err());
-    }
-}
-
-/// Refuse a direct-database write on a shard without write authority
-/// (issue #1823).
-///
-/// `harvest partition` and `harvest shard rebalance` connect to shard
-/// databases directly, so the management API fence never sees them. The
-/// operator states the generation that holds authority. A demoted primary is
-/// still at an older one.
-async fn direct_write_authority(
-    conn: &mut autumn_harvest::diesel_async::AsyncPgConnection,
-    shard_id: i32,
-    expect_generation: &[ExpectGeneration],
-    kind: autumn_harvest::replication::AdminWrite,
-) -> Result<(), String> {
-    let expected =
-        expected_generation_for(expect_generation, shard_id).map_err(|e| e.to_string())?;
-    autumn_harvest::replication::assert_admin_write_authority(
-        conn,
-        autumn_harvest::types::ShardId::new(shard_id),
-        expected.map(autumn_harvest::replication::ShardGeneration::new),
-        autumn_harvest::replication::DEFAULT_DR_SLOT_PREFIX,
-        kind,
-    )
-    .await
-    .map_err(|error| match error {
-        autumn_harvest::HarvestError::Config(_) => format!(
-            "{error} Pass --expect-generation <N> (or <ID>=<N> per shard), where N is the \
-             generation `harvest dr status` reports on the promoted primary."
-        ),
-        other => other.to_string(),
-    })
-}
-
-/// Open the fence barriers for one direct-database command on one database
-/// (issue #1823), at the epochs the operator stated.
-///
-/// The command changes tables that every logical shard on the database
-/// shares. So it holds a barrier for the named shard and for every other
-/// shard whose generation row is on that database. A bump of any of them
-/// then waits for the command. A named shard with no stated epoch has no DR
-/// marker, so it needs no barrier. A colocated shard with no stated epoch is
-/// refused: the command cannot hold its barrier.
-///
-/// A last guard then freezes the set of rows, so a shard provisioned during
-/// the command cannot appear without a barrier. See
-/// `autumn_harvest::replication::freeze_generation_rows_on`.
-///
-/// Each barrier takes its own connection. A bump cannot commit while the
-/// caller holds them, so the command's DDL and row moves keep their
-/// authority.
-async fn database_fence(
-    dsn: &str,
-    shard_id: i32,
-    expect_generation: &[ExpectGeneration],
-) -> Result<Vec<autumn_harvest::replication::FencePassGuard>, String> {
-    lock_database_fence(plan_database_fence(dsn, shard_id, expect_generation).await?).await
-}
-
-/// The connections of a [`database_fence`], open but holding no lock yet.
-struct PlannedFence {
-    /// One connection per guarded shard, with the epoch it must hold.
-    passes: Vec<(
-        autumn_harvest::types::ShardId,
-        i64,
-        autumn_harvest::diesel_async::AsyncPgConnection,
-    )>,
-    /// The connection of the row freeze.
-    freeze: autumn_harvest::diesel_async::AsyncPgConnection,
-}
-
-/// The first half of [`database_fence`]: probe the database and open every
-/// connection, with no lock taken (issue #1823). A command over several
-/// databases plans them all before it locks any. A slow connection then
-/// holds no barrier.
-async fn plan_database_fence(
-    dsn: &str,
-    shard_id: i32,
-    expect_generation: &[ExpectGeneration],
-) -> Result<PlannedFence, String> {
-    use autumn_harvest::types::ShardId;
-    let rows = {
-        let mut probe = dr_connect(dsn).await.map_err(|e| e.to_string())?;
-        autumn_harvest::replication::probe_dr_markers(
-            &mut probe,
-            autumn_harvest::replication::DEFAULT_DR_SLOT_PREFIX,
-        )
-        .await
-        .map_err(|e| e.to_string())?
-        .generation_shards
-    };
-    let mut shards = vec![shard_id];
-    for row in &rows {
-        if !shards.contains(&row.as_i32()) {
-            shards.push(row.as_i32());
-        }
-    }
-    let mut plan = Vec::with_capacity(shards.len());
-    for shard in shards {
-        let Some(expected) =
-            expected_generation_for(expect_generation, shard).map_err(|e| e.to_string())?
-        else {
-            if shard == shard_id {
-                continue;
-            }
-            return Err(format!(
-                "this database also holds the generation row of shard {shard}. The command \
-                 changes tables that shard shares, so it must hold its barrier too. Pass \
-                 --expect-generation <N> for every shard, or {shard}=<N>."
-            ));
-        };
-        plan.push((ShardId::new(shard), expected));
-    }
-    // Issue #1823: every connection opens here, before any lock.
-    let conns = futures::future::try_join_all(plan.iter().map(|_| dr_connect(dsn)))
-        .await
-        .map_err(|e| e.to_string())?;
-    let freeze = dr_connect(dsn).await.map_err(|e| e.to_string())?;
-    Ok(PlannedFence {
-        passes: plan
-            .into_iter()
-            .zip(conns)
-            .map(|((shard, expected), conn)| (shard, expected, conn))
-            .collect(),
-        freeze,
-    })
-}
-
-/// The second half of [`database_fence`]: take every pass lock together,
-/// then freeze the rows (issue #1823). Each lock waits a bounded time. A
-/// bump that holds one lock then fails the command fast. Its other guards
-/// drop before a bump on another shard times out.
-async fn lock_database_fence(
-    planned: PlannedFence,
-) -> Result<Vec<autumn_harvest::replication::FencePassGuard>, String> {
-    let guarded: Vec<autumn_harvest::types::ShardId> =
-        planned.passes.iter().map(|(shard, ..)| *shard).collect();
-    let mut guards =
-        futures::future::try_join_all(planned.passes.into_iter().map(|(shard, expected, conn)| {
-            autumn_harvest::replication::begin_fenced_pass_on(
-                conn,
-                shard,
-                autumn_harvest::replication::ShardGeneration::new(expected),
-            )
-        }))
-        .await
-        .map_err(|e| e.to_string())?;
-    // Frozen even when the table is empty: the first row must not appear
-    // mid-command either.
-    guards.push(
-        autumn_harvest::replication::freeze_generation_rows_on(planned.freeze, &guarded)
-            .await
-            .map_err(|e| e.to_string())?,
-    );
-    Ok(guards)
-}
-
-/// [`direct_write_authority`] for every shard of a rebalance pool, before any
-/// write. A rebalance moves history between two shards, so both must hold
-/// authority. The returned guards hold each stated epoch until the caller
-/// drops them, so a bump cannot commit while the rebalance writes.
-///
-/// The rebalance scans tables that every logical shard on a database
-/// shares. So each database gets [`database_fence`], which guards every
-/// shard with a row there, not only the configured ones.
-async fn shard_pool_write_authority(
-    pool: &autumn_harvest::shard::ShardedDbPool,
-    targets: &[autumn_harvest::backup_verify::ShardTarget],
-    expect_generation: &[ExpectGeneration],
-) -> Result<Vec<autumn_harvest::replication::FencePassGuard>, CliError> {
-    let mut guards = Vec::new();
-    for (shard, shard_pool) in pool.iter_shards() {
-        let mut conn = shard_pool
-            .get()
-            .await
-            .map_err(|e| CliError::InvalidInput(format!("cannot connect to shard {shard}: {e}")))?;
-        direct_write_authority(
-            &mut conn,
-            shard.as_i32(),
-            expect_generation,
-            autumn_harvest::replication::AdminWrite::Data,
-        )
-        .await
-        .map_err(|e| CliError::InvalidInput(format!("shard {shard}: {e}")))?;
-    }
-    // Hold the barriers for the whole command, so a bump cannot commit while
-    // the rebalance writes (issue #1823). One set for each database. Every
-    // database's connections open first. Then the locks on all of them are
-    // taken together, so a slow database holds no other's barrier.
-    let mut fenced: Vec<&autumn_harvest::backup_verify::ShardTarget> = Vec::new();
-    for target in targets {
-        if fenced.iter().any(|seen| seen.dsn == target.dsn) {
-            continue;
-        }
-        fenced.push(target);
-    }
-    let planned = futures::future::try_join_all(fenced.iter().map(|target| async move {
-        plan_database_fence(&target.dsn, target.shard_id, expect_generation)
-            .await
-            .map_err(|e| CliError::InvalidInput(format!("shard {}: {e}", target.shard_id)))
-    }))
-    .await?;
-    let locked = futures::future::try_join_all(planned.into_iter().zip(&fenced).map(
-        |(plan, target)| async move {
-            lock_database_fence(plan)
-                .await
-                .map_err(|e| CliError::InvalidInput(format!("shard {}: {e}", target.shard_id)))
-        },
-    ))
-    .await?;
-    guards.extend(locked.into_iter().flatten());
-    Ok(guards)
-}
-
-/// What `harvest partition disable` did on one shard.
-///
-/// A named enum rather than `Option<Option<_>>`: "already unpartitioned" is a
-/// successful no-op, not an absent result, and the two must not be spelled the
-/// same way in the JSON an operator's script reads.
-#[derive(Debug)]
-enum DisableOutcome {
-    /// Reverted, discarding the rows the flat layout's constraints forbid.
-    Reverted(autumn_harvest::partition::DisableReport),
-    /// Already unpartitioned; nothing to do.
-    AlreadyUnpartitioned,
-}
-
-impl DisableOutcome {
-    fn to_json(&self) -> Value {
-        match self {
-            Self::Reverted(r) => serde_json::to_value(r).unwrap_or(Value::Null),
-            Self::AlreadyUnpartitioned => json!({"already_unpartitioned": true}),
-        }
-    }
-}
-
-/// One shard's row in a `harvest partition` report.
-///
-/// A plain struct with a hand-written JSON projection rather than a
-/// `serde::Serialize` derive: this crate depends on `serde_json` but
-/// deliberately not on `serde` itself (see `DrShardStatus`), and one small
-/// projection is a better trade than a new dependency. The engine types it
-/// embeds do derive `Serialize`, so `serde_json::to_value` handles them.
-#[derive(Debug)]
-struct PartitionShardReport {
-    shard_id: i32,
-    dsn: String,
-    reachable: bool,
-    unreachable_reason: Option<String>,
-    layout: Option<autumn_harvest::partition::EventLayout>,
-    partitions: Option<Vec<autumn_harvest::partition::PartitionInfo>>,
-    maintenance: Option<autumn_harvest::partition::MaintenanceOutcome>,
-    enable: Option<autumn_harvest::partition::EnableReport>,
-    /// What a sweep WOULD do right now — read-only, from `status`.
-    would_sweep: Option<autumn_harvest::partition::SweepOutcome>,
-    /// Outcome of `disable`, when that is the verb.
-    disable: Option<DisableOutcome>,
-    error: Option<String>,
-}
-
-impl PartitionShardReport {
-    const fn unreachable(shard_id: i32, dsn: String, reason: String) -> Self {
-        Self {
-            shard_id,
-            dsn,
-            reachable: false,
-            unreachable_reason: Some(reason),
-            layout: None,
-            partitions: None,
-            maintenance: None,
-            enable: None,
-            would_sweep: None,
-            disable: None,
-            error: None,
-        }
-    }
-
-    const fn reachable(shard_id: i32, dsn: String) -> Self {
-        Self {
-            shard_id,
-            dsn,
-            reachable: true,
-            unreachable_reason: None,
-            layout: None,
-            partitions: None,
-            maintenance: None,
-            enable: None,
-            would_sweep: None,
-            disable: None,
-            error: None,
-        }
-    }
-
-    fn to_json(&self) -> Value {
-        let mut obj = Map::new();
-        obj.insert("shard_id".into(), json!(self.shard_id));
-        obj.insert("dsn".into(), json!(self.dsn));
-        obj.insert("reachable".into(), json!(self.reachable));
-        let mut put = |key: &str, value: Option<Value>| {
-            if let Some(v) = value {
-                obj.insert(key.to_string(), v);
-            }
-        };
-        put(
-            "unreachable_reason",
-            self.unreachable_reason.as_ref().map(|v| json!(v)),
-        );
-        put(
-            "layout",
-            self.layout.and_then(|v| serde_json::to_value(v).ok()),
-        );
-        put(
-            "partitions",
-            self.partitions
-                .as_ref()
-                .and_then(|v| serde_json::to_value(v).ok()),
-        );
-        put(
-            "maintenance",
-            self.maintenance
-                .as_ref()
-                .and_then(|v| serde_json::to_value(v).ok()),
-        );
-        put(
-            "enable",
-            self.enable
-                .as_ref()
-                .and_then(|v| serde_json::to_value(v).ok()),
-        );
-        put(
-            "would_sweep",
-            self.would_sweep
-                .as_ref()
-                .and_then(|v| serde_json::to_value(v).ok()),
-        );
-        put(
-            "disable",
-            self.disable.as_ref().map(DisableOutcome::to_json),
-        );
-        put("error", self.error.as_ref().map(|v| json!(v)));
-        Value::Object(obj)
-    }
-}
-
-/// Dispatch for `harvest partition`.
-///
-/// # Errors
-///
-/// [`CliError::InvalidInput`] for a malformed `--shard` spec or a missing
-/// confirmation flag on a destructive subcommand.
-pub async fn run_partition(command: &PartitionCommand) -> Result<(), CliError> {
-    match command {
-        PartitionCommand::Plan {
-            cohort_width_secs,
-            lookahead_cohorts,
-            allow_incompatible_publications,
-        } => {
-            let opts = autumn_harvest::partition::EnableOptions {
-                cohort_width_secs: *cohort_width_secs,
-                lookahead_cohorts: *lookahead_cohorts,
-                allow_incompatible_publications: *allow_incompatible_publications,
-                ..autumn_harvest::partition::EnableOptions::default()
-            };
-            opts.validate()
-                .map_err(|e| CliError::InvalidInput(e.to_string()))?;
-            println!(
-                "{}",
-                autumn_harvest::partition::migration_plan(
-                    &opts,
-                    autumn_harvest::chrono::Utc::now()
-                )
-            );
-            Ok(())
-        }
-        PartitionCommand::Status { shards, format } => run_partition_status(shards, *format).await,
-        PartitionCommand::Enable {
-            shards,
-            cohort_width_secs,
-            lookahead_cohorts,
-            lock_timeout_secs,
-            confirm,
-            expect_generation,
-            allow_incompatible_publications,
-            format,
-        } => {
-            if !confirm {
-                return Err(CliError::InvalidInput(
-                    "refusing to convert without --i-understand-the-lock-window: \
-                     `enable` takes a brief ACCESS EXCLUSIVE lock on harvest_events, \
-                     during which every append waits. On a populated table that window \
-                     also covers two index builds and a full-table constraint validation \
-                     — run `harvest partition plan` instead and follow its steps."
-                        .to_string(),
-                ));
-            }
-            let opts = autumn_harvest::partition::EnableOptions {
-                cohort_width_secs: *cohort_width_secs,
-                lookahead_cohorts: *lookahead_cohorts,
-                lock_timeout: std::time::Duration::from_secs((*lock_timeout_secs).max(1)),
-                allow_incompatible_publications: *allow_incompatible_publications,
-            };
-            opts.validate()
-                .map_err(|e| CliError::InvalidInput(e.to_string()))?;
-            run_partition_enable(shards, &opts, expect_generation, *format).await
-        }
-        PartitionCommand::Maintain {
-            shards,
-            lookahead_cohorts,
-            max_drops,
-            expect_generation,
-            format,
-        } => {
-            run_partition_maintain(
-                shards,
-                *lookahead_cohorts,
-                *max_drops,
-                expect_generation,
-                *format,
-            )
-            .await
-        }
-        PartitionCommand::Disable {
-            shards,
-            confirm,
-            expect_generation,
-            format,
-        } => {
-            if !confirm {
-                return Err(CliError::InvalidInput(
-                    "refusing to revert without --i-understand-this-rewrites-the-table: \
-                     `disable` copies every surviving event row back into a plain table, \
-                     which rewrites harvest_events in full."
-                        .to_string(),
-                ));
-            }
-            run_partition_disable(shards, expect_generation, *format).await
-        }
-    }
-}
-
-async fn run_partition_status(shards: &[String], format: DrFormat) -> Result<(), CliError> {
-    let targets = parse_shard_targets(shards)?;
-    let mut out = Vec::with_capacity(targets.len());
-    for target in &targets {
-        let redacted = autumn_harvest::backup_verify::redact_dsn(&target.dsn);
-        // Read-only, like `dr status`, and enforced by Postgres rather than by
-        // care: `status` is documented as safe against a production primary.
-        let mut conn = match dr_connect_read_only(&target.dsn).await {
-            Ok(conn) => conn,
-            Err(error) => {
-                out.push(PartitionShardReport::unreachable(
-                    target.shard_id,
-                    redacted,
-                    error.to_string(),
-                ));
-                continue;
-            }
-        };
-        let mut row = PartitionShardReport::reachable(target.shard_id, redacted);
-        match autumn_harvest::partition::detect_layout(&mut conn).await {
-            Ok(layout) => {
-                row.layout = Some(layout);
-                if layout.is_partitioned() {
-                    match autumn_harvest::partition::list_partitions(&mut conn).await {
-                        Ok(parts) => row.partitions = Some(parts),
-                        Err(e) => row.error = Some(e.to_string()),
-                    }
-                    // The `blocked` reasons are produced by the sweep's gate,
-                    // so a status command that only listed partitions could
-                    // never answer the question this command exists for. This
-                    // is a read-only evaluation of the same gate: no lock, no
-                    // DDL, no straggler delete.
-                    match autumn_harvest::partition::evaluate(
-                        &mut conn,
-                        autumn_harvest::chrono::Utc::now(),
-                        &autumn_harvest::partition::SweepOptions::default(),
-                        None,
-                    )
-                    .await
-                    {
-                        Ok(sweep) => row.would_sweep = Some(sweep),
-                        Err(e) => row.error = Some(e.to_string()),
-                    }
-                }
-            }
-            Err(e) => row.error = Some(e.to_string()),
-        }
-        out.push(row);
-    }
-    emit_partition_report(&out, format, "status")
-}
-
-async fn run_partition_enable(
-    shards: &[String],
-    opts: &autumn_harvest::partition::EnableOptions,
-    expect_generation: &[ExpectGeneration],
-    format: DrFormat,
-) -> Result<(), CliError> {
-    let targets = parse_shard_targets(shards)?;
-    let mut out = Vec::with_capacity(targets.len());
-    for target in &targets {
-        let redacted = autumn_harvest::backup_verify::redact_dsn(&target.dsn);
-        let mut conn = match dr_connect(&target.dsn).await {
-            Ok(conn) => conn,
-            Err(error) => {
-                out.push(PartitionShardReport::unreachable(
-                    target.shard_id,
-                    redacted,
-                    error.to_string(),
-                ));
-                continue;
-            }
-        };
-        let mut row = PartitionShardReport::reachable(target.shard_id, redacted);
-        if let Err(error) = direct_write_authority(
-            &mut conn,
-            target.shard_id,
-            expect_generation,
-            autumn_harvest::replication::AdminWrite::SchemaOnly,
-        )
-        .await
-        {
-            row.error = Some(error);
-            out.push(row);
-            continue;
-        }
-        // Held until this shard's mutation ends (issue #1823).
-        let fence = match database_fence(&target.dsn, target.shard_id, expect_generation).await {
-            Ok(guard) => guard,
-            Err(error) => {
-                row.error = Some(error);
-                out.push(row);
-                continue;
-            }
-        };
-        // Per-shard independence is deliberate: a shard is a database, and a
-        // half-converted cluster is a supported state (each shard's layout is
-        // detected at runtime), so one shard's lock timeout must not abort the
-        // conversion of the rest.
-        // A lost fence session stops the mutation. See `run_fenced_pass`.
-        let enabled = autumn_harvest::replication::run_fenced_pass(&fence, async {
-            // Issue #1823: the connection predates the pass, so it joins it.
-            // A lost guard then ends its backend.
-            let _member =
-                autumn_harvest::replication::join_fenced_pass_direct(&target.dsn, &mut conn).await;
-            autumn_harvest::partition::enable_partitioning(&mut conn, opts).await
-        })
-        .await
-        .and_then(|done| done);
-        match enabled {
-            Ok(report) => row.enable = Some(report),
-            Err(e) => row.error = Some(e.to_string()),
-        }
-        out.push(row);
-    }
-    emit_partition_report(&out, format, "enable")
-}
-
-async fn run_partition_maintain(
-    shards: &[String],
-    lookahead_cohorts: u32,
-    max_drops: usize,
-    expect_generation: &[ExpectGeneration],
-    format: DrFormat,
-) -> Result<(), CliError> {
-    let targets = parse_shard_targets(shards)?;
-    let sweep = autumn_harvest::partition::SweepOptions {
-        max_drops,
-        ..autumn_harvest::partition::SweepOptions::default()
-    };
-    let mut out = Vec::with_capacity(targets.len());
-    for target in &targets {
-        let redacted = autumn_harvest::backup_verify::redact_dsn(&target.dsn);
-        let mut conn = match dr_connect(&target.dsn).await {
-            Ok(conn) => conn,
-            Err(error) => {
-                out.push(PartitionShardReport::unreachable(
-                    target.shard_id,
-                    redacted,
-                    error.to_string(),
-                ));
-                continue;
-            }
-        };
-        let mut row = PartitionShardReport::reachable(target.shard_id, redacted);
-        if let Err(error) = direct_write_authority(
-            &mut conn,
-            target.shard_id,
-            expect_generation,
-            autumn_harvest::replication::AdminWrite::SchemaOnly,
-        )
-        .await
-        {
-            row.error = Some(error);
-            out.push(row);
-            continue;
-        }
-        // Held until this shard's mutation ends (issue #1823).
-        let fence = match database_fence(&target.dsn, target.shard_id, expect_generation).await {
-            Ok(guard) => guard,
-            Err(error) => {
-                row.error = Some(error);
-                out.push(row);
-                continue;
-            }
-        };
-        // A lost fence session stops the pass. See `run_fenced_pass`.
-        let maintained = autumn_harvest::replication::run_fenced_pass(&fence, async {
-            // Issue #1823: the connection predates the pass, so it joins it.
-            // A lost guard then ends its backend.
-            let _member =
-                autumn_harvest::replication::join_fenced_pass_direct(&target.dsn, &mut conn).await;
-            autumn_harvest::partition::maintain(
-                &mut conn,
-                autumn_harvest::chrono::Utc::now(),
-                lookahead_cohorts,
-                &sweep,
-                None,
-                None,
-            )
-            .await
-        })
-        .await
-        .and_then(|done| done);
-        match maintained {
-            Ok(outcome) => {
-                // A pass that ran but did not COMPLETE — a `drain_default` that
-                // lost its bounded lock attempt, say — comes back as `Ok` with
-                // `last_error` set, because maintenance is best-effort and must
-                // never fail a retention tick. The CLI is not a retention tick.
-                // Without this, `harvest partition maintain` would print an
-                // ordinary zero-drain report and exit 0 while the DEFAULT
-                // partition stayed undrained, and scheduled operator automation
-                // would never notice.
-                row.error.clone_from(&outcome.last_error);
-                row.maintenance = Some(outcome);
-            }
-            Err(e) => row.error = Some(e.to_string()),
-        }
-        out.push(row);
-    }
-    emit_partition_report(&out, format, "maintain")
-}
-
-async fn run_partition_disable(
-    shards: &[String],
-    expect_generation: &[ExpectGeneration],
-    format: DrFormat,
-) -> Result<(), CliError> {
-    let targets = parse_shard_targets(shards)?;
-    let mut out = Vec::with_capacity(targets.len());
-    for target in &targets {
-        let redacted = autumn_harvest::backup_verify::redact_dsn(&target.dsn);
-        let mut conn = match dr_connect(&target.dsn).await {
-            Ok(conn) => conn,
-            Err(error) => {
-                out.push(PartitionShardReport::unreachable(
-                    target.shard_id,
-                    redacted,
-                    error.to_string(),
-                ));
-                continue;
-            }
-        };
-        let mut row = PartitionShardReport::reachable(target.shard_id, redacted);
-        if let Err(error) = direct_write_authority(
-            &mut conn,
-            target.shard_id,
-            expect_generation,
-            autumn_harvest::replication::AdminWrite::SchemaOnly,
-        )
-        .await
-        {
-            row.error = Some(error);
-            out.push(row);
-            continue;
-        }
-        // Held until this shard's mutation ends (issue #1823).
-        let fence = match database_fence(&target.dsn, target.shard_id, expect_generation).await {
-            Ok(guard) => guard,
-            Err(error) => {
-                row.error = Some(error);
-                out.push(row);
-                continue;
-            }
-        };
-        // A lost fence session stops the mutation. See `run_fenced_pass`.
-        let disabled = autumn_harvest::replication::run_fenced_pass(&fence, async {
-            // Issue #1823: the connection predates the pass, so it joins it.
-            // A lost guard then ends its backend.
-            let _member =
-                autumn_harvest::replication::join_fenced_pass_direct(&target.dsn, &mut conn).await;
-            autumn_harvest::partition::disable_partitioning(&mut conn).await
-        })
-        .await
-        .and_then(|done| done);
-        match disabled {
-            Ok(report) => {
-                row.layout = Some(autumn_harvest::partition::EventLayout::Unpartitioned);
-                // `None` = already unpartitioned. That is a successful no-op,
-                // not a failure: `enable` on an already-partitioned shard exits
-                // 0, and a deployment script must be able to run `disable`
-                // twice without the second run failing.
-                row.disable = Some(report.map_or(
-                    DisableOutcome::AlreadyUnpartitioned,
-                    DisableOutcome::Reverted,
-                ));
-            }
-            Err(e) => row.error = Some(e.to_string()),
-        }
-        out.push(row);
-    }
-    emit_partition_report(&out, format, "disable")
-}
-
-/// Render a report, and fail the process if any shard errored.
-///
-/// The nonzero exit is the point: `harvest partition enable --shard a --shard b`
-/// that converted `a` and failed on `b` has left a half-converted cluster, and a
-/// zero exit would let a deployment script move on as though it had not.
-// One text/JSON report, field by field. Splitting it would scatter one
-// operator-facing rendering across helpers that only print once each.
-#[allow(clippy::too_many_lines)]
-fn emit_partition_report(
-    rows: &[PartitionShardReport],
-    format: DrFormat,
-    verb: &str,
-) -> Result<(), CliError> {
-    // `status` is read-only reporting and must not fail the process for an
-    // unreachable shard — that is the established `harvest dr status`
-    // behaviour, and a monitoring script should get the report for the shards
-    // it could reach. Only the MUTATING verbs exit nonzero, where a partial
-    // result means a half-converted cluster a deployment script must not move
-    // on from.
-    let fail_on_error = verb != "status";
-    match format {
-        DrFormat::Json => {
-            let payload: Vec<Value> = rows.iter().map(PartitionShardReport::to_json).collect();
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&payload)
-                    .map_err(|e| CliError::InvalidInput(e.to_string()))?
-            );
-        }
-        DrFormat::Text => {
-            for r in rows {
-                println!("shard {} ({})", r.shard_id, r.dsn);
-                if !r.reachable {
-                    println!(
-                        "  UNREACHABLE: {}",
-                        r.unreachable_reason.as_deref().unwrap_or("unknown")
-                    );
-                    continue;
-                }
-                if let Some(layout) = &r.layout {
-                    println!("  layout: {layout:?}");
-                }
-                if let Some(report) = &r.enable {
-                    println!("  mode: {:?}", report.mode);
-                    println!(
-                        "  cohort width: {}s, partitions created: {}",
-                        report.cohort_width_secs,
-                        report.partitions_created.len()
-                    );
-                }
-                if let Some(parts) = &r.partitions {
-                    println!("  partitions: {}", parts.len());
-                    for p in parts {
-                        println!(
-                            "    {:<40} {} .. {}",
-                            p.name,
-                            p.lower
-                                .map_or_else(|| "MINVALUE".into(), |t| t.to_rfc3339()),
-                            p.upper
-                                .map_or_else(|| "MAXVALUE".into(), |t| t.to_rfc3339()),
-                        );
-                    }
-                }
-                if let Some(m) = &r.maintenance {
-                    println!(
-                        "  created: {}, drained rows: {}, dropped: {}, straggler rows: {}",
-                        m.created.len(),
-                        m.drained,
-                        m.sweep.dropped.len(),
-                        m.sweep.straggler_rows_deleted,
-                    );
-                    if m.sweep.truncated {
-                        // Issue #1270 item 1's whole reason for existing. A
-                        // pass that dropped and blocked nothing must not
-                        // read as "shard is clean". It may really mean the
-                        // pass ran out of budget before it looked at the rest.
-                        println!("  sweep: truncated, ran out of budget before finishing");
-                    }
-                    if let Some(e) = &m.last_error {
-                        println!("  INCOMPLETE: {e}");
-                    }
-                    // The answer to "why has space not come back?". Printed
-                    // even when empty is noise, so only when there is
-                    // something to explain.
-                    for b in &m.sweep.blocked {
-                        println!("  blocked: {b}");
-                    }
-                    // A partial catch-up: some of the lookahead window covered,
-                    // some not. Named individually so an operator can tell
-                    // exactly which range still lands in the DEFAULT partition.
-                    for b in &m.lookahead_blocked {
-                        println!("  lookahead blocked: {b}");
-                    }
-                }
-                if let Some(sweep) = &r.would_sweep {
-                    println!(
-                        "  droppable now: {}, blocked: {}",
-                        sweep.dropped.len(),
-                        sweep.blocked.len()
-                    );
-                    if sweep.truncated {
-                        println!("  sweep: truncated, ran out of budget before finishing");
-                    }
-                    for b in &sweep.blocked {
-                        println!("  blocked: {b}");
-                    }
-                }
-                match &r.disable {
-                    Some(DisableOutcome::Reverted(d)) => println!(
-                        "  reverted: {} orphan row(s) and {} duplicate row(s) discarded \
-                         to rebuild the flat layout's constraints",
-                        d.orphans_removed, d.duplicates_removed
-                    ),
-                    Some(DisableOutcome::AlreadyUnpartitioned) => {
-                        println!("  already unpartitioned; nothing to do");
-                    }
-                    None => {}
-                }
-                if let Some(e) = &r.error {
-                    println!("  ERROR: {e}");
-                }
-            }
-        }
-    }
-    let failed: Vec<String> = rows
-        .iter()
-        .filter(|r| !r.reachable || r.error.is_some())
-        .map(|r| r.shard_id.to_string())
-        .collect();
-    if failed.is_empty() || !fail_on_error {
-        Ok(())
-    } else {
-        Err(CliError::InvalidInput(format!(
-            "`partition {verb}` did not succeed on shard(s) {}: see the report above",
-            failed.join(", ")
-        )))
-    }
-}
-
-/// Run a `harvest dr` subcommand.
-///
-/// # Errors
-///
-/// Returns [`CliError::InvalidInput`] for an unparseable or unreachable shard
-/// target, and propagates database errors from the fence and promote paths.
-/// `status` never fails on an unreachable shard: it reports the shard as
-/// unreachable and carries on, because during an incident a partial answer
-/// about the shards you *can* reach is the answer you need.
-pub async fn run_dr(command: &DrCommand) -> Result<(), CliError> {
-    match command {
-        DrCommand::Status {
-            shards,
-            slot_prefix,
-            format,
-        } => run_dr_status(shards, slot_prefix, *format).await,
-        DrCommand::Fence {
-            shards,
-            reason,
-            actor,
-            confirm,
-            provision,
-            force,
-            format,
-        } => run_dr_fence(shards, reason, actor, *confirm, *provision, *force, *format).await,
-        DrCommand::Promote { shards, format } => run_dr_promote(shards, *format).await,
-    }
-}
-
-async fn run_dr_status(
-    shards: &[String],
-    slot_prefix: &str,
-    format: DrFormat,
-) -> Result<(), CliError> {
-    use autumn_harvest::replication::{current_generation, query_replication_status};
-    use autumn_harvest::types::ShardId;
-
-    let targets = parse_shard_targets(shards)?;
-    let mut out = Vec::with_capacity(targets.len());
-    for target in &targets {
-        let shard = ShardId::new(target.shard_id);
-        let redacted = autumn_harvest::backup_verify::redact_dsn(&target.dsn);
-        let mut conn = match dr_connect_read_only(&target.dsn).await {
-            Ok(conn) => conn,
-            Err(error) => {
-                out.push(DrShardStatus {
-                    shard_id: target.shard_id,
-                    dsn: redacted,
-                    reachable: false,
-                    unreachable_reason: Some(error.to_string()),
-                    generation: None,
-                    generation_error: None,
-                    rpo_seconds: None,
-                    rpo_is_lower_bound: false,
-                    lag_bytes: None,
-                    connected_standbys: None,
-                    inactive_slots: None,
-                    replication_error: None,
-                });
-                continue;
-            }
-        };
-        let (generation, generation_error) = match current_generation(&mut conn, shard).await {
-            Ok(Some(g)) => (Some(g.as_i64().to_string()), None),
-            Ok(None) => (None, None),
-            Err(error) => (None, Some(error.to_string())),
-        };
-        let status = query_replication_status(&mut conn, shard, slot_prefix)
-            .await
-            .ok();
-        out.push(DrShardStatus {
-            shard_id: target.shard_id,
-            dsn: redacted,
-            reachable: true,
-            unreachable_reason: None,
-            generation,
-            generation_error,
-            rpo_seconds: status
-                .as_ref()
-                .and_then(autumn_harvest::replication::ReplicationStatus::rpo_seconds),
-            rpo_is_lower_bound: status
-                .as_ref()
-                .is_some_and(autumn_harvest::replication::ReplicationStatus::rpo_is_lower_bound),
-            lag_bytes: status
-                .as_ref()
-                .and_then(autumn_harvest::replication::ReplicationStatus::max_lag_bytes),
-            // `Unavailable` is carried through as `None` rather than counted as
-            // zero standbys: "we cannot see" and "there is nothing there" are
-            // opposite answers to a failover decision.
-            connected_standbys: status.as_ref().and_then(|st| {
-                matches!(
-                    st,
-                    autumn_harvest::replication::ReplicationStatus::Observed { .. }
-                )
-                .then(|| st.connected_standbys())
-            }),
-            inactive_slots: status.as_ref().and_then(|st| {
-                matches!(
-                    st,
-                    autumn_harvest::replication::ReplicationStatus::Observed { .. }
-                )
-                .then(|| st.inactive_slots())
-            }),
-            // `ReplicationStatus` is `#[non_exhaustive]`, so this matches the
-            // two variants it cares about and treats anything else as
-            // observable — a future variant must opt in to being reported as an
-            // outage rather than inherit it.
-            replication_error: match status.as_ref() {
-                Some(autumn_harvest::replication::ReplicationStatus::Unavailable { reason }) => {
-                    Some(reason.clone())
-                }
-                None => Some("replication views could not be queried".to_string()),
-                Some(_) => None,
-            },
-        });
-    }
-
-    match format {
-        DrFormat::Json => {
-            let payload: Vec<serde_json::Value> = out.iter().map(DrShardStatus::to_json).collect();
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&payload)
-                    .map_err(|e| CliError::InvalidInput(e.to_string()))?
-            );
-        }
-        DrFormat::Text => print!("{}", format_dr_status_text(&out)),
-    }
-    Ok(())
-}
-
-/// Render `harvest dr status` as a table.
-///
-/// Pure, so the "unknown is not zero" rendering is testable without a database.
-/// An unknown RPO prints `unknown`, never `0.0s`: a dead standby that reads as
-/// a perfect RPO is the most dangerous line this table could print.
-fn format_dr_status_text(rows: &[DrShardStatus]) -> String {
-    use std::fmt::Write as _;
-
-    let mut s = String::new();
-    let _ = writeln!(
-        s,
-        "{:<6} {:<11} {:>10} {:>12} {:>10} {:>10}  DSN",
-        "SHARD", "GENERATION", "RPO", "LAG BYTES", "STANDBYS", "IDLE SLOTS",
-    );
-    for r in rows {
-        if !r.reachable {
-            let _ = writeln!(
-                s,
-                "{:<6} {:<11} {:>10} {:>12} {:>10} {:>8}  {}",
-                r.shard_id, "UNREACHABLE", "-", "-", "-", "-", r.dsn
-            );
-            continue;
-        }
-        let generation = r.generation.clone().unwrap_or_else(|| {
-            if r.generation_error.is_some() {
-                // NOT "unfenced": an unreadable row is not an absent one, and
-                // the difference decides whether an operator re-fences.
-                "unknown".to_string()
-            } else {
-                "unfenced".to_string()
-            }
-        });
-        let rpo = r.rpo_seconds.map_or_else(
-            || "unknown".to_string(),
-            |v| {
-                if r.rpo_is_lower_bound {
-                    // The standby is behind the whole retained trail, so this
-                    // is a floor. Printing it bare would read as a measurement.
-                    format!(">={v:.0}s")
-                } else {
-                    format!("{v:.1}s")
-                }
-            },
-        );
-        let bytes = r
-            .lag_bytes
-            .map_or_else(|| "unknown".to_string(), |v| v.to_string());
-        // `unreadable`, never `0`: `0` is the definitive "there is no standby
-        // here", and printing it for a role that simply cannot read
-        // `pg_stat_replication` tells an operator mid-failover that DR is down
-        // when the truth is that it is unobservable.
-        let standbys = r
-            .connected_standbys
-            .map_or_else(|| "unreadable".to_string(), |n| n.to_string());
-        let slots = r
-            .inactive_slots
-            .map_or_else(|| "-".to_string(), |n| n.to_string());
-        let _ = writeln!(
-            s,
-            "{:<6} {:<11} {:>10} {:>12} {:>10} {:>8}  {}",
-            r.shard_id, generation, rpo, bytes, standbys, slots, r.dsn
-        );
-    }
-    if rows
-        .iter()
-        .any(|r| r.reachable && r.connected_standbys == Some(0))
-    {
-        let _ = writeln!(
-            s,
-            "\nWARNING: a shard has no connected standby. Its RPO is unbounded and growing; \
-             `unknown` above means UNMEASURABLE, not zero."
-        );
-    }
-    // Deliberately a separate, differently-worded line from the warning above.
-    if rows
-        .iter()
-        .any(|r| r.reachable && r.replication_error.is_some())
-    {
-        let _ = writeln!(
-            s,
-            "\nNOTE: a shard's replication views could not be read (usually a missing \
-             `GRANT pg_monitor`), so its standby count and RPO are UNKNOWN — not zero, and not \
-             evidence that replication is down."
-        );
-    }
-    s
-}
-
-/// Phase 1 of `harvest dr fence`: validate every shard, mutate nothing.
-///
-/// A fence that dies partway leaves a HALF-FENCED cluster — the state the
-/// runbook names as the worst possible one, because live cross-shard traffic
-/// then turns bounded skew into unbounded skew — and during a regional failover
-/// an unreachable shard is the *expected* condition, not the exceptional one.
-/// So every failure that can be found without writing is found here, before
-/// anything is written.
-async fn dr_fence_preflight(
-    targets: &[autumn_harvest::backup_verify::ShardTarget],
-    provision: bool,
-    force: bool,
-) -> Result<
-    Vec<(
-        i32,
-        autumn_harvest::types::ShardId,
-        autumn_harvest::diesel_async::AsyncPgConnection,
-    )>,
-    CliError,
-> {
-    use autumn_harvest::replication::{current_generation, ensure_generation_row};
-    use autumn_harvest::types::ShardId;
-
-    // without writing is found before anything is written.
-    let mut conns = Vec::with_capacity(targets.len());
-    for target in targets {
-        let shard = ShardId::new(target.shard_id);
-        let mut conn = dr_connect(&target.dsn).await?;
-        let posture = dr_write_posture(&mut conn).await?;
-        if posture.looks_like_a_live_primary() && !force {
-            return Err(CliError::InvalidInput(format!(
-                "refusing to fence shard {}: {} is not in recovery and still has {} connected \
-                 standby(s), so it looks like a healthy PRIMARY rather than the standby you just \
-                 promoted. Fencing it stops every worker on it, recoverable only by restarting \
-                 the fleet. Pass --force if this really is the promoted primary.",
-                target.shard_id,
-                autumn_harvest::backup_verify::redact_dsn(&target.dsn),
-                posture.connected_standbys,
-            )));
-        }
-        if provision {
-            ensure_generation_row(&mut conn, shard)
-                .await
-                .map_err(|e| dr_error(target.shard_id, &e))?;
-        } else if current_generation(&mut conn, shard)
-            .await
-            .map_err(|e| dr_error(target.shard_id, &e))?
-            .is_none()
-        {
-            // Preflight the row's existence here rather than letting
-            // `bump_generation` return NotFound in phase 2. A missing row is a
-            // fully discoverable input error — almost always a wrong shard id,
-            // since an unprefixed `--shard <dsn>` takes its POSITIONAL index —
-            // and discovering it after earlier shards were already bumped
-            // produces precisely the half-fenced cluster this two-phase
-            // structure exists to prevent.
-            return Err(CliError::InvalidInput(format!(
-                "shard {} has no harvest_shard_generation row at {}, so there is nothing to \
-                 fence: no worker has ever pinned it. This is usually a wrong shard id — an \
-                 unprefixed `--shard <dsn>` takes its positional index as the shard id, so \
-                 prefix explicitly as `<id>=<dsn>`. Pass --provision to create the row and fence \
-                 it anyway. No shard has been fenced.",
-                target.shard_id,
-                autumn_harvest::backup_verify::redact_dsn(&target.dsn),
-            )));
-        }
-        conns.push((target.shard_id, shard, conn));
-    }
-
-    Ok(conns)
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_dr_fence(
-    shards: &[String],
-    reason: &str,
-    actor: &str,
-    confirm: bool,
-    provision: bool,
-    force: bool,
-    format: DrFormat,
-) -> Result<(), CliError> {
-    use autumn_harvest::replication::bump_generation;
-
-    // clap marks the flag `required`, so this is belt-and-braces for a
-    // programmatic caller — but the cost of getting it wrong is a fleet.
-    if !confirm {
-        return Err(CliError::InvalidInput(
-            "refusing to fence without --i-understand-this-stops-the-fleet".to_string(),
-        ));
-    }
-
-    let targets = parse_shard_targets(shards)?;
-
-    let mut conns = dr_fence_preflight(&targets, provision, force).await?;
-
-    // ── Phase 2: bump. `bump_generation` returns NotFound for a shard with no
-    // row, which is deliberately NOT papered over with a provisioning call —
-    // see `--provision`.
-    let mut results = Vec::with_capacity(conns.len());
-    let mut failure: Option<CliError> = None;
-    for (shard_id, shard, conn) in &mut conns {
-        match bump_generation(conn, *shard, reason, actor).await {
-            Ok(generation) => results.push(serde_json::json!({
-                "shard_id": *shard_id,
-                "generation": generation.as_i64(),
-                "reason": reason,
-                "actor": actor,
-            })),
-            Err(error) => {
-                failure = Some(dr_error(*shard_id, &error));
-                break;
-            }
-        }
-    }
-
-    // Report what DID happen before returning any error. An operator who is
-    // told only "shard 3 failed" cannot know that shards 0-2 are already
-    // fenced, and that is exactly the fact they need in order to decide what to
-    // do next. On the JSON path this goes to stderr so stdout stays parseable.
-    let rendered = match format {
-        DrFormat::Json => serde_json::to_string_pretty(&results)
-            .map_err(|e| CliError::InvalidInput(e.to_string()))?,
-        DrFormat::Text => {
-            let mut out = String::new();
-            for r in &results {
-                let _ = std::fmt::Write::write_fmt(
-                    &mut out,
-                    format_args!(
-                        "shard {} fenced at generation {}\n",
-                        r["shard_id"], r["generation"]
-                    ),
-                );
-            }
-            out
-        }
-    };
-    if let Some(error) = failure {
-        eprintln!(
-            "PARTIAL FENCE — {} of {} shard(s) were fenced before the failure below. The cluster \
-             is now HALF-FENCED: do not start workers until every shard is fenced.\n{rendered}",
-            results.len(),
-            targets.len()
-        );
-        return Err(error);
-    }
-
-    match format {
-        DrFormat::Json => println!("{rendered}"),
-        DrFormat::Text => {
-            print!("{rendered}");
-            println!(
-                "\nEvery worker pinned to the previous generation is now unable to claim or \
-                 persist and will stop. Restart the fleet against this region; never re-pin a \
-                 fenced worker in place."
-            );
-        }
-    }
-    Ok(())
-}
-
-/// What a target database looks like from a write-authority standpoint.
-struct DrWritePosture {
-    in_recovery: bool,
-    connected_standbys: i64,
-}
-
-impl DrWritePosture {
-    /// A database that is writable *and* still serving standbys is a primary
-    /// doing its job — not the standby an operator just promoted.
-    const fn looks_like_a_live_primary(&self) -> bool {
-        !self.in_recovery && self.connected_standbys > 0
-    }
-}
-
-async fn dr_write_posture(
-    conn: &mut autumn_harvest::diesel_async::AsyncPgConnection,
-) -> Result<DrWritePosture, CliError> {
-    // `QueryableByName`'s generated code refers to `diesel` by that bare path,
-    // so the re-export has to be in scope under that name.
-    use autumn_harvest::diesel;
-    use autumn_harvest::diesel_async::RunQueryDsl as _;
-
-    #[derive(diesel::QueryableByName)]
-    struct Row {
-        #[diesel(sql_type = diesel::sql_types::Bool)]
-        in_recovery: bool,
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        standbys: i64,
-    }
-    let rows: Vec<Row> = diesel::sql_query(
-        "SELECT pg_is_in_recovery() AS in_recovery, \
-                (SELECT COUNT(*) FROM pg_stat_replication)::bigint AS standbys",
-    )
-    .load(conn)
-    .await
-    .map_err(|e| CliError::InvalidInput(format!("could not read write posture: {e}")))?;
-
-    // An unreadable `pg_stat_replication` (no `pg_monitor`) must not block a
-    // failover: degrade to "cannot tell", which lets the fence proceed. The
-    // guard is a typo catcher, not a security boundary.
-    Ok(rows.into_iter().next().map_or(
-        DrWritePosture {
-            in_recovery: false,
-            connected_standbys: 0,
-        },
-        |r| DrWritePosture {
-            in_recovery: r.in_recovery,
-            connected_standbys: r.standbys,
-        },
-    ))
-}
-
-/// Wrap a database error with the shard it came from.
-///
-/// During a multi-shard failover "which shard" is the single missing detail in
-/// an error an operator reads under time pressure.
-fn dr_error(shard_id: i32, error: &autumn_harvest::error::HarvestError) -> CliError {
-    CliError::InvalidInput(format!("shard {shard_id}: {error}"))
-}
-
-async fn run_dr_promote(shards: &[String], format: DrFormat) -> Result<(), CliError> {
-    use autumn_harvest::replication::advance_sequences_after_promotion;
-
-    let targets = parse_shard_targets(shards)?;
-    let mut results = Vec::with_capacity(targets.len());
-    for target in &targets {
-        let mut conn = dr_connect(&target.dsn).await?;
-        let advanced = advance_sequences_after_promotion(&mut conn)
-            .await
-            .map_err(|e| CliError::InvalidInput(e.to_string()))?;
-        results.push(serde_json::json!({
-            "shard_id": target.shard_id,
-            "sequences_advanced": advanced
-                .iter()
-                .map(|(name, value)| serde_json::json!({ "sequence": name, "set_to": value }))
-                .collect::<Vec<_>>(),
-        }));
-    }
-
-    match format {
-        DrFormat::Json => println!(
-            "{}",
-            serde_json::to_string_pretty(&results)
-                .map_err(|e| CliError::InvalidInput(e.to_string()))?
-        ),
-        DrFormat::Text => {
-            for r in &results {
-                let seqs = r["sequences_advanced"].as_array().map_or(0, Vec::len);
-                println!("shard {}: {seqs} sequence(s) advanced", r["shard_id"]);
-            }
-        }
-    }
-    Ok(())
 }
 
 // ── harvest schema: payload-schema contract gate (issue #794) ───────────────
@@ -8213,8 +4900,7 @@ fn print_new_next_steps(names: &ScaffoldNames, target: &Path) {
 /// API returns a non-success status, or the response body is not valid JSON.
 pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
     let request = cli.api_request()?;
-    let timeout = cli.request_timeout();
-    let client = http_client(timeout)?;
+    let client = reqwest::Client::new();
     let url = format!("{}{}", cli.base_url.trim_end_matches('/'), request.path);
     let builder = match request.method {
         ApiMethod::Get => client.get(url),
@@ -8222,13 +4908,6 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
         ApiMethod::Post => client.post(url),
         ApiMethod::Delete => client.delete(url),
     };
-    // Issue #1579: a bare `Accept: */*` (curl's own default) makes the
-    // server's error-page negotiation treat the request as browser
-    // navigation. It then returns an HTML error page, not the
-    // documented JSON body, on a validation error. State the CLI's
-    // real expectation here so its behavior never depends on a
-    // client-library default.
-    let builder = builder.header("Accept", "application/json");
     let builder = if let Some(token) = &cli.token {
         builder.bearer_auth(token)
     } else {
@@ -8254,15 +4933,9 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
         builder
     };
 
-    let response = builder
-        .send()
-        .await
-        .map_err(|e| transport_error(e, timeout))?;
+    let response = builder.send().await?;
     let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|e| transport_error(e, timeout))?;
+    let body = response.text().await?;
     if !status.is_success() {
         return Err(CliError::Http { status, body });
     }
@@ -8273,72 +4946,6 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
     serde_json::from_str(&body).map_err(CliError::ParseResponse)
 }
 
-/// An HTTP client whose every request ends within `timeout` (issue #1832).
-///
-/// # Errors
-///
-/// Returns [`CliError::Request`] if the TLS backend fails to start.
-pub(crate) fn http_client(timeout: std::time::Duration) -> Result<reqwest::Client, CliError> {
-    Ok(reqwest::Client::builder()
-        .timeout(timeout)
-        .connect_timeout(timeout.min(MAX_CONNECT_TIMEOUT))
-        .build()?)
-}
-
-/// An HTTP client for an SSE stream (issue #1832).
-///
-/// A total timeout would cut a live stream. So this client bounds only the
-/// connect phase and the silence between two reads.
-fn sse_client(timeout: std::time::Duration) -> Result<reqwest::Client, CliError> {
-    Ok(reqwest::Client::builder()
-        .connect_timeout(timeout.min(MAX_CONNECT_TIMEOUT))
-        .read_timeout(timeout.max(SSE_IDLE_TIMEOUT))
-        .build()?)
-}
-
-/// Map a transport error. A timeout names the limit that expired.
-fn transport_error(error: reqwest::Error, timeout: std::time::Duration) -> CliError {
-    if !error.is_timeout() {
-        CliError::Request(error)
-    } else if error.is_connect() {
-        CliError::ConnectTimeout {
-            seconds: timeout.min(MAX_CONNECT_TIMEOUT).as_secs(),
-        }
-    } else {
-        CliError::Timeout {
-            seconds: timeout.as_secs(),
-        }
-    }
-}
-
-/// Send `request` and wait at most `timeout` for the response headers.
-///
-/// A non-2xx response becomes [`CliError::Http`]. Its body must arrive in the
-/// same `timeout` as the headers. Only a 2xx stream has no total limit, so a
-/// live stream can run for as long as it needs.
-async fn send_for_stream(
-    request: reqwest::RequestBuilder,
-    timeout: std::time::Duration,
-) -> Result<reqwest::Response, CliError> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    let timed_out = |_| CliError::Timeout {
-        seconds: timeout.as_secs(),
-    };
-    let response = tokio::time::timeout_at(deadline, request.send())
-        .await
-        .map_err(timed_out)?
-        .map_err(|e| transport_error(e, timeout))?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = tokio::time::timeout_at(deadline, response.text())
-            .await
-            .map_err(timed_out)?
-            .map_err(|e| transport_error(e, timeout))?;
-        return Err(CliError::Http { status, body });
-    }
-    Ok(response)
-}
-
 /// Open the SSE stream for `execution_id` and print events to stdout.
 ///
 /// Each complete SSE event block is printed as `<event-type>: <data>`.
@@ -8347,7 +4954,7 @@ async fn send_for_stream(
 async fn run_events_tail(
     cli: &Cli,
     execution_id: &str,
-    last_event_id: Option<i32>,
+    last_event_id: Option<i64>,
 ) -> Result<(), CliError> {
     let path = format!("/executions/{}", path_segment(execution_id));
     let url = format!(
@@ -8356,8 +4963,7 @@ async fn run_events_tail(
         path
     );
 
-    let timeout = cli.http_timeout();
-    let client = sse_client(timeout)?;
+    let client = reqwest::Client::new();
     let mut builder = client
         .get(&url)
         .header("Accept", "text/event-stream")
@@ -8370,7 +4976,14 @@ async fn run_events_tail(
         builder = builder.header("Last-Event-ID", id.to_string());
     }
 
-    let mut response = send_for_stream(builder, timeout).await?;
+    let response = builder.send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await?;
+        return Err(CliError::Http { status, body });
+    }
+
+    let mut response = response;
     let mut buf: Vec<u8> = Vec::new();
     // SSE fields for the current event block.
     let mut ev_id = String::new();
@@ -8378,10 +4991,7 @@ async fn run_events_tail(
     let mut ev_data = String::new();
 
     loop {
-        let chunk = response
-            .chunk()
-            .await
-            .map_err(|e| transport_error(e, timeout.max(SSE_IDLE_TIMEOUT)))?;
+        let chunk = response.chunk().await?;
         let Some(bytes) = chunk else {
             // Server closed the connection.
             break;
@@ -8475,7 +5085,6 @@ async fn run_worker_drain_wait(
             actor: cli.actor.clone(),
             request_id: cli.request_id.clone(),
             output: cli.output,
-            http_timeout_secs: cli.http_timeout_secs,
             command: Commands::Worker {
                 command: WorkerCommand::Get {
                     worker_id: worker_id.to_string(),
@@ -8807,7 +5416,22 @@ fn format_usage_table(value: &Value) -> String {
         ]);
     }
 
-    let table = render_table(&rows);
+    let widths = (0..rows[0].len())
+        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    let table = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
     format!("{summary}\n\n{table}")
 }
@@ -8908,7 +5532,22 @@ fn format_dlq_aggregate_table(value: &Value) -> String {
         rows.push(row);
     }
 
-    let table = render_table(&rows);
+    let widths = (0..rows[0].len())
+        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    let table = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let mut summary = format!("total: {total}  filtered: {filtered}");
     if truncated {
@@ -8959,7 +5598,21 @@ fn format_rate_limit_table(value: &Value) -> String {
         ]);
     }
 
-    render_table(&rows)
+    let widths = (0..rows[0].len())
+        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    rows.iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn format_f64(value: Option<&Value>) -> String {
@@ -9123,7 +5776,22 @@ fn format_canary_table(value: &Value) -> String {
             ]);
         }
 
-        let table = render_table(&rows);
+        let widths = (0..rows[0].len())
+            .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+            .collect::<Vec<_>>();
+        let table = rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .enumerate()
+                    .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                    .collect::<Vec<_>>()
+                    .join("  ")
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
 
         let _ = writeln!(out, "\nSummary by Workflow Type:\n{table}");
     }
@@ -9168,7 +5836,22 @@ fn format_canary_table(value: &Value) -> String {
             ]);
         }
 
-        let table = render_table(&rows);
+        let widths = (0..rows[0].len())
+            .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+            .collect::<Vec<_>>();
+        let table = rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .enumerate()
+                    .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                    .collect::<Vec<_>>()
+                    .join("  ")
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
 
         let _ = writeln!(out, "\nReplay Failures:\n{table}");
 
@@ -9318,7 +6001,22 @@ fn format_preflight_table(value: &Value) -> String {
         ]);
     }
 
-    let table = render_table(&rows);
+    let widths = (0..rows[0].len())
+        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    let table = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let findings = format_preflight_findings(checks);
     if findings.is_empty() {
@@ -9426,7 +6124,22 @@ fn format_shard_health_table(value: &Value) -> String {
         ]);
     }
 
-    let table = render_table(&rows);
+    let widths = (0..rows[0].len())
+        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    let table = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
     format!("overall_readiness: {overall}\nobserved_at: {observed_at}\n\n{table}")
 }
@@ -9477,7 +6190,22 @@ fn format_version_usage_table(value: &Value) -> String {
         ]);
     }
 
-    let table = render_table(&rows);
+    let widths = (0..rows[0].len())
+        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    let table = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
     format!("status: {status}\nobserved_at: {observed_at}\n\n{table}")
 }
@@ -9685,7 +6413,22 @@ fn format_workflow_reachability_table(value: &Value) -> String {
         ]);
     }
 
-    let table = render_table(&rows);
+    let widths = (0..rows[0].len())
+        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    let table = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let unavailable = value
         .get("shards")
@@ -9801,7 +6544,22 @@ fn format_activity_list_table(value: &Value) -> String {
         ]);
     }
 
-    let table = render_table(&rows);
+    let widths = (0..rows[0].len())
+        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    let table = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
     format!("status: {status}\n\n{table}")
 }
@@ -9977,7 +6735,22 @@ fn format_queue_coverage_table(value: &Value) -> String {
         ]);
     }
 
-    let table = render_table(&rows);
+    let widths = (0..rows[0].len())
+        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    let table = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
     format!(
         "status: {status}\nobserved_at: {observed_at}\ntotal_uncovered_queues: {total_uncovered}\n\n{table}{footer}{paused_note}"
@@ -10160,7 +6933,22 @@ fn format_handoff_table(value: &Value) -> String {
         ]);
     }
 
-    let table = render_table(&rows);
+    let widths = (0..rows[0].len())
+        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    let table = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let coverage = coverage.map_or_else(String::new, handoff_coverage_summary);
     if coverage.is_empty() {
@@ -10229,7 +7017,22 @@ fn format_workflow_children_table(value: &Value) -> String {
         ]);
     }
 
-    let mut rendered = render_table(&rows);
+    let widths = (0..rows[0].len())
+        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    let mut rendered = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
     if let Some(cursor) = value.get("next_cursor").and_then(Value::as_str) {
         rendered.push_str("\nnext_cursor: ");
@@ -10268,7 +7071,22 @@ fn format_workflow_summaries_table(value: &Value) -> String {
         ]);
     }
 
-    let mut rendered = render_table(&rows);
+    let widths = (0..rows[0].len())
+        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    let mut rendered = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
     if let Some(cursor) = value.get("next_cursor").and_then(Value::as_str) {
         rendered.push_str("\nnext_cursor: ");
@@ -10489,7 +7307,22 @@ fn format_run_chain_table(value: &Value) -> String {
         ]);
     }
 
-    let mut rendered = render_table(&rows);
+    let widths = (0..rows[0].len())
+        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    let mut rendered = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
     if let Some(workflow_id) = value.get("workflow_id").and_then(Value::as_str) {
         rendered = format!("workflow_id: {workflow_id}\n{rendered}");
@@ -10543,13 +7376,6 @@ fn format_audit_table(value: &Value) -> String {
         ]);
     }
 
-    render_table(&rows)
-}
-
-/// Render rows as a column-aligned table. Each column takes the width of its
-/// widest cell. Two spaces separate columns, and trailing padding on each
-/// line is trimmed. Callers must pass at least one row (the header).
-fn render_table(rows: &[Vec<String>]) -> String {
     let widths = (0..rows[0].len())
         .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
         .collect::<Vec<_>>();
@@ -10718,285 +7544,6 @@ fn shard_request(command: &ShardCommand) -> ApiRequest {
             || ApiRequest::get("/admin/shards/health"),
             |shard| ApiRequest::get(format!("/admin/shards/health?candidate_shard={shard}")),
         ),
-        // Intercepted in `run_cli` and executed against the shard databases
-        // directly (issue #964); they never reach the management API. Kept in
-        // the match rather than a `_` arm so a future shard subcommand is a
-        // compile error here until it declares which path it takes.
-        ShardCommand::Rebalance { .. }
-        | ShardCommand::RebalanceResume { .. }
-        | ShardCommand::ReconcileMigratedSeals { .. } => {
-            unreachable!("shard rebalance commands are dispatched in-process by run_cli")
-        }
-    }
-}
-
-/// Execute `harvest shard rebalance` / `shard rebalance-resume` against the
-/// shard databases directly (issue #964).
-#[allow(clippy::too_many_lines)] // Two sibling subcommands whose argument
-// handling reads better side by side than split across helpers.
-async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Result<(), CliError> {
-    use autumn_harvest::payload_codec::PayloadCodecs;
-    use autumn_harvest::shard::ShardedDbPool;
-    use autumn_harvest::types::ShardId;
-
-    fn build_pool(
-        targets: &[autumn_harvest::backup_verify::ShardTarget],
-    ) -> Result<ShardedDbPool, CliError> {
-        let default = targets.first().map_or(0, |t| t.shard_id);
-        ShardedDbPool::from_dsns(
-            targets
-                .iter()
-                .map(|t| (ShardId::new(t.shard_id), t.dsn.clone())),
-            ShardId::new(default),
-            4,
-        )
-        .map_err(|e| CliError::InvalidInput(e.to_string()))
-    }
-
-    fn require_shard(
-        targets: &[autumn_harvest::backup_verify::ShardTarget],
-        shard: i32,
-        flag: &str,
-    ) -> Result<(), CliError> {
-        if targets.iter().any(|t| t.shard_id == shard) {
-            return Ok(());
-        }
-        Err(CliError::InvalidInput(format!(
-            "--{flag} names shard {shard}, but no --shard {shard}=<DSN> was supplied"
-        )))
-    }
-
-    match command {
-        ShardCommand::Rebalance {
-            shards,
-            from,
-            to,
-            limit,
-            dry_run,
-            after_created_at,
-            after_execution_id,
-            expect_generation,
-            json,
-        } => {
-            let targets = parse_shard_targets(shards)?;
-            require_shard(&targets, *from, "from")?;
-            require_shard(&targets, *to, "to")?;
-            if from == to {
-                return Err(CliError::InvalidInput(
-                    "--from and --to must name different shards".to_string(),
-                ));
-            }
-            let pool = build_pool(&targets)?;
-            // Held until the command ends. See `shard_pool_write_authority`.
-            let fence = if *dry_run {
-                Vec::new()
-            } else {
-                shard_pool_write_authority(&pool, &targets, expect_generation).await?
-            };
-            let after = after_created_at
-                .zip(*after_execution_id)
-                .map(|(at, id)| (at, autumn_harvest::types::ExecutionId::from_uuid(id)));
-            // A lost fence session stops the command. See `run_fenced_pass`.
-            let report = autumn_harvest::replication::run_fenced_pass(
-                &fence,
-                autumn_harvest::shard_rebalance::migrate_quiescent_executions_after(
-                    &pool,
-                    ShardId::new(*from),
-                    ShardId::new(*to),
-                    *limit,
-                    *dry_run,
-                    actor.unwrap_or("anonymous"),
-                    &PayloadCodecs::default(),
-                    after,
-                ),
-            )
-            .await
-            .and_then(|done| done)
-            .map_err(|e| CliError::InvalidInput(e.to_string()))?;
-
-            if *json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&report)
-                        .map_err(|e| CliError::InvalidInput(e.to_string()))?
-                );
-            } else {
-                print!("{}", format_rebalance_report(&report));
-            }
-            Ok(())
-        }
-        ShardCommand::RebalanceResume {
-            shards,
-            from,
-            limit,
-            expect_generation,
-            json,
-        } => {
-            let targets = parse_shard_targets(shards)?;
-            require_shard(&targets, *from, "from")?;
-            let pool = build_pool(&targets)?;
-            let fence = shard_pool_write_authority(&pool, &targets, expect_generation).await?;
-            // A lost fence session stops the command. See `run_fenced_pass`.
-            let outcomes = autumn_harvest::replication::run_fenced_pass(
-                &fence,
-                autumn_harvest::shard_rebalance::resume_incomplete_migrations(
-                    &pool,
-                    ShardId::new(*from),
-                    *limit,
-                    actor.unwrap_or("anonymous"),
-                    &PayloadCodecs::default(),
-                ),
-            )
-            .await
-            .and_then(|done| done)
-            .map_err(|e| CliError::InvalidInput(e.to_string()))?;
-
-            if *json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&outcomes)
-                        .map_err(|e| CliError::InvalidInput(e.to_string()))?
-                );
-            } else if outcomes.is_empty() {
-                println!("no unfinished shard migrations on shard {from}");
-            } else {
-                for outcome in &outcomes {
-                    println!("{}", format_rebalance_outcome(outcome));
-                }
-            }
-            Ok(())
-        }
-        ShardCommand::ReconcileMigratedSeals {
-            shards,
-            from,
-            limit,
-            after_migrated_at,
-            after_execution_id,
-            expect_generation,
-            json,
-        } => {
-            let targets = parse_shard_targets(shards)?;
-            require_shard(&targets, *from, "from")?;
-            let pool = build_pool(&targets)?;
-            let fence = shard_pool_write_authority(&pool, &targets, expect_generation).await?;
-            let after = after_migrated_at
-                .zip(*after_execution_id)
-                .map(|(at, id)| (at, autumn_harvest::types::ExecutionId::from_uuid(id)));
-            // A lost fence session stops the command. See `run_fenced_pass`.
-            let (reconciled, failures, next_cursor) = autumn_harvest::replication::run_fenced_pass(
-                &fence,
-                autumn_harvest::shard_rebalance::reconcile_migrated_seals_after(
-                    &pool,
-                    ShardId::new(*from),
-                    *limit,
-                    after,
-                ),
-            )
-            .await
-            .and_then(|done| done)
-            .map_err(|e| CliError::InvalidInput(e.to_string()))?;
-
-            if *json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "reconciled": reconciled,
-                        "failures": failures,
-                        "next_scan_cursor": next_cursor.map(|(at, id)| serde_json::json!({
-                            "migrated_at": at.to_rfc3339(),
-                            "execution_id": id.as_uuid(),
-                        })),
-                    }))
-                    .map_err(|e| CliError::InvalidInput(e.to_string()))?
-                );
-            } else {
-                println!("reconciled {reconciled} seal(s) on shard {from}");
-                for failure in &failures {
-                    println!("  failed    {}  ({})", failure.execution_id, failure.reason);
-                }
-                if let Some((at, id)) = next_cursor {
-                    println!(
-                        "more may remain past this window; resume with:\n  \
-                         --after-migrated-at {} --after-execution-id {}",
-                        at.to_rfc3339(),
-                        id.as_uuid()
-                    );
-                }
-            }
-            Ok(())
-        }
-        ShardCommand::Health { .. } => unreachable!("health goes through the management API"),
-    }
-}
-
-/// One line per execution, plus a summary — the progress report AC8 asks for.
-fn format_rebalance_report(
-    report: &autumn_harvest::shard_rebalance::MigrationBatchReport,
-) -> String {
-    use std::fmt::Write as _;
-
-    let mut out = String::new();
-    let mode = if report.dry_run { " (dry run)" } else { "" };
-    let _ = writeln!(
-        out,
-        "shard rebalance {} -> {}{mode}",
-        report.source_shard.as_i32(),
-        report.target_shard.as_i32()
-    );
-    for outcome in &report.outcomes {
-        out.push_str("  ");
-        out.push_str(&format_rebalance_outcome(outcome));
-        out.push('\n');
-    }
-    let _ = writeln!(
-        out,
-        "\nexamined {}  migrated {}  would-migrate {}  skipped {}  aborted {}",
-        report.examined,
-        report.migrated(),
-        report.would_migrate(),
-        report.skipped(),
-        report.aborted()
-    );
-    if let Some((at, id)) = report.next_scan_cursor {
-        let _ = writeln!(
-            out,
-            "more may remain past this window; resume with:\n  \
-             --after-created-at {} --after-execution-id {}",
-            at.to_rfc3339(),
-            id.as_uuid()
-        );
-    }
-    out
-}
-
-fn format_rebalance_outcome(outcome: &autumn_harvest::shard_rebalance::MigrationOutcome) -> String {
-    use autumn_harvest::shard_rebalance::MigrationOutcome;
-    match outcome {
-        MigrationOutcome::Migrated {
-            execution_id,
-            fingerprint,
-        } => format!(
-            "migrated      {execution_id}  (verified {})",
-            &fingerprint[..fingerprint.len().min(12)]
-        ),
-        MigrationOutcome::WouldMigrate { execution_id } => {
-            format!("would-migrate {execution_id}")
-        }
-        MigrationOutcome::Skipped {
-            execution_id,
-            blockers,
-        } => format!(
-            "skipped       {execution_id}  ({})",
-            blockers
-                .iter()
-                .map(|b| b.describe())
-                .collect::<Vec<_>>()
-                .join("; ")
-        ),
-        MigrationOutcome::Aborted {
-            execution_id,
-            reason,
-        } => format!("aborted       {execution_id}  ({reason})"),
     }
 }
 
@@ -11938,7 +8485,6 @@ fn schedule_request(command: &ScheduleCommand) -> Result<ApiRequest, CliError> {
             max_active_runs,
             catchup,
             paused,
-            jitter_secs,
         } => {
             let mut body = Map::new();
             body.insert("workflow_name".to_string(), Value::String(name.clone()));
@@ -11946,9 +8492,6 @@ fn schedule_request(command: &ScheduleCommand) -> Result<ApiRequest, CliError> {
             body.insert("max_active_runs".to_string(), json!(max_active_runs));
             body.insert("catchup".to_string(), json!(catchup));
             body.insert("paused".to_string(), json!(paused));
-            if let Some(secs) = jitter_secs {
-                body.insert("jitter_secs".to_string(), json!(secs));
-            }
             if let Some(input) =
                 parse_json_source(input_json.as_deref(), input_file.as_deref(), "input")?
             {
@@ -12051,9 +8594,11 @@ fn schedule_request(command: &ScheduleCommand) -> Result<ApiRequest, CliError> {
             None,
         )),
         ScheduleCommand::Delete { id } => {
-            // DELETE uses its own `ApiMethod::Delete` variant rather than a
-            // POST to a `/delete` path, so the request carries the verb the
-            // admin API actually expects.
+            // DELETE — use a dedicated ApiMethod variant or reuse Post with a
+            // special path. Since ApiMethod only has Get/Patch/Post and adding
+            // Delete would require more changes, we'll represent it as a Post
+            // to a /delete path.
+            // Actually, let's add Delete to ApiMethod.
             Ok(ApiRequest {
                 method: ApiMethod::Delete,
                 path: format!("/admin/schedules/{}", path_segment(id)),
@@ -12413,7 +8958,6 @@ fn audit_request(command: &AuditCommand) -> ApiRequest {
             status,
             since,
             before,
-            before_id,
             limit,
         } => {
             let mut params: Vec<(&'static str, String)> = Vec::new();
@@ -12437,9 +8981,6 @@ fn audit_request(command: &AuditCommand) -> ApiRequest {
             }
             if let Some(v) = before {
                 params.push(("before", v.clone()));
-            }
-            if let Some(v) = before_id {
-                params.push(("before_id", v.clone()));
             }
             if let Some(v) = limit {
                 params.push(("limit", v.to_string()));
@@ -12655,9 +9196,9 @@ fn dead_letter_request(command: &DeadLetterCommand) -> ApiRequest {
             failure_signature,
             limit,
             dry_run,
-            spread_secs,
-        } => {
-            let mut body = build_bulk_dlq_body(
+        } => ApiRequest::post(
+            "/dead-letters/replay",
+            Some(build_bulk_dlq_body(
                 activity_name.as_deref(),
                 workflow_name.as_deref(),
                 queue_name.as_deref(),
@@ -12669,10 +9210,8 @@ fn dead_letter_request(command: &DeadLetterCommand) -> ApiRequest {
                 failure_signature.as_deref(),
                 *limit,
                 *dry_run,
-            );
-            insert_spread_secs(&mut body, *spread_secs);
-            ApiRequest::post("/dead-letters/replay", Some(body))
-        }
+            )),
+        ),
         DeadLetterCommand::BulkDiscard {
             activity_name,
             workflow_name,
@@ -12760,9 +9299,9 @@ fn dead_letter_request(command: &DeadLetterCommand) -> ApiRequest {
             max,
             reason,
             dry_run,
-            spread_secs,
-        } => {
-            let mut body = build_redrive_dlq_body(
+        } => ApiRequest::post(
+            "/dlq/redrive",
+            Some(build_redrive_dlq_body(
                 queue.as_deref(),
                 workflow_name.as_deref(),
                 dead_lettered_after.as_deref(),
@@ -12772,10 +9311,8 @@ fn dead_letter_request(command: &DeadLetterCommand) -> ApiRequest {
                 *max,
                 reason.as_deref(),
                 *dry_run,
-            );
-            insert_spread_secs(&mut body, *spread_secs);
-            ApiRequest::post("/dlq/redrive", Some(body))
-        }
+            )),
+        ),
     }
 }
 
@@ -12843,13 +9380,6 @@ fn build_bulk_dlq_body(
         body.insert("dry_run".to_string(), json!(true));
     }
     Value::Object(body)
-}
-
-/// Add `--spread-secs` to a redrive or bulk-replay body (issue #1832).
-fn insert_spread_secs(body: &mut Value, spread_secs: Option<u64>) {
-    if let (Value::Object(map), Some(secs)) = (body, spread_secs) {
-        map.insert("spread_secs".to_string(), json!(secs));
-    }
 }
 
 fn gate_request(command: &GateCommand) -> Result<ApiRequest, CliError> {
@@ -12956,7 +9486,7 @@ pub struct BootstrapToken {
     pub secret: String,
     /// `hex(SHA256(secret))` — the value embedded in the INSERT and stored.
     pub hash: String,
-    /// The token scope (`read` | `mutate` | `admin`).
+    /// The token scope (`read` | `mutate`).
     pub scope: String,
     /// The token label.
     pub name: String,
@@ -13061,16 +9591,10 @@ fn run_token_bootstrap(
     println!();
     println!("  3. Send the secret above as a bearer credential:");
     println!("       Authorization: Bearer <secret>");
-    if token.scope == "admin" {
-        println!(
-            "     An `admin`-scoped token can mint every further token via POST /admin/tokens."
-        );
-    } else {
-        println!(
-            "     A `{}`-scoped token cannot mint tokens. Only an `admin` token can.",
-            token.scope
-        );
-    }
+    println!(
+        "     A `{}`-scoped token can mint every further token via POST /admin/tokens.",
+        token.scope
+    );
     Ok(())
 }
 
@@ -13600,7 +10124,22 @@ fn format_retirement_check_table(value: &Value) -> String {
         ]);
     }
 
-    let table = render_table(&rows);
+    let widths = (0..rows[0].len())
+        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    let table = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
     format!("{header}\n\n{table}")
 }
@@ -16702,117 +13241,6 @@ mod usage_cli_tests {
         let rendered = format_usage_table(&value);
         assert!(rendered.contains("No usage groups found."));
     }
-
-    #[test]
-    fn render_table_pads_columns_to_their_widest_cell() {
-        let rows = vec![
-            vec!["A".to_string(), "BB".to_string()],
-            vec!["CCC".to_string(), "D".to_string()],
-        ];
-        assert_eq!(render_table(&rows), "A    BB\nCCC  D");
-    }
-
-    #[test]
-    fn render_table_trims_trailing_padding_on_each_line() {
-        let rows = vec![
-            vec!["A".to_string(), "B".to_string(), "C".to_string()],
-            vec![String::new(), String::new(), String::new()],
-        ];
-        assert_eq!(render_table(&rows), "A  B  C\n");
-    }
-
-    #[test]
-    fn render_table_handles_a_single_row() {
-        let rows = vec![vec!["HEADER".to_string()]];
-        assert_eq!(render_table(&rows), "HEADER");
-    }
-
-    #[test]
-    fn format_workflow_summaries_table_renders_rows_and_next_cursor() {
-        let value = serde_json::json!({
-            "summaries": [
-                {
-                    "execution_id": "exec-1",
-                    "workflow_name": "onboarding",
-                    "workflow_id": "wf-1",
-                    "state": "completed",
-                    "completed_at": "2026-05-18T00:00:00Z",
-                    "duration_ms": 4200,
-                    "shard_id": 3
-                }
-            ],
-            "next_cursor": "abc123"
-        });
-        let rendered = format_workflow_summaries_table(&value);
-        assert!(rendered.contains("EXEC ID"), "{rendered}");
-        assert!(rendered.contains("exec-1"), "{rendered}");
-        assert!(rendered.contains("onboarding"), "{rendered}");
-        assert!(rendered.ends_with("\nnext_cursor: abc123"), "{rendered}");
-    }
-
-    #[test]
-    fn format_workflow_summaries_table_reports_no_summaries() {
-        let value = serde_json::json!({ "summaries": [] });
-        assert_eq!(
-            format_workflow_summaries_table(&value),
-            "No execution summaries found."
-        );
-    }
-
-    #[test]
-    fn format_run_chain_table_renders_rows_workflow_id_and_head_unknown_note() {
-        let value = serde_json::json!({
-            "workflow_id": "wf-9",
-            "head_unknown": true,
-            "runs": [
-                {
-                    "sequence": 1,
-                    "exec_id": "exec-1",
-                    "run_id": "run-1",
-                    "state": "completed",
-                    "outcome": "success",
-                    "started_at": "2026-05-18T00:00:00Z",
-                    "completed_at": "2026-05-18T00:05:00Z",
-                    "continued_to_exec_id": "exec-2"
-                }
-            ]
-        });
-        let rendered = format_run_chain_table(&value);
-        assert!(rendered.starts_with("workflow_id: wf-9\n"), "{rendered}");
-        assert!(rendered.contains("exec-1"), "{rendered}");
-        assert!(rendered.contains("note: head_unknown"), "{rendered}");
-    }
-
-    #[test]
-    fn format_run_chain_table_reports_no_runs() {
-        let value = serde_json::json!({ "runs": [] });
-        assert_eq!(format_run_chain_table(&value), "No run chain found.");
-    }
-
-    #[test]
-    fn format_audit_table_renders_target_type_and_id_joined() {
-        let value = serde_json::json!([
-            {
-                "occurred_at": "2026-05-18T00:00:00Z",
-                "actor": "operator@example.com",
-                "operation": "pause",
-                "target_type": "workflow",
-                "target_id": "wf-1",
-                "status": "ok",
-                "source": "cli",
-                "error_summary": null
-            }
-        ]);
-        let rendered = format_audit_table(&value);
-        assert!(rendered.contains("workflow:wf-1"), "{rendered}");
-        assert!(rendered.contains("operator@example.com"), "{rendered}");
-    }
-
-    #[test]
-    fn format_audit_table_reports_no_records() {
-        let value = serde_json::json!([]);
-        assert_eq!(format_audit_table(&value), "No audit records found.");
-    }
 }
 
 #[cfg(test)]
@@ -16917,32 +13345,6 @@ mod det_check_cli_tests {
     }
 
     #[test]
-    fn backup_verify_default_shard_defaults_to_zero_and_is_overridable() {
-        let cli = parse(&["backup", "verify", "--shard", "postgres://scratch/a"]);
-        match cli.command {
-            Commands::Backup {
-                command: BackupCommand::Verify { default_shard, .. },
-            } => assert_eq!(default_shard, 0, "0 is the overwhelmingly common default"),
-            other => panic!("expected Backup::Verify, got {other:?}"),
-        }
-
-        let cli = parse(&[
-            "backup",
-            "verify",
-            "--shard",
-            "postgres://scratch/a",
-            "--default-shard",
-            "3",
-        ]);
-        match cli.command {
-            Commands::Backup {
-                command: BackupCommand::Verify { default_shard, .. },
-            } => assert_eq!(default_shard, 3),
-            other => panic!("expected Backup::Verify, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn backup_verify_requires_at_least_one_shard() {
         Cli::try_parse_from(["harvest", "backup", "verify"])
             .expect_err("--shard is required; a verify with no target is meaningless");
@@ -17036,7 +13438,7 @@ async fn entry_wf(ctx: &WorkflowContext) -> Result<(), String> {
 }
 
 fn bad_helper() -> i64 {
-    autumn_harvest::chrono::Utc::now().timestamp()
+    chrono::Utc::now().timestamp()
 }
 ";
         let text = format_det_findings_text(&report(src));
@@ -17381,10 +13783,10 @@ mod token_bootstrap_tests {
         );
     }
 
-    /// `--scope` defaults to `admin` (a seed must be able to mint others) and
+    /// `--scope` defaults to `mutate` (a seed must be able to mint others) and
     /// `--created-by`/`--name` default to `bootstrap`.
     #[test]
-    fn bootstrap_defaults_scope_to_admin() {
+    fn bootstrap_defaults_scope_to_mutate() {
         let cli = Cli::try_parse_from(["harvest", "token", "bootstrap"])
             .expect("token bootstrap should parse with no flags");
         match cli.command {
@@ -17397,7 +13799,7 @@ mod token_bootstrap_tests {
                         created_by,
                     },
             } => {
-                assert_eq!(scope, "admin", "default scope must be admin");
+                assert_eq!(scope, "mutate", "default scope must be mutate");
                 assert_eq!(name, "bootstrap");
                 assert_eq!(created_by, "bootstrap");
                 assert_eq!(expires_at, None);
@@ -17406,13 +13808,11 @@ mod token_bootstrap_tests {
         }
     }
 
-    /// The `value_parser` rejects a scope outside {read, mutate, admin}.
+    /// The `value_parser` rejects a scope outside {read, mutate}.
     #[test]
     fn bootstrap_rejects_invalid_scope() {
-        let result = Cli::try_parse_from(["harvest", "token", "bootstrap", "--scope", "root"]);
+        let result = Cli::try_parse_from(["harvest", "token", "bootstrap", "--scope", "admin"]);
         assert!(result.is_err(), "an invalid --scope must fail to parse");
-        let admin = Cli::try_parse_from(["harvest", "token", "bootstrap", "--scope", "admin"]);
-        assert!(admin.is_ok(), "admin is a valid --scope (issue #1803)");
     }
 
     /// A `read`-scoped bootstrap flows the flag values through to the SQL.
@@ -18671,1035 +15071,5 @@ mod debug_cli_tests {
     #[test]
     fn debug_diff_requires_two_paths() {
         assert!(try_parse(&["debug", "diff", "only-one.json"]).is_err());
-    }
-}
-
-#[cfg(test)]
-mod migrate_cli_tests {
-    //! `harvest migrate` argument mapping, rendering, and the `--check` gate
-    //! (issue #1240). No database: the DB half is covered by
-    //! `autumn-harvest/tests/integration/migrate_tests.rs`.
-    use super::*;
-    use autumn_harvest::migrate::{
-        FailedMigration, MigrationPlan, MigrationReport, MigrationScript, UnserializedMigration,
-    };
-
-    fn parse(args: &[&str]) -> Cli {
-        Cli::try_parse_from(std::iter::once("harvest").chain(args.iter().copied()))
-            .expect("CLI should parse successfully")
-    }
-
-    fn script(name: &str) -> MigrationScript {
-        MigrationScript::new(name, "SELECT 1;").expect("well-formed migration name")
-    }
-
-    fn plan(pending: &[&str], already: usize, unrecognized: &[&str]) -> MigrationPlan {
-        MigrationPlan {
-            already_applied: (0..already)
-                .map(|i| format!("2026010{i}000000_applied"))
-                .collect(),
-            pending: pending.iter().map(|n| script(n)).collect(),
-            unrecognized: unrecognized.iter().map(|v| (*v).to_string()).collect(),
-            ledger_exists: true,
-        }
-    }
-
-    // ── argument mapping ────────────────────────────────────────────────────
-
-    #[test]
-    fn migrate_status_parses_repeated_targets_and_include_dirs() {
-        let cli = parse(&[
-            "migrate",
-            "status",
-            "--database-url",
-            "postgres://harvest/a",
-            "--database-url",
-            "postgres://harvest/b",
-            "--include-dir",
-            "autumn-harvest-plugin/migrations/harvest",
-            "--format",
-            "json",
-            "--check",
-        ]);
-        let Commands::Migrate {
-            command:
-                MigrateCommand::Status {
-                    database_url,
-                    include_dir,
-                    format,
-                    check,
-                },
-        } = cli.command
-        else {
-            panic!("expected migrate status");
-        };
-        // A multi-shard deployment migrates every shard database; one flag per
-        // shard, not a delimiter-split single value.
-        assert_eq!(
-            database_url,
-            vec!["postgres://harvest/a", "postgres://harvest/b"]
-        );
-        assert_eq!(
-            include_dir,
-            vec![PathBuf::from("autumn-harvest-plugin/migrations/harvest")]
-        );
-        assert_eq!(format, MigrateFormat::Json);
-        assert!(check);
-    }
-
-    #[test]
-    fn migrate_defaults_are_text_and_ungated() {
-        let cli = parse(&[
-            "migrate",
-            "status",
-            "--database-url",
-            "postgres://harvest/a",
-        ]);
-        let Commands::Migrate {
-            command:
-                MigrateCommand::Status {
-                    include_dir,
-                    format,
-                    check,
-                    ..
-                },
-        } = cli.command
-        else {
-            panic!("expected migrate status");
-        };
-        assert_eq!(include_dir, [] as [std::path::PathBuf; 0]);
-        assert_eq!(format, MigrateFormat::Text);
-        assert!(!check, "the deploy gate must be opt-in");
-    }
-
-    #[test]
-    fn migrate_run_dry_run_is_opt_in() {
-        let cli = parse(&[
-            "migrate",
-            "run",
-            "--database-url",
-            "postgres://harvest/a",
-            "--dry-run",
-        ]);
-        let Commands::Migrate {
-            command: MigrateCommand::Run { dry_run, .. },
-        } = cli.command
-        else {
-            panic!("expected migrate run");
-        };
-        assert!(dry_run);
-
-        let cli = parse(&["migrate", "run", "--database-url", "postgres://harvest/a"]);
-        let Commands::Migrate {
-            command: MigrateCommand::Run { dry_run, .. },
-        } = cli.command
-        else {
-            panic!("expected migrate run");
-        };
-        assert!(!dry_run);
-    }
-
-    #[test]
-    fn migrate_requires_a_database_url() {
-        // Nothing to default to: the whole point is a database Autumn cannot
-        // reach, so guessing one would migrate the wrong database.
-        assert!(
-            Cli::try_parse_from(["harvest", "migrate", "run"]).is_err()
-                || std::env::var("HARVEST_DATABASE_URL").is_ok(),
-            "--database-url must be required when the env var is unset"
-        );
-    }
-
-    #[test]
-    fn migrate_is_not_routed_through_the_api() {
-        // Guards the local-execution early return in `run_cli`: if a future
-        // edit drops it, this panics instead of the command silently trying to
-        // build an HTTP request.
-        let cli = parse(&[
-            "migrate",
-            "status",
-            "--database-url",
-            "postgres://harvest/a",
-        ]);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cli.api_request()));
-        assert!(
-            result.is_err(),
-            "migrate must be handled locally, never mapped to an API request"
-        );
-    }
-
-    // ── include-dir loading ─────────────────────────────────────────────────
-
-    #[test]
-    fn include_dir_extends_the_embedded_set() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir(dir.path().join("29990101000000_extra")).expect("mkdir");
-        std::fs::write(
-            dir.path().join("29990101000000_extra").join("up.sql"),
-            "SELECT 1;",
-        )
-        .expect("write up.sql");
-
-        let scripts = migration_set(&[dir.path().to_path_buf()]).expect("set loads");
-        let embedded = autumn_harvest::migrate::embedded();
-        assert_eq!(scripts.len(), embedded.len() + 1);
-        assert!(scripts.iter().any(|s| s.name == "29990101000000_extra"));
-    }
-
-    #[test]
-    fn an_include_dir_reusing_an_embedded_version_is_refused() {
-        // Diesel's ledger is keyed by version alone: one of the two would be
-        // recorded and never run. Refused up front, before any connection.
-        let embedded = autumn_harvest::migrate::embedded();
-        let collision = embedded
-            .first()
-            .expect("Harvest has migrations")
-            .version
-            .clone();
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let name = format!("{collision}_collides");
-        std::fs::create_dir(dir.path().join(&name)).expect("mkdir");
-        std::fs::write(dir.path().join(&name).join("up.sql"), "SELECT 1;").expect("write up.sql");
-
-        let error = migration_set(&[dir.path().to_path_buf()])
-            .expect_err("a duplicate version must be refused");
-        assert!(error.to_string().contains(&collision), "{error}");
-    }
-
-    #[test]
-    fn a_missing_include_dir_names_the_path() {
-        let error = migration_set(&[PathBuf::from("/nonexistent/harvest/migrations")])
-            .expect_err("a missing directory must fail loudly");
-        assert!(
-            error
-                .to_string()
-                .contains("/nonexistent/harvest/migrations"),
-            "{error}"
-        );
-    }
-
-    // ── rendering ───────────────────────────────────────────────────────────
-
-    #[test]
-    fn status_text_lists_pending_migrations_per_database() {
-        let targets = vec![
-            (
-                "postgres://harvest/a".to_string(),
-                plan(&["20260801000000_x"], 2, &[]),
-            ),
-            ("postgres://harvest/b".to_string(), plan(&[], 3, &[])),
-        ];
-        let text = format_migrate_plan_text("harvest migrate status", &targets);
-        assert!(text.contains("postgres://harvest/a"));
-        assert!(text.contains("20260801000000_x"));
-        assert!(
-            text.contains("1 pending migration(s) across 2 database(s)"),
-            "the summary must total across databases: {text}"
-        );
-    }
-
-    #[test]
-    fn status_text_says_when_a_database_has_never_been_migrated() {
-        let mut empty = plan(&["20260801000000_x"], 0, &[]);
-        empty.ledger_exists = false;
-        let targets = vec![("postgres://harvest/a".to_string(), empty)];
-        let text = format_migrate_plan_text("harvest migrate status", &targets);
-        assert!(text.contains("never been migrated"), "{text}");
-    }
-
-    #[test]
-    fn status_text_flags_ledger_rows_the_binary_does_not_know() {
-        let targets = vec![(
-            "postgres://harvest/a".to_string(),
-            plan(&[], 2, &["29990101000000"]),
-        )];
-        let text = format_migrate_plan_text("harvest migrate status", &targets);
-        assert!(text.contains("unrecognized"), "{text}");
-        assert!(text.contains("29990101000000"), "{text}");
-    }
-
-    #[test]
-    fn status_json_reports_names_and_a_pending_total() {
-        let targets = vec![
-            (
-                "postgres://harvest/a".to_string(),
-                plan(&["20260801000000_x"], 2, &[]),
-            ),
-            (
-                "postgres://harvest/b".to_string(),
-                plan(&["20260802000000_y"], 2, &[]),
-            ),
-        ];
-        let rendered = migrate_plan_json("migrate status", &targets).expect("serializes");
-        let value: Value = serde_json::from_str(&rendered).expect("valid JSON");
-        assert_eq!(value["command"], "migrate status");
-        assert_eq!(value["pending_total"], 2);
-        assert_eq!(value["targets"][0]["database"], "postgres://harvest/a");
-        assert_eq!(value["targets"][0]["pending"][0], "20260801000000_x");
-        assert_eq!(value["targets"][1]["ledger_exists"], true);
-    }
-
-    #[test]
-    fn an_unlocked_run_says_so_in_text_and_json() {
-        // The engine logs this through `tracing`, and the `harvest` binary
-        // installs no subscriber -- so if the report did not carry it, an
-        // operator would get no signal that concurrent runs are unsafe here.
-        let targets = vec![MigrateRunTarget {
-            database: "postgres://harvest/a".to_string(),
-            setup_failed: false,
-            report: MigrationReport {
-                applied: vec!["20260801000000_x".to_string()],
-                already_applied: Vec::new(),
-                applied_concurrently: Vec::new(),
-                unrecognized: Vec::new(),
-                failed: None,
-                ledger_lock_available: false,
-                applied_unserialized: vec![UnserializedMigration {
-                    name: "20260801000000_x".to_string(),
-                    reason: UnserializedReason::LedgerLockUnavailable,
-                }],
-            },
-        }];
-
-        let text = format_migrate_run_text(&targets);
-        assert!(
-            text.contains("WITHOUT the ledger lock"),
-            "an unserialized apply must be visible to the operator: {text}"
-        );
-        assert!(
-            text.contains("lacks UPDATE/DELETE/TRUNCATE"),
-            "a missing grant must name the grant as the cause: {text}"
-        );
-        assert!(
-            text.contains("one at a time"),
-            "the warning must say what to do about it: {text}"
-        );
-        assert!(
-            text.contains("20260801000000_x"),
-            "the warning must name which migrations ran that way: {text}"
-        );
-
-        let value: Value =
-            serde_json::from_str(&migrate_run_json(&targets).expect("serializes")).expect("JSON");
-        assert_eq!(value["targets"][0]["ledger_lock_available"], false);
-        assert_eq!(
-            value["targets"][0]["applied_unserialized"][0]["name"],
-            "20260801000000_x"
-        );
-        assert_eq!(
-            value["targets"][0]["applied_unserialized"][0]["reason"],
-            "ledger_lock_unavailable"
-        );
-    }
-
-    #[test]
-    fn a_nontransactional_migration_warns_without_blaming_privileges() {
-        // A privileged role still cannot hold a lock across a migration that
-        // declares `run_in_transaction = false` -- there is no transaction to
-        // hold it in. Telling this operator to fix a grant would send them to
-        // change something that was never the cause.
-        let targets = vec![MigrateRunTarget {
-            database: "postgres://harvest/a".to_string(),
-            setup_failed: false,
-            report: MigrationReport {
-                applied: vec![
-                    "20260801000000_x".to_string(),
-                    "20260802000000_concurrent_index".to_string(),
-                ],
-                already_applied: Vec::new(),
-                applied_concurrently: Vec::new(),
-                unrecognized: Vec::new(),
-                failed: None,
-                ledger_lock_available: true,
-                applied_unserialized: vec![UnserializedMigration {
-                    name: "20260802000000_concurrent_index".to_string(),
-                    reason: UnserializedReason::NoTransaction,
-                }],
-            },
-        }];
-
-        let text = format_migrate_run_text(&targets);
-        assert!(text.contains("WITHOUT the ledger lock"), "{text}");
-        assert!(
-            text.contains("run_in_transaction = false"),
-            "the cause must be the migration's own metadata: {text}"
-        );
-        assert!(
-            !text.contains("lacks UPDATE/DELETE/TRUNCATE"),
-            "a privileged role must not be told to fix a grant: {text}"
-        );
-        // Scoped to the warning block: the transactional migration belongs in
-        // `applied:` above it, just not in the list of what ran unserialized.
-        let warning = text.split("WARNING:").nth(1).expect("a warning block");
-        assert!(
-            warning.contains("20260802000000_concurrent_index"),
-            "the warning names the unserialized migration: {warning}"
-        );
-        assert!(
-            !warning.contains("20260801000000_x"),
-            "the warning must not name a migration that WAS serialized: {warning}"
-        );
-    }
-
-    #[test]
-    fn a_locked_run_carries_no_warning() {
-        let targets = vec![MigrateRunTarget {
-            database: "postgres://harvest/a".to_string(),
-            setup_failed: false,
-            report: MigrationReport {
-                applied: vec!["20260801000000_x".to_string()],
-                already_applied: Vec::new(),
-                applied_concurrently: Vec::new(),
-                unrecognized: Vec::new(),
-                failed: None,
-                ledger_lock_available: true,
-                applied_unserialized: Vec::new(),
-            },
-        }];
-
-        let text = format_migrate_run_text(&targets);
-        assert!(
-            !text.contains("without the ledger lock"),
-            "the normal path must not cry wolf: {text}"
-        );
-    }
-
-    #[test]
-    fn a_mixed_run_gives_each_migration_its_own_cause() {
-        // A role without the privilege applies everything unserialized, and a
-        // `run_in_transaction = false` migration in the same run is
-        // unserialized for a reason no grant fixes. Attributing the whole list
-        // to the missing grant would tell an operator that granting it makes
-        // the run safe, which for the second entry is false.
-        let targets = vec![MigrateRunTarget {
-            database: "postgres://harvest/a".to_string(),
-            setup_failed: false,
-            report: MigrationReport {
-                applied: vec![
-                    "20260801000000_x".to_string(),
-                    "20260802000000_concurrent_index".to_string(),
-                ],
-                already_applied: Vec::new(),
-                applied_concurrently: Vec::new(),
-                unrecognized: Vec::new(),
-                failed: None,
-                ledger_lock_available: false,
-                applied_unserialized: vec![
-                    UnserializedMigration {
-                        name: "20260801000000_x".to_string(),
-                        reason: UnserializedReason::LedgerLockUnavailable,
-                    },
-                    UnserializedMigration {
-                        name: "20260802000000_concurrent_index".to_string(),
-                        reason: UnserializedReason::NoTransaction,
-                    },
-                ],
-            },
-        }];
-
-        let text = format_migrate_run_text(&targets);
-        let warning = text.split("WARNING:").nth(1).expect("a warning block");
-        assert!(
-            warning.contains("lacks UPDATE/DELETE/TRUNCATE"),
-            "the privilege cause must appear: {warning}"
-        );
-        assert!(
-            warning.contains("run_in_transaction = false"),
-            "the non-transactional cause must appear too, not be collapsed into \
-             the privilege one: {warning}"
-        );
-        assert!(
-            warning.contains("no grant changes this"),
-            "the operator must be told the grant will not fix that entry: {warning}"
-        );
-
-        // Each cause sits on its own migration's line.
-        let index_line = warning
-            .lines()
-            .find(|line| line.contains("20260802000000_concurrent_index"))
-            .expect("a line for the non-transactional migration");
-        assert!(
-            index_line.contains("run_in_transaction = false"),
-            "the cause must be attached to the migration it explains: {index_line}"
-        );
-        assert!(
-            !index_line.contains("lacks UPDATE"),
-            "and not to the other one's: {index_line}"
-        );
-    }
-
-    #[test]
-    fn run_text_and_json_report_what_was_applied() {
-        let targets = vec![MigrateRunTarget {
-            database: "postgres://harvest/a".to_string(),
-            setup_failed: false,
-            report: MigrationReport {
-                applied: vec!["20260801000000_x".to_string()],
-                already_applied: vec!["20260101000000_a".to_string()],
-                applied_concurrently: vec!["20260802000000_y".to_string()],
-                unrecognized: Vec::new(),
-                failed: None,
-                ledger_lock_available: true,
-                applied_unserialized: Vec::new(),
-            },
-        }];
-
-        let text = format_migrate_run_text(&targets);
-        assert!(text.contains("20260801000000_x"), "{text}");
-        assert!(
-            text.contains("applied by a concurrent migrator"),
-            "a concurrent apply must not read as 'nothing happened': {text}"
-        );
-        assert!(
-            text.contains("1 migration(s) applied across 1 database(s)"),
-            "{text}"
-        );
-
-        let value: Value =
-            serde_json::from_str(&migrate_run_json(&targets).expect("serializes")).expect("JSON");
-        assert_eq!(value["command"], "migrate run");
-        assert_eq!(value["applied_total"], 1);
-        assert_eq!(value["targets"][0]["applied"][0], "20260801000000_x");
-        assert_eq!(
-            value["targets"][0]["applied_concurrently"][0],
-            "20260802000000_y"
-        );
-    }
-
-    #[test]
-    fn a_failing_target_is_reported_even_when_nothing_applied() {
-        // The case that matters: a `run_in_transaction = false` migration that
-        // failed part-way left changes it cannot list. An empty report for that
-        // target would read as "nothing happened".
-        let targets = vec![MigrateRunTarget {
-            database: "postgres://harvest/a".to_string(),
-            setup_failed: false,
-            report: MigrationReport {
-                applied: Vec::new(),
-                already_applied: Vec::new(),
-                applied_concurrently: Vec::new(),
-                unrecognized: Vec::new(),
-                failed: Some(FailedMigration {
-                    name: "20260801000000_concurrent_index".to_string(),
-                    rolled_back: false,
-                }),
-                ledger_lock_available: true,
-                applied_unserialized: Vec::new(),
-            },
-        }];
-
-        let text = format_migrate_run_text(&targets);
-        assert!(
-            text.contains("FAILED: 20260801000000_concurrent_index"),
-            "{text}"
-        );
-        assert!(
-            text.contains("NOT rolled back"),
-            "an unrolled-back failure must say so: {text}"
-        );
-
-        let value: Value =
-            serde_json::from_str(&migrate_run_json(&targets).expect("serializes")).expect("JSON");
-        assert_eq!(
-            value["targets"][0]["failed"]["name"],
-            "20260801000000_concurrent_index"
-        );
-        assert_eq!(value["targets"][0]["failed"]["rolled_back"], false);
-    }
-
-    #[test]
-    fn a_transactional_failure_says_the_database_is_unchanged() {
-        let targets = vec![MigrateRunTarget {
-            database: "postgres://harvest/a".to_string(),
-            setup_failed: false,
-            report: MigrationReport {
-                applied: vec!["20260801000000_x".to_string()],
-                already_applied: Vec::new(),
-                applied_concurrently: Vec::new(),
-                unrecognized: Vec::new(),
-                failed: Some(FailedMigration {
-                    name: "20260802000000_y".to_string(),
-                    rolled_back: true,
-                }),
-                ledger_lock_available: true,
-                applied_unserialized: Vec::new(),
-            },
-        }];
-        let text = format_migrate_run_text(&targets);
-        assert!(text.contains("rolled back"), "{text}");
-        assert!(!text.contains("NOT rolled back"), "{text}");
-
-        let value: Value =
-            serde_json::from_str(&migrate_run_json(&targets).expect("serializes")).expect("JSON");
-        assert_eq!(value["targets"][0]["failed"]["rolled_back"], true);
-        // What DID apply is still listed beside the failure.
-        assert_eq!(value["targets"][0]["applied"][0], "20260801000000_x");
-    }
-
-    #[test]
-    fn a_target_the_run_could_not_prepare_is_not_reported_as_finished() {
-        // Creating or reading the ledger failed, so no migration ever ran: the
-        // report is empty and `failed` is None. Without the flag that is
-        // byte-identical to "finished with nothing to do" -- a JSON consumer
-        // would mark a database the run could not even inspect as done.
-        let targets = vec![MigrateRunTarget {
-            database: "postgres://harvest/a".to_string(),
-            setup_failed: true,
-            report: MigrationReport {
-                applied: Vec::new(),
-                already_applied: Vec::new(),
-                applied_concurrently: Vec::new(),
-                unrecognized: Vec::new(),
-                failed: None,
-                ledger_lock_available: true,
-                applied_unserialized: Vec::new(),
-            },
-        }];
-
-        let text = format_migrate_run_text(&targets);
-        assert!(text.contains("FAILED: before any migration ran"), "{text}");
-
-        let value: Value =
-            serde_json::from_str(&migrate_run_json(&targets).expect("serializes")).expect("JSON");
-        assert_eq!(value["targets"][0]["setup_failed"], true);
-        assert!(value["targets"][0]["failed"].is_null());
-    }
-
-    #[test]
-    fn a_finished_target_reports_no_failure() {
-        let targets = vec![MigrateRunTarget {
-            database: "postgres://harvest/a".to_string(),
-            setup_failed: false,
-            report: MigrationReport {
-                applied: vec!["20260801000000_x".to_string()],
-                already_applied: Vec::new(),
-                applied_concurrently: Vec::new(),
-                unrecognized: Vec::new(),
-                failed: None,
-                ledger_lock_available: true,
-                applied_unserialized: Vec::new(),
-            },
-        }];
-        assert!(!format_migrate_run_text(&targets).contains("FAILED"));
-        let value: Value =
-            serde_json::from_str(&migrate_run_json(&targets).expect("serializes")).expect("JSON");
-        assert!(value["targets"][0]["failed"].is_null());
-        assert_eq!(value["targets"][0]["setup_failed"], false);
-    }
-
-    // ── the deploy gate ─────────────────────────────────────────────────────
-
-    #[test]
-    fn the_check_gate_is_silent_when_every_database_is_migrated() {
-        let targets = vec![("postgres://harvest/a".to_string(), plan(&[], 3, &[]))];
-        assert!(migrate_pending_gate(&targets).is_none());
-    }
-
-    #[test]
-    fn the_check_gate_counts_pending_migrations_and_databases() {
-        let targets = vec![
-            (
-                "postgres://harvest/a".to_string(),
-                plan(&["20260801000000_x"], 2, &[]),
-            ),
-            ("postgres://harvest/b".to_string(), plan(&[], 2, &[])),
-            (
-                "postgres://harvest/c".to_string(),
-                plan(&["20260801000000_x", "20260802000000_y"], 2, &[]),
-            ),
-        ];
-        let error = migrate_pending_gate(&targets).expect("pending migrations must gate");
-        match error {
-            CliError::MigrationsPending { pending, databases } => {
-                assert_eq!(pending, 3);
-                assert_eq!(databases, 2);
-            }
-            other => panic!("expected MigrationsPending, got {other:?}"),
-        }
-        // Exit 1 = "determined: not migrated", distinct from the exit-2
-        // "could not determine" gates.
-        let error = migrate_pending_gate(&targets).expect("pending migrations must gate");
-        assert_eq!(error.exit_code(), 1);
-        // The remedy must carry the flags forward: a bare `run` after a
-        // `--check` with `--include-dir` applies fewer sets than the gate
-        // examined, exits 0, and leaves the gating migration unapplied.
-        let message = error.to_string();
-        assert!(message.contains("--include-dir"), "{message}");
-        assert!(message.contains("--database-url"), "{message}");
-    }
-
-    #[test]
-    fn an_unrecognized_ledger_row_alone_never_gates() {
-        // The database is ahead of this binary. That is worth reporting, but it
-        // is not a reason to fail a deploy that has nothing to apply.
-        let targets = vec![(
-            "postgres://harvest/a".to_string(),
-            plan(&[], 3, &["29990101000000"]),
-        )];
-        assert!(migrate_pending_gate(&targets).is_none());
-    }
-
-    // ── TLS / DSN normalization ─────────────────────────────────────────────
-
-    #[test]
-    fn a_verify_dsn_is_rewritten_so_tokio_postgres_can_parse_it() {
-        // tokio-postgres 0.7 knows only disable/prefer/require and FAILS TO
-        // PARSE anything else, so a `verify-full` DSN that libpq and the
-        // `diesel` CLI accept would be rejected before we ever connect. rustls
-        // verifies the chain and the hostname regardless, so `require` here
-        // describes what the connector already does.
-        for mode in ["verify-ca", "verify-full"] {
-            let rewritten = normalize_sslmode(&format!(
-                "postgres://u:p@db.internal/harvest?sslmode={mode}"
-            ));
-            assert!(rewritten.contains("sslmode=require"), "{rewritten}");
-            assert!(!rewritten.contains(mode), "{rewritten}");
-            rewritten
-                .parse::<tokio_postgres::Config>()
-                .expect("the rewritten DSN must parse");
-        }
-    }
-
-    #[test]
-    fn other_ssl_modes_and_dsns_pass_through_byte_identical() {
-        for dsn in [
-            "postgres://u:p@db.internal/harvest",
-            "postgres://u:p@db.internal/harvest?sslmode=require",
-            "postgres://u:p@db.internal/harvest?sslmode=disable",
-            "postgres://u:p@db.internal/harvest?application_name=harvest%20migrate",
-        ] {
-            assert_eq!(normalize_sslmode(dsn), dsn, "must not be rewritten: {dsn}");
-        }
-    }
-
-    #[test]
-    fn the_libpq_keyword_form_is_rewritten_too() {
-        let rewritten = normalize_sslmode("host=db.internal dbname=harvest sslmode=verify-full");
-        assert_eq!(rewritten, "host=db.internal dbname=harvest sslmode=require");
-        rewritten
-            .parse::<tokio_postgres::Config>()
-            .expect("the rewritten DSN must parse");
-    }
-
-    #[test]
-    fn a_password_that_merely_contains_the_text_is_untouched() {
-        // Only a whole `sslmode=<verify mode>` option is rewritten.
-        let dsn = "host=db.internal password=sslmode=verify-full-not-really sslmode=require";
-        assert_eq!(normalize_sslmode(dsn), dsn);
-    }
-
-    #[test]
-    fn a_quoted_value_containing_whitespace_is_never_rewritten_inside() {
-        // A whitespace split cannot see quoting, so it would rewrite the text
-        // INSIDE the password -- corrupting the credential and failing
-        // authentication against a database that was reachable.
-        let dsn = "password='abc sslmode=verify-full def' sslmode=verify-full";
-        let rewritten = normalize_sslmode(dsn);
-        assert_eq!(
-            rewritten, "password='abc sslmode=verify-full def' sslmode=require",
-            "only the top-level option may change"
-        );
-        let config: tokio_postgres::Config = rewritten.parse().expect("still parses");
-        assert_eq!(
-            config.get_password(),
-            Some(b"abc sslmode=verify-full def".as_slice())
-        );
-    }
-
-    #[test]
-    fn spacing_around_the_equals_sign_is_handled() {
-        // libpq accepts it, so a DSN using it must not slip past unrewritten
-        // and then fail to parse.
-        let rewritten = normalize_sslmode("host=db.internal sslmode = verify-full");
-        assert_eq!(rewritten, "host=db.internal sslmode = require");
-        rewritten
-            .parse::<tokio_postgres::Config>()
-            .expect("the rewritten DSN must parse");
-    }
-
-    #[test]
-    fn a_quoted_sslmode_value_is_rewritten_and_an_escaped_password_survives() {
-        let rewritten = normalize_sslmode(r"password='a\'b c' sslmode='verify-ca'");
-        assert_eq!(rewritten, r"password='a\'b c' sslmode=require");
-        let config: tokio_postgres::Config = rewritten.parse().expect("still parses");
-        assert_eq!(config.get_password(), Some(b"a'b c".as_slice()));
-    }
-
-    #[test]
-    fn a_backslash_escape_in_a_bare_value_is_understood() {
-        // tokio-postgres honours `\` escapes in unquoted values too, so
-        // `password=abc\ def` is ONE value. Stopping at the escaped space
-        // would take `def` for the next keyword and abandon the rewrite,
-        // leaving a `verify-full` the driver then refuses.
-        let rewritten = normalize_sslmode(r"password=abc\ def sslmode=verify-full");
-        assert_eq!(rewritten, r"password=abc\ def sslmode=require");
-        let config: tokio_postgres::Config = rewritten.parse().expect("still parses");
-        assert_eq!(config.get_password(), Some(b"abc def".as_slice()));
-    }
-
-    #[test]
-    fn an_escaped_multibyte_character_does_not_panic() {
-        // `\é` is three bytes: advancing two would leave the scanner inside
-        // the character and the next slice would panic on a non-char boundary.
-        for dsn in [
-            r"password='a\éb' sslmode=verify-full",
-            r"password=a\éb sslmode=verify-full",
-        ] {
-            let rewritten = normalize_sslmode(dsn);
-            assert!(rewritten.contains("sslmode=require"), "{rewritten}");
-            let config: tokio_postgres::Config = rewritten.parse().expect("still parses");
-            assert_eq!(config.get_password(), Some("aéb".as_bytes()));
-        }
-    }
-
-    #[test]
-    fn a_dsn_this_cannot_scan_is_returned_unchanged() {
-        // An unterminated quote is tokio-postgres's error to report, not ours
-        // to paper over by mangling the string first. `host=db password=` ends
-        // after the `=`: reading a value there indexed past the end and
-        // panicked, which an empty templated environment value would trip.
-        for dsn in [
-            "password='unterminated sslmode=verify-full",
-            "host",
-            "host=db password=",
-            "host=db password=   ",
-            "host=db sslmode=",
-        ] {
-            assert_eq!(normalize_sslmode(dsn), dsn);
-        }
-    }
-
-    // ── target labels ───────────────────────────────────────────────────────
-
-    #[test]
-    fn a_keyword_form_target_is_labelled_by_its_own_dsn() {
-        // `redact_dsn` only parses URLs, so every keyword-form shard used to
-        // report as the same `<unparseable dsn>` -- and a partial report that
-        // cannot tell shard A from shard B answers nothing.
-        let label = migrate_target_label("host=shard-a dbname=harvest password='s e cret'", 1);
-        assert!(label.contains("host=shard-a"), "{label}");
-        assert!(label.contains("dbname=harvest"), "{label}");
-        assert!(
-            !label.contains("cret"),
-            "the credential must not survive: {label}"
-        );
-    }
-
-    #[test]
-    fn keyword_form_targets_stay_distinguishable() {
-        let a = migrate_target_label("host=shard-a dbname=harvest", 1);
-        let b = migrate_target_label("host=shard-b dbname=harvest", 2);
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn a_url_target_still_uses_the_url_redaction() {
-        let label = migrate_target_label("postgres://u:hunter2@db.internal/harvest", 1);
-        assert!(!label.contains("hunter2"), "{label}");
-        assert!(label.contains("db.internal"), "{label}");
-    }
-
-    #[test]
-    fn a_malformed_url_never_reaches_the_keyword_scanner() {
-        // `redact_dsn` cannot parse this (`notaport`), and the keyword scanner
-        // would take the whole prefix for one keyword whose value needs no
-        // redaction -- handing the password straight to the deploy log.
-        let label = migrate_target_label(
-            "postgres://alice:hunter2@db:notaport/harvest?sslmode=require",
-            1,
-        );
-        assert!(
-            !label.contains("hunter2"),
-            "credential leaked into: {label}"
-        );
-        assert_eq!(label, "<unparseable dsn> #1");
-    }
-
-    #[test]
-    fn a_url_password_option_other_than_password_is_withheld_too() {
-        // The URL branch delegates to `redact_dsn`, which matched the exact
-        // key `password` while the keyword branch matched any key *containing*
-        // it. So the same secret was redacted or not depending purely on how
-        // the DSN was spelled, and `?sslpassword=` -- a real libpq option --
-        // reached the migration report.
-        for dsn in [
-            "postgres://db.prod/harvest?sslpassword=hunter2",
-            "postgresql://db.prod/harvest?sslmode=require&sslpassword=hunter2",
-        ] {
-            let label = migrate_target_label(dsn, 2);
-            assert!(
-                !label.contains("hunter2"),
-                "credential leaked into: {label} (from {dsn})"
-            );
-            // Withholding the whole DSN costs the label its identity, so the
-            // ordinal is what keeps two targets apart.
-            assert_eq!(label, "<redacted dsn> #2", "from {dsn}");
-        }
-    }
-
-    #[test]
-    fn a_keyword_shaped_token_that_is_not_a_keyword_is_refused() {
-        // A mistyped URL that loses the `://` but keeps the credential scans
-        // as the "keyword" `postgres`: character-set-valid, and with no
-        // `password=` key there is nothing for the scanner to redact, so the
-        // whole DSN came back as if it had been examined. Only requiring a
-        // keyword libpq actually recognizes catches it.
-        for dsn in [
-            "postgres=//alice:hunter2@db/harvest",
-            "postgresql=//alice:hunter2@db/harvest",
-            "notakeyword=alice:hunter2@db",
-        ] {
-            let label = migrate_target_label(dsn, 1);
-            assert!(
-                !label.contains("hunter2"),
-                "credential leaked into: {label} (from {dsn})"
-            );
-            assert_eq!(label, "<unparseable dsn> #1", "from {dsn}");
-        }
-    }
-
-    #[test]
-    fn recognized_keywords_still_produce_a_usable_label() {
-        // The refusal above must not swallow legitimate keyword DSNs: an
-        // operator needs the shard's identity to know which one failed, and
-        // libpq keywords are case-insensitive.
-        let label = migrate_target_label("host=db.internal port=5432 dbname=harvest", 1);
-        assert!(label.contains("db.internal"), "{label}");
-        assert!(!label.starts_with("<unparseable"), "{label}");
-
-        let mixed_case = migrate_target_label("Host=db.internal DBName=harvest", 1);
-        assert!(!mixed_case.starts_with("<unparseable"), "{mixed_case}");
-
-        // And a password in a recognized keyword DSN is still redacted.
-        let with_password =
-            migrate_target_label("host=db.internal password=hunter2 dbname=harvest", 1);
-        assert!(
-            !with_password.contains("hunter2"),
-            "credential leaked into: {with_password}"
-        );
-    }
-
-    #[test]
-    fn a_credential_bearing_non_url_is_not_passed_through_either() {
-        // No scheme, so not caught by the URL check -- caught instead by the
-        // scanner refusing a "keyword" that is not `[A-Za-z0-9_]+`.
-        for dsn in [
-            "alice:hunter2@db.internal/harvest?sslmode=require",
-            "postgres://alice:hunter2@db/harvest",
-        ] {
-            let label = migrate_target_label(dsn, 3);
-            assert!(
-                !label.contains("hunter2"),
-                "credential leaked into: {label}"
-            );
-        }
-    }
-
-    #[test]
-    fn wholly_withheld_url_targets_stay_distinguishable() {
-        // A password in the query string cannot be rewritten, so `redact_dsn`
-        // withholds the whole DSN -- identically for every shard. Without the
-        // ordinal a partial multi-shard report cannot say which database moved.
-        let a = migrate_target_label("postgres://db-a/harvest?password=secret", 1);
-        let b = migrate_target_label("postgres://db-b/harvest?password=secret", 2);
-        assert!(!a.contains("secret"), "{a}");
-        assert!(!b.contains("secret"), "{b}");
-        assert_eq!(a, "<redacted dsn> #1");
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn an_unredactable_target_falls_back_to_an_ordinal() {
-        // Neither a URL nor a scannable keyword DSN: it must still be tellable
-        // apart from the next one, and must not print anything unexamined.
-        let first = migrate_target_label("host=db password='unterminated", 1);
-        let second = migrate_target_label("host=db password='unterminated", 2);
-        assert_eq!(first, "<unparseable dsn> #1");
-        assert_ne!(first, second);
-    }
-
-    #[test]
-    fn keyword_separators_use_unicode_whitespace_like_the_client_does() {
-        // `tokio_postgres` skips option separators with `char::is_whitespace` --
-        // the Unicode `White_Space` property, not ASCII (issue #1321).
-        //
-        // A scan that knows only ASCII reads the whole tail as ONE option.
-        // Its value contains the text `password=hunter2`. No `password` key
-        // is found, so the DSN returns whole, credential included.
-        for separator in [
-            '\u{0009}', // tab
-            '\u{000b}', // vertical tab -- ASCII, but not `is_ascii_whitespace`
-            '\u{0085}', // next line
-            '\u{00a0}', // no-break space
-            '\u{1680}', // ogham space mark
-            '\u{2003}', // em space
-            '\u{202f}', // narrow no-break space
-            '\u{3000}', // ideographic space
-        ] {
-            let dsn =
-                format!("host=db.internal{separator}password=hunter2{separator}dbname=harvest");
-            let label = migrate_target_label(&dsn, 1);
-            assert!(
-                !label.contains("hunter2"),
-                "credential leaked for {separator:?}: {label}"
-            );
-            assert!(label.contains("host=db.internal"), "{separator:?}: {label}");
-            assert!(label.contains("dbname=harvest"), "{separator:?}: {label}");
-        }
-    }
-
-    #[test]
-    fn a_no_break_space_separated_dsn_redacts_to_the_exact_expected_label() {
-        // An exact match catches a span slip that leaks the edge of a
-        // credential, not just a substring check missing it.
-        let label = migrate_target_label(
-            "host=db.internal\u{a0}password=hunter2\u{a0}dbname=harvest",
-            1,
-        );
-        assert_eq!(
-            label,
-            "host=db.internal\u{a0}password=***\u{a0}dbname=harvest"
-        );
-    }
-
-    // ── credential hygiene ──────────────────────────────────────────────────
-
-    #[test]
-    fn a_failure_message_carries_the_redacted_dsn_not_the_password() {
-        let url = "postgres://harvest:hunter2@db.internal:5432/harvest";
-        let redacted = autumn_harvest::backup_verify::redact_dsn(url);
-        let error = migrate_error(
-            url,
-            &redacted,
-            &format!("connection to `{url}` was refused"),
-        );
-        let rendered = error.to_string();
-        assert!(
-            !rendered.contains("hunter2"),
-            "a deploy log must not learn the database password: {rendered}"
-        );
-        assert!(rendered.contains(&redacted), "{rendered}");
-        assert_eq!(error.exit_code(), 1);
-    }
-}
-
-#[cfg(test)]
-mod pg_tls_feature_tests {
-    /// `harvest dr` and `harvest backup verify` connect through
-    /// `autumn_harvest::pg_tls`. A standalone CLI build must carry its TLS
-    /// connector, or a managed Postgres that needs TLS is unreachable.
-    #[test]
-    fn the_cli_build_has_tls_for_its_database_probes() {
-        let result = autumn_harvest::pg_tls::prepare("postgres://u@h/db?sslmode=require");
-        let unsupported = matches!(
-            &result,
-            Err(autumn_harvest::pg_tls::PgTlsError::Unsupported(m)) if m.contains("`tls` feature")
-        );
-        assert!(
-            !unsupported,
-            "the CLI must enable autumn-harvest/tls: {:?}",
-            result.err()
-        );
     }
 }

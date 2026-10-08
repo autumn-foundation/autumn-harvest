@@ -42,7 +42,7 @@ static DB_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 // ---------------------------------------------------------------------------
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::test_init_sql().as_bytes().to_vec()
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
 }
 
 const CREATE_USER_RECORDS: &str = "
@@ -66,7 +66,7 @@ async fn setup_db() -> (String, DbHandle) {
         let mut conn = AsyncPgConnection::establish(&url)
             .await
             .expect("connect to TEST_DATABASE_URL");
-        conn.batch_execute(&autumn_harvest::test_init_sql())
+        conn.batch_execute(autumn_harvest::full_migrations_sql())
             .await
             .unwrap_or(()); // ignore "already exists" errors on repeat runs
         return (url, DbHandle::External);
@@ -123,9 +123,6 @@ fn make_worker(_db_url: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
     Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
-                codec_rotation_batch_size: 0,
-                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
-                dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: uuid::Uuid::new_v4().to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -141,7 +138,6 @@ fn make_worker(_db_url: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 100,
-                resident_workflows: true,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
@@ -284,7 +280,7 @@ async fn transactional_activity_happy_path_atomic_commit() {
                 workflow_name: "happy_txn_workflow",
                 workflow_id: &format!("txn-happy-{}", uuid::Uuid::new_v4()),
                 exec_id: ExecutionId::new(),
-                input: serde_json::json!(null).into(),
+                input: serde_json::json!(null),
                 parent_id: None,
                 queue_name: "default",
                 execution_timeout: None,
@@ -381,7 +377,7 @@ async fn transactional_activity_err_rolls_back_user_writes() {
                 workflow_name: "failing_txn_workflow",
                 workflow_id: &format!("txn-fail-{}", uuid::Uuid::new_v4()),
                 exec_id: ExecutionId::new(),
-                input: serde_json::json!(null).into(),
+                input: serde_json::json!(null),
                 parent_id: None,
                 queue_name: "default",
                 execution_timeout: None,

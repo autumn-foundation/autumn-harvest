@@ -163,7 +163,7 @@ mod db_tests {
     use autumn_harvest::telemetry::TelemetryConfig;
     use autumn_harvest::types::ExecutionId;
     use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
-    use autumn_harvest::{JitterPolicy, RetryPolicy, WorkflowContext, store};
+    use autumn_harvest::{RetryPolicy, WorkflowContext, store};
 
     use chrono::Utc;
     use diesel::prelude::*;
@@ -180,7 +180,7 @@ mod db_tests {
     // -----------------------------------------------------------------------
 
     fn init_sql() -> Vec<u8> {
-        autumn_harvest::test_init_sql().as_bytes().to_vec()
+        autumn_harvest::full_migrations_sql().as_bytes().to_vec()
     }
 
     async fn setup_db() -> (String, Option<ContainerAsync<Postgres>>) {
@@ -312,9 +312,7 @@ mod db_tests {
             ctx.execute_local_activity_raw(
                 "local_echo",
                 input,
-                Some(
-                    RetryPolicy::fixed(2, Duration::from_secs(999)).with_jitter(JitterPolicy::None),
-                ),
+                Some(RetryPolicy::fixed(2, Duration::from_secs(999))),
                 None,
             )
             .await
@@ -486,9 +484,6 @@ mod db_tests {
         Arc::new(
             Worker::new(
                 WorkerRuntimeConfig {
-                    codec_rotation_batch_size: 0,
-                    scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
-                    dr: autumn_harvest::replication::DrConfig::default(),
                     worker_id: worker_id.to_string(),
                     queues: vec![queue.to_string()],
                     notification_database_url: None,
@@ -504,7 +499,6 @@ mod db_tests {
                     build_id: String::new(),
                     deployment_name: None,
                     workflow_cache_size: 1000,
-                    resident_workflows: true,
                     priority_aging_secs: None,
                     unknown_target_grace_window: Duration::from_secs(5),
                     poison_pill_threshold: 3,
@@ -544,7 +538,7 @@ mod db_tests {
             workflow_id: &format!("wf-{}", exec_id.as_uuid()),
             run_id: Uuid::new_v4(),
             shard_id: 0,
-            input: input.clone().into(),
+            input: input.clone(),
             parent_id: None,
             queue_name: queue,
             execution_timeout: None,
@@ -703,9 +697,7 @@ mod db_tests {
             vec![act_info(
                 "echo",
                 fail_retry_after_2s,
-                Some(
-                    RetryPolicy::fixed(2, Duration::from_secs(999)).with_jitter(JitterPolicy::None),
-                ),
+                Some(RetryPolicy::fixed(2, Duration::from_secs(999))),
                 None,
             )],
             None,
@@ -777,9 +769,7 @@ mod db_tests {
             vec![act_info(
                 "echo",
                 fail_retry_after_over_ceiling,
-                Some(
-                    RetryPolicy::fixed(2, Duration::from_secs(999)).with_jitter(JitterPolicy::None),
-                ),
+                Some(RetryPolicy::fixed(2, Duration::from_secs(999))),
                 None,
             )],
             Some(Duration::from_secs(1)),
@@ -827,7 +817,7 @@ mod db_tests {
             vec![act_info(
                 "echo",
                 fail_retry_after_zero,
-                Some(RetryPolicy::fixed(2, Duration::from_secs(2)).with_jitter(JitterPolicy::None)),
+                Some(RetryPolicy::fixed(2, Duration::from_secs(2))),
                 None,
             )],
             None,

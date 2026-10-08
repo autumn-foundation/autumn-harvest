@@ -3,10 +3,10 @@
 # soak — it is a "does each target still build and run clean on a quick pass"
 # check. For a real campaign, run a single target with a larger budget:
 #
-#   cargo +nightly-2026-08-14 fuzz run fuzz_det_check_source -- -max_total_time=300
+#   cargo +nightly fuzz run fuzz_det_check_source -- -max_total_time=300
 #
-# Requires the pinned nightly toolchain and cargo-fuzz:
-#   rustup toolchain install nightly-2026-08-14
+# Requires a nightly toolchain and cargo-fuzz:
+#   rustup toolchain install nightly
 #   cargo install cargo-fuzz
 set -euo pipefail
 
@@ -18,22 +18,13 @@ TARGETS=(
   fuzz_det_check_source
   fuzz_validate_target_url
   fuzz_failure_signature
-  fuzz_replay
 )
 
 MAX_TIME="${MAX_TOTAL_TIME:-15}"
 
-# The nightly that .github/workflows/fuzz-nightly.yml pins. Override it with
-# FUZZ_TOOLCHAIN.
-TOOLCHAIN="${FUZZ_TOOLCHAIN:-nightly-2026-08-14}"
-
 for t in "${TARGETS[@]}"; do
   echo "=== fuzzing ${t} for ${MAX_TIME}s ==="
-  # New inputs go to the first directory. The seeds are read only.
-  mkdir -p "corpus/${t}"
-  dirs=("corpus/${t}")
-  if [ -d "seeds/${t}" ]; then dirs+=("seeds/${t}"); fi
-  cargo +"${TOOLCHAIN}" fuzz run "${t}" "${dirs[@]}" -- -max_total_time="${MAX_TIME}"
+  cargo +nightly fuzz run "${t}" -- -max_total_time="${MAX_TIME}"
 done
 
 echo "smoke run complete: all targets ran clean"

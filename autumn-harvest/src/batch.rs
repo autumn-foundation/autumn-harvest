@@ -574,21 +574,9 @@ mod db {
                     // Terminate seals live runs as TERMINATED; exclude both
                     // already-sealed terminal states so a re-run never
                     // re-selects rows this batch already finalized (#504).
-                    //
-                    // `MIGRATED` and `MIGRATING` (issue #964) are excluded for a
-                    // sharper reason than tidiness. Terminating a `MIGRATED`
-                    // source would overwrite the seal an id resolves through;
-                    // terminating a `MIGRATING` staged copy would poison the
-                    // migration permanently, because `discard_staged_copy` then
-                    // refuses the row on every retry and the run is stranded
-                    // holding the target's uniqueness slot. Neither is a run an
-                    // unfiltered "terminate everything" batch means to touch.
-                    query = query.filter(harvest_workflow_executions::state.ne_all([
-                        "CANCELLED",
-                        "TERMINATED",
-                        "MIGRATED",
-                        "MIGRATING",
-                    ]));
+                    query = query.filter(
+                        harvest_workflow_executions::state.ne_all(["CANCELLED", "TERMINATED"]),
+                    );
                 }
                 BatchAction::Cancel | BatchAction::Signal => {
                     query = query
@@ -726,51 +714,6 @@ mod db {
         }
     }
 
-    /// The pool for the shard `target` **currently** lives on.
-    ///
-    /// The all-shard scan finds a rebalanced run on its live target copy, but
-    /// the id it hands back still encodes the shard the run was minted on. A
-    /// plain `pool_for_execution` would therefore dispatch the cancel, the
-    /// terminate or the signal back to the sealed source, where the row reads
-    /// as `MIGRATED`: signals come back shard-unavailable and a terminate
-    /// would seal the wrong copy while the live one keeps running. Following
-    /// the forwarding pointer is what makes "the scan found it, so the write
-    /// reaches it" true.
-    ///
-    /// Single-shard deployments take the original path verbatim — there is
-    /// nowhere to migrate to, so there is no pointer to read.
-    async fn dispatch_pool_for(pool: &ShardedDbPool, target: ExecutionId) -> HarvestResult<DbPool> {
-        if pool.len() <= 1 {
-            return Ok(pool.pool_for_execution(target).clone());
-        }
-        let shard = crate::shard_rebalance::resolve_execution_shard(pool, target).await?;
-        pool.exact_pool_for(shard)
-            .cloned()
-            .ok_or_else(|| HarvestError::ShardUnavailable {
-                shard_id: shard.as_i32(),
-                reason: "no database pool is configured for this shard on this node".to_string(),
-            })
-    }
-
-    /// Check out a connection inside the executor pass (issue #1823).
-    ///
-    /// The pass holds a fence barrier on every pinned shard. With fencing on,
-    /// this checkout waits at most
-    /// [`crate::replication::FENCED_CHECKOUT_BOUND`]. A pass that gets
-    /// no connection then fails, its guards drop, and the next tick tries
-    /// again. With fencing off, the checkout waits as before. The pass
-    /// records the backend, so a lost guard ends it.
-    async fn executor_conn(pool: &DbPool) -> HarvestResult<crate::replication::FencedConn> {
-        if crate::replication::FenceRegistry::is_enabled() {
-            return crate::replication::fenced_acquire(
-                pool,
-                crate::replication::FENCED_CHECKOUT_BOUND,
-            )
-            .await;
-        }
-        crate::replication::fenced_checkout(pool).await
-    }
-
     /// Drive every open batch job to terminal status across all shards.
     ///
     /// One tick is sufficient for a 1k-target batch on a laptop-class
@@ -781,35 +724,16 @@ mod db {
         pool: &ShardedDbPool,
         config: &BatchExecutorConfig,
     ) -> HarvestResult<()> {
-        // Issue #1823: the tick holds a fence barrier on each pinned shard,
-        // so a bump cannot commit while it claims or updates a job. A lost
-        // barrier stops the tick before its next write. A checkout before a
-        // write is bounded, see `executor_conn`. So is a progress or
-        // completion checkout. A timeout there ends the pass like a failed
-        // `record_progress`: the next tick dispatches the chunk again.
-        let fence = crate::replication::begin_fenced_tick(pool).await?;
-        crate::replication::run_fenced_pass(&fence, Box::pin(executor_pass(pool, config))).await?
-    }
-
-    /// One executor pass over every shard. See [`run_executor_once`].
-    async fn executor_pass(
-        pool: &ShardedDbPool,
-        config: &BatchExecutorConfig,
-    ) -> HarvestResult<()> {
         // Discover open jobs from every shard. The same job_id may live on
         // every shard's workflow table; the row itself is per-shard so we
         // process each shard's view independently and merge counters via
         // `record_progress` against the *default* shard's row.
         for (_shard, shard_pool) in pool.iter_shards() {
-            // This block drops the listing connection before `process_job`
-            // runs, because `process_job` does not need it past `open_jobs`.
-            // `process_job` checks out its own connection from this exact
-            // pool. A small shard pool self-deadlocks otherwise, waiting for
-            // a connection this loop still holds (issue #1360).
-            let jobs = {
-                let mut conn = executor_conn(shard_pool).await?;
-                open_jobs(&mut conn).await?
-            };
+            let mut conn = shard_pool
+                .get()
+                .await
+                .map_err(|e| HarvestError::Database(e.to_string()))?;
+            let jobs = open_jobs(&mut conn).await?;
             for job in jobs {
                 process_job(pool, shard_pool, job, config).await?;
             }
@@ -830,7 +754,10 @@ mod db {
             Ok(a) => a,
             Err(reason) => {
                 tracing::warn!(job_id = %job.id, reason, "batch job has unknown action; failing");
-                let mut conn = executor_conn(owning_shard_pool).await?;
+                let mut conn = owning_shard_pool
+                    .get()
+                    .await
+                    .map_err(|e| HarvestError::Database(e.to_string()))?;
                 let _ = mark_failed(&mut conn, job.id, &reason).await;
                 return Ok(());
             }
@@ -839,7 +766,10 @@ mod db {
             Ok(f) => f,
             Err(error) => {
                 tracing::warn!(job_id = %job.id, %error, "batch job filter is malformed");
-                let mut conn = executor_conn(owning_shard_pool).await?;
+                let mut conn = owning_shard_pool
+                    .get()
+                    .await
+                    .map_err(|e| HarvestError::Database(e.to_string()))?;
                 let _ = mark_failed(&mut conn, job.id, &error.to_string()).await;
                 return Ok(());
             }
@@ -852,7 +782,10 @@ mod db {
         // when concatenating results from 256 default shards.
         let mut all_targets: Vec<ExecutionId> = Vec::with_capacity(pool.iter_shards().count() * 10);
         for (_, shard_pool) in pool.iter_shards() {
-            let mut conn = executor_conn(shard_pool).await?;
+            let mut conn = shard_pool
+                .get()
+                .await
+                .map_err(|e| HarvestError::Database(e.to_string()))?;
             let mut targets = resolve_targets_on_shard(&mut conn, action, &filter).await?;
             all_targets.append(&mut targets);
         }
@@ -862,19 +795,12 @@ mod db {
         // lease is reclaimed without touching `total`. If another worker
         // owns the lease, skip silently. record_progress runs on the owning
         // shard (where the job row lives).
-        //
-        // This block checks out and releases the claim connection; the rest
-        // of the function does not hold it. The dispatch loop below
-        // concurrently checks out its own connections from `pool`. For a
-        // single-shard deployment that is this exact same pool. Holding a
-        // connection across that loop self-deadlocks a small pool
-        // (issue #1360).
+        let mut owning_conn = owning_shard_pool
+            .get()
+            .await
+            .map_err(|e| HarvestError::Database(e.to_string()))?;
         let total = i64::try_from(all_targets.len()).unwrap_or(i64::MAX);
-        let claimed = {
-            let mut owning_conn = executor_conn(owning_shard_pool).await?;
-            try_claim_job(&mut owning_conn, job.id, total).await?
-        };
-        if !claimed {
+        if !try_claim_job(&mut owning_conn, job.id, total).await? {
             tracing::debug!(
                 job_id = %job.id,
                 "batch job is owned by another worker; skipping"
@@ -909,21 +835,14 @@ mod db {
         for chunk in targets_to_dispatch.chunks(concurrency) {
             let mut tasks: FuturesUnordered<_> = FuturesUnordered::new();
             for target in chunk.iter().copied() {
+                let pool_for_target = pool.pool_for_execution(target).clone();
                 let signal_name = signal_name.clone();
                 let signal_payload = signal_payload.clone();
                 let metrics = Arc::clone(&metrics);
                 tasks.push(async move {
-                    let pool_for_target = match dispatch_pool_for(pool, target).await {
-                        Ok(p) => p,
-                        Err(e) => return (target, Ok(Err(e.to_string()))),
-                    };
-                    // A checkout that times out under the fence defers the
-                    // target, so the pass can drop its guards. The target is
-                    // not recorded, and the next tick dispatches it.
-                    let mut conn = match executor_conn(&pool_for_target).await {
+                    let mut conn = match pool_for_target.get().await {
                         Ok(c) => c,
-                        Err(e) if e.is_pool_acquire_timeout() => return (target, Err(e)),
-                        Err(e) => return (target, Ok(Err(e.to_string()))),
+                        Err(e) => return (target, Err(e.to_string())),
                     };
                     let result = dispatch_target(
                         &mut conn,
@@ -934,22 +853,14 @@ mod db {
                         metrics.as_ref(),
                     )
                     .await;
-                    (target, Ok(result))
+                    (target, result)
                 });
             }
             let mut completed_delta = 0i64;
             let mut failed_delta = 0i64;
             let mut new_errors: Vec<BatchTargetError> = Vec::with_capacity(chunk.len());
             let mut dispatched_ids: Vec<Uuid> = Vec::with_capacity(chunk.len());
-            let mut deferred: Option<HarvestError> = None;
             while let Some((target, outcome)) = tasks.next().await {
-                let outcome = match outcome {
-                    Ok(outcome) => outcome,
-                    Err(error) => {
-                        deferred.get_or_insert(error);
-                        continue;
-                    }
-                };
                 dispatched_ids.push(target.as_uuid());
                 match outcome {
                     Ok(()) => completed_delta += 1,
@@ -962,10 +873,6 @@ mod db {
                     }
                 }
             }
-            // This block acquires a fresh connection for this write and
-            // drops it at the end of the chunk. The next chunk's dispatch
-            // loop never finds it held (issue #1360).
-            let mut owning_conn = executor_conn(owning_shard_pool).await?;
             record_progress(
                 &mut owning_conn,
                 job.id,
@@ -975,12 +882,8 @@ mod db {
                 &dispatched_ids,
             )
             .await?;
-            if let Some(error) = deferred {
-                return Err(error);
-            }
         }
 
-        let mut owning_conn = executor_conn(owning_shard_pool).await?;
         mark_completed(&mut owning_conn, job.id).await?;
         Ok(())
     }

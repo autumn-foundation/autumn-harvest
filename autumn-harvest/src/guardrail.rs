@@ -414,7 +414,7 @@ mod tests {
 
     #[test]
     fn catalog_is_nonempty() {
-        assert_ne!(catalog(), []);
+        assert!(!catalog().is_empty());
     }
 
     #[test]
@@ -448,6 +448,6 @@ mod tests {
     fn suppression_accepts_valid_reason() {
         let s = GuardrailSuppression::new("HVG001", "replay test covers this").unwrap();
         assert_eq!(s.rule_id(), "HVG001");
-        assert_ne!(s.reason(), "");
+        assert!(!s.reason().is_empty());
     }
 }

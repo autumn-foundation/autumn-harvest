@@ -408,37 +408,15 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
         &["SELECT", "INSERT", "UPDATE", "DELETE"],
     ),
     ("harvest_events", &["SELECT", "INSERT"]),
-    // The terminal-task janitor deletes finished rows (issue #1811). Without
-    // `DELETE`, every sweep fails and the table grows without limit.
-    (
-        "harvest_task_queue",
-        &["SELECT", "INSERT", "UPDATE", "DELETE"],
-    ),
+    ("harvest_task_queue", &["SELECT", "INSERT", "UPDATE"]),
     ("harvest_schedules", &["SELECT", "INSERT", "UPDATE"]),
     ("harvest_signals", &["SELECT", "INSERT", "UPDATE"]),
     ("harvest_timers", &["SELECT", "INSERT", "UPDATE", "DELETE"]),
     ("harvest_dead_letters", &["SELECT", "INSERT", "DELETE"]),
     ("harvest_external_tasks", &["SELECT", "INSERT", "UPDATE"]),
     ("harvest_workers", &["SELECT", "INSERT", "UPDATE"]),
-    // Each worker heartbeat upserts its stats and prunes old rows (issue
-    // #1815). An upsert checks both INSERT and UPDATE. A missing grant turns
-    // the gray-failure signal off for the whole fleet.
-    (
-        "harvest_worker_task_stats",
-        &["SELECT", "INSERT", "UPDATE", "DELETE"],
-    ),
     ("harvest_batch_jobs", &["SELECT", "INSERT", "UPDATE"]),
     ("harvest_audit_log", &["SELECT", "INSERT", "DELETE"]),
-    // The retention purge writes this table in the same statement as its
-    // delete (issue #1508). A missing grant fails the whole purge.
-    (
-        "harvest_audit_purge_watermark",
-        &["SELECT", "INSERT", "UPDATE"],
-    ),
-    // The timeout checker takes its per-shard lease here on every tick
-    // (issue #1795). A missing grant does not stop enforcement: the worker
-    // fails open and every replica runs every pass, as before the lease.
-    ("harvest_scanner_leases", &["SELECT", "INSERT", "UPDATE"]),
     // Claim-path gate tables. The claim CTE reads all four unconditionally on
     // every poll, so a storage role missing `SELECT` on any one of them makes
     // `claim_task` error and the worker claim *nothing* -- a missing grant
@@ -461,13 +439,8 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
         &["SELECT", "INSERT", "UPDATE", "DELETE"],
     ),
     (
-        // DELETE is required by the idle-bucket GC (issue #1127). Without it
-        // here, a least-privilege role passes preflight and then every janitor
-        // tick fails with `permission denied`, swallowed into a warn log with a
-        // zero count — indistinguishable from "nothing was eligible" while the
-        // table grows unbounded, which is the exact bug the GC exists to fix.
         "harvest_rate_limit_buckets",
-        &["SELECT", "INSERT", "UPDATE", "DELETE"],
+        &["SELECT", "INSERT", "UPDATE"],
     ),
 ];
 
@@ -1502,16 +1475,7 @@ fn check_admin_auth_boundary(api_state: &HarvestApiState) -> PreflightCheckResul
     let profile = api_state.deployment_profile();
     let has_boundary = api_state.admin_auth_boundary();
     let is_dev = profile == "dev";
-    // Issue #1802: the opt-out opens the mutating routes outside `dev`. That
-    // is a known open state, so the check fails rather than warns.
-    let opt_out_open = crate::boot::mutation_opt_out_opens_routes(
-        &profile,
-        has_boundary,
-        api_state.allow_unauthenticated_mutations(),
-    );
-    let status = if opt_out_open {
-        PreflightStatus::Fail
-    } else if is_dev || has_boundary {
+    let status = if is_dev || has_boundary {
         PreflightStatus::Pass
     } else if profile == "unknown" {
         PreflightStatus::Warn
@@ -1519,39 +1483,16 @@ fn check_admin_auth_boundary(api_state: &HarvestApiState) -> PreflightCheckResul
         PreflightStatus::Fail
     };
 
-    // Issue #1284: in the `dev` profile with no declared boundary, a caller
-    // that presents no session cookie reaches every admin route
-    // unauthenticated — which is what makes the quickstart's own documented
-    // `harvest preflight` step work. That is deliberate, but it must never be
-    // silent: report it as data on the check that already describes the auth
-    // posture, so `harvest preflight --output json` and the compact table both
-    // carry it. Always present (never conditionally omitted) so a CI script can
-    // assert on the field rather than on its absence.
-    let unauthenticated_access = is_dev && !has_boundary;
-    // Issue #1802: report open mutating routes the same way. The opt-out can
-    // open them outside `dev`, so this is not the same field as above.
-    let unauthenticated_mutations = crate::boot::unauthenticated_mutations_open(
-        &profile,
-        has_boundary,
-        api_state.allow_unauthenticated_mutations(),
-    );
-
     check(
         "admin_auth_boundary",
         status,
         match status {
-            PreflightStatus::Pass if unauthenticated_access => {
-                "admin API is reachable unauthenticated: the dev profile is mounted without an auth boundary"
-            }
             PreflightStatus::Pass if is_dev => {
                 "admin API auth boundary is optional for the dev profile"
             }
             PreflightStatus::Pass => "admin API is mounted with an auth boundary",
             PreflightStatus::Warn => {
                 "admin API auth boundary cannot be confirmed because the deployment profile is unknown"
-            }
-            PreflightStatus::Fail if opt_out_open => {
-                "mutating routes are reachable unauthenticated: allow_unauthenticated_mutations is set without an auth boundary"
             }
             PreflightStatus::Fail => {
                 "admin API is mounted without an auth boundary in a non-dev profile"
@@ -1562,25 +1503,14 @@ fn check_admin_auth_boundary(api_state: &HarvestApiState) -> PreflightCheckResul
             PreflightStatus::Warn => {
                 Some("Set the deployment profile or mark the admin auth boundary explicitly.")
             }
-            PreflightStatus::Fail if opt_out_open => Some(
-                "Remove allow_unauthenticated_mutations, or declare an auth layer: \
-                 HarvestPlugin::api_with_auth on autumn-web, or \
-                 StandaloneAdminAuth::with_admin_auth_boundary on a standalone mount.",
-            ),
             PreflightStatus::Fail => Some(
-                "Wrap the Harvest API in your own auth layer and declare it: \
-                 HarvestPlugin::api_with_auth on autumn-web, or \
-                 StandaloneAdminAuth::with_admin_auth_boundary on a standalone mount. \
-                 API tokens alone are not a boundary, because a request with no token \
-                 still reaches each route that has no admin guard.",
+                "Use HarvestPlugin::api_with_auth or mount equivalent middleware before the Harvest admin API.",
             ),
         },
         Vec::new(),
         json!({
             "profile": profile,
             "auth_boundary_present": has_boundary,
-            "unauthenticated_access": unauthenticated_access,
-            "unauthenticated_mutations": unauthenticated_mutations,
         }),
     )
 }
@@ -1772,121 +1702,6 @@ mod tests {
 
     use super::*;
 
-    /// **Issue #1284.** The dev-profile management API is reachable
-    /// unauthenticated, which is deliberate but must never be silent. The
-    /// posture is reported as a stable `unauthenticated_access` boolean on the
-    /// check that already describes the auth boundary, so a release script can
-    /// assert on the field rather than string-match a message. It is always
-    /// present — never conditionally omitted — for exactly that reason.
-    #[test]
-    fn admin_auth_boundary_reports_unauthenticated_dev_access() {
-        let open = HarvestApiState::new();
-        open.set_deployment_profile("dev");
-        let result = check_admin_auth_boundary(&open);
-        assert_eq!(result.status, PreflightStatus::Pass);
-        assert_eq!(
-            result.details["unauthenticated_access"],
-            serde_json::json!(true)
-        );
-        assert!(
-            result.summary.contains("reachable unauthenticated"),
-            "summary must name the posture, got: {}",
-            result.summary
-        );
-
-        // A declared boundary closes it, in the same profile.
-        let closed = HarvestApiState::new();
-        closed.set_deployment_profile("dev");
-        closed.set_admin_auth_boundary(true);
-        let result = check_admin_auth_boundary(&closed);
-        assert_eq!(result.status, PreflightStatus::Pass);
-        assert_eq!(
-            result.details["unauthenticated_access"],
-            serde_json::json!(false)
-        );
-
-        // Non-dev profiles never report unauthenticated access — they are
-        // fail-closed whether or not a boundary is declared, and a `fail`
-        // status there is the pre-existing signal.
-        for profile in ["prod", "staging", "unknown"] {
-            let state = HarvestApiState::new();
-            state.set_deployment_profile(profile);
-            let result = check_admin_auth_boundary(&state);
-            assert_eq!(
-                result.details["unauthenticated_access"],
-                serde_json::json!(false),
-                "profile {profile:?} must not report unauthenticated access"
-            );
-        }
-    }
-
-    /// Issue #1802: the check reports open mutating routes as data. The
-    /// field is always present, so a release script can gate on it.
-    #[test]
-    fn admin_auth_boundary_reports_unauthenticated_mutations() {
-        let cases = [
-            ("dev", false, false, true),
-            ("dev", true, false, false),
-            ("prod", false, false, false),
-            ("prod", false, true, true),
-            ("prod", true, true, false),
-            ("unknown", false, false, false),
-        ];
-        for (profile, boundary, opt_out, expected) in cases {
-            let state = HarvestApiState::new();
-            state.set_deployment_profile(profile);
-            state.set_admin_auth_boundary(boundary);
-            state.set_allow_unauthenticated_mutations(opt_out);
-            let result = check_admin_auth_boundary(&state);
-            assert_eq!(
-                result.details["unauthenticated_mutations"],
-                serde_json::json!(expected),
-                "profile={profile} boundary={boundary} opt_out={opt_out}"
-            );
-        }
-
-        // The opt-out outside `dev` is a known open state, so the check
-        // fails and names the opt-out. An `unknown` profile does not soften it.
-        for profile in ["prod", "unknown"] {
-            let state = HarvestApiState::new();
-            state.set_deployment_profile(profile);
-            state.set_allow_unauthenticated_mutations(true);
-            let result = check_admin_auth_boundary(&state);
-            assert_eq!(result.status, PreflightStatus::Fail, "{profile}");
-            assert!(
-                result.summary.contains("allow_unauthenticated_mutations"),
-                "{profile}: {}",
-                result.summary
-            );
-        }
-    }
-
-    /// Issue #1614. A standalone embedder reads this remediation too, so it
-    /// names the standalone declaration. It also says that a token layer alone
-    /// is not a boundary.
-    #[test]
-    fn admin_auth_boundary_remediation_names_the_standalone_declaration() {
-        let state = HarvestApiState::new();
-        state.set_deployment_profile("prod");
-        let result = check_admin_auth_boundary(&state);
-        assert_eq!(result.status, PreflightStatus::Fail);
-        let remediation = result.remediation.unwrap_or_default();
-        for needle in [
-            "HarvestPlugin::api_with_auth",
-            "StandaloneAdminAuth::with_admin_auth_boundary",
-            "API tokens alone",
-        ] {
-            assert!(
-                remediation.contains(needle),
-                "remediation must name {needle:?}, got: {remediation}"
-            );
-        }
-        assert!(
-            !remediation.contains("  "),
-            "each line continuation must leave one space, got: {remediation}"
-        );
-    }
-
     /// Build a `WorkerRow` with the given registered `shard_assignments`.
     fn worker_row_with_shard_assignments(shard_assignments: &[i64], queues: &[&str]) -> WorkerRow {
         use autumn_harvest::models::HarvestWorker;
@@ -2040,12 +1855,11 @@ mod tests {
         assert_eq!(result.name, "scanner_liveness");
         assert_eq!(result.status, PreflightStatus::Pass);
         assert_eq!(result.details["scanners_registered"], 2);
-        assert_eq!(
+        assert!(
             result.details["stale_scanners"]
                 .as_array()
                 .expect("stale_scanners must be an array")
-                .as_slice(),
-            [] as [serde_json::Value; 0]
+                .is_empty()
         );
         assert!(result.remediation.is_none());
     }
@@ -2392,7 +2206,7 @@ mod tests {
             privilege_row("harvest_task_queue", "UPDATE", true),
         ]);
 
-        assert_eq!(missing, [] as [crate::preflight::MissingWritePrivilege; 0]);
+        assert!(missing.is_empty());
     }
 
     #[test]
@@ -2489,10 +2303,7 @@ mod tests {
             true,
         )]);
 
-        assert_eq!(
-            missing,
-            [] as [crate::preflight::MissingSequencePrivilege; 0]
-        );
+        assert!(missing.is_empty());
     }
 
     #[test]
@@ -2767,13 +2578,13 @@ mod tests {
                 Some(&["send_email", "charge_card"]),
                 Some(&["generate_report"]),
             )];
-            assert_eq!(
+            assert!(
                 failures_for(
                     &workflows,
                     &["send_email", "charge_card"],
                     &["onboarding", "generate_report"],
-                ),
-                [] as [std::string::String; 0]
+                )
+                .is_empty()
             );
         }
 
@@ -2782,10 +2593,7 @@ mod tests {
             // The zero-false-positive guarantee: `None` is skipped outright, so
             // an empty registry cannot produce a failure for it.
             let workflows = [wf("legacy", None, None)];
-            assert_eq!(
-                failures_for(&workflows, &[], &[]),
-                [] as [std::string::String; 0]
-            );
+            assert!(failures_for(&workflows, &[], &[]).is_empty());
         }
 
         #[test]
@@ -2798,10 +2606,7 @@ mod tests {
             // and on the wire by
             // `registered_workflow_record_distinguishes_empty_declaration_from_absent`.
             let workflows = [wf("noop", Some(&[]), Some(&[]))];
-            assert_eq!(
-                failures_for(&workflows, &[], &[]),
-                [] as [std::string::String; 0]
-            );
+            assert!(failures_for(&workflows, &[], &[]).is_empty());
         }
 
         #[test]
@@ -2874,10 +2679,7 @@ mod tests {
             // Self-recursion is legal (`spawn_child_workflow` of one's own type);
             // the name resolves against the registry like any other.
             let workflows = [wf("recursive", None, Some(&["recursive"]))];
-            assert_eq!(
-                failures_for(&workflows, &[], &["recursive"]),
-                [] as [std::string::String; 0]
-            );
+            assert!(failures_for(&workflows, &[], &["recursive"]).is_empty());
         }
 
         #[test]

@@ -102,7 +102,7 @@ async fn setup_db() -> (AsyncPgConnection, String, ContainerAsync<Postgres>) {
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@{host}:{port}/postgres");
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
-    conn.batch_execute(&autumn_harvest::test_init_sql())
+    conn.batch_execute(autumn_harvest::full_migrations_sql())
         .await
         .expect("migration");
     (conn, url, container)
@@ -169,9 +169,6 @@ fn make_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
     Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
-                codec_rotation_batch_size: 0,
-                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
-                dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: worker_id.to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -187,7 +184,6 @@ fn make_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 100,
-                resident_workflows: true,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
@@ -245,7 +241,7 @@ async fn two_scheduled_runs_carry_cursor_forward() {
     let registry = make_registry_for(wf_name, incremental_etl_handler);
     let dags = Arc::new(DagCatalog::default());
 
-    // Register a schedule with a 60-second interval. Time advances manually.
+    // Register a schedule with a 60-second interval; we'll manually advance time.
     let sched = WorkflowSchedule::new(wf_name, Schedule::Interval(Duration::from_secs(60)));
     register_workflow_schedules(&mut conn, &[sched])
         .await
@@ -360,7 +356,7 @@ async fn manual_start_has_no_carryover() {
             workflow_name: wf_name,
             workflow_id: "manual-1",
             exec_id,
-            input: json!(null).into(),
+            input: json!(null),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -435,7 +431,7 @@ async fn last_error_reflects_prior_failure_and_clears_after_recovery() {
     let wf_name = "carryover_recovery_wf";
     let pool = make_pool(&url);
 
-    // A shared atomic counter controls what each run does.
+    // We'll control what each run does via a shared atomic counter.
     use std::sync::atomic::{AtomicI32, Ordering};
     static COUNTER: AtomicI32 = AtomicI32::new(0);
     COUNTER.store(0, Ordering::SeqCst);

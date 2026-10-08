@@ -217,17 +217,6 @@ const MECHANISMS: &[(&str, &[&str])] = &[
 /// `excluded_modules_all_exist` keeps the list from rotting past a rename).
 const AUDIT_EXCLUDED_MODULES: &[&str] = &["chaos"];
 
-/// Subdirectories of `autumn-harvest/src` that the flat scan skips, with the
-/// reason for each.
-///
-/// `dst` is the simulation harness of issue #1830. It is test
-/// infrastructure, like `chaos`, and a port to `SQLite` does not carry it. It
-/// also has no Postgres coupling.
-/// `skipped_subdirectories_have_no_postgres_coupling` checks that every file
-/// in it stays free of the `MECHANISMS` tokens, so the skip cannot hide
-/// coupling.
-const SKIPPED_SUBDIRS: &[&str] = &["dst"];
-
 /// Every auditable core `.rs` module directly under `autumn-harvest/src`, as
 /// `(module name, path)`.
 ///
@@ -257,7 +246,7 @@ fn core_module_files() -> Vec<(String, PathBuf)> {
                 .and_then(|s| s.to_str())
                 .unwrap_or_default()
                 .to_string();
-            if name != "bin" && !SKIPPED_SUBDIRS.contains(&name.as_str()) {
+            if name != "bin" {
                 subdirs.push(name);
             }
             continue;
@@ -423,36 +412,6 @@ fn markdown_section<'a>(document: &'a str, heading_contains: &str) -> Option<&'a
     }
     // Unterminated section: runs to end of document.
     start.map(|begin| &document[begin..])
-}
-
-/// A skipped subdirectory must not carry Postgres coupling. Otherwise the
-/// skip would hide the coupling that the inventory exists to record.
-#[test]
-fn skipped_subdirectories_have_no_postgres_coupling() {
-    for dir in SKIPPED_SUBDIRS {
-        let path = repo_root().join("autumn-harvest/src").join(dir);
-        let entries = std::fs::read_dir(&path)
-            .unwrap_or_else(|err| panic!("cannot read {}: {err}", path.display()));
-        let mut files = 0;
-        for entry in entries {
-            let file = entry.expect("readable dir entry").path();
-            if file.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
-            files += 1;
-            let body = read_normalized(&file);
-            for (label, tokens) in MECHANISMS {
-                let hit = tokens.iter().find(|token| body.contains(**token));
-                assert!(
-                    hit.is_none(),
-                    "{} is in a skipped subdirectory but has {label} coupling ({hit:?}). \
-                     Remove it from SKIPPED_SUBDIRS and inventory it.",
-                    file.display()
-                );
-            }
-        }
-        assert!(files > 0, "skipped subdirectory {dir} has no .rs files");
-    }
 }
 
 #[test]
@@ -773,42 +732,6 @@ fn derived_totals_agree_with_the_table_and_the_tree() {
         rows.len()
     );
 
-    // The same figures again, as the *prose* quotes them.
-    //
-    // The table above is guarded, but a reader making a decision quotes the
-    // sentences, not the table — "19 of 43 coupled modules are portable only by
-    // dropping a capability" is the line that gets pasted into a design review.
-    // Those sentences drifted: they were a coherent snapshot of an earlier audit
-    // (43 coupled, 19 class (c), 26 raw-SQL) left behind by a table that had
-    // since grown, so the document contradicted itself in the one place it is
-    // most likely to be quoted from. Each figure below is pure arithmetic over
-    // the inventory rows, so it is derivable and therefore guardable; the
-    // estimates that are *not* derivable (`~13 modules` for the scanner rewrite)
-    // are deliberately left alone.
-    let raw_sql = detect_coupled_modules()
-        .values()
-        .filter(|ms| ms.contains("raw-sql"))
-        .count();
-    for phrase in [
-        format!("{c} of {} coupled modules", rows.len()),
-        format!(
-            "That {raw_sql} of the {} coupled modules hand-write SQL",
-            rows.len()
-        ),
-        format!("~{} modules touched", rows.len()),
-        format!("**{c} modules are class (c)**"),
-        format!("against {a} that are trivially trait-able"),
-        format!("**{raw_sql} modules reach for raw SQL**"),
-    ] {
-        assert!(
-            report.contains(&phrase),
-            "the report's prose must quote the same figures as its own table; \
-             expected to find {phrase:?}. A live audit finds {} coupled modules, \
-             {a} class (a), {c} class (c), {raw_sql} reaching for raw SQL.",
-            rows.len()
-        );
-    }
-
     // Migration count.
     let migrations = std::fs::read_dir(repo_root().join("autumn-harvest/migrations"))
         .expect("migrations dir readable")
@@ -817,31 +740,9 @@ fn derived_totals_agree_with_the_table_and_the_tree() {
         .count();
     assert!(
         report.contains(&format!("**{migrations} migrations**")),
-        "the report states {}; a live count finds {migrations} migration \
-         directories. Update the report to \"**{migrations} migrations**\"",
-        stated_migration_count(&report).map_or_else(
-            || "no \"**N migrations**\" figure".to_string(),
-            |stated| format!("\"**{stated} migrations**\"")
-        )
+        "the report should state \"**{migrations} migrations**\"; a live count \
+         finds {migrations} migration directories"
     );
-}
-
-/// Return the migration count the report currently states, if a bold
-/// `**N migrations**` figure is present.
-///
-/// The panic message above quotes this alongside the live count. Without it,
-/// a failing assertion could only ever interpolate the live count on both
-/// sides of its sentence. A reader could not tell from the message alone
-/// what the report actually says versus what is live.
-fn stated_migration_count(report: &str) -> Option<usize> {
-    let digits_end = report.find(" migrations**")?;
-    let digits_start = report[..digits_end]
-        .rfind(|c: char| !c.is_ascii_digit())
-        .map_or(0, |i| i + 1);
-    if digits_start >= digits_end || !report[..digits_start].ends_with("**") {
-        return None;
-    }
-    report[digits_start..digits_end].parse().ok()
 }
 
 #[test]

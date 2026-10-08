@@ -26,7 +26,7 @@ use crate::error::{HarvestError, HarvestResult, TimeoutType};
 use crate::event::WorkflowEvent;
 use crate::execution::{
     apply_parent_close_cascade, cancel_workflow_execution_collect,
-    check_and_report_unfinished_handlers, check_and_report_unfinished_handlers_batch,
+    check_and_report_unfinished_handlers,
 };
 use crate::models::{ExternalTask, TaskQueueItem, WorkflowExecution};
 use crate::schema::{harvest_external_tasks, harvest_task_queue, harvest_workflow_executions};
@@ -62,17 +62,6 @@ impl std::fmt::Display for TimeoutReason {
 }
 
 impl TimeoutReason {
-    /// Whether this timeout retries per the retry policy (issue #1809).
-    ///
-    /// ADR 0005 records the rule. A start-to-close or heartbeat timeout ends
-    /// one attempt, and the next attempt can succeed. A schedule-to-start
-    /// retry goes back to the same starved queue. Schedule-to-close is the
-    /// deadline for all attempts.
-    #[must_use]
-    pub const fn retries_per_policy(&self) -> bool {
-        matches!(self, Self::Heartbeat | Self::StartToClose)
-    }
-
     const fn timeout_type(&self) -> TimeoutType {
         match self {
             Self::Heartbeat => TimeoutType::Heartbeat,
@@ -222,171 +211,6 @@ pub const fn schedule_to_close_timeout_query() -> &'static str {
          AND e.state = 'PAUSED')"
 }
 
-/// SQL query behind [`enforce_workflow_history_ceiling`] (issue #493):
-/// RUNNING workflow executions whose durable event count has reached the
-/// operator-configured ceiling.
-///
-/// The per-execution event count is a correlated `COUNT(*)` against
-/// `harvest_events` (served by `idx_harvest_events_exec_last`, so each
-/// evaluation is an indexed lookup, not a table scan) -- but it is needed in
-/// two places: the `SELECT` list (to report `event_count` to the caller) and
-/// the `WHERE` clause (to filter on it, since a `SELECT`-list alias is not
-/// visible to the `WHERE` clause that filters the same query). Writing the
-/// subquery out twice makes Postgres evaluate it twice per row: once to
-/// filter, once more (for surviving rows) to project -- confirmed by
-/// `EXPLAIN`, see `docs/performance-history-ceiling.md`. A plain
-/// derived-table wrap (`SELECT ... FROM (SELECT ..., count) sub WHERE
-/// sub.count >= $1`) does not fix this -- Postgres pulls the subquery up
-/// into the outer query and re-duplicates the correlated expression at each
-/// reference site, reproducing the identical two-`SubPlan` shape (also
-/// confirmed by `EXPLAIN` while evaluating this fix). A `MATERIALIZED` CTE
-/// opts out of that pull-up, so the count is computed exactly once per
-/// RUNNING row and both the `SELECT` list and the `WHERE` clause read the
-/// same computed column.
-#[must_use]
-pub const fn workflow_history_ceiling_query() -> &'static str {
-    "WITH oversized_candidates AS MATERIALIZED (\
-         SELECT id, workflow_id, workflow_name, queue_name, parent_id, parent_close_policy, \
-             (SELECT COUNT(*) FROM harvest_events \
-              WHERE workflow_exec_id = harvest_workflow_executions.id)::bigint AS event_count \
-         FROM harvest_workflow_executions \
-         WHERE state = 'RUNNING') \
-     SELECT id, workflow_id, workflow_name, queue_name, parent_id, parent_close_policy, event_count \
-     FROM oversized_candidates \
-     WHERE event_count >= $1"
-}
-
-/// The one query shape behind all three external-outbox scanners
-/// (issue #1486).
-///
-/// The three scanners differ only in the request type they claim, the two
-/// events that resolve it, and the payload key that correlates them. The
-/// shape must stay identical across the three, so it is written once here
-/// and substituted, rather than copied.
-///
-/// `$1` is the caller's shard assignment list. `$2` is the per-sweep list of
-/// event ids this sweep already gave up on.
-///
-/// # Why the executions join is a `LATERAL`, and the resolution check is not
-///
-/// The executions join is pinned to its correlated form on purpose. A `LIMIT
-/// 1` inside a `LATERAL` cannot be pulled up into the outer query, so the
-/// shape is structural. `harvest_workflow_executions.id` is the primary key,
-/// so the subquery returns at most one row with or without that `LIMIT`, and
-/// the pin changes no result. It is also free: the same query with this join
-/// written as an ordinary `INNER JOIN` measures 6,350 buffers against 6,358.
-/// The pin buys a plan that cannot change shape with the statistics, at no
-/// measured cost. That is the whole argument for it.
-///
-/// The resolution check stays a `NOT EXISTS`, and that is also measured. An
-/// earlier revision of this change pinned it the same way, as a `LEFT JOIN
-/// LATERAL ... WHERE res.resolved IS NULL`. The two forms select the same
-/// rows. The outer join costs twice as much.
-///
-/// The reason is join order, and it only shows once resolved requests
-/// accumulate. `harvest_events` is append-only, so a request row stays in
-/// `idx_harvest_events_external_outbox_pending` after it resolves. Every
-/// claim walks those rows and discards them. As an anti-join the planner
-/// runs the resolution probe first and lifts the executions probe above it,
-/// so the executions probe runs once. An outer join cannot be reordered, so
-/// both probes run for every row about to be discarded. Measured over a
-/// backlog of 8,000 resolved requests: 24,253 buffers against 48,253.
-///
-/// # Why the `ORDER BY`
-///
-/// `ORDER BY e.timestamp, e.id` pins the outer scan. Only
-/// `idx_harvest_events_external_outbox_pending` produces that order. Every
-/// competing plan needs a sort, and a sort under `LIMIT 1` must read every
-/// candidate first. The ordered index scan returns after one row. It wins
-/// whatever the row estimate says.
-///
-/// `ORDER BY e.id` alone does not pin it. `harvest_events_pkey` supplies
-/// that order too. Under an inflated estimate the planner walks the primary
-/// key, and filters every unrelated event out of a full ascending scan.
-/// Prefixing the order with `event_type` does not help either. The planner
-/// drops a column that the `WHERE` clause pins to a constant, because the
-/// remaining order is all it has to satisfy.
-///
-/// The order is also the drain order. `timestamp` is the request instant the
-/// grace-window check already reads, and `id` breaks ties. The oldest
-/// pending request goes first, so newer arrivals cannot starve a backlog.
-/// Note `timestamp` is caller-settable, so this is request order and not
-/// append order; `id` is append order and decides every tie.
-macro_rules! external_outbox_claim_query {
-    (requested = $requested:literal, resolved = ($first:literal, $second:literal), key = $key:literal) => {
-        concat!(
-            "SELECT e.* FROM harvest_events e \
-             JOIN LATERAL ( \
-                 SELECT 1 AS running_exec FROM harvest_workflow_executions x \
-                 WHERE x.id = e.workflow_exec_id \
-                   AND x.state = 'RUNNING' \
-                   AND x.shard_id = ANY($1) \
-                 LIMIT 1 \
-             ) running ON TRUE \
-             WHERE e.event_type = '",
-            $requested,
-            "' \
-               AND (e.event_data->'data'->>'",
-            $key,
-            "') IS NOT NULL \
-               AND NOT (e.id = ANY($2)) \
-               AND NOT EXISTS ( \
-                   SELECT 1 FROM harvest_events res \
-                   WHERE res.workflow_exec_id = e.workflow_exec_id \
-                     AND res.event_type IN ('",
-            $first,
-            "', '",
-            $second,
-            "') \
-                     AND res.event_data->'data'->>'",
-            $key,
-            "' = e.event_data->'data'->>'",
-            $key,
-            "' \
-               ) \
-             ORDER BY e.timestamp, e.id \
-             LIMIT 1 \
-             FOR UPDATE OF e SKIP LOCKED"
-        )
-    };
-}
-
-/// SQL behind the external-signal outbox scanner
-/// ([`enforce_external_signals_outbox`], issue #1146). Shape and plan
-/// rationale: [`external_outbox_claim_query`].
-#[must_use]
-pub const fn external_signal_outbox_claim_query() -> &'static str {
-    external_outbox_claim_query!(
-        requested = "ExternalSignalRequested",
-        resolved = ("ExternalSignalDelivered", "ExternalSignalFailed"),
-        key = "signal_id"
-    )
-}
-
-/// SQL behind the external-cancel outbox scanner
-/// ([`enforce_external_cancels_outbox`], issue #1146). Shape and plan
-/// rationale: [`external_outbox_claim_query`].
-#[must_use]
-pub const fn external_cancel_outbox_claim_query() -> &'static str {
-    external_outbox_claim_query!(
-        requested = "ExternalCancelRequested",
-        resolved = ("ExternalCancelDelivered", "ExternalCancelFailed"),
-        key = "cancel_id"
-    )
-}
-
-/// SQL behind the external-await outbox scanner
-/// ([`enforce_external_awaits_outbox`], issue #1146). Shape and plan
-/// rationale: [`external_outbox_claim_query`].
-#[must_use]
-pub const fn external_await_outbox_claim_query() -> &'static str {
-    external_outbox_claim_query!(
-        requested = "ExternalAwaitRequested",
-        resolved = ("ExternalAwaitResolved", "ExternalAwaitFailed"),
-        key = "await_id"
-    )
-}
-
 /// SQL query to find RUNNING workflow executions that have exceeded either their
 /// per-run `execution_timeout` deadline (issue #243) OR their chain-scoped
 /// lifetime cap deadline (issue #617).
@@ -449,27 +273,31 @@ pub fn effective_chain_timeout(
 /// whole-chain lifetime and is terminated as a chain timeout. A chain-only expiry
 /// (no per-run deadline configured) is handled without panicking — the scanner
 /// selects rows on either disjunct, so `deadline_at` may be `None` here.
-///
-/// Returns `None` when no deadline fired before `now` (issue #1821).
 #[must_use]
 pub fn classify_workflow_timeout(
     deadline_at: Option<chrono::DateTime<chrono::Utc>>,
     chain_deadline_at: Option<chrono::DateTime<chrono::Utc>>,
     now: chrono::DateTime<chrono::Utc>,
-) -> Option<(chrono::DateTime<chrono::Utc>, TimeoutKind)> {
-    let fired = |deadline: Option<chrono::DateTime<chrono::Utc>>| deadline.filter(|d| *d < now);
-    fired(chain_deadline_at)
-        .map(|chain| (chain, TimeoutKind::Chain))
-        .or_else(|| fired(deadline_at).map(|run| (run, TimeoutKind::Run)))
+) -> (chrono::DateTime<chrono::Utc>, TimeoutKind) {
+    let chain_fired = chain_deadline_at.is_some_and(|d| d < now);
+    if chain_fired {
+        (
+            chain_deadline_at.expect("chain_fired implies chain_deadline_at is Some"),
+            TimeoutKind::Chain,
+        )
+    } else {
+        (
+            deadline_at
+                .expect("selected row without a fired chain deadline implies deadline_at < NOW()"),
+            TimeoutKind::Run,
+        )
+    }
 }
 
 /// Find all tasks that have exceeded their timeout limits.
 ///
-/// Runs all four timeout queries and returns the matched tasks along with
+/// Runs all three timeout queries and returns the matched tasks along with
 /// their timeout reason.
-///
-/// This scan has no bound. The spawned checker uses
-/// [`find_timed_out_tasks_batch`] instead (issue #1795).
 ///
 /// # Errors
 ///
@@ -480,661 +308,59 @@ pub async fn find_timed_out_tasks(
     let mut results = Vec::new();
     let mut seen = HashSet::new();
 
-    for (reason, predicate) in task_timeout_scans() {
-        let tasks: Vec<TaskQueueItem> = diesel::sql_query(predicate)
+    // Heartbeat timeouts
+    let heartbeat_tasks: Vec<TaskQueueItem> = diesel::sql_query(heartbeat_timeout_query())
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    for task in heartbeat_tasks {
+        if seen.insert(task.id) {
+            results.push((task, TimeoutReason::Heartbeat));
+        }
+    }
+
+    // Start-to-close timeouts
+    let start_close_tasks: Vec<TaskQueueItem> = diesel::sql_query(start_to_close_timeout_query())
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    for task in start_close_tasks {
+        if seen.insert(task.id) {
+            results.push((task, TimeoutReason::StartToClose));
+        }
+    }
+
+    // Schedule-to-start timeouts
+    let sched_start_tasks: Vec<TaskQueueItem> =
+        diesel::sql_query(schedule_to_start_timeout_query())
             .load(conn)
             .await
             .map_err(crate::error::database_error)?;
-        for task in tasks {
-            if seen.insert(task.id) {
-                results.push((task, reason.clone()));
-            }
+    for task in sched_start_tasks {
+        if seen.insert(task.id) {
+            results.push((task, TimeoutReason::ScheduleToStart));
+        }
+    }
+
+    // Schedule-to-close timeouts (cross-retry wall-clock deadline, issue #378)
+    let sched_close_tasks: Vec<TaskQueueItem> =
+        diesel::sql_query(schedule_to_close_timeout_query())
+            .load(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+    for task in sched_close_tasks {
+        if seen.insert(task.id) {
+            results.push((task, TimeoutReason::ScheduleToClose));
         }
     }
 
     Ok(results)
 }
 
-pub use crate::scanner_lease::DEFAULT_TIMEOUT_SCAN_BATCH_SIZE;
-
-/// The four task-timeout scans, in enforcement order.
-///
-/// [`find_timed_out_tasks`] and [`find_timed_out_tasks_batch`] both read this
-/// list, so the two cannot disagree on a predicate.
-const fn task_timeout_scans() -> [(TimeoutReason, &'static str); 4] {
-    [
-        (TimeoutReason::Heartbeat, heartbeat_timeout_query()),
-        (TimeoutReason::StartToClose, start_to_close_timeout_query()),
-        (
-            TimeoutReason::ScheduleToStart,
-            schedule_to_start_timeout_query(),
-        ),
-        (
-            TimeoutReason::ScheduleToClose,
-            schedule_to_close_timeout_query(),
-        ),
-    ]
-}
-
-/// The sort key of a live row in a timeout sweep (issue #1795).
-///
-/// It is the row's creation time. Rows enqueued before migration
-/// `20260619000000` have no `created_at`, so they sort first. The partial
-/// index `idx_harvest_tq_live_created` holds live rows in `(key, id)` order.
-/// The text must match the index expression, or Postgres cannot use it.
-const LIVE_ROW_KEY: &str = "COALESCE(created_at, TIMESTAMPTZ '1970-01-01 00:00:00+00')";
-
-/// One refill of a task-timeout queue (issue #1795).
-///
-/// The refill reads one page of live rows in `(key, id)` order, where the
-/// key is [`LIVE_ROW_KEY`]. A live row is `PENDING` or `RUNNING`. The page
-/// reads only rows created at or before the sweep's clock. The index scan
-/// applies that bound and the keyset bound itself. So the page reads at most
-/// `LIMIT` index entries, and rows created later are never visited.
-///
-/// The page holds the columns the predicates read. Each predicate then reads
-/// the page, not the table, so no predicate can fall back to its own index and scan past the
-/// page. A row is left to an earlier reason only when that reason's lane can
-/// still claim it. The query returns the expired ids, oldest first. It also returns the
-/// key and id of the last row of the page, and the number of rows read. So
-/// the work of a refill does not grow with the backlog. One sweep reads once
-/// each row that was live at its start.
-///
-/// Each predicate compares against the sweep's clock, not `NOW()`. So the
-/// sweep queues only rows that had expired when it started. The predicate
-/// consts stay plain, because the backup drill `UNION`s them.
-///
-/// With `after`, `$1` and `$2` are the key and id of the last row of the
-/// previous page. Then `$3` is the page size and `$4` is the sweep's clock.
-/// Without it, `$1` is the page size and `$2` is the clock. The next four
-/// params describe the earlier lanes. They hold the clocks, the cursor keys,
-/// the cursor ids, and the ids that the lanes hold.
-///
-/// An earlier lane matches each row at its own clock. A row ahead of its
-/// cursor is left to it. A row that it holds is left to it whatever it
-/// matches, because the row can have moved there after that clock. A row
-/// that it has already passed goes to this lane.
-fn timeout_refill_query(predicate: &str, higher: &[&str], after: bool) -> String {
-    use std::fmt::Write as _;
-
-    let (keyset, limit, clock, first) = if after {
-        (
-            format!(" AND ({LIVE_ROW_KEY}, id) > ($1, $2)"),
-            "$3",
-            "$4",
-            5,
-        )
-    } else {
-        (String::new(), "$1", "$2", 3)
-    };
-    let [clocks, keys, ids, held] = std::array::from_fn::<_, 4, _>(|i| format!("${}", first + i));
-    let on_page = |sql: &str, at: &str| on_refill_page(sql).replace("NOW()", at);
-    // `EXCEPT` leaves a row to an earlier reason. A set operation stays near
-    // linear in the page. A correlated `NOT EXISTS` on the page can run as a
-    // nested loop, because the planner cannot estimate the page's rows.
-    let mut expired = format!(
-        "SELECT q.id, q.row_key FROM ({}) q",
-        on_page(predicate, clock)
-    );
-    for (index, earlier) in higher.iter().enumerate() {
-        let k = index + 1;
-        let at = format!("({clocks})[{k}]");
-        let _ = write!(
-            expired,
-            " EXCEPT SELECT h.id, h.row_key FROM ({}) h WHERE h.row_key <= {at} \
-             AND (({keys})[{k}] IS NULL OR (h.row_key, h.id) > (({keys})[{k}], ({ids})[{k}]))",
-            on_page(earlier, &at)
-        );
-    }
-    if !higher.is_empty() {
-        let _ = write!(
-            expired,
-            " EXCEPT SELECT p.id, p.row_key FROM page p \
-             WHERE p.id IN (SELECT u.id FROM unnest({held}) AS u(id))"
-        );
-    }
-    format!(
-        "WITH page AS MATERIALIZED (SELECT {TIMEOUT_PAGE_COLUMNS}, {LIVE_ROW_KEY} AS row_key \
-         FROM harvest_task_queue \
-         WHERE state IN ('PENDING', 'RUNNING') AND {LIVE_ROW_KEY} <= {clock}{keyset} \
-         ORDER BY {LIVE_ROW_KEY}, id LIMIT {limit}), \
-         tail AS (SELECT row_key, id FROM page ORDER BY row_key DESC, id DESC LIMIT 1) \
-         SELECT (SELECT row_key FROM tail) AS last_key, (SELECT id FROM tail) AS last_id, \
-         (SELECT COUNT(*) FROM page) AS rows_read, \
-         ARRAY(SELECT e.id FROM ({expired}) e ORDER BY e.row_key, e.id) AS expired"
-    )
-}
-
-/// The columns of a refill page (issue #1795).
-///
-/// These are the id and the columns that the four predicates read. Payload
-/// columns stay out, so a refill does not copy task inputs. The bounded
-/// batch query loads whole rows. A unit test checks the list against the
-/// predicates.
-const TIMEOUT_PAGE_COLUMNS: &str = "id, state, queue_name, task_type, activity_name, \
-     workflow_exec_id, scheduled_at, started_at, last_heartbeat_at, heartbeat_timeout, \
-     start_to_close, schedule_to_start, schedule_to_close_at";
-
-/// Points a timeout predicate at the refill page instead of the table.
-///
-/// Every predicate reads `harvest_task_queue` once, at its top level. Its
-/// subqueries read other tables only. A unit test holds both facts.
-fn on_refill_page(predicate: &str) -> String {
-    predicate.replacen("FROM harvest_task_queue", "FROM page", 1)
-}
-
-/// The start of a sweep (issue #1795): the database clock.
-///
-/// The sweep reads the rows created at or before this time, and tests
-/// expiry against it. See [`timeout_refill_query`].
-const TIMEOUT_SWEEP_START_SQL: &str = "SELECT NOW() AS as_of";
-
-/// The rows of one batch of queued ids (issue #1795).
-///
-/// `$1` is the batch of ids. A primary-key lookup finds them, so the work is
-/// bounded by the batch. The predicate is checked again, because a queued
-/// row can stop matching before its turn.
-///
-/// The batch keeps the reason that the refill gave each row. An earlier
-/// reason that starts to match later does not drop the row. That reason's
-/// sweep has already passed it, so the row would wait for the next sweep.
-fn timeout_batch_query(predicate: &str) -> String {
-    format!("SELECT q.* FROM ({predicate} AND id = ANY($1) OFFSET 0) q ORDER BY q.id")
-}
-
-/// The ids among `$1` that match `predicate` now (issue #1795).
-///
-/// It selects ids only. A probe of a large batch then loads no payloads.
-fn timeout_probe_query(predicate: &str) -> String {
-    format!("SELECT q.id FROM ({predicate} AND id = ANY($1) OFFSET 0) q")
-}
-
-/// One id from [`timeout_probe_query`].
-#[derive(diesel::QueryableByName)]
-struct ProbedId {
-    #[diesel(sql_type = diesel::sql_types::Uuid)]
-    id: uuid::Uuid,
-}
-
-/// What an earlier lane can still claim in its current sweep (issue #1795).
-///
-/// A later lane leaves a row to this lane only if this lane can still claim
-/// it. The row is then ahead of the cursor of this lane, or held by it.
-struct LaneClaim {
-    /// The lane's sweep clock. `None` when its sweep is over, so its next
-    /// sweep starts later with a newer clock.
-    clock: Option<chrono::DateTime<chrono::Utc>>,
-    /// The last row the lane has read. `None` means every row is ahead.
-    read_to: Option<(chrono::DateTime<chrono::Utc>, uuid::Uuid)>,
-    /// The ids in the lane's queue, moved list and retry list. The lane
-    /// holds them also after its sweep is over.
-    held: Vec<uuid::Uuid>,
-}
-
-impl TimeoutScanLane {
-    /// What this lane can still claim after a batch of `limit`.
-    fn claim(&self, limit: usize) -> LaneClaim {
-        let (_, _, queued_taken) = self.batch_split(limit);
-        let open = self.after.is_some() || self.queued.len() > queued_taken;
-        let as_of = self.as_of.filter(|_| open);
-        LaneClaim {
-            clock: as_of,
-            // A lane on its last page has read every row of its sweep.
-            read_to: as_of.map(|as_of| self.after.unwrap_or((as_of, uuid::Uuid::max()))),
-            held: self
-                .queued
-                .iter()
-                .chain(&self.moved)
-                .copied()
-                .chain(self.retry.iter().map(|(id, _)| *id))
-                .collect(),
-        }
-    }
-}
-
-/// Batches of live rows that one refill reads, per timeout reason.
-///
-/// A refill reads one page of live rows and queues the expired ones. A
-/// larger page means fewer refills per sweep. Each refill still reads a
-/// bounded number of rows.
-const REFILL_BATCHES: i64 = 64;
-
-/// Most live rows that one refill reads, whatever the batch size.
-const MAX_PAGE_ROWS: i64 = 100_000;
-
-/// The batch limit and the refill page size for a requested `limit`.
-///
-/// The limit is kept within 1 and [`MAX_PAGE_ROWS`]. So no setting can make
-/// a refill read more than [`MAX_PAGE_ROWS`] rows.
-fn timeout_scan_bounds(limit: i64) -> (i64, i64) {
-    let limit = limit.clamp(1, MAX_PAGE_ROWS);
-    let page_rows = limit.saturating_mul(REFILL_BATCHES).min(MAX_PAGE_ROWS);
-    (limit, page_rows)
-}
-
-/// One timeout reason's place in its sweep.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct TimeoutScanLane {
-    /// The key and id of the last row of the last full page. `None` starts
-    /// the sweep from its first row.
-    after: Option<(chrono::DateTime<chrono::Utc>, uuid::Uuid)>,
-    /// The database clock when the current sweep started. It stays until the
-    /// next sweep starts. Refills read rows created by then, and test expiry
-    /// against it.
-    as_of: Option<chrono::DateTime<chrono::Utc>>,
-    /// Expired ids from the last refill, not yet handed out.
-    queued: std::collections::VecDeque<uuid::Uuid>,
-    /// Ids that failed to enforce, with the tries each has had. The next
-    /// batch loads them first.
-    retry: Vec<(uuid::Uuid, u32)>,
-    /// The retried ids of the last loaded batch, with their tries.
-    loaded_retries: std::collections::HashMap<uuid::Uuid, u32>,
-    /// Ids that moved here from another reason. They stay out of `queued`,
-    /// so moves never hold back a refill. At most one batch of them waits.
-    moved: std::collections::VecDeque<uuid::Uuid>,
-    /// Which of moved and queued ids gets the odd slot of the next batch.
-    /// It flips each pass that has both, so neither can starve the other.
-    favor_moved: bool,
-}
-
-/// Most passes in a row that try one failing row.
-///
-/// It matches the failed passes after which a leader gives up its lease.
-/// After that, the row waits for the next sweep. So rows that keep failing
-/// cannot hold the batch forever on a checker without a lease.
-const MAX_ROW_TRIES: u32 = 3;
-
-impl TimeoutScanLane {
-    /// The ids of the next batch, without taking them.
-    ///
-    /// Retried ids come first. Moved and queued ids share the rest. All
-    /// three share one `limit`, so the load of a pass stays bounded.
-    fn next_batch(&self, limit: usize) -> Vec<uuid::Uuid> {
-        let (retries, moved, queued) = self.batch_split(limit);
-        self.retry[..retries]
-            .iter()
-            .map(|(id, _)| *id)
-            .chain(self.moved.iter().take(moved).copied())
-            .chain(self.queued.iter().take(queued).copied())
-            .collect()
-    }
-
-    /// Takes the ids of [`Self::next_batch`] after the batch loads.
-    ///
-    /// Ids that the batch did not load stay for the next pass.
-    fn commit_batch(&mut self, limit: usize) {
-        let (retries, moved, queued) = self.batch_split(limit);
-        if !self.moved.is_empty() && !self.queued.is_empty() {
-            self.favor_moved = !self.favor_moved;
-        }
-        self.loaded_retries = self.retry.drain(..retries).collect();
-        self.moved.drain(..moved);
-        self.queued.drain(..queued);
-    }
-
-    /// The retried, moved and queued ids that a batch of `limit` takes.
-    ///
-    /// When both have ids, moved and queued ids split the slots after the
-    /// retries. A slot one of them leaves unused goes to the other.
-    fn batch_split(&self, limit: usize) -> (usize, usize, usize) {
-        let retries = limit.min(self.retry.len());
-        let rest = limit - retries;
-        let share = if self.favor_moved {
-            rest.div_ceil(2)
-        } else {
-            rest / 2
-        };
-        let mut moved = self.moved.len().min(share);
-        let queued = self.queued.len().min(rest - moved);
-        moved = self.moved.len().min(rest - queued);
-        (retries, moved, queued)
-    }
-
-    /// Queues the expired ids of a refill.
-    ///
-    /// An id that waits for a retry is left out. A second, queued copy would
-    /// count as a first try, so the row could hold the batch past
-    /// [`MAX_ROW_TRIES`].
-    fn queue_refill(&mut self, expired: impl IntoIterator<Item = uuid::Uuid>) {
-        let held: HashSet<uuid::Uuid> = self
-            .retry
-            .iter()
-            .map(|(id, _)| *id)
-            .chain(self.moved.iter().copied())
-            .collect();
-        self.queued
-            .extend(expired.into_iter().filter(|id| !held.contains(id)));
-    }
-
-    /// Tries `id` again on the next pass, unless it has had its tries.
-    fn retry(&mut self, id: uuid::Uuid) {
-        let tries = self.loaded_retries.get(&id).map_or(1, |tries| tries + 1);
-        if tries < MAX_ROW_TRIES {
-            self.retry.push((id, tries));
-        }
-    }
-}
-
-/// Where the next batched task-timeout scan starts (issue #1795).
-///
-/// One lane per timeout reason. A sweep starts by fixing a clock: the
-/// database time at that moment. When a lane runs empty, one refill reads
-/// the next page of live rows created by then, in creation order. It queues
-/// the rows of that page that had expired by the clock. Each pass then takes
-/// one batch from the queue and loads it by primary key. A full page moves
-/// the position to its last row. A short page ends the sweep, so the next
-/// sweep starts again with a new clock.
-///
-/// A sweep reads each row that was live at its start once. It queues each
-/// such row that had expired by its clock and still matches. A row created
-/// after the sweep starts, or that expires later, waits for the next sweep.
-/// So new rows cannot stretch a sweep or push an older row out of it. A
-/// queued row that stops matching moves to the first other reason that
-/// matches when its batch loads. It waits in that lane's moved list, which
-/// holds at most one batch and shares each batch with the queue. A row that
-/// matches none is dropped.
-///
-/// Each refill reads at most one page of index entries, and each pass loads
-/// at most one batch. So the work of a pass does not grow with the backlog.
-///
-/// A row that fails to enforce is tried again first in the next batch, for
-/// at most three passes in a row. So a leader that fails on it keeps failing
-/// until it gives up its lease. After that, the row waits for the next sweep,
-/// so rows that keep failing cannot block the rows behind them. A replica
-/// starts a new sweep after a tick without a pass, as a standby or without
-/// a connection.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TimeoutScanCursor {
-    lanes: [TimeoutScanLane; 4],
-}
-
-impl TimeoutScanCursor {
-    /// Tries `id` again on the next pass, in the lane of `reason`.
-    pub(crate) fn retry(&mut self, reason: &TimeoutReason, id: uuid::Uuid) {
-        self.lanes[timeout_lane(reason)].retry(id);
-    }
-
-    /// Prepares the cursor for a tick that runs the pass.
-    ///
-    /// After a tick that did not run the pass, for example as a standby, the
-    /// cursor starts a new sweep. The old sweep's clock and queue are stale,
-    /// and another replica may have done its work.
-    pub(crate) fn resume(&mut self, ran_last_tick: bool) {
-        if !ran_last_tick {
-            *self = Self::default();
-        }
-    }
-}
-
-/// The lane of `reason` in [`task_timeout_scans`] order.
-const fn timeout_lane(reason: &TimeoutReason) -> usize {
-    match reason {
-        TimeoutReason::Heartbeat => 0,
-        TimeoutReason::StartToClose => 1,
-        TimeoutReason::ScheduleToStart => 2,
-        TimeoutReason::ScheduleToClose => 3,
-    }
-}
-
-#[derive(diesel::QueryableByName)]
-struct SweepStart {
-    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    as_of: chrono::DateTime<chrono::Utc>,
-}
-
-#[derive(diesel::QueryableByName)]
-struct Refill {
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-    last_key: Option<chrono::DateTime<chrono::Utc>>,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
-    last_id: Option<uuid::Uuid>,
-    #[diesel(sql_type = diesel::sql_types::BigInt)]
-    rows_read: i64,
-    #[diesel(sql_type = diesel::sql_types::Array<diesel::sql_types::Uuid>)]
-    expired: Vec<uuid::Uuid>,
-}
-
-/// Reads the next page of `lane`'s sweep and queues its expired rows.
-///
-/// `claims` describes the earlier lanes, in scan order.
-async fn refill_lane(
-    conn: &mut AsyncPgConnection,
-    lane: &mut TimeoutScanLane,
-    predicate: &str,
-    higher: &[&str],
-    claims: &[LaneClaim],
-    page_rows: i64,
-) -> HarvestResult<()> {
-    use diesel::sql_types::{Array, BigInt, Nullable, Timestamptz, Uuid};
-
-    let Some(as_of) = lane.as_of else {
-        return Ok(());
-    };
-    let clocks: Vec<_> = claims.iter().map(|c| c.clock.unwrap_or(as_of)).collect();
-    let keys: Vec<_> = claims.iter().map(|c| c.read_to.map(|r| r.0)).collect();
-    let ids: Vec<_> = claims.iter().map(|c| c.read_to.map(|r| r.1)).collect();
-    let held: Vec<uuid::Uuid> = claims.iter().flat_map(|c| c.held.iter().copied()).collect();
-    let refill: Vec<Refill> = match lane.after {
-        Some((after_key, after_id)) => {
-            diesel::sql_query(timeout_refill_query(predicate, higher, true))
-                .bind::<Timestamptz, _>(after_key)
-                .bind::<Uuid, _>(after_id)
-                .bind::<BigInt, _>(page_rows)
-                .bind::<Timestamptz, _>(as_of)
-                .bind::<Array<Timestamptz>, _>(&clocks)
-                .bind::<Array<Nullable<Timestamptz>>, _>(&keys)
-                .bind::<Array<Nullable<Uuid>>, _>(&ids)
-                .bind::<Array<Uuid>, _>(&held)
-                .load(conn)
-                .await
-        }
-        None => {
-            diesel::sql_query(timeout_refill_query(predicate, higher, false))
-                .bind::<BigInt, _>(page_rows)
-                .bind::<Timestamptz, _>(as_of)
-                .bind::<Array<Timestamptz>, _>(&clocks)
-                .bind::<Array<Nullable<Timestamptz>>, _>(&keys)
-                .bind::<Array<Nullable<Uuid>>, _>(&ids)
-                .bind::<Array<Uuid>, _>(&held)
-                .load(conn)
-                .await
-        }
-    }
-    .map_err(crate::error::database_error)?;
-    let refill = refill.into_iter().next();
-    // A full page moves the position. A short page ends the sweep.
-    lane.after = refill
-        .as_ref()
-        .filter(|r| r.rows_read >= page_rows)
-        .and_then(|r| r.last_key.zip(r.last_id));
-    lane.queue_refill(refill.into_iter().flat_map(|r| r.expired));
-    Ok(())
-}
-
-/// The ids of `batch` that its load did not return.
-///
-/// A set keeps this linear, also at a batch of 100,000.
-fn lapsed_ids(batch: &[uuid::Uuid], loaded: impl Iterator<Item = uuid::Uuid>) -> Vec<uuid::Uuid> {
-    let loaded: HashSet<uuid::Uuid> = loaded.collect();
-    batch
-        .iter()
-        .filter(|id| !loaded.contains(id))
-        .copied()
-        .collect()
-}
-
-/// The lanes of other reasons that match `lapsed` now, in scan order.
-///
-/// `lapsed` holds the ids that stopped matching the reason of lane `index`.
-/// Each id goes to the first other reason that matches it. An id that
-/// matches none is left out.
-async fn lapsed_moves(
-    conn: &mut AsyncPgConnection,
-    index: usize,
-    mut lapsed: Vec<uuid::Uuid>,
-) -> HarvestResult<Vec<(usize, uuid::Uuid)>> {
-    let mut moves = Vec::new();
-    for (other, (_, predicate)) in task_timeout_scans().into_iter().enumerate() {
-        if other == index || lapsed.is_empty() {
-            continue;
-        }
-        let matched: Vec<ProbedId> = diesel::sql_query(timeout_probe_query(predicate))
-            .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&lapsed)
-            .load(conn)
-            .await
-            .map_err(crate::error::database_error)?;
-        let matched_ids: HashSet<uuid::Uuid> = matched.iter().map(|row| row.id).collect();
-        lapsed.retain(|id| !matched_ids.contains(id));
-        moves.extend(matched.iter().map(|row| (other, row.id)));
-    }
-    Ok(moves)
-}
-
-/// Bounded form of [`find_timed_out_tasks`] (issue #1795).
-///
-/// Returns at most `limit` rows per timeout reason, from `cursor` onward, and
-/// moves `cursor`. The `limit` is kept within 1 and 100,000.
-///
-/// # Errors
-///
-/// Returns [`HarvestError::Database`] on query failure.
-pub async fn find_timed_out_tasks_batch(
-    conn: &mut AsyncPgConnection,
-    cursor: &mut TimeoutScanCursor,
-    limit: i64,
-) -> HarvestResult<Vec<(TaskQueueItem, TimeoutReason)>> {
-    let (limit, page_rows) = timeout_scan_bounds(limit);
-    let mut results = Vec::new();
-    let mut seen = HashSet::new();
-
-    let scans = task_timeout_scans();
-    let predicates = scans.clone().map(|(_, predicate)| predicate);
-    let take = usize::try_from(limit).unwrap_or(usize::MAX);
-    // What each lane already done in this pass can still claim.
-    let mut claims: Vec<LaneClaim> = Vec::with_capacity(4);
-    // Rows whose queued reason lapsed, with the lane of a reason that
-    // matches now. They join that lane's queue after the pass.
-    let mut moves: Vec<Move> = Vec::new();
-    for (index, (lane, (reason, predicate))) in cursor.lanes.iter_mut().zip(scans).enumerate() {
-        let higher = &predicates[..index];
-        if lane.queued.is_empty() && lane.after.is_none() {
-            // A new sweep: fix its clock.
-            let start: Vec<SweepStart> = diesel::sql_query(TIMEOUT_SWEEP_START_SQL)
-                .load(conn)
-                .await
-                .map_err(crate::error::database_error)?;
-            lane.as_of = start.into_iter().next().map(|r| r.as_of);
-        }
-        if lane.queued.is_empty() {
-            refill_lane(conn, lane, predicate, higher, &claims, page_rows).await?;
-        }
-        claims.push(lane.claim(take));
-
-        let batch = lane.next_batch(take);
-        if batch.is_empty() {
-            continue;
-        }
-        let page: Vec<TaskQueueItem> = diesel::sql_query(timeout_batch_query(predicate))
-            .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&batch)
-            .load(conn)
-            .await
-            .map_err(crate::error::database_error)?;
-        let lapsed = lapsed_ids(&batch, page.iter().map(|task| task.id));
-        for task in page {
-            if seen.insert(task.id) {
-                results.push((task, reason.clone()));
-            }
-        }
-        // A row whose queued reason stopped matching can match another one
-        // now. The other lanes may have left it to this reason. It moves to
-        // the first one that matches, and counts against that lane's limit.
-        // The move is reserved for the rest of the pass, so no later lane
-        // hands the row out under its own reason.
-        if !lapsed.is_empty() {
-            let reserved = lapsed_moves(conn, index, lapsed).await?;
-            seen.extend(reserved.iter().map(|(_, id)| *id));
-            moves.extend(reserved.into_iter().map(|(to, id)| Move {
-                from: index,
-                to,
-                id,
-            }));
-        }
-    }
-
-    // The lanes give up their ids only after every load succeeds. So a
-    // failed load loses no id, in this lane or an earlier one.
-    for lane in &mut cursor.lanes {
-        lane.commit_batch(take);
-    }
-    admit_moves(&mut cursor.lanes, moves, take);
-    Ok(results)
-}
-
-/// A row whose queued reason lapsed, with the lane it came from and the lane
-/// of a reason that matches it now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Move {
-    from: usize,
-    to: usize,
-    id: uuid::Uuid,
-}
-
-/// Hands each moved row to the lane of its new reason.
-///
-/// Moved rows wait in their own list, first in, first out. The list keeps
-/// the row reserved for its new reason across passes. A later lane never
-/// takes a held row, so it cannot record the wrong reason.
-///
-/// A lane holds at most `limit` moved rows. Three other lanes can each move
-/// a full batch here in one pass. A move past the cap is not dropped. It goes
-/// back to the front of its source lane's queue, so that lane still holds it
-/// and probes it again next pass. That is backpressure: a source whose moves
-/// do not fit stops taking new rows until the lane drains. The moved list
-/// gives up at least half a batch each pass, so the source always resumes.
-/// No list grows, because a deferred id only changes lists.
-fn admit_moves(lanes: &mut [TimeoutScanLane; 4], moves: Vec<Move>, limit: usize) {
-    if moves.is_empty() {
-        return;
-    }
-    let mut held: Vec<HashSet<uuid::Uuid>> = lanes
-        .iter()
-        .map(|lane| {
-            lane.queued
-                .iter()
-                .chain(&lane.moved)
-                .copied()
-                .chain(lane.retry.iter().map(|(id, _)| *id))
-                .collect()
-        })
-        .collect();
-    let mut deferred: [Vec<uuid::Uuid>; 4] = Default::default();
-    for Move { from, to, id } in moves {
-        if held[to].contains(&id) {
-            continue;
-        }
-        if lanes[to].moved.len() < limit {
-            held[to].insert(id);
-            lanes[to].moved.push_back(id);
-        } else if held[from].insert(id) {
-            deferred[from].push(id);
-        }
-    }
-    for (lane, ids) in lanes.iter_mut().zip(deferred) {
-        for id in ids.into_iter().rev() {
-            lane.queued.push_front(id);
-        }
-    }
-}
-
-/// Which task-timeout scan one pass runs (issue #1795).
-pub(crate) enum TaskScan<'a> {
-    /// Every expired row. The public [`enforce_timeouts_once`] keeps this.
-    All,
-    /// One bounded page per reason. The spawned checker uses this.
-    Batch {
-        cursor: &'a mut TimeoutScanCursor,
-        limit: i64,
-    },
+fn execution_id_from_uuid(id: uuid::Uuid) -> crate::types::ExecutionId {
+    id.to_string()
+        .parse()
+        .expect("database UUIDs must round-trip into ExecutionId")
 }
 
 fn timeout_error(task_name: &str, reason: &TimeoutReason) -> String {
@@ -1292,13 +518,10 @@ pub(crate) fn pending_activity_id_for_task(
 pub(crate) async fn lock_workflow_execution_and_load_history(
     conn: &mut AsyncPgConnection,
     exec_id: crate::types::ExecutionId,
-    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<store::EventHistory> {
-    Ok(
-        lock_workflow_execution_row_and_load_history(conn, exec_id, codecs)
-            .await?
-            .1,
-    )
+    Ok(lock_workflow_execution_row_and_load_history(conn, exec_id)
+        .await?
+        .1)
 }
 
 /// Like [`lock_workflow_execution_and_load_history`], but also returns the
@@ -1310,7 +533,6 @@ pub(crate) async fn lock_workflow_execution_and_load_history(
 async fn lock_workflow_execution_row_and_load_history(
     conn: &mut AsyncPgConnection,
     exec_id: crate::types::ExecutionId,
-    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<(WorkflowExecution, store::EventHistory)> {
     let execution = harvest_workflow_executions::table
         .find(exec_id.as_uuid())
@@ -1322,10 +544,7 @@ async fn lock_workflow_execution_row_and_load_history(
         .map_err(crate::error::database_error)?
         .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
 
-    // Codec-aware, NOT `store::load_history` -- the same reason as `worker.rs`'s
-    // sibling: the engine's writes encode through the configured registry, so an
-    // identity read raises `UnknownCodecKey` on the first keyed envelope.
-    let history = store::load_history_with_codecs(conn, exec_id, codecs).await?;
+    let history = store::load_history(conn, exec_id).await?;
     Ok((execution, history))
 }
 
@@ -1345,127 +564,26 @@ pub(crate) async fn task_state_for_update(
         .map_err(crate::error::database_error)
 }
 
-/// A task row read under its `FOR UPDATE` lock by [`enforce_activity_timeout`].
-struct LockedTask {
-    state: String,
-    /// The row-current deadline. The frozen-row half of the PAUSED re-check
-    /// ([`pause_suppresses_timeout_enforcement`]) and the retry deadline
-    /// check (issue #1809) read it, not the scan-time snapshot.
-    schedule_to_close_at: Option<chrono::DateTime<Utc>>,
-    /// The row-current poison-pill count. A timeout retry keeps it.
-    crash_strikes: i32,
-    /// The row is `RUNNING` under the claim that the scan saw (issue #1809).
-    scanned_claim: bool,
-    /// The handler of the scanned claim started (issue #1809).
-    handler_started: bool,
-    /// The `started_at` of the `RUNNING` claim that holds the row now, when
-    /// its handler started (issue #1809). A schedule-to-close timeout ends
-    /// this claim, which can be later than the scanned one.
-    current_started_claim: Option<chrono::DateTime<Utc>>,
-    /// How long the handler of the claim that holds the row now has run, when
-    /// it started (issue #1809). The database clock measures it, because that
-    /// clock also wrote the start.
-    current_handler_elapsed_secs: Option<f64>,
-    /// The row-current `attempt`. With `current_started_claim`, it names the
-    /// claim that holds the row now.
-    attempt: i32,
-    /// The heartbeat deadline has passed on the row-current values.
-    heartbeat_expired: bool,
-}
-
-/// SQL for [`lock_task_for_timeout`].
-///
-/// `clock_timestamp()`, not `NOW()`: this transaction can wait on row locks,
-/// and `NOW()` is frozen at its start.
-const LOCK_TASK_FOR_TIMEOUT_SQL: &str = "SELECT state, schedule_to_close_at, crash_strikes, \
-         worker_id, attempt, started_at, handler_started_attempt, \
-         EXTRACT(EPOCH FROM clock_timestamp() - handler_started_at)::float8 \
-             AS handler_elapsed_secs, \
-         COALESCE(heartbeat_timeout IS NOT NULL \
-             AND COALESCE(last_heartbeat_at, started_at) + heartbeat_timeout \
-                 < clock_timestamp(), false) AS heartbeat_expired \
-     FROM harvest_task_queue WHERE id = $1 FOR UPDATE";
-
-#[derive(diesel::QueryableByName)]
-struct LockedTaskRow {
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    state: String,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-    schedule_to_close_at: Option<chrono::DateTime<Utc>>,
-    #[diesel(sql_type = diesel::sql_types::Integer)]
-    crash_strikes: i32,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
-    worker_id: Option<String>,
-    #[diesel(sql_type = diesel::sql_types::Integer)]
-    attempt: i32,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-    started_at: Option<chrono::DateTime<Utc>>,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
-    handler_started_attempt: Option<i32>,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
-    handler_elapsed_secs: Option<f64>,
-    #[diesel(sql_type = diesel::sql_types::Bool)]
-    heartbeat_expired: bool,
-}
-
-/// Locked (`FOR UPDATE`) read of a task row for [`enforce_activity_timeout`].
-///
-/// A claim is the pair `(worker_id, attempt)`, but a self-release before the
-/// handler lets a later claim reuse the pair. `started_at` tells the two
-/// claims apart, so `scanned_claim` compares all three with the scan
-/// snapshot `task`.
-async fn lock_task_for_timeout(
+/// Locked (`FOR UPDATE`) read of a task row's current state **and**
+/// row-current `schedule_to_close_at`. [`enforce_activity_timeout`] needs the
+/// deadline in addition to the state so the frozen-row half of the PAUSED
+/// re-check ([`pause_suppresses_timeout_enforcement`]) can be evaluated
+/// against the row's current value under the execution row lock, not the
+/// scan-time snapshot.
+async fn task_state_and_deadline_for_update(
     conn: &mut AsyncPgConnection,
-    task: &TaskQueueItem,
-) -> HarvestResult<Option<LockedTask>> {
-    let row = diesel::sql_query(LOCK_TASK_FOR_TIMEOUT_SQL)
-        .bind::<diesel::sql_types::Uuid, _>(task.id)
-        .get_result::<LockedTaskRow>(conn)
+    task_id: uuid::Uuid,
+) -> HarvestResult<Option<(String, Option<chrono::DateTime<Utc>>)>> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    dsl::harvest_task_queue
+        .find(task_id)
+        .for_update()
+        .select((dsl::state, dsl::schedule_to_close_at))
+        .first(conn)
         .await
         .optional()
-        .map_err(crate::error::database_error)?;
-    Ok(row.map(|row| {
-        let running = row.state == "RUNNING";
-        let scanned_claim = running
-            && row.worker_id == task.worker_id
-            && row.attempt == task.attempt
-            && row.started_at == task.started_at;
-        let current_handler_started = running && row.handler_started_attempt == Some(row.attempt);
-        LockedTask {
-            handler_started: scanned_claim && current_handler_started,
-            scanned_claim,
-            current_started_claim: row.started_at.filter(|_| current_handler_started),
-            current_handler_elapsed_secs: row
-                .handler_elapsed_secs
-                .filter(|_| current_handler_started),
-            attempt: row.attempt,
-            heartbeat_expired: row.heartbeat_expired,
-            crash_strikes: row.crash_strikes,
-            state: row.state,
-            schedule_to_close_at: row.schedule_to_close_at,
-        }
-    }))
-}
-
-/// The result of [`enforce_activity_timeout`]'s transaction. `None` means
-/// the task moved on and the transaction changed nothing.
-type TimeoutEnforcement = Option<ActivityTimeoutOutcome>;
-
-/// What [`enforce_activity_timeout`] did to a timed-out activity task.
-#[derive(Debug, Clone, Copy)]
-struct ActivityTimeoutOutcome {
-    /// The task went back to `PENDING` for a retry (issue #1809).
-    retried: bool,
-    /// The handler of the timed-out attempt started (issue #1809).
-    handler_started: bool,
-    /// The timed-out claim is the one the scan saw (issue #1809).
-    scanned_claim: bool,
-    /// The `started_at` of the timed-out claim, when its handler started.
-    /// The enforcer then counts that attempt as a failed one.
-    started_attempt: Option<chrono::DateTime<Utc>>,
-    /// How long the handler of the timed-out attempt ran. The attempt
-    /// duration counts from its start, as on the worker path.
-    handler_elapsed_secs: Option<f64>,
+        .map_err(crate::error::database_error)
 }
 
 /// SQL for [`schedule_to_start_still_expired`], exposed for shape tests.
@@ -1686,38 +804,6 @@ fn external_task_timeout_still_due(
     state == "PENDING" && schedule_to_close_at < now
 }
 
-/// What a task timeout may do to its owning execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TaskTimeoutDisposition {
-    /// The run is open. Enforce the timeout: a workflow task seals the run
-    /// `TIMED_OUT`, and an activity task retries or records the timeout.
-    Enforce,
-    /// The run is already sealed. Fail the orphan task and nothing else.
-    FailTaskOnly,
-    /// The row is a staged shard copy. Do not touch it.
-    Skip,
-}
-
-/// Classify the locked execution state for a task timeout.
-///
-/// `PAUSED` is open, as on the quarantine and poison-pill paths (issue
-/// #383). A terminal state never changes, so a late timeout cannot rewrite
-/// the recorded outcome of a run. That holds for an activity task too: its
-/// timeout appends no event to a sealed history and starts no new attempt
-/// (issue #1870).
-fn task_timeout_disposition(state: &str) -> TaskTimeoutDisposition {
-    match state {
-        "RUNNING" | "PAUSED" => TaskTimeoutDisposition::Enforce,
-        s if crate::erase::is_terminal_state(s) => TaskTimeoutDisposition::FailTaskOnly,
-        _ => TaskTimeoutDisposition::Skip,
-    }
-}
-
-/// Seal an open execution `TIMED_OUT`.
-///
-/// The write carries its own state predicate. Only a `RUNNING` or `PAUSED` row
-/// changes, and any other state returns an error. A paused run also loses its
-/// pause record, so it cannot appear both terminal and paused (issue #383).
 async fn update_workflow_execution_timed_out(
     conn: &mut AsyncPgConnection,
     exec_id: crate::types::ExecutionId,
@@ -1738,35 +824,28 @@ async fn update_workflow_execution_timed_out(
         .map_err(crate::error::database_error)?
         .unwrap_or(false);
 
-    let updated = diesel::update(
-        dsl::harvest_workflow_executions
-            .find(exec_id.as_uuid())
-            .filter(dsl::state.eq_any(["RUNNING", "PAUSED"])),
-    )
-    .set((
-        dsl::state.eq("TIMED_OUT"),
-        dsl::output.eq(None::<serde_json::Value>),
-        dsl::error.eq(Some(error.to_string())),
-        dsl::completed_at.eq(Some(Utc::now())),
-        dsl::paused_at.eq(None::<chrono::DateTime<Utc>>),
-        dsl::pause_reason.eq(None::<String>),
-        dsl::pause_actor.eq(None::<String>),
-        // Belt-and-braces ND-block reset (code-review fix, issue #603):
-        // a TIMED_OUT execution closes out permanently — a stale block
-        // marker must not survive on a terminal row, matching the
-        // precedent already applied to the two worker.rs terminal
-        // writers.
-        dsl::nd_blocked_at.eq(None::<chrono::DateTime<Utc>>),
-        dsl::nd_block_reason.eq(None::<String>),
-        dsl::nd_block_count.eq(0),
-    ))
-    .execute(conn)
-    .await
-    .map_err(crate::error::database_error)?;
+    let updated = diesel::update(dsl::harvest_workflow_executions.find(exec_id.as_uuid()))
+        .set((
+            dsl::state.eq("TIMED_OUT"),
+            dsl::output.eq(None::<serde_json::Value>),
+            dsl::error.eq(Some(error.to_string())),
+            dsl::completed_at.eq(Some(Utc::now())),
+            // Belt-and-braces ND-block reset (code-review fix, issue #603):
+            // a TIMED_OUT execution closes out permanently — a stale block
+            // marker must not survive on a terminal row, matching the
+            // precedent already applied to the two worker.rs terminal
+            // writers.
+            dsl::nd_blocked_at.eq(None::<chrono::DateTime<Utc>>),
+            dsl::nd_block_reason.eq(None::<String>),
+            dsl::nd_block_count.eq(0),
+        ))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
 
     if updated == 0 {
         return Err(HarvestError::NotFound(format!(
-            "workflow execution {exec_id} is not RUNNING or PAUSED"
+            "workflow execution {exec_id}"
         )));
     }
 
@@ -1791,19 +870,6 @@ async fn wake_parent_for_child_timeout(
     child_exec_id: crate::types::ExecutionId,
     error: &str,
 ) -> HarvestResult<()> {
-    // Issue #956: a cross-shard parent is not on this connection, and appending
-    // to it here would `NotFound` and roll back the child's own timeout
-    // transaction — leaving the child non-terminal forever. The cross-shard
-    // relay delivers this wake instead, from the parent's own shard. Mirrors the
-    // identical guard in `worker::wake_parent_for_child_completion`/`_failure`.
-    if crate::worker::parent_is_on_another_shard(conn, parent_exec_id, child_exec_id).await? {
-        tracing::debug!(
-            parent_execution_id = %parent_exec_id,
-            child_execution_id = %child_exec_id,
-            "cross-shard child timed out; the parent wake is the relay's to deliver"
-        );
-        return Ok(());
-    }
     // #779 (Codex P2): order any DUE child-timeout deadline BEFORE the child
     // terminal (mirrors worker::wake_parent_for_child_completion/_failure) so an
     // over-deadline child that hits its OWN execution timeout resolves the
@@ -1831,110 +897,74 @@ async fn commit_workflow_execution_timeout(
     bool,
     Vec<crate::completion_trigger::DeferredTriggerStart>,
     Vec<(ExecutionId, String)>,
-    Vec<crate::execution::StartCancelledRun>,
 )> {
-    // `wake_parent_for_child_timeout` below raises a dispatch hint (issue
-    // #1429). The scope ties its publish to this transaction's commit, so
-    // a reader never probes a parent row before it is visible.
-    //
-    // `enforce_workflow_execution_timeouts` calls this once per expired
-    // execution in its own sweep loop (Codex review, issue #1429). A
-    // synchronous per-row publish (`buffered_settled`) would pay a Redis
-    // round trip once per row. It would stall the sweep when the channel
-    // is slow, even though Postgres already committed. Hand hints to the
-    // background publisher instead, the same fix already applied to the
-    // outbox sweeps in this file.
-    crate::dispatch::buffered_settled_in_background(Box::pin(conn.transaction::<(
+    Box::pin(conn.transaction::<(
         bool,
         Vec<crate::completion_trigger::DeferredTriggerStart>,
         Vec<(ExecutionId, String)>,
-        Vec<crate::execution::StartCancelledRun>,
-    ), HarvestError, _>(
-        async |conn| {
-            let timeout_event = timeout_event.clone();
-            let error_msg = error_msg.to_owned();
-            // Re-check state under lock to guard against concurrent completion.
-            let current_state: Option<String> = harvest_workflow_executions::table
-                .find(exec_id.as_uuid())
-                .for_update()
-                .select(harvest_workflow_executions::state)
-                .first(conn)
-                .await
-                .optional()
-                .map_err(crate::error::database_error)?;
-
-            match current_state.as_deref() {
-                Some("RUNNING") => {}
-                _ => return Ok((false, Vec::new(), Vec::new(), Vec::new())),
-            }
-
-            store::append_single_event(conn, exec_id, timeout_event).await?;
-            update_workflow_execution_timed_out(conn, exec_id, &error_msg).await?;
-
-            // Each open task did not finish before the run deadline. The claim
-            // skips such a task (issue #1824), so this write is its recorded
-            // outcome. The prefix lets an operator find it.
-            let task_error = format!("{}: {error_msg}", crate::queue::DEADLINE_EXCEEDED_ERROR);
-            let _rows = diesel::update(
-                harvest_task_queue::table
-                    .filter(harvest_task_queue::workflow_exec_id.eq(exec_id.as_uuid()))
-                    .filter(
-                        harvest_task_queue::state
-                            .eq("PENDING")
-                            .or(harvest_task_queue::state.eq("RUNNING")),
-                    ),
-            )
-            .set((
-                harvest_task_queue::state.eq("FAILED"),
-                harvest_task_queue::error.eq(Some(&task_error)),
-                harvest_task_queue::completed_at.eq(Some(Utc::now())),
-            ))
-            .execute(conn)
+    ), HarvestError, _>(async |conn| {
+        let timeout_event = timeout_event.clone();
+        let error_msg = error_msg.to_owned();
+        // Re-check state under lock to guard against concurrent completion.
+        let current_state: Option<String> = harvest_workflow_executions::table
+            .find(exec_id.as_uuid())
+            .for_update()
+            .select(harvest_workflow_executions::state)
+            .first(conn)
             .await
+            .optional()
             .map_err(crate::error::database_error)?;
 
-            if let Some(parent_uuid) = parent_uuid {
-                wake_parent_for_child_timeout(
-                    conn,
-                    ExecutionId::from_uuid(parent_uuid),
-                    exec_id,
-                    &error_msg,
-                )
-                .await?;
-            }
+        match current_state.as_deref() {
+            Some("RUNNING") => {}
+            _ => return Ok((false, Vec::new(), Vec::new())),
+        }
 
-            // Issue #1243: neither this cascade nor `timeout_event`
-            // (`WorkflowExecutionTimedOut`) carries a payload-bearing field.
-            // `enforce_workflow_execution_timeouts` also has no configured
-            // registry threaded through its many test call sites. Identity is
-            // exact here, not a shortcut.
-            let (mut deferred, closed_children) =
-                apply_parent_close_cascade(conn, exec_id, &crate::store::DEFAULT_PAYLOAD_CODECS)
-                    .await?;
-            let mut pending_cancel_metrics = Vec::new();
-            // Issue #1243: same identity-registry rationale as this function's
-            // `apply_parent_close_cascade` call above.
-            let triggers =
-                crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
-                    conn,
-                    exec_id,
-                    crate::completion_trigger::TerminalState::TimedOut,
-                    metrics,
-                    &mut pending_cancel_metrics,
-                    &crate::store::DEFAULT_PAYLOAD_CODECS,
-                )
-                .await?;
-            deferred.extend(triggers);
-            Ok((true, deferred, closed_children, pending_cancel_metrics))
-        },
-    )))
+        store::append_single_event(conn, exec_id, timeout_event).await?;
+        update_workflow_execution_timed_out(conn, exec_id, &error_msg).await?;
+
+        let _rows = diesel::update(
+            harvest_task_queue::table
+                .filter(harvest_task_queue::workflow_exec_id.eq(exec_id.as_uuid()))
+                .filter(
+                    harvest_task_queue::state
+                        .eq("PENDING")
+                        .or(harvest_task_queue::state.eq("RUNNING")),
+                ),
+        )
+        .set((
+            harvest_task_queue::state.eq("FAILED"),
+            harvest_task_queue::error.eq(Some(&error_msg)),
+            harvest_task_queue::completed_at.eq(Some(Utc::now())),
+        ))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+        if let Some(parent_uuid) = parent_uuid {
+            wake_parent_for_child_timeout(
+                conn,
+                execution_id_from_uuid(parent_uuid),
+                exec_id,
+                &error_msg,
+            )
+            .await?;
+        }
+
+        let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
+        let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+            conn,
+            exec_id,
+            crate::completion_trigger::TerminalState::TimedOut,
+            metrics,
+        )
+        .await?;
+        deferred.extend(triggers);
+        Ok((true, deferred, closed_children))
+    }))
     .await
 }
 
-// The `dispatch::buffered_settled` wrap (issue #1429) added two lines over
-// the 100-line cap. The transaction below is one atomic unit; splitting it
-// would only move lines around, not shrink the function.
-#[allow(clippy::too_many_lines)]
 async fn enforce_activity_timeout(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
@@ -1942,15 +972,14 @@ async fn enforce_activity_timeout(
     reason: &TimeoutReason,
     circuit_breakers: Option<&crate::circuit_breaker::CircuitBreakerRegistry>,
     metrics: &(dyn MetricsRecorder + Send + Sync),
-    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     let Some(activity_name) = task.activity_name.as_deref() else {
         return queue::fail_task(conn, task.id, &timeout_error("activity", reason)).await;
     };
     let error = timeout_error(activity_name, reason);
 
-    // Did the task time out (vs. a no-op because the task already moved on)?
-    // Only a real enforcement can count toward the breaker.
+    // Did we actually append a timeout (vs. a no-op because the task already
+    // moved on)? Only a real enforcement should count toward the breaker.
     //
     // Pinned `READ COMMITTED`, not the session default (issue #619 round-24
     // review). The queue advisory lock taken below is a `SELECT`, so it fixes
@@ -1964,197 +993,82 @@ async fn enforce_activity_timeout(
     // `default_transaction_isolation = repeatable read` on the database or the
     // role disable the guarantee from outside this code.
     let mut tx = conn.build_transaction().read_committed();
-    // Mark the claim before the transaction can requeue it (issue #1809).
-    // The handler can return as soon as the requeue commits. A result that
-    // arrives while the mark is provisional is held. The code after the
-    // transaction confirms the mark, which drops the held result, or rolls
-    // it back, which applies the held result.
-    let claim_key = crate::circuit_breaker::ClaimKey {
-        task_id: task.id,
-        attempt: task.attempt,
-        started_at: task.started_at,
-    };
-    // The guard rolls the mark back on every exit that does not confirm it,
-    // including a dropped future. A mark left provisional would hold a late
-    // result, and with it a probe slot, for good.
-    let mut provisional =
-        ProvisionalTimeoutMark::new(circuit_breakers, activity_name, claim_key, metrics);
-    // A schedule-to-close timeout can end a later claim than the scanned
-    // one. The transaction marks that claim under its row lock, so the
-    // owner cannot see its loss before the mark. This guard rolls the mark
-    // back on every exit that does not confirm it.
-    let current_mark = std::sync::Mutex::new(None::<ProvisionalTimeoutMark<'_>>);
-    // `wake_workflow_task` below raises a dispatch hint (issue #1429). The
-    // scope ties its publish to this transaction's commit.
-    //
-    // `enforce_timeouts_once_on_conn_shard` calls this once per timed-out
-    // activity task in its own sweep loop (Codex review, issue #1429). A
-    // synchronous per-row publish (`buffered_settled`) would pay a Redis
-    // round trip once per row. It would stall the sweep when the channel
-    // is slow, even though Postgres already committed. Hand hints to the
-    // background publisher instead, the same fix already applied to the
-    // outbox sweeps in this file.
-    let enforced = crate::dispatch::buffered_settled_in_background(Box::pin(
-        tx.run::<TimeoutEnforcement, HarvestError, _>(async |conn| {
-            let error = error.clone();
+    let enforced = Box::pin(tx.run::<bool, HarvestError, _>(async |conn| {
+        let error = error.clone();
 
-            // Authoritative QUEUE-pause re-check (issue #619). The scan predicate
-            // is a non-locking snapshot, so a queue pause committing after the scan
-            // would otherwise let this transaction schedule-to-start-fail the very
-            // task the hold was meant to protect.
-            //
-            // Unlike the execution-pause re-check further down — which is
-            // authoritative because both sides lock the *execution row* —
-            // `pause_queue` shares no row with this transaction, so a bare re-read
-            // would not serialize: a pause could commit in the window between the
-            // read and this transaction's own commit. Both sides therefore take the
-            // same queue-scoped advisory lock, so a pause is either fully visible
-            // here or blocked until this enforcement commits.
-            //
-            // LOCK ORDERING (load-bearing): this runs FIRST, before the execution
-            // and task row locks below, because `resume_queue` takes the very same
-            // advisory lock and *then* row-locks every PENDING task on the queue via
-            // its `scheduled_at` shift. Taking the rows first here and the advisory
-            // lock after would invert that order — enforcement holding a task row
-            // and waiting on the advisory lock while resume holds the advisory lock
-            // and waits on that task row — and Postgres would abort one of them,
-            // failing either the timeout pass or the operator's resume. Both paths
-            // now take advisory-then-rows. (Same convention as the
-            // `harvest_external_tasks` task-row -> execution-row ordering documented
-            // in `enforce_external_task_timeouts`.)
-            //
-            // Scoped by `queue_pause_suppresses_timeout` to `ScheduleToStart` only
-            // — the absolute `schedule_to_close` deadline keeps ticking during a
-            // queue pause, and heartbeat/start-to-close apply to RUNNING rows that a
-            // pause never touches — so the lock is taken only for that reason and
-            // never on the far more common in-flight timeout paths. Bailing here
-            // also skips the row locks and history load entirely for a held task.
-            //
-            // SHARED mode (round-21 review): exclusive would block every claim's
-            // `try_lock_queue_for_claim` for this whole transaction, stalling
-            // dispatch on a queue that is not paused at all. Shared still mutually
-            // excludes the exclusive pause/resume, which is the only ordering this
-            // re-check needs. See `lock_queue_for_timeout_recheck`.
-            if matches!(reason, TimeoutReason::ScheduleToStart) {
-                crate::queue_pause::lock_queue_for_timeout_recheck(conn, &task.queue_name).await?;
-                if crate::queue_pause::queue_pause_suppresses_timeout(
-                    reason,
-                    crate::queue_pause::is_queue_paused(conn, &task.queue_name).await?,
-                ) {
-                    return Ok(None);
-                }
-                // Authoritative ACTIVITY-pause re-check (issue #807), the
-                // per-activity-type sibling of the queue re-check above. Same
-                // staleness problem, same fix: the scan predicate is a non-locking
-                // snapshot, so a pause committing after the scan would otherwise let
-                // this transaction schedule-to-start-fail a task the hold protects.
-                //
-                // No advisory lock (unlike the queue path). This copy is an
-                // ADVISORY FAST PATH: it lets a held task bail before paying for the
-                // execution row lock and history load below. It is NOT the
-                // guarantee -- the very next statement,
-                // `lock_workflow_execution_row_and_load_history`, can block for an
-                // UNBOUNDED period behind any other holder of that row, and
-                // `pause_activity` shares no row with this transaction so it commits
-                // freely during that wait (round-17 review, P1). The authoritative
-                // re-check therefore runs AFTER the row locks; see it below.
-                // Placed after the queue re-check so the two read coarse-to-fine,
-                // and before `schedule_to_start_still_expired_unlocked` so a held
-                // task short-circuits on the cheaper condition.
-                //
-                // Scoped by `task_type = 'activity'` to match the scan predicate
-                // exactly. A *workflow* task can carry a non-NULL `activity_name` —
-                // the engine stamps the `'mixed_signal_suspension'` sentinel there —
-                // so without this an activity paused under that name would suppress
-                // a workflow task's schedule-to-start timeout. That is unreachable
-                // today only because workflow tasks are enqueued with
-                // `schedule_to_start: None` and so never reach this scan; relying on
-                // that would leave the enforcer silently disagreeing with its own
-                // scan predicate the moment a workflow task gains one.
-                if task.task_type == crate::activity_pause::ACTIVITY_TASK_TYPE
-                    && let Some(activity_name) = task.activity_name.as_deref()
-                    && crate::activity_pause::activity_pause_suppresses_timeout(
-                        reason,
-                        crate::activity_pause::is_activity_paused(conn, activity_name).await?,
-                    )
-                {
-                    return Ok(None);
-                }
-                // A *completed* pause/resume cycle leaves nothing for either check
-                // above to suppress on, but resume has already credited the held
-                // time back into `scheduled_at`. Re-read the row-current deadline
-                // before trusting the scan snapshot, or a task is timed out the
-                // instant its deadline was extended. Covers both the queue (#619)
-                // and activity (#807) resume paths, which shift the same column.
-                //
-                // Unlocked here (round-22 review): locking the task row before the
-                // execution row below would invert the documented
-                // execution-row -> task-row order and deadlock against
-                // `resume_workflow_execution`. This is a fast path that skips the
-                // execution lock and history load for the common held-task case;
-                // the authoritative locked re-read runs after the row locks below.
-                if !schedule_to_start_still_expired_unlocked(conn, task.id).await? {
-                    return Ok(None);
-                }
+        // Authoritative QUEUE-pause re-check (issue #619). The scan predicate
+        // is a non-locking snapshot, so a queue pause committing after the scan
+        // would otherwise let this transaction schedule-to-start-fail the very
+        // task the hold was meant to protect.
+        //
+        // Unlike the execution-pause re-check further down — which is
+        // authoritative because both sides lock the *execution row* —
+        // `pause_queue` shares no row with this transaction, so a bare re-read
+        // would not serialize: a pause could commit in the window between the
+        // read and this transaction's own commit. Both sides therefore take the
+        // same queue-scoped advisory lock, so a pause is either fully visible
+        // here or blocked until this enforcement commits.
+        //
+        // LOCK ORDERING (load-bearing): this runs FIRST, before the execution
+        // and task row locks below, because `resume_queue` takes the very same
+        // advisory lock and *then* row-locks every PENDING task on the queue via
+        // its `scheduled_at` shift. Taking the rows first here and the advisory
+        // lock after would invert that order — enforcement holding a task row
+        // and waiting on the advisory lock while resume holds the advisory lock
+        // and waits on that task row — and Postgres would abort one of them,
+        // failing either the timeout pass or the operator's resume. Both paths
+        // now take advisory-then-rows. (Same convention as the
+        // `harvest_external_tasks` task-row -> execution-row ordering documented
+        // in `enforce_external_task_timeouts`.)
+        //
+        // Scoped by `queue_pause_suppresses_timeout` to `ScheduleToStart` only
+        // — the absolute `schedule_to_close` deadline keeps ticking during a
+        // queue pause, and heartbeat/start-to-close apply to RUNNING rows that a
+        // pause never touches — so the lock is taken only for that reason and
+        // never on the far more common in-flight timeout paths. Bailing here
+        // also skips the row locks and history load entirely for a held task.
+        //
+        // SHARED mode (round-21 review): exclusive would block every claim's
+        // `try_lock_queue_for_claim` for this whole transaction, stalling
+        // dispatch on a queue that is not paused at all. Shared still mutually
+        // excludes the exclusive pause/resume, which is the only ordering this
+        // re-check needs. See `lock_queue_for_timeout_recheck`.
+        if matches!(reason, TimeoutReason::ScheduleToStart) {
+            crate::queue_pause::lock_queue_for_timeout_recheck(conn, &task.queue_name).await?;
+            if crate::queue_pause::queue_pause_suppresses_timeout(
+                reason,
+                crate::queue_pause::is_queue_paused(conn, &task.queue_name).await?,
+            ) {
+                return Ok(false);
             }
-
-            let (execution, history) =
-                lock_workflow_execution_row_and_load_history(conn, exec_id, codecs).await?;
-            let Some(locked) = lock_task_for_timeout(conn, task).await? else {
-                return Ok(None);
-            };
-            if !expected_task_states_for_timeout(reason).contains(&locked.state.as_str()) {
-                return Ok(None);
-            }
-            // A start-to-close or heartbeat timeout judges one claim (issue
-            // #1809). When a later claim holds the row, the scan snapshot is
-            // stale and the new attempt has its own clock. A heartbeat that
-            // landed after the scan also cancels the timeout.
-            if reason.retries_per_policy()
-                && (!locked.scanned_claim
-                    || (matches!(reason, TimeoutReason::Heartbeat) && !locked.heartbeat_expired))
-            {
-                return Ok(None);
-            }
-            // Authoritative `schedule_to_start` deadline re-read. It runs here,
-            // after the execution row lock above. The transaction already holds
-            // the task row from `lock_task_for_timeout`. So the read keeps the
-            // execution-row -> task-row lock order. The unlocked
-            // fast-path check near the top of this transaction is advisory; this is
-            // the one that must be trusted, because only a lock held across the
-            // resume's own `scheduled_at` shift can serialize against it.
-            if matches!(reason, TimeoutReason::ScheduleToStart)
-                && !schedule_to_start_still_expired(conn, task.id).await?
-            {
-                return Ok(None);
-            }
-            // Authoritative ACTIVITY-pause re-check, AFTER the blocking row
-            // acquisitions above (issue #807, round-17 review, P1).
+            // Authoritative ACTIVITY-pause re-check (issue #807), the
+            // per-activity-type sibling of the queue re-check above. Same
+            // staleness problem, same fix: the scan predicate is a non-locking
+            // snapshot, so a pause committing after the scan would otherwise let
+            // this transaction schedule-to-start-fail a task the hold protects.
             //
-            // The copy near the top of this transaction is a fast path only. Between
-            // it and here sits `lock_workflow_execution_row_and_load_history`, a
-            // `FOR UPDATE` that can block for an UNBOUNDED period behind any other
-            // transaction holding the execution row. `pause_activity` touches
-            // neither that row nor this task's, so an operator pause commits
-            // immediately during that wait and returns success -- and without this
-            // re-check the enforcer went on to append `ActivityTimedOut` and
-            // terminally fail the very task the acknowledged hold was placed to
-            // protect, seconds after the operator was told the brake had taken.
+            // No advisory lock (unlike the queue path). This copy is an
+            // ADVISORY FAST PATH: it lets a held task bail before paying for the
+            // execution row lock and history load below. It is NOT the
+            // guarantee -- the very next statement,
+            // `lock_workflow_execution_row_and_load_history`, can block for an
+            // UNBOUNDED period behind any other holder of that row, and
+            // `pause_activity` shares no row with this transaction so it commits
+            // freely during that wait (round-17 review, P1). The authoritative
+            // re-check therefore runs AFTER the row locks; see it below.
+            // Placed after the queue re-check so the two read coarse-to-fine,
+            // and before `schedule_to_start_still_expired_unlocked` so a held
+            // task short-circuits on the cheaper condition.
             //
-            // Why this is not the queue path's problem: `lock_queue_for_timeout_recheck`
-            // takes a shared advisory lock at the TOP of this transaction and holds
-            // it through COMMIT, so `pause_queue` cannot interleave at all. The
-            // activity path deliberately takes no advisory lock -- a new keyspace
-            // would impose a fleet-wide queue-before-activity ordering rule and an
-            // ABBA hazard on two paths that today take none -- so the equivalent
-            // guarantee is bought by re-reading after the last blocking acquisition
-            // instead. That is what makes the documented residual genuinely
-            // "bounded by this transaction's own remaining work": every statement
-            // from here to COMMIT touches only rows this transaction already holds.
-            //
-            // Cheap by construction: one indexed `EXISTS` on `harvest_activity_pauses`,
-            // and only on the `ScheduleToStart` path (`activity_pause_suppresses_timeout`
-            // is false for every other reason), which is the rarest of the four.
+            // Scoped by `task_type = 'activity'` to match the scan predicate
+            // exactly. A *workflow* task can carry a non-NULL `activity_name` —
+            // the engine stamps the `'mixed_signal_suspension'` sentinel there —
+            // so without this an activity paused under that name would suppress
+            // a workflow task's schedule-to-start timeout. That is unreachable
+            // today only because workflow tasks are enqueued with
+            // `schedule_to_start: None` and so never reach this scan; relying on
+            // that would leave the enforcer silently disagreeing with its own
+            // scan predicate the moment a workflow task gains one.
             if task.task_type == crate::activity_pause::ACTIVITY_TASK_TYPE
                 && let Some(activity_name) = task.activity_name.as_deref()
                 && crate::activity_pause::activity_pause_suppresses_timeout(
@@ -2162,341 +1076,150 @@ async fn enforce_activity_timeout(
                     crate::activity_pause::is_activity_paused(conn, activity_name).await?,
                 )
             {
-                return Ok(None);
+                return Ok(false);
             }
-            // Authoritative PAUSED re-check under the execution row lock
-            // (issue #609 post-review hardening, second bot-review round):
-            // the scan snapshot's PAUSED exclusions are non-locking, so a
-            // pause committing after the scan — or while this transaction
-            // waited on the lock `pause_workflow_execution` itself holds —
-            // must be honoured here or the timeout lands mid-pause. See
-            // `pause_suppresses_timeout_enforcement` for the per-reason
-            // scoping (schedule_to_close always; schedule_to_start only
-            // for a now-frozen row; heartbeat/start-to-close pause-blind).
-            if pause_suppresses_timeout_enforcement(
-                reason,
-                &execution.state,
-                locked.schedule_to_close_at,
-                Utc::now(),
-            ) {
-                return Ok(None);
-            }
-            // A late timeout must not change a sealed run (issue #1870). A
-            // workflow can end while its activity still runs. The timeout then
-            // fails the orphan task only. It appends no event and wakes nothing,
-            // as for a workflow task. A retry would run the handler again.
-            match task_timeout_disposition(&execution.state) {
-                TaskTimeoutDisposition::Enforce => {}
-                TaskTimeoutDisposition::FailTaskOnly => {
-                    queue::fail_task(conn, task.id, &error).await?;
-                    return Ok(None);
-                }
-                TaskTimeoutDisposition::Skip => return Ok(None),
-            }
-            // (The queue-pause re-check runs at the TOP of this transaction, before
-            // the row locks above — see the lock-ordering note there.)
-            let activity_id =
-                match pending_activity_id_for_task(&history.events, task, activity_name) {
-                    Ok(Some(activity_id)) => activity_id,
-                    Ok(None) => return Ok(None),
-                    Err(missing_error) => {
-                        let fallback = missing_error.to_string();
-                        queue::fail_task(conn, task.id, &fallback).await?;
-                        return Ok(None);
-                    }
-                };
-            let outcome = |retried, started_attempt| {
-                Some(ActivityTimeoutOutcome {
-                    retried,
-                    handler_started: locked.handler_started,
-                    scanned_claim: locked.scanned_claim,
-                    started_attempt,
-                    handler_elapsed_secs: locked.current_handler_elapsed_secs,
-                })
-            };
-            // Timeout retry (issue #1809, ADR 0005). A start-to-close or
-            // heartbeat timeout retries per the retry policy, as a handler
-            // failure does. The check above confirmed the scanned claim, and
-            // the requeue is fenced by it too. It appends no event: the
-            // workflow sees only the final outcome. It keeps `crash_strikes`,
-            // because a timeout does not prove that the attempt ended without
-            // a crash.
+            // A *completed* pause/resume cycle leaves nothing for either check
+            // above to suppress on, but resume has already credited the held
+            // time back into `scheduled_at`. Re-read the row-current deadline
+            // before trusting the scan snapshot, or a task is timed out the
+            // instant its deadline was extended. Covers both the queue (#619)
+            // and activity (#807) resume paths, which shift the same column.
             //
-            // No retry starts after `schedule_to_close`. A paused execution
-            // is the exception, because a pause stops that clock. Resume then
-            // shifts the deadline, as on the worker retry path.
-            if reason.retries_per_policy()
-                && let Some(delay) = crate::worker::timeout_retry_delay(task, &error)
-                && let Some(claim) = queue::TaskClaim::of(task)
-            {
-                let past_deadline = execution.state != "PAUSED"
-                    && crate::worker::deadline_would_be_exceeded(
-                        locked.schedule_to_close_at,
-                        queue::db_clock_now(conn).await?,
-                        delay,
-                    );
-                if !past_deadline {
-                    return Ok(
-                        match queue::requeue_claimed_task_after_timeout(
-                            conn,
-                            &claim,
-                            delay,
-                            &error,
-                            locked.crash_strikes,
-                        )
-                        .await?
-                        {
-                            queue::ClaimWrite::Applied => {
-                                let started_attempt =
-                                    task.started_at.filter(|_| locked.handler_started);
-                                record_timed_out_claim(
-                                    conn,
-                                    task.id,
-                                    task.attempt,
-                                    started_attempt,
-                                )
-                                .await?;
-                                outcome(true, started_attempt)
-                            }
-                            queue::ClaimWrite::LeaseLost => None,
-                        },
-                    );
-                }
+            // Unlocked here (round-22 review): locking the task row before the
+            // execution row below would invert the documented
+            // execution-row -> task-row order and deadlock against
+            // `resume_workflow_execution`. This is a fast path that skips the
+            // execution lock and history load for the common held-task case;
+            // the authoritative locked re-read runs after the row locks below.
+            if !schedule_to_start_still_expired_unlocked(conn, task.id).await? {
+                return Ok(false);
             }
-            let timeout_event = WorkflowEvent::ActivityTimedOut {
-                activity_id,
-                timeout_type: reason.timeout_type(),
-            };
-            store::append_events_with_codecs(
-                conn,
-                exec_id,
-                &[timeout_event],
-                history.next_event_id,
-                codecs,
-            )
-            .await?;
-            // A schedule-to-close timeout ends the claim that holds the row
-            // now, which can be later than the scanned one. Mark and record
-            // that claim. The row lock holds until commit, so its owner sees
-            // the loss only after the mark.
-            if !locked.scanned_claim
-                && let Some(started_at) = locked.current_started_claim
-            {
-                let current = crate::circuit_breaker::ClaimKey {
-                    task_id: task.id,
-                    attempt: locked.attempt,
-                    started_at: Some(started_at),
-                };
-                *current_mark
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(
-                    ProvisionalTimeoutMark::new(circuit_breakers, activity_name, current, metrics),
-                );
-            }
-            queue::fail_task(conn, task.id, &error).await?;
-            record_timed_out_claim(conn, task.id, locked.attempt, locked.current_started_claim)
-                .await?;
-            queue::wake_workflow_task(conn, exec_id).await?;
-            Ok(outcome(false, locked.current_started_claim))
-        }),
-    ))
-    .await;
-    // No timeout after all: the guard rolls the mark back as it drops, and a
-    // result held meanwhile counts now.
-    let Some(enforced) = enforced? else {
-        return Ok(());
-    };
-    // Circuit breaker (issues #369, #1809). A timeout against a protected
-    // downstream is a retryable, downstream-style failure. The handler-result
-    // path never sees it, because the worker may be gone. The confirm counts
-    // it out of band, so a hanging downstream trips the breaker as an
-    // explicit error does.
-    //
-    // Only an attempt whose handler started can say anything about the
-    // downstream. A task that waited after its claim made no call, and
-    // neither did a `PENDING` task that timed out in the queue. Counting
-    // them would let a backlog open the circuit and turn overload into
-    // failure (#1785). The confirm also fences a late result of this attempt.
-    //
-    // A schedule-to-close timeout can end a later claim than the scanned
-    // one. The scanned mark then rolls back, and the mark on the later claim
-    // counts its timeout here. An owner in this process waits for that
-    // confirm. An owner elsewhere counts the timeout from its record.
-    if enforced.scanned_claim {
-        provisional.confirm(enforced.handler_started);
-    } else {
-        drop(provisional);
-        if let Some(mut current) = current_mark
-            .into_inner()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+
+        let (execution, history) =
+            lock_workflow_execution_row_and_load_history(conn, exec_id).await?;
+        let Some((state, row_schedule_to_close_at)) =
+            task_state_and_deadline_for_update(conn, task.id).await?
+        else {
+            return Ok(false);
+        };
+        if !expected_task_states_for_timeout(reason).contains(&state.as_str()) {
+            return Ok(false);
+        }
+        // Authoritative `schedule_to_start` deadline re-read (round-18 review),
+        // now placed here — after the execution row lock above and while this
+        // transaction already holds the task row from
+        // `task_state_and_deadline_for_update` — so it preserves the
+        // execution-row -> task-row order (round-22 review). The unlocked
+        // fast-path check near the top of this transaction is advisory; this is
+        // the one that must be trusted, because only a lock held across the
+        // resume's own `scheduled_at` shift can serialize against it.
+        if matches!(reason, TimeoutReason::ScheduleToStart)
+            && !schedule_to_start_still_expired(conn, task.id).await?
         {
-            current.confirm(true);
+            return Ok(false);
         }
-    }
-    if enforced.retried {
-        metrics.record_activity_retried(activity_name, &task.queue_name);
-    }
-    // The timed-out attempt is a failed attempt (issue #1809). Its handler
-    // started, so it belongs in the success-rate denominator. A worker that
-    // later reports this attempt finds its record and does not count it.
+        // Authoritative ACTIVITY-pause re-check, AFTER the blocking row
+        // acquisitions above (issue #807, round-17 review, P1).
+        //
+        // The copy near the top of this transaction is a fast path only. Between
+        // it and here sits `lock_workflow_execution_row_and_load_history`, a
+        // `FOR UPDATE` that can block for an UNBOUNDED period behind any other
+        // transaction holding the execution row. `pause_activity` touches
+        // neither that row nor this task's, so an operator pause commits
+        // immediately during that wait and returns success -- and without this
+        // re-check the enforcer went on to append `ActivityTimedOut` and
+        // terminally fail the very task the acknowledged hold was placed to
+        // protect, seconds after the operator was told the brake had taken.
+        //
+        // Why this is not the queue path's problem: `lock_queue_for_timeout_recheck`
+        // takes a shared advisory lock at the TOP of this transaction and holds
+        // it through COMMIT, so `pause_queue` cannot interleave at all. The
+        // activity path deliberately takes no advisory lock -- a new keyspace
+        // would impose a fleet-wide queue-before-activity ordering rule and an
+        // ABBA hazard on two paths that today take none -- so the equivalent
+        // guarantee is bought by re-reading after the last blocking acquisition
+        // instead. That is what makes the documented residual genuinely
+        // "bounded by this transaction's own remaining work": every statement
+        // from here to COMMIT touches only rows this transaction already holds.
+        //
+        // Cheap by construction: one indexed `EXISTS` on `harvest_activity_pauses`,
+        // and only on the `ScheduleToStart` path (`activity_pause_suppresses_timeout`
+        // is false for every other reason), which is the rarest of the four.
+        if task.task_type == crate::activity_pause::ACTIVITY_TASK_TYPE
+            && let Some(activity_name) = task.activity_name.as_deref()
+            && crate::activity_pause::activity_pause_suppresses_timeout(
+                reason,
+                crate::activity_pause::is_activity_paused(conn, activity_name).await?,
+            )
+        {
+            return Ok(false);
+        }
+        // Authoritative PAUSED re-check under the execution row lock
+        // (issue #609 post-review hardening, second bot-review round):
+        // the scan snapshot's PAUSED exclusions are non-locking, so a
+        // pause committing after the scan — or while this transaction
+        // waited on the lock `pause_workflow_execution` itself holds —
+        // must be honoured here or the timeout lands mid-pause. See
+        // `pause_suppresses_timeout_enforcement` for the per-reason
+        // scoping (schedule_to_close always; schedule_to_start only
+        // for a now-frozen row; heartbeat/start-to-close pause-blind).
+        if pause_suppresses_timeout_enforcement(
+            reason,
+            &execution.state,
+            row_schedule_to_close_at,
+            Utc::now(),
+        ) {
+            return Ok(false);
+        }
+        // (The queue-pause re-check runs at the TOP of this transaction, before
+        // the row locks above — see the lock-ordering note there.)
+        let activity_id = match pending_activity_id_for_task(&history.events, task, activity_name) {
+            Ok(Some(activity_id)) => activity_id,
+            Ok(None) => return Ok(false),
+            Err(missing_error) => {
+                let fallback = missing_error.to_string();
+                queue::fail_task(conn, task.id, &fallback).await?;
+                return Ok(false);
+            }
+        };
+        let timeout_event = WorkflowEvent::ActivityTimedOut {
+            activity_id,
+            timeout_type: reason.timeout_type(),
+        };
+        store::append_events(conn, exec_id, &[timeout_event], history.next_event_id).await?;
+        queue::fail_task(conn, task.id, &error).await?;
+        queue::wake_workflow_task(conn, exec_id).await?;
+        Ok(true)
+    }))
+    .await?;
+
+    // Circuit breaker (issue #369): a start-to-close / heartbeat timeout against
+    // a protected downstream is a retryable, downstream-style failure that the
+    // handler-result path never sees (the worker may be gone). Record it
+    // out-of-band so a hanging downstream trips the breaker just like an
+    // explicit error would.
     //
-    // The duration counts from the handler start, as on the worker path. The
-    // wait between the claim and the handler start is local setup. The
-    // database clock wrote the start, so the same clock measures the run. A
-    // marker written without a start time falls back to the claim time.
-    if let Some(started_at) = enforced.started_attempt {
-        let (error_type, non_retryable, _) = crate::failure::parse_error_payload(&error);
-        let duration_secs = enforced.handler_elapsed_secs.map_or_else(
-            || {
-                (Utc::now() - started_at)
-                    .to_std()
-                    .unwrap_or_default()
-                    .as_secs_f64()
-            },
-            |elapsed| elapsed.max(0.0),
-        );
-        metrics.record_activity_completed_with_error_type(
-            activity_name,
-            &task.queue_name,
-            duration_secs,
-            crate::telemetry::ActivityStatus::Failed,
-            Some(&error_type),
-        );
-        metrics.record_activity_attempt(
-            activity_name,
-            &task.queue_name,
-            crate::telemetry::ActivityStatus::Failed,
-        );
-        metrics.record_activity_failed(activity_name, "", &error_type, non_retryable);
+    // ScheduleToClose on a PENDING task means the activity sat in the queue
+    // until its total deadline elapsed without any handler being dispatched.
+    // No downstream call was made, so the breaker must NOT be fed — a backlog
+    // spike would otherwise incorrectly open the circuit.
+    // ScheduleToStart: task sat in the queue until the schedule-to-start window
+    // expired without ever being dispatched — no downstream call was made.
+    // ScheduleToClose on a PENDING task: total deadline expired before dispatch.
+    // Neither case represents a downstream failure; suppress the breaker so a
+    // queue backlog does not incorrectly open the circuit.
+    let downstream_call_made = matches!(reason, TimeoutReason::ScheduleToStart)
+        || (matches!(reason, TimeoutReason::ScheduleToClose) && task.state == "PENDING");
+    if enforced
+        && !downstream_call_made
+        && let Some(breakers) = circuit_breakers
+        && breakers.on_external_failure(activity_name, std::time::Instant::now())
+            == Some(crate::circuit_breaker::CircuitTransition::Tripped)
+    {
+        metrics.record_circuit_tripped(activity_name);
     }
-
     Ok(())
-}
-
-/// Record the timed-out claim on its row (issue #1809). The worker that held
-/// it can then tell this timeout from any other loss of its claim.
-///
-/// The caller passes `started_at` only for a claim whose handler started.
-/// Any other timeout feeds no breaker, so its owner must not count it
-/// either. A `PENDING` task holds no claim and records nothing.
-async fn record_timed_out_claim(
-    conn: &mut AsyncPgConnection,
-    task_id: uuid::Uuid,
-    attempt: i32,
-    started_at: Option<chrono::DateTime<Utc>>,
-) -> HarvestResult<()> {
-    match started_at {
-        Some(started_at) => queue::record_timed_out_claim(conn, task_id, attempt, started_at).await,
-        None => Ok(()),
-    }
-}
-
-/// A provisional timeout mark on one claim (issue #1809).
-///
-/// [`confirm`](Self::confirm) settles it as a timeout. Any other exit,
-/// including a dropped enforcement future, rolls it back. A held result then
-/// counts as usual. Each settle records the breaker transition it causes.
-struct ProvisionalTimeoutMark<'a> {
-    breakers: Option<&'a crate::circuit_breaker::CircuitBreakerRegistry>,
-    activity_name: &'a str,
-    claim: crate::circuit_breaker::ClaimKey,
-    metrics: &'a (dyn MetricsRecorder + Send + Sync),
-}
-
-impl<'a> ProvisionalTimeoutMark<'a> {
-    fn new(
-        breakers: Option<&'a crate::circuit_breaker::CircuitBreakerRegistry>,
-        activity_name: &'a str,
-        claim: crate::circuit_breaker::ClaimKey,
-        metrics: &'a (dyn MetricsRecorder + Send + Sync),
-    ) -> Self {
-        if let Some(breakers) = breakers {
-            breakers.mark_claim_timed_out(activity_name, claim);
-        }
-        Self {
-            breakers,
-            activity_name,
-            claim,
-            metrics,
-        }
-    }
-
-    /// The enforcer timed the claim out. A timed-out probe re-opens the
-    /// breaker here, which releases its slot. The trip is recorded only when
-    /// the handler started, since `on_external_failure` skips a breaker that
-    /// is already open. An unstarted probe made no downstream call, so its
-    /// timeout is local congestion, not a failed probe.
-    fn confirm(&mut self, handler_started: bool) {
-        if let Some(breakers) = self.breakers.take() {
-            // Only a started handler counts against the downstream.
-            let transition = breakers.confirm_claim_timed_out(
-                self.activity_name,
-                self.claim,
-                handler_started,
-                std::time::Instant::now(),
-            );
-            if handler_started {
-                self.record(transition);
-            }
-        }
-    }
-
-    fn record(&self, transition: Option<crate::circuit_breaker::CircuitTransition>) {
-        match transition {
-            Some(crate::circuit_breaker::CircuitTransition::Tripped) => {
-                self.metrics.record_circuit_tripped(self.activity_name);
-            }
-            Some(crate::circuit_breaker::CircuitTransition::Closed) => {
-                self.metrics.record_circuit_closed(self.activity_name);
-            }
-            None => {}
-        }
-    }
-}
-
-impl Drop for ProvisionalTimeoutMark<'_> {
-    fn drop(&mut self) {
-        if let Some(breakers) = self.breakers.take() {
-            let transition = breakers.unmark_claim_timed_out(
-                self.activity_name,
-                self.claim,
-                std::time::Instant::now(),
-            );
-            self.record(transition);
-        }
-    }
-}
-
-/// Test seam for the activity timeout enforcer (issue #1809).
-///
-/// [`enforce_timeouts_once`] scans and enforces in one call, so a test cannot
-/// hand it a stale scan snapshot. This enforces `reason` for `task` as the
-/// scanner would.
-///
-/// # Errors
-///
-/// Returns the error of the enforcement transaction.
-#[doc(hidden)]
-pub async fn enforce_activity_timeout_for_test(
-    conn: &mut AsyncPgConnection,
-    task: &TaskQueueItem,
-    reason: &TimeoutReason,
-    circuit_breakers: Option<&crate::circuit_breaker::CircuitBreakerRegistry>,
-    codecs: &crate::payload_codec::PayloadCodecs,
-) -> HarvestResult<()> {
-    let exec_uuid = task.workflow_exec_id.ok_or_else(|| {
-        HarvestError::NotFound(format!("task queue item {} has no execution", task.id))
-    })?;
-    enforce_activity_timeout(
-        conn,
-        task,
-        ExecutionId::from_uuid(exec_uuid),
-        reason,
-        circuit_breakers,
-        &crate::telemetry::NoOpMetrics,
-        codecs,
-    )
-    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -2661,24 +1384,20 @@ pub async fn force_fail_activity(
     workflow_exec_id: uuid::Uuid,
     task_id: uuid::Uuid,
     reason: Option<&str>,
-
-    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<ForceFailActivityOutcome> {
     use crate::failure::IntoActivityErrorString;
     use crate::schema::harvest_task_queue::dsl;
 
-    let exec_id = ExecutionId::from_uuid(workflow_exec_id);
+    let exec_id = execution_id_from_uuid(workflow_exec_id);
     let reason = reason.map(str::to_owned);
 
-    // `wake_workflow_task` below raises a dispatch hint (issue #1429). The
-    // scope ties its publish to this transaction's commit.
-    crate::dispatch::buffered_settled(Box::pin(
+    Box::pin(
         conn.transaction::<ForceFailActivityOutcome, HarvestError, _>(async |conn| {
             // Lock ordering (harvest_task_queue convention, see the comment in
             // `enforce_external_task_timeouts`): execution row FIRST, then the
             // task row.
             let (execution, history) =
-                lock_workflow_execution_row_and_load_history(conn, exec_id, codecs).await?;
+                lock_workflow_execution_row_and_load_history(conn, exec_id).await?;
 
             let task: Option<TaskQueueItem> = dsl::harvest_task_queue
                 .filter(dsl::id.eq(task_id))
@@ -2817,14 +1536,7 @@ pub async fn force_fail_activity(
                 non_retryable: parsed.non_retryable,
                 details: parsed.details,
             };
-            store::append_events_with_codecs(
-                conn,
-                exec_id,
-                &[failed_event],
-                history.next_event_id,
-                codecs,
-            )
-            .await?;
+            store::append_events(conn, exec_id, &[failed_event], history.next_event_id).await?;
             queue::fail_task(conn, task.id, &envelope).await?;
             queue::wake_workflow_task(conn, exec_id).await?;
 
@@ -2836,194 +1548,139 @@ pub async fn force_fail_activity(
                 already_forced: false,
             })
         }),
-    ))
+    )
     .await
 }
 
-// issue #1197, item 1: threading `pending_cancel_metrics` out to the
-// post-commit emission point pushed this just over the 100-line clippy
-// threshold; the function's shape and control flow are otherwise unchanged.
-#[allow(clippy::too_many_lines)]
 async fn enforce_workflow_timeout(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
     exec_id: crate::types::ExecutionId,
     reason: &TimeoutReason,
     metrics: &(dyn MetricsRecorder + Send + Sync),
-
-    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     // Pinned `READ COMMITTED` for the same fresh-snapshot reason as
     // `enforce_activity_timeout` — see the note there (issue #619 round-24
     // review). Without it, a `repeatable read` session default lets this
     // enforcer time out the whole execution after a pause was acknowledged.
     let mut tx = conn.build_transaction().read_committed();
-    // `wake_parent_for_child_timeout` below raises a dispatch hint (issue
-    // #1429). The scope ties its publish to this transaction's commit.
-    //
-    // `enforce_timeouts_once_on_conn_shard` calls this once per timed-out
-    // workflow task in its own sweep loop, the same reason
-    // `enforce_activity_timeout` above switched (Codex review, issue
-    // #1429).
-    let enforced = crate::dispatch::buffered_settled_in_background(Box::pin(
-        tx.run::<_, HarvestError, _>(async |conn| {
-            // Authoritative QUEUE-pause re-check (issue #619), the exact mirror of
-            // the one in `enforce_activity_timeout` — see that function for the full
-            // rationale on why an advisory lock (not a bare re-read) is required and
-            // why the lock must be taken BEFORE any row is touched.
-            //
-            // This path needs it for the same reason: `find_timed_out_tasks` does
-            // not filter on `task_type`, so a PENDING **workflow** task carrying
-            // `schedule_to_start` reaches here exactly as an activity task does, and
-            // the scan's queue-pause carve-out is only a non-locking snapshot. A
-            // pause committing after that snapshot would otherwise let this
-            // transaction append `WorkflowFailed` and seal the whole execution
-            // `TIMED_OUT` — strictly worse than the activity case, which fails one
-            // task, and precisely the outcome AC3/AC4 forbid.
-            //
-            // Bailing here also skips the execution/history loads below, so the
-            // advisory-lock wait cannot widen the window between reading
-            // `history.next_event_id` and appending at it (those loads used to sit
-            // outside this transaction; they are inside it now for that reason).
-            //
-            // Returning `None` — rather than proceeding with no writes — is
-            // load-bearing beyond the appends: it also skips
-            // `maybe_increment_schedule_failure_counter` below, so a deliberately
-            // held task can never count toward the schedule auto-pause threshold
-            // (issue #360). A hold is not a schedule failure.
-            if matches!(reason, TimeoutReason::ScheduleToStart) {
-                // Shared mode, exactly as in `enforce_activity_timeout` — and it
-                // matters more here, because this transaction holds the lock across
-                // `append_events`, the parent-close cascade and trigger evaluation,
-                // so an exclusive lock would stall dispatch on an unpaused queue for
-                // that entire span. See `lock_queue_for_timeout_recheck`.
-                crate::queue_pause::lock_queue_for_timeout_recheck(conn, &task.queue_name).await?;
-                if crate::queue_pause::queue_pause_suppresses_timeout(
-                    reason,
-                    crate::queue_pause::is_queue_paused(conn, &task.queue_name).await?,
-                ) {
-                    return Ok(None);
-                }
-                // Same stale-scan guard as the activity path, and it matters more
-                // here: this path seals the whole execution `TIMED_OUT` rather than
-                // failing one task, so acting on a deadline a completed resume has
-                // already credited forward destroys the run the hold was protecting.
-                //
-                // Unlocked fast path, for the same lock-ordering reason as the
-                // activity path (round-22 review); the authoritative locked re-read
-                // runs below, once the execution row is held.
-                if !schedule_to_start_still_expired_unlocked(conn, task.id).await? {
-                    return Ok(None);
-                }
-            }
-
-            // Lock the execution row BEFORE any task row (round-22 review). This
-            // path used to read the execution unlocked and only take the row lock
-            // implicitly, inside `store::append_events` below — which left the
-            // locked `schedule_to_start` re-read above it, inverting the documented
-            // execution-row -> task-row order. Locking here also loads the history
-            // in the same call, replacing a separate `store::load_history`.
-            let (execution, history) =
-                lock_workflow_execution_row_and_load_history(conn, exec_id, codecs).await?;
-            // Authoritative deadline re-read, now correctly ordered after the
-            // execution lock. See the activity path for why the unlocked check
-            // above cannot be trusted on its own.
-            if matches!(reason, TimeoutReason::ScheduleToStart)
-                && !schedule_to_start_still_expired(conn, task.id).await?
-            {
+    let enforced = Box::pin(tx.run::<_, HarvestError, _>(async |conn| {
+        // Authoritative QUEUE-pause re-check (issue #619), the exact mirror of
+        // the one in `enforce_activity_timeout` — see that function for the full
+        // rationale on why an advisory lock (not a bare re-read) is required and
+        // why the lock must be taken BEFORE any row is touched.
+        //
+        // This path needs it for the same reason: `find_timed_out_tasks` does
+        // not filter on `task_type`, so a PENDING **workflow** task carrying
+        // `schedule_to_start` reaches here exactly as an activity task does, and
+        // the scan's queue-pause carve-out is only a non-locking snapshot. A
+        // pause committing after that snapshot would otherwise let this
+        // transaction append `WorkflowFailed` and seal the whole execution
+        // `TIMED_OUT` — strictly worse than the activity case, which fails one
+        // task, and precisely the outcome AC3/AC4 forbid.
+        //
+        // Bailing here also skips the execution/history loads below, so the
+        // advisory-lock wait cannot widen the window between reading
+        // `history.next_event_id` and appending at it (those loads used to sit
+        // outside this transaction; they are inside it now for that reason).
+        //
+        // Returning `None` — rather than proceeding with no writes — is
+        // load-bearing beyond the appends: it also skips
+        // `maybe_increment_schedule_failure_counter` below, so a deliberately
+        // held task can never count toward the schedule auto-pause threshold
+        // (issue #360). A hold is not a schedule failure.
+        if matches!(reason, TimeoutReason::ScheduleToStart) {
+            // Shared mode, exactly as in `enforce_activity_timeout` — and it
+            // matters more here, because this transaction holds the lock across
+            // `append_events`, the parent-close cascade and trigger evaluation,
+            // so an exclusive lock would stall dispatch on an unpaused queue for
+            // that entire span. See `lock_queue_for_timeout_recheck`.
+            crate::queue_pause::lock_queue_for_timeout_recheck(conn, &task.queue_name).await?;
+            if crate::queue_pause::queue_pause_suppresses_timeout(
+                reason,
+                crate::queue_pause::is_queue_paused(conn, &task.queue_name).await?,
+            ) {
                 return Ok(None);
             }
-            let error = timeout_error(&execution.workflow_name, reason);
-            // The task scan filters on task state only. So the owning execution
-            // can already be sealed, or can be a staged shard copy. A workflow
-            // task timeout seals only an open run: `RUNNING` or `PAUSED`.
-            match task_timeout_disposition(&execution.state) {
-                TaskTimeoutDisposition::Enforce => {}
-                TaskTimeoutDisposition::FailTaskOnly => {
-                    // The run is already sealed. Close the orphan task so the
-                    // scan stops finding it, and keep the recorded outcome.
-                    queue::fail_task(conn, task.id, &error).await?;
-                    return Ok(None);
-                }
-                TaskTimeoutDisposition::Skip => return Ok(None),
+            // Same stale-scan guard as the activity path, and it matters more
+            // here: this path seals the whole execution `TIMED_OUT` rather than
+            // failing one task, so acting on a deadline a completed resume has
+            // already credited forward destroys the run the hold was protecting.
+            //
+            // Unlocked fast path, for the same lock-ordering reason as the
+            // activity path (round-22 review); the authoritative locked re-read
+            // runs below, once the execution row is held.
+            if !schedule_to_start_still_expired_unlocked(conn, task.id).await? {
+                return Ok(None);
             }
-            // The engine-reserved type keeps the timeout readable after a
-            // start-replace seals this row `CONTINUED_AS_NEW`.
-            let workflow_event = WorkflowEvent::WorkflowFailed {
-                error: error.clone(),
-                error_type: Some(crate::failure::ERROR_TYPE_WORKFLOW_TASK_TIMED_OUT.to_string()),
-                details: None,
-                non_retryable: None,
-            };
+        }
 
-            store::append_events_with_codecs(
+        // Lock the execution row BEFORE any task row (round-22 review). This
+        // path used to read the execution unlocked and only take the row lock
+        // implicitly, inside `store::append_events` below — which left the
+        // locked `schedule_to_start` re-read above it, inverting the documented
+        // execution-row -> task-row order. Locking here also loads the history
+        // in the same call, replacing a separate `store::load_history`.
+        let (execution, history) =
+            lock_workflow_execution_row_and_load_history(conn, exec_id).await?;
+        // Authoritative deadline re-read, now correctly ordered after the
+        // execution lock. See the activity path for why the unlocked check
+        // above cannot be trusted on its own.
+        if matches!(reason, TimeoutReason::ScheduleToStart)
+            && !schedule_to_start_still_expired(conn, task.id).await?
+        {
+            return Ok(None);
+        }
+        let error = timeout_error(&execution.workflow_name, reason);
+        let workflow_event = WorkflowEvent::workflow_failed(error.clone());
+
+        store::append_events(conn, exec_id, &[workflow_event], history.next_event_id).await?;
+        update_workflow_execution_timed_out(conn, exec_id, &error).await?;
+        queue::fail_task(conn, task.id, &error).await?;
+        let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
+        let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+            conn,
+            exec_id,
+            crate::completion_trigger::TerminalState::TimedOut,
+            Some(metrics),
+        )
+        .await?;
+        deferred.extend(triggers);
+        if execution.parent_close_policy.is_none()
+            && let Some(parent_uuid) = execution.parent_id
+        {
+            wake_parent_for_child_timeout(
                 conn,
+                execution_id_from_uuid(parent_uuid),
                 exec_id,
-                &[workflow_event],
-                history.next_event_id,
-                codecs,
+                &error,
             )
             .await?;
-            update_workflow_execution_timed_out(conn, exec_id, &error).await?;
-            queue::fail_task(conn, task.id, &error).await?;
-            let (mut deferred, closed_children) =
-                apply_parent_close_cascade(conn, exec_id, codecs).await?;
-            let mut pending_cancel_metrics = Vec::new();
-            let triggers =
-                crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
-                    conn,
-                    exec_id,
-                    crate::completion_trigger::TerminalState::TimedOut,
-                    Some(metrics),
-                    &mut pending_cancel_metrics,
-                    codecs,
-                )
-                .await?;
-            deferred.extend(triggers);
-            if execution.parent_close_policy.is_none()
-                && let Some(parent_uuid) = execution.parent_id
-            {
-                wake_parent_for_child_timeout(
-                    conn,
-                    ExecutionId::from_uuid(parent_uuid),
-                    exec_id,
-                    &error,
-                )
-                .await?;
-            }
-            Ok(Some((
-                execution,
-                deferred,
-                closed_children,
-                pending_cancel_metrics,
-            )))
-        }),
-    ))
+        }
+        Ok(Some((execution, deferred, closed_children)))
+    }))
     .await?;
 
     // Suppressed by a queue pause: nothing was written, so there is nothing to
     // cascade, no handler check to run, and no schedule failure to count.
-    let Some((execution, deferred_starts, closed_children, pending_cancel_metrics)) = enforced
-    else {
+    let Some((execution, deferred_starts, closed_children)) = enforced else {
         return Ok(());
     };
-
-    // issue #1197, item 1: emitted only now that this transaction has
-    // actually committed.
-    crate::execution::emit_start_cancel_metrics(metrics, &pending_cancel_metrics);
 
     for start in deferred_starts {
         start.spawn();
     }
 
-    if let Err(e) =
-        check_and_report_unfinished_handlers_batch(conn, &closed_children, Some(metrics)).await
-    {
-        tracing::error!(
-            child_count = closed_children.len(),
-            err = %e,
-            "Failed to check and report unfinished handlers on cascaded children in workflow timeout"
-        );
+    for (child_id, child_name) in closed_children {
+        if let Err(e) =
+            check_and_report_unfinished_handlers(conn, child_id, &child_name, Some(metrics)).await
+        {
+            tracing::error!(
+                child_id = %child_id,
+                err = %e,
+                "Failed to check and report unfinished handlers on cascaded child in workflow timeout"
+            );
+        }
     }
 
     if let Err(e) =
@@ -3112,7 +1769,7 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
     let mut count = 0usize;
 
     for task in &expired {
-        let exec_id = ExecutionId::from_uuid(task.workflow_exec_id);
+        let exec_id = execution_id_from_uuid(task.workflow_exec_id);
         let exec_uuid = task.workflow_exec_id;
         let activity_id = ActivityExecId::from_uuid(task.activity_id);
         let task_id = task.id;
@@ -3122,124 +1779,111 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
             timeout_type: TimeoutType::ScheduleToClose,
         };
 
-        // `wake_workflow_task` below raises a dispatch hint (issue #1429).
-        // This scanner claims one row per loop iteration, the same shape as
-        // the three outbox sweeps `buffered_settled_in_background` already
-        // covers. An inline `buffered_settled` awaits the dispatch
-        // channel's publish call after every commit. That can cost up to
-        // `DISPATCH_CALL_TIMEOUT` per row when the channel is slow (Codex
-        // review, issue #1429). Postgres already committed by then.
-        // Reconciliation is the durability fallback regardless, so
-        // `buffered_settled_in_background` hands the hint to the existing
-        // non-blocking background publisher instead of awaiting it inline.
-        let result = crate::dispatch::buffered_settled_in_background(Box::pin(
-            conn.transaction::<bool, HarvestError, _>(async |conn| {
-                // Per-table lock-ordering convention (issue #609
-                // post-review hardening, third bot-review round):
-                //
-                //   harvest_external_tasks: task row → execution row
-                //   harvest_task_queue:     execution row → task row
-                //
-                // The external-task completion paths (`external_task.rs`'s
-                // `complete_externally`/`fail_externally`/`extend_deadline`)
-                // lock the task row first via `lock_task`, then lock the
-                // execution row inside `store::append_single_event` — so
-                // this scanner MUST lock the task row first too. An
-                // earlier revision took the execution row lock first,
-                // which was an ABBA inversion against a concurrent
-                // completion: Postgres deadlock-detects and aborts one of
-                // the two transactions, surfacing spurious errors to
-                // valid external-completion callers. (The task-queue
-                // enforcers — `enforce_activity_timeout`,
-                // `worker::record_schedule_to_close_activity_timeout` —
-                // follow the *opposite*, execution-first convention for
-                // `harvest_task_queue` rows; that is safe because no
-                // task-queue writer locks the task row and then the
-                // execution row, e.g. `queue::requeue_for_retry` touches
-                // only the task row. The one external-task writer that
-                // must run execution-first — resume's pause-span shift,
-                // `execution::shift_external_schedule_to_close_on_resume_query`,
-                // which lives inside the execution-locked resume
-                // transaction — uses `FOR UPDATE SKIP LOCKED` so it never
-                // waits on a task row and cannot join a lock cycle.)
-                //
-                // The locked re-read below replaces trusting the scan
-                // snapshot (the pre-fix code re-verified it via filters
-                // on the claiming UPDATE instead).
-                let locked_row: Option<(String, chrono::DateTime<Utc>)> =
-                    harvest_external_tasks::table
-                        .find(task_id)
-                        .for_update()
-                        .select((
-                            harvest_external_tasks::state,
-                            harvest_external_tasks::schedule_to_close_at,
-                        ))
-                        .first(conn)
-                        .await
-                        .optional()
-                        .map_err(crate::error::database_error)?;
-                let Some((task_state, deadline)) = locked_row else {
-                    // Row vanished after the scan (e.g. retention
-                    // cascade-deleted the owning execution): skip.
-                    return Ok(false);
-                };
-                // Guard against two races the scan snapshot cannot see:
-                // 1. complete/fail landed after our scan → state != PENDING
-                // 2. heartbeat (or a resume's pause-span shift, issue
-                //    #609) extended the deadline after our scan →
-                //    schedule_to_close_at is now in the future
-                // Either way: skip — no flip, no event, not counted.
-                if !external_task_timeout_still_due(&task_state, deadline, Utc::now()) {
-                    return Ok(false);
-                }
+        let result = Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
+            // Per-table lock-ordering convention (issue #609
+            // post-review hardening, third bot-review round):
+            //
+            //   harvest_external_tasks: task row → execution row
+            //   harvest_task_queue:     execution row → task row
+            //
+            // The external-task completion paths (`external_task.rs`'s
+            // `complete_externally`/`fail_externally`/`extend_deadline`)
+            // lock the task row first via `lock_task`, then lock the
+            // execution row inside `store::append_single_event` — so
+            // this scanner MUST lock the task row first too. An
+            // earlier revision took the execution row lock first,
+            // which was an ABBA inversion against a concurrent
+            // completion: Postgres deadlock-detects and aborts one of
+            // the two transactions, surfacing spurious errors to
+            // valid external-completion callers. (The task-queue
+            // enforcers — `enforce_activity_timeout`,
+            // `worker::record_schedule_to_close_activity_timeout` —
+            // follow the *opposite*, execution-first convention for
+            // `harvest_task_queue` rows; that is safe because no
+            // task-queue writer locks the task row and then the
+            // execution row, e.g. `queue::requeue_for_retry` touches
+            // only the task row. The one external-task writer that
+            // must run execution-first — resume's pause-span shift,
+            // `execution::shift_external_schedule_to_close_on_resume_query`,
+            // which lives inside the execution-locked resume
+            // transaction — uses `FOR UPDATE SKIP LOCKED` so it never
+            // waits on a task row and cannot join a lock cycle.)
+            //
+            // The locked re-read below replaces trusting the scan
+            // snapshot (the pre-fix code re-verified it via filters
+            // on the claiming UPDATE instead).
+            let locked_row: Option<(String, chrono::DateTime<Utc>)> = harvest_external_tasks::table
+                .find(task_id)
+                .for_update()
+                .select((
+                    harvest_external_tasks::state,
+                    harvest_external_tasks::schedule_to_close_at,
+                ))
+                .first(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?;
+            let Some((task_state, deadline)) = locked_row else {
+                // Row vanished after the scan (e.g. retention
+                // cascade-deleted the owning execution): skip.
+                return Ok(false);
+            };
+            // Guard against two races the scan snapshot cannot see:
+            // 1. complete/fail landed after our scan → state != PENDING
+            // 2. heartbeat (or a resume's pause-span shift, issue
+            //    #609) extended the deadline after our scan →
+            //    schedule_to_close_at is now in the future
+            // Either way: skip — no flip, no event, not counted.
+            if !external_task_timeout_still_due(&task_state, deadline, Utc::now()) {
+                return Ok(false);
+            }
 
-                // THEN the execution row lock — the same lock
-                // `pause_workflow_execution`/`resume_workflow_execution`
-                // hold — so the PAUSED re-check, the external-task state
-                // flip, and the event append below all serialize with the
-                // pause path (issue #609 post-review hardening, second
-                // bot-review round): the pause-suppression guarantee is
-                // unchanged by the task-first reordering. A vanished
-                // execution row (None) proceeds and surfaces as
-                // `append_single_event`'s NotFound, matching the
-                // pre-existing behaviour.
-                let execution_state: Option<String> = harvest_workflow_executions::table
-                    .find(exec_uuid)
-                    .for_update()
-                    .select(harvest_workflow_executions::state)
-                    .first(conn)
-                    .await
-                    .optional()
-                    .map_err(crate::error::database_error)?;
-                if execution_state.as_deref().is_some_and(|state| {
-                    pause_suppresses_timeout_enforcement(
-                        &TimeoutReason::ScheduleToClose,
-                        state,
-                        None,
-                        Utc::now(),
-                    )
-                }) {
-                    // Pause won the race: leave the row PENDING and
-                    // untouched — the resume-time deadline shift covers it.
-                    return Ok(false);
-                }
+            // THEN the execution row lock — the same lock
+            // `pause_workflow_execution`/`resume_workflow_execution`
+            // hold — so the PAUSED re-check, the external-task state
+            // flip, and the event append below all serialize with the
+            // pause path (issue #609 post-review hardening, second
+            // bot-review round): the pause-suppression guarantee is
+            // unchanged by the task-first reordering. A vanished
+            // execution row (None) proceeds and surfaces as
+            // `append_single_event`'s NotFound, matching the
+            // pre-existing behaviour.
+            let execution_state: Option<String> = harvest_workflow_executions::table
+                .find(exec_uuid)
+                .for_update()
+                .select(harvest_workflow_executions::state)
+                .first(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?;
+            if execution_state.as_deref().is_some_and(|state| {
+                pause_suppresses_timeout_enforcement(
+                    &TimeoutReason::ScheduleToClose,
+                    state,
+                    None,
+                    Utc::now(),
+                )
+            }) {
+                // Pause won the race: leave the row PENDING and
+                // untouched — the resume-time deadline shift covers it.
+                return Ok(false);
+            }
 
-                // The task row is locked and verified above, so a plain
-                // flip suffices — no re-filters needed.
-                diesel::update(harvest_external_tasks::table.find(task_id))
-                    .set((
-                        harvest_external_tasks::state.eq("TIMED_OUT"),
-                        harvest_external_tasks::updated_at.eq(Utc::now()),
-                    ))
-                    .execute(conn)
-                    .await
-                    .map_err(crate::error::database_error)?;
+            // The task row is locked and verified above, so a plain
+            // flip suffices — no re-filters needed.
+            diesel::update(harvest_external_tasks::table.find(task_id))
+                .set((
+                    harvest_external_tasks::state.eq("TIMED_OUT"),
+                    harvest_external_tasks::updated_at.eq(Utc::now()),
+                ))
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
 
-                store::append_single_event(conn, exec_id, timeout_event).await?;
-                queue::wake_workflow_task(conn, exec_id).await?;
-                Ok(true)
-            }),
-        ))
+            store::append_single_event(conn, exec_id, timeout_event).await?;
+            queue::wake_workflow_task(conn, exec_id).await?;
+            Ok(true)
+        }))
         .await;
 
         match result {
@@ -3302,16 +1946,12 @@ pub async fn enforce_workflow_execution_timeouts(
     let count = expired.len();
 
     for execution in &expired {
-        let exec_id = ExecutionId::from_uuid(execution.id);
+        let exec_id = execution_id_from_uuid(execution.id);
         // Chain deadline takes precedence when both fired (issue #617). A
-        // chain-only expiry has no per-run `deadline_at`.
-        let Some((deadline, timeout_kind)) =
-            classify_workflow_timeout(execution.deadline_at, execution.chain_deadline_at, now)
-        else {
-            // The scan filter makes this unreachable. Skip the row, not the pass.
-            tracing::warn!(exec_id = %exec_id, "timed-out row has no fired deadline; skipping");
-            continue;
-        };
+        // chain-only expiry has no per-run `deadline_at`, so classification must
+        // not `.expect()` `deadline_at`.
+        let (deadline, timeout_kind) =
+            classify_workflow_timeout(execution.deadline_at, execution.chain_deadline_at, now);
         let timed_out_at = Utc::now();
 
         let timeout_event = WorkflowEvent::WorkflowExecutionTimedOut {
@@ -3347,48 +1987,43 @@ pub async fn enforce_workflow_execution_timeouts(
         )
         .await;
 
-        let (timed_out_applied, deferred_starts, closed_children, pending_cancel_metrics) =
-            match result {
-                Ok((applied, deferred, closed, cancel_metrics)) => {
-                    (applied, deferred, closed, cancel_metrics)
-                }
-                Err(error) => {
-                    tracing::error!(
-                        exec_id = %exec_id,
-                        workflow_name = %workflow_name,
-                        error = %error,
-                        "failed to enforce workflow execution timeout"
-                    );
-                    return Err(error);
-                }
-            };
+        let (timed_out_applied, deferred_starts, closed_children) = match result {
+            Ok((applied, deferred, closed)) => (applied, deferred, closed),
+            Err(error) => {
+                tracing::error!(
+                    exec_id = %exec_id,
+                    workflow_name = %workflow_name,
+                    error = %error,
+                    "failed to enforce workflow execution timeout"
+                );
+                return Err(error);
+            }
+        };
 
         if !timed_out_applied {
             // Row was already non-RUNNING; nothing to do.
             continue;
         }
 
-        // issue #1197, item 1: emitted only now that
-        // `commit_workflow_execution_timeout`'s transaction has actually
-        // committed (`timed_out_applied` is true).
-        crate::execution::emit_start_cancel_metrics(metrics, &pending_cancel_metrics);
-
         for start in deferred_starts {
             start.spawn();
         }
 
-        if let Err(e) = crate::execution::check_and_report_unfinished_handlers_batch(
-            conn,
-            &closed_children,
-            Some(metrics),
-        )
-        .await
-        {
-            tracing::error!(
-                child_count = closed_children.len(),
-                err = %e,
-                "Failed to check and report unfinished handlers on cascaded children in timeout"
-            );
+        for (child_id, child_name) in closed_children {
+            if let Err(e) = crate::execution::check_and_report_unfinished_handlers(
+                conn,
+                child_id,
+                &child_name,
+                Some(metrics),
+            )
+            .await
+            {
+                tracing::error!(
+                    child_id = %child_id,
+                    err = %e,
+                    "Failed to check and report unfinished handlers on cascaded child in timeout"
+                );
+            }
         }
 
         if let Err(e) = crate::execution::check_and_report_unfinished_handlers(
@@ -3541,512 +2176,6 @@ pub async fn enforce_workflow_sla_breaches(
     Ok(count)
 }
 
-/// Where an outbox delivery attempt for one external target should run
-/// (issue #1146).
-///
-/// Produced by [`resolve_delivery_route`], which is the single place the
-/// engine decides which database owns an [`ExternalTarget`].
-#[derive(Debug)]
-enum DeliveryRoute {
-    /// Deliver on the caller's own connection — the target lives in the same
-    /// database the sweep is already running against.
-    Caller {
-        /// See [`DeliveryRoute::CrossShard::expected_live`].
-        expected_live: bool,
-        /// See [`DeliveryRoute::CrossShard::may_assert_key_state`].
-        may_assert_key_state: bool,
-        /// See [`DeliveryRoute::CrossShard::reverify_after_cancel`].
-        reverify_after_cancel: bool,
-    },
-    /// Deliver on a fresh connection from `shard`'s pool.
-    CrossShard {
-        /// The shard whose database holds the resolved run.
-        shard: crate::types::ShardId,
-        /// The cross-shard resolution found a **live** run on `shard`
-        /// (issue #1146, Codex round 1 P2).
-        ///
-        /// The delivery attempt re-resolves shard-locally on `shard` — which it
-        /// must, to catch a continue-as-new that lands between resolution and
-        /// delivery (issue #751). But a *shard-local* re-read cannot see the
-        /// key move shards: if the live run on `shard` terminates and a new run
-        /// of the same key starts on another shard in that window — reachable
-        /// after writable-set drift or a placement change — the re-read sees
-        /// only the old terminal run. Recording its verdict would durably fail
-        /// the signal `not_running`, or report a cancel as a no-op success,
-        /// against a run that is alive elsewhere.
-        ///
-        /// So when this is `true` and the shard-local read comes back
-        /// terminal-or-absent, the two views disagree and the delivery is left
-        /// **pending** instead: the next sweep re-resolves globally and finds
-        /// wherever the key went. This terminates — once the key really is
-        /// terminal everywhere, the global winner is terminal, this is `false`,
-        /// and the shard-local verdict is recorded as before.
-        ///
-        /// `false` whenever no global resolution ran: `ExecutionId` targets,
-        /// and the single-shard short-circuit (where "another shard" does not
-        /// exist). Both then behave exactly as they did pre-#1146.
-        expected_live: bool,
-        /// May a terminal event assert something about the **whole business
-        /// key** from this resolution (issue #1146, Codex rounds 2 and 3)?
-        ///
-        /// `false` in the two cases that leave a live run of the key outside the
-        /// answer: a shard that could not be inspected and **may** hold one, and
-        /// a shard that was inspected and **does** hold one besides the winner
-        /// (possible because `(workflow_name, workflow_id)` uniqueness is
-        /// shard-local — pin a key to one shard while an unpinned start of it
-        /// hashes to another).
-        ///
-        /// A signal is unaffected: it reports a *delivery*, and a live run in
-        /// hand is a real recipient. Re-delivery is also not idempotent without
-        /// an idempotency key, so staying pending would duplicate it.
-        ///
-        /// A cancel still **cancels** — that is idempotent progress — but must
-        /// not record `ExternalCancelDelivered`, which claims nothing is running
-        /// under the key. It stays pending, and converges: each sweep cancels a
-        /// live copy, until an unambiguous answer can make the claim.
-        ///
-        /// `true` whenever no global resolution ran — `ExecutionId` targets and
-        /// the single-shard short-circuit — since neither case can arise.
-        may_assert_key_state: bool,
-        /// This resolution came from a **cross-shard fan-out**, so a cancel
-        /// that ends a live run must not report from it (issue #1313).
-        ///
-        /// The fan-out reads each shard on its own connection to its own
-        /// database. Postgres offers no cross-shard transaction and this engine
-        /// adds no coordinator, so the reads share no snapshot. A run of the key
-        /// can start on a shard after that shard answered and before the merge
-        /// completes. `may_assert_key_state` cannot see that run: every shard
-        /// answered, and the selected run is live, so nothing disagrees.
-        ///
-        /// The gap only matters once the cancel changes the key's state.
-        /// Cancelling the run it found makes that run terminal. The run that
-        /// started during the fan-out then becomes the current run for the key,
-        /// and `ExternalCancelDelivered` claims that nothing runs under the key.
-        /// So the assertion is withheld and made by a LATER fan-out, which
-        /// observes the whole window this one ran in. The cancel itself stands,
-        /// exactly as it does for the other two withholding cases.
-        ///
-        /// A cancel that finds the goal already met changes nothing, so it
-        /// reports at once. `false` whenever no fan-out ran: `ExecutionId`
-        /// targets and the single-shard short-circuit.
-        reverify_after_cancel: bool,
-    },
-    /// Every expected shard was inspected and none holds a run for this
-    /// business key. The caller applies its not-found policy (leave pending
-    /// inside the grace window, `target_unknown` once it elapses).
-    NoRunAnywhere,
-    /// Nothing can be concluded this sweep: leave the row pending and retry.
-    Retry {
-        /// Operator-facing explanation for the log line.
-        reason: String,
-        /// The shard(s) responsible, structured for metrics (issue #1307).
-        ///
-        /// Mirrors [`crate::external_target_location::TargetLocation::Indeterminate`]'s
-        /// list when this came from an incomplete fan-out. When it came from
-        /// the target shard's pool being unconfigured instead, this is a
-        /// single synthetic entry naming that shard with
-        /// [`crate::external_target_location::UninspectedReasonKind::NoPool`].
-        /// Both are "why is this row stuck" instances the same counter cares
-        /// about.
-        uninspected: Vec<crate::external_target_location::UninspectedShard>,
-    },
-    /// A keyed signal already landed on some shard for this business key,
-    /// found while resolving the target's location (issue #1318). No
-    /// delivery attempt runs; the caller records `ExternalSignalDelivered`
-    /// directly.
-    ///
-    /// Never produced for a cancel. Cancel carries no idempotency key, so
-    /// `resolve_delivery_route`'s `idempotency_key` argument is always
-    /// `None` on that path, and this variant requires `Some`.
-    AlreadyDelivered,
-}
-
-/// Resolve which database an outbox delivery to `target` must run against
-/// (issue #1146).
-///
-/// Shared by the signal and cancel outbox sweeps, which previously each
-/// carried their own copy of this decision.
-///
-/// * An [`ExternalTarget::ExecutionId`] is O(1) and authoritative: the shard is
-///   encoded in the id itself. Unchanged from issue #751.
-/// * An [`ExternalTarget::WorkflowId`] is resolved by **observation** —
-///   [`crate::external_target_location::resolve_location_by_workflow_id`]
-///   fans out across every expected shard and merges the answers — rather than
-///   by re-deriving the rendezvous hash a fresh start would use. The hash is a
-///   prediction of where *new* work would be placed and is wrong for a workflow
-///   pinned by an explicit [`crate::shard::ShardPlacement`] (issue #697) or one
-///   left behind by a change to `writable_shards`; both cases previously
-///   resolved to a shard the target does not live on and failed the request
-///   `target_unknown` while it was running.
-///
-/// # Connection budget
-///
-/// `conn` is the connection the sweep already holds, checked out of the
-/// caller's own shard pool, with an open transaction and a `FOR UPDATE` lock on
-/// the outbox row. A pool may have no deadpool `Timeouts`. Then a bare
-/// `pool.get()` from that same pool is an unbounded wait. It can park the
-/// whole timeout checker. That is the hazard `codec_rotation.rs` and
-/// `audit_export.rs` were both fixed for. Three things prevent it:
-///
-/// * A deployment expecting **one** shard short-circuits here with no fan-out
-///   at all, so the single-shard default is exactly what it was pre-#1146.
-/// * The caller's own shard is probed on `conn` itself, never re-acquired.
-/// * Every other acquisition is bounded, and a shard that fails becomes
-///   `Indeterminate` (retry), memoized in `uninspectable` so a backlog pays the
-///   bound once per shard per sweep rather than once per row.
-///
-/// The delivery attempt then re-resolves under the connection it actually
-/// delivers on, so a run that moves between resolution and delivery — a
-/// continue-as-new, say — is caught there rather than here.
-///
-/// With no sharded pool configured at all there is one database by definition,
-/// so the route is always the caller's own connection.
-/// Where the run behind an `ExecutionId` currently lives.
-///
-/// An id names the shard a run ORIGINATED on, which stopped being where it
-/// lives once a rebalance could move it (issue #964). The `WorkflowId` route
-/// resolves residence by observation, fanning out across shards; an id gets the
-/// cheaper equivalent — the durable forwarding pointer the migration left on
-/// the sealed source row. Skipping it delivers to that seal, reads it as
-/// terminal, and records `target_terminal` in the SENDER's history for a
-/// workflow that is alive on another shard.
-///
-/// The pointer is read on the connection the caller already holds whenever the
-/// id enters on that same database. Acquiring a second connection from the pool
-/// that lent the first is the self-deadlock this module's own documentation
-/// warns about, and an unresolvable residence degrades to the entry shard,
-/// which is the pre-#964 behaviour.
-async fn execution_id_residence(
-    conn: &mut AsyncPgConnection,
-    pool: &crate::shard::ShardedDbPool,
-    id: ExecutionId,
-    caller_shard: crate::types::ShardId,
-) -> crate::types::ShardId {
-    let encoded = id.shard();
-    let entry = if encoded.is_unencoded() {
-        pool.default_shard()
-    } else {
-        encoded
-    };
-    if crate::external_target_location::same_underlying_pool(
-        pool.pool_for(entry),
-        pool.pool_for(caller_shard),
-    ) {
-        crate::shard_rebalance::forward_of_held_row(conn, id)
-            .await
-            .unwrap_or(entry)
-    } else {
-        // `_holding`, not the bare hop-walk (issue #1324, Codex review). A
-        // migration's forwarding pointer usually lands in one hop. But the
-        // walk still checks out a connection to confirm no further hop
-        // follows. A target rebalanced onto the caller's shard puts that
-        // confirmation hop on `caller_shard`'s own pool. A bare checkout
-        // there self-deadlocks a pool of size one.
-        crate::shard_rebalance::resolve_execution_shard_holding(conn, pool, id, caller_shard)
-            .await
-            .unwrap_or(entry)
-    }
-}
-
-#[allow(clippy::too_many_lines)]
-async fn resolve_delivery_route(
-    conn: &mut AsyncPgConnection,
-    sharded_pool: Option<&crate::shard::ShardedDbPool>,
-    target: &ExternalTarget,
-    caller_exec_id: ExecutionId,
-    uninspectable: &crate::external_target_location::UninspectableShards,
-    metrics: &(dyn MetricsRecorder + Send + Sync),
-    // `Some` only on the signal path, and only when the caller opted into a
-    // keyed delivery (issue #1318). Cancel always passes `None` — it has no
-    // idempotency-key concept.
-    idempotency_key: Option<&str>,
-) -> DeliveryRoute {
-    let Some(pool) = sharded_pool else {
-        return DeliveryRoute::Caller {
-            expected_live: false,
-            may_assert_key_state: true,
-            reverify_after_cancel: false,
-        };
-    };
-
-    // The caller's CURRENT residence, read off the connection this transaction
-    // already holds (issue #964). An `ExecutionId` encodes where a run
-    // ORIGINATED, so a caller that has itself been rebalanced would otherwise
-    // be compared against the target's residence below and two connections to
-    // the same database judged "cross-shard" — taking the branch that acquires
-    // a second connection from the pool already driving this transaction. The
-    // held connection is used deliberately: re-entering that pool is the
-    // self-deadlock this module's own doc comment warns about.
-    let caller_shard = match crate::shard_rebalance::shard_of_held_row(conn, caller_exec_id).await {
-        Some(shard) if !shard.is_unencoded() => shard,
-        _ if caller_exec_id.shard().is_unencoded() => pool.default_shard(),
-        _ => caller_exec_id.shard(),
-    };
-
-    // Belt-and-braces (issue #1324). Fail loud here, not with `pool_for`'s
-    // silent default-shard fallback below. `conn` came from `caller_shard`'s
-    // pool by construction. A missing entry for it means this process does
-    // not know the shard `conn` actually serves.
-    if pool.exact_pool_for(caller_shard).is_none() {
-        return DeliveryRoute::Retry {
-            reason: format!("caller shard {caller_shard} has no storage pool in this process"),
-            uninspected: vec![crate::external_target_location::UninspectedShard {
-                shard: caller_shard,
-                reason: "caller shard has no storage pool in this process".to_string(),
-                kind: crate::external_target_location::UninspectedReasonKind::NoPool,
-            }],
-        };
-    }
-
-    let (target_shard, expected_live, may_assert_key_state, reverify_after_cancel) = match target {
-        ExternalTarget::ExecutionId(id) => {
-            // Authoritative by construction: an id identifies exactly one run,
-            // and the residence below is a durable fact, not a prediction. An
-            // id names one run, never a business key, so no concurrent start
-            // can invalidate the answer (issue #1313).
-            (
-                execution_id_residence(conn, pool, *id, caller_shard).await,
-                false,
-                true,
-                false,
-            )
-        }
-        ExternalTarget::WorkflowId {
-            workflow_name,
-            workflow_id,
-        } => {
-            let router = crate::external_target_location::global_router_snapshot();
-            let expected =
-                crate::external_target_location::fanout_shards(&pool.shard_ids(), router.as_ref());
-            // One expected shard is the whole deployment: the target can only be
-            // there, and the delivery attempt on `conn` already reports
-            // `NoRunFound` when it is not. Fanning out would add a query on a
-            // second connection from the pool this transaction is already
-            // holding one from, for no information. Fall through to the pool
-            // comparison below with that single shard, which reproduces the
-            // pre-#1146 route exactly.
-            if let [only] = expected.as_slice() {
-                // No global resolution ran, so there is no live-run expectation
-                // to compare a shard-local read against — and with one shard
-                // there is nowhere else for the key to be. One shard also means
-                // one snapshot, so the fan-out race of issue #1313 needs no
-                // second look here.
-                (*only, false, true, false)
-            } else {
-                match crate::external_target_location::resolve_location_by_workflow_id_with(
-                    pool,
-                    router.as_ref(),
-                    workflow_name,
-                    workflow_id,
-                    Some((caller_shard, conn)),
-                    Some(uninspectable),
-                    idempotency_key,
-                )
-                .await
-                {
-                    ref found @ crate::external_target_location::TargetLocation::Found {
-                        shard,
-                        ref run,
-                        ref uninspected,
-                        ref other_live,
-                        ..
-                    } => {
-                        // A live/terminal run was found, but not every
-                        // expected shard could be inspected. A silently
-                        // ambiguous SUCCESS, not a stall, since delivery
-                        // still proceeds (issue #1307). The log line lives in
-                        // `resolve_location_by_workflow_id_with`, next to the
-                        // condition it counts. This is the metric twin.
-                        if !uninspected.is_empty() {
-                            metrics.record_external_by_id_found_over_incomplete_fanout(
-                                crate::worker::shard_metric_label(shard),
-                            );
-                        }
-                        // The fan-out was complete, and it still saw a
-                        // second live run of this key (issue #1313). This
-                        // cannot catch the race the issue names -- a run
-                        // that starts mid fan-out is invisible to it by
-                        // construction. It is evidence of the race's
-                        // precondition: a key pinned to one shard while
-                        // an unpinned start of it hashed to another.
-                        if should_record_other_live_observed(
-                            other_live.is_empty(),
-                            uninspected.is_empty(),
-                        ) {
-                            metrics.record_external_by_id_other_live_observed(
-                                crate::worker::shard_metric_label(shard),
-                            );
-                        }
-                        (
-                            shard,
-                            !crate::erase::is_terminal_state(&run.state),
-                            // Not merely "every shard answered": a complete fan-out
-                            // that found a SECOND live run of this key is equally
-                            // unable to assert that nothing is running under it.
-                            found.is_authoritative_for_key(),
-                            // A fan-out ran, so a cancel that ends a live run
-                            // reports from a later one instead (issue #1313).
-                            true,
-                        )
-                    }
-                    crate::external_target_location::TargetLocation::NotFound => {
-                        return DeliveryRoute::NoRunAnywhere;
-                    }
-                    // The key was already delivered — on this shard or
-                    // another one, it does not matter which. No location
-                    // resolution is needed at all: the caller must record
-                    // delivery, never attempt a fresh insert (issue #1318).
-                    crate::external_target_location::TargetLocation::AlreadyDelivered {
-                        shard,
-                        ..
-                    } => {
-                        tracing::info!(
-                            workflow_name,
-                            workflow_id,
-                            %shard,
-                            "by-id signal: idempotency key already delivered; skipping re-delivery"
-                        );
-                        return DeliveryRoute::AlreadyDelivered;
-                    }
-                    crate::external_target_location::TargetLocation::Indeterminate {
-                        uninspected,
-                    } => {
-                        // NEVER `NoRunAnywhere`: that is what becomes a permanent
-                        // `target_unknown` once the grace window elapses, and a
-                        // shard we could not read is not a shard the target is
-                        // absent from.
-                        let named = uninspected
-                            .iter()
-                            .map(|u| format!("{} ({})", u.shard, u.reason))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        return DeliveryRoute::Retry {
-                            reason: format!(
-                                "could not inspect every shard for (workflow_name={workflow_name}, \
-                                 workflow_id={workflow_id}): {named}"
-                            ),
-                            uninspected,
-                        };
-                    }
-                }
-            }
-        }
-    };
-
-    // Identity of the two resolved pools decides inline-vs-cross-pool: two
-    // logical shards may be backed by the same physical pool, in which case
-    // delivering on the caller's own connection keeps the work inside its
-    // transaction — and, more importantly, avoids re-entering a pool this
-    // transaction already holds a connection from.
-    //
-    // That comparison must be `same_underlying_pool`, NOT `std::ptr::eq` on the
-    // two `&DbPool`s: `ShardedDbPool` stores every shard's pool in its own map
-    // slot, so pointer equality of the slots is really *shard-id* equality and
-    // reports two aliases of one pool as different (issue #1146; the same trap
-    // `external_target_location::same_underlying_pool` was extracted for).
-    // `caller_shard`, not `caller_exec_id` (issue #1324). The id's encoded
-    // shard names where the run STARTED. A rebalanced caller now lives
-    // elsewhere. `caller_shard` above already read the real one off `conn`.
-    // Comparing pools by the id instead brings back the held-pool
-    // mislabelling issue #964 fixed one level up.
-    match (
-        pool.exact_pool_for(target_shard),
-        pool.exact_pool_for(caller_shard),
-    ) {
-        (Some(target_pool), Some(caller_pool))
-            if crate::external_target_location::same_underlying_pool(target_pool, caller_pool) =>
-        {
-            DeliveryRoute::Caller {
-                expected_live,
-                may_assert_key_state,
-                reverify_after_cancel,
-            }
-        }
-        (Some(_), _) => DeliveryRoute::CrossShard {
-            shard: target_shard,
-            expected_live,
-            may_assert_key_state,
-            reverify_after_cancel,
-        },
-        (None, _) => DeliveryRoute::Retry {
-            reason: format!("target shard {target_shard} has no storage pool in this process"),
-            uninspected: vec![crate::external_target_location::UninspectedShard {
-                shard: target_shard,
-                reason: "target shard has no storage pool in this process".to_string(),
-                kind: crate::external_target_location::UninspectedReasonKind::NoPool,
-            }],
-        },
-    }
-}
-
-/// What to do with a shard-local by-id delivery outcome, once the cross-shard
-/// resolution's view is taken into account (issue #1146, Codex round 1 P2).
-///
-/// Split out as a pure function for the same reason
-/// `worker::classify_cross_shard_continue_as_new` and `classify_successor_slot`
-/// are: the interesting cases are a matrix over two inputs, and the window that
-/// produces the interesting ones — the key moving shards between the global
-/// resolution and the shard-local delivery read — is microseconds wide and has
-/// no test seam. Classifying here makes the matrix exhaustively testable
-/// without one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ByIdVerdict {
-    /// Record the outcome the shard-local read reported.
-    Record,
-    /// The two views disagree, or the target is momentarily unresolvable.
-    /// Leave the row pending so a later sweep re-resolves globally.
-    LeavePending,
-    /// No run found anywhere: apply the caller's grace-window policy.
-    NotFoundPolicy,
-}
-
-/// The by-id verdict for one shard-local outcome.
-///
-/// `resolved_terminal`/`resolved_absent` describe what the *shard-local* read
-/// found; `expected_live` is whether the cross-shard resolution had just seen a
-/// **live** run on this same shard.
-///
-/// The one non-obvious row is `expected_live && (terminal || absent)`. The two
-/// reads disagree, and only one of them can see across shards — so the
-/// shard-local verdict is not evidence the key is dead, it is evidence the key
-/// moved. Recording it would durably fail a signal `not_running`, or report a
-/// cancel as a no-op success, against a run alive on another shard. Retrying
-/// terminates: once the key really is terminal everywhere, the global winner is
-/// terminal too, `expected_live` is `false`, and the verdict is recorded.
-const fn classify_by_id_outcome(
-    expected_live: bool,
-    resolved_terminal: bool,
-    resolved_absent: bool,
-) -> ByIdVerdict {
-    if expected_live && (resolved_terminal || resolved_absent) {
-        return ByIdVerdict::LeavePending;
-    }
-    if resolved_absent {
-        return ByIdVerdict::NotFoundPolicy;
-    }
-    ByIdVerdict::Record
-}
-
-/// Whether a by-id fan-out's `other_live` observation should be counted as
-/// topology-drift evidence (issue #1313, review finding).
-///
-/// Pulled out as a pure predicate, for the same reason as
-/// `classify_by_id_outcome`. The interesting case needs a fan-out that is
-/// both partial and ambiguous. That window has no test seam in the
-/// resolver itself.
-///
-/// A partial fan-out that also saw `other_live` is not this signal. It is
-/// the ordinary partial-view case `by_id_found_over_incomplete_fanout`
-/// already counts. Only a fan-out that reached every expected shard and
-/// still saw a second live run is evidence the precondition, not the
-/// view, produced the ambiguity.
-const fn should_record_other_live_observed(
-    other_live_is_empty: bool,
-    uninspected_is_empty: bool,
-) -> bool {
-    !other_live_is_empty && uninspected_is_empty
-}
-
 /// Attempt one signal delivery to `target` on `conn` (issue #751).
 ///
 /// Shared by `enforce_external_signals_outbox`'s same-pool and cross-pool
@@ -4055,36 +2184,15 @@ const fn should_record_other_live_observed(
 /// ("leave pending, retry on the next sweep") rather than propagated — a
 /// transient failure delivering to ONE row must not abort the scan of every
 /// other pending row.
-/// One pending outbox signal, bundled so [`attempt_signal_delivery`] stays under
-/// clippy's argument-count ceiling — the same shape
-/// [`CancelDeliveryAccumulators`] took for the cancel side (issue #751).
-struct SignalDeliveryRequest<'a> {
-    /// Who to deliver to.
-    target: &'a ExternalTarget,
-    /// The caller's correlation id, echoed into the terminal event.
-    signal_id: crate::types::ExternalSignalId,
-    /// Signal name and payload as recorded on the `ExternalSignalRequested`.
-    signal_name: &'a str,
-    payload: serde_json::Value,
-    idempotency_key: Option<&'a str>,
-    /// Whether the cross-shard resolution saw a **live** run on the shard this
-    /// attempt is running against — see [`DeliveryRoute::CrossShard`].
-    expected_live: bool,
-}
-
 async fn attempt_signal_delivery(
     conn: &mut AsyncPgConnection,
-    request: SignalDeliveryRequest<'_>,
+    target: &ExternalTarget,
+    signal_id: crate::types::ExternalSignalId,
+    signal_name: &str,
+    payload: serde_json::Value,
+    idempotency_key: Option<&str>,
     not_found_terminal: impl Fn() -> Option<WorkflowEvent>,
 ) -> Option<WorkflowEvent> {
-    let SignalDeliveryRequest {
-        target,
-        signal_id,
-        signal_name,
-        payload,
-        idempotency_key,
-        expected_live,
-    } = request;
     match target {
         ExternalTarget::ExecutionId(target_id) => {
             match crate::signal::send_signal_idempotent(
@@ -4128,45 +2236,18 @@ async fn attempt_signal_delivery(
             Ok(crate::signal::ByIdSignalOutcome::Delivered) => {
                 Some(WorkflowEvent::ExternalSignalDelivered { signal_id })
             }
-            // No run has ever existed for this business key — subject to the
-            // same grace window as an `ExecutionId`'s `NotFound`, unless the
-            // resolution just saw a live run here (see
-            // `classify_by_id_outcome`).
-            Ok(crate::signal::ByIdSignalOutcome::NoRunFound) => {
-                match classify_by_id_outcome(expected_live, false, true) {
-                    ByIdVerdict::NotFoundPolicy => not_found_terminal(),
-                    ByIdVerdict::LeavePending | ByIdVerdict::Record => None,
-                }
-            }
+            // No run has ever existed for this business key — subject to
+            // the same grace window as an `ExecutionId`'s `NotFound`.
+            Ok(crate::signal::ByIdSignalOutcome::NoRunFound) => not_found_terminal(),
             // The current run for this business key is already terminal — a
             // genuine, immediate failure (unlike cancel, a signal's goal is
             // never already met by a terminal target), never gated by the
             // grace window (issue #751 AC4).
-            //
-            // UNLESS the cross-shard resolution just saw a LIVE run here
-            // (issue #1146, Codex round 1 P2): the two views disagree, which
-            // means the key moved shards between the two reads, and this
-            // shard-local read cannot see where it went. Leave the row pending
-            // so the next sweep re-resolves globally rather than durably
-            // failing a signal whose target is alive elsewhere.
             Ok(crate::signal::ByIdSignalOutcome::NotRunning) => {
-                match classify_by_id_outcome(expected_live, true, false) {
-                    ByIdVerdict::LeavePending => {
-                        tracing::warn!(
-                            workflow_name,
-                            workflow_id,
-                            "by-id signal: resolution saw a live run but the shard-local read \
-                             found it terminal; re-resolving on the next sweep"
-                        );
-                        None
-                    }
-                    ByIdVerdict::Record | ByIdVerdict::NotFoundPolicy => {
-                        Some(WorkflowEvent::ExternalSignalFailed {
-                            signal_id,
-                            reason_code: "not_running".to_string(),
-                        })
-                    }
-                }
+                Some(WorkflowEvent::ExternalSignalFailed {
+                    signal_id,
+                    reason_code: "not_running".to_string(),
+                })
             }
             Err(HarvestError::Database(e)) => {
                 tracing::error!(error = %e, "outbox sweep: db error during by-id signal delivery");
@@ -4179,47 +2260,6 @@ async fn attempt_signal_delivery(
             // error is likewise left unresolved.
             Ok(crate::signal::ByIdSignalOutcome::RacedToSuccessor) | Err(_) => None,
         },
-    }
-}
-
-/// Age of the oldest pending by-id row a sweep left retrying, memoized for the
-/// length of that sweep (issue #1307).
-///
-/// Mirrors [`crate::external_target_location::UninspectableShards`]'s shape:
-/// an `Arc<Mutex<_>>` the per-row transaction closure can update by
-/// reference. This avoids threading a value back through the step-outcome
-/// tuple both sweeps already return.
-///
-/// Only ever grows during a sweep. So the maximum observed `age` at the end
-/// IS the oldest pending row this sweep visited. The claim query orders by
-/// `(timestamp, id)` ascending, so a backlog is drained oldest-first. A row
-/// that resolves to [`DeliveryRoute::Retry`] is added to the sweep's own
-/// exclusion list. It is not reclaimed this sweep, but it is not lost
-/// either: the next full sweep tick reclaims it with a fresh, larger `age`.
-#[derive(Clone, Debug, Default)]
-struct OldestPendingIndeterminateAge(std::sync::Arc<std::sync::Mutex<Option<chrono::Duration>>>);
-
-impl OldestPendingIndeterminateAge {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    fn observe(&self, age: chrono::Duration) {
-        if let Ok(mut guard) = self.0.lock() {
-            *guard = Some(guard.map_or(age, |oldest| oldest.max(age)));
-        }
-    }
-
-    /// Seconds, or `0.0` if this sweep left no row pending. Matches
-    /// [`MetricsRecorder::record_queue_oldest_pending_age`]'s convention so a
-    /// drained backlog does not leave a stale gauge value behind.
-    #[allow(clippy::cast_precision_loss)] // millisecond age never approaches 2^53
-    fn seconds(&self) -> f64 {
-        self.0
-            .lock()
-            .ok()
-            .and_then(|guard| *guard)
-            .map_or(0.0, |age| age.num_milliseconds() as f64 / 1000.0)
     }
 }
 
@@ -4242,34 +2282,15 @@ pub async fn enforce_external_signals_outbox(
     unknown_target_grace_window: Duration,
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
     shard_assignments: &[crate::types::ShardId],
-
-    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<usize> {
     let mut count = 0;
-    // The configured registry, NOT `PayloadCodecs::default()`. This decodes
-    // stored `ExternalSignalRequested` / cancel / await rows and reloads the
-    // caller's history to append the terminal event; with the identity
-    // registry both raise `UnknownCodecKey` the moment a keyed codec is
-    // configured, stranding every outbox row on the shard.
-    let codecs = codecs.clone();
+    let codecs = crate::payload_codec::PayloadCodecs::default();
 
     let shards: Vec<i32> = if shard_assignments.is_empty() {
         vec![0]
     } else {
         shard_assignments.iter().map(|s| s.as_i32()).collect()
     };
-
-    // Per-sweep memo of shards that could not be inspected (issue #1146). A
-    // backlog can hold hundreds of pending by-id rows; a shard that failed to
-    // hand over a connection on the first has not recovered by the last, and
-    // each re-probe costs the full acquisition bound. Shared across every step
-    // of this sweep, discarded when it returns.
-    let uninspectable = crate::external_target_location::UninspectableShards::new();
-
-    // Age of the oldest pending by-id row this sweep left retrying (issue
-    // #1307). See `OldestPendingIndeterminateAge` for why the maximum
-    // observed age at sweep end is the right answer.
-    let oldest_indeterminate = OldestPendingIndeterminateAge::new();
 
     let mut excluded_event_ids: Vec<i64> = Vec::new();
 
@@ -4278,19 +2299,26 @@ pub async fn enforce_external_signals_outbox(
         let codecs_clone = codecs.clone();
         let excluded_clone = excluded_event_ids.clone();
 
-        // The terminal-event append below can raise a dispatch hint through
-        // `wake_workflow_task` (issue #1429). The scope ties its publish to
-        // this step transaction's commit. This loop claims one outbox row
-        // per iteration. A synchronous per-row publish (`buffered_settled`)
-        // would pay a Redis round trip once per row. It would stall the
-        // sweep when the channel is slow (Codex review, issue #1429). Hand
-        // hints to the background publisher instead.
-        let step_res: Result<Option<(bool, Option<i64>)>, HarvestError> = crate::dispatch::buffered_settled_in_background(Box::pin(conn
+        let step_res: Result<Option<(bool, Option<i64>)>, HarvestError> = Box::pin(conn
             .transaction::<Option<(bool, Option<i64>)>, HarvestError, _>(async |conn| {
                 let shards = shards_clone;
                 let codecs = codecs_clone;
                 let excluded = excluded_clone;
-                let sql = external_signal_outbox_claim_query();
+                let sql = "SELECT e.* FROM harvest_events e \
+                           INNER JOIN harvest_workflow_executions execs ON e.workflow_exec_id = execs.id \
+                           WHERE e.event_type = 'ExternalSignalRequested' \
+                             AND execs.state = 'RUNNING' \
+                             AND execs.shard_id = ANY($1) \
+                             AND (e.event_data->'data'->>'signal_id') IS NOT NULL \
+                             AND NOT (e.id = ANY($2)) \
+                             AND NOT EXISTS ( \
+                                 SELECT 1 FROM harvest_events res \
+                                 WHERE res.workflow_exec_id = e.workflow_exec_id \
+                                   AND res.event_type IN ('ExternalSignalDelivered', 'ExternalSignalFailed') \
+                                   AND res.event_data->'data'->>'signal_id' = e.event_data->'data'->>'signal_id' \
+                             ) \
+                           LIMIT 1 \
+                           FOR UPDATE OF e SKIP LOCKED";
 
                 let row_opt: Option<crate::models::HarvestEvent> = diesel::sql_query(sql)
                     .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(&shards)
@@ -4344,10 +2372,7 @@ pub async fn enforce_external_signals_outbox(
                     })
                 };
 
-                // Route the delivery to the database that actually owns the
-                // target (issue #1146). For a `WorkflowId` target this is an
-                // observation across every expected shard, not a re-derivation
-                // of the placement hash — see `resolve_delivery_route`.
+                // Try to route target using the config's sharded pool if configured
                 let active_sharded_pool = sharded_pool
                     .clone()
                     .or_else(|| {
@@ -4355,140 +2380,61 @@ pub async fn enforce_external_signals_outbox(
                             .and_then(|lock| lock.clone())
                     });
 
-                let route = resolve_delivery_route(
-                    conn,
-                    active_sharded_pool.as_ref(),
-                    &target,
-                    caller_exec_id,
-                    &uninspectable,
-                    metrics,
-                    idempotency_key.as_deref(),
-                )
-                .await;
+                let caller_shard = caller_exec_id.shard();
 
-                let terminal_opt = match route {
-                    // `may_assert_key_state` is deliberately unused on the signal
-                    // path: a live run found over a partial view is still real
-                    // delivery, and re-delivery is not idempotent without an
-                    // idempotency key, so staying pending would duplicate the
-                    // signal (issue #1146, Codex round 2).
-                    // `reverify_after_cancel` is likewise unused (issue
-                    // #1313). A signal reports a delivery to one run, never a
-                    // claim about the whole key. A run that starts during the
-                    // fan-out does not falsify that.
-                    DeliveryRoute::Caller {
-                        expected_live,
-                        may_assert_key_state: _,
-                        reverify_after_cancel: _,
-                    } => {
-                        attempt_signal_delivery(
-                            conn,
-                            SignalDeliveryRequest {
-                                target: &target,
-                                signal_id,
-                                signal_name: &signal_name,
-                                payload: payload.clone(),
-                                idempotency_key: idempotency_key.as_deref(),
-                                expected_live,
-                            },
-                            not_found_terminal,
-                        )
-                        .await
+                let same_pool = active_sharded_pool.as_ref().is_none_or(|pool| {
+                    if let (Some(t_pool), Some(c_pool)) = (
+                        pool.exact_pool_for_target(&target, caller_shard),
+                        pool.exact_pool_for_execution(caller_exec_id),
+                    ) {
+                        std::ptr::eq(t_pool, c_pool)
+                    } else {
+                        false
                     }
-                    DeliveryRoute::CrossShard {
-                        shard: target_shard,
-                        expected_live,
-                        may_assert_key_state: _,
-                        reverify_after_cancel: _,
-                    } => {
-                        let Some(pool) = active_sharded_pool
-                            .as_ref()
-                            .and_then(|p| p.exact_pool_for(target_shard))
-                        else {
-                            tracing::warn!(
-                                %target_shard,
-                                "outbox sweep: target shard is not configured locally; leaving row locked/pending for other workers"
-                            );
-                            return Ok(Some((false, Some(row.id))));
-                        };
+                });
 
-                        // Bounded for the same reason the fan-out is (issue
-                        // #1146, Codex round 1 P1): this is a peer pool reached
-                        // while holding a connection from another pool in the
-                        // same process, and one timeout checker runs per
-                        // assigned shard. An unbounded wait here lets two
-                        // checkers hold each other's only connection. This
-                        // acquisition predates #1146 — it has always served
-                        // cross-shard `ExecutionId` delivery — and was
-                        // unbounded until now.
-                        //
-                        // The bound is chosen from the pool's own state rather
-                        // than fixed: the tight one applies only when the pool
-                        // is at capacity with nothing free, the only case where
-                        // acquiring means waiting on another task. A pool that
-                        // merely has to open a connection is doing a handshake,
-                        // and holding a cold connect to 250 ms would fail it
-                        // forever rather than slowly. See
-                        // `external_target_location::peer_acquire_bound`.
-                        let mut target_conn = match crate::replication::fenced_get_within(
-                            pool,
-                            crate::external_target_location::peer_acquire_bound(pool),
-                        )
-                        .await
-                        {
-                            Ok(Ok(c)) => c,
-                            Ok(Err(e)) => {
-                                tracing::error!(error = %e, "outbox sweep: failed to acquire target connection");
-                                return Ok(Some((false, Some(row.id))));
-                            }
-                            Err(_elapsed) => {
-                                tracing::warn!(
-                                    %target_shard,
-                                    "outbox sweep: no connection available for the target shard; leaving row pending"
-                                );
-                                return Ok(Some((false, Some(row.id))));
-                            }
-                        };
-
-                        attempt_signal_delivery(
-                            &mut target_conn,
-                            SignalDeliveryRequest {
-                                target: &target,
-                                signal_id,
-                                signal_name: &signal_name,
-                                payload: payload.clone(),
-                                idempotency_key: idempotency_key.as_deref(),
-                                expected_live,
-                            },
-                            not_found_terminal,
-                        )
-                        .await
-                    }
-                    // Every expected shard answered and none holds this
-                    // business key: the same not-found policy a per-shard
-                    // delivery attempt would have applied.
-                    DeliveryRoute::NoRunAnywhere => not_found_terminal(),
-                    // The keyed request was already fulfilled elsewhere
-                    // (issue #1318): report delivered, attempt nothing.
-                    DeliveryRoute::AlreadyDelivered => {
-                        Some(WorkflowEvent::ExternalSignalDelivered { signal_id })
-                    }
-                    // Inconclusive — leave the row pending rather than write a
-                    // wrong terminal into the caller's append-only history.
-                    DeliveryRoute::Retry { reason, uninspected } => {
+                let terminal_opt = if same_pool {
+                    attempt_signal_delivery(
+                        conn,
+                        &target,
+                        signal_id,
+                        &signal_name,
+                        payload.clone(),
+                        idempotency_key.as_deref(),
+                        not_found_terminal,
+                    )
+                    .await
+                } else {
+                    // Different pools, so we must have a target_pool resolved
+                    let Some(pool) = active_sharded_pool
+                        .as_ref()
+                        .and_then(|p| p.exact_pool_for_target(&target, caller_shard))
+                    else {
                         tracing::warn!(
-                            %reason,
-                            "outbox sweep: by-id target resolution inconclusive; leaving row pending"
+                            target_shard = ?crate::shard::external_target_owning_shard(&target),
+                            "outbox sweep: target shard is not configured locally; leaving row locked/pending for other workers"
                         );
-                        for shard in &uninspected {
-                            metrics.record_external_by_id_indeterminate_shard(
-                                crate::worker::shard_metric_label(shard.shard),
-                                shard.kind.as_label(),
-                            );
-                        }
-                        oldest_indeterminate.observe(age);
                         return Ok(Some((false, Some(row.id))));
-                    }
+                    };
+
+                    let mut target_conn = match pool.get().await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::error!(error = %e, "outbox sweep: failed to acquire target connection");
+                            return Ok(Some((false, Some(row.id))));
+                        }
+                    };
+
+                    attempt_signal_delivery(
+                        &mut target_conn,
+                        &target,
+                        signal_id,
+                        &signal_name,
+                        payload.clone(),
+                        idempotency_key.as_deref(),
+                        not_found_terminal,
+                    )
+                    .await
                 };
 
                 if let Some(terminal_event) = terminal_opt {
@@ -4503,13 +2449,12 @@ pub async fn enforce_external_signals_outbox(
                         _ => None,
                     };
 
-                    let history = lock_workflow_execution_and_load_history(conn, caller_exec_id, &codecs).await?;
-                    store::append_events_with_codecs(
+                    let history = lock_workflow_execution_and_load_history(conn, caller_exec_id).await?;
+                    store::append_events(
                         conn,
                         caller_exec_id,
                         &[terminal_event],
                         history.next_event_id,
-                        &codecs,
                     )
                     .await?;
                     queue::wake_workflow_task(conn, caller_exec_id).await?;
@@ -4519,7 +2464,7 @@ pub async fn enforce_external_signals_outbox(
                 } else {
                     Ok(Some((false, Some(row.id))))
                 }
-            })))
+            }))
             .await;
 
         match step_res {
@@ -4541,9 +2486,6 @@ pub async fn enforce_external_signals_outbox(
         }
     }
 
-    metrics.record_external_signal_by_id_oldest_pending_indeterminate_age(
-        oldest_indeterminate.seconds(),
-    );
     Ok(count)
 }
 
@@ -4555,14 +2497,6 @@ struct CancelDeliveryAccumulators {
     deferred_starts: Vec<crate::completion_trigger::DeferredTriggerStart>,
     deferred_checks: Vec<(ExecutionId, String)>,
     cancel_metrics: Vec<(String, String)>,
-    /// This delivery ended a run that was **live** when it read it, rather
-    /// than finding the goal already met (issue #1313).
-    ///
-    /// A cancel that changes the key's state invalidates the fan-out that
-    /// chose its target. The reads are sequential, on separate databases. A
-    /// run of the key can start on a shard after that shard answered.
-    /// See `DeliveryRoute::CrossShard::reverify_after_cancel`.
-    cancelled_live_run: bool,
 }
 
 /// Attempt one cancel delivery to `target` on `conn` (issue #751).
@@ -4584,13 +2518,6 @@ struct CancelDeliveryAccumulators {
 /// on the next sweep") rather than propagated — matching
 /// `attempt_signal_delivery`'s "one row's transient failure must not abort
 /// the scan" contract.
-// issue #1197, item 2 (Codex round 3, P2): `metrics` is threaded through to
-// `cancel_workflow_execution_collect` so a nested self-referential admission
-// this delivery's own trigger evaluation recurses into sees the real
-// recorder. That pushes this function's argument count one over clippy's
-// default ceiling; bundling it into `CancelDeliveryAccumulators` would be
-// wrong (that struct is a per-call OUTPUT accumulator, not shared input).
-#[allow(clippy::too_many_arguments)]
 async fn attempt_cancel_delivery(
     conn: &mut AsyncPgConnection,
     target: &ExternalTarget,
@@ -4598,39 +2525,21 @@ async fn attempt_cancel_delivery(
     reason: &str,
     not_found_terminal: impl Fn() -> Option<WorkflowEvent>,
     acc: &mut CancelDeliveryAccumulators,
-    expected_live: bool,
-    metrics: &(dyn MetricsRecorder + Send + Sync),
 ) -> Option<WorkflowEvent> {
     match target {
         ExternalTarget::ExecutionId(target_id) => {
-            match cancel_workflow_execution_collect(conn, *target_id, reason, Some(metrics)).await {
+            match cancel_workflow_execution_collect(conn, *target_id, reason).await {
                 Ok((_cancelled, deferred, checks, metrics_opt)) => {
                     acc.deferred_starts.extend(deferred);
                     acc.deferred_checks.extend(checks);
                     if let Some(m) = metrics_opt {
                         acc.cancel_metrics.push(m);
                     }
-                    acc.cancelled_live_run = true;
                     Some(WorkflowEvent::ExternalCancelDelivered { cancel_id })
                 }
                 Err(HarvestError::NotFound(_)) => not_found_terminal(),
                 Err(HarvestError::Database(e)) => {
                     tracing::error!(error = %e, "cancel outbox sweep: db error");
-                    None
-                }
-                // The cancel landed on a shard that is not where the run lives
-                // (issue #964) — a forwarding seal, or a residence this node
-                // cannot reach. `None` leaves the row pending for a later
-                // sweep. Anything else here would record
-                // `ExternalCancelDelivered` in the sender's history for a
-                // workflow that is still running and never retry it, which is
-                // the one failure mode worse than a slow cancel.
-                Err(HarvestError::ShardUnavailable { shard_id, reason }) => {
-                    tracing::warn!(
-                        shard_id,
-                        reason = %reason,
-                        "cancel outbox sweep: target is not on this shard; leaving pending"
-                    );
                     None
                 }
                 // Other Err (already terminal) = no-op success.
@@ -4660,39 +2569,13 @@ async fn attempt_cancel_delivery(
                     if let Some(m) = metrics {
                         acc.cancel_metrics.push(m);
                     }
-                    acc.cancelled_live_run = true;
                     Some(WorkflowEvent::ExternalCancelDelivered { cancel_id })
                 }
-                // Already terminal = no-op success (goal already met) —
-                // UNLESS the cross-shard resolution just saw a LIVE run on this
-                // shard (issue #1146, Codex round 1 P2). The two views disagree,
-                // so the key moved shards between the reads and this
-                // shard-local read cannot see where. Reporting success here
-                // would durably record a cancellation that never reached the
-                // run that is actually alive. Leave it pending; the next sweep
-                // re-resolves globally.
+                // Already terminal = no-op success (goal already met).
                 Ok(crate::execution::ByIdCancelOutcome::AlreadyTerminal) => {
-                    match classify_by_id_outcome(expected_live, true, false) {
-                        ByIdVerdict::LeavePending => {
-                            tracing::warn!(
-                                workflow_name,
-                                workflow_id,
-                                "by-id cancel: resolution saw a live run but the shard-local \
-                                 read found it terminal; re-resolving on the next sweep"
-                            );
-                            None
-                        }
-                        ByIdVerdict::Record | ByIdVerdict::NotFoundPolicy => {
-                            Some(WorkflowEvent::ExternalCancelDelivered { cancel_id })
-                        }
-                    }
+                    Some(WorkflowEvent::ExternalCancelDelivered { cancel_id })
                 }
-                Ok(crate::execution::ByIdCancelOutcome::NoRunFound) => {
-                    match classify_by_id_outcome(expected_live, false, true) {
-                        ByIdVerdict::NotFoundPolicy => not_found_terminal(),
-                        ByIdVerdict::LeavePending | ByIdVerdict::Record => None,
-                    }
-                }
+                Ok(crate::execution::ByIdCancelOutcome::NoRunFound) => not_found_terminal(),
                 Err(HarvestError::Database(e)) => {
                     tracing::error!(
                         error = %e,
@@ -4746,16 +2629,9 @@ pub async fn enforce_external_cancels_outbox(
     unknown_target_grace_window: Duration,
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
     shard_assignments: &[crate::types::ShardId],
-
-    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<usize> {
     let mut count = 0;
-    // The configured registry, NOT `PayloadCodecs::default()`. This decodes
-    // stored `ExternalSignalRequested` / cancel / await rows and reloads the
-    // caller's history to append the terminal event; with the identity
-    // registry both raise `UnknownCodecKey` the moment a keyed codec is
-    // configured, stranding every outbox row on the shard.
-    let codecs = codecs.clone();
+    let codecs = crate::payload_codec::PayloadCodecs::default();
 
     let shards: Vec<i32> = if shard_assignments.is_empty() {
         vec![0]
@@ -4774,18 +2650,6 @@ pub async fn enforce_external_cancels_outbox(
             .and_then(|lock| lock.clone())
     });
 
-    // Per-sweep memo of shards that could not be inspected (issue #1146). A
-    // backlog can hold hundreds of pending by-id rows; a shard that failed to
-    // hand over a connection on the first has not recovered by the last, and
-    // each re-probe costs the full acquisition bound. Shared across every step
-    // of this sweep, discarded when it returns.
-    let uninspectable = crate::external_target_location::UninspectableShards::new();
-
-    // Age of the oldest pending by-id row this sweep left retrying (issue
-    // #1307). See `OldestPendingIndeterminateAge` for why the maximum
-    // observed age at sweep end is the right answer.
-    let oldest_indeterminate = OldestPendingIndeterminateAge::new();
-
     let mut excluded_event_ids: Vec<i64> = Vec::new();
 
     loop {
@@ -4793,19 +2657,26 @@ pub async fn enforce_external_cancels_outbox(
         let codecs_clone = codecs.clone();
         let excluded_clone = excluded_event_ids.clone();
 
-        // The terminal-event append below can raise a dispatch hint through
-        // `wake_workflow_task` (issue #1429). The scope ties its publish to
-        // this step transaction's commit. This loop claims one outbox row
-        // per iteration. A synchronous per-row publish (`buffered_settled`)
-        // would pay a Redis round trip once per row. It would stall the
-        // sweep when the channel is slow (Codex review, issue #1429). Hand
-        // hints to the background publisher instead.
-        let step_res: Result<Option<CancelStepOutcome>, HarvestError> = crate::dispatch::buffered_settled_in_background(Box::pin(conn
+        let step_res: Result<Option<CancelStepOutcome>, HarvestError> = Box::pin(conn
             .transaction::<Option<CancelStepOutcome>, HarvestError, _>(async |conn| {
                 let shards = shards_clone;
                 let codecs = codecs_clone;
                 let excluded = excluded_clone;
-                let sql = external_cancel_outbox_claim_query();
+                let sql = "SELECT e.* FROM harvest_events e \
+                           INNER JOIN harvest_workflow_executions execs ON e.workflow_exec_id = execs.id \
+                           WHERE e.event_type = 'ExternalCancelRequested' \
+                             AND execs.state = 'RUNNING' \
+                             AND execs.shard_id = ANY($1) \
+                             AND (e.event_data->'data'->>'cancel_id') IS NOT NULL \
+                             AND NOT (e.id = ANY($2)) \
+                             AND NOT EXISTS ( \
+                                 SELECT 1 FROM harvest_events res \
+                                 WHERE res.workflow_exec_id = e.workflow_exec_id \
+                                   AND res.event_type IN ('ExternalCancelDelivered', 'ExternalCancelFailed') \
+                                   AND res.event_data->'data'->>'cancel_id' = e.event_data->'data'->>'cancel_id' \
+                             ) \
+                           LIMIT 1 \
+                           FOR UPDATE OF e SKIP LOCKED";
 
                 let row_opt: Option<crate::models::HarvestEvent> = diesel::sql_query(sql)
                     .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(&shards)
@@ -4824,17 +2695,7 @@ pub async fn enforce_external_cancels_outbox(
                 // the deferred unfinished-handler-check routing after this
                 // step commits) can tell a same-shard check apart from a
                 // cross-shard one without re-deriving it (issue #751 review).
-                //
-                // The caller's CURRENT residence, not its id's encoded origin
-                // (issue #964): a caller that has itself been rebalanced would
-                // otherwise be compared against the target's residence and
-                // judged cross-pool against its own database, sending the
-                // delivery down the branch that checks out a second connection
-                // from the pool already driving this transaction. Read off the
-                // held connection, so resolving it cannot deadlock in turn.
-                let caller_shard = crate::shard_rebalance::shard_of_held_row(conn, caller_exec_id)
-                    .await
-                    .unwrap_or_else(|| caller_exec_id.shard());
+                let caller_shard = caller_exec_id.shard();
 
                 let (cancel_id, target) = match codecs.decode_event(row.event_data.clone()) {
                     Ok(WorkflowEvent::ExternalCancelRequested { cancel_id, target }) => {
@@ -4876,20 +2737,16 @@ pub async fn enforce_external_cancels_outbox(
                             .and_then(|lock| lock.clone())
                     });
 
-                // Route to the database that actually owns the target
-                // (issue #1146) — an observation for a `WorkflowId` target,
-                // the encoded shard for an `ExecutionId` one. Cancel has no
-                // idempotency-key concept, so `None` here (issue #1318).
-                let route = resolve_delivery_route(
-                    conn,
-                    active_sharded_pool.as_ref(),
-                    &target,
-                    caller_exec_id,
-                    &uninspectable,
-                    metrics,
-                    None,
-                )
-                .await;
+                let same_pool = active_sharded_pool.as_ref().is_none_or(|pool| {
+                    if let (Some(t_pool), Some(c_pool)) = (
+                        pool.exact_pool_for_target(&target, caller_shard),
+                        pool.exact_pool_for_execution(caller_exec_id),
+                    ) {
+                        std::ptr::eq(t_pool, c_pool)
+                    } else {
+                        false
+                    }
+                });
 
                 // Completion-trigger / cascade follow-up starts + terminal
                 // metrics, spawned/recorded only after this step transaction
@@ -4904,20 +2761,10 @@ pub async fn enforce_external_cancels_outbox(
                     deferred_starts: Vec::new(),
                     deferred_checks: Vec::new(),
                     cancel_metrics: Vec::new(),
-                    cancelled_live_run: false,
                 };
 
                 let mut target_conn_opt = None;
-                let mut cancel_may_assert = true;
-                let mut cancel_reverify = false;
-                let terminal_opt = match route {
-                    DeliveryRoute::Caller {
-                        expected_live,
-                        may_assert_key_state,
-                        reverify_after_cancel,
-                    } => {
-                    cancel_may_assert = may_assert_key_state;
-                    cancel_reverify = reverify_after_cancel;
+                let terminal_opt = if same_pool {
                     attempt_cancel_delivery(
                         conn,
                         &target,
@@ -4925,80 +2772,24 @@ pub async fn enforce_external_cancels_outbox(
                         "cancelled by external request",
                         not_found_terminal,
                         &mut acc,
-                        expected_live,
-                        metrics,
                     )
                     .await
-                    }
-                    // Every expected shard answered and none holds this
-                    // business key.
-                    DeliveryRoute::NoRunAnywhere => not_found_terminal(),
-                    // Unreachable in practice: `resolve_delivery_route` is
-                    // called above with `idempotency_key: None`, and this
-                    // route only arises when a key is given (issue #1318).
-                    // Handled defensively rather than with `unreachable!()`
-                    // so a future wiring mistake degrades to a retried row,
-                    // not a panicked scanner.
-                    DeliveryRoute::AlreadyDelivered => {
-                        tracing::error!(
-                            "cancel outbox sweep: unexpected AlreadyDelivered route -- cancel \
-                             carries no idempotency key"
-                        );
-                        return Ok(Some((false, Some(row.id), Vec::new(), Vec::new(), Vec::new(), caller_shard)));
-                    }
-                    // Inconclusive — leave pending rather than record a wrong
-                    // terminal in the caller's append-only history.
-                    DeliveryRoute::Retry { reason, uninspected } => {
-                        tracing::warn!(
-                            %reason,
-                            "cancel outbox sweep: by-id target resolution inconclusive; leaving row pending"
-                        );
-                        for shard in &uninspected {
-                            metrics.record_external_by_id_indeterminate_shard(
-                                crate::worker::shard_metric_label(shard.shard),
-                                shard.kind.as_label(),
-                            );
-                        }
-                        oldest_indeterminate.observe(age);
-                        return Ok(Some((false, Some(row.id), Vec::new(), Vec::new(), Vec::new(), caller_shard)));
-                    }
-                    DeliveryRoute::CrossShard {
-                        shard: target_shard,
-                        expected_live,
-                        may_assert_key_state,
-                        reverify_after_cancel,
-                    } => {
-                    cancel_may_assert = may_assert_key_state;
-                    cancel_reverify = reverify_after_cancel;
+                } else {
                     let Some(pool) = active_sharded_pool
                         .as_ref()
-                        .and_then(|p| p.exact_pool_for(target_shard))
+                        .and_then(|p| p.exact_pool_for_target(&target, caller_shard))
                     else {
                         tracing::warn!(
-                            %target_shard,
+                            target_shard = ?crate::shard::external_target_owning_shard(&target),
                             "cancel outbox sweep: target shard not configured locally; skipping"
                         );
                         return Ok(Some((false, Some(row.id), Vec::new(), Vec::new(), Vec::new(), caller_shard)));
                     };
 
-                    // Bounded for the same reason as the signal outbox above
-                    // (issue #1146, Codex round 1 P1).
-                    let mut target_conn = match crate::replication::fenced_get_within(
-                        pool,
-                        crate::external_target_location::peer_acquire_bound(pool),
-                    )
-                    .await
-                    {
-                        Ok(Ok(c)) => c,
-                        Ok(Err(e)) => {
+                    let mut target_conn = match pool.get().await {
+                        Ok(c) => c,
+                        Err(e) => {
                             tracing::error!(error = %e, "cancel outbox sweep: failed to acquire target connection");
-                            return Ok(Some((false, Some(row.id), Vec::new(), Vec::new(), Vec::new(), caller_shard)));
-                        }
-                        Err(_elapsed) => {
-                            tracing::warn!(
-                                %target_shard,
-                                "cancel outbox sweep: no connection available for the target shard; leaving row pending"
-                            );
                             return Ok(Some((false, Some(row.id), Vec::new(), Vec::new(), Vec::new(), caller_shard)));
                         }
                     };
@@ -5010,8 +2801,6 @@ pub async fn enforce_external_cancels_outbox(
                         "cancelled by external request",
                         not_found_terminal,
                         &mut acc,
-                        expected_live,
-                        metrics,
                     )
                     .await;
                     // Keep the target connection open past this branch: for
@@ -5026,89 +2815,12 @@ pub async fn enforce_external_cancels_outbox(
                     // (issue #751 review, round 3).
                     target_conn_opt = Some(target_conn);
                     terminal
-                    }
-                };
-
-                // A cancellation may act on what it found, but may only
-                // *report* from an answer that is authoritative about the whole
-                // business key (issue #1146, Codex rounds 2 and 3).
-                // `ExternalCancelDelivered` asserts "nothing is running under
-                // this key", and `(workflow_name, workflow_id)` uniqueness is
-                // shard-local, so two things can falsify that claim: a shard we
-                // could not read, which MAY hold another live run, and a shard
-                // we did read that DOES hold one besides the winner. Recording
-                // success in either case durably closes the request over a run
-                // that is still alive, and the outbox never looks again.
-                //
-                // The cancel itself stands: cancelling is idempotent, so acting
-                // on the run we found is pure progress. Only the terminal event
-                // is withheld, leaving the row pending until an authoritative
-                // answer can make the assertion. That converges in both cases:
-                // the run just cancelled is terminal, so a later sweep either
-                // finds the shard back and reports, or cancels the next live
-                // copy — one per sweep until none is left.
-                //
-                // The signal path deliberately does NOT do this: re-delivery is
-                // not idempotent without an idempotency key, so staying pending
-                // would deliver the signal twice.
-                //
-                // A third case withholds for the same reason, one step removed
-                // (issue #1313). The fan-out that chose this target read each
-                // shard on its own connection, and the reads share no snapshot.
-                // A run of the key can start on a shard after that shard
-                // answered. The two checks above cannot see such a run: every
-                // shard answered, and the run they selected really was live.
-                // The stale answer only becomes a wrong assertion once this
-                // cancel makes the selected run terminal. That promotes the run
-                // which started during the fan-out to current run for the key.
-                // So a cancel that ends a live run leaves the assertion to a
-                // LATER fan-out, one that observes the whole window this sweep
-                // ran in.
-                //
-                // That converges exactly as the other two do. The run just
-                // cancelled is terminal, so the next sweep either finds nothing
-                // live and reports, or cancels the next live copy and defers
-                // again. A cancel that found its target already terminal changed
-                // nothing and reports at once, which is what ends the chain. A
-                // deployment that starts fresh runs of one key faster than the
-                // outbox cancels them defers indefinitely. The two checks above
-                // already leave that deployment pending forever.
-                let withheld = if cancel_may_assert {
-                    (cancel_reverify && acc.cancelled_live_run).then_some(
-                        "this cancel ended a live run, so its own fan-out is older than the \
-                         state it asserts",
-                    )
-                } else {
-                    Some("a shard was uninspected, or another live run exists")
-                };
-                let terminal_opt = match terminal_opt {
-                    Some(WorkflowEvent::ExternalCancelDelivered { .. })
-                        if withheld.is_some() =>
-                    {
-                        tracing::warn!(
-                            caller_exec_id = %caller_exec_id,
-                            reason = withheld.unwrap_or_default(),
-                            "by-id cancel: acted on the run found, but the resolution cannot \
-                             assert the state of the key; withholding the terminal and retrying"
-                        );
-                        // This row is also left pending (issue #1307), so the
-                        // "oldest stuck row" gauge must see its age too. It is
-                        // NOT counted in `by_id_indeterminate_shard`: that
-                        // counter is specifically about a `Retry` from an
-                        // uninspected shard. The uninspected-shard case here
-                        // was already counted at resolution time, by
-                        // `record_external_by_id_found_over_incomplete_fanout`.
-                        oldest_indeterminate.observe(age);
-                        None
-                    }
-                    other => other,
                 };
 
                 let CancelDeliveryAccumulators {
                     deferred_starts,
                     deferred_checks,
                     cancel_metrics,
-                    cancelled_live_run: _,
                 } = acc;
 
                 // Deferring a cross-pool cancellation's follow-ups past the
@@ -5125,18 +2837,21 @@ pub async fn enforce_external_cancels_outbox(
                         for start in deferred_starts {
                             start.spawn();
                         }
-                        if let Err(e) = check_and_report_unfinished_handlers_batch(
-                            &mut target_conn,
-                            &deferred_checks,
-                            Some(metrics),
-                        )
-                        .await
-                        {
-                            tracing::error!(
-                                check_count = deferred_checks.len(),
-                                err = %e,
-                                "cancel outbox sweep: failed to check unfinished update handlers on target shard"
-                            );
+                        for (exec_id, workflow_name) in deferred_checks {
+                            if let Err(e) = check_and_report_unfinished_handlers(
+                                &mut target_conn,
+                                exec_id,
+                                &workflow_name,
+                                Some(metrics),
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    exec_id = %exec_id,
+                                    err = %e,
+                                    "cancel outbox sweep: failed to check unfinished update handlers on target shard"
+                                );
+                            }
                         }
                         for (workflow_name, queue_name) in cancel_metrics {
                             crate::telemetry::emit_workflow_terminal(
@@ -5163,13 +2878,12 @@ pub async fn enforce_external_cancels_outbox(
                         _ => None,
                     };
 
-                    let history = lock_workflow_execution_and_load_history(conn, caller_exec_id, &codecs).await?;
-                    store::append_events_with_codecs(
+                    let history = lock_workflow_execution_and_load_history(conn, caller_exec_id).await?;
+                    store::append_events(
                         conn,
                         caller_exec_id,
                         &[terminal_event],
                         history.next_event_id,
-                        &codecs,
                     )
                     .await?;
                     queue::wake_workflow_task(conn, caller_exec_id).await?;
@@ -5178,7 +2892,7 @@ pub async fn enforce_external_cancels_outbox(
                 } else {
                     Ok(Some((false, Some(row.id), deferred_starts, cancel_metrics, deferred_checks, caller_shard)))
                 }
-            })))
+            }))
             .await;
 
         match step_res {
@@ -5207,10 +2921,10 @@ pub async fn enforce_external_cancels_outbox(
                 // cancellation, which live only on the target shard) gets a
                 // fresh connection to that shard's own pool.
                 //
-                // "Same shard" here means "resolves to the same *physical
-                // pool*", not a raw `ShardId` equality check (issue #751
-                // review, round 5): a legacy/pre-sharding caller execution
-                // carries `ShardId::UNENCODED`, which `exact_pool_for_execution`
+                // "Same shard" here means "resolves to the same *pool*", not
+                // a raw `ShardId` equality check (issue #751 review, round
+                // 5): a legacy/pre-sharding caller execution carries
+                // `ShardId::UNENCODED`, which `exact_pool_for_execution`
                 // correctly resolves to the default shard's pool via its own
                 // fallback -- but a raw `exec_id.shard() == caller_shard`
                 // comparison would treat that as cross-shard even against an
@@ -5223,99 +2937,10 @@ pub async fn enforce_external_cancels_outbox(
                 // `exact_pool_for_execution(caller_exec_id)` -- both consult
                 // only `.shard()` internally, so the two are provably
                 // equivalent without needing `caller_exec_id` itself here.
-                //
-                // The identity test must be `same_underlying_pool`, NOT
-                // `std::ptr::eq` on the two `&DbPool`s (issue #1146). Each
-                // shard's pool lives in its own `ShardedDbPool` map slot, so
-                // pointer equality of the slots is *shard-id* equality: it
-                // reports two logical shards backed by one cloned `DbPool` as
-                // different pools. That is not hypothetical — it is the
-                // colocated topology `ShardedDbPool::from_map` produces for a
-                // pre-split deployment, and it took exactly the branch this
-                // comment says it exists to avoid. With a caller on shard 1 and
-                // a target on shard 0 aliased onto one `max_size(1)` pool, the
-                // `else` branch below called an UNBOUNDED `pool.get()` on the
-                // very pool whose only connection this sweep is still holding,
-                // and parked forever. Rounds 5 and 6 fixed this trap in the
-                // *resolution* path; it was still live here, on the delivery
-                // side, which is why it survived them both.
                 for (exec_id, workflow_name) in deferred_checks {
-                    // Forwarding-aware (issue #964). These ids come back from a
-                    // cancel that already ran on the target's CURRENT residence,
-                    // but an id still encodes the shard it originated on. For a
-                    // rebalanced target `exact_pool_for_execution` would hand
-                    // back the origin pool and this check would report on the
-                    // sealed source's frozen history — and append its findings
-                    // to a row nothing reads. Resolve the residence first; a
-                    // failure degrades to the un-forwarded shard, which is the
-                    // pre-#964 behaviour.
-                    let residence = match outer_sharded_pool.as_ref() {
-                        Some(pool) => {
-                            let entry = pool.routed_shard_for_execution(exec_id);
-                            // This loop runs while `conn` is STILL CHECKED OUT,
-                            // so the residence lookup must not take a second
-                            // connection from the pool that lent it -- that is
-                            // the size-1 self-deadlock this deferred path was
-                            // restructured to avoid in the first place (issue
-                            // #751), and resolving through `pool` reintroduced
-                            // it by the back door. Read the pointer on `conn`
-                            // whenever the id enters on the held database;
-                            // only a genuinely different one is resolved
-                            // through the pool.
-                            let resolved: crate::types::ShardId =
-                                if crate::external_target_location::same_underlying_pool(
-                                    pool.pool_for(entry),
-                                    pool.pool_for(caller_shard),
-                                ) {
-                                    crate::shard_rebalance::forward_of_held_row(conn, exec_id)
-                                        .await
-                                        .unwrap_or(entry)
-                                } else {
-                                    // `_holding` (issue #1324, Codex review).
-                                    // The bare hop-walk's own confirmation
-                                    // checkout can land on `caller_shard`'s
-                                    // pool. That is `conn`'s own pool here,
-                                    // and reaching for it fresh self-deadlocks.
-                                    crate::shard_rebalance::resolve_execution_shard_holding(
-                                        conn,
-                                        pool,
-                                        exec_id,
-                                        caller_shard,
-                                    )
-                                    .await
-                                    .unwrap_or(entry)
-                                };
-                            Some(resolved)
-                        }
-                        None => None,
-                    };
-                    // `residence`, not `exact_pool_for_execution(exec_id)`
-                    // (issue #1324). The bits-based lookup ignores the
-                    // forwarding-aware resolution just above. It can report
-                    // the target's stale origin pool instead. A rebalanced
-                    // target then reads as cross-pool from a caller it is
-                    // actually co-located with. The `else` branch below then
-                    // acquires a second connection from the pool `conn`
-                    // already holds one from.
-                    //
-                    // No isolated DB test reproduces this one directly. Any
-                    // real migration that makes `residence` differ from
-                    // `entry` above needs `resolve_execution_shard`'s own
-                    // hop-walk. That walk checks out a connection on the
-                    // destination shard regardless of this bug. Under the
-                    // pool-size-1 setup that would expose this defect, the
-                    // walk hits its own, pre-existing hazard first. Covered
-                    // by inspection, and by the sibling fix above in
-                    // `resolve_delivery_route`, which this mirrors.
                     let same_pool_as_caller = outer_sharded_pool.as_ref().is_none_or(|pool| {
-                        residence
-                            .and_then(|shard| pool.exact_pool_for(shard))
-                            .is_some_and(|e_pool| {
-                                crate::external_target_location::same_underlying_pool(
-                                    e_pool,
-                                    pool.pool_for(caller_shard),
-                                )
-                            })
+                        pool.exact_pool_for_execution(exec_id)
+                            .is_some_and(|e_pool| std::ptr::eq(e_pool, pool.pool_for(caller_shard)))
                     });
                     if same_pool_as_caller {
                         if let Err(e) = check_and_report_unfinished_handlers(
@@ -5334,23 +2959,10 @@ pub async fn enforce_external_cancels_outbox(
                         }
                     } else if let Some(pool) = outer_sharded_pool
                         .as_ref()
-                        .zip(residence)
-                        .and_then(|(p, shard)| p.exact_pool_for(shard))
+                        .and_then(|p| p.exact_pool_for_execution(exec_id))
                     {
-                        // Bounded like the cross-shard delivery acquisitions
-                        // above (issue #1323, issue #1146). This check
-                        // reaches a peer pool while still holding a
-                        // connection from another pool in the same process.
-                        // This check is best-effort already: it logs its own
-                        // errors instead of propagating them. It logs a
-                        // timed-out acquisition and skips it the same way.
-                        match crate::replication::fenced_get_within(
-                            pool,
-                            crate::external_target_location::peer_acquire_bound(pool),
-                        )
-                        .await
-                        {
-                            Ok(Ok(mut target_conn)) => {
+                        match pool.get().await {
+                            Ok(mut target_conn) => {
                                 if let Err(e) = check_and_report_unfinished_handlers(
                                     &mut target_conn,
                                     exec_id,
@@ -5366,17 +2978,11 @@ pub async fn enforce_external_cancels_outbox(
                                     );
                                 }
                             }
-                            Ok(Err(e)) => {
+                            Err(e) => {
                                 tracing::error!(
                                     exec_id = %exec_id,
                                     error = %e,
                                     "cancel outbox sweep: failed to acquire target-shard connection for unfinished-handler check"
-                                );
-                            }
-                            Err(_elapsed) => {
-                                tracing::warn!(
-                                    exec_id = %exec_id,
-                                    "cancel outbox sweep: no connection available for the target shard's unfinished-handler check; skipping"
                                 );
                             }
                         }
@@ -5410,9 +3016,6 @@ pub async fn enforce_external_cancels_outbox(
         }
     }
 
-    metrics.record_external_cancel_by_id_oldest_pending_indeterminate_age(
-        oldest_indeterminate.seconds(),
-    );
     Ok(count)
 }
 
@@ -5434,16 +3037,9 @@ pub async fn enforce_external_awaits_outbox(
     unknown_target_grace_window: Duration,
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
     shard_assignments: &[crate::types::ShardId],
-
-    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<usize> {
     let mut count = 0;
-    // The configured registry, NOT `PayloadCodecs::default()`. This decodes
-    // stored `ExternalSignalRequested` / cancel / await rows and reloads the
-    // caller's history to append the terminal event; with the identity
-    // registry both raise `UnknownCodecKey` the moment a keyed codec is
-    // configured, stranding every outbox row on the shard.
-    let codecs = codecs.clone();
+    let codecs = crate::payload_codec::PayloadCodecs::default();
 
     let shards: Vec<i32> = if shard_assignments.is_empty() {
         vec![0]
@@ -5458,19 +3054,26 @@ pub async fn enforce_external_awaits_outbox(
         let codecs_clone = codecs.clone();
         let excluded_clone = excluded_event_ids.clone();
 
-        // The terminal-event append below can raise a dispatch hint through
-        // `wake_workflow_task` (issue #1429). The scope ties its publish to
-        // this step transaction's commit. This loop claims one outbox row
-        // per iteration. A synchronous per-row publish (`buffered_settled`)
-        // would pay a Redis round trip once per row. It would stall the
-        // sweep when the channel is slow (Codex review, issue #1429). Hand
-        // hints to the background publisher instead.
-        let step_res: Result<Option<(bool, Option<i64>)>, HarvestError> = crate::dispatch::buffered_settled_in_background(Box::pin(conn
+        let step_res: Result<Option<(bool, Option<i64>)>, HarvestError> = Box::pin(conn
             .transaction::<Option<(bool, Option<i64>)>, HarvestError, _>(async |conn| {
                 let shards = shards_clone;
                 let codecs = codecs_clone;
                 let excluded = excluded_clone;
-                let sql = external_await_outbox_claim_query();
+                let sql = "SELECT e.* FROM harvest_events e \
+                           INNER JOIN harvest_workflow_executions execs ON e.workflow_exec_id = execs.id \
+                           WHERE e.event_type = 'ExternalAwaitRequested' \
+                             AND execs.state = 'RUNNING' \
+                             AND execs.shard_id = ANY($1) \
+                             AND (e.event_data->'data'->>'await_id') IS NOT NULL \
+                             AND NOT (e.id = ANY($2)) \
+                             AND NOT EXISTS ( \
+                                 SELECT 1 FROM harvest_events res \
+                                 WHERE res.workflow_exec_id = e.workflow_exec_id \
+                                   AND res.event_type IN ('ExternalAwaitResolved', 'ExternalAwaitFailed') \
+                                   AND res.event_data->'data'->>'await_id' = e.event_data->'data'->>'await_id' \
+                             ) \
+                           LIMIT 1 \
+                           FOR UPDATE OF e SKIP LOCKED";
 
                 let row_opt: Option<crate::models::HarvestEvent> = diesel::sql_query(sql)
                     .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(&shards)
@@ -5485,12 +3088,6 @@ pub async fn enforce_external_awaits_outbox(
                 };
 
                 let caller_exec_id = crate::types::ExecutionId::from_uuid(row.workflow_exec_id);
-                // The caller's CURRENT residence (issue #964), read off the held
-                // connection — see the signal outbox above for why the id's
-                // encoded origin is the wrong thing to compare pools with.
-                let caller_shard = crate::shard_rebalance::shard_of_held_row(conn, caller_exec_id)
-                    .await
-                    .unwrap_or_else(|| caller_exec_id.shard());
 
                 let (await_id, target) = match codecs.decode_event(row.event_data.clone()) {
                     Ok(WorkflowEvent::ExternalAwaitRequested { await_id, target }) => {
@@ -5518,39 +3115,15 @@ pub async fn enforce_external_awaits_outbox(
                             .and_then(|lock| lock.clone())
                     });
 
-                // Issue #964: compare RESIDENCES, not the shards the two ids
-                // encode. After a rebalance an id names where its run
-                // ORIGINATED, so comparing origins can call two connections to
-                // one database "cross-pool" and take the branch that acquires a
-                // second connection from the pool already driving this
-                // transaction. The lookup reads on the held connection for that
-                // same reason.
-                let target_residence = match active_sharded_pool.as_ref() {
-                    Some(pool) => {
-                        crate::shard_rebalance::resolve_target_shard_holding(
-                            conn,
-                            pool,
-                            &ExternalTarget::ExecutionId(target),
-                            caller_shard,
-                        )
-                        .await
-                    }
-                    None => target.shard(),
-                };
-
                 let same_pool = active_sharded_pool.as_ref().is_none_or(|pool| {
-                    // The caller side keeps `pool_for`'s default-shard fallback
-                    // so a legacy caller carrying `ShardId::UNENCODED` resolves
-                    // to the pool that actually serves it rather than to a
-                    // spurious cross-pool verdict. The target side stays exact:
-                    // an unknown shard must fail rather than silently deliver to
-                    // the default database.
-                    pool.exact_pool_for(target_residence).is_some_and(|t_pool| {
-                        crate::external_target_location::same_underlying_pool(
-                            t_pool,
-                            pool.pool_for(caller_shard),
-                        )
-                    })
+                    if let (Some(t_pool), Some(c_pool)) = (
+                        pool.exact_pool_for_execution(target),
+                        pool.exact_pool_for_execution(caller_exec_id),
+                    ) {
+                        std::ptr::eq(t_pool, c_pool)
+                    } else {
+                        false
+                    }
                 });
 
                 // Map the reader's 3-state result to the awaiter's terminal
@@ -5616,36 +3189,18 @@ pub async fn enforce_external_awaits_outbox(
                 } else {
                     let Some(pool) = active_sharded_pool
                         .as_ref()
-                        .and_then(|p| p.exact_pool_for(target_residence))
+                        .and_then(|p| p.exact_pool_for_execution(target))
                     else {
                         tracing::warn!(
-                            target_shard = %target_residence,
+                            target_shard = %target.shard(),
                             "await outbox sweep: target shard not configured locally; skipping"
                         );
                         return Ok(Some((false, Some(row.id))));
                     };
-                    // Bounded like the cross-shard delivery acquisitions
-                    // above (issue #1323, issue #1146). This read reaches a
-                    // peer pool while still holding a connection from
-                    // another pool in the same process. One timeout checker
-                    // runs per assigned shard. See
-                    // `external_target_location::peer_acquire_bound`.
-                    let mut target_conn = match crate::replication::fenced_get_within(
-                        pool,
-                        crate::external_target_location::peer_acquire_bound(pool),
-                    )
-                    .await
-                    {
-                        Ok(Ok(c)) => c,
-                        Ok(Err(e)) => {
+                    let mut target_conn = match pool.get().await {
+                        Ok(c) => c,
+                        Err(e) => {
                             tracing::error!(error = %e, "await outbox sweep: failed to acquire target connection");
-                            return Ok(Some((false, Some(row.id))));
-                        }
-                        Err(_elapsed) => {
-                            tracing::warn!(
-                                target_shard = %target_residence,
-                                "await outbox sweep: no connection available for the target shard; leaving pending"
-                            );
                             return Ok(Some((false, Some(row.id))));
                         }
                     };
@@ -5672,7 +3227,7 @@ pub async fn enforce_external_awaits_outbox(
                     // If present, skip the duplicate append (the inline path
                     // owns the awaiter's own wake/resolution).
                     let history =
-                        lock_workflow_execution_and_load_history(conn, caller_exec_id, &codecs).await?;
+                        lock_workflow_execution_and_load_history(conn, caller_exec_id).await?;
                     let already_resolved = history.events.iter().any(|e| match e {
                         WorkflowEvent::ExternalAwaitResolved { await_id: a, .. }
                         | WorkflowEvent::ExternalAwaitFailed { await_id: a, .. } => *a == await_id,
@@ -5681,12 +3236,11 @@ pub async fn enforce_external_awaits_outbox(
                     if already_resolved {
                         return Ok(Some((false, Some(row.id))));
                     }
-                    store::append_events_with_codecs(
+                    store::append_events(
                         conn,
                         caller_exec_id,
                         &[terminal_event],
                         history.next_event_id,
-                        &codecs,
                     )
                     .await?;
                     queue::wake_workflow_task(conn, caller_exec_id).await?;
@@ -5694,7 +3248,7 @@ pub async fn enforce_external_awaits_outbox(
                 } else {
                     Ok(Some((false, Some(row.id))))
                 }
-            })))
+            }))
             .await;
 
         match step_res {
@@ -5725,16 +3279,10 @@ pub async fn enforce_external_awaits_outbox(
 /// poison-pill reclaimer's `worker_stale_secs` convention (`2 ×
 /// worker_heartbeat_interval`, computed once by the caller).
 ///
-/// `payload_codecs` / `codec_rotation_batch_size` drive the lazy payload-codec
-/// re-encryption sweep (issue #948). The sweep is a no-op — not one statement
-/// issued — unless the registry holds a keyed codec, so it costs nothing on
-/// every deployment that has not adopted key rotation. A batch size of `0`
-/// disables it outright.
-///
 /// # Errors
 ///
 /// Returns the first database or persistence error encountered.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn enforce_timeouts_once(
     conn: &mut AsyncPgConnection,
     metrics: &(dyn MetricsRecorder + Send + Sync),
@@ -5744,158 +3292,9 @@ pub async fn enforce_timeouts_once(
     circuit_breakers: Option<&crate::circuit_breaker::CircuitBreakerRegistry>,
     max_workflow_history_events: Option<u64>,
     session_worker_stale_secs: i64,
-    payload_codecs: &crate::payload_codec::PayloadCodecs,
-    codec_rotation_batch_size: i64,
 ) -> HarvestResult<usize> {
-    // Issue #1815: `conn` names no shard, so the scan carries each assigned
-    // shard, as the background checker on the single pool does.
-    enforce_timeouts_once_on_conn_shard(
-        conn,
-        None,
-        &scan_metric_shards(None, None, shard_assignments),
-        TaskScan::All,
-        metrics,
-        unknown_target_grace_window,
-        sharded_pool,
-        shard_assignments,
-        circuit_breakers,
-        max_workflow_history_events,
-        session_worker_stale_secs,
-        payload_codecs,
-        codec_rotation_batch_size,
-    )
-    .await
-}
-
-/// [`enforce_timeouts_once`] for a caller that knows `conn`'s shard.
-///
-/// `conn_shard` must name the shard whose own pool `conn` came from. The
-/// per-shard scanners in this pass then reuse `conn` for that shard instead
-/// of checking out a second connection. See
-/// [`crate::shard::connect_or_reuse`].
-///
-/// `metric_shards` are the `shard` labels of the pass's `scan` sample (issue
-/// #1815). They stay separate from `conn_shard`, because a checker without a
-/// pool shard still labels its samples with its assigned shards. See
-/// [`scan_metric_shards`].
-// `&Option` because the body forwards `sharded_pool` to many public
-// scanners that take `&Option<ShardedDbPool>`.
-#[allow(clippy::too_many_arguments, clippy::ref_option)]
-pub(crate) async fn enforce_timeouts_once_on_conn_shard(
-    conn: &mut AsyncPgConnection,
-    conn_shard: Option<crate::types::ShardId>,
-    metric_shards: &[u16],
-    task_scan: TaskScan<'_>,
-    metrics: &(dyn MetricsRecorder + Send + Sync),
-    unknown_target_grace_window: Duration,
-    sharded_pool: &Option<crate::shard::ShardedDbPool>,
-    shard_assignments: &[crate::types::ShardId],
-    circuit_breakers: Option<&crate::circuit_breaker::CircuitBreakerRegistry>,
-    max_workflow_history_events: Option<u64>,
-    session_worker_stale_secs: i64,
-    payload_codecs: &crate::payload_codec::PayloadCodecs,
-    codec_rotation_batch_size: i64,
-) -> HarvestResult<usize> {
-    // Issue #1815: one pass is one `scan` op, whether it succeeds or fails.
-    let started = std::time::Instant::now();
-    let result = Box::pin(enforce_timeouts_pass(
-        conn,
-        conn_shard,
-        task_scan,
-        metrics,
-        unknown_target_grace_window,
-        sharded_pool,
-        shard_assignments,
-        circuit_breakers,
-        max_workflow_history_events,
-        session_worker_stale_secs,
-        payload_codecs,
-        codec_rotation_batch_size,
-    ))
-    .await;
-    let elapsed = started.elapsed().as_secs_f64();
-    for label in metric_shards {
-        metrics.record_db_query_duration(crate::telemetry::DbOp::Scan, *label, elapsed);
-    }
-    result
-}
-
-/// The `shard` labels of a timeout checker's pool waits and scans (issue
-/// #1815).
-///
-/// A checker on a shard pool uses that shard. A checker on the single pool
-/// scans the database that serves every assigned shard. It then uses each
-/// assigned shard, as the claim path and the pool gauges do. A worker with
-/// no assignment uses shard 0.
-fn scan_metric_shards(
-    pool_shard: Option<crate::types::ShardId>,
-    shard: Option<crate::types::ShardId>,
-    assignments: &[crate::types::ShardId],
-) -> Vec<u16> {
-    pool_shard.or(shard).map_or_else(
-        || crate::worker::single_pool_shard_labels(assignments),
-        |shard| vec![crate::worker::shard_metric_label(shard)],
-    )
-}
-
-/// The body of one [`enforce_timeouts_once_on_conn_shard`] pass.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::ref_option)]
-async fn enforce_timeouts_pass(
-    conn: &mut AsyncPgConnection,
-    conn_shard: Option<crate::types::ShardId>,
-    task_scan: TaskScan<'_>,
-    metrics: &(dyn MetricsRecorder + Send + Sync),
-    unknown_target_grace_window: Duration,
-    sharded_pool: &Option<crate::shard::ShardedDbPool>,
-    shard_assignments: &[crate::types::ShardId],
-    circuit_breakers: Option<&crate::circuit_breaker::CircuitBreakerRegistry>,
-    max_workflow_history_events: Option<u64>,
-    session_worker_stale_secs: i64,
-    payload_codecs: &crate::payload_codec::PayloadCodecs,
-    codec_rotation_batch_size: i64,
-) -> HarvestResult<usize> {
-    // Off-box audit-record export (issue #953) used to run here, sharing
-    // this loop's connection and cadence. Issue #1269 moved it to its own
-    // task, `crate::audit_export::spawn_audit_export_checker_for_shard`. A
-    // slow sink no longer delays timeout enforcement, SLA checks, session
-    // cleanup, or codec rotation. A `max_size(1)` shard pool no longer
-    // needs a second connection while this loop still holds the first.
-    let mut count = 0usize;
-    // Refresh this process's active codec key from the durable, fleet-wide
-    // `harvest_codec_key_state` table (issue #1244). Placed here, before the
-    // first `?`-propagating resident, deliberately.
-    //
-    // Every resident below this point can end the tick early with `?`.
-    // `codec_rotation::FleetWriteFence`'s retirement gate treats elapsed
-    // wall-clock time as proof that every live process has refreshed within
-    // one scanner-tick interval. A refresh reachable only after fallible
-    // residents would break that proof. A process stuck failing earlier in
-    // the tick would never refresh, yet retirement would still count its
-    // staleness window as satisfied.
-    //
-    // Shard-local, on this connection, and never allowed to break the rest
-    // of the tick. Same posture as the re-encryption sweep below.
-    match crate::codec_rotation::refresh_active_codec_key(conn, payload_codecs).await {
-        Ok(_flipped) => {}
-        Err(e) => tracing::warn!(
-            error = %e,
-            "codec key state refresh failed; continuing with the remaining timeout-pass \
-             residents"
-        ),
-    }
-
-    let (timed_out, mut retry_cursor) = match task_scan {
-        TaskScan::All => (find_timed_out_tasks(conn).await?, None),
-        TaskScan::Batch { cursor, limit } => (
-            find_timed_out_tasks_batch(conn, cursor, limit).await?,
-            Some(cursor),
-        ),
-    };
-    count += timed_out.len();
-    // Issue #1795: in a batched pass, a row that fails is tried again on the
-    // next pass, and the rest of the pass goes on. The pass still reports the
-    // first error, so a leader that keeps failing gives up its lease.
-    let mut first_error = None;
+    let timed_out = find_timed_out_tasks(conn).await?;
+    let mut count = timed_out.len();
 
     for (task, reason) in timed_out {
         let result = match (task.task_type.as_str(), task.workflow_exec_id) {
@@ -5903,11 +3302,10 @@ async fn enforce_timeouts_pass(
                 enforce_activity_timeout(
                     conn,
                     &task,
-                    ExecutionId::from_uuid(exec_uuid),
+                    execution_id_from_uuid(exec_uuid),
                     &reason,
                     circuit_breakers,
                     metrics,
-                    payload_codecs,
                 )
                 .await
             }
@@ -5915,10 +3313,9 @@ async fn enforce_timeouts_pass(
                 enforce_workflow_timeout(
                     conn,
                     &task,
-                    ExecutionId::from_uuid(exec_uuid),
+                    execution_id_from_uuid(exec_uuid),
                     &reason,
                     metrics,
-                    payload_codecs,
                 )
                 .await
             }
@@ -5933,13 +3330,7 @@ async fn enforce_timeouts_pass(
                 error = %error,
                 "failed to enforce timed-out task"
             );
-            match retry_cursor.as_deref_mut() {
-                Some(cursor) => {
-                    cursor.retry(&reason, task.id);
-                    first_error.get_or_insert(error);
-                }
-                None => return Err(error),
-            }
+            return Err(error);
         }
     }
 
@@ -5956,7 +3347,6 @@ async fn enforce_timeouts_pass(
         unknown_target_grace_window,
         sharded_pool,
         shard_assignments,
-        payload_codecs,
     )
     .await?;
     count += enforce_external_cancels_outbox(
@@ -5965,7 +3355,6 @@ async fn enforce_timeouts_pass(
         unknown_target_grace_window,
         sharded_pool,
         shard_assignments,
-        payload_codecs,
     )
     .await?;
     count += enforce_external_awaits_outbox(
@@ -5973,137 +3362,43 @@ async fn enforce_timeouts_pass(
         unknown_target_grace_window,
         sharded_pool,
         shard_assignments,
-        payload_codecs,
     )
     .await?;
-    count += crate::completion_trigger::enforce_completion_triggers_outbox_with_codecs(
+    count += crate::completion_trigger::enforce_completion_triggers_outbox(
         conn,
         metrics,
         sharded_pool,
         shard_assignments,
-        payload_codecs,
     )
     .await?;
-    // Cross-shard child workflows (issue #956). Runs on this shard's own
-    // `harvest_cross_shard_children` rows: creates opt-in cross-shard children on
-    // their target shard, delivers their terminals back to the parent parked
-    // here, relays parent-side cancels, and applies the `ParentClosePolicy`
-    // cascade across the shard boundary. A no-op — one indexed, empty-relation
-    // scan — in every deployment that never opts in.
-    //
-    // Placed after the #492 outbox scanners deliberately: those deliver signals
-    // and cancels that a workflow is parked on, and a parent woken by this
-    // scanner will re-enter its decision cycle on the next claim either way, so
-    // ordering costs nothing but keeps the cheap always-empty scan last among
-    // the delivery family.
-    count += crate::cross_shard_child::enforce_cross_shard_children(
+    count +=
+        crate::debounce::fire_due_debounced_starts(conn, sharded_pool, shard_assignments, metrics)
+            .await?;
+    count +=
+        crate::throttle::fire_due_throttled_starts(conn, sharded_pool, shard_assignments, metrics)
+            .await?;
+    count +=
+        crate::event_batch::fire_due_event_batches(conn, sharded_pool, shard_assignments, metrics)
+            .await?;
+    count += crate::completion_callback::fire_due_completion_deliveries(
         conn,
         sharded_pool,
-        payload_codecs,
-        metrics,
-    )
-    .await?;
-    count += crate::debounce::fire_due_debounced_starts_on_conn_shard(
-        conn,
-        conn_shard,
-        sharded_pool.as_ref(),
-        shard_assignments,
-        metrics,
-        payload_codecs,
-    )
-    .await?;
-    count += crate::throttle::fire_due_throttled_starts_on_conn_shard(
-        conn,
-        conn_shard,
-        sharded_pool.as_ref(),
-        shard_assignments,
-        metrics,
-        payload_codecs,
-    )
-    .await?;
-    count += crate::event_batch::fire_due_event_batches_on_conn_shard(
-        conn,
-        conn_shard,
-        sharded_pool.as_ref(),
-        shard_assignments,
-        metrics,
-        payload_codecs,
-    )
-    .await?;
-    count += crate::completion_callback::fire_due_completion_deliveries_on_conn_shard(
-        conn,
-        conn_shard,
-        sharded_pool.as_ref(),
         shard_assignments,
     )
     .await?;
     if let Some(ceiling) = max_workflow_history_events {
-        count +=
-            enforce_workflow_history_ceiling_with_codecs(conn, ceiling, metrics, payload_codecs)
-                .await?;
+        count += enforce_workflow_history_ceiling(conn, ceiling, metrics).await?;
     }
-    count +=
-        crate::sessions::enforce_broken_sessions(conn, session_worker_stale_secs, payload_codecs)
-            .await?;
+    count += crate::sessions::enforce_broken_sessions(conn, session_worker_stale_secs).await?;
     // Sweep expired request-scoped start-idempotency claims (issue #808). Best
     // effort table growth control; the reserve upsert overwrites an expired row
     // in place regardless, so correctness does not depend on this running.
-    count += crate::start_idempotency::sweep_expired_start_idempotency_on_conn_shard(
+    count += crate::start_idempotency::sweep_expired_start_idempotency(
         conn,
-        conn_shard,
-        sharded_pool.as_ref(),
+        sharded_pool,
         shard_assignments,
     )
     .await?;
-    // Lazy payload-codec re-encryption (issue #948): convert a bounded batch of
-    // stored rows per shard from a retired key id onto the active one.
-    //
-    // ⚠️ This is the ONLY resident of this pass that mutates
-    // `harvest_events.event_data` in place — sanctioned exception #3, see
-    // `crate::codec_rotation` and CLAUDE.md. Only the ciphertext bytes inside
-    // payload fields change; decoded plaintext, event `type`, ids, ordering and
-    // timestamps are untouched, so replay is unaffected by construction.
-    //
-    // Returns without issuing a statement unless a keyed codec is registered,
-    // so a deployment that has never rotated pays nothing for it.
-    // Shard-local by design: it sweeps THIS connection's shard through THIS
-    // connection. Reaching back into the same shard pool for a second
-    // connection would park forever on a single-connection pool (deadpool is
-    // configured with no acquisition timeout), wedging every later resident of
-    // this tick as well as rotation itself.
-    //
-    // Isolated from the rest of the pass on purpose: a rotation failure is
-    // logged and skipped, never propagated. Rotation is new and optional; the
-    // durable-mutex lease reclamation below is neither, and a workflow waiting
-    // on a lease this pass would have freed stays stuck for as long as the
-    // sweep keeps failing. Missing grants on `harvest_codec_rotation_cursor`
-    // or on `UPDATE harvest_events` are exactly the kind of persistent,
-    // deployment-shaped failure that repeats identically every tick, so
-    // propagating would not be a transient blip — it would take mutex
-    // reclamation down on that shard indefinitely. A new feature must not be
-    // able to break an old one by failing.
-    match crate::codec_rotation::sweep_codec_reencryption(
-        conn,
-        shard_assignments,
-        payload_codecs,
-        codec_rotation_batch_size,
-        metrics,
-    )
-    .await
-    {
-        // Deliberately NOT folded into `count`. That value is the
-        // timeout-enforcement total: the caller logs `warn!("enforced timed-out
-        // tasks")` whenever it is non-zero, and embedders read it as "this many
-        // tasks timed out". Adding rotation rewrites to it makes every
-        // productive sweep tick claim a timeout that never happened. Rotation
-        // reports itself through `harvest.codec.reencrypted` instead.
-        Ok(_swept) => {}
-        Err(e) => tracing::warn!(
-            error = %e,
-            "codec re-encryption sweep failed; continuing with the remaining \
-             timeout-pass residents"
-        ),
-    }
     // Reclaim expired durable-mutex leases (crash recovery, issue #691) and wake
     // each freed key's new head of line. Shard-local: it runs against this
     // connection's own database (like `enforce_broken_sessions`), and is a no-op
@@ -6123,7 +3418,7 @@ async fn enforce_timeouts_pass(
             crate::mutex::reclaim_expired_leases_and_wake(conn).await
         })
         .await?;
-    first_error.map_or(Ok(count), Err)
+    Ok(count)
 }
 
 /// Spawn a background task that periodically checks for timed-out tasks.
@@ -6163,13 +3458,6 @@ pub fn spawn_timeout_checker(
         max_workflow_history_events,
         session_worker_stale_secs,
         None,
-        // Issue #948: this legacy single-shard entry point carries no codec
-        // registry, so it drives the sweep with an empty one — which is an
-        // unconditional no-op. A deployment that has adopted key rotation
-        // reaches the sweep through `spawn_timeout_checker_for_shard`, wired
-        // from `WorkerConfig::payload_codecs` by `HarvestBuilder::build`.
-        crate::payload_codec::PayloadCodecs::default(),
-        0,
     )
 }
 
@@ -6182,10 +3470,6 @@ pub fn spawn_timeout_checker(
 /// shard label, so this is the only surface that can localize it.
 ///
 /// Pass `None` for a process-wide loop or a single-shard deployment.
-///
-/// This loop does not take part in election and does not jitter. Every
-/// caller runs every pass on a fixed cadence. For election, use
-/// [`spawn_coordinated_timeout_checker_for_shard`] (issue #1795).
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_timeout_checker_for_shard(
@@ -6200,172 +3484,7 @@ pub fn spawn_timeout_checker_for_shard(
     max_workflow_history_events: Option<u64>,
     session_worker_stale_secs: i64,
     shard: Option<crate::types::ShardId>,
-    payload_codecs: crate::payload_codec::PayloadCodecs,
-    codec_rotation_batch_size: i64,
 ) -> tokio::task::JoinHandle<()> {
-    spawn_timeout_checker_on_shard_pool(
-        pool,
-        cancel,
-        interval,
-        telemetry,
-        unknown_target_grace_window,
-        sharded_pool,
-        shard_assignments,
-        circuit_breakers,
-        max_workflow_history_events,
-        session_worker_stale_secs,
-        shard,
-        None,
-        payload_codecs,
-        codec_rotation_batch_size,
-        crate::scanner_lease::ScannerCoordination::unelected(),
-        DEFAULT_TIMEOUT_SCAN_BATCH_SIZE,
-    )
-}
-
-/// [`spawn_timeout_checker_for_shard`] with scanner election (issue #1795).
-///
-/// With a holder in `coordination`, replicas that share a database elect
-/// one checker for `shard`. Only that checker runs the pass. The others
-/// stand by and take over within the lease TTL. `task_batch_size` bounds the
-/// task-timeout rows that one pass reads per reason. See
-/// [`crate::scanner_lease`].
-///
-/// `pool_shard` names the shard whose own pool `pool` is, when the caller
-/// knows it. The pass then reuses its held connection for that shard. Without
-/// it, a pass that also scans that shard through `sharded_pool` checks out a
-/// second connection, and a pool of one connection waits forever.
-///
-/// The lease key is `pool_shard`, then `shard`, then shard 0.
-#[must_use]
-#[allow(clippy::too_many_arguments)]
-pub fn spawn_coordinated_timeout_checker_for_shard(
-    pool: Pool<AsyncPgConnection>,
-    cancel: CancellationToken,
-    interval: Duration,
-    telemetry: std::sync::Arc<crate::telemetry::TelemetryConfig>,
-    unknown_target_grace_window: Duration,
-    sharded_pool: Option<crate::shard::ShardedDbPool>,
-    shard_assignments: Vec<crate::types::ShardId>,
-    circuit_breakers: std::sync::Arc<crate::circuit_breaker::CircuitBreakerRegistry>,
-    max_workflow_history_events: Option<u64>,
-    session_worker_stale_secs: i64,
-    shard: Option<crate::types::ShardId>,
-    pool_shard: Option<crate::types::ShardId>,
-    payload_codecs: crate::payload_codec::PayloadCodecs,
-    codec_rotation_batch_size: i64,
-    coordination: crate::scanner_lease::ScannerCoordination,
-    task_batch_size: u32,
-) -> tokio::task::JoinHandle<()> {
-    spawn_timeout_checker_on_shard_pool(
-        pool,
-        cancel,
-        interval,
-        telemetry,
-        unknown_target_grace_window,
-        sharded_pool,
-        shard_assignments,
-        circuit_breakers,
-        max_workflow_history_events,
-        session_worker_stale_secs,
-        shard,
-        pool_shard,
-        payload_codecs,
-        codec_rotation_batch_size,
-        coordination,
-        task_batch_size,
-    )
-}
-
-/// Records a checker tick that got no connection (issue #1795).
-///
-/// The tick ran no pass, so the next pass starts a new sweep. The lease can
-/// move during the gap, so the run of failed leader passes ends too.
-fn skip_tick(ran_last_tick: &mut bool, leader_failures: &mut crate::scanner_lease::LeaderFailures) {
-    *ran_last_tick = false;
-    *leader_failures = crate::scanner_lease::LeaderFailures::default();
-}
-
-/// The tick interval of a timeout checker.
-///
-/// A zero interval would busy-spin and time out every checkout, so every
-/// checker gets the floor. Only a leased checker gets the cap, because the
-/// cap keeps three of its sleeps within the lease TTL.
-fn checker_interval(interval: Duration, leased: bool) -> Duration {
-    if leased {
-        crate::scanner_lease::scanner_interval(interval)
-    } else {
-        interval.max(crate::scanner_lease::MIN_SCANNER_INTERVAL)
-    }
-}
-
-/// [`spawn_timeout_checker_for_shard`] for a caller that knows `pool`'s shard.
-///
-/// `pool_shard` must name the shard whose own pool `pool` is. `shard` stays
-/// a health-check label only. The worker passes both, because it builds
-/// `pool` from `sharded_pool.pool_for(shard)` itself.
-///
-/// `coordination` decides which replica runs the pass (issue #1795). With a
-/// holder, each tick takes or renews the `timeout` lease for this shard. Only
-/// the holder runs the pass. A standby still refreshes the active codec key,
-/// because `codec_rotation::FleetWriteFence` counts on every live process
-/// to do that once per tick. `task_batch_size` bounds the task-timeout scans
-/// of one pass. See [`crate::scanner_lease`].
-#[must_use]
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-pub(crate) fn spawn_timeout_checker_on_shard_pool(
-    pool: Pool<AsyncPgConnection>,
-    cancel: CancellationToken,
-    interval: Duration,
-    telemetry: std::sync::Arc<crate::telemetry::TelemetryConfig>,
-    unknown_target_grace_window: Duration,
-    sharded_pool: Option<crate::shard::ShardedDbPool>,
-    shard_assignments: Vec<crate::types::ShardId>,
-    circuit_breakers: std::sync::Arc<crate::circuit_breaker::CircuitBreakerRegistry>,
-    max_workflow_history_events: Option<u64>,
-    session_worker_stale_secs: i64,
-    shard: Option<crate::types::ShardId>,
-    pool_shard: Option<crate::types::ShardId>,
-    payload_codecs: crate::payload_codec::PayloadCodecs,
-    codec_rotation_batch_size: i64,
-    coordination: crate::scanner_lease::ScannerCoordination,
-    task_batch_size: u32,
-) -> tokio::task::JoinHandle<()> {
-    use crate::scanner_lease::{ScannerLease, ScannerRole};
-
-    let interval = checker_interval(interval, coordination.holder.is_some());
-    let jitter = coordination.jitter;
-    // Liveness judges the loop against its longest sleep, not its mean.
-    let longest_sleep = crate::scanner_lease::max_jittered_interval(interval, jitter);
-    // The lease row is per shard. `pool_shard` names the database this loop
-    // scans. The health label is the fallback for a caller that has no pool
-    // shard.
-    let lease_shard = pool_shard
-        .or(shard)
-        .unwrap_or(crate::types::ShardId::new(0));
-    let lease_ttl =
-        crate::scanner_lease::effective_lease_ttl(coordination.lease_ttl, interval, jitter);
-    // The key carries this checker's scope when the scope is not just the
-    // lease shard. Checkers on one pool with different shard assignments then
-    // each lead their own scope, instead of one leaving the others unscanned.
-    // It also carries the routing mode, because a sharded pass and a local
-    // pass do different work with one scope.
-    let routing = if sharded_pool.is_some() {
-        crate::scanner_lease::LeaseRouting::Sharded
-    } else {
-        crate::scanner_lease::LeaseRouting::Local
-    };
-    let lease_key = crate::scanner_lease::lease_scanner_key(
-        crate::scanner_health::Scanner::Timeout,
-        lease_shard,
-        &shard_assignments,
-        routing,
-    );
-    let lease = coordination
-        .holder
-        .map(|holder| ScannerLease::new(lease_shard, lease_key, holder, lease_ttl));
-    let task_batch_size = i64::from(task_batch_size.max(1));
-
     // Issue #797: declare this loop (and the sub-passes it drives) before the
     // first iteration, so the `scanner_liveness` health check knows they are
     // expected in this process and grants them their boot grace window.
@@ -6389,233 +3508,46 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
         crate::scanner_health::register_scanner_for_shard(
             &*telemetry.metrics,
             scanner,
-            longest_sleep,
+            interval,
             shard,
         )
     })
     .collect();
-    // Issue #1815: the `shard` labels of this loop's pool waits and scans.
-    let metric_shards = scan_metric_shards(pool_shard, shard, &shard_assignments);
-    // The tick series and the pass series carry the same shard label.
-    let shard_label = owners[0].shard_label();
-    // Keep the worker dispatch binding for hints (issue #1431).
-    crate::dispatch::spawn_bound(async move {
-        let mut cursor = TimeoutScanCursor::default();
-        let mut last_role: Option<ScannerRole> = None;
-        let mut leader_failures = crate::scanner_lease::LeaderFailures::default();
-        let mut ran_last_tick = true;
-        let mut abdicated_until: Option<tokio::time::Instant> = None;
+    tokio::spawn(async move {
         loop {
-            // Issue #1795: a random sleep in `[1 - jitter, 1 + jitter]` of
-            // the interval. The mean is the interval, so enforcement latency
-            // does not change. Replica ticks stop lining up.
-            let sleep = crate::scanner_lease::jittered_interval(interval, jitter, rand::random());
             tokio::select! {
                 () = cancel.cancelled() => {
                     tracing::debug!("timeout checker cancelled");
                     break;
                 }
-                () = tokio::time::sleep(sleep) => {}
-            }
-            // Issue #1823: a held shard skips the tick before it takes a connection.
-            // It can be an unreachable standby, so a checkout could wait on it.
-            if crate::replication::shard_writes_held(pool_shard) {
-                skip_tick(&mut ran_last_tick, &mut leader_failures);
-                // The loop is still alive, so a skipped tick still counts.
-                for owner in &owners {
-                    crate::scanner_health::record_scanner_tick(&*telemetry.metrics, *owner);
+                () = tokio::time::sleep(interval) => {
+                    // Check for timed out tasks
                 }
-                continue;
             }
 
-            // Bounded to `interval`. Unbounded pool contention here would
-            // silently stretch this loop's actual period past `interval`,
-            // which is exactly the assumption
-            // `codec_rotation::FleetWriteFence`'s staleness window relies
-            // on.
-            //
-            // Skipping this tick and retrying next `interval` is the same
-            // posture `acquire_shard_conn` already uses for registration and
-            // heartbeats. It is better than blocking the whole scanner on
-            // one contested pool.
-            //
-            // Also selected against `cancel` (issue #1426): the `interval`
-            // bound above only limits a merely-slow acquisition. Without this
-            // select, a shutdown request during that wait would still queue
-            // behind the full `interval` before this loop noticed it.
-            let wait_started = std::time::Instant::now();
-            let get_result = tokio::select! {
-                () = cancel.cancelled() => {
-                    tracing::debug!("timeout checker cancelled while acquiring a connection");
-                    break;
-                }
-                result = tokio::time::timeout(interval, pool.get()) => result,
-            };
-            // Issue #1815: a wait that ends in an error or a timeout counts too.
-            // A single-pool checker has no `pool_shard`, so it records under each
-            // assigned shard. That matches the claim path and the pool gauges.
-            // The scan sample of the pass uses the same labels.
-            let waited = wait_started.elapsed().as_secs_f64();
-            for label in &metric_shards {
-                telemetry.metrics.record_db_pool_wait(*label, waited);
-            }
-            // The fence opens only after the checkout. A tick that waits for a
-            // connection holds no barrier, so pool pressure cannot block a bump. The
-            // tick runs under the barrier of this shard and each pinned shard
-            // colocated with it. A fenced shard skips the tick, and a lost barrier
-            // stops it.
-            let Some(fence) = crate::replication::begin_shard_tick(&pool, pool_shard).await else {
-                skip_tick(&mut ran_last_tick, &mut leader_failures);
-                // The loop is still alive, so a skipped tick still counts.
-                for owner in &owners {
-                    crate::scanner_health::record_scanner_tick(&*telemetry.metrics, *owner);
-                }
-                continue;
-            };
-            match get_result {
-                Ok(Ok(mut conn)) => {
-                    let abdicated =
-                        abdicated_until.is_some_and(|until| tokio::time::Instant::now() < until);
-                    let role = match &lease {
-                        None => ScannerRole::Unelected,
-                        // After giving up the lease, stand by for one TTL, so
-                        // another replica can take it.
-                        Some(_) if abdicated => ScannerRole::Standby,
-                        Some(lease) => match lease.try_acquire(&mut conn).await {
-                            Ok(Some(_epoch)) => ScannerRole::Leader,
-                            Ok(None) => ScannerRole::Standby,
-                            Err(e) => {
-                                if last_role != Some(ScannerRole::FailOpen) {
-                                    tracing::warn!(
-                                        error = %e,
-                                        "timeout scanner lease query failed; running the pass \
-                                         without election until it recovers"
-                                    );
-                                }
-                                ScannerRole::FailOpen
-                            }
-                        },
-                    };
-                    if last_role != Some(role) {
-                        tracing::info!(
-                            shard = %shard_label,
-                            role = role.as_str(),
-                            "timeout scanner role changed"
-                        );
-                        last_role = Some(role);
+            match pool.get().await {
+                Ok(mut conn) => match enforce_timeouts_once(
+                    &mut conn,
+                    &*telemetry.metrics,
+                    unknown_target_grace_window,
+                    &sharded_pool,
+                    &shard_assignments,
+                    Some(&circuit_breakers),
+                    max_workflow_history_events,
+                    session_worker_stale_secs,
+                )
+                .await
+                {
+                    Ok(enforced_count) if enforced_count > 0 => {
+                        tracing::warn!(enforced_count, "enforced timed-out tasks");
                     }
-
-                    if role.runs_pass() {
-                        cursor.resume(ran_last_tick);
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to enforce timed-out tasks");
                     }
-                    ran_last_tick = role.runs_pass();
-                    if role.runs_pass() {
-                        // Issue #1823: the pass runs under the tick's fence
-                        // barrier. A lost barrier stops it before its next
-                        // write.
-                        let failed = match crate::replication::run_fenced_pass(
-                            &fence,
-                            Box::pin(async {
-                                // Issue #1823: the older connection joins the pass.
-                                // A lost guard then ends its backend.
-                                let _member =
-                                    crate::replication::join_fenced_pass(&pool, &mut conn).await;
-                                enforce_timeouts_once_on_conn_shard(
-                                    &mut conn,
-                                    pool_shard,
-                                    &metric_shards,
-                                    TaskScan::Batch {
-                                        cursor: &mut cursor,
-                                        limit: task_batch_size,
-                                    },
-                                    &*telemetry.metrics,
-                                    unknown_target_grace_window,
-                                    &sharded_pool,
-                                    &shard_assignments,
-                                    Some(&circuit_breakers),
-                                    max_workflow_history_events,
-                                    session_worker_stale_secs,
-                                    &payload_codecs,
-                                    codec_rotation_batch_size,
-                                )
-                                .await
-                            }),
-                        )
-                        .await
-                        .and_then(|done| done)
-                        {
-                            Ok(enforced_count) => {
-                                if enforced_count > 0 {
-                                    tracing::warn!(enforced_count, "enforced timed-out tasks");
-                                }
-                                false
-                            }
-                            Err(e) => {
-                                tracing::error!(error = %e, "failed to enforce timed-out tasks");
-                                true
-                            }
-                        };
-                        // A pass can fail on one replica alone, for example on
-                        // a codec only that replica lacks. Before #1795,
-                        // another replica's pass did the work. So a leader
-                        // that keeps failing gives up the lease.
-                        if leader_failures.record(role, failed)
-                            && let Some(lease) = &lease
-                        {
-                            abdicated_until = Some(tokio::time::Instant::now() + lease_ttl);
-                            tracing::warn!(
-                                shard = %shard_label,
-                                "timeout scanner gave up its lease after failed passes"
-                            );
-                            // Bounded like the shutdown release. A failure
-                            // only leaves the lease to expire after its TTL.
-                            match tokio::time::timeout(
-                                crate::scanner_lease::LEASE_RELEASE_BOUND,
-                                lease.release(&mut conn),
-                            )
-                            .await
-                            {
-                                Ok(Ok(())) => {}
-                                Ok(Err(e)) => {
-                                    tracing::warn!(error = %e, "timeout scanner lease release failed");
-                                }
-                                Err(_elapsed) => {
-                                    tracing::warn!("timeout scanner lease release timed out");
-                                }
-                            }
-                        }
-                    } else {
-                        // A standby tick ends any run of failed leader passes.
-                        let _ = leader_failures.record(role, false);
-                        if let Err(e) = crate::codec_rotation::refresh_active_codec_key(
-                            &mut conn,
-                            &payload_codecs,
-                        )
-                        .await
-                        {
-                            // A standby skips the pass but not this refresh.
-                            // The pass runs the same refresh first on the
-                            // leader.
-                            tracing::warn!(error = %e, "codec key state refresh failed on a standby");
-                        }
-                    }
-
-                    telemetry.metrics.record_scanner_pass(
-                        crate::scanner_health::Scanner::Timeout.as_str(),
-                        &shard_label,
-                        role.as_str(),
-                    );
-                }
-                Ok(Err(e)) => {
+                },
+                Err(e) => {
                     tracing::error!(error = %e, "failed to acquire DB connection for timeout check");
-                    skip_tick(&mut ran_last_tick, &mut leader_failures);
-                }
-                Err(_elapsed) => {
-                    tracing::error!(
-                        ?interval,
-                        "pool acquisition exceeded the tick interval; skipping this tick"
-                    );
-                    skip_tick(&mut ran_last_tick, &mut leader_failures);
                 }
             }
 
@@ -6623,49 +3555,12 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
             // no-work pass, an enforcement error, and a failed connection
             // checkout all still prove the loop itself is alive. Only a
             // panicked, deadlocked, or permanently hung loop stops ticking.
-            // A standby tick counts too: the loop is alive and ready to lead.
             for owner in &owners {
                 crate::scanner_health::record_scanner_tick(&*telemetry.metrics, *owner);
             }
 
             if cancel.is_cancelled() {
                 break;
-            }
-        }
-
-        // Issue #1795: a graceful stop expires the lease at once, so a
-        // standby leads on its next tick instead of after the TTL. Best
-        // effort: a failure here only delays the handover to the TTL.
-        //
-        // The bound is fixed, not the scan interval. Worker shutdown awaits
-        // each checker in turn, so a long interval would add up per shard.
-        //
-        // Issue #1823: the tick's fence is gone by now, so the release takes a
-        // fresh one. A held or fenced shard skips it, and the lease expires
-        // after its TTL. A stale release could expire a lease that the
-        // promoted region holds under the same worker id.
-        if let Some(lease) = &lease {
-            let release = async {
-                let fence = crate::replication::begin_shard_tick(&pool, pool_shard)
-                    .await
-                    .ok_or_else(|| "the shard is held or fenced".to_string())?;
-                crate::replication::run_fenced_pass(&fence, async {
-                    let mut conn = crate::replication::fenced_checkout(&pool)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    lease.release(&mut conn).await.map_err(|e| e.to_string())
-                })
-                .await
-                .map_err(|e| e.to_string())?
-            };
-            match tokio::time::timeout(crate::scanner_lease::LEASE_RELEASE_BOUND, release).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    tracing::warn!(error = %e, "timeout scanner lease release failed");
-                }
-                Err(_elapsed) => {
-                    tracing::warn!("timeout scanner lease release timed out");
-                }
             }
         }
 
@@ -6699,39 +3594,12 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
 /// # Errors
 ///
 /// Returns the first database or persistence error encountered.
-///
-/// Delegates to [`enforce_workflow_history_ceiling_with_codecs`] under the
-/// identity registry (issue #1243 review, P2). A payload-bearing call site
-/// should use the `_with_codecs` sibling instead. This wrapper keeps the
-/// pre-#1243 public signature for an out-of-tree caller.
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_lines)]
 pub async fn enforce_workflow_history_ceiling(
     conn: &mut AsyncPgConnection,
     ceiling: u64,
     metrics: &(dyn MetricsRecorder + Send + Sync),
-) -> HarvestResult<usize> {
-    enforce_workflow_history_ceiling_with_codecs(
-        conn,
-        ceiling,
-        metrics,
-        &crate::store::DEFAULT_PAYLOAD_CODECS,
-    )
-    .await
-}
-
-/// [`enforce_workflow_history_ceiling`], encoding through `codecs` (issue #1243).
-///
-/// # Errors
-///
-/// Same as [`enforce_workflow_history_ceiling`].
-#[cfg(feature = "db")]
-#[allow(clippy::too_many_lines)]
-pub async fn enforce_workflow_history_ceiling_with_codecs(
-    conn: &mut AsyncPgConnection,
-    ceiling: u64,
-    metrics: &(dyn MetricsRecorder + Send + Sync),
-    // Issue #1243: threaded to `apply_parent_close_cascade` below.
-    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<usize> {
     use diesel::sql_types::{BigInt, Nullable, Text, Uuid as SqlUuid};
 
@@ -6756,16 +3624,22 @@ pub async fn enforce_workflow_history_ceiling_with_codecs(
     }
 
     let ceiling_i64 = i64::try_from(ceiling).unwrap_or(i64::MAX);
-    let oversized: Vec<OversizedRow> = diesel::sql_query(workflow_history_ceiling_query())
-        .bind::<BigInt, _>(ceiling_i64)
-        .load(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    let oversized: Vec<OversizedRow> = diesel::sql_query(
+        "SELECT id, workflow_id, workflow_name, queue_name, parent_id, parent_close_policy, \
+         (SELECT COUNT(*) FROM harvest_events WHERE workflow_exec_id = harvest_workflow_executions.id)::bigint AS event_count \
+         FROM harvest_workflow_executions \
+         WHERE state = 'RUNNING' \
+         AND (SELECT COUNT(*) FROM harvest_events WHERE workflow_exec_id = harvest_workflow_executions.id) >= $1",
+    )
+    .bind::<BigInt, _>(ceiling_i64)
+    .load(conn)
+    .await
+    .map_err(crate::error::database_error)?;
 
     let count = oversized.len();
 
     for row in &oversized {
-        let exec_id = ExecutionId::from_uuid(row.id);
+        let exec_id = execution_id_from_uuid(row.id);
         let event_count = row.event_count;
 
         let error_msg =
@@ -6780,20 +3654,11 @@ pub async fn enforce_workflow_history_ceiling_with_codecs(
         let workflow_name = row.workflow_name.clone();
         let queue_name = row.queue_name.clone();
 
-        // `wake_parent_for_child_timeout` below raises a dispatch hint
-        // (issue #1429). This scanner claims one row per loop iteration,
-        // the same shape as the outbox sweeps and the external-task
-        // timeout scanner. Those already use `buffered_settled_in_background`
-        // (Codex review, issue #1429). That function hands the hint to the
-        // existing non-blocking background publisher instead of awaiting
-        // it inline. Reconciliation is the durability fallback regardless
-        // of when the hint reaches the channel.
-        let (applied, deferred_starts, closed_children, pending_cancel_metrics) =
-            crate::dispatch::buffered_settled_in_background(Box::pin(conn.transaction::<(
+        let (applied, deferred_starts, closed_children) =
+            Box::pin(conn.transaction::<(
                 bool,
                 Vec<crate::completion_trigger::DeferredTriggerStart>,
                 Vec<(ExecutionId, String)>,
-                Vec<crate::execution::StartCancelledRun>,
             ), HarvestError, _>(async |conn| {
                 let fail_event = fail_event.clone();
                 let error_msg = error_msg.clone();
@@ -6809,7 +3674,7 @@ pub async fn enforce_workflow_history_ceiling_with_codecs(
                     .map_err(crate::error::database_error)?;
 
                 if current_state.as_deref() != Some("RUNNING") {
-                    return Ok((false, Vec::new(), Vec::new(), Vec::new()));
+                    return Ok((false, Vec::new(), Vec::new()));
                 }
 
                 store::append_single_event(conn, exec_id, fail_event).await?;
@@ -6848,7 +3713,7 @@ pub async fn enforce_workflow_history_ceiling_with_codecs(
                 if let Some(parent_uuid) = parent_uuid {
                     wake_parent_for_child_timeout(
                         conn,
-                        ExecutionId::from_uuid(parent_uuid),
+                        execution_id_from_uuid(parent_uuid),
                         exec_id,
                         &error_msg,
                     )
@@ -6856,30 +3721,22 @@ pub async fn enforce_workflow_history_ceiling_with_codecs(
                 }
 
                 let (mut deferred, closed_children) =
-                    apply_parent_close_cascade(conn, exec_id, codecs).await?;
-                let mut pending_cancel_metrics = Vec::new();
-                let triggers =
-                    crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
-                        conn,
-                        exec_id,
-                        crate::completion_trigger::TerminalState::Failed,
-                        Some(metrics),
-                        &mut pending_cancel_metrics,
-                        codecs,
-                    )
-                    .await?;
+                    apply_parent_close_cascade(conn, exec_id).await?;
+                let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+                    conn,
+                    exec_id,
+                    crate::completion_trigger::TerminalState::Failed,
+                    Some(metrics),
+                )
+                .await?;
                 deferred.extend(triggers);
-                Ok((true, deferred, closed_children, pending_cancel_metrics))
-            })))
+                Ok((true, deferred, closed_children))
+            }))
             .await?;
 
         if !applied {
             continue;
         }
-
-        // issue #1197, item 1: emitted only now that this transaction has
-        // actually committed (`applied` is true).
-        crate::execution::emit_start_cancel_metrics(metrics, &pending_cancel_metrics);
 
         for start in deferred_starts {
             start.spawn();
@@ -6914,18 +3771,21 @@ pub async fn enforce_workflow_history_ceiling_with_codecs(
             );
         }
 
-        if let Err(e) = crate::execution::check_and_report_unfinished_handlers_batch(
-            conn,
-            &closed_children,
-            Some(metrics),
-        )
-        .await
-        {
-            tracing::error!(
-                child_count = closed_children.len(),
-                err = %e,
-                "Failed to check and report unfinished handlers on cascaded child executions in history ceiling"
-            );
+        for (child_id, child_name) in closed_children {
+            if let Err(e) = crate::execution::check_and_report_unfinished_handlers(
+                conn,
+                child_id,
+                &child_name,
+                Some(metrics),
+            )
+            .await
+            {
+                tracing::error!(
+                    child_id = %child_id,
+                    err = %e,
+                    "Failed to check and report unfinished handlers on cascaded child execution in history ceiling"
+                );
+            }
         }
 
         // Best-effort: count ceiling failures toward the schedule auto-pause threshold.
@@ -6951,285 +3811,6 @@ pub async fn enforce_workflow_history_ceiling_with_codecs(
 
 #[cfg(test)]
 mod tests {
-
-    /// Issue #1815: a single-pool checker labels its pool waits and scans
-    /// with each assigned shard, as the claim path and the pool gauges do. It
-    /// never reports under a shard the worker does not serve.
-    #[test]
-    fn a_single_pool_checker_labels_its_assigned_shards() {
-        use super::scan_metric_shards;
-        use crate::types::ShardId;
-        let shard = ShardId::new;
-        assert_eq!(scan_metric_shards(None, None, &[shard(7)]), vec![7]);
-        assert_eq!(
-            scan_metric_shards(None, None, &[shard(7), shard(3)]),
-            vec![3, 7]
-        );
-        assert_eq!(scan_metric_shards(None, None, &[]), vec![0]);
-        assert_eq!(
-            scan_metric_shards(Some(shard(5)), Some(shard(5)), &[shard(5)]),
-            vec![5]
-        );
-    }
-    // ── Timeout retry rule (issue #1809, ADR 0005) ───────────────────────
-
-    /// A confirmed timeout releases a probe slot either way. Only a probe whose
-    /// handler started records the trip (issue #1809). An unstarted probe
-    /// made no downstream call.
-    #[test]
-    fn only_a_started_probe_timeout_records_a_trip() {
-        use crate::circuit_breaker::{
-            AttemptOutcome, CircuitBreakerRegistry, ClaimKey, DispatchDecision,
-        };
-        use crate::policy::CircuitBreakerPolicy;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::time::{Duration, Instant};
-
-        #[derive(Default)]
-        struct Trips(AtomicUsize);
-        impl crate::telemetry::MetricsRecorder for Trips {
-            fn record_circuit_tripped(&self, _activity_name: &str) {
-                self.0.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-
-        for handler_started in [false, true] {
-            let mut policies = std::collections::HashMap::new();
-            policies.insert(
-                "send".to_string(),
-                CircuitBreakerPolicy::new(1, Duration::from_secs(30), Duration::from_secs(60)),
-            );
-            let reg = CircuitBreakerRegistry::new(policies);
-            let t0 = Instant::now();
-            let DispatchDecision::Allow { token } = reg.on_dispatch("send", t0) else {
-                panic!("a closed breaker admits");
-            };
-            let _ = reg.on_result("send", AttemptOutcome::RetryableFailure, token, t0);
-            let t1 = t0 + Duration::from_secs(61);
-            let DispatchDecision::Allow { token: probe } = reg.on_dispatch("send", t1) else {
-                panic!("the cooldown admits a probe");
-            };
-            let claim = ClaimKey {
-                task_id: uuid::Uuid::from_u128(1809),
-                attempt: 1,
-                started_at: None,
-            };
-            reg.begin_claim("send", claim, probe);
-            let trips = Trips::default();
-            let mut mark = super::ProvisionalTimeoutMark::new(Some(&reg), "send", claim, &trips);
-            mark.confirm(handler_started);
-            let state = reg.snapshot("send", t1).expect("tracked").state;
-            assert_eq!(state, "open", "the probe slot is released");
-            assert_eq!(
-                AtomicUsize::load(&trips.0, Ordering::SeqCst),
-                usize::from(handler_started),
-                "handler started: {handler_started}"
-            );
-        }
-    }
-
-    /// A dropped enforcement rolls its provisional mark back (issue #1809). A
-    /// result held meanwhile then counts, so a successful probe closes the
-    /// breaker instead of holding its slot for good.
-    #[test]
-    fn a_dropped_enforcement_rolls_its_mark_back() {
-        use crate::circuit_breaker::{
-            AttemptOutcome, CircuitBreakerRegistry, ClaimKey, DispatchDecision,
-        };
-        use crate::policy::CircuitBreakerPolicy;
-        use std::time::{Duration, Instant};
-
-        let mut policies = std::collections::HashMap::new();
-        policies.insert(
-            "send".to_string(),
-            CircuitBreakerPolicy::new(1, Duration::from_secs(30), Duration::from_secs(60)),
-        );
-        let reg = CircuitBreakerRegistry::new(policies);
-        let t0 = Instant::now();
-        let DispatchDecision::Allow { token } = reg.on_dispatch("send", t0) else {
-            panic!("a closed breaker admits");
-        };
-        let _ = reg.on_result("send", AttemptOutcome::RetryableFailure, token, t0);
-        let t1 = t0 + Duration::from_secs(61);
-        let DispatchDecision::Allow { token: probe } = reg.on_dispatch("send", t1) else {
-            panic!("the cooldown admits a probe");
-        };
-        let claim = ClaimKey {
-            task_id: uuid::Uuid::from_u128(1809),
-            attempt: 1,
-            started_at: None,
-        };
-        reg.begin_claim("send", claim, probe);
-        let metrics = crate::telemetry::NoOpMetrics;
-        let mark = super::ProvisionalTimeoutMark::new(Some(&reg), "send", claim, &metrics);
-        let held = reg.on_claim_result("send", AttemptOutcome::Success, probe, claim, t1);
-        assert_eq!(held, None, "the result waits for the enforcer");
-        drop(mark);
-        assert_eq!(
-            reg.snapshot("send", t1).expect("tracked").state,
-            "closed",
-            "the rollback applies the held probe success"
-        );
-    }
-
-    #[test]
-    fn only_start_to_close_and_heartbeat_timeouts_retry() {
-        use super::TimeoutReason;
-        assert!(TimeoutReason::StartToClose.retries_per_policy());
-        assert!(TimeoutReason::Heartbeat.retries_per_policy());
-        assert!(!TimeoutReason::ScheduleToStart.retries_per_policy());
-        assert!(!TimeoutReason::ScheduleToClose.retries_per_policy());
-    }
-
-    // ── task timeout against the locked execution state ─────────────────
-
-    #[test]
-    fn a_task_timeout_is_enforced_only_in_an_open_run() {
-        for state in ["RUNNING", "PAUSED"] {
-            assert_eq!(
-                task_timeout_disposition(state),
-                TaskTimeoutDisposition::Enforce,
-                "{state}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_task_timeout_never_rewrites_a_sealed_run() {
-        for state in crate::erase::TERMINAL_STATES {
-            assert_eq!(
-                task_timeout_disposition(state),
-                TaskTimeoutDisposition::FailTaskOnly,
-                "{state}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_task_timeout_leaves_a_staged_copy_alone() {
-        assert_eq!(
-            task_timeout_disposition("MIGRATING"),
-            TaskTimeoutDisposition::Skip
-        );
-    }
-
-    // ── by-id shard-local vs. cross-shard disagreement (issue #1146) ──────
-
-    #[test]
-    fn an_agreeing_shard_local_read_is_recorded() {
-        // Resolution saw a terminal winner; the shard-local read agrees. This
-        // is issue #751's ordinary `not_running` / no-op-success case and must
-        // stay exactly as it was.
-        assert_eq!(
-            classify_by_id_outcome(false, true, false),
-            ByIdVerdict::Record
-        );
-    }
-
-    #[test]
-    fn an_absent_key_with_no_live_expectation_follows_the_grace_window() {
-        assert_eq!(
-            classify_by_id_outcome(false, false, true),
-            ByIdVerdict::NotFoundPolicy
-        );
-    }
-
-    #[test]
-    fn a_terminal_read_against_a_live_expectation_is_left_pending() {
-        // THE regression. The cross-shard resolution saw a live run on this
-        // shard; the shard-local re-read says terminal. Only the resolution can
-        // see across shards, so this is evidence the key MOVED, not that it
-        // died. Recording it would durably fail a signal `not_running` — or
-        // report a cancel as a no-op success — against a run alive elsewhere.
-        assert_eq!(
-            classify_by_id_outcome(true, true, false),
-            ByIdVerdict::LeavePending
-        );
-    }
-
-    #[test]
-    fn an_absent_read_against_a_live_expectation_is_left_pending() {
-        // Same disagreement, and in particular NOT the grace-window path: a
-        // shard that just held a live run reporting the key absent must never
-        // start the clock toward a permanent `target_unknown`.
-        assert_eq!(
-            classify_by_id_outcome(true, false, true),
-            ByIdVerdict::LeavePending
-        );
-    }
-
-    #[test]
-    fn a_live_expectation_met_by_a_live_read_is_recorded() {
-        assert_eq!(
-            classify_by_id_outcome(true, false, false),
-            ByIdVerdict::Record
-        );
-    }
-
-    #[test]
-    fn a_terminal_expectation_met_by_a_live_read_is_recorded() {
-        // The last reachable row of the matrix, and the disagreement in the
-        // OPPOSITE direction to the one the `expected_live` rule exists for: the
-        // global resolution ranked a terminal run as the current one, and the
-        // shard-local read then found a live run — a new run of the key started
-        // in the window between the two reads.
-        //
-        // Recorded, not left pending. The shard-local read is the more recent of
-        // the two views AND it is the one the delivery actually ran against, so
-        // its outcome describes what really happened to a real run. The
-        // `LeavePending` rule is deliberately asymmetric: it exists only to stop
-        // a *terminal-or-absent* shard-local read from durably failing a request
-        // whose target the global view had just seen alive somewhere else. There
-        // is no equivalent hazard here — nothing is being wrongly failed.
-        assert_eq!(
-            classify_by_id_outcome(false, false, false),
-            ByIdVerdict::Record
-        );
-    }
-
-    #[test]
-    fn the_disagreement_rule_terminates() {
-        // `LeavePending` retries, so the rule must not be able to retry
-        // forever. It cannot: a retry re-resolves globally, and once the key is
-        // terminal everywhere the global winner is terminal too, which is
-        // `expected_live == false` — the recorded row above.
-        assert_eq!(
-            classify_by_id_outcome(true, true, false),
-            ByIdVerdict::LeavePending
-        );
-        assert_eq!(
-            classify_by_id_outcome(false, true, false),
-            ByIdVerdict::Record,
-            "the very next sweep's classification, once the global view agrees"
-        );
-    }
-
-    // ── by-id other-live-observed metric gate (issue #1313) ────────────────
-
-    #[test]
-    fn a_complete_fanout_with_other_live_is_counted() {
-        assert!(should_record_other_live_observed(false, true));
-    }
-
-    #[test]
-    fn a_complete_fanout_with_no_other_live_is_not_counted() {
-        assert!(!should_record_other_live_observed(true, true));
-    }
-
-    #[test]
-    fn a_partial_fanout_with_other_live_is_not_counted() {
-        // Review finding (PR #1645). A fan-out that missed a shard AND saw
-        // `other_live` is not topology-drift evidence -- it is the
-        // ordinary partial-view case `by_id_found_over_incomplete_fanout`
-        // already counts. Counting it here too would blur the two.
-        assert!(!should_record_other_live_observed(false, false));
-    }
-
-    #[test]
-    fn a_partial_fanout_with_no_other_live_is_not_counted() {
-        assert!(!should_record_other_live_observed(true, false));
-    }
-
     use super::*;
 
     // ── force_fail_activity classification truth table (issue #765) ────────
@@ -7387,465 +3968,6 @@ mod tests {
             },
         ];
         assert!(named_activity_has_terminal_event(&history, "hung_activity"));
-    }
-
-    #[test]
-    fn refill_query_reads_one_bounded_page_of_live_rows() {
-        let predicate = start_to_close_timeout_query();
-        // The first page of a sweep is bounded only by the clock.
-        let first = timeout_refill_query(predicate, &[], false);
-        assert!(first.starts_with(&format!(
-            "WITH page AS MATERIALIZED (SELECT {TIMEOUT_PAGE_COLUMNS}, {LIVE_ROW_KEY} AS row_key \
-             FROM harvest_task_queue WHERE state IN ('PENDING', 'RUNNING') \
-             AND {LIVE_ROW_KEY} <= $2 ORDER BY {LIVE_ROW_KEY}, id LIMIT $1)"
-        )));
-        assert!(!first.contains("$3"));
-        // A later page starts after the last row of the previous one. Both
-        // bounds are on the index key, so the index scan applies them.
-        let next = timeout_refill_query(predicate, &[], true);
-        assert!(next.contains(&format!(
-            "AND {LIVE_ROW_KEY} <= $4 AND ({LIVE_ROW_KEY}, id) > ($1, $2) \
-             ORDER BY {LIVE_ROW_KEY}, id LIMIT $3)"
-        )));
-        // The predicate reads the page, not the table.
-        let on_page = on_refill_page(predicate).replace("NOW()", "$4");
-        assert!(next.contains(&format!(
-            "ARRAY(SELECT e.id FROM (SELECT q.id, q.row_key FROM ({on_page}) q) e"
-        )));
-        // The queue keeps the page's order, oldest first.
-        assert!(next.contains("ORDER BY e.row_key, e.id) AS expired"));
-        assert!(next.contains("AS last_key"));
-        assert!(next.contains("AS last_id"));
-        assert!(next.contains("(SELECT COUNT(*) FROM page) AS rows_read"));
-    }
-
-    /// The column names of `harvest_task_queue`, read from the schema.
-    fn task_queue_columns() -> Vec<String> {
-        let schema = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/schema.rs"))
-            .expect("read the schema");
-        let start = schema
-            .find("harvest_task_queue (id)")
-            .expect("the task queue table");
-        let body = &schema[start..];
-        let body = &body[..body.find("\n    }").expect("the end of the table")];
-        body.lines()
-            .filter_map(|line| line.split_once("->"))
-            .map(|(name, _)| name.trim().to_owned())
-            .filter(|name| !name.is_empty() && !name.contains(' '))
-            .collect()
-    }
-
-    /// Whether `sql` names `column` as a whole word.
-    fn names_column(sql: &str, column: &str) -> bool {
-        let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
-        sql.match_indices(column).any(|(at, _)| {
-            let before = sql[..at].chars().next_back();
-            let after = sql[at + column.len()..].chars().next();
-            !before.is_some_and(word) && !after.is_some_and(word)
-        })
-    }
-
-    #[test]
-    fn the_refill_page_holds_only_the_columns_its_predicates_read() {
-        let columns = task_queue_columns();
-        assert!(columns.len() > 20, "{columns:?}");
-        let sql = timeout_refill_query(start_to_close_timeout_query(), &[], true);
-        let page = &sql[..sql.find("), tail AS").expect("the page CTE")];
-        // Payload columns such as `input` and `context_headers` stay out of
-        // the page. The bounded batch query loads whole rows.
-        assert!(!page.contains("harvest_task_queue.*"), "{page}");
-        assert!(!names_column(page, "input"), "{page}");
-        // Every column that a predicate reads is on the page.
-        for (_, predicate) in task_timeout_scans() {
-            for column in columns.iter().filter(|c| names_column(predicate, c)) {
-                assert!(
-                    names_column(page, column),
-                    "the page must hold `{column}`: {page}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn every_predicate_reads_the_task_queue_once_at_its_top_level() {
-        for (reason, predicate) in task_timeout_scans() {
-            assert_eq!(
-                predicate.matches("harvest_task_queue").count(),
-                1,
-                "{reason:?} must read the task queue once, or the page rewrite misses a read"
-            );
-            let on_page = on_refill_page(predicate);
-            assert!(
-                on_page.contains("FROM page") && !on_page.contains("harvest_task_queue"),
-                "{reason:?} must read the page after the rewrite: {on_page}"
-            );
-        }
-    }
-
-    #[test]
-    fn live_row_key_matches_the_index_expression() {
-        // Read at run time: the migration hygiene guard bans `include_str!`
-        // of a migration outside the paved-path helper.
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("migrations")
-            .join("20261002110913_harvest_task_queue_live_created_index")
-            .join("up.sql");
-        let migration = std::fs::read_to_string(path).expect("read the index migration");
-        assert!(migration.contains(&format!("(({LIVE_ROW_KEY}), id)")));
-    }
-
-    #[test]
-    fn refill_query_tests_expiry_against_the_sweep_clock() {
-        // Every reason, with all its earlier reasons as exclusions.
-        let predicates = task_timeout_scans().map(|(_, predicate)| predicate);
-        for (index, predicate) in predicates.iter().enumerate() {
-            for after in [false, true] {
-                let sql = timeout_refill_query(predicate, &predicates[..index], after);
-                assert!(
-                    !sql.contains("NOW()"),
-                    "a refill must not use the live clock: {sql}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn sweep_start_takes_the_database_clock() {
-        assert_eq!(TIMEOUT_SWEEP_START_SQL, "SELECT NOW() AS as_of");
-    }
-
-    #[test]
-    fn refill_query_leaves_a_row_to_the_first_reason_it_matches() {
-        let higher = heartbeat_timeout_query();
-        let sql = timeout_refill_query(start_to_close_timeout_query(), &[higher], true);
-        // The earlier reason is tested at its own lane's clock, and only for
-        // rows ahead of that lane's cursor.
-        let higher = on_refill_page(higher).replace("NOW()", "($5)[1]");
-        assert!(sql.contains(&format!(
-            " EXCEPT SELECT h.id, h.row_key FROM ({higher}) h WHERE h.row_key <= ($5)[1] \
-             AND (($6)[1] IS NULL OR (h.row_key, h.id) > (($6)[1], ($7)[1]))"
-        )));
-        // A row that an earlier lane holds is left to it, whatever it matches.
-        assert!(sql.contains(
-            " EXCEPT SELECT p.id, p.row_key FROM page p \
-             WHERE p.id IN (SELECT u.id FROM unnest($8) AS u(id))"
-        ));
-        // A first lane has no earlier lane, so it binds no lane params.
-        let first = timeout_refill_query(heartbeat_timeout_query(), &[], true);
-        assert!(!first.contains("$5") && !first.contains("EXCEPT"));
-    }
-
-    #[test]
-    fn a_lane_holds_its_moved_and_retried_rows_after_its_sweep() {
-        let (moved, retried, queued) = (
-            uuid::Uuid::new_v4(),
-            uuid::Uuid::new_v4(),
-            uuid::Uuid::new_v4(),
-        );
-        let lane = TimeoutScanLane {
-            as_of: Some(chrono::Utc::now()),
-            queued: [queued].into(),
-            retry: vec![(retried, 1)],
-            moved: [moved].into(),
-            ..TimeoutScanLane::default()
-        };
-        // A batch of two takes the retry and the queued row. The moved row
-        // waits, and the sweep is on its last page.
-        let claim = lane.claim(2);
-        assert_eq!(claim.clock, None);
-        // A later lane must still leave each held row to this lane.
-        let held: HashSet<_> = claim.held.into_iter().collect();
-        assert_eq!(held, HashSet::from([moved, retried, queued]));
-    }
-
-    #[test]
-    fn batch_query_loads_by_id_and_checks_the_predicate_again() {
-        let predicate = start_to_close_timeout_query();
-        let sql = timeout_batch_query(predicate);
-        assert!(sql.starts_with(&format!(
-            "SELECT q.* FROM ({predicate} AND id = ANY($1) OFFSET 0) q"
-        )));
-        // The batch keeps the reason of the refill. See the integration test
-        // `a_queued_row_keeps_its_reason_when_an_earlier_one_starts_to_match`.
-        assert!(!sql.contains("NOT EXISTS"));
-        assert!(!sql.contains("LIMIT"));
-    }
-
-    #[test]
-    fn retries_and_queued_rows_share_one_batch_limit() {
-        let reason = TimeoutReason::StartToClose;
-        let lane = timeout_lane(&reason);
-        let ids = |n| (0..n).map(|_| uuid::Uuid::new_v4()).collect::<Vec<_>>();
-        let mut cursor = TimeoutScanCursor::default();
-        let queued = ids(5);
-        cursor.lanes[lane].queued = queued.clone().into();
-        let failed = ids(2);
-        for id in &failed {
-            cursor.retry(&reason, *id);
-        }
-        // Retries come first and take slots from the same limit.
-        let batch = cursor.lanes[lane].next_batch(3);
-        assert_eq!(batch, [failed[0], failed[1], queued[0]]);
-        cursor.lanes[lane].commit_batch(3);
-        assert_eq!(cursor.lanes[lane].next_batch(3), queued[1..4]);
-
-        // More retries than the limit wait for the next pass.
-        let failed = ids(7);
-        for id in &failed {
-            cursor.retry(&reason, *id);
-        }
-        assert_eq!(cursor.lanes[lane].next_batch(3), failed[..3]);
-        cursor.lanes[lane].commit_batch(3);
-        assert_eq!(cursor.lanes[lane].next_batch(3), failed[3..6]);
-    }
-
-    #[test]
-    fn a_row_is_tried_at_most_three_passes_in_a_row() {
-        let reason = TimeoutReason::Heartbeat;
-        let lane = timeout_lane(&reason);
-        let id = uuid::Uuid::new_v4();
-        let mut cursor = TimeoutScanCursor::default();
-        // The first try failed. Two more tries follow, then the row waits
-        // for the next sweep, so it cannot hold a slot forever.
-        cursor.retry(&reason, id);
-        for _ in 0..2 {
-            assert_eq!(cursor.lanes[lane].next_batch(1), [id]);
-            cursor.lanes[lane].commit_batch(1);
-            cursor.retry(&reason, id);
-        }
-        assert_eq!(cursor.lanes[lane].next_batch(1), Vec::<uuid::Uuid>::new());
-    }
-
-    #[test]
-    fn a_tick_without_a_connection_ends_the_run() {
-        use crate::scanner_lease::{LeaderFailures, ScannerRole};
-        let mut ran_last_tick = true;
-        let mut failures = LeaderFailures::default();
-        assert!(!failures.record(ScannerRole::Leader, true));
-        assert!(!failures.record(ScannerRole::Leader, true));
-        skip_tick(&mut ran_last_tick, &mut failures);
-        // The next pass starts a new sweep. The lease may have moved during
-        // the gap, so the run of failed passes starts again too.
-        assert!(!ran_last_tick);
-        assert!(!failures.record(ScannerRole::Leader, true));
-        assert!(!failures.record(ScannerRole::Leader, true));
-        assert!(failures.record(ScannerRole::Leader, true));
-    }
-
-    #[test]
-    fn only_a_leased_checker_caps_its_interval() {
-        use crate::scanner_lease::{MAX_SCANNER_INTERVAL, MIN_SCANNER_INTERVAL};
-        let day = Duration::from_secs(24 * 3600);
-        assert_eq!(checker_interval(day, true), MAX_SCANNER_INTERVAL);
-        assert_eq!(checker_interval(day, false), day);
-        for leased in [true, false] {
-            assert_eq!(
-                checker_interval(Duration::ZERO, leased),
-                MIN_SCANNER_INTERVAL
-            );
-        }
-    }
-
-    #[test]
-    fn an_oversized_batch_cannot_raise_the_page_bound() {
-        assert_eq!(timeout_scan_bounds(0), (1, REFILL_BATCHES));
-        assert_eq!(timeout_scan_bounds(500), (500, 500 * REFILL_BATCHES));
-        let (limit, page_rows) = timeout_scan_bounds(i64::from(u32::MAX));
-        assert_eq!((limit, page_rows), (MAX_PAGE_ROWS, MAX_PAGE_ROWS));
-    }
-
-    #[test]
-    fn a_refill_skips_rows_that_wait_for_a_retry() {
-        let (failing, other) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
-        let mut lane = TimeoutScanLane {
-            retry: vec![(failing, 1)],
-            ..TimeoutScanLane::default()
-        };
-        // A new sweep reads the failing row again. A second, queued copy
-        // would count as a first try and reset the cap on tries in a row.
-        lane.queue_refill([failing, other]);
-        assert_eq!(lane.queued, [other]);
-    }
-
-    #[test]
-    fn lapsed_ids_stay_linear_at_the_largest_batch() {
-        let limit = usize::try_from(MAX_PAGE_ROWS).expect("fits");
-        let batch: Vec<uuid::Uuid> = (0..limit).map(|_| uuid::Uuid::new_v4()).collect();
-        let started = std::time::Instant::now();
-        assert_eq!(lapsed_ids(&batch, batch[1..].iter().copied()), batch[..1]);
-        // A scan of the page per id takes minutes here. A set takes far
-        // less than a second, even in a debug build.
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "took {:?}",
-            started.elapsed()
-        );
-    }
-
-    #[test]
-    fn moved_rows_do_not_hold_back_a_refill() {
-        let mut lanes: [TimeoutScanLane; 4] = Default::default();
-        admit_moves(&mut lanes, vec![to_lane_3(uuid::Uuid::new_v4())], 1);
-        // The lane refills when its queue runs empty. A move must not fill
-        // that queue, or steady moves would stop the lane's sweep.
-        assert!(lanes[3].queued.is_empty());
-        assert_eq!(lanes[3].moved.len(), 1);
-    }
-
-    #[test]
-    fn moved_and_queued_rows_share_each_batch() {
-        let ids = |n| (0..n).map(|_| uuid::Uuid::new_v4()).collect::<Vec<_>>();
-        let mut lane = TimeoutScanLane {
-            queued: ids(10).into(),
-            moved: ids(10).into(),
-            ..TimeoutScanLane::default()
-        };
-        // Two each at a limit of 4.
-        assert_eq!(lane.batch_split(4), (0, 2, 2));
-        // At a limit of 1, the slot alternates between them.
-        let mut picks = Vec::new();
-        for _ in 0..4 {
-            let (_, moved, queued) = lane.batch_split(1);
-            picks.push((moved, queued));
-            lane.commit_batch(1);
-        }
-        assert_eq!(picks, [(0, 1), (1, 0), (0, 1), (1, 0)]);
-        // A slot one list leaves unused goes to the other.
-        let lane = TimeoutScanLane {
-            moved: ids(5).into(),
-            ..TimeoutScanLane::default()
-        };
-        assert_eq!(lane.batch_split(4), (0, 4, 0));
-    }
-
-    /// The probe for lapsed rows needs their ids only. It must not load task
-    /// payloads, which a batch of 100,000 rows makes large.
-    fn to_lane_3(id: uuid::Uuid) -> Move {
-        Move { from: 0, to: 3, id }
-    }
-
-    /// Three source lanes can each move a full batch into one lane in one
-    /// pass. The lane takes one batch. Each other move waits at the front
-    /// of its source lane's queue, so it stays held and is probed again.
-    /// No move is dropped, and no list grows past its bound.
-    #[test]
-    fn a_move_past_the_cap_waits_in_its_source_lane() {
-        let mut lanes: [TimeoutScanLane; 4] = Default::default();
-        let ids: Vec<uuid::Uuid> = (0..6).map(|_| uuid::Uuid::new_v4()).collect();
-        lanes[1].queued.push_back(ids[5]);
-        let moves = [
-            (0, ids[0]),
-            (0, ids[1]),
-            (1, ids[2]),
-            (2, ids[3]),
-            (2, ids[4]),
-        ]
-        .into_iter()
-        .map(|(from, id)| Move { from, to: 3, id })
-        .collect();
-        admit_moves(&mut lanes, moves, 2);
-        assert_eq!(lanes[3].moved, ids[..2].to_vec());
-        assert_eq!(lanes[0].queued, [] as [uuid::Uuid; 0]);
-        assert_eq!(lanes[1].queued, [ids[2], ids[5]]);
-        assert_eq!(lanes[2].queued, ids[3..5].to_vec());
-        // A row the lane already holds is not added twice.
-        admit_moves(&mut lanes, vec![to_lane_3(ids[0])], 2);
-        assert_eq!(lanes[3].moved, ids[..2].to_vec());
-        assert!(lanes[0].queued.is_empty());
-    }
-
-    #[test]
-    fn the_lapsed_row_probe_selects_ids_only() {
-        for (_, predicate) in task_timeout_scans() {
-            let sql = timeout_probe_query(predicate);
-            assert!(sql.starts_with("SELECT q.id FROM ("), "{sql}");
-        }
-    }
-
-    #[test]
-    fn moved_rows_wait_behind_the_rows_already_queued() {
-        let ids = |n| (0..n).map(|_| uuid::Uuid::new_v4()).collect::<Vec<_>>();
-        let waiting = ids(2);
-        let moved = ids(2);
-        let mut lanes: [TimeoutScanLane; 4] = Default::default();
-        lanes[3].moved = waiting.clone().into();
-        admit_moves(
-            &mut lanes,
-            moved.iter().map(|id| to_lane_3(*id)).collect(),
-            4,
-        );
-        // First in, first out among moved rows.
-        let order: Vec<_> = lanes[3].moved.iter().copied().collect();
-        assert_eq!(order, [waiting, moved].concat());
-    }
-
-    #[test]
-    fn a_batch_stays_queued_until_it_loads() {
-        let lane = TimeoutScanLane {
-            queued: std::collections::VecDeque::from([uuid::Uuid::new_v4()]),
-            retry: vec![(uuid::Uuid::new_v4(), 1)],
-            ..TimeoutScanLane::default()
-        };
-        let before = lane.clone();
-        let _ = lane.next_batch(1);
-        assert_eq!(lane, before);
-    }
-
-    #[test]
-    fn timeout_lanes_follow_the_scan_order() {
-        for (index, (reason, _)) in task_timeout_scans().into_iter().enumerate() {
-            assert_eq!(timeout_lane(&reason), index, "{reason:?}");
-        }
-    }
-
-    #[test]
-    fn a_cursor_starts_a_new_sweep_after_a_tick_without_a_pass() {
-        let mut cursor = TimeoutScanCursor::default();
-        cursor.lanes[1] = TimeoutScanLane {
-            after: Some((chrono::Utc::now(), uuid::Uuid::new_v4())),
-            as_of: Some(chrono::Utc::now()),
-            queued: std::collections::VecDeque::from([uuid::Uuid::new_v4()]),
-            retry: vec![(uuid::Uuid::new_v4(), 1)],
-            loaded_retries: [(uuid::Uuid::new_v4(), 1)].into(),
-            moved: std::collections::VecDeque::from([uuid::Uuid::new_v4()]),
-            favor_moved: true,
-        };
-        let mid_sweep = cursor.clone();
-        // A leader that ran the last tick goes on with its sweep.
-        cursor.resume(true);
-        assert_eq!(cursor, mid_sweep);
-        // A replica back from standby starts again with a new clock.
-        cursor.resume(false);
-        assert_eq!(cursor, TimeoutScanCursor::default());
-    }
-
-    #[test]
-    fn a_failed_row_is_retried_in_its_own_lane() {
-        let mut cursor = TimeoutScanCursor::default();
-        let id = uuid::Uuid::new_v4();
-        cursor.retry(&TimeoutReason::ScheduleToStart, id);
-        assert_eq!(cursor.lanes[2].retry, vec![(id, 1)]);
-        assert!(
-            cursor
-                .lanes
-                .iter()
-                .enumerate()
-                .all(|(i, l)| i == 2 || l.retry.is_empty())
-        );
-    }
-
-    #[test]
-    fn task_timeout_scans_keep_their_enforcement_order() {
-        let reasons: Vec<_> = task_timeout_scans().into_iter().map(|(r, _)| r).collect();
-        assert_eq!(
-            reasons,
-            [
-                TimeoutReason::Heartbeat,
-                TimeoutReason::StartToClose,
-                TimeoutReason::ScheduleToStart,
-                TimeoutReason::ScheduleToClose,
-            ]
-        );
     }
 
     #[test]
@@ -8075,131 +4197,6 @@ mod tests {
         // carve-out — see the dedicated test below.)
         assert!(!heartbeat_timeout_query().contains("PAUSED"));
         assert!(!start_to_close_timeout_query().contains("PAUSED"));
-    }
-
-    /// Each outbox claim query names its own family, and only its own.
-    ///
-    /// The three come from one macro, so a transposed event type or
-    /// correlation key is the defect this catches. Every gate that runs the
-    /// SQL needs Postgres and the migration, so this runs in the default
-    /// lane instead.
-    #[test]
-    fn external_outbox_claim_queries_name_their_own_family() {
-        let families = [
-            (
-                external_signal_outbox_claim_query(),
-                "ExternalSignalRequested",
-                "ExternalSignalDelivered",
-                "ExternalSignalFailed",
-                "signal_id",
-            ),
-            (
-                external_cancel_outbox_claim_query(),
-                "ExternalCancelRequested",
-                "ExternalCancelDelivered",
-                "ExternalCancelFailed",
-                "cancel_id",
-            ),
-            // The await family resolves as `Resolved`, not `Delivered`.
-            (
-                external_await_outbox_claim_query(),
-                "ExternalAwaitRequested",
-                "ExternalAwaitResolved",
-                "ExternalAwaitFailed",
-                "await_id",
-            ),
-        ];
-
-        let all_keys = ["signal_id", "cancel_id", "await_id"];
-        for (sql, requested, first, second, key) in families {
-            assert!(
-                sql.contains(&format!("e.event_type = '{requested}'")),
-                "{sql}"
-            );
-            assert!(
-                sql.contains(&format!("IN ('{first}', '{second}')")),
-                "{sql}"
-            );
-            for other in all_keys {
-                let occurrences = sql.matches(&format!("'{other}'")).count();
-                if other == key {
-                    assert!(occurrences > 0, "{requested} must key on {key}: {sql}");
-                } else {
-                    assert_eq!(
-                        occurrences, 0,
-                        "{requested} must not mention {other}: {sql}"
-                    );
-                }
-            }
-        }
-    }
-
-    /// The claim queries keep the four clauses their plan and their
-    /// concurrency contract depend on.
-    #[test]
-    fn external_outbox_claim_queries_keep_their_plan_pins() {
-        for sql in [
-            external_signal_outbox_claim_query(),
-            external_cancel_outbox_claim_query(),
-            external_await_outbox_claim_query(),
-        ] {
-            // Pins the outer scan to idx_harvest_events_external_outbox_pending.
-            assert!(sql.contains("ORDER BY e.timestamp, e.id"), "{sql}");
-            // Pins the executions lookup to a correlated probe.
-            assert!(sql.contains("JOIN LATERAL"), "{sql}");
-            // Keeps the resolution check an anti-join, so a discarded
-            // candidate does not also pay the executions probe.
-            assert!(sql.contains("NOT EXISTS"), "{sql}");
-            assert!(!sql.contains("LEFT JOIN LATERAL"), "{sql}");
-            // The concurrency contract the drain loop relies on.
-            assert!(sql.contains("FOR UPDATE OF e SKIP LOCKED"), "{sql}");
-        }
-    }
-
-    #[test]
-    fn workflow_history_ceiling_query_references_correct_columns() {
-        let sql = workflow_history_ceiling_query();
-        assert!(
-            sql.contains("FROM harvest_workflow_executions"),
-            "should query harvest_workflow_executions"
-        );
-        assert!(
-            sql.contains("state = 'RUNNING'"),
-            "should filter to RUNNING executions only"
-        );
-        assert!(
-            sql.contains("harvest_events"),
-            "should consult the durable event log"
-        );
-        assert!(
-            sql.contains("event_count >= $1"),
-            "should filter on the operator-supplied ceiling bind"
-        );
-    }
-
-    /// The correlated `harvest_events` event-count subquery must appear
-    /// exactly once in `workflow_history_ceiling_query()` -- one
-    /// `MATERIALIZED` CTE definition, referenced (not re-evaluated) by both
-    /// the reported `event_count` column and the `WHERE event_count >= $1`
-    /// filter. Two occurrences would mean the query regressed to evaluating
-    /// the correlated `COUNT(*)` once per RUNNING row for the filter and
-    /// again, separately, for the projection -- exactly the shape
-    /// `docs/performance-history-ceiling.md` measures and fixes.
-    #[test]
-    fn workflow_history_ceiling_query_counts_events_exactly_once_per_row() {
-        let sql = workflow_history_ceiling_query();
-        assert_eq!(
-            sql.matches("SELECT COUNT(*) FROM harvest_events").count(),
-            1,
-            "the correlated event-count subquery must be written exactly \
-             once; got:\n{sql}"
-        );
-        assert!(
-            sql.contains("MATERIALIZED"),
-            "the event-count CTE must be MATERIALIZED so Postgres cannot \
-             pull it up and re-duplicate the correlated subquery at each \
-             reference site (SELECT list + WHERE clause); got:\n{sql}"
-        );
     }
 
     #[test]
@@ -8482,7 +4479,7 @@ mod tests {
         let run = now - Duration::seconds(10);
         let chain = now - Duration::seconds(5);
         // Both fired → chain wins (precedence).
-        let (fired, kind) = classify_workflow_timeout(Some(run), Some(chain), now).unwrap();
+        let (fired, kind) = classify_workflow_timeout(Some(run), Some(chain), now);
         assert_eq!(kind, TimeoutKind::Chain);
         assert_eq!(fired, chain);
     }
@@ -8494,11 +4491,11 @@ mod tests {
         let run = now - Duration::seconds(10);
         // Chain deadline in the future (not fired) → run wins.
         let future_chain = now + Duration::hours(1);
-        let (fired, kind) = classify_workflow_timeout(Some(run), Some(future_chain), now).unwrap();
+        let (fired, kind) = classify_workflow_timeout(Some(run), Some(future_chain), now);
         assert_eq!(kind, TimeoutKind::Run);
         assert_eq!(fired, run);
         // No chain deadline at all → run wins.
-        let (fired2, kind2) = classify_workflow_timeout(Some(run), None, now).unwrap();
+        let (fired2, kind2) = classify_workflow_timeout(Some(run), None, now);
         assert_eq!(kind2, TimeoutKind::Run);
         assert_eq!(fired2, run);
     }
@@ -8509,29 +4506,9 @@ mod tests {
         let now = Utc::now();
         let chain = now - Duration::seconds(5);
         // A chain-only expiry has no per-run deadline_at — must NOT panic.
-        let (fired, kind) = classify_workflow_timeout(None, Some(chain), now).unwrap();
+        let (fired, kind) = classify_workflow_timeout(None, Some(chain), now);
         assert_eq!(kind, TimeoutKind::Chain);
         assert_eq!(fired, chain);
-    }
-
-    // Issue #1821: a scanned row with no fired deadline must not panic the scanner.
-    #[test]
-    fn classify_workflow_timeout_without_a_fired_deadline_does_not_panic_1821() {
-        let now = Utc::now();
-        let future = now + chrono::Duration::hours(1);
-        for (run, chain) in [
-            (None, None),
-            (None, Some(future)),
-            (Some(future), None),
-            (Some(future), Some(future)),
-            (Some(now), None),
-        ] {
-            let result = std::panic::catch_unwind(|| classify_workflow_timeout(run, chain, now));
-            assert_eq!(result.ok(), Some(None), "run={run:?} chain={chain:?}");
-        }
-        let past = now - chrono::Duration::seconds(1);
-        let fired = classify_workflow_timeout(Some(future), Some(past), now);
-        assert_eq!(fired, Some((past, TimeoutKind::Chain)));
     }
 
     #[test]

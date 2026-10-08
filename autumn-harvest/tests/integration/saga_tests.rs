@@ -963,10 +963,7 @@ async fn saga_compensation_failed_metric_distinct_and_once() {
     }
     assert_eq!(recorder.count(METRIC_SAGA_COMPENSATED), 1);
     assert_eq!(recorder.count(METRIC_SAGA_COMPENSATION_FAILED), 1);
-    assert_eq!(
-        marker_command_names(&ctx2.drain_commands()),
-        [] as [std::string::String; 0]
-    );
+    assert!(marker_command_names(&ctx2.drain_commands()).is_empty());
 
     // Labels carry workflow + queue (AC1), never an execution id — enforced
     // by construction: the recorder only ever receives the two strings.
@@ -1341,10 +1338,7 @@ async fn two_saga_unwinds_in_one_workflow_count_independently() {
         2,
         "a replay of two recorded unwinds emits nothing new"
     );
-    assert_eq!(
-        marker_command_names(&ctx2.drain_commands()),
-        [] as [std::string::String; 0]
-    );
+    assert!(marker_command_names(&ctx2.drain_commands()).is_empty());
 }
 
 /// Known pre-existing engine limitation, pinned (round-3 Codex review of

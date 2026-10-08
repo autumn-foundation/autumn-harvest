@@ -124,15 +124,47 @@ async fn greet(
         .start_or_load(
             &mut conn,
             StartWorkflowParams {
+                workflow_name: "instant_greeting",
+                workflow_id: &workflow_id,
+                exec_id,
+                input: serde_json::json!(name),
+                parent_id: None,
+                queue_name: "default",
+                execution_timeout: None,
+                memo: None,
+                search_attrs: None,
                 reuse_policy: WorkflowIdReusePolicy::RejectDuplicate,
+                conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
+                trace_context: None,
+                max_execution_timeout_ceiling: None,
+                chain_execution_timeout: None,
+                max_workflow_chain_timeout_ceiling: None,
+                inherited_chain_deadline_at: None,
+                concurrency_key: None,
+                concurrency_limit: None,
+                concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+                priority: Priority::default(),
+                max_workflow_input_bytes: 0,
+                start_at: None,
+                delay: None,
+                max_workflow_start_delay: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                context_headers: None,
+                sla: None,
+                schedule_id: None,
+                scheduled_for: None,
+                workflow_attempt: 1,
+                workflow_retry_policy: None,
+                retry_of_exec_id: None,
+                max_workflow_attempts_ceiling: None,
+                origin: None,
+                completion_callbacks: None,
                 start_source: autumn_harvest::StartSource::Api,
-                ..StartWorkflowParams::new(
-                    "instant_greeting",
-                    &workflow_id,
-                    exec_id,
-                    serde_json::json!(name),
-                    "default",
-                )
+                start_source_ref: None,
+                started_by: None,
             },
         )
         .await
@@ -156,21 +188,17 @@ fn request_response_workflow_id() -> AutumnResult<String> {
 
 #[autumn_web::main]
 async fn main() {
-    // The `run` future is large in autumn-web 0.8, so it is boxed.
-    // That keeps it off the stack and satisfies `clippy::large_futures`.
-    Box::pin(
-        autumn_web::app()
-            .routes(routes![greet])
-            .plugin(
-                HarvestPlugin::new()
-                    .workflows(workflows![greeting, instant_greeting])
-                    .activities(activities![send_greeting])
-                    .worker(WorkerConfig::default())
-                    .api("/api/harvest"),
-            )
-            .run(),
-    )
-    .await;
+    autumn_web::app()
+        .routes(routes![greet])
+        .plugin(
+            HarvestPlugin::new()
+                .workflows(workflows![greeting, instant_greeting])
+                .activities(activities![send_greeting])
+                .worker(WorkerConfig::default())
+                .api("/api/harvest"),
+        )
+        .run()
+        .await;
 }
 
 #[cfg(test)]

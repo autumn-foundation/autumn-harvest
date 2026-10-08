@@ -11,15 +11,6 @@ machine-readable registry of every route** — method, path, auth class, request
 and response fields — is [`docs/api-contract.json`](api-contract.json) (see
 [`api-contract-guide.md`](api-contract-guide.md) for how to consume it).
 
-## OpenAPI 3.1 document
-
-An OpenAPI 3.1 document for every route on this page is served at
-`GET {api_path}/openapi.json` and checked in at
-[`docs/openapi.json`](openapi.json). Point any OpenAPI generator at it for a
-typed client with no hand-written HTTP. See [`openapi.md`](openapi.md) for the
-ten-minute path, what the document carries, and what it deliberately leaves
-open.
-
 New route families added in **0.5.0** (all in the contract; each has a CLI verb):
 
 - `GET /workflows/summaries` — tiered-retention summaries of expired runs (#752).
@@ -35,51 +26,6 @@ New route families added in **0.5.0** (all in the contract; each has a CLI verb)
 - `GET /admin/usage` — per-tenant/per-workflow historical usage report (#596).
 - `GET /admin/workflow-types/reachability` — safe-handler-removal pre-flight (#520).
 - `GET /dags/{dag_name}/runs/{run_exec_id}` — DAG run graph view (#690).
-
-## Authorization: token scopes and the authorizer hook
-
-Two opt-in gates sit in front of every route. See
-[`security-posture.md`](security-posture.md#scoped-api-tokens-built-in-opt-in--issue-942)
-for the full model.
-
-- **Token scopes** (issue #942, #1803). A `read` token gets `403` on every
-  mutation. A `mutate` token gets `403` on `POST /admin/tokens` and
-  `DELETE /admin/tokens/{id}`. Only an `admin` token mints or revokes tokens.
-- **Authorizer hook** (issue #1803). An embedder policy that sees the
-  principal, route class, tenant key and shard of each request. It can only
-  deny. A deny answers `403` with
-  `{"error":"forbidden by authorization policy"}`.
-
-Send a tenant key in the `x-harvest-tenant` header. With a hook installed, a
-value that is repeated, blank, holds a non-ASCII byte, or is longer than 128
-bytes gets `400`. Without a hook, Harvest ignores the header.
-
-| Request | Shard the hook sees |
-|---|---|
-| A path with an execution id, e.g. `GET /workflows/{id}`, also under `/ui` | The entry shard of the id and its live shard after a rebalance. On a route that acts on the live attempt (`cancel`, `signal`, `/result` and others), also the shard of each later retry attempt. |
-| `GET /workflows/{id}/children` or `/tree` | The execution's shards, and also None. These routes read every shard. |
-| `GET /admin/history/exports`, `.../export-sample`, `GET /admin/external-handoffs` with a shard query parameter | That shard. |
-| `POST /workflows/{name}/start` with `shard_id` or `residency_key` | The pinned shard. |
-| DLQ replay, discard and redrive, queue pause and resume, with body `shard_id` | That shard. |
-| `POST /admin/audit-export/...` with body `shard` | That shard. |
-| Anything else | None. A shard query parameter on a route that ignores it is not read. |
-
-`None` means Harvest cannot name the shard before the handler runs. A by-id
-route or a start with no placement still reaches one shard by hash. To confine
-a caller to some shards, deny `None` too.
-
-Every token-scope deny and every hook deny writes an `authz.deny` audit row
-with status `failed`. The audit export ships it to the SIEM.
-
-## Rate limiting
-
-The optional per-client rate limiter (issue #1827) can answer `429 Too Many
-Requests` on any route that is not `PublicSafe`. The response carries a
-`Retry-After` header in whole seconds and the body
-`{"error": "rate limited", "route_class", "retry_after_secs"}`. The `error`
-value tells it apart from a load-shed `429` (`"load shed"`). Wait
-`Retry-After` seconds, then send the request again. See
-[API rate limiting](./security-posture.md#api-rate-limiting).
 
 ## SSE Execution Event Stream
 
@@ -102,13 +48,13 @@ GET /executions/{exec_id}/events/stream
 Each event arrives as a standard SSE block:
 
 ```
-id: <event_id, per-execution monotonic>
+id: <harvest_events.id BIGSERIAL>
 event: <WorkflowEvent type name>
 data: <JSON event payload>
 
 ```
 
-- `id` is `harvest_events.event_id` (issue #1405), the per-execution sequential event ID — **not** `harvest_events.id`, the row-level `BIGSERIAL` primary key. A shard-rebalance migration copies `event_id` byte-for-byte but never `id`, so `event_id` is the field safe to use as a resume cursor across a migration. It is monotonic within one execution, starting at 0.
+- `id` is the row-level `BIGSERIAL` primary key of `harvest_events`, **not** the per-execution sequential event ID. It is monotonically increasing across all executions on the shard and is safe to use as a resume cursor.
 - `event` is the adjacently-tagged type string (`ActivityScheduled`, `SignalReceived`, etc.). New `WorkflowEvent` variants land in the stream automatically without client changes.
 - `data` is the `data` inner object of the adjacently-tagged JSON envelope `{"type":"…","data":{…}}` stored in `harvest_events.event_data`.
 
@@ -128,7 +74,7 @@ Keepalive comments prevent reverse proxies and load balancers from killing idle 
 When the execution reaches a terminal state (`Completed`, `Failed`, `Cancelled`, `TimedOut`, `ResetTerminated`), the server sends a final event block then closes the stream:
 
 ```
-id: <last_event_id>
+id: <last_row_id>
 event: stream-end
 data: {"reason":"completed","execution_id":"<exec_id>","state":"COMPLETED"}
 
@@ -154,16 +100,13 @@ The client may reconnect immediately with `Last-Event-ID: <n>` to resume from wh
 
 The browser `EventSource` API sends `Last-Event-ID` automatically on reconnect. Curl and custom clients must set it explicitly.
 
-The cursor is `event_id` (issue #1405), not `harvest_events.id`. `id` is a shard-local `BIGSERIAL` a shard-rebalance migration does not copy, so a cursor keyed on it means nothing once an execution has moved shards.
-
 When the server receives `Last-Event-ID: <n>`:
 
-1. It translates `n` (an `event_id`) to the connection's own `harvest_events.id`, following a migration's forwarding pointer if the execution has moved shards.
-2. It queries `harvest_events` for all rows after that translated cursor for this execution (the backfill).
-3. It sends the backfill rows over the stream in ascending `event_id` order.
-4. It then enters live-tail mode, forwarding new events via LISTEN/NOTIFY.
+1. It queries `harvest_events` for all rows with `id > n` for this execution (the backfill).
+2. It sends the backfill rows over the stream in ascending `id` order.
+3. It then enters live-tail mode, forwarding new events via LISTEN/NOTIFY.
 
-A client that drops mid-stream and reconnects with the last `event_id` it saw will receive every event exactly once with no gaps, including across a shard migration.
+A client that drops mid-stream and reconnects with the last `id` it saw will receive every event exactly once with no gaps.
 
 **First connection** (no `Last-Event-ID`): the server starts from the beginning — all existing events are backfilled, then live-tail begins.
 
@@ -171,7 +114,7 @@ A client that drops mid-stream and reconnects with the last `event_id` it saw wi
 
 ### Sharding
 
-The endpoint resolves the execution row's CURRENT shard (its live residence, following any migration's forwarding pointer — issue #1317), not the shard encoded in `exec_id`'s bits. It subscribes to that shard's Postgres LISTEN/NOTIFY channel, and rebinds mid-stream if the execution migrates while the stream is open. Cross-shard fan-out is not required in v1; one stream always maps to one shard at a time.
+The endpoint resolves `exec_id.shard()` and subscribes to that shard's Postgres LISTEN/NOTIFY channel. Cross-shard fan-out is not required in v1; one stream always maps to one shard.
 
 ---
 
@@ -381,9 +324,7 @@ exactly: **read** (describe/result/stack/children/query) and **signal** are
 guessability of business ids removes the unguessable-`exec_id` defense-in-depth,
 mount the harvest management API **behind your own auth boundary** (e.g.
 `api_with_auth` / your app's authenticated admin surface) rather than relying on
-id opacity to gate read/signal access. Outside the `dev` profile, the by-id
-signal route answers `401` to an anonymous caller even with no auth layer
-(issue #1802). The by-id read routes stay open.
+id opacity to gate read/signal access.
 
 ### Examples
 
@@ -416,7 +357,7 @@ curl -i "$BASE/workflows/by-id/order_flow/does-not-exist"   # HTTP 404
 | `state` | string | Filter by execution state (e.g. `RUNNING`, `COMPLETED`) |
 | `limit` | integer | Maximum rows to return (default 200, max 200) |
 | `search_attr` | repeated | `key:value` pairs against `search_attrs` JSONB (exact-match equality; value is always a string) |
-| `search_attr_filter` | repeated | Typed comparison/set predicate `key:op:value` against `search_attrs` JSONB. See [Typed search-attribute predicates](#typed-search-attribute-predicates-get-workflows). |
+| `search_attr_filter` | repeated | Typed comparison/set predicate `key:op:value` against `search_attrs` JSONB. See [Typed search-attribute predicates](#typed-search-attribute-predicates-getworkflows). |
 | `no_progress_minutes` | integer | Return stalled workflows with no task activity for N minutes |
 | `sla_breached` | bool | Filter to executions that have breached their SLA |
 | `page_size` | integer | Per-page limit for keyset pagination (1–200; overrides `limit`). Presence activates the opt-in paginated envelope. |

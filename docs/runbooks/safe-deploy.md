@@ -56,9 +56,9 @@ Drain a specific worker:
 harvest worker drain <worker-id>
 ```
 
-The server sets the worker's status to `Draining`. The worker finishes or
-gives back its current tasks. It then transitions to `Stopped` within one
-heartbeat interval (default: 5 s) after quiescing.
+The server sets the worker's status to `Draining`. The worker will finish its
+current tasks and then transition to `Stopped` within one heartbeat interval
+(default: 5 s) after quiescing.
 
 To specify an explicit deadline (RFC 3339):
 
@@ -67,12 +67,7 @@ harvest worker drain <worker-id> --deadline 2026-05-09T14:30:00Z
 ```
 
 When `--deadline` is omitted the server uses the configured
-`WorkerConfig::shutdown_timeout` (default 25 s from the current time).
-
-One join window before the deadline, the worker cancels its running
-activities. It releases the claim of each one whose handler returns a
-retryable error. A handler that ignores the cancel keeps its claim. See
-[What a drain does with its claims](../getting-started/10-operations.md#what-a-drain-does-with-its-claims).
+`WorkerConfig::shutdown_timeout` (default 30 s from the current time).
 
 ### Drain outcome codes
 
@@ -123,9 +118,6 @@ Once the worker is `Stopped` you can safely send SIGTERM (or SIGKILL) to the
 process, redeploy the binary, or decommission the host. No in-flight tasks will
 be lost.
 
-For Kubernetes probes, `preStop` and the grace period, see
-[`../operations/kubernetes-probes.md`](../operations/kubernetes-probes.md).
-
 ---
 
 ## Degraded mode: unavailable shards
@@ -155,8 +147,7 @@ and `request_id`.
 | Mistake | Fix |
 |---------|-----|
 | Terminating the process before `Stopped` | Poll with `--wait` or `worker get` until status is `Stopped` |
-| Forgetting `--deadline` on a slow worker | The default deadline is `shutdown_timeout` (25 s); set a longer deadline for workers with large in-flight batches |
-| `shutdown_timeout` at or above the platform grace period | Keep it at least 5 s below `terminationGracePeriodSeconds`, or the platform kills the worker before the drain releases its claims |
+| Forgetting `--deadline` on a slow worker | The default deadline is `shutdown_timeout` (30 s); set a longer deadline for workers with large in-flight batches |
 | Draining the wrong shard | Use `--shard-id` with `drain-preview` to scope the preview first |
 | Ignoring `unavailable_shards` in the response | The worker may be on an unreachable shard; retry after shard recovers |
 
@@ -598,7 +589,7 @@ behaviour change). Those deploys can use the plain drain runbook above.
 
 | Term | Meaning |
 |------|---------|
-| `build_id` | Immutable string (Git SHA, semver tag, CI job ID) advertised by a worker at startup via `WorkerConfig::with_build_id("sha-abc123")`. Empty string = no build identity. Such a worker cannot claim a pinned task (issue #1805). |
+| `build_id` | Immutable string (Git SHA, semver tag, CI job ID) advertised by a worker at startup via `WorkerConfig::with_build_id("sha-abc123")`. Empty string = legacy worker that can claim any task. |
 | Build policy | Per-queue row in `harvest_build_policies`. New workflow starts on the queue receive `assigned_build_id = policy.build_id`. Updated by operators when a new build ships. |
 | Compat declaration | Row in `harvest_build_compat`. Means "workers running build B may process executions assigned to build A". Added after replay tests confirm safety. |
 | `required_build_id` | Denormalized onto `harvest_task_queue`. Workers skip tasks whose `required_build_id` they are not eligible for. |
@@ -663,26 +654,14 @@ set_build_policy(&mut conn, "default", "sha-new123", Some("v2.3.0")).await?;
 New executions now get `assigned_build_id = "sha-new123"` and old-build
 workers are ineligible to claim them.
 
-> **First-adoption prerequisite:** old-build workers must advertise a
-> non-empty `build_id` to keep their pinned runs. Workers using the default
-> `WorkerConfig` have `build_id = ""`. The claim filter never lets such a
-> worker take a task with a `required_build_id` (issue #1805). Before you
-> advance the build policy, run the entire old fleet with
-> `with_build_id("sha-old456")`. An empty-build worker on a queue with a
-> policy logs a warning and sets `harvest.worker.empty_build_policy`.
->
-> **Stuck pinned runs.** After you upgrade, pinned rows that only
-> empty-build workers poll stay `PENDING`. List them with:
->
-> ```sql
-> SELECT queue_name, required_build_id, count(*)
-> FROM harvest_task_queue
-> WHERE state = 'PENDING' AND required_build_id IS NOT NULL
-> GROUP BY 1, 2;
-> ```
->
-> Start workers with the listed build, or declare compatibility for the
-> build your workers run.
+> **First-adoption prerequisite:** this exclusion only applies to workers
+> that advertise a non-empty `build_id`. Workers using the default
+> `WorkerConfig` have `build_id = ""` (the legacy sentinel) and the claim
+> filter allows them to pick up **any** task regardless of
+> `required_build_id`. Before advancing the build policy, ensure the entire
+> old fleet is already running with `with_build_id("sha-old456")` — or drain
+> all legacy workers first. A mixed fleet with even one legacy worker
+> invalidates the routing guarantee.
 
 **Step 4 — Drain and retire old-build workers.**
 
@@ -765,9 +744,8 @@ The response's `policies` array carries `build_id`, `target_build_id`, and
 `ramp_percent` per queue, alongside the existing cross-shard `reachability`
 snapshot. Watch the canary build's failure rate, DLQ entries
 (`harvest dlq aggregate --group-by workflow_name,failure_signature`), and
-`harvest.workflow.terminal{outcome=...}` / `harvest.activity.attempts`
-metrics before deciding to ramp up. Both carry a `build_id` label (issue
-#1814), so `sum by (build_id)` compares the target build with the base build.
+`harvest.workflow.terminal{outcome=...}` / `harvest.activity.failed` metrics
+segmented by `assigned_build_id` before deciding to ramp up.
 
 **Step 3 — Ramp up, or abort.**
 
@@ -792,15 +770,6 @@ Either form immediately stops new starts from reaching the target build; a
 follow-up start lands on the base build on its very next attempt. Ramping to
 `0` keeps the ramp record around (useful if you want to retry later without
 re-declaring `target_build_id`); `clear` removes it entirely.
-
-> **Automatic abort (issue #1814).** Turn on the ramp guard with
-> `HarvestPlugin::ramp_guard(RampGuardConfig::new())`. The target build can
-> fail or ND-block more runs than the base build. The guard then clears the
-> ramp with no operator action and writes a `build_routing.ramp.auto_abort`
-> audit row. Send an `Idempotency-Key` header with each ramp request, and
-> resend the same key when you retry a `207` response. Every shard then
-> keeps one ramp id, so the guard judges one ramp.
-> See [`docs/operations/build-ramp-guard.md`](../operations/build-ramp-guard.md).
 
 **Step 4 — Promote to full cutover.**
 
@@ -977,7 +946,7 @@ Response fields:
 | Forgetting to declare compat in Scenario A | New workers skip old-build tasks; old-build executions stall |
 | Breaking deploy without a `ctx.patched()` / `ctx.version()` gate | New workers corrupt in-flight histories on replay; use a patched gate (or a version gate for >2 versions) |
 | Rollback without updating the build policy | New starts continue landing on the bad build; set policy back first |
-| Empty `build_id` on new workers | The worker cannot claim pinned runs (issue #1805); set `with_build_id` on every worker |
+| Empty `build_id` on new workers | Legacy sentinel — the worker claims any task, bypassing all routing |
 
 ---
 
@@ -1015,7 +984,7 @@ If a type is still `in_use` (registered) that is normal; only an `orphaned` verd
 
 ## Boot-time gate (on by default)
 
-Harvest runs this same check at startup, so a mis-sequenced deploy is caught before it serves traffic. **The gate runs before the worker poll loop and schedulers are spawned** — so under `fail` a boot is refused *before any task can be claimed*, and a worker can never claim and terminally fail an orphaned-type run in the boot window. **It runs by default** — the default `warn` action still executes the reachability check on every boot; only `off` skips it entirely:
+The plugin runs this same check at startup, so a mis-sequenced deploy is caught before it serves traffic. **The gate runs before the worker poll loop and schedulers are spawned** — so under `fail` a boot is refused *before any task can be claimed*, and a worker can never claim and terminally fail an orphaned-type run in the boot window. **It runs by default** — the default `warn` action still executes the reachability check on every boot; only `off` skips it entirely:
 
 ```toml
 [harvest.startup]
@@ -1028,14 +997,6 @@ orphaned_workflows = "warn"
 ```
 
 (Env override: `AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS=fail`.)
-
-**Both boot paths are gated (issue #1128).** The `HarvestPlugin` web-app path and the standalone `HarvestRunner::start` embedder path run the *same* check, from the same code, driven by the same `[harvest.startup] orphaned_workflows` setting. The standalone runner runs it as the first act of `start` — after pure configuration validation, but before it resolves the runtime, installs any process global or syncs completion triggers, and long before it spawns a worker — so a refused standalone boot leaves the process and the database exactly as it found them. On a **multi-shard** standalone deployment (`HarvestRunnerResources::with_sharded_pool`, #522) the gate fans out across *every* shard in the resolved pool, so an orphan on a non-zero shard refuses boot just as one on shard 0 does; a shard the router names but this process has no pool for is reported `unavailable`, which degrades the report to `partial` and therefore warns rather than aborts — the runner then refuses that router/pool pair outright a moment later with a `ShardRouter references shards …` error, so boot is still refused, just with the configuration error rather than the orphan one. Each shard's query is bounded (10s); a shard that is reachable-but-silent is reported `unavailable` rather than parking the boot indefinitely.
-
-**On the standalone path, use `HarvestEmbedding`.** The plugin loads `[harvest.startup] orphaned_workflows` and its `AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS` override automatically. `HarvestEmbedding::start` (issue #1613) does the same. The code value in the `HarvestRuntimeConfig` you pass is the default. A value in `autumn.toml`, `autumn-{profile}.toml` or the environment overrides it. An invalid value refuses boot, so a typo cannot silently become `warn`. `HarvestRunner::start` alone uses only the config it is handed. An embedder that calls it directly must call `HarvestStartupConfig::with_operator_overrides` itself. [`embedding.md`](../embedding.md#start-the-runtime) lists every startup step of the standalone path.
-
-**A deliberately handler-free process** (a control plane that registers no `#[workflow]`s but shares the Harvest database) will see every in-flight type as orphaned. That is the setting doing what it says — under the default `warn` it logs and boots; set `orphaned_workflows = "off"` on such a process rather than leaving it to refuse boot under `fail`.
-
-**The same applies to a partially-registering fleet.** The gate runs regardless of `worker_enabled`, and "registered" means *registered in this process*. So a fleet split into processes that each register a subset of the workflow types — a common standalone shape, e.g. one process per queue — will have each process see the other processes' in-flight types as orphaned. Under `fail` every one of them refuses to boot. `fail` is a statement about a deployment whose registered handlers are expected to cover the whole fleet's in-flight work; on a split-registration fleet use `warn` (or `off`) and run the CLI gate against the *union* of registered types in CI instead.
 
 **Boot cost:** the check is a single bounded cross-shard `GROUP BY … COUNT(*) … ARRAY_AGG` aggregate (never a per-execution row load), and the per-group sample slice is bounded (drop-in `LATERAL (SELECT … ORDER BY started_at LIMIT n)` fallback keeps memory bounded even on a huge group). It runs by default under `warn`; a deployment concerned about boot latency on a very large non-terminal backlog can set `orphaned_workflows = "off"` to make boot zero-cost.
 

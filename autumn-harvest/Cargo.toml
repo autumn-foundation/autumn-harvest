@@ -12,31 +12,16 @@ keywords = ["workflow", "durable", "postgres", "orchestration", "autumn"]
 categories = ["asynchronous", "database"]
 
 [features]
-default = ["db", "unified-dag-execution", "tls"]
+default = ["db", "unified-dag-execution"]
 unified-dag-execution = ["autumn-harvest-macros/unified-dag-execution"]
 db = [
     "dep:deadpool",
     "dep:diesel",
     "dep:diesel-async",
     "dep:diesel_migrations",
-    "dep:percent-encoding",
     "dep:tokio-postgres",
 ]
-# TLS for the connections Harvest opens itself (`pg_tls`): LISTEN/NOTIFY,
-# `backup verify` and `dr`. Uses rustls with the `ring` provider and the
-# platform trust store. Without this feature, `prefer` stays plaintext and a
-# verified `sslmode` gets a clear configuration error.
-tls = [
-    "db",
-    "dep:rustls",
-    "dep:rustls-native-certs",
-    "dep:tokio-postgres-rustls",
-]
 testing = []
-# Replay fuzz harness (issue #1835). Derives `arbitrary::Arbitrary` for
-# `WorkflowEvent` and adds the `fuzzing` module. For the `fuzz/` crate and its
-# seed test only. Not a stable API and not covered by semver.
-fuzzing = ["testing", "dep:arbitrary", "chrono/arbitrary", "uuid/arbitrary"]
 # Time-travel replay debugger (issue #949): a stepping/diff API over the existing
 # replay machinery. Read-only by construction -- no new `WorkflowEvent` variant, no
 # migration, no engine-runtime change. Depends on `testing` for `HistorySnapshot`
@@ -49,29 +34,12 @@ schema = ["dep:schemars"]
 # Sandboxed WebAssembly activities (issue #965). Pulls wasmtime + wat only when
 # explicitly enabled; requires the `db` feature (activity events are persisted).
 #
-# EFFECTIVE MSRV: this feature requires Rust >= 1.95 (wasmtime 48's own minimum).
+# EFFECTIVE MSRV: this feature requires Rust >= 1.94 (wasmtime 46's own minimum).
 # The crate's core/default MSRV is 1.88 and is UNAFFECTED: this optional R&D-spike
 # feature is out of the default build and the MSRV CI check (`cargo check
 # --workspace`, default features, never compiles wasmtime). See
 # docs/rnd/wasm-activities-spike.md.
-wasm-activities = ["dep:wasmtime", "dep:wat", "db", "dep:ed25519-dalek"]
-# Hot code swap for workflow definitions via runtime modules (issue #967).
-#
-# R&D spike. Hosts `#[workflow]` logic as a runtime-loaded WebAssembly module
-# registered under an explicit `BuildId`, so the shipped build-routing machinery
-# (percent ramp #604, compatibility sets + claim-time filtering #171,
-# reachability #520/#535) governs a hot swap with no new safety machinery and
-# **zero replay-surface change**. Off by default and never in `default`.
-#
-# Implies `wasm-activities` (and through it `db`): the module host reuses that
-# feature's already-embedded wasmtime engine, `WasmModuleStore` compile cache,
-# capability model and resource limits rather than adding a second sandbox, so
-# this feature adds **no new dependency to the workspace**.
-#
-# EFFECTIVE MSRV: inherited from `wasm-activities` (Rust >= 1.95, wasmtime 48's
-# own minimum). The crate's core/default MSRV is 1.88 and is UNAFFECTED.
-# See docs/rnd/hot-code-swap.md.
-hot-code-swap = ["wasm-activities"]
+wasm-activities = ["dep:wasmtime", "dep:wat", "db"]
 # Deterministic chaos / fault-injection test harness (issue #940). Off by
 # default and never in `default`: injection points compile to a zero-cost
 # const-check when this feature is off, so a non-chaos build has no hot-path
@@ -79,43 +47,22 @@ hot-code-swap = ["wasm-activities"]
 chaos = ["db"]
 
 [dependencies]
-autumn-harvest-macros = { version = "0.7.0", path = "../autumn-harvest-macros" }
+autumn-harvest-macros = { version = "0.6.0", path = "../autumn-harvest-macros" }
 tokio = { workspace = true }
-async-trait = "0.1"
 tokio-util = { version = "0.7", features = ["rt"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 base64 = "0.22"
-sha2 = "0.11"
-hmac = "0.13"
-# AES-256-GCM payload codec (issue #1825). `autumn-web` already pins 0.10.3 in
-# the lockfile. No default features: the codec reads nonces from `rand`'s
-# `OsRng`, so `aead/getrandom` is not needed.
-aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc", "zeroize"] }
-# `aes-gcm`'s own `zeroize` feature clears only a temporary key. These turn on
-# `ZeroizeOnDrop` for the AES round keys and the GHASH state. All three crates
-# are already in the lockfile through `aes-gcm`.
-aes = { version = "0.8.4", features = ["zeroize"] }
-ghash = { version = "0.5.1", default-features = false, features = ["zeroize"] }
-polyval = { version = "0.7.3", default-features = false, features = ["zeroize"] }
-# Clears data-key bytes on drop (issue #1825). Already in the lockfile.
-zeroize = "1"
+sha2 = "0.10"
+hmac = "0.12"
 url = "2"
 thiserror = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
-arbitrary = { version = "1.4", features = ["derive"], optional = true }
 chrono-tz = { workspace = true }
-# Reads a migration's `metadata.toml` in `crate::migrate` with the SAME parser
-# Diesel reads it with, so what this applies and what `diesel migration run`
-# applies can never disagree. A hand-rolled subset was tried first and leaked
-# five separate ways (unknown keys, duplicate keys, non-`key = value` lines,
-# unbalanced key quotes, non-ASCII whitespace); already in the workspace
-# lockfile via the plugin, so this unifies rather than widening.
-toml = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
-lru = "0.18.2"
+lru = "0.16"
 croner = "2.2"
 seahash = "4.1"
 rand = { workspace = true }
@@ -126,31 +73,12 @@ diesel_migrations = { workspace = true, optional = true }
 # 0.7.18 is the first release with the RUSTSEC advisory fix; pin the floor so a
 # downstream lockfile can't silently resolve back to a vulnerable 0.7.x.
 tokio-postgres = { version = "0.7.18", optional = true }
-# Decodes URL parts of a DSN in `pg_tls`.
-percent-encoding = { version = "2", optional = true }
-# The `tls` feature. These are the versions the CLI already uses for
-# `harvest migrate` (issue #1240), so the lockfile gets no new crate.
-# `default-features = false` keeps `aws-lc-rs` out of the build.
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
-rustls-native-certs = { version = "0.8", optional = true }
-tokio-postgres-rustls = { version = "0.14", optional = true }
-# 0.24.6 is the first non-yanked 0.24.x release; pin the floor for the same
-# reason as tokio-postgres above (a downstream lockfile shouldn't be able to
-# freshly resolve the yanked 0.24.5).
-metrics = { version = "0.24.6", optional = true }
+metrics = { version = "0.24", optional = true }
 schemars = { version = "0.8", optional = true }
-# wasmtime 48's own minimum Rust is 1.95, so the `wasm-activities` feature that
-# enables these has an effective MSRV of 1.95 (the crate's core MSRV stays 1.88).
-# 48.0.3 is the first 48.x release with the RUSTSEC-2026-0316 fix (46.x has no
-# patched release); pin the floor so a downstream consumer enabling
-# `wasm-activities` can't silently resolve back to a vulnerable 48.0.x (same
-# reasoning as tokio-postgres above -- a workspace's own Cargo.lock never
-# propagates to downstream consumers, only the manifest constraint does).
-wasmtime = { version = "48.0.4", optional = true }
+# wasmtime 46's own minimum Rust is 1.94, so the `wasm-activities` feature that
+# enables these has an effective MSRV of 1.94 (the crate's core MSRV stays 1.88).
+wasmtime = { version = "46", optional = true }
 wat = { version = "1", optional = true }
-# Publisher signatures on WASM modules (issue #1838). The lockfile already
-# holds this version through `jsonwebtoken`, so it adds no new crate.
-ed25519-dalek = { version = "2.2", optional = true }
 
 [[test]]
 name = "integration"
@@ -165,24 +93,9 @@ path = "tests/integration/mod.rs"
 name = "property"
 path = "tests/property/mod.rs"
 
-# Deterministic simulation sweeps (issue #1830). Needs no database, so the
-# no-db CI job runs it. `HARVEST_DST_SEEDS` sets the sweep size.
-[[test]]
-name = "dst"
-path = "tests/dst/main.rs"
-
 [[bench]]
 name = "metrics_noop"
 harness = false
-
-# End-to-end benchmark suite (issue #941). `harness = false`: every scenario is
-# destructive and stateful, so libtest/criterion's repeat-the-closure model would
-# end up timing an empty queue. Needs `db` for the three engine scenarios and
-# `testing` for the replay scenario's `WorkflowReplayer`.
-[[bench]]
-name = "e2e_bench"
-harness = false
-required-features = ["db", "testing"]
 
 [[example]]
 name = "signal_with_start_webhook"
@@ -307,11 +220,6 @@ wat = "1"
 # on it) at the workspace version, so `{ workspace = true }` unifies rather than
 # widening the graph — same rationale as the `tokio-util` dev-dep above.
 proc-macro2 = { workspace = true }
-# Parse `.github/workflows/*.yml` in the `ci_run_coverage` guard (issue #1790).
-# A workflow that does not parse never runs. `autumn-web` already pulls this
-# version into the lockfile, so this dev-dependency adds no new crate. The crate
-# is deprecated upstream. It is dev-only, so it never ships.
-serde_yaml = "0.9"
 
 # testcontainers pulls bollard -> hyper-util, which uses `tokio::net`. Under a
 # global `RUSTFLAGS="--cfg loom"` build tokio's `net` module is compiled out
@@ -332,17 +240,6 @@ testcontainers-modules = { workspace = true }
 # or compiled) on every normal build. See `docs/testing/loom.md`.
 [target.'cfg(loom)'.dependencies]
 loom = "0.7.2"
-
-# Shuttle is only pulled in under `RUSTFLAGS="--cfg shuttle"` (issue #1800).
-# It is a target dependency for the same reason as loom above: the
-# `crate::shuttle_sync` shim names these crates from the library sources.
-# `shuttle-tokio` and `shuttle-tokio-util` mirror the tokio and tokio-util
-# APIs. Their `shuttle` feature swaps in the Shuttle-scheduled types. See
-# `docs/testing/shuttle.md`.
-[target.'cfg(shuttle)'.dependencies]
-shuttle = "0.9.5"
-shuttle-tokio = { version = "1.0.0", features = ["shuttle", "macros", "rt", "sync", "time"] }
-shuttle-tokio-util = { version = "0.7.0", features = ["shuttle"] }
 
 [[bench]]
 name = "replay_bench"
@@ -366,23 +263,6 @@ name = "replay_profile"
 required-features = ["testing"]
 harness = false
 
-# Deterministic (non-criterion) instruction/allocation-count profiling harness
-# for `shard_rebalance::history_fingerprint` -- the replay-determinism check
-# `verify_target_copy` runs on both sides of a shard migration.
-[[bench]]
-name = "history_fingerprint_profile"
-required-features = ["testing"]
-harness = false
-
-# Isolates build_history's own inclusive cost (see the doc comment) so
-# history_fingerprint_profile.rs's workload-share claim in
-# docs/performance-history-fingerprint.md rests on a real measurement, not a
-# flat-profile self-cost line.
-[[bench]]
-name = "history_fingerprint_workload_share_profile"
-required-features = ["testing"]
-harness = false
-
 # Task-claim / enqueue throughput benchmark (issue #786). `harness = false` +
 # its own `main()`: `claim_task` is destructive (PENDING -> RUNNING), so
 # criterion's repeat-the-closure model would drain the seeded backlog and time
@@ -391,28 +271,6 @@ harness = false
 # builds are unaffected.
 [[bench]]
 name = "claim_bench"
-required-features = ["db"]
-harness = false
-[[bench]]
-name = "notify_commit_bench"
-required-features = ["db"]
-harness = false
-
-# Claim latency after 1M terminal task rows, before and after the task-queue
-# hygiene fix (issue #1811). `harness = false` for the same reason as
-# `claim_bench`: claims and the janitor sweep are destructive.
-[[bench]]
-name = "task_queue_hygiene_bench"
-required-features = ["db"]
-harness = false
-
-# Retention-reclamation benchmark for the opt-in partitioned `harvest_events`
-# layout (issue #958). `harness = false` for the same reason as `claim_bench`:
-# the measured operation is destructive and enormous (it collects half the
-# corpus and drops partitions), so criterion's repeat-until-stable loop would
-# end up timing a pass against an already-empty database.
-[[bench]]
-name = "retention_reclaim_bench"
 required-features = ["db"]
 harness = false
 
@@ -446,28 +304,6 @@ name = "det_check_profile"
 harness = false
 
 # Deterministic (non-criterion) instruction/allocation-count profiling harness
-# for `critical_path::CriticalPathAnalyzer::analyze` -- the longest-path DP
-# behind the crate's DAG bottleneck-analysis API, re-exported at the crate
-# root and consumed by `dag_export::export_mermaid_with_critical_path`. No
-# feature requirement: `critical_path.rs` and `dag.rs` are unconditional. See
-# `benches/critical_path_profile.rs`.
-[[bench]]
-name = "critical_path_profile"
-harness = false
-
-# Deterministic (non-criterion) instruction/allocation-count profiling harness
-# for `calendar::plan_backfill_with_calendar` -- the calendar-aware backfill
-# planner behind `POST /admin/schedules/{id}/backfill`. `plan_backfill_with_calendar`
-# is `cfg(feature = "db")` (calendar.rs's DB-dependent section), so
-# `required-features` makes `cargo bench --no-default-features` skip it
-# cleanly instead of failing to compile, mirroring `dlq_aggregate_profile`
-# below. See `benches/calendar_backfill_profile.rs`.
-[[bench]]
-name = "calendar_backfill_profile"
-required-features = ["db"]
-harness = false
-
-# Deterministic (non-criterion) instruction/allocation-count profiling harness
 # for `dlq::group_dead_letter_rows` -- the in-memory grouping core behind
 # `GET /admin/dead-letters/aggregate` (issue #385 / #613). `dlq.rs` uses
 # `diesel_async` unconditionally (no per-item `cfg(feature = "db")` gates), so
@@ -481,104 +317,12 @@ required-features = ["db"]
 harness = false
 
 # Deterministic (non-criterion) instruction/allocation-count profiling harness
-# for `dlq::merge_dlq_aggregates` -- the cross-shard merge stage behind
-# `GET /admin/dead-letters/aggregate` (issue #385/#613), distinct from
-# `dlq_aggregate_profile`'s per-shard `group_dead_letter_rows` target above.
-# Same `db` requirement, same reason (dlq.rs uses diesel_async
-# unconditionally). See `benches/dlq_merge_profile.rs`.
-[[bench]]
-name = "dlq_merge_profile"
-required-features = ["db"]
-harness = false
-
-# Deterministic (non-criterion) instruction/allocation-count profiling harness
 # for `stall_diagnosis::classify_execution` -- the pure root-cause classifier
 # behind `GET /api/harvest/workflows/{id}/diagnose` (issue #809). No feature
 # requirement: `stall_diagnosis` is pure and unconditional (no DB access). See
 # `benches/stall_diagnosis_profile.rs`.
 [[bench]]
 name = "stall_diagnosis_profile"
-harness = false
-
-# Deterministic (non-criterion) instruction/allocation-count profiling harness
-# for `codec_rotation::{has_non_active_key, reencrypt_event_payload_fields_under}`
-# -- the per-row body of the lazy codec-key re-encryption sweep (issue #948).
-# No feature requirement: both functions are pure and unconditional (the
-# `db`-gated sweep loop that calls them is not exercised here). See
-# `benches/codec_rotation_reencrypt_profile.rs`.
-[[bench]]
-name = "codec_rotation_reencrypt_profile"
-harness = false
-
-# Deterministic (non-criterion) instruction/allocation-count profiling harness
-# for `awaitables::project_awaitables` -- the pure, read-only "what is this
-# execution parked on right now?" projection behind the `/awaitables`
-# management endpoint and the awaitables sub-report folded into `/diagnose`
-# and `/replay-diagnosis` (issue #615). No feature requirement:
-# `project_awaitables` is pure and unconditional (no DB access). See
-# `benches/awaitables_profile.rs`.
-[[bench]]
-name = "awaitables_profile"
-harness = false
-
-# Deterministic (non-criterion) instruction/allocation-count profiling harness
-# for `timeline::derive_timeline` -- the pure, read-only per-execution
-# timeline read model behind `GET /workflows/{id}/timeline` (issue #739). No
-# feature requirement: `derive_timeline` is pure and unconditional (no DB
-# access). See `benches/timeline_profile.rs`.
-[[bench]]
-name = "timeline_profile"
-harness = false
-
-# Deterministic (non-criterion) instruction/allocation-count profiling harness
-# for `run_chain::assemble_run_chain` -- the pure ordering pass behind
-# `GET /workflows/{id}/run-chain` (issue #701). No feature requirement:
-# `run_chain.rs` is pure and unconditional (no DB access). See
-# `benches/run_chain_profile.rs`.
-[[bench]]
-name = "run_chain_profile"
-harness = false
-
-# Deterministic (non-criterion) instruction/allocation-count profiling harness
-# for `history_export::export_history` -- the archival-export path
-# `retention.rs`'s reclamation sweep calls once per retiring execution before
-# deleting its row (issue #524/#698/#772/#798), also re-exported at the crate
-# root as public API. No feature requirement: `history_export.rs` is pure and
-# unconditional (no DB access). See `benches/history_export_profile.rs`.
-[[bench]]
-name = "history_export_profile"
-harness = false
-
-# Deterministic (non-criterion) instruction/allocation-count profiling harness
-# for `queue_fairness::{effective_queue_weights, weighted_queue_order}` --
-# the weighted-random queue-selection step `Worker::poll_once` runs on every
-# poll once an operator configures `WorkerConfig::queue_weights` (issue
-# #515). No feature requirement: `queue_fairness.rs` is pure and
-# unconditional (no DB access). See `benches/queue_fairness_profile.rs`.
-[[bench]]
-name = "queue_fairness_profile"
-harness = false
-
-# Deterministic (non-criterion) instruction/allocation-count profiling harness
-# for `worker::any_activity_wait_already_resolved` -- the post-park re-check
-# every mixed suspension batch (issue #950 `join!`/`race()` fan-out) and the
-# cancel-race-loser check ahead of it run to ask "did anything in this
-# just-parked activity-wait set already resolve?". The function itself is
-# pure and unconditional (no DB access), but `worker` is a `db`-gated module.
-# See `benches/activity_wait_resolution_profile.rs`.
-[[bench]]
-name = "activity_wait_resolution_profile"
-required-features = ["db"]
-harness = false
-
-# Deterministic (non-criterion) instruction/allocation-count profiling harness
-# for `payload_codec::PayloadCodecs::{encode_event, decode_event}` -- the
-# codec transform `store.rs` runs on every workflow-event append and every
-# history read / replay load, for every payload-bearing field of every
-# event. No feature requirement: `payload_codec.rs` is pure and unconditional
-# (no DB access). See `benches/payload_codec_profile.rs`.
-[[bench]]
-name = "payload_codec_profile"
 harness = false
 
 [lints]

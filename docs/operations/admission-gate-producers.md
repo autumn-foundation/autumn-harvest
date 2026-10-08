@@ -9,9 +9,6 @@ every start it relays on `harvest.admission.bypassed`). The gate governs new
 admissions — it deliberately does not halt in-flight continuation (see
 [Out of scope](#out-of-scope--in-flight-continuation-not-new-admission)).
 
-An automatic, backlog-driven gate also exists (issue #1794). It sheds new
-starts with `429` and `Retry-After`. See [load shedding](load-shedding.md).
-
 The contract is discoverable at runtime: `GET /admin/gates` returns a
 `producers` block (in addition to the active `gates`) enumerating each producer
 and whether it is **gated**, **gated-at-admission**, **gated-at-relay**, or
@@ -233,11 +230,6 @@ rather than admitting a new one:
 
 Gating these would halt in-flight work mid-flight, the opposite of the gate's
 "halt **new** starts while in-flight work drains" contract.
-
-The claim order uses a similar split (issue #1824). The first task of a
-retry, continue-as-new, child or reset fork does not yield at claim. A
-typed-client handle start differs: the gate exempts it, but its first task
-yields like any fresh start. See [`claim-order.md`](claim-order.md).
 
 Gating starts from *outside* the plugin process, auto-lifting/scheduling gates,
 and rate-limited recovery replay are also out of scope (issue #618).

@@ -80,13 +80,13 @@ struct BillingOutput {
 }
 
 #[workflow]
-async fn billing_cycle(ctx: &WorkflowContext, _input: ()) -> Result<BillingOutput, String> {
-    ctx.timer("month1", 30 * 24 * 3600)
+async fn billing_cycle(ctx: &WorkflowContext, _: ()) -> Result<BillingOutput, String> {
+    ctx.timer("month1", Duration::from_secs(30 * 24 * 3600))
         .await
         .map_err(|e| e.to_string())?;
     let charge1_date = ctx.now().format("%Y-%m-%d").to_string();
 
-    ctx.timer("month2", 30 * 24 * 3600)
+    ctx.timer("month2", Duration::from_secs(30 * 24 * 3600))
         .await
         .map_err(|e| e.to_string())?;
     let charge2_date = ctx.now().format("%Y-%m-%d").to_string();

@@ -58,6 +58,7 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
+use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -74,7 +75,7 @@ use tower::ServiceExt;
 // ── DB bootstrap (adapted from `lineage_tree_integration.rs`) ──────────────
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::test_init_sql().as_bytes().to_vec()
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
 }
 
 type HarvestApiApp = axum::Router;
@@ -150,7 +151,7 @@ fn build_app(pool: HarvestDbPool, router: ShardRouter) -> HarvestApiApp {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         router,
     ));
-    harvest_api_router(api_state)
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
 
 /// Two independent shard databases behind one router -- the shape that makes
@@ -222,7 +223,7 @@ async fn insert_root(conn: &mut AsyncPgConnection, root: ExecutionId) {
         workflow_id: "root",
         run_id: uuid::Uuid::new_v4(),
         shard_id: 0,
-        input: json!({}).into(),
+        input: json!({}),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -280,7 +281,7 @@ async fn bulk_insert(conns: &mut [AsyncPgConnection; 2], nodes: &[Node], workflo
                     workflow_id: &n.workflow_id,
                     run_id: uuid::Uuid::new_v4(),
                     shard_id: n.shard,
-                    input: json!({}).into(),
+                    input: json!({}),
                     parent_id: Some(n.parent.as_uuid()),
                     queue_name: "default",
                     execution_timeout: None,

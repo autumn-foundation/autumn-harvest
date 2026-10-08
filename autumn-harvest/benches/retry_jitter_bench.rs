@@ -2,8 +2,7 @@ use autumn_harvest::policy::{JitterPolicy, RetryPolicy};
 use criterion::{Criterion, criterion_group, criterion_main};
 
 fn bench_retry_jitter(c: &mut Criterion) {
-    let base = RetryPolicy::exponential(10, std::time::Duration::from_millis(250))
-        .with_jitter(JitterPolicy::None);
+    let base = RetryPolicy::exponential(10, std::time::Duration::from_millis(250));
     let full = base.clone().with_jitter(JitterPolicy::Full);
     let equal = base.clone().with_jitter(JitterPolicy::Equal);
     let deco = base.clone().with_jitter(JitterPolicy::Decorrelated);

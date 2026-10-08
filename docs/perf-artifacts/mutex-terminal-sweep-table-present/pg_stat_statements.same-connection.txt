@@ -1,5 +1,0 @@
-                     query                     | calls | shared_blks_hit | shared_blks_read 
------------------------------------------------+-------+-----------------+------------------
- SELECT to_regclass($1) IS NOT NULL AS present |     3 |               6 |                0
-(1 row)
-

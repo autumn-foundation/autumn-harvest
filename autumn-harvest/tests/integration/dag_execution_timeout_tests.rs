@@ -109,7 +109,7 @@ fn base_params<'a>(
         workflow_name,
         workflow_id,
         exec_id,
-        input: serde_json::json!({}).into(),
+        input: serde_json::json!({}),
         parent_id: None,
         queue_name: "default",
         execution_timeout,

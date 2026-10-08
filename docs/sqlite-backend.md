@@ -72,8 +72,8 @@ management API, worker sessions, retention, or sharding.
 
 ```toml
 [dependencies]
-autumn-harvest = { version = "0.7", default-features = false }
-autumn-harvest-sqlite = "0.7"
+autumn-harvest = { version = "0.4", default-features = false }
+autumn-harvest-sqlite = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
@@ -138,9 +138,7 @@ let mut rt = SqliteRuntime::open_in_memory()?;
 
 - Use **`open(path)`** for anything that must survive a process restart. Opening
   applies the schema idempotently and reclaims any task stranded `RUNNING` by a
-  previous crash (see [§9](#9-durability-and-crash-recovery)). It first takes the
-  single-writer lock, so a second open of a held file fails with
-  `SqliteError::DatabaseLocked` (see [§10](#10-the-single-writer--single-server-contract)).
+  previous crash (see [§9](#9-durability-and-crash-recovery)).
 - Use **`open_in_memory()`** for tests, demos, and throwaway runs. Each call is a
   brand-new database and is **not** reopen-safe — dropping the runtime discards
   all state.
@@ -210,22 +208,14 @@ step 7.
 `workflow_id` (what `ctx.info().workflow_id` reports — idempotency-key material,
 cross-backend-identical).
 
-> **Idempotent starts by default (issue #1068).** `start_workflow_with_id`
-> applies the `AllowDuplicate` reuse policy. A non-blank `workflow_id` that
-> matches an existing, non-sealed execution for the same `workflow_name`
-> **attaches** to it. The call returns the SAME `ExecutionId`. No second run
-> starts. **The new `input` is discarded** — a duplicate delivery, e.g. a
-> retried webhook, does not repeat side effects.
->
-> A blank or whitespace-only `workflow_id` has no reuse key. It always
-> creates a fresh, distinct run.
->
-> For a different policy — reject the duplicate, replace a failed run, or
-> terminate and restart — use `start_workflow_with_reuse_policy`. It applies
-> the full `WorkflowIdReusePolicy` matrix and returns a `StartOutcome`, which
-> reports whether the call attached to a prior run or started a fresh one.
-> See the rustdoc on both methods for the full matrix
-> (`cargo doc --open -p autumn-harvest-sqlite`).
+> **v0.1 non-idempotent-start contract.** This backend does **not** enforce
+> `(workflow_name, workflow_id)` uniqueness and does **not** apply the core's
+> `WorkflowIdReusePolicy` matrix. **Every call creates a new, independent
+> execution**, even when `workflow_id` matches a prior run — so a duplicate
+> delivery (e.g. a retried webhook) starts a second run and repeats its side
+> effects. The `workflow_id` is observability + idempotency-key *material*, not
+> an enforced start-boundary uniqueness key. **Dedupe upstream for now.** The
+> reuse-policy matrix is a tracked follow-up (issue #1068).
 
 An oversized start input (over the 2 MiB default cap) is rejected with
 `SqliteError::PayloadTooLarge` before anything is persisted, matching the core.
@@ -264,7 +254,6 @@ match rt.outcome(exec)? {
     ExecutionOutcome::Completed(output) => println!("{output}"),
     ExecutionOutcome::Failed(err)       => println!("{err}"),
     ExecutionOutcome::Running           => println!("still running"),
-    ExecutionOutcome::Terminated(state) => println!("terminal ({state}) — superseded/cancelled, no clean output"),
 }
 ```
 
@@ -278,18 +267,8 @@ match rt.outcome(exec)? {
 - **`poll_once()`** for a custom loop — e.g. a background tick where you decide
   the cadence and inspect the `bool` progress flag yourself.
 
-`poll_once()`/`run_until_idle()` drive every execution in a pass even if an
-earlier one errors — see [§11](#11-v01-non-goals-and-follow-ups) for what
-happens to a rejected execution. `run_until_blocked(exec)` is the one
-fail-fast driver, since it already targets a single execution.
-
 `outcome(exec)`, `load_history(exec)`, and `activity_attempts(exec, name)` are
 **pure reads** — they never advance a run.
-
-Every call that takes an `exec` id returns `SqliteError::ExecutionNotFound(exec)`
-when no execution has that id. This includes `run_until_blocked` and the list
-reads. A typo or a stale id gives this one typed error. It never gives an empty
-list or a generic `SQLite` error.
 
 Timers use the real wall clock (read once per decision cycle), so a run blocked
 on a `ctx.timer(...)` that is not yet due returns `WaitingTimer`; drive it again
@@ -372,39 +351,8 @@ The runtime opens the database with `journal_mode = WAL`, `synchronous = FULL`
 (fsync on every commit — the crash tests depend on it), and a `busy_timeout` so
 an occasional external *reader* (a monitoring/inspector connection) can coexist.
 
-### The contract is enforced (issue #1834)
-
-`SqliteRuntime::open` takes an exclusive OS lock on a sidecar file,
-`<database>.lock`. A second runtime on the same file fails fast with
-`SqliteError::DatabaseLocked`. This applies to another process, and to a
-second runtime in the same process.
-
-- The second open fails **before** it changes the file. It runs no pragma, no
-  schema step and no orphan reclaim. It cannot steal a `RUNNING` task.
-- The open retries the lock for about 100 ms before it fails. A just-dropped
-  runtime can hold its lock for a moment, for example while another thread
-  forks a child process.
-- The kernel releases the lock when the holder exits, also on a crash. A
-  restart never meets a stale lock.
-- The lock path comes from the canonical database path. A symlink or a
-  relative path to the same file maps to the same lock. A hard link or a bind
-  mount gives a second path, and so a second lock. Open the database through
-  one path.
-- A read-only inspector connection still works. It never touches the lock.
-- An in-memory database has no file, so its lock is an owner row inside the
-  database (`harvest_memory_writer_lock`). Several URI forms share one such
-  database, such as `cache=shared` or `vfs=memdb`. `SQLite` decides which
-  connections reach it, so no URI alias can split the lock. A private
-  `:memory:` database starts empty and never conflicts.
-
-The lock file stays on disk after the runtime drops. **Do not delete it** while
-a runtime runs: a second process could then lock a new file. On Unix the lock
-file takes the database file's read and write bits. Any user who can open the
-lock file can hold it, so this keeps that set to the users who reach the data.
-
-**Do not** use this backend as a shared multi-server queue. The lock is an
-advisory lock on the local file system. A network file system may not honour
-it. The only residual crash window is *mid
+**Do not** point two writer processes at the same file, and **do not** use this
+backend as a shared multi-server queue. The only residual crash window is *mid
 activity body* — a crash while a body is executing leaves the task `RUNNING` and
 is recovered (re-running the body, at-least-once) by the orphan reclaim on the
 next `open`. A single-process design has no heartbeat-timeout reclaimer for a
@@ -417,7 +365,7 @@ next `open`. A single-process design has no heartbeat-timeout reclaimer for a
 Out-of-subset workflow primitives are rejected **loudly, by name** — never
 silently dropped. A workflow reaching one of these surfaces
 `SqliteError::Unsupported` (or a setup-time panic at registration) naming the
-specific command/feature. The run then ends `FAILED` (see below):
+specific command/feature:
 
 - **Child workflows** (`spawn_child_workflow`, `spawn_child_workflow_detached`).
 - **External signals / cancels** (`signal_external_workflow`,
@@ -429,42 +377,12 @@ specific command/feature. The run then ends `FAILED` (see below):
 - **Worker sessions** (`create_session`) and **cancellable durable timers**
   (`start_timer` / `TimerHandle::…` — use the fire-once `ctx.timer(...)`).
 
-A rejected execution ends `FAILED` (issue #1834). The drive that meets the
-feature rolls back the whole cycle. It then seals the run in a new
-transaction, with a typed `WorkflowFailed` event:
-
-| Field | Value |
-|---|---|
-| `error_type` | `"UnsupportedFeature"` (`UNSUPPORTED_FEATURE_ERROR_TYPE`) |
-| `details` | `{"feature": "<stable token>", "message": "<full text>"}`. The token is a command or field name, such as `StartChildWorkflow` or `ScheduleActivity.session_id`. |
-| `non_retryable` | `true` |
-| `error` | The `SqliteError::Unsupported` message |
-
-The seal also removes the run's pending tasks, unfired timers and staged
-signals. The cycle's own cleanup rolled back, and nothing can use them now.
-
-That drive still returns `SqliteError::Unsupported`, so the caller sees the
-reason. A later drive returns `RunState::Failed` and does not run the handler
-again. `outcome()` returns `ExecutionOutcome::Failed`.
-
-Only an unsupported feature seals a run. Other errors leave the run `RUNNING`:
-an unregistered workflow or activity, a replay divergence, a contained panic
-under its budget, or a failed task. A fix in the same runtime can then resume
-the run.
-
-A failing execution does not block unrelated executions. `poll_once` still
-drives the rest of the fleet in the same pass (issue #1530). `run_until_idle`
-still converges the rest of the fleet in one call (issue #1555). Both report
-the first execution error to the caller. A sealed execution is terminal, so
-later passes skip it.
-
 Backend-level non-goals: distributed / multi-writer workers, `LISTEN`/`NOTIFY`
 push wake-ups, multi-server crash recovery, schedules, the management API,
-retention, worker sessions, sharding, and DAGs. Rejection is deliberate, so a
-partial, silently-wrong implementation never ships.
-
-The `WorkflowIdReusePolicy` matrix (see [§6](#6-starting-a-workflow)) shipped
-under issue #1068. It is no longer a non-goal.
+retention, worker sessions, sharding, DAGs, and the `WorkflowIdReusePolicy`
+matrix (see [§6](#6-starting-a-workflow)). These are tracked as issue #1068
+follow-ups — rejection is deliberate, so a partial, silently-wrong implementation
+never ships.
 
 Two benign bookkeeping commands are silently no-ops (they append no event and
 gate no control flow): `ctx.set_current_details(...)` and a re-park
@@ -489,18 +407,6 @@ gate no control flow): `ctx.set_current_details(...)` and a re-park
 
   ```text
   cargo run -p autumn-harvest-sqlite --example durability
-  ```
-
-- **[`examples/claude-agent-daemon/`](../examples/claude-agent-daemon/)** — a
-  whole application on this backend: a local daemon that runs Claude agent
-  sessions as durable workflows. It shows the drive loop
-  ([§7](#7-the-drive-model)), pull signals with a deadline
-  ([§8](#8-signals-pull-only)), and crash recovery
-  ([§9](#9-durability-and-crash-recovery)) in one place, and it runs with no API
-  key against a scripted offline model.
-
-  ```text
-  cargo run -p claude-agent-daemon -- serve --workspace /tmp/agent-demo
   ```
 
 For the full API/contract reference, run

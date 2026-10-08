@@ -586,14 +586,8 @@ mod tests {
 
     #[test]
     fn merge_of_nothing_is_empty() {
-        assert_eq!(
-            merge_coverage(&[]),
-            [] as [crate::replay_sample::SampleWorkflowCoverage; 0]
-        );
-        assert_eq!(
-            merge_coverage(&[vec![]]),
-            [] as [crate::replay_sample::SampleWorkflowCoverage; 0]
-        );
+        assert!(merge_coverage(&[]).is_empty());
+        assert!(merge_coverage(&[vec![]]).is_empty());
     }
 
     #[test]

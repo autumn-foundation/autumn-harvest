@@ -1087,8 +1087,6 @@ fn schedule_create_workflow_body_fields_are_documented() {
         "3",
         "--catchup",
         "--paused",
-        "--jitter-secs",
-        "0",
     ]);
 }
 

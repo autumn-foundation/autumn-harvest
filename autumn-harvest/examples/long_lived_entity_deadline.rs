@@ -42,9 +42,7 @@
 //! async fn subscription_entity(ctx: &WorkflowContext, state: SubState) -> Result<SubState, String> {
 //!     // Checkpoint before the hard deadline (or history growth) truncates us.
 //!     if ctx.should_continue_as_new() {
-//!         ctx.continue_as_new(serde_json::to_value(&state).map_err(|e| e.to_string())?)
-//!             .await
-//!             .map_err(|e| e.to_string())?;
+//!         ctx.continue_as_new(serde_json::to_value(&state).unwrap()).await?;
 //!     }
 //!     // ... one cycle of durable work ...
 //!     Ok(state)

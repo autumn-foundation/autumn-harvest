@@ -113,16 +113,8 @@ impl CanaryConfig {
     /// warning) rather than accepted — a too-small interval would derive a
     /// `per_probe_timeout` at or below the probe's own minimum runtime and
     /// false-fail a healthy pipeline (issue #796, AC6). **30s is recommended.**
-    /// A fractional `interval` rounds up to the next whole second (issue #1967).
     #[must_use]
     pub fn new(interval: Duration) -> Self {
-        // An interval schedule takes whole seconds only (issue #1967). Round a
-        // fraction up, so the probe keeps its timeout band.
-        let interval = if interval.subsec_nanos() == 0 {
-            interval
-        } else {
-            Duration::from_secs(interval.as_secs().saturating_add(1))
-        };
         let interval = if interval < MIN_CANARY_INTERVAL {
             tracing::warn!(
                 requested_secs = interval.as_secs(),
@@ -785,9 +777,21 @@ async fn load_canary_rows(conn: &mut AsyncPgConnection) -> Result<Vec<CanaryRow>
 /// unreachable shard never fails the whole fan-out — the merge folds it into
 /// `unavailable_shards` and a `partial`/`unavailable` status instead.
 async fn observe_canary_shard(shard_id: i32, pool: Option<DbPool>) -> ShardObservation<CanaryRow> {
-    let mut conn = match shard_fanout::acquire_shard_conn(shard_id, pool).await {
-        Ok(conn) => conn,
-        Err(observation) => return observation,
+    let Some(pool) = pool else {
+        return ShardObservation {
+            shard_id,
+            rows: Vec::new(),
+            error: Some(format!("shard {shard_id} has no configured storage pool")),
+        };
+    };
+    let Ok(mut conn) = pool.get().await else {
+        return ShardObservation {
+            shard_id,
+            rows: Vec::new(),
+            error: Some(format!(
+                "database connection for shard {shard_id} could not be acquired"
+            )),
+        };
     };
     match load_canary_rows(&mut conn).await {
         Ok(rows) => ShardObservation {
@@ -1013,15 +1017,6 @@ mod tests {
             .iter()
             .find(|s| s.workflow_name == wf_name)
             .unwrap_or_else(|| panic!("expected a schedule for {wf_name}"))
-    }
-
-    #[test]
-    fn a_fractional_canary_interval_still_builds() {
-        // Issue #1967: an interval schedule takes whole seconds only.
-        let cfg = CanaryConfig::new(Duration::from_millis(90_500));
-        assert_eq!(cfg.interval(), Duration::from_secs(91));
-        let built = register_canary(HarvestBuilder::default(), &cfg).try_build();
-        assert!(built.is_ok(), "got: {:?}", built.err());
     }
 
     #[test]
@@ -1383,10 +1378,7 @@ mod tests {
         let report = CanaryReport::empty(at(0));
         let value = serde_json::to_value(&report).unwrap();
         assert_eq!(value["status"], serde_json::json!("complete"));
-        assert_eq!(
-            value["probes"].as_array().unwrap().as_slice(),
-            [] as [serde_json::Value; 0]
-        );
+        assert!(value["probes"].as_array().unwrap().is_empty());
         assert_eq!(value["staleness_window_secs"], serde_json::json!(0));
     }
 }

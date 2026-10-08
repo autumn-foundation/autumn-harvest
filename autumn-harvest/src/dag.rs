@@ -1112,16 +1112,9 @@ impl DagBuilder {
             return Err(DagBuildError::CycleDetected);
         }
 
-        // Signal/timer gate isolation (issue #746). Originally a hard
-        // requirement: the worker could persist only a homogeneous suspension
-        // batch, so a gate's `WaitForSignal` must never share a level with a
-        // sibling activity's `ScheduleActivity`. Issue #950 lifted that
-        // constraint (`persist_mixed_suspension_batch` persists the mixed batch
-        // in one transaction), but the split is RETAINED deliberately: it is the
-        // recorded execution shape of every DAG already in flight, and merging a
-        // gate back into its level would change the command order those
-        // histories replay against. Collapsing it is a separate, versioned
-        // change, not a side effect of #950.
+        // Signal/timer gate isolation (issue #746): the worker requires a
+        // homogeneous suspension batch, so a gate's `WaitForSignal` command must
+        // never share a level with a sibling activity's `ScheduleActivity`.
         // Split each Kahn level that contains a gate into
         // `[non-gate tasks] ++ [each gate as its own singleton]`. Same-level
         // tasks are mutually independent, so re-sequencing among them is safe.
@@ -1723,13 +1716,9 @@ pub async fn run_unified_dag(
 /// compensator — a divergence, surfacing as a #603 nd-block (a stuck-but-
 /// recoverable run, never a silent partial rollback).
 ///
-/// The same class as any config-dependent decision the engine re-evaluates on
-/// replay because it left no history footprint; issue #780 enlarges the surface
-/// rather than creating it. (Issue #952 closed the sibling case where such a
-/// failure is *uncaught* and seals the run — see
-/// `replayer_tests::early_config_dependent_failure_replays_cleanly` — but a
-/// rejection the unwind catches and routes around records nothing, so it stays
-/// re-decided.) A durable fix means persisting the rejection
+/// The same class as the engine-wide `known_limitation_early_config_dependent_
+/// failure_does_not_replay_cleanly` (issue #601); issue #780 enlarges the
+/// surface rather than creating it. A durable fix means persisting the rejection
 /// in the *engine's* dispatch path — it cannot be done here, because a level
 /// dispatches concurrently through `join_all`, so a marker from inside a task
 /// future has no deterministic position and one after the join is read too late
@@ -1844,7 +1833,7 @@ mod tests {
         let builder = DagBuilder::new();
         let dag = builder.build().expect("build should succeed");
         assert!(dag.tasks().is_empty());
-        assert_eq!(dag.execution_levels().len(), 0);
+        assert!(dag.execution_levels().is_empty());
     }
 
     #[test]
@@ -1856,7 +1845,7 @@ mod tests {
         let tasks = dag.tasks();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].activity_name, "dummy_activity");
-        assert_eq!(tasks[0].upstreams, [] as [usize; 0]);
+        assert!(tasks[0].upstreams.is_empty());
         assert_eq!(tasks[0].trigger_rule, TriggerRule::AllSuccess);
         assert!(tasks[0].retry_policy.is_none());
         assert!(tasks[0].start_to_close.is_none());
@@ -1909,7 +1898,7 @@ mod tests {
         let tasks = dag.tasks();
 
         assert_eq!(tasks.len(), 3);
-        assert_eq!(tasks[0].upstreams, [] as [usize; 0]);
+        assert!(tasks[0].upstreams.is_empty());
         assert_eq!(tasks[1].upstreams, vec![0]);
         // upstreams are inserted in order
         assert_eq!(tasks[2].upstreams, vec![0, 1]);

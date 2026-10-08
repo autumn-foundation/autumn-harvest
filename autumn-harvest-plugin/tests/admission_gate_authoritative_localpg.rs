@@ -289,7 +289,7 @@ async fn admin_gates_exposes_producer_contract() {
     let metrics = Arc::new(CapturingMetrics::default());
     let registry = build_registry(metrics);
     let api_state = build_api_state(&pool, registry);
-    let app = harvest_api_router(api_state);
+    let app = harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"));
 
     let (status, body) = get_json(&app, "/admin/gates").await;
     assert_eq!(status, StatusCode::OK);
@@ -297,7 +297,7 @@ async fn admin_gates_exposes_producer_contract() {
         .get("producers")
         .and_then(Value::as_array)
         .expect("response must carry a `producers` block (AC5)");
-    assert_ne!(producers.as_slice(), [] as [serde_json::Value; 0]);
+    assert!(!producers.is_empty());
 
     let by_name = |name: &str| -> Value {
         producers
@@ -552,7 +552,8 @@ async fn scoped_gate_blocks_matching_start_and_passes_non_matching() {
     let metrics = Arc::new(CapturingMetrics::default());
     let registry = build_registry(metrics);
     let api_state = build_api_state(&pool, registry);
-    let app = harvest_api_router(api_state.clone());
+    let app =
+        harvest_api_router(api_state.clone()).with_state(AppState::for_test().with_profile("test"));
 
     // A WorkflowName gate scoped to a DIFFERENT workflow than the one started.
     autumn_harvest::admission_gate::db::create_gate(
@@ -625,7 +626,8 @@ async fn fleet_gate_leaves_zero_uncounted_admissions() {
     let metrics = Arc::new(CapturingMetrics::default());
     let registry = build_registry(Arc::clone(&metrics));
     let api_state = build_api_state(&pool, Arc::clone(&registry));
-    let app = harvest_api_router(api_state.clone());
+    let app =
+        harvest_api_router(api_state.clone()).with_state(AppState::for_test().with_profile("test"));
 
     // Raise a Fleet gate; publish the SAME cache the API uses globally so the
     // core completion-trigger path honours it too.
@@ -672,7 +674,7 @@ async fn fleet_gate_leaves_zero_uncounted_admissions() {
             workflow_name: "ag_source_wf",
             workflow_id: "ag-src-success",
             exec_id: source_exec_id,
-            input: json!({}).into(),
+            input: json!({}),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -905,7 +907,7 @@ async fn seed_target_prior(conn: &mut AsyncPgConnection, workflow_id: &str, stat
             workflow_name: "ag_target_wf",
             workflow_id,
             exec_id,
-            input: json!({}).into(),
+            input: json!({}),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -1005,7 +1007,8 @@ async fn gate_blocks_terminate_if_running_start_over_a_live_prior() {
     let metrics = Arc::new(CapturingMetrics::default());
     let registry = build_registry(Arc::clone(&metrics));
     let api_state = build_api_state(&pool, registry);
-    let app = harvest_api_router(api_state.clone());
+    let app =
+        harvest_api_router(api_state.clone()).with_state(AppState::for_test().with_profile("test"));
 
     seed_target_prior(&mut conn, "tir-live-prior", "RUNNING").await;
     raise_fleet_gate(&mut conn, &api_state, "tir-incident").await;
@@ -1056,7 +1059,8 @@ async fn gate_blocks_allow_duplicate_failed_only_start_over_a_failed_prior() {
     let metrics = Arc::new(CapturingMetrics::default());
     let registry = build_registry(Arc::clone(&metrics));
     let api_state = build_api_state(&pool, registry);
-    let app = harvest_api_router(api_state.clone());
+    let app =
+        harvest_api_router(api_state.clone()).with_state(AppState::for_test().with_profile("test"));
 
     seed_target_prior(&mut conn, "adfo-failed-prior", "FAILED").await;
     raise_fleet_gate(&mut conn, &api_state, "adfo-incident").await;
@@ -1109,7 +1113,8 @@ async fn gate_skips_allow_duplicate_attach_regardless_of_prior_state() {
         let metrics = Arc::new(CapturingMetrics::default());
         let registry = build_registry(Arc::clone(&metrics));
         let api_state = build_api_state(&pool, registry);
-        let app = harvest_api_router(api_state.clone());
+        let app = harvest_api_router(api_state.clone())
+            .with_state(AppState::for_test().with_profile("test"));
 
         seed_target_prior(&mut conn, "ad-prior", prior_state).await;
         raise_fleet_gate(&mut conn, &api_state, "ad-incident").await;
@@ -1167,7 +1172,8 @@ async fn http_start_blocks_a_prior_that_seals_between_read_and_start() {
     let metrics = Arc::new(CapturingMetrics::default());
     let registry = build_registry(Arc::clone(&metrics));
     let api_state = build_api_state(&pool, registry);
-    let app = harvest_api_router(api_state.clone());
+    let app =
+        harvest_api_router(api_state.clone()).with_state(AppState::for_test().with_profile("test"));
 
     let prior = seed_target_prior(&mut conn, "seal-race", "RUNNING").await;
     raise_fleet_gate(&mut conn, &api_state, "seal-race-incident").await;
@@ -1272,7 +1278,8 @@ async fn keyed_start_blocked_by_gate_is_counted_and_rolls_back_reservation() {
     let metrics = Arc::new(CapturingMetrics::default());
     let registry = build_registry(Arc::clone(&metrics));
     let api_state = build_api_state(&pool, registry);
-    let app = harvest_api_router(api_state.clone());
+    let app =
+        harvest_api_router(api_state.clone()).with_state(AppState::for_test().with_profile("test"));
 
     raise_fleet_gate(&mut conn, &api_state, "keyed-incident").await;
 
@@ -1334,7 +1341,8 @@ async fn throttle_reserved_start_blocked_by_gate_refunds_token_and_counts() {
     let metrics = Arc::new(CapturingMetrics::default());
     let registry = build_registry(Arc::clone(&metrics));
     let api_state = build_api_state(&pool, registry);
-    let app = harvest_api_router(api_state.clone());
+    let app =
+        harvest_api_router(api_state.clone()).with_state(AppState::for_test().with_profile("test"));
 
     raise_fleet_gate(&mut conn, &api_state, "throttle-incident").await;
 
@@ -1394,7 +1402,8 @@ async fn batch_item_blocks_a_prior_that_seals_between_phase1_and_phase2() {
     let metrics = Arc::new(CapturingMetrics::default());
     let registry = build_registry(Arc::clone(&metrics));
     let api_state = build_api_state(&pool, registry);
-    let app = harvest_api_router(api_state.clone());
+    let app =
+        harvest_api_router(api_state.clone()).with_state(AppState::for_test().with_profile("test"));
 
     let prior = seed_target_prior(&mut conn, "batch-seal-race", "RUNNING").await;
     raise_fleet_gate(&mut conn, &api_state, "batch-seal-incident").await;

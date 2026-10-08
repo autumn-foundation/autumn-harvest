@@ -478,7 +478,7 @@
       "default_threshold": "Page when any shard reports stranded_pending > 0 sustained for longer than 2 x worker poll_interval (default 2 x 500 ms; a 2m `for` is a conservative starter value that also rides out a rolling worker restart). This pack ships expressions only, not `for` windows \u2014 set one in your own rule and tune it to your restart window.",
       "severity": "page",
       "owner_persona": "platform on-call",
-      "description": "A writable shard has pending work that no live worker can claim. The cause can be missing shard coverage or a queue, build-id, capability, or sticky-lease mismatch. Use shard health to select the remediation path.",
+      "description": "A writable shard has claimable pending work but no live worker is polling it, so every workflow rendezvous-hashed onto that shard is permanently undispatched. This is the SHARD-dimension analogue of harvest_queue_uncovered (#774), which detects the same condition per QUEUE. It fires most often after adding a shard to writable_shards without starting (or widening) a worker that covers it, or after the only worker covering a shard dies. Since issue #961 a worker with EMPTY shard_assignments auto-covers every shard in its pool, so a persistent alert here usually means a worker was explicitly narrowed with with_shard_assignments and never widened, or that shard has no pool entry in this process at all.",
       "first_action": "harvest shard health --output json",
       "dependencies": [
         {
@@ -494,7 +494,7 @@
       ],
       "prometheus": {
         "mode": "native-metric",
-        "notes": "harvest.shard.stranded_pending is exposed as harvest_shard_stranded_pending{shard}. Use max by (shard) to avoid replica double-counting. No dispatch activity does not prove poller absence. A poller can be present but unable to claim the pending rows. The narrow variant uses `unless`, not `and ... == 0`: a shard that has never dispatched has no harvest_shard_dispatched_total{shard} series. `unless` retains that shard.",
+        "notes": "harvest.shard.stranded_pending is exposed as the gauge harvest_shard_stranded_pending{shard}. Use max by (shard) so multiple worker replicas sampling the same shard are not double-counted. The companion harvest_shard_dispatched_total{shard} counter distinguishes 'no poller at all' from 'poller present but backlogged' (dispatch rate non-zero). The narrow variant uses `unless`, not `and ... == 0`: a shard that has NEVER had a covering poller has no harvest_shard_dispatched_total{shard} series at all, so an `== 0` comparison yields no element for it and the vector match would silently drop the alert in exactly the case it is written to detect. `unless` keeps the left-hand element when the right-hand side has none.",
         "expressions": [
           {
             "kind": "promql",
@@ -503,7 +503,7 @@
           {
             "kind": "promql",
             "expr": "max by (shard) (harvest_shard_stranded_pending) > 0 unless (sum by (shard) (rate(harvest_shard_dispatched_total[5m])) > 0)",
-            "note": "Narrower variant: stranded work with no dispatch activity. Either no covering poller exists, or a poller is present but unable to claim these rows because of a queue, build-id, capability, or sticky-lease mismatch. Check shard health."
+            "note": "Narrower variant: stranded work with NO dispatch series on that shard, i.e. genuinely no covering poller rather than a poller that is merely behind."
           }
         ]
       },
@@ -739,7 +739,7 @@
       ],
       "prometheus": {
         "mode": "native-metric",
-        "notes": "Non-determinism signals a logic mismatch. harvest_workflow_non_determinism_total carries workflow and build_id labels (keep build_id low-cardinality); harvest_workflow_nondeterministic_block_total carries workflow, queue and build_id (issue #1814, capped).",
+        "notes": "Non-determinism signals a logic mismatch. harvest_workflow_non_determinism_total carries workflow and build_id labels (keep build_id low-cardinality); harvest_workflow_nondeterministic_block_total carries workflow and queue.",
         "expressions": [
           {
             "kind": "promql",
@@ -927,11 +927,11 @@
     {
       "id": "harvest_workflow_history_bloat",
       "status": "enforceable",
-      "signal_source": "harvest.workflow.history_bloat counter (issue #704), incremented once (at-least-once delivery; a rare crash-window duplicate is possible) per workflow execution when its recorded harvest_events count first crosses history_bloat_warn_fraction * event_hard_cap (WorkflowHistoryPolicy, default fraction 0.2048 of the default 50,000-event cap, so 10,240 events, since issue #1804) -- either while still-running, or in the same decision that terminally force-fails the run for exceeding the hard cap in one shot.",
-      "default_threshold": "Ticket on any increase over a 15 minute window: sum by (workflow) (increase(harvest_workflow_history_bloat_total[15m])) > 0. This is a per-run early-warning crossing, not a sustained rate -- a single occurrence is worth triaging before the run reaches the hard cap and is terminally force-failed to the DLQ. The event cap is on by default since issue #1804, so the signal fires for every workflow type. It is a no-op (a permanently flat series) only when the operator disables it: an unlimited event cap (history_event_hard_cap_unlimited()) or a warn fraction of 0 (history_bloat_warn_fraction(0.0)). Both are expected, not a health issue. Prometheus caveat: this counter's series for a given workflow label is created only at that label's first-ever crossing (no prior zero sample exists to diff against), so increase() computed over that genesis crossing can read as zero/no-data until a second sample of the same series is scraped -- a true first-ever crossing for a workflow type that has never crossed before may not reliably page/ticket from this expression alone (it typically becomes observable on a second crossing, or once a later scrape re-samples the still-flat series). This is a general Prometheus counter-genesis property shared by every ANY-occurrence rule in this pack (harvest_workflow_non_determinism, harvest_workflow_nondeterministic_block, harvest_saga_compensation_failed), not specific to this signal. For guaranteed single-occurrence detection independent of Prometheus sampling, poll the discovery endpoint directly: GET /api/harvest/workflows?history_bloat_min_events=<threshold> (or harvest workflow list --history-bloat-min-events <threshold>), which has no such genesis-sample gap.",
+      "signal_source": "harvest.workflow.history_bloat counter (issue #704), incremented once (at-least-once delivery; a rare crash-window duplicate is possible) per workflow execution when its recorded harvest_events count first crosses history_bloat_warn_fraction * event_hard_cap (WorkflowHistoryPolicy, default fraction 0.75) -- either while still-running, or in the same decision that terminally force-fails the run for exceeding the hard cap in one shot.",
+      "default_threshold": "Ticket on any increase over a 15 minute window: sum by (workflow) (increase(harvest_workflow_history_bloat_total[15m])) > 0. This is a per-run early-warning crossing, not a sustained rate -- a single occurrence is worth triaging before the run reaches the hard cap and is terminally force-failed to the DLQ. The signal only fires for workflow types where the operator has configured event_hard_cap; it is a no-op (a permanently flat series) otherwise, which is expected, not a health issue. Prometheus caveat: this counter's series for a given workflow label is created only at that label's first-ever crossing (no prior zero sample exists to diff against), so increase() computed over that genesis crossing can read as zero/no-data until a second sample of the same series is scraped -- a true first-ever crossing for a workflow type that has never crossed before may not reliably page/ticket from this expression alone (it typically becomes observable on a second crossing, or once a later scrape re-samples the still-flat series). This is a general Prometheus counter-genesis property shared by every ANY-occurrence rule in this pack (harvest_workflow_non_determinism, harvest_workflow_nondeterministic_block, harvest_saga_compensation_failed), not specific to this signal. For guaranteed single-occurrence detection independent of Prometheus sampling, poll the discovery endpoint directly: GET /api/harvest/workflows?history_bloat_min_events=<threshold> (or harvest workflow list --history-bloat-min-events <threshold>), which has no such genesis-sample gap.",
       "severity": "ticket",
       "owner_persona": "workflow owner",
-      "description": "A workflow execution's recorded event history has crossed a configurable fraction (default 20.48%) of the engine's hard history-event-count cap (default 50,000 events, issue #1804). This is an operator early-warning: for a still-running execution the run keeps executing exactly as before, and the counter fires once per crossing per run (at-least-once delivery). A single decision can also grow history past the cap in one shot, in which case the crossing is caught and the counter fires right before that same decision terminally force-fails the run. Left unaddressed, continued growth risks the execution eventually reaching the hard cap and being terminally force-failed to the dead-letter queue. Typical causes are a workflow that polls or loops without ever calling continue_as_new, or an unexpectedly wide fan-out.",
+      "description": "A workflow execution's recorded event history has crossed a configurable fraction (default 75%) of the engine's optional hard history-event-count cap. This is an operator early-warning: for a still-running execution the run keeps executing exactly as before, and the counter fires once per crossing per run (at-least-once delivery). A single decision can also grow history past the cap in one shot, in which case the crossing is caught and the counter fires right before that same decision terminally force-fails the run. Left unaddressed, continued growth risks the execution eventually reaching the hard cap and being terminally force-failed to the dead-letter queue. Typical causes are a workflow that polls or loops without ever calling continue_as_new, or an unexpectedly wide fan-out.",
       "first_action": "harvest workflow list --history-bloat-min-events <threshold>, which returns only live executions at or above that recorded event count, sorted by history size descending with each row's current history_event_count -- rank and triage the largest offenders first.",
       "dependencies": [
         {
@@ -947,7 +947,7 @@
       ],
       "prometheus": {
         "mode": "native",
-        "notes": "The counter fires once per run at the moment it crosses the soft threshold, so alert on ANY increase within the window rather than a sustained rate. workflow is the only label; execution.id is never a label. A deployment whose event cap is unlimited (history_event_hard_cap_unlimited()) or whose warn fraction is 0 (history_bloat_warn_fraction(0.0)) shows a permanently flat, never-incrementing series -- this is the disabled/no-op state (AC4), not an outage. A workflow label crossing for the very first time creates its series with no prior zero sample, so increase() may not observe that genesis crossing until a second sample of the series exists (see default_threshold's Prometheus caveat); the discovery endpoint has no such gap and is the reliable fallback for guaranteed single-occurrence detection.",
+        "notes": "The counter fires once per run at the moment it crosses the soft threshold, so alert on ANY increase within the window rather than a sustained rate. workflow is the only label; execution.id is never a label. An unconfigured deployment (no event_hard_cap set on any workflow) will show a permanently flat, never-incrementing series -- this is the disabled/no-op state (AC4), not an outage. A workflow label crossing for the very first time creates its series with no prior zero sample, so increase() may not observe that genesis crossing until a second sample of the series exists (see default_threshold's Prometheus caveat); the discovery endpoint has no such gap and is the reliable fallback for guaranteed single-occurrence detection.",
         "expressions": [
           {
             "kind": "promql",
@@ -1009,10 +1009,10 @@
       "id": "harvest_scanner_stalled",
       "status": "enforceable",
       "signal_source": "ADR-0001/#797 counter harvest.scanner.tick, incremented unconditionally at the end of EVERY background control-loop iteration (label scanner). Companion in-process check: the scanner_liveness entry in GET /api/harvest/admin/preflight.",
-      "default_threshold": "Page when a scanner series stops incrementing for longer than its loop's cadence allows, while the process is up. The windows are per-cadence, NOT uniform: seven of the nine loops poll sub-minute (timeout/sla/external_outbox 500ms, schedule 1s, poison_pill/pause_auto_resume/rebalance_resume 5s), so a 5m window is ~300x their interval and never flaps. `audit_export` gets its own 10m window (see the audit_export-specific expression's own note): its per-tick duration is bounded by the operator-configurable audit_export_lease, not the poll interval, so it cannot share the sub-minute window the way the other six do. The retention janitor polls hourly by default, so it gets a 3h window. A uniform 5m window would page continuously on a HEALTHY retention loop. Retune all three windows if you have changed WorkerConfig::poll_interval, RetentionConfig's tick interval, or audit_export_lease respectively. Retune the 5m window too if you raised ScannerConfig::rebalance_resume_interval above about one minute. These windows are the coarse fleet-wide signal; the scanner_liveness preflight check is the low-latency one (max(2 x poll_interval, 60s) -- audit_export registers against poll_interval + SHARD_ACQUIRE_BOUND + its configured export lease instead of the bare poll interval, so a legitimately slow-but-within-lease delivery is not misclassified as wedged).",
+      "default_threshold": "Page when a scanner series stops incrementing for longer than its loop's cadence allows, while the process is up. The windows are per-cadence, NOT uniform: six of the seven loops poll sub-minute (timeout/sla/external_outbox 500ms, schedule 1s, poison_pill/pause_auto_resume 5s), so a 5m window is ~300x their interval and never flaps; the retention janitor polls hourly by default, so it gets a 3h window. A uniform 5m window would page continuously on a HEALTHY retention loop. Retune both windows if you have changed WorkerConfig::poll_interval or RetentionConfig's tick interval. These windows are the coarse fleet-wide signal; the scanner_liveness preflight check is the low-latency one (max(2 x poll_interval, 60s)).",
       "severity": "page",
       "owner_persona": "service on-call",
-      "description": "A background control loop has stopped completing iterations. Because the tick fires even on no-work iterations, a flat-lined series means the loop is wedged (panicked, deadlocked on a poisoned connection, or stalled on a never-returning query) rather than idle. Whichever enforcement it owns -- workflow/activity timeouts, SLA breaches, poison-pill reclaim, external signal/cancel outbox delivery, retention, schedule firing, bounded-pause auto-resume, or audit-record export -- is silently not running.",
+      "description": "A background control loop has stopped completing iterations. Because the tick fires even on no-work iterations, a flat-lined series means the loop is wedged (panicked, deadlocked on a poisoned connection, or stalled on a never-returning query) rather than idle. Whichever enforcement it owns -- workflow/activity timeouts, SLA breaches, poison-pill reclaim, external signal/cancel outbox delivery, retention, schedule firing, or bounded-pause auto-resume -- is silently not running.",
       "first_action": "harvest preflight --output json",
       "dependencies": [
         {
@@ -1023,21 +1023,16 @@
         {
           "ref": "ADR-0001",
           "status": "accepted",
-          "surface": "bounded metric label: scanner (8 values)"
+          "surface": "bounded metric label: scanner (7 values)"
         }
       ],
       "prometheus": {
         "mode": "native-metric",
-        "notes": "Alert on the RATE, never the value: the counter is monotonic, so a wedged loop holds its last value forever rather than dropping. `absent()` is deliberately not used -- a scanner that never runs in a given process (an API-only replica) legitimately exports no series, and a process that is entirely down is the `up` alert's job. The expressions deliberately do NOT `sum by (scanner)`: every replica runs its own copy of all nine loops, so summing across instances lets two healthy replicas mask a third's wedged loop. Keep the scrape target's own instance/pod labels so the alert names WHICH process stalled. A multi-shard worker spawns one timeout/poison_pill/pause_auto_resume/audit_export/rebalance_resume loop per assigned shard, so the counter also carries a bounded `shard` label (the shard id, or `none` for the process-wide retention/schedule loops and single-shard deployments). Without it those instances would share one series on one scrape target and a healthy shard's ticks would hold rate(...) > 0 while a sibling's loop was dead -- the wedge would be MASKED, not merely unlocalised. Keep `shard` in any grouping you add for the same reason you keep `instance`. A duplicate shard_assignments entry is deduplicated at the config boundary, so a repeated shard can neither spawn a second set of loops against one database nor collapse two instances onto one series. RESIDUAL: (instance, scanner, shard) still does not separate two INDEPENDENTLY CONSTRUCTED runtimes (two Workers, or two RetentionRuntimes) polling the same shard inside one process -- their ticks share a series, so a healthy one masks its wedged peer. A per-owner label was rejected: registry owner ids are monotonic and never reused, so labelling by them would grow without bound in any process that restarts a runtime, violating the ADR-0001 \u00a77 bounded-label rule. If you run two runtimes of the same kind in one process, treat the scanner_liveness preflight check as the authority for those scanners -- it tracks each owner separately. The scanner_liveness preflight check complements this: it lists EVERY stale shard in affected_shards, so the operator sees the full blast radius in one read. The series is initialized at ZERO when each loop registers, at spawn time, before its first iteration -- so a loop that panics or hangs on iteration one still exports a series that reads rate() == 0 and pages, instead of exporting nothing and staying silent forever. One consequence: the series exists from process start, so the boot window for a slow loop is its first poll interval after start (the retention janitor's 3h window is quiet during hour 0-1 of a fresh process); use `for:` at least one poll interval to ride that out. GRACEFUL DRAIN NEEDS A GATE: deregistration is in-process only -- a Prometheus counter cannot be un-exported, so a deliberately stopped loop's series stays at its final value and reads rate() == 0 forever. If the process exits after draining, the scrape target disappears and this resolves itself; if it keeps serving HTTP after draining, gate the rule on the process still owning worker duties -- e.g. append `and on(instance) (count by (instance) (harvest_worker_slots_available) > 0)`, since the worker's own sampler stops when it drains but keeps reporting while a scanner is merely wedged. The scanner_liveness preflight check needs no such gate: it knows which loops are currently registered. STARTUP GATE (retention only): because the series is initialized at zero at registration, a fresh process exports retention=0 for the whole first hour while its hourly janitor sleeps toward its first pass -- and Prometheus evaluates increase() over a PARTIAL window, so a bare increase(...[3h]) == 0 returns 0 after two scrapes and pages through every healthy startup. The retention expression therefore ANDs on the counter having reached a nonzero value in the same window, which needs no process_start_time_seconds (not exported) and no assumption about scrape interval. Note the gate is max_over_time(...[3h]) > 0 and NOT a bare `harvest_scanner_tick_total{...} > 0`: PromQL set operators match on the FULL label set including __name__, and increase() drops __name__ while a bare selector keeps it, so ANDing against a bare selector would match nothing and silently disable the alert. Both sides are function results over the same selector and window, so their label sets are identical and the AND matches per series. The cost is that a retention loop wedging before its FIRST tick is invisible to this alert -- unavoidable from the counter alone, since during the startup hour it is indistinguishable from a healthy sleeping janitor. That case is covered by the scanner_liveness preflight check, which knows the registration timestamp and flags a never-ticked retention loop once 2h have passed. The sub-minute expression deliberately carries NO such gate: those loops tick within seconds of registration, so there is no startup window to ride out, and gating them would blind the alert to exactly the first-iteration wedge that initializing the series at zero exists to catch. RESTART SEMANTICS (why the gate needs no resets()/uptime term): on a restart that preserves the Prometheus label set the counter resets to zero, but increase() is reset-AWARE -- it computes last - first + correction, adding the pre-reset value at each reset. A healthy retention loop that ticked at least once in the pre-restart portion of the window therefore yields increase > 0 (samples 3,4,5,reset,0,0 -> 0 - 3 + 5 = 2), so the `== 0` side fails and the rule cannot fire; the gate is never even consulted. The only post-restart shape that fires is one whose pre-restart portion contained NO increments (samples 5,5,5,reset,0,0 -> 0 - 5 + 5 = 0), i.e. the loop had already been stalled for the whole window and the rule was already correctly firing -- it simply continues, for at most one more hour, until the new process's first pass proves liveness. A resets()- or uptime-scoped gate was rejected: `unless resets(...[3h]) > 0` would blind the alert for 3h after EVERY deploy, hiding a genuine post-restart wedge, which is strictly worse than prolonging an already-true page.",
+        "notes": "Alert on the RATE, never the value: the counter is monotonic, so a wedged loop holds its last value forever rather than dropping. `absent()` is deliberately not used -- a scanner that never runs in a given process (an API-only replica) legitimately exports no series, and a process that is entirely down is the `up` alert's job. The expressions deliberately do NOT `sum by (scanner)`: every replica runs its own copy of all seven loops, so summing across instances lets two healthy replicas mask a third's wedged loop. Keep the scrape target's own instance/pod labels so the alert names WHICH process stalled. A multi-shard worker spawns one timeout/poison_pill/pause_auto_resume loop per assigned shard, so the counter also carries a bounded `shard` label (the shard id, or `none` for the process-wide retention/schedule loops and single-shard deployments). Without it those instances would share one series on one scrape target and a healthy shard's ticks would hold rate(...) > 0 while a sibling's loop was dead -- the wedge would be MASKED, not merely unlocalised. Keep `shard` in any grouping you add for the same reason you keep `instance`. A duplicate shard_assignments entry is deduplicated at the config boundary, so a repeated shard can neither spawn a second set of loops against one database nor collapse two instances onto one series. RESIDUAL: (instance, scanner, shard) still does not separate two INDEPENDENTLY CONSTRUCTED runtimes (two Workers, or two RetentionRuntimes) polling the same shard inside one process -- their ticks share a series, so a healthy one masks its wedged peer. A per-owner label was rejected: registry owner ids are monotonic and never reused, so labelling by them would grow without bound in any process that restarts a runtime, violating the ADR-0001 \u00a77 bounded-label rule. If you run two runtimes of the same kind in one process, treat the scanner_liveness preflight check as the authority for those scanners -- it tracks each owner separately. The scanner_liveness preflight check complements this: it lists EVERY stale shard in affected_shards, so the operator sees the full blast radius in one read. The series is initialized at ZERO when each loop registers, at spawn time, before its first iteration -- so a loop that panics or hangs on iteration one still exports a series that reads rate() == 0 and pages, instead of exporting nothing and staying silent forever. One consequence: the series exists from process start, so the boot window for a slow loop is its first poll interval after start (the retention janitor's 3h window is quiet during hour 0-1 of a fresh process); use `for:` at least one poll interval to ride that out. GRACEFUL DRAIN NEEDS A GATE: deregistration is in-process only -- a Prometheus counter cannot be un-exported, so a deliberately stopped loop's series stays at its final value and reads rate() == 0 forever. If the process exits after draining, the scrape target disappears and this resolves itself; if it keeps serving HTTP after draining, gate the rule on the process still owning worker duties -- e.g. append `and on(instance) (count by (instance) (harvest_worker_slots_available) > 0)`, since the worker's own sampler stops when it drains but keeps reporting while a scanner is merely wedged. The scanner_liveness preflight check needs no such gate: it knows which loops are currently registered. STARTUP GATE (retention only): because the series is initialized at zero at registration, a fresh process exports retention=0 for the whole first hour while its hourly janitor sleeps toward its first pass -- and Prometheus evaluates increase() over a PARTIAL window, so a bare increase(...[3h]) == 0 returns 0 after two scrapes and pages through every healthy startup. The retention expression therefore ANDs on the counter having reached a nonzero value in the same window, which needs no process_start_time_seconds (not exported) and no assumption about scrape interval. Note the gate is max_over_time(...[3h]) > 0 and NOT a bare `harvest_scanner_tick_total{...} > 0`: PromQL set operators match on the FULL label set including __name__, and increase() drops __name__ while a bare selector keeps it, so ANDing against a bare selector would match nothing and silently disable the alert. Both sides are function results over the same selector and window, so their label sets are identical and the AND matches per series. The cost is that a retention loop wedging before its FIRST tick is invisible to this alert -- unavoidable from the counter alone, since during the startup hour it is indistinguishable from a healthy sleeping janitor. That case is covered by the scanner_liveness preflight check, which knows the registration timestamp and flags a never-ticked retention loop once 2h have passed. The sub-minute expression deliberately carries NO such gate: those loops tick within seconds of registration, so there is no startup window to ride out, and gating them would blind the alert to exactly the first-iteration wedge that initializing the series at zero exists to catch. RESTART SEMANTICS (why the gate needs no resets()/uptime term): on a restart that preserves the Prometheus label set the counter resets to zero, but increase() is reset-AWARE -- it computes last - first + correction, adding the pre-reset value at each reset. A healthy retention loop that ticked at least once in the pre-restart portion of the window therefore yields increase > 0 (samples 3,4,5,reset,0,0 -> 0 - 3 + 5 = 2), so the `== 0` side fails and the rule cannot fire; the gate is never even consulted. The only post-restart shape that fires is one whose pre-restart portion contained NO increments (samples 5,5,5,reset,0,0 -> 0 - 5 + 5 = 0), i.e. the loop had already been stalled for the whole window and the rule was already correctly firing -- it simply continues, for at most one more hour, until the new process's first pass proves liveness. A resets()- or uptime-scoped gate was rejected: `unless resets(...[3h]) > 0` would blind the alert for 3h after EVERY deploy, hiding a genuine post-restart wedge, which is strictly worse than prolonging an already-true page.",
         "expressions": [
           {
             "kind": "promql",
-            "expr": "rate(harvest_scanner_tick_total{scanner!=\"retention\",scanner!=\"audit_export\"}[5m]) == 0"
-          },
-          {
-            "kind": "promql",
-            "expr": "rate(harvest_scanner_tick_total{scanner=\"audit_export\"}[10m]) == 0 and max_over_time(harvest_scanner_tick_total{scanner=\"audit_export\"}[10m]) > 0",
-            "note": "A 10m window, not the shared 5m one: a single audit-export tick can legitimately run as long as the configured audit_export_lease allows (default 60s, operator-configurable). 10m covers any lease up to a few minutes without retuning; a fleet configured with a longer lease must widen this window to stay ahead of it, exactly like the retention window below must track RetentionConfig's tick interval. Carries the same startup gate as the retention expression below (Codex review on PR #1520, follow-up P2): the series starts at zero at registration, and a healthy first tick can legitimately still be in flight when Prometheus evaluates a partial 10m window, so a bare rate(...) == 0 would page through every healthy startup. ANDing on the counter having reached a nonzero value in the same window rules that out, exactly like the retention gate below. Same cost as retention's gate (Codex review on PR #1520, follow-up P2, third round): a task that wedges before its FIRST tick -- for example hanging inside ensure_cursor_row or claim_shard on its very first iteration -- never reaches max_over_time(...) > 0, so this alert cannot fire for it; that case is covered instead by the scanner_liveness preflight check, which knows the registration timestamp and flags a never-ticked audit_export loop once its registered interval has passed."
+            "expr": "rate(harvest_scanner_tick_total{scanner!=\"retention\"}[5m]) == 0"
           },
           {
             "kind": "promql",
@@ -1175,474 +1170,6 @@
         "GET /api/harvest/admin/queue-coverage (issue #774 \u2014 confirm the queue has any live worker at all)"
       ],
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_capability_miss_release_sustained"
-    },
-    {
-      "id": "harvest_replication_down",
-      "status": "enforceable",
-      "signal_source": "harvest.replication.standbys{shard}, emitted per shard by the DR sampler from pg_stat_replication scoped to that shard's database (issue #954).",
-      "default_threshold": "Page when harvest_replication_standbys is 0 for any shard for two sampler intervals. Ticket when a replication slot is inactive but a standby is still connected.",
-      "severity": "page",
-      "owner_persona": "runtime on-call",
-      "description": "A shard has no connected standby, so cross-region DR is not protecting it: the RPO is unbounded and growing, and failing over now would lose everything since the standby stopped consuming. This is deliberately NOT a lag threshold. The lag series is absent, not zero, when the RPO is unknown - reporting a dead standby as a perfect RPO would be the most dangerous number this feature could publish - so a lag-based alert stays silent through exactly this outage. Retained WAL also accumulates on the primary until it runs out of disk. Gated on harvest_replication_observable == 1 so it cannot fire on a stale reading left behind after the views became unreadable; that case has its own rule.",
-      "first_action": "harvest dr status --shard <id>=<dsn> -o json",
-      "dependencies": [
-        {
-          "ref": "#954",
-          "status": "shipped",
-          "surface": "harvest.replication.standbys and harvest dr status"
-        }
-      ],
-      "prometheus": {
-        "mode": "native",
-        "notes": "Keyed on the standby gauge, never on lag: the lag series goes absent when replication is down. The `observable == 1` conjunct is required, not decorative: a Prometheus gauge keeps exporting its last value, so without it this rule could fire on a frozen standby count from before the views became unreadable.",
-        "expressions": [
-          {
-            "name": "harvest_replication_down",
-            "expr": "min by (shard) (harvest_replication_standbys) == 0 and on (shard) max by (shard) (harvest_replication_observable) == 1",
-            "for": "2m"
-          },
-          {
-            "name": "harvest_replication_wal_backlog",
-            "expr": "max by (shard) (harvest_replication_lag_bytes) > 1073741824",
-            "for": "15m"
-          }
-        ]
-      },
-      "management_checks": [
-        "harvest dr status --shard <id>=<dsn> -o json",
-        "SELECT slot_name, active, pg_current_wal_lsn() - confirmed_flush_lsn FROM pg_replication_slots"
-      ],
-      "runbook": "docs/runbooks/harvest-alerts.md#harvest_replication_down"
-    },
-    {
-      "id": "harvest_replication_lag_high",
-      "status": "enforceable",
-      "signal_source": "harvest.replication.lag_seconds{shard} - the measured RPO, derived from the LSN watermark trail (issue #954).",
-      "default_threshold": "Ticket when the measured RPO exceeds 60s for 10 minutes on any shard. Page when it exceeds your documented RPO budget. Both are starter defaults: the only correct threshold is the loss the business has agreed to accept.",
-      "severity": "ticket",
-      "owner_persona": "platform team",
-      "description": "A shard's standby is falling behind, so the amount of acknowledged work a failover would lose is growing. At failover time the number is literal: up to `lag` seconds of confirmed work is gone, and per the at-least-once contract side effects from that window may re-execute on the new primary. Rising lag with a healthy standby count usually means a slow standby, a long-running transaction on the subscriber, or a stalled apply worker - compare against pg_stat_replication.replay_lag, which goes NULL for a stuck logical apply worker while this metric keeps measuring.",
-      "first_action": "harvest dr status --shard <id>=<dsn> -o json",
-      "dependencies": [
-        {
-          "ref": "#954",
-          "status": "shipped",
-          "surface": "harvest.replication.lag_seconds and harvest dr status"
-        }
-      ],
-      "prometheus": {
-        "mode": "native",
-        "notes": "Pair with harvest_replication_down: this alert can only fire while a lag reading exists at all.",
-        "expressions": [
-          {
-            "name": "harvest_replication_lag_high",
-            "expr": "max by (shard) (harvest_replication_lag_seconds) > 60",
-            "for": "10m"
-          },
-          {
-            "name": "harvest_replication_shard_generation_skew",
-            "expr": "max(harvest_shard_generation) - min(harvest_shard_generation) > 0",
-            "for": "15m"
-          }
-        ]
-      },
-      "management_checks": [
-        "harvest dr status --shard <id>=<dsn> -o json",
-        "SELECT application_name, state, replay_lag FROM pg_stat_replication"
-      ],
-      "runbook": "docs/runbooks/harvest-alerts.md#harvest_replication_lag_high"
-    },
-    {
-      "id": "harvest_shard_fenced",
-      "status": "enforceable",
-      "signal_source": "harvest.shard.fenced{shard}, incremented once by a worker immediately before it stops because its pinned write-authority generation was superseded (issue #954).",
-      "default_threshold": "Page on any increase. There is no benign rate.",
-      "severity": "page",
-      "owner_persona": "runtime on-call",
-      "description": "A worker was fenced off a shard and stopped: that database's write-authority generation moved past the epoch the worker pinned at startup. During a planned failover this is expected for the old fleet, and the fix is to restart workers against the region that now holds authority. Outside a failover it means a generation was bumped on a healthy shard, which stops every worker pinned to the old epoch and is recovered only by restarting the fleet - never by re-pinning a worker in place, which would re-admit a worker the promoted region just evicted. The condition is not self-healing: a fenced worker does not retry.",
-      "first_action": "harvest dr status --shard <id>=<dsn> -o json",
-      "dependencies": [
-        {
-          "ref": "#954",
-          "status": "shipped",
-          "surface": "harvest.shard.fenced, harvest.shard.generation, harvest dr fence"
-        }
-      ],
-      "prometheus": {
-        "mode": "native",
-        "notes": "Also watch harvest_shard_generation for skew: shards fail over independently, and a split generation across shards means a half-failed-over cluster.",
-        "expressions": [
-          {
-            "name": "harvest_shard_fenced",
-            "expr": "sum by (shard) (increase(harvest_shard_fenced_total[5m])) > 0",
-            "for": "0m"
-          }
-        ]
-      },
-      "management_checks": [
-        "harvest dr status --shard <id>=<dsn> -o json",
-        "harvest worker health --output json",
-        "SELECT shard_id, generation, fenced_at, fenced_by, fenced_reason FROM harvest_shard_generation"
-      ],
-      "runbook": "docs/runbooks/harvest-alerts.md#harvest_shard_fenced"
-    },
-    {
-      "id": "harvest_replication_unobservable",
-      "status": "enforceable",
-      "signal_source": "harvest.replication.observable{shard}, emitted every DR sampler tick (issue #954).",
-      "default_threshold": "Ticket when harvest_replication_observable is 0 for a shard for 10 minutes.",
-      "severity": "ticket",
-      "owner_persona": "platform team",
-      "description": "A shard's replication views cannot be read, so its RPO and standby count are UNKNOWN -- not zero, and not evidence that replication is down. Almost always a missing GRANT pg_monitor on the role Harvest connects as. This is a ticket rather than a page because replication itself may be perfectly healthy; what is lost is the ability to see it. It matters anyway: the other DR gauges are withheld while this is 0, and a Prometheus gauge keeps exporting its last value, so without this signal a shard that became unobservable would go on showing its last healthy reading indefinitely.",
-      "first_action": "harvest dr status --shard <id>=<dsn> -o json",
-      "dependencies": [
-        {
-          "ref": "#954",
-          "status": "shipped",
-          "surface": "harvest.replication.observable and harvest dr status"
-        }
-      ],
-      "prometheus": {
-        "mode": "native",
-        "notes": "The companion to harvest_replication_down: that rule requires observable == 1, this one fires on 0, so the two are mutually exclusive and neither can fire on a stale gauge.",
-        "expressions": [
-          {
-            "name": "harvest_replication_unobservable",
-            "expr": "min by (shard) (harvest_replication_observable) == 0",
-            "for": "10m"
-          }
-        ]
-      },
-      "management_checks": [
-        "harvest dr status --shard <id>=<dsn> -o json",
-        "SELECT rolname FROM pg_roles WHERE pg_has_role(current_user, oid, 'member') AND rolname = 'pg_monitor'"
-      ],
-      "runbook": "docs/runbooks/harvest-alerts.md#harvest_replication_unobservable"
-    },
-    {
-      "id": "harvest_replication_rpo_unknown",
-      "status": "enforceable",
-      "signal_source": "harvest.replication.rpo_known{shard}, emitted every DR sampler tick the views are readable (issue #954).",
-      "default_threshold": "Ticket when harvest_replication_rpo_known is 0 for a shard for 10 minutes, gated on observable == 1 and at least one connected standby.",
-      "severity": "ticket",
-      "owner_persona": "platform team",
-      "description": "A shard's replication views are readable and a standby is connected, but its RPO has no source: no DR slot confirmed a position yet, and the standby has not reported a replay_lag either. This is the readable-but-unmeasurable gap harvest_replication_unobservable does not cover, and harvest.replication.lag_seconds is withheld rather than published as a stale or fabricated number. A Prometheus gauge keeps exporting its last value, so without this signal the dashboard would go on showing the last healthy RPO indefinitely.",
-      "first_action": "harvest dr status --shard <id>=<dsn> -o json",
-      "dependencies": [
-        {
-          "ref": "#1249",
-          "status": "shipped",
-          "surface": "harvest.replication.rpo_known and harvest dr status"
-        }
-      ],
-      "prometheus": {
-        "mode": "native",
-        "notes": "Gated on observable == 1 (readable) and standbys > 0 (not the harvest_replication_down case) so the three replication-health rules stay mutually exclusive.",
-        "expressions": [
-          {
-            "name": "harvest_replication_rpo_unknown",
-            "expr": "min by (shard) (harvest_replication_rpo_known) == 0 and on (shard) max by (shard) (harvest_replication_observable) == 1 and on (shard) min by (shard) (harvest_replication_standbys) > 0",
-            "for": "10m"
-          }
-        ]
-      },
-      "management_checks": [
-        "harvest dr status --shard <id>=<dsn> -o json"
-      ],
-      "runbook": "docs/runbooks/harvest-alerts.md#harvest_replication_rpo_unknown"
-    },
-    {
-      "id": "harvest_audit_export_lag_high",
-      "status": "enforceable",
-      "signal_source": "harvest.audit.export_lag{shard} - age in seconds of the OLDEST audit record the SIEM sink has not acknowledged (issue #953).",
-      "default_threshold": "Ticket when the lag exceeds 300s for 10 minutes on any shard. The issue's own success metric is < 30s p99 under sustained load, so 300s is a deliberately slack starting point: tune it to the window during which your compliance posture can tolerate privileged-action logs not being in the SIEM.",
-      "severity": "ticket",
-      "owner_persona": "security/compliance engineer",
-      "description": "Audit records are not reaching the SIEM. Nothing is lost - the export cursor is held rather than advanced past a failure, and the retention sweep will not purge an unexported record - but the window during which a privileged action would be invisible to detection is growing, and the audit table is growing with it. Read GET /admin/audit-export for the shard's last_error and delivery_state: a populated last_error is a sink problem, a delivery_state of NOT_STARTED with sink_configured false means export is configured on the web app but not on the worker fleet. A MISSING series is worse than a high one: it means no exporter is running for that shard at all, and the gauge cannot tell you so.",
-      "first_action": "curl -s $HARVEST/admin/audit-export | jq '.sink_configured, .shards[]'",
-      "dependencies": [
-        {
-          "ref": "#953",
-          "status": "shipped",
-          "surface": "harvest.audit.export_lag and GET /admin/audit-export"
-        }
-      ],
-      "prometheus": {
-        "mode": "native",
-        "notes": "Two expressions, because the threshold alone is blind to the worst case. harvest_audit_export_lag_high catches an exporter that is running and falling behind. harvest_audit_export_absent catches no exporter running ANYWHERE: the gauge then has no series, so the threshold evaluates over an empty vector and can never fire. absent() is safe here, unlike in harvest_scanner_stalled where an API-only replica legitimately exports no series - it is false as soon as any one process exports any shard, so a mixed fleet does not trip it. What harvest_audit_export_absent still does NOT catch: PARTIAL shard coverage - absent() is false as soon as any shard reports, so a shard that has never been scanned is invisible to both expressions even though its records are not reaching the SIEM. Template one absence rule per configured shard (absent(harvest_audit_export_lag{shard=\"N\"})) from your own shard inventory - the pack cannot do it generically because it does not know your shard set. An exporter alive but unable to read a shard - the gauge keeps serving its last value, commonly 0, so the series is neither high nor absent - is now caught by harvest_audit_export_unobservable (autumn-foundation/autumn-harvest#1268), the companion rule on harvest.audit.export_observed. Do NOT substitute a `time() - timestamp(...)` staleness rule - Prometheus stamps each scraped sample with the scrape time, so it never fires on a stale-but-exposed gauge.",
-        "expressions": [
-          {
-            "name": "harvest_audit_export_lag_high",
-            "expr": "max by (shard) (harvest_audit_export_lag) > 300",
-            "for": "10m"
-          },
-          {
-            "name": "harvest_audit_export_absent",
-            "expr": "absent(harvest_audit_export_lag)",
-            "for": "15m"
-          }
-        ]
-      },
-      "management_checks": [
-        "GET /admin/audit-export (per-shard cursor, lag, delivery_state, last_error)",
-        "POST /admin/audit-export/redrive (after sink-side data loss only - it re-exports, it does not fix a stalled sink)"
-      ],
-      "runbook": "docs/runbooks/harvest-alerts.md#harvest_audit_export_lag_high"
-    },
-    {
-      "id": "harvest_audit_export_unobservable",
-      "status": "enforceable",
-      "signal_source": "harvest.audit.export_observed{shard}, emitted every export scanner tick that reaches a shard (issue #1268), and every tick after a live sink is removed (issue #1506).",
-      "default_threshold": "Ticket when harvest_audit_export_observed is 0 for a shard for 10 minutes.",
-      "severity": "ticket",
-      "owner_persona": "security/compliance engineer",
-      "description": "The exporter could not read this shard's cursor, or its lag, or could not even acquire a connection to the shard this tick. harvest_audit_export_lag is not a reliable signal here: a Prometheus gauge keeps its last value, so the lag reading for this shard is frozen, commonly at 0, and looks healthy. This is the companion signal harvest_audit_export_lag_high's own notes call for: it is the metric-only detection for a shard the exporter cannot observe, distinct from a shard missing from shard_assignments entirely, which neither this rule nor the lag threshold can see -- only a per-shard absent(harvest_audit_export_lag{shard=\"N\"}) rule templated from your own inventory catches that case; see the runbook's coverage table.",
-      "first_action": "curl -s $HARVEST/admin/audit-export | jq '.shards[] | select(.shard == <id>)'",
-      "dependencies": [
-        {
-          "ref": "#1268",
-          "status": "shipped",
-          "surface": "harvest.audit.export_observed and GET /admin/audit-export"
-        }
-      ],
-      "prometheus": {
-        "mode": "native",
-        "notes": "The companion to harvest_audit_export_lag_high: that rule's threshold is blind to a shard the exporter cannot observe, because a stale-but-present gauge is not a high value. This rule fires on observed == 0 directly, so it does not depend on what the lag gauge happens to be frozen at.",
-        "expressions": [
-          {
-            "name": "harvest_audit_export_unobservable",
-            "expr": "min by (shard) (harvest_audit_export_observed) == 0",
-            "for": "10m"
-          }
-        ]
-      },
-      "management_checks": [
-        "GET /admin/audit-export (per-shard cursor, lag, delivery_state, last_error)",
-        "Worker logs for '[audit_export] failed to acquire a connection for the export tick' or 'timed out acquiring a connection for the export tick' (the dedicated export task, issue #1269), or '[audit_export] failed to get connection to shard' / 'timed out acquiring a connection for this shard' (an embedder driving fire_due_audit_exports by hand)"
-      ],
-      "runbook": "docs/runbooks/harvest-alerts.md#harvest_audit_export_unobservable"
-    },
-    {
-      "id": "harvest_dispatch_dropped_hints",
-      "status": "enforceable",
-      "signal_source": "METRIC_DISPATCH_DROPPED_HINTS / harvest.dispatch.dropped_hints, a per-process gauge sampled from the Redis dispatch background publisher's drop counter (issue #1429).",
-      "default_threshold": "Ticket when the counter keeps climbing for 15 minutes past a single burst window.",
-      "severity": "ticket",
-      "owner_persona": "service on-call",
-      "description": "The Redis dispatch background publisher's bounded queue is full, so this process is dropping hints. A dropped hint costs latency only -- the row stays PENDING and the worker's reconcile sweep republishes it -- so this is a health signal, not a durability one.",
-      "first_action": "GET /api/harvest/admin/config (confirm the dispatch channel is installed and read its reconcile_batch/reconcile_interval_ms)",
-      "dependencies": [
-        {
-          "ref": "#1429",
-          "status": "shipped",
-          "surface": "METRIC_DISPATCH_DROPPED_HINTS / harvest.dispatch.dropped_hints"
-        }
-      ],
-      "prometheus": {
-        "mode": "native-metric",
-        "notes": "Unlabeled gauge, one series per process. A sustained climb over the alert window, not a single sample, is the signal. The 5m clause requires growth to still be happening in the most recent slice, so a brief burst that already cleared does not satisfy the 15m clause alone. That AND alone still lets one dropped hint hold both clauses true for up to 5 minutes, so the `for: 15m` clause is load-bearing too: a single burst's AND clause decays to false once its 5m window ages out, well short of 15m, so only drops still recurring every 5-minute slice across the full window keep the condition true long enough to fire.",
-        "expressions": [
-          {
-            "kind": "promql",
-            "expr": "increase(harvest_dispatch_dropped_hints[15m]) > 0 and increase(harvest_dispatch_dropped_hints[5m]) > 0",
-            "for": "15m"
-          }
-        ]
-      },
-      "management_checks": [
-        "GET /api/harvest/admin/config",
-        "harvest queue backlog --output json"
-      ],
-      "runbook": "docs/runbooks/harvest-alerts.md#harvest_dispatch_dropped_hints"
-    },
-    {
-      "id": "harvest_notify_send_failures",
-      "status": "enforceable",
-      "signal_source": "METRIC_NOTIFY_SEND_FAILURES / harvest.notify.send_failures, a per-process gauge sampled from the post-commit notify sender's failure counter (issue #1796).",
-      "default_threshold": "Ticket when the counter keeps climbing for 15 minutes past a single burst window.",
-      "severity": "ticket",
-      "owner_persona": "service on-call",
-      "description": "The post-commit notify sender on this process is losing notifications. Causes are a send error, a full sender queue, or a sender that stops before it drains. A lost notification costs latency only. The row is committed, and workers find it on their next poll. This is a health signal, not a durability signal.",
-      "first_action": "Search this process's logs for 'harvest: notifications lost; workers find the rows on their next poll' and read the cause field.",
-      "dependencies": [
-        {
-          "ref": "#1796",
-          "status": "shipped",
-          "surface": "METRIC_NOTIFY_SEND_FAILURES / harvest.notify.send_failures"
-        }
-      ],
-      "prometheus": {
-        "mode": "native-metric",
-        "notes": "Unlabeled gauge, one series per process. The rule uses the same shape as harvest_dispatch_dropped_hints. The 15m clause requires growth over the window. The 5m clause requires recent growth. `for: 15m` stops one short burst from opening a ticket.",
-        "expressions": [
-          {
-            "kind": "promql",
-            "expr": "increase(harvest_notify_send_failures[15m]) > 0 and increase(harvest_notify_send_failures[5m]) > 0",
-            "for": "15m"
-          }
-        ]
-      },
-      "management_checks": [
-        "Worker and API process logs for 'harvest: notifications lost' (rate-limited to one warning every 30 seconds; the total field carries the running count)",
-        "harvest queue backlog --output json"
-      ],
-      "runbook": "docs/runbooks/harvest-alerts.md#harvest_notify_send_failures"
-    },
-    {
-      "id": "harvest_notify_queue_usage_high",
-      "status": "enforceable",
-      "signal_source": "METRIC_NOTIFY_QUEUE_USAGE / harvest.notify.queue_usage, the largest pg_notification_queue_usage() a live notify sender on this process read last (issue #1796).",
-      "default_threshold": "Ticket when the Postgres notification queue stays more than half full for 10 minutes.",
-      "severity": "ticket",
-      "owner_persona": "service on-call",
-      "description": "The Postgres asynchronous notification queue is filling up. A listening session that does not consume its notifications, often one held inside a long open transaction, pins the queue tail. Postgres rejects every NOTIFY once the queue is full, so harvest_notify_send_failures climbs next and workers fall back to polling latency.",
-      "first_action": "psql -c \"SELECT pid, state, xact_start, query FROM pg_stat_activity WHERE xact_start < now() - interval '10 minutes' ORDER BY xact_start\"",
-      "dependencies": [
-        {
-          "ref": "#1796",
-          "status": "shipped",
-          "surface": "METRIC_NOTIFY_QUEUE_USAGE / harvest.notify.queue_usage"
-        }
-      ],
-      "prometheus": {
-        "mode": "native-metric",
-        "notes": "Unlabeled gauge, one series per process, from 0 to 1. The queue belongs to the database, so every process on one database reports about the same value. max() collapses them into one alert. The series is absent until a notify sender reads the queue usage, and an absent series is not an alert condition.",
-        "expressions": [
-          {
-            "kind": "promql",
-            "expr": "max(harvest_notify_queue_usage) > 0.5",
-            "for": "10m"
-          }
-        ]
-      },
-      "management_checks": [
-        "psql -c \"SELECT pg_notification_queue_usage()\"",
-        "psql -c \"SELECT pid, state, xact_start, query FROM pg_stat_activity ORDER BY xact_start NULLS LAST\""
-      ],
-      "runbook": "docs/runbooks/harvest-alerts.md#harvest_notify_queue_usage_high"
-    },
-    {
-      "id": "harvest_worker_gray_failure",
-      "status": "enforceable",
-      "signal_source": "METRIC_WORKER_OUTLIER / harvest.worker.outlier{dimension}, set by each worker's liveness heartbeat from its rolling task window against the median of its live peers (issue #1815).",
-      "default_threshold": "Ticket when one worker stays an outlier on any dimension for 10 minutes. Page instead when the outlier worker serves a latency-critical queue.",
-      "severity": "ticket",
-      "owner_persona": "workflow on-call",
-      "description": "A worker is alive and passes its heartbeat, but it fails a far higher share of tasks, or runs them far slower, than its peers on the same queues. This is a gray failure: worker health alone shows the worker as healthy. A fault that hits the whole fleet moves the peer median too, so it does not fire this rule.",
-      "first_action": "curl -s https://your-app/api/harvest/admin/status | jq '.subsystems[] | select(.name==\"workers\") | .outliers'",
-      "dependencies": [
-        {
-          "ref": "#1815",
-          "status": "shipped",
-          "surface": "METRIC_WORKER_OUTLIER / harvest.worker.outlier; GET /admin/status workers.outliers"
-        },
-        {
-          "ref": "ADR-0001",
-          "status": "accepted",
-          "surface": "bounded metric labels: dimension; no worker_id label, the scrape instance label tells workers apart"
-        }
-      ],
-      "prometheus": {
-        "mode": "native-metric",
-        "notes": "Gauge, 1 or 0, one series per worker and dimension. Each worker reports itself, so the instance label identifies the worker. A worker is compared only with live peers that poll the same queues with the same queue weights, on the same build with the same labels, slots per task kind, session capacity, priority aging, activity eligibility, shards and registered handlers. It needs at least 20 tasks in its window, and 2 such peers, before the gauge can read 1. The window holds at most 1024 tasks, from the last 5 minutes or two heartbeat intervals, whichever is longer. A tick that cannot compare sets 0.",
-        "expressions": [
-          {
-            "kind": "promql",
-            "expr": "max by (instance) (harvest_worker_outlier) == 1",
-            "for": "10m"
-          }
-        ]
-      },
-      "management_checks": [
-        "GET /api/harvest/admin/status",
-        "harvest worker health --output json",
-        "GET /api/harvest/workers/health"
-      ],
-      "runbook": "docs/runbooks/harvest-alerts.md#harvest_worker_gray_failure"
-    },
-    {
-      "id": "harvest_db_pool_wait_high",
-      "status": "enforceable",
-      "signal_source": "METRIC_DB_POOL_WAIT / harvest.db.pool.wait_duration{shard}, timed around pool.get() on the claim path, the timeout scanner and the activity heartbeat flush (issue #1815).",
-      "default_threshold": "Ticket when the p99 wait for a pooled connection on any replica and shard exceeds 100 ms for 10 minutes. Pools are per replica, so the rules keep the instance label: one starved replica must not hide behind healthy ones.",
-      "severity": "ticket",
-      "owner_persona": "service on-call",
-      "description": "Callers wait too long for a database connection. The worker pool is too small for the load, or slow queries hold connections too long. Claims slow down first, so schedule-to-start latency rises next.",
-      "first_action": "harvest worker health --output json",
-      "dependencies": [
-        {
-          "ref": "#1815",
-          "status": "shipped",
-          "surface": "METRIC_DB_POOL_WAIT / harvest.db.pool.wait_duration; METRIC_DB_POOL_IN_USE / METRIC_DB_POOL_IDLE"
-        }
-      ],
-      "prometheus": {
-        "mode": "native-metric",
-        "notes": "The p99 rule needs histogram bucket boundaries on the metrics-rs Prometheus exporter (set_buckets_for_metric for harvest_db_pool_wait_duration, see docs/telemetry.md). The built-in scrape endpoint renders no _bucket series, so use the average fallback there.",
-        "expressions": [
-          {
-            "kind": "promql",
-            "expr": "histogram_quantile(0.99, sum by (le, instance, shard) (rate(harvest_db_pool_wait_duration_bucket[5m]))) > 0.1",
-            "for": "10m"
-          },
-          {
-            "kind": "promql",
-            "expr": "sum by (instance, shard) (rate(harvest_db_pool_wait_duration_sum[5m])) / sum by (instance, shard) (rate(harvest_db_pool_wait_duration_count[5m])) > 0.05",
-            "for": "10m",
-            "note": "Bucket-less fallback: the average wait. Use it on the built-in scrape endpoint, which renders only _sum and _count."
-          },
-          {
-            "kind": "promql",
-            "expr": "(harvest_db_pool_idle == 0) and on (instance, shard) (sum by (instance, shard) (rate(harvest_db_pool_wait_duration_sum[5m])) / sum by (instance, shard) (rate(harvest_db_pool_wait_duration_count[5m])) > 0.05)",
-            "for": "10m",
-            "note": "Companion, per replica: this replica's pool for the shard has no idle connection and callers wait for one. deadpool opens connections only when it needs them, so a busy but healthy pool also reads idle 0; the measured wait keeps that case quiet. When several runtimes in one process share a sink with separate pools for the shard, the gauge reads 0 while any of those pools is exhausted. Pools are per replica, so a sum across replicas would hide one starved replica."
-          }
-        ]
-      },
-      "management_checks": [
-        "harvest worker health --output json",
-        "psql -c \"SELECT state, count(*) FROM pg_stat_activity GROUP BY state\""
-      ],
-      "runbook": "docs/runbooks/harvest-alerts.md#harvest_db_pool_wait_high"
-    },
-    {
-      "id": "harvest_db_query_latency_high",
-      "status": "enforceable",
-      "signal_source": "METRIC_DB_QUERY_DURATION / harvest.db.query.duration{op, shard}, one sample per claim, workflow-task persist transaction, timeout-scanner pass and activity heartbeat write (issue #1815).",
-      "default_threshold": "Ticket when the p99 claim or persist duration on any replica exceeds 500 ms for 10 minutes. The rule keeps the instance label, so one slow replica cannot hide behind healthy ones. Scan passes are longer by design, so tune that op on its own.",
-      "severity": "ticket",
-      "owner_persona": "service on-call",
-      "description": "Database operations on the hot path are slow. The database is saturated, a lock blocks the queue table, or an index is missing. Throughput falls while worker slots look busy.",
-      "first_action": "psql -c \"SELECT pid, wait_event_type, wait_event, state, now() - query_start AS age, query FROM pg_stat_activity WHERE state <> 'idle' ORDER BY age DESC LIMIT 20\"",
-      "dependencies": [
-        {
-          "ref": "#1815",
-          "status": "shipped",
-          "surface": "METRIC_DB_QUERY_DURATION / harvest.db.query.duration"
-        }
-      ],
-      "prometheus": {
-        "mode": "native-metric",
-        "notes": "The p99 rule needs histogram bucket boundaries on the metrics-rs Prometheus exporter (set_buckets_for_metric for harvest_db_query_duration). The built-in scrape endpoint renders no _bucket series, so use the average fallback there. The op label is bounded to claim, persist, scan and heartbeat.",
-        "expressions": [
-          {
-            "kind": "promql",
-            "expr": "histogram_quantile(0.99, sum by (le, instance, op, shard) (rate(harvest_db_query_duration_bucket{op=~\"claim|persist\"}[5m]))) > 0.5",
-            "for": "10m"
-          },
-          {
-            "kind": "promql",
-            "expr": "sum by (instance, op, shard) (rate(harvest_db_query_duration_sum{op=~\"claim|persist\"}[5m])) / sum by (instance, op, shard) (rate(harvest_db_query_duration_count{op=~\"claim|persist\"}[5m])) > 0.25",
-            "for": "10m",
-            "note": "Bucket-less fallback: the average duration. Use it on the built-in scrape endpoint, which renders only _sum and _count."
-          }
-        ]
-      },
-      "management_checks": [
-        "psql -c \"SELECT * FROM pg_stat_activity WHERE wait_event_type = 'Lock'\"",
-        "harvest worker health --output json"
-      ],
-      "runbook": "docs/runbooks/harvest-alerts.md#harvest_db_query_latency_high"
     }
   ]
 }

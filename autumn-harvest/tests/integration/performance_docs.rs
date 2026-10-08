@@ -36,36 +36,33 @@ fn performance_doc_path() -> PathBuf {
     repo_root().join("docs/performance.md")
 }
 
-/// Marker opening the released performance narrative in the shipped-work record.
+/// Marker opening the collated home of the released performance narrative.
 ///
-/// This prose has been chased across three homes by routine maintenance, and
-/// each move broke these guards: it began in
-/// `docs/changelog.d/pr-786-claim-throughput-benchmark.md`, which the 0.6.0
-/// collation sweep folded away and deleted; it then lived in `CLAUDE.md`'s
-/// phase list, which `562c781` removed when it cut that file down to workflow
-/// instructions. It now lives in `docs/shipped-work.md`, whose header says it
-/// is guard-referenced and must not be collated or condensed.
-///
-/// The *verbatim* entry is the one these guards need — a condensed bullet no
-/// longer carries the per-gate figures they cross-check, which is why
-/// `CHANGELOG.md` cannot serve as the source.
+/// Until the 0.6.0 collation sweep this prose lived in
+/// `docs/changelog.d/pr-786-claim-throughput-benchmark.md`. Collation folds
+/// every fragment into `CHANGELOG.md` (condensed to one bullet) and
+/// `CLAUDE.md`'s phase list (verbatim) and then deletes it, so the fragment
+/// path stopped existing and every guard below panicked on the read. The
+/// verbatim copy is the one these guards need — a condensed bullet no longer
+/// carries the per-gate figures they cross-check — so they now read the phase
+/// entry out of `CLAUDE.md` instead.
 const RELEASED_PERF_ENTRY_MARKER: &str =
     "- **Tooling** — Task-claim / enqueue throughput benchmark";
 
-fn shipped_work_path() -> PathBuf {
-    repo_root().join("docs/shipped-work.md")
+fn claude_md_path() -> PathBuf {
+    repo_root().join("CLAUDE.md")
 }
 
-/// The released performance narrative, extracted from the shipped-work record.
+/// The released performance narrative, extracted from `CLAUDE.md`'s phase list.
 ///
 /// Scoped to the single entry rather than handing the guards the whole file:
 /// several of them ban a superseded phrasing, and an unscoped read would let an
 /// unrelated entry elsewhere in a 10 000-line file trip — or mask — a check.
 fn released_perf_entry() -> String {
-    let text = read_normalized(&shipped_work_path());
+    let text = read_normalized(&claude_md_path());
     let start = text.find(RELEASED_PERF_ENTRY_MARKER).unwrap_or_else(|| {
         panic!(
-            "docs/shipped-work.md must contain the claim-benchmark phase entry \
+            "CLAUDE.md must contain the claim-benchmark phase entry \
              (marker: {RELEASED_PERF_ENTRY_MARKER:?}); the performance guards \
              cross-check the published tables against it"
         )
@@ -342,12 +339,8 @@ fn per_gate_bullets_quote_the_published_gate_table() {
 /// top-level item. Good enough to read one function's call sites out of a file
 /// this test does not otherwise need to understand.
 fn top_level_fn_body<'a>(src: &'a str, name: &str) -> Option<&'a str> {
-    // A private helper has no `pub`, so try both spellings.
-    let public = format!("pub async fn {name}(");
-    let private = format!("\nasync fn {name}(");
-    let start = src
-        .find(&public)
-        .or_else(|| src.find(&private).map(|i| i + 1))?;
+    let signature = format!("pub async fn {name}(");
+    let start = src.find(&signature)?;
     let rest = &src[start..];
     let end = rest.find("\n}\n")?;
     Some(&rest[..end])
@@ -390,29 +383,18 @@ fn doc_section<'a>(doc: &'a str, heading: &str) -> Option<&'a str> {
 #[test]
 fn claim_transaction_statements_are_all_named_in_the_docs() {
     let queue_src = read_normalized(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src/queue.rs"));
-    // `claim_task_on_shard`, not `claim_task`: issue #954 made the latter a thin
-    // wrapper that delegates, so the claim transaction — and every statement
-    // this guard exists to keep the docs honest about — lives in the former.
-    // The guard follows the transaction, which is what it was always about.
-    let body = top_level_fn_body(&queue_src, "claim_task_on_shard")
-        .expect("queue.rs must define `pub async fn claim_task_on_shard(`");
-    // Issue #1312 moved the post-claim re-checks into a helper that the
-    // by-id claim shares. The transaction still runs every statement, so the
-    // guard follows the call into that helper.
-    let rechecks = top_level_fn_body(&queue_src, "apply_post_claim_rechecks")
-        .expect("queue.rs must define `async fn apply_post_claim_rechecks(`");
+    let body = top_level_fn_body(&queue_src, "claim_task")
+        .expect("queue.rs must define `pub async fn claim_task(`");
 
     let mut called: Vec<&str> = Vec::new();
-    for body in [body, rechecks] {
-        for (idx, _) in body.match_indices("crate::queue_pause::") {
-            let tail = &body[idx + "crate::queue_pause::".len()..];
-            let end = tail
-                .find(|c: char| !(c.is_alphanumeric() || c == '_'))
-                .unwrap_or(tail.len());
-            let name = &tail[..end];
-            if !name.is_empty() && !called.contains(&name) {
-                called.push(name);
-            }
+    for (idx, _) in body.match_indices("crate::queue_pause::") {
+        let tail = &body[idx + "crate::queue_pause::".len()..];
+        let end = tail
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(tail.len());
+        let name = &tail[..end];
+        if !name.is_empty() && !called.contains(&name) {
+            called.push(name);
         }
     }
     assert!(
@@ -594,108 +576,6 @@ fn the_paused_rows_delta_is_not_attributed_to_the_predicate() {
              Publish the depth-controlled finding, not a predicate cost."
         );
     }
-}
-
-/// The sticky-routing `CASE` key is *sufficient* to force `Seq Scan` + `Sort`,
-/// but issue #1177 shows it is not *necessary*: with the `CASE` removed
-/// entirely from `ORDER BY` and `idx_harvest_tq_poll` forced via planner
-/// hints, adding any single one of the query's other residual `WHERE`
-/// predicates — including several with zero actual selectivity —
-/// independently reproduces the identical collapse.
-///
-/// Read on its own, [the plan](#the-plan)'s original wording ("the claim
-/// query's `ORDER BY` leads with a non-indexable `CASE` expression, so
-/// `idx_harvest_tq_poll` cannot serve the ordering") invites the natural next
-/// step of "drop the `CASE`, get the cheap plan back". Issue #1177 exists
-/// because that reading does not survive a reproduction. This pins the
-/// correction so the CASE-is-sufficient reading cannot silently return.
-#[test]
-fn the_case_key_is_not_published_as_sufficient_to_restore_the_cheap_plan() {
-    let doc = read_performance_doc();
-    let flat = collapse_ws(&doc);
-
-    assert!(
-        doc.contains("## Any residual predicate defeats sort-elision (issue #1177)"),
-        "docs/performance.md must keep the section documenting that any one \
-         of the claim query's residual `WHERE` predicates independently \
-         defeats sort-elision and `LIMIT` pushdown, not only the sticky \
-         `CASE` key. Without it, [the plan](#the-plan) reads as though \
-         fixing the `CASE` key alone would restore the cheap index-ordered \
-         plan."
-    );
-    assert!(
-        flat.contains("Fixing that key would not be sufficient on its own"),
-        "the TL;DR must state up front that fixing the `CASE` sort key alone \
-         would not restore the cheap plan — any other residual predicate \
-         independently defeats sort-elision too (issue #1177)."
-    );
-    assert!(
-        flat.contains("Follow-up (issue #1177)"),
-        "[the plan](#the-plan) section must carry a follow-up callout, in \
-         the same style as the issue #619 callout beside it, pointing readers \
-         at the #1177 correction before they walk away with the CASE-only \
-         reading."
-    );
-
-    // Phrases that would assert the CASE key is the sole/sufficient fix target.
-    for banned in [
-        "dropping the CASE key restores",
-        "removing the CASE key restores",
-        "fixing the sort key restores the cheap plan",
-        "indexing the sticky columns would restore",
-        "dropping the CASE key is sufficient",
-        "removing the CASE key is sufficient",
-        "the CASE expression restores",
-        "the CASE expression alone restores",
-        "the cheap plan returns once the CASE",
-        "the cheap plan comes back once the CASE",
-        "get the cheap plan back",
-        "gets you back to the indexed plan",
-    ] {
-        assert!(
-            !asserted_in_own_voice(&flat, banned),
-            "docs/performance.md says \"{banned}\", which reads as though the \
-             `CASE` key is the sole obstacle to the cheap plan. Issue #1177 \
-             shows any one of the other residual `WHERE` predicates \
-             independently defeats sort-elision too, `CASE` or no `CASE`."
-        );
-    }
-}
-
-/// The "Known limitations" bullet for `schedule_to_close`/sessions/sticky
-/// routing called them "cheap inline column tests" on the strength of never
-/// having measured them. Issue #1177 reproduces — for each independently —
-/// that they defeat sort-elision regardless of the value tested against, so
-/// "cheap" was never an established finding. That is a plan-eligibility
-/// result, not a cost measurement. All three predicates now carry a
-/// completed cost measurement of their own (`schedule_to_close` #378,
-/// worker sessions #606, sticky routing #235). The bullet must keep
-/// crediting that separate work, rather than re-asserting "cheap" or
-/// conflating the two kinds of evidence.
-#[test]
-fn known_limitations_no_longer_calls_the_unmeasured_predicates_cheap() {
-    let doc = read_performance_doc();
-    let flat = collapse_ws(&doc);
-
-    assert!(
-        !asserted_in_own_voice(&doc, "cheap inline column tests"),
-        "docs/performance.md's Known limitations section still calls the \
-         `schedule_to_close`/session/sticky-routing predicates \"cheap inline \
-         column tests\" in its own voice. Issue #1177 measured them: each \
-         independently defeats sort-elision regardless of the value it is \
-         tested against, so they were never cheap — they were untested."
-    );
-    assert!(
-        flat.contains(
-            "cost measurement above is what fills the gap that plan-eligibility finding cannot"
-        ),
-        "the Known limitations bullet for `schedule_to_close` (#378), worker \
-         sessions (#606) and sticky routing (#235) must keep distinguishing \
-         issue #1177's plan-eligibility finding (each independently defeats \
-         sort-elision) from each predicate's own completed cost measurement \
-         — conflating the two would replace one unsupported cost claim with \
-         another."
-    );
 }
 
 /// These guards must actually execute on a docs-only pull request.
@@ -1355,7 +1235,7 @@ fn the_all_gates_figure_is_not_published_as_a_directional_bound() {
     ];
 
     // Pairs of (label, already-extracted text) rather than (label, path): the
-    // released entry is one item inside a long shipped-work record, so handing
+    // released entry is one item inside a 10 000-line `CLAUDE.md`, so handing
     // this loop that whole file would let an unrelated entry's "28%" trip — or
     // mask — the scan below.
     for (label, source) in [
@@ -1364,7 +1244,7 @@ fn the_all_gates_figure_is_not_published_as_a_directional_bound() {
             read_normalized(&performance_doc_path()),
         ),
         (
-            "the released performance entry in docs/shipped-work.md",
+            "the released performance entry in CLAUDE.md",
             released_perf_entry(),
         ),
     ] {
@@ -1630,435 +1510,4 @@ fn claim_gate_docs_do_not_claim_the_delta_isolates_the_anti_join() {
          republish the delta as a predicate cost. State that it is an \
          equal-total-depth comparison, not predicate isolation."
     );
-}
-
-/// The `ClaimGate` known-gaps list must name activity pauses (#807).
-///
-/// Issue #1215 found this predicate absent from the gap list. It is
-/// unmeasured by every scenario here, exactly like the other five gaps. A
-/// maintainer reading only this enum would not learn it exists.
-#[test]
-fn claim_gate_docs_name_the_activity_pause_gap() {
-    let harness = read_normalized(
-        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration/claim_bench_support.rs"),
-    );
-    let start = harness
-        .find("Which accreted claim-path gate a scenario exercises")
-        .expect("the harness must document `ClaimGate`");
-    let end = harness
-        .find("pub enum ClaimGate {")
-        .expect("the harness must declare `pub enum ClaimGate`");
-    let region = &harness[start..end];
-
-    assert!(
-        region.contains("#807"),
-        "the `ClaimGate` doc comment's known-gaps list does not mention \
-         issue #807 (activity pauses). It names five gaps and omits a sixth: \
-         no scenario here seeds `harvest_activity_pauses` either, so a \
-         maintainer reading only this list would not know the predicate \
-         exists."
-    );
-}
-
-/// `docs/performance.md`'s Known limitations section must document the
-/// activity-pause gap (#807) that issue #1215 found missing from it. It
-/// must not present the queue-pause fix (#619) as resolved at every array
-/// size without qualification.
-#[test]
-fn known_limitations_documents_the_pause_array_size_finding() {
-    let doc = read_performance_doc();
-    let flat = collapse_ws(&doc);
-
-    assert!(
-        flat.contains("Activity pauses (#807)"),
-        "docs/performance.md's Known limitations section must list activity \
-         pauses (#807) alongside the other five unmeasured-in-the-attribution-\
-         table predicates. Issue #1215 found it absent entirely — not even \
-         acknowledged as a gap."
-    );
-    assert!(
-        doc.contains("#the-pause-array-size-sweep-issue-1215"),
-        "the activity-pauses bullet must link to the pause-array-size sweep \
-         that measures it, or the claim is unsourced."
-    );
-    assert!(
-        flat.contains("That fix was measured against exactly one active pause"),
-        "the queue-pauses (#619) bullet must say its fix was only measured \
-         against a single active pause, or a reader has no reason to expect \
-         the finding below about array width."
-    );
-}
-
-/// One row of `docs/perf-artifacts/pause-array-size/summary.txt`, keyed by
-/// the same three fields the doc table is keyed by.
-struct SummaryRow {
-    predicate: String,
-    ballast: u32,
-    array_size: u32,
-    backlog: u32,
-    sort_method: String,
-    disk_kb: Option<u32>,
-}
-
-fn field_after<'a>(line: &'a str, marker: &str) -> &'a str {
-    line.split(marker)
-        .nth(1)
-        .unwrap_or_else(|| panic!("summary line missing `{marker}`: {line}"))
-        .split_whitespace()
-        .next()
-        .unwrap_or_else(|| panic!("summary line has no token after `{marker}`: {line}"))
-}
-
-fn parse_summary_row(line: &str) -> SummaryRow {
-    let disk_kb = line.split("Disk: ").nth(1).map(|after| {
-        let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
-        digits
-            .parse()
-            .unwrap_or_else(|_| panic!("could not parse a disk-kB figure out of: {line}"))
-    });
-    let sort_method = line
-        .split("Sort Method: ")
-        .nth(1)
-        .unwrap_or_else(|| panic!("summary line missing `Sort Method: `: {line}"))
-        .split("  ")
-        .next()
-        .unwrap_or_else(|| panic!("summary line has no text after `Sort Method: `: {line}"))
-        .trim()
-        .to_string();
-    SummaryRow {
-        predicate: field_after(line, "predicate=").to_string(),
-        ballast: field_after(line, "ballast=")
-            .parse()
-            .unwrap_or_else(|_| panic!("could not parse ballast out of: {line}")),
-        array_size: field_after(line, "array_size=")
-            .parse()
-            .unwrap_or_else(|_| panic!("could not parse array_size out of: {line}")),
-        backlog: field_after(line, "backlog=")
-            .parse()
-            .unwrap_or_else(|_| panic!("could not parse backlog out of: {line}")),
-        sort_method,
-        disk_kb,
-    }
-}
-
-/// One row of the doc's pause-array-size table, keyed the same way.
-/// `ballast_sizes` holds every seeded-pause count the row covers. Several
-/// rows collapse a shared outcome across sizes (`0 / 1 / 20`). `array_sizes`
-/// holds the materialized array size claimed for each of those same
-/// entries, in the same order. A single-value column broadcasts to every
-/// ballast entry: the typical-worker row claims array size 0 for all four.
-struct DocRow {
-    predicate: String,
-    backlog: u32,
-    ballast_sizes: Vec<u32>,
-    array_sizes: Vec<u32>,
-    sort_method: String,
-    disk_kb: Option<u32>,
-}
-
-/// A table cell holding one or more `/`-separated numbers, each optionally
-/// followed by trailing prose (`0 (none of these ballast queues ...)`).
-fn parse_number_list_cell(cell: &str, line: &str) -> Vec<u32> {
-    cell.split('/')
-        .map(|entry| {
-            let digits: String = entry
-                .trim()
-                .chars()
-                .take_while(char::is_ascii_digit)
-                .collect();
-            digits.parse().unwrap_or_else(|_| {
-                panic!("could not parse a number out of table cell {cell:?}: {line}")
-            })
-        })
-        .collect()
-}
-
-fn parse_doc_row(line: &str) -> DocRow {
-    let cells: Vec<&str> = line
-        .trim()
-        .trim_matches('|')
-        .split('|')
-        .map(str::trim)
-        .collect();
-    assert!(
-        cells.len() == 6,
-        "pause-array-size table row does not have 6 columns, the table \
-         gained or lost a column: {line}"
-    );
-    let (predicate_cell, backlog_cell, bind_cell, ballast_cell, array_size_cell, sort_cell) =
-        (cells[0], cells[1], cells[2], cells[3], cells[4], cells[5]);
-
-    let predicate = if predicate_cell.contains("paused_activities") {
-        "activity-pause"
-    } else if bind_cell.contains("atypical") {
-        "queue-pause-wide"
-    } else if bind_cell.contains("typical") {
-        "queue-pause-bound"
-    } else {
-        panic!("could not classify pause-array-size table row: {line}")
-    }
-    .to_string();
-
-    let backlog: u32 = backlog_cell
-        .replace(' ', "")
-        .parse()
-        .unwrap_or_else(|_| panic!("could not parse the backlog column out of: {line}"));
-    let ballast_sizes = parse_number_list_cell(ballast_cell, line);
-    let array_sizes_raw = parse_number_list_cell(array_size_cell, line);
-    let array_sizes: Vec<u32> = if array_sizes_raw.len() == 1 {
-        vec![array_sizes_raw[0]; ballast_sizes.len()]
-    } else if array_sizes_raw.len() == ballast_sizes.len() {
-        array_sizes_raw
-    } else {
-        panic!(
-            "pause-array-size table row's ballast column ({} entries) and \
-             array-size column ({} entries) do not line up: {line}",
-            ballast_sizes.len(),
-            array_sizes_raw.len()
-        )
-    };
-
-    let sort_method = sort_cell
-        .split(',')
-        .next()
-        .unwrap_or_else(|| panic!("sort-method cell has no comma-delimited method name: {line}"))
-        .trim()
-        .to_string();
-
-    let sort_flat = sort_cell.replace(' ', "");
-    let disk_kb = if sort_flat.contains("disk") {
-        let idx = sort_flat
-            .find("kBdisk")
-            .unwrap_or_else(|| panic!("disk row has no kBdisk figure: {line}"));
-        let digits: String = sort_flat[..idx]
-            .chars()
-            .rev()
-            .take_while(char::is_ascii_digit)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-        Some(
-            digits
-                .parse()
-                .unwrap_or_else(|_| panic!("could not parse the disk-kB figure out of: {line}")),
-        )
-    } else {
-        None
-    };
-
-    DocRow {
-        predicate,
-        backlog,
-        ballast_sizes,
-        array_sizes,
-        sort_method,
-        disk_kb,
-    }
-}
-
-/// The pause-array-size table must quote the committed evidence, not a
-/// number someone typed by hand and forgot to update.
-///
-/// Every earlier gate table on this page has its own cross-check against a
-/// committed source. This one had none. A reviewer of issue #1215's own fix
-/// found the two new prose-only guards above would not have caught a wrong
-/// number, only a missing one.
-///
-/// A later reviewer found that first cross-check too weak. It only checked
-/// that every disk-kB figure from the summary appeared *somewhere* in the
-/// doc. Two figures transposed between rows, or a spill that later turned
-/// in-memory while its old figure stayed in the text, would still pass.
-/// This parses both the summary and the doc table into rows keyed by
-/// (predicate, ballast count, backlog). Each doc row is compared against
-/// its own matching summary row, not the document as one flat string.
-///
-/// A third round found this row-keyed version still reduced each row to
-/// only its spill classification and kB figure. A regenerated capture
-/// switching `quicksort` for another in-memory method, such as `top-N
-/// heapsort`, would still show `disk_kb: None` on both sides and pass.
-/// This also compares the sort method name itself, not only whether it
-/// spilled.
-///
-/// A fourth round found the doc table's own materialized-array-size
-/// column was parsed and thrown away: nothing compared it to anything.
-/// That column was added to stop the table implying a 199-element array
-/// stays in memory. Regressing it back to 199 for the typical-worker row
-/// left this guard green as long as ballast and sort method stayed put.
-/// That is exactly what the column exists to prevent. This now parses
-/// and compares it too, against a matching `array_size=` field this guard
-/// added to the raw summary alongside `ballast=`.
-#[test]
-fn pause_array_size_table_matches_the_committed_summary() {
-    let doc = read_performance_doc();
-    let start = doc
-        .find("| Predicate | Backlog | Worker's own")
-        .expect("the pause-array-size table must exist");
-    let end = doc[start..]
-        .find("\n\n")
-        .map_or(doc.len(), |off| start + off);
-    let table = &doc[start..end];
-
-    let summary =
-        read_normalized(&repo_root().join("docs/perf-artifacts/pause-array-size/summary.txt"));
-    let summary_rows: Vec<SummaryRow> = summary.lines().map(parse_summary_row).collect();
-    assert!(
-        summary_rows.len() >= 15,
-        "expected at least 15 rows in the committed pause-array-size \
-         summary; parsed {} -- the summary format may have drifted from \
-         what this guard expects",
-        summary_rows.len()
-    );
-
-    let mut matched = vec![false; summary_rows.len()];
-    let mut doc_ballast_entries = 0;
-    for line in table
-        .lines()
-        .skip(2)
-        .filter(|l| l.trim_start().starts_with('|'))
-    {
-        let doc_row = parse_doc_row(line);
-        for (ballast, array_size) in doc_row.ballast_sizes.iter().zip(&doc_row.array_sizes) {
-            doc_ballast_entries += 1;
-            let key_desc = format!(
-                "predicate={} ballast={ballast} backlog={}",
-                doc_row.predicate, doc_row.backlog
-            );
-            let (idx, summary_row) = summary_rows
-                .iter()
-                .enumerate()
-                .find(|(_, s)| {
-                    s.predicate == doc_row.predicate
-                        && s.ballast == *ballast
-                        && s.backlog == doc_row.backlog
-                })
-                .unwrap_or_else(|| {
-                    panic!(
-                        "docs/performance.md's pause-array-size table has a row \
-                         ({key_desc}) with no matching line in \
-                         docs/perf-artifacts/pause-array-size/summary.txt"
-                    )
-                });
-            matched[idx] = true;
-            assert_eq!(
-                *array_size, summary_row.array_size,
-                "docs/performance.md's row for {key_desc} claims a \
-                 materialized array size of {array_size}, but the \
-                 committed summary reports {} for this exact row",
-                summary_row.array_size
-            );
-            assert_eq!(
-                doc_row.sort_method, summary_row.sort_method,
-                "docs/performance.md's row for {key_desc} names sort method \
-                 {:?}, but the committed summary reports {:?} for this \
-                 exact row",
-                doc_row.sort_method, summary_row.sort_method
-            );
-            match (doc_row.disk_kb, summary_row.disk_kb) {
-                (Some(doc_kb), Some(summary_kb)) => assert_eq!(
-                    doc_kb, summary_kb,
-                    "docs/performance.md's row for {key_desc} quotes \
-                     {doc_kb}kB disk, but the committed summary reports \
-                     {summary_kb}kB disk for this exact row"
-                ),
-                (Some(doc_kb), None) => panic!(
-                    "docs/performance.md's row for {key_desc} claims a \
-                     {doc_kb}kB disk spill, but the committed summary shows \
-                     this exact row staying in memory"
-                ),
-                (None, Some(summary_kb)) => panic!(
-                    "docs/performance.md's row for {key_desc} claims \
-                     in-memory, but the committed summary reports a \
-                     {summary_kb}kB disk spill for this exact row"
-                ),
-                (None, None) => {}
-            }
-        }
-    }
-
-    assert!(
-        matched.iter().all(|&m| m),
-        "the committed pause-array-size summary has a row this guard could \
-         not find in docs/performance.md's table -- the doc table dropped \
-         a captured scenario"
-    );
-    assert_eq!(
-        doc_ballast_entries,
-        summary_rows.len(),
-        "the doc table and the committed summary do not name the same set \
-         of rows"
-    );
-}
-
-/// The "N more are present" prose must track the top predicate table's own
-/// row count, everywhere it is stated.
-///
-/// Issue #1215 added an 11th row to the top-of-file predicate table. This
-/// page states the unmeasured count twice. The PR that added the row fixed
-/// one occurrence and missed the other. That is exactly the class of drift
-/// this whole test module exists to catch, this time inside the same file.
-#[test]
-fn unmeasured_predicate_count_matches_the_top_table() {
-    const MEASURED: usize = 5;
-
-    let doc = read_performance_doc();
-    let start = doc
-        .find("| Predicate | Issue |")
-        .expect("the top-of-file predicate table must exist");
-    let end = doc[start..]
-        .find("\n\n")
-        .map_or(doc.len(), |off| start + off);
-    let table = &doc[start..end];
-    // Every row is a `| name | #NNN |` line; subtract the header and the
-    // `|:--|:--|` separator.
-    let row_count = table
-        .lines()
-        .filter(|l| l.trim_start().starts_with('|'))
-        .count()
-        - 2;
-
-    assert!(
-        row_count > MEASURED,
-        "the top predicate table has {row_count} rows, at or below the \
-         {MEASURED} the attribution table measures -- either the table lost \
-         rows or MEASURED needs revisiting"
-    );
-    let unmeasured = row_count - MEASURED;
-    let word = match unmeasured {
-        5 => "five",
-        6 => "six",
-        7 => "seven",
-        8 => "eight",
-        n => panic!(
-            "unmeasured predicate count is {n}; this guard only spells five \
-             through eight -- extend the word list before trusting it"
-        ),
-    };
-
-    let perf_doc = doc.clone();
-    let readme = read_normalized(&repo_root().join("README.md"));
-    for (rel, text, needle) in [
-        (
-            "docs/performance.md (opening table intro)",
-            &perf_doc,
-            format!("other {word} are present"),
-        ),
-        (
-            "docs/performance.md (Known limitations)",
-            &perf_doc,
-            format!("{word} more are present"),
-        ),
-        (
-            "README.md",
-            &readme,
-            format!("{word} more are in the query"),
-        ),
-    ] {
-        assert!(
-            text.to_lowercase().contains(&needle),
-            "{rel} must say \"{needle}\" for the unmeasured-predicate count \
-             ({row_count} total - {MEASURED} measured), matching the \
-             top-of-file predicate table's current row count."
-        );
-    }
 }

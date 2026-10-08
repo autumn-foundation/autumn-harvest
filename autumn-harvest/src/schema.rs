@@ -153,64 +153,7 @@ diesel::table! {
         /// the workflow type has no declared `QuotaPolicy` or the key could not
         /// be resolved from the input. Never read on replay -- purely an
         /// admission-time bookkeeping column backing the quota usage counts.
-        /// Also backfilled post-INSERT, once, by `quota_reconcile`'s periodic
-        /// sweep (issue #1226), for a row whose policy was declared after it
-        /// started. Guarded by `WHERE quota_key IS NULL`, so this never
-        /// overwrites a value admission already set.
         quota_key -> Nullable<Text>,
-        /// Forwarding pointer for a shard-rebalanced execution (issue #964).
-        /// Non-NULL exactly when `state = 'MIGRATED'`: the shard the run now
-        /// physically lives on, after an operator migrated it off this one. The
-        /// `ExecutionId` is never re-minted by a migration, so an id captured
-        /// before the move still routes here and resolves through this column.
-        /// NULL for every execution that never moved.
-        migrated_to_shard -> Nullable<Int4>,
-        /// Wall-clock of the cutover commit that sealed this row (issue #964).
-        /// Non-NULL exactly when `state = 'MIGRATED'`.
-        migrated_at -> Nullable<Timestamptz>,
-        /// Every shard that PREVIOUSLY hosted this execution (issue #964), as a
-        /// JSONB array of shard ids, oldest first. Appended to at each
-        /// activation; NULL for an execution that never moved.
-        ///
-        /// Distinct from `migrated_to_shard` on purpose. The pointer is
-        /// collapsed so routing hops do not accumulate, which destroys the
-        /// evidence of intermediate residences; this array does not, so the
-        /// live row's array plus the live row's own shard is the COMPLETE set
-        /// of shards still holding a copy of this run's bytes. That is what a
-        /// cross-residence payload erasure has to traverse.
-        migrated_from_shards -> Nullable<Jsonb>,
-        /// Wall-clock a reconciler observed this seal's live copy as terminal
-        /// (issue #1317). NULL until observed.
-        ///
-        /// `is_active_conflict_state` treats `MIGRATED` as active forever, on
-        /// purpose -- the run is still live, just elsewhere. Nothing else
-        /// propagates the live copy's terminal completion back here. So a
-        /// start of the same business key attached to this seal forever,
-        /// long past the point the real run finished. Non-NULL releases the
-        /// row from that classification.
-        ///
-        /// Deliberately NOT a `state` change. Retention and erasure key off
-        /// `state = 'MIGRATED'` to protect the forwarding pointer from
-        /// deletion; this column carries the fact separately so that
-        /// protection stays intact.
-        migrated_run_terminal_at -> Nullable<Timestamptz>,
-        /// The live copy's own terminal state, recorded alongside
-        /// `migrated_run_terminal_at` (fresh review, P2 follow-up). `state`
-        /// on this row stays `MIGRATED` forever. A reuse-policy decision
-        /// that needs to distinguish a failed live copy from a successful
-        /// one reads this column instead.
-        migrated_run_terminal_state -> Nullable<Text>,
-        /// The state a shard-rebalance staging vacate sealed over (issue
-        /// #1317 review). Non-NULL only while the migration that vacated
-        /// this row is still in flight. An abort restores `state` to this
-        /// value and clears it; a successful cutover just clears it.
-        staging_vacated_state -> Nullable<Text>,
-        /// The execution id of the migration whose staging vacated this row
-        /// (issue #1596 review). Non-NULL exactly when
-        /// `staging_vacated_state` is. Lets `activate_target` finalize this
-        /// row's marker with a direct match on the vacating migration's own
-        /// execution id, with no cross-database write and no retry race.
-        staging_vacated_by -> Nullable<Uuid>,
     }
 }
 
@@ -312,26 +255,6 @@ diesel::table! {
         /// a mismatch means the evidence belongs to a frontier now behind us.
         /// `NULL` = none recorded yet, which reads as a mismatch.
         capability_miss_handler -> Nullable<Text>,
-        /// The `fires_at` of the durable timer this row is armed for (issue
-        /// #1402). Set only by `queue::reschedule_task`. Survives a later
-        /// `scheduled_at` drift with the same wake reason (a queue-pause
-        /// resume credit, an orphan reclaim, a capability-miss release).
-        /// `NULL` when no timer owns this row, or once a different wake
-        /// reason repends it.
-        timer_fires_at -> Nullable<Timestamptz>,
-        /// The `attempt` whose activity handler started (issue #1809).
-        /// Written with `ActivityStarted`. Equal to `attempt` only after
-        /// the current claim started its handler. `NULL` when no attempt
-        /// started.
-        handler_started_attempt -> Nullable<Int4>,
-        timed_out_claims -> Nullable<Array<Nullable<Text>>>,
-        /// When the handler of `handler_started_attempt` started (issue
-        /// #1809).
-        handler_started_at -> Nullable<Timestamptz>,
-        /// `TRUE` on the first workflow task of a freshly admitted run
-        /// (issue #1824). Set only by the workflow start path. The claim
-        /// order reads it while `attempt = 0`.
-        new_start -> Bool,
     }
 }
 
@@ -560,13 +483,6 @@ diesel::table! {
         updated_at -> Timestamptz,
         target_build_id -> Nullable<Text>,
         ramp_percent -> Nullable<Integer>,
-        /// One operator ramp's identity, the same on every shard pool (issue
-        /// #1814). NULL = no ramp, or a ramp set before the column existed.
-        ramp_id -> Nullable<Uuid>,
-        /// The ramp guard's abort markers on this pool, newest first (issue
-        /// #1814). Each is `{"id": ramp_id, "base": build_id}`. A later guard
-        /// uses them to finish a partial abort.
-        ramp_aborted -> Jsonb,
     }
 }
 
@@ -622,64 +538,6 @@ diesel::table! {
         error_summary -> Nullable<Text>,
         shard_id -> Nullable<Int4>,
         source -> Text,
-        /// Dense per-shard export sequence assigned by the audit exporter
-        /// (issue #953). `NULL` until assigned; stays `NULL` forever when no
-        /// audit sink is configured.
-        export_seq -> Nullable<Int8>,
-        /// Audit-chain link of the previous `export_seq` (issue #1838).
-        chain_prev -> Nullable<Bytea>,
-        /// Newest `occurred_at` chained before this row (issue #1838).
-        chain_newest_before -> Nullable<Timestamptz>,
-        /// Audit-chain link of this row (issue #1838).
-        chain_hash -> Nullable<Bytea>,
-        /// The shard whose exporter made the links (issue #1838).
-        chain_shard -> Nullable<Int4>,
-    }
-}
-
-diesel::table! {
-    use diesel::sql_types::*;
-
-    /// Per-shard audit-export delivery cursor (issue #953). One row per shard,
-    /// living in that shard's own database and provisioned by the exporter
-    /// (a database cannot know its own shard id). `last_acked_seq` advances
-    /// only after the sink acknowledges a batch.
-    harvest_audit_export_cursor (shard_id) {
-        shard_id -> Int4,
-        last_assigned_seq -> Int8,
-        last_acked_seq -> Int8,
-        claim_epoch -> Int8,
-        lease_until -> Nullable<Timestamptz>,
-        next_attempt_at -> Timestamptz,
-        consecutive_failures -> Int4,
-        last_status -> Nullable<Int4>,
-        last_error -> Nullable<Text>,
-        last_delivered_at -> Nullable<Timestamptz>,
-        updated_at -> Timestamptz,
-        retired_at -> Nullable<Timestamptz>,
-        /// Newest audit-chain link on this shard (issue #1838).
-        chain_head -> Nullable<Bytea>,
-        /// First chained `export_seq` on this shard (issue #1838).
-        chain_start_seq -> Nullable<Int8>,
-        /// `export_seq` of the newest chained row (issue #1838).
-        chain_head_seq -> Nullable<Int8>,
-        /// Newest `occurred_at` of the chain, through the head (issue #1838).
-        chain_newest_at -> Nullable<Timestamptz>,
-        /// Keyed MAC over the checkpoint columns (issue #1838).
-        chain_mac -> Nullable<Bytea>,
-    }
-}
-
-diesel::table! {
-    use diesel::sql_types::*;
-
-    /// Latest `occurred_at` of any sequenced audit record retention purged
-    /// (issue #1508). One row per database; see the migration.
-    harvest_audit_purge_watermark (singleton) {
-        singleton -> Bool,
-        max_purged_occurred_at -> Timestamptz,
-        purged_records -> Int8,
-        updated_at -> Timestamptz,
     }
 }
 
@@ -762,18 +620,6 @@ diesel::table! {
         /// it elapses every consumer reverts to the declared baseline with no
         /// operator action or background sweeper needed (issue #945).
         override_expires_at -> Nullable<Timestamptz>,
-        /// When `queue::ensure_rate_limit_bucket` last (re-)registered this
-        /// bucket (issue #1127). Part of the idle-bucket GC's idleness clock,
-        /// and deliberately not `updated_at`, which keeps its "an operator or
-        /// config write changed this bucket" meaning. `NULL` on a pre-#1127
-        /// row until the first registration stamps it.
-        last_registered_at -> Nullable<Timestamptz>,
-        /// When an operator last wrote this bucket's PERMANENT baseline via
-        /// `POST /admin/rate-limits/{key}` (issue #332). A bucket carrying this
-        /// is exempt from the idle-bucket GC (issue #1127) — collecting it
-        /// would silently revert deliberate operator intent to the
-        /// code-declared rate.
-        baseline_set_at -> Nullable<Timestamptz>,
     }
 }
 
@@ -805,16 +651,6 @@ diesel::table! {
         /// NULL = fired; `condition_unmet` / `condition_invalid` =
         /// resolved-skipped by the output guard (issue #810).
         outcome -> Nullable<Text>,
-        /// The shard the relay resolved for the target, at relay time (issue
-        /// #1401). NULL on a resolved-skip row (no target was ever picked)
-        /// and on every pre-migration row.
-        target_shard -> Nullable<Integer>,
-        /// `harvest_completion_triggers.target_workflow_name` AT RELAY TIME
-        /// (issue #1401). `sync_completion_triggers` can update that column
-        /// in place, so a join against the CURRENT value can name a target
-        /// this specific fire never used. NULL on a resolved-skip row and on
-        /// every pre-migration row.
-        target_workflow_name -> Nullable<Text>,
     }
 }
 
@@ -835,45 +671,6 @@ diesel::table! {
         priority -> Jsonb,
         max_workflow_input_bytes -> BigInt,
         created_at -> Timestamptz,
-        /// NULL = never quota-blocked; eligible immediately. Set to
-        /// `now() + backoff` when a relay attempt hits `QuotaExceeded` (issue
-        /// #1227, Finding 4). The claim query can then exclude the row until
-        /// its backoff elapses, instead of leaving it to dominate every batch.
-        next_attempt_at -> Nullable<Timestamptz>,
-    }
-}
-
-diesel::table! {
-    use diesel::sql_types::*;
-
-    /// One in-flight **cross-shard child workflow**, recorded on the PARENT's
-    /// shard in the same transaction as the parent's `ChildWorkflowStarted` /
-    /// `ChildWorkflowSpawnedDetached` event (issue #956).
-    ///
-    /// Not a message queue: this is the child's lifecycle record on the
-    /// parent's side. Start, cancel, terminal delivery and close-cascade are
-    /// transitions of this one row.
-    harvest_cross_shard_children (child_exec_id) {
-        /// The child's `ExecutionId` — also the PK on the target shard, which
-        /// is what makes a repeated relay a no-op.
-        child_exec_id -> Uuid,
-        /// The parent, always on this shard.
-        parent_exec_id -> Uuid,
-        /// Denormalised from `child_exec_id`'s encoded shard.
-        target_shard -> Integer,
-        /// `PENDING_START` | `STARTED`.
-        status -> Text,
-        /// A parent-side cancel not yet delivered to the target shard.
-        cancel_requested -> Bool,
-        /// NULL = awaited child; otherwise the detached child's `ParentClosePolicy`.
-        parent_close_policy -> Nullable<Text>,
-        workflow_name -> Text,
-        /// Fully-resolved child creation spec (see `CrossShardChildSpec`).
-        child_spec -> Jsonb,
-        created_at -> Timestamptz,
-        attempts -> Integer,
-        last_error -> Nullable<Text>,
-        last_attempt_at -> Nullable<Timestamptz>,
     }
 }
 
@@ -1113,11 +910,6 @@ diesel::table! {
         /// parent's execution rows are gone.
         parent_id     -> Nullable<Uuid>,
         summarized_at -> Timestamptz,
-        /// The demoted execution's residence history (issue #964), carried over
-        /// verbatim so a cross-residence payload erasure can still reach the
-        /// sealed source copies after the execution row itself is collected.
-        /// NULL for a run that never moved.
-        migrated_from_shards -> Nullable<Jsonb>,
     }
 }
 
@@ -1134,8 +926,6 @@ diesel::table! {
         wasm_bytes    -> Bytea,
         active        -> Bool,
         published_at  -> Timestamptz,
-        /// Hex Ed25519 publisher signature (issue #1838). `NULL` = unsigned.
-        signature     -> Nullable<Text>,
     }
 }
 
@@ -1193,95 +983,6 @@ diesel::table! {
     }
 }
 
-diesel::table! {
-    use diesel::sql_types::*;
-
-    /// Durable resume cursor for the lazy payload-codec re-encryption sweep
-    /// (issue #948).
-    ///
-    /// One row per shard, with the target key stored as a COLUMN: any change of
-    /// active key — including a rollback to a key that already completed a pass
-    /// — must restart the scan, which keying the row on the key id could not
-    /// express.
-    harvest_codec_rotation_cursor (shard_id) {
-        shard_id -> Int4,
-        active_key_id -> Text,
-        last_event_id -> Int8,
-        rows_reencrypted -> Int8,
-        unresolved_rows -> Int8,
-        completed_at -> Nullable<Timestamptz>,
-        updated_at -> Timestamptz,
-        next_revalidation_at -> Nullable<Timestamptz>,
-    }
-}
-
-diesel::table! {
-    use diesel::sql_types::*;
-
-    /// Durable fleet-wide codec key lifecycle state (issue #1244). One row per
-    /// key id, `state` one of `active` / `retiring` / `retired`.
-    harvest_codec_key_state (key_id) {
-        key_id -> Text,
-        state -> Text,
-        activated_at -> Nullable<Timestamptz>,
-        retiring_since -> Nullable<Timestamptz>,
-        retired_at -> Nullable<Timestamptz>,
-        updated_at -> Timestamptz,
-    }
-}
-
-diesel::table! {
-    use diesel::sql_types::*;
-
-    /// Durable per-execution shard-migration record (issue #964).
-    ///
-    /// Lives on the **source** shard -- the one that stays authoritative right
-    /// up to the cutover commit -- so a crash at any point leaves a record on
-    /// the database that still owns the run. `resume_incomplete_migrations`
-    /// drives it forward; the phase machine that decides what to do with a row
-    /// found mid-flight is pure and lives in `shard_rebalance`.
-    harvest_shard_migrations (execution_id) {
-        execution_id -> Uuid,
-        source_shard -> Int4,
-        target_shard -> Int4,
-        /// PENDING | COPIED | VERIFIED | COMMITTED | DONE | ABORTED. Only the
-        /// VERIFIED -> COMMITTED transition changes who is authoritative.
-        phase -> Text,
-        /// The replay-verification fingerprint the target copy produced, kept
-        /// so an operator can see WHAT was verified, not only that it passed.
-        verified_fingerprint -> Nullable<Text>,
-        /// The source history's high-water mark at the instant verification
-        /// passed. The cutover seals only while the source's live counts still
-        /// equal these, so a run that woke, ran a decision cycle and re-parked
-        /// between verification and cutover is refused rather than cut over to
-        /// a copy that no longer contains its latest events.
-        verified_event_count -> Nullable<Int8>,
-        verified_max_event_id -> Nullable<Int4>,
-        abort_reason -> Nullable<Text>,
-        /// The source's parked workflow task row, captured verbatim at stage
-        /// time and re-inserted on the target at activation. Held here rather
-        /// than staged on the target because the claim query does not filter on
-        /// execution state, so a task row next to a staged `MIGRATING`
-        /// execution would be claimable -- live on two shards at once.
-        staged_task -> Nullable<Jsonb>,
-        attempts -> Int4,
-        last_error -> Nullable<Text>,
-        last_attempt_at -> Nullable<Timestamptz>,
-        created_at -> Timestamptz,
-        updated_at -> Timestamptz,
-        /// The source's `legal_hold_set_at` as re-read at verify time. The
-        /// cutover requires the live value to still match this one. A hold
-        /// placed or released after verification aborts the cutover. It does
-        /// not seal a source whose target copy has the wrong hold state.
-        verified_legal_hold_set_at -> Nullable<Timestamptz>,
-        /// True once `verify_target_copy` has checked the legal-hold state for
-        /// this record. Distinguishes "verified, no hold" from "never checked
-        /// by code that knows this column exists", so a legacy or
-        /// foreign-verified record fails the cutover guard closed.
-        legal_hold_verified -> Bool,
-    }
-}
-
 diesel::joinable!(harvest_workflow_logs -> harvest_workflow_executions (workflow_exec_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
@@ -1296,8 +997,6 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_workers,
     harvest_batch_jobs,
     harvest_audit_log,
-    harvest_audit_export_cursor,
-    harvest_audit_purge_watermark,
     harvest_api_tokens,
     harvest_build_policies,
     harvest_build_compat,
@@ -1309,8 +1008,6 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_completion_triggers,
     harvest_completion_trigger_fires,
     harvest_completion_trigger_outbox,
-    harvest_cross_shard_children,
-    harvest_shard_migrations,
     harvest_debounce,
     harvest_start_throttle,
     harvest_start_idempotency,
@@ -1323,6 +1020,4 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_mutex_locks,
     harvest_mutex_waiters,
     harvest_workflow_logs,
-    harvest_codec_rotation_cursor,
-    harvest_codec_key_state,
 );

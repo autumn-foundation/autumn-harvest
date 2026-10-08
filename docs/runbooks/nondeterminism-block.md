@@ -16,10 +16,7 @@ non-terminally:
   `worker.rs`). Retries are otherwise **unbounded** — the block is
   rate-limited, not attempt-capped, so a rollback at *any* later time still
   resumes the execution. A permanently diverging history costs one dispatch
-  every 150s to 300s, never a hot loop.
-- **Jittered re-dispatch.** Each delay is in `[base/2, base]` (issue #1792).
-  The seed comes from the execution id. When one deploy blocks many
-  executions, they do not re-dispatch together.
+  per ≤300s, never a hot loop.
 - **Diagnostic stamped.** The execution row records `nd_blocked_at` (most
   recent observation), `nd_block_reason` (the divergence error), and
   `nd_block_count` (consecutive blocks — drives the backoff); `search_attrs`
@@ -63,27 +60,6 @@ For any blocked row, read `search_attrs`:
 `nd_block_reason` / `nd_block_count` / `nd_blocked_at` on the embedded
 execution object.
 
-**Skipped recorded command (issue #1791).** The deployed code can also stop
-before a command that the recorded run issued. For example, a deploy deletes
-an activity call or a timer. Then `expected` is `<workflow returned early>` or
-`<workflow suspended early>`. `actual` names the skipped event, for example
-`ActivityScheduled(send_email)`. `event_index` is its history position. The
-replay-diagnosis endpoint below reports the same drift with strict-replay
-labels. There, `<workflow returned early>` or `<workflow suspended early>`
-appears in `actual`, and `event_index` can differ. Use the block's
-`event_index` to choose a reset point.
-
-The engine upgrade alone can surface this case. A run that skipped a
-recorded command under an earlier deploy blocks on its next wake. The
-`build_id` is then the current build, so a rollback does not help. Reset the
-run to before `event_index`, or terminate it.
-
-A block with `expected: <workflow suspended early>` and a `clean` diagnosis
-has a different cause. The workflow body awaits non-durable work beside a
-durable await, so the cycle suspends before that work ends (issue #1797).
-Move that work into an activity. Non-durable work alone does not block: after
-2 s it fails the workflow task, and the worker retries the task.
-
 ## Diagnose the divergence (issue #614)
 
 To confirm — on demand, for one specific execution — exactly how the
@@ -99,8 +75,7 @@ This is read-only (it appends no events and performs no writes) and admin-gated.
 The response verdict is one of `clean` / `diverged` / `workflow_failed` /
 `not_registered` / `not_replayable_dag` (all `200`; the diagnosis, not the HTTP
 status, carries the answer). For a blocked run the verdict is `diverged`, with a
-`divergence` object using the **same vocabulary as the block diagnostic** above.
-A skipped recorded command (issue #1791) is the exception, as noted above:
+`divergence` object using the **same vocabulary as the block diagnostic** above:
 
 ```json
 {
@@ -139,8 +114,8 @@ released on reset, or PII-erased); `408` = the replay exceeded the bounded
 `query_timeout` budget — the bound applies to async-yielding replays, and a
 workflow that busy-loops synchronously without ever `.await`-ing is out of scope,
 exactly as for the live executor (a large but healthy history is not at risk:
-the executor suspends only on a parked durable await (issue #1797), never on
-a CPU-bound replay of recorded events).
+the executor's 100 ms per-cycle suspension heuristic only fires at a genuine
+frontier suspension, never on a CPU-bound replay of recorded events).
 
 ## Roll back
 
@@ -203,11 +178,7 @@ POST /api/harvest/workflows/{execution_id}/reset
 ```
 
 Reset to an event index before the divergence (`event_index` in the
-diagnostic), which forks a fresh run from the compatible prefix. The full
-request body (`reset_to_event_id`, required `reason` and `operator_id`,
-`signal_reapply`) is in `docs/api-contract.json` under this path; the worked
-CLI walkthrough — dry-run first, then commit — is
-[README.md § Resetting a workflow after a bad deploy](../../README.md#resetting-a-workflow-after-a-bad-deploy).
+diagnostic), which forks a fresh run from the compatible prefix.
 
 ## Prevention (complementary, not replaced by this safety net)
 
