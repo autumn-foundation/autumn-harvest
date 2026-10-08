@@ -134,8 +134,8 @@ matching the virtual-clock rule above.
 When a signal arrives before the deadline the virtual clock does **not** advance:
 
 ```rust
-let mut env = WorkflowTestEnv::new();
-env.queue_signal("approved", serde_json::json!({ "approver": "alice" }));
+let env = WorkflowTestEnv::new()
+    .queue_signal("approved", serde_json::json!({ "approver": "alice" }));
 
 let outcome = env.run(approval_workflow_handler, ()).await;
 // Signal fired first — no TimerStarted recorded — clock unchanged.
@@ -158,6 +158,73 @@ async fn year_of_timers_is_fast() {
     assert!(start.elapsed().as_millis() < 50, "time-skipping must be fast");
 }
 ```
+
+### Signals, updates and queries mid-run
+
+`queue_signal` delivers its signals before the workflow starts. To send an
+input after the workflow reaches a given point, start the run and drive it
+step by step:
+
+| Call | Effect |
+|------|--------|
+| `env.start(handler, input)` | Creates a `WorkflowTestRun`. Nothing runs yet. |
+| `run.run_until_blocked().await` | Drives the run. Returns `TestRunStatus::Blocked` or `TestRunStatus::Finished`. |
+| `run.signal(name, payload)` | Queues a signal. The next drive delivers it. |
+| `run.update(name, input).await` | Runs the validator, then the handler. Records `UpdateAdmitted` and `UpdateCompleted` or `UpdateFailed`. |
+| `run.query(name, args).await` | Runs a query handler. Writes no event. |
+| `run.events()` | Returns the history so far. |
+| `run.finish().await` | Drives the run to its end and returns the `TestRunOutcome`. |
+
+`signal`, `update` and `query` do not drive the run. Call
+`run_until_blocked` or `finish` to continue.
+
+```rust
+use autumn_harvest::error::HarvestError;
+use autumn_harvest::testing::{TestRunStatus, WorkflowTestEnv};
+use serde_json::json;
+
+#[tokio::test]
+async fn approval_waits_for_a_signal() {
+    let env = WorkflowTestEnv::new()
+        .mock_activity("prepare", |_| Ok(json!("prepared")));
+    let mut run = env.start(approval_handler, json!(null));
+
+    // The workflow runs its activity, then waits for `approve`.
+    assert_eq!(run.run_until_blocked().await, TestRunStatus::Blocked);
+    assert_eq!(run.query("seen", json!(null)).await.unwrap(), json!(["prepared"]));
+
+    // The validator rejects the input. No event is written.
+    let err = run.update("set_limit", json!(-1)).await.unwrap_err();
+    assert!(matches!(err, HarvestError::UpdateRejected { .. }));
+
+    // The handler runs and its result is recorded.
+    assert_eq!(
+        run.update("set_limit", json!(5)).await.unwrap(),
+        json!({ "limit": 5 })
+    );
+
+    run.signal("approve", json!({ "by": "alice" })).unwrap();
+    let outcome = run.finish().await;
+    assert!(outcome.result.is_ok());
+}
+```
+
+Rules:
+
+- A drive ingests pending signals before the workflow runs, as the worker
+  does.
+- Timers still fire when the workflow waits on them. So a drive stops only
+  on a wait with no timer, such as a signal or a contended mutex. To make a
+  signal win a race against a timer, send it before the drive that reaches
+  the race.
+- An update and a query replay the history to rebuild the workflow state.
+  Their handlers then run against that state.
+- An update's `UpdateAdmitted` timestamp is the current virtual time.
+- Declarative `#[query]` and `#[update]` handlers need
+  `env.queries(queries![...])` and `env.updates(updates![...])`.
+- After the run finishes, `signal` and `update` return
+  `HarvestError::WorkflowNotRunning`. `query` still reads the final state.
+- `env.run(handler, input)` is `env.start(handler, input).finish()`.
 
 ---
 

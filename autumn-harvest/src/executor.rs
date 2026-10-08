@@ -1909,8 +1909,32 @@ pub async fn run_workflow_with_state_advancing_clock(
     tracing::Span,
     Option<crate::shard::ShardRouter>,
 ) {
-    use crate::context::WorkflowContext;
-    let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
+    let ctx = advancing_clock_context(
+        exec_id,
+        history,
+        state,
+        span_meta,
+        metrics,
+        workflow_log_policy,
+    );
+    drive_workflow(ctx, handler, input, span_meta).await
+}
+
+/// Builds the advancing-clock replay context that one `WorkflowTestEnv`
+/// cycle runs on.
+///
+/// The test harness also uses it to rebuild state for a mid-run query or
+/// update (issue #1991). Both paths then replay the same history the same way.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn advancing_clock_context(
+    exec_id: ExecutionId,
+    history: Vec<WorkflowEvent>,
+    state: SharedState,
+    span_meta: Option<&WorkflowExecuteSpanMeta>,
+    metrics: std::sync::Arc<dyn MetricsRecorder>,
+    workflow_log_policy: Option<crate::context::WorkflowLogPolicy>,
+) -> crate::context::WorkflowContext {
+    crate::context::WorkflowContext::for_replay_with_state_and_history_policy(
         exec_id,
         history,
         state,
@@ -1954,8 +1978,7 @@ pub async fn run_workflow_with_state_advancing_clock(
     .with_build_id(span_meta.and_then(|m| m.build_id.clone()))
     .with_metrics(metrics)
     // Issue #790.
-    .with_log_policy(workflow_log_policy);
-    drive_workflow(ctx, handler, input, span_meta).await
+    .with_log_policy(workflow_log_policy)
 }
 
 /// Like [`run_workflow_with_state`] but installs explicit history guardrails,
@@ -2264,7 +2287,7 @@ impl DriveResult {
 /// the outcome.  Shared by all public entry points so the advancing-clock
 /// variant (`run_workflow_with_state_advancing_clock`) does not duplicate the
 /// span/cycle/drain logic.
-async fn drive_workflow(
+pub(crate) async fn drive_workflow(
     ctx: WorkflowContext,
     handler: WorkflowHandlerFn,
     input: Value,

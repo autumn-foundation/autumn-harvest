@@ -51,7 +51,7 @@ use crate::context::{SharedState, WorkflowCommand, empty_shared_state};
 use crate::event::WorkflowEvent;
 use crate::executor::{
     WorkflowExecuteSpanMeta, WorkflowOutcome, run_workflow_canary, run_workflow_strict,
-    run_workflow_strict_advancing_clock, run_workflow_with_state_advancing_clock,
+    run_workflow_strict_advancing_clock,
 };
 use crate::info::{WorkflowHandlerFn, WorkflowInfo};
 use crate::types::{ActivityExecId, ExecutionId, ParentClosePolicy, WorkerId};
@@ -4940,6 +4940,16 @@ async fn replay_fixture_file(
 // The loop terminates when the workflow returns `Completed` or `Failed`, or
 // when no commands can be resolved (workflow stuck) or the iteration cap is
 // reached.
+//
+// Mid-run injection (issue #1991)
+// ───────────────────────────────
+// `start` returns a `WorkflowTestRun` that owns this loop. When no command
+// resolves, `run_until_blocked` returns `Blocked` and keeps the run. The test
+// can then send a signal, which the next cycle ingests at task-prep. It can
+// also run an update or a query. Each one replays the history into a fresh
+// context, as the plugin query path does, and calls the handler there. An
+// update appends `UpdateAdmitted` and its result event. `run` is
+// `start(..).finish()`, so both APIs share one loop.
 
 /// Maximum number of executor iterations before declaring an infinite loop.
 const MAX_TEST_ITERATIONS: usize = 1_000;
@@ -5073,6 +5083,17 @@ pub struct TestRunOutcome {
     recorded_logs: Vec<RecordedLogLine>,
 }
 
+/// The virtual clock after `events`: `start_time` plus the fired timer time.
+fn virtual_now(start_time: DateTime<Utc>, events: &[WorkflowEvent]) -> DateTime<Utc> {
+    let total_secs: u64 = fired_timer_duration_secs(events);
+    start_time
+        + chrono::Duration::seconds(
+            i64::try_from(total_secs)
+                .unwrap_or(i64::MAX / 1000)
+                .min(i64::MAX / 1000),
+        )
+}
+
 /// Reconstruct the final virtual-clock elapsed (in seconds) from the durable
 /// timers that **actually fired** in `events` (issue #768, Codex P2 rounds 8 and
 /// 16).
@@ -5182,13 +5203,7 @@ impl TestRunOutcome {
     /// so the sum is unchanged from the pre-round-16 model.
     #[must_use]
     pub fn final_now(&self) -> DateTime<Utc> {
-        let total_secs: u64 = fired_timer_duration_secs(&self.events);
-        self.start_time
-            + chrono::Duration::seconds(
-                i64::try_from(total_secs)
-                    .unwrap_or(i64::MAX / 1000)
-                    .min(i64::MAX / 1000),
-            )
+        virtual_now(self.start_time, &self.events)
     }
 
     /// Total virtual time elapsed during the run (issue #526).
@@ -5288,6 +5303,335 @@ impl TestRunOutcome {
 }
 
 // ---------------------------------------------------------------------------
+// WorkflowTestRun — a run that a test drives step by step (issue #1991)
+// ---------------------------------------------------------------------------
+
+/// Time limit for the replay that rebuilds state for a mid-run query or
+/// update. It matches the default in-process query timeout.
+const MID_RUN_REPLAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Where a [`WorkflowTestRun`] stopped after a drive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestRunStatus {
+    /// The workflow waits for an input the harness cannot supply, such as a
+    /// signal that was not sent or a contended mutex.
+    Blocked,
+    /// The run ended. [`WorkflowTestRun::finish`] returns its outcome.
+    ///
+    /// A harness error, such as a missing activity mock, also ends the run.
+    Finished,
+}
+
+/// A workflow run that a test drives step by step (issue #1991).
+///
+/// [`WorkflowTestEnv::start`] creates it. The run uses the same engine loop
+/// as [`WorkflowTestEnv::run`]. Activities resolve from mocks and timers fire
+/// on the virtual clock.
+///
+/// Between drives, a test can send a signal, run an update or run a query.
+/// None of these calls drives the run. Call
+/// [`run_until_blocked`](Self::run_until_blocked) or
+/// [`finish`](Self::finish) to continue.
+///
+/// Timers fire when the workflow waits on them. So `run_until_blocked` stops
+/// only on a wait with no timer. To make a signal win a race against a timer,
+/// send the signal before the drive that reaches the race.
+pub struct WorkflowTestRun<'env> {
+    env: &'env WorkflowTestEnv,
+    handler: WorkflowHandlerFn,
+    input: Value,
+    exec_id: ExecutionId,
+    start_time: DateTime<Utc>,
+    history: Vec<WorkflowEvent>,
+    call_counts: HashMap<String, u32>,
+    /// Signals not yet in history. The next cycle ingests them at task-prep.
+    pending_signals: Vec<(String, Value)>,
+    retry_sequences: HashMap<String, std::collections::VecDeque<Vec<Result<Value, String>>>>,
+    recorded_logs: std::collections::BTreeMap<u64, RecordedLogLine>,
+    /// `Some` once the run ends. It then owns the history.
+    outcome: Option<TestRunOutcome>,
+}
+
+impl WorkflowTestRun<'_> {
+    /// The execution id of this run.
+    #[must_use]
+    pub const fn exec_id(&self) -> ExecutionId {
+        self.exec_id
+    }
+
+    /// The event history so far.
+    #[must_use]
+    pub fn events(&self) -> &[WorkflowEvent] {
+        self.outcome
+            .as_ref()
+            .map_or(&self.history, |outcome| &outcome.events)
+    }
+
+    /// Drive the run until the workflow blocks or the run ends.
+    ///
+    /// The drive first ingests every pending signal into history. A finished
+    /// run returns [`TestRunStatus::Finished`] at once.
+    pub async fn run_until_blocked(&mut self) -> TestRunStatus {
+        if self.outcome.is_some() {
+            return TestRunStatus::Finished;
+        }
+        let span_meta = self.env.span_meta();
+        for _iter in 0..MAX_TEST_ITERATIONS {
+            // Task-prep ingest (issue #775): production's
+            // `worker::ingest_due_timers_and_signals` appends every pending
+            // signal before the handler runs. It does not wait for a
+            // `WaitForSignal` command. A workflow that drains or polls
+            // signals first then sees them, as in production.
+            for (name, payload) in std::mem::take(&mut self.pending_signals) {
+                self.history.push(WorkflowEvent::SignalReceived {
+                    signal_name: name,
+                    payload,
+                });
+            }
+
+            let ctx = self.env.cycle_context(
+                self.exec_id,
+                self.history.clone(),
+                span_meta.as_ref(),
+                self.env.metrics.clone(),
+                // Issue #790: the durable-log policy this env was configured
+                // with (`None` = the sink disabled, the default).
+                self.env.workflow_log_policy,
+            );
+            let (outcome, pending_cmds, _span, _resolved_router) = crate::executor::drive_workflow(
+                ctx,
+                self.handler,
+                self.input.clone(),
+                span_meta.as_ref(),
+            )
+            .await;
+
+            // Issue #790: harvest this cycle's durable-log commands before the
+            // outcome is consumed. A suspension carries them on
+            // `outcome.commands`. A terminal cycle carries them on
+            // `pending_cmds`. Collecting from both covers every cycle shape.
+            if let WorkflowOutcome::Suspended { commands } = &outcome {
+                accumulate_recorded_logs(commands, &mut self.recorded_logs);
+            }
+            accumulate_recorded_logs(&pending_cmds, &mut self.recorded_logs);
+
+            match outcome {
+                WorkflowOutcome::Suspended { commands } => {
+                    match self.env.process_suspension(
+                        commands,
+                        &mut self.history,
+                        &mut self.call_counts,
+                        &mut self.retry_sequences,
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => return TestRunStatus::Blocked,
+                        Err(error) => {
+                            self.end_with_error(error);
+                            return TestRunStatus::Finished;
+                        }
+                    }
+                }
+                terminal => {
+                    let logs = std::mem::take(&mut self.recorded_logs);
+                    self.outcome = Some(self.env.finish_terminal_outcome(
+                        terminal,
+                        &pending_cmds,
+                        std::mem::take(&mut self.history),
+                        self.exec_id,
+                        self.start_time,
+                        logs.into_values().collect(),
+                    ));
+                    return TestRunStatus::Finished;
+                }
+            }
+        }
+        self.end_with_error(format!(
+            "WorkflowTestEnv: workflow exceeded {MAX_TEST_ITERATIONS} iterations \
+             (possible infinite loop or unresolvable suspension)"
+        ));
+        TestRunStatus::Finished
+    }
+
+    /// Drive the run to its end and return the outcome.
+    ///
+    /// A run that stays blocked ends with the same error that
+    /// [`WorkflowTestEnv::run`] returns for it.
+    pub async fn finish(mut self) -> TestRunOutcome {
+        self.run_until_blocked().await;
+        if let Some(outcome) = self.outcome.take() {
+            return outcome;
+        }
+        self.error_outcome(
+            "WorkflowTestEnv: workflow suspended with no resolvable \
+             commands (check that all signals are queued and activities \
+             are mocked)"
+                .to_string(),
+        )
+    }
+
+    /// Send a signal. The next drive delivers it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::WorkflowNotRunning`] after the run ends.
+    ///
+    /// [`HarvestError::WorkflowNotRunning`]: crate::error::HarvestError::WorkflowNotRunning
+    pub fn signal(
+        &mut self,
+        name: impl Into<String>,
+        payload: Value,
+    ) -> crate::error::HarvestResult<()> {
+        self.ensure_running()?;
+        self.pending_signals.push((name.into(), payload));
+        Ok(())
+    }
+
+    /// Run an update against the current state, as the engine does.
+    ///
+    /// The harness replays the history to rebuild the workflow state and its
+    /// handlers. The validator runs first. A rejection writes no event. An
+    /// admitted update records `UpdateAdmitted` at the virtual time. The
+    /// handler then runs, and its result records `UpdateCompleted` or
+    /// `UpdateFailed`. The update does not drive the run.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::WorkflowNotRunning`] after the run ends.
+    /// - [`HarvestError::UpdateHandlerNotFound`] if no handler has the name.
+    /// - [`HarvestError::UpdateRejected`] if the validator rejects the input.
+    /// - [`HarvestError::WorkflowFailed`] if the handler returns an error,
+    ///   as the in-process update client reports it.
+    /// - [`HarvestError::QueryHandlerPanicked`] or
+    ///   [`HarvestError::QueryTimedOut`] if the replay that rebuilds the
+    ///   state panics or times out.
+    ///
+    /// [`HarvestError::WorkflowNotRunning`]: crate::error::HarvestError::WorkflowNotRunning
+    /// [`HarvestError::UpdateHandlerNotFound`]: crate::error::HarvestError::UpdateHandlerNotFound
+    /// [`HarvestError::UpdateRejected`]: crate::error::HarvestError::UpdateRejected
+    /// [`HarvestError::WorkflowFailed`]: crate::error::HarvestError::WorkflowFailed
+    /// [`HarvestError::QueryHandlerPanicked`]: crate::error::HarvestError::QueryHandlerPanicked
+    /// [`HarvestError::QueryTimedOut`]: crate::error::HarvestError::QueryTimedOut
+    pub async fn update(&mut self, name: &str, input: Value) -> crate::error::HarvestResult<Value> {
+        self.ensure_running()?;
+        let ctx = self.rebuild_state(name).await?;
+        ctx.validate_update(name, &input)?;
+
+        let update_id = crate::types::UpdateId::new();
+        self.history.push(WorkflowEvent::UpdateAdmitted {
+            update_id,
+            name: name.to_string(),
+            input: input.clone(),
+            timestamp: virtual_now(self.start_time, &self.history),
+        });
+        // The context replayed the history before the admission. So the
+        // update has no result in it, and the handler runs live.
+        let result = ctx.execute_admitted_update(update_id, name, input).await;
+        self.history.push(match &result {
+            Ok(output) => WorkflowEvent::UpdateCompleted {
+                update_id,
+                output: output.clone(),
+            },
+            Err(error) => WorkflowEvent::UpdateFailed {
+                update_id,
+                error: error.clone(),
+            },
+        });
+        result.map_err(|error| {
+            crate::error::HarvestError::workflow_failed_untyped(self.exec_id.to_string(), error)
+        })
+    }
+
+    /// Run a query against the current state. It writes no event.
+    ///
+    /// The harness replays the history to rebuild the workflow state, then
+    /// runs the handler. A finished run still serves queries, as the query
+    /// API does for a terminal execution.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::QueryHandlerNotFound`] if no handler has the name.
+    /// - [`HarvestError::QueryHandlerFailed`] if the handler returns an error.
+    /// - [`HarvestError::QueryHandlerPanicked`] or
+    ///   [`HarvestError::QueryTimedOut`] if the replay panics or times out.
+    ///
+    /// [`HarvestError::QueryHandlerNotFound`]: crate::error::HarvestError::QueryHandlerNotFound
+    /// [`HarvestError::QueryHandlerFailed`]: crate::error::HarvestError::QueryHandlerFailed
+    /// [`HarvestError::QueryHandlerPanicked`]: crate::error::HarvestError::QueryHandlerPanicked
+    /// [`HarvestError::QueryTimedOut`]: crate::error::HarvestError::QueryTimedOut
+    pub async fn query(&self, name: &str, args: Value) -> crate::error::HarvestResult<Value> {
+        self.rebuild_state(name)
+            .await?
+            .execute_query_with_args(name, args)
+    }
+
+    /// Replay the history into a fresh context so its handlers see the
+    /// current state.
+    ///
+    /// Metrics and durable logs are off. The cycles already emitted them, so
+    /// the replay must not count them again.
+    async fn rebuild_state(
+        &self,
+        handler_name: &str,
+    ) -> crate::error::HarvestResult<crate::context::WorkflowContext> {
+        let span_meta = self.env.span_meta();
+        let ctx = self.env.cycle_context(
+            self.exec_id,
+            self.events().to_vec(),
+            span_meta.as_ref(),
+            Arc::new(crate::telemetry::NoOpMetrics),
+            None,
+        );
+        match crate::executor::drive_query_replay_async(
+            &ctx,
+            self.handler,
+            self.input.clone(),
+            MID_RUN_REPLAY_TIMEOUT,
+        )
+        .await
+        {
+            crate::executor::QueryReplayOutcome::ReachedTerminal
+            | crate::executor::QueryReplayOutcome::Suspended => Ok(ctx),
+            crate::executor::QueryReplayOutcome::TimedOut => {
+                Err(crate::error::HarvestError::QueryTimedOut {
+                    query_name: handler_name.to_string(),
+                    timeout_ms: u64::try_from(MID_RUN_REPLAY_TIMEOUT.as_millis())
+                        .unwrap_or(u64::MAX),
+                })
+            }
+            crate::executor::QueryReplayOutcome::Panicked => {
+                Err(crate::error::HarvestError::QueryHandlerPanicked(format!(
+                    "the workflow panicked while its state was rebuilt for '{handler_name}'"
+                )))
+            }
+        }
+    }
+
+    const fn ensure_running(&self) -> crate::error::HarvestResult<()> {
+        if self.outcome.is_some() {
+            return Err(crate::error::HarvestError::WorkflowNotRunning(self.exec_id));
+        }
+        Ok(())
+    }
+
+    /// End the run with a harness error, keeping the history so far.
+    fn end_with_error(&mut self, error: String) {
+        self.outcome = Some(self.error_outcome(error));
+    }
+
+    /// Move the history so far into an outcome that carries `error`.
+    fn error_outcome(&mut self, error: String) -> TestRunOutcome {
+        let logs = std::mem::take(&mut self.recorded_logs);
+        self.env.outcome(
+            Err(error),
+            std::mem::take(&mut self.history),
+            self.exec_id,
+            self.start_time,
+            logs.into_values().collect(),
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // WorkflowTestEnv
 // ---------------------------------------------------------------------------
 
@@ -5296,6 +5640,8 @@ impl TestRunOutcome {
 /// Run a workflow to completion without Postgres, workers, or Docker.
 /// Activities are satisfied by registered closures; timers auto-fire;
 /// signals are injected from a pre-queued list; child workflows are stubbed.
+/// To send a signal, an update or a query mid-run, use
+/// [`start`](Self::start).
 ///
 /// # Quick start
 ///
@@ -5404,6 +5750,10 @@ pub struct WorkflowTestEnv {
     /// contender. A key NOT in this set is auto-granted. Populated via
     /// [`with_mutex_contended`](Self::with_mutex_contended).
     mutex_contended: HashSet<String>,
+    /// Declarative `#[query]` handlers registered on each cycle (issue #1991).
+    declarative_queries: Vec<crate::info::QueryHandlerInfo>,
+    /// Declarative `#[update]` handlers registered on each cycle (issue #1991).
+    declarative_updates: Vec<crate::info::UpdateHandlerInfo>,
 }
 
 /// A canned `await_external_workflow` failure outcome (issue #757):
@@ -5451,6 +5801,8 @@ impl WorkflowTestEnv {
             external_await_results: HashMap::new(),
             external_await_failures: HashMap::new(),
             mutex_contended: HashSet::new(),
+            declarative_queries: Vec::new(),
+            declarative_updates: Vec::new(),
         }
     }
 
@@ -5576,6 +5928,27 @@ impl WorkflowTestEnv {
     #[must_use]
     pub fn queue_signal(mut self, name: impl Into<String>, payload: Value) -> Self {
         self.queued_signals.push((name.into(), payload));
+        self
+    }
+
+    /// Register declarative `#[query]` handlers (issue #1991).
+    ///
+    /// The worker registers these before the workflow body runs. Pass the
+    /// `queries![...]` of the workflow under test, so
+    /// [`WorkflowTestRun::query`] can find them.
+    #[must_use]
+    pub fn queries(mut self, queries: Vec<crate::info::QueryHandlerInfo>) -> Self {
+        self.declarative_queries = queries;
+        self
+    }
+
+    /// Register declarative `#[update]` handlers (issue #1991).
+    ///
+    /// Pass the `updates![...]` of the workflow under test, so
+    /// [`WorkflowTestRun::update`] can find them. Their validators run too.
+    #[must_use]
+    pub fn updates(mut self, updates: Vec<crate::info::UpdateHandlerInfo>) -> Self {
+        self.declarative_updates = updates;
         self
     }
 
@@ -5864,10 +6237,41 @@ impl WorkflowTestEnv {
     /// handler dispatch), so a signal wins a `tokio::select!` race by resolving
     /// its branch synchronously from history; a classic timer only fires when it
     /// genuinely suspends (the no-signal, timer-wins case).
-    #[allow(clippy::too_many_lines)]
+    ///
+    /// Equivalent to `self.start(handler, input).finish().await`. Use
+    /// [`start`](Self::start) to send a signal, an update or a query mid-run.
     pub async fn run(&self, handler: WorkflowHandlerFn, input: Value) -> TestRunOutcome {
-        let exec_id = ExecutionId::new();
+        self.start(handler, input).finish().await
+    }
 
+    /// Start a run that a test drives step by step (issue #1991).
+    ///
+    /// The run does nothing until the test calls
+    /// [`run_until_blocked`](WorkflowTestRun::run_until_blocked) or
+    /// [`finish`](WorkflowTestRun::finish). Between drives, the test can call
+    /// [`signal`](WorkflowTestRun::signal), [`update`](WorkflowTestRun::update)
+    /// and [`query`](WorkflowTestRun::query).
+    ///
+    /// ```rust,no_run
+    /// # use autumn_harvest::testing::{TestRunStatus, WorkflowTestEnv};
+    /// # use autumn_harvest::context::WorkflowContext;
+    /// # use serde_json::{Value, json};
+    /// # use std::pin::Pin;
+    /// # fn approval<'a>(ctx: &'a WorkflowContext, _: Value)
+    /// #   -> Pin<Box<dyn std::future::Future<Output=Result<Value,String>>+Send+'a>>
+    /// # { Box::pin(async move { ctx.wait_for_signal("approve").await.map_err(|e| e.to_string()) }) }
+    /// # #[tokio::main] async fn main() -> autumn_harvest::HarvestResult<()> {
+    /// let env = WorkflowTestEnv::new();
+    /// let mut run = env.start(approval, json!(null));
+    /// assert_eq!(run.run_until_blocked().await, TestRunStatus::Blocked);
+    ///
+    /// run.signal("approve", json!("yes"))?;
+    /// let outcome = run.finish().await;
+    /// assert_eq!(outcome.result, Ok(json!("yes")));
+    /// # Ok(()) }
+    /// ```
+    #[must_use]
+    pub fn start(&self, handler: WorkflowHandlerFn, input: Value) -> WorkflowTestRun<'_> {
         let mut history = vec![WorkflowEvent::WorkflowStarted {
             input: input.clone(),
             timestamp: self.simulated_now,
@@ -5880,23 +6284,31 @@ impl WorkflowTestEnv {
                 reason: reason.clone(),
             });
         }
+        WorkflowTestRun {
+            env: self,
+            handler,
+            input,
+            exec_id: ExecutionId::new(),
+            start_time: self.simulated_now,
+            history,
+            call_counts: HashMap::new(),
+            pending_signals: self.queued_signals.clone(),
+            retry_sequences: self.retry_sequences.clone(),
+            // Issue #790: the durable log lines this run would have persisted,
+            // accumulated across every decision cycle and de-duplicated by `seq`
+            // exactly the way the store's unique index does.
+            recorded_logs: std::collections::BTreeMap::new(),
+            outcome: None,
+        }
+    }
 
-        let mut call_counts: HashMap<String, u32> = HashMap::new();
-        let mut remaining_signals = self.queued_signals.clone();
-        let mut retry_sequences = self.retry_sequences.clone();
-        // Issue #790: the durable log lines this run would have persisted,
-        // accumulated across every decision cycle and de-duplicated by `seq`
-        // exactly the way the store's unique index does.
-        let mut recorded_logs: std::collections::BTreeMap<u64, RecordedLogLine> =
-            std::collections::BTreeMap::new();
-
-        let start_time = self.simulated_now;
-
-        // Thread the configured workflow/queue names into the context (via
-        // the executor's span-meta plumbing, the same path the worker uses)
-        // so engine metrics emitted from inside the workflow carry real
-        // labels a test can assert on.
-        let span_meta = if self.workflow_name.is_empty()
+    /// The span metadata each cycle runs with.
+    ///
+    /// Threads the configured workflow and queue names into the context
+    /// through the executor's span-meta plumbing, the same path the worker
+    /// uses. Engine metrics from inside the workflow then carry real labels.
+    fn span_meta(&self) -> Option<WorkflowExecuteSpanMeta> {
+        if self.workflow_name.is_empty()
             && self.workflow_id.is_empty()
             && self.queue_name.is_empty()
             && self.execution_timeout.is_none()
@@ -5907,165 +6319,81 @@ impl WorkflowTestEnv {
             // but silently ignoring the caller's setting.
             && self.build_id.is_none()
         {
-            None
-        } else {
-            Some(WorkflowExecuteSpanMeta {
-                workflow_name: self.workflow_name.clone(),
-                // Issue #698: thread the configured business `workflow_id` so
-                // `ctx.info().workflow_id` reports it inside the live test run
-                // (was hardcoded empty).
-                workflow_id: self.workflow_id.clone(),
-                shard_id: 0,
-                queue_name: self.queue_name.clone(),
-                is_replay: false,
-                link_traceparent: None,
-                // Issue #798: thread the configured build id so `ctx.build_id()`
-                // reports it inside the live test run (was hardcoded `None`).
-                build_id: self.build_id.clone(),
-                // Issue #772: thread the deadline budget so a live test run can
-                // exercise deadline-aware continue-as-new.
-                execution_timeout: self.execution_timeout,
-                // The test-env carries only the timeout; `ctx.deadline()` falls
-                // back to `start + execution_timeout` (no resume/redrive shift
-                // to model here).
-                deadline_at: None,
-                // Issue #698: thread the configured parent so `ctx.info()` /
-                // `ctx.parent_execution_id()` report it inside the test run.
-                parent_execution_id: self.parent_execution_id,
-            })
-        };
-
-        for _iter in 0..MAX_TEST_ITERATIONS {
-            // Task-prep ingest (issue #775, Codex P2): mirror production's
-            // `worker::ingest_due_timers_and_signals`, which appends every
-            // pending signal into history *before* the workflow handler runs
-            // for this task pickup — NOT gated on the workflow emitting a
-            // `WaitForSignal`. Draining all currently-queued signals here (in
-            // queued order) makes a workflow that *starts* by non-blockingly
-            // draining/polling a pending signal (`drain_signals_raw` /
-            // `try_receive_signal`, with no prior blocking `wait_for_signal`)
-            // observe it, matching production. All signals are queued up front
-            // via `queue_signal`, so this drains on the first iteration and is a
-            // no-op on every resume cycle thereafter.
-            for (name, payload) in std::mem::take(&mut remaining_signals) {
-                history.push(WorkflowEvent::SignalReceived {
-                    signal_name: name,
-                    payload,
-                });
-            }
-
-            let (outcome, pending_cmds, _span, _resolved_router) =
-                run_workflow_with_state_advancing_clock(
-                    exec_id,
-                    history.clone(),
-                    handler,
-                    input.clone(),
-                    self.state.clone(),
-                    span_meta.as_ref(),
-                    self.metrics.clone(),
-                    // Issue #790: the durable-log policy this env was configured
-                    // with (`None` = the sink disabled, the default).
-                    self.workflow_log_policy,
-                )
-                .await;
-
-            // Issue #790: harvest this cycle's durable-log commands before the
-            // outcome is consumed. A suspension carries them on
-            // `outcome.commands`; a terminal cycle carries them on
-            // `pending_cmds` (the executor returns an empty `pending_cmds` for
-            // a suspension), so collecting from both covers every cycle shape.
-            if let WorkflowOutcome::Suspended { commands } = &outcome {
-                accumulate_recorded_logs(commands, &mut recorded_logs);
-            }
-            accumulate_recorded_logs(&pending_cmds, &mut recorded_logs);
-
-            match outcome {
-                WorkflowOutcome::Suspended { commands } => {
-                    let made_progress = match self.process_suspension(
-                        commands,
-                        &mut history,
-                        &mut call_counts,
-                        &mut retry_sequences,
-                    ) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            return TestRunOutcome {
-                                result: Err(e),
-                                events: history,
-                                exec_id,
-                                state: self.state.clone(),
-                                start_time,
-                                execution_timeout: self.execution_timeout,
-                                // Issue #698: carry the spawning-parent id for replay_check.
-                                parent_execution_id: self.parent_execution_id,
-                                // Issue #698 (Codex P2): carry the configured
-                                // workflow type / business id for replay_check.
-                                workflow_name: self.workflow_name.clone(),
-                                workflow_id: self.workflow_id.clone(),
-                                // Issue #798: carry the env's task queue so `replay_check`
-                                // self-checks against the same queue the live run saw.
-                                queue_name: self.queue_name.clone(),
-                                // Issue #798: likewise carry the env's build id, so a build-gated
-                                // workflow's self-check replays under the same build the live run saw.
-                                build_id: self.build_id.clone(),
-                                recorded_logs: recorded_logs.into_values().collect(),
-                            };
-                        }
-                    };
-                    if !made_progress {
-                        return TestRunOutcome {
-                            result: Err("WorkflowTestEnv: workflow suspended with no resolvable \
-                                 commands (check that all signals are queued and activities \
-                                 are mocked)"
-                                .to_string()),
-                            events: history,
-                            exec_id,
-                            state: self.state.clone(),
-                            start_time,
-                            execution_timeout: self.execution_timeout,
-                            // Issue #698: carry the spawning-parent id for replay_check.
-                            parent_execution_id: self.parent_execution_id,
-                            // Issue #698 (Codex P2): carry the configured workflow
-                            // type / business id for replay_check.
-                            workflow_name: self.workflow_name.clone(),
-                            workflow_id: self.workflow_id.clone(),
-                            // Issue #798: carry the env's task queue so `replay_check`
-                            // self-checks against the same queue the live run saw.
-                            queue_name: self.queue_name.clone(),
-                            // Issue #798: likewise carry the env's build id, so a build-gated
-                            // workflow's self-check replays under the same build the live run saw.
-                            build_id: self.build_id.clone(),
-                            recorded_logs: recorded_logs.into_values().collect(),
-                        };
-                    }
-                }
-                terminal => {
-                    return self.finish_terminal_outcome(
-                        terminal,
-                        &pending_cmds,
-                        history,
-                        exec_id,
-                        start_time,
-                        recorded_logs.into_values().collect(),
-                    );
-                }
-            }
+            return None;
         }
+        Some(WorkflowExecuteSpanMeta {
+            workflow_name: self.workflow_name.clone(),
+            // Issue #698: thread the configured business `workflow_id` so
+            // `ctx.info().workflow_id` reports it inside the live test run
+            // (was hardcoded empty).
+            workflow_id: self.workflow_id.clone(),
+            shard_id: 0,
+            queue_name: self.queue_name.clone(),
+            is_replay: false,
+            link_traceparent: None,
+            // Issue #798: thread the configured build id so `ctx.build_id()`
+            // reports it inside the live test run (was hardcoded `None`).
+            build_id: self.build_id.clone(),
+            // Issue #772: thread the deadline budget so a live test run can
+            // exercise deadline-aware continue-as-new.
+            execution_timeout: self.execution_timeout,
+            // The test-env carries only the timeout; `ctx.deadline()` falls
+            // back to `start + execution_timeout` (no resume/redrive shift
+            // to model here).
+            deadline_at: None,
+            // Issue #698: thread the configured parent so `ctx.info()` /
+            // `ctx.parent_execution_id()` report it inside the test run.
+            parent_execution_id: self.parent_execution_id,
+        })
+    }
 
+    /// Build the replay context for one cycle and register the declarative
+    /// handlers on it, as the worker does before the workflow body runs.
+    fn cycle_context(
+        &self,
+        exec_id: ExecutionId,
+        history: Vec<WorkflowEvent>,
+        span_meta: Option<&WorkflowExecuteSpanMeta>,
+        metrics: Arc<dyn crate::telemetry::MetricsRecorder>,
+        workflow_log_policy: Option<crate::context::WorkflowLogPolicy>,
+    ) -> crate::context::WorkflowContext {
+        let ctx = crate::executor::advancing_clock_context(
+            exec_id,
+            history,
+            self.state.clone(),
+            span_meta,
+            metrics,
+            workflow_log_policy,
+        );
+        for info in &self.declarative_queries {
+            ctx.register_declarative_query_handler(info);
+        }
+        for info in &self.declarative_updates {
+            ctx.register_declarative_update_handler(info);
+        }
+        ctx
+    }
+
+    /// Wrap a result and its history into a [`TestRunOutcome`].
+    fn outcome(
+        &self,
+        result: Result<Value, String>,
+        events: Vec<WorkflowEvent>,
+        exec_id: ExecutionId,
+        start_time: DateTime<Utc>,
+        recorded_logs: Vec<RecordedLogLine>,
+    ) -> TestRunOutcome {
         TestRunOutcome {
-            result: Err(format!(
-                "WorkflowTestEnv: workflow exceeded {MAX_TEST_ITERATIONS} iterations \
-                 (possible infinite loop or unresolvable suspension)"
-            )),
-            events: history,
+            result,
+            events,
             exec_id,
             state: self.state.clone(),
             start_time,
             execution_timeout: self.execution_timeout,
             // Issue #698: carry the spawning-parent id for replay_check.
             parent_execution_id: self.parent_execution_id,
-            // Issue #698 (Codex P2): carry the configured workflow type /
-            // business id for replay_check.
+            // Issue #698: carry the configured workflow type and business id
+            // for replay_check.
             workflow_name: self.workflow_name.clone(),
             workflow_id: self.workflow_id.clone(),
             // Issue #798: carry the env's task queue so `replay_check`
@@ -6074,7 +6402,7 @@ impl WorkflowTestEnv {
             // Issue #798: likewise carry the env's build id, so a build-gated
             // workflow's self-check replays under the same build the live run saw.
             build_id: self.build_id.clone(),
-            recorded_logs: recorded_logs.into_values().collect(),
+            recorded_logs,
         }
     }
 
@@ -6128,34 +6456,13 @@ impl WorkflowTestEnv {
             // and records no terminal event, as the worker does.
             WorkflowOutcome::TaskFailed { error } => Err(error),
             WorkflowOutcome::Suspended { .. } => {
-                unreachable!("suspended outcomes are handled in run")
+                unreachable!("run_until_blocked handles suspended outcomes")
             }
         };
         if should_record_cascades {
             Self::record_terminal_parent_close_cascades(&mut history);
         }
-
-        TestRunOutcome {
-            result,
-            events: history,
-            exec_id,
-            state: self.state.clone(),
-            start_time,
-            execution_timeout: self.execution_timeout,
-            // Issue #698: carry the spawning-parent id for replay_check.
-            parent_execution_id: self.parent_execution_id,
-            // Issue #698 (Codex P2): carry the configured workflow type /
-            // business id for replay_check.
-            workflow_name: self.workflow_name.clone(),
-            workflow_id: self.workflow_id.clone(),
-            // Issue #798: carry the env's task queue so `replay_check`
-            // self-checks against the same queue the live run saw.
-            queue_name: self.queue_name.clone(),
-            // Issue #798: likewise carry the env's build id, so a build-gated
-            // workflow's self-check replays under the same build the live run saw.
-            build_id: self.build_id.clone(),
-            recorded_logs,
-        }
+        self.outcome(result, history, exec_id, start_time, recorded_logs)
     }
 
     fn record_terminal_pending_commands(
