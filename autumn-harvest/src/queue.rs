@@ -886,8 +886,9 @@ pub const NEW_START_HANDICAP_SECS: u32 = 30;
 /// wins. Priority ageing (`priority_aging_secs`) reads `scheduled_at`, not
 /// this term. An ageing interval below the handicap can lift an aged new
 /// start above a fresh continuation.
-/// The claim already sorts on a `CASE` key, so this adds no sort that
-/// an index could have saved. See `docs/performance.md`, issue #1177.
+/// The full scan already sorts on a `CASE` key, so this adds no sort that
+/// an index could have saved. See `docs/performance.md`, issue #1177. The
+/// seek window walks `scheduled_at` inside each head instead (issue #1971).
 macro_rules! claim_order_due_sql {
     () => {
         "(scheduled_at + CASE WHEN new_start AND attempt = 0 \
@@ -1069,12 +1070,16 @@ macro_rules! claim_row_local_gates_sql {
 ///
 /// Each gate here is implied by a gate of `claim_row_local_gates_sql!`, so
 /// a row it skips is ineligible. The three activity-name gates sit in one
-/// `CASE`. Their arrays come from a CTE and a subquery, so the planner
-/// cannot read them at plan time. In their plain form it may then estimate
+/// `CASE`. Their arrays come from a CTE, a bind and a subquery, so the
+/// planner cannot read them at plan time. In their plain form it may then estimate
 /// that almost no row passes, for example when one activity type fills the
 /// queue. It then reads the whole head with a bitmap scan instead of
 /// stopping after the window. The planner gives a `CASE` a fixed default
 /// estimate, so the head stays a bounded index scan.
+///
+/// A head scan reads past each row that these gates skip. A long run of
+/// skipped rows at a queue head costs one heap read per row on each claim.
+/// Live pins to other workers are one example.
 macro_rules! claim_head_gates_sql {
     () => {
         "AND ( \
@@ -1226,36 +1231,6 @@ macro_rules! claim_candidate_scan_sql {
     };
 }
 
-/// The window candidate scan of the claim query (issue #1971).
-///
-/// It joins the window rows to their table rows and applies every gate. It
-/// sorts on the window copy of the claim key, which reads the same row in the
-/// same snapshot. So Postgres sorts the small window first, then fetches
-/// table rows in claim order and stops at the first row that passes.
-macro_rules! claim_seek_candidate_sql {
-    () => {
-        concat!(
-            "seek_candidate AS ( \
-             SELECT id, task_type, concurrency_key, concurrency_cap, rate_limit_key, activity_name, \
-                    workflow_exec_id \
-             FROM seek_heads w \
-             JOIN harvest_task_queue ON harvest_task_queue.id = w.seek_id \
-             CROSS JOIN worker_info \
-             CROSS JOIN paused_queues \
-             CROSS JOIN paused_activities \
-             WHERE queue_name = ANY($2) \
-               AND state = 'PENDING' \
-               AND scheduled_at <= NOW() \
-               AND NOT (harvest_task_queue.queue_name = ANY(paused_queues.names)) ",
-            claim_seek_guard_sql!(),
-            claim_candidate_gates_sql!("seek_running_counts"),
-            "ORDER BY w.seek_rank DESC, w.seek_priority DESC, w.seek_due ASC \
-             LIMIT 1 FOR UPDATE SKIP LOCKED \
-        )"
-        )
-    };
-}
-
 /// The running count per concurrency key, for the keys in `$keys`.
 macro_rules! claim_running_counts_sql {
     ($name:literal, $keys:literal) => {
@@ -1308,6 +1283,38 @@ macro_rules! claim_leading_ctes_sql {
     };
 }
 
+/// The result columns of the claim query, one per [`TaskQueueItem`] field
+/// (issue #1971).
+///
+/// The default claim reuses one prepared statement per connection. If the
+/// result followed the table, a migration that adds a column would change
+/// the result type. Postgres then fails the cached statement with "cached
+/// plan must not change result type". A fixed list keeps the result type.
+/// `claim_result_columns_match_the_task_queue_item_fields` pins the list.
+macro_rules! claim_result_columns_sql {
+    () => {
+        "claimed.id, claimed.queue_name, claimed.task_type, \
+             claimed.workflow_exec_id, claimed.activity_name, claimed.activity_id, \
+             claimed.input, claimed.state, claimed.priority, claimed.worker_id, \
+             claimed.attempt, claimed.max_attempts, claimed.scheduled_at, \
+             claimed.started_at, claimed.completed_at, claimed.last_heartbeat_at, \
+             claimed.heartbeat_details, claimed.heartbeat_timeout, \
+             claimed.start_to_close, claimed.schedule_to_start, \
+             claimed.retry_policy, claimed.output, claimed.error, \
+             claimed.sticky_worker_id, claimed.sticky_until, \
+             claimed.sticky_timeout, claimed.trace_context, \
+             claimed.concurrency_key, claimed.concurrency_cap, \
+             claimed.required_build_id, claimed.rate_limit_key, \
+             claimed.crash_strikes, claimed.schedule_to_close_at, \
+             claimed.required_capabilities, claimed.context_headers, \
+             claimed.created_at, claimed.wake_requested, claimed.session_id, \
+             claimed.capability_misses, claimed.capability_miss_workers, \
+             claimed.capability_miss_handler, claimed.timer_fires_at, \
+             claimed.handler_started_attempt, claimed.timed_out_claims, \
+             claimed.handler_started_at, claimed.new_start"
+    };
+}
+
 /// The CTEs after `candidate`: the deadline re-check, the debit and the
 /// claim itself.
 macro_rules! claim_trailing_ctes_sql {
@@ -1356,19 +1363,23 @@ macro_rules! claim_trailing_ctes_sql {
               AND NOT (SELECT expired FROM run_expired_now) \
             RETURNING harvest_task_queue.* \
         ) \
-        SELECT * FROM claimed"
+        SELECT ",
+            claim_result_columns_sql!(),
+            " FROM claimed"
         )
     };
 }
 
 /// The bounded window of the default claim (issue #1971).
 ///
-/// `seek_heads` reads [`CLAIM_SEEK_WINDOW`] rows from each head, in index
-/// order. Each polled queue has two heads: continuations and new starts. A
-/// third head holds the live pins to this worker. `idx_harvest_tq_claim_seek`
-/// serves the queue heads and `idx_harvest_tq_sticky_poll` the pin head.
-/// Each head scan applies the row-local gates of `claim_head_gates_sql!`,
-/// so a row that no claim can take does not use a window slot.
+/// `seek_heads` reads up to [`CLAIM_SEEK_WINDOW`] rows from each head. Each
+/// polled queue has four heads: one per task type, for continuations and
+/// for new starts. Each queue head is one ordered range of
+/// `idx_harvest_tq_claim_seek`, so a claim for one kind never reads the
+/// other kind. The pin head reads every live pin of this worker through
+/// `idx_harvest_tq_sticky_poll` and keeps the best rows. Each head scan
+/// applies the row-local gates of `claim_head_gates_sql!`, so a row that
+/// this claim cannot take does not use a window slot.
 ///
 /// Inside one queue head the due time follows `scheduled_at`. So each head
 /// is in claim order, `priority DESC, due ASC`. A row outside a head sorts at
@@ -1377,6 +1388,12 @@ macro_rules! claim_trailing_ctes_sql {
 ///
 /// Priority ageing reorders rows at claim time, so the window cannot serve it.
 /// With `$4 > 0` the window is empty and the full scan runs.
+///
+/// The guard compares `priority` and the due time. Both are `NOT NULL`
+/// (`priority`, `scheduled_at`, `new_start` and `attempt`), so a comparison
+/// is never NULL. The head order and the window key copy the sort terms of
+/// `claim_order_by_sql!` without ageing. A new sort term there needs a head
+/// for it here, or the guard stops being exact.
 ///
 /// Each window row carries its claim key and concurrency columns. The column
 /// names start with `seek_`, so they never shadow a table column in a gate.
@@ -1389,23 +1406,26 @@ macro_rules! claim_seek_ctes_sql {
              SELECT h.seek_id, h.seek_rank, h.seek_priority, h.seek_due, h.seek_pinned, \
                     h.seek_concurrency_key, h.seek_concurrency_cap, h.seek_task_type, \
                     row_number() OVER ( \
-                        PARTITION BY h.head_queue, h.head_new_start \
+                        PARTITION BY h.head_queue, h.head_kind, h.head_new_start \
                         ORDER BY h.seek_priority DESC, h.seek_due ASC \
                     ) AS seek_rn \
              FROM ( \
-                 SELECT s.*, FALSE AS seek_pinned, \
-                        q.name AS head_queue, k.new_start_head AS head_new_start \
+                 SELECT s.*, FALSE AS seek_pinned, q.name AS head_queue, \
+                        k.head_kind, k.new_start_head AS head_new_start \
                  FROM (SELECT DISTINCT name FROM unnest($2::text[]) AS u(name)) AS q \
                  CROSS JOIN paused_queues \
                  CROSS JOIN paused_activities \
-                 CROSS JOIN (VALUES (FALSE), (TRUE)) AS k(new_start_head) \
+                 CROSS JOIN (VALUES ('workflow', FALSE), ('workflow', TRUE), \
+                                    ('activity', FALSE), ('activity', TRUE)) \
+                     AS k(head_kind, new_start_head) \
                  CROSS JOIN LATERAL ( \
                      SELECT ",
             claim_seek_row_sql!(),
             " \
                      FROM harvest_task_queue \
                      WHERE queue_name = q.name \
-                       AND harvest_task_queue.state = 'PENDING' \
+                       AND task_type = k.head_kind \
+                       AND state = 'PENDING' \
                        AND (new_start AND attempt = 0) = k.new_start_head \
                        AND scheduled_at <= NOW() ",
             claim_head_gates_sql!(),
@@ -1416,7 +1436,7 @@ macro_rules! claim_seek_ctes_sql {
                  ) s \
                  WHERE NOT (q.name = ANY(paused_queues.names)) \
                  UNION ALL \
-                 SELECT p.*, TRUE, NULL, NULL \
+                 SELECT p.*, TRUE, NULL, NULL, NULL \
                  FROM paused_queues \
                  CROSS JOIN paused_activities \
                  CROSS JOIN LATERAL ( \
@@ -1478,22 +1498,32 @@ macro_rules! claim_seek_row_sql {
     };
 }
 
-/// The guard on a window row (issue #1971).
+/// The window predicate of the window candidate scan (issue #1971).
 ///
-/// A window row may be the candidate only when no row outside the window can
-/// sort before it. A row pinned to this worker outranks every other row, but
-/// a full pin head bounds it. Any other row must sort at or before the last
-/// row of each full head.
+/// The array holds the window rows that pass the guard. A window row may be
+/// the candidate only when no row outside the window can sort before it. A
+/// row pinned to this worker outranks every other row, but a full pin head
+/// bounds it. Any other row must sort at or before the last row of each full
+/// head.
+///
+/// The candidate scan reads the table rows by primary key through the
+/// array. That plan does not depend on the table statistics. A join to the
+/// window CTE did depend on them. After an `ANALYZE` that saw almost no
+/// `PENDING` row, the planner put the table on the outer side of the join.
 macro_rules! claim_seek_guard_sql {
     () => {
-        "AND NOT EXISTS (SELECT 1 FROM seek_bounds b WHERE \
-                   (b.bound_pinned OR w.seek_rank = 0) \
-                   AND ( \
-                       (b.bound_pinned AND w.seek_rank = 0) \
-                       OR w.seek_priority < b.bound_priority \
-                       OR (w.seek_priority = b.bound_priority AND w.seek_due > b.bound_due) \
+        "AND harvest_task_queue.id = ANY(ARRAY( \
+                   SELECT w.seek_id FROM seek_heads w \
+                   WHERE NOT EXISTS (SELECT 1 FROM seek_bounds b WHERE \
+                       (b.bound_pinned OR w.seek_rank = 0) \
+                       AND ( \
+                           (b.bound_pinned AND w.seek_rank = 0) \
+                           OR w.seek_priority < b.bound_priority \
+                           OR (w.seek_priority = b.bound_priority \
+                               AND w.seek_due > b.bound_due) \
+                       ) \
                    ) \
-               ) "
+               )) "
     };
 }
 
@@ -1574,14 +1604,15 @@ macro_rules! claim_full_scan_fallback_sql {
 ///
 /// # Seek window (issue #1971)
 ///
-/// The query has two candidate scans. `seek_candidate` reads a bounded
-/// window from the head of each queue. `legacy_candidate` is the full scan.
-/// The full scan runs only when the window cannot prove its pick. See
+/// The query has two candidate scans. `seek_candidate` reads the rows of a
+/// bounded window from the head of each queue. `legacy_candidate` is the full
+/// scan. The full scan runs only when the window cannot prove its pick. See
 /// `claim_seek_ctes_sql!`, `claim_seek_guard_sql!` and
-/// `claim_full_scan_fallback_sql!`. Both scans apply the same gates, from
-/// `claim_candidate_gates_sql!`. So the claim picks the same row as one full
-/// scan would. Its cost no longer grows with the backlog when the window
-/// decides. `docs/performance.md` has the measurements.
+/// `claim_full_scan_fallback_sql!`. Both scans come from
+/// `claim_candidate_scan_sql!`, so they apply the same gates and the same
+/// sort. So the claim picks the same row as one full scan would. Its cost no
+/// longer grows with the backlog when the window decides.
+/// `docs/performance.md` has the measurements.
 ///
 /// Binds: `$1` worker id, `$2` queue names, `$3` worker build id,
 /// `$4` priority-aging seconds, `$5` circuit-breaker-tracked activities,
@@ -1609,7 +1640,8 @@ macro_rules! claim_full_scan_fallback_sql {
 /// is a realistic operator action, not an edge case. See
 /// `docs/performance.md`'s Known limitations section for the measured
 /// comparison against `paused_queues`. That page explains why no
-/// query-shape fix is proposed here.
+/// query-shape fix is proposed here. Since issue #1971 the seek window
+/// sorts only window rows, so the spill does not occur when it decides.
 ///
 /// **Both activity-name gates (`$6` and `paused_activities`) are guarded by
 /// `task_type != 'activity' OR activity_name IS NULL` and this is load-bearing,
@@ -1642,7 +1674,11 @@ pub const fn claim_task_query() -> &'static str {
     concat!(
         claim_leading_ctes_sql!(),
         claim_seek_ctes_sql!(),
-        claim_seek_candidate_sql!(),
+        claim_candidate_scan_sql!(
+            "seek_candidate",
+            "seek_running_counts",
+            [claim_seek_guard_sql!()]
+        ),
         ", ",
         claim_candidate_scan_sql!(
             "legacy_candidate",
@@ -1674,22 +1710,74 @@ const fn claim_task_full_scan_query() -> &'static str {
 /// estimated cost of the full scan to the plan, even when its one-time
 /// filter skips it. At a deep backlog that estimate passes
 /// `jit_above_cost`. JIT then compiles about 330 functions on every claim,
-/// about 250 ms on the reference box, for a statement that runs in about
-/// 2 ms. Postgres does not cache JIT code between executions.
+/// for a statement that runs in about 2 ms. With 8 claimers that cut
+/// throughput at 10K pending rows from 127 to 1.6 claims per second.
 ///
-/// **Generic plan.** The claim statement is prepared once per connection.
-/// A custom plan costs about 6 ms of planning on each claim, which is more
-/// than the claim itself. Postgres may keep a custom plan because it
-/// compares estimated costs, not planning time. The generic plan has the
-/// same shape: bounded head scans and a gated full scan. An `ANALYZE` of
-/// the table invalidates it, so it follows the table statistics.
+/// **Generic plan.** [`CachedClaimQuery`] keeps one prepared statement per
+/// connection. A custom plan costs about 6 ms of planning on each claim,
+/// more than the claim itself. Postgres may keep a custom plan anyway,
+/// because it compares estimated costs, not planning time. The generic plan
+/// has the same shape: bounded head scans, a lookup by primary key and a
+/// gated full scan. An `ANALYZE` of the table invalidates it.
 ///
 /// `SET LOCAL` ends with the transaction, so the session settings of the
 /// connection do not change. The settings travel with the claim, as the
 /// isolation level does, so they do not depend on the pool configuration.
-/// Both go in one batch, so they cost one round trip.
+/// They also cover the post-claim rechecks. Those are short statements on
+/// one row, so a generic plan without JIT suits them too. Both settings go
+/// in one batch, so they cost one round trip.
 pub const CLAIM_PLAN_SETTINGS_SQL: &str =
     "SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan";
+
+/// One default claim statement with its binds (issue #1971).
+///
+/// `diesel::sql_query` marks every statement as unsafe to cache, so each
+/// claim would parse and plan the statement again. This type pushes the same
+/// SQL and binds, and lets diesel cache the statement by its text. The SQL
+/// text is one of a few constant strings, so the cache stays small.
+///
+/// The claim returns a fixed column list. A migration that adds a column
+/// therefore does not change the result type of the cached statement.
+struct CachedClaimQuery<'a> {
+    sql: &'static str,
+    worker_id: &'a str,
+    queues: &'a [String],
+    worker_build_id: &'a str,
+    aging_secs: Option<i64>,
+    circuit_breaker_activities: &'a [String],
+    ineligible_activities: &'a [String],
+    fence: Option<(i32, i64)>,
+}
+
+impl diesel::query_builder::QueryId for CachedClaimQuery<'_> {
+    type QueryId = ();
+    const HAS_STATIC_QUERY_ID: bool = false;
+}
+
+impl diesel::query_builder::Query for CachedClaimQuery<'_> {
+    type SqlType = diesel::sql_types::Untyped;
+}
+
+impl diesel::query_builder::QueryFragment<diesel::pg::Pg> for CachedClaimQuery<'_> {
+    fn walk_ast<'b>(
+        &'b self,
+        mut out: diesel::query_builder::AstPass<'_, 'b, diesel::pg::Pg>,
+    ) -> diesel::QueryResult<()> {
+        use diesel::sql_types::{Array, BigInt, Integer, Nullable, Text};
+        out.push_sql(self.sql);
+        out.push_bind_param_value_only::<Text, _>(self.worker_id)?;
+        out.push_bind_param_value_only::<Array<Text>, _>(self.queues)?;
+        out.push_bind_param_value_only::<Text, _>(self.worker_build_id)?;
+        out.push_bind_param_value_only::<Nullable<BigInt>, _>(&self.aging_secs)?;
+        out.push_bind_param_value_only::<Array<Text>, _>(self.circuit_breaker_activities)?;
+        out.push_bind_param_value_only::<Array<Text>, _>(self.ineligible_activities)?;
+        if let Some((shard, generation)) = &self.fence {
+            out.push_bind_param_value_only::<Integer, _>(shard)?;
+            out.push_bind_param_value_only::<BigInt, _>(generation)?;
+        }
+        Ok(())
+    }
+}
 
 /// Resolve the cross-region DR fence binding for a claim (issue #954).
 ///
@@ -2043,56 +2131,30 @@ pub async fn claim_task_of_kind_on_shard(
                 diesel_async::SimpleAsyncConnection::batch_execute(conn, CLAIM_PLAN_SETTINGS_SQL)
                     .await
                     .map_err(crate::error::database_error)?;
-                // Cross-region DR fence (issue #954). Two fully separate
-                // arms rather than one boxed builder: `BoxedSqlQuery::bind`
-                // heap-allocates per bind and dispatches dynamically, and the
-                // unfenced arm — which is every deployment that has not opted
-                // into DR — must not pay for a feature it does not use on the
-                // engine's hottest statement.
-                let result: Vec<TaskQueueItem> = match fence_binding(shard) {
-                    None => {
-                        let query = kind.map_or_else(claim_task_query, |kind| {
-                            claim_task_query_for_kind(kind, false)
-                        });
-                        diesel::sql_query(query)
-                            .bind::<diesel::sql_types::Text, _>(worker_id)
-                            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
-                            .bind::<diesel::sql_types::Text, _>(worker_build_id)
-                            .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(
-                                aging_secs_i64,
-                            )
-                            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
-                                circuit_breaker_activities,
-                            )
-                            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
-                                ineligible_activities,
-                            )
-                            .load(conn)
-                            .await
-                    }
-                    Some((fence_shard, generation)) => {
-                        let query = kind.map_or_else(claim_task_query_fenced, |kind| {
-                            claim_task_query_for_kind(kind, true)
-                        });
-                        diesel::sql_query(query)
-                            .bind::<diesel::sql_types::Text, _>(worker_id)
-                            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
-                            .bind::<diesel::sql_types::Text, _>(worker_build_id)
-                            .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(
-                                aging_secs_i64,
-                            )
-                            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
-                                circuit_breaker_activities,
-                            )
-                            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
-                                ineligible_activities,
-                            )
-                            .bind::<diesel::sql_types::Integer, _>(fence_shard)
-                            .bind::<diesel::sql_types::BigInt, _>(generation)
-                            .load(conn)
-                            .await
-                    }
+                // Cross-region DR fence (issue #954). The unfenced form binds
+                // no fence values, so a deployment that has not opted into DR
+                // sends the same statement as before. `CachedClaimQuery` binds
+                // without a boxed builder, so neither form pays a heap
+                // allocation per bind.
+                let fence = fence_binding(shard);
+                let sql = match (fence, kind) {
+                    (None, None) => claim_task_query(),
+                    (None, Some(kind)) => claim_task_query_for_kind(kind, false),
+                    (Some(_), None) => claim_task_query_fenced(),
+                    (Some(_), Some(kind)) => claim_task_query_for_kind(kind, true),
+                };
+                let result: Vec<TaskQueueItem> = CachedClaimQuery {
+                    sql,
+                    worker_id,
+                    queues,
+                    worker_build_id,
+                    aging_secs: aging_secs_i64,
+                    circuit_breaker_activities,
+                    ineligible_activities,
+                    fence,
                 }
+                .load(conn)
+                .await
                 .map_err(crate::error::database_error)?;
 
                 let Some(task) = result.into_iter().next() else {
@@ -2213,33 +2275,43 @@ pub fn claim_task_by_id_query_fenced() -> &'static str {
     &BY_ID_FENCED
 }
 
-/// The head-scan predicate that the kind splice extends (issue #1971).
+/// The pin-head predicate that the kind splice extends (issue #1971).
 ///
-/// It appears once in each head scan of the seek window: the queue heads and
-/// the pin head. The candidate scans spell the state test without the table
-/// name, so they never match it.
+/// It appears once, in the pin head of the seek window. The other scans
+/// spell the state test without the table name, so they never match it.
 const SEEK_HEAD_ANCHOR: &str = "AND harvest_task_queue.state = 'PENDING' ";
+
+/// The queue-head predicate that the kind splice extends (issue #1971).
+///
+/// It appears once, after the queue heads. A kind filter there drops the
+/// heads of the other kind before their index scans run.
+const SEEK_QUEUE_HEADS_ANCHOR: &str = "WHERE NOT (q.name = ANY(paused_queues.names)) ";
 
 /// Splice a literal task-kind predicate into every scan of `base`.
 ///
-/// The predicate goes into both candidate scans and both head scans. A head
-/// scan that skips the other kind keeps the window full of rows this claim
-/// can take. The assertions make an edit that breaks an anchor panic at
-/// first use.
+/// The predicate goes into both candidate scans and the pin head. The queue
+/// heads get a filter on their kind instead, so the heads of the other kind
+/// never run. The window then holds only rows of this kind. The assertions
+/// make an edit that breaks an anchor panic at first use.
 fn splice_kind_predicate(base: &str, kind: TaskType) -> String {
-    assert_eq!(
-        base.matches(BY_ID_ANCHOR).count(),
-        2,
-        "claim query kind anchor must appear once per candidate scan"
-    );
-    assert_eq!(
-        base.matches(SEEK_HEAD_ANCHOR).count(),
-        2,
-        "claim query head anchor must appear once per head scan"
-    );
-    let predicate = format!("AND harvest_task_queue.task_type = '{}' ", kind.as_str());
-    base.replace(BY_ID_ANCHOR, &format!("{BY_ID_ANCHOR}{predicate}"))
-        .replace(SEEK_HEAD_ANCHOR, &format!("{SEEK_HEAD_ANCHOR}{predicate}"))
+    let anchors = [
+        (BY_ID_ANCHOR, 2, "harvest_task_queue.task_type"),
+        (SEEK_HEAD_ANCHOR, 1, "harvest_task_queue.task_type"),
+        (SEEK_QUEUE_HEADS_ANCHOR, 1, "k.head_kind"),
+    ];
+    let mut spliced = base.to_owned();
+    for (anchor, count, column) in anchors {
+        assert_eq!(
+            spliced.matches(anchor).count(),
+            count,
+            "claim query kind anchor {anchor:?} must appear {count} time(s)"
+        );
+        spliced = spliced.replace(
+            anchor,
+            &format!("{anchor}AND {column} = '{}' ", kind.as_str()),
+        );
+    }
+    spliced
 }
 
 /// [`claim_task_query`] limited to one task kind (issue #1787).
@@ -9954,10 +10026,10 @@ mod tests {
     #[test]
     fn every_claim_query_sorts_on_the_claim_order_due_time() {
         let order_key = format!("END DESC, {CLAIM_ORDER_DUE_SQL} ASC");
-        // The full scan sorts on the claim key. A seek form also sorts its
-        // window on the window copy of the key, built from the same due time
-        // (issue #1971). Only its queue heads walk `scheduled_at`, because
-        // inside one head the due time follows it.
+        // Each candidate scan sorts on the claim key. A seek form has two
+        // scans, and its window copies the same due time (issue #1971). Only
+        // its queue heads walk `scheduled_at`, because inside one head the due
+        // time follows it.
         let variants = [
             (claim_task_query(), true),
             (claim_task_query_fenced(), true),
@@ -9971,7 +10043,7 @@ mod tests {
         for (sql, seek) in variants {
             assert_eq!(
                 sql.matches(&order_key).count(),
-                1,
+                if seek { 2 } else { 1 },
                 "the due time must sort right after the priority key; got:\n{sql}"
             );
             let window_key = format!("{CLAIM_ORDER_DUE_SQL} AS seek_due");
@@ -10105,7 +10177,7 @@ mod tests {
         let claimed = base.find("claimed AS (").expect("claimed CTE");
         assert!(
             candidate < gate && gate < claimed,
-            "the gate sits in candidate"
+            "the gate sits in a candidate scan"
         );
     }
 
@@ -10171,9 +10243,8 @@ mod tests {
         );
         let seek = cte(sql, "seek_candidate", "legacy_candidate");
         for clause in [
-            "FROM seek_heads w JOIN harvest_task_queue ON harvest_task_queue.id = w.seek_id",
+            "AND harvest_task_queue.id = ANY(ARRAY( SELECT w.seek_id FROM seek_heads w",
             "NOT EXISTS (SELECT 1 FROM seek_bounds b",
-            "ORDER BY w.seek_rank DESC, w.seek_priority DESC, w.seek_due ASC",
             "FROM seek_running_counts rc",
             "FOR UPDATE SKIP LOCKED",
         ] {
@@ -10246,6 +10317,40 @@ mod tests {
         assert!(CLAIM_PLAN_SETTINGS_SQL.contains("plan_cache_mode = force_generic_plan"));
     }
 
+    /// The claim result lists every `TaskQueueItem` field (issue #1971).
+    ///
+    /// The list is fixed so that a cached claim statement keeps its result
+    /// type. A field added to the model must be added to the list too.
+    #[test]
+    fn claim_result_columns_match_the_task_queue_item_fields() {
+        use diesel::SelectableHelper;
+        let select = diesel::debug_query::<diesel::pg::Pg, _>(
+            &crate::schema::harvest_task_queue::table.select(TaskQueueItem::as_select()),
+        )
+        .to_string();
+        let model: Vec<String> = select
+            .trim_start_matches("SELECT ")
+            .split(" FROM ")
+            .next()
+            .expect("select list")
+            .split(", ")
+            .map(|c| c.replace("\"harvest_task_queue\".", "").replace('"', ""))
+            .collect();
+        let listed: Vec<String> = claim_result_columns_sql!()
+            .split(", ")
+            .map(|c| c.trim().trim_start_matches("claimed.").to_owned())
+            .collect();
+        assert_eq!(listed, model);
+        assert!(
+            claim_task_query().ends_with(concat!(
+                "SELECT ",
+                claim_result_columns_sql!(),
+                " FROM claimed"
+            )),
+            "the claim must return the fixed column list"
+        );
+    }
+
     /// A kind-filtered claim applies its kind to every head scan too.
     #[test]
     fn kind_claim_query_filters_every_head_scan() {
@@ -10253,16 +10358,17 @@ mod tests {
             for fenced in [false, true] {
                 let sql = claim_task_query_for_kind(kind, fenced);
                 let heads = cte(sql, "seek_heads", "seek_bounds");
-                assert_eq!(
-                    heads
-                        .matches(&format!(
-                            "{SEEK_HEAD_ANCHOR}AND harvest_task_queue.task_type = '{}' ",
-                            kind.as_str()
-                        ))
-                        .count(),
-                    2,
-                    "the queue heads and the pin head filter on kind; got:\n{heads}"
-                );
+                let kind = kind.as_str();
+                for filter in [
+                    format!("{SEEK_HEAD_ANCHOR}AND harvest_task_queue.task_type = '{kind}' "),
+                    format!("{SEEK_QUEUE_HEADS_ANCHOR}AND k.head_kind = '{kind}' "),
+                ] {
+                    assert_eq!(
+                        heads.matches(&filter).count(),
+                        1,
+                        "missing {filter:?}; got:\n{heads}"
+                    );
+                }
             }
         }
     }
@@ -13587,6 +13693,7 @@ mod tests {
             (TaskType::Activity, "'activity'"),
         ] {
             let predicate = format!("AND harvest_task_queue.task_type = {literal} ");
+            let head_filter = format!("AND k.head_kind = {literal} ");
             for (fenced, base) in [
                 (false, claim_task_query()),
                 (true, claim_task_query_fenced()),
@@ -13594,10 +13701,15 @@ mod tests {
                 let query = claim_task_query_for_kind(kind, fenced);
                 assert_eq!(
                     query.matches(&predicate).count(),
-                    4,
-                    "two candidate scans and two head scans; {kind} {fenced}"
+                    3,
+                    "two candidate scans and the pin head; {kind} {fenced}"
                 );
-                assert_eq!(query.replace(&predicate, ""), base, "{kind} {fenced}");
+                assert_eq!(query.matches(&head_filter).count(), 1, "{kind} {fenced}");
+                assert_eq!(
+                    query.replace(&predicate, "").replace(&head_filter, ""),
+                    base,
+                    "{kind} {fenced}"
+                );
             }
         }
     }
@@ -13616,8 +13728,15 @@ mod tests {
     fn the_kind_predicate_lands_inside_every_scan() {
         let query = claim_task_query_for_kind(TaskType::Activity, false);
         let predicate = "AND harvest_task_queue.task_type = 'activity'";
+        assert_eq!(
+            cte(query, "seek_heads", "seek_bounds")
+                .matches("AND k.head_kind = 'activity'")
+                .count(),
+            1,
+            "the queue heads of the other kind must not run"
+        );
         for (name, next, count) in [
-            ("seek_heads", "seek_bounds", 2),
+            ("seek_heads", "seek_bounds", 1),
             ("seek_candidate", "legacy_candidate", 1),
             ("legacy_candidate", "candidate", 1),
         ] {

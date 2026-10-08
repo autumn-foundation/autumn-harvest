@@ -1,11 +1,13 @@
 -- Issue #1971. The claim reads a bounded window from the head of each queue.
 -- It no longer scans and sorts every due row on each claim.
 --
--- The window reads one ordered range of this index per queue and kind of
--- head. A new start is a row with `new_start AND attempt = 0`. Inside one
--- head, the claim due time follows `scheduled_at`: a continuation is due at
--- `scheduled_at`, and a new start 30 s later. So each range is already in
--- claim order, `priority DESC, due ASC`. See `queue::claim_task_query`.
+-- The window reads one ordered range of this index per head: one queue, one
+-- task type, and new starts or continuations. A new start is a row with
+-- `new_start AND attempt = 0`. Inside one head, the claim due time follows
+-- `scheduled_at`: a continuation is due at `scheduled_at`, and a new start
+-- 30 s later. So each range is already in claim order, `priority DESC, due
+-- ASC`. The task type lets a claim for one kind skip the other kind. See
+-- `queue::claim_task_query`.
 --
 -- The due time itself cannot be an index key. `timestamptz + interval` is
 -- not immutable, and Harvest supports Postgres 12 and later.
@@ -21,7 +23,7 @@
 --
 --     CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_harvest_tq_claim_seek
 --         ON harvest_task_queue
---         (queue_name, (new_start AND attempt = 0), priority DESC, scheduled_at)
+--         (queue_name, task_type, (new_start AND attempt = 0), priority DESC, scheduled_at)
 --         WHERE state = 'PENDING';
 --
 -- Then run this migration. The guard below accepts an index that already
@@ -55,10 +57,10 @@ BEGIN
         -- lock-safety: allow blocking-index #1971 operators prebuild it CONCURRENTLY, see the header
         CREATE INDEX idx_harvest_tq_claim_seek
             ON harvest_task_queue
-            (queue_name, (new_start AND attempt = 0), priority DESC, scheduled_at)
+            (queue_name, task_type, (new_start AND attempt = 0), priority DESC, scheduled_at)
             WHERE state = 'PENDING';
-    ELSIF regexp_replace(existing_def, '^CREATE INDEX \S+ ON (ONLY )?\S+ ', '') <>
-          'USING btree (queue_name, ((new_start AND (attempt = 0))), priority DESC, scheduled_at) WHERE (state = ''PENDING''::text)'
+    ELSIF regexp_replace(existing_def, '^CREATE INDEX [^ ]+ ON (ONLY )?[^ ]+ ', '') <>
+          'USING btree (queue_name, task_type, ((new_start AND (attempt = 0))), priority DESC, scheduled_at) WHERE (state = ''PENDING''::text)'
     THEN
         RAISE EXCEPTION
             'idx_harvest_tq_claim_seek already exists with an unexpected definition -- resolve the name collision (rename or drop the existing index) before retrying this migration: %',

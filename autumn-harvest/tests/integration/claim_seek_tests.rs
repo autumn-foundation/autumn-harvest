@@ -17,8 +17,10 @@
 
 use autumn_harvest::queue::{self, TaskType};
 use diesel_async::{AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use futures::FutureExt;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use std::panic::AssertUnwindSafe;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -101,12 +103,21 @@ async fn delete_queues(conn: &mut AsyncPgConnection, queues: &[String]) {
 ///
 /// - 45% workflow new starts, 35% activity continuations, 10% woken workflow
 ///   tasks pinned to other workers, 10% activities with a concurrency key.
+/// - At most 200 of the pins are live. The others have expired, so any
+///   worker may claim them. A live pin lasts one sticky timeout, a few
+///   seconds by default. So the live pins follow the claim rate, not the
+///   backlog depth.
 /// - Priorities are skewed: 80% `0`, 15% `1`, 5% `2`.
 /// - Due times spread over the last hour.
 /// - `depth / 10` more rows are due in the future, as timers and backoffs are.
 /// - `depth / 50` rows are `RUNNING` on the concurrency keys.
-/// - `depth / 10` dead tuples, from rows inserted and then deleted, and
-///   `depth / 50` rows claimed after insert. Autovacuum may not have run yet.
+/// - `depth / 10` rows inserted and then deleted, and `depth / 50` rows
+///   claimed after insert, as a busy table has.
+///
+/// The seed then runs `VACUUM`, so every run starts from the same index
+/// state. Without it, the dead index entries of the claimed rows sit at the
+/// queue head until a scan can mark them dead. An open snapshot elsewhere
+/// blocks that, and the measurement would depend on it.
 async fn seed_deep_backlog(conn: &mut AsyncPgConnection, queues: &[String], depth: i64) {
     let q = text_array(queues);
     let n = queues.len();
@@ -126,7 +137,8 @@ async fn seed_deep_backlog(conn: &mut AsyncPgConnection, queues: &[String], dept
                     NOW() - make_interval(secs => 1 + (i % 3600)), \
                     i % 20 < 9, \
                     CASE WHEN i % 20 IN (16, 17) THEN 'other-' || (i % 7) END, \
-                    CASE WHEN i % 20 IN (16, 17) THEN NOW() + INTERVAL '1 hour' END, \
+                    CASE WHEN i % 20 IN (16, 17) AND i <= 2000 THEN NOW() + INTERVAL '1 hour' \
+                         WHEN i % 20 IN (16, 17) THEN NOW() - INTERVAL '1 minute' END, \
                     CASE WHEN i % 20 IN (18, 19) THEN 'deep-ck-' || (i % 64) END, \
                     CASE WHEN i % 20 IN (18, 19) THEN 1000000 END \
              FROM generate_series(1, {depth}) AS i; \
@@ -163,6 +175,7 @@ async fn seed_deep_backlog(conn: &mut AsyncPgConnection, queues: &[String], dept
         ),
     )
     .await;
+    exec(conn, "VACUUM harvest_task_queue").await;
 }
 
 /// The buffers and temp blocks of one real claim statement.
@@ -174,15 +187,34 @@ struct ClaimCost {
     temp_written: i64,
     /// Whether the statement claimed a row.
     claimed: bool,
+    /// Whether the full scan read any table row.
+    fallback_ran: bool,
+}
+
+/// Whether the plan subtree under `name` scanned `harvest_task_queue`.
+fn cte_scanned_the_table(plan: &serde_json::Value, name: &str, inside: bool) -> bool {
+    let inside = inside || plan["Subplan Name"].as_str() == Some(&format!("CTE {name}"));
+    let scanned = inside
+        && plan["Relation Name"].as_str() == Some("harvest_task_queue")
+        && plan["Actual Loops"].as_i64().unwrap_or(0) > 0;
+    scanned
+        || plan["Plans"]
+            .as_array()
+            .is_some_and(|plans| plans.iter().any(|p| cte_scanned_the_table(p, name, inside)))
 }
 
 /// Run `EXPLAIN (ANALYZE, BUFFERS)` of the claim statement that
 /// [`queue::claim_task`] sends, and roll the claim back.
 ///
 /// The statement is prepared with typed parameters, under the planner
-/// settings that the claim transaction sets. So the plan is the plan that a
-/// real claim gets, not a plan for substituted literals.
+/// settings of the claim transaction. So the plan is the generic plan that a
+/// real claim reuses, not a plan for substituted literals.
 async fn claim_cost(conn: &mut AsyncPgConnection, queues: &[String]) -> ClaimCost {
+    claim_cost_of(conn, queues, queue::claim_task_query()).await
+}
+
+/// [`claim_cost`] for one form of the claim query.
+async fn claim_cost_of(conn: &mut AsyncPgConnection, queues: &[String], sql: &str) -> ClaimCost {
     #[derive(diesel::QueryableByName)]
     struct Plan {
         #[diesel(sql_type = diesel::sql_types::Json, column_name = "QUERY PLAN")]
@@ -194,7 +226,7 @@ async fn claim_cost(conn: &mut AsyncPgConnection, queues: &[String]) -> ClaimCos
             "BEGIN; {}; \
              PREPARE seek_probe(text, text[], text, bigint, text[], text[]) AS {}",
             queue::CLAIM_PLAN_SETTINGS_SQL,
-            queue::claim_task_query()
+            sql
         ),
     )
     .await;
@@ -213,6 +245,7 @@ async fn claim_cost(conn: &mut AsyncPgConnection, queues: &[String]) -> ClaimCos
         buffers: num("Shared Hit Blocks") + num("Shared Read Blocks"),
         temp_written: num("Temp Written Blocks"),
         claimed: num("Actual Rows") == 1,
+        fallback_ran: cte_scanned_the_table(root, "legacy_candidate", false),
     }
 }
 
@@ -270,6 +303,10 @@ async fn claim_buffers_stay_flat_from_1k_to_100k_pending_rows() {
         eprintln!("depth={depth} claim costs, first run cold: {runs:?}");
         for cost in &runs {
             assert!(cost.claimed, "depth {depth}: the claim takes a row");
+            assert!(
+                !cost.fallback_ran,
+                "depth {depth}: the window decides: {cost:?}"
+            );
             assert_eq!(
                 cost.temp_written, 0,
                 "the claim spills to disk at depth {depth}: {cost:?}"
@@ -309,15 +346,20 @@ async fn a_large_activity_pause_array_does_not_spill_the_claim_at_100k() {
         ),
     )
     .await;
-    let cost = claim_cost(&mut conn, &qs).await;
+    // The pauses are global. A panic must not leave them for later tests.
+    let cost = AssertUnwindSafe(claim_cost(&mut conn, &qs))
+        .catch_unwind()
+        .await;
     exec(
         &mut conn,
         &format!("DELETE FROM harvest_activity_pauses WHERE activity_name LIKE '{ballast}-%'"),
     )
     .await;
     delete_queues(&mut conn, &qs).await;
+    let cost = cost.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     eprintln!("199 paused activities, depth=100000 claim cost: {cost:?}");
     assert!(cost.claimed, "the ballast pauses exclude no row");
+    assert!(!cost.fallback_ran, "the window decides: {cost:?}");
     assert_eq!(cost.temp_written, 0, "the claim sort spills: {cost:?}");
 }
 
@@ -559,6 +601,113 @@ async fn a_single_activity_type_backlog_keeps_the_window_bounded() {
     );
 }
 
+/// Stale statistics do not make the claim read the backlog (issue #1971).
+///
+/// A drained system keeps its terminal rows for a while. An `ANALYZE` then
+/// sees almost no `PENDING` row. A burst below the autoanalyze threshold
+/// leaves those statistics in place. The claim plan must stay bounded
+/// anyway: a join to the window once put the table on the outer side.
+#[tokio::test]
+async fn stale_statistics_keep_the_window_bounded() {
+    let (mut conn, _container) = setup_db().await;
+    let qs = queues(4);
+    let q = text_array(&qs);
+    exec(
+        &mut conn,
+        &format!(
+            "INSERT INTO harvest_task_queue \
+               (queue_name, task_type, activity_name, input, state, max_attempts, \
+                scheduled_at, completed_at) \
+             SELECT ({q})[1 + (i % 4)], 'activity', 'noop', '{{}}'::jsonb, 'COMPLETED', 3, \
+                    NOW() - INTERVAL '1 day', NOW() \
+             FROM generate_series(1, 400000) AS i; \
+             INSERT INTO harvest_task_queue \
+               (queue_name, task_type, activity_name, input, state, max_attempts, scheduled_at) \
+             SELECT ({q})[1 + (i % 4)], 'activity', 'noop', '{{}}'::jsonb, 'PENDING', 3, \
+                    NOW() - INTERVAL '1 hour' \
+             FROM generate_series(1, 20) AS i"
+        ),
+    )
+    .await;
+    exec(&mut conn, "VACUUM ANALYZE harvest_task_queue").await;
+    exec(
+        &mut conn,
+        &format!(
+            "INSERT INTO harvest_task_queue \
+               (queue_name, task_type, activity_name, input, state, max_attempts, \
+                scheduled_at, new_start) \
+             SELECT ({q})[1 + (i % 4)], \
+                    CASE WHEN i % 2 = 0 THEN 'workflow' ELSE 'activity' END, \
+                    CASE WHEN i % 2 = 0 THEN NULL ELSE 'noop' END, \
+                    '{{}}'::jsonb, 'PENDING', 3, \
+                    NOW() - make_interval(secs => i % 3600), i % 2 = 0 \
+             FROM generate_series(1, 30000) AS i"
+        ),
+    )
+    .await;
+    exec(&mut conn, "VACUUM harvest_task_queue").await;
+    let stale = claim_cost(&mut conn, &qs).await;
+    exec(&mut conn, "ANALYZE harvest_task_queue").await;
+    let fresh = claim_cost(&mut conn, &qs).await;
+    delete_queues(&mut conn, &qs).await;
+    eprintln!("stale statistics: {stale:?}, fresh: {fresh:?}");
+    assert!(stale.claimed && !stale.fallback_ran, "{stale:?}");
+    assert!(
+        stale.buffers <= 3 * fresh.buffers.max(1),
+        "stale statistics change the claim plan: {stale:?} against {fresh:?}"
+    );
+}
+
+/// A kind-filtered claim stays flat behind a deep run of the other kind
+/// (issues #1787, #1971).
+///
+/// A saturated worker claims for one kind only. The index keys the heads by
+/// task type, so the claim never walks the rows of the other kind.
+#[tokio::test]
+async fn a_kind_filtered_claim_stays_flat_behind_the_other_kind() {
+    let (mut conn, _container) = setup_db().await;
+    let mut costs = Vec::new();
+    for depth in [1_000_i64, 100_000] {
+        let qs = queues(4);
+        exec(
+            &mut conn,
+            &format!(
+                "INSERT INTO harvest_task_queue \
+                   (queue_name, task_type, activity_name, input, state, max_attempts, \
+                    scheduled_at) \
+                 SELECT ({q})[1 + (i % 4)], 'activity', 'noop', '{{}}'::jsonb, 'PENDING', 3, \
+                        NOW() - INTERVAL '1 hour' - make_interval(secs => i % 3600) \
+                 FROM generate_series(1, {depth}) AS i; \
+                 INSERT INTO harvest_task_queue \
+                   (queue_name, task_type, input, state, max_attempts, scheduled_at) \
+                 SELECT ({q})[1 + (i % 4)], 'workflow', '{{}}'::jsonb, 'PENDING', 3, \
+                        NOW() - INTERVAL '1 second' \
+                 FROM generate_series(1, 100) AS i; \
+                 ANALYZE harvest_task_queue;",
+                q = text_array(&qs)
+            ),
+        )
+        .await;
+        let sql = queue::claim_task_query_for_kind(TaskType::Workflow, false);
+        let mut runs = Vec::new();
+        for _ in 0..3 {
+            runs.push(claim_cost_of(&mut conn, &qs, sql).await);
+        }
+        delete_queues(&mut conn, &qs).await;
+        eprintln!("workflow claim behind {depth} activities: {runs:?}");
+        for cost in &runs {
+            assert!(cost.claimed && !cost.fallback_ran, "{cost:?}");
+        }
+        let mut buffers: Vec<i64> = runs.iter().map(|c| c.buffers).collect();
+        buffers.sort_unstable();
+        costs.push(buffers[1]);
+    }
+    assert!(
+        costs[1] <= 3 * costs[0].max(1),
+        "a kind-filtered claim grows with the other kind: {costs:?}"
+    );
+}
+
 /// A kind-filtered claim finds its kind behind a deep run of the other kind
 /// (issue #1787).
 #[tokio::test]
@@ -645,6 +794,97 @@ async fn the_claim_leaves_the_session_planner_settings_unchanged() {
     assert_eq!(after.plan_cache_mode, "auto", "SET LOCAL must not leak");
 }
 
+/// The default claim reuses one prepared statement per connection (issue
+/// #1971).
+///
+/// The claim statement costs more to plan than to run. A statement that is
+/// prepared again on every claim pays that cost every time.
+#[tokio::test]
+async fn the_claim_statement_is_prepared_once_per_connection() {
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    async fn cached(conn: &mut AsyncPgConnection) -> i64 {
+        let row: Count = diesel::sql_query(
+            "SELECT count(*)::bigint AS n FROM pg_prepared_statements \
+             WHERE statement LIKE '%seek_heads AS MATERIALIZED%'",
+        )
+        .get_result(conn)
+        .await
+        .expect("prepared statements");
+        row.n
+    }
+    let (mut conn, _container) = setup_db().await;
+    let qs = queues(1);
+    let mut counts = Vec::new();
+    for _ in 0..4 {
+        for _ in 0..3 {
+            claim(&mut conn, &qs, None).await;
+        }
+        counts.push(cached(&mut conn).await);
+    }
+    eprintln!("cached claim statements after 3, 6, 9 and 12 claims: {counts:?}");
+    assert!(
+        counts[0] >= 1,
+        "the claim statement must be cached: {counts:?}"
+    );
+    assert!(
+        counts.iter().all(|n| *n == counts[0]),
+        "claims must reuse the cached statement: {counts:?}"
+    );
+}
+
+/// A column added while a claim statement is cached does not break the
+/// claim (issue #1971).
+///
+/// A rolling migration may add a column to `harvest_task_queue` while
+/// workers run. A cached statement whose result columns follow the table
+/// would then fail with "cached plan must not change result type".
+#[tokio::test]
+async fn an_added_column_does_not_break_a_cached_claim() {
+    let (mut conn, _container) = setup_db().await;
+    let qs = queues(1);
+    let q = &qs[0];
+    let column = format!("seek_probe_{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        ids.push(
+            insert_row(
+                &mut conn,
+                "queue_name, task_type, activity_name, scheduled_at",
+                &format!("'{q}', 'activity', 'noop', NOW() - INTERVAL '1 second'"),
+            )
+            .await,
+        );
+    }
+    let first = claim(&mut conn, &qs, None).await;
+    exec(
+        &mut conn,
+        &format!("ALTER TABLE harvest_task_queue ADD COLUMN {column} INTEGER"),
+    )
+    .await;
+    let second = queue::claim_task(&mut conn, &qs, WORKER, "", None, &[], &[]).await;
+    exec(
+        &mut conn,
+        &format!("ALTER TABLE harvest_task_queue DROP COLUMN {column}"),
+    )
+    .await;
+    delete_queues(&mut conn, &qs).await;
+    let second = second
+        .expect("the claim after the migration must not fail")
+        .map(|t| t.id);
+    let mut claimed = vec![first, second];
+    claimed.sort();
+    ids.sort();
+    assert_eq!(
+        claimed,
+        ids.into_iter().map(Some).collect::<Vec<_>>(),
+        "the two claims take the two rows"
+    );
+}
+
 /// The claim key of the best eligible row, by the reference order.
 ///
 /// The reference is a plain scan and sort over every due row. It applies the
@@ -687,7 +927,9 @@ async fn reference_best(
         .map(|k| (k.sticky_rank, k.priority, k.due))
 }
 
-/// The claim key of one row, read before it is claimed.
+/// The claim key of a claimed row, as it was before the claim.
+///
+/// The claim adds one to `attempt`, so the due term tests `attempt = 1`.
 async fn key_of(conn: &mut AsyncPgConnection, id: Uuid) -> (i32, i32, f64) {
     #[derive(diesel::QueryableByName)]
     struct Key {
@@ -732,77 +974,83 @@ async fn randomized_drains_follow_the_reference_order() {
         ),
     )
     .await;
-    for seed in 0..6_u64 {
-        let mut rng = StdRng::seed_from_u64(1971 + seed);
-        let qs = queues(2);
-        let mut values = Vec::new();
-        for _ in 0..rng.gen_range(150..400) {
-            let q = &qs[rng.gen_range(0..qs.len())];
-            let priority = [0, 0, 0, 1, 2][rng.gen_range(0..5)];
-            let age = rng.gen_range(0..120);
-            let kind = rng.gen_range(0..10);
-            let (task_type, activity, new_start) = match kind {
-                0..=3 => ("workflow", "NULL".to_string(), "TRUE"),
-                4 => ("activity", format!("'{paused}'"), "FALSE"),
-                _ => ("activity", "'noop'".to_string(), "FALSE"),
-            };
-            let (pin, until) = match rng.gen_range(0..10) {
-                0 => (format!("'{WORKER}'"), "NOW() + INTERVAL '1 hour'"),
-                1 | 2 => ("'someone-else'".to_string(), "NOW() + INTERVAL '1 hour'"),
-                3 => ("'someone-else'".to_string(), "NOW() - INTERVAL '1 minute'"),
-                _ => ("NULL".to_string(), "NULL"),
-            };
-            // The cap counts per key and task type. The holder is an
-            // activity, so only an activity row is saturated.
-            let (key, cap) = if task_type == "activity" && rng.gen_range(0..4) == 0 {
-                (format!("'{saturated}'"), "1")
-            } else {
-                ("NULL".to_string(), "NULL")
-            };
-            values.push(format!(
-                "('{q}', '{task_type}', {activity}, '{{}}'::jsonb, 'PENDING', {priority}, 3, \
-                 NOW() - make_interval(secs => {age}), {new_start}, {pin}, {until}, {key}, {cap})"
-            ));
-        }
-        exec(
-            &mut conn,
-            &format!(
-                "INSERT INTO harvest_task_queue \
-                   (queue_name, task_type, activity_name, input, state, priority, max_attempts, \
-                    scheduled_at, new_start, sticky_worker_id, sticky_until, concurrency_key, \
-                    concurrency_cap) VALUES {}; \
-                 INSERT INTO harvest_task_queue \
-                   (queue_name, task_type, activity_name, input, state, attempt, max_attempts, \
-                    worker_id, started_at, concurrency_key, concurrency_cap) \
-                 VALUES ('{q0}', 'activity', 'noop', '{{}}'::jsonb, 'RUNNING', 1, 3, 'holder', \
-                         NOW(), '{saturated}', 1)",
-                values.join(", "),
-                q0 = qs[0],
-            ),
-        )
-        .await;
-        for step in 0..60 {
-            let expected = reference_best(&mut conn, &qs, &paused, &saturated).await;
-            let claimed = claim(&mut conn, &qs, None).await;
-            match (expected, claimed) {
-                (None, None) => break,
-                (Some(want), Some(id)) => {
-                    let got = key_of(&mut conn, id).await;
-                    assert!(
-                        got.0 == want.0 && got.1 == want.1 && (got.2 - want.2).abs() < 1e-3,
-                        "seed {seed} step {step}: claimed key {got:?}, reference best {want:?}"
-                    );
-                }
-                (want, got) => {
-                    panic!("seed {seed} step {step}: reference {want:?}, claimed {got:?}")
+    // The pause is global. A panic must not leave it for later tests.
+    let drains = AssertUnwindSafe(async {
+        for seed in 0..6_u64 {
+            let mut rng = StdRng::seed_from_u64(1971 + seed);
+            let qs = queues(2);
+            let mut values = Vec::new();
+            for _ in 0..rng.gen_range(150..400) {
+                let q = &qs[rng.gen_range(0..qs.len())];
+                let priority = [0, 0, 0, 1, 2][rng.gen_range(0..5)];
+                let age = rng.gen_range(0..120);
+                let kind = rng.gen_range(0..10);
+                let (task_type, activity, new_start) = match kind {
+                    0..=3 => ("workflow", "NULL".to_string(), "TRUE"),
+                    4 => ("activity", format!("'{paused}'"), "FALSE"),
+                    _ => ("activity", "'noop'".to_string(), "FALSE"),
+                };
+                let (pin, until) = match rng.gen_range(0..10) {
+                    0 => (format!("'{WORKER}'"), "NOW() + INTERVAL '1 hour'"),
+                    1 | 2 => ("'someone-else'".to_string(), "NOW() + INTERVAL '1 hour'"),
+                    3 => ("'someone-else'".to_string(), "NOW() - INTERVAL '1 minute'"),
+                    _ => ("NULL".to_string(), "NULL"),
+                };
+                // The cap counts per key and task type. The holder is an
+                // activity, so only an activity row is saturated.
+                let (key, cap) = if task_type == "activity" && rng.gen_range(0..4) == 0 {
+                    (format!("'{saturated}'"), "1")
+                } else {
+                    ("NULL".to_string(), "NULL")
+                };
+                values.push(format!(
+                    "('{q}', '{task_type}', {activity}, '{{}}'::jsonb, 'PENDING', {priority}, 3, \
+                     NOW() - make_interval(secs => {age}), {new_start}, {pin}, {until}, {key}, {cap})"
+                ));
+            }
+            exec(
+                &mut conn,
+                &format!(
+                    "INSERT INTO harvest_task_queue \
+                       (queue_name, task_type, activity_name, input, state, priority, max_attempts, \
+                        scheduled_at, new_start, sticky_worker_id, sticky_until, concurrency_key, \
+                        concurrency_cap) VALUES {}; \
+                     INSERT INTO harvest_task_queue \
+                       (queue_name, task_type, activity_name, input, state, attempt, max_attempts, \
+                        worker_id, started_at, concurrency_key, concurrency_cap) \
+                     VALUES ('{q0}', 'activity', 'noop', '{{}}'::jsonb, 'RUNNING', 1, 3, 'holder', \
+                             NOW(), '{saturated}', 1)",
+                    values.join(", "),
+                    q0 = qs[0],
+                ),
+            )
+            .await;
+            for step in 0..60 {
+                let expected = reference_best(&mut conn, &qs, &paused, &saturated).await;
+                let claimed = claim(&mut conn, &qs, None).await;
+                match (expected, claimed) {
+                    (None, None) => break,
+                    (Some(want), Some(id)) => {
+                        let got = key_of(&mut conn, id).await;
+                        assert!(
+                            got.0 == want.0 && got.1 == want.1 && (got.2 - want.2).abs() < 1e-3,
+                            "seed {seed} step {step}: claimed key {got:?}, reference best {want:?}"
+                        );
+                    }
+                    (want, got) => {
+                        panic!("seed {seed} step {step}: reference {want:?}, claimed {got:?}")
+                    }
                 }
             }
+            delete_queues(&mut conn, &qs).await;
         }
-        delete_queues(&mut conn, &qs).await;
-    }
+    })
+    .catch_unwind()
+    .await;
     exec(
         &mut conn,
         &format!("DELETE FROM harvest_activity_pauses WHERE activity_name = '{paused}'"),
     )
     .await;
+    drains.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
