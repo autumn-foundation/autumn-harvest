@@ -9,7 +9,7 @@
 
 ## Context
 
-Before this change, the host app owned all authentication. Harvest had three
+Before this change, the host app owned all user authentication. Harvest had three
 coarse tiers: admin, read-only and anonymous. It had no OIDC login, no
 custom roles and no mTLS. Enterprise buyers expect SSO and RBAC.
 
@@ -38,10 +38,14 @@ login for Vantage and the management API.
   claim-to-role map and the session boundary.
 - autumn-web owns the protocol and the crypto. Harvest adds no JWT code and
   no new crate.
+- Harvest requires a signed ID token. It refuses a `userinfo_url`, because
+  the autumn-web userinfo path checks no signature, audience or nonce.
+- Harvest refuses a Microsoft multi-tenant issuer. autumn-web would accept
+  the unverified issuer of any tenant.
 - `HarvestPlugin::api_with_oidc` and `StandaloneAdminAuth::with_oidc` mount
   it. Each declares the auth boundary.
 - The callback maps ID-token claims to role names. An identity that maps to
-  no role cannot log in.
+  no role cannot log in. A failed callback does not change the session.
 - The session keeps the subject, the roles and the login time. After
   `max_session_age` (default 12 hours) the user must log in again.
 - The audit actor of a session user is `oidc:{subject}`. The boundary strips
@@ -63,7 +67,11 @@ login for Vantage and the management API.
   `harvest_roles`. A client cannot set either one.
 - A Vantage `GET` is a read. Any other Vantage method is a mutation.
 - An unclassified API path is a mutation, so the check fails closed.
-- A deny is `403` and writes one `authz.deny` audit row.
+- A deny is `403` and writes one `authz.deny` audit row. A caller with no
+  role names writes no row.
+- Under the role layer, the admin checks inside handlers pass only for a
+  role with the `admin` scope. A declared auth boundary cannot widen a
+  narrower role.
 - The role layer sits between the read-only layer and the authorizer hook.
   The hook can only narrow what a role allows.
 
@@ -80,13 +88,12 @@ middleware maps the certificate identity to a `RoleGrant`. See
 
 - Roles are fixed at login. A group change at the identity provider takes
   effect at the next login.
-- The claim map reads the ID token. It does not call the userinfo endpoint.
-  An identity provider that puts groups only in userinfo needs a claim
-  mapper on its side.
+- The claim map reads the signed ID token only. An identity provider that
+  puts groups only in userinfo needs a claim mapper on its side.
 - autumn-web fetches the JWKS on each login. That costs one request per
   login. It does not cost a request per API call.
-- Logout clears the Harvest session only. It does not end the session at
-  the identity provider.
+- Logout removes the Harvest keys from the session and rotates its id. It
+  does not end the session at the identity provider.
 - An extra route covers the API only. A Vantage form post needs the `mutate`
   scope.
 - The OIDC login needs an autumn-web session layer. `HarvestPlugin` has one.

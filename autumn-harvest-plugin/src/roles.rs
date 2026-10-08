@@ -23,9 +23,9 @@
 //! - A `PublicSafe` route is always allowed.
 //! - A role allows a route when its scope allows the route, or when the role
 //!   names the route.
-//! - A Vantage path (`/ui/...`) has no route class. A `GET` or `HEAD` there is
-//!   a read. Every other method is a mutation. The #1802 gate uses the same
-//!   rule.
+//! - A Vantage path (`/ui/...`) has no route class. A `GET`, `HEAD` or
+//!   `OPTIONS` there is a read. Every other method is a mutation. The #1802
+//!   gate uses the same rule.
 //! - An unclassified API path is a mutation, so a `read` role cannot reach it.
 //! - An unknown role name grants nothing.
 //!
@@ -299,11 +299,24 @@ impl HarvestRoles {
         })
     }
 
-    /// Whether any of `roles` has a scope that allows a call by `method` to a
-    /// route with no route table, such as a generated MCP tool route.
+    /// Whether any of `roles` has the `admin` scope.
     ///
-    /// A `GET` or `HEAD` needs `read`. Any other method needs `mutate`. Extra
-    /// routes do not apply.
+    /// The in-handler admin checks use it. Payload decode on read and
+    /// `terminate_if_running` are two such checks.
+    #[must_use]
+    pub fn grants_admin<'a>(&self, roles: impl IntoIterator<Item = &'a str>) -> bool {
+        roles.into_iter().any(|name| {
+            self.roles
+                .get(name)
+                .is_some_and(|role| role.scope == Some(TokenScope::Admin))
+        })
+    }
+
+    /// Whether any of `roles` has a scope that allows a call by `method` to a
+    /// route with no route table. A generated MCP tool route is one example.
+    ///
+    /// A `GET`, `HEAD` or `OPTIONS` needs `read`. Any other method needs
+    /// `mutate`. Extra routes do not apply.
     #[must_use]
     pub fn allows_by_method<'a>(
         &self,
@@ -423,6 +436,32 @@ pub fn join_role_list(roles: &[String]) -> String {
     roles.join(",")
 }
 
+/// The audit-actor prefix that only the OIDC boundary may set.
+pub(crate) const OIDC_ACTOR_PREFIX: &str = "oidc:";
+
+/// Remove an inbound `oidc:` actor.
+///
+/// The OIDC boundary sets that actor for a session user. It runs outside
+/// this layer, so an `oidc:` actor here came from the boundary only when the
+/// request has a live OIDC session. Without OIDC, no caller may claim one.
+fn strip_reserved_actor(request: &mut Request) {
+    let from_boundary = request.extensions().get::<OidcActor>().is_some();
+    let reserved = request
+        .headers()
+        .get(autumn_harvest::audit::HEADER_ACTOR)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with(OIDC_ACTOR_PREFIX));
+    if reserved && !from_boundary {
+        request
+            .headers_mut()
+            .remove(autumn_harvest::audit::HEADER_ACTOR);
+    }
+}
+
+/// A marker the OIDC boundary sets when it writes the actor header.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OidcActor;
+
 /// The role names of a request: the [`RoleGrant`], else the session value.
 ///
 /// It takes the extensions apart first. A `&Request` is not `Send`, so the
@@ -441,6 +480,41 @@ async fn request_roles(grant: Option<RoleGrant>, session: Option<Session>) -> Ve
         .unwrap_or_default()
 }
 
+tokio::task_local! {
+    /// Whether the roles that admitted the current request have the `admin`
+    /// scope.
+    static ADMIN_ROLE_ADMITTED: bool;
+}
+
+/// Whether the role layer admitted the current request with an `admin` role.
+///
+/// `None` means no role gate admitted the request. The in-handler admin
+/// checks then fall back to the declared boundary. `Some(false)` overrides a
+/// declared boundary, so the boundary cannot widen a narrow role.
+pub(crate) fn role_admin_access() -> Option<bool> {
+    ADMIN_ROLE_ADMITTED.try_with(|admin| *admin).ok()
+}
+
+/// Run `next` as a request that `names` admitted.
+///
+/// It sets the [`RolePrincipal`] and the admin flag that
+/// [`role_admin_access`] reads.
+pub(crate) async fn run_admitted(
+    roles: &HarvestRoles,
+    names: Vec<String>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    // No role admitted a request with no role names. Only a public route
+    // gets here so, and it carries no principal.
+    if names.is_empty() {
+        return next.run(request).await;
+    }
+    let admin = roles.grants_admin(names.iter().map(String::as_str));
+    request.extensions_mut().insert(RolePrincipal::new(names));
+    ADMIN_ROLE_ADMITTED.scope(admin, next.run(request)).await
+}
+
 /// The `403` body of a role deny.
 pub const ROLE_DENIED_ERROR: &str = "role does not allow this route";
 
@@ -455,12 +529,14 @@ fn role_forbidden() -> Response {
 /// The custom-role layer (issue #1978).
 ///
 /// It runs after the token layer and the read-only layer, and before the
-/// authorizer hook. A deny gives `403` and writes one `authz.deny` row.
+/// authorizer hook. A deny gives `403`. A deny of a caller with role names
+/// writes one `authz.deny` row.
 pub(crate) async fn enforce_custom_roles(
     State((api_state, roles)): State<(HarvestApiState, HarvestRoles)>,
     mut request: Request,
     next: Next,
 ) -> Response {
+    strip_reserved_actor(&mut request);
     // OPTIONS is a preflight verb. It carries no credential and changes nothing.
     if *request.method() == Method::OPTIONS
         || request
@@ -476,17 +552,35 @@ pub(crate) async fn enforce_custom_roles(
     let method = request.method().clone();
     let path = request.uri().path().to_string();
     if roles.allows(names.iter().map(String::as_str), &method, &path) {
-        request.extensions_mut().insert(RolePrincipal::new(names));
-        return next.run(request).await;
+        return run_admitted(&roles, names, request, next).await;
     }
+    // A caller with no role names no principal, so the deny writes no row.
+    // An anonymous flood then cannot fill the audit table.
+    if !names.is_empty() {
+        audit_role_deny(&api_state, request.headers(), &method, &path, &names).await;
+    }
+    role_forbidden()
+}
+
+/// Log one role deny and write one `authz.deny` row to the control shard.
+///
+/// Best effort: with no store, or with a failed write, the deny stands and
+/// only the log records it.
+pub(crate) async fn audit_role_deny(
+    api_state: &HarvestApiState,
+    headers: &axum::http::HeaderMap,
+    method: &Method,
+    path: &str,
+    names: &[String],
+) {
     tracing::warn!(
         method = %method,
         path = %path,
-        roles = %join_role_list(&names),
+        roles = %join_role_list(names),
         "harvest: role denied route (403)"
     );
-    let (actor, source, request_id) = audit_context(request.headers(), &api_state);
-    let summary = format!("roles {:?} do not allow this route", join_role_list(&names));
+    let (actor, source, request_id) = audit_context(headers, api_state);
+    let summary = format!("roles {:?} do not allow this route", join_role_list(names));
     if let Ok(pool) = api_state.storage_pool()
         && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
     {
@@ -494,8 +588,8 @@ pub(crate) async fn enforce_custom_roles(
             &mut conn,
             &crate::authz::DenyAudit {
                 actor: &actor,
-                method: &method,
-                path: &path,
+                method,
+                path,
                 request_id: request_id.as_deref(),
                 source: &source,
                 shard: None,
@@ -504,18 +598,17 @@ pub(crate) async fn enforce_custom_roles(
         )
         .await;
     }
-    role_forbidden()
 }
 
 /// The role gate on a generated MCP tool route (issue #1978).
 ///
 /// A tool route has no route class. A `GET` tool needs a role with a `read`
 /// scope or wider. Any other tool needs `mutate` or wider. Host auth runs
-/// outside this gate and sets the roles.
+/// outside this gate and sets the roles. A deny writes one `authz.deny` row.
 #[cfg(feature = "mcp")]
 pub(crate) async fn enforce_mcp_tool_roles(
-    State(roles): State<HarvestRoles>,
-    mut request: Request,
+    State((api_state, roles)): State<(HarvestApiState, HarvestRoles)>,
+    request: Request,
     next: Next,
 ) -> Response {
     if *request.method() == Method::OPTIONS {
@@ -525,10 +618,14 @@ pub(crate) async fn enforce_mcp_tool_roles(
     let session = request.extensions().get::<Session>().cloned();
     let names = request_roles(grant, session).await;
     if !roles.allows_by_method(names.iter().map(String::as_str), request.method()) {
+        if !names.is_empty() {
+            let method = request.method().clone();
+            let path = request.uri().path().to_string();
+            audit_role_deny(&api_state, request.headers(), &method, &path, &names).await;
+        }
         return role_forbidden();
     }
-    request.extensions_mut().insert(RolePrincipal::new(names));
-    next.run(request).await
+    run_admitted(&roles, names, request, next).await
 }
 
 // ── Claim-to-role map ─────────────────────────────────────────────────────────
@@ -544,8 +641,10 @@ pub struct ClaimRule {
 impl ClaimRule {
     /// Grant `role` when the claim at `claim` holds `value`.
     ///
-    /// `claim` is a dot-separated path, such as `groups` or
-    /// `realm_access.roles`. A string claim matches when it equals `value`.
+    /// `claim` is a top-level claim name, or else a dot-separated path, such
+    /// as `groups` or `realm_access.roles`. A whole top-level name wins, so a
+    /// URL claim name matches as one key. A string claim matches when it
+    /// equals `value`.
     /// An array claim matches when one of its strings equals `value`.
     #[must_use]
     pub fn new(
@@ -563,18 +662,23 @@ impl ClaimRule {
     /// Whether `claims` match this rule.
     #[must_use]
     pub fn matches(&self, claims: &serde_json::Value) -> bool {
-        let mut node = claims;
-        for key in self.claim.split('.') {
-            match node.get(key) {
-                Some(next) => node = next,
-                None => return false,
-            }
-        }
+        // A whole top-level key wins, so a URL claim name such as
+        // `https://acme.example.com/roles` matches as one key.
+        let node = claims.get(&self.claim).or_else(|| {
+            self.claim
+                .split('.')
+                .try_fold(claims, |node, key| node.get(key))
+        });
+        node.is_some_and(|node| Self::holds(node, &self.value))
+    }
+
+    /// Whether `node` is `value`, or an array that holds `value`.
+    fn holds(node: &serde_json::Value, value: &str) -> bool {
         match node {
-            serde_json::Value::String(value) => *value == self.value,
-            serde_json::Value::Array(items) => items
-                .iter()
-                .any(|item| item.as_str() == Some(self.value.as_str())),
+            serde_json::Value::String(found) => found == value,
+            serde_json::Value::Array(items) => {
+                items.iter().any(|item| item.as_str() == Some(value))
+            }
             _ => false,
         }
     }
@@ -620,9 +724,10 @@ impl ClaimRoleMap {
     ///
     /// # Errors
     ///
-    /// Returns [`RoleConfigError::UndefinedRole`] for a rule or a default role
-    /// that `roles` does not define, and [`RoleConfigError::EmptyClaimRule`]
-    /// for a rule with an empty claim path or value.
+    /// Returns [`RoleConfigError::UndefinedRole`] when `roles` does not define
+    /// a rule role or the default role. Returns
+    /// [`RoleConfigError::EmptyClaimRule`] for a rule with an empty claim path
+    /// or value.
     pub fn validate(&self, roles: &HarvestRoles) -> Result<(), RoleConfigError> {
         for rule in &self.rules {
             if rule.claim.split('.').any(str::is_empty) || rule.value.is_empty() {
@@ -860,6 +965,112 @@ mod tests {
     }
 
     #[test]
+    fn a_claim_name_with_dots_matches_as_one_key() {
+        // Auth0 requires a namespaced claim name, such as a URL.
+        let claims = json!({
+            "https://acme.example.com/roles": ["harvest-admins"],
+            "a": { "b": "nested" },
+            "a.b": "flat",
+        });
+        assert!(
+            ClaimRule::new(
+                "https://acme.example.com/roles",
+                "harvest-admins",
+                ROLE_ADMIN
+            )
+            .matches(&claims)
+        );
+        // A whole-key match wins over the dotted walk.
+        assert!(ClaimRule::new("a.b", "flat", ROLE_VIEWER).matches(&claims));
+        assert!(!ClaimRule::new("a.b", "nested", ROLE_VIEWER).matches(&claims));
+        // With no whole key, the dotted walk applies.
+        let nested = json!({ "a": { "b": "nested" } });
+        assert!(ClaimRule::new("a.b", "nested", ROLE_VIEWER).matches(&nested));
+    }
+
+    #[tokio::test]
+    async fn a_public_route_gives_no_role_principal() {
+        let app = axum::Router::new()
+            .route(
+                "/health",
+                axum::routing::get(|request: Request| async move {
+                    request
+                        .extensions()
+                        .get::<RolePrincipal>()
+                        .is_some()
+                        .to_string()
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                (HarvestApiState::new(), roles()),
+                enforce_custom_roles,
+            ));
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/health")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("served");
+        let body = axum::body::to_bytes(response.into_body(), 64)
+            .await
+            .expect("body");
+        assert_eq!(&body[..], b"false");
+    }
+
+    #[tokio::test]
+    async fn the_role_layer_strips_an_oidc_actor_it_did_not_see_set() {
+        let echo = |marker: bool| {
+            axum::Router::new()
+                .route(
+                    "/workflows",
+                    axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                        headers
+                            .get(autumn_harvest::audit::HEADER_ACTOR)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("-")
+                            .to_string()
+                    }),
+                )
+                .layer(axum::middleware::from_fn_with_state(
+                    (HarvestApiState::new(), roles()),
+                    enforce_custom_roles,
+                ))
+                .layer(axum::middleware::from_fn(
+                    move |mut request: Request, next: Next| async move {
+                        request
+                            .extensions_mut()
+                            .insert(RoleGrant::new([ROLE_VIEWER]));
+                        if marker {
+                            request.extensions_mut().insert(OidcActor);
+                        }
+                        next.run(request).await
+                    },
+                ))
+        };
+        let call = |marker: bool, actor: &'static str| {
+            let app = echo(marker);
+            async move {
+                let request = axum::http::Request::builder()
+                    .uri("/workflows")
+                    .header(autumn_harvest::audit::HEADER_ACTOR, actor)
+                    .body(axum::body::Body::empty())
+                    .expect("request");
+                let response = app.oneshot(request).await.expect("served");
+                let bytes = axum::body::to_bytes(response.into_body(), 64)
+                    .await
+                    .expect("body");
+                String::from_utf8_lossy(&bytes).into_owned()
+            }
+        };
+        assert_eq!(call(false, "oidc:admin").await, "-");
+        assert_eq!(call(true, "oidc:user-42").await, "oidc:user-42");
+        assert_eq!(call(false, "alice").await, "alice");
+    }
+
+    #[test]
     fn claim_map_returns_sorted_unique_roles_and_the_default() {
         let map = ClaimRoleMap::new()
             .rule(ClaimRule::new("groups", "eng", ROLE_VIEWER))
@@ -993,6 +1204,60 @@ mod tests {
             .await
             .expect("body");
         assert_eq!(&body[..], ROLE_OPERATOR.as_bytes());
+    }
+
+    /// Issue #1978 review: a declared boundary must not widen a narrow role.
+    /// The in-handler admin checks follow the role, not the boundary.
+    #[tokio::test]
+    async fn in_handler_admin_checks_follow_the_role_not_the_boundary() {
+        let state = HarvestApiState::new();
+        state.set_admin_auth_boundary(true);
+        let probe = state.clone();
+        let app = |role: &'static str| {
+            let probe = probe.clone();
+            axum::Router::new()
+                .route(
+                    "/workflows",
+                    axum::routing::get(move || {
+                        let probe = probe.clone();
+                        async move {
+                            crate::api::has_harvest_admin_access(&probe, None)
+                                .await
+                                .to_string()
+                        }
+                    }),
+                )
+                .layer(axum::middleware::from_fn_with_state(
+                    (state.clone(), roles()),
+                    enforce_custom_roles,
+                ))
+                .layer(axum::middleware::from_fn(
+                    move |mut request: Request, next: Next| async move {
+                        request.extensions_mut().insert(RoleGrant::new([role]));
+                        next.run(request).await
+                    },
+                ))
+        };
+        let body = |role: &'static str| {
+            let app = app(role);
+            async move {
+                let request = axum::http::Request::builder()
+                    .uri("/workflows")
+                    .body(axum::body::Body::empty())
+                    .expect("request");
+                let response = app.oneshot(request).await.expect("served");
+                let bytes = axum::body::to_bytes(response.into_body(), 64)
+                    .await
+                    .expect("body");
+                String::from_utf8_lossy(&bytes).into_owned()
+            }
+        };
+        assert_eq!(body(ROLE_VIEWER).await, "false");
+        assert_eq!(body(ROLE_OPERATOR).await, "false");
+        assert_eq!(body("dlq-operator").await, "false");
+        assert_eq!(body(ROLE_ADMIN).await, "true");
+        // Outside the role layer, the boundary still decides.
+        assert!(crate::api::has_harvest_admin_access(&state, None).await);
     }
 
     fn arb_method() -> impl Strategy<Value = Method> {

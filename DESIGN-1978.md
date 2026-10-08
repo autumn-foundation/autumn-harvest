@@ -19,7 +19,7 @@ mTLS on the management API. The decision record is
   algorithm to the key, and checks `iss`, `aud` and `exp`.
 - `jsonwebtoken` 11 is already in the lockfile, through autumn-web.
 - autumn-web 0.8 has mTLS (`[server.tls.client_auth]`, `required_paths`,
-  `ClientCert`). Harvest does not own the listener.
+  `OptionalClientCert`). Harvest does not own the listener.
 - Harvest has three route classes (`PublicSafe`, `ReadOnly`, `Mutating`) and
   one admin-only list (`ADMIN_SCOPE_ROUTES`). Token scopes `read`, `mutate`
   and `admin` already map onto them (`token_scope_denies`).
@@ -53,8 +53,10 @@ mTLS on the management API. The decision record is
 | R9 | Declaring the boundary opens the MCP tool routes. | `api_with_oidc` applies the same OIDC boundary and role check to each generated MCP tool route. |
 | R10 | A token caller loses access. | A verified `hvst_` token skips the role check. Its scope still applies. The boundary passes an `hvst_` bearer only when tokens are on. |
 | R11 | A stale session keeps old roles forever. | The session stores the login time. After `max_session_age` (default 12 h) the user must log in again. Test. |
-| R12 | Plain HTTP to the identity provider. | `OidcLogin::build` refuses a non-`https` endpoint unless the host is loopback. Test. |
-| R13 | A discovery document names another issuer (mix-up). | `discover` refuses a document whose `issuer` differs from the one asked for. Test. |
+| R12 | Plain HTTP to the identity provider. | `OidcLogin::new` refuses a non-`https` endpoint unless the host is loopback. Test. |
+| R13 | A discovery document names another issuer (mix-up). | `discover_provider` refuses a document whose `issuer` differs from the one asked for. Test. |
+| R15 | A declared boundary lets a narrow role pass the admin checks inside handlers. | A task-local flag follows the admitted roles. Only an `admin`-scope role passes. Test (review finding). |
+| R16 | The unsigned userinfo path or a multi-tenant issuer admits a forged identity. | `OidcLogin::new` refuses a `userinfo_url` and the Microsoft multi-tenant aliases. Tests (review finding). |
 | R14 | A deployment without the feature changes. | No layer is installed unless asked for. Existing suites stay green. |
 
 ### 0.4 Six thinking hats
@@ -79,10 +81,11 @@ mTLS on the management API. The decision record is
   (admin).
 - The decision is `HarvestRoles::allows(roles, method, path)`:
   - `PublicSafe` is always allowed.
-  - A role allows a route when its scope allows it (`token_scope_denies`) or
-    when it names the route.
-  - A Vantage path (`/ui/...`) is a read for `GET`/`HEAD` and a mutation
-    otherwise, as the #1802 gate decides.
+  - A role allows a route when its scope allows it (`admin` all, `mutate`
+    all but the admin routes, `read` the non-mutating routes) or when it
+    names the route.
+  - A Vantage path (`/ui/...`) is a read for `GET`, `HEAD` and `OPTIONS`,
+    and a mutation otherwise, as the #1802 gate decides.
 - The role layer reads roles from a `RoleGrant` extension, else from the
   session key `harvest_roles` (comma-separated). A verified token skips it.
   A deny is `403` and writes one `authz.deny` row.
@@ -93,17 +96,19 @@ mTLS on the management API. The decision record is
 
 - `ClaimRule::new("groups", "harvest-admins", "harvest-admin")`. The claim
   path is dot-separated (`realm_access.roles`). A string claim matches by
-  equality. An array claim matches when it holds the value.
+  equality. An array claim matches when it holds the value. A whole
+  top-level claim name wins over the dotted walk.
 - `ClaimRoleMap::roles_for(&claims)` returns the role names, sorted and
-  without duplicates. Its build refuses a rule that names an undefined role.
+  without duplicates. `ClaimRoleMap::validate`, which `OidcLogin::new`
+  calls, refuses a rule that names an undefined role.
 
 ## 3. OIDC login (`oidc.rs`, feature `oidc`)
 
-- `OidcLogin::new(provider, roles, claim_map)` and `OidcLogin::discover(..)`.
+- `OidcLogin::new(provider, roles, claim_map)` and the free function `discover_provider(..)`.
 - Routes, outside the boundary: `GET /auth/oidc/login`,
   `GET /auth/oidc/callback`, `POST /auth/oidc/logout`.
 - The boundary layer admits a session principal, a `PublicSafe` route and an
-  `hvst_` bearer when tokens are on. Else a Vantage `GET` gets `302` to login
+  `hvst_` bearer when tokens are on. Else a Vantage `GET` gets `303` to login
   and any other request gets `401`.
 - Wiring: `HarvestPlugin::api_with_oidc(path, login)` and
   `StandaloneAdminAuth::with_oidc(login)`. Both declare the auth boundary.
@@ -112,7 +117,7 @@ mTLS on the management API. The decision record is
 
 `docs/security-posture.md` shows `[server.tls.client_auth]` with
 `required_paths = ["/api/harvest"]`, and a host middleware that maps the
-`ClientCert` common name to a `RoleGrant`.
+`OptionalClientCert` common name to a `RoleGrant`.
 
 ## 5. Tests
 

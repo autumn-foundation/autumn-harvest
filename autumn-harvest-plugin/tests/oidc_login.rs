@@ -259,7 +259,7 @@ fn provider(idp: &Idp) -> OAuth2ProviderConfig {
         authorize_url: format!("{}/authorize", idp.issuer),
         token_url: format!("{}/token", idp.issuer),
         userinfo_url: None,
-        redirect_uri: format!("http://harvest.test{MOUNT}{CALLBACK_PATH}"),
+        redirect_uri: format!("https://harvest.test{MOUNT}{CALLBACK_PATH}"),
         scope: "openid profile email".to_string(),
         issuer: Some(idp.issuer.clone()),
         jwks_url: Some(format!("{}/jwks", idp.issuer)),
@@ -385,7 +385,7 @@ impl Browser {
             .expect("provider redirects back")
             .to_string();
         location
-            .strip_prefix("http://harvest.test")
+            .strip_prefix("https://harvest.test")
             .expect("callback on harvest")
             .to_string()
     }
@@ -408,14 +408,27 @@ fn denied_by_role(reply: &Reply) -> bool {
     reply.status == StatusCode::FORBIDDEN && reply.body.contains(ROLE_DENIED_ERROR)
 }
 
+/// The error a handler gives when it runs with no storage pool.
+const NO_STORE: &str = "storage pool is not configured";
+
+/// Whether the request reached its handler.
+///
+/// With no store, a handler can answer `400` or `503`. A gate answers `401`,
+/// `403` or a redirect. A wrong route answers `404` or `405`. A broken
+/// extractor answers `500`. None of those count. A handler that ran and
+/// found no store answers `500` too, and names the store, so it counts.
 fn admitted(reply: &Reply) -> bool {
-    !matches!(
-        reply.status,
-        StatusCode::UNAUTHORIZED
-            | StatusCode::FORBIDDEN
-            | StatusCode::SEE_OTHER
-            | StatusCode::FOUND
-    )
+    reply.body.contains(NO_STORE)
+        || !matches!(
+            reply.status,
+            StatusCode::UNAUTHORIZED
+                | StatusCode::FORBIDDEN
+                | StatusCode::SEE_OTHER
+                | StatusCode::FOUND
+                | StatusCode::NOT_FOUND
+                | StatusCode::METHOD_NOT_ALLOWED
+                | StatusCode::INTERNAL_SERVER_ERROR
+        )
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -581,9 +594,13 @@ async fn a_token_for_another_audience_is_refused() {
 async fn an_old_session_must_log_in_again() {
     let idp = start_idp().await;
     set_claims(&idp, json!({ "groups": ["support"] }));
-    let login = login(&idp).with_max_session_age(Duration::ZERO);
+    let login = login(&idp).with_max_session_age(Duration::from_secs(1));
     let mut browser = Browser::new(harvest_app(login));
     assert_eq!(browser.login().await.status, StatusCode::SEE_OTHER);
+    let api = browser.get(&format!("{MOUNT}/workflows")).await;
+    assert!(admitted(&api), "{} {}", api.status, api.body);
+    // The login time has a one-second resolution. Wait past two ticks.
+    tokio::time::sleep(Duration::from_millis(2100)).await;
     let api = browser.get(&format!("{MOUNT}/workflows")).await;
     assert_eq!(api.status, StatusCode::UNAUTHORIZED);
 }
@@ -615,7 +632,7 @@ async fn discovery_builds_the_provider_and_checks_the_issuer() {
         &idp.issuer,
         CLIENT_ID,
         CLIENT_SECRET,
-        format!("http://harvest.test{MOUNT}{CALLBACK_PATH}"),
+        format!("https://harvest.test{MOUNT}{CALLBACK_PATH}"),
     )
     .await
     .expect("discovery");
@@ -699,4 +716,140 @@ async fn bad_configurations_are_refused() {
             "{bad:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_replayed_callback_is_refused_and_keeps_the_session() {
+    let idp = start_idp().await;
+    set_claims(&idp, json!({ "groups": ["support"] }));
+    let mut browser = Browser::new(harvest_app(login(&idp)));
+    let callback = browser.begin_login().await;
+    assert_eq!(browser.get(&callback).await.status, StatusCode::SEE_OTHER);
+    let replay = browser.get(&callback).await;
+    assert_eq!(replay.status, StatusCode::UNAUTHORIZED, "{}", replay.body);
+    // A stray callback does not log the user out.
+    let api = browser.get(&format!("{MOUNT}/workflows")).await;
+    assert!(admitted(&api), "{} {}", api.status, api.body);
+}
+
+#[tokio::test]
+async fn a_token_with_a_wrong_nonce_is_refused() {
+    let idp = start_idp().await;
+    set_claims(
+        &idp,
+        json!({ "groups": ["harvest-admins"], "nonce": "not-the-session-nonce" }),
+    );
+    let mut browser = Browser::new(harvest_app(login(&idp)));
+    let reply = browser.login().await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{}", reply.body);
+}
+
+#[tokio::test]
+async fn an_expired_id_token_is_refused() {
+    let idp = start_idp().await;
+    let past = chrono::Utc::now().timestamp() - 600;
+    set_claims(
+        &idp,
+        json!({ "groups": ["harvest-admins"], "exp": past, "iat": past - 300 }),
+    );
+    let mut browser = Browser::new(harvest_app(login(&idp)));
+    let reply = browser.login().await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{}", reply.body);
+}
+
+#[tokio::test]
+async fn a_token_from_another_issuer_is_refused() {
+    let idp = start_idp().await;
+    set_claims(
+        &idp,
+        json!({ "groups": ["harvest-admins"], "iss": "https://evil.example.com" }),
+    );
+    let mut browser = Browser::new(harvest_app(login(&idp)));
+    let reply = browser.login().await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{}", reply.body);
+}
+
+#[tokio::test]
+async fn login_rotates_the_session_cookie() {
+    let idp = start_idp().await;
+    set_claims(&idp, json!({ "groups": ["support"] }));
+    let app = harvest_app(login(&idp));
+    let mut browser = Browser::new(app.clone());
+    let callback = browser.begin_login().await;
+    let before = browser.cookies.clone();
+    assert!(!before.is_empty(), "login sets a session cookie");
+    assert_eq!(browser.get(&callback).await.status, StatusCode::SEE_OTHER);
+    assert_ne!(browser.cookies, before, "the session id rotates at login");
+    // The pre-login cookie does not carry the new principal.
+    let mut stale = Browser::new(app);
+    stale.cookies = before;
+    let api = stale.get(&format!("{MOUNT}/workflows")).await;
+    assert_eq!(api.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_cross_site_logout_is_refused() {
+    let idp = start_idp().await;
+    set_claims(&idp, json!({ "groups": ["support"] }));
+    let mut browser = Browser::new(harvest_app(login(&idp)));
+    assert_eq!(browser.login().await.status, StatusCode::SEE_OTHER);
+    let out = browser
+        .send(
+            Method::POST,
+            &format!("{MOUNT}{LOGOUT_PATH}"),
+            &[("sec-fetch-site", "cross-site")],
+        )
+        .await;
+    assert_eq!(out.status, StatusCode::FORBIDDEN, "{}", out.body);
+    let api = browser.get(&format!("{MOUNT}/workflows")).await;
+    assert!(admitted(&api), "{} {}", api.status, api.body);
+}
+
+#[tokio::test]
+async fn an_api_token_bearer_passes_the_boundary_only_with_tokens_on() {
+    let idp = start_idp().await;
+    let api_state = HarvestApiState::new();
+    let router =
+        harvest_api_router(api_state.clone()).nest("/ui", harvest_ui_router(api_state.clone()));
+    let mounted = StandaloneAdminAuth::new()
+        .with_deployment_profile("prod")
+        .with_api_tokens()
+        .with_oidc(login(&idp))
+        .mount(router, &api_state);
+    let app = axum::Router::new()
+        .nest(MOUNT, mounted)
+        .layer(SessionLayer::new(
+            MemoryStore::new(),
+            SessionConfig {
+                secure: false,
+                ..SessionConfig::default()
+            },
+        ));
+    let mut with_tokens = Browser::new(app);
+    // The boundary passes the bearer. The token layer has no store, so it
+    // refuses to trust the token and answers `503`.
+    let reply = with_tokens
+        .send(
+            Method::GET,
+            &format!("{MOUNT}/workflows"),
+            &[("authorization", "Bearer hvst_unverifiable")],
+        )
+        .await;
+    assert_eq!(
+        reply.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        reply.body
+    );
+
+    // Without tokens, the same bearer is not a credential.
+    let mut without = Browser::new(harvest_app(login(&idp)));
+    let reply = without
+        .send(
+            Method::GET,
+            &format!("{MOUNT}/workflows"),
+            &[("authorization", "Bearer hvst_unverifiable")],
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{}", reply.body);
 }

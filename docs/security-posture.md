@@ -7,8 +7,8 @@ production-readiness checklist.
 Harvest does not ship its own identity provider or session store. By default,
 authentication and authorization are **delegated to the host Autumn application**,
 exactly as Oban Web and Sidekiq Web are mounted behind Plug/Rack authentication
-in their respective ecosystems. Two opt-in layers are built in. One is
-[OIDC login with custom roles](#sso-and-custom-roles-issue-1978). The other is
+in their respective ecosystems. Built-in opt-in layers include
+[OIDC login with custom roles](#sso-and-custom-roles-issue-1978) and
 [scoped API tokens](#scoped-api-tokens-built-in-opt-in--issue-942). The
 responsibility of this document is to make the API surface explicit so
 embedders can make informed decisions and verify their posture before
@@ -566,22 +566,30 @@ A client cannot set either one. No header grants a role.
 - A `PublicSafe` route needs no role.
 - A role allows a route when its scope allows the route, or when the role
   names the route.
-- A Vantage (`/ui`) `GET` or `HEAD` is a read. Any other Vantage method is a
-  mutation. An extra route does not cover Vantage.
+- A Vantage (`/ui`) `GET`, `HEAD` or `OPTIONS` is a read. Any other Vantage
+  method is a mutation. An extra route does not cover Vantage.
 - An unclassified API path is a mutation, so a `read` role cannot reach it.
 - An unknown role name grants nothing.
 - A verified `hvst_` token skips the role check. Its scope applies.
 - A deny is `403` with `{"error":"role does not allow this route"}`. It
-  writes one `authz.deny` audit row.
+  writes one `authz.deny` audit row. A caller with no role names no
+  principal, so its deny writes no row.
+- The layer strips an inbound `oidc:` actor. Only the OIDC boundary sets one.
 
 An allowed request carries a `RolePrincipal` extension. The admin gate and
 the #1802 mutation gate admit it, as they admit a token. The
 [authorizer hook](#authorizer-hook-issue-1803) can read it from
 `extensions`. The hook runs after the role layer, so it can only narrow.
 
+**Admin checks inside handlers.** Some handlers check for admin access a
+second time. Examples are payload decode on read, `terminate_if_running`,
+batch start and reset, the SSE event stream and the Vantage logs panel.
+Under the role layer, only a role with the `admin` scope passes those
+checks. A declared auth boundary does not widen a narrower role.
+
 **MCP tool routes.** A generated tool route has no route class. With roles
 on, a `GET` tool needs a `read` scope or wider. Any other tool needs `mutate`
-or wider. Extra routes do not apply.
+or wider. Extra routes do not apply. A deny writes one `authz.deny` row.
 
 ### OIDC login
 
@@ -590,7 +598,7 @@ autumn-web OIDC client and adds no other crate.
 
 ```rust
 use autumn_harvest_plugin::oidc::{OidcLogin, discover_provider};
-use autumn_harvest_plugin::roles::{ClaimRoleMap, ClaimRule, HarvestRoles};
+use autumn_harvest_plugin::roles::{ClaimRoleMap, ClaimRule};
 
 let provider = discover_provider(
     "https://login.example.com",
@@ -617,17 +625,21 @@ autumn-web session layer outside the mounted router.
 |---|---|
 | `GET /auth/oidc/login` | `303` to the identity provider, with PKCE, `state` and `nonce`. |
 | `GET /auth/oidc/callback` | Check the code, the ID token and the claims. Then `303` to Vantage. |
-| `POST /auth/oidc/logout` | Clear the Harvest session. |
+| `POST /auth/oidc/logout` | Remove the Harvest keys from the session and rotate its id. Host keys stay. A cross-site post gets `403`. |
 
 Register the callback URL with the identity provider as the redirect URI.
 
 **The callback.** autumn-web checks `state`, then trades the code with the
 PKCE verifier. It checks the ID-token signature against the JWKS, with the
 algorithm the key allows. It checks `iss`, `aud`, `exp`, `nbf` and `nonce`.
-Any failure is `401`. Then Harvest maps the claims to roles:
+A failed check is `401`. A callback with no `code` or `state` is `400`. A
+failed callback does not change the session, so a stray link cannot log a
+user out. Then Harvest maps the claims to roles:
 
 - `ClaimRule::new(claim, value, role)` matches when the claim equals `value`,
-  or when an array claim holds `value`. The claim path is dot-separated.
+  or when an array claim holds `value`. `claim` is a top-level claim name,
+  or else a dot-separated path. A whole name wins, so a URL claim name such
+  as `https://acme.example.com/roles` works.
 - `ClaimRoleMap::default_role` gives a role to every identity that logs in.
 - An identity with no role gets `403` and no session.
 - `OidcLogin::new` refuses a rule for an undefined role.
@@ -640,22 +652,35 @@ Any failure is `401`. Then Harvest maps the claims to roles:
 - A `PublicSafe` route needs no session.
 - An `hvst_` bearer passes when API tokens are on. The token layer verifies
   it.
+- A request with a host `RoleGrant` passes. The role layer reads the grant.
 - Any other Vantage `GET` gets `303` to the login route.
 - Any other request gets `401`.
 
 **Configuration checks.** `OidcLogin::new` needs `client_id`,
 `authorize_url`, `token_url`, `redirect_uri`, `issuer` and `jwks_url`. Each
-provider URL must use `https`, unless its host is loopback. The scope must
-include `openid`. `discover_provider` refuses a document that names another
-issuer.
+URL, `redirect_uri` included, must use `https`, unless its host is
+loopback. The scope must include `openid`.
+
+- `userinfo_url` must be unset. The autumn-web userinfo path checks no
+  signature, no audience and no nonce, so Harvest requires a signed ID
+  token. `discover_provider` leaves `userinfo_url` unset.
+- A Microsoft multi-tenant issuer (`/common/`, `/organizations/`,
+  `/consumers/`) is refused. autumn-web would accept the issuer of any
+  tenant. Use the issuer of your own tenant.
+- `discover_provider` refuses a document that names another issuer. It
+  follows no redirect and reads at most 1 MiB.
+- `Debug` output of an `OidcLogin` never shows the client secret.
 
 **Limits.**
 
 - Roles are fixed at login. After `max_session_age` (default 12 hours) the
-  user must log in again. Set it with `OidcLogin::with_max_session_age`.
-- The claim map reads the ID token, not the userinfo endpoint.
+  user must log in again. Set it with `OidcLogin::with_max_session_age`. An
+  age under one second becomes one second.
+- The claim map reads the signed ID token only.
 - Logout does not end the session at the identity provider.
-- `api_with_oidc` and `api_with_auth` replace each other. The last call wins.
+- `api_with_oidc` and `api_with_auth` replace each other. The last call
+  wins, and the roles of a replaced login go with it. The roles of a login
+  replace any set by `with_roles`.
 
 ### mTLS on the management API
 

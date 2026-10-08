@@ -1,9 +1,13 @@
 //! OIDC login for Vantage and the management API (issue #1978).
 //!
-//! Harvest does the login routes, the claim-to-role map and the session
-//! boundary. autumn-web does the protocol and the crypto: PKCE, `state`,
-//! `nonce`, the JWKS signature check, and the `iss`, `aud` and `exp` checks.
+//! Harvest owns the login routes, the claim-to-role map and the session
+//! boundary. autumn-web owns the protocol and the crypto. It checks PKCE,
+//! `state`, `nonce`, the JWKS signature, `iss`, `aud`, `exp` and `nbf`.
 //! See ADR 0006.
+//!
+//! Harvest requires a signed ID token. It refuses a provider with a
+//! `userinfo_url`, because the autumn-web userinfo path checks no signature,
+//! no audience and no nonce.
 //!
 //! # Routes
 //!
@@ -14,15 +18,17 @@
 //! |---|---|
 //! | `GET /auth/oidc/login` | Redirect to the identity provider. |
 //! | `GET /auth/oidc/callback` | Finish the login, map claims to roles, then redirect to Vantage. |
-//! | `POST /auth/oidc/logout` | Clear the Harvest session. |
+//! | `POST /auth/oidc/logout` | Remove the Harvest keys from the session. A cross-site post is refused. |
 //!
 //! # The session boundary
 //!
 //! - A session principal reaches the role layer. Its audit actor is
 //!   `oidc:{subject}`.
+//! - A request with a host `RoleGrant` reaches the role layer.
 //! - A `PublicSafe` route needs no session.
-//! - A verified `hvst_` token passes, when API tokens are on.
-//! - Any other Vantage `GET` gets `302` to the login route.
+//! - An `hvst_` bearer passes when API tokens are on. The token layer
+//!   verifies it.
+//! - Any other Vantage `GET` gets `303` to the login route.
 //! - Any other request gets `401`.
 //!
 //! The roles are fixed at login. After `max_session_age` the user must log in
@@ -44,8 +50,7 @@ use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 
 use crate::roles::{
-    ClaimRoleMap, HarvestRoles, RoleConfigError, RolePrincipal, SESSION_ROLES_KEY, join_role_list,
-    parse_role_list,
+    ClaimRoleMap, HarvestRoles, RoleConfigError, SESSION_ROLES_KEY, join_role_list,
 };
 
 /// The login route, relative to the management API mount.
@@ -64,14 +69,20 @@ pub const SESSION_SUBJECT_KEY: &str = "harvest_oidc_subject";
 pub const SESSION_AUTH_AT_KEY: &str = "harvest_oidc_auth_at";
 
 /// The audit-actor prefix of a session principal.
-pub const OIDC_ACTOR_PREFIX: &str = "oidc:";
+pub const OIDC_ACTOR_PREFIX: &str = crate::roles::OIDC_ACTOR_PREFIX;
 
 /// The default longest session age.
 pub const DEFAULT_MAX_SESSION_AGE: Duration = Duration::from_secs(12 * 60 * 60);
 
+/// The shortest session age. The login time has a one-second resolution.
+const MIN_SESSION_AGE: Duration = Duration::from_secs(1);
+
 /// The longest OIDC subject Harvest accepts, in bytes. OIDC Core sets the
 /// same limit.
 const MAX_SUBJECT_LEN: usize = 255;
+
+/// The largest discovery document Harvest reads.
+const MAX_DISCOVERY_BYTES: usize = 1024 * 1024;
 
 /// The time limit of a discovery request.
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -97,6 +108,13 @@ pub enum OidcConfigError {
         /// The URL as given.
         url: String,
     },
+    /// The provider sets `userinfo_url`. Harvest needs a signed ID token.
+    #[error("oidc provider must not set `userinfo_url`: Harvest requires a signed ID token")]
+    UserinfoNotSupported,
+    /// The issuer is a Microsoft multi-tenant alias. autumn-web then accepts
+    /// the unverified issuer of any tenant.
+    #[error("oidc issuer {0:?} is a multi-tenant alias: use the issuer of one tenant")]
+    MultiTenantIssuer(String),
     /// The scope does not include `openid`.
     #[error("oidc provider scope must include `openid`")]
     MissingOpenidScope,
@@ -116,13 +134,29 @@ pub enum OidcConfigError {
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct OidcInner {
     provider: OAuth2ProviderConfig,
     roles: HarvestRoles,
     claim_map: ClaimRoleMap,
     max_session_age: Duration,
     post_login_redirect: Option<String>,
+}
+
+impl std::fmt::Debug for OidcInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The autumn-web provider type prints its client secret. This does not.
+        f.debug_struct("OidcInner")
+            .field("client_id", &self.provider.client_id)
+            .field("client_secret", &"<redacted>")
+            .field("issuer", &self.provider.issuer)
+            .field("redirect_uri", &self.provider.redirect_uri)
+            .field("roles", &self.roles)
+            .field("claim_map", &self.claim_map)
+            .field("max_session_age", &self.max_session_age)
+            .field("post_login_redirect", &self.post_login_redirect)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A validated OIDC login configuration.
@@ -137,8 +171,9 @@ impl OidcLogin {
     /// Validate a login configuration.
     ///
     /// The provider needs `client_id`, `authorize_url`, `token_url`,
-    /// `redirect_uri`, `issuer` and `jwks_url`. Each provider URL must use
-    /// `https`, unless its host is loopback. The scope must include `openid`.
+    /// `redirect_uri`, `issuer` and `jwks_url`. It must not set
+    /// `userinfo_url`. Each URL must use `https`, unless its host is loopback.
+    /// The scope must include `openid`.
     ///
     /// # Errors
     ///
@@ -164,10 +199,14 @@ impl OidcLogin {
     }
 
     /// Set the longest session age. After it, the user must log in again.
+    ///
+    /// The login time has a resolution of one second, so an age under one
+    /// second becomes one second. A shorter age would expire each session at
+    /// once and loop through the identity provider.
     #[must_use]
     pub fn with_max_session_age(self, age: Duration) -> Self {
         let mut inner = Arc::unwrap_or_clone(self.inner);
-        inner.max_session_age = age;
+        inner.max_session_age = age.max(MIN_SESSION_AGE);
         Self {
             inner: Arc::new(inner),
         }
@@ -231,12 +270,26 @@ fn validate_provider(provider: &OAuth2ProviderConfig) -> Result<(), OidcConfigEr
             return Err(OidcConfigError::MissingField(field));
         }
     }
+    // For these Microsoft aliases, autumn-web adds the token's own `iss` to
+    // the accepted issuers. Any tenant could then log in.
+    if let Some(issuer) = &provider.issuer
+        && issuer.contains("login.microsoftonline.com")
+        && ["/common/", "/organizations/", "/consumers/"]
+            .iter()
+            .any(|alias| issuer.contains(alias))
+    {
+        return Err(OidcConfigError::MultiTenantIssuer(issuer.clone()));
+    }
+    // The autumn-web userinfo path checks no signature, audience or nonce.
+    if provider.userinfo_url.is_some() {
+        return Err(OidcConfigError::UserinfoNotSupported);
+    }
     let urls: [(&'static str, Option<&str>); 5] = [
         ("authorize_url", Some(provider.authorize_url.as_str())),
         ("token_url", Some(provider.token_url.as_str())),
+        ("redirect_uri", Some(provider.redirect_uri.as_str())),
         ("issuer", provider.issuer.as_deref()),
         ("jwks_url", provider.jwks_url.as_deref()),
-        ("userinfo_url", provider.userinfo_url.as_deref()),
     ];
     for (field, url) in urls {
         if let Some(url) = url
@@ -288,16 +341,16 @@ struct DiscoveryDocument {
     authorization_endpoint: String,
     token_endpoint: String,
     jwks_uri: String,
-    #[serde(default)]
-    userinfo_endpoint: Option<String>,
 }
 
 /// Read the OIDC discovery document of `issuer` and build a provider.
 ///
-/// The document is at `{issuer}/.well-known/openid-configuration`. Its
+/// The document is at `{issuer}/.well-known/openid-configuration`. Harvest
+/// follows no redirect and reads at most 1 MiB. Its
 /// `issuer` must equal `issuer` exactly, as OIDC Discovery requires. The
-/// scope is `openid profile email`. Pass the result to [`OidcLogin::new`],
-/// which checks the URLs.
+/// scope is `openid profile email`. The result has no `userinfo_url`, so a
+/// login needs a signed ID token. Pass it to [`OidcLogin::new`], which checks
+/// the URLs.
 ///
 /// # Errors
 ///
@@ -322,8 +375,9 @@ pub async fn discover_provider(
         issuer.trim_end_matches('/')
     );
     let discovery = |e: reqwest::Error| OidcConfigError::Discovery(e.to_string());
-    let body = reqwest::Client::builder()
+    let mut response = reqwest::Client::builder()
         .timeout(DISCOVERY_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(discovery)?
         .get(&url)
@@ -331,10 +385,16 @@ pub async fn discover_provider(
         .await
         .map_err(discovery)?
         .error_for_status()
-        .map_err(discovery)?
-        .bytes()
-        .await
         .map_err(discovery)?;
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(discovery)? {
+        if body.len() + chunk.len() > MAX_DISCOVERY_BYTES {
+            return Err(OidcConfigError::Discovery(format!(
+                "document is larger than {MAX_DISCOVERY_BYTES} bytes"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
     let document: DiscoveryDocument =
         serde_json::from_slice(&body).map_err(|e| OidcConfigError::Discovery(e.to_string()))?;
     if document.issuer != issuer {
@@ -348,7 +408,7 @@ pub async fn discover_provider(
         client_secret: client_secret.into(),
         authorize_url: document.authorization_endpoint,
         token_url: document.token_endpoint,
-        userinfo_url: document.userinfo_endpoint,
+        userinfo_url: None,
         redirect_uri: redirect_uri.into(),
         scope: "openid profile email".to_string(),
         issuer: Some(document.issuer),
@@ -402,6 +462,8 @@ async fn login_handler(
 
 /// Remove the Harvest principal keys from `session`.
 async fn clear_principal(session: &Session) {
+    // autumn-web writes `auth_provider` at a verified login.
+    session.remove("auth_provider").await;
     session.remove(SESSION_SUBJECT_KEY).await;
     session.remove(SESSION_ROLES_KEY).await;
     session.remove(SESSION_AUTH_AT_KEY).await;
@@ -431,8 +493,6 @@ async fn callback_handler(
     let Some(Extension(session)) = session else {
         return no_session_layer();
     };
-    // A new login replaces any earlier principal, even when it fails.
-    clear_principal(&session).await;
     if let Some(provider_error) = query.get("error") {
         tracing::warn!(error = %provider_error, "harvest: oidc provider refused the login");
         return error(StatusCode::UNAUTHORIZED, "oidc login failed");
@@ -455,6 +515,10 @@ async fn callback_handler(
             return error(StatusCode::UNAUTHORIZED, "oidc login failed");
         }
     };
+    // A verified login replaces any earlier principal, even when it maps to no
+    // role. A forged or stray callback never reaches this point, so it cannot
+    // log the user out.
+    clear_principal(&session).await;
     if !valid_subject(&identity.subject) {
         tracing::warn!("harvest: oidc subject is not 1 to 255 visible ASCII characters");
         return error(StatusCode::UNAUTHORIZED, "oidc login failed");
@@ -489,7 +553,10 @@ async fn callback_handler(
     Redirect::to(&target).into_response()
 }
 
-/// `POST /auth/oidc/logout`: end the Harvest session.
+/// `POST /auth/oidc/logout`: remove the Harvest keys from the session.
+///
+/// The host app can share the session, so its own keys stay. The session id
+/// rotates, so an old cookie cannot reach the next login.
 async fn logout_handler(
     session: Option<Extension<Session>>,
     original: OriginalUri,
@@ -497,7 +564,7 @@ async fn logout_handler(
 ) -> Response {
     if let Some(Extension(session)) = session {
         clear_principal(&session).await;
-        session.destroy().await;
+        session.rotate_id().await;
     }
     let login = format!("{}{LOGIN_PATH}", mount_prefix(&original.0, &uri));
     let page = maud::html! {
@@ -579,6 +646,8 @@ fn set_actor(request: &mut Request, subject: &str) {
     request.headers_mut().remove(HEADER_ACTOR);
     if let Ok(value) = HeaderValue::from_str(&format!("{OIDC_ACTOR_PREFIX}{subject}")) {
         request.headers_mut().insert(HEADER_ACTOR, value);
+        // The role layer keeps an `oidc:` actor only with this marker.
+        request.extensions_mut().insert(crate::roles::OidcActor);
     }
 }
 
@@ -606,6 +675,15 @@ pub(crate) async fn require_oidc_session(
         set_actor(&mut request, &subject);
         return next.run(request).await;
     }
+    // Host middleware can give roles, for example from an mTLS certificate.
+    // The role layer then reads them.
+    if request
+        .extensions()
+        .get::<crate::roles::RoleGrant>()
+        .is_some()
+    {
+        return next.run(request).await;
+    }
     let method = request.method().clone();
     let path = request.uri().path().to_string();
     if crate::api::classified_route(&method, &path) == Some(RouteClass::PublicSafe) {
@@ -630,9 +708,11 @@ pub(crate) async fn require_oidc_session(
 ///
 /// A tool route has no route class. A `GET` tool needs a role with a `read`
 /// scope or wider. Any other tool needs `mutate` or wider. A caller with no
-/// live session principal gets `401`.
+/// live session principal gets `401`. A role deny writes one `authz.deny`
+/// row.
+#[cfg(feature = "mcp")]
 pub(crate) async fn gate_mcp_tool(
-    State(login): State<OidcLogin>,
+    State((api_state, login)): State<(crate::api::HarvestApiState, OidcLogin)>,
     mut request: Request,
     next: Next,
 ) -> Response {
@@ -640,32 +720,52 @@ pub(crate) async fn gate_mcp_tool(
     if *request.method() == Method::OPTIONS {
         return next.run(request).await;
     }
-    let Some(session) = request.extensions().get::<Session>().cloned() else {
-        return error(StatusCode::UNAUTHORIZED, "authentication required");
+    let grant = request
+        .extensions()
+        .get::<crate::roles::RoleGrant>()
+        .cloned();
+    let session = request.extensions().get::<Session>().cloned();
+    // A host `RoleGrant` wins, as in the role layer. Else the session decides.
+    let (subject, roles) = if let Some(grant) = grant {
+        (None, grant.roles().to_vec())
+    } else {
+        let Some(session) = session else {
+            return error(StatusCode::UNAUTHORIZED, "authentication required");
+        };
+        let Some(subject) = session_subject(&session, login.inner.max_session_age).await else {
+            return error(StatusCode::UNAUTHORIZED, "authentication required");
+        };
+        let roles = session
+            .get(SESSION_ROLES_KEY)
+            .await
+            .map(|v| crate::roles::parse_role_list(&v))
+            .unwrap_or_default();
+        (Some(subject), roles)
     };
-    let Some(subject) = session_subject(&session, login.inner.max_session_age).await else {
-        return error(StatusCode::UNAUTHORIZED, "authentication required");
-    };
-    let roles = session
-        .get(SESSION_ROLES_KEY)
-        .await
-        .map(|v| parse_role_list(&v))
-        .unwrap_or_default();
+    if let Some(subject) = &subject {
+        set_actor(&mut request, subject);
+    }
     if !login
         .roles()
         .allows_by_method(roles.iter().map(String::as_str), request.method())
     {
+        if !roles.is_empty() {
+            let method = request.method().clone();
+            let path = request.uri().path().to_string();
+            crate::roles::audit_role_deny(&api_state, request.headers(), &method, &path, &roles)
+                .await;
+        }
         return error(StatusCode::FORBIDDEN, crate::roles::ROLE_DENIED_ERROR);
     }
-    set_actor(&mut request, &subject);
-    request.extensions_mut().insert(RolePrincipal::new(roles));
-    next.run(request).await
+    crate::roles::run_admitted(login.roles(), roles, request, next).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::roles::{ROLE_OPERATOR, ROLE_VIEWER};
+    #[cfg(feature = "mcp")]
+    use crate::roles::ROLE_OPERATOR;
+    use crate::roles::ROLE_VIEWER;
     use axum::body::Body;
     use tower::ServiceExt;
 
@@ -710,14 +810,154 @@ mod tests {
     }
 
     #[test]
-    fn userinfo_url_must_be_secure_too() {
+    fn a_multi_tenant_microsoft_issuer_is_refused() {
+        for alias in ["common", "organizations", "consumers"] {
+            let mut p = provider();
+            let issuer = format!("https://login.microsoftonline.com/{alias}/v2.0");
+            p.issuer = Some(issuer.clone());
+            assert_eq!(
+                OidcLogin::new(p, HarvestRoles::builtin(), ClaimRoleMap::new()).err(),
+                Some(OidcConfigError::MultiTenantIssuer(issuer))
+            );
+        }
+        let mut one_tenant = provider();
+        one_tenant.issuer = Some("https://login.microsoftonline.com/0f1e2d3c/v2.0".to_string());
+        assert!(OidcLogin::new(one_tenant, HarvestRoles::builtin(), ClaimRoleMap::new()).is_ok());
+    }
+
+    #[test]
+    fn debug_never_prints_the_client_secret() {
         let mut p = provider();
-        p.userinfo_url = Some("http://idp.example.com/userinfo".to_string());
+        p.client_secret = "very-secret-value".to_string();
+        let login = OidcLogin::new(p, HarvestRoles::builtin(), ClaimRoleMap::new()).expect("ok");
+        let text = format!("{login:?}");
+        assert!(!text.contains("very-secret-value"), "{text}");
+        assert!(text.contains("<redacted>"), "{text}");
+        let auth = crate::api::StandaloneAdminAuth::new().with_oidc(login);
+        assert!(!format!("{auth:?}").contains("very-secret-value"));
+    }
+
+    #[test]
+    fn a_session_age_under_one_second_is_raised_to_one() {
+        let l = login().with_max_session_age(Duration::from_millis(500));
+        assert_eq!(l.max_session_age(), Duration::from_secs(1));
+        assert_eq!(
+            login()
+                .with_max_session_age(Duration::ZERO)
+                .max_session_age(),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_expires_after_its_max_age() {
+        let max = Duration::from_secs(60);
+        let fresh = session(Some("u"), ROLE_VIEWER, now_unix() - 30);
+        assert_eq!(session_subject(&fresh, max).await.as_deref(), Some("u"));
+        let old = session(Some("u"), ROLE_VIEWER, now_unix() - 120);
+        assert_eq!(session_subject(&old, max).await, None);
+        // A login time in the future counts as age zero.
+        let future = session(Some("u"), ROLE_VIEWER, now_unix() + 3600);
+        assert_eq!(session_subject(&future, max).await.as_deref(), Some("u"));
+        // A missing or bad login time is never fresh.
+        let mut data = HashMap::new();
+        data.insert(SESSION_SUBJECT_KEY.to_string(), "u".to_string());
+        data.insert(SESSION_AUTH_AT_KEY.to_string(), "soon".to_string());
+        let bad = Session::new_for_test("b".to_string(), data);
+        assert_eq!(session_subject(&bad, max).await, None);
+    }
+
+    #[tokio::test]
+    async fn logout_keeps_the_host_keys_of_the_session() {
+        let mut data = HashMap::new();
+        data.insert("user_id".to_string(), "host-user".to_string());
+        data.insert(SESSION_SUBJECT_KEY.to_string(), "u".to_string());
+        data.insert(SESSION_ROLES_KEY.to_string(), ROLE_VIEWER.to_string());
+        data.insert(SESSION_AUTH_AT_KEY.to_string(), now_unix().to_string());
+        data.insert("auth_provider".to_string(), PROVIDER_NAME.to_string());
+        let session = Session::new_for_test("s".to_string(), data);
+        let original: Uri = "/api/harvest/auth/oidc/logout".parse().expect("uri");
+        let nested: Uri = "/auth/oidc/logout".parse().expect("uri");
+        let response = logout_handler(
+            Some(Extension(session.clone())),
+            OriginalUri(original),
+            nested,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(session.get("user_id").await.as_deref(), Some("host-user"));
+        for key in [
+            SESSION_SUBJECT_KEY,
+            SESSION_ROLES_KEY,
+            SESSION_AUTH_AT_KEY,
+            "auth_provider",
+        ] {
+            assert!(session.get(key).await.is_none(), "{key}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_boundary_admits_a_host_role_grant() {
+        let granted = echo_actor()
+            .layer(axum::middleware::from_fn_with_state(
+                (login(), false),
+                require_oidc_session,
+            ))
+            .layer(axum::middleware::from_fn(
+                |mut request: Request, next: Next| async move {
+                    request
+                        .extensions_mut()
+                        .insert(crate::roles::RoleGrant::new([ROLE_VIEWER]));
+                    next.run(request).await
+                },
+            ));
+        let out = call(granted, Method::GET, None, "oidc:admin").await;
+        // The grant passes. The forged `oidc:` actor does not.
+        assert_eq!(out, (StatusCode::OK, "-".to_string()));
+    }
+
+    #[tokio::test]
+    async fn the_boundary_passes_a_bearer_only_with_tokens_on() {
+        let app = |tokens: bool| {
+            echo_actor().layer(axum::middleware::from_fn_with_state(
+                (login(), tokens),
+                require_oidc_session,
+            ))
+        };
+        let send = |tokens: bool| {
+            let app = app(tokens);
+            async move {
+                let request = axum::http::Request::builder()
+                    .uri("/workflows")
+                    .header("authorization", "Bearer hvst_x")
+                    .body(Body::empty())
+                    .expect("request");
+                app.oneshot(request).await.expect("served").status()
+            }
+        };
+        assert_eq!(send(true).await, StatusCode::OK);
+        assert_eq!(send(false).await, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn a_userinfo_url_is_refused() {
+        let mut p = provider();
+        p.userinfo_url = Some("https://idp.example.com/userinfo".to_string());
+        assert_eq!(
+            OidcLogin::new(p, HarvestRoles::builtin(), ClaimRoleMap::new()).err(),
+            Some(OidcConfigError::UserinfoNotSupported)
+        );
+    }
+
+    #[test]
+    fn the_redirect_uri_must_be_secure_too() {
+        let mut p = provider();
+        p.redirect_uri = "http://harvest.example.com/cb".to_string();
         assert_eq!(
             OidcLogin::new(p, HarvestRoles::builtin(), ClaimRoleMap::new()).err(),
             Some(OidcConfigError::InsecureUrl {
-                field: "userinfo_url",
-                url: "http://idp.example.com/userinfo".to_string(),
+                field: "redirect_uri",
+                url: "http://harvest.example.com/cb".to_string(),
             })
         );
     }
@@ -750,16 +990,14 @@ mod tests {
 
     /// An inner handler that echoes the actor header it received.
     fn echo_actor() -> Router<()> {
-        Router::new().route(
-            "/workflows",
-            axum::routing::get(|headers: axum::http::HeaderMap| async move {
-                headers
-                    .get(HEADER_ACTOR)
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("-")
-                    .to_string()
-            }),
-        )
+        let echo = |headers: axum::http::HeaderMap| async move {
+            headers
+                .get(HEADER_ACTOR)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("-")
+                .to_string()
+        };
+        Router::new().route("/workflows", axum::routing::get(echo).options(echo))
     }
 
     fn session(subject: Option<&str>, roles: &str, auth_at: u64) -> Session {
@@ -824,18 +1062,23 @@ mod tests {
     #[tokio::test]
     async fn options_passes_but_loses_a_reserved_actor() {
         let out = call(bounded(), Method::OPTIONS, None, "oidc:admin").await;
-        assert_ne!(out.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(out, (StatusCode::OK, "-".to_string()));
     }
 
+    #[cfg(feature = "mcp")]
     fn mcp_gated() -> Router<()> {
         Router::new()
             .route(
                 "/workflows",
                 axum::routing::get(|| async { "read" }).post(|| async { "write" }),
             )
-            .layer(axum::middleware::from_fn_with_state(login(), gate_mcp_tool))
+            .layer(axum::middleware::from_fn_with_state(
+                (crate::api::HarvestApiState::new(), login()),
+                gate_mcp_tool,
+            ))
     }
 
+    #[cfg(feature = "mcp")]
     #[tokio::test]
     async fn the_mcp_gate_needs_a_scope_for_the_method() {
         let viewer = || Some(session(Some("u"), ROLE_VIEWER, now_unix()));

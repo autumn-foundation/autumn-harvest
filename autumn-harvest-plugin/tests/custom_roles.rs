@@ -112,8 +112,25 @@ fn role_denied((status, body): &(StatusCode, String)) -> bool {
     *status == StatusCode::FORBIDDEN && body.contains(ROLE_DENIED_ERROR)
 }
 
-fn admitted((status, _): &(StatusCode, String)) -> bool {
-    *status != StatusCode::FORBIDDEN && *status != StatusCode::UNAUTHORIZED
+/// The error a handler gives when it runs with no storage pool.
+const NO_STORE: &str = "storage pool is not configured";
+
+/// Whether the request reached its handler.
+///
+/// With no store, a handler can answer `400`, `503` or a Vantage redirect. A
+/// gate answers `401` or `403`. A wrong route answers `404` or `405`. A broken
+/// extractor answers `500`. None of those count. A handler that ran and
+/// found no store answers `500` too, and names the store, so it counts.
+fn admitted((status, body): &(StatusCode, String)) -> bool {
+    body.contains(NO_STORE)
+        || !matches!(
+            *status,
+            StatusCode::FORBIDDEN
+                | StatusCode::UNAUTHORIZED
+                | StatusCode::NOT_FOUND
+                | StatusCode::METHOD_NOT_ALLOWED
+                | StatusCode::INTERNAL_SERVER_ERROR
+        )
 }
 
 #[tokio::test]

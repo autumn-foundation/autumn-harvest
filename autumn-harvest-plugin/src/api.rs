@@ -5521,13 +5521,13 @@ impl StandaloneAdminAuth {
     /// Install OIDC login and its session boundary (issue #1978).
     ///
     /// This also installs the role layer with the roles of `login`, and
-    /// declares the auth boundary. The login routes sit outside the boundary.
+    /// declares the auth boundary. The roles of `login` replace any set by
+    /// [`Self::with_roles`]. The login routes sit outside the boundary.
     /// The host must apply an autumn-web session layer outside the mounted
     /// router. See [`crate::oidc`].
     #[cfg(feature = "oidc")]
     #[must_use]
     pub fn with_oidc(mut self, login: crate::oidc::OidcLogin) -> Self {
-        self.roles = Some(login.roles().clone());
         self.admin_auth_boundary = true;
         self.oidc = Some(login);
         self
@@ -5610,6 +5610,14 @@ impl StandaloneAdminAuth {
         if let Some(session_key) = &self.admin_auth_session_key {
             api_state.set_admin_auth_session_key(session_key.clone());
         }
+        #[cfg(feature = "oidc")]
+        let roles = self
+            .oidc
+            .as_ref()
+            .map(|login| login.roles().clone())
+            .or_else(|| self.roles.clone());
+        #[cfg(not(feature = "oidc"))]
+        let roles = self.roles.clone();
         let router = apply_admin_auth_layers(
             router,
             api_state,
@@ -5618,7 +5626,7 @@ impl StandaloneAdminAuth {
                 read_only_role: self.read_only_role,
                 authorizer: self.authorizer.clone(),
                 rate_limit: self.rate_limit.clone(),
-                roles: self.roles.clone(),
+                roles,
             },
         );
         #[cfg(feature = "oidc")]
@@ -5878,6 +5886,11 @@ pub(crate) async fn has_harvest_admin_access(
     api_state: &HarvestApiState,
     session: Option<Session>,
 ) -> bool {
+    // Issue #1978: under the role layer, only an `admin`-scope role passes.
+    // A declared boundary must not widen a narrower role.
+    if let Some(admin) = crate::roles::role_admin_access() {
+        return admin;
+    }
     if api_state.admin_auth_boundary() {
         return true;
     }
