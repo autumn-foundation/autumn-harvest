@@ -1909,6 +1909,11 @@ standalone note rather than part of the claim-path attribution table above:
   one statement per key (`calls` -66.7% at every swept size; buffers flat
   by design, so the fix is measured in DB-socket syscalls instead: `sendto`
   -44.5%, `recvfrom` -40.9%).
+* [`docs/performance-broken-session-scan.md`](performance-broken-session-scan.md)
+  — the two `harvest_task_queue.session_id` seeks in
+  `sessions::enforce_broken_sessions`, which had no index after migration
+  `20261003201739`. A partial index cut their buffers by 99.7% and the
+  pass total by 91.4% at 1,600 broken sessions, with identical outcomes.
 * [`docs/performance-mutex-terminal-sweep-table-present.md`](performance-mutex-terminal-sweep-table-present.md)
   — `mutex::sweep_terminal_holder_and_wake`, reached from the workflow
   completion-trigger evaluator (skipped on a successfully-retried failure),

@@ -1,0 +1,5 @@
+-- after: enforce_broken_sessions, pg_stat_statements sweep --
+n	candidates	failed_members	total_calls	reverify_calls	reverify_buffers	total_buffers	temp_blks_written	wal_bytes	seek_calls	seek_buffers	pinned_cold_wal	pinned_warm_wal	plain_cold_wal	plain_warm_wal	tq_seq_scans	tq_seq_tup_read	tq_idx_scans
+100	88	125	2237	191	264	15646	0	248168	98	274	433120	394648	396496	351336	0	0	0
+400	349	497	8880	758	1594	41731	0	1032896	391	1399	465288	392056	422744	345112	0	0	2924
+1600	1396	1991	35556	3032	6351	170771	0	4098096	1567	5299	562488	399456	527616	350568	0	0	13477
