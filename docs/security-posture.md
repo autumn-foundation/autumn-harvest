@@ -680,7 +680,11 @@ loopback. The scope must include `openid`.
 - Logout does not end the session at the identity provider.
 - `api_with_oidc` and `api_with_auth` replace each other. The last call
   wins, and the roles of a replaced login go with it. `api_with_oidc` also
-  turns off the read-only layer of an earlier `api_with_role_auth`. The roles of a login
+  turns off the read-only layer of an earlier `api_with_role_auth`.
+  `StandaloneAdminAuth::with_oidc` turns off `with_read_only_role` too.
+- Two mounts can share one session. The session binds its principal to the
+  login that made it (`client_id@issuer`). A principal of one login is not a
+  principal on a mount with another login. The roles of a login
   replace any set by `with_roles`.
 
 ### mTLS on the management API

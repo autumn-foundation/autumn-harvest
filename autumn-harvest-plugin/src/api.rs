@@ -5522,13 +5522,16 @@ impl StandaloneAdminAuth {
     ///
     /// This also installs the role layer with the roles of `login`, and
     /// declares the auth boundary. The roles of `login` replace any set by
-    /// [`Self::with_roles`]. The login routes sit outside the boundary.
+    /// [`Self::with_roles`]. It turns off [`Self::with_read_only_role`]. The login routes sit outside the boundary.
     /// The host must apply an autumn-web session layer outside the mounted
     /// router. See [`crate::oidc`].
     #[cfg(feature = "oidc")]
     #[must_use]
     pub fn with_oidc(mut self, login: crate::oidc::OidcLogin) -> Self {
         self.admin_auth_boundary = true;
+        // The read-only role reads host session keys. The login replaces that
+        // host auth, so the custom roles decide alone.
+        self.read_only_role = false;
         self.oidc = Some(login);
         self
     }

@@ -853,3 +853,40 @@ async fn an_api_token_bearer_passes_the_boundary_only_with_tokens_on() {
         .await;
     assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{}", reply.body);
 }
+
+#[tokio::test]
+async fn standalone_oidc_replaces_the_legacy_read_only_role() {
+    let idp = start_idp().await;
+    set_claims(&idp, json!({ "groups": ["harvest-admins"] }));
+    let api_state = HarvestApiState::new();
+    let router =
+        harvest_api_router(api_state.clone()).nest("/ui", harvest_ui_router(api_state.clone()));
+    let mounted = StandaloneAdminAuth::new()
+        .with_deployment_profile("prod")
+        .with_read_only_role()
+        .with_oidc(login(&idp))
+        .mount(router, &api_state);
+    // The host app shares the session and keeps a legacy read-only marker.
+    let host = axum::Router::new().route(
+        "/host/mark",
+        axum::routing::get(|session: autumn_web::session::Session| async move {
+            session.insert("role", "operator").await;
+            "marked"
+        }),
+    );
+    let app = axum::Router::new()
+        .nest(MOUNT, mounted)
+        .merge(host)
+        .layer(SessionLayer::new(
+            MemoryStore::new(),
+            SessionConfig {
+                secure: false,
+                ..SessionConfig::default()
+            },
+        ));
+    let mut browser = Browser::new(app);
+    assert_eq!(browser.get("/host/mark").await.status, StatusCode::OK);
+    assert_eq!(browser.login().await.status, StatusCode::SEE_OTHER);
+    let start = browser.post(&format!("{MOUNT}/workflows/wf/start")).await;
+    assert!(admitted(&start), "{} {}", start.status, start.body);
+}

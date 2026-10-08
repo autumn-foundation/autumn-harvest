@@ -87,8 +87,11 @@ const MAX_DISCOVERY_BYTES: usize = 1024 * 1024;
 /// The time limit of a discovery request.
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The provider name autumn-web uses for its session keys.
-const PROVIDER_NAME: &str = "harvest";
+/// The session key that binds the principal to the login that made it.
+///
+/// Two mounts can share one autumn-web session. A principal from one login
+/// is not a principal on a mount with another login.
+pub const SESSION_LOGIN_KEY: &str = "harvest_oidc_login";
 
 /// A configuration error in an OIDC login.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -252,6 +255,25 @@ impl OidcLogin {
     #[must_use]
     pub fn max_session_age(&self) -> Duration {
         self.inner.max_session_age
+    }
+
+    /// The identity of this login: `{client_id}@{issuer}`.
+    ///
+    /// The session stores it with the principal under [`SESSION_LOGIN_KEY`].
+    fn fingerprint(&self) -> String {
+        format!(
+            "{}@{}",
+            self.inner.provider.client_id,
+            self.inner.provider.issuer.as_deref().unwrap_or_default()
+        )
+    }
+
+    /// The provider name autumn-web puts in its session keys.
+    ///
+    /// It holds the fingerprint, so two logins in one session keep separate
+    /// `state`, `nonce` and PKCE values.
+    fn provider_name(&self) -> String {
+        format!("harvest:{}", self.fingerprint())
     }
 }
 
@@ -451,7 +473,7 @@ async fn login_handler(
     let Some(Extension(session)) = session else {
         return no_session_layer();
     };
-    match oauth2_authorize_url(&session, PROVIDER_NAME, &login.inner.provider).await {
+    match oauth2_authorize_url(&session, &login.provider_name(), &login.inner.provider).await {
         Ok(url) => Redirect::to(&url).into_response(),
         Err(e) => {
             tracing::error!(error = %e, "harvest: oidc authorize url failed");
@@ -467,6 +489,7 @@ async fn clear_principal(session: &Session) {
     session.remove(SESSION_SUBJECT_KEY).await;
     session.remove(SESSION_ROLES_KEY).await;
     session.remove(SESSION_AUTH_AT_KEY).await;
+    session.remove(SESSION_LOGIN_KEY).await;
 }
 
 /// Whether `subject` is 1 to 255 visible ASCII characters.
@@ -508,7 +531,8 @@ async fn callback_handler(
         state: state.clone(),
     };
     let provider = &login.inner.provider;
-    let identity = match oauth2_finish_login(&session, PROVIDER_NAME, provider, &callback).await {
+    let provider_name = login.provider_name();
+    let identity = match oauth2_finish_login(&session, &provider_name, provider, &callback).await {
         Ok(identity) => identity,
         Err(e) => {
             tracing::warn!(error = %e, "harvest: oidc login failed");
@@ -540,6 +564,7 @@ async fn callback_handler(
     session
         .insert(SESSION_AUTH_AT_KEY, now_unix().to_string())
         .await;
+    session.insert(SESSION_LOGIN_KEY, login.fingerprint()).await;
     tracing::info!(
         subject = %identity.subject,
         roles = %join_role_list(&roles),
@@ -611,11 +636,17 @@ pub(crate) fn apply_oidc(router: Router<()>, login: &OidcLogin, api_tokens: bool
 
 // ── Session boundary ──────────────────────────────────────────────────────────
 
-/// The subject of a live session principal, or `None`.
+/// The subject of a live session principal of `login`, or `None`.
 ///
-/// A session older than the longest age loses its principal keys.
-async fn session_subject(session: &Session, max_age: Duration) -> Option<String> {
+/// A principal that another login made is not one here. Its keys stay, so a
+/// visit to this mount does not log the user out of the other one. A session
+/// older than the longest age loses its principal keys.
+async fn session_subject(session: &Session, login: &OidcLogin) -> Option<String> {
+    let max_age = login.inner.max_session_age;
     let subject = session.get(SESSION_SUBJECT_KEY).await?;
+    if session.get(SESSION_LOGIN_KEY).await != Some(login.fingerprint()) {
+        return None;
+    }
     let auth_at = session
         .get(SESSION_AUTH_AT_KEY)
         .await
@@ -670,7 +701,7 @@ pub(crate) async fn require_oidc_session(
     }
     let session = request.extensions().get::<Session>().cloned();
     if let Some(session) = session
-        && let Some(subject) = session_subject(&session, login.inner.max_session_age).await
+        && let Some(subject) = session_subject(&session, &login).await
     {
         set_actor(&mut request, &subject);
         return next.run(request).await;
@@ -732,7 +763,7 @@ pub(crate) async fn gate_mcp_tool(
         let Some(session) = session else {
             return error(StatusCode::UNAUTHORIZED, "authentication required");
         };
-        let Some(subject) = session_subject(&session, login.inner.max_session_age).await else {
+        let Some(subject) = session_subject(&session, &login).await else {
             return error(StatusCode::UNAUTHORIZED, "authentication required");
         };
         let roles = session
@@ -851,20 +882,39 @@ mod tests {
 
     #[tokio::test]
     async fn a_session_expires_after_its_max_age() {
-        let max = Duration::from_secs(60);
+        let l = login().with_max_session_age(Duration::from_secs(60));
         let fresh = session(Some("u"), ROLE_VIEWER, now_unix() - 30);
-        assert_eq!(session_subject(&fresh, max).await.as_deref(), Some("u"));
+        assert_eq!(session_subject(&fresh, &l).await.as_deref(), Some("u"));
         let old = session(Some("u"), ROLE_VIEWER, now_unix() - 120);
-        assert_eq!(session_subject(&old, max).await, None);
+        assert_eq!(session_subject(&old, &l).await, None);
         // A login time in the future counts as age zero.
         let future = session(Some("u"), ROLE_VIEWER, now_unix() + 3600);
-        assert_eq!(session_subject(&future, max).await.as_deref(), Some("u"));
+        assert_eq!(session_subject(&future, &l).await.as_deref(), Some("u"));
         // A missing or bad login time is never fresh.
         let mut data = HashMap::new();
         data.insert(SESSION_SUBJECT_KEY.to_string(), "u".to_string());
         data.insert(SESSION_AUTH_AT_KEY.to_string(), "soon".to_string());
+        data.insert(SESSION_LOGIN_KEY.to_string(), l.fingerprint());
         let bad = Session::new_for_test("b".to_string(), data);
-        assert_eq!(session_subject(&bad, max).await, None);
+        assert_eq!(session_subject(&bad, &l).await, None);
+    }
+
+    /// Two mounts can share one session. A login on one is not a login on
+    /// the other, and a visit to the other does not log the user out.
+    #[tokio::test]
+    async fn a_session_from_another_login_has_no_principal_here() {
+        let mut other = provider();
+        other.client_id = "another-client".to_string();
+        let other =
+            OidcLogin::new(other, HarvestRoles::builtin(), ClaimRoleMap::new()).expect("ok");
+        assert_ne!(other.fingerprint(), login().fingerprint());
+        assert_ne!(other.provider_name(), login().provider_name());
+        let s = session(Some("u"), ROLE_VIEWER, now_unix());
+        assert_eq!(session_subject(&s, &other).await, None);
+        assert_eq!(session_subject(&s, &login()).await.as_deref(), Some("u"));
+        // A session with no binding names no principal either.
+        s.remove(SESSION_LOGIN_KEY).await;
+        assert_eq!(session_subject(&s, &login()).await, None);
     }
 
     #[tokio::test]
@@ -874,7 +924,8 @@ mod tests {
         data.insert(SESSION_SUBJECT_KEY.to_string(), "u".to_string());
         data.insert(SESSION_ROLES_KEY.to_string(), ROLE_VIEWER.to_string());
         data.insert(SESSION_AUTH_AT_KEY.to_string(), now_unix().to_string());
-        data.insert("auth_provider".to_string(), PROVIDER_NAME.to_string());
+        data.insert("auth_provider".to_string(), login().provider_name());
+        data.insert(SESSION_LOGIN_KEY.to_string(), login().fingerprint());
         let session = Session::new_for_test("s".to_string(), data);
         let original: Uri = "/api/harvest/auth/oidc/logout".parse().expect("uri");
         let nested: Uri = "/auth/oidc/logout".parse().expect("uri");
@@ -890,6 +941,7 @@ mod tests {
             SESSION_SUBJECT_KEY,
             SESSION_ROLES_KEY,
             SESSION_AUTH_AT_KEY,
+            SESSION_LOGIN_KEY,
             "auth_provider",
         ] {
             assert!(session.get(key).await.is_none(), "{key}");
@@ -1007,6 +1059,7 @@ mod tests {
         }
         data.insert(SESSION_ROLES_KEY.to_string(), roles.to_string());
         data.insert(SESSION_AUTH_AT_KEY.to_string(), auth_at.to_string());
+        data.insert(SESSION_LOGIN_KEY.to_string(), login().fingerprint());
         Session::new_for_test("s".to_string(), data)
     }
 
