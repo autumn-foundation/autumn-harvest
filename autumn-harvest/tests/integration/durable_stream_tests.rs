@@ -226,6 +226,35 @@ async fn a_re_driven_batch_at_the_cap_is_not_a_truncation() {
 }
 
 #[tokio::test]
+async fn the_cap_holds_when_stored_offsets_are_not_a_prefix() {
+    // A call that fails to serialize leaves its offset unused, so stored
+    // offsets can have holes. Rows inside a batch's range then still count.
+    let (url, _c) = setup_database().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let exec_id = ExecutionId::new();
+    insert_execution(&mut conn, exec_id, "stream_cap_holes").await;
+    store::append_stream_chunks(&mut conn, exec_id, &[chunk(2, json!(2))], 2)
+        .await
+        .expect("append offset 2");
+    let batch: Vec<_> = (0..3).map(|i| chunk(i, json!(i))).collect();
+    store::append_stream_chunks(&mut conn, exec_id, &batch, 2)
+        .await
+        .expect("append over the cap");
+
+    let rows = read_all(&mut conn, exec_id).await;
+    let real = rows
+        .iter()
+        .filter(|(o, _)| *o != DURABLE_STREAM_TRUNCATION_OFFSET)
+        .count();
+    assert_eq!(real, 2, "never more real rows than the cap: {rows:?}");
+    assert_eq!(
+        rows.last().map(|(o, _)| *o),
+        Some(DURABLE_STREAM_TRUNCATION_OFFSET),
+        "a dropped chunk is visible as the marker: {rows:?}"
+    );
+}
+
+#[tokio::test]
 async fn one_append_can_exceed_the_bind_parameter_limit() {
     // Postgres allows 65,535 bind parameters in one statement. Three
     // parameters for each row would fail near 21,845 rows without batching.

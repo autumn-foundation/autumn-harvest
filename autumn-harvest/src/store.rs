@@ -2847,8 +2847,8 @@ pub struct DurableStreamChunk {
 /// **Cap.** Once the execution holds `max_chunks` real chunks, the store
 /// drops newer chunks and stores one marker at
 /// [`DURABLE_STREAM_TRUNCATION_OFFSET`]. The marker latches: a later batch
-/// adds nothing, also when a later worker has a larger cap. The stored rows
-/// then stay a gap-free prefix of the stream.
+/// adds nothing, also when a later worker has a larger cap. No stored chunk
+/// then follows a dropped one.
 ///
 /// Returns the number of real chunks that this call inserted.
 ///
@@ -2879,30 +2879,39 @@ pub async fn append_stream_chunks(
         return Ok(0);
     }
 
-    // Count stored rows outside this batch's offset range. A re-driven batch
-    // is already stored, so counting it would charge the cap twice. A batch
-    // holds consecutive call ordinals, so a range check is exact. It is also
-    // an index range scan, not a per-row comparison with every batch offset.
-    let lowest = chunks.iter().map(|c| c.offset).min().unwrap_or(0);
-    let highest = chunks.iter().map(|c| c.offset).max().unwrap_or(0);
-    let existing: i64 = dsl::harvest_stream_chunks
+    // Admit by the real row count, so the cap holds for any stored offsets.
+    // A failed serialization leaves an offset unused, so stored offsets can
+    // have holes. A chunk that is already stored is a re-drive: it costs no
+    // budget and is never a drop. Only new offsets use the budget.
+    let batch_offsets: Vec<i64> = chunks.iter().map(|c| c.offset).collect();
+    let stored: i64 = dsl::harvest_stream_chunks
         .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
-        .filter(
-            dsl::stream_offset
-                .lt(lowest)
-                .or(dsl::stream_offset.gt(highest)),
-        )
         .count()
         .get_result(conn)
         .await
         .map_err(crate::error::database_error)?;
-    let remaining = i64::from(max_chunks).saturating_sub(existing).max(0);
+    let already: std::collections::HashSet<i64> = dsl::harvest_stream_chunks
+        .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
+        .filter(dsl::stream_offset.eq_any(batch_offsets))
+        .select(dsl::stream_offset)
+        .load::<i64>(conn)
+        .await
+        .map_err(crate::error::database_error)?
+        .into_iter()
+        .collect();
+    let mut new_chunks: Vec<&DurableStreamChunk> = chunks
+        .iter()
+        .filter(|c| !already.contains(&c.offset))
+        .collect();
+    new_chunks.sort_by_key(|c| c.offset);
+    new_chunks.dedup_by_key(|c| c.offset);
+    let remaining = i64::from(max_chunks).saturating_sub(stored).max(0);
     let admit = usize::try_from(remaining)
         .unwrap_or(usize::MAX)
-        .min(chunks.len());
+        .min(new_chunks.len());
 
     let mut inserted = 0usize;
-    for batch in chunks[..admit].chunks(STREAM_CHUNK_INSERT_BATCH) {
+    for batch in new_chunks[..admit].chunks(STREAM_CHUNK_INSERT_BATCH) {
         let rows: Vec<crate::models::NewHarvestStreamChunk<'_>> = batch
             .iter()
             .map(|c| crate::models::NewHarvestStreamChunk {
@@ -2920,9 +2929,9 @@ pub async fn append_stream_chunks(
             .map_err(crate::error::database_error)?;
     }
 
-    // Gate the marker on `admit`, not on `inserted`. A re-drive inserts
-    // nothing and drops nothing.
-    if admit < chunks.len() {
+    // Gate the marker on new chunks that did not fit. A re-drive offers only
+    // stored offsets, so it drops nothing and writes no marker.
+    if admit < new_chunks.len() {
         let marker = serde_json::json!({
             "_harvest_stream_truncated": true,
             "max_chunks": max_chunks,

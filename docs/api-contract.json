@@ -1691,7 +1691,7 @@
       "success_response": {
         "content_type": "text/event-stream",
         "status": 200,
-        "note": "Content-Type: text/event-stream. Frames: event:progress (id = the chunk offset, data = the stored chunk JSON), a terminal event:end with {\"reason\": <terminal-state>}, or event:error. The offsets of real chunks are contiguous, and the first stored copy of a chunk is canonical. Delivery is at-least-once across reconnects, so dedup by offset. A cap marker has data {\"_harvest_stream_truncated\": true, \"max_chunks\": N}.",
+        "note": "Content-Type: text/event-stream. Frames: event:progress (id = the chunk offset, data = the stored chunk JSON), a terminal event:end with {\"reason\": <terminal-state>}, or event:error. Offsets increase with each publish call. A call that fails to serialize leaves its offset unused, so resume by the last offset received, not by a count. The first stored copy of a chunk is canonical. Delivery is at-least-once across reconnects, so dedup by offset. A cap marker has data {\"_harvest_stream_truncated\": true, \"max_chunks\": N}.",
         "free_form": true
       },
       "error_responses": [

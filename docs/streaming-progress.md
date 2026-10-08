@@ -259,10 +259,11 @@ same transaction as the decision cycle. The table is not `harvest_events`.
 ### Offsets
 
 Each chunk has a 0-based **offset**: the ordinal of the call in the workflow
-body. The SSE `id:` carries it. The offsets of real chunks are contiguous:
-0, 1, 2 and so on. A reset, a fork or a retry is a new execution whose replay
-claims the offsets of the copied history, so its first chunk can have an
-offset above 0.
+body. The SSE `id:` carries it. Offsets increase with each call: 0, 1, 2 and
+so on. A call that fails to serialize returns an error and leaves its offset
+unused. A reset, a fork or a retry is a new execution whose replay claims the
+offsets of the copied history, so its first chunk can have an offset above 0.
+Resume by the last offset you received, not by a count.
 
 A re-driven decision cycle runs the body again and gives each chunk the same
 offset. The store keeps the first copy, so a reader never sees a chunk twice
@@ -301,8 +302,8 @@ any workflow code.
   (`DURABLE_STREAM_MAX_CHUNKS`). Above the cap the newest chunks drop. One
   terminal marker frame then has the offset `9223372036854775807` and the
   data `{"_harvest_stream_truncated": true, "max_chunks": 10000}`. The stored
-  chunks stay a gap-free prefix. Put several tokens in one chunk for a long
-  run.
+  chunks stay a prefix: no stored chunk follows a dropped one. Put several
+  tokens in one chunk for a long run.
 - **Handler contexts.** A chunk from an update or query handler is not
   stored, as for `publish_progress`.
 - **Postgres only.** The SQLite runtime ignores durable chunks.
