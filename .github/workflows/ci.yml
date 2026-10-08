@@ -136,6 +136,11 @@ jobs:
         # the `quickstart`/build-only CI jobs run `cargo build`, which can't
         # itself be ambiguous. See scripts/check-default-run.sh.
         run: ./scripts/check-default-run.sh
+      - name: Check license and policy files (issue #1990)
+        # Each published crate must ship both license texts. Cargo does not
+        # copy a root LICENSE file into a crate. See
+        # scripts/check-license-files.sh.
+        run: ./scripts/check-license-files.sh
       - name: Check cargo-dev root caveat is documented
         # Guards a real, reproduced-live defect: `cargo dev` is the flagship
         # "no database, no Docker, nothing to configure" front door
