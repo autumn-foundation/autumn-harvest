@@ -1119,9 +1119,13 @@ mod db {
         // A column pass that spends its budget may leave work behind. The
         // cursor then stays at the end of the event log, incomplete, so the
         // next tick resumes the column pass without rescanning events.
+        //
+        // The two passes share one tick budget. The column pass gets only
+        // what the event pass left. `reached_end` means the event batch was
+        // short, so at least one unit is left.
         let columns_pending = if reached_end && !already_complete {
-            let columns =
-                sweep_codec_columns(conn, shard, codecs, &active_key_id, batch_limit).await?;
+            let left = batch_limit.saturating_sub(i64::try_from(batch_len).unwrap_or(i64::MAX));
+            let columns = sweep_codec_columns(conn, shard, codecs, &active_key_id, left).await?;
             rewritten = rewritten.saturating_add(columns.rewritten);
             unresolved_total = unresolved_total.saturating_add(columns.unresolved);
             columns.pending
@@ -3455,7 +3459,8 @@ mod tests {
     /// An engine signal or dead-letter write without the registry stores the
     /// payload in clear (issue #1979). The sweep never encrypts plaintext, so
     /// that leak is permanent. An external-await read without the registry
-    /// cannot decode the target output, so the await stays pending. This
+    /// cannot decode the target output, so the await stays pending. A trigger
+    /// evaluation without the registry starts its target in clear. This
     /// guard keeps every engine call on the codec-aware variant.
     #[test]
     fn engine_signal_and_dead_letter_writes_pass_the_registry() {
@@ -3467,6 +3472,8 @@ mod tests {
             "send_signal_from_resolved(",
             "resolve_and_signal_by_workflow_id(",
             "dlq::dead_letter(",
+            "evaluate_triggers_for_execution(",
+            "evaluate_triggers_for_execution_collecting(",
         ];
         // A completion-callback dead letter copies the delivery body, which
         // stays in clear (see `docs/security-posture.md`). The count is pinned
@@ -3488,6 +3495,7 @@ mod tests {
                 include_str!("completion_trigger.rs"),
             ),
             ("reset.rs", include_str!("reset.rs")),
+            ("cross_shard_child.rs", include_str!("cross_shard_child.rs")),
         ];
         for (name, src) in engine_sources {
             for call in PLAIN_WRITES {

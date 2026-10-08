@@ -1542,12 +1542,13 @@ async fn start_child_on_target(
                     // are returned rather than emitted inline.
                     let mut pending_cancel_metrics = Vec::new();
                     for start in
-                        crate::completion_trigger::evaluate_triggers_for_execution_collecting(
+                        crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
                             conn,
                             child_exec_id,
                             crate::completion_trigger::TerminalState::Cancelled,
                             Some(metrics),
                             &mut pending_cancel_metrics,
+                            codecs,
                         )
                         .await?
                     {

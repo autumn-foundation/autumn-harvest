@@ -4086,6 +4086,46 @@ async fn the_column_sweep_keeps_to_its_budget_and_finishes_over_several_ticks() 
     );
 }
 
+/// The event pass and the column pass share one tick budget. A short event
+/// tail must leave the column pass only the rest of it.
+#[tokio::test]
+async fn the_event_and_column_passes_share_one_tick_budget() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_key_registry();
+    seed_codec_columns(&mut conn, &codecs, "k1").await;
+    seed_codec_columns(&mut conn, &codecs, "k1").await;
+    let exec_id = insert_execution(&mut conn, "budget-tail").await;
+    append_under_key(
+        &mut conn,
+        &codecs,
+        exec_id,
+        "k1",
+        1,
+        &[started(json!({"n": 1})), completed(json!({"n": 2}))],
+    )
+    .await;
+    codecs.set_active_key("k2").expect("flip");
+
+    // The first tick reads the 2 events and reaches the end of the log. At a
+    // budget of 3, the column pass may then rewrite only 1 cell.
+    let mut total = 0;
+    for _ in 0..12 {
+        let rewritten = sweep_codec_reencryption_once(&mut conn, 0, &codecs, 3, &NoOpMetrics)
+            .await
+            .expect("sweep");
+        assert!(
+            rewritten <= 3,
+            "a tick rewrote {rewritten} rows and cells, over its budget of 3"
+        );
+        total += rewritten;
+        if rewritten == 0 {
+            break;
+        }
+    }
+    assert_eq!(total, 18, "every event and cell converts across ticks");
+}
+
 #[tokio::test]
 async fn a_column_swap_lost_to_another_writer_is_not_counted_as_a_rewrite() {
     #[derive(diesel::QueryableByName)]
