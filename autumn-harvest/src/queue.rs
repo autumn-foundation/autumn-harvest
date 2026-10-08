@@ -898,6 +898,9 @@ macro_rules! claim_order_due_sql {
 /// The `claim_order_due_sql!` text as a value, for shape tests.
 pub const CLAIM_ORDER_DUE_SQL: &str = claim_order_due_sql!();
 
+/// Rows the claim reads from the head of each queue (issue #1971).
+pub const CLAIM_SEEK_WINDOW: i64 = 32;
+
 /// The error prefix on a task that the timeout scanner fails (issue #1824).
 ///
 /// The claim never hands out a task of an expired run. See
@@ -9699,6 +9702,142 @@ mod tests {
             candidate < gate && gate < claimed,
             "the gate sits in candidate"
         );
+    }
+
+    // ── Seek window (issue #1971) ──────────────────────────────────────────
+
+    /// The text of one top-level CTE of `sql`, from its name to the next CTE.
+    fn cte<'a>(sql: &'a str, name: &str, next: &str) -> &'a str {
+        let start = sql
+            .find(&format!("{name} AS ("))
+            .or_else(|| sql.find(&format!("{name} AS MATERIALIZED (")))
+            .unwrap_or_else(|| panic!("no {name} CTE in:\n{sql}"));
+        let end = sql[start..]
+            .find(&format!("{next} AS"))
+            .unwrap_or_else(|| panic!("no {next} CTE after {name} in:\n{sql}"));
+        &sql[start..start + end]
+    }
+
+    /// The default claim reads a bounded, index-ordered window per queue head.
+    ///
+    /// Each head is one equality range of `idx_harvest_tq_claim_seek`. The
+    /// window must never read the whole due backlog.
+    #[test]
+    fn claim_query_reads_a_bounded_seek_window_per_queue_head() {
+        let sql = claim_task_query();
+        let heads = cte(sql, "seek_heads", "seek_bounds");
+        for clause in [
+            "seek_heads AS MATERIALIZED",
+            "FROM unnest($2::text[]) AS q(name)",
+            "CROSS JOIN LATERAL",
+            "t.queue_name = q.name",
+            "(t.new_start AND t.attempt = 0) = k.new_start_head",
+            "ORDER BY t.priority DESC, t.scheduled_at ASC",
+            "t.sticky_worker_id = $1",
+        ] {
+            assert!(heads.contains(clause), "missing {clause:?} in:\n{heads}");
+        }
+        assert_eq!(
+            heads.matches(&format!("LIMIT {CLAIM_SEEK_WINDOW}")).count(),
+            2,
+            "the queue heads and the pin head are each bounded; got:\n{heads}"
+        );
+        assert!(
+            heads.contains("WHERE $4::BIGINT IS NULL OR $4::BIGINT <= 0"),
+            "ageing reorders at claim time, so it empties the window; got:\n{heads}"
+        );
+    }
+
+    /// The window candidate passes the guard against every full head.
+    #[test]
+    fn claim_query_guards_the_window_against_every_full_head() {
+        let sql = claim_task_query();
+        assert!(
+            cte(sql, "seek_bounds", "seek_pending_keys")
+                .contains(&format!("WHERE rn = {CLAIM_SEEK_WINDOW}")),
+            "only a full head bounds the rows outside the window; got:\n{sql}"
+        );
+        let seek = cte(sql, "seek_candidate", "legacy_candidate");
+        for clause in [
+            "harvest_task_queue.id IN (SELECT id FROM seek_heads)",
+            "NOT EXISTS (SELECT 1 FROM seek_bounds b",
+            "FROM seek_running_counts rc",
+            "FOR UPDATE SKIP LOCKED",
+        ] {
+            assert!(seek.contains(clause), "missing {clause:?} in:\n{seek}");
+        }
+        assert!(
+            !seek.contains("concurrency_running_counts"),
+            "the window must not read the backlog-wide count CTE; got:\n{seek}"
+        );
+    }
+
+    /// The full scan runs only when the window cannot decide.
+    #[test]
+    fn claim_query_falls_back_to_the_full_scan_only_when_the_window_cannot_decide() {
+        let sql = claim_task_query();
+        let legacy = cte(sql, "legacy_candidate", "candidate");
+        assert!(
+            legacy.contains(
+                "AND NOT EXISTS (SELECT 1 FROM seek_candidate) \
+                 AND (EXISTS (SELECT 1 FROM seek_bounds) \
+                 OR ($4::BIGINT IS NOT NULL AND $4::BIGINT > 0)) "
+            ),
+            "the fallback needs an empty window result and a full head or ageing; \
+             got:\n{legacy}"
+        );
+        assert!(legacy.contains("FROM concurrency_running_counts rc"));
+        assert!(
+            sql.contains(
+                "candidate AS ( SELECT * FROM seek_candidate \
+                 UNION ALL SELECT * FROM legacy_candidate )"
+            ),
+            "got:\n{sql}"
+        );
+    }
+
+    /// Both candidate scans carry the same gates, so the window cannot pick a
+    /// row that the full scan would reject.
+    #[test]
+    fn both_candidate_scans_carry_every_gate() {
+        let sql = claim_task_query();
+        let seek = cte(sql, "seek_candidate", "legacy_candidate");
+        let legacy = cte(sql, "legacy_candidate", "candidate");
+        for gate in [
+            "NOT (harvest_task_queue.queue_name = ANY(paused_queues.names))",
+            "schedule_to_close_at IS NULL",
+            "sticky_until <= NOW()",
+            "session_id IS NULL",
+            "required_build_id IS NULL",
+            "e.state = 'PAUSED'",
+            EXPIRED_RUN_GATE_SQL,
+            "OR NOT (activity_name = ANY($6))",
+            "OR NOT (activity_name = ANY(paused_activities.names))",
+            "jsonb_array_elements(required_capabilities)",
+            "harvest_rate_limit_buckets b",
+            "FOR UPDATE SKIP LOCKED",
+        ] {
+            assert!(seek.contains(gate), "window scan lacks {gate:?}");
+            assert!(legacy.contains(gate), "full scan lacks {gate:?}");
+        }
+    }
+
+    /// A kind-filtered claim applies its kind to every head scan too.
+    #[test]
+    fn kind_claim_query_filters_every_head_scan() {
+        for kind in [TaskType::Workflow, TaskType::Activity] {
+            for fenced in [false, true] {
+                let sql = claim_task_query_for_kind(kind, fenced);
+                let heads = cte(sql, "seek_heads", "seek_bounds");
+                assert_eq!(
+                    heads
+                        .matches(&format!("AND t.task_type = '{}' ", kind.as_str()))
+                        .count(),
+                    2,
+                    "the queue heads and the pin head filter on kind; got:\n{heads}"
+                );
+            }
+        }
     }
 
     /// The per-candidate attempt query must reuse the exact production
