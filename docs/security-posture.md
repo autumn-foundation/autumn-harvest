@@ -576,9 +576,12 @@ pre-auth charge takes one request from the client address bucket of each
 request that carries an `hvst_` bearer. A client over its address limit gets
 `429` before the token lookup, so a flood of made-up tokens takes no pool
 connection. When the token verifies, the limiter gives the address charge back
-and charges the token bucket instead. Valid tokens that share one address do
-not share its budget. A request with no `hvst_` bearer skips the pre-auth
-charge, because the token layer does no lookup for it.
+and charges the token bucket instead. A valid token that its scope refuses
+also gets the charge back. Valid tokens that share one address do not share
+its budget. A request with no `hvst_` bearer skips the pre-auth charge,
+because the token layer does no lookup for it. An `OPTIONS` request also
+skips it. An exempt route, such as a health probe, does not: the token layer
+looks up a claimed token there too. That request pays from the read bucket.
 
 ### Client address
 
@@ -646,7 +649,8 @@ in your audit retention and erasure policy.
   lookup runs. A burst larger than the address burst can thus see a `429`.
 - **Scope denies.** The token layer refuses a route outside the token scope
   with `403` and writes an `authz.deny` row. This also happens before the
-  limiter runs.
+  token bucket is charged. The address charge comes back, so a scope deny is
+  not counted.
 - **Streams.** The limiter counts a request when it opens an SSE stream. It
   does not limit how many streams stay open.
 - **Other surfaces.** The limiter covers the management API and Vantage. It

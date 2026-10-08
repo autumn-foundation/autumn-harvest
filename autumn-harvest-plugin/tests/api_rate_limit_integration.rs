@@ -179,7 +179,12 @@ async fn send(
 
 /// Mint a `mutate` token. Return its secret and id.
 async fn mint(app: &axum::Router, name: &str) -> (String, String) {
-    let body = json!({ "name": name, "scope": "mutate" });
+    mint_scoped(app, name, "mutate").await
+}
+
+/// Mint a token with `scope`. Return its secret and id.
+async fn mint_scoped(app: &axum::Router, name: &str, scope: &str) -> (String, String) {
+    let body = json!({ "name": name, "scope": scope });
     let (status, _, created) = send(app, "POST", "/admin/tokens", Some(body), None).await;
     assert_eq!(status, StatusCode::CREATED, "mint should 201: {created:?}");
     let secret = created["secret"].as_str().unwrap().to_owned();
@@ -377,5 +382,38 @@ async fn made_up_tokens_are_limited_before_the_lookup_and_valid_tokens_are_not()
             .iter()
             .all(|(class, kind)| class == "mutating" && kind == "unknown"),
         "a made-up token is charged to its address: {samples:?}"
+    );
+}
+
+/// A valid token that its scope refuses gets its address charge back. So a
+/// read token that keeps calling a mutating route does not empty the bucket
+/// of the address it shares with other tokens.
+#[tokio::test]
+async fn a_scope_denied_token_does_not_empty_its_address_bucket() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    let minting = minting_app(&pool);
+    let (reader, _) = mint_scoped(&minting, "reader", "read").await;
+    let (writer, _) = mint(&minting, "writer").await;
+    let app = limited_app(&pool, Arc::default(), ten_per_second());
+
+    // Twice the address bucket of 10. Each request is a scope deny.
+    let mut statuses = Vec::new();
+    for _ in 0..20 {
+        let (status, _, _) = send(&app, "POST", START, Some(json!({})), Some(&reader)).await;
+        statuses.push(status);
+    }
+    let (writer_status, _, body) = send(&app, "POST", START, Some(json!({})), Some(&writer)).await;
+
+    assert!(
+        statuses.iter().all(|s| *s == StatusCode::FORBIDDEN),
+        "every scope deny is a 403, never a 429: {statuses:?}"
+    );
+    assert_ne!(
+        writer_status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "another token from the address still passes the pre-auth charge: {body:?}"
     );
 }

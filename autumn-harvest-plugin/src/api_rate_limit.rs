@@ -570,30 +570,43 @@ pub(crate) struct PreAuthCharge {
 /// This layer runs outside the token layer. It charges the address bucket of
 /// each request that claims a token. A request over the limit gets `429` and
 /// costs no lookup. A request with no `hvst_` bearer passes, because the token
-/// layer does no lookup for it.
+/// layer does no lookup for it. An `OPTIONS` request passes for the same reason.
 ///
-/// [`enforce_api_rate_limit`] refunds the charge when the token verifies. Thus
-/// valid tokens behind one address do not share its bucket. Only the lookups
-/// still in flight hold a charge.
+/// A route that the limiter exempts, such as a health probe, still pays here.
+/// The token layer looks up a claimed token on every route. Such a request pays
+/// from the read bucket.
+///
+/// A valid token gets the charge back. [`enforce_api_rate_limit`] refunds it
+/// when the token passes the token layer. This layer refunds it when the token
+/// layer refuses the token by scope. Thus valid tokens behind one address do
+/// not share its bucket. Only the lookups still in flight hold a charge.
 pub(crate) async fn enforce_pre_auth_rate_limit(
     State((api_state, limiter)): State<(HarvestApiState, ApiRateLimiter)>,
     client_addr: Option<ClientAddr>,
     mut request: Request,
     next: Next,
 ) -> Response {
-    let Some(class) = limit_class(request.method(), request.uri().path()) else {
-        return next.run(request).await;
-    };
-    if !crate::api_token::claims_harvest_token(request.headers()) {
+    if *request.method() == Method::OPTIONS
+        || !crate::api_token::claims_harvest_token(request.headers())
+    {
         return next.run(request).await;
     }
+    let class = limit_class(request.method(), request.uri().path()).unwrap_or(LimitClass::Read);
     let key = address_key(&request, client_addr);
     match limiter.charge(key, class, Instant::now()) {
         (Decision::Allow, key) => {
             request
                 .extensions_mut()
                 .insert(PreAuthCharge { key, class });
-            next.run(request).await
+            let response = next.run(request).await;
+            if response
+                .extensions()
+                .get::<crate::api_token::ScopeDeniedToken>()
+                .is_some()
+            {
+                limiter.refund(key, class, Instant::now());
+            }
+            response
         }
         (
             Decision::Reject {
@@ -620,22 +633,24 @@ pub(crate) async fn enforce_pre_auth_rate_limit(
 /// request reaches no handler.
 ///
 /// A verified token first gets back the address charge of
-/// [`enforce_pre_auth_rate_limit`]. Then the token pays from its own bucket.
+/// [`enforce_pre_auth_rate_limit`]. The refund comes before the exempt-route
+/// check, because that layer charges exempt routes too. Then the token pays
+/// from its own bucket.
 pub(crate) async fn enforce_api_rate_limit(
     State((api_state, limiter)): State<(HarvestApiState, ApiRateLimiter)>,
     client_addr: Option<ClientAddr>,
     request: Request,
     next: Next,
 ) -> Response {
-    let Some(class) = limit_class(request.method(), request.uri().path()) else {
-        return next.run(request).await;
-    };
     let now = Instant::now();
     if request.extensions().get::<TokenPrincipal>().is_some()
         && let Some(charge) = request.extensions().get::<PreAuthCharge>()
     {
         limiter.refund(charge.key, charge.class, now);
     }
+    let Some(class) = limit_class(request.method(), request.uri().path()) else {
+        return next.run(request).await;
+    };
     let key = client_key(&request, client_addr);
     match limiter.check(key, class, now) {
         Decision::Allow => next.run(request).await,

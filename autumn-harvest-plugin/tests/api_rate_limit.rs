@@ -365,3 +365,47 @@ async fn made_up_tokens_are_limited_before_the_token_lookup() {
         "another address keeps its bucket"
     );
 }
+
+/// A claimed token pays before the lookup on an exempt route too.
+///
+/// The token layer looks up a claimed token on a health probe as well. Only an
+/// `OPTIONS` request skips the lookup, so only it skips the charge.
+#[tokio::test(start_paused = true)]
+async fn made_up_tokens_on_a_health_probe_are_limited_before_the_lookup() {
+    let app = app(StandaloneAdminAuth::new()
+        .with_api_tokens()
+        .with_rate_limit(ten_per_second()));
+    let claimed = |method: &Method, uri: &str| {
+        let mut request = request(method, uri, Peer::Connect("192.0.2.1"));
+        request.headers_mut().insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer hvst_made_up".parse().expect("header should parse"),
+        );
+        request
+    };
+    let mut limited = 0;
+    for _ in 0..30 {
+        let status = app
+            .clone()
+            .oneshot(claimed(&Method::GET, "/api/harvest/health/live"))
+            .await
+            .expect("router should serve the request")
+            .status();
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            limited += 1;
+        }
+    }
+    let preflight = app
+        .clone()
+        .oneshot(claimed(&Method::OPTIONS, START))
+        .await
+        .expect("router should serve the request")
+        .status();
+
+    assert_eq!(limited, 20, "a bucket of 10 admits 10 lookups");
+    assert_ne!(
+        preflight,
+        StatusCode::TOO_MANY_REQUESTS,
+        "a preflight is never charged"
+    );
+}
