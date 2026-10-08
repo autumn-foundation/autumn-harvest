@@ -471,3 +471,73 @@ async fn a_tenant_start_refuses_a_reconciled_seal_of_another_tenant() {
     }
     scrub(&mut conn, &names).await;
 }
+
+/// Idempotency keys are shared across tenants (issue #1977). A tenant start
+/// whose key names a run of another tenant is a conflict. It must not return
+/// that run as a duplicate.
+#[tokio::test]
+async fn a_tenant_start_refuses_an_idempotency_claim_of_another_tenant() {
+    let (url, _container) = setup_db().await;
+    let names = ["tp_idem"];
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn, &names).await;
+    let key = format!("tp-idem-{}", uuid::Uuid::new_v4());
+    let params = |tenant, workflow_id| StartWorkflowParams {
+        tenant: Some(tenant),
+        ..StartWorkflowParams::new(
+            "tp_idem",
+            workflow_id,
+            ExecutionId::new_for_shard(ShardId::new(0)),
+            json!({}),
+            "default",
+        )
+    };
+
+    let first = autumn_harvest::start_or_load_workflow_execution_idempotent(
+        &mut conn,
+        params("globex", "tp-idem-globex"),
+        &key,
+        3600.0,
+        None,
+        None,
+    )
+    .await
+    .expect("start the globex run");
+    assert!(matches!(
+        first,
+        autumn_harvest::IdempotentStartOutcome::Started(_)
+    ));
+
+    let same_tenant = autumn_harvest::start_or_load_workflow_execution_idempotent(
+        &mut conn,
+        params("globex", "tp-idem-globex"),
+        &key,
+        3600.0,
+        None,
+        None,
+    )
+    .await
+    .expect("the owner replays its key");
+    assert!(matches!(
+        same_tenant,
+        autumn_harvest::IdempotentStartOutcome::Deduplicated { .. }
+    ));
+
+    let other = autumn_harvest::start_or_load_workflow_execution_idempotent(
+        &mut conn,
+        params("acme", "tp-idem-acme"),
+        &key,
+        3600.0,
+        None,
+        None,
+    )
+    .await;
+    assert!(
+        matches!(
+            other,
+            Err(autumn_harvest::HarvestError::TenantConflict { .. })
+        ),
+        "{other:?}"
+    );
+    scrub(&mut conn, &names).await;
+}

@@ -751,7 +751,7 @@ so a `read` tenant token cannot cancel.
 | Any route not in the list: list routes, admin routes, token mint and revoke, Vantage, signal-with-start, update-with-start, reset, erase, legal hold | `403` |
 | A run of another tenant, or a run with no tenant | `404`, the same as an unknown id |
 | A start whose workflow id is in use by a run of another tenant, with any reuse or conflict policy | `409`. The engine refuses before it attaches, cancels, replaces or seals the run. |
-| A start that resolves to a run of another tenant through an idempotency key | `409` |
+| A start that resolves to a run of another tenant through an idempotency key | `409`. The engine refuses before it returns the run. |
 | A start of a throttled, debounced or batched workflow | `400`. A deferred start cannot carry the tenant. |
 
 Every `409` of a bound start has the body `{"error": "workflow id is in
@@ -775,7 +775,8 @@ refused requests.
   `SignalWithStartParams::tenant`, `UpdateWithStartParams::tenant`, or the
   `tenant` field of the typed start options. Set it only from a verified
   source. With a tenant, the engine refuses to touch a prior run of another
-  tenant with `HarvestError::TenantConflict`.
+  tenant with `HarvestError::TenantConflict`. It also refuses to return one
+  as an idempotency duplicate.
 - These start paths carry no tenant: transactional starts, the outbox,
   debounce, throttle, event batches, schedules, webhooks, broker connectors
   and the MCP tools. Their runs have no tenant.

@@ -227,6 +227,23 @@ fn refuse_other_tenant(
     }
 }
 
+/// Refuse a tenant-bound start whose idempotency claim names a run of another
+/// tenant (issue #1977).
+///
+/// Idempotency keys are shared across tenants. A duplicate must not hand one
+/// tenant the run of another.
+pub(crate) async fn refuse_other_tenant_claim(
+    conn: &mut AsyncPgConnection,
+    request: &StartWorkflowParams<'_>,
+    claimed: ExecutionId,
+) -> HarvestResult<()> {
+    if request.tenant.is_none() {
+        return Ok(());
+    }
+    let existing = load_execution(conn, claimed).await?;
+    refuse_other_tenant(request, &existing)
+}
+
 /// Origin marker for a normal scheduler-tick fire (issue #534).
 pub const ORIGIN_SCHEDULED: &str = "scheduled";
 /// Origin marker for a run created by a schedule backfill (issue #534).
@@ -2563,16 +2580,19 @@ pub async fn start_or_load_workflow_execution_idempotent_with_codecs(
                     exec_id,
                     workflow_id,
                     state,
-                } => Ok((
-                    IdempotentStartOutcome::Deduplicated {
-                        exec_id,
-                        workflow_id,
-                        state,
-                    },
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                )),
+                } => {
+                    refuse_other_tenant_claim(conn, &request, exec_id).await?;
+                    Ok((
+                        IdempotentStartOutcome::Deduplicated {
+                            exec_id,
+                            workflow_id,
+                            state,
+                        },
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    ))
+                }
                 crate::start_idempotency::StartIdempotencyReservation::Reserved => {
                     let workflow_name = request.workflow_name;
                     let (started, ds, dc, cm) =
