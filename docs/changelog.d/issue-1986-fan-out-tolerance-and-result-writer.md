@@ -42,8 +42,11 @@ Issue #1986 adds two options to the activity fan-out helpers. The new
 - **Breaking.** `WorkflowCommand::ScheduleActivity` has a new field,
   `result_writer`. Outside the crate, a struct literal or a pattern without
   `..` must name it.
+- History records the writer mode as `fan_out_writer:{n}`. Replay reads the
+  mode from history, not from the current options.
 - **Known gaps.** Each item still records its activity events, so event count
-  grows with width. PII erasure and codec rotation do not touch result blobs.
+  grows with width. A windowed fan-out in a `join!` with other activity
+  dispatch can mis-assign its resumed slots, as the `_windowed` helpers can. PII erasure and codec rotation do not touch result blobs.
   A manifest is valid only while the run that wrote it exists.
 
 No migration. No new `WorkflowEvent` variant. No route change.

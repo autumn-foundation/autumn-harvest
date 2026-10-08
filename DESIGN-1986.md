@@ -58,6 +58,8 @@ Issue #1986 asks for two options on the activity fan-out helpers:
 | R17 | Let a transactional activity commit its own result inline, past the writer. | `run_transactional` writes the blob and commits the reference row in its own transaction. |
 | R18 | Leave a slot running after a caught stop. Its result lands after the workflow terminal, and replay reports drift. | The stop cancels the slot, as a race loser. |
 | R19 | Offload a stored reference again under a low threshold. | The completion append skips ordinary offload for a stored result. |
+| R20 | Read the writer option from the current code on replay. A deploy that turns it off reads references as values. | History records `fan_out_writer:{n}`, and replay uses it. |
+| R21 | Run a windowed fan-out in a `join!` with other activities. The resumed prefix counts a sibling's schedule. | Not fixed: the `_windowed` helpers share it (issue #750). A fix needs a fan-out identity on each schedule. Documented. |
 
 ### 0.4 Six thinking hats
 

@@ -10301,6 +10301,29 @@ impl WorkflowContext {
         });
     }
 
+    /// The writer mode of a fan-out, as history records it (issue #1986).
+    ///
+    /// A fresh dispatch with the writer records `fan_out_writer:{seq}` right
+    /// after the `fan_out:{seq}` marker. Replay reads the mode from history,
+    /// not from the current options. A deploy can change the option for an
+    /// in-flight run. Replay then still reads each recorded item as recorded.
+    fn fan_out_writer_mode(&self, seq: u32, fresh: bool, wanted: bool) -> bool {
+        let name = format!("fan_out_writer:{seq}");
+        if fresh {
+            if wanted {
+                self.push_command(WorkflowCommand::RecordMarker {
+                    name,
+                    details: Value::from(1u64),
+                });
+            }
+            return wanted;
+        }
+        matches!(
+            self.match_history(|m| m.match_u64_marker(&name, 1)),
+            HistoryMatch::Matched { .. }
+        )
+    }
+
     /// Record or verify the stop marker of a fan-out (issue #1986).
     ///
     /// A fan-out that stops on its failure tolerance records how many slots
@@ -11074,7 +11097,12 @@ impl WorkflowContext {
     /// never takes an activity that the workflow scheduled after the stop. The
     /// stop also consumes the start events of its slots that still run, and
     /// removes their waits. Change a tolerance for in-flight runs behind
-    /// `ctx.version()`.
+    /// `ctx.version()`. History records the writer mode, so a change to it
+    /// needs no guard.
+    ///
+    /// Do not run a windowed fan-out in a `join!` with other activity
+    /// dispatch. On resume, it treats the recorded schedules after it as its
+    /// own. The `_windowed` helpers have the same limit (issue #750).
     ///
     /// # Errors
     ///
@@ -11095,8 +11123,7 @@ impl WorkflowContext {
         activities: Vec<(String, Value, String)>,
         options: &crate::fan_out::FanOutOptions,
     ) -> HarvestResult<crate::fan_out::FanOutResults<Value>> {
-        let writer = options.result_writer();
-        let (slots, tolerated) = self
+        let (slots, tolerated, writer) = self
             .fan_out_with_impl(activities, options, None, None)
             .await?;
         let items = slots
@@ -11143,8 +11170,7 @@ impl WorkflowContext {
             })
             .collect::<Result<Vec<_>, serde_json::Error>>()?;
 
-        let writer = options.result_writer();
-        let (slots, tolerated) = self
+        let (slots, tolerated, writer) = self
             .fan_out_with_impl(
                 activities,
                 options,
@@ -11165,7 +11191,8 @@ impl WorkflowContext {
 
     /// Shared body of the fan-out helpers that take options.
     ///
-    /// Returns the classified slots in input order and the tolerated count.
+    /// Returns the classified slots in input order, the tolerated count and
+    /// the writer mode that history records.
     /// The structure is the windowed fan-out's: resume the recorded prefix,
     /// then dispatch the rest in waves. No window means one wave.
     async fn fan_out_with_impl(
@@ -11174,16 +11201,16 @@ impl WorkflowContext {
         options: &crate::fan_out::FanOutOptions,
         retry: Option<crate::policy::RetryPolicy>,
         timeout: Option<std::time::Duration>,
-    ) -> HarvestResult<(Vec<Result<Value, String>>, usize)> {
+    ) -> HarvestResult<(Vec<Result<Value, String>>, usize, bool)> {
         self.check_cancellation()?;
 
         let seq = self.next_fan_out_seq();
         let count = activities.len();
-        let writer = options.result_writer();
         // Check the store before the marker, so a failed check records
         // nothing. Replay does not check again: the store can change.
-        if self.peek_fan_out_count(seq, count)? {
-            if writer && self.payload_offload_threshold.is_none() {
+        let fresh = self.peek_fan_out_count(seq, count)?;
+        if fresh {
+            if options.result_writer() && self.payload_offload_threshold.is_none() {
                 return Err(HarvestError::Config(
                     "a fan-out with a result writer needs a PayloadStore; \
                      register one with HarvestBuilder::payload_store"
@@ -11192,10 +11219,11 @@ impl WorkflowContext {
             }
             self.record_fan_out_marker(seq, count);
         }
+        let writer = self.fan_out_writer_mode(seq, fresh, options.result_writer());
 
         let tolerated = options.tolerance().max_failures(count);
         if activities.is_empty() {
-            return Ok((Vec::new(), tolerated));
+            return Ok((Vec::new(), tolerated, writer));
         }
         let window = options.max_in_flight().map_or(count, |w| w.max(1));
 
@@ -11288,7 +11316,7 @@ impl WorkflowContext {
             self.record_fan_out_stop(&stop_marker, count - activities.len())?;
         }
         joined?;
-        Ok((results, tolerated))
+        Ok((results, tolerated, writer))
     }
 
     // ── Fan-out / parallel child workflows (issue #601) ──────────────────

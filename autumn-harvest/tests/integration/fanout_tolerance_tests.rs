@@ -785,6 +785,54 @@ async fn replay_after_a_window_change_is_drift_free() {
     assert_eq!(completed_output(&replayed), &first);
 }
 
+/// History records the writer mode. A deploy that turns the writer off for
+/// an in-flight run still reads its recorded references as `Stored`.
+#[tokio::test]
+async fn replay_keeps_the_recorded_writer_mode() {
+    let run = drive(
+        tolerant_handler,
+        json!({ "n": 2, "writer": true }),
+        true,
+        |input| Ok(stored(input.as_u64().unwrap()).to_recorded_value()),
+    )
+    .await;
+    let without_writer = json!({ "n": 2 });
+    let replayed = run_workflow(
+        ExecutionId::new(),
+        run.history,
+        tolerant_handler,
+        without_writer,
+    )
+    .await;
+    let output = completed_output(&replayed);
+    let results: FanOutResults<Value> = serde_json::from_value(output["results"].clone()).unwrap();
+    assert_eq!(results.items()[0], FanOutItem::Stored(stored(0)));
+}
+
+/// A run recorded without the writer keeps plain values when a deploy turns
+/// the writer on. Replay does not check for a store either.
+#[tokio::test]
+async fn replay_without_a_recorded_writer_keeps_values() {
+    let run = drive(tolerant_handler, json!({ "n": 2 }), false, |input| {
+        Ok(stored(input.as_u64().unwrap()).to_recorded_value())
+    })
+    .await;
+    let with_writer = json!({ "n": 2, "writer": true });
+    let replayed = run_workflow(
+        ExecutionId::new(),
+        run.history,
+        tolerant_handler,
+        with_writer,
+    )
+    .await;
+    let output = completed_output(&replayed);
+    let results: FanOutResults<Value> = serde_json::from_value(output["results"].clone()).unwrap();
+    assert!(
+        matches!(results.items()[0], FanOutItem::Value(_)),
+        "got {results:?}"
+    );
+}
+
 /// The typed helper keeps a stored reference as `Stored`.
 #[tokio::test]
 async fn typed_fan_out_keeps_stored_references() {

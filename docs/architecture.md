@@ -1081,6 +1081,14 @@ for item in manifest.items() {
   it. A manifest passed to another run (a child, or a continue-as-new
   successor) is valid only while the writing run exists. Read or copy the
   results before then.
+- **Concurrent windowed fan-out.** Do not run a windowed fan-out in a
+  `join!` with other activity dispatch. On resume, it treats the recorded
+  schedules after it as its own, so a sibling's schedule can shift its slots.
+  The `_windowed` helpers have the same limit (issue #750). An unwindowed
+  fan-out records all its slots in one batch, so it is safe.
+- **Writer mode.** A fresh dispatch with the writer records
+  `fan_out_writer:{n}`. Replay reads the mode from history, so a deploy that
+  changes the option keeps an in-flight run consistent.
 - **Known gaps.** PII erasure replaces the reference but leaves the blob in
   the store until retention purges the run. The codec rotation sweep does
   not re-encrypt blobs, so keep a retired key decode-only while its blobs
