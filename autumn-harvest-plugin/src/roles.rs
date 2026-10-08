@@ -605,12 +605,14 @@ pub(crate) async fn audit_role_deny(
 /// A tool route has no route class. A `GET` tool needs a role with a `read`
 /// scope or wider. Any other tool needs `mutate` or wider. Host auth runs
 /// outside this gate and sets the roles. A deny writes one `authz.deny` row.
+/// The gate strips a forged `oidc:` actor, as the role layer does.
 #[cfg(feature = "mcp")]
 pub(crate) async fn enforce_mcp_tool_roles(
     State((api_state, roles)): State<(HarvestApiState, HarvestRoles)>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
+    strip_reserved_actor(&mut request);
     if *request.method() == Method::OPTIONS {
         return next.run(request).await;
     }
@@ -1258,6 +1260,46 @@ mod tests {
         assert_eq!(body(ROLE_ADMIN).await, "true");
         // Outside the role layer, the boundary still decides.
         assert!(crate::api::has_harvest_admin_access(&state, None).await);
+    }
+
+    /// The MCP role gate reserves the `oidc:` actor too.
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn the_mcp_role_gate_strips_a_forged_oidc_actor() {
+        let echo = |headers: axum::http::HeaderMap| async move {
+            headers
+                .get(autumn_harvest::audit::HEADER_ACTOR)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("-")
+                .to_string()
+        };
+        let app = axum::Router::new()
+            .route("/tool", axum::routing::post(echo).options(echo))
+            .layer(axum::middleware::from_fn_with_state(
+                (HarvestApiState::new(), roles()),
+                enforce_mcp_tool_roles,
+            ))
+            .layer(axum::middleware::from_fn(
+                |mut request: Request, next: Next| async move {
+                    request
+                        .extensions_mut()
+                        .insert(RoleGrant::new([ROLE_OPERATOR]));
+                    next.run(request).await
+                },
+            ));
+        for method in [Method::POST, Method::OPTIONS] {
+            let request = axum::http::Request::builder()
+                .method(method.clone())
+                .uri("/tool")
+                .header(autumn_harvest::audit::HEADER_ACTOR, "oidc:admin")
+                .body(axum::body::Body::empty())
+                .expect("request");
+            let response = app.clone().oneshot(request).await.expect("served");
+            let body = axum::body::to_bytes(response.into_body(), 64)
+                .await
+                .expect("body");
+            assert_eq!(&body[..], b"-", "{method}");
+        }
     }
 
     fn arb_method() -> impl Strategy<Value = Method> {
