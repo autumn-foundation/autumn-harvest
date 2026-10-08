@@ -15,7 +15,8 @@ Transit, which runs on any cloud and on premises.
 - **Safety.** A key name outside the Vault alphabet, a bad mount, a bad
   address or a non-UTF-8 wrapped key fails before any request. The address
   must use `https`, except for a loopback host or after `allow_plain_http`.
-  The default client follows no redirect. A reply over 64 KiB fails. `Debug`
+  The default client follows no redirect, and it sends plain `http` direct,
+  never through a proxy. A reply over 64 KiB fails. `Debug`
   never shows the token. Error text never holds key material. Each request
   times out after 30 seconds.
 - **Shared suite.** The new `kms_conformance` test module holds one suite for

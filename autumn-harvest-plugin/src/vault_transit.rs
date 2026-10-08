@@ -13,7 +13,8 @@
 //!
 //! The address must use `https`. Plain `http` is allowed for a loopback host,
 //! or after [`VaultTransit::allow_plain_http`]. The default client follows no
-//! redirect, so the token goes to the configured address only.
+//! redirect, so the token goes to the configured address only. It sends plain
+//! `http` direct, never through a proxy.
 //!
 //! ```text
 //! use autumn_harvest_plugin::vault_transit::VaultTransit;
@@ -41,7 +42,8 @@ pub use reqwest;
 /// A Vault Transit client that unwraps codec data keys.
 #[derive(Clone)]
 pub struct VaultTransit {
-    client: reqwest::Client,
+    /// `None` selects the default client for each request.
+    client: Option<reqwest::Client>,
     address: String,
     mount: String,
     namespace: Option<String>,
@@ -68,7 +70,7 @@ impl VaultTransit {
     #[must_use]
     pub fn new(address: impl Into<String>, token: impl Into<String>) -> Self {
         Self {
-            client: default_client(),
+            client: None,
             address: address.into(),
             mount: "transit".to_string(),
             namespace: None,
@@ -97,7 +99,7 @@ impl VaultTransit {
     /// token there. The 30-second request timeout still applies.
     #[must_use]
     pub fn with_client(mut self, client: reqwest::Client) -> Self {
-        self.client = client;
+        self.client = Some(client);
         self
     }
 
@@ -115,17 +117,6 @@ impl VaultTransit {
 /// The settings of the default client: no redirect.
 fn client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
-}
-
-/// The default client.
-#[expect(
-    clippy::expect_used,
-    reason = "`reqwest::Client::new` panics on the same TLS backend failure"
-)]
-fn default_client() -> reqwest::Client {
-    client_builder()
-        .build()
-        .expect("the TLS backend initializes")
 }
 
 /// The time limit for one Vault request. With it, startup fails on a dead
@@ -250,8 +241,14 @@ impl VaultTransit {
             .map_err(|_| "the Vault token is not a valid header value".to_string())?;
         token.set_sensitive(true);
         // Vault Agent and Vault Proxy can require `X-Vault-Request`.
-        let mut request = self
-            .client
+        let client = match &self.client {
+            Some(client) => Ok(client.clone()),
+            // A proxy would see the token and the data key in clear.
+            None if url.scheme() == "http" => client_builder().no_proxy().build(),
+            None => client_builder().build(),
+        }
+        .map_err(|err| format!("cannot build the HTTP client: {err}"))?;
+        let mut request = client
             .request(method, url.clone())
             .timeout(REQUEST_TIMEOUT)
             .header("X-Vault-Token", token)
@@ -535,6 +532,18 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("ciphertext"), "{err}");
         assert!(server.requests().is_empty());
+    }
+
+    /// Run with `HTTP_PROXY` set to a dead proxy to prove the bypass.
+    #[tokio::test]
+    async fn the_default_client_sends_plain_http_direct() {
+        let server =
+            FakeServer::start(|request| vault(request, &Reply::Unwrap(KEY.to_vec()), true)).await;
+        provider(VaultTransit::new(&server.endpoint, TOKEN))
+            .data_key(KEY_ID)
+            .await
+            .unwrap();
+        assert_eq!(server.requests().len(), 2);
     }
 
     #[tokio::test]

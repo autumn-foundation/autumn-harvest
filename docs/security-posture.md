@@ -1044,7 +1044,7 @@ The wrapped key is the `vault:v1:` text. Load it with `with_wrapped_key`, not
   for example a Vault Agent sidecar. `allow_plain_http` allows it for other
   hosts, for development only.
 - The default client follows no redirect, so the token goes to the configured
-  address only. It trusts the bundled public CA roots, not the OS store, and
+  address only. It sends plain `http` direct, never through a proxy. It trusts the bundled public CA roots, not the OS store, and
   it ignores `VAULT_CACERT`.
 - Each request times out after 30 seconds, also with `with_client`.
 - `VaultTransit::new` takes the token once. The binding does not renew it. The
