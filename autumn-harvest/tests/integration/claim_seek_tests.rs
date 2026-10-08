@@ -244,6 +244,11 @@ async fn insert_row(conn: &mut AsyncPgConnection, columns: &str, values: &str) -
 ///
 /// Before issue #1971, the claim scanned and sorted every due row. Its buffers
 /// grew about linearly with depth, and the sort spilled to disk at 100K.
+///
+/// Each depth runs three claims, each rolled back. The assertion reads the
+/// median, which is the steady state. The first claim after the seed also
+/// walks the dead index entries of the rows the seed drained, and marks them
+/// dead for later scans. Its cost is reported, not asserted.
 #[tokio::test]
 async fn claim_buffers_stay_flat_from_1k_to_100k_pending_rows() {
     let (mut conn, _container) = setup_db().await;
@@ -251,23 +256,29 @@ async fn claim_buffers_stay_flat_from_1k_to_100k_pending_rows() {
     for depth in [1_000_i64, 10_000, 100_000] {
         let qs = queues(4);
         seed_deep_backlog(&mut conn, &qs, depth).await;
-        let cost = claim_cost(&mut conn, &qs).await;
-        eprintln!("depth={depth} claim cost: {cost:?}");
+        let mut runs = Vec::new();
+        for _ in 0..3 {
+            runs.push(claim_cost(&mut conn, &qs).await);
+        }
         delete_queues(&mut conn, &qs).await;
-        assert!(cost.claimed, "depth {depth}: the claim takes a row");
-        costs.push((depth, cost));
+        eprintln!("depth={depth} claim costs, first run cold: {runs:?}");
+        for cost in &runs {
+            assert!(cost.claimed, "depth {depth}: the claim takes a row");
+            assert_eq!(
+                cost.temp_written, 0,
+                "the claim spills to disk at depth {depth}: {cost:?}"
+            );
+        }
+        let mut buffers: Vec<i64> = runs.iter().map(|c| c.buffers).collect();
+        buffers.sort_unstable();
+        costs.push((depth, buffers[1]));
     }
-    let shallow = costs[0].1.buffers.max(1);
-    for (depth, cost) in &costs {
+    let shallow = costs[0].1.max(1);
+    for (depth, median) in &costs {
         assert!(
-            cost.buffers <= 3 * shallow,
-            "claim buffers grow with backlog depth: {} at depth {depth} \
-             against {shallow} at depth 1000 (all: {costs:?})",
-            cost.buffers
-        );
-        assert_eq!(
-            cost.temp_written, 0,
-            "the claim spills to disk at depth {depth}: {cost:?}"
+            *median <= 3 * shallow,
+            "claim buffers grow with backlog depth: median {median} at depth {depth} \
+             against {shallow} at depth 1000 (all medians: {costs:?})"
         );
     }
 }
@@ -443,6 +454,95 @@ async fn ageing_lifts_an_old_row_over_a_deep_high_priority_backlog() {
     let claimed = claim(&mut conn, &qs, Some(60)).await;
     delete_queues(&mut conn, &qs).await;
     assert_eq!(claimed, Some(old), "one hour at 60 s ageing adds 60 priority");
+}
+
+/// Rows of an ineligible or saturated activity type at the head do not hide
+/// the next eligible row (issues #1836, #1971).
+///
+/// The `$6` array names `nohandler` as ineligible and marks `busy` as
+/// saturated. A `nohandler` row with capability requirements is exempt from
+/// the `$6` gate, so it is the first eligible row.
+#[tokio::test]
+async fn ineligible_and_saturated_types_at_the_head_do_not_hide_the_next_row() {
+    let (mut conn, _container) = setup_db().await;
+    let qs = queues(1);
+    let q = &qs[0];
+    exec(
+        &mut conn,
+        &format!(
+            "INSERT INTO harvest_task_queue \
+               (queue_name, task_type, activity_name, input, state, max_attempts, scheduled_at) \
+             SELECT '{q}', 'activity', CASE WHEN i % 2 = 0 THEN 'busy' ELSE 'nohandler' END, \
+                    '{{}}'::jsonb, 'PENDING', 3, NOW() - INTERVAL '1 hour' \
+             FROM generate_series(1, {DEEP}) AS i"
+        ),
+    )
+    .await;
+    let exempt = insert_row(
+        &mut conn,
+        "queue_name, task_type, activity_name, required_capabilities, scheduled_at",
+        &format!("'{q}', 'activity', 'nohandler', '[]'::jsonb, NOW() - INTERVAL '2 minutes'"),
+    )
+    .await;
+    let plain = insert_row(
+        &mut conn,
+        "queue_name, task_type, activity_name, scheduled_at",
+        &format!("'{q}', 'activity', 'ok', NOW() - INTERVAL '1 minute'"),
+    )
+    .await;
+    let exclusions = ["nohandler".to_string(), "\u{1}busy".to_string()];
+    let mut claimed = Vec::new();
+    for _ in 0..3 {
+        claimed.push(
+            queue::claim_task(&mut conn, &qs, WORKER, "", None, &[], &exclusions)
+                .await
+                .expect("claim")
+                .map(|t| t.id),
+        );
+    }
+    delete_queues(&mut conn, &qs).await;
+    assert_eq!(claimed, vec![Some(exempt), Some(plain), None]);
+}
+
+/// A backlog of one activity type keeps the window bounded (issue #1971).
+///
+/// With one activity name in the table, the planner can misjudge an
+/// activity-name gate whose array it cannot read at plan time. It then reads
+/// the whole head instead of the window. The cost must stay flat.
+#[tokio::test]
+async fn a_single_activity_type_backlog_keeps_the_window_bounded() {
+    let (mut conn, _container) = setup_db().await;
+    let mut costs = Vec::new();
+    for depth in [1_000_i64, 100_000] {
+        let qs = queues(4);
+        exec(
+            &mut conn,
+            &format!(
+                "INSERT INTO harvest_task_queue \
+                   (queue_name, task_type, activity_name, input, state, max_attempts, \
+                    scheduled_at) \
+                 SELECT ({q})[1 + (i % 4)], 'activity', 'single', '{{}}'::jsonb, 'PENDING', 3, \
+                        NOW() - make_interval(secs => 1 + (i % 3600)) \
+                 FROM generate_series(1, {depth}) AS i; \
+                 ANALYZE harvest_task_queue;",
+                q = text_array(&qs)
+            ),
+        )
+        .await;
+        let mut runs = Vec::new();
+        for _ in 0..3 {
+            runs.push(claim_cost(&mut conn, &qs).await);
+        }
+        delete_queues(&mut conn, &qs).await;
+        eprintln!("single type, depth={depth} claim costs: {runs:?}");
+        let mut buffers: Vec<i64> = runs.iter().map(|c| c.buffers).collect();
+        buffers.sort_unstable();
+        costs.push(buffers[1]);
+    }
+    assert!(
+        costs[1] <= 3 * costs[0].max(1),
+        "claim buffers grow with depth on a one-type backlog: {costs:?}"
+    );
 }
 
 /// A kind-filtered claim finds its kind behind a deep run of the other kind
