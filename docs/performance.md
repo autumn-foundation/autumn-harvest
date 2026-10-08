@@ -1268,6 +1268,58 @@ figure is the median of 12 runs.
 No index can remove the sort. The sticky `CASE` key already forces it. See
 [any residual predicate defeats sort-elision](#any-residual-predicate-defeats-sort-elision-issue-1177).
 
+## Fairness keys (issue #1976)
+
+Fairness keys are off by default. Off, the claim statement is unchanged. On,
+the claim adds three things. See [Fairness keys](fairness-keys.md).
+
+- **One map per claim.** An uncorrelated subquery maps each key in debt to
+  its lag. It runs once per claim, as an `InitPlan`.
+- **One sort term.** Each candidate row looks up its key's lag.
+- **One upsert.** After the rechecks, the claim charges the claimed key's
+  state row.
+
+Run it with `HARVEST_CLAIM_BENCH_SECTION=fairness cargo bench -p
+autumn-harvest --features db --bench claim_bench`. Measured on the reference
+environment, with 8 claimers and a 90 s budget per row:
+
+| Backlog | Keys | Queues | Baseline p50 | Fair p50 | Delta |
+|--:|--:|--:|--:|--:|--:|
+| 1,000 | 256 | 1 | 14.29 ms | 18.09 ms | +27% |
+| 10,000 | 256 | 1 | 328.16 ms | 396.02 ms | +21% |
+| 10,000 | 10,000 | 1 | 352.01 ms | 379.99 ms | +8% |
+| 1,000 | 256 | 4 | 12.83 ms | 14.89 ms | +16% |
+| 10,000 | 256 | 4 | 340.03 ms | 328.07 ms | -4% |
+| 10,000 | 1 | 4 | 327.94 ms | 320.00 ms | -2% |
+| 10,000 | 10,000 | 4 | 319.99 ms | 310.05 ms | -3% |
+| 100,000 ⚠ | 256 | 4 | 5100.00 ms | 5263.77 ms | +3% |
+
+`⚠`: the row hit the wall-clock budget, so it is not a full sample.
+
+- **Read the 1-queue rows for the cost of the SQL.** There both modes run
+  one statement over the same rows. The fair claim costs 8% to 27% more.
+- **Do not read the 4-queue rows as a speed-up.** A fair claim over several
+  queues runs one statement per queue. Each statement sorts a quarter of the
+  backlog. That offsets the cost of the fair SQL. It does not make the fair
+  SQL cheaper.
+- **The key count does not drive the cost.** The map lookup is a binary
+  search. 10,000 keys cost no more than 256 keys.
+- **The cost grows with the backlog**, as the baseline does. The claim sorts
+  the whole eligible backlog (issue #1971).
+
+### Rejected forms of the lag lookup
+
+The claim filters estimate one candidate row. With that estimate, the
+planner runs any join on the lag table as a nested loop. It reads the lag
+table again for each candidate row.
+
+| Form | Result |
+|---|---|
+| Join on a CTE of the state rows | A nested loop. About 2x the claim time. |
+| `jsonb` map in a CTE, cross-joined | One copy of the map per row. 4.4 s per claim at 10,000 keys. |
+| Join on a derived table | A hash join only with good statistics. In the benchmark, a nested loop: 9,707 rescans, 1.1 s per claim, +238% at 10,000 rows. |
+| `jsonb` map in an `InitPlan` | Built once. Chosen. |
+
 ## Enqueue throughput
 
 8 concurrent writers enqueueing into an already-populated queue:

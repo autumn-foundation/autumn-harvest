@@ -178,8 +178,8 @@ async fn fairness_section(db: &BenchDb) {
     db::FAIRNESS_KEY_CARDINALITY.store(256, Ordering::Relaxed);
     println!();
     println!(
-        "> The fair claim joins a hashed table of the lags of keys in debt and \
-         adds one sort term. \
+        "> The fair claim builds one map of the lags of keys in debt per claim \
+         and adds one sort term. \
          After the rechecks it upserts the claimed key's state row. With \
          several queues it claims one queue per statement."
     );

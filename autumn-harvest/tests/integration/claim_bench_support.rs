@@ -129,7 +129,7 @@ pub enum ClaimGate {
     /// Rows carry a `fairness_key`, and the claim runs with fairness keys on
     /// (issue #1976).
     ///
-    /// The fair claim joins a hashed table of the lags of keys in debt. It
+    /// The fair claim builds one map of the lags of keys in debt. It
     /// also adds one sort term and one state upsert. This row measures that
     /// cost against `baseline`. It is a claim mode, not a gate, so
     /// `all_gates` does not include it.

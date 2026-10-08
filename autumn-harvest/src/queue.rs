@@ -2023,48 +2023,41 @@ fn fair_variant(kind: Option<TaskType>, fenced: bool) -> &'static str {
     &FAIR[slot]
 }
 
-/// The join that gives each candidate row the lag of its key (issue #1976).
+/// The lag of a candidate row's key: `max(pass - V, 0)` (issue #1976).
 ///
-/// `fair_lag` lists each key of the polled queue whose `pass` is above the
-/// queue clock `V`, the largest `last_start`, with its lag `pass - V`. A key
-/// not in it has lag 0.
-///
-/// A fair claim polls one queue per statement (see
-/// [`claim_task_with_fairness`]), so the join needs only the key. A by-id
-/// claim may pass several queues, but it names one row, so its order does not
-/// matter.
-///
-/// It is a derived table, not a CTE, so the planner sees its statistics and
-/// hashes it. Two earlier forms cost one probe of every key per candidate
-/// row. A join on a CTE ran as a nested loop. A `jsonb` map cost one copy of
-/// the whole map per lookup: 4.4 s per claim at 10,000 keys, against 26 ms
-/// for this join.
-pub const FAIR_JOINS_SQL: &str = "LEFT JOIN ( \
-         SELECT s.fairness_key AS fl_key, s.pass - c.v AS fl_lag \
-         FROM harvest_fairness_state s \
-         JOIN ( \
-             SELECT queue_name, MAX(last_start) AS v \
-             FROM harvest_fairness_state \
-             WHERE queue_name = ANY($2) \
-             GROUP BY queue_name \
-         ) c ON c.queue_name = s.queue_name \
-         WHERE s.pass > c.v \
-     ) fair_lag ON fair_lag.fl_key = COALESCE(harvest_task_queue.fairness_key, '') ";
-
-/// The lag of a candidate row's key: `max(pass - V, 0)`.
-///
-/// The fair claim sorts on the lag, not on the start tag. A key with no
-/// state, or with `pass <= V`, has lag 0. See
+/// An uncorrelated subquery maps each queue to its keys in debt, with their
+/// lags. A key is in debt when its `pass` is above the queue clock `V`, the
+/// largest `last_start`. A key not in the map has lag 0. See
 /// [`crate::queue_fairness::fair_lag`].
-pub const FAIR_LAG_SQL: &str = "COALESCE(fair_lag.fl_lag, 0)";
-
-/// The row lock of the fair claim.
 ///
-/// The fair claim joins `fair_lag` on the nullable side of an outer join, and
-/// Postgres cannot lock rows there. The lock therefore names
-/// `harvest_task_queue`. The base statement locks the same rows: every other
-/// relation in `candidate` is a CTE, which a lock clause skips.
-pub const FAIR_LOCK_SQL: &str = "LIMIT 1 FOR UPDATE OF harvest_task_queue SKIP LOCKED";
+/// The subquery runs once per claim, as an `InitPlan`. Each candidate row then
+/// does one map lookup, so the plan does not depend on row estimates.
+///
+/// Two earlier forms did depend on them. The claim filters estimate one
+/// candidate row. The planner then joined a lag table as a nested loop and
+/// read it again for each row. At 10,000 rows that cost about 0.6 s per claim.
+/// A map in a CTE copied the whole map for each row.
+///
+/// The lag goes through `float8::text`, which round-trips exactly under the
+/// default `extra_float_digits`. A lower setting changes only the sort, by at
+/// most one unit in the last place.
+pub const FAIR_LAG_SQL: &str = "COALESCE((( \
+         SELECT COALESCE(jsonb_object_agg(fq.queue_name, fq.lags), '{}'::jsonb) \
+         FROM ( \
+             SELECT s.queue_name, \
+                 jsonb_object_agg(s.fairness_key, (s.pass - c.v)::text) AS lags \
+             FROM harvest_fairness_state s \
+             JOIN ( \
+                 SELECT queue_name, MAX(last_start) AS v \
+                 FROM harvest_fairness_state \
+                 WHERE queue_name = ANY($2) \
+                 GROUP BY queue_name \
+             ) c ON c.queue_name = s.queue_name \
+             WHERE s.pass > c.v \
+             GROUP BY s.queue_name \
+         ) fq \
+     ) -> harvest_task_queue.queue_name \
+       ->> COALESCE(harvest_task_queue.fairness_key, ''))::float8, 0)";
 
 /// The weight of the key `(q, k)`: its override, else the default `1`.
 macro_rules! fair_weight_sql {
@@ -2143,54 +2136,41 @@ async fn recheck_and_charge(
     Ok(outcome)
 }
 
-/// Anchors of [`splice_fairness`]. Each appears exactly once in every claim
+/// The anchor of [`splice_fairness`]. It appears exactly once in every claim
 /// variant.
-const FAIR_JOIN_ANCHOR: &str = "CROSS JOIN paused_activities ";
 const FAIR_ORDER_ANCHOR: &str = concat!("END DESC, ", claim_order_due_sql!(), " ASC");
-const FAIR_LOCK_ANCHOR: &str = "LIMIT 1 FOR UPDATE SKIP LOCKED";
 
 /// Splice the fair claim into a claim statement (issue #1976).
 ///
-/// Three edits, each at an anchor that appears exactly once:
-///
-/// 1. `candidate` joins `fair_lag` ([`FAIR_JOINS_SQL`]).
-/// 2. The sort takes the lag after the effective priority and before the due
-///    time. Sticky rank and priority keep their meaning. Within one key the
-///    order is the old order.
-/// 3. The row lock names `harvest_task_queue` ([`FAIR_LOCK_SQL`]).
+/// The sort takes the lag ([`FAIR_LAG_SQL`]) after the effective priority and
+/// before the due time. Sticky rank and priority keep their meaning. Within
+/// one key the order is the old order.
 ///
 /// The statement does not charge the key. The claim does that after the
 /// post-claim rechecks. See [`FAIR_CHARGE_SQL`].
 ///
-/// No bind is added, so the fenced and by-id binds keep their numbers. Every
-/// other gate stays the same text. `fair_claim_query_preserves_every_gate_and_bind`
-/// pins that.
+/// No bind, join or lock changes, so the fenced and by-id binds keep their
+/// numbers. Every other gate stays the same text.
+/// `fair_claim_query_preserves_every_gate_and_bind` pins that.
 ///
 /// # Panics
 ///
-/// Panics at first use if an anchor does not appear exactly once. That makes
+/// Panics at first use if the anchor does not appear exactly once. That makes
 /// a future edit of the base query fail loudly, not claim unfairly.
 #[must_use]
 pub fn splice_fairness(base: &str) -> String {
-    for anchor in [FAIR_JOIN_ANCHOR, FAIR_ORDER_ANCHOR, FAIR_LOCK_ANCHOR] {
-        assert_eq!(
-            base.matches(anchor).count(),
-            1,
-            "fair claim anchor {anchor:?} must appear exactly once"
-        );
-    }
+    assert_eq!(
+        base.matches(FAIR_ORDER_ANCHOR).count(),
+        1,
+        "fair claim anchor {FAIR_ORDER_ANCHOR:?} must appear exactly once"
+    );
     base.replace(
-        FAIR_JOIN_ANCHOR,
-        &format!("{FAIR_JOIN_ANCHOR}{FAIR_JOINS_SQL}"),
-    )
-    .replace(
         FAIR_ORDER_ANCHOR,
         &format!(
             "END DESC, {FAIR_LAG_SQL} ASC, {} ASC",
             claim_order_due_sql!()
         ),
     )
-    .replace(FAIR_LOCK_ANCHOR, FAIR_LOCK_SQL)
 }
 
 /// [`claim_task_query`] limited to one task kind (issue #1787).
@@ -13592,9 +13572,6 @@ mod tests {
     #[test]
     fn fair_claim_query_preserves_every_gate_and_bind() {
         for (base, fair) in fair_pairs() {
-            // The fair lock names the task table. It locks the same rows.
-            let fair = fair.replace(FAIR_LOCK_SQL, FAIR_LOCK_ANCHOR);
-            let fair = fair.as_str();
             for gate in CLAIM_GATES {
                 assert_eq!(
                     base.matches(gate).count(),
@@ -13624,8 +13601,7 @@ mod tests {
         let order = format!("END DESC, {FAIR_LAG_SQL} ASC, {CLAIM_ORDER_DUE_SQL} ASC");
         for (_, fair) in fair_pairs() {
             assert_eq!(fair.matches(order.as_str()).count(), 1, "{fair}");
-            assert_eq!(fair.matches(FAIR_JOINS_SQL).count(), 1);
-            assert_eq!(fair.matches(FAIR_LOCK_SQL).count(), 1);
+            assert!(!fair.contains("fair_lag"), "the lag is not a join");
         }
     }
 
@@ -13660,10 +13636,14 @@ mod tests {
     fn fair_sql_mirrors_the_model_rules() {
         // lag = max(pass - V, 0): only keys with pass > V are in the map, and
         // a missing key has lag 0.
-        assert!(FAIR_JOINS_SQL.contains("s.pass - c.v AS fl_lag"));
-        assert!(FAIR_JOINS_SQL.contains("WHERE s.pass > c.v"));
-        assert!(FAIR_JOINS_SQL.contains("MAX(last_start) AS v"));
-        assert_eq!(FAIR_LAG_SQL, "COALESCE(fair_lag.fl_lag, 0)");
+        assert!(FAIR_LAG_SQL.contains("(s.pass - c.v)::text"));
+        assert!(FAIR_LAG_SQL.contains("WHERE s.pass > c.v"));
+        assert!(FAIR_LAG_SQL.contains("MAX(last_start) AS v"));
+        assert!(FAIR_LAG_SQL.starts_with("COALESCE((("));
+        assert!(FAIR_LAG_SQL.ends_with("::float8, 0)"));
+        // The map is keyed by queue, then by key, so a lag never crosses
+        // queues.
+        assert!(FAIR_LAG_SQL.contains("-> harvest_task_queue.queue_name"));
         // A new key starts at V. An existing key starts at max(pass, V).
         assert!(FAIR_CHARGE_SQL.contains("SELECT COALESCE(MAX(last_start), 0) AS v"));
         assert!(

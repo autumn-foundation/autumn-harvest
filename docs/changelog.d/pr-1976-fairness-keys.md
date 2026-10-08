@@ -13,9 +13,9 @@ claim statement is byte-identical.
   continue-as-new runs and workflow retries inherit it. Reset forks, DLQ
   redrives, re-runs and with-start calls take the quota key. The HTTP start
   rejects a key on a throttled, debounced or batched start.
-- **Claim.** Start-time fair queuing. `queue::splice_fairness` joins a
-  hashed table of key lags and adds one sort term after the effective
-  priority. No new bind. A separate upsert charges the key after
+- **Claim.** Start-time fair queuing. `queue::splice_fairness` adds one sort
+  term, the key lag, after the effective priority. A map of the lags is built
+  once per claim. No new bind. A separate upsert charges the key after
   the post-claim rechecks. A fair claim over several queues runs one
   statement per queue. New entry points: `claim_task_with_fairness` and
   `claim_task_by_id_with_fairness`.

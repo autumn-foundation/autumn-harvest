@@ -125,8 +125,8 @@ take up to `C` claims in a row. The charge of each claim is still exact.
 
 ## Cost
 
-Each fair claim joins a derived table of the keys in debt, with their
-lags. The planner hashes it, so each candidate row does one hash probe for
+Each fair claim builds one map of the keys in debt, with their lags. It
+builds the map once per claim. Each candidate row does one map lookup for
 its sort term. After the rechecks, the claim upserts the claimed key's state
 row. Concurrent claims of one key wait for that row, for one statement. A
 queue of mostly unkeyed work has one key, so its fair claims queue on one
