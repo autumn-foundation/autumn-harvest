@@ -57,8 +57,9 @@ lives in a new crate, `autumn-harvest-agent`.
   with the reply, so replay never asks the policy again.
 - The adapter owns its history types. An upstream type without a serde
   contract never reaches history.
-- A tool result is cut to fit the 2 MiB activity-result cap. A transcript
-  that cannot fit the next request ends the run as `transcript_full`.
+- A tool result is cut to fit the activity-result cap (2 MiB by default,
+  configurable). A transcript that cannot fit the next request ends the run
+  as `transcript_full`.
 - The daemon example keeps its Anthropic-native turn, because it replays
   thinking blocks verbatim. It takes the approval names, the durable
   approval wait and the payload checks from the adapter.

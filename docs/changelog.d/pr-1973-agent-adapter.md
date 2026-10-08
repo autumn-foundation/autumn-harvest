@@ -18,11 +18,14 @@ framework and why. `docs/agent-adapter.md` shows the pattern end to end.
   runs once. A tool error, or a tool over its time budget, is a result that
   the model reads.
 - A payload that is not an `Approval` denies the call. It never fails the
-  run. `approval::await_decision` gives this wait to the daemon too.
+  run. The daemon uses the same wait, `approval::await_decision`, and keeps
+  its own rule: an unreadable decision fails its session.
 - The caps are configurable: `AgentTask::max_request_bytes` and
   `AgentHarness::max_result_bytes`.
 - Step, token, output-cap and transcript bounds end a run under a named
-  `AgentStop`. A tool result is cut to fit the 2 MiB result cap.
+  `AgentStop`. A tool result, or a tool error, is cut to fit the result cap
+  (2 MiB by default). A stalled tool policy denies the call after
+  `policy_timeout`.
 - The crate takes the core engine and plugin-agent with no default
   features. `scripts/check-agent-adapter-no-autumn-web.sh` fails CI if
   `autumn-web` reaches its graph.

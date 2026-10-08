@@ -132,6 +132,12 @@ A worker with a payload cap other than the default must say so. Set
 - `tool_timeout(d)` — the time budget of one tool call. The default is
   9 minutes, below the 10-minute `start_to_close`. A call over it is an
   error result that the model reads.
+- `policy_timeout(d)` — the time budget of the policy for one call. The
+  default is one minute. A policy that does not decide in time denies the
+  call, and the decision is recorded.
+
+A tool error is cut to fit the result cap too, so a huge error message
+cannot fail the run.
 
 `AgentTask` sets the run: `input`, `system`, `history`, `session`,
 `max_steps` (default 8), `max_total_tokens`, `max_output_tokens`,

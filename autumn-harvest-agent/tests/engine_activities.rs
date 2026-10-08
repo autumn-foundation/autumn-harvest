@@ -198,3 +198,72 @@ fn the_engine_registration_builds() {
     assert_eq!(names, ["agent_model_turn", "agent_tool_call"]);
     assert_eq!(workflows()[0].name, autumn_harvest_agent::WORKFLOW_NAME);
 }
+
+#[tokio::test]
+async fn a_huge_tool_error_still_fits_the_result_cap() {
+    use autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
+    use autumn_plugin_agent::{AgentError, ErrorKind, FnTool};
+
+    let failing = FnTool::new(
+        "fail",
+        "Fails with a huge message.",
+        json!({"type": "object"}),
+        |_input| async {
+            // Control characters and quotes escape to the most JSON bytes.
+            let message = "\u{0}\"".repeat(2 * 1024 * 1024);
+            Err::<serde_json::Value, _>(AgentError::new(ErrorKind::Tool, message))
+        },
+    )
+    .effect(ToolEffect::ReadOnly)
+    .shared();
+    let harness = AgentHarness::new(ScriptedModel::new(Vec::new()))
+        .tool(failing)
+        .tool_output_limit(usize::MAX);
+    let outcome = harness
+        .tool_call(ToolCallRequest {
+            run_id: "run-1".into(),
+            session_id: None,
+            step: 0,
+            call: ToolCall {
+                id: "c".into(),
+                name: "fail".into(),
+                arguments: json!({}),
+            },
+        })
+        .await
+        .unwrap();
+
+    assert!(outcome.is_error);
+    let size = serde_json::to_vec(&outcome).unwrap().len() as u64;
+    assert!(size <= DEFAULT_MAX_ACTIVITY_RESULT_BYTES, "{size}");
+    let body: serde_json::Value = serde_json::from_str(&outcome.content).unwrap();
+    assert!(body["error"].as_str().unwrap().ends_with("…[truncated]"));
+}
+
+#[tokio::test]
+async fn a_stalled_policy_denies_the_call_instead_of_hanging_the_turn() {
+    #[derive(Debug)]
+    struct Stalled;
+    impl autumn_plugin_agent::ToolPolicy for Stalled {
+        fn decide<'a>(
+            &'a self,
+            _call: &'a ToolCall,
+            _tool: Option<&'a dyn autumn_plugin_agent::Tool>,
+            _info: &'a autumn_plugin_agent::hooks::RunInfo,
+        ) -> futures::future::BoxFuture<'a, ToolDecision> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    let model = ScriptedModel::new(vec![calls(&[("c", "read", json!({}))], 1)]);
+    let harness = AgentHarness::new(model)
+        .policy(Arc::new(Stalled))
+        .policy_timeout(std::time::Duration::from_millis(20));
+    let turn = harness.model_turn(turn_request()).await.unwrap();
+
+    assert!(
+        matches!(&turn.decisions[0], ToolDecision::Deny { reason } if reason.contains("did not decide")),
+        "{:?}",
+        turn.decisions
+    );
+}

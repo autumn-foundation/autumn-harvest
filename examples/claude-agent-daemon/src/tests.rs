@@ -363,9 +363,10 @@ async fn a_denied_call_is_reported_to_the_model_and_the_session_continues() {
 }
 
 /// The approval wait comes from the agent adapter (issue #1973). A payload
-/// that is not an `ApprovalDecision` denies the call. The session goes on.
+/// that is not an `ApprovalDecision` still fails the session, as before, and
+/// never releases the write.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_unreadable_decision_denies_the_write_and_the_session_goes_on() {
+async fn an_unreadable_decision_fails_the_session_and_never_writes() {
     let dir = tempfile::tempdir().expect("a temporary directory");
     let workspace = dir.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("the workspace is created");
@@ -383,8 +384,8 @@ async fn an_unreadable_decision_denies_the_write_and_the_session_goes_on() {
     let state = rt.run_until_blocked(exec).await.expect("the run finishes");
 
     assert!(
-        matches!(state, RunState::Completed(_)),
-        "expected completion, got {state:?}"
+        matches!(state, RunState::Failed(ref e) if e.contains("not readable")),
+        "expected a failed session, got {state:?}"
     );
     assert!(
         !workspace.join("agent-notes.md").exists(),

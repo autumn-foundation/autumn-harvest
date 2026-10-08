@@ -13,7 +13,8 @@ use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
 use autumn_plugin_agent::hooks::RunInfo;
 use autumn_plugin_agent::policy::AllowAll;
 use autumn_plugin_agent::{
-    AgentError, ChatRequest, ErrorKind, LlmClient, RunId, Tool, ToolContext, ToolPolicy,
+    AgentError, ChatRequest, ErrorKind, LlmClient, RunId, Tool, ToolContext, ToolDecision,
+    ToolPolicy,
 };
 
 use crate::types::{ModelTurn, ModelTurnRequest, ToolCallRequest, ToolOutcome};
@@ -36,6 +37,12 @@ pub const DEFAULT_MODEL_TIMEOUT: Duration = Duration::from_secs(14 * 60);
 /// tool therefore gives the model an error result, and the run goes on.
 pub const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(9 * 60);
 
+/// The default time budget of the policy for one tool call: one minute.
+///
+/// A policy can wait on I/O. Without a budget, a stalled policy would hang
+/// the model turn, and SQLite cannot end the turn from outside.
+pub const DEFAULT_POLICY_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// The bytes that the `ToolOutcome` JSON adds around its content.
 const OUTCOME_ENVELOPE_BYTES: u64 = 64;
 
@@ -56,6 +63,7 @@ pub struct AgentHarness {
     max_result_bytes: u64,
     model_timeout: Duration,
     tool_timeout: Duration,
+    policy_timeout: Duration,
 }
 
 impl AgentHarness {
@@ -71,6 +79,7 @@ impl AgentHarness {
             max_result_bytes: DEFAULT_MAX_ACTIVITY_RESULT_BYTES,
             model_timeout: DEFAULT_MODEL_TIMEOUT,
             tool_timeout: DEFAULT_TOOL_TIMEOUT,
+            policy_timeout: DEFAULT_POLICY_TIMEOUT,
         }
     }
 
@@ -131,6 +140,14 @@ impl AgentHarness {
         self
     }
 
+    /// Set the time budget of the policy for one tool call. A policy that
+    /// does not decide in time denies the call.
+    #[must_use]
+    pub const fn policy_timeout(mut self, timeout: Duration) -> Self {
+        self.policy_timeout = timeout;
+        self
+    }
+
     /// Run one model call, then ask the policy about each tool call.
     ///
     /// The decisions are part of the result. Replay reads them back, so a
@@ -154,10 +171,7 @@ impl AgentHarness {
             Err(_) => {
                 return Err(ActivityFailure::retryable(
                     "ModelTimeout",
-                    format!(
-                        "the model did not answer within {}s",
-                        self.model_timeout.as_secs()
-                    ),
+                    format!("the model did not answer within {:?}", self.model_timeout),
                 )
                 .into_error_payload());
             }
@@ -176,10 +190,14 @@ impl AgentHarness {
             usage: request.usage.saturating_add(response.usage),
         };
         for call in turn.calls() {
-            let decision = self
-                .policy
-                .decide(&call, self.find(&call.name), &info)
-                .await;
+            let decide = self.policy.decide(&call, self.find(&call.name), &info);
+            // A stalled policy denies the call. That fails closed, and the
+            // model reads why.
+            let decision = tokio::time::timeout(self.policy_timeout, decide)
+                .await
+                .unwrap_or_else(|_| ToolDecision::Deny {
+                    reason: format!("the policy did not decide within {:?}", self.policy_timeout),
+                });
             turn.decisions.push(decision);
         }
         Ok(turn)
@@ -197,7 +215,7 @@ impl AgentHarness {
     pub async fn tool_call(&self, request: ToolCallRequest) -> Result<ToolOutcome, String> {
         let call = request.call;
         let Some(tool) = self.find(&call.name) else {
-            return Ok(ToolOutcome::error(&format!("unknown tool {:?}", call.name)));
+            return Ok(self.error_outcome(&format!("unknown tool {:?}", call.name)));
         };
         let ctx = ToolContext {
             run_id: RunId::new(request.run_id),
@@ -214,14 +232,26 @@ impl AgentHarness {
                 )),
                 Ok(Err(err)) => {
                     tracing::warn!(tool = %call.name, error = %err, "agent tool call failed");
-                    ToolOutcome::error(err.message())
+                    self.error_outcome(err.message())
                 }
-                Err(_) => ToolOutcome::error(&format!(
-                    "the tool did not finish within {}s",
-                    self.tool_timeout.as_secs()
+                Err(_) => self.error_outcome(&format!(
+                    "the tool did not finish within {:?}",
+                    self.tool_timeout
                 )),
             },
         )
+    }
+
+    /// An error result whose recorded outcome fits the result cap.
+    ///
+    /// The message is escaped twice: once into the error JSON, and once as
+    /// the outcome content. One byte can grow to twelve, so the message keeps
+    /// a twelfth of the cap.
+    fn error_outcome(&self, message: &str) -> ToolOutcome {
+        let message = truncate(message, self.tool_output_limit);
+        let cap = self.max_result_bytes.saturating_sub(OUTCOME_ENVELOPE_BYTES);
+        let max = usize::try_from(cap / 12).unwrap_or(usize::MAX);
+        ToolOutcome::error(&cut_bytes(message, max))
     }
 
     fn find(&self, name: &str) -> Option<&dyn Tool> {
@@ -259,7 +289,11 @@ pub fn max_tool_result_bytes(cap: u64) -> usize {
 
 /// Cut `text` so that its recorded outcome fits the result cap.
 fn fit_result(text: String, cap: u64) -> String {
-    let max = max_tool_result_bytes(cap);
+    cut_bytes(text, max_tool_result_bytes(cap))
+}
+
+/// Cut `text` to at most `max` bytes on a char boundary, and mark the cut.
+fn cut_bytes(text: String, max: usize) -> String {
     if text.len() <= max {
         return text;
     }

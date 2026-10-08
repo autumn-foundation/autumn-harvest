@@ -401,8 +401,10 @@ async fn gated_call(
 ) -> Result<ToolOutcome, String> {
     // The durable wait comes from the adapter. It records the same events as
     // a plain signal wait, so a history from an older daemon still replays.
-    // A payload that is not an `ApprovalDecision` denies the call instead of
-    // failing the session.
+    //
+    // A payload that is not an `ApprovalDecision` fails the session, as it
+    // did before. The startup check refuses such a history on the same rule,
+    // so the two stay consistent.
     let decision = await_decision::<ApprovalDecision>(
         ctx,
         &approval_signal(turn, position, &call.id),
@@ -416,9 +418,7 @@ async fn gated_call(
             "denied by the operator: {}",
             d.note.unwrap_or_else(|| "no reason given".to_string())
         ))),
-        Decision::Unreadable(why) => Ok(ToolOutcome::error(format!(
-            "denied: the decision was not readable ({why})"
-        ))),
+        Decision::Unreadable(why) => Err(format!("the decision is not readable: {why}")),
         Decision::TimedOut => Ok(ToolOutcome::error(format!(
             "denied: no approval arrived within {}s",
             task.approval_timeout_secs
