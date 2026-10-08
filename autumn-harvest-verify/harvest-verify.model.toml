@@ -1014,7 +1014,7 @@ reason = "context.rs:10268; emits a command transitively: execute_activity_fan_o
 [[sink]]
 path = "execute_activity_fan_out_raw_with"
 receiver = "WorkflowContext"
-reason = "context.rs:11089; emits a command transitively: execute_activity_fan_out_raw_with -> fan_out_with_impl -> record_fan_out_marker* (`*` = the `push_command` site). The activities are recorded into history and matched on replay; the window and tolerance are not, as for the windowed helpers (issue #1986)."
+reason = "context.rs:11093; emits a command transitively: execute_activity_fan_out_raw_with -> fan_out_with_impl -> record_fan_out_marker* (`*` = the `push_command` site). The activities are recorded into history and matched on replay; the window and tolerance are not, as for the windowed helpers (issue #1986)."
 [[sink]]
 path = "execute_activity_fan_out_windowed"
 receiver = "WorkflowContext"
@@ -1022,7 +1022,7 @@ reason = "context.rs:10492; emits a command transitively: execute_activity_fan_o
 [[sink]]
 path = "execute_activity_fan_out_with"
 receiver = "WorkflowContext"
-reason = "context.rs:11117; emits a command transitively: execute_activity_fan_out_with -> fan_out_with_impl -> record_fan_out_marker* (`*` = the `push_command` site). The activities are recorded into history and matched on replay; the window and tolerance are not, as for the windowed helpers (issue #1986)."
+reason = "context.rs:11121; emits a command transitively: execute_activity_fan_out_with -> fan_out_with_impl -> record_fan_out_marker* (`*` = the `push_command` site). The activities are recorded into history and matched on replay; the window and tolerance are not, as for the windowed helpers (issue #1986)."
 [[sink]]
 path = "execute_activity_raw"
 receiver = "WorkflowContext"
