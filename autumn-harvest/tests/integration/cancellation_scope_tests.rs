@@ -3,7 +3,9 @@
 //!
 //! - A scope cancel tears down an activity, a timer and a child workflow.
 //! - A non-cancellable block runs to completion after a workflow cancel.
-//! - A full replay of each recorded history adds no command.
+//! - A deferred cancel also completes after an inline local activity, and
+//!   it replaces a continue-as-new.
+//! - A full replay of each recorded history stays deterministic.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -12,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
 use autumn_harvest::models::TaskQueueItem;
-use autumn_harvest::schema::harvest_task_queue;
+use autumn_harvest::schema::{harvest_task_queue, harvest_workflow_executions};
 use autumn_harvest::telemetry::NoOpMetrics;
 use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::HandlerRegistry;
@@ -20,6 +22,8 @@ use autumn_harvest::{HarvestError, WorkflowContext, cancel_workflow_execution};
 use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use serde_json::{Value, json};
+use testcontainers::ContainerAsync;
+use testcontainers_modules::postgres::Postgres;
 
 use crate::integration_e2e::{
     build_runtime_worker, build_test_pool, enqueue_started_workflow_task,
@@ -97,7 +101,7 @@ fn fast_activity(_ctx: &autumn_harvest::ActivityContext, _input: Value) -> ActFu
     Box::pin(async move { Ok(json!("fast")) })
 }
 
-/// Opens when the test sets it. One test uses it.
+/// Opens when the test sets it. Each test closes it first.
 static CLEANUP_GATE: AtomicBool = AtomicBool::new(false);
 
 fn gated_cleanup(_ctx: &autumn_harvest::ActivityContext, _input: Value) -> ActFuture {
@@ -106,6 +110,38 @@ fn gated_cleanup(_ctx: &autumn_harvest::ActivityContext, _input: Value) -> ActFu
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         Ok(json!("cleaned"))
+    })
+}
+
+/// Cleanup in a block, then an inline local activity, then a long timer.
+fn shield_then_local_wf(ctx: &WorkflowContext, _input: Value) -> WfFuture<'_> {
+    Box::pin(async move {
+        ctx.non_cancellable(ctx.execute_activity_raw("gated_cleanup", Value::Null, "default"))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        ctx.execute_local_activity_raw("fast_local", Value::Null, None, Some(10))
+            .await
+            .map_err(|e| e.to_string())?;
+        ctx.timer("after", 3600).await.map_err(|e| e.to_string())?;
+        Ok(json!("done"))
+    })
+}
+
+/// Cleanup in a block, then continue as new.
+fn shield_then_continue_wf(ctx: &WorkflowContext, input: Value) -> WfFuture<'_> {
+    Box::pin(async move {
+        if input == json!("next") {
+            return Ok(json!("successor"));
+        }
+        ctx.non_cancellable(ctx.execute_activity_raw("gated_cleanup", Value::Null, "default"))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        ctx.continue_as_new(json!("next"))
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!("unreachable"))
     })
 }
 
@@ -258,6 +294,14 @@ async fn scope_cancel_tears_down_an_activity_a_timer_and_a_child() {
     assert!(
         history.events.iter().any(|e| matches!(
             e,
+            WorkflowEvent::TimerStarted { timer_id, .. } if timer_id.as_str() == "scope_deadline"
+        )),
+        "the timer was armed before the cancel: {:?}",
+        history.events
+    );
+    assert!(
+        history.events.iter().any(|e| matches!(
+            e,
             WorkflowEvent::MarkerRecorded { name, .. } if name == "cancel_scope:1"
         )),
         "the cancel decision is recorded: {:?}",
@@ -355,6 +399,165 @@ async fn non_cancellable_block_completes_after_the_workflow_is_cancelled() {
             .any(|t| t.activity_name.as_deref() == Some("gated_cleanup") && t.state == "COMPLETED"),
         "the shielded activity completes: {tasks:?}"
     );
+    assert!(
+        !tasks
+            .iter()
+            .any(|t| t.activity_name.as_deref() == Some("fast_activity") && t.state == "COMPLETED"),
+        "the cancel lands in the cycle that closes the block: {tasks:?}"
+    );
+
+    // AC3: the history replays with no divergence. The run parks on the
+    // activity after the block, because the cancel ended it there.
+    let ctx = WorkflowContext::for_replay(exec_id, history.events);
+    let replayed = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        shielded_cleanup_wf(&ctx, Value::Null),
+    )
+    .await;
+    assert!(replayed.is_err(), "the replay parks where the run stopped");
+    assert!(
+        ctx.take_nd_details().is_none(),
+        "replay must be deterministic"
+    );
+}
+
+/// Starts a run of `handler`, cancels it while its block is open, then opens
+/// the gate. Returns the database guard and URL, the execution, its final
+/// row and its history.
+async fn cancel_inside_block_then_release(
+    worker_id: &str,
+    handler: WfHandler,
+    expected_state: &str,
+) -> (
+    Option<ContainerAsync<Postgres>>,
+    String,
+    ExecutionId,
+    autumn_harvest::models::WorkflowExecution,
+    Vec<WorkflowEvent>,
+) {
+    CLEANUP_GATE.store(false, Ordering::SeqCst);
+    let (database_url, guard) = setup_test_database_url_or_env().await;
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("connect");
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    enqueue_started_workflow_task(&mut conn, exec_id, Value::Null).await;
+
+    let local = ActivityInfo {
+        is_local: true,
+        ..act_info("fast_local", fast_activity)
+    };
+    let reg = Arc::new(HandlerRegistry::new(
+        vec![wf_info("e2e_test_workflow", handler)],
+        vec![act_info("gated_cleanup", gated_cleanup), local],
+    ));
+    let worker = build_runtime_worker(worker_id, 4, 2, reg);
+    let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&database_url));
+
+    wait_for_event(&database_url, exec_id, "the cleanup start", |e| {
+        matches!(e, WorkflowEvent::ActivityStarted { .. })
+    })
+    .await;
+    let cancelled = cancel_workflow_execution(&mut conn, exec_id, "operator abort", &NoOpMetrics)
+        .await
+        .expect("cancel");
+    assert!(cancelled.deferred, "an open block defers the cancel");
+
+    CLEANUP_GATE.store(true, Ordering::SeqCst);
+    let execution = wait_for_execution_state_with_timeout(
+        &database_url,
+        exec_id,
+        expected_state,
+        std::time::Duration::from_secs(20),
+    )
+    .await;
+    let history = load_history_from_url(&database_url, exec_id).await.events;
+    worker.shutdown();
+    handle.await.expect("join");
+    (guard, database_url, exec_id, execution, history)
+}
+
+/// A block that closes before an inline local activity still completes the
+/// deferred cancel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deferred_cancel_completes_after_an_inline_local_activity() {
+    let (_guard, _, _, execution, history) = cancel_inside_block_then_release(
+        "worker-1984-shield-local",
+        shield_then_local_wf,
+        "CANCELLED",
+    )
+    .await;
+
+    assert_eq!(execution.error.as_deref(), Some("operator abort"));
+    assert!(
+        history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowCancelled { .. })),
+        "{history:?}"
+    );
+}
+
+/// A run that would continue as new after its block is cancelled instead,
+/// so no successor drops the cancel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deferred_cancel_replaces_a_continue_as_new() {
+    let (_guard, database_url, exec_id, execution, history) = cancel_inside_block_then_release(
+        "worker-1984-shield-continue",
+        shield_then_continue_wf,
+        "CANCELLED",
+    )
+    .await;
+
+    assert_eq!(execution.error.as_deref(), Some("operator abort"));
+    assert!(
+        !history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowContinuedAsNew { .. })),
+        "{history:?}"
+    );
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("connect");
+    let successors: i64 = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::continued_from_exec_id.eq(Some(exec_id.as_uuid())))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count successors");
+    assert_eq!(successors, 0, "no successor run starts");
+}
+
+/// A paused run cannot close its block, so its cancel is not deferred.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_of_a_paused_run_is_not_deferred() {
+    let (database_url, _guard) = setup_test_database_url_or_env().await;
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("connect");
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    autumn_harvest::store::append_events(
+        &mut conn,
+        exec_id,
+        &[WorkflowEvent::MarkerRecorded {
+            name: "non_cancellable_open:1".into(),
+            details: Value::Null,
+        }],
+        0,
+    )
+    .await
+    .expect("seed history");
+    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+        .set(harvest_workflow_executions::state.eq("PAUSED"))
+        .execute(&mut conn)
+        .await
+        .expect("pause");
+
+    let cancelled = cancel_workflow_execution(&mut conn, exec_id, "operator abort", &NoOpMetrics)
+        .await
+        .expect("cancel");
+
+    assert!(!cancelled.deferred);
+    assert_eq!(cancelled.state, "CANCELLED");
 }
 
 /// A cancel with no open block stays terminal at once.
