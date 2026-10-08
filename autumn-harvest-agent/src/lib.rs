@@ -15,6 +15,7 @@
 //! # Use it on SQLite
 //!
 //! ```no_run
+//! # #[cfg(feature = "sqlite")]
 //! # async fn demo(model: std::sync::Arc<dyn autumn_harvest_agent::AgentModel>)
 //! # -> Result<(), autumn_harvest_sqlite::SqliteError> {
 //! use std::sync::Arc;
