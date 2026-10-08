@@ -35,10 +35,12 @@ Done when: the page exists and `docs/comparison.md` links it.
   "What replay costs" section and a "When checkpoint-only is the better
   choice" section.
 - **R2. The page cites work that has not shipped.** Foreclosed: each `#NNN`
-  on the page must appear in `docs/shipped-work.md`.
+  on the page must appear in `docs/shipped-work.md` or name a fragment in
+  `docs/changelog.d/`. An anchor such as `page.md#5-title` is not a citation.
 - **R3. The HVG range drifts.** A new HVG012 lands and the page still says
-  HVG011. Foreclosed: the guard reads the highest `HVGnnn` code in the macro
-  source and requires the page to cite that range.
+  HVG011. Foreclosed: the guard reads the highest code from
+  `guardrail::catalog()` and checks that the macro agrees. Each range on the
+  page must match it.
 - **R4. A named asset is dropped in a later edit.** Foreclosed: the guard
   requires each asset from the issue: the HVG range, `det_check`,
   `harvest-verify`, replay canaries, drift gates and the park state.
@@ -47,8 +49,8 @@ Done when: the page exists and `docs/comparison.md` links it.
   determinism guide links it too. `corpus-link-check.py` checks each link
   target and reports an orphan page.
 - **R6. The guard never runs on a docs-only change.** Foreclosed: an ungated
-  `lint` step runs the module, and a guard test fails if that step is removed
-  or gains an `if:`.
+  `lint` step runs the module. A guard test fails if that step is removed, gains
+  an `if:` or `continue-on-error`, or narrows its filter.
 - **R7. The prose drifts away from short STE sentences.** Foreclosed: the guard
   fails on a prose sentence over 25 words.
 - **R8. A competitor claim goes stale.** Foreclosed in part: the page dates its
@@ -60,7 +62,8 @@ Done when: the page exists and `docs/comparison.md` links it.
 - **White (facts).** The issue has one acceptance criterion. The report names
   Sayiir, Absurd, Trigger.dev and Golem. The assets to cite are HVG001–HVG011,
   `det_check`, `harvest-verify`, replay canaries, drift gates and parked
-  non-deterministic runs.
+  non-deterministic runs. The issue also names Golem. Golem's own page does not
+  say that it avoids replay, so the page leaves Golem out.
 - **Red (feelings).** An evaluator fears that replay is a trap that fires at
   2 a.m. The page must meet that fear first, not bury it.
 - **Black (risks).** Overclaiming, stale competitor facts, a defensive tone, and
@@ -84,3 +87,19 @@ Done when: the page exists and `docs/comparison.md` links it.
 3. **Refactor.** Tighten the prose and the guard. Run the guard,
    `corpus-link-check.py`, `doc-claim-drift.py`, `workflow-yaml-parse.py` and
    `comment-hygiene.py --base origin/trunk-dev`.
+
+## 5. Review round
+
+Four review agents read the change: facts, guard code, writing, and CI. Codex
+also reviewed it. The fixes:
+
+- The page scopes drift detection to a changed command sequence. It no longer
+  says that a checkpoint engine "cannot copy" it.
+- The history ceiling moved from the remedies to the costs. `harvest-verify` is
+  marked as a prototype. `det_check` reaches one call only.
+- The replay gate is `ReplayVerifier` (#251), not the `WorkflowReplayer` harness.
+- `docs/replay-verify.md` no longer offers `harvest-replay` as a batch gate. Its
+  CI snippet splits the batch envelope into one file per run.
+- The guard reads the HVG range from the catalog and checks each range. Its
+  sentence parser handles code spans, abbreviations, blockquotes and wrapped
+  `#` lines. Its CI check rejects `continue-on-error` and a narrowed filter.

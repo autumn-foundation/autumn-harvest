@@ -1,10 +1,11 @@
 # Gating deploys with replay-verify
 
 Replay-verify is the CI gate that ensures code changes to `#[workflow]` functions
-do not break in-flight production executions. You run it from your own binary through
-`ReplayVerifier::verify_dir`, or with the `harvest-replay` binary. The `harvest` CLI has
-no `replay-verify` subcommand. It batch-replays exported history fixtures
-against the current codebase and exits non-zero on any regression, blocking the merge.
+do not break in-flight production executions. You run it from your own binary or test,
+which calls `ReplayVerifier` (see [Quick start](#quick-start-rust-api)). The `harvest` CLI
+has no `replay-verify` subcommand. The `harvest-replay` binary replays one history file
+only. The verifier batch-replays exported history fixtures against the current codebase
+and exits non-zero on any regression, blocking the merge.
 
 ## What it catches — and what it does not
 
@@ -151,7 +152,7 @@ let ci = report.into_ci_report_with_threshold(0.95); // fail only if < 95% pass
 ```
 
 ```bash
-# CLI (harvest-replay binary or downstream app)
+# A downstream binary that you write (see Quick start)
 my-app replay-verify --fixtures-dir ./fixtures --fail-on rate=0.95
 ```
 
@@ -175,6 +176,10 @@ ReplayVerifier::new()
 ---
 
 ## Complete GitHub Actions snippet
+
+`replay-verify` below is the binary from the Quick start. Your binary parses its own
+flags. The verifier reads one `HistorySnapshot` per file, so the export step splits the
+batch envelope into one file per run.
 
 ```yaml
 # .github/workflows/replay-verify.yml
@@ -200,7 +205,12 @@ jobs:
       #       history export-batch \
       #       --state-group terminal \
       #       --limit 200 \
-      #       --output-file ./fixtures/replay/batch.json
+      #       --payload-policy full \
+      #       --output-file ./batch.json
+      #     jq -c '.exports[]' ./batch.json | while read -r doc; do
+      #       id=$(jq -r '.execution_id' <<<"$doc")
+      #       printf '%s\n' "$doc" > "./fixtures/replay/$id.json"
+      #     done
 
       - name: Run replay-verify
         run: |
@@ -251,6 +261,8 @@ cargo bench -p autumn-harvest \
   No new key-management surface is introduced by the verifier.
 - **DAG runs:** The verifier covers `#[workflow]`-annotated event histories only. A DAG-level
   verifier is a planned follow-up.
-- **Fixture lifecycle:** The verifier consumes a fixture directory that
-  `harvest history export-batch --output-file` fills (issue #169). Fixture rotation, pruning, and
+- **Fixture lifecycle:** The verifier reads a directory of `HistorySnapshot` files.
+  `harvest history export` writes one such file per run (issue #169).
+  `harvest history export-batch` writes one envelope file, so split its `exports`
+  array into one file per run first. Fixture rotation, pruning, and
   auto-export-on-merge are deployment concerns outside the verifier's scope.

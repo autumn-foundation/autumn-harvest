@@ -108,7 +108,7 @@ sourcing doc and flag anything unverified.
 
 | Engine | Approach |
 |---|---|
-| **autumn-harvest** | Event-sourced deterministic replay, layered with the deepest safety tooling in this set: **compile-time guardrails HVG001–HVG011** plus a `det_check` static analyzer (DET010/DET011) that flag non-deterministic patterns before they ship; the [`WorkflowReplayer` harness (#251)](replay-verify.md) that replays current code against recorded histories in CI; **non-terminal [ND-blocking (#603)](https://github.com/autumn-foundation/autumn-harvest/issues/603)** that _parks and alerts_ a divergent run rather than silently wedging or failing it; and [deterministic side-effect primitives (#384)](https://github.com/autumn-foundation/autumn-harvest/issues/384) for time/UUID/random. See the [workflow determinism guide](workflow-determinism-guide.md), and [why Harvest keeps deterministic replay](why-deterministic-replay.md) for the case against checkpoint-only steps. |
+| **autumn-harvest** | Event-sourced deterministic replay, layered with the deepest safety tooling in this set: **compile-time guardrails HVG001–HVG011** plus a `det_check` static analyzer (DET010/DET011) that flag non-deterministic patterns before they ship; the [`ReplayVerifier` CI gate (#251)](replay-verify.md), built on the `WorkflowReplayer` harness, that replays current code against recorded histories; **non-terminal [ND-blocking (#603)](https://github.com/autumn-foundation/autumn-harvest/issues/603)** that _parks and alerts_ a divergent run rather than silently wedging or failing it; and [deterministic side-effect primitives (#384)](https://github.com/autumn-foundation/autumn-harvest/issues/384) for time/UUID/random. See the [workflow determinism guide](workflow-determinism-guide.md), and [why Harvest keeps deterministic replay](why-deterministic-replay.md) for the trade-off against checkpoint-only steps. |
 | Temporal | Deterministic replay is core (Event History replayed against code); ships **Replay testing** to detect non-determinism before deploy. ([docs](https://docs.temporal.io/develop/safe-deployments)) |
 | DBOS | Checkpoint/resume from the last completed step (not command-comparison replay); docs state workflow functions must be deterministic and keep I/O in steps. ([docs](https://docs.dbos.dev/architecture)) |
 | Inngest | Step-based memoization; docs state **no determinism requirement** on the orchestration layer (each step runs once, result persisted, completed steps skipped on retry). ([docs](https://www.inngest.com/docs/learn/how-functions-are-executed)) |
@@ -219,7 +219,7 @@ replay tests alone:
 2. **[Deterministic side-effect primitives (#384)](https://github.com/autumn-foundation/autumn-harvest/issues/384)**
    give authors safe replacements (`ctx.system_now`, `ctx.new_uuid`,
    `ctx.random_*`) that record their value once and replay it verbatim.
-3. **The [`WorkflowReplayer` harness (#251)](replay-verify.md)** replays a
+3. **The [`ReplayVerifier` gate (#251)](replay-verify.md)** replays a
    code change against recorded production histories in CI, so a non-determinism
    regression is a failed test, not a 2 a.m. page.
 4. **Non-terminal [ND-blocking (#603)](https://github.com/autumn-foundation/autumn-harvest/issues/603)**
