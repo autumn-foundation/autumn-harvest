@@ -1774,7 +1774,8 @@ async fn upsert_schedule(
             .await
             .map_err(crate::error::database_error)?;
         if inserted_rows == 0 {
-            // The other writer owns this row and has set its `next_run_at`.
+            // The other writer owns this row and sets its `next_run_at`.
+            // A later registration tick reconciles the row.
             return Ok(inserted);
         }
         let initial_next_run = next_run_after(dag.schedule.as_ref(), now);

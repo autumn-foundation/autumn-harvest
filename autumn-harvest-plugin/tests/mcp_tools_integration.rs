@@ -9,8 +9,8 @@
 //! app is torn down and a second app on the same database finishes the run).
 //!
 //! Requires Docker. CI runs this suite from a `linux` manifest row (issue #1959).
-//! The tests that wait for an update handler stay ignored until issue #2035
-//! is fixed. The engine admits a declarative update but never runs it.
+//! The tests that wait for an update handler stay ignored until a fix for
+//! issue #2035 lands. The engine admits a declarative update but never runs it.
 //! Each test uses a multi-thread runtime. `TestApp::plugin` blocks on plugin
 //! startup, and that deadlocks a current-thread runtime.
 
@@ -46,6 +46,9 @@ async fn agent_approval_flow(ctx: &WorkflowContext, request_id: String) -> Resul
         .await
         .map_err(|e| e.to_string())?;
     ctx.set_current_details("step 2/2: finalizing");
+    // A durable step after the signal keeps the run open for 1 s. The watch
+    // then reads it as RUNNING and emits a second progress frame.
+    ctx.timer("finalize", 1).await.map_err(|e| e.to_string())?;
     let decision = approval
         .get("decision")
         .and_then(Value::as_str)
@@ -136,12 +139,12 @@ async fn ping_relay(_ctx: &WorkflowContext, _req: Value) -> Result<String, Strin
     Ok("pong".to_string())
 }
 
-/// Sleeps briefly so a concurrent second DAG trigger reliably observes the
-/// first run still `RUNNING` -- needed to exercise `max_active_runs`
-/// deterministically without a flaky race against instant completion.
+/// Sleeps 2 s. A concurrent second DAG trigger then sees the first run still
+/// `RUNNING`. This exercises `max_active_runs` without a race against an
+/// instant completion.
 #[activity]
 async fn dag_mcp_slow_task(_ctx: &ActivityContext) -> Result<(), String> {
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
     Ok(())
 }
 
@@ -240,8 +243,8 @@ async fn rpc(client: &TestClient, body: Value) -> Value {
 
 /// `tools/call` returning the inner handler body parsed as JSON.
 ///
-/// A JSON-RPC `error` has no `result`. It counts as an error, and its body is
-/// the error object.
+/// A JSON-RPC `error` (an unknown tool or a missing argument) fails the test.
+/// It never counts as a tool error, so a negative test cannot pass on it.
 async fn call_tool(client: &TestClient, name: &str, arguments: Value) -> (bool, Value) {
     let out = rpc(
         client,
@@ -251,9 +254,11 @@ async fn call_tool(client: &TestClient, name: &str, arguments: Value) -> (bool, 
         }),
     )
     .await;
-    if out.get("error").is_some() {
-        return (true, out["error"].clone());
-    }
+    assert!(
+        out.get("error").is_none(),
+        "{name}: JSON-RPC error, not a tool result: {}",
+        out["error"]
+    );
     let is_error = out["result"]["isError"].as_bool().unwrap_or(false);
     let text = out["result"]["content"][0]["text"]
         .as_str()
@@ -263,7 +268,7 @@ async fn call_tool(client: &TestClient, name: &str, arguments: Value) -> (bool, 
     (is_error, body)
 }
 
-/// Poll the status tool until `pred` holds or ~15 s elapse.
+/// Poll the status tool until `pred` holds, for at most 150 polls.
 async fn wait_for_status(
     client: &TestClient,
     tool: &str,
@@ -342,6 +347,7 @@ async fn agent_drives_a_durable_workflow_via_mcp_tools() {
     // the remaining transitions live (initial frame + signal-driven events),
     // and deliver the signal concurrently (the watch response body only
     // completes once the run reaches a terminal state).
+    let listeners_before = count_listeners(&db).await;
     let watch_fut = post_sse(
         &client,
         json!({
@@ -354,8 +360,13 @@ async fn agent_drives_a_durable_workflow_via_mcp_tools() {
         }),
     );
     let signal_fut = async {
-        // Give the SSE subscription a moment to establish its LISTEN connection.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Wait until the watch holds its LISTEN connection.
+        for _ in 0..100 {
+            if count_listeners(&db).await > listeners_before {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         call_tool(
             &client,
             "signal_agent_approval_flow",
@@ -404,10 +415,11 @@ async fn agent_drives_a_durable_workflow_via_mcp_tools() {
     assert_eq!(status["output"], json!("req-42:approved"));
 }
 
-/// Durability across a daemon restart: the workflow is started through an MCP
-/// tool on app #1, app #1 is torn down entirely (simulated daemon stop), and
-/// app #2 — a fresh process-equivalent on the same database — resumes it. The
-/// agent's connection lifetime is irrelevant to the work completing.
+/// Durability across a daemon restart. App #1 starts the workflow through an
+/// MCP tool. App #2, a new app on the same database, then finds, steers and
+/// completes the run. `TestApp` does not run shutdown hooks, so app #1's
+/// worker can still run in this process. The test proves that app #2 needs
+/// only Postgres. It does not prove that app #1's worker stopped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workflow_started_via_mcp_survives_daemon_restart() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -431,7 +443,7 @@ async fn workflow_started_via_mcp_survives_daemon_restart() {
         })
         .await;
         handle
-        // client dropped here — the first app (worker included) is gone.
+        // The client drops here. App #1's HTTP surface is gone.
     };
 
     // "Daemon restart": a brand new app against the same database.
@@ -565,7 +577,7 @@ async fn status_and_watch_follow_the_continue_as_new_chain_to_the_real_result() 
 ///
 /// Status follows the chain, so a new `execution_id` proves the successor
 /// runs. A bare `RUNNING` check is not enough: the predecessor is `RUNNING`
-/// before it continues, and a call admitted to it is then orphaned.
+/// before it continues, and the successor never sees a call sent then.
 async fn start_relay_and_wait_for_successor(client: &TestClient) -> String {
     let (is_error, started) =
         call_tool(client, "start_agent_relay_signal_flow", json!({"body": 0})).await;
@@ -728,6 +740,21 @@ async fn mcp_update_tool_rejects_invalid_payload_via_registered_validator() {
     assert_eq!(status["is_terminal"], json!(false));
 }
 
+/// Counts the sessions whose last statement is a `LISTEN`.
+async fn count_listeners(db: &TestPg) -> i64 {
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let mut conn = db.pool.get().await.expect("pool connection");
+    diesel::sql_query("SELECT COUNT(*) AS n FROM pg_stat_activity WHERE query LIKE 'LISTEN %'")
+        .get_result::<Count>(&mut conn)
+        .await
+        .expect("count LISTEN sessions")
+        .n
+}
+
 /// Counts the `UpdateAdmitted` events of one execution.
 async fn count_update_admitted(db: &TestPg, execution_id: &str) -> i64 {
     #[derive(diesel::QueryableByName)]
@@ -811,9 +838,8 @@ async fn dag_start_tool_triggers_a_real_dag_run_and_enforces_max_active_runs() {
     })
     .await;
 
-    // The first run's activity sleeps 500ms, so this concurrent second
-    // trigger reliably observes it still RUNNING and must be rejected by
-    // max_active_runs (default 1) rather than admitted as a second run.
+    // The first run's activity sleeps 2 s, so this second trigger sees it
+    // still RUNNING. `max_active_runs` (default 1) must reject the trigger.
     let (is_error, second) = call_tool(&client, "start_agent_mcp_dag", json!({"body": null})).await;
     assert!(
         is_error,

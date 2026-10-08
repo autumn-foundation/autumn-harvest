@@ -853,23 +853,31 @@ fn issue_1799_suites_have_covering_rows() {
     }
 }
 
-/// Plugin suites that issue #1959 wired.
-const ISSUE_1959_PLUGIN: &[&str] = &["mcp_tools_integration", "webhook_durable_integration"];
+/// Plugin suites that issue #1959 wired, with the features each row needs.
+///
+/// `mcp_tools_integration` gates two DAG tests on `unified-dag-execution`.
+/// Its file `cfg` names only `mcp`, so the list names the second feature.
+const ISSUE_1959_PLUGIN: &[(&str, &[&str])] = &[
+    ("mcp_tools_integration", &["mcp", "unified-dag-execution"]),
+    ("webhook_durable_integration", &["webhooks"]),
+];
 
 /// The suites that issue #1959 wired must run in CI and must keep their three
 /// fixes. On a current-thread runtime, `TestApp::plugin` deadlocks. `TestDb`
-/// starts Postgres 11, where the worker claim query fails on `MATERIALIZED`.
-/// A `run_pending` call for `autumn_harvest::MIGRATIONS` after the framework
-/// set skips six Harvest migrations that share a framework version.
+/// and an untagged `Postgres::default()` start Postgres 11, where the worker
+/// claim query fails on `MATERIALIZED`. A `run_pending` call for the Harvest
+/// set after the framework set skips six Harvest migrations that share a
+/// framework version.
 #[test]
 fn issue_1959_suites_run_in_ci() {
     let rows = parse_manifest();
-    for &stem in ISSUE_1959_PLUGIN {
+    for &(stem, required) in ISSUE_1959_PLUGIN {
         let src = read_source(&plugin_tests_dir().join(format!("{stem}.rs")));
         let code = strip_line_comments(&src);
+        let required: Vec<String> = required.iter().map(ToString::to_string).collect();
         assert!(
-            plugin_covered(&rows, stem, &plugin_required_features(&src)),
-            "plugin:{stem} needs a covering `linux` manifest row"
+            plugin_covered(&rows, stem, &required),
+            "plugin:{stem} needs a covering `linux` manifest row with {required:?}"
         );
         assert!(
             !all_tests_ignored(&src),
@@ -879,16 +887,21 @@ fn issue_1959_suites_run_in_ci() {
             !allowlisted(&format!("plugin:{stem}")),
             "plugin:{stem} is wired; remove its ALLOWLIST entry and lower ALLOWLIST_MAX_LEN"
         );
-        assert!(
-            !code.contains("#[tokio::test]"),
-            "plugin:{stem} must use the multi-thread flavor, not a current-thread runtime"
+        assert_eq!(
+            code.matches("#[tokio::test").count(),
+            code.matches("#[tokio::test(flavor = \"multi_thread\"")
+                .count(),
+            "plugin:{stem} must use the multi-thread flavor for every test"
         );
         assert!(
-            !code.contains("TestDb::"),
-            "plugin:{stem} must pin a supported Postgres, not the `TestDb` default (Postgres 11)"
+            !code.contains("TestDb::") && code.contains(".with_tag(\"16\")"),
+            "plugin:{stem} must pin Postgres 16, not the `TestDb` default (Postgres 11)"
         );
         assert!(
-            !code.contains("autumn_harvest::MIGRATIONS"),
+            code.contains("test_init_sql()")
+                && !code
+                    .replace("FRAMEWORK_MIGRATIONS", "")
+                    .contains("MIGRATIONS"),
             "plugin:{stem} must load the Harvest schema with `test_init_sql()`"
         );
     }

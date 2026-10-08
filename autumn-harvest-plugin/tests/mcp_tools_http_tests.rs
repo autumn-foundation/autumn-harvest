@@ -8,9 +8,8 @@
 //!
 //! NOTE: `TestApp::plugin(HarvestPlugin)` cannot be used here — `TestApp`
 //! replays plugin startup hooks and `start_harvest_runtime` requires a live
-//! Postgres. The full plugin-wired flow is covered by the testcontainers
-//! integration test (`mcp_tools_integration.rs`, compile-checked in this
-//! sandbox per the #543/#544 precedent).
+//! Postgres. The testcontainers suite `mcp_tools_integration.rs` covers the
+//! full plugin-wired flow. CI runs it (issue #1959).
 
 #![cfg(feature = "mcp")]
 #![allow(clippy::unused_async, clippy::used_underscore_binding)]

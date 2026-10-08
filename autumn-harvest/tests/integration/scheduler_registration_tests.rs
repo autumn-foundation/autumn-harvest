@@ -1222,23 +1222,39 @@ fn unscheduled_dag(name: &str) -> autumn_harvest::scheduler::RegisteredDag {
     }
 }
 
-/// Waits until a session blocks on a lock while it writes `harvest_schedules`.
-async fn wait_for_blocked_schedule_insert(conn: &mut AsyncPgConnection) {
+/// The backend process id of one connection.
+async fn backend_pid(conn: &mut AsyncPgConnection) -> i32 {
     #[derive(diesel::QueryableByName)]
-    struct Count {
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        n: i64,
+    struct Pid {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        pid: i32,
+    }
+    diesel::sql_query("SELECT pg_backend_pid() AS pid")
+        .get_result::<Pid>(conn)
+        .await
+        .expect("read pg_backend_pid")
+        .pid
+}
+
+/// Waits until backend `waiter` blocks on a lock that backend `holder` holds.
+///
+/// `pg_blocking_pids` names the exact pair. A query-text match on
+/// `pg_stat_activity` can match an unrelated session on a shared cluster.
+async fn wait_until_blocked_by(conn: &mut AsyncPgConnection, waiter: i32, holder: i32) {
+    #[derive(diesel::QueryableByName)]
+    struct Blocked {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        blocked: bool,
     }
     for _ in 0..200 {
-        let blocked = diesel::sql_query(
-            "SELECT COUNT(*) AS n FROM pg_stat_activity \
-             WHERE wait_event_type = 'Lock' AND query ILIKE '%harvest_schedules%'",
-        )
-        .get_result::<Count>(conn)
-        .await
-        .expect("read pg_stat_activity")
-        .n;
-        if blocked > 0 {
+        let blocked = diesel::sql_query("SELECT $1 = ANY(pg_blocking_pids($2)) AS blocked")
+            .bind::<diesel::sql_types::Integer, _>(holder)
+            .bind::<diesel::sql_types::Integer, _>(waiter)
+            .get_result::<Blocked>(conn)
+            .await
+            .expect("read pg_blocking_pids")
+            .blocked;
+        if blocked {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1262,6 +1278,8 @@ async fn a_concurrent_dag_registration_uses_the_first_row() {
         .await
         .expect("connect");
     let dag = unscheduled_dag("raced_dag");
+    let first_pid = backend_pid(&mut first).await;
+    let second_pid = backend_pid(&mut second).await;
 
     // The first registration inserts its row and holds the transaction open.
     first.batch_execute("BEGIN").await.expect("begin");
@@ -1275,7 +1293,7 @@ async fn a_concurrent_dag_registration_uses_the_first_row() {
         let dag = dag.clone();
         async move { ensure_dag_schedule(&mut second, &dag).await }
     });
-    wait_for_blocked_schedule_insert(&mut observer).await;
+    wait_until_blocked_by(&mut observer, second_pid, first_pid).await;
     first.batch_execute("COMMIT").await.expect("commit");
 
     let second_row = racer
