@@ -666,3 +666,32 @@ async fn concurrent_fair_claims_keep_every_charge() {
     assert!(state["a"] <= 305.0 + 1e-9, "a was charged twice: {state:?}");
     assert!(state["b"] >= 5.0 - 1e-9, "b lost a charge: {state:?}");
 }
+
+/// The public enqueue paths reject a key that the weight API rejects. Such a
+/// key would make the claim's charge fail, so no row may store it.
+#[tokio::test]
+async fn enqueue_rejects_an_invalid_fairness_key() {
+    use autumn_harvest::schema::harvest_task_queue::dsl;
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+    let (mut conn, _container) = connect().await;
+    let q = fresh_queue("badkey");
+    let too_long = "k".repeat(autumn_harvest::queue_fairness::MAX_FAIRNESS_KEY_LEN + 1);
+    for bad in ["", " a", "..", too_long.as_str()] {
+        let mut params = EnqueueParams::new(&q, TaskType::Activity, serde_json::json!({}));
+        params.fairness_key = Some(bad.to_owned());
+        let one = queue::enqueue(&mut conn, &params).await;
+        assert!(one.is_err(), "enqueue accepted key {bad:?}");
+        let good = EnqueueParams::new(&q, TaskType::Activity, serde_json::json!({}));
+        let batch = queue::enqueue_batch(&mut conn, &[good, params]).await;
+        assert!(batch.is_err(), "enqueue_batch accepted key {bad:?}");
+    }
+    let rows: i64 = dsl::harvest_task_queue
+        .filter(dsl::queue_name.eq(&q))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count rows");
+    assert_eq!(rows, 0, "a rejected batch inserts no row");
+    enqueue_keyed(&mut conn, &q, Some("tenant-a"), Duration::zero()).await;
+}

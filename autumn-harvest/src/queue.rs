@@ -485,14 +485,29 @@ impl EnqueueParams {
 // Queue operations
 // ---------------------------------------------------------------------------
 
+/// Check the fairness key of an enqueue (issue #1976).
+///
+/// The claim charges the key into the primary key of
+/// `harvest_fairness_state`. A key that the weight API rejects would make
+/// that charge fail, so enqueue rejects it first.
+fn check_enqueue_fairness_key(params: &EnqueueParams) -> HarvestResult<()> {
+    params
+        .fairness_key
+        .as_deref()
+        .map_or(Ok(()), crate::queue_fairness::validate_fairness_key)
+}
+
 /// Insert a new task into the work queue and return its ID.
 ///
 /// # Errors
 ///
-/// Returns [`crate::error::HarvestError::Database`] on insert failure.
+/// Returns [`crate::error::HarvestError::Config`] for an invalid
+/// [`EnqueueParams::fairness_key`], and
+/// [`crate::error::HarvestError::Database`] on insert failure.
 pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> HarvestResult<Uuid> {
     use crate::schema::harvest_task_queue;
 
+    check_enqueue_fairness_key(params)?;
     let task_id = Uuid::new_v4();
 
     // Sticky pin: only valid when both worker_id and timeout are present so the
@@ -751,7 +766,9 @@ fn compute_chunk_bounds(params: &[EnqueueParams]) -> Vec<(usize, usize)> {
 ///
 /// # Errors
 ///
-/// Returns [`crate::error::HarvestError::Database`] on insert failure.
+/// Returns [`crate::error::HarvestError::Config`] for an invalid
+/// [`EnqueueParams::fairness_key`], before any row is inserted, and
+/// [`crate::error::HarvestError::Database`] on insert failure.
 pub async fn enqueue_batch(
     conn: &mut AsyncPgConnection,
     params: &[EnqueueParams],
@@ -760,6 +777,9 @@ pub async fn enqueue_batch(
 
     if params.is_empty() {
         return Ok(Vec::new());
+    }
+    for p in params {
+        check_enqueue_fairness_key(p)?;
     }
 
     let task_ids: Vec<Uuid> = params.iter().map(|_| Uuid::new_v4()).collect();
@@ -1949,18 +1969,16 @@ pub fn claim_task_by_id_query_fenced() -> &'static str {
 
 /// The by-id claim statement for one `(fenced, fairness)` choice.
 ///
-/// [`ClaimFairness::Off`] returns the unchanged by-id statement.
+/// Both choices return the unchanged by-id statement. A by-id claim names
+/// one row, so the lag sort cannot change its pick. A fair by-id claim still
+/// charges the key after the rechecks (issue #1976).
 #[must_use]
 pub fn claim_by_id_query_for(fenced: bool, fairness: ClaimFairness) -> &'static str {
-    use std::sync::LazyLock;
-    static FAIR: LazyLock<String> = LazyLock::new(|| splice_fairness(claim_task_by_id_query()));
-    static FAIR_FENCED: LazyLock<String> =
-        LazyLock::new(|| splice_fairness(claim_task_by_id_query_fenced()));
-    match (fenced, fairness) {
-        (false, ClaimFairness::Off) => claim_task_by_id_query(),
-        (true, ClaimFairness::Off) => claim_task_by_id_query_fenced(),
-        (false, ClaimFairness::Keys) => &FAIR,
-        (true, ClaimFairness::Keys) => &FAIR_FENCED,
+    let _ = fairness;
+    if fenced {
+        claim_task_by_id_query_fenced()
+    } else {
+        claim_task_by_id_query()
     }
 }
 
@@ -13515,13 +13533,19 @@ mod tests {
                 ));
             }
         }
-        for fenced in [false, true] {
-            pairs.push((
-                claim_by_id_query_for(fenced, ClaimFairness::Off),
-                claim_by_id_query_for(fenced, ClaimFairness::Keys),
-            ));
-        }
         pairs
+    }
+
+    /// A by-id claim names one row, so a fair by-id claim skips the lag
+    /// sort. It still charges the key.
+    #[test]
+    fn a_fair_by_id_claim_uses_the_plain_statement() {
+        for fenced in [false, true] {
+            assert_eq!(
+                claim_by_id_query_for(fenced, ClaimFairness::Keys),
+                claim_by_id_query_for(fenced, ClaimFairness::Off)
+            );
+        }
     }
 
     /// The `$n` binds of a statement, sorted and deduplicated.

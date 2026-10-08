@@ -95,9 +95,10 @@ The key lives on task rows only. `harvest_workflow_executions` is at Diesel's
 
 ### 1.4 Claim
 
-`splice_fairness` derives the fair form from any claim variant (base, fenced,
-kind, by-id). It adds one sort term, the lag, before the due time. No bind,
-join or lock changes. The charge, `FAIR_CHARGE_SQL`, is a separate upsert in the same
+`splice_fairness` derives the fair form of each sorted claim variant (base,
+fenced, kind). It adds one sort term, the lag, before the due time. No bind,
+join or lock changes. A by-id claim names one row, so it keeps the plain
+statement. The charge, `FAIR_CHARGE_SQL`, is a separate upsert in the same
 transaction. It runs only when the post-claim rechecks keep the row.
 
 Four forms of the lag lookup were measured. The claim filters estimate one
