@@ -49,12 +49,17 @@
 //! optional one. See `docs/cross-region-dr.md` and
 //! `docs/runbooks/cross-region-failover.md`.
 //!
-//! # Opt-in by construction
+//! # On by default where DR is configured (issue #1823)
 //!
-//! A deployment that never registers a generation pays nothing: [`FenceRegistry`]
-//! reports [`FenceRegistry::is_enabled`] `false`, `claim_task` issues the
-//! byte-for-byte unchanged claim SQL, and [`assert_fence`] issues no statement
-//! at all.
+//! [`pin_process_fence`] runs at process startup. In the default
+//! [`DrFencing::Auto`] mode it probes each shard database for a DR marker
+//! ([`DrMarkers`]) and fences only when it finds one. A process configured
+//! [`DrFencing::Disabled`] refuses to start on a DR database.
+//!
+//! A process that pins nothing pays one probe per shard at startup, and
+//! nothing after. [`FenceRegistry::is_enabled`] reports `false`. `claim_task`
+//! issues the byte-for-byte unchanged claim SQL. [`assert_fence`] issues no
+//! statement at all.
 //!
 //! # Measured RPO
 //!
@@ -437,8 +442,8 @@ impl ReplicationStatus {
 // breaking change we accept in exchange for the setter being usable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DrConfig {
-    /// Whether write-authority fencing is enabled for this process.
-    pub fencing: bool,
+    /// How this process decides whether to fence (issue #1823).
+    pub fencing: DrFencing,
     /// DR sampler cadence: the RPO's resolution floor and the bound on
     /// fence-detection latency.
     pub sample_interval: std::time::Duration,
@@ -461,10 +466,11 @@ pub struct DrConfig {
 }
 
 impl Default for DrConfig {
-    /// Fencing **off**, which is byte-for-byte the pre-#954 runtime.
+    /// Fencing in [`DrFencing::Auto`] mode. A database with no DR marker runs
+    /// the byte-for-byte pre-#954 runtime.
     fn default() -> Self {
         Self {
-            fencing: false,
+            fencing: DrFencing::Auto,
             sample_interval: std::time::Duration::from_secs(15),
             watermark_retain: std::time::Duration::from_secs(3600),
             slot_prefix: DEFAULT_DR_SLOT_PREFIX.to_string(),
@@ -474,6 +480,106 @@ impl Default for DrConfig {
 
 /// The slot-name prefix `docs/cross-region-dr.md`'s setup SQL prescribes.
 pub const DEFAULT_DR_SLOT_PREFIX: &str = "harvest_dr";
+
+/// How a process decides whether to fence its writes (issue #1823).
+///
+/// The fence used to be opt-in per process. A process started without it
+/// could write to a demoted primary after a failover. `Auto` closes that gap:
+/// a process on a DR database fences itself with no setting at all.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DrFencing {
+    /// Fence when a shard database carries a DR marker. See [`DrMarkers`].
+    #[default]
+    Auto,
+    /// Always fence. Provision the generation row when it is absent.
+    Enabled,
+    /// Never fence. A shard database with a DR marker refuses this process.
+    Disabled,
+}
+
+impl DrFencing {
+    /// Decide whether to fence, from whether any shard has a DR marker.
+    ///
+    /// # Errors
+    ///
+    /// A message for the operator when the mode disagrees with the database:
+    /// [`Self::Disabled`] on a database that carries a DR marker. The process
+    /// must refuse to start. An unfenced writer on a DR database is the
+    /// split-brain hazard the fence exists to stop.
+    pub fn resolve(self, dr_configured: bool) -> Result<bool, String> {
+        match (self, dr_configured) {
+            (Self::Auto, found) => Ok(found),
+            (Self::Enabled, _) => Ok(true),
+            (Self::Disabled, false) => Ok(false),
+            (Self::Disabled, true) => Err(
+                "DR fencing is Disabled, but a shard database carries a DR marker (a \
+                 harvest_shard_generation row, a DR replication slot or a DR subscription). An \
+                 unfenced process could write to a demoted primary after a failover. Delete \
+                 the with_dr_fencing(false) or with_dr_fencing_mode(DrFencing::Disabled) call, \
+                 or replace it with with_dr_fencing_mode(DrFencing::Auto)."
+                    .to_string(),
+            ),
+        }
+    }
+}
+
+/// What a direct-database admin write changes (issue #1823).
+///
+/// The kind decides whether the write may run on a logical standby.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminWrite {
+    /// Schema only, such as partition DDL. Logical replication carries no
+    /// DDL, so the docs run it on both sides. Allowed on a logical standby.
+    SchemaOnly,
+    /// Rows, such as a shard rebalance. On a logical standby it would collide
+    /// with replicated rows. Refused on any standby.
+    Data,
+}
+
+/// What a startup probe found in one shard database (issue #1823).
+///
+/// Any one signal means DR is configured for the database.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DrMarkers {
+    /// The shards that have a `harvest_shard_generation` row here.
+    pub generation_shards: Vec<ShardId>,
+    /// Replication slots with the DR prefix, scoped like the RPO metric.
+    pub dr_slots: i64,
+    /// Subscriptions in this database whose name or slot name has the DR
+    /// prefix. A subscription may have any local name, but its slot is the
+    /// one the DR setup names.
+    pub dr_subscriptions: i64,
+    /// Every subscription in this database, whatever its name.
+    ///
+    /// Not a DR marker by itself. A direct-database data write refuses any
+    /// subscriber, because the CLI cannot know a custom DR prefix.
+    pub subscriptions: i64,
+    /// Whether the server is a physical standby (`pg_is_in_recovery()`).
+    pub in_recovery: bool,
+}
+
+impl DrMarkers {
+    /// Whether any DR signal is present.
+    ///
+    /// Recovery alone is not a signal. A plain read replica is not DR.
+    #[must_use]
+    pub const fn is_dr(&self) -> bool {
+        !self.generation_shards.is_empty() || self.dr_slots > 0 || self.dr_subscriptions > 0
+    }
+
+    /// Whether this database is a DR standby that has not been promoted.
+    ///
+    /// A subscription means a logical standby, whatever its name. `Enabled`
+    /// exists for replication that does not use the DR prefix, and the
+    /// tables of a subscriber stay writable. Recovery means a physical
+    /// standby. No fenced Harvest process may start on either. The runbook
+    /// starts workers only after promotion.
+    #[must_use]
+    pub const fn is_standby(&self) -> bool {
+        self.in_recovery || self.subscriptions > 0
+    }
+}
 
 static DR_CONFIG: RwLock<Option<DrConfig>> = RwLock::new(None);
 
@@ -520,6 +626,50 @@ pub fn dr_config() -> DrConfig {
 /// The generations this process pinned at startup, one per shard.
 static PINNED: RwLock<Option<Pinned>> = RwLock::new(None);
 
+/// Whether a worker must skip writes to `shard` (issue #1823).
+///
+/// A held shard may be an unpromoted logical standby, so no worker task
+/// writes there until the resolver releases it. `None` names a single-pool
+/// worker's database, which resolves through the default shard. With no
+/// fence on, this is one atomic load.
+#[must_use]
+pub fn shard_writes_held(shard: Option<ShardId>) -> bool {
+    FenceRegistry::is_held(shard.unwrap_or(ShardId::UNENCODED))
+}
+
+/// One worker's reservation of fenced or unfenced mode (issue #1823). See
+/// [`FenceRegistry::reserve_mode`].
+///
+/// A startup that fails drops the reservation, and the drop gives the mode
+/// back. Each reservation counts on its own. A failed startup therefore
+/// never frees a mode that another worker still holds. A worker that starts
+/// calls [`Self::keep`].
+#[derive(Debug)]
+#[must_use = "dropping a reservation gives the mode back"]
+pub struct ModeReservation {
+    fenced: bool,
+    kept: bool,
+}
+
+impl ModeReservation {
+    /// Keep the mode for the life of the process.
+    pub fn keep(mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for ModeReservation {
+    fn drop(&mut self) {
+        if !self.kept {
+            FenceRegistry::release_mode(self.fenced);
+        }
+    }
+}
+
+/// The sentinel a held shard is pinned to (issue #1823). No row holds it,
+/// so the claim gate selects nothing and the persist assert fails closed.
+const HELD: ShardGeneration = ShardGeneration(i64::MIN);
+
 /// Fast, lock-free "is fencing on at all" gate.
 ///
 /// Every persist consults this. Keeping it an atomic means a deployment that
@@ -527,10 +677,33 @@ static PINNED: RwLock<Option<Pinned>> = RwLock::new(None);
 /// acquisition.
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// The shutdown tokens of the workers in this process (issue #1823). See
+/// [`FenceRegistry::register_worker_shutdown`].
+static WORKER_SHUTDOWNS: std::sync::Mutex<Vec<tokio_util::sync::CancellationToken>> =
+    std::sync::Mutex::new(Vec::new());
+
 #[derive(Debug, Default)]
 struct Pinned {
     generations: BTreeMap<i32, ShardGeneration>,
     default_shard: Option<ShardId>,
+    /// How many holders each held shard has (issue #1823). Two workers in one
+    /// process can hold the same shard. The sentinel goes only when the last
+    /// one releases it.
+    holders: BTreeMap<i32, usize>,
+    /// The other pinned shards that share each shard's database (issue
+    /// #1823). A claim scan there is not filtered by shard, so it checks
+    /// them all.
+    colocated: BTreeMap<i32, Vec<i32>>,
+    /// How many workers in this process reserved unfenced mode (issue
+    /// #1823). A later pin would apply to their databases too, so a fenced
+    /// worker then refuses to start.
+    unfenced_workers: usize,
+    /// How many workers in this process reserved fenced mode (issue #1823).
+    fenced_workers: usize,
+    /// Whether this process found one of its pins superseded (issue #1823).
+    /// Shutdown then skips its database bookkeeping. Another region owns
+    /// those rows now.
+    fenced_out: bool,
 }
 
 /// A [`FenceRegistry::publish`] rejected because the shard is already pinned at
@@ -667,12 +840,12 @@ impl FenceRegistry {
                 return Err(conflict);
             }
             pinned.generations.insert(shard.as_i32(), generation);
+            // Stored under the write lock, after the map. A reader that sees
+            // `true` then waits on the lock, so it never finds an empty
+            // registry. A release cannot clear the flag between the two steps.
+            ENABLED.store(true, Ordering::Release);
             drop(guard);
         }
-        // Published only after the map is visible and the lock is released, so
-        // a reader that observes `is_enabled() == true` can never then find an
-        // empty registry.
-        ENABLED.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -755,13 +928,113 @@ impl FenceRegistry {
                 pinned.generations.insert(shard.as_i32(), *generation);
             }
             pinned.default_shard = Some(default_shard);
+            // Stored under the write lock, after the map AND the default
+            // shard. A reader that observes `is_enabled()` then waits on the
+            // lock, so it never finds a half-built registry.
+            ENABLED.store(true, Ordering::Release);
             drop(guard);
         }
-        // Published only after the map AND the default shard are visible, so a
-        // reader that observes `is_enabled()` can never find a half-built
-        // registry.
-        ENABLED.store(true, Ordering::Release);
         Ok(())
+    }
+
+    /// Hold `shards`: pin each to a sentinel generation that no row holds
+    /// (issue #1823).
+    ///
+    /// A worker holds a shard it could not probe at startup. The claim gate
+    /// then selects nothing on it, and the persist assert fails closed. A
+    /// shard this process already pinned keeps its pin. Each call adds one
+    /// holder to each held shard; [`Self::release_held`] removes one.
+    ///
+    /// # Errors
+    ///
+    /// The default shard conflicts with one already pinned.
+    pub fn hold(shards: &[ShardId], default_shard: ShardId) -> Result<(), PublishConflict> {
+        // One write lock covers the check, the sentinel and the holder count.
+        // A release between two locks could drop the sentinel before the new
+        // holder was counted, and leave an unprobed shard unfenced.
+        let mut guard = PINNED
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pinned = guard.get_or_insert_with(Pinned::default);
+        if let Some(existing) = pinned.default_shard
+            && existing != default_shard
+        {
+            let conflict = DefaultShardConflict {
+                pinned: existing.as_i32(),
+                attempted: default_shard.as_i32(),
+            };
+            drop(guard);
+            return Err(conflict.into());
+        }
+        pinned.default_shard = Some(default_shard);
+        // Stored before the sentinel, under the write lock. A reader that
+        // sees `true` waits on the lock, so it finds the sentinel.
+        if !shards.is_empty() || !pinned.generations.is_empty() {
+            ENABLED.store(true, Ordering::Release);
+        }
+        for shard in shards {
+            let key = shard.as_i32();
+            // A shard this process already pinned keeps its real pin.
+            let generation = *pinned.generations.entry(key).or_insert(HELD);
+            if generation == HELD {
+                *pinned.holders.entry(key).or_insert(0) += 1;
+            }
+        }
+        drop(guard);
+        Ok(())
+    }
+
+    /// Remove one holder from a held shard (issue #1823). When the last
+    /// holder goes, the shard runs unfenced.
+    ///
+    /// Only a sentinel pin is removed. A real pin is fixed for the life of the
+    /// process, so this never touches one.
+    pub fn release_held(shard: ShardId) {
+        let mut guard = PINNED
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let empty = guard.as_mut().is_none_or(|pinned| {
+            let key = shard.as_i32();
+            let remaining = pinned.holders.get_mut(&key).map_or(0, |count| {
+                *count = count.saturating_sub(1);
+                *count
+            });
+            if remaining == 0 {
+                pinned.holders.remove(&key);
+                if pinned.generations.get(&key) == Some(&HELD) {
+                    pinned.generations.remove(&key);
+                }
+            }
+            pinned.generations.is_empty()
+        });
+        // Stored under the write lock. A publisher waits on the lock, so its
+        // `true` always lands after this `false` and never before it.
+        if empty {
+            ENABLED.store(false, Ordering::Release);
+        }
+        drop(guard);
+    }
+
+    /// Whether this process pins any shard to a real generation.
+    #[must_use]
+    pub fn has_real_pin() -> bool {
+        if !Self::is_enabled() {
+            return false;
+        }
+        let guard = PINNED
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let found = guard
+            .as_ref()
+            .is_some_and(|pinned| pinned.generations.values().any(|pin| *pin != HELD));
+        drop(guard);
+        found
+    }
+
+    /// Whether `shard` is held: pinned to the sentinel, waiting for a probe.
+    #[must_use]
+    pub fn is_held(shard: ShardId) -> bool {
+        Self::expected(shard) == Some(HELD)
     }
 
     /// Set the shard that [`ShardId::UNENCODED`] execution ids resolve to.
@@ -854,6 +1127,186 @@ impl FenceRegistry {
         found
     }
 
+    /// Record that this process lost write authority (issue #1823). The
+    /// sampler calls it before it stops the worker.
+    ///
+    /// The pins are process-wide, so every worker in this process stops:
+    /// each registered shutdown token is cancelled. See
+    /// [`Self::register_worker_shutdown`].
+    pub fn mark_fenced_out() {
+        let mut guard = PINNED
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.get_or_insert_with(Pinned::default).fenced_out = true;
+        drop(guard);
+        let tokens = WORKER_SHUTDOWNS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for token in tokens.iter() {
+            token.cancel();
+        }
+        drop(tokens);
+    }
+
+    /// Register a worker's shutdown token (issue #1823). When this process
+    /// is fenced out, every registered worker stops, not only the one whose
+    /// sampler saw the bump. A token registered after that is cancelled at
+    /// once. An activity heartbeat flusher registers its stop token too,
+    /// because it outlives a drain.
+    pub fn register_worker_shutdown(token: &tokio_util::sync::CancellationToken) {
+        let mut tokens = WORKER_SHUTDOWNS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tokens.retain(|known| !known.is_cancelled());
+        tokens.push(token.clone());
+        drop(tokens);
+        if Self::is_fenced_out() {
+            token.cancel();
+        }
+    }
+
+    /// Whether this process lost write authority (issue #1823). Shutdown
+    /// writes check it and skip, because another region owns the rows.
+    #[must_use]
+    pub fn is_fenced_out() -> bool {
+        if !Self::is_enabled() {
+            return false;
+        }
+        let guard = PINNED
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let found = guard.as_ref().is_some_and(|pinned| pinned.fenced_out);
+        drop(guard);
+        found
+    }
+
+    /// Reserve fenced or unfenced mode for a starting worker (issue #1823).
+    ///
+    /// The registry is process-wide, so one process cannot run fenced and
+    /// unfenced workers side by side. The check and the reservation happen
+    /// under one write lock, so two workers that start at once cannot both
+    /// pass the check. A worker that starts keeps its reservation for the
+    /// life of the process. A startup that fails drops it, and the mode is
+    /// free again. See [`ModeReservation`].
+    ///
+    /// # Errors
+    ///
+    /// A message for the operator when the process already runs a worker in
+    /// the other mode.
+    pub fn reserve_mode(fenced: bool) -> Result<ModeReservation, String> {
+        let mut guard = PINNED
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pinned = guard.get_or_insert_with(Pinned::default);
+        let refusal = if fenced && pinned.unfenced_workers > 0 {
+            Some(
+                "this process already runs a worker whose databases carry no DR marker. The \
+                 fence registry is process-wide, so pinning DR shards now would check that \
+                 worker's writes against another database. Run this worker in its own \
+                 process, or set DrFencing::Enabled on both.",
+            )
+        } else if !fenced
+            && (pinned.fenced_workers > 0 || pinned.generations.values().any(|pin| *pin != HELD))
+        {
+            Some(
+                "this process already pins DR shard generations, but this worker's databases \
+                 carry no DR marker. The fence registry is process-wide, so the worker would \
+                 check its writes against another database's pins. Run it in its own process, \
+                 or set DrFencing::Enabled to fence its databases too.",
+            )
+        } else {
+            None
+        };
+        if refusal.is_none() {
+            if fenced {
+                pinned.fenced_workers += 1;
+            } else {
+                pinned.unfenced_workers += 1;
+            }
+        }
+        drop(guard);
+        refusal.map_or_else(
+            || {
+                Ok(ModeReservation {
+                    fenced,
+                    kept: false,
+                })
+            },
+            |message| Err(message.to_string()),
+        )
+    }
+
+    /// Give back one reservation of `fenced` mode. See [`ModeReservation`].
+    fn release_mode(fenced: bool) {
+        let mut guard = PINNED
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(pinned) = guard.as_mut() {
+            let count = if fenced {
+                &mut pinned.fenced_workers
+            } else {
+                &mut pinned.unfenced_workers
+            };
+            *count = count.saturating_sub(1);
+        }
+        drop(guard);
+    }
+
+    /// Record that `shards` share one database (issue #1823).
+    ///
+    /// A claim on one of them then checks the pins of all of them. See
+    /// [`Self::claim_bindings`].
+    pub fn colocate(shards: &[ShardId]) {
+        let mut guard = PINNED
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pinned = guard.get_or_insert_with(Pinned::default);
+        for shard in shards {
+            let peers = pinned.colocated.entry(shard.as_i32()).or_default();
+            for peer in shards {
+                if peer != shard && !peers.contains(&peer.as_i32()) {
+                    peers.push(peer.as_i32());
+                }
+            }
+        }
+        drop(guard);
+    }
+
+    /// The pins a claim on `shard` checks (issue #1823): the shard's own
+    /// [`Self::binding`], then each pinned shard colocated with it.
+    ///
+    /// `None` when `shard` itself is not pinned.
+    #[must_use]
+    pub fn claim_bindings(shard: ShardId) -> Option<Vec<(ShardId, ShardGeneration)>> {
+        if !Self::is_enabled() {
+            return None;
+        }
+        let guard = PINNED
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let found = guard.as_ref().and_then(|pinned| {
+            let resolved = if shard.is_unencoded() {
+                pinned.default_shard?
+            } else {
+                shard
+            };
+            let own = *pinned.generations.get(&resolved.as_i32())?;
+            let mut bindings = vec![(resolved, own)];
+            for peer in pinned
+                .colocated
+                .get(&resolved.as_i32())
+                .map_or(&[][..], Vec::as_slice)
+            {
+                if let Some(generation) = pinned.generations.get(peer) {
+                    bindings.push((ShardId::new(*peer), *generation));
+                }
+            }
+            Some(bindings)
+        });
+        drop(guard);
+        found
+    }
+
     /// The shard whose fencing row backs `shard`, resolving
     /// [`ShardId::UNENCODED`] through the default shard.
     #[must_use]
@@ -905,9 +1358,9 @@ impl FenceRegistry {
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             *guard = None;
+            ENABLED.store(false, Ordering::Release);
             drop(guard);
         }
-        ENABLED.store(false, Ordering::Release);
     }
 }
 
@@ -973,8 +1426,9 @@ mod db {
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 
     use super::{
-        BUMP_LOCK_TIMEOUT_MS, FenceRegistry, PROMOTE_STATEMENT_TIMEOUT_MS, ReplicationStatus,
-        ShardGeneration, SlotLag, StandbyLag, WatermarkReading, qualified, quote_ident,
+        BUMP_LOCK_TIMEOUT_MS, DrMarkers, FenceRegistry, PROMOTE_STATEMENT_TIMEOUT_MS,
+        ReplicationStatus, ShardGeneration, SlotLag, StandbyLag, WatermarkReading, qualified,
+        quote_ident,
     };
     use crate::error::{HarvestResult, database_error};
     use crate::types::ShardId;
@@ -1037,16 +1491,33 @@ mod db {
         conn: &mut AsyncPgConnection,
         shard: ShardId,
     ) -> HarvestResult<ShardGeneration> {
-        let inserted: Vec<GenerationRow> = diesel::sql_query(
-            "INSERT INTO harvest_shard_generation (shard_id, generation, fenced_reason) \
-             VALUES ($1, 0, 'provisioned') \
-             ON CONFLICT (shard_id) DO NOTHING \
-             RETURNING generation",
+        // An existing row needs no write. A restart therefore never waits.
+        if let Some(existing) = current_generation(conn, shard).await? {
+            return Ok(existing);
+        }
+        // A new row waits for every fenced pass already running on this
+        // database (issue #1823). See `PROVISION_LOCK_KEY`.
+        let shard_id = shard.as_i32();
+        let inserted: Vec<GenerationRow> = Box::pin(
+            conn.transaction::<_, crate::error::HarvestError, _>(async move |conn| {
+                diesel::sql_query(FENCE_PASS_LOCK_EXCLUSIVE)
+                    .bind::<BigInt, _>(PROVISION_LOCK_KEY)
+                    .execute(conn)
+                    .await
+                    .map_err(database_error)?;
+                diesel::sql_query(
+                    "INSERT INTO harvest_shard_generation (shard_id, generation, fenced_reason) \
+                     VALUES ($1, 0, 'provisioned') \
+                     ON CONFLICT (shard_id) DO NOTHING \
+                     RETURNING generation",
+                )
+                .bind::<Integer, _>(shard_id)
+                .load(conn)
+                .await
+                .map_err(database_error)
+            }),
         )
-        .bind::<Integer, _>(shard.as_i32())
-        .load(conn)
-        .await
-        .map_err(database_error)?;
+        .await?;
         if let Some(row) = inserted.into_iter().next() {
             return Ok(ShardGeneration(row.generation));
         }
@@ -1092,6 +1563,10 @@ mod db {
     /// racy read: this cannot commit while an in-flight persist holds the row,
     /// and every persist that starts afterwards sees the new epoch.
     ///
+    /// A bump takes at least six seconds. That wait lets a pass
+    /// that lost its guard stop before the bump commits. See
+    /// [`BUMP_WRITER_GRACE`].
+    ///
     /// # Errors
     ///
     /// Returns [`crate::error::HarvestError::Database`] on query failure, or
@@ -1115,6 +1590,19 @@ mod db {
                 .execute(conn)
                 .await
                 .map_err(database_error)?;
+                // Wait for every fenced pass in flight on this shard (issue
+                // #1823). A pass holds this lock shared, so its writes commit
+                // before the bump. The wait comes before the table lock, so a
+                // pass's own `FOR SHARE` checks never queue behind this bump.
+                diesel::sql_query(FENCE_PASS_LOCK_EXCLUSIVE)
+                    .bind::<BigInt, _>(fence_pass_lock_key(shard_id))
+                    .execute(conn)
+                    .await
+                    .map_err(database_error)?;
+                // A lost guard frees the lock while its pass can still
+                // write. Wait until that pass stops and its write commits.
+                // The table lock comes after, so appends do not wait.
+                tokio::time::sleep(BUMP_WRITER_GRACE).await;
                 diesel::sql_query("LOCK TABLE harvest_shard_generation IN ACCESS EXCLUSIVE MODE")
                     .execute(conn)
                     .await
@@ -1147,11 +1635,1235 @@ mod db {
             })
     }
 
+    /// Take one shard's pass lock shared, for a fenced pass (issue #1823).
+    /// `$1` is [`fence_pass_lock_key`]. Shards on one database have separate
+    /// locks, so a pass on one shard does not block a bump of another.
+    const FENCE_PASS_LOCK_SHARED: &str = "SELECT pg_advisory_xact_lock_shared($1)";
+    /// Take one shard's pass lock exclusive, for a bump (issue #1823).
+    const FENCE_PASS_LOCK_EXCLUSIVE: &str = "SELECT pg_advisory_xact_lock($1)";
+
+    /// The single-argument advisory key for a shard's fence pass lock
+    /// (issue #1823).
+    ///
+    /// The key uses the single-argument form for the reason that
+    /// [`heartbeat_lock_key`] gives: `queue_pause` owns the two-argument
+    /// form. The issue number fills the high word, so the key is outside
+    /// the `hashtext` range and differs from the heartbeat key. The shard id
+    /// fills the low word.
+    #[allow(clippy::cast_sign_loss)]
+    pub(super) const fn fence_pass_lock_key(shard_id: i32) -> i64 {
+        (1823_i64 << 32) | (shard_id as u32 as i64)
+    }
+
+    /// The single-argument advisory key that serializes a new generation row
+    /// with the fenced passes on its database (issue #1823).
+    ///
+    /// Every pass guard takes it shared. Provisioning a new row takes it
+    /// exclusive, so the row waits for every pass already running. A pass
+    /// guards only the rows it saw, so a row provisioned mid-pass would have
+    /// no barrier. The high word differs from [`fence_pass_lock_key`] and the
+    /// heartbeat key, so no shard id can collide with it.
+    pub(super) const PROVISION_LOCK_KEY: i64 = 18_230_i64 << 32;
+    /// The error a pass gets when its fence guard loses its session.
+    const FENCE_PASS_LOST: &str = "the DR fence session ended, so the pass stopped. A fence \
+                                   bump can commit after that point. Run the pass again.";
+    /// How long a guard waits for its pass locks and its check (issue #1823).
+    /// It stays below the bump's lock timeout. An operation that meets a
+    /// bump then gives up, and its other guards drop before that bump times
+    /// out.
+    const FENCE_LOCK_WAIT_SQL: &str = "SET LOCAL lock_timeout = '2000ms'";
+    /// The error a pass gets when [`fenced_checkout`] gives up on a pool.
+    const FENCE_PASS_ABANDONED: &str = "a fenced pass could not check out a pooled connection \
+                                        in time, so it released its DR fence guards. The next \
+                                        pass tries again.";
+
+    /// The longest a checkout waits inside a pass that holds fence guards
+    /// (issue #1823). It stays below the bump's lock timeout, so a pass
+    /// parked on an exhausted pool cannot hold a bump off.
+    pub const FENCED_CHECKOUT_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+
+    tokio::task_local! {
+        /// Set while [`run_fenced_pass`] runs a pass under guards (issue
+        /// #1823). A [`fenced_checkout`] that times out cancels its token,
+        /// and the pass is abandoned so that its guards drop. Each checkout
+        /// records its backend here, so a stopped pass can end it.
+        static PASS_SCOPE: PassScope;
+    }
+
+    /// What [`run_fenced_pass`] shares with the pass it runs (issue #1823).
+    #[derive(Clone)]
+    struct PassScope {
+        abandon: tokio_util::sync::CancellationToken,
+        backends: std::sync::Arc<PassBackends>,
+    }
+
+    /// How long a stopped pass waits for the backends it ends (issue #1823).
+    /// A guard sees its loss at its next ping. This wait adds at most one
+    /// more second, and a bump waits out both ([`BUMP_WRITER_GRACE`]). So the
+    /// wait ends before such a bump commits.
+    const PASS_STOP_BOUND: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// Where a stopped pass opens the connection that ends a backend (issue
+    /// #1823).
+    #[derive(Clone)]
+    enum BackendHome {
+        /// A backend of a connection of this pool.
+        Pool(crate::worker::DbPool),
+        /// A backend of a connection opened from this DSN, outside any pool.
+        Dsn(std::sync::Arc<str>),
+    }
+
+    /// The backends of the connections that a fenced pass holds (issue
+    /// #1823).
+    #[derive(Default)]
+    struct PassBackends {
+        next: std::sync::atomic::AtomicU64,
+        held: std::sync::Mutex<std::collections::HashMap<u64, (BackendHome, i32)>>,
+    }
+
+    impl PassBackends {
+        /// Record that the pass holds backend `pid` of `home`.
+        fn hold(self: &std::sync::Arc<Self>, home: BackendHome, pid: i32) -> HeldBackend {
+            let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.held
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(id, (home, pid));
+            HeldBackend {
+                backends: std::sync::Arc::clone(self),
+                id,
+            }
+        }
+
+        /// End every backend the pass still holds, and wait until each exits.
+        ///
+        /// The server rolls back the statement and the transaction of an
+        /// ended backend. So a write the pass already sent cannot commit
+        /// after a bump. Each wait is at most [`PASS_STOP_BOUND`].
+        async fn stop(&self) {
+            // The pass drops next, so the records are no longer needed. Taking
+            // them frees the lock before the waits below.
+            let held = std::mem::take(
+                &mut *self
+                    .held
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            let stops = held.into_values().map(|(home, pid)| async move {
+                let outcome = tokio::time::timeout(PASS_STOP_BOUND, end_backend(&home, pid)).await;
+                (pid, outcome)
+            });
+            for (pid, outcome) in futures::future::join_all(stops).await {
+                let error = match outcome {
+                    Ok(Ok(())) => continue,
+                    Ok(Err(error)) => error.to_string(),
+                    Err(_) => "the backend did not exit in time".to_string(),
+                };
+                tracing::warn!(
+                    pid,
+                    error = %error,
+                    "a stopped DR fence pass could not end a backend it held"
+                );
+            }
+        }
+    }
+
+    /// End backend `pid` on the database of `home`, and wait until it exits
+    /// (issue #1823).
+    ///
+    /// The stopped pass can hold every connection of a pool. So this opens
+    /// its own connection outside the pool, as a fence guard does.
+    async fn end_backend(home: &BackendHome, pid: i32) -> HarvestResult<()> {
+        use deadpool::managed::Manager as _;
+        #[derive(diesel::QueryableByName)]
+        struct Alive {
+            #[diesel(sql_type = BigInt)]
+            alive: i64,
+        }
+        let mut conn = match home {
+            BackendHome::Pool(pool) => pool
+                .manager()
+                .create()
+                .await
+                .map_err(|error| crate::error::HarvestError::Database(error.to_string()))?,
+            BackendHome::Dsn(dsn) => crate::pg_tls::connect(dsn)
+                .await
+                .map_err(|error| crate::error::HarvestError::Database(error.to_string()))?,
+        };
+        diesel::sql_query("SELECT pg_terminate_backend($1)")
+            .bind::<Integer, _>(pid)
+            .execute(&mut conn)
+            .await
+            .map_err(database_error)?;
+        loop {
+            let rows: Vec<Alive> =
+                diesel::sql_query("SELECT count(*) AS alive FROM pg_stat_activity WHERE pid = $1")
+                    .bind::<Integer, _>(pid)
+                    .load(&mut conn)
+                    .await
+                    .map_err(database_error)?;
+            if <[Alive]>::first(&rows).is_none_or(|row| row.alive == 0) {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A record that a fenced pass holds a backend. Dropping it ends the
+    /// record.
+    struct HeldBackend {
+        backends: std::sync::Arc<PassBackends>,
+        id: u64,
+    }
+
+    impl Drop for HeldBackend {
+        fn drop(&mut self) {
+            self.backends
+                .held
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&self.id);
+        }
+    }
+
+    /// A pooled connection from [`fenced_checkout`] or [`fenced_acquire`]
+    /// (issue #1823). It dereferences to the connection.
+    ///
+    /// Inside a pass that [`run_fenced_pass`] runs under guards, the pass
+    /// records the connection's backend while it holds the connection. A
+    /// dropped future does not cancel a statement the server already runs.
+    /// So a pass that stops ends each backend it still holds, before it
+    /// drops. A statement it sent then cannot commit after a bump.
+    ///
+    /// A connection checked out before its pass starts calls
+    /// [`FencedConn::join_pass`] inside the pass.
+    pub struct FencedConn {
+        // The record drops first, so the backend is out of the record
+        // before the pool can lend it again.
+        held: Option<HeldBackend>,
+        conn: crate::pool::PooledConn,
+        pool: crate::worker::DbPool,
+    }
+
+    impl FencedConn {
+        /// The pooled connection. The pass then no longer records it, so a
+        /// stopped pass does not end its backend.
+        pub fn into_pooled(self) -> crate::pool::PooledConn {
+            self.conn
+        }
+
+        /// Record this connection in the pass this task runs, if any
+        /// (issue #1823). A connection checked out before the pass started
+        /// calls this inside the pass. A stopped pass then ends its backend
+        /// too.
+        ///
+        /// # Errors
+        ///
+        /// [`crate::error::HarvestError::Database`] when the backend id
+        /// cannot be read.
+        pub async fn join_pass(&mut self) -> HarvestResult<()> {
+            if self.held.is_none() {
+                self.held =
+                    hold_in_pass(BackendHome::Pool(self.pool.clone()), &mut self.conn).await?;
+            }
+            Ok(())
+        }
+
+        /// `conn` from `pool`, recorded in the pass this task runs, if any.
+        async fn in_pass(
+            pool: &crate::worker::DbPool,
+            conn: crate::pool::PooledConn,
+        ) -> HarvestResult<Self> {
+            let mut fenced = Self::outside_pass(pool, conn);
+            fenced.join_pass().await?;
+            Ok(fenced)
+        }
+
+        /// `conn` from `pool`, with no record.
+        fn outside_pass(pool: &crate::worker::DbPool, conn: crate::pool::PooledConn) -> Self {
+            Self {
+                held: None,
+                conn,
+                pool: pool.clone(),
+            }
+        }
+    }
+
+    /// Record `conn`, a connection of `home`, in the pass this task runs.
+    /// `None` outside a pass.
+    async fn hold_in_pass(
+        home: BackendHome,
+        conn: &mut AsyncPgConnection,
+    ) -> HarvestResult<Option<HeldBackend>> {
+        #[derive(diesel::QueryableByName)]
+        struct Backend {
+            #[diesel(sql_type = Integer)]
+            pid: i32,
+        }
+        let Ok(backends) = PASS_SCOPE.try_with(|scope| std::sync::Arc::clone(&scope.backends))
+        else {
+            return Ok(None);
+        };
+        let rows: Vec<Backend> = diesel::sql_query("SELECT pg_backend_pid() AS pid")
+            .load(conn)
+            .await
+            .map_err(database_error)?;
+        Ok(<[Backend]>::first(&rows).map(|row| backends.hold(home, row.pid)))
+    }
+
+    /// A connection's membership in a fenced pass, from
+    /// [`join_fenced_pass`]. Dropping it ends the membership.
+    pub struct PassMember {
+        // Only its drop is read.
+        #[allow(dead_code)]
+        held: Option<HeldBackend>,
+    }
+
+    /// Record `conn`, a connection of `pool`, in the pass this task runs
+    /// (issue #1823).
+    ///
+    /// A loop that checks out before it takes its fence calls this first
+    /// inside the pass. A lost guard then ends the connection's backend, so
+    /// a statement it sent cannot commit after a bump. Keep the result until
+    /// the pass's writes end.
+    ///
+    /// Outside a pass this records nothing. A failure to read the backend
+    /// id records nothing and logs a warning. The pass then runs as it did
+    /// before, with the in-transaction fence checks of its writes.
+    pub async fn join_fenced_pass(
+        pool: &crate::worker::DbPool,
+        conn: &mut AsyncPgConnection,
+    ) -> PassMember {
+        join_home(BackendHome::Pool(pool.clone()), conn).await
+    }
+
+    /// [`join_fenced_pass`] for `conn`, a connection opened from `dsn`
+    /// outside any pool (issue #1823).
+    ///
+    /// A stopped pass ends the backend on a new connection from `dsn`. So
+    /// the role of `dsn` can end its own backend.
+    pub async fn join_fenced_pass_direct(dsn: &str, conn: &mut AsyncPgConnection) -> PassMember {
+        join_home(BackendHome::Dsn(std::sync::Arc::from(dsn)), conn).await
+    }
+
+    /// Record `conn` in the pass this task runs, and log a failure.
+    async fn join_home(home: BackendHome, conn: &mut AsyncPgConnection) -> PassMember {
+        let held = hold_in_pass(home, conn).await.unwrap_or_else(|error| {
+            tracing::warn!(
+                error = %error,
+                "a connection could not join its DR fence pass"
+            );
+            None
+        });
+        PassMember { held }
+    }
+
+    impl std::ops::Deref for FencedConn {
+        type Target = AsyncPgConnection;
+
+        fn deref(&self) -> &AsyncPgConnection {
+            &self.conn
+        }
+    }
+
+    impl std::ops::DerefMut for FencedConn {
+        fn deref_mut(&mut self) -> &mut AsyncPgConnection {
+            &mut self.conn
+        }
+    }
+
+    /// Check out a pooled connection inside a fenced pass (issue #1823).
+    ///
+    /// The guards of a pass hold a shared pass lock, and a bump needs it
+    /// exclusive. A checkout that waits on an exhausted pool would hold the
+    /// bump off without writing. So inside a pass that [`run_fenced_pass`]
+    /// runs under guards, this waits at most [`FENCED_CHECKOUT_BOUND`]. On
+    /// timeout it abandons the whole pass, so its guards drop. Outside such a
+    /// pass, it waits as `pool.get()` does.
+    ///
+    /// # Errors
+    ///
+    /// The pool's error, or [`crate::error::HarvestError::PoolAcquireTimeout`]
+    /// when the bound runs out.
+    pub async fn fenced_checkout(pool: &crate::worker::DbPool) -> HarvestResult<FencedConn> {
+        if PASS_SCOPE.try_with(|_| ()).is_err() {
+            let conn = pool
+                .get()
+                .await
+                .map_err(|error| crate::error::HarvestError::Database(error.to_string()))?;
+            return Ok(FencedConn::outside_pass(pool, conn));
+        }
+        fenced_acquire(pool, FENCED_CHECKOUT_BOUND).await
+    }
+
+    /// The wait for a checkout bounded by `bound` (issue #1823). Inside a
+    /// pass that [`run_fenced_pass`] runs under guards, the wait is at most
+    /// [`FENCED_CHECKOUT_BOUND`]. Elsewhere it is `bound`.
+    #[must_use]
+    pub fn fenced_wait(bound: std::time::Duration) -> std::time::Duration {
+        if PASS_SCOPE.try_with(|_| ()).is_ok() {
+            bound.min(FENCED_CHECKOUT_BOUND)
+        } else {
+            bound
+        }
+    }
+
+    /// Abandon the fenced pass this task runs, if any (issue #1823). A
+    /// checkout that gave up calls it, so the pass's guards drop. See
+    /// [`fenced_checkout`].
+    pub fn abandon_fenced_pass() {
+        let _ = PASS_SCOPE.try_with(|scope| scope.abandon.cancel());
+    }
+
+    /// A fence-aware [`crate::pool::acquire`] (issue #1823).
+    ///
+    /// It waits at most [`fenced_wait`] of `bound`. Inside a fenced pass, a
+    /// failed checkout abandons the pass. Outside one, it is
+    /// [`crate::pool::acquire`].
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::pool::acquire`].
+    pub async fn fenced_acquire(
+        pool: &crate::worker::DbPool,
+        bound: std::time::Duration,
+    ) -> HarvestResult<FencedConn> {
+        match crate::pool::acquire(pool, fenced_wait(bound)).await {
+            Ok(conn) => FencedConn::in_pass(pool, conn).await,
+            Err(error) => {
+                abandon_fenced_pass();
+                Err(error)
+            }
+        }
+    }
+    /// A fence-aware [`crate::pool::acquire_with_retries`] (issue #1823).
+    ///
+    /// Inside a fenced pass, retries would hold a bump off. So the pass
+    /// makes one [`fenced_acquire`] try within [`crate::pool::acquire_bound`],
+    /// and a failed try abandons it. Outside a pass, this is
+    /// [`crate::pool::acquire_with_retries`].
+    ///
+    /// # Errors
+    ///
+    /// As [`fenced_acquire`] in a pass, and as
+    /// [`crate::pool::acquire_with_retries`] outside one.
+    pub async fn fenced_acquire_with_retries(
+        pool: &crate::worker::DbPool,
+        attempts: u32,
+    ) -> HarvestResult<FencedConn> {
+        if PASS_SCOPE.try_with(|_| ()).is_ok() {
+            return fenced_acquire(pool, crate::pool::acquire_bound(pool)).await;
+        }
+        let conn = crate::pool::acquire_with_retries(pool, attempts).await?;
+        Ok(FencedConn::outside_pass(pool, conn))
+    }
+
+    /// The wait of a [`fenced_get_within`] checkout ran out (issue #1823).
+    #[derive(Debug, Clone, Copy)]
+    pub struct CheckoutElapsed;
+
+    /// A fence-aware `tokio::time::timeout(bound, pool.get())` (issue
+    /// #1823).
+    ///
+    /// The result has the same shape, so a caller keeps its match arms. It
+    /// is [`fenced_acquire`]: inside a fenced pass the wait is at most
+    /// [`FENCED_CHECKOUT_BOUND`], a failed checkout abandons the pass, and
+    /// the pass records the backend.
+    ///
+    /// # Errors
+    ///
+    /// [`CheckoutElapsed`] when the bound runs out. The inner error is any
+    /// other pool error.
+    pub async fn fenced_get_within(
+        pool: &crate::worker::DbPool,
+        bound: std::time::Duration,
+    ) -> Result<HarvestResult<FencedConn>, CheckoutElapsed> {
+        match fenced_acquire(pool, bound).await {
+            Ok(conn) => Ok(Ok(conn)),
+            Err(crate::error::HarvestError::PoolAcquireTimeout { .. }) => Err(CheckoutElapsed),
+            Err(error) => Ok(Err(error)),
+        }
+    }
+
+    /// How often a fence guard pings its session (issue #1823). The ping
+    /// keeps an idle proxy from closing it, and finds a lost session.
+    const FENCE_PASS_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(1);
+    /// The longest a guard waits for one keepalive ping (issue #1823). A
+    /// network path that drops packets gives no socket error. A ping that
+    /// does not return in this time counts as a lost session.
+    const FENCE_PASS_PING_BOUND: std::time::Duration = std::time::Duration::from_secs(3);
+    /// How long a bump waits after it takes the pass lock (issue #1823).
+    ///
+    /// A guard whose session ends just after a ping finds the loss at its
+    /// next ping. That ping starts one keepalive interval later and can wait
+    /// its whole bound on a path that drops packets. The pass then ends its
+    /// backends, for at most [`PASS_STOP_BOUND`]. One more second is slack
+    /// for scheduling and connection time. So the stopped pass's backends
+    /// end before the bump commits.
+    ///
+    /// The sum is computed from those bounds, so it follows any change to
+    /// them.
+    const BUMP_WRITER_GRACE: std::time::Duration = std::time::Duration::from_secs(
+        FENCE_PASS_KEEPALIVE.as_secs()
+            + FENCE_PASS_PING_BOUND.as_secs()
+            + PASS_STOP_BOUND.as_secs()
+            + 1,
+    );
+    /// The server ends a guard session that sends no ping for this long
+    /// (issue #1823). It is far above the ping interval. A process cut off
+    /// from the server then frees its pass locks, so a bump can commit.
+    const FENCE_GUARD_IDLE_SQL: &str = "SET LOCAL idle_in_transaction_session_timeout = '10s'";
+    /// How long a pass waits to open its fence connection.
+    const FENCE_PASS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// A commit-order barrier for a pass of several writes (issue #1823).
+    ///
+    /// A scheduler pass or a partition-maintenance pass writes in many
+    /// statements and transactions. A check before the pass is not a
+    /// barrier: a bump can commit between the check and a write. This guard
+    /// holds a transaction open on its own connection, with the shard's
+    /// pass lock shared and the generation checked. [`bump_generation`]
+    /// takes that lock exclusive, so it cannot commit while the pass runs. A
+    /// pass that starts after the bump sees the new generation and stops.
+    ///
+    /// The guard holds no lock on `harvest_shard_generation`. A bump takes
+    /// that table exclusive, so a table lock would block a bump of every
+    /// shard on the database.
+    ///
+    /// The connection is not from the pool, so the guard never starves the
+    /// pass of a connection. Dropping the guard closes the connection. The
+    /// server then ends the transaction and frees the lock, even when the
+    /// pass is cancelled.
+    pub struct FencePassGuard {
+        lost: tokio_util::sync::CancellationToken,
+        keepalive: tokio::task::JoinHandle<()>,
+        /// A share of its operation's slots of [`FENCE_GUARD_SLOTS`]. The
+        /// operation takes one slot per guard. The slots free when the last
+        /// guard of the operation drops. It is boxed as `dyn Send`. The guard then keeps the drop
+        /// behaviour it had before the slot. Callers hold a guard for a
+        /// whole pass on purpose.
+        #[allow(dead_code)]
+        slot: Option<Box<dyn Send + Sync>>,
+    }
+
+    /// How many guard connections concurrent operations may hold at once
+    /// (issue #1823).
+    ///
+    /// A guard opens its own connection outside the pool. An admin write
+    /// holds one guard for each database it fences, until its handler
+    /// returns. Without a cap, heavy admin traffic could open sessions
+    /// without limit and use up the server's connections.
+    ///
+    /// An operation takes one slot per guard, all at once, before it opens
+    /// any guard. The semaphore serves waiters in order. So no operation
+    /// holds some slots while it waits for more, and concurrent operations
+    /// cannot split the slots and stall each other. An operation waits for
+    /// its slots for at most [`FENCE_PASS_CONNECT_TIMEOUT`], then fails
+    /// closed.
+    ///
+    /// An operation that guards more databases than the cap must still hold
+    /// one guard on each of them at once. It takes every slot, so it runs
+    /// alone, and it logs a warning. The process then holds one guard
+    /// connection per database, the most its configuration allows. Failing
+    /// closed instead would stop every fenced write on such a process.
+    pub const FENCE_GUARD_LIMIT: usize = 64;
+
+    /// The slots behind [`FENCE_GUARD_LIMIT`].
+    static FENCE_GUARD_SLOTS: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::LazyLock::new(|| {
+            std::sync::Arc::new(tokio::sync::Semaphore::new(FENCE_GUARD_LIMIT))
+        });
+
+    /// The slots of one operation, shared by its guards.
+    type GuardSlot = std::sync::Arc<tokio::sync::OwnedSemaphorePermit>;
+
+    /// Take one slot of [`FENCE_GUARD_LIMIT`] per guard, all at once (issue
+    /// #1823). A request above the cap takes every slot.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::error::HarvestError::Database`] when the slots do not free
+    /// within [`FENCE_PASS_CONNECT_TIMEOUT`].
+    async fn guard_slots(guards: usize) -> HarvestResult<GuardSlot> {
+        if guards > FENCE_GUARD_LIMIT {
+            tracing::warn!(
+                guards,
+                limit = FENCE_GUARD_LIMIT,
+                "a DR fence operation guards more databases than the guard cap; it takes every \
+                 slot and runs alone, with one guard connection per database"
+            );
+        }
+        let wanted = u32::try_from(guards.clamp(1, FENCE_GUARD_LIMIT)).unwrap_or(1);
+        let slot = tokio::time::timeout(
+            FENCE_PASS_CONNECT_TIMEOUT,
+            std::sync::Arc::clone(&FENCE_GUARD_SLOTS).acquire_many_owned(wanted),
+        )
+        .await
+        .map_err(|_| {
+            crate::error::HarvestError::Database(format!(
+                "all {FENCE_GUARD_LIMIT} DR fence guard slots stayed busy; try again"
+            ))
+        })?
+        .map_err(|error| crate::error::HarvestError::Database(error.to_string()))?;
+        Ok(std::sync::Arc::new(slot))
+    }
+
+    impl FencePassGuard {
+        /// Whether the guard's session has ended (issue #1823).
+        ///
+        /// The server then frees the pass lock, so a bump can commit. A pass
+        /// checks this before it writes, and stops when it is set. A long
+        /// pass uses [`run_fenced_pass`] instead. A pass already mid-write
+        /// when the session ends can still race a bump, for at most one
+        /// keepalive interval.
+        #[must_use]
+        pub fn is_lost(&self) -> bool {
+            self.lost.is_cancelled()
+        }
+    }
+
+    impl Drop for FencePassGuard {
+        fn drop(&mut self) {
+            // The task owns the connection. Aborting it closes the
+            // connection, and the server then frees the pass lock.
+            self.keepalive.abort();
+        }
+    }
+
+    /// Run `pass` until it ends or a guard loses its session (issue #1823).
+    ///
+    /// A lost session frees the pass lock, so a bump can commit. This then
+    /// drops `pass`, and the pass stops before its next write. With no
+    /// guard, the pass runs to its end. A [`fenced_checkout`] inside `pass`
+    /// that times out abandons it the same way.
+    ///
+    /// A dropped pass can leave a transaction open on a pooled connection.
+    /// The pool discards a connection in a transaction state, so the server
+    /// rolls that transaction back.
+    ///
+    /// Dropping `pass` does not cancel a statement the server already runs.
+    /// So before it drops `pass`, this ends the backend of each connection
+    /// that `pass` holds from [`fenced_checkout`] or [`fenced_acquire`]. The
+    /// server then rolls back that statement and its transaction. The loss
+    /// is seen at the next keepalive ping, within its bound, and the ends
+    /// take at most one more second. A bump waits longer than all three
+    /// after it takes the lock ([`BUMP_WRITER_GRACE`]). So the backends end
+    /// before the bump commits.
+    ///
+    /// Each end runs on its own connection outside the pool, so a pass that
+    /// holds the whole pool cannot starve it. A connection that a pass
+    /// checked out before it started joins through [`join_fenced_pass`] or
+    /// [`FencedConn::join_pass`]. A connection opened from a DSN joins
+    /// through [`join_fenced_pass_direct`].
+    ///
+    /// Known limit: a backend that this cannot end in time keeps running.
+    /// An example is a server this process cannot reach. A warning names
+    /// the backend. So a write that can run
+    /// long also asserts the fence in its own transaction. That ties the
+    /// barrier to the writing session. History appends and the retention
+    /// deletes do this.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::error::HarvestError::Database`] when a guard loses its
+    /// session before `pass` ends.
+    pub async fn run_fenced_pass<'a, T>(
+        guards: impl IntoIterator<Item = &'a FencePassGuard>,
+        pass: impl std::future::Future<Output = T>,
+    ) -> HarvestResult<T> {
+        let lost: Vec<_> = guards
+            .into_iter()
+            .map(|guard| Box::pin(guard.lost.cancelled()))
+            .collect();
+        if lost.is_empty() {
+            return Ok(pass.await);
+        }
+        let scope = PassScope {
+            abandon: tokio_util::sync::CancellationToken::new(),
+            backends: std::sync::Arc::default(),
+        };
+        let abandon = scope.abandon.clone();
+        let backends = std::sync::Arc::clone(&scope.backends);
+        let pass = PASS_SCOPE.scope(scope, pass);
+        tokio::pin!(pass);
+        let stopped = tokio::select! {
+            biased;
+            _ = futures::future::select_all(lost) => FENCE_PASS_LOST,
+            () = abandon.cancelled() => FENCE_PASS_ABANDONED,
+            output = &mut pass => return Ok(output),
+        };
+        // The pass is no longer polled, but it still holds its connections.
+        // So their backends are still its own when this ends them.
+        backends.stop().await;
+        Err(crate::error::HarvestError::Database(stopped.to_string()))
+    }
+
+    /// Open a [`FencePassGuard`] for `shard`, or `None` when this process
+    /// pins no generation for it (issue #1823).
+    ///
+    /// # Errors
+    ///
+    /// [`crate::error::HarvestError::ShardFenced`] when the shard is at
+    /// another generation. [`crate::error::HarvestError::Database`] when
+    /// the connection or a query fails.
+    pub async fn begin_fenced_pass(
+        pool: &crate::worker::DbPool,
+        shard: ShardId,
+    ) -> HarvestResult<Option<FencePassGuard>> {
+        let Some(pinned) = FenceRegistry::expected(shard) else {
+            return Ok(None);
+        };
+        let resolved = FenceRegistry::resolve_shard(shard).unwrap_or(shard);
+        begin_fenced_pass_at(pool, resolved, pinned).await.map(Some)
+    }
+
+    /// Open the fence for one tick of a per-shard background loop (issue
+    /// #1823), or `None` to skip the tick.
+    ///
+    /// A held shard skips the tick: it can be an unpromoted standby. A
+    /// fenced shard skips it too, and the log names the reason. Otherwise
+    /// the caller runs the tick under [`run_fenced_pass`] with the guards.
+    /// With no pin, this opens no connection.
+    pub async fn begin_shard_tick(
+        pool: &crate::worker::DbPool,
+        shard: Option<ShardId>,
+    ) -> Option<Vec<FencePassGuard>> {
+        if super::shard_writes_held(shard) {
+            return None;
+        }
+        let key = shard.unwrap_or(ShardId::UNENCODED);
+        match begin_fenced_group(pool, key).await {
+            Ok(guards) => Some(guards),
+            Err(error) => {
+                tracing::warn!(
+                    shard_id = key.as_i32(),
+                    error = %error,
+                    "background tick skipped: this process is fenced on this shard"
+                );
+                None
+            }
+        }
+    }
+
+    /// [`assert_fence`] for `shard` and each pinned shard colocated with it
+    /// (issue #1823). The sampler uses it, so a bump of a colocated peer
+    /// stops this process too.
+    ///
+    /// # Errors
+    ///
+    /// As [`assert_fence`].
+    pub async fn assert_fence_group(
+        conn: &mut AsyncPgConnection,
+        shard: ShardId,
+    ) -> HarvestResult<()> {
+        let bindings = FenceRegistry::claim_bindings(shard).unwrap_or_default();
+        for (pinned, generation) in &bindings {
+            assert_generation(conn, *pinned, *generation).await?;
+        }
+        if !bindings.is_empty() {
+            assert_no_unpinned_rows(conn, &bindings).await?;
+        }
+        Ok(())
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct PinnedRow {
+        #[diesel(sql_type = Integer)]
+        shard_id: i32,
+        #[diesel(sql_type = BigInt)]
+        generation: i64,
+    }
+
+    /// Fail when this database holds a generation row that this process does
+    /// not pin at that generation (issue #1823).
+    ///
+    /// It needs no shard, so a write that cannot name its shard uses it. An
+    /// audit row is one. It reads every row `FOR SHARE`. Run it in the
+    /// write's own transaction, so a bump cannot commit in between. A process
+    /// that pins nothing pays one atomic load.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::error::HarvestError::ShardFenced`] for a superseded or held
+    /// row. [`crate::error::HarvestError::Config`] for a row this process did
+    /// not pin. [`crate::error::HarvestError::Database`] on query failure.
+    pub async fn assert_database_fence(conn: &mut AsyncPgConnection) -> HarvestResult<()> {
+        if !FenceRegistry::is_enabled() {
+            return Ok(());
+        }
+        let rows: Vec<PinnedRow> = diesel::sql_query(
+            "SELECT shard_id, generation FROM harvest_shard_generation \
+             ORDER BY shard_id FOR SHARE",
+        )
+        .load(conn)
+        .await
+        .map_err(database_error)?;
+        // A restored or edited database can lose a row. With no row, nothing
+        // proves authority, so the write fails closed. See the per-shard
+        // `assert_generation`, which does the same. A held-only process pins
+        // no generation. A plain database then has no row, and that is not
+        // a lost row, so its write goes ahead.
+        let present: std::collections::BTreeSet<i32> = rows.iter().map(|r| r.shard_id).collect();
+        if present.is_empty() {
+            if !FenceRegistry::has_real_pin() {
+                return Ok(());
+            }
+            return Err(match FenceRegistry::binding(ShardId::UNENCODED) {
+                Some((shard, pinned)) => crate::error::HarvestError::ShardFenced {
+                    shard_id: shard.as_i32(),
+                    pinned: pinned.as_i64(),
+                    current: None,
+                },
+                None => crate::error::HarvestError::Config(
+                    "this database holds no generation row, so this process cannot prove \
+                     write authority on it."
+                        .to_string(),
+                ),
+            });
+        }
+        for row in rows {
+            match FenceRegistry::expected(ShardId::new(row.shard_id)) {
+                Some(pinned) if pinned.as_i64() == row.generation => {}
+                Some(pinned) => {
+                    return Err(crate::error::HarvestError::ShardFenced {
+                        shard_id: row.shard_id,
+                        pinned: pinned.as_i64(),
+                        current: Some(row.generation),
+                    });
+                }
+                None => {
+                    return Err(crate::error::HarvestError::Config(format!(
+                        "this database holds the generation row of shard {}, which this \
+                         process did not pin. Restart the process to pin it.",
+                        row.shard_id
+                    )));
+                }
+            }
+        }
+        // Each pinned shard colocated with a row here must have its own row.
+        // An incomplete set fails closed like an empty one.
+        for shard in &present {
+            let bindings = FenceRegistry::claim_bindings(ShardId::new(*shard)).unwrap_or_default();
+            for (peer, pinned) in bindings {
+                if !present.contains(&peer.as_i32()) {
+                    return Err(crate::error::HarvestError::ShardFenced {
+                        shard_id: peer.as_i32(),
+                        pinned: pinned.as_i64(),
+                        current: None,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Open a [`FencePassGuard`] for `shard` and each pinned shard colocated
+    /// with it on `pool` (issue #1823). A pass whose work is not filtered by
+    /// shard holds them all. See [`FenceRegistry::claim_bindings`].
+    ///
+    /// # Errors
+    ///
+    /// As [`begin_fenced_pass`]. A held shard counts as fenced.
+    pub async fn begin_fenced_group(
+        pool: &crate::worker::DbPool,
+        shard: ShardId,
+    ) -> HarvestResult<Vec<FencePassGuard>> {
+        begin_fenced_groups(&[(pool, shard)]).await
+    }
+
+    /// [`begin_fenced_group`] for each `(pool, shard)` in `groups`, as one
+    /// operation (issue #1823).
+    ///
+    /// The operation takes one slot of [`FENCE_GUARD_LIMIT`] per guard, all
+    /// at once, before it opens any guard. It therefore never waits for a
+    /// slot while it holds one. A shard that an earlier group already guards
+    /// is not guarded twice. With no pin, this opens no connection.
+    ///
+    /// # Errors
+    ///
+    /// As [`begin_fenced_group`].
+    pub async fn begin_fenced_groups(
+        groups: &[(&crate::worker::DbPool, ShardId)],
+    ) -> HarvestResult<Vec<FencePassGuard>> {
+        let mut guarded: Vec<ShardId> = Vec::new();
+        let mut plan = Vec::new();
+        for (pool, shard) in groups {
+            let bindings = FenceRegistry::claim_bindings(*shard).unwrap_or_default();
+            let fresh: Vec<(ShardId, ShardGeneration)> = bindings
+                .iter()
+                .filter(|(pinned, _)| !guarded.contains(pinned))
+                .copied()
+                .collect();
+            if fresh.is_empty() {
+                continue;
+            }
+            guarded.extend(fresh.iter().map(|(pinned, _)| *pinned));
+            plan.push((*pool, fresh, bindings));
+        }
+        if plan.is_empty() {
+            return Ok(Vec::new());
+        }
+        let slot = guard_slots(plan.len()).await?;
+        // Every connection opens first, together. A slow or unreachable
+        // database then fails the operation before any pass lock is held, so
+        // it cannot hold a bump off on another database.
+        let conns =
+            futures::future::try_join_all(plan.iter().map(|(pool, _, _)| connect_guard(pool)))
+                .await?;
+        // The locks are taken on every database together. One that waits holds
+        // the others for at most its own bounded wait. One guard per database
+        // holds the barrier of every shard there, and checks for rows this
+        // process did not pin.
+        futures::future::try_join_all(conns.into_iter().zip(&plan).map(
+            |(conn, (_, fresh, bindings))| {
+                lock_checked_pass(conn, fresh, bindings, std::sync::Arc::clone(&slot))
+            },
+        ))
+        .await
+    }
+
+    /// The shard of every generation row on this database (issue #1823).
+    async fn generation_shard_ids(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<ShardId>> {
+        #[derive(diesel::QueryableByName)]
+        struct ShardRow {
+            #[diesel(sql_type = Integer)]
+            shard_id: i32,
+        }
+        let rows: Vec<ShardRow> =
+            diesel::sql_query("SELECT shard_id FROM harvest_shard_generation ORDER BY shard_id")
+                .load(conn)
+                .await
+                .map_err(database_error)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ShardId::new(row.shard_id))
+            .collect())
+    }
+
+    /// Fail when the database holds a generation row that this process did
+    /// not pin at startup (issue #1823).
+    ///
+    /// Such a row belongs to a logical shard that started on this database
+    /// later. This process cannot tell whether that shard was fenced, and its
+    /// database-wide work reaches that shard's rows. So it stops writing here
+    /// until a restart pins the row.
+    async fn assert_no_unpinned_rows(
+        conn: &mut AsyncPgConnection,
+        pinned: &[(ShardId, ShardGeneration)],
+    ) -> HarvestResult<()> {
+        #[derive(diesel::QueryableByName)]
+        struct ShardRow {
+            #[diesel(sql_type = Integer)]
+            shard_id: i32,
+        }
+        let rows: Vec<ShardRow> =
+            diesel::sql_query("SELECT shard_id FROM harvest_shard_generation")
+                .load(conn)
+                .await
+                .map_err(database_error)?;
+        let unpinned: Vec<i32> = rows
+            .into_iter()
+            .map(|row| row.shard_id)
+            .filter(|row| !pinned.iter().any(|(shard, _)| shard.as_i32() == *row))
+            .collect();
+        if unpinned.is_empty() {
+            return Ok(());
+        }
+        Err(crate::error::HarvestError::Config(format!(
+            "this database holds generation rows for shard(s) {unpinned:?} that this process \
+             did not pin at startup. It cannot tell whether those shards were fenced, so it \
+             stops writing here. Restart the process to pin them."
+        )))
+    }
+
+    /// Open a [`FencePassGuard`] for each shard of `pool` that this process
+    /// pins (issue #1823). A background tick holds them, so a bump cannot
+    /// commit while the tick writes.
+    ///
+    /// A single pool names its shard through the default pin, as the
+    /// scheduler does. A tick's work is not filtered by shard, so each pool
+    /// also guards every pinned shard colocated on it. See
+    /// [`FenceRegistry::claim_bindings`]. With no pin, this opens no
+    /// connection.
+    ///
+    /// # Errors
+    ///
+    /// As [`begin_fenced_pass`]. A held shard counts as fenced, because it
+    /// can be an unpromoted standby.
+    pub async fn begin_fenced_tick(
+        pool: &crate::shard::ShardedDbPool,
+    ) -> HarvestResult<Vec<FencePassGuard>> {
+        if !FenceRegistry::is_enabled() {
+            return Ok(Vec::new());
+        }
+        let single = pool.len() == 1;
+        let groups: Vec<(&crate::worker::DbPool, ShardId)> = pool
+            .iter_shards()
+            .map(|(shard, shard_pool)| {
+                (shard_pool, if single { ShardId::UNENCODED } else { shard })
+            })
+            .collect();
+        // The tick takes all of its slots at once. See `FENCE_GUARD_LIMIT`.
+        begin_fenced_groups(&groups).await
+    }
+
+    /// [`begin_fenced_pass`] at an explicit generation, for a process that
+    /// pins nothing (issue #1823). The CLI states the epoch an operator gave.
+    ///
+    /// # Errors
+    ///
+    /// As [`begin_fenced_pass`].
+    pub async fn begin_fenced_pass_at(
+        pool: &crate::worker::DbPool,
+        shard: ShardId,
+        expected: ShardGeneration,
+    ) -> HarvestResult<FencePassGuard> {
+        begin_checked_pass(pool, &[(shard, expected)], &[]).await
+    }
+
+    /// One guard for every shard in `shards`, on one connection, and fail
+    /// when the database holds a row outside `allowed` (issue #1823). An
+    /// empty `allowed` skips that check. The check runs on the guard's own
+    /// connection, so it never waits for a pool connection.
+    ///
+    /// The guard takes one slot of [`FENCE_GUARD_LIMIT`], however many shards
+    /// it covers. A group of any size therefore fits.
+    async fn begin_checked_pass(
+        pool: &crate::worker::DbPool,
+        shards: &[(ShardId, ShardGeneration)],
+        allowed: &[(ShardId, ShardGeneration)],
+    ) -> HarvestResult<FencePassGuard> {
+        let slot = guard_slots(1).await?;
+        open_checked_pass(pool, shards, allowed, slot).await
+    }
+
+    /// [`begin_checked_pass`] under a slot the caller already holds.
+    async fn open_checked_pass(
+        pool: &crate::worker::DbPool,
+        shards: &[(ShardId, ShardGeneration)],
+        allowed: &[(ShardId, ShardGeneration)],
+        slot: GuardSlot,
+    ) -> HarvestResult<FencePassGuard> {
+        let conn = connect_guard(pool).await?;
+        lock_checked_pass(conn, shards, allowed, slot).await
+    }
+
+    /// Open the connection a fence guard owns (issue #1823). It takes no
+    /// lock. It waits at most [`FENCE_PASS_CONNECT_TIMEOUT`].
+    async fn connect_guard(pool: &crate::worker::DbPool) -> HarvestResult<AsyncPgConnection> {
+        use deadpool::managed::Manager as _;
+        tokio::time::timeout(FENCE_PASS_CONNECT_TIMEOUT, pool.manager().create())
+            .await
+            .map_err(|_| {
+                crate::error::HarvestError::Database(
+                    "timed out opening the DR fence connection".to_string(),
+                )
+            })?
+            .map_err(|error| crate::error::HarvestError::Database(error.to_string()))
+    }
+
+    /// Take the pass locks on a connection from [`connect_guard`], under
+    /// `slot`. See [`begin_checked_pass`] for `allowed`.
+    async fn lock_checked_pass(
+        conn: AsyncPgConnection,
+        shards: &[(ShardId, ShardGeneration)],
+        allowed: &[(ShardId, ShardGeneration)],
+        slot: GuardSlot,
+    ) -> HarvestResult<FencePassGuard> {
+        let mut guard = begin_pass_on(conn, shards, allowed).await?;
+        guard.slot = Some(Box::new(slot));
+        Ok(guard)
+    }
+
+    /// [`begin_fenced_pass_at`] on a connection the caller opened (issue
+    /// #1823). The guard owns it, and closes it on drop. The caller must
+    /// not run its own writes on this connection.
+    ///
+    /// # Errors
+    ///
+    /// As [`begin_fenced_pass`].
+    pub async fn begin_fenced_pass_on(
+        conn: AsyncPgConnection,
+        shard: ShardId,
+        expected: ShardGeneration,
+    ) -> HarvestResult<FencePassGuard> {
+        begin_pass_on(conn, &[(shard, expected)], &[]).await
+    }
+
+    /// The guard itself: the pass lock of every shard in `shards`, on one
+    /// connection. See [`begin_checked_pass`] for `allowed`.
+    async fn begin_pass_on(
+        mut conn: AsyncPgConnection,
+        shards: &[(ShardId, ShardGeneration)],
+        allowed: &[(ShardId, ShardGeneration)],
+    ) -> HarvestResult<FencePassGuard> {
+        use diesel_async::SimpleAsyncConnection as _;
+        begin_guard_transaction(&mut conn).await?;
+        // The locks and the check below wait at most `FENCE_LOCK_WAIT_SQL`. A
+        // bump in progress on this database then fails the operation fast, and
+        // its other guards drop. They cannot hold a bump off elsewhere.
+        conn.batch_execute(FENCE_LOCK_WAIT_SQL)
+            .await
+            .map_err(database_error)?;
+        // Taken in shard order. A bump takes one pass lock only, so no order
+        // of these shared locks can deadlock with it.
+        let mut ordered = shards.to_vec();
+        ordered.sort_by_key(|(shard, _)| *shard);
+        for (shard, _) in &ordered {
+            diesel::sql_query(FENCE_PASS_LOCK_SHARED)
+                .bind::<BigInt, _>(fence_pass_lock_key(shard.as_i32()))
+                .execute(&mut conn)
+                .await
+                .map_err(database_error)?;
+        }
+        // A new row on this database waits for this pass. See
+        // `PROVISION_LOCK_KEY`.
+        diesel::sql_query(FENCE_PASS_LOCK_SHARED)
+            .bind::<BigInt, _>(PROVISION_LOCK_KEY)
+            .execute(&mut conn)
+            .await
+            .map_err(database_error)?;
+        // The check reads the generation row, which locks the table. The
+        // rollback to the savepoint frees that lock and keeps the pass lock.
+        // A bump of another shard then does not wait for this pass.
+        conn.batch_execute("SAVEPOINT harvest_fence_check")
+            .await
+            .map_err(database_error)?;
+        for (shard, expected) in &ordered {
+            assert_generation(&mut conn, *shard, *expected).await?;
+        }
+        if !allowed.is_empty() {
+            assert_no_unpinned_rows(&mut conn, allowed).await?;
+        }
+        conn.batch_execute("ROLLBACK TO SAVEPOINT harvest_fence_check; SET LOCAL lock_timeout = 0")
+            .await
+            .map_err(database_error)?;
+        let label = <[_]>::first(&ordered).map_or(-1, |(shard, _)| shard.as_i32());
+        Ok(keep_guard_alive(conn, label))
+    }
+
+    /// Open a transaction on `conn` that a long guard holds (issue #1823).
+    /// A pass can run for a long time. A statement or transaction timeout
+    /// must not end the guard mid-pass, so this turns them off. PostgreSQL
+    /// 17 adds `transaction_timeout`; older servers do not know it.
+    ///
+    /// The idle timeout stays on, at [`FENCE_GUARD_IDLE_SQL`]. The keepalive
+    /// pings each second, so a live guard is never idle that long.
+    async fn begin_guard_transaction(conn: &mut AsyncPgConnection) -> HarvestResult<()> {
+        use diesel_async::SimpleAsyncConnection as _;
+        conn.batch_execute("BEGIN").await.map_err(database_error)?;
+        conn.batch_execute(FENCE_GUARD_IDLE_SQL)
+            .await
+            .map_err(database_error)?;
+        conn.batch_execute(
+            "SET LOCAL statement_timeout = 0; \
+             SET LOCAL application_name = 'harvest_dr_fence_pass'; \
+             DO $$ BEGIN \
+               IF current_setting('server_version_num')::int >= 170000 THEN \
+                 PERFORM set_config('transaction_timeout', '0', true); \
+               END IF; \
+             END $$",
+        )
+        .await
+        .map_err(database_error)?;
+        Ok(())
+    }
+
+    /// Hand `conn` to a keepalive task and return its guard. The task pings
+    /// the session, and marks the guard lost when the session ends.
+    fn keep_guard_alive(mut conn: AsyncPgConnection, shard_id: i32) -> FencePassGuard {
+        let lost = tokio_util::sync::CancellationToken::new();
+        let flag = lost.clone();
+        let keepalive = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(FENCE_PASS_KEEPALIVE).await;
+                let ping = tokio::time::timeout(
+                    FENCE_PASS_PING_BOUND,
+                    diesel::sql_query("SELECT 1").execute(&mut conn),
+                )
+                .await;
+                // The task ends on a failed or late ping. That drops the
+                // connection, and the server's idle bound ends the session.
+                if !matches!(ping, Ok(Ok(_))) {
+                    flag.cancel();
+                    tracing::error!(
+                        shard_id,
+                        "the DR fence guard lost its session; its pass stops writing"
+                    );
+                    return;
+                }
+            }
+        });
+        FencePassGuard {
+            lost,
+            keepalive,
+            slot: None,
+        }
+    }
+
+    /// Freeze the set of generation rows on a database while a command runs
+    /// (issue #1823).
+    ///
+    /// A command that changes tables every logical shard shares must hold a
+    /// barrier for each shard there. A row provisioned during the command
+    /// would have none. So this guard takes `harvest_shard_generation` in
+    /// `SHARE` mode. That blocks a new row and every bump on this database
+    /// until the guard drops. Reads and the `FOR SHARE` fence checks still
+    /// run.
+    ///
+    /// Take the per-shard barriers in `guarded` first. A bump takes its pass
+    /// lock before the table, so this order cannot deadlock with one.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::error::HarvestError::Config`] when the database holds a row
+    /// outside `guarded`. [`crate::error::HarvestError::Database`] when the
+    /// lock is not granted within the bump's lock timeout, or a query fails.
+    pub async fn freeze_generation_rows_on(
+        mut conn: AsyncPgConnection,
+        guarded: &[ShardId],
+    ) -> HarvestResult<FencePassGuard> {
+        use diesel_async::SimpleAsyncConnection as _;
+        begin_guard_transaction(&mut conn).await?;
+        // A database migrated before the fence table has nothing to freeze.
+        let present: Vec<TableRow> = diesel::sql_query(
+            "SELECT to_regclass('harvest_shard_generation') IS NOT NULL AS present",
+        )
+        .load(&mut conn)
+        .await
+        .map_err(database_error)?;
+        if !<[TableRow]>::first(&present).is_some_and(|row| row.present) {
+            return Ok(keep_guard_alive(conn, -1));
+        }
+        conn.batch_execute(&format!(
+            "SET LOCAL lock_timeout = '{BUMP_LOCK_TIMEOUT_MS}ms'; \
+             LOCK TABLE harvest_shard_generation IN SHARE MODE"
+        ))
+        .await
+        .map_err(database_error)?;
+        let rows = probe_dr_markers(&mut conn, super::DEFAULT_DR_SLOT_PREFIX)
+            .await?
+            .generation_shards;
+        let unguarded: Vec<i32> = rows
+            .iter()
+            .filter(|row| !guarded.contains(row))
+            .map(|row| row.as_i32())
+            .collect();
+        if !unguarded.is_empty() {
+            return Err(crate::error::HarvestError::Config(format!(
+                "shard row(s) {unguarded:?} appeared on this database while the command \
+                 took its barriers. Run the command again, with --expect-generation for \
+                 every shard."
+            )));
+        }
+        Ok(keep_guard_alive(conn, -1))
+    }
+
     /// Assert that this process still holds write authority for `shard`.
     ///
     /// Call at the top of a persist. Costs **nothing** — not even a round trip
-    /// — when this process pinned no generation, which is every deployment that
-    /// has not opted into DR fencing.
+    /// — when this process pinned no generation. That is every process that
+    /// found no DR marker at startup (issue #1823).
     ///
     /// When it does run it takes the fencing row `FOR SHARE`. Inside a
     /// transaction that makes the check a commit-order barrier:
@@ -1173,24 +2885,682 @@ mod db {
             return Ok(());
         };
         let resolved = FenceRegistry::resolve_shard(shard).unwrap_or(shard);
+        assert_generation(conn, resolved, pinned).await
+    }
 
+    /// Fail with `ShardFenced` unless `shard` is at `expected`.
+    ///
+    /// The one check both the persist assert and the admin check run. It
+    /// takes the row `FOR SHARE`; see [`assert_fence`] for why. An absent row
+    /// fails closed.
+    async fn assert_generation(
+        conn: &mut AsyncPgConnection,
+        shard: ShardId,
+        expected: ShardGeneration,
+    ) -> HarvestResult<()> {
         let rows: Vec<GenerationRow> = diesel::sql_query(
             "SELECT generation FROM harvest_shard_generation WHERE shard_id = $1 FOR SHARE",
         )
-        .bind::<Integer, _>(resolved.as_i32())
+        .bind::<Integer, _>(shard.as_i32())
         .load(conn)
         .await
         .map_err(database_error)?;
 
         let current = rows.into_iter().next().map(|r| r.generation);
-        if current == Some(pinned.as_i64()) {
+        if current == Some(expected.as_i64()) {
             return Ok(());
         }
         Err(crate::error::HarvestError::ShardFenced {
-            shard_id: resolved.as_i32(),
-            pinned: pinned.as_i64(),
+            shard_id: shard.as_i32(),
+            pinned: expected.as_i64(),
             current,
         })
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct TableRow {
+        #[diesel(sql_type = Bool)]
+        present: bool,
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct MarkerRow {
+        #[diesel(sql_type = diesel::sql_types::Array<Integer>)]
+        generation_shards: Vec<i32>,
+        #[diesel(sql_type = BigInt)]
+        dr_slots: i64,
+        #[diesel(sql_type = BigInt)]
+        dr_subscriptions: i64,
+        #[diesel(sql_type = BigInt)]
+        subscriptions: i64,
+        #[diesel(sql_type = Bool)]
+        in_recovery: bool,
+    }
+
+    /// Probe this database for DR markers (issue #1823).
+    ///
+    /// The slot test uses the same scope as the RPO metric. A logical slot
+    /// counts for its own database. A physical slot has no database, so it
+    /// counts for every database on the cluster. Physical replication copies
+    /// the whole cluster, so that is the correct answer. The query uses
+    /// `starts_with`, not `LIKE`, because `_` is a wildcard in `LIKE`.
+    ///
+    /// Every catalog read here needs no special grant. `pg_subscription`
+    /// hides only its connection string from ordinary roles.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::HarvestError::Database`] on query failure.
+    pub async fn probe_dr_markers(
+        conn: &mut AsyncPgConnection,
+        slot_prefix: &str,
+    ) -> HarvestResult<DrMarkers> {
+        // A database without the fence table has no generation row. Before
+        // issue #1823 an unfenced process issued no DR query at all, so a
+        // missing table must not fail its start now.
+        let has_table: TableRow = diesel::sql_query(
+            "SELECT to_regclass('harvest_shard_generation') IS NOT NULL AS present",
+        )
+        .get_result(conn)
+        .await
+        .map_err(database_error)?;
+        let generation_shards = if has_table.present {
+            "ARRAY(SELECT shard_id FROM harvest_shard_generation ORDER BY shard_id)"
+        } else {
+            "ARRAY[]::integer[]"
+        };
+        let row: MarkerRow = diesel::sql_query(format!(
+            "SELECT \
+                 {generation_shards} AS generation_shards, \
+                 (SELECT COUNT(*) FROM pg_replication_slots s \
+                  WHERE (s.database IS NULL OR s.database = current_database()) \
+                    AND starts_with(s.slot_name, $1)) AS dr_slots, \
+                 (SELECT COUNT(*) FROM pg_subscription s \
+                  JOIN pg_database d ON d.oid = s.subdbid \
+                  WHERE d.datname = current_database() \
+                    AND (starts_with(s.subname::text, $1) \
+                         OR starts_with(COALESCE(s.subslotname::text, ''), $1))) \
+                     AS dr_subscriptions, \
+                 (SELECT COUNT(*) FROM pg_subscription s \
+                  JOIN pg_database d ON d.oid = s.subdbid \
+                  WHERE d.datname = current_database()) AS subscriptions, \
+                 pg_is_in_recovery() AS in_recovery"
+        ))
+        .bind::<Text, _>(slot_prefix)
+        .get_result(conn)
+        .await
+        .map_err(database_error)?;
+        Ok(DrMarkers {
+            generation_shards: row
+                .generation_shards
+                .into_iter()
+                .map(ShardId::new)
+                .collect(),
+            dr_slots: row.dr_slots,
+            dr_subscriptions: row.dr_subscriptions,
+            subscriptions: row.subscriptions,
+            in_recovery: row.in_recovery,
+        })
+    }
+
+    /// How many times startup probes one shard before it refuses to start.
+    const PROBE_ATTEMPTS: u32 = 5;
+
+    /// Probe one pool, and retry a failure with backoff (issue #1823).
+    ///
+    /// Before the default became `Auto`, an unfenced worker issued no probe.
+    /// A shard that is briefly unreachable at boot must not stop it at once.
+    /// After the last attempt the error stands, and the process refuses to
+    /// start. An unknown shard could carry a DR marker, so running unfenced
+    /// would fail open.
+    async fn probe_pool(
+        pool: &crate::worker::DbPool,
+        slot_prefix: &str,
+    ) -> HarvestResult<DrMarkers> {
+        let mut delay = std::time::Duration::from_millis(500);
+        let mut attempt = 1;
+        loop {
+            let probed = async {
+                let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
+                probe_dr_markers(&mut conn, slot_prefix).await
+            }
+            .await;
+            match probed {
+                Ok(markers) => return Ok(markers),
+                Err(error) if attempt < PROBE_ATTEMPTS => {
+                    tracing::warn!(
+                        attempt,
+                        error = %error,
+                        "DR marker probe failed; retrying before startup refuses"
+                    );
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                    attempt += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Check that a direct-database admin write may run on `shard`
+    /// (issue #1823).
+    ///
+    /// A CLI process pins nothing, so [`assert_fence`] cannot help it. A pin
+    /// taken at connect time would match a demoted primary too. The operator
+    /// therefore states the epoch that holds authority, as `expected`.
+    ///
+    /// - `Some(expected)`: the shard must be at exactly that generation.
+    /// - `None`: allowed only on a database with no DR marker.
+    ///
+    /// A logical standby carries the replicated row at the primary's
+    /// generation, so a matching epoch does not prove authority there. The
+    /// probe therefore always runs. A server in recovery refuses every write.
+    /// Any subscription in the database refuses an [`AdminWrite::Data`]
+    /// write, whatever its name. The CLI cannot know a custom DR prefix.
+    ///
+    /// The check is a preflight read, not a commit-order barrier.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::error::HarvestError::ShardFenced`] when the shard is at another
+    /// generation, or has no row. [`crate::error::HarvestError::Config`] when
+    /// `expected` is `None` on a DR database, or the write may not run on this
+    /// standby.
+    /// [`crate::error::HarvestError::Database`] on query failure.
+    pub async fn assert_admin_write_authority(
+        conn: &mut AsyncPgConnection,
+        shard: ShardId,
+        expected: Option<ShardGeneration>,
+        slot_prefix: &str,
+        kind: super::AdminWrite,
+    ) -> HarvestResult<()> {
+        let markers = probe_dr_markers(conn, slot_prefix).await?;
+        let standby_refuses =
+            markers.in_recovery || (kind == super::AdminWrite::Data && markers.subscriptions > 0);
+        if standby_refuses {
+            return Err(crate::error::HarvestError::Config(format!(
+                "shard {} is a DR standby, so this admin write may not run here. Point it at \
+                 the primary, or promote this database first.",
+                shard.as_i32()
+            )));
+        }
+        if let Some(expected) = expected {
+            return assert_generation(conn, shard, expected).await;
+        }
+        if markers.is_dr() {
+            return Err(crate::error::HarvestError::Config(format!(
+                "shard {} is a DR database, so an admin write must state the generation that \
+                 holds write authority. Read it from the promoted primary.",
+                shard.as_i32()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Resolve this process's fencing mode and pin every shard it serves
+    /// (issue #1823).
+    ///
+    /// Workers and the management API both call this at startup, before
+    /// they write anything.
+    ///
+    /// `targets` is the `(shard, pool)` set and the default shard, when the
+    /// caller knows its shard identity. With `None`, the probe runs on
+    /// `fallback_pool`. If the fence turns on, exactly one
+    /// `harvest_shard_generation` row there names the shard. That row is how
+    /// an operator addressed this database with `harvest dr fence`.
+    ///
+    /// Returns the fenced targets, or `None` when the process runs unfenced.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::error::HarvestError::Config`] when the process must refuse to
+    /// start. Three causes: the mode disagrees with the database, the shard
+    /// cannot be named, or a pin conflicts with one already in this process.
+    /// A database error also refuses the start. A fenced process never falls
+    /// back to unfenced.
+    pub async fn pin_process_fence(
+        mode: super::DrFencing,
+        slot_prefix: &str,
+        targets: Option<(Vec<(ShardId, crate::worker::DbPool)>, ShardId)>,
+        fallback_pool: &crate::worker::DbPool,
+    ) -> HarvestResult<Option<Vec<(ShardId, crate::worker::DbPool)>>> {
+        pin_fence(mode, slot_prefix, targets, fallback_pool, None)
+            .await
+            .map(|(fenced, _)| fenced)
+    }
+
+    /// [`pin_process_fence`] for a worker, which holds a shard it cannot
+    /// probe instead of refusing to start (issue #1823).
+    ///
+    /// A worker tolerates an unreachable shard at boot (issue #961). It
+    /// registers, retries and serves the other shards. A shard it cannot
+    /// probe might carry a DR marker, so running it unfenced would fail
+    /// open. The worker therefore pins it to a sentinel generation that no
+    /// row holds. The claim gate selects nothing there, and the persist
+    /// assert fails closed. [`resolve_held`] later releases or refuses it.
+    ///
+    /// Returns the fenced targets and the held `(shard, pool)` pairs. With no
+    /// shard identity, the held shard is [`ShardId::UNENCODED`].
+    ///
+    /// # Errors
+    ///
+    /// As [`pin_process_fence`]. In addition, a fenced worker refuses to
+    /// start when it cannot probe an assigned shard: it cannot pin that
+    /// shard. An unassigned shard is held instead, so an outage there does
+    /// not stop the worker. `assigned` empty means every target is assigned.
+    #[allow(clippy::type_complexity)]
+    pub async fn pin_worker_fence(
+        mode: super::DrFencing,
+        slot_prefix: &str,
+        targets: Option<(Vec<(ShardId, crate::worker::DbPool)>, ShardId)>,
+        fallback_pool: &crate::worker::DbPool,
+        assigned: &[ShardId],
+    ) -> HarvestResult<(
+        Option<Vec<(ShardId, crate::worker::DbPool)>>,
+        Vec<(ShardId, crate::worker::DbPool)>,
+    )> {
+        pin_fence(mode, slot_prefix, targets, fallback_pool, Some(assigned)).await
+    }
+
+    /// The pool type a pin records.
+    type PinPool = deadpool::managed::WeakPool<
+        diesel_async::pooled_connection::AsyncDieselConnectionManager<AsyncPgConnection>,
+    >;
+
+    /// The pools this process took each pin through (issue #1823).
+    ///
+    /// A worker that cannot probe a pinned shard reuses the pin only
+    /// through one of these pools. Another pool can reach another
+    /// database. The handles are weak, so a pin does not keep a pool open.
+    static PIN_POOLS: std::sync::Mutex<Vec<(i32, PinPool)>> = std::sync::Mutex::new(Vec::new());
+
+    /// Record that this process pinned `shard` through `pool`.
+    fn record_pin_pool(shard: ShardId, pool: &crate::worker::DbPool) {
+        let mut pools = PIN_POOLS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pools.retain(|(_, weak)| weak.upgrade().is_some());
+        if !pools.iter().any(|(key, weak)| {
+            *key == shard.as_i32() && weak.upgrade().is_some_and(|known| same_pool(&known, pool))
+        }) {
+            pools.push((shard.as_i32(), pool.weak()));
+        }
+        drop(pools);
+    }
+
+    /// Whether this process pinned `shard` through `pool`.
+    fn pinned_through(shard: ShardId, pool: &crate::worker::DbPool) -> bool {
+        let pools = PIN_POOLS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let found = pools.iter().any(|(key, weak)| {
+            *key == shard.as_i32() && weak.upgrade().is_some_and(|known| same_pool(&known, pool))
+        });
+        drop(pools);
+        found
+    }
+
+    /// Whether two handles share one pool. Clones share one manager.
+    fn same_pool(a: &crate::worker::DbPool, b: &crate::worker::DbPool) -> bool {
+        std::ptr::eq(a.manager(), b.manager())
+    }
+
+    /// Re-probe the shards [`pin_worker_fence`] held (issue #1823).
+    ///
+    /// A shard that still cannot be probed stays held. A shard with no DR
+    /// marker is released, and its claims resume unfenced. A shard with a
+    /// marker cannot be pinned now. A pin is fixed for the life of a process.
+    /// So the process must restart, and the startup pin then covers the
+    /// shard.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::error::HarvestError::Config`] when a held shard now carries a
+    /// DR marker. The caller stops the process.
+    pub async fn resolve_held(
+        held: &mut Vec<(ShardId, crate::worker::DbPool)>,
+        slot_prefix: &str,
+    ) -> HarvestResult<()> {
+        let mut index = 0;
+        while index < held.len() {
+            let (shard, pool) = &held[index];
+            let probed = async {
+                let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
+                probe_dr_markers(&mut conn, slot_prefix).await
+            }
+            .await;
+            match probed {
+                Err(_) => index += 1,
+                // A fencing process must pin a returning shard. A pin is
+                // taken only at startup, so the process restarts.
+                Ok(markers) if markers.is_dr() || FenceRegistry::has_real_pin() => {
+                    return Err(crate::error::HarvestError::Config(format!(
+                        "shard {} was unreachable at startup and must now be pinned. A pin \
+                         is fixed for the life of a process, so this process stops. Restart \
+                         it to pin the shard.",
+                        shard.as_i32()
+                    )));
+                }
+                Ok(_) => {
+                    FenceRegistry::release_held(*shard);
+                    tracing::info!(
+                        shard_id = shard.as_i32(),
+                        "held shard has no DR marker; it runs unfenced"
+                    );
+                    held.swap_remove(index);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The shared startup path. `worker` is the worker's shard assignment,
+    /// or `None` for a process pin. A worker tolerates a shard it cannot
+    /// probe. See [`pin_worker_fence`].
+    #[allow(clippy::type_complexity, clippy::too_many_lines)]
+    async fn pin_fence(
+        mode: super::DrFencing,
+        slot_prefix: &str,
+        targets: Option<(Vec<(ShardId, crate::worker::DbPool)>, ShardId)>,
+        fallback_pool: &crate::worker::DbPool,
+        worker: Option<&[ShardId]>,
+    ) -> HarvestResult<(
+        Option<Vec<(ShardId, crate::worker::DbPool)>>,
+        Vec<(ShardId, crate::worker::DbPool)>,
+    )> {
+        let probe_targets: Vec<(ShardId, &crate::worker::DbPool)> = targets.as_ref().map_or_else(
+            || vec![(ShardId::UNENCODED, fallback_pool)],
+            |(targets, _)| targets.iter().map(|(shard, pool)| (*shard, pool)).collect(),
+        );
+        // `None` marks a shard this worker could not probe. Only a worker
+        // tolerates that; every other caller refuses to start.
+        let mut probed: Vec<Option<DrMarkers>> = Vec::with_capacity(probe_targets.len());
+        let mut held: Vec<(ShardId, crate::worker::DbPool)> = Vec::new();
+        // Shards this process pinned before, keyed by their position. A
+        // worker reuses such a pin when its probe fails, so a brief outage
+        // does not hold a shard the process already fences. It must probe
+        // through the pool that took the pin.
+        let mut reused: Vec<(usize, ShardId, ShardGeneration)> = Vec::new();
+        // Pinned shards whose probe failed on another pool.
+        let mut unproven: Vec<ShardId> = Vec::new();
+        for (index, (shard, pool)) in probe_targets.iter().enumerate() {
+            if worker.is_some() {
+                let once = async {
+                    let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
+                    probe_dr_markers(&mut conn, slot_prefix).await
+                }
+                .await;
+                let pinned = FenceRegistry::binding(*shard).filter(|(_, pin)| *pin != super::HELD);
+                match (once, pinned) {
+                    (Ok(markers), _) => probed.push(Some(markers)),
+                    (Err(_), Some((resolved, _))) if !pinned_through(resolved, pool) => {
+                        probed.push(None);
+                        unproven.push(resolved);
+                    }
+                    (Err(error), Some((resolved, generation))) => {
+                        tracing::warn!(
+                            shard_id = resolved.as_i32(),
+                            generation = generation.as_i64(),
+                            error = %error,
+                            "DR marker probe failed; the worker reuses this process's pin"
+                        );
+                        probed.push(None);
+                        reused.push((index, resolved, generation));
+                    }
+                    (Err(error), None) => {
+                        tracing::warn!(
+                            shard_id = shard.as_i32(),
+                            error = %error,
+                            "DR marker probe failed; the worker holds this shard until it can \
+                             probe it"
+                        );
+                        probed.push(None);
+                        held.push((*shard, (*pool).clone()));
+                    }
+                }
+            } else {
+                probed.push(Some(probe_pool(pool, slot_prefix).await?));
+            }
+        }
+        // This process fences the shard, but nothing proves this pool
+        // reaches the pinned database. It can be a logical standby.
+        if !unproven.is_empty() {
+            return Err(crate::error::HarvestError::Config(format!(
+                "this process pins shard(s) {:?}, but this worker cannot probe them, and its \
+                 pool is not the pool that took the pin. Nothing proves that the pool reaches \
+                 the pinned database. Refusing to start. Start the worker when the shard is \
+                 reachable.",
+                unproven
+                    .iter()
+                    .map(|shard| shard.as_i32())
+                    .collect::<Vec<_>>()
+            )));
+        }
+        let dr_configured = !reused.is_empty() || probed.iter().flatten().any(DrMarkers::is_dr);
+        let fence = mode
+            .resolve(dr_configured)
+            .map_err(crate::error::HarvestError::Config)?;
+        // This process already fences another database. The registry is
+        // process-wide, so one process cannot mix fenced and unfenced workers.
+        // The check and the reservation are one atomic step.
+        // A failed startup drops the reservation, so the mode is free again.
+        let reservation =
+            FenceRegistry::reserve_mode(fence).map_err(crate::error::HarvestError::Config)?;
+        if !fence {
+            if !held.is_empty() {
+                let default_shard = targets
+                    .as_ref()
+                    .map_or(ShardId::UNENCODED, |(_, default)| *default);
+                let shards: Vec<ShardId> = held.iter().map(|(shard, _)| *shard).collect();
+                FenceRegistry::hold(&shards, default_shard)
+                    .map_err(|conflict| crate::error::HarvestError::Config(conflict.to_string()))?;
+            }
+            reservation.keep();
+            return Ok((None, held));
+        }
+        // A shard outside this worker's assignment does not block it. The
+        // worker holds that shard, so a cross-shard write there fails closed.
+        // An assigned shard, or a worker with no explicit assignment, refuses.
+        let assigned_held = held
+            .iter()
+            .filter(|(shard, _)| match (worker, targets.as_ref()) {
+                (Some(assigned), Some(_)) if !assigned.is_empty() => assigned.contains(shard),
+                _ => true,
+            })
+            .count();
+        if assigned_held > 0 {
+            return Err(crate::error::HarvestError::Config(format!(
+                "DR fencing is on, but {assigned_held} assigned shard(s) could not be \
+                 probed, so they cannot be pinned. Refusing to start rather than run them \
+                 unfenced."
+            )));
+        }
+        if probed.iter().flatten().any(DrMarkers::is_standby) {
+            return Err(crate::error::HarvestError::Config(
+                "this database is a DR standby: it has a logical subscription or is in recovery. \
+                 No Harvest process may write to a standby. Promote it first (runbook step 2), \
+                 or point this process at the primary."
+                    .to_string(),
+            ));
+        }
+
+        let (targets, default_shard) = match targets {
+            Some(targets) => targets,
+            // The fallback pool was not probed, but the process pin names
+            // its shard.
+            None if !reused.is_empty() => {
+                let shard = reused[0].1;
+                (vec![(shard, fallback_pool.clone())], shard)
+            }
+            None => match probed[0]
+                .as_ref()
+                .map_or(&[][..], |markers| markers.generation_shards.as_slice())
+            {
+                [shard] => (vec![(*shard, fallback_pool.clone())], *shard),
+                rows => {
+                    return Err(crate::error::HarvestError::Config(format!(
+                        "DR fencing is on, but this process has no shard identity and the \
+                         database names {} shards in harvest_shard_generation. Set \
+                         WorkerConfig::with_shard_assignments([shard]) or use a sharded pool. \
+                         Refusing to start rather than pin a guessed shard.",
+                        rows.len()
+                    )));
+                }
+            },
+        };
+
+        // A shard database holds its own row only. A row for another shard
+        // means this process names the database wrongly. Pinning would add a
+        // second row, and `harvest dr fence` on the real shard would then
+        // fence nothing this process checks.
+        //
+        // Logical shards that share one pool share one database. A row for
+        // any of them is then expected there.
+        //
+        // A process on one database may share it with processes for other
+        // logical shards. Their rows are expected there, so it only warns.
+        let single_database = targets
+            .iter()
+            .all(|(_, pool)| std::ptr::eq(pool.manager(), fallback_pool.manager()));
+        for ((shard, pool), markers) in targets.iter().zip(&probed) {
+            let Some(markers) = markers else { continue };
+            if single_database {
+                if !markers.generation_shards.is_empty()
+                    && !markers.generation_shards.contains(shard)
+                {
+                    tracing::warn!(
+                        shard_id = shard.as_i32(),
+                        rows = ?markers
+                            .generation_shards
+                            .iter()
+                            .map(|s| s.as_i32())
+                            .collect::<Vec<_>>(),
+                        "this database holds the rows of other logical shards; this process \
+                         provisions its own row beside them"
+                    );
+                }
+                continue;
+            }
+            let colocated = |row: &ShardId| {
+                targets.iter().any(|(peer, peer_pool)| {
+                    peer == row && std::ptr::eq(peer_pool.manager(), pool.manager())
+                })
+            };
+            if !markers.generation_shards.is_empty()
+                && !markers.generation_shards.contains(shard)
+                && !markers.generation_shards.iter().any(colocated)
+            {
+                return Err(crate::error::HarvestError::Config(format!(
+                    "this process serves shard {} on a database whose harvest_shard_generation \
+                     names shard(s) {:?}. Configure the shard number the operator fences with \
+                     `harvest dr fence`. Refusing to start.",
+                    shard.as_i32(),
+                    markers
+                        .generation_shards
+                        .iter()
+                        .map(|s| s.as_i32())
+                        .collect::<Vec<_>>()
+                )));
+            }
+        }
+
+        let held_shards: Vec<ShardId> = held.iter().map(|(shard, _)| *shard).collect();
+        let mut pins = Vec::with_capacity(targets.len());
+        for (index, (shard, pool)) in targets.iter().enumerate() {
+            if held_shards.contains(shard) {
+                continue;
+            }
+            if let Some((_, _, generation)) = reused.iter().find(|(at, ..)| *at == index) {
+                pins.push((*shard, *generation));
+                continue;
+            }
+            let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
+            pins.push((*shard, ensure_generation_row(&mut conn, *shard).await?));
+        }
+        // A database that another process's logical shards share holds
+        // their rows too. A claim scan there is not filtered by shard, so
+        // this process pins those rows as it finds them. A bump of any of
+        // them then stops this process too. Each peer is (row, target).
+        //
+        // The probe ran before this process provisioned its own rows. A peer
+        // that started at the same moment may have provisioned since, so the
+        // rows are read again. Of two processes that start together, the
+        // later one then pins the earlier one's row, as in a sequential
+        // start. A held or unprobed target is skipped.
+        let mut peers: Vec<(ShardId, ShardId)> = Vec::new();
+        for ((shard, pool), markers) in targets.iter().zip(&probed) {
+            if markers.is_none() || held_shards.contains(shard) {
+                continue;
+            }
+            let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
+            for row in generation_shard_ids(&mut conn).await? {
+                if pins.iter().any(|(pinned, _)| *pinned == row)
+                    || targets.iter().any(|(target, _)| *target == row)
+                {
+                    continue;
+                }
+                if let Some(generation) = current_generation(&mut conn, row).await? {
+                    pins.push((row, generation));
+                    peers.push((row, *shard));
+                }
+            }
+        }
+        // Held first, so the default shard is never briefly unpinned.
+        if !held_shards.is_empty() {
+            FenceRegistry::hold(&held_shards, default_shard)
+                .map_err(|conflict| crate::error::HarvestError::Config(conflict.to_string()))?;
+        }
+        if let Err(conflict) = FenceRegistry::publish(&pins, default_shard) {
+            // This startup fails, so it drops the holds it just added.
+            // Otherwise the sentinel stays, and every worker in this process
+            // treats the shard as unwritable.
+            for shard in &held_shards {
+                FenceRegistry::release_held(*shard);
+            }
+            return Err(crate::error::HarvestError::Config(conflict.to_string()));
+        }
+        // Logical shards that share one database share one claim scan.
+        for (shard, pool) in &targets {
+            let group: Vec<ShardId> = targets
+                .iter()
+                .filter(|(_, peer_pool)| same_pool(peer_pool, pool))
+                .map(|(peer, _)| *peer)
+                .collect();
+            if group[0] != *shard {
+                continue;
+            }
+            let rows = peers
+                .iter()
+                .filter(|(_, target)| group.contains(target))
+                .map(|(row, _)| *row);
+            let group: Vec<ShardId> = group.iter().copied().chain(rows).collect();
+            if group.len() > 1 {
+                FenceRegistry::colocate(&group);
+            }
+        }
+        for (shard, generation) in &pins {
+            tracing::info!(
+                shard_id = shard.as_i32(),
+                generation = generation.as_i64(),
+                "pinned shard write-authority generation for cross-region DR fencing"
+            );
+        }
+        let fenced: Vec<_> = targets
+            .into_iter()
+            .filter(|(shard, _)| !held_shards.contains(shard))
+            .collect();
+        for (shard, pool) in &fenced {
+            record_pin_pool(*shard, pool);
+        }
+        // A peer row was pinned through the pool of the target that found it.
+        // A later worker that targets the peer can then reuse the pin there.
+        for (row, target) in &peers {
+            if let Some((_, pool)) = fenced.iter().find(|(shard, _)| shard == target) {
+                record_pin_pool(*row, pool);
+            }
+        }
+        reservation.keep();
+        Ok((Some(fenced), held))
     }
 
     // ── Replication lag ────────────────────────────────────────────────────
@@ -1322,6 +3692,9 @@ mod db {
     /// # Errors
     ///
     /// Returns [`crate::error::HarvestError::Database`] on query failure.
+    /// Also returns the errors of [`assert_fence_group`], for example when
+    /// this process pins a superseded generation (issue #1823). It then
+    /// writes no beat.
     pub async fn record_replication_heartbeat(
         conn: &mut AsyncPgConnection,
         shard: ShardId,
@@ -1363,6 +3736,10 @@ mod db {
                     // check and gauges still ran; only the write is skipped.
                     return Ok(());
                 }
+                // Check the fence in this transaction (issue #1823). The
+                // check holds each pinned row `FOR SHARE`, so a bump cannot
+                // commit between the check and the beat.
+                assert_fence_group(conn, shard).await?;
 
                 // The lock alone only prevents SIMULTANEOUS writers. Workers
                 // sampling on staggered schedules each take it uncontended a
@@ -1972,19 +4349,27 @@ mod db {
 
 #[cfg(feature = "db")]
 pub use db::{
-    advance_sequences_after_promotion, assert_fence, bump_generation, current_generation,
-    ensure_generation_row, measure_rpo, query_replication_status, record_replication_heartbeat,
+    CheckoutElapsed, FENCE_GUARD_LIMIT, FENCED_CHECKOUT_BOUND, FencePassGuard, FencedConn,
+    PassMember, abandon_fenced_pass, advance_sequences_after_promotion,
+    assert_admin_write_authority, assert_database_fence, assert_fence, assert_fence_group,
+    begin_fenced_group, begin_fenced_groups, begin_fenced_pass, begin_fenced_pass_at,
+    begin_fenced_pass_on, begin_fenced_tick, begin_shard_tick, bump_generation, current_generation,
+    ensure_generation_row, fenced_acquire, fenced_acquire_with_retries, fenced_checkout,
+    fenced_get_within, fenced_wait, freeze_generation_rows_on, join_fenced_pass,
+    join_fenced_pass_direct, measure_rpo, pin_process_fence, pin_worker_fence, probe_dr_markers,
+    query_replication_status, record_replication_heartbeat, resolve_held, run_fenced_pass,
 };
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// [`FenceRegistry`] is process-global, so the tests that mutate it must
     /// not interleave with each other under the default parallel harness.
+    /// Tests in other modules take the same lock.
     static REGISTRY_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn registry_guard() -> std::sync::MutexGuard<'static, ()> {
+    pub fn registry_guard() -> std::sync::MutexGuard<'static, ()> {
         REGISTRY_SERIAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2409,6 +4794,22 @@ mod tests {
         );
     }
 
+    /// The fence pass key sits outside the `hashtext` range, differs per
+    /// shard, and never equals a heartbeat key (issue #1823).
+    #[cfg(feature = "db")]
+    #[test]
+    fn fence_pass_lock_keys_are_distinct_and_outside_the_hashtext_range() {
+        for shard in [0_i32, 1, 7, 255, i32::MAX] {
+            let key = super::db::fence_pass_lock_key(shard);
+            assert!(key > i64::from(i32::MAX), "shard {shard} key {key}");
+            assert_ne!(key, super::db::heartbeat_lock_key(shard));
+        }
+        assert_ne!(
+            super::db::fence_pass_lock_key(0),
+            super::db::fence_pass_lock_key(1)
+        );
+    }
+
     // ── promotion: identifier quoting ──────────────────────────────────────
     //
     // `db`-gated with the helpers themselves: without that feature — which is
@@ -2447,12 +4848,196 @@ mod tests {
         );
     }
 
+    // ── fencing mode (issue #1823) ─────────────────────────────────────────
+    #[test]
+    fn the_default_mode_is_auto() {
+        assert_eq!(DrFencing::default(), DrFencing::Auto);
+        assert_eq!(DrConfig::default().fencing, DrFencing::Auto);
+    }
+
+    #[test]
+    fn auto_fences_exactly_when_a_dr_marker_is_found() {
+        assert_eq!(DrFencing::Auto.resolve(false), Ok(false));
+        assert_eq!(DrFencing::Auto.resolve(true), Ok(true));
+    }
+
+    #[test]
+    fn enabled_always_fences() {
+        assert_eq!(DrFencing::Enabled.resolve(false), Ok(true));
+        assert_eq!(DrFencing::Enabled.resolve(true), Ok(true));
+    }
+
+    #[test]
+    fn disabled_refuses_a_dr_database() {
+        assert_eq!(DrFencing::Disabled.resolve(false), Ok(false));
+        let refusal = DrFencing::Disabled
+            .resolve(true)
+            .expect_err("a disagreeing config must refuse to start");
+        assert!(refusal.contains("Disabled"), "{refusal}");
+        assert!(refusal.contains("DR"), "{refusal}");
+        // The fix must not select Disabled again.
+        assert!(
+            refusal.contains("with_dr_fencing_mode(DrFencing::Auto)"),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn markers_report_dr_when_any_signal_is_present() {
+        assert!(!DrMarkers::default().is_dr());
+        let row = DrMarkers {
+            generation_shards: vec![ShardId::new(4)],
+            ..DrMarkers::default()
+        };
+        assert!(row.is_dr());
+        let slot = DrMarkers {
+            dr_slots: 1,
+            ..DrMarkers::default()
+        };
+        assert!(slot.is_dr());
+        let subscription = DrMarkers {
+            dr_subscriptions: 1,
+            ..DrMarkers::default()
+        };
+        assert!(subscription.is_dr());
+    }
+
+    /// Any logical subscription makes a standby, whatever its name (issue
+    /// #1823). `Enabled` exists for replication that does not use the DR
+    /// prefix, and subscriber tables stay writable.
+    #[test]
+    fn any_subscription_makes_a_standby() {
+        let custom = DrMarkers {
+            subscriptions: 1,
+            ..DrMarkers::default()
+        };
+        assert!(custom.is_standby());
+        assert!(
+            !custom.is_dr(),
+            "a custom subscription alone is not a DR marker"
+        );
+        assert!(!DrMarkers::default().is_standby());
+    }
+
+    #[test]
+    fn the_mode_serializes_in_snake_case() {
+        assert_eq!(
+            serde_json::to_value(DrFencing::Auto).unwrap(),
+            serde_json::json!("auto")
+        );
+        assert_eq!(
+            serde_json::to_value(DrFencing::Disabled).unwrap(),
+            serde_json::json!("disabled")
+        );
+    }
+
+    /// A held shard is pinned to a sentinel no row holds, and release
+    /// removes only that sentinel (issue #1823).
+    #[test]
+    fn a_held_shard_fails_closed_until_released() {
+        let _serial = registry_guard();
+        FenceRegistry::clear();
+        FenceRegistry::hold(&[ShardId::new(3)], ShardId::new(3)).expect("hold");
+        assert!(FenceRegistry::is_held(ShardId::new(3)));
+        assert!(FenceRegistry::is_enabled(), "a held shard is checked");
+        assert_eq!(
+            FenceRegistry::binding(ShardId::UNENCODED),
+            Some((ShardId::new(3), HELD)),
+            "pre-sharding ids resolve to the held default shard"
+        );
+
+        // A second holder keeps the shard held until it releases too.
+        FenceRegistry::hold(&[ShardId::new(3)], ShardId::new(3)).expect("second holder");
+        FenceRegistry::release_held(ShardId::new(3));
+        assert!(
+            FenceRegistry::is_held(ShardId::new(3)),
+            "one holder remains"
+        );
+
+        FenceRegistry::release_held(ShardId::new(3));
+        assert!(!FenceRegistry::is_held(ShardId::new(3)));
+        assert_eq!(FenceRegistry::expected(ShardId::new(3)), None);
+        assert!(!FenceRegistry::is_enabled(), "nothing left to check");
+
+        // A real pin is never released, and never replaced by a hold.
+        FenceRegistry::register(ShardId::new(4), ShardGeneration(2)).expect("pin");
+        FenceRegistry::hold(&[ShardId::new(4)], ShardId::new(3)).expect("hold skips a pin");
+        FenceRegistry::release_held(ShardId::new(4));
+        assert_eq!(
+            FenceRegistry::expected(ShardId::new(4)),
+            Some(ShardGeneration(2))
+        );
+        FenceRegistry::clear();
+    }
+
+    /// A release that races a publish must not switch the fence off over
+    /// the new pin (issue #1823). The flag and the map change under one lock.
+    #[test]
+    fn a_release_racing_a_publish_leaves_the_fence_on() {
+        let _serial = registry_guard();
+        for round in 0..2_000 {
+            FenceRegistry::clear();
+            FenceRegistry::hold(&[ShardId::new(3)], ShardId::new(3)).expect("hold");
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let release = {
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    FenceRegistry::release_held(ShardId::new(3));
+                })
+            };
+            barrier.wait();
+            FenceRegistry::register(ShardId::new(4), ShardGeneration(2)).expect("pin");
+            release.join().expect("release thread");
+            assert!(
+                FenceRegistry::is_enabled(),
+                "round {round}: a live pin must keep the fence on"
+            );
+            assert_eq!(
+                FenceRegistry::binding(ShardId::new(4)),
+                Some((ShardId::new(4), ShardGeneration(2)))
+            );
+        }
+        FenceRegistry::clear();
+    }
+
+    /// A second hold that races the first holder's release keeps the shard
+    /// held (issue #1823). The sentinel and the holder count change under
+    /// one lock, so the shard is never left unpinned between them.
+    #[test]
+    fn a_hold_racing_a_release_keeps_the_shard_held() {
+        let _serial = registry_guard();
+        for round in 0..2_000 {
+            FenceRegistry::clear();
+            FenceRegistry::hold(&[ShardId::new(3)], ShardId::new(3)).expect("first holder");
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let release = {
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    FenceRegistry::release_held(ShardId::new(3));
+                })
+            };
+            barrier.wait();
+            FenceRegistry::hold(&[ShardId::new(3)], ShardId::new(3)).expect("second holder");
+            release.join().expect("release thread");
+            assert!(
+                FenceRegistry::is_held(ShardId::new(3)),
+                "round {round}: the second holder keeps the shard held"
+            );
+        }
+        FenceRegistry::clear();
+    }
+
     // ── fence registry ─────────────────────────────────────────────────────
     #[test]
     fn registry_round_trips_and_defaults_to_disabled() {
         let _serial = registry_guard();
         FenceRegistry::clear();
-        assert!(!FenceRegistry::is_enabled(), "fencing is opt-in");
+        assert!(
+            !FenceRegistry::is_enabled(),
+            "an empty registry fences nothing"
+        );
         assert_eq!(FenceRegistry::expected(ShardId::new(3)), None);
 
         FenceRegistry::register(ShardId::new(3), ShardGeneration(7)).expect("first registration");
@@ -2465,6 +5050,103 @@ mod tests {
 
         FenceRegistry::clear();
         assert!(!FenceRegistry::is_enabled());
+    }
+
+    /// A fenced-out process stops every registered worker, not only the one
+    /// that saw the bump (issue #1823). A late registration stops at once.
+    #[test]
+    fn fenced_out_stops_every_registered_worker() {
+        let _serial = registry_guard();
+        FenceRegistry::clear();
+        FenceRegistry::register(ShardId::new(0), ShardGeneration(1)).expect("pin");
+        let first = tokio_util::sync::CancellationToken::new();
+        let second = tokio_util::sync::CancellationToken::new();
+        FenceRegistry::register_worker_shutdown(&first);
+        FenceRegistry::register_worker_shutdown(&second);
+        FenceRegistry::mark_fenced_out();
+        assert!(first.is_cancelled() && second.is_cancelled());
+        let late = tokio_util::sync::CancellationToken::new();
+        FenceRegistry::register_worker_shutdown(&late);
+        assert!(late.is_cancelled());
+        FenceRegistry::clear();
+    }
+
+    /// A process reserves one mode, fenced or unfenced, atomically (issue
+    /// #1823). The other mode is refused until the registry is cleared.
+    #[test]
+    fn a_process_reserves_one_fence_mode() {
+        let _serial = registry_guard();
+        FenceRegistry::clear();
+        assert!(
+            FenceRegistry::reserve_mode(true)
+                .map(ModeReservation::keep)
+                .is_ok()
+        );
+        assert!(
+            FenceRegistry::reserve_mode(true)
+                .map(ModeReservation::keep)
+                .is_ok(),
+            "same mode is fine"
+        );
+        assert!(FenceRegistry::reserve_mode(false).is_err());
+        FenceRegistry::clear();
+        assert!(
+            FenceRegistry::reserve_mode(false)
+                .map(ModeReservation::keep)
+                .is_ok()
+        );
+        assert!(FenceRegistry::reserve_mode(true).is_err());
+        FenceRegistry::clear();
+    }
+
+    /// A failed startup gives back its mode reservation (issue #1823). A
+    /// worker in the other mode can then start.
+    #[test]
+    fn a_failed_startup_gives_back_its_mode_reservation() {
+        let _serial = registry_guard();
+        FenceRegistry::clear();
+        let failed = FenceRegistry::reserve_mode(true).expect("reserve");
+        drop(failed);
+        assert!(
+            FenceRegistry::reserve_mode(false).is_ok(),
+            "a failed fenced startup must not block an unfenced worker"
+        );
+        FenceRegistry::clear();
+    }
+
+    /// A failed startup gives back only its own reservation (issue #1823). A
+    /// fenced worker that started still blocks an unfenced one.
+    #[test]
+    fn a_failed_startup_keeps_another_workers_mode() {
+        let _serial = registry_guard();
+        FenceRegistry::clear();
+        FenceRegistry::reserve_mode(true)
+            .map(ModeReservation::keep)
+            .expect("the first worker starts");
+        let failed = FenceRegistry::reserve_mode(true).expect("reserve");
+        drop(failed);
+        assert!(
+            FenceRegistry::reserve_mode(false).is_err(),
+            "a started fenced worker still blocks an unfenced worker"
+        );
+        FenceRegistry::clear();
+    }
+
+    /// A fenced-out process skips its shutdown writes (issue #1823). The flag
+    /// counts only while the fence is on, and a clear resets it.
+    #[test]
+    fn the_fenced_out_flag_follows_the_registry() {
+        let _serial = registry_guard();
+        FenceRegistry::clear();
+        FenceRegistry::mark_fenced_out();
+        assert!(
+            !FenceRegistry::is_fenced_out(),
+            "an unfenced process is never fenced out"
+        );
+        FenceRegistry::register(ShardId::new(0), ShardGeneration(1)).expect("pin");
+        assert!(FenceRegistry::is_fenced_out());
+        FenceRegistry::clear();
+        assert!(!FenceRegistry::is_fenced_out());
     }
 
     #[test]

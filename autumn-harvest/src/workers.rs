@@ -2056,15 +2056,15 @@ async fn transition_active_to_draining(
 ///
 /// [`ShardRouter`]: crate::shard::ShardRouter
 ///
-/// This is the single-shard convenience form: it assumes the row was read
-/// from the exact shard being asked about, which holds for every consumer
+/// This is the single-shard convenience form. It assumes the row was read
+/// from the exact shard being asked about. That holds for every consumer
 /// that queries one shard's own connection (fleet health's `by_shard`, queue
-/// coverage, preflight). A cross-shard fan-out that reads a row from one
-/// shard while evaluating coverage for a *different* requested shard must
-/// use [`shard_assignments_cover_from_source`] instead — issue #1213 was a
-/// call site (`GET /workers?shard_id=`) that used this form across a fan-out
-/// and let an empty-array row registered on shard A falsely cover a request
-/// for shard B.
+/// coverage, preflight). A cross-shard fan-out can read a row from one shard
+/// while it evaluates coverage for a *different* requested shard. That
+/// fan-out must use [`shard_assignments_cover_from_source`] instead. Issue
+/// #1213 was a call site (`GET /workers?shard_id=`) that used this form
+/// across a fan-out. It let an empty-array row registered on shard A falsely
+/// cover a request for shard B.
 #[must_use]
 pub fn shard_assignments_cover(assignments: &serde_json::Value, shard_id: i32) -> bool {
     shard_assignments_cover_from_source(assignments, shard_id, shard_id)
@@ -2076,11 +2076,11 @@ pub fn shard_assignments_cover(assignments: &serde_json::Value, shard_id: i32) -
 /// The empty-array auto/legacy shape (see [`shard_assignments_cover`]) means
 /// "covers whatever shard the row was read from", so it covers the request
 /// only when `source_shard_id == requested_shard_id`. A non-empty list is the
-/// worker's own explicit claim and is evaluated by membership against
-/// `requested_shard_id` regardless of `source_shard_id` — a multi-shard
-/// worker's row is replicated identically into every shard it is assigned to,
-/// so which one it happened to be read from doesn't change what it claims
-/// (issue #1213).
+/// worker's own explicit claim. It is evaluated by membership against
+/// `requested_shard_id` regardless of `source_shard_id`. A multi-shard
+/// worker's row is replicated identically into every shard it is assigned to.
+/// So the shard that the row happened to be read from does not change what it
+/// claims (issue #1213).
 #[must_use]
 pub fn shard_assignments_cover_from_source(
     assignments: &serde_json::Value,
@@ -3236,6 +3236,9 @@ pub fn spawn_worker_heartbeat(
     // task has already started. A heartbeat must advertise the current
     // registry, not the one at spawn time.
     codecs: crate::payload_codec::PayloadCodecs,
+    // The shard this pool serves (issue #1823). While the process holds it,
+    // the tick writes nothing: the database may be an unpromoted standby.
+    held_gate: Option<crate::types::ShardId>,
     // Issue #1815: publishes task stats and sets the outlier gauge each tick.
     outliers: OutlierProbe,
 ) -> JoinHandle<()> {
@@ -3245,6 +3248,16 @@ pub fn spawn_worker_heartbeat(
         let labels_json = serde_json::to_value(&registration.labels).unwrap_or_default();
         let mut schedule = HeartbeatSchedule::new(interval);
         while schedule.wait(&cancel).await {
+            // Issue #1823: a process that lost write authority stops beating.
+            // Another region owns this row, and may reuse this worker id.
+            if crate::replication::FenceRegistry::is_fenced_out() {
+                break;
+            }
+            // Issue #1823: a held shard skips the tick before it takes a connection.
+            // It can be an unreachable standby, so a checkout could wait on it.
+            if crate::replication::shard_writes_held(held_gate) {
+                continue;
+            }
             // Loaded fresh each tick (issue #548 review): a tuned worker's
             // dispatch target can change between heartbeats, so a value
             // captured once at spawn time would drift from reality.
@@ -3269,36 +3282,64 @@ pub fn spawn_worker_heartbeat(
                 () = cancel.cancelled() => break,
                 result = pool.get() => result,
             };
+            // The fence opens only after the checkout. A tick that waits for a
+            // connection holds no barrier, so pool pressure cannot block a bump. The
+            // tick runs under the barrier of this shard and each pinned shard
+            // colocated with it. A fenced shard skips the tick, and a lost barrier
+            // stops it.
+            let Some(fence) = crate::replication::begin_shard_tick(&pool, held_gate).await else {
+                continue;
+            };
             let registered_codec_key_ids = codecs.registered_key_ids();
             match get_result {
                 Ok(mut conn) => {
-                    let () = do_heartbeat_tick(
-                        &mut conn,
-                        &registration,
-                        in_flight,
-                        &labels_json,
-                        &worker_shutdown,
-                        &drain_deadline_max,
-                        &remote_drain_deadline,
-                        in_use_sessions,
-                        &registration_pending,
-                        &registered_codec_key_ids,
+                    // A lost barrier stops the beat. The next tick tries again.
+                    let tick = crate::replication::run_fenced_pass(
+                        &fence,
+                        Box::pin(async {
+                            // Issue #1823: the older connection joins the pass.
+                            // A lost guard then ends its backend.
+                            let _member =
+                                crate::replication::join_fenced_pass(&pool, &mut conn).await;
+                            do_heartbeat_tick(
+                                &mut conn,
+                                &registration,
+                                in_flight,
+                                &labels_json,
+                                &worker_shutdown,
+                                &drain_deadline_max,
+                                &remote_drain_deadline,
+                                in_use_sessions,
+                                &registration_pending,
+                                &registered_codec_key_ids,
+                            )
+                            .await;
+                            // Issue #1823: the task-stats writes run under the
+                            // same barrier, so they cannot commit after a bump.
+                            run_outlier_tick(
+                                &mut conn,
+                                &registration.worker_id,
+                                &outliers,
+                                worker_shutdown.is_cancelled(),
+                            )
+                            .await
+                        }),
                     )
                     .await;
-                    if let Err(error) = run_outlier_tick(
-                        &mut conn,
-                        &registration.worker_id,
-                        &outliers,
-                        worker_shutdown.is_cancelled(),
-                    )
-                    .await
-                    {
-                        tracing::warn!(
-                            worker_id = %registration.worker_id,
-                            error = %error,
-                            "worker task-stats tick failed; outlier gauge cleared"
-                        );
-                        outliers.clear_gauge(&registration.worker_id);
+                    match tick {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(error)) => {
+                            tracing::warn!(
+                                worker_id = %registration.worker_id,
+                                error = %error,
+                                "worker task-stats tick failed; outlier gauge cleared"
+                            );
+                            outliers.clear_gauge(&registration.worker_id);
+                        }
+                        // The guard already logged the lost session. A tick
+                        // with no fresh stats clears its view, as a failed
+                        // tick does.
+                        Err(_lost) => outliers.clear_gauge(&registration.worker_id),
                     }
                 }
                 Err(error) => {
@@ -5301,9 +5342,9 @@ mod tests {
     #[test]
     fn shard_assignments_cover_from_source_treats_empty_as_source_relative() {
         // Issue #1213: the auto/legacy empty shape covers "whatever shard the
-        // row was read from" -- when a cross-shard fan-out reads the row from
-        // a shard OTHER than the one the caller asked about, it must not
-        // claim to cover the request. Only a request for the row's own
+        // row was read from". A cross-shard fan-out can read the row from a
+        // shard OTHER than the one the caller asked about. Then the row must
+        // not claim to cover the request. Only a request for the row's own
         // source shard is covered.
         assert!(shard_assignments_cover_from_source(
             &serde_json::json!([]),
@@ -5319,9 +5360,9 @@ mod tests {
 
     #[test]
     fn shard_assignments_cover_from_source_ignores_source_when_narrowed() {
-        // A non-empty list is the worker's own explicit claim and is
-        // evaluated by membership alone, regardless of which shard's table
-        // this particular row happened to be read from.
+        // A non-empty list is the worker's own explicit claim. It is
+        // evaluated by membership alone. The shard table that this
+        // particular row happened to be read from does not matter.
         assert!(shard_assignments_cover_from_source(
             &serde_json::json!([1, 2]),
             0,
@@ -5350,10 +5391,10 @@ mod tests {
 
     #[test]
     fn shard_assignments_cover_matches_the_source_aware_predicate_at_matching_source() {
-        // `shard_assignments_cover` is the single-shard convenience form used
-        // by every consumer that already reads the row from the exact shard
-        // being asked about (fleet_health.by_shard, queue coverage,
-        // preflight): the row's source IS the request.
+        // `shard_assignments_cover` is the single-shard convenience form.
+        // Every consumer that already reads the row from the exact shard
+        // being asked about uses it (fleet_health.by_shard, queue coverage,
+        // preflight). For those consumers, the row's source IS the request.
         for assignments in [
             serde_json::json!([]),
             serde_json::json!([5]),

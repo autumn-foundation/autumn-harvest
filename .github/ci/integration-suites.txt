@@ -263,6 +263,7 @@ linux        autumn-harvest-plugin  dlq_aggregate_integration        -          
 linux        autumn-harvest-plugin  dlq_bulk_discard_perf            -                          -
 linux        autumn-harvest-plugin  dlq_bulk_integration             -                          -
 linux        autumn-harvest-plugin  dlq_redrive_integration          -                          -
+linux        autumn-harvest-plugin  dr_fence_admin_integration       -                          -
 linux        autumn-harvest-plugin  eligibility_tests                -                          -
 linux        autumn-harvest-plugin  erase_payloads_integration       -                          -
 linux        autumn-harvest-plugin  event_batch_integration          -                          -

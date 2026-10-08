@@ -1843,7 +1843,7 @@ async fn target_conn(
     pool: &ShardedDbPool,
     row: &CrossShardChildRow,
     acquire_bound: Option<std::time::Duration>,
-) -> HarvestResult<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>> {
+) -> HarvestResult<crate::replication::FencedConn> {
     let shard_pool = pool
         .exact_pool_for(ShardId::new(row.target_shard))
         .ok_or_else(|| HarvestError::ShardUnavailable {
@@ -1864,26 +1864,28 @@ async fn target_conn(
 /// pools with no timeout on either side. Bounding the acquisition converts that
 /// from a permanent hang into "skip this shard, retry next sweep", which is
 /// exactly what `shard_acquire_bound` (issue #961) exists for.
+///
+/// The sweep can run inside a fenced pass of the parent's shard (issue
+/// #1823). The checkout is then fence-aware. It waits at most
+/// [`crate::replication::FENCED_CHECKOUT_BOUND`], and a timeout abandons the
+/// pass, so a busy target pool cannot hold a bump off. The pass also records
+/// the target backend, so a lost guard ends it.
 async fn acquire_bounded(
     shard_pool: &crate::worker::DbPool,
     shard: i32,
     bound: Option<std::time::Duration>,
-) -> HarvestResult<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>> {
-    let unavailable = |reason: String| HarvestError::ShardUnavailable {
-        shard_id: shard,
-        reason,
+) -> HarvestResult<crate::replication::FencedConn> {
+    let checkout = match bound {
+        None => crate::replication::fenced_checkout(shard_pool).await,
+        Some(bound) => crate::replication::fenced_acquire(shard_pool, bound).await,
     };
-    match bound {
-        None => shard_pool
-            .get()
-            .await
-            .map_err(|e| unavailable(format!("pool checkout failed: {e}"))),
-        Some(bound) => match tokio::time::timeout(bound, shard_pool.get()).await {
-            Ok(Ok(conn)) => Ok(conn),
-            Ok(Err(e)) => Err(unavailable(format!("pool checkout failed: {e}"))),
-            Err(_) => Err(unavailable(format!(
-                "pool checkout did not complete within {bound:?}"
-            ))),
+    checkout.map_err(|error| HarvestError::ShardUnavailable {
+        shard_id: shard,
+        reason: match error {
+            HarvestError::PoolAcquireTimeout { waited } => {
+                format!("pool checkout did not complete within {waited:?}")
+            }
+            error => format!("pool checkout failed: {error}"),
         },
-    }
+    })
 }
