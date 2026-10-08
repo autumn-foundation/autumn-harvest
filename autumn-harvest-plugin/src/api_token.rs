@@ -396,6 +396,13 @@ fn harvest_bearer(headers: &HeaderMap) -> Option<String> {
     }
 }
 
+/// Whether a request claims an API token, so the token layer looks it up.
+///
+/// The pre-auth rate limit charges exactly these requests (issue #1827).
+pub(crate) fn claims_harvest_token(headers: &HeaderMap) -> bool {
+    harvest_bearer(headers).is_some()
+}
+
 /// Reserve the `token:` audit-actor namespace on a pass-through request.
 ///
 /// Strips any inbound `x-harvest-actor` header whose value begins with

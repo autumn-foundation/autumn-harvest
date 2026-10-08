@@ -420,6 +420,19 @@ impl ApiRateLimiter {
 
     /// Charge one request to the bucket of `key` and `class` at `now`.
     pub(crate) fn check(&self, key: ClientKey, class: LimitClass, now: Instant) -> Decision {
+        self.charge(key, class, now).0
+    }
+
+    /// Charge one request, and return the decision and the key charged.
+    ///
+    /// The key charged differs from `key` at the address cap, where a new
+    /// address goes to the overflow bucket. [`Self::refund`] needs that key.
+    pub(crate) fn charge(
+        &self,
+        key: ClientKey,
+        class: LimitClass,
+        now: Instant,
+    ) -> (Decision, ClientKey) {
         let config = &self.inner.config;
         let rate = config.rate_for(class);
         let mut state = self
@@ -432,17 +445,40 @@ impl ApiRateLimiter {
         bucket.refill(rate, now);
         if bucket.tokens >= 1.0 {
             bucket.tokens -= 1.0;
-            return Decision::Allow;
+            return (Decision::Allow, key);
         }
         let retry_after_secs = bucket.retry_after_secs(rate);
         let sustained = bucket
             .count_rejection(now, config.sustained_rejections, config.sustained_window)
             .filter(|_| state.take_audit(now));
         drop(state);
-        Decision::Reject {
+        let decision = Decision::Reject {
             key,
             retry_after_secs,
             sustained,
+        };
+        (decision, key)
+    }
+
+    /// Give back one request that [`Self::charge`] took from `key`.
+    ///
+    /// The bucket never grows past its burst. A pruned bucket was full, so a
+    /// missing bucket needs nothing.
+    pub(crate) fn refund(&self, key: ClientKey, class: LimitClass, now: Instant) {
+        let rate = self.inner.config.rate_for(class);
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let map = if matches!(key, ClientKey::Token(_)) {
+            &mut state.tokens
+        } else {
+            &mut state.addresses
+        };
+        if let Some(bucket) = map.get_mut(&(key, class)) {
+            bucket.refill(rate, now);
+            bucket.tokens = (bucket.tokens + 1.0).min(f64::from(rate.burst));
         }
     }
 
@@ -492,21 +528,89 @@ pub(crate) fn limit_class(method: &Method, path: &str) -> Option<LimitClass> {
 
 /// The client a request is charged to.
 ///
-/// A verified token comes first. Next is the autumn-web `ClientAddr`, which
-/// applies `[security.trusted_proxies]`. Next is the socket peer. A request
-/// with none of these shares the `unknown` bucket.
+/// A verified token comes first. Otherwise the client is its address, as
+/// [`address_key`] finds it.
 fn client_key(request: &Request, client_addr: Option<ClientAddr>) -> ClientKey {
-    let extensions = request.extensions();
-    if let Some(principal) = extensions.get::<TokenPrincipal>() {
+    if let Some(principal) = request.extensions().get::<TokenPrincipal>() {
         return ClientKey::Token(principal.id);
     }
+    address_key(request, client_addr)
+}
+
+/// The address a request comes from.
+///
+/// The autumn-web `ClientAddr` comes first. It applies
+/// `[security.trusted_proxies]`. Next is the socket peer. A request with
+/// neither shares the `unknown` bucket.
+fn address_key(request: &Request, client_addr: Option<ClientAddr>) -> ClientKey {
     if let Some(addr) = client_addr {
         return ip_key(addr.ip());
     }
-    if let Some(ConnectInfo(peer)) = extensions.get::<ConnectInfo<SocketAddr>>() {
+    if let Some(ConnectInfo(peer)) = request.extensions().get::<ConnectInfo<SocketAddr>>() {
         return ip_key(peer.ip());
     }
     ClientKey::Unknown
+}
+
+/// The address charge that [`enforce_pre_auth_rate_limit`] took.
+///
+/// [`enforce_api_rate_limit`] gives it back when the token verifies.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PreAuthCharge {
+    key: ClientKey,
+    class: LimitClass,
+}
+
+/// Charge a claimed API token to its address before the token lookup.
+///
+/// The token layer looks up every `hvst_` bearer in the database. Without
+/// this layer, a sender could flood the pool with made-up tokens. Each
+/// lookup would end in `401` before the limiter ran.
+///
+/// This layer runs outside the token layer. It charges the address bucket of
+/// each request that claims a token. A request over the limit gets `429` and
+/// costs no lookup. A request with no `hvst_` bearer passes, because the token
+/// layer does no lookup for it.
+///
+/// [`enforce_api_rate_limit`] refunds the charge when the token verifies. Thus
+/// valid tokens behind one address do not share its bucket. Only the lookups
+/// still in flight hold a charge.
+pub(crate) async fn enforce_pre_auth_rate_limit(
+    State((api_state, limiter)): State<(HarvestApiState, ApiRateLimiter)>,
+    client_addr: Option<ClientAddr>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let Some(class) = limit_class(request.method(), request.uri().path()) else {
+        return next.run(request).await;
+    };
+    if !crate::api_token::claims_harvest_token(request.headers()) {
+        return next.run(request).await;
+    }
+    let key = address_key(&request, client_addr);
+    match limiter.charge(key, class, Instant::now()) {
+        (Decision::Allow, key) => {
+            request
+                .extensions_mut()
+                .insert(PreAuthCharge { key, class });
+            next.run(request).await
+        }
+        (
+            Decision::Reject {
+                key,
+                retry_after_secs,
+                sustained,
+            },
+            _,
+        ) => reject(
+            &api_state,
+            &limiter,
+            &request,
+            (class, key),
+            retry_after_secs,
+            sustained,
+        ),
+    }
 }
 
 /// Refuse a request over its client's limit with `429` (issue #1827).
@@ -514,6 +618,9 @@ fn client_key(request: &Request, client_addr: Option<ClientAddr>) -> ClientKey {
 /// The layer runs inside the token layer, so it can read the verified token.
 /// It runs before the read-only, authorizer and admin layers, so a refused
 /// request reaches no handler.
+///
+/// A verified token first gets back the address charge of
+/// [`enforce_pre_auth_rate_limit`]. Then the token pays from its own bucket.
 pub(crate) async fn enforce_api_rate_limit(
     State((api_state, limiter)): State<(HarvestApiState, ApiRateLimiter)>,
     client_addr: Option<ClientAddr>,
@@ -523,28 +630,51 @@ pub(crate) async fn enforce_api_rate_limit(
     let Some(class) = limit_class(request.method(), request.uri().path()) else {
         return next.run(request).await;
     };
+    let now = Instant::now();
+    if request.extensions().get::<TokenPrincipal>().is_some()
+        && let Some(charge) = request.extensions().get::<PreAuthCharge>()
+    {
+        limiter.refund(charge.key, charge.class, now);
+    }
     let key = client_key(&request, client_addr);
-    match limiter.check(key, class, Instant::now()) {
+    match limiter.check(key, class, now) {
         Decision::Allow => next.run(request).await,
         Decision::Reject {
             key,
             retry_after_secs,
             sustained,
-        } => {
-            if let Ok(runtime) = api_state.runtime() {
-                runtime
-                    .registry()
-                    .telemetry()
-                    .metrics
-                    .record_api_rate_limited(class.as_str(), key.kind());
-            }
-            if let Some(rejections) = sustained {
-                let window = limiter.config().sustained_window;
-                audit_sustained(&api_state, &request, key, class, rejections, window);
-            }
-            rate_limited_response(class, retry_after_secs)
-        }
+        } => reject(
+            &api_state,
+            &limiter,
+            &request,
+            (class, key),
+            retry_after_secs,
+            sustained,
+        ),
     }
+}
+
+/// Record one rejection and build the `429`.
+fn reject(
+    api_state: &HarvestApiState,
+    limiter: &ApiRateLimiter,
+    request: &Request,
+    (class, key): (LimitClass, ClientKey),
+    retry_after_secs: u64,
+    sustained: Option<u32>,
+) -> Response {
+    if let Ok(runtime) = api_state.runtime() {
+        runtime
+            .registry()
+            .telemetry()
+            .metrics
+            .record_api_rate_limited(class.as_str(), key.kind());
+    }
+    if let Some(rejections) = sustained {
+        let window = limiter.config().sustained_window;
+        audit_sustained(api_state, request, key, class, rejections, window);
+    }
+    rate_limited_response(class, retry_after_secs)
 }
 
 /// The `429` answer: `Retry-After` in whole seconds and a JSON body.

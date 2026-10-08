@@ -5640,6 +5640,11 @@ pub(crate) struct AdminAuthLayers {
 /// cannot open a new bucket. It runs before the read-only and authorizer
 /// layers, so a refused request reaches no handler.
 ///
+/// With tokens on, a pre-auth layer of the same limiter sits OUTSIDE the token
+/// layer. It charges each claimed token to its address before the lookup. A
+/// flood of made-up tokens thus gets `429` and never reaches the pool. The
+/// inner layer refunds that charge when the token verifies.
+///
 /// No layer is installed unless asked for, so a deployment that declares none
 /// does an identical amount of work as before.
 pub(crate) fn apply_admin_auth_layers(
@@ -5657,12 +5662,13 @@ pub(crate) fn apply_admin_auth_layers(
     if layers.read_only_role {
         router = router.layer(middleware::from_fn(enforce_read_only_class));
     }
-    if let Some(rate_limit) = &layers.rate_limit {
+    let limiter = layers
+        .rate_limit
+        .clone()
+        .map(crate::api_rate_limit::ApiRateLimiter::new);
+    if let Some(limiter) = &limiter {
         router = router.layer(middleware::from_fn_with_state(
-            (
-                api_state.clone(),
-                crate::api_rate_limit::ApiRateLimiter::new(rate_limit.clone()),
-            ),
+            (api_state.clone(), limiter.clone()),
             crate::api_rate_limit::enforce_api_rate_limit,
         ));
     }
@@ -5671,6 +5677,12 @@ pub(crate) fn apply_admin_auth_layers(
             api_state.clone(),
             crate::api_token::enforce_token_scope,
         ));
+        if let Some(limiter) = limiter {
+            router = router.layer(middleware::from_fn_with_state(
+                (api_state.clone(), limiter),
+                crate::api_rate_limit::enforce_pre_auth_rate_limit,
+            ));
+        }
     }
     router
 }

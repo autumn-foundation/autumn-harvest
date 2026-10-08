@@ -316,3 +316,52 @@ async fn a_rejected_request_never_reaches_a_handler() {
     assert_eq!(limited, 20);
     assert_eq!(reached.load(Ordering::SeqCst), 10);
 }
+
+/// A claimed token pays from its address bucket before the token lookup.
+///
+/// This mount has no token store, so a request that reaches the lookup gets
+/// `503`. A flood of made-up tokens from one address reaches the lookup only
+/// until its bucket is empty. Another address keeps its own bucket.
+#[tokio::test(start_paused = true)]
+async fn made_up_tokens_are_limited_before_the_token_lookup() {
+    let app = app(StandaloneAdminAuth::new()
+        .with_api_tokens()
+        .with_rate_limit(ten_per_second()));
+    let claimed = |addr: &'static str| {
+        let mut request = request(&Method::POST, START, Peer::Connect(addr));
+        request.headers_mut().insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer hvst_made_up".parse().expect("header should parse"),
+        );
+        request
+    };
+    let mut looked_up = 0;
+    let mut limited = 0;
+    for _ in 0..30 {
+        let status = app
+            .clone()
+            .oneshot(claimed("192.0.2.1"))
+            .await
+            .expect("router should serve the request")
+            .status();
+        match status {
+            StatusCode::SERVICE_UNAVAILABLE => looked_up += 1,
+            StatusCode::TOO_MANY_REQUESTS => limited += 1,
+            other => panic!("unexpected status {other}"),
+        }
+    }
+    let other = app
+        .clone()
+        .oneshot(claimed("192.0.2.2"))
+        .await
+        .expect("router should serve the request")
+        .status();
+
+    assert_eq!(looked_up, 10, "a bucket of 10 admits 10 lookups");
+    assert_eq!(limited, 20, "the rest get 429 with no lookup");
+    assert_eq!(
+        other,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "another address keeps its bucket"
+    );
+}

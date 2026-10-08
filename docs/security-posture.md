@@ -366,12 +366,13 @@ identically to a route-minted one (shared core hashing helper).
 
 ### Operational caveats
 
-- **Standalone-token mode should sit behind a rate-limiting proxy.** With
+- **Standalone-token mode needs a rate limit on token lookups.** With
   `enable_api_tokens()` as the only auth, any `hvst_` bearer triggers one indexed
-  lookup before authentication (inherent to any bearer scheme). Front the API
-  with a per-source rate-limiting proxy to bound unauthenticated lookup floods.
-  The built-in [API rate limiter](#api-rate-limiting) runs after this lookup,
-  so it does not bound these floods.
+  lookup before authentication (inherent to any bearer scheme). Turn on the
+  built-in [API rate limiter](#api-rate-limiting). It charges each claimed token
+  to its client address before the lookup, so a flood of made-up tokens gets
+  `429` and takes no pool connection. Without the limiter, front the API with a
+  per-source rate-limiting proxy.
 - **Rotation needs `admin`.** `harvest token rotate` mints through
   `POST /admin/tokens`, so only an `admin` token can rotate.
 - **A compromised `admin` token can mint replacement tokens.** Give `admin` to
@@ -565,10 +566,19 @@ The limiter runs directly inside the token layer. It keys a bucket on the
 verified token id, so a random `hvst_` bearer cannot open a new bucket. It
 runs before the read-only, authorizer and `require_admin` layers, so a
 refused request reaches no handler. The request order is: embedder auth ->
-token layer -> rate limiter -> read-only layer -> authorizer ->
-`require_admin` -> handler. A standalone token-only mount also puts
-`require_token_for_non_public` first. It refuses a request with no token
+pre-auth charge -> token layer -> rate limiter -> read-only layer ->
+authorizer -> `require_admin` -> handler. A standalone token-only mount also
+puts `require_token_for_non_public` first. It refuses a request with no token
 before any lookup.
+
+With API tokens on, the same limiter also runs outside the token layer. This
+pre-auth charge takes one request from the client address bucket of each
+request that carries an `hvst_` bearer. A client over its address limit gets
+`429` before the token lookup, so a flood of made-up tokens takes no pool
+connection. When the token verifies, the limiter gives the address charge back
+and charges the token bucket instead. Valid tokens that share one address do
+not share its budget. A request with no `hvst_` bearer skips the pre-auth
+charge, because the token layer does no lookup for it.
 
 ### Client address
 
@@ -625,11 +635,15 @@ in your audit retention and erasure policy.
 - **Per replica.** Each replica keeps its own buckets. With N replicas, a
   client can send N times the limit. For one fleet-wide limit, also turn on
   the autumn-web `[security.rate_limit]` layer with its Redis backend.
-- **Token lookup.** The token layer looks up each `hvst_` bearer before the
-  limiter runs. A refused request from a valid token still costs that one
-  lookup. An unknown bearer gets `401` from the token layer and is never
-  counted. Keep the rate-limiting proxy advice in
-  [operational caveats](#operational-caveats).
+- **Token lookup.** The pre-auth charge bounds token lookups per client
+  address. A refused request from a valid token still costs one lookup,
+  because its token bucket is known only after the lookup. A made-up token
+  costs its address one request, which the limiter never gives back.
+- **Shared addresses.** A flood of made-up tokens empties the bucket of its
+  address. Valid tokens from that address then get `429` until it refills.
+  Behind a proxy, configure `[security.trusted_proxies]`, so each caller has
+  its own address bucket. A valid token holds an address charge only while its
+  lookup runs. A burst larger than the address burst can thus see a `429`.
 - **Scope denies.** The token layer refuses a route outside the token scope
   with `403` and writes an `authz.deny` row. This also happens before the
   limiter runs.
