@@ -117,27 +117,39 @@ def cell_table(runs):
     return "\n".join(out)
 
 
+# Every per-run signal the harness prints, in table order.
+SIGNAL_COLUMNS = [
+    ("claim_n", "claims"),
+    ("claim_mean_ms", "claim mean ms"),
+    ("claim_p99_ms", "claim p99 ms"),
+    ("persist_n", "persists"),
+    ("persist_mean_ms", "persist mean ms"),
+    ("persist_p99_ms", "persist p99 ms"),
+    ("scan_n", "scans"),
+    ("scan_mean_ms", "scan mean ms"),
+    ("scan_p99_ms", "scan p99 ms"),
+    ("heartbeat_n", "heartbeats"),
+    ("heartbeat_mean_ms", "heartbeat mean ms"),
+    ("heartbeat_p99_ms", "heartbeat p99 ms"),
+    ("wait_n", "pool waits"),
+    ("wait_p99_ms", "pool wait p99 ms"),
+    ("wait_max_ms", "pool wait max ms"),
+    ("in_use_mean", "in use, mean"),
+    ("in_use_max", "in use, max"),
+]
+
+
 def signal_table(runs):
+    """Every registered #1815 field, as a mean over the valid reps."""
     out = [
-        "| tree | arm | depth | claim mean ms | persist mean ms | scan mean ms "
-        "| pool wait p99 ms | pool in use, mean | pool in use, max |",
-        "|:--|:--|--:|--:|--:|--:|--:|--:|--:|",
+        "| tree | arm | depth | " + " | ".join(label for _, label in SIGNAL_COLUMNS) + " |",
+        "|:--|:--|--:|" + "--:|" * len(SIGNAL_COLUMNS),
     ]
     for tree in TREES:
         for arm in HARVEST_ARMS:
             for depth in DEPTHS:
                 key = (tree, arm, depth)
-                cells = [
-                    signal_mean(runs, key, s)
-                    for s in [
-                        "claim_mean_ms",
-                        "persist_mean_ms",
-                        "scan_mean_ms",
-                        "wait_p99_ms",
-                        "in_use_mean",
-                        "in_use_max",
-                    ]
-                ]
+                cells = [signal_mean(runs, key, field) for field, _ in SIGNAL_COLUMNS]
                 out.append(
                     f"| `{tree}` | `{arm}` | {depth} | " + " | ".join(fmt(c) for c in cells) + " |"
                 )
