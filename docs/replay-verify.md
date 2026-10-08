@@ -206,7 +206,9 @@ async fn main() {
             }
             "--fail-on" => {
                 let rate = value.strip_prefix("rate=").expect("use --fail-on rate=<0..1>");
-                min_pass_rate = Some(rate.parse().expect("rate must be a number"));
+                let rate: f64 = rate.parse().expect("rate must be a number");
+                assert!((0.0..=1.0).contains(&rate), "rate must be in 0..=1");
+                min_pass_rate = Some(rate);
             }
             other => panic!("unknown flag {other}"),
         }
