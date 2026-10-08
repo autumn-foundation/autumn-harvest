@@ -112,6 +112,9 @@ pub struct CrossShardChildSpec {
     /// Ambient context headers inherited from the parent (issue #481).
     #[serde(default)]
     pub context_headers: Option<serde_json::Value>,
+    /// Tenant inherited from the parent (issue #1977). `None` means no tenant.
+    #[serde(default)]
+    pub tenant: Option<String>,
     #[serde(default)]
     pub owner: Option<String>,
     #[serde(default)]
@@ -1422,6 +1425,7 @@ async fn start_child_on_target(
                     start_source_ref: Some(parent_exec_id_str.as_str()),
                     started_by: None,
                     quota_key: spec.quota_key.as_deref(),
+                    tenant: spec.tenant.as_deref(),
                 };
                 let inserted = diesel::insert_into(harvest_workflow_executions::table)
                     .values(&child_row)
@@ -1875,5 +1879,26 @@ async fn acquire_bounded(
                 "pool checkout did not complete within {bound:?}"
             ))),
         },
+    }
+}
+
+#[cfg(test)]
+mod tenant_spec_tests {
+    use super::CrossShardChildSpec;
+
+    /// A stored spec carries the parent's tenant to the target shard (issue
+    /// #1977). A spec that an older release wrote has no tenant field. It
+    /// still reads, with no tenant.
+    #[test]
+    fn spec_carries_the_tenant_and_reads_old_rows() {
+        let old = serde_json::json!({ "input": {}, "queue_name": "default" });
+        let spec: CrossShardChildSpec = serde_json::from_value(old).expect("old spec reads");
+        assert_eq!(spec.tenant, None);
+
+        let new = serde_json::json!({ "input": {}, "queue_name": "default", "tenant": "acme" });
+        let spec: CrossShardChildSpec = serde_json::from_value(new).expect("new spec reads");
+        assert_eq!(spec.tenant.as_deref(), Some("acme"));
+        let round_trip = serde_json::to_value(&spec).expect("spec writes");
+        assert_eq!(round_trip["tenant"], "acme");
     }
 }

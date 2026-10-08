@@ -27,8 +27,11 @@
 //!   other caller. Read the embedder's own claims from `extensions`.
 //! - `route_class`: from [`autumn_harvest::audit::CLASSIFIED_ROUTES`].
 //!   An unclassified path is `Mutating`.
-//! - `tenant_key`: the [`autumn_harvest::audit::HEADER_TENANT`] header.
-//!   The caller declares it. Harvest does not bind it to stored executions.
+//! - `tenant_key`: the verified tenant, when the credential carries one
+//!   (issue #1977). `tenant_verified` is then `true`. See [`crate::tenant`].
+//!   Otherwise it is the [`autumn_harvest::audit::HEADER_TENANT`] header,
+//!   and `tenant_verified` is `false`. The caller declares that header, so
+//!   do not grant access on an unverified tenant.
 //! - `shard`: read only from a source the route's handler uses. One source is
 //!   an execution id in the path, also under `/ui`. The others are a shard
 //!   query parameter or body field on the routes in `SHARD_SOURCES`. `None`
@@ -72,7 +75,7 @@ use crate::api::{
 use crate::api_token::{TokenPrincipal, TokenScope};
 
 /// Longest accepted [`HEADER_TENANT`] value, in bytes.
-pub const MAX_TENANT_KEY_LEN: usize = 128;
+pub const MAX_TENANT_KEY_LEN: usize = autumn_harvest::tenant::MAX_TENANT_LEN;
 
 /// Longest request path an audit row records.
 const MAX_AUDITED_PATH_LEN: usize = 256;
@@ -129,8 +132,11 @@ pub struct AuthzRequest<'a> {
     pub principal: AuthzPrincipal,
     /// The route class of `method` and `path`.
     pub route_class: RouteClass,
-    /// The caller-declared tenant key, trimmed.
+    /// The tenant key. It is the verified tenant when `tenant_verified` is
+    /// `true`. Otherwise it is the caller-declared header, trimmed.
     pub tenant_key: Option<&'a str>,
+    /// Whether a credential verified `tenant_key` (issue #1977).
+    pub tenant_verified: bool,
     /// The shard this call is about, if the request names one.
     pub shard: Option<ShardId>,
     /// The HTTP method.
@@ -156,6 +162,7 @@ impl<'a> AuthzRequest<'a> {
             principal,
             route_class,
             tenant_key: None,
+            tenant_verified: false,
             shard: None,
             method,
             path,
@@ -163,10 +170,19 @@ impl<'a> AuthzRequest<'a> {
         }
     }
 
-    /// Set the tenant key.
+    /// Set an unverified tenant key.
     #[must_use]
     pub const fn with_tenant_key(mut self, tenant_key: Option<&'a str>) -> Self {
         self.tenant_key = tenant_key;
+        self.tenant_verified = false;
+        self
+    }
+
+    /// Set a verified tenant key (issue #1977).
+    #[must_use]
+    pub const fn with_verified_tenant(mut self, tenant: &'a str) -> Self {
+        self.tenant_key = Some(tenant);
+        self.tenant_verified = true;
         self
     }
 
@@ -694,6 +710,18 @@ fn tenant_key(request: &Request) -> Result<Option<String>, ()> {
     Ok(Some(value.to_string()))
 }
 
+/// The tenant the hook sees, and whether a credential verified it.
+///
+/// A verified tenant replaces the header (issue #1977). The tenant binding
+/// layer has already refused a header that names another tenant. `Err`
+/// means an unusable header.
+fn request_tenant(request: &Request) -> Result<(Option<String>, bool), ()> {
+    match request.extensions().get::<crate::tenant::VerifiedTenant>() {
+        Some(t) => Ok((Some(t.as_str().to_string()), true)),
+        None => tenant_key(request).map(|t| (t, false)),
+    }
+}
+
 fn forbidden() -> Response {
     (
         StatusCode::FORBIDDEN,
@@ -702,7 +730,7 @@ fn forbidden() -> Response {
         .into_response()
 }
 
-fn bad_tenant() -> Response {
+pub(crate) fn bad_tenant() -> Response {
     (
         StatusCode::BAD_REQUEST,
         axum::Json(serde_json::json!({
@@ -729,7 +757,7 @@ pub(crate) async fn enforce_authorizer(
     if *request.method() == Method::OPTIONS {
         return next.run(request).await;
     }
-    let Ok(tenant) = tenant_key(&request) else {
+    let Ok((tenant, tenant_verified)) = request_tenant(&request) else {
         return bad_tenant();
     };
 
@@ -790,8 +818,11 @@ pub(crate) async fn enforce_authorizer(
 
     for shard in candidates {
         let authz = AuthzRequest::new(principal, route_class, &method, &path, request.extensions())
-            .with_tenant_key(tenant.as_deref())
             .with_shard(shard);
+        let authz = match tenant.as_deref() {
+            Some(t) if tenant_verified => authz.with_verified_tenant(t),
+            t => authz.with_tenant_key(t),
+        };
         let AuthzDecision::Deny(reason) = authorizer.0.authorize(&authz).await else {
             continue;
         };

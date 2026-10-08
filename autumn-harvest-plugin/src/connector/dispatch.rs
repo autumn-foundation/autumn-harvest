@@ -84,6 +84,7 @@ pub async fn dispatch(
                 Extension(api_state.clone()),
                 axum::extract::Path(workflow.to_string()),
                 None,
+                None,
                 headers,
                 Ok(Json(body)),
             ))

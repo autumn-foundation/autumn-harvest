@@ -3947,6 +3947,11 @@ struct CreateTokenRequest {
     /// Optional expiry; an expired token is rejected 401 on the next request.
     #[serde(default)]
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Optional tenant claim (issue #1977). A tenant-bound token reaches only
+    /// the runs of its tenant, through the tenant-scoped routes. It must be 1
+    /// to 128 bytes of visible ASCII, with no spaces.
+    #[serde(default)]
+    tenant: Option<String>,
 }
 
 fn default_token_scope() -> String {
@@ -3974,6 +3979,15 @@ async fn create_token_handler(
         )
             .into_response();
     };
+    if let Some(tenant) = body.tenant.as_deref()
+        && let Err(e) = autumn_harvest::tenant::validate_tenant(tenant)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("invalid tenant: {e}") })),
+        )
+            .into_response();
+    }
 
     let pool = match api_state.storage_pool() {
         Ok(p) => p,
@@ -3984,8 +3998,15 @@ async fn create_token_handler(
         Err(e) => return e.into_response(),
     };
 
-    match crate::api_token::create_token(&mut conn, &body.name, scope, body.expires_at, &actor)
-        .await
+    match crate::api_token::create_token(
+        &mut conn,
+        &body.name,
+        scope,
+        body.expires_at,
+        &actor,
+        body.tenant.as_deref(),
+    )
+    .await
     {
         Ok(mint) => {
             let id_str = mint.view.id.to_string();
@@ -5447,8 +5468,9 @@ pub struct StandaloneAdminAuth {
 }
 
 impl StandaloneAdminAuth {
-    /// A mount that declares nothing. [`Self::mount`] then returns the router
-    /// unchanged, which is the pre-issue-#1608 standalone posture.
+    /// A mount that declares nothing. [`Self::mount`] then adds only the tenant
+    /// binding layer (issue #1977). It passes every request with no verified
+    /// tenant unchanged, which is the pre-issue-#1608 standalone posture.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -5564,8 +5586,9 @@ impl StandaloneAdminAuth {
     /// is how [`HarvestPlugin`] composes it.
     ///
     /// When an embedder auth boundary is declared, apply it outside. The
-    /// request order is then: embedder auth -> token layer -> read-only-role
-    /// layer -> authorizer -> per-route `require_admin` -> handler. Without
+    /// request order is then as follows. Embedder auth, the token layer, the
+    /// rate limiter, tenant binding, the read-only-role layer, the
+    /// authorizer, per-route `require_admin`, the handler. Without
     /// that declaration, enabling API tokens additionally installs a
     /// fail-closed token requirement on every non-public route.
     ///
@@ -5635,13 +5658,16 @@ pub(crate) struct AdminAuthLayers {
 /// layer. It runs after both built-in gates, so it can only deny. It sees the
 /// `TokenPrincipal` the token layer sets.
 ///
-/// Issue #1827: the rate-limit layer sits directly INSIDE the token layer. It
-/// keys a bucket on the verified `TokenPrincipal`, so an unverified bearer
-/// cannot open a new bucket. It runs before the read-only and authorizer
-/// layers, so a refused request reaches no handler.
+/// Issue #1827: the rate-limit layer sits directly INSIDE the token layer.
+/// It keys a bucket on the verified `TokenPrincipal`, so an unverified bearer
+/// cannot open a new bucket. A refused request reaches no handler.
 ///
-/// No layer is installed unless asked for, so a deployment that declares none
-/// does an identical amount of work as before.
+/// Issue #1977: the tenant binding layer sits directly INSIDE the rate-limit
+/// layer. Its refusals do a lookup and an audit write, so the limiter bounds
+/// them. It is always installed. A request with no verified tenant passes it
+/// unchanged.
+///
+/// No other layer is installed unless asked for.
 pub(crate) fn apply_admin_auth_layers(
     router: Router<()>,
     api_state: &HarvestApiState,
@@ -5657,6 +5683,12 @@ pub(crate) fn apply_admin_auth_layers(
     if layers.read_only_role {
         router = router.layer(middleware::from_fn(enforce_read_only_class));
     }
+    // Issue #1977: always installed. A request with no verified tenant passes
+    // it unchanged, so a deployment with no tenants sees no change.
+    router = router.layer(middleware::from_fn_with_state(
+        api_state.clone(),
+        crate::tenant::enforce_tenant_binding,
+    ));
     if let Some(rate_limit) = &layers.rate_limit {
         router = router.layer(middleware::from_fn_with_state(
             (
@@ -16959,10 +16991,15 @@ pub(crate) async fn start_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path(workflow_name): Path<String>,
     maybe_session: Option<Extension<Session>>,
+    verified_tenant: Option<Extension<crate::tenant::VerifiedTenant>>,
     headers: axum::http::HeaderMap,
     body: Result<Json<StartWorkflowRequest>, JsonRejection>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
+
+    // The tenant binding layer sets this for a tenant-bound caller (issue
+    // #1977). The new run is stamped with it. The body cannot set a tenant.
+    let tenant: Option<&str> = verified_tenant.as_ref().map(|Extension(t)| t.as_str());
 
     // issue #808 (Codex P2): take the body as a `Result` so a malformed JSON
     // body no longer short-circuits with axum's `400`/`422` before the handler
@@ -17674,6 +17711,18 @@ pub(crate) async fn start_workflow(
     // a `200` no-op before this check, so a workflow that gained a throttle/
     // debounce/batch policy after an original keyed start still returns the
     // existing execution rather than a `400` on retry.
+    // Issue #1977: a deferred start creates its run later, through a path
+    // that carries no tenant. Refuse it for a tenant-bound caller rather
+    // than start a run the caller then cannot reach.
+    if tenant.is_some() && (throttle_applies || is_debounced_start || has_batch_policy) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "a tenant-bound start cannot be throttled, debounced or batched"
+            })),
+        )
+            .into_response();
+    }
     if idempotency_key.is_some() && (throttle_applies || is_debounced_start || has_batch_policy) {
         return (
             axum::http::StatusCode::BAD_REQUEST,
@@ -19288,6 +19337,7 @@ pub(crate) async fn start_workflow(
                 completion_callbacks,
                 start_source: effective_start_source,
                 start_source_ref: effective_start_source_ref.as_deref(),
+                tenant,
                 ..StartWorkflowParams::new(
                     &workflow_name,
                     &workflow_id,
@@ -19514,6 +19564,7 @@ pub(crate) async fn start_workflow(
         completion_callbacks,
         start_source: effective_start_source,
         start_source_ref: effective_start_source_ref.as_deref(),
+        tenant,
         ..StartWorkflowParams::new(&workflow_name, &workflow_id, exec_id, input, &queue_name)
     };
     let metrics_ref: Option<&(dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync)> =
@@ -21956,6 +22007,7 @@ pub(crate) async fn signal_with_start_workflow(
             workflow_info: runtime.registry.workflows.get(&workflow_name),
             start_source_override: request.start_source_override,
             start_source_ref_override: request.start_source_ref_override.clone(),
+            tenant: None,
         },
         Some(runtime.registry.telemetry().metrics.as_ref()),
         // issue #618 (PR #1014): gate a FRESH create AUTHORITATIVELY under the
@@ -22783,6 +22835,7 @@ async fn update_with_start_workflow(
         workflow_retry_policy: uws_workflow_retry_policy,
         max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
         reject_fresh_if_debounced,
+        tenant: None,
     };
 
     // A committed-replay hit short-circuits the authoritative in-lock call and
@@ -45391,6 +45444,9 @@ pub(crate) fn map_error(error: HarvestError) -> AutumnError {
         } => AutumnError::bad_request_msg(format!(
             "workflow execution already exists: {existing_exec_id} (state: {existing_state})"
         )),
+        // Issue #1977: the message names the key the caller sent, never a run.
+        e @ HarvestError::TenantConflict { .. } => AutumnError::bad_request_msg(e.to_string())
+            .with_status(axum::http::StatusCode::CONFLICT),
         // Safety-net fallback for a per-tenant resource quota rejection
         // (issue #946) reached from a route that has no bespoke structured
         // 429 arm of its own (every request-time `map_error` call site not
@@ -53826,6 +53882,7 @@ mod tests {
                 start_source: autumn_harvest::StartSource::Api,
                 start_source_ref: None,
                 started_by: None,
+                tenant: None,
             },
             None,
             None,
@@ -53915,6 +53972,7 @@ mod tests {
                 start_source: autumn_harvest::StartSource::Api,
                 start_source_ref: None,
                 started_by: None,
+                tenant: None,
             },
             None,
             None,
@@ -54042,6 +54100,7 @@ mod tests {
                 start_source: autumn_harvest::StartSource::Api,
                 start_source_ref: None,
                 started_by: None,
+                tenant: None,
             },
             None,
             None,
@@ -54175,6 +54234,7 @@ mod tests {
                 start_source: autumn_harvest::StartSource::Api,
                 start_source_ref: None,
                 started_by: None,
+                tenant: None,
             },
             None,
             None,
@@ -57994,6 +58054,7 @@ mod tests {
             migrated_run_terminal_state: None,
             staging_vacated_state: None,
             staging_vacated_by: None,
+            tenant: None,
         }
     }
 
@@ -60026,6 +60087,7 @@ mod mutation_gate_tests {
                 .insert(crate::api_token::TokenPrincipal {
                     id: uuid::Uuid::nil(),
                     scope: crate::api_token::TokenScope::Mutate,
+                    tenant: None,
                 });
         }
         harvest_api_router(api_state)

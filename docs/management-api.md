@@ -50,9 +50,18 @@ for the full model.
   deny. A deny answers `403` with
   `{"error":"forbidden by authorization policy"}`.
 
-Send a tenant key in the `x-harvest-tenant` header. With a hook installed, a
-value that is repeated, blank, holds a non-ASCII byte, or is longer than 128
-bytes gets `400`. Without a hook, Harvest ignores the header.
+- **Tenant binding** (issue #1977). A token minted with `tenant`, or a
+  request that the embedder marks with `VerifiedTenant`, is bound to one
+  tenant. It reaches only the tenant-scoped routes, and only runs of its
+  tenant. Every other route answers `403`. A run of another tenant answers
+  `404`. See
+  [`security-posture.md`](security-posture.md#tenant-binding-issue-1977).
+
+Send a tenant key in the `x-harvest-tenant` header. A bad value gets `400`
+when a hook is installed or the caller is tenant-bound. A value is bad when
+it is repeated, blank, non-ASCII, or longer than 128 bytes. A bound caller
+that names another tenant gets `403`. For an unbound caller, the hook sees
+the header as an unverified tenant. Without a hook, Harvest ignores it.
 
 | Request | Shard the hook sees |
 |---|---|

@@ -133,12 +133,15 @@ impl TokenScope {
 /// [`enforce_token_scope`]. Its presence is what lets [`crate::api::require_harvest_admin`]
 /// admit a token-authenticated request without a session/embedder boundary
 /// (issue #942, AC6/AC7).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct TokenPrincipal {
-    // The authorizer hook (issue #1803) reads both fields.
+    // The authorizer hook (issue #1803) reads `id` and `scope`.
     // `require_harvest_admin` needs only the extension's presence.
     pub id: Uuid,
     pub scope: TokenScope,
+    /// The tenant claim of the token (issue #1977). The tenant binding layer
+    /// reads it.
+    pub tenant: Option<String>,
 }
 
 /// Metadata-only response DTO for `GET /admin/tokens` (issue #942, AC2).
@@ -156,6 +159,9 @@ pub struct TokenView {
     pub expires_at: Option<DateTime<Utc>>,
     pub last_used_at: Option<DateTime<Utc>>,
     pub revoked_at: Option<DateTime<Utc>>,
+    /// Tenant claim of the token (issue #1977). `null` means not
+    /// tenant-bound.
+    pub tenant: Option<String>,
 }
 
 impl TokenView {
@@ -173,6 +179,7 @@ impl TokenView {
             last_used_at,
             revoked_at,
             created_by: _,
+            tenant,
         } = t;
         Self {
             id: *id,
@@ -182,6 +189,7 @@ impl TokenView {
             expires_at: *expires_at,
             last_used_at: *last_used_at,
             revoked_at: *revoked_at,
+            tenant: tenant.clone(),
         }
     }
 }
@@ -255,12 +263,16 @@ fn admin_scope_required_response() -> Response {
 // ── DB CRUD (default/control shard) ───────────────────────────────────────────
 
 /// Mint and persist a new token; returns the one-time [`MintResult`].
+///
+/// `tenant` binds the token to one tenant (issue #1977). The caller has
+/// already checked it with [`autumn_harvest::tenant::validate_tenant`].
 pub(crate) async fn create_token(
     conn: &mut AsyncPgConnection,
     name: &str,
     scope: TokenScope,
     expires_at: Option<DateTime<Utc>>,
     created_by: &str,
+    tenant: Option<&str>,
 ) -> HarvestResult<MintResult> {
     let secret = mint_secret();
     let hash = hash_secret(&secret);
@@ -270,6 +282,7 @@ pub(crate) async fn create_token(
         scope: scope.as_str(),
         expires_at,
         created_by,
+        tenant,
     };
     let row: ApiToken = diesel::insert_into(harvest_api_tokens::table)
         .values(&new)
@@ -502,6 +515,7 @@ pub async fn enforce_token_scope(
     request.extensions_mut().insert(TokenPrincipal {
         id: token.id,
         scope,
+        tenant: token.tenant.clone(),
     });
 
     // AC6: authoritative actor. Strip any spoofed inbound value, set token:{id}.
@@ -599,6 +613,31 @@ pub async fn enforce_token_scope_mcp_mutation(
     if is_expired(token.expires_at, Utc::now()) {
         return unauthorized("api token expired");
     }
+    // A generated tool starts or changes a run with no tenant check, so a
+    // tenant-bound token never reaches one (issue #1977).
+    if token.tenant.is_some() {
+        tracing::warn!(
+            method = %request.method(),
+            path = %request.uri().path(),
+            "harvest: tenant-bound api token denied MCP tool (403)"
+        );
+        let (_, source, request_id) = audit_context(request.headers(), &api_state);
+        let actor = format!("{TOKEN_ACTOR_PREFIX}{}", token.id);
+        crate::authz::audit_deny(
+            &mut conn,
+            &crate::authz::DenyAudit {
+                actor: &actor,
+                method: request.method(),
+                path: request.uri().path(),
+                request_id: request_id.as_deref(),
+                source: &source,
+                shard: None,
+                summary: "route is not tenant-scoped",
+            },
+        )
+        .await;
+        return crate::tenant::forbidden();
+    }
     // Every generated route carrying this layer is a mutation, so a read token
     // is always denied here. An unknown scope is `Read`, as in the main layer.
     let scope = TokenScope::from_db(&token.scope).unwrap_or(TokenScope::Read);
@@ -669,6 +708,7 @@ mod tests {
             expires_at: None,
             last_used_at: None,
             revoked_at: None,
+            tenant: None,
         };
         let secret = "hvst_super_secret_value".to_string();
         let mr = MintResult {
@@ -697,6 +737,7 @@ mod tests {
             last_used_at: None,
             revoked_at: None,
             created_by: "op".to_string(),
+            tenant: None,
         };
         let view = TokenView::from_row(&row);
         let body = serde_json::to_string(&view).unwrap();
