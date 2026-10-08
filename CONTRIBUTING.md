@@ -1,8 +1,8 @@
 # Contributing
 
-Thank you for your help. This file gives the short version. The rules that
-bind each change are in [`AGENTS.md`](AGENTS.md) and [`CLAUDE.md`](CLAUDE.md).
-They apply to human contributors and to agents. Read them before you start.
+Thank you for your help. This file is a summary. [`AGENTS.md`](AGENTS.md) and
+[`CLAUDE.md`](CLAUDE.md) contain the rules for each change. The rules apply to
+human contributors and to agents. Read them before you start.
 
 ## Before you start
 
@@ -31,17 +31,20 @@ cargo test -p <crate>
 python3 docs/audits/comment-hygiene.py --base origin/trunk-dev
 ```
 
-CI also runs each `scripts/check-*.sh` script and each audit in
-[`docs/audits/`](docs/audits/README.md). Run the ones that apply to your change.
+CI also runs each `scripts/check-*.sh` script. It runs each audit that
+[`docs/audits/README.md`](docs/audits/README.md) marks as wired into CI. Run the
+ones that apply to your change.
 
 ## Rules for code and docs
 
 - Write comments and docs in ASD-STE100 style: one idea per sentence, 25 words
-  or fewer, active voice. Keep the reason a comment exists.
+  or fewer, active voice, present tense, no contractions, no first person.
+- Do not delete the reason for a comment to make it shorter. Split a long
+  sentence into several short sentences.
 - Do not change a stored `harvest_events` row. `CLAUDE.md` names the two
   sanctioned exceptions.
-- Give a new migration a second-precision UTC timestamp. Bound each lock on a
-  hot table. Read
+- Start each new migration directory name with a second-precision UTC
+  timestamp (`date -u +%Y%m%d%H%M%S`). Bound each lock on a hot table. Read
   [`docs/upgrading/online-migrations.md`](docs/upgrading/online-migrations.md).
 
 ## License

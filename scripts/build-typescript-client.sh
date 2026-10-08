@@ -27,7 +27,10 @@ tarball="$(npm pack --json --loglevel=error | node -e \
 
 # The package must hold the build output and nothing from src or test.
 listing="$(tar -tzf "${tarball}")"
-for required in package/dist/index.js package/dist/index.d.ts package/dist/harvest-api.d.ts; do
+# The package must also ship both license texts (issue #1990). npm adds a
+# file named LICENSE-MIT only when `files` lists it.
+for required in package/dist/index.js package/dist/index.d.ts package/dist/harvest-api.d.ts \
+  package/LICENSE-MIT package/LICENSE-APACHE; do
   if ! grep -qxF "${required}" <<<"${listing}"; then
     echo "error: ${tarball} has no ${required}"
     exit 1
