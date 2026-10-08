@@ -9,6 +9,5 @@ spec:
   maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
   selector:
     matchLabels:
-      {{- include "harvest-worker.selectorLabels" . | nindent 6 }}
-      app.kubernetes.io/component: worker
+      {{- include "harvest-worker.workerSelectorLabels" . | nindent 6 }}
 {{- end }}

@@ -739,8 +739,8 @@ jobs:
           python3 docs/audits/action-sha-pin.py
 
       # Issue #1989. Lint the worker chart, then check the image contract.
-      # The audit renders the chart with `helm template`. The pinned tarball
-      # and its checksum keep a new Helm release from reddening lint.
+      # The audit renders the chart with `helm template`. The pinned version
+      # and its checksum stop a new Helm release from failing the lint job.
       - name: Worker chart and image contract (docs/audits/worker-image-contract.py)
         env:
           HELM_VERSION: "3.21.0"

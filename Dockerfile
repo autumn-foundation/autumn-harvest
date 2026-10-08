@@ -17,11 +17,13 @@ RUN cargo install cargo-auditable --version 0.7.7 --locked
 WORKDIR /src
 COPY . .
 # `cargo auditable` embeds the dependency list, so `cargo audit bin` can scan
-# a binary from the image. The cache mounts stay on the builder host.
+# a binary from the image. Two builds keep the features of each package
+# apart, so the CLI matches the release archive. The cache mounts stay on the
+# builder host. The lock keeps a parallel build out of the target directory.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
-    cargo auditable build --release --locked \
-        -p autumn-harvest-cli -p standalone-runner \
+    --mount=type=cache,target=/src/target,sharing=locked \
+    cargo auditable build --release --locked -p autumn-harvest-cli \
+    && cargo auditable build --release --locked -p standalone-runner \
     && mkdir -p /out \
     && cp target/release/harvest target/release/harvest-replay \
         target/release/standalone-runner /out/

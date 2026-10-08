@@ -24,8 +24,9 @@ fullnameOverride: ""
 command: []
 args: []
 
-# The deployment profile, set as `AUTUMN_PROFILE`. Outside `dev`, the
-# runner applies no migrations and each admin route needs an API token.
+# The deployment profile, set as `AUTUMN_PROFILE`. `AUTUMN_ENV` in `env`
+# overrides it. Outside `dev`, the runner applies no migrations and each
+# admin route needs an API token.
 # Do not use `dev` in a shared cluster: its admin API has no auth.
 profile: prod
 
@@ -47,6 +48,14 @@ service:
 probes:
   # The path where the worker mounts the Harvest router.
   basePath: /api/harvest
+  # `GET <basePath>/health/live` until it answers. The runner answers HTTP
+  # only after the runtime starts, so this covers a slow start. The default
+  # allows 150 s.
+  startup:
+    enabled: true
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 30
   # `GET <basePath>/health/live`. It does no I/O.
   liveness:
     periodSeconds: 10
@@ -74,20 +83,32 @@ migrations:
   # Run `harvest migrate run` as a pre-install and pre-upgrade hook.
   enabled: true
   # Run `harvest migrate status --check` as an init container. A pod then
-  # starts only on a migrated database.
+  # starts only on a migrated database. It uses the `database` Secret. The
+  # chart skips it in `dev`, where the runner migrates itself.
   checkOnStart: true
   # Extra migration directories in the image. The default holds the
   # connector dead-letter table of the plugin.
   includeDirs:
     - /usr/share/autumn-harvest/migrations/harvest
-  # A Secret for a role that may run DDL. Empty means `database`.
+  # A Secret for a role that may run DDL. Only the hook uses it. Empty
+  # means `database.existingSecret`.
   existingSecret: ""
+  # Empty means `database.secretKey`.
   secretKey: ""
   # A service account for the hook. It must exist before the install,
   # because the hook runs before the chart creates its own.
   serviceAccountName: ""
   backoffLimit: 1
+  # Helm waits for the hook for `--timeout`, 5 minutes by default. Install
+  # with a `--timeout` above this value.
   activeDeadlineSeconds: 600
+  # Kubernetes deletes a finished Job after this time.
+  ttlSecondsAfterFinished: 86400
+  # For example `sidecar.istio.io/inject: "false"`. A sidecar that does not
+  # stop keeps the Job from completing.
+  podAnnotations: {}
+  podLabels: {}
+  # The hook Job and the init container use these.
   resources: {}
 
 serviceAccount:
@@ -99,6 +120,7 @@ podDisruptionBudget:
   enabled: true
   maxUnavailable: 1
 
+# The chart sets `rollingUpdate` only for the `RollingUpdate` type.
 strategy:
   type: RollingUpdate
   rollingUpdate:

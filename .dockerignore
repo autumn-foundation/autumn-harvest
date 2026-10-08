@@ -2,7 +2,9 @@
 # keep local secrets out of it.
 .git
 .claude
-.env*
+**/.env*
+/agentd.db*
+/agentd.sock*
 **/target
 **/node_modules
 clients/typescript/dist

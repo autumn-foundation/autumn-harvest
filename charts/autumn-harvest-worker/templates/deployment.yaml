@@ -9,18 +9,24 @@ metadata:
   labels:
     {{- include "harvest-worker.labels" . | nindent 4 }}
 spec:
-  replicas: {{ .Values.replicaCount }}
+  replicas: {{ int .Values.replicaCount }}
   strategy:
-    {{- toYaml .Values.strategy | nindent 4 }}
+    type: {{ .Values.strategy.type }}
+    {{- if eq .Values.strategy.type "RollingUpdate" }}
+    {{- with .Values.strategy.rollingUpdate }}
+    rollingUpdate:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- end }}
   selector:
     matchLabels:
-      {{- include "harvest-worker.selectorLabels" . | nindent 6 }}
+      {{- include "harvest-worker.workerSelectorLabels" . | nindent 6 }}
   template:
     metadata:
       labels:
-        {{- include "harvest-worker.selectorLabels" . | nindent 8 }}
-        app.kubernetes.io/component: worker
-        {{- with .Values.podLabels }}
+        {{- include "harvest-worker.workerSelectorLabels" . | nindent 8 }}
+        {{- /* A selector key here would detach the pods from the Service. */}}
+        {{- with omit .Values.podLabels "app.kubernetes.io/name" "app.kubernetes.io/instance" "app.kubernetes.io/component" }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
       {{- with .Values.podAnnotations }}
@@ -31,14 +37,15 @@ spec:
       serviceAccountName: {{ include "harvest-worker.serviceAccountName" . }}
       # The worker does not call the Kubernetes API.
       automountServiceAccountToken: false
-      terminationGracePeriodSeconds: {{ .Values.drain.terminationGracePeriodSeconds }}
+      terminationGracePeriodSeconds: {{ int .Values.drain.terminationGracePeriodSeconds }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
-      {{- if .Values.migrations.checkOnStart }}
+      {{- /* In `dev`, the runner applies the migrations itself after this check. */}}
+      {{- if and .Values.migrations.checkOnStart (ne .Values.profile "dev") }}
       initContainers:
         - name: check-migrations
           image: {{ include "harvest-worker.image" . }}
@@ -52,7 +59,11 @@ spec:
             {{- include "harvest-worker.includeDirs" . | trim | nindent 12 }}
             {{- end }}
           env:
-            {{- include "harvest-worker.migrationEnv" . | nindent 12 }}
+            {{- include "harvest-worker.checkEnv" . | nindent 12 }}
+          {{- with .Values.migrations.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
       {{- end }}
@@ -70,7 +81,7 @@ spec:
           {{- end }}
           ports:
             - name: http
-              containerPort: {{ .Values.containerPort }}
+              containerPort: {{ int .Values.containerPort }}
               protocol: TCP
           env:
             - name: DATABASE_URL
@@ -89,6 +100,14 @@ spec:
           envFrom:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+          {{- /* The runner answers HTTP only after the runtime starts. */}}
+          {{- if .Values.probes.startup.enabled }}
+          startupProbe:
+            httpGet:
+              path: {{ printf "%s/health/live" .Values.probes.basePath }}
+              port: http
+            {{- toYaml (omit .Values.probes.startup "enabled") | nindent 12 }}
+          {{- end }}
           livenessProbe:
             httpGet:
               path: {{ printf "%s/health/live" .Values.probes.basePath }}
@@ -102,7 +121,7 @@ spec:
           lifecycle:
             preStop:
               sleep:
-                seconds: {{ .Values.drain.preStopSleepSeconds }}
+                seconds: {{ int .Values.drain.preStopSleepSeconds }}
           {{- with .Values.resources }}
           resources:
             {{- toYaml . | nindent 12 }}

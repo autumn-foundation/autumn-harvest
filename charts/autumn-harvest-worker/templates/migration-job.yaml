@@ -1,10 +1,12 @@
 {{- if .Values.migrations.enabled }}
-# Helm runs this Job before it installs or upgrades the worker. Concurrent
-# runs are safe: `harvest migrate run` locks the migration ledger.
+# Helm runs this Job before it installs or upgrades the worker. A second
+# concurrent run waits on the ledger lock, then skips applied migrations.
+# The lock needs UPDATE, DELETE or TRUNCATE on the ledger.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "harvest-worker.fullname" . }}-migrate
+  {{- /* The Job controller copies the name into a label of 63 characters. */}}
+  name: {{ printf "%s-migrate" (include "harvest-worker.fullname" . | trunc 55 | trimSuffix "-") }}
   labels:
     {{- include "harvest-worker.labels" . | nindent 4 }}
     app.kubernetes.io/component: migrate
@@ -12,15 +14,25 @@ metadata:
     helm.sh/hook: pre-install,pre-upgrade
     helm.sh/hook-weight: "-5"
     # Keep a finished Job, so its log stays readable until the next upgrade.
+    # A hook is not a release resource, so the TTL removes it after an
+    # uninstall.
     helm.sh/hook-delete-policy: before-hook-creation
 spec:
-  backoffLimit: {{ .Values.migrations.backoffLimit }}
-  activeDeadlineSeconds: {{ .Values.migrations.activeDeadlineSeconds }}
+  backoffLimit: {{ int .Values.migrations.backoffLimit }}
+  activeDeadlineSeconds: {{ int .Values.migrations.activeDeadlineSeconds }}
+  ttlSecondsAfterFinished: {{ int .Values.migrations.ttlSecondsAfterFinished }}
   template:
     metadata:
       labels:
         {{- include "harvest-worker.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: migrate
+        {{- with omit .Values.migrations.podLabels "app.kubernetes.io/name" "app.kubernetes.io/instance" "app.kubernetes.io/component" }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.migrations.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
     spec:
       restartPolicy: Never
       {{- with .Values.migrations.serviceAccountName }}

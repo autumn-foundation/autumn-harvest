@@ -177,6 +177,10 @@ installs a standalone worker with these probe and drain settings. It also
 runs the migrations as a hook. [ADR 0006](../adr/0006-worker-container-image.md)
 states what the worker image holds (issue #1989).
 
+The chart adds a `startupProbe`. The reference runner serves HTTP only after
+`HarvestEmbedding::start` returns, so its liveness route does not answer
+during a slow start.
+
 ## Shutdown sequence (`HarvestPlugin`)
 
 1. Kubernetes marks the pod `Terminating` and removes it from endpoints.

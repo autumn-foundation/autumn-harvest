@@ -7,13 +7,13 @@ the contract that `docs/adr/0006-worker-container-image.md` states.
 
 Checks:
 1. The decision note has its sections and names the image and each binary.
-2. The `Dockerfile` pins each base image by digest. The build image uses the
-   toolchain of `rust-toolchain.toml`. The build is auditable and locked.
-   The final stage runs as a non-root user and holds each binary and the
-   plugin migrations.
+2. The `Dockerfile` pins each base image by digest. The build image and
+   `RUSTUP_TOOLCHAIN` use the toolchain of `rust-toolchain.toml`. The build
+   is auditable and locked. The last `USER` of the final stage is non-root.
+   The final stage holds each binary and the plugin migrations.
 3. `Chart.yaml` has the workspace version as `appVersion`, and a
    `kubeVersion` that allows the `preStop` sleep action.
-4. The chart default image is the image that the release publishes.
+4. The chart default image is the `IMAGE` that the release publishes.
 5. The rendered chart has the probe paths, the `preStop` sleep, a grace
    period that covers the drain, a non-root security context, and a
    migration Job that runs as a pre-install and pre-upgrade hook.
@@ -33,6 +33,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 try:
@@ -126,14 +127,21 @@ def check_dockerfile(text, channel):
             f"{DOCKERFILE}: the build image is not `rust:{channel}-*` from {TOOLCHAIN}"
         )
     build = " ".join(parts[0][1])
+    # The env var picks the compiler, so it must move with the image tag.
+    if not re.search(rf"\bRUSTUP_TOOLCHAIN={re.escape(channel or '')}(?:\s|$)", build):
+        found.append(
+            f"{DOCKERFILE}: the build stage does not set RUSTUP_TOOLCHAIN={channel}"
+        )
     for needle in ("cargo auditable build --release --locked",) + tuple(
         f"-p {p}" for p in ("autumn-harvest-cli", "standalone-runner")
     ):
         if needle not in build:
             found.append(f"{DOCKERFILE}: the build stage does not run `{needle}`")
     final = parts[-1][1]
-    if f"USER {NONROOT}" not in final:
-        found.append(f"{DOCKERFILE}: the runtime stage is not `USER {NONROOT}`")
+    # Docker applies the last `USER`.
+    users = [line for line in final if re.match(r"(?i)^USER\s", line)]
+    if not users or users[-1].split(None, 1)[1].strip() != NONROOT:
+        found.append(f"{DOCKERFILE}: the runtime stage does not end as `USER {NONROOT}`")
     copies = " ".join(line for line in final if line.upper().startswith("COPY"))
     for binary in BINARIES:
         if not re.search(rf"/{re.escape(binary)}(?:\s|$)", copies):
@@ -146,10 +154,17 @@ def check_dockerfile(text, channel):
     return found
 
 
+def parse_toml(text):
+    """Return the parsed TOML, or an empty table."""
+    try:
+        return tomllib.loads(text or "")
+    except tomllib.TOMLDecodeError:
+        return {}
+
+
 def toolchain_channel(text):
     """Return the pinned channel of `rust-toolchain.toml`, or None."""
-    match = re.search(r'^channel\s*=\s*"([^"]+)"', text or "", re.MULTILINE)
-    return match.group(1) if match else None
+    return parse_toml(text).get("toolchain", {}).get("channel")
 
 
 # ── Chart metadata ──────────────────────────────────────────────────────────
@@ -157,12 +172,7 @@ def toolchain_channel(text):
 
 def workspace_version(text):
     """Return `[workspace.package] version`, or None."""
-    match = re.search(
-        r'^\[workspace\.package\][^\[]*?^version\s*=\s*"([^"]+)"',
-        text or "",
-        re.MULTILINE | re.DOTALL,
-    )
-    return match.group(1) if match else None
+    return parse_toml(text).get("workspace", {}).get("package", {}).get("version")
 
 
 def kube_floor(constraint):
@@ -175,6 +185,8 @@ def check_chart(chart, version):
     """Return the findings for the parsed `Chart.yaml`."""
     if chart is None:
         return [f"{CHART}/Chart.yaml: missing"]
+    if version is None:
+        return [f"{WORKSPACE}: no [workspace.package] version"]
     found = []
     if str(chart.get("appVersion")) != version:
         found.append(
@@ -190,14 +202,16 @@ def check_chart(chart, version):
     return found
 
 
-def check_values(values, release_text):
+def check_values(values, release):
     """Return the findings for the chart image against the release image."""
     found = []
     repo = ((values or {}).get("image") or {}).get("repository")
     if repo != IMAGE:
         found.append(f"{CHART}/values.yaml: image.repository is {repo!r}, not {IMAGE}")
-    if f"IMAGE: {IMAGE}" not in (release_text or ""):
-        found.append(f"{RELEASE}: does not publish `IMAGE: {IMAGE}`")
+    # The publish job and the release notes both read the workflow `env`.
+    published = ((release or {}).get("env") or {}).get("IMAGE")
+    if published != IMAGE:
+        found.append(f"{RELEASE}: env.IMAGE is {published!r}, not {IMAGE}")
     return found
 
 
@@ -255,11 +269,12 @@ def check_migration_job(docs):
         j
         for j in jobs
         if {"pre-install", "pre-upgrade"}
-        <= set(
-            ((j.get("metadata") or {}).get("annotations") or {})
+        <= {
+            hook.strip()
+            for hook in ((j.get("metadata") or {}).get("annotations") or {})
             .get("helm.sh/hook", "")
             .split(",")
-        )
+        }
     ]
     if len(hooked) != 1:
         return [f"{CHART}: renders {len(hooked)} pre-install,pre-upgrade Jobs, not 1"]
@@ -270,13 +285,16 @@ def check_migration_job(docs):
         found.append(f"{CHART}: the migration Job does not run `harvest`")
     if argv[1:3] != ["migrate", "run"]:
         found.append(f"{CHART}: the migration Job does not run `migrate run`")
-    if MIGRATIONS_DIR not in argv:
-        found.append(f"{CHART}: the migration Job does not include {MIGRATIONS_DIR}")
+    if ["--include-dir", MIGRATIONS_DIR] not in [argv[i : i + 2] for i in range(len(argv))]:
+        found.append(
+            f"{CHART}: the migration Job does not pass `--include-dir {MIGRATIONS_DIR}`"
+        )
     return found
 
 
 def helm_binary():
-    return os.environ.get("HELM") or shutil.which("helm")
+    """Return the `helm` path, or None. A bad `HELM` path also gives None."""
+    return shutil.which(os.environ.get("HELM") or "helm")
 
 
 def render(helm, *extra):
@@ -326,7 +344,7 @@ def run():
         check_note(read(NOTE))
         + check_dockerfile(read(DOCKERFILE), channel)
         + check_chart(load(f"{CHART}/Chart.yaml"), workspace_version(read(WORKSPACE)))
-        + check_values(load(f"{CHART}/values.yaml"), read(RELEASE))
+        + check_values(load(f"{CHART}/values.yaml"), load(RELEASE))
     )
     if (ROOT / CHART).is_dir():
         findings += check_render(helm)
@@ -342,6 +360,7 @@ PIN = "@sha256:" + "a" * 64
 
 GOOD_DOCKERFILE = f"""\
 FROM rust:1.99.0-bookworm{PIN} AS build
+ENV RUSTUP_TOOLCHAIN=1.99.0
 RUN cargo auditable build --release --locked \\
     -p autumn-harvest-cli -p standalone-runner
 FROM gcr.io/distroless/cc-debian12:nonroot{PIN}
@@ -353,14 +372,14 @@ USER {NONROOT}
 GOOD_NOTE = "\n".join(SECTIONS) + f"\n{IMAGE} " + " ".join(f"`{b}`" for b in BINARIES)
 
 
-def pod(probe_live=LIVE, probe_ready=READY, sleep=10, grace=60, ro=True):
+def pod(probe_live=LIVE, probe_ready=READY, sleep=10, grace=60, ro=True, nonroot=True):
     return {
         "kind": "Deployment",
         "spec": {
             "template": {
                 "spec": {
                     "terminationGracePeriodSeconds": grace,
-                    "securityContext": {"runAsNonRoot": True},
+                    "securityContext": {"runAsNonRoot": nonroot},
                     "containers": [
                         {
                             "livenessProbe": {"httpGet": {"path": probe_live}},
@@ -385,20 +404,29 @@ def job(hook="pre-install,pre-upgrade", argv=None):
 
 
 def self_test():
-    release = f"env:\n  IMAGE: {IMAGE}\n"
+    release = {"env": {"IMAGE": IMAGE}}
+    df = GOOD_DOCKERFILE
     chart = {"appVersion": "0.7.0", "kubeVersion": ">=1.30.0-0"}
     cases = [
         (check_note(GOOD_NOTE), 0),
         (check_note(None), 1),
         (check_note(GOOD_NOTE.replace("## Decision", "## Choice")), 1),
         (check_note(GOOD_NOTE.replace("`harvest-replay`", "")), 1),
+        (check_note(GOOD_NOTE.replace(IMAGE, "")), 1),
         (check_dockerfile(GOOD_DOCKERFILE, "1.99.0"), 0),
         (check_dockerfile(None, "1.99.0"), 1),
-        # A toolchain bump without a builder bump.
-        (check_dockerfile(GOOD_DOCKERFILE, "1.100.0"), 1),
+        # A toolchain bump without a builder bump: the tag and the env var.
+        (check_dockerfile(GOOD_DOCKERFILE, "1.100.0"), 2),
         # A tag with no digest.
         (check_dockerfile(GOOD_DOCKERFILE.replace(PIN, "", 1), "1.99.0"), 1),
-        (check_dockerfile(GOOD_DOCKERFILE.replace(f"USER {NONROOT}", "USER root"), "1.99.0"), 1),
+        (check_dockerfile(df.replace(f"USER {NONROOT}", "USER root"), "1.99.0"), 1),
+        # Docker applies the last `USER`.
+        (check_dockerfile(df.replace(f"USER {NONROOT}", f"USER {NONROOT}\nUSER root"), "1.99.0"), 1),
+        (check_dockerfile(df.replace(f"USER {NONROOT}", ""), "1.99.0"), 1),
+        # The image tag moved, the env var did not.
+        (check_dockerfile(df.replace("rust:1.99.0", "rust:1.100.0"), "1.100.0"), 1),
+        (check_dockerfile(df.replace("ENV RUSTUP_TOOLCHAIN=1.99.0\n", ""), "1.99.0"), 1),
+        (check_dockerfile(df.split("FROM gcr")[0], "1.99.0"), 1),
         (check_dockerfile(GOOD_DOCKERFILE.replace(" /out/harvest-replay", ""), "1.99.0"), 1),
         (check_dockerfile(GOOD_DOCKERFILE.replace("auditable ", ""), "1.99.0"), 1),
         (check_dockerfile(GOOD_DOCKERFILE.replace(f"COPY {MIGRATIONS_SRC}", "COPY x"), "1.99.0"), 1),
@@ -411,9 +439,12 @@ def self_test():
         (check_chart(chart, "0.8.0"), 1),
         (check_chart({**chart, "kubeVersion": ">=1.29.0-0"}, "0.7.0"), 1),
         (check_chart({"appVersion": "0.7.0"}, "0.7.0"), 1),
+        (check_chart(chart, None), 1),
         (check_values({"image": {"repository": IMAGE}}, release), 0),
         (check_values({"image": {"repository": "x/y"}}, release), 1),
-        (check_values({"image": {"repository": IMAGE}}, "env: {}\n"), 1),
+        (check_values({"image": {"repository": IMAGE}}, {"env": {}}), 1),
+        # A job-level comment or value does not count, only the workflow env.
+        (check_values({"image": {"repository": IMAGE}}, {"jobs": {"x": {"env": release["env"]}}}), 1),
         (check_deployment([pod()]), 0),
         (check_deployment([]), 1),
         (check_deployment([pod(probe_live=READY)]), 1),
@@ -421,16 +452,25 @@ def self_test():
         (check_deployment([pod(sleep=0)]), 1),
         (check_deployment([pod(grace=30)]), 1),
         (check_deployment([pod(ro=False)]), 1),
+        (check_deployment([pod(nonroot=False)]), 1),
+        (check_deployment([{"kind": "Deployment", "spec": {"template": {"spec": {"containers": []}}}}]), 1),
         (check_migration_job([job()]), 0),
         (check_migration_job([]), 1),
         (check_migration_job([job(hook="post-install")]), 1),
         (check_migration_job([job(argv=["/usr/local/bin/harvest", "migrate", "status"])]), 2),
-        (workspace_version('[workspace]\n[workspace.package]\nedition = "2024"\nversion = "1.2.3"\n'), "1.2.3"),
+        # Helm accepts a space after the comma.
+        (check_migration_job([job(hook="pre-install, pre-upgrade")]), 0),
+        (check_migration_job([job(argv=["/bin/migrate", "migrate", "run", "--include-dir", MIGRATIONS_DIR])]), 1),
+        (check_migration_job([job(argv=["/usr/local/bin/harvest", "migrate", "run", "--other", MIGRATIONS_DIR])]), 1),
+        (workspace_version('[workspace]\n[workspace.package]\nkeywords = ["a"]\nversion = "1.2.3"\n'), "1.2.3"),
+        (workspace_version("[workspace]\n"), None),
+        (workspace_version("not toml ["), None),
         (toolchain_channel('[toolchain]\nchannel = "1.99.0"\n'), "1.99.0"),
+        (toolchain_channel(None), None),
     ]
     bad = []
     for i, (got, want) in enumerate(cases):
-        ok = got == want if isinstance(want, str) else len(got) == want
+        ok = got == want if want is None or isinstance(want, str) else len(got) == want
         if not ok:
             bad.append(i)
             print(f"self-test case {i}: got {got}")

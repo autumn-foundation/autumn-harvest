@@ -9,9 +9,9 @@ Accepted (issue #1989).
 - Harvest is a library. A workflow is Rust code that compiles into the
   binary of the user. An image cannot hold the workflows of a user. See
   [ADR 0002](0002-rust-native-execution-boundary.md).
-- An operator still needs the CLI. It applies migrations, gates a deploy
-  with `harvest migrate status --check`, seeds the first API token and runs
-  `harvest preflight`.
+- An operator still needs the CLI. The operator uses it to apply
+  migrations, gate a deploy with `harvest migrate status --check`, seed the
+  first API token and run `harvest preflight`.
 - The probes ([#1812](../operations/kubernetes-probes.md)) and the drain
   (#1813) set how a pod starts and stops. Nothing packaged them.
 - The repository had no `Dockerfile`, no chart and no image release.
@@ -50,7 +50,9 @@ COPY --from=build /src/target/release/my-worker /usr/local/bin/
 CMD ["my-worker"]
 ```
 
-Pin the base by the digest that `cosign verify` checked.
+Pin the base by the digest that `cosign verify` checked. Build on Debian 12
+(bookworm): a binary that links a newer glibc does not start on the
+runtime. The runtime has no OpenSSL, so use rustls for TLS.
 
 ### 3. A distroless runtime
 
@@ -59,11 +61,13 @@ glibc, libgcc and CA certificates. It has no shell and no package manager.
 
 No other shared library is necessary. The Postgres client and SQLite are
 compiled in (`pq-src`, bundled `libsqlite3-sys`), and TLS is rustls. The
-CA certificates are necessary: `harvest migrate` checks the server
-certificate against the platform store.
+CA certificates are necessary. `harvest migrate` and the worker check the
+Postgres server certificate against the platform store.
 
-Each base image is pinned by digest. Dependabot updates the digests. The
-build image must use the toolchain of `rust-toolchain.toml`.
+The Dockerfile pins each base image by digest. Dependabot updates the
+digests. The build image must use the toolchain of `rust-toolchain.toml`.
+The CLI and the runner build in two cargo runs, so the CLI has the features
+of the release archive.
 
 ### 4. Build, sign and publish
 
@@ -71,20 +75,25 @@ The release workflow keeps the split of issue #1826. The job that runs
 third-party build code holds no write token.
 
 - `image` builds with `cargo auditable`, so `cargo audit bin` can scan each
-  binary. It runs each binary once and checks the user. It saves the image
-  as a workflow artifact. A pull request that changes the image inputs runs
-  it as a dry run.
-- `publish-image` runs on a tag push only, after `validate`. It pushes the
-  image to GHCR and signs the pushed digest with keyless Sigstore. It
-  verifies the signature as a user does. It pushes a build provenance
-  attestation to the registry. It runs no repository code.
-- The GitHub Release waits for `publish-image`.
+  binary. It checks that the image runs as `65532:65532`. It then applies
+  the migrations to a Postgres service, starts the runner, waits for
+  readiness, and stops it with SIGTERM. It saves the image as a workflow
+  artifact.
+- A pull request that changes the `Dockerfile`, `.dockerignore`,
+  `rust-toolchain.toml`, the plugin migrations or `release.yml` runs
+  `image` as a dry run.
+- `publish-image` runs on a tag push only, after `validate` and both sign
+  jobs. It pushes the image to GHCR and signs the pushed digest with
+  keyless Sigstore. It verifies the signature against the identity of this
+  workflow run. It pushes a build provenance attestation to the registry.
+  It runs no repository code.
+- The GitHub Release waits for `publish-image` and names the image digest.
 
 Verify an image:
 
 ```bash
 cosign verify ghcr.io/autumn-foundation/autumn-harvest@sha256:<digest> \
-  --certificate-identity-regexp '^https://github.com/autumn-foundation/autumn-harvest/\.github/workflows/release\.yml@refs/tags/v' \
+  --certificate-identity-regexp '^https://github\.com/autumn-foundation/autumn-harvest/\.github/workflows/release\.yml@refs/tags/v' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 gh attestation verify oci://ghcr.io/autumn-foundation/autumn-harvest@sha256:<digest> \
   --repo autumn-foundation/autumn-harvest
@@ -110,15 +119,21 @@ list.
 ## Consequences
 
 - The image and the chart follow the workspace version. The audit fails
-  when `appVersion` differs.
+  when `appVersion` differs. It does not check the chart `version`, so bump
+  that by hand.
+- GHCR makes a new package private. After the first release, an
+  organization owner sets the `autumn-harvest` package to public. Until
+  then, `publish-image` writes a warning, and the chart default cannot pull
+  the image.
 - A toolchain bump must also bump the build image. The audit fails on a
   mismatch.
 - The image is `linux/amd64` only. The release archives also have no Linux
   arm64 build.
-- The chart is not published to a chart registry. Install it from a
-  checkout or a release tag.
+- The release does not publish the chart to a chart registry. Install it
+  from a checkout or a release tag.
 - Outside `dev`, the operator seeds the first API token with
-  `harvest token bootstrap`. The chart does not write to the database.
+  `harvest token bootstrap`. The chart seeds no API token. Only its
+  migration Job writes to the database.
 
 ## Alternatives rejected
 
@@ -133,5 +148,5 @@ list.
 - **An operator.** A chart covers one worker fleet. An operator is a larger
   product. Open a new issue when a chart is not sufficient.
 - **Migrations at worker start.** Only `dev` does this. In a fleet, each
-  replica would race to migrate. The upgrade guides apply migrations before
-  the roll.
+  replica would then need DDL rights, and a slow migration would delay
+  every start. The upgrade guides apply migrations before the roll.

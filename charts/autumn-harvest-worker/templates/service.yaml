@@ -8,9 +8,8 @@ spec:
   type: {{ .Values.service.type }}
   ports:
     - name: http
-      port: {{ .Values.service.port }}
+      port: {{ int .Values.service.port }}
       targetPort: http
       protocol: TCP
   selector:
-    {{- include "harvest-worker.selectorLabels" . | nindent 4 }}
-    app.kubernetes.io/component: worker
+    {{- include "harvest-worker.workerSelectorLabels" . | nindent 4 }}

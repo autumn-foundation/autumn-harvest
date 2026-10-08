@@ -42,8 +42,10 @@ updates:
         update-types: [minor, patch]
 
   # Issue #1989. The Dockerfile pins each base image by digest. Dependabot
-  # moves a digest within its tag. A new Rust release is a toolchain bump in
-  # rust-toolchain.toml, so it does not update the `rust` tag.
+  # moves a digest within its tag. Dependabot does not move the `rust` tag to
+  # a new minor or major release. That is a toolchain bump in
+  # rust-toolchain.toml. A patch tag bump fails the image contract audit
+  # until rust-toolchain.toml moves with it.
   - package-ecosystem: docker
     directory: "/"
     target-branch: trunk-dev
@@ -58,4 +60,3 @@ updates:
         update-types:
           - version-update:semver-major
           - version-update:semver-minor
-          - version-update:semver-patch

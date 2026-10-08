@@ -15,10 +15,11 @@ Check readiness:
   curl -s http://127.0.0.1:{{ .Values.service.port }}{{ .Values.probes.basePath }}/health/ready
 {{- if ne .Values.profile "dev" }}
 
-Outside `dev`, each admin route needs an API token. Seed the first one:
+Outside `dev`, each admin route needs an API token. Seed the first one on
+your workstation. The command uses no network, and the secret stays out of
+the pod logs:
 
-  kubectl -n {{ .Release.Namespace }} run harvest-token --rm -i --restart=Never \
-    --image={{ include "harvest-worker.image" . }} -- harvest token bootstrap
+  docker run --rm {{ include "harvest-worker.image" . }} harvest token bootstrap
 
 Run the printed INSERT statement against the database, and keep the secret.
 {{- end }}

@@ -22,6 +22,12 @@ app.kubernetes.io/name: {{ include "harvest-worker.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
+{{/* The worker pods. The Deployment, the Service and the PDB select them. */}}
+{{- define "harvest-worker.workerSelectorLabels" -}}
+{{ include "harvest-worker.selectorLabels" . }}
+app.kubernetes.io/component: worker
+{{- end }}
+
 {{- define "harvest-worker.labels" -}}
 helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
 {{ include "harvest-worker.selectorLabels" . }}
@@ -51,7 +57,16 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- required "database.existingSecret is required: create a Secret that holds the database URL" .Values.database.existingSecret }}
 {{- end }}
 
-{{/* `HARVEST_DATABASE_URL` for the migration commands. */}}
+{{/* `HARVEST_DATABASE_URL` for the read-only check. It uses the app role. */}}
+{{- define "harvest-worker.checkEnv" -}}
+- name: HARVEST_DATABASE_URL
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "harvest-worker.databaseSecret" . }}
+      key: {{ .Values.database.secretKey }}
+{{- end }}
+
+{{/* `HARVEST_DATABASE_URL` for the migration hook. It may use a DDL role. */}}
 {{- define "harvest-worker.migrationEnv" -}}
 - name: HARVEST_DATABASE_URL
   valueFrom:
