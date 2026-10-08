@@ -11,8 +11,8 @@ No engine code, query, index or migration changes here. See
 ## TL;DR
 
 * **Claim cost grows with backlog depth, not with work done.** On one seed and
-  one workload, a 4k-row backlog costs 885 buffers and 18 ms per claim. A
-  1M-row backlog costs 985,871 buffers and 19.9 s per claim.
+  one workload, a 4k-row backlog costs 840 buffers and 19 ms per claim. A
+  1M-row backlog costs 136,360 buffers and 16.8 s per claim.
 * **At 1M rows the claim spills to disk.** Each claim sorts about 868k eligible
   rows to return one. The sort writes 155 MB to disk (`work_mem` is 4 MB). The
   issue's tiny fixture wrote none.
@@ -20,15 +20,15 @@ No engine code, query, index or migration changes here. See
   byte-identical fixture, the planner picks one of two candidate scans. A
   bitmap heap scan costs about 136k buffers per claim. An index scan on
   `idx_harvest_tq_poll` costs about 986k. The time per claim is close for both:
-  15 to 20 s. See [two plans, one fixture](#two-plans-one-fixture).
+  15 to 20 s. This capture took the bitmap heap scan. See [two plans, one fixture](#two-plans-one-fixture).
 * **The PAUSED-execution skip scans every execution on every claim.** In the
   plan, `harvest_workflow_executions` gets a `Seq Scan` with `state = 'PAUSED'`
   as its filter. At 1M rows it reads all 250k executions per claim. The e2e
   hook shows the same scan on the issue's own workload: 56,075 sequential scans
   and 35.4M tuples read for 1,440 executions.
-* **The claim CTE is 99.9% of shared buffers at depth** (90.4% at 4k). The FK
+* **The claim CTE is 99.3% of shared buffers at depth** (86.3% at 4k). The FK
   `FOR KEY SHARE` lead from the issue is real but small at both depths.
-* **JIT costs 2.6 s of a 17.4 s claim.** The plan cost is above
+* **JIT costs 2.5 s of a 15.9 s claim.** The plan cost is above
   `jit_above_cost`, and the planner plans each claim again.
 
 ## 🎯 Workload
@@ -39,7 +39,10 @@ HARVEST_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
 ```
 
 The script seeds a shallow (4k) and a deep (1M) fixture on seed 1956. On each it
-runs 4 claimers for up to 2,000 claims, and starts no claim after 600 s. A
+runs 4 claimers for one claim per 200 live rows (20 at 4k, 5,000 at 1M), and
+starts no claim after 600 s. Each claim leaves about three dead versions, and
+autovacuum is off. So the cap keeps the dead ratio of both runs within about
+1.5 points of its start: 11.2% and 10.0% at the end of this capture. A
 claimer calls `queue::claim_task` over all 64 queues, completes the task,
 deletes it as the hygiene sweep would, and enqueues a replacement. So the table
 keeps its depth. The delete is the one measured statement that the engine does
@@ -86,46 +89,47 @@ calls.
 
 | | shallow (4k) | deep (1M) | ratio |
 |:--|--:|--:|--:|
-| claims in the run | 2,000 in 19 s | 122 in 616 s | |
-| claim CTE share of shared buffers | 90.4% | 99.9% | |
-| claim CTE buffers per call | 885 | 985,871 | 1,114x |
-| claim CTE mean time per call | 18 ms | 19,864 ms | 1,110x |
+| claims in the run | 20 in 0.5 s | 144 in 609 s | |
+| claim CTE share of shared buffers | 86.3% | 99.3% | |
+| claim CTE buffers per call | 840 | 136,360 | 162x |
+| claim CTE mean time per call | 19 ms | 16,780 ms | 900x |
 | claim CTE temp blocks written per call | 0 | 38,834 | |
 | `harvest_task_queue` tuples read by seq scan, per claim | 4,000 | 1,000,000 | 250x |
 | `harvest_workflow_executions` tuples read by seq scan, per claim | 1,000 | 250,000 | 250x |
-| claim `UPDATE` buffers per call | 26 | 444 | 17x |
+| claim `UPDATE` buffers per call | 36 | 438 | 12x |
 
 ### The plan at 1M rows
 
-From `deep-claim.explain.txt` (one claim, 17.4 s):
+From `deep-claim.explain.txt` (one claim, 15.9 s):
 
-1. **Candidate scan and sort.** An index scan on `idx_harvest_tq_poll` returns
-   868,423 eligible rows (12.0 s). A `Sort` on the sticky `CASE` key orders
+1. **Candidate scan and sort.** A `BitmapAnd` of `idx_harvest_tq_live_created`
+   and `idx_harvest_tq_poll` feeds a bitmap heap scan that returns 868,423
+   eligible rows (9.5 s). A `Sort` on the sticky `CASE` key orders
    them to return one row: `external merge  Disk: 155168kB`. This is the
    sort-elision defeat that `docs/performance.md` describes (issues #786 and
    #1177). Issue #1340 left its depth scaling open. At this fixture it is worse
-   than linear in buffers and in time.
+   than linear in time.
 2. **`concurrency_pending_keys`.** A `Seq Scan` on `harvest_task_queue` reads
-   454,617 keyed rows on every claim (251 ms). This is the per-claim sequential
+   454,617 keyed rows on every claim (371 ms). This is the per-claim sequential
    scan that `pg_stat_user_tables` shows.
 3. **The PAUSED-execution skip.** A `Seq Scan` on `harvest_workflow_executions`
    with `Filter: (state = 'PAUSED')` removes all 250,000 rows (5,320 buffers).
    `idx_harvest_we_state` covers only `RUNNING`, so no index serves it.
-4. **JIT.** 2.6 s of the 17.4 s.
+4. **JIT.** 2.5 s of the 15.9 s.
 
-At 4k rows the same plan sorts 3,573 rows in memory and runs in 20 ms.
+At 4k rows the same plan sorts 3,573 rows in memory and runs in 19 ms.
 
 ### Two plans, one fixture
 
-Five complete captures of this fixture ran on seed 1956 while the harness
+Six complete captures of this fixture ran on seed 1956 while the harness
 matured. The fixture is byte-identical for a seed, and
 `one_seed_gives_one_fixture_and_another_seed_differs` proves it. Yet the deep
 claim took one of two plans for the candidate scan:
 
 | plan | buffers per claim | time per claim | captures |
 |:--|--:|--:|:--|
-| `BitmapAnd` of `idx_harvest_tq_live_created` and `idx_harvest_tq_poll`, then a bitmap heap scan | about 136k | about 15 s | three; artifacts at commit `ac5ba2c` |
-| index scan on `idx_harvest_tq_poll` | about 986k | 17 to 20 s | two, including this one |
+| `BitmapAnd` of `idx_harvest_tq_live_created` and `idx_harvest_tq_poll`, then a bitmap heap scan | about 136k | 15 to 17 s | four, including this one |
+| index scan on `idx_harvest_tq_poll` | about 986k | 17 to 20 s | two; artifacts at commit `2b11551` |
 
 Both read the same 868,423 rows and spill the same 155 MB sort. The index scan
 touches a buffer per row, so it reads 7x the buffers for a similar time. The
@@ -195,8 +199,9 @@ needs a human decision and its own before/after on this fixture.
   near 2% dead would read fewer dead tuples.
 * The workload claims over all 64 queues with no build, capability or session
   filters. It does not exercise the dispatch-channel by-id claim.
-* The deep run starts no claim after 600 s and stops at 122 claims. The
-  per-call figures rest on those 122 claim calls.
+* The deep run starts no claim after 600 s and stops at 144 claims. The
+  shallow run stops at its cap of 20. The per-call figures rest on those
+  claim calls.
 
 ## See also
 

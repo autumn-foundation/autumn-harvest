@@ -1,9 +1,9 @@
 -- pg_stat_user_tables, workload deltas (n_live_tup and n_dead_tup are final) --
 | relname | seq_scan | seq_tup_read | idx_scan | idx_tup_fetch | n_tup_ins | n_tup_upd | n_tup_hot_upd | n_tup_del | n_live_tup | n_dead_tup | dead_pct |
 |--|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| harvest_task_queue | 2020 | 8079751 | 144406 | 7321143 | 2000 | 4000 | 0 | 2000 | 4000 | 6445 | 61.7 |
-| harvest_workflow_executions | 2020 | 2020000 | 8102 | 4062 | 0 | 0 | 0 | 0 | 1000 | 0 | 0.0 |
-| harvest_activity_pauses | 2020 | 0 | 1986 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0.0 |
+| harvest_task_queue | 21 | 84000 | 1507 | 76123 | 20 | 40 | 0 | 20 | 4000 | 505 | 11.2 |
+| harvest_workflow_executions | 21 | 21000 | 98 | 56 | 0 | 0 | 0 | 0 | 1000 | 0 | 0.0 |
+| harvest_activity_pauses | 21 | 0 | 15 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0.0 |
 | harvest_admission_gates | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0.0 |
 | harvest_api_tokens | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0.0 |
 | harvest_audit_export_cursor | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0.0 |
@@ -31,10 +31,10 @@
 | harvest_mutex_locks | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0.0 |
 | harvest_mutex_waiters | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0.0 |
 | harvest_payload_refs | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0.0 |
-| harvest_queue_pauses | 2020 | 0 | 2000 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0.0 |
+| harvest_queue_pauses | 21 | 0 | 20 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0.0 |
 | harvest_ramp_abort_reports | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0.0 |
 | harvest_ramp_retired_ids | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0.0 |
-| harvest_rate_limit_buckets | 0 | 0 | 4040 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0.0 |
+| harvest_rate_limit_buckets | 0 | 0 | 42 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0.0 |
 | harvest_replication_heartbeat | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0.0 |
 | harvest_scanner_leases | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0.0 |
 | harvest_schedule_decisions | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0.0 |

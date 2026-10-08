@@ -14,15 +14,15 @@ states: [("PENDING", 3773), ("COMPLETED", 153), ("RUNNING", 44), ("FAILED", 30)]
 running: 44 rows, at most 5 per key and task type (cap 32), at most 1 per worker (16 slots)
 server: PostgreSQL 16.15 (Ubuntu 16.15-0ubuntu0.24.04.1) on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit; jit=on, shared_buffers=128MB, work_mem=4MB, max_parallel_workers_per_gather=2
 pg_stat_statements reset: ok
-workload: 4 claimers, 2000 claims, 2000 completions, 2000 reclaims, 2000 enqueues, 20 empty polls, 0 errors, in 18.8s (106.6 claims/s)
-statements: 17 rows, 1976926 shared buffers
+workload: 4 claimers, 20 claims, 20 completions, 20 reclaims, 20 enqueues, 1 empty polls, 0 errors, in 0.5s (39.3 claims/s)
+statements: 17 rows, 20458 shared buffers
 database dropped after the snapshot: true
 
 ## deep
 
 spec: FixtureSpec { seed: 1956, live_rows: 1000000, tasks_per_execution: 4, queues: 64, queue_skew: 3.0, keys: 4096, key_skew: 4.0, keyed_share: 0.5, key_cap: 32, dead_ratio: 0.1, running_share: 0.01, terminal_share: 0.04, future_share: 0.05, workers: 64 }
-seeded: 1000000 live rows, 250000 executions, churn Churn { released: 27777, reclaimed: 18519 }, in 83.6s
-task queue: 1000000 live rows, heap 441.6 MiB, n_live_tup 1000082, n_dead_tup 111213, dead ratio 0.100 (target 0.100)
+seeded: 1000000 live rows, 250000 executions, churn Churn { released: 27777, reclaimed: 18519 }, in 83.0s
+task queue: 1000000 live rows, heap 441.6 MiB, n_live_tup 999982, n_dead_tup 111077, dead ratio 0.100 (target 0.100)
 queues: head share 0.251 (expected 0.250), 64 queues hold rows
   deep-backlog-q-0: 250984
   deep-backlog-q-1: 65016
@@ -34,7 +34,7 @@ states: [("PENDING", 960116), ("COMPLETED", 31072), ("FAILED", 7788), ("RUNNING"
 running: 1024 rows, at most 32 per key and task type (cap 32), at most 16 per worker (16 slots)
 server: PostgreSQL 16.15 (Ubuntu 16.15-0ubuntu0.24.04.1) on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit; jit=on, shared_buffers=128MB, work_mem=4MB, max_parallel_workers_per_gather=2
 pg_stat_statements reset: ok
-workload: 4 claimers, 122 claims, 122 completions, 122 reclaims, 122 enqueues, 0 empty polls, 0 errors, in 615.6s (0.2 claims/s)
-statements: 17 rows, 120391971 shared buffers
+workload: 4 claimers, 144 claims, 144 completions, 144 reclaims, 144 enqueues, 0 empty polls, 0 errors, in 609.3s (0.2 claims/s)
+statements: 17 rows, 19770595 shared buffers
 database dropped after the snapshot: true
 
