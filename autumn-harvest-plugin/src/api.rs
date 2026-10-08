@@ -11713,6 +11713,11 @@ pub(crate) async fn fetch_archived_history(
         for event in &mut doc.events {
             outcome = outcome.merged(codecs.decode_value_lossy(event));
         }
+        // The decode changes the byte count. State the size of what the
+        // caller gets, as `export_history_decoded` does.
+        if let Err(err) = doc.remeasure() {
+            tracing::warn!(execution_id = %exec_id, error = %err, "archived history size not recomputed");
+        }
         let target = exec_id.to_string();
         audit_decoded_read(
             api_state,

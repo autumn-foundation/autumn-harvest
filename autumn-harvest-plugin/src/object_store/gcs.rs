@@ -270,8 +270,16 @@ impl GcsBackend {
         let response = self.send("get", key, request).await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             // GCS also answers 404 for a missing bucket. That is a
-            // configuration fault, so check the bucket before "not found".
-            self.check_bucket().await?;
+            // configuration fault, not a missing object. The error message
+            // tells the two apart. A bucket probe would need
+            // `storage.buckets.get`, which object-only IAM roles lack.
+            let body = response.text().await.unwrap_or_default();
+            if is_missing_bucket(&body) {
+                return Err(ObjectStoreError(format!(
+                    "GCS get of {key} failed: bucket {} does not exist",
+                    self.bucket
+                )));
+            }
             return Ok(None);
         }
         if !response.status().is_success() {
@@ -290,30 +298,6 @@ impl GcsBackend {
         Ok(Some(bytes.to_vec()))
     }
 
-    /// Fail when the bucket does not exist.
-    async fn check_bucket(&self) -> Result<(), ObjectStoreError> {
-        let url = format!(
-            "{}/storage/v1/b/{}",
-            self.endpoint,
-            encode_object_name(&self.bucket)
-        );
-        let response = self
-            .send("bucket check", &self.bucket, self.http.get(url))
-            .await?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(ObjectStoreError(format!(
-                "GCS bucket {} does not exist",
-                self.bucket
-            )));
-        }
-        // Only a successful probe proves that the object is the missing part.
-        // An auth error or an outage stays an error.
-        if !response.status().is_success() {
-            return Err(status_error("bucket check", &self.bucket, response).await);
-        }
-        Ok(())
-    }
-
     async fn send(
         &self,
         op: &str,
@@ -329,6 +313,14 @@ impl GcsBackend {
             .await
             .map_err(|err| ObjectStoreError(format!("GCS {op} of {key} failed: {err}")))
     }
+}
+
+/// Whether a GCS 404 body reports a missing bucket.
+///
+/// GCS sends "The specified bucket does not exist." for a missing bucket and
+/// "No such object" for a missing object.
+fn is_missing_bucket(body: &str) -> bool {
+    body.to_ascii_lowercase().contains("bucket does not exist")
 }
 
 async fn status_error(op: &str, key: &str, response: reqwest::Response) -> ObjectStoreError {

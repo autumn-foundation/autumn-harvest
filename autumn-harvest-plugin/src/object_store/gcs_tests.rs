@@ -31,28 +31,23 @@ async fn serve(router: Router) -> String {
 }
 
 /// A fake GCS download route: `ok` returns bytes, any other name is 404.
+/// The bucket `no-such-bucket` answers with the GCS missing-bucket message.
 fn fake_gcs(seen: Seen) -> Router {
     Router::new()
-        .route(
-            "/storage/v1/b/{bucket}",
-            get(|Path(bucket): Path<String>| async move {
-                match bucket.as_str() {
-                    "b" => (StatusCode::OK, "{}"),
-                    "denied" => (StatusCode::FORBIDDEN, "denied"),
-                    _ => (StatusCode::NOT_FOUND, ""),
-                }
-            }),
-        )
         .route(
             "/storage/v1/b/{bucket}/o/{name}",
             get(
                 |State(seen): State<Seen>,
-                 Path((_, name)): Path<(String, String)>,
+                 Path((bucket, name)): Path<(String, String)>,
                  headers: HeaderMap| async move {
                     let auth = headers
                         .get("authorization")
                         .map(|v| v.to_str().unwrap().to_string());
                     seen.auth.lock().unwrap().push(auth);
+                    if bucket == "no-such-bucket" {
+                        let body = r#"{"error":{"code":404,"message":"The specified bucket does not exist."}}"#;
+                        return (StatusCode::NOT_FOUND, body.to_string());
+                    }
                     match name.as_str() {
                         "ok" => (StatusCode::OK, "bytes".to_string()),
                         "boom" => (StatusCode::FORBIDDEN, "denied".to_string()),
@@ -62,6 +57,17 @@ fn fake_gcs(seen: Seen) -> Router {
             ),
         )
         .with_state(seen)
+}
+
+#[test]
+fn a_missing_bucket_is_told_apart_from_a_missing_object() {
+    assert!(super::is_missing_bucket(
+        r#"{"error":{"code":404,"message":"The specified bucket does not exist."}}"#
+    ));
+    assert!(!super::is_missing_bucket(
+        r#"{"error":{"code":404,"message":"No such object: b/history/x.json"}}"#
+    ));
+    assert!(!super::is_missing_bucket("Not Found"));
 }
 
 #[test]
@@ -108,14 +114,6 @@ async fn a_missing_bucket_is_an_error_not_a_missing_object() {
     let backend = GcsBackend::new("no-such-bucket", NoAuth).with_endpoint(&endpoint);
     let err = backend.get("missing").await.unwrap_err();
     assert!(err.to_string().contains("does not exist"), "{err}");
-}
-
-#[tokio::test]
-async fn a_failed_bucket_check_is_an_error_not_a_missing_object() {
-    let endpoint = serve(fake_gcs(Seen::default())).await;
-    let backend = GcsBackend::new("denied", NoAuth).with_endpoint(&endpoint);
-    let err = backend.get("missing").await.unwrap_err();
-    assert!(err.to_string().contains("403"), "{err}");
 }
 
 #[tokio::test]

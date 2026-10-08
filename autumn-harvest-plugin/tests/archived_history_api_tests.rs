@@ -258,6 +258,11 @@ async fn payloads_decode_under_the_read_path_gate() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json["events"][0]["data"]["output"]["secret"], MARKER);
+    assert_eq!(
+        json["size_limit"]["actual_bytes"],
+        body.len(),
+        "the size field states the decoded document"
+    );
 }
 
 #[tokio::test]
