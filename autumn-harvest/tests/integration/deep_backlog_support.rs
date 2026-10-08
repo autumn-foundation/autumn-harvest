@@ -1164,20 +1164,57 @@ impl StagedArtifacts {
 
     /// Move every staged file over its target, then remove the stage.
     ///
+    /// The set moves whole or not at all. Each target must be a file or
+    /// absent, so a bad target fails before any move. Each old file goes
+    /// aside into the stage before its new file moves in. When a move fails,
+    /// the new files go back and the old files return.
+    ///
     /// # Errors
-    /// Returns the I/O error of the first move that fails.
+    /// Returns the error of the check or of the first move that fails.
     pub fn publish(self) -> std::io::Result<Vec<PathBuf>> {
-        let mut staged: Vec<PathBuf> = std::fs::read_dir(&self.staging)?
-            .map(|entry| entry.map(|e| e.path()))
+        let mut names: Vec<std::ffi::OsString> = std::fs::read_dir(&self.staging)?
+            .map(|entry| entry.map(|e| e.file_name()))
             .collect::<std::io::Result<_>>()?;
-        staged.sort();
-        let mut published = Vec::with_capacity(staged.len());
-        for from in staged {
-            let to = self.target.join(from.file_name().unwrap_or_default());
-            std::fs::rename(&from, &to)?;
-            published.push(to);
+        names.sort();
+        for name in &names {
+            let to = self.target.join(name);
+            if to.symlink_metadata().is_ok_and(|m| !m.is_file()) {
+                return Err(std::io::Error::other(format!(
+                    "{} is not a file, so the capture cannot replace it",
+                    to.display()
+                )));
+            }
         }
-        Ok(published)
+        let previous = self.staging.join(".previous");
+        std::fs::create_dir(&previous)?;
+        let mut set_aside = Vec::new();
+        let mut moved = Vec::new();
+        let mut result = Ok(());
+        for name in &names {
+            let to = self.target.join(name);
+            if to.symlink_metadata().is_ok() {
+                result = std::fs::rename(&to, previous.join(name));
+                if result.is_err() {
+                    break;
+                }
+                set_aside.push(name);
+            }
+            result = std::fs::rename(self.staging.join(name), &to);
+            if result.is_err() {
+                break;
+            }
+            moved.push(name);
+        }
+        if let Err(e) = result {
+            for name in moved.iter().rev() {
+                let _ = std::fs::rename(self.target.join(name), self.staging.join(name));
+            }
+            for name in set_aside.iter().rev() {
+                let _ = std::fs::rename(previous.join(name), self.target.join(name));
+            }
+            return Err(e);
+        }
+        Ok(names.iter().map(|name| self.target.join(name)).collect())
     }
 }
 

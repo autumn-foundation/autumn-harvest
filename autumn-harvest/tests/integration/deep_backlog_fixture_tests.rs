@@ -383,6 +383,39 @@ fn a_capture_replaces_its_artifacts_only_when_it_completes() {
     let _ = std::fs::remove_dir_all(&out);
 }
 
+#[test]
+fn a_publish_that_fails_part_way_keeps_the_old_set() {
+    let out = std::env::temp_dir().join(format!("harvest-ledger-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(out.join("shallow-claim.explain.txt")).expect("block one target");
+    std::fs::write(out.join("fixture-summary.txt"), "old").expect("seed the old summary");
+    let stage = fixture::StagedArtifacts::new(&out).expect("stage a run");
+    std::fs::write(stage.dir().join("fixture-summary.txt"), "new").expect("stage");
+    std::fs::write(stage.dir().join("shallow-claim.explain.txt"), "plan").expect("stage");
+    // The summary sorts first, so a one-by-one move would replace it before
+    // the blocked target fails.
+    assert!(
+        stage.publish().is_err(),
+        "a target that is a directory fails"
+    );
+    assert_eq!(
+        std::fs::read_to_string(out.join("fixture-summary.txt")).expect("read"),
+        "old",
+        "no file of the failed set replaces the old one"
+    );
+    assert!(
+        out.join("shallow-claim.explain.txt").is_dir(),
+        "the blocker stays"
+    );
+    let left: Vec<_> = std::fs::read_dir(&out)
+        .expect("read the out dir")
+        .filter_map(Result::ok)
+        .map(|e| e.file_name())
+        .filter(|name| name.to_string_lossy().starts_with(".staging-"))
+        .collect();
+    assert!(left.is_empty(), "the stage is gone: {left:?}");
+    let _ = std::fs::remove_dir_all(&out);
+}
+
 // ── DB tests ──────────────────────────────────────────────────────────────
 
 /// Start a server, or return `None` and print why the test skips.
