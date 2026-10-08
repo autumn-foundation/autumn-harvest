@@ -712,6 +712,29 @@ Each entry in `events`:
 | `type` | string | Event discriminator (e.g. `TimerStarted`, `ActivityCompleted`). |
 | `data` | object | Event payload (the `data` object from the adjacently-tagged stored JSON). |
 
+### Archived history (issue #1983)
+
+```
+GET /workflows/{id}/archived-history
+```
+
+Returns the `HistoryExportDocument` that retention archived for a run. The
+route reads the configured `HistoryArchiver` only. It works after retention
+deletes the run from Postgres. Admin only.
+
+| Status | When |
+|--------|------|
+| 200 | The archive holds the run. The body is the document. |
+| 400 | The id is not a valid execution UUID. |
+| 401 | The caller is not a Harvest admin. |
+| 404 | The archive holds no document for the run. |
+| 503 | No archiver is set, the archiver cannot read back, the store fails, or the read times out. |
+
+Payload fields decode under the same gate as `GET /workflows/{id}/history`.
+Otherwise they stay in their stored form, for example codec envelopes. The
+read times out after `archival_timeout_secs`. Vantage shows the same document
+at `/ui/workflows/{id}/archived-history`. See [`docs/archival.md`](archival.md).
+
 ### `get_workflow` truncation contract
 
 `GET /workflows/{id}` now bounds `history` to the first **100** events and adds two

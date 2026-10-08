@@ -297,11 +297,41 @@ pub type ArchiverFuture<'a> = std::pin::Pin<
     >,
 >;
 
+/// Future type returned by [`HistoryArchiver::fetch`] (issue #1983).
+///
+/// `Ok(None)` means that the archive has no document for the run.
+pub type ArchiveFetchFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<
+                    Option<crate::history_export::HistoryExportDocument>,
+                    ArchiveFetchError,
+                >,
+            > + Send
+            + 'a,
+    >,
+>;
+
+/// Error returned by [`HistoryArchiver::fetch`] (issue #1983).
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ArchiveFetchError {
+    /// The archiver can write but cannot read back.
+    #[error("the history archiver does not support read-back")]
+    Unsupported,
+    /// The store or the decode fails.
+    #[error("archived history read failed: {0}")]
+    Backend(Box<dyn std::error::Error + Send + Sync>),
+}
+
 /// Trait for pre-retention workflow history cold storage archivers.
 ///
 /// Implementations of this trait are invoked by the retention janitor to ship
 /// a completed workflow execution's event history to cold storage *before* it
 /// is permanently deleted from the database.
+///
+/// Payload fields in the document are in their stored form. With a payload
+/// codec on, they are codec envelopes (ciphertext). Issue #1983.
 pub trait HistoryArchiver: Send + Sync + 'static {
     /// Ship the history export document to cold storage.
     ///
@@ -309,6 +339,16 @@ pub trait HistoryArchiver: Send + Sync + 'static {
     /// workflow execution and its associated events on this tick, retrying
     /// on the next tick to prevent data loss.
     fn archive(&self, doc: &crate::history_export::HistoryExportDocument) -> ArchiverFuture<'_>;
+
+    /// Read back the archived document for `execution_id` (issue #1983).
+    ///
+    /// The management API and Vantage call this to show a pruned run.
+    /// The default returns [`ArchiveFetchError::Unsupported`], so an
+    /// archiver that only writes still compiles.
+    fn fetch(&self, execution_id: &crate::types::ExecutionId) -> ArchiveFetchFuture<'_> {
+        let _ = execution_id;
+        Box::pin(async { Err(ArchiveFetchError::Unsupported) })
+    }
 }
 
 /// Configuration for the background retention job.
@@ -2869,20 +2909,20 @@ async fn run_shard_tick(
             let mut doc = None;
             if !config.dry_run && archiver.is_some() {
                 let exec_id = crate::types::ExecutionId::from_uuid(candidate.id);
-                // Inflate offloaded envelopes before archiving so the archived
-                // document contains real payloads, not blob references that will
-                // be deleted moments later. Issue #524.
-                let load_result = if offloader.is_some() {
-                    crate::store::load_history_inflated(
-                        &mut conn,
-                        exec_id,
-                        &crate::payload_codec::PayloadCodecs::default(),
-                        offloader.as_deref(),
-                    )
-                    .await
-                } else {
-                    crate::store::load_history(&mut conn, exec_id).await
-                };
+                // Inflate offloaded references before archiving. The archive then
+                // holds the payload bytes, not references to blobs that retention
+                // deletes next. Issue #524.
+                //
+                // Do not decode codec envelopes. The archive keeps the stored
+                // form, so a codec keeps the payloads ciphertext. A decode with
+                // the identity registry also fails on the first envelope, and
+                // retention then never archives the run. Issue #1983.
+                let load_result = crate::store::load_history_inflated_undecoded(
+                    &mut conn,
+                    exec_id,
+                    offloader.as_deref(),
+                )
+                .await;
                 match load_result {
                     Ok(history) => {
                         let req = crate::history_export::HistoryExportRequest {
@@ -5555,5 +5595,30 @@ mod tests {
             .len();
         assert_eq!(left, 0);
         guard.active = false;
+    }
+}
+
+#[cfg(test)]
+mod archive_fetch_tests {
+    use super::{ArchiveFetchError, ArchiverFuture, HistoryArchiver};
+    use crate::history_export::HistoryExportDocument;
+    use crate::types::ExecutionId;
+
+    /// An archiver that writes only, as every archiver did before issue #1983.
+    struct WriteOnly;
+
+    impl HistoryArchiver for WriteOnly {
+        fn archive(&self, _doc: &HistoryExportDocument) -> ArchiverFuture<'_> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn default_fetch_is_unsupported() {
+        let result = WriteOnly.fetch(&ExecutionId::new()).await;
+        assert!(
+            matches!(result, Err(ArchiveFetchError::Unsupported)),
+            "a write-only archiver reports that it cannot read back"
+        );
     }
 }

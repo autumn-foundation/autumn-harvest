@@ -2695,11 +2695,11 @@ mod tests {
             text.matches("load_history(").count()
         }
 
-        // Both still need a `PayloadCodecs` threaded through a public
-        // signature (`RetentionScanner::spawn`, `run_canary`), which is
-        // issue #1243's remaining scope rather than rotation's. Neither is on
-        // the task-processing path: archival and the replay canary.
-        const KNOWN_IDENTITY_READS: &[(&str, usize)] = &[("retention.rs", 1), ("testing.rs", 2)];
+        // The replay canary still needs a `PayloadCodecs` threaded through a
+        // public signature (`run_canary`), which is issue #1243's remaining
+        // scope rather than rotation's. It is not on the task-processing path.
+        // Retention archival reads the stored form since issue #1983.
+        const KNOWN_IDENTITY_READS: &[(&str, usize)] = &[("testing.rs", 2)];
 
         // `store.rs` is excluded: it *defines* the loaders, and its own
         // delegation between them is the thing every other file must not do.

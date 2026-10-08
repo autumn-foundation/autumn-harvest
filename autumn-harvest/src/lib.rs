@@ -725,7 +725,8 @@ pub use reset::{
     resolve_batch_reset_one, resolve_reset_point, validate_reset_point,
 };
 pub use retention::{
-    ArchiverFuture, HistoryArchiver, LegalHoldOutcome, RetentionConfig, legal_hold_active,
+    ArchiveFetchError, ArchiveFetchFuture, ArchiverFuture, HistoryArchiver, LegalHoldOutcome,
+    RetentionConfig, legal_hold_active,
 };
 #[cfg(feature = "db")]
 pub use retention::{

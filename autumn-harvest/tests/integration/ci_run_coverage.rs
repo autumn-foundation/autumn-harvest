@@ -424,6 +424,9 @@ fn plugin_required_features(source: &str) -> Vec<String> {
                 "metrics",
                 "unified-dag-execution",
                 "dev-runtime",
+                // Issue #1983: the object-store emulator suites.
+                "s3",
+                "gcs",
             ] {
                 let needle = format!("feature = \"{feat}\"");
                 if seg.contains(&needle) {

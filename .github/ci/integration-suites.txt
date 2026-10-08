@@ -58,6 +58,7 @@ allos        autumn-harvest         integration                      testing,deb
 allos        autumn-harvest         integration                      testing,metrics-rs         metrics_rs_adapter
 allos        autumn-harvest         property                         db                         -
 allos        autumn-harvest-plugin  api_rate_limit                   -                          -
+allos        autumn-harvest-plugin  archived_history_api_tests       -                          -
 allos        autumn-harvest-plugin  connector_dependency_graph       -                          -
 allos        autumn-harvest-plugin  connector_example_budget         -                          -
 allos        autumn-harvest-plugin  contract_regression              -                          -
@@ -159,6 +160,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          rate_limit_bucket_gc_tests
 linux        autumn-harvest         integration                      -                          rate_limit_key
 linux        autumn-harvest         integration                      -                          redrive_tests
+linux        autumn-harvest         integration                      -                          retention_archive_codec_tests
 linux        autumn-harvest         integration                      -                          retention_overrides_tests
 linux        autumn-harvest         integration                      -                          retention_summary_tests
 linux        autumn-harvest         integration                      -                          retry_after_tests
@@ -275,6 +277,8 @@ linux        autumn-harvest-plugin  interface_schema_integration     -          
 linux        autumn-harvest-plugin  legal_hold_integration           -                          -
 linux        autumn-harvest-plugin  lineage_tree_integration         -                          -
 linux        autumn-harvest-plugin  load_shed_localpg                -                          -
+linux        autumn-harvest-plugin  object_store_gcs_emulator        s3,gcs                     -
+linux        autumn-harvest-plugin  object_store_s3_minio            s3,gcs                     -
 linux        autumn-harvest-plugin  openapi_response_conformance     -                          -
 linux        autumn-harvest-plugin  outbox_integration               -                          -
 linux        autumn-harvest-plugin  pacing_override_integration      -                          -
@@ -343,6 +347,7 @@ linuxpart    autumn-harvest         integration                      -          
 linuxpart    autumn-harvest         integration                      -                          integration_e2e
 linuxpart    autumn-harvest         integration                      -                          legal_hold_tests
 linuxpart    autumn-harvest         integration                      -                          lineage_store_tests
+linuxpart    autumn-harvest         integration                      -                          retention_archive_codec_tests
 linuxpart    autumn-harvest         integration                      -                          retention_overrides_tests
 linuxpart    autumn-harvest         integration                      -                          retention_summary_tests
 linuxpart    autumn-harvest         integration                      -                          workflow_retry_tests

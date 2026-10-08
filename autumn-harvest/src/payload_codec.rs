@@ -1710,7 +1710,7 @@ impl PayloadCodecs {
     /// As [`PayloadCodecs::decode_payload`], including
     /// [`HarvestError::Serialization`] when the decoded bytes are not valid
     /// JSON.
-    pub(crate) fn decode_payload_bytes(&self, payload: &Value) -> HarvestResult<Option<Vec<u8>>> {
+    pub fn decode_payload_bytes(&self, payload: &Value) -> HarvestResult<Option<Vec<u8>>> {
         let Some(parts) = codec_envelope_parts(payload) else {
             return Ok(None);
         };

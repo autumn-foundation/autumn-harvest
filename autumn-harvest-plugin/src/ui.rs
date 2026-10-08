@@ -79,9 +79,9 @@ use autumn_harvest::{
 use crate::api::{
     DagRetryFailure, DagRetryResponse, HarvestApiRuntime, HarvestApiState, KNOWN_WORKFLOW_STATES,
     WorkflowFilters, acquire_conn, audit_decoded_read, db_conn_for_execution, db_conn_for_shard,
-    decode_error_field, decode_workflow_execution_fields, extension_session, load_execution,
-    load_workflows, load_workflows_from_shards, map_error, parse_execution_id, read_path_decoder,
-    require_harvest_admin, retry_dag_run_inner,
+    decode_error_field, decode_workflow_execution_fields, extension_session,
+    fetch_archived_history, load_execution, load_workflows, load_workflows_from_shards, map_error,
+    parse_execution_id, read_path_decoder, require_harvest_admin, retry_dag_run_inner,
 };
 use crate::dag_graph::{DagNodeStatus, DagRunNode, build_run_graph};
 use crate::shard_fanout::UnavailableShard;
@@ -794,6 +794,12 @@ pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<()> {
         // issue #960: standalone execution timeline / Gantt view (read-only,
         // non-admin — parity with the #739 API and the detail page).
         .route("/workflows/{id}/timeline", get(workflow_timeline_ui))
+        // Issue #1983: archived history of a pruned run. Admin only, like the
+        // API route.
+        .route(
+            "/workflows/{id}/archived-history",
+            get(archived_history_ui).route_layer(require_admin.clone()),
+        )
         .route("/workflows/{id}/cancel", post(cancel_workflow_ui))
         .route(
             "/workflows/{id}/terminate",
@@ -1743,8 +1749,10 @@ async fn workflow_detail_ui(
     Query(params): Query<WorkflowDetailParams>,
     headers: axum::http::HeaderMap,
     maybe_session: Option<Extension<Session>>,
-) -> Result<Markup, AutumnError> {
-    render_workflow_detail_page(
+    token: Option<Extension<crate::api_token::TokenPrincipal>>,
+) -> axum::response::Response {
+    let hint_session = extension_session(maybe_session.clone());
+    let page = render_workflow_detail_page(
         &api_state,
         &id,
         params.event_page.as_deref(),
@@ -1757,7 +1765,165 @@ async fn workflow_detail_ui(
         &headers,
         maybe_session,
     )
-    .await
+    .await;
+    match page {
+        Ok(markup) => markup.into_response(),
+        Err(err) => {
+            let token = token.map(|Extension(token)| token);
+            let is_admin = caller_is_harvest_admin(&api_state, token, hint_session).await;
+            archived_history_hint(&api_state, &id, err, is_admin)
+        }
+    }
+}
+
+/// Whether the caller passes `require_harvest_admin` (issue #1983).
+///
+/// The guard admits a verified API token first, then an admin session. This
+/// check does the same, so a token-authenticated admin also gets the link.
+async fn caller_is_harvest_admin(
+    api_state: &HarvestApiState,
+    token: Option<crate::api_token::TokenPrincipal>,
+    session: Option<Session>,
+) -> bool {
+    token.is_some() || crate::api::has_harvest_admin_access(api_state, session).await
+}
+
+/// Turn a 404 on the detail page into a link to the archive (issue #1983).
+///
+/// Retention deletes a pruned run from Postgres. When an archiver is set, the
+/// 404 page links to the archived history. The archive page is admin only,
+/// so only an admin gets the link. Other errors pass through.
+fn archived_history_hint(
+    api_state: &HarvestApiState,
+    id: &str,
+    err: AutumnError,
+    is_admin: bool,
+) -> axum::response::Response {
+    let has_archiver = api_state
+        .runtime()
+        .is_ok_and(|runtime| runtime.history_archiver().is_some());
+    let exec_id = match parse_execution_id(id) {
+        Ok(exec_id)
+            if is_admin && has_archiver && err.status() == axum::http::StatusCode::NOT_FOUND =>
+        {
+            exec_id
+        }
+        _ => return err.into_response(),
+    };
+    let body = html! {
+        div.card {
+            h3 { "Execution not found" }
+            p {
+                "Postgres has no row for execution " code { (exec_id) } ". "
+                "Retention deletes a finished run after its retention age."
+            }
+            // The page is at `ui/workflows/{id}`, so this resolves to
+            // `ui/workflows/{id}/archived-history`.
+            a href={ (exec_id) "/archived-history" } { "View archived history" }
+        }
+    };
+    let page = layout("Execution not found · Vantage", &body, "../", None);
+    (axum::http::StatusCode::NOT_FOUND, page).into_response()
+}
+
+/// Vantage page for the archived history of a run (issue #1983).
+async fn archived_history_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    maybe_session: Option<Extension<Session>>,
+) -> Result<Markup, AutumnError> {
+    let exec_id = parse_execution_id(&id)?;
+    let decoder = read_path_decoder(&api_state, extension_session(maybe_session)).await;
+    let doc = fetch_archived_history(
+        &api_state,
+        &headers,
+        exec_id,
+        decoder,
+        "GET /ui/workflows/{id}/archived-history",
+        Some(SOURCE_UI),
+    )
+    .await?;
+    let title = format!("Archived history · {} · Vantage", doc.workflow_name);
+    Ok(layout(
+        &title,
+        &render_archived_history_body(&doc),
+        "../../",
+        None,
+    ))
+}
+
+/// The archived-history page shows at most this many events.
+///
+/// An archive holds a whole history and has no pagination. The API route
+/// returns every event.
+const ARCHIVED_HISTORY_UI_EVENT_LIMIT: usize = 1000;
+
+/// Body of the archived-history page: run metadata, then the event table.
+fn render_archived_history_body(
+    doc: &autumn_harvest::history_export::HistoryExportDocument,
+) -> Markup {
+    let optional = |value: Option<&str>| value.unwrap_or("—").to_string();
+    html! {
+        div.card {
+            h2 { "Archived history" }
+            p {
+                "Read from the history archiver. "
+                "Retention archives a run before it deletes the run from Postgres."
+            }
+            table {
+                tbody {
+                    tr { th { "Workflow" } td { (doc.workflow_name) } }
+                    tr { th { "Workflow ID" } td { (optional(doc.workflow_id.as_deref())) } }
+                    tr { th { "Execution ID" } td { code { (doc.execution_id) } } }
+                    tr { th { "State" } td { (doc.status.state) } }
+                    tr { th { "Queue" } td { (optional(doc.queue_name.as_deref())) } }
+                    tr { th { "Shard" } td { (doc.shard_id) } }
+                    @if let Some(parent) = doc.parent_execution_id {
+                        tr { th { "Parent" } td { code { (parent) } } }
+                    }
+                    tr { th { "Archived at" } td { (format_timestamp(Some(doc.exported_at))) } }
+                }
+            }
+        }
+        div.card {
+            h3 { "Event history (" (doc.events.len()) " events)" }
+            @if doc.events.is_empty() {
+                div.empty { "The archive holds no events." }
+            } @else {
+                @if doc.events.len() > ARCHIVED_HISTORY_UI_EVENT_LIMIT {
+                    p.flash {
+                        "This page shows the first " (ARCHIVED_HISTORY_UI_EVENT_LIMIT)
+                        " events. Use GET /workflows/" (doc.execution_id)
+                        "/archived-history for the full document."
+                    }
+                }
+                table {
+                    thead {
+                        tr {
+                            th { "#" }
+                            th { "Type" }
+                            th { "Data" }
+                        }
+                    }
+                    tbody {
+                        @for (index, event) in doc.events.iter().take(ARCHIVED_HISTORY_UI_EVENT_LIMIT).enumerate() {
+                            tr {
+                                td { (index + 1) }
+                                td { code { (event.get("type").and_then(Value::as_str).unwrap_or("?")) } }
+                                td {
+                                    details {
+                                        summary { "view payload" }
+                                        pre { (pretty_json(event.get("data").unwrap_or(&Value::Null))) }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Loads and renders the workflow detail page.
@@ -12556,6 +12722,96 @@ fn layout_schedules(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod archived_history_hint_tests {
+        use super::*;
+
+        struct WriteOnly;
+
+        impl autumn_harvest::HistoryArchiver for WriteOnly {
+            fn archive(
+                &self,
+                _doc: &autumn_harvest::history_export::HistoryExportDocument,
+            ) -> autumn_harvest::ArchiverFuture<'_> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        fn state(with_archiver: bool) -> HarvestApiState {
+            let runtime = HarvestApiRuntime::new(
+                Arc::new(autumn_harvest::worker::HandlerRegistry::new(vec![], vec![])),
+                Arc::new(autumn_harvest::scheduler::DagCatalog::default()),
+                Arc::new(Vec::new()),
+                None,
+                Vec::new(),
+                autumn_harvest::scheduler::SchedulerMonitor::offline(),
+                crate::api::HarvestRetentionRuntime::disabled(
+                    autumn_harvest::RetentionConfig::default(),
+                ),
+                ShardRouter::single(),
+            );
+            let runtime = if with_archiver {
+                runtime.with_history_archiver(Arc::new(WriteOnly))
+            } else {
+                runtime
+            };
+            let state = HarvestApiState::new();
+            state.install(runtime);
+            state
+        }
+
+        async fn body(response: axum::response::Response) -> String {
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        }
+
+        const ID: &str = "0190a1b2-0000-7000-8000-000000000001";
+
+        /// Issue #1983: an admin who opens a pruned run gets a link to the archive.
+        #[tokio::test]
+        async fn admin_404_links_to_the_archive() {
+            let err = AutumnError::not_found_msg("workflow execution");
+            let response = archived_history_hint(&state(true), ID, err, true);
+            assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+            let html = body(response).await;
+            assert!(
+                html.contains(&format!("href=\"{ID}/archived-history\"")),
+                "{html}"
+            );
+        }
+
+        #[tokio::test]
+        async fn no_link_without_an_archiver_or_for_a_non_admin() {
+            for (with_archiver, is_admin) in [(false, true), (true, false)] {
+                let err = AutumnError::not_found_msg("workflow execution");
+                let response = archived_history_hint(&state(with_archiver), ID, err, is_admin);
+                assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+                assert!(!body(response).await.contains("archived-history"));
+            }
+        }
+
+        #[tokio::test]
+        async fn a_token_principal_counts_as_admin() {
+            let token = crate::api_token::TokenPrincipal {
+                id: uuid::Uuid::nil(),
+                scope: crate::api_token::TokenScope::Read,
+            };
+            assert!(caller_is_harvest_admin(&state(true), Some(token), None).await);
+            assert!(!caller_is_harvest_admin(&state(true), None, None).await);
+        }
+
+        #[tokio::test]
+        async fn other_errors_pass_through() {
+            let err = AutumnError::service_unavailable_msg("pool down");
+            let response = archived_history_hint(&state(true), ID, err, true);
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+    }
 
     /// GREEN -- the fix under test (Snag repro, boundary tour on
     /// `jump_event`). The fix in #1627 handles a non-numeric `jump_event`.
