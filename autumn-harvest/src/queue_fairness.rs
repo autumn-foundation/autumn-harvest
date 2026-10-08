@@ -26,7 +26,17 @@
 /// Weights decide **which queue** to claim from. `claim_task` then picks the
 /// best row in that queue by its standard claim order. That order is
 /// `priority`, then the claim-order due time (issue #1824).
-use std::collections::HashMap;
+///
+/// # Fairness keys within a queue (issue #1976)
+///
+/// Queue weights do not help when many tenants share one queue. A fairness
+/// key on each task does. [`FairClock`] is the pure model of the fair claim:
+/// start-time fair queuing (SFQ) across the keys of one queue. The fair claim
+/// splice in `queue.rs` is the SQL form of the same rules. See
+/// `DESIGN-1976.md` and `tests/property/fairness_key_props.rs`.
+use std::collections::{BTreeMap, HashMap};
+
+use crate::error::{HarvestError, HarvestResult};
 
 /// Pair a queue name with its effective non-negative weight.
 ///
@@ -109,6 +119,208 @@ pub fn weighted_queue_order<'a>(
     let mut result: Vec<&'a str> = positive.iter().map(|(n, _)| *n).collect();
     result.extend(zeros.iter().copied());
     result
+}
+
+/// The key of a task that has no fairness key.
+///
+/// The fair claim puts every unkeyed row in this one key. A start rejects an
+/// empty key, so no caller can collide with it.
+pub const DEFAULT_FAIRNESS_KEY: &str = "";
+
+/// The weight of a key that has no override.
+pub const DEFAULT_FAIRNESS_WEIGHT: f64 = 1.0;
+
+/// The smallest weight an override can set.
+pub const MIN_FAIRNESS_WEIGHT: f64 = 0.001;
+
+/// The largest weight an override can set.
+pub const MAX_FAIRNESS_WEIGHT: f64 = 1000.0;
+
+/// The most weight overrides one queue can hold.
+///
+/// Temporal uses the same cap. The claim reads one override per claim, so the
+/// cap bounds the table, not the claim cost.
+pub const MAX_FAIRNESS_OVERRIDES_PER_QUEUE: usize = 1000;
+
+/// The longest fairness key, in bytes.
+pub const MAX_FAIRNESS_KEY_LEN: usize = 255;
+
+/// Check a fairness key that a caller supplies.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Config`] for an empty key, a key with outer
+/// whitespace, or a key longer than [`MAX_FAIRNESS_KEY_LEN`] bytes. The empty
+/// key is [`DEFAULT_FAIRNESS_KEY`].
+pub fn validate_fairness_key(key: &str) -> HarvestResult<()> {
+    if key.is_empty() {
+        return Err(HarvestError::Config(
+            "fairness key must not be empty".to_owned(),
+        ));
+    }
+    if key.trim() != key {
+        return Err(HarvestError::Config(
+            "fairness key must not start or end with whitespace".to_owned(),
+        ));
+    }
+    if key.len() > MAX_FAIRNESS_KEY_LEN {
+        return Err(HarvestError::Config(format!(
+            "fairness key is {} bytes; the limit is {MAX_FAIRNESS_KEY_LEN}",
+            key.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Check a weight override.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Config`] when `weight` is not finite or is outside
+/// [`MIN_FAIRNESS_WEIGHT`]`..=`[`MAX_FAIRNESS_WEIGHT`].
+pub fn validate_fairness_weight(weight: f64) -> HarvestResult<f64> {
+    if weight.is_finite() && (MIN_FAIRNESS_WEIGHT..=MAX_FAIRNESS_WEIGHT).contains(&weight) {
+        Ok(weight)
+    } else {
+        Err(HarvestError::Config(format!(
+            "fairness weight must be a finite number from {MIN_FAIRNESS_WEIGHT} to \
+             {MAX_FAIRNESS_WEIGHT}; got {weight}"
+        )))
+    }
+}
+
+/// The stored state of one fairness key in one queue.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FairPass {
+    /// The virtual time at which the key may next start: its last start plus
+    /// `1 / weight`.
+    pub pass: f64,
+    /// The start tag of the last claim of the key.
+    pub last_start: f64,
+}
+
+/// Pure model of the fair claim within one queue (issue #1976).
+///
+/// Each key has a [`FairPass`]. The queue clock `V` is the largest
+/// `last_start` of any key. It never decreases.
+///
+/// - The start tag of a key is `max(pass, V)`. A key with no state starts
+///   at `V`. Idle time thus earns no credit.
+/// - The claim takes the row whose key has the smallest lag
+///   `start - V`. The due time breaks a tie.
+/// - A claim charges the key: `last_start = start` and
+///   `pass = start + 1 / weight`.
+///
+/// The SQL in `queue::splice_fairness` follows the same rules. The DB test
+/// `fair_claim_matches_the_model_sequence` compares the two.
+#[derive(Debug, Clone, Default)]
+pub struct FairClock {
+    keys: BTreeMap<String, FairPass>,
+}
+
+impl FairClock {
+    /// The queue clock `V`: the largest `last_start`, or `0` with no state.
+    #[must_use]
+    pub fn vclock(&self) -> f64 {
+        self.keys.values().map(|p| p.last_start).fold(0.0, f64::max)
+    }
+
+    /// The stored state of `key`, if any.
+    #[must_use]
+    pub fn state(&self, key: &str) -> Option<FairPass> {
+        self.keys.get(key).copied()
+    }
+
+    /// The start tag of `key`: `max(pass, V)`.
+    #[must_use]
+    pub fn start_tag(&self, key: &str) -> f64 {
+        fair_start(self.keys.get(key).map(|p| p.pass), self.vclock())
+    }
+
+    /// The lag of `key`: its start tag minus `V`. The claim sorts on it.
+    #[must_use]
+    pub fn lag(&self, key: &str) -> f64 {
+        fair_lag(self.keys.get(key).map(|p| p.pass), self.vclock())
+    }
+
+    /// Pick the key of the next claim from `(key, due)` rows.
+    ///
+    /// Returns the key with the smallest lag. The smallest due time breaks a
+    /// tie. Returns `None` for no rows.
+    pub fn pick<'k, D: Ord>(
+        &self,
+        rows: impl IntoIterator<Item = (&'k str, D)>,
+    ) -> Option<&'k str> {
+        let v = self.vclock();
+        rows.into_iter()
+            .map(|(k, due)| (fair_lag(self.keys.get(k).map(|p| p.pass), v), due, k))
+            .min_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)))
+            .map(|(_, _, k)| k)
+    }
+
+    /// Pick the index of the next claim from `(key, due)` rows.
+    ///
+    /// Same order as [`FairClock::pick`]. The first row wins a full tie.
+    #[must_use]
+    pub fn pick_row<D: Ord + Copy>(&self, rows: &[(&str, D)]) -> Option<usize> {
+        let v = self.vclock();
+        rows.iter()
+            .enumerate()
+            .min_by(|(ia, a), (ib, b)| {
+                let la = fair_lag(self.keys.get(a.0).map(|p| p.pass), v);
+                let lb = fair_lag(self.keys.get(b.0).map(|p| p.pass), v);
+                la.total_cmp(&lb)
+                    .then_with(|| a.1.cmp(&b.1))
+                    .then_with(|| ia.cmp(ib))
+            })
+            .map(|(i, _)| i)
+    }
+
+    /// Charge one claim to `key` at `weight` and return its new state.
+    ///
+    /// The start tag comes from the current state, as the SQL upsert does
+    /// after it waits for a concurrent charge of the same key.
+    pub fn charge(&mut self, key: &str, weight: f64) -> FairPass {
+        let start = self.start_tag(key);
+        let next = fair_charge(start, weight);
+        self.keys.insert(key.to_owned(), next);
+        next
+    }
+
+    /// Delete the state of idle keys that the claim cannot tell apart from
+    /// no state. Returns the number of keys deleted.
+    ///
+    /// A key goes when `is_active` is false, its `pass` is at most `V` (no
+    /// debt), and its `last_start` is below `V` (it does not set `V`). Such a
+    /// key starts at `V` with or without its row.
+    pub fn prune(&mut self, is_active: impl Fn(&str) -> bool) -> usize {
+        let v = self.vclock();
+        let before = self.keys.len();
+        self.keys
+            .retain(|k, p| is_active(k) || p.pass > v || p.last_start >= v);
+        before - self.keys.len()
+    }
+}
+
+/// The start tag of a key: `max(pass, v)`. A key with no state starts at `v`.
+#[must_use]
+pub fn fair_start(pass: Option<f64>, v: f64) -> f64 {
+    pass.map_or(v, |p| p.max(v))
+}
+
+/// The lag of a key: its start tag minus `v`. Never negative.
+#[must_use]
+pub fn fair_lag(pass: Option<f64>, v: f64) -> f64 {
+    pass.map_or(0.0, |p| (p - v).max(0.0))
+}
+
+/// The state after one claim that starts at `start` with `weight`.
+#[must_use]
+pub fn fair_charge(start: f64, weight: f64) -> FairPass {
+    FairPass {
+        pass: start + 1.0 / weight,
+        last_start: start,
+    }
 }
 
 #[cfg(test)]
