@@ -183,8 +183,26 @@ fn harvest_plugin() -> HarvestPlugin {
     plugin
 }
 
+/// Builds the app on `db`. The URL goes through the app config, not the
+/// process environment, so parallel tests cannot see another test's URL.
 async fn build_app(db: &TestPg) -> TestClient {
+    let config = autumn_web::config::AutumnConfig {
+        profile: Some("test".into()),
+        security: autumn_web::security::SecurityConfig {
+            csrf: autumn_web::security::CsrfConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        database: autumn_web::config::DatabaseConfig {
+            url: Some(db.url.clone()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     TestApp::new()
+        .config(config)
         .plugin(harvest_plugin())
         .with_db(db.pool.clone())
         .mount_mcp("/mcp")
@@ -203,6 +221,7 @@ async fn build_app(db: &TestPg) -> TestClient {
 /// collisions in production.
 struct TestPg {
     _container: ContainerAsync<Postgres>,
+    url: String,
     pool: Pool<AsyncPgConnection>,
 }
 
@@ -219,9 +238,6 @@ async fn setup_db() -> TestPg {
         .await
         .expect("container port");
     let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
-    unsafe {
-        std::env::set_var("AUTUMN_DATABASE__URL", &url);
-    }
     autumn_web::migrate::run_pending(&url, autumn_web::migrate::FRAMEWORK_MIGRATIONS)
         .expect("failed to run framework migrations");
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&url);
@@ -231,6 +247,7 @@ async fn setup_db() -> TestPg {
         .expect("failed to build pool");
     TestPg {
         _container: container,
+        url,
         pool,
     }
 }
