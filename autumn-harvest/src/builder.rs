@@ -3949,14 +3949,20 @@ pub struct WorkerConfig {
     /// A value of `0` is normalized to `None` (no aging). `None` is the
     /// default — existing deployments are unaffected.
     pub priority_aging_secs: Option<u32>,
-    /// Enable cross-region DR write-authority fencing for this worker
-    /// (issue #954).
+    /// How this worker decides whether to fence its writes for cross-region
+    /// DR (issues #954, #1823).
     ///
-    /// **Off by default, and off costs nothing**: with it off the claim query
-    /// is the byte-for-byte pre-#954 statement, the persist path issues no
-    /// extra statement, and no replication sampler is spawned.
+    /// **[`DrFencing::Auto`] by default.** At startup the worker probes each
+    /// shard database for a DR marker: a `harvest_shard_generation` row, a DR
+    /// replication slot or a DR subscription. With a marker it fences. With
+    /// none it runs the byte-for-byte pre-#954 claim and persist paths, and
+    /// spawns no replication sampler. [`DrFencing::Disabled`] on a database
+    /// with a marker refuses to start.
     ///
-    /// When on, at startup the worker provisions and *pins* each assigned
+    /// [`DrFencing::Auto`]: crate::replication::DrFencing::Auto
+    /// [`DrFencing::Disabled`]: crate::replication::DrFencing::Disabled
+    ///
+    /// When fenced, at startup the worker provisions and *pins* each assigned
     /// shard's `harvest_shard_generation` epoch. From then on it can only claim
     /// tasks and append events while the database still reports that epoch. If
     /// an operator bumps it — the failover fence — this worker stops with
@@ -3967,22 +3973,23 @@ pub struct WorkerConfig {
     /// it, never by adopting the new epoch: adopting is precisely the
     /// split-brain the epoch exists to prevent. See
     /// `docs/runbooks/cross-region-failover.md`.
-    pub dr_fencing: bool,
+    pub dr_fencing: crate::replication::DrFencing,
     /// How often the DR sampler writes a replication watermark, reads the
     /// replication views, and re-checks this worker's fence (issue #954).
     ///
     /// Also the **resolution floor of the reported RPO** — a healthy
     /// deployment reports somewhere between zero and one interval — and the
     /// bound on how long a fenced worker keeps running before it notices. Only
-    /// used when [`Self::dr_fencing`] is set. Default: 15 seconds.
+    /// used when the worker is fenced; see [`Self::dr_fencing`]. Default: 15
+    /// seconds.
     pub replication_sample_interval: Duration,
     /// How much trailing watermark history the DR sampler keeps
     /// (issue #954).
     ///
     /// The ceiling on the lag that can be *measured*: a standby further behind
     /// than the oldest retained watermark reports an unknown RPO rather than a
-    /// floor value that would understate the loss. Only used when
-    /// [`Self::dr_fencing`] is set. Default: 1 hour.
+    /// floor value that would understate the loss. Only used when the worker is
+    /// fenced; see [`Self::dr_fencing`]. Default: 1 hour.
     pub replication_watermark_retain: Duration,
     /// Slot-name prefix identifying this shard's DR replication (issue #954).
     ///
@@ -3991,7 +3998,7 @@ pub struct WorkerConfig {
     /// the shard's database counts as a DR standby — including an unrelated
     /// logical-decoding consumer such as a CDC pipeline — and a shard whose
     /// real cross-region subscriber had disconnected would report itself
-    /// protected. Only used when [`Self::dr_fencing`] is set.
+    /// protected. The startup DR-marker probe uses it too (issue #1823).
     pub replication_slot_prefix: String,
     /// Maximum allowed start delay for a workflow (issue #322).
     /// Default: 365 days.
@@ -4388,7 +4395,7 @@ impl Default for WorkerConfig {
             deployment_name: None,
             query_timeout: Duration::from_secs(5),
             priority_aging_secs: None,
-            dr_fencing: false,
+            dr_fencing: crate::replication::DrFencing::Auto,
             replication_sample_interval: Duration::from_secs(15),
             replication_watermark_retain: Duration::from_secs(3600),
             replication_slot_prefix: crate::replication::DEFAULT_DR_SLOT_PREFIX.to_string(),
@@ -4555,23 +4562,53 @@ impl WorkerConfig {
         self.query_timeout = timeout;
         self
     }
-    /// Enable cross-region DR write-authority fencing (issue #954).
+    /// Force cross-region DR write-authority fencing on or off (issue #954).
     ///
-    /// See [`WorkerConfig::dr_fencing`]. Turning this on is what makes a
-    /// failover fence bite; leaving it off is byte-for-byte the pre-#954
-    /// runtime.
+    /// `true` sets [`DrFencing::Enabled`]. `false` sets [`DrFencing::Disabled`],
+    /// which refuses to start on a database that carries a DR marker. Leave
+    /// the default [`DrFencing::Auto`] unless you need one of those. See
+    /// [`WorkerConfig::dr_fencing`].
+    ///
+    /// [`DrFencing::Enabled`]: crate::replication::DrFencing::Enabled
+    /// [`DrFencing::Disabled`]: crate::replication::DrFencing::Disabled
+    /// [`DrFencing::Auto`]: crate::replication::DrFencing::Auto
     ///
     /// ## Examples
     ///
     /// ```rust
     /// use autumn_harvest::builder::WorkerConfig;
+    /// use autumn_harvest::replication::DrFencing;
     ///
     /// let config = WorkerConfig::default().with_dr_fencing(true);
-    /// assert!(config.dr_fencing);
+    /// assert_eq!(config.dr_fencing, DrFencing::Enabled);
     /// ```
     #[must_use]
     pub const fn with_dr_fencing(mut self, enabled: bool) -> Self {
-        self.dr_fencing = enabled;
+        self.dr_fencing = if enabled {
+            crate::replication::DrFencing::Enabled
+        } else {
+            crate::replication::DrFencing::Disabled
+        };
+        self
+    }
+
+    /// Set the cross-region DR fencing mode (issue #1823).
+    ///
+    /// See [`WorkerConfig::dr_fencing`].
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::builder::WorkerConfig;
+    /// use autumn_harvest::replication::DrFencing;
+    ///
+    /// assert_eq!(WorkerConfig::default().dr_fencing, DrFencing::Auto);
+    /// let config = WorkerConfig::default().with_dr_fencing_mode(DrFencing::Disabled);
+    /// assert_eq!(config.dr_fencing, DrFencing::Disabled);
+    /// ```
+    #[must_use]
+    pub const fn with_dr_fencing_mode(mut self, mode: crate::replication::DrFencing) -> Self {
+        self.dr_fencing = mode;
         self
     }
 

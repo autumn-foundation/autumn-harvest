@@ -1131,18 +1131,66 @@ impl HarvestRunner {
             );
         }
 
+        // Issue #1823: pin the DR fence before this process writes anything.
+        // An API-only node owns no worker, so it must pin here. The management
+        // API checks these pins before every admin write. An in-process worker
+        // pins the same generations again, which is idempotent.
+        autumn_harvest::replication::pin_process_fence(
+            prepared.worker_runtime_config.dr.fencing,
+            &prepared.worker_runtime_config.dr.slot_prefix,
+            autumn_harvest::worker::dr_fence_targets(
+                &prepared.worker_runtime_config,
+                &harvest_pool,
+            ),
+            &harvest_pool,
+        )
+        .await
+        .map_err(|error| {
+            AutumnError::service_unavailable_msg(format!(
+                "refusing to start: cross-region DR fencing could not be resolved: {error}"
+            ))
+        })?;
+
         // Sync static triggers before starting workers (issue #517)
+        let single_pool = prepared.storage_pool.sharded_pool().len() == 1;
         for (shard_id, shard_pool) in prepared.storage_pool.iter_shards() {
+            // Issue #1823: a bump cannot commit while the sync writes. A single
+            // pool names its shard through the default pin.
+            let fence_key = if single_pool {
+                autumn_harvest::types::ShardId::UNENCODED
+            } else {
+                shard_id
+            };
+            // The connection comes first, so a sync that waits for one holds
+            // no fence barrier and cannot block a bump.
             let mut conn = shard_pool.get().await.map_err(|e| {
                 AutumnError::service_unavailable_msg(format!(
                     "Failed to get DB connection to sync completion triggers for shard {shard_id}: {e}"
                 ))
             })?;
-            autumn_harvest::completion_trigger::sync_completion_triggers(
-                &mut conn,
-                &completion_triggers,
-            )
+            // The sync rewrites a database-wide table, so it guards every
+            // pinned shard colocated on this database too.
+            let fence = autumn_harvest::replication::begin_fenced_group(shard_pool, fence_key)
+                .await
+                .map_err(|error| {
+                    AutumnError::service_unavailable_msg(format!(
+                        "refusing to start: shard {shard_id} is fenced: {error}"
+                    ))
+                })?;
+            // A lost fence session stops the sync. See `run_fenced_pass`.
+            autumn_harvest::replication::run_fenced_pass(&fence, async {
+                // The older connection joins the pass. A lost guard then
+                // ends its backend.
+                let _member =
+                    autumn_harvest::replication::join_fenced_pass(shard_pool, &mut conn).await;
+                autumn_harvest::completion_trigger::sync_completion_triggers(
+                    &mut conn,
+                    &completion_triggers,
+                )
+                .await
+            })
             .await
+            .and_then(|done| done)
             .map_err(|e| {
                 AutumnError::service_unavailable_msg(format!(
                     "Failed to sync completion triggers on startup for shard {shard_id}: {e:?}"

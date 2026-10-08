@@ -4658,7 +4658,7 @@ mod db {
     pub async fn conn_for_shard(
         pool: &ShardedDbPool,
         shard: ShardId,
-    ) -> HarvestResult<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>> {
+    ) -> HarvestResult<crate::replication::FencedConn> {
         checkout(pool, shard).await
     }
 
@@ -4676,7 +4676,7 @@ mod db {
     /// that the two can differ.
     pub enum ResidentConn<'a> {
         Held(&'a mut AsyncPgConnection),
-        Fresh(Box<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>>),
+        Fresh(Box<crate::replication::FencedConn>),
     }
 
     impl AsMut<AsyncPgConnection> for ResidentConn<'_> {
@@ -4740,7 +4740,7 @@ mod db {
     pub async fn conn_for_live_shard(
         pool: &ShardedDbPool,
         shard: ShardId,
-    ) -> HarvestResult<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>> {
+    ) -> HarvestResult<crate::replication::FencedConn> {
         checkout_entry(pool, shard).await
     }
 
@@ -4791,7 +4791,7 @@ mod db {
     pub async fn conn_for_execution_forwarded(
         pool: &ShardedDbPool,
         exec_id: ExecutionId,
-    ) -> HarvestResult<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>> {
+    ) -> HarvestResult<crate::replication::FencedConn> {
         conn_for_execution_forwarded_with_shard(pool, exec_id)
             .await
             .map(|(conn, _)| conn)
@@ -4814,10 +4814,7 @@ mod db {
     pub async fn conn_for_execution_forwarded_with_shard(
         pool: &ShardedDbPool,
         exec_id: ExecutionId,
-    ) -> HarvestResult<(
-        diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>,
-        ShardId,
-    )> {
+    ) -> HarvestResult<(crate::replication::FencedConn, ShardId)> {
         // The first hop keeps `pool_for_execution`'s default-shard fallback, so
         // every pre-#964 routing behaviour (including the mid-rollout cases
         // where the pool map and the router legitimately disagree) is
@@ -4838,12 +4835,12 @@ mod db {
         // fence itself (issue #1803). The fence names `origin`, the shard
         // the authorizer hook showed the policy, as `checkout_entry` does.
         crate::shard_fence::check(origin)?;
-        let mut conn = pool.pool_for_execution(exec_id).get().await.map_err(|e| {
-            HarvestError::ShardUnavailable {
+        let mut conn = crate::replication::fenced_checkout(pool.pool_for_execution(exec_id))
+            .await
+            .map_err(|e| HarvestError::ShardUnavailable {
                 shard_id: origin.as_i32(),
                 reason: format!("pool checkout failed: {e}"),
-            }
-        })?;
+            })?;
 
         if pool.len() <= 1 {
             return Ok((conn, checkout_shard));
@@ -5152,10 +5149,9 @@ mod db {
     async fn checkout_entry(
         pool: &ShardedDbPool,
         shard: ShardId,
-    ) -> HarvestResult<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>> {
+    ) -> HarvestResult<crate::replication::FencedConn> {
         crate::shard_fence::check(shard)?;
-        pool.pool_for(shard)
-            .get()
+        crate::replication::fenced_checkout(pool.pool_for(shard))
             .await
             .map_err(|e| HarvestError::ShardUnavailable {
                 shard_id: shard.as_i32(),
@@ -5170,7 +5166,7 @@ mod db {
     async fn checkout(
         pool: &ShardedDbPool,
         shard: ShardId,
-    ) -> HarvestResult<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>> {
+    ) -> HarvestResult<crate::replication::FencedConn> {
         crate::shard_fence::check(shard)?;
         let shard_pool =
             pool.exact_pool_for(shard)
@@ -5179,8 +5175,7 @@ mod db {
                     reason: "no database pool is configured for this shard on this node"
                         .to_string(),
                 })?;
-        shard_pool
-            .get()
+        crate::replication::fenced_checkout(shard_pool)
             .await
             .map_err(|e| HarvestError::ShardUnavailable {
                 shard_id: shard.as_i32(),

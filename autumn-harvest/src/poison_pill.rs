@@ -1451,6 +1451,13 @@ mod scanner {
                     () = cancel.cancelled() => break,
                     () = tokio::time::sleep(interval) => {}
                 }
+                // Issue #1823: a held shard skips the tick before it takes a connection.
+                // It can be an unreachable standby, so a checkout could wait on it.
+                if crate::replication::shard_writes_held(shard) {
+                    // The loop is still alive, so a skipped tick still counts.
+                    crate::scanner_health::record_scanner_tick(&*telemetry.metrics, owner);
+                    continue;
+                }
                 // Selected against `cancel` (issue #1426). A pool may have no
                 // deadpool `Timeouts`, so `pool.get()` alone can park this task
                 // indefinitely on an exhausted shard pool. The top-of-loop select
@@ -1462,19 +1469,40 @@ mod scanner {
                     () = cancel.cancelled() => break,
                     result = pool.get() => result,
                 };
+                // The fence opens only after the checkout. A tick that waits for a
+                // connection holds no barrier, so pool pressure cannot block a bump. The
+                // tick runs under the barrier of this shard and each pinned shard
+                // colocated with it. A fenced shard skips the tick, and a lost barrier
+                // stops it.
+                let Some(fence) = crate::replication::begin_shard_tick(&pool, shard).await else {
+                    // The loop is still alive, so a skipped tick still counts.
+                    crate::scanner_health::record_scanner_tick(&*telemetry.metrics, owner);
+                    continue;
+                };
                 match get_result {
                     Ok(mut conn) => {
-                        match reclaim_orphaned_tasks_witnessed(
-                            &mut conn,
-                            threshold,
-                            worker_stale_secs,
-                            stuck_running_secs,
-                            &*telemetry.metrics,
-                            &payload_codecs,
-                            &mut witness,
-                            &std::time::Instant::now,
+                        match crate::replication::run_fenced_pass(
+                            &fence,
+                            Box::pin(async {
+                                // Issue #1823: the older connection joins the pass.
+                                // A lost guard then ends its backend.
+                                let _member =
+                                    crate::replication::join_fenced_pass(&pool, &mut conn).await;
+                                reclaim_orphaned_tasks_witnessed(
+                                    &mut conn,
+                                    threshold,
+                                    worker_stale_secs,
+                                    stuck_running_secs,
+                                    &*telemetry.metrics,
+                                    &payload_codecs,
+                                    &mut witness,
+                                    &std::time::Instant::now,
+                                )
+                                .await
+                            }),
                         )
                         .await
+                        .and_then(|done| done)
                         {
                             Ok(summary) => {
                                 if summary.total() > 0 {

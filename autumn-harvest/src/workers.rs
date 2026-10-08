@@ -3236,6 +3236,9 @@ pub fn spawn_worker_heartbeat(
     // task has already started. A heartbeat must advertise the current
     // registry, not the one at spawn time.
     codecs: crate::payload_codec::PayloadCodecs,
+    // The shard this pool serves (issue #1823). While the process holds it,
+    // the tick writes nothing: the database may be an unpromoted standby.
+    held_gate: Option<crate::types::ShardId>,
     // Issue #1815: publishes task stats and sets the outlier gauge each tick.
     outliers: OutlierProbe,
 ) -> JoinHandle<()> {
@@ -3245,6 +3248,16 @@ pub fn spawn_worker_heartbeat(
         let labels_json = serde_json::to_value(&registration.labels).unwrap_or_default();
         let mut schedule = HeartbeatSchedule::new(interval);
         while schedule.wait(&cancel).await {
+            // Issue #1823: a process that lost write authority stops beating.
+            // Another region owns this row, and may reuse this worker id.
+            if crate::replication::FenceRegistry::is_fenced_out() {
+                break;
+            }
+            // Issue #1823: a held shard skips the tick before it takes a connection.
+            // It can be an unreachable standby, so a checkout could wait on it.
+            if crate::replication::shard_writes_held(held_gate) {
+                continue;
+            }
             // Loaded fresh each tick (issue #548 review): a tuned worker's
             // dispatch target can change between heartbeats, so a value
             // captured once at spawn time would drift from reality.
@@ -3269,36 +3282,64 @@ pub fn spawn_worker_heartbeat(
                 () = cancel.cancelled() => break,
                 result = pool.get() => result,
             };
+            // The fence opens only after the checkout. A tick that waits for a
+            // connection holds no barrier, so pool pressure cannot block a bump. The
+            // tick runs under the barrier of this shard and each pinned shard
+            // colocated with it. A fenced shard skips the tick, and a lost barrier
+            // stops it.
+            let Some(fence) = crate::replication::begin_shard_tick(&pool, held_gate).await else {
+                continue;
+            };
             let registered_codec_key_ids = codecs.registered_key_ids();
             match get_result {
                 Ok(mut conn) => {
-                    let () = do_heartbeat_tick(
-                        &mut conn,
-                        &registration,
-                        in_flight,
-                        &labels_json,
-                        &worker_shutdown,
-                        &drain_deadline_max,
-                        &remote_drain_deadline,
-                        in_use_sessions,
-                        &registration_pending,
-                        &registered_codec_key_ids,
+                    // A lost barrier stops the beat. The next tick tries again.
+                    let tick = crate::replication::run_fenced_pass(
+                        &fence,
+                        Box::pin(async {
+                            // Issue #1823: the older connection joins the pass.
+                            // A lost guard then ends its backend.
+                            let _member =
+                                crate::replication::join_fenced_pass(&pool, &mut conn).await;
+                            do_heartbeat_tick(
+                                &mut conn,
+                                &registration,
+                                in_flight,
+                                &labels_json,
+                                &worker_shutdown,
+                                &drain_deadline_max,
+                                &remote_drain_deadline,
+                                in_use_sessions,
+                                &registration_pending,
+                                &registered_codec_key_ids,
+                            )
+                            .await;
+                            // Issue #1823: the task-stats writes run under the
+                            // same barrier, so they cannot commit after a bump.
+                            run_outlier_tick(
+                                &mut conn,
+                                &registration.worker_id,
+                                &outliers,
+                                worker_shutdown.is_cancelled(),
+                            )
+                            .await
+                        }),
                     )
                     .await;
-                    if let Err(error) = run_outlier_tick(
-                        &mut conn,
-                        &registration.worker_id,
-                        &outliers,
-                        worker_shutdown.is_cancelled(),
-                    )
-                    .await
-                    {
-                        tracing::warn!(
-                            worker_id = %registration.worker_id,
-                            error = %error,
-                            "worker task-stats tick failed; outlier gauge cleared"
-                        );
-                        outliers.clear_gauge(&registration.worker_id);
+                    match tick {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(error)) => {
+                            tracing::warn!(
+                                worker_id = %registration.worker_id,
+                                error = %error,
+                                "worker task-stats tick failed; outlier gauge cleared"
+                            );
+                            outliers.clear_gauge(&registration.worker_id);
+                        }
+                        // The guard already logged the lost session. A tick
+                        // with no fresh stats clears its view, as a failed
+                        // tick does.
+                        Err(_lost) => outliers.clear_gauge(&registration.worker_id),
                     }
                 }
                 Err(error) => {

@@ -1770,12 +1770,31 @@ fn index_build_finished(key: &BuildKey, end: BuildEnd) {
 /// The connection is never pooled. It closes when this function returns, or
 /// when the caller drops the future. Postgres then cancels a running build and
 /// leaves an invalid index, which the next attempt drops and rebuilds.
-#[cfg(feature = "db")]
+///
+/// The exporter itself builds under a fence, through
+/// [`build_unexported_index_fenced`]. This unfenced form serves the tests.
+#[cfg(all(feature = "db", test))]
 async fn build_unexported_index_on_dedicated_connection(
     dsn: &str,
     schema: &str,
     connect_timeout: std::time::Duration,
 ) -> crate::error::HarvestResult<UnexportedIndexOutcome> {
+    let mut conn = connect_index_builder(dsn, schema, connect_timeout).await?;
+    let outcome = ensure_unexported_index(&mut conn).await;
+    // On `Err` the session may still hold the advisory lock. Closing the
+    // connection releases it either way.
+    drop(conn);
+    outcome
+}
+
+/// Open the dedicated connection of an index build, with its `search_path`
+/// set. See [`build_unexported_index_on_dedicated_connection`].
+#[cfg(feature = "db")]
+async fn connect_index_builder(
+    dsn: &str,
+    schema: &str,
+    connect_timeout: std::time::Duration,
+) -> crate::error::HarvestResult<diesel_async::AsyncPgConnection> {
     use diesel_async::RunQueryDsl;
 
     // A host can accept the socket and never finish the handshake. Without a
@@ -1797,11 +1816,7 @@ async fn build_unexported_index_on_dedicated_connection(
         .execute(&mut conn)
         .await
         .map_err(crate::error::database_error)?;
-    let outcome = ensure_unexported_index(&mut conn).await;
-    // On `Err` the session may still hold the advisory lock. Closing the
-    // connection releases it either way.
-    drop(conn);
-    outcome
+    Ok(conn)
 }
 
 /// The quoted name of the schema that holds `harvest_audit_log` for the
@@ -1855,6 +1870,40 @@ async fn operator_ddl(conn: &mut diesel_async::AsyncPgConnection) -> (String, St
     )
 }
 
+/// [`build_unexported_index_on_dedicated_connection`] under its own DR fence
+/// (issue #1823).
+///
+/// The build outlives the export tick and its fence. So it takes a fence of
+/// its own, and a bump waits for the DDL. A fenced or held shard, or a lost
+/// guard, returns an error, and the caller then waits to retry.
+#[cfg(feature = "db")]
+async fn build_unexported_index_fenced(
+    pool: &crate::worker::DbPool,
+    fence_key: crate::types::ShardId,
+    dsn: &str,
+    schema: &str,
+) -> crate::error::HarvestResult<UnexportedIndexOutcome> {
+    // The connection opens before the fence. A slow or unreachable build URL
+    // then holds no barrier.
+    let mut conn = connect_index_builder(dsn, schema, INDEX_BUILD_CONNECT_TIMEOUT).await?;
+    let fence = crate::replication::begin_fenced_group(pool, fence_key).await?;
+    let outcome = crate::replication::run_fenced_pass(
+        &fence,
+        Box::pin(async {
+            // The connection predates the pass, so it joins it. A lost guard
+            // then ends its backend.
+            let _member = crate::replication::join_fenced_pass_direct(dsn, &mut conn).await;
+            ensure_unexported_index(&mut conn).await
+        }),
+    )
+    .await
+    .and_then(|built| built);
+    // On `Err` the session may still hold the advisory lock. Closing the
+    // connection releases it either way.
+    drop(conn);
+    outcome
+}
+
 /// Start the index build in a detached task, off the export tick (issue #1667).
 ///
 /// The build can take minutes on a large table. It must not delay a claim,
@@ -1884,10 +1933,12 @@ async fn operator_ddl(conn: &mut diesel_async::AsyncPgConnection) -> (String, St
 async fn spawn_unexported_index_build_if_due(
     conn: &mut diesel_async::AsyncPgConnection,
     shard_id: i32,
-    pool_id: usize,
+    pool: &crate::worker::DbPool,
+    fence_key: crate::types::ShardId,
     build_dsn: Option<&str>,
     cancel: &tokio_util::sync::CancellationToken,
 ) {
+    let pool_id = std::ptr::from_ref(pool.manager()) as usize;
     // One probe per interval. Without it, every tick of a healthy exporter
     // would read the catalogs.
     if !index_probe_due(&(shard_id, build_dsn.map_or(0, dsn_fingerprint), pool_id)) {
@@ -1939,16 +1990,13 @@ async fn spawn_unexported_index_build_if_due(
     }
     let dsn = dsn.to_owned();
     let cancel = cancel.clone();
+    let pool = pool.clone();
     tokio::spawn(async move {
         // The task owns the in-flight mark now. A panic or an abort that drops
         // the task leaves a retry wait too.
         let guard = guard;
         let end = tokio::select! {
-            result = build_unexported_index_on_dedicated_connection(
-                &dsn,
-                &schema,
-                INDEX_BUILD_CONNECT_TIMEOUT,
-            ) => match result {
+            result = build_unexported_index_fenced(&pool, fence_key, &dsn, &schema) => match result {
                 Ok(UnexportedIndexOutcome::Ready) => BuildEnd::Ready,
                 Ok(UnexportedIndexOutcome::LockBusy) => {
                     tracing::debug!(
@@ -3577,7 +3625,7 @@ pub async fn fire_due_audit_exports(
                 };
                 // Bounded, never a bare `pool.get()` — see `SHARD_ACQUIRE_BOUND`.
                 let mut shard_conn =
-                    match tokio::time::timeout(SHARD_ACQUIRE_BOUND, pool.get()).await {
+                    match crate::replication::fenced_get_within(&pool, SHARD_ACQUIRE_BOUND).await {
                         Ok(Ok(c)) => c,
                         Ok(Err(e)) => {
                             tracing::error!(
@@ -3677,15 +3725,12 @@ async fn acquire_shard_conn_for_export(
     shard_u16: u16,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
     bound: std::time::Duration,
-) -> Option<
-    deadpool::managed::Object<
-        diesel_async::pooled_connection::AsyncDieselConnectionManager<
-            diesel_async::AsyncPgConnection,
-        >,
-    >,
-> {
-    // Bounded, never a bare `pool.get()` — see `SHARD_ACQUIRE_BOUND`.
-    match tokio::time::timeout(bound, pool.get()).await {
+) -> Option<crate::replication::FencedConn> {
+    // Bounded, never a bare `pool.get()` — see `SHARD_ACQUIRE_BOUND`. Under
+    // the tick's fence the wait stays below a bump's lock timeout, and a
+    // failed checkout drops the guards (issue #1823).
+    let checkout = crate::replication::fenced_get_within(pool, bound).await;
+    match checkout {
         Ok(Ok(conn)) => Some(conn),
         Ok(Err(error)) => {
             tracing::error!(
@@ -3778,6 +3823,7 @@ async fn acquire_shard_conn_for_export(
 async fn export_once_via_pool(
     pool: &crate::worker::DbPool,
     shard_id: i32,
+    fence_key: crate::types::ShardId,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
     cancel: &tokio_util::sync::CancellationToken,
     config_arc: Option<std::sync::Arc<AuditExportRuntimeConfig>>,
@@ -3804,7 +3850,8 @@ async fn export_once_via_pool(
         spawn_unexported_index_build_if_due(
             &mut conn,
             shard_id,
-            std::ptr::from_ref(pool.manager()) as usize,
+            pool,
+            fence_key,
             index_build_dsn,
             cancel,
         ),
@@ -3839,7 +3886,7 @@ async fn export_once_via_pool(
             // pool instead of recycling it. Dropping the raw connection
             // then closes the socket, and Postgres rolls back whatever
             // that session still had open.
-            drop(deadpool::managed::Object::take(conn));
+            drop(deadpool::managed::Object::take(conn.into_pooled()));
             return Ok(0);
         }
     };
@@ -4055,7 +4102,7 @@ async fn export_once_via_pool(
             // behind a locked row would otherwise be recycled anyway. Every
             // later user of a size-one shard pool would then queue behind
             // that same blocked statement.
-            drop(deadpool::managed::Object::take(conn));
+            drop(deadpool::managed::Object::take(conn.into_pooled()));
             return Ok(0);
         }
     };
@@ -4215,6 +4262,12 @@ pub fn spawn_audit_export_checker_for_shard(
                 () = cancel.cancelled() => break,
                 () = tokio::time::sleep(interval) => {}
             }
+            // A held shard gets no write until the resolver releases it (issue #1823).
+            // The loop is still alive, so it still ticks.
+            if crate::replication::shard_writes_held(shard) {
+                crate::scanner_health::record_scanner_tick(&*telemetry.metrics, owner);
+                continue;
+            }
 
             // Read the config ONCE. Use this same snapshot for both the
             // registration decision below and the tick itself (Codex review
@@ -4244,16 +4297,39 @@ pub fn spawn_audit_export_checker_for_shard(
                 registered_interval = desired_interval;
             }
 
-            if let Err(error) = export_once_via_pool(
-                &pool,
-                shard_id,
-                &*telemetry.metrics,
-                &cancel,
-                config_snapshot,
-                index_build_dsn.as_deref(),
+            // Issue #1823: the tick claims and moves the export cursor, so
+            // it holds a fence barrier on its shard and every pinned shard
+            // colocated there. A fenced process skips the tick. A lost
+            // barrier stops it before its next write.
+            let fence_key = shard.unwrap_or(crate::types::ShardId::UNENCODED);
+            let fence = match crate::replication::begin_fenced_group(&pool, fence_key).await {
+                Ok(guards) => guards,
+                Err(error) => {
+                    tracing::warn!(
+                        shard = shard_id,
+                        error = %error,
+                        "[audit_export] tick skipped: this process is fenced"
+                    );
+                    crate::scanner_health::record_scanner_tick(&*telemetry.metrics, owner);
+                    continue;
+                }
+            };
+            let exported = crate::replication::run_fenced_pass(
+                &fence,
+                Box::pin(export_once_via_pool(
+                    &pool,
+                    shard_id,
+                    fence_key,
+                    &*telemetry.metrics,
+                    &cancel,
+                    config_snapshot,
+                    index_build_dsn.as_deref(),
+                )),
             )
             .await
-            {
+            .and_then(|done| done);
+            drop(fence);
+            if let Err(error) = exported {
                 tracing::error!(
                     shard = shard_id,
                     error = %error,

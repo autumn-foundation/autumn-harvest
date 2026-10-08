@@ -1551,10 +1551,33 @@ impl Default for AuditFilters {
 /// the HTTP client — the audit record must be durable before the response is
 /// sent.
 ///
+/// A read route writes audit rows too, with no fence barrier. So when the
+/// DR fence is on, the insert checks the fence in its own transaction
+/// (issue #1823). See [`crate::replication::assert_database_fence`].
+///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] if the insert fails.
+/// Returns the fence's error when this process lost write authority.
 pub async fn insert_audit(
+    conn: &mut AsyncPgConnection,
+    record: &NewAuditRecord<'_>,
+) -> HarvestResult<Uuid> {
+    use diesel_async::AsyncConnection as _;
+    if !crate::replication::FenceRegistry::is_enabled() {
+        return insert_audit_row(conn, record).await;
+    }
+    Box::pin(
+        conn.transaction::<_, crate::error::HarvestError, _>(async move |conn| {
+            crate::replication::assert_database_fence(conn).await?;
+            insert_audit_row(conn, record).await
+        }),
+    )
+    .await
+}
+
+/// The insert of [`insert_audit`], with no fence check.
+async fn insert_audit_row(
     conn: &mut AsyncPgConnection,
     record: &NewAuditRecord<'_>,
 ) -> HarvestResult<Uuid> {
@@ -1584,7 +1607,8 @@ const MAX_AUDIT_BATCH_ROWS: usize = 4999;
 /// the connection.
 ///
 /// Same durability contract as [`insert_audit`]: the caller must ensure this
-/// returns `Ok` before reporting success for every mutation it covers.
+/// returns `Ok` before reporting success for every mutation it covers. Same
+/// DR fence check too (issue #1823).
 ///
 /// # Errors
 ///
@@ -1593,6 +1617,24 @@ const MAX_AUDIT_BATCH_ROWS: usize = 4999;
 /// chunk is its own statement, matching the per-row loop this replaces,
 /// which offered no cross-row atomicity either.
 pub async fn insert_audit_batch(
+    conn: &mut AsyncPgConnection,
+    records: &[NewAuditRecord<'_>],
+) -> HarvestResult<Vec<Uuid>> {
+    use diesel_async::AsyncConnection as _;
+    if records.is_empty() || !crate::replication::FenceRegistry::is_enabled() {
+        return insert_audit_rows(conn, records).await;
+    }
+    Box::pin(
+        conn.transaction::<_, crate::error::HarvestError, _>(async move |conn| {
+            crate::replication::assert_database_fence(conn).await?;
+            insert_audit_rows(conn, records).await
+        }),
+    )
+    .await
+}
+
+/// The inserts of [`insert_audit_batch`], with no fence check.
+async fn insert_audit_rows(
     conn: &mut AsyncPgConnection,
     records: &[NewAuditRecord<'_>],
 ) -> HarvestResult<Vec<Uuid>> {
