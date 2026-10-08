@@ -128,8 +128,8 @@ backlog. Ties may go either way, as before. `priority`, `scheduled_at`,
 `new_start` and `attempt` are `NOT NULL`, so no comparison is NULL.
 
 The window candidate scan reads the rows that pass the guard by primary key,
-through `id = ANY(ARRAY(...))`. That plan does not depend on the table
-statistics.
+through `id = ANY(ARRAY(...))`. Its row test gives the planner no partial
+index, so the plan does not depend on the table statistics. See §1.8.
 
 ### 1.4 The fallback
 
@@ -148,13 +148,20 @@ Otherwise the scan never runs. `candidate` is the union of the two. The
 ### 1.6 Planner settings
 
 The claim transaction sends `SET LOCAL jit = off; SET LOCAL plan_cache_mode =
-force_generic_plan` as one batch, before the claim.
+force_generic_plan; SET LOCAL enable_bitmapscan = off` as one batch, before
+the claim.
 
 - The plan carries the estimated cost of the full scan, even when the
   one-time filter skips it. That estimate passes `jit_above_cost` at depth.
   JIT then compiled about 330 functions per claim.
 - A custom plan costs about 6 ms to plan. The generic plan has the same
   shape, and Postgres builds it once per connection.
+- A bitmap scan reads every due row of a head, then sorts. The planner picks
+  it when it estimates a head below the window. A generic plan, queue skew
+  and stale statistics all cause that estimate. Found on the issue #1956
+  fixture and in the stale-statistics test under CI.
+- `expired_runs` reads each deadline index in its own `UNION ALL` branch.
+  An `OR` needs a bitmap scan to use both indexes.
 - `SET LOCAL` ends with the transaction, so the session keeps its settings.
 
 ### 1.7 The cached statement
@@ -163,6 +170,24 @@ force_generic_plan` as one batch, before the claim.
 pushes the same SQL and binds and lets diesel cache the statement by its
 text. The claim returns a fixed column list, so a migration that adds a
 column does not change the result type of the cached statement.
+
+### 1.8 Plan robustness on the issue #1956 fixture
+
+The synthetic test fixture hid three plan traps. The generator of PR #2045
+(issue #1956) and the stale-statistics test under CI found them.
+
+| Trap | Cause | Cost | Fix |
+|---|---|---|---|
+| Bitmap head scan | The planner estimated a head below 32 rows: a generic plan, queue skew, stale statistics. | 2,515 buffers at 10K; 11,704 with stale statistics. | `SET LOCAL enable_bitmapscan = off`. `expired_runs` reads each deadline index in its own branch. |
+| Multi-array index scan | A queue test let Postgres 16 use `idx_harvest_tq_coverage_sample` with two arrays, one descent per pair. | 27K buffers at 1K pending rows, 64 queues. | No queue test in the window scan. |
+| Partial index on `id` | A constant state test let stale statistics pick `idx_harvest_tq_live_created`, or a table-outer join. | 17K to 30K buffers. | The state test compares with a scalar subquery, so no partial index matches. |
+
+### 1.9 The concurrency cap
+
+The cap test at depth found a race older than this change. The `claimed`
+CTE counts the key under the snapshot of its statement, which predates the
+advisory lock. A post-claim statement now counts again in a fresh snapshot,
+under the lock, and gives the row back over the cap.
 
 ## 2. Test plan
 
@@ -173,6 +198,8 @@ column does not change the result type of the cached statement.
 | Red | Shape tests for `seek_heads`, the guard and the fallback | Fail: no window. | Pass. |
 | Red, added in green | `a_single_activity_type_backlog_keeps_the_window_bounded` | Fail with plain head gates: 1,393 to 10,916 buffers. | Pass. |
 | Added after review | `stale_statistics_keep_the_window_bounded`, `a_kind_filtered_claim_stays_flat_behind_the_other_kind`, `the_claim_statement_is_prepared_once_per_connection`, `an_added_column_does_not_break_a_cached_claim` | Each covers one review finding (R13 to R16). | Pass. |
+| Added on the #1956 fixture | `stale_statistics_keep_the_window_bounded` under CI, `the_window_scan_matches_no_partial_index` | Fail: 11,704, then 30,278 buffers. | Pass: 479 buffers. |
+| Added on the #1956 fixture | `concurrent_claimers_never_exceed_a_cap_at_depth`, `the_cap_recheck_counts_what_the_claim_counts` | Fail: 4 rows run on a key capped at 3. | Pass. |
 | Both | Order tests and the randomized drain | Pass. | Pass. |
 | Both | Existing claim suites: concurrency, pause, build routing, DR fence, run deadline, continuation priority, batched | Pass. | Pass. |
 
@@ -194,3 +221,12 @@ with ageing off) and the fallback cases.
 5. Size the window per head from the number of polled queues, so a worker
    that polls many queues reads a bounded total.
 6. Cache the by-id claim statement the same way (issue #1312 path).
+7. Count `RUNNING` rows per window key through
+   `harvest_task_queue_concurrency_key_running`. The planner now walks every
+   `RUNNING` row, about 900 buffers with a full fleet.
+8. Switch `claim_seek_tests` to the generator of PR #2045 once it merges.
+9. Gate saturated keys in the head scans. A hashed set of the
+   `(concurrency_key, task_type, concurrency_cap)` triples at their cap is
+   built from the same `RUNNING` walk. The head scans then skip those rows,
+   and a head of hot-key rows no longer falls back. On the #1956 fixture at
+   1M, one claim in 800 fell back this way under `pgbench`.
