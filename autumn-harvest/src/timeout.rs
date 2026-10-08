@@ -6437,23 +6437,30 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
                         // write.
                         let failed = match crate::replication::run_fenced_pass(
                             &fence,
-                            Box::pin(enforce_timeouts_once_on_conn_shard(
-                                &mut conn,
-                                pool_shard,
-                                TaskScan::Batch {
-                                    cursor: &mut cursor,
-                                    limit: task_batch_size,
-                                },
-                                &*telemetry.metrics,
-                                unknown_target_grace_window,
-                                &sharded_pool,
-                                &shard_assignments,
-                                Some(&circuit_breakers),
-                                max_workflow_history_events,
-                                session_worker_stale_secs,
-                                &payload_codecs,
-                                codec_rotation_batch_size,
-                            )),
+                            Box::pin(async {
+                                // Issue #1823: the older connection joins the pass.
+                                // A lost guard then ends its backend.
+                                let _member =
+                                    crate::replication::join_fenced_pass(&pool, &mut conn).await;
+                                enforce_timeouts_once_on_conn_shard(
+                                    &mut conn,
+                                    pool_shard,
+                                    TaskScan::Batch {
+                                        cursor: &mut cursor,
+                                        limit: task_batch_size,
+                                    },
+                                    &*telemetry.metrics,
+                                    unknown_target_grace_window,
+                                    &sharded_pool,
+                                    &shard_assignments,
+                                    Some(&circuit_breakers),
+                                    max_workflow_history_events,
+                                    session_worker_stale_secs,
+                                    &payload_codecs,
+                                    codec_rotation_batch_size,
+                                )
+                                .await
+                            }),
                         )
                         .await
                         .and_then(|done| done)

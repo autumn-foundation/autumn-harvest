@@ -1483,16 +1483,23 @@ mod scanner {
                     Ok(mut conn) => {
                         match crate::replication::run_fenced_pass(
                             &fence,
-                            Box::pin(reclaim_orphaned_tasks_witnessed(
-                                &mut conn,
-                                threshold,
-                                worker_stale_secs,
-                                stuck_running_secs,
-                                &*telemetry.metrics,
-                                &payload_codecs,
-                                &mut witness,
-                                &std::time::Instant::now,
-                            )),
+                            Box::pin(async {
+                                // Issue #1823: the older connection joins the pass.
+                                // A lost guard then ends its backend.
+                                let _member =
+                                    crate::replication::join_fenced_pass(&pool, &mut conn).await;
+                                reclaim_orphaned_tasks_witnessed(
+                                    &mut conn,
+                                    threshold,
+                                    worker_stale_secs,
+                                    stuck_running_secs,
+                                    &*telemetry.metrics,
+                                    &payload_codecs,
+                                    &mut witness,
+                                    &std::time::Instant::now,
+                                )
+                                .await
+                            }),
                         )
                         .await
                         .and_then(|done| done)

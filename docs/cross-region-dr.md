@@ -404,14 +404,18 @@ Three limits, stated plainly:
   warning. Size `max_connections` for that on a process with more than 64
   shard databases. On a DR node
   every admin write, scheduler pass and partition pass pays that cost. The
-  barrier pings that connection each second. If the session ends, the
+  barrier pings that connection each second. If the session ends, or a
+  ping takes more than 3 seconds, the pass counts the barrier as lost. The
+  server ends a barrier session that sends no ping for 10 seconds, so a
+  node cut off from the database frees its lock. If the session ends, the
   server frees the lock. The pass then stops: a scheduler pass before it
   fires, a partition pass or a rebalance at once, with an error. An admin
   write or a webhook answers `503`. Before it stops, the pass ends the
   backend of each pooled connection it holds, so the server rolls back a
-  statement it already runs. That happens inside the bump's 2-second wait.
-  If the process cannot end a backend in time, it logs a warning, and that
-  statement can still commit after a bump. History appends are not
+  statement it already runs. It does so on a connection of its own, outside
+  the pool. That happens inside the bump's 2-second wait. If the process
+  cannot end a backend in time, it logs a warning, and that statement can
+  still commit after a bump. History appends are not
   exposed: each checks the fence in its own transaction.
 - The check reads every shard of the storage pool, and every pinned shard
   colocated with one, on each admin write. If one cannot be read, every

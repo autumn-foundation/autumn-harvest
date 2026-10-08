@@ -30027,11 +30027,18 @@ fn spawn_pause_auto_resumer(
                 Ok(mut conn) => {
                     match crate::replication::run_fenced_pass(
                         &fence,
-                        Box::pin(crate::execution::auto_resume_expired_pauses(
-                            &mut conn,
-                            max_pause_duration,
-                            &*telemetry.metrics,
-                        )),
+                        Box::pin(async {
+                            // Issue #1823: the older connection joins the pass.
+                            // A lost guard then ends its backend.
+                            let _member =
+                                crate::replication::join_fenced_pass(&pool, &mut conn).await;
+                            crate::execution::auto_resume_expired_pauses(
+                                &mut conn,
+                                max_pause_duration,
+                                &*telemetry.metrics,
+                            )
+                            .await
+                        }),
                     )
                     .await
                     .and_then(|done| done)
@@ -36307,7 +36314,7 @@ impl Worker {
                                 continue;
                             };
                             let touched = tokio::time::timeout(bound, crate::replication::run_fenced_pass(&fence, Box::pin(async {
-                                let mut conn = crate::pool::acquire(&pool, bound).await?;
+                                let mut conn = crate::replication::fenced_acquire(&pool, bound).await?;
                                 let touched =
                                     crate::workers::touch_worker_liveness(&mut conn, &worker_id)
                                         .await?;
@@ -36454,7 +36461,7 @@ async fn final_abandoned_claim_sweep(
                 crate::replication::run_fenced_pass(
                     fence,
                     Box::pin(async {
-                        let mut conn = crate::pool::acquire(pool, bound).await?;
+                        let mut conn = crate::replication::fenced_acquire(pool, bound).await?;
                         release_abandoned_claims(&mut conn, worker_id, claims).await
                     }),
                 ),

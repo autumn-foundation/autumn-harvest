@@ -614,9 +614,13 @@ pub fn spawn_quota_key_reconciler_for_shard(
                 Ok(mut conn) => {
                     match crate::replication::run_fenced_pass(
                         &fence,
-                        Box::pin(reconcile_quota_keys_from(
-                            &mut conn, batch_size, cursor, shard,
-                        )),
+                        Box::pin(async {
+                            // Issue #1823: the older connection joins the pass.
+                            // A lost guard then ends its backend.
+                            let _member =
+                                crate::replication::join_fenced_pass(&pool, &mut conn).await;
+                            reconcile_quota_keys_from(&mut conn, batch_size, cursor, shard).await
+                        }),
                     )
                     .await
                     .and_then(|done| done)

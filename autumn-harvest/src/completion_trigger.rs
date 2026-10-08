@@ -1243,7 +1243,7 @@ impl DeferredTriggerStart {
             return;
         };
         tokio::spawn(async move {
-            let conn_res = pool.get().await;
+            let conn_res = crate::replication::fenced_checkout(&pool).await;
             let mut target_conn = match conn_res {
                 Ok(c) => c,
                 Err(e) => {
@@ -1285,7 +1285,7 @@ impl DeferredTriggerStart {
                 );
                 return;
             };
-            let mut source_conn = match source_pool.get().await {
+            let mut source_conn = match crate::replication::fenced_checkout(&source_pool).await {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::error!(
@@ -1351,18 +1351,25 @@ impl DeferredTriggerStart {
                     return;
                 }
             };
+            // Both connections predate the pass. They join it, so a lost
+            // guard ends their backends too.
             let relayed = crate::replication::run_fenced_pass(
                 &fence,
-                Box::pin(relay_gate_checked_start(
-                    &mut target_conn,
-                    &mut source_conn,
-                    params,
-                    self.outbox_id,
-                    self.source_exec_id,
-                    self.trigger_id,
-                    metrics_ref,
-                    &self.codecs,
-                )),
+                Box::pin(async {
+                    target_conn.join_pass().await?;
+                    source_conn.join_pass().await?;
+                    relay_gate_checked_start(
+                        &mut target_conn,
+                        &mut source_conn,
+                        params,
+                        self.outbox_id,
+                        self.source_exec_id,
+                        self.trigger_id,
+                        metrics_ref,
+                        &self.codecs,
+                    )
+                    .await
+                }),
             )
             .await
             .and_then(|relayed| relayed);

@@ -1898,18 +1898,25 @@ pub fn spawn_worker_heartbeat(
                     // A lost barrier stops the beat. The next tick tries again.
                     let _beat = crate::replication::run_fenced_pass(
                         &fence,
-                        Box::pin(do_heartbeat_tick(
-                            &mut conn,
-                            &registration,
-                            in_flight,
-                            &labels_json,
-                            &worker_shutdown,
-                            &drain_deadline_max,
-                            &remote_drain_deadline,
-                            in_use_sessions,
-                            &registration_pending,
-                            &registered_codec_key_ids,
-                        )),
+                        Box::pin(async {
+                            // Issue #1823: the older connection joins the pass.
+                            // A lost guard then ends its backend.
+                            let _member =
+                                crate::replication::join_fenced_pass(&pool, &mut conn).await;
+                            do_heartbeat_tick(
+                                &mut conn,
+                                &registration,
+                                in_flight,
+                                &labels_json,
+                                &worker_shutdown,
+                                &drain_deadline_max,
+                                &remote_drain_deadline,
+                                in_use_sessions,
+                                &registration_pending,
+                                &registered_codec_key_ids,
+                            )
+                            .await;
+                        }),
                     )
                     .await;
                 }

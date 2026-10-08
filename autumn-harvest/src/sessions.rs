@@ -410,7 +410,12 @@ pub fn spawn_session_slot_reconciler(
             match get_result {
                 Ok(mut conn) => match crate::replication::run_fenced_pass(
                     &fence,
-                    Box::pin(reconcile_local_sessions(&mut conn, &registry)),
+                    Box::pin(async {
+                        // Issue #1823: the older connection joins the pass.
+                        // A lost guard then ends its backend.
+                        let _member = crate::replication::join_fenced_pass(&pool, &mut conn).await;
+                        reconcile_local_sessions(&mut conn, &registry).await
+                    }),
                 )
                 .await
                 .and_then(|done| done)

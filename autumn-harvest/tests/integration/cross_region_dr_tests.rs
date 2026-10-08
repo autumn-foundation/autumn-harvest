@@ -4012,6 +4012,187 @@ async fn a_lost_pass_ends_a_write_that_waits_on_a_row_lock() {
     );
 }
 
+/// A lost pass ends its backends when it holds the whole pool (issue
+/// #1823). The terminator must not wait for a pooled connection that the
+/// stopped pass itself holds.
+#[tokio::test]
+async fn a_lost_pass_ends_a_write_that_holds_the_whole_pool() {
+    use diesel_async::SimpleAsyncConnection as _;
+
+    let (url, db) = require_db!("passfullpool");
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    conn.batch_execute(
+        "CREATE TABLE dr_full_pool (id int PRIMARY KEY); INSERT INTO dr_full_pool VALUES (1)",
+    )
+    .await
+    .expect("seed the probe row");
+    let mut blocker = connect(&url).await;
+    blocker
+        .batch_execute("BEGIN; SELECT id FROM dr_full_pool WHERE id = 1 FOR UPDATE")
+        .await
+        .expect("lock the probe row");
+    let manager =
+        diesel_async::pooled_connection::AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            url.as_str(),
+        );
+    let pool: autumn_harvest::worker::DbPool = deadpool::managed::Pool::builder(manager)
+        .max_size(1)
+        .build()
+        .expect("pool build");
+    let guard = autumn_harvest::replication::begin_fenced_pass_at(&pool, ShardId::new(0), pinned)
+        .await
+        .expect("open the pass");
+    let pass = autumn_harvest::replication::run_fenced_pass(Some(&guard), async {
+        let mut writer = autumn_harvest::replication::fenced_checkout(&pool)
+            .await
+            .expect("check out");
+        diesel::sql_query("DELETE FROM dr_full_pool WHERE id = 1")
+            .execute(&mut *writer)
+            .await
+    });
+    let terminate = async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        diesel::sql_query(format!(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname = '{db}' AND application_name = 'harvest_dr_fence_pass'"
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("terminate the guard backend");
+    };
+    let (stopped, ()) = tokio::join!(
+        tokio::time::timeout(std::time::Duration::from_secs(10), pass),
+        terminate
+    );
+    assert!(
+        stopped.is_ok_and(|outcome| outcome.is_err()),
+        "the pass must stop when its guard is lost"
+    );
+
+    bump_generation(&mut conn, ShardId::new(0), "failover", "test")
+        .await
+        .expect("bump");
+    blocker.batch_execute("COMMIT").await.expect("free the row");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let rows = count_rows(&mut conn, "dr_full_pool").await;
+    drop(guard);
+
+    assert_eq!(
+        rows, 1,
+        "a write the lost pass sent must not commit after the bump"
+    );
+}
+
+/// A guard notices a network path that goes silent (issue #1823). A path
+/// that drops packets gives no socket error. A late ping must count as a
+/// lost session. The server must also end the silent session, so that a
+/// bump can commit.
+#[tokio::test]
+async fn a_guard_behind_a_silent_network_reports_its_loss() {
+    let (url, _db) = require_db!("guardsilent");
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    let (proxied, frozen) = silent_proxy(&url).await;
+    let pool = dr_pool(&proxied);
+    let guard = autumn_harvest::replication::begin_fenced_pass_at(&pool, ShardId::new(0), pinned)
+        .await
+        .expect("open the pass through the proxy");
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    assert!(!guard.is_lost(), "a guard on a live path keeps its session");
+
+    frozen.store(true, std::sync::atomic::Ordering::SeqCst);
+    eventually(
+        "the guard to report a silent path",
+        std::time::Duration::from_secs(10),
+        || async { guard.is_lost() },
+    )
+    .await;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match bump_generation(&mut conn, ShardId::new(0), "failover", "test").await {
+            Ok(_) => break,
+            Err(error) => assert!(
+                std::time::Instant::now() < deadline,
+                "the server must end the silent guard session: {error}"
+            ),
+        }
+    }
+    drop(guard);
+}
+
+/// A connection checked out before its pass starts can join the pass
+/// (issue #1823). A lost guard then ends its backend too.
+#[tokio::test]
+async fn a_connection_that_joins_a_lost_pass_has_its_write_ended() {
+    use diesel_async::SimpleAsyncConnection as _;
+
+    let (url, db) = require_db!("passjoined");
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    conn.batch_execute(
+        "CREATE TABLE dr_joined (id int PRIMARY KEY); INSERT INTO dr_joined VALUES (1)",
+    )
+    .await
+    .expect("seed the probe row");
+    let mut blocker = connect(&url).await;
+    blocker
+        .batch_execute("BEGIN; SELECT id FROM dr_joined WHERE id = 1 FOR UPDATE")
+        .await
+        .expect("lock the probe row");
+    let pool = dr_pool(&url);
+    let mut writer = autumn_harvest::replication::fenced_checkout(&pool)
+        .await
+        .expect("check out before the pass");
+    let guard = autumn_harvest::replication::begin_fenced_pass_at(&pool, ShardId::new(0), pinned)
+        .await
+        .expect("open the pass");
+    let pass = autumn_harvest::replication::run_fenced_pass(Some(&guard), async {
+        writer.join_pass().await.expect("join the pass");
+        diesel::sql_query("DELETE FROM dr_joined WHERE id = 1")
+            .execute(&mut *writer)
+            .await
+    });
+    let terminate = async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        diesel::sql_query(format!(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname = '{db}' AND application_name = 'harvest_dr_fence_pass'"
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("terminate the guard backend");
+    };
+    let (stopped, ()) = tokio::join!(
+        tokio::time::timeout(std::time::Duration::from_secs(10), pass),
+        terminate
+    );
+    assert!(
+        stopped.is_ok_and(|outcome| outcome.is_err()),
+        "the pass must stop when its guard is lost"
+    );
+
+    bump_generation(&mut conn, ShardId::new(0), "failover", "test")
+        .await
+        .expect("bump");
+    blocker.batch_execute("COMMIT").await.expect("free the row");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let rows = count_rows(&mut conn, "dr_joined").await;
+    drop(guard);
+
+    assert_eq!(
+        rows, 1,
+        "a write on a joined connection must not commit after the bump"
+    );
+}
+
 /// A fence stops an activity heartbeat flusher (issue #1823). The flusher
 /// outlives a drain, so the worker token does not reach it. Without this,
 /// it keeps writing `last_heartbeat_at` after another region owns the row.
@@ -5835,4 +6016,78 @@ async fn promotion_body(regions: &Regions) -> Result<(), String> {
         return Err(format!("history forked: {forks} duplicated event ids"));
     }
     Ok(())
+}
+
+/// The number of rows in `table`.
+async fn count_rows(conn: &mut AsyncPgConnection, table: &str) -> i64 {
+    #[derive(diesel::QueryableByName)]
+    struct Rows {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let rows: Vec<Rows> = diesel::sql_query(format!("SELECT count(*) AS n FROM {table}"))
+        .load(conn)
+        .await
+        .expect("count the rows");
+    <[Rows]>::first(&rows).map_or(0, |row| row.n)
+}
+
+/// A TCP proxy in front of the database of `url`, and its switch. When the
+/// switch is on, the proxy stops forwarding bytes but keeps every socket
+/// open, as a path that drops packets does. Returns `url` through the proxy.
+async fn silent_proxy(url: &str) -> (String, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    async fn pipe(
+        mut from: tokio::net::tcp::OwnedReadHalf,
+        mut to: tokio::net::tcp::OwnedWriteHalf,
+        frozen: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let mut buf = vec![0_u8; 8192];
+        loop {
+            let Ok(n) = from.read(&mut buf).await else {
+                return;
+            };
+            if n == 0 {
+                return;
+            }
+            if std::sync::atomic::AtomicBool::load(&frozen, std::sync::atomic::Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            if to.write_all(&buf[..n]).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    let at = url.find('@').expect("the url names a user") + 1;
+    let end = at + url[at..].find('/').expect("the url names a database");
+    let upstream = url[at..end].replace("localhost", "127.0.0.1");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the proxy");
+    let port = listener.local_addr().expect("proxy address").port();
+    let frozen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let switch = std::sync::Arc::clone(&frozen);
+    tokio::spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            let Ok(server) = tokio::net::TcpStream::connect(&upstream).await else {
+                continue;
+            };
+            let (client_read, client_write) = client.into_split();
+            let (server_read, server_write) = server.into_split();
+            tokio::spawn(pipe(
+                client_read,
+                server_write,
+                std::sync::Arc::clone(&switch),
+            ));
+            tokio::spawn(pipe(
+                server_read,
+                client_write,
+                std::sync::Arc::clone(&switch),
+            ));
+        }
+    });
+    let proxied = format!("{}127.0.0.1:{port}{}", &url[..at], &url[end..]);
+    (proxied, frozen)
 }

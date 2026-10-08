@@ -1178,13 +1178,17 @@ impl HarvestRunner {
                     ))
                 })?;
             // A lost fence session stops the sync. See `run_fenced_pass`.
-            autumn_harvest::replication::run_fenced_pass(
-                &fence,
+            autumn_harvest::replication::run_fenced_pass(&fence, async {
+                // The older connection joins the pass. A lost guard then
+                // ends its backend.
+                let _member =
+                    autumn_harvest::replication::join_fenced_pass(shard_pool, &mut conn).await;
                 autumn_harvest::completion_trigger::sync_completion_triggers(
                     &mut conn,
                     &completion_triggers,
-                ),
-            )
+                )
+                .await
+            })
             .await
             .and_then(|done| done)
             .map_err(|e| {
