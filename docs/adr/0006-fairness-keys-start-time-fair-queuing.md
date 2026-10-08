@@ -68,7 +68,9 @@ survives.
 - Each fair claim writes one state row. Concurrent claims of one key wait
   for that row. The claim benchmark measures the cost.
 - State rows grow with keys. The retention janitor prunes idle rows that
-  the claim cannot tell from no row.
+  the claim cannot tell from no row. It also resets an idle queue, as the
+  SFQ idle rule does. Keys that claim once never move `V`, so only the
+  reset bounds them.
 - Fairness is shard-local. A key bounds load, not access.
 - `claim_task_batched` ignores keys. A successor default (#1971) must carry
   the lag sort key.

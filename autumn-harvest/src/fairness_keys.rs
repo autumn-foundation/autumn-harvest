@@ -250,18 +250,23 @@ pub async fn list_fairness_state(
 /// bounded.
 pub const MAX_PRUNE_BATCHES: usize = 10;
 
-/// Delete the state of idle keys that the claim cannot tell from no state.
+/// Delete fairness state that no claim needs.
 ///
-/// A row goes when all of these hold:
+/// A row goes when no claim wrote it since `cutoff` and one of two cases
+/// holds:
 ///
-/// - No `PENDING` task of its queue has its key.
-/// - Its `pass` is at most the queue clock `V`, so it holds no debt.
-/// - Its `last_start` is below `V`, so it does not set `V`.
-/// - No claim wrote it since `cutoff`.
+/// - **An idle key.** No `PENDING` task of its queue has its key. Its `pass`
+///   is at most the queue clock `V`, so it holds no debt. Its `last_start` is
+///   below `V`, so it does not set `V`. Such a key starts at `V` with or
+///   without its row, so prune changes no claim. The property test
+///   `prune_is_invisible_to_the_claim` proves that on the model.
+/// - **An idle queue.** The queue has no `PENDING` task, and no claim charged
+///   any of its keys since `cutoff`. Every row of the queue goes, lowest
+///   `last_start` first, so `V` holds until the last row. This is the idle
+///   rule of start-time fair queuing: with no backlog, every debt is
+///   forgiven. See [`crate::queue_fairness::FairClock::reset_if_idle`].
 ///
-/// Such a key starts at `V` with or without its row, so prune changes no
-/// claim. The property test `prune_is_invisible_to_the_claim` proves that on
-/// the model. Rows are locked `SKIP LOCKED`, so prune never waits for a claim.
+/// Rows are locked `SKIP LOCKED`, so prune never waits for a claim.
 ///
 /// Prune deletes in batches of `batch_size`, up to [`MAX_PRUNE_BATCHES`]
 /// batches, and stops at the first short batch. With `preview`, nothing is
@@ -322,12 +327,24 @@ pub async fn prune_fairness_state(
 /// The rows that [`prune_fairness_state`] may delete. Binds `$1` cutoff,
 /// `$2` row limit and `$3` queue (`NULL` for every queue).
 ///
+/// A row goes in one of two cases:
+///
+/// - The claim cannot tell it from no row. Its key has no pending task and
+///   no debt, and it does not set `V`.
+/// - Its queue is idle: no pending task and no charge since the cutoff. This
+///   is the idle rule of start-time fair queuing. With no backlog, no key is
+///   behind another, so every debt is forgiven. Keys that claim once never
+///   move `V`, so without this rule their rows would never go.
+///
+/// Rows go in `last_start` order. A partial reset thus keeps `V` until the
+/// last row of the queue goes.
+///
 /// `active` reads the pending keys of the pruned queues once. The planner
 /// can then hash it for the anti-join. A probe per state row would scan the
 /// pending backlog once per row.
 const PRUNE_VICTIMS_SQL: &str = "\
     clock AS ( \
-        SELECT queue_name, MAX(last_start) AS v \
+        SELECT queue_name, MAX(last_start) AS v, MAX(updated_at) AS last_charge \
         FROM harvest_fairness_state \
         WHERE $3::TEXT IS NULL OR queue_name = $3 \
         GROUP BY queue_name \
@@ -342,15 +359,25 @@ const PRUNE_VICTIMS_SQL: &str = "\
         SELECT s.queue_name, s.fairness_key \
         FROM harvest_fairness_state s \
         JOIN clock c ON c.queue_name = s.queue_name \
-        WHERE s.pass <= c.v \
-          AND s.last_start < c.v \
-          AND s.updated_at < $1 \
-          AND NOT EXISTS ( \
-              SELECT 1 FROM active a \
-              WHERE a.queue_name = s.queue_name \
-                AND a.fairness_key = s.fairness_key \
+        WHERE s.updated_at < $1 \
+          AND ( \
+              ( \
+                  s.pass <= c.v \
+                  AND s.last_start < c.v \
+                  AND NOT EXISTS ( \
+                      SELECT 1 FROM active a \
+                      WHERE a.queue_name = s.queue_name \
+                        AND a.fairness_key = s.fairness_key \
+                  ) \
+              ) \
+              OR ( \
+                  c.last_charge < $1 \
+                  AND NOT EXISTS ( \
+                      SELECT 1 FROM active a WHERE a.queue_name = s.queue_name \
+                  ) \
+              ) \
           ) \
-        ORDER BY s.updated_at \
+        ORDER BY s.last_start, s.updated_at \
         LIMIT $2 \
         FOR UPDATE OF s SKIP LOCKED \
     )";
@@ -373,5 +400,14 @@ mod tests {
         assert!(PRUNE_VICTIMS_SQL.contains("SKIP LOCKED"));
         assert!(PRUNE_VICTIMS_SQL.contains("t.state = 'PENDING'"));
         assert!(PRUNE_VICTIMS_SQL.contains("active AS MATERIALIZED"));
+    }
+
+    #[test]
+    fn prune_resets_an_idle_queue_in_last_start_order() {
+        assert!(PRUNE_VICTIMS_SQL.contains("c.last_charge < $1"));
+        assert!(
+            PRUNE_VICTIMS_SQL.contains("SELECT 1 FROM active a WHERE a.queue_name = s.queue_name")
+        );
+        assert!(PRUNE_VICTIMS_SQL.contains("ORDER BY s.last_start, s.updated_at"));
     }
 }

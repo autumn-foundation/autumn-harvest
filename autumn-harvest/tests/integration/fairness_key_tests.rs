@@ -389,6 +389,66 @@ async fn prune_deletes_only_rows_the_claim_cannot_tell_apart() {
     assert_eq!(left, ["busy", "clock", "debt", "fresh"]);
 }
 
+/// A queue with no pending task and no recent charge forgets its state.
+///
+/// Keys that claim once never move `V`, so their rows keep a debt and the
+/// plain prune rule never deletes them. Start-time fair queuing forgives
+/// every debt when the queue is idle. Prune follows that rule. It deletes in
+/// `last_start` order, so `V` holds until the last row goes.
+#[tokio::test]
+async fn prune_resets_a_queue_with_no_pending_task() {
+    let (mut conn, _container) = connect().await;
+    let idle = fresh_queue("idle");
+    let recent = fresh_queue("recent");
+    let rows: Vec<String> = (0..15)
+        .map(|i| {
+            format!(
+                "('{idle}', 'k{i}', {pass}, {start}, NOW() - INTERVAL '30 minutes')",
+                pass = f64::from(i) / 10.0 + 1.0,
+                start = f64::from(i) / 10.0
+            )
+        })
+        .chain(std::iter::once(format!(
+            "('{recent}', 'one-shot', 1, 0, NOW())"
+        )))
+        .collect();
+    diesel::sql_query(format!(
+        "INSERT INTO harvest_fairness_state (queue_name, fairness_key, pass, last_start, updated_at) \
+         VALUES {}",
+        rows.join(", ")
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("seed state");
+    let cutoff = Utc::now() - Duration::minutes(10);
+    let clock = |rows: &[autumn_harvest::fairness_keys::FairnessKeyState]| {
+        rows.iter().map(|r| r.last_start).fold(f64::MIN, f64::max)
+    };
+
+    // One row per batch: one call deletes MAX_PRUNE_BATCHES rows, lowest
+    // last_start first, so the clock row stays.
+    let deleted = prune_fairness_state(&mut conn, Some(&idle), cutoff, 1, false)
+        .await
+        .unwrap();
+    assert_eq!(deleted, 10);
+    let left = list_fairness_state(&mut conn, &idle).await.unwrap();
+    assert_eq!(left.len(), 5);
+    assert!((clock(&left) - 1.4).abs() < 1e-9, "V holds: {left:?}");
+
+    let deleted = prune_fairness_state(&mut conn, Some(&idle), cutoff, 100, false)
+        .await
+        .unwrap();
+    assert_eq!(deleted, 5, "the idle queue resets");
+    let left = list_fairness_state(&mut conn, &idle).await.unwrap();
+    assert_eq!(left.len(), 0, "{left:?}");
+
+    // A charge inside the idle window keeps the queue's state.
+    let deleted = prune_fairness_state(&mut conn, Some(&recent), cutoff, 100, false)
+        .await
+        .unwrap();
+    assert_eq!(deleted, 0);
+}
+
 /// A claim without fairness keys writes no state.
 #[tokio::test]
 async fn fairness_off_writes_no_state() {

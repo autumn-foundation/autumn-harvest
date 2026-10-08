@@ -270,6 +270,47 @@ proptest! {
     }
 }
 
+proptest! {
+    /// Property 6: an idle reset forgets every key. With any active key it
+    /// changes nothing.
+    #[test]
+    fn idle_reset_forgets_all_or_nothing(
+        ops in proptest::collection::vec((0usize..8, weight()), 0..200),
+    ) {
+        let mut clock = FairClock::default();
+        for (k, w) in ops {
+            clock.charge(&key(k), w);
+        }
+        let before: Vec<Option<(u64, u64)>> = (0..8)
+            .map(|k| clock.state(&key(k)).map(|p| (p.pass.to_bits(), p.last_start.to_bits())))
+            .collect();
+        prop_assert_eq!(clock.reset_if_idle(true), 0);
+        let kept: Vec<Option<(u64, u64)>> = (0..8)
+            .map(|k| clock.state(&key(k)).map(|p| (p.pass.to_bits(), p.last_start.to_bits())))
+            .collect();
+        prop_assert_eq!(before, kept);
+        clock.reset_if_idle(false);
+        for k in 0..8 {
+            prop_assert!(clock.state(&key(k)).is_none());
+            prop_assert_eq!(clock.lag(&key(k)).to_bits(), 0f64.to_bits());
+        }
+    }
+}
+
+/// Keys that claim once never move `V`. Their rows keep a debt, so the plain
+/// prune keeps them all. The idle reset bounds the state.
+#[test]
+fn one_shot_keys_grow_the_state_until_the_queue_is_idle() {
+    let mut clock = FairClock::default();
+    for k in 0..100 {
+        clock.charge(&format!("once-{k}"), 1.0);
+    }
+    assert_eq!(clock.vclock().to_bits(), 0f64.to_bits(), "V never moves");
+    assert_eq!(clock.prune(|_| false), 0, "every key keeps a debt");
+    assert_eq!(clock.reset_if_idle(false), 100);
+    assert!(clock.state("once-0").is_none());
+}
+
 /// A flood of 1,000 rows from tenant A cannot delay tenant B by more than one
 /// claim. This is the model form of the DB red test.
 #[test]

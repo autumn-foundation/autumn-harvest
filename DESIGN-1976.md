@@ -30,7 +30,7 @@ claim statement.**
 | R2 | Let a returning idle key spend saved credit in a burst. | The start tag is `max(pass, V)`. Idle time earns no credit. A property test pins it. |
 | R3 | Let a new key enter behind the flood. | A new key enters at `V`. A property test pins that it is served within `N` claims, where `N` is the number of active keys. |
 | R4 | Deadlock the claim on the state row. | The claim locks the task row (`SKIP LOCKED`), then the state row. No other writer locks a state row first. Prune uses `SKIP LOCKED`. |
-| R5 | Let state rows grow without a bound. | `prune_fairness_state` deletes idle rows that hold no debt and do not set `V`. |
+| R5 | Let state rows grow without a bound. | `prune_fairness_state` deletes idle rows that hold no debt and do not set `V`. It also resets an idle queue. |
 | R6 | Let one queue's large pass push its rows behind another queue. | The sort key is the lag `max(pass, V) - V`, not the pass. Each queue's front key has a small lag. |
 | R7 | Break a pinned gate (pause, build, cap, rate limit, fence). | The fair form is a splice of the base text. A test asserts that every gate survives. |
 | R8 | Let an operator store 10^6 overrides. | At most 1,000 overrides per queue. The cap is checked under a queue-scoped advisory lock. |
@@ -72,6 +72,8 @@ Properties, proven by `fairness_key_props`:
 5. New keys take only the claims they need. While they arrive more slowly
    than the queue drains, a backlogged key gets every other claim.
 6. Prune changes no start tag.
+7. An idle queue forgets all its state. Keys that claim once never move `V`,
+   so only this reset bounds their rows.
 
 ### 1.2 Key source
 
@@ -139,13 +141,13 @@ list_fairness_weights, prune_fairness_state}`, the admin HTTP routes and the
 
 | Test | Phase |
 |------|-------|
-| `fairness_key_props` (property, 7 tests): newcomer bound, returning key, pair lag bound, monotone `V`, one-key order, invisible prune | Spec |
+| `fairness_key_props` (property tests): newcomer bound, returning key, pair lag bound, monotone `V`, one-key order, invisible prune, idle reset | Spec |
 | `tenant_flood_holds_tenant_b_within_the_bound_with_fairness_keys` (DB) | Red (199 claims), then green (at most 1) |
 | `without_fairness_keys_a_flood_holds_tenant_b_past_the_bound` (DB) | Control |
 | `fair_claim_matches_the_model_sequence` (DB) | Green |
 | `weight_override_changes_share_at_runtime` (DB) | Green |
 | `override_cap_is_1000_per_queue` (DB) | Green |
-| `prune_deletes_only_rows_the_claim_cannot_tell_apart` (DB) | Green |
+| `prune_deletes_only_rows_the_claim_cannot_tell_apart`, `prune_resets_a_queue_with_no_pending_task` (DB) | Green |
 | `concurrent_fair_claims_keep_every_charge` (DB, 8 claimers) | Green |
 | `by_id_claim_and_unkeyed_rows_charge_their_keys`, `multi_queue_claim_keeps_a_clock_per_queue`, `fairness_off_writes_no_state` (DB) | Green |
 | `start_key_reaches_activities_and_children`, `worker_with_fairness_keys_serves_tenant_b_through_a_flood` (worker end-to-end) | Green |

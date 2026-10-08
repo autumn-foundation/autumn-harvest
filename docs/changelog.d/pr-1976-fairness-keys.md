@@ -25,7 +25,8 @@ claim statement is byte-identical.
   A queue holds at most 1,000 overrides. A change applies at the next claim.
   The HTTP routes write every shard and an audit row for each change.
 - **Upkeep.** The retention janitor prunes idle state rows that the claim
-  cannot tell from no row.
+  cannot tell from no row. It resets the state of a queue with no pending
+  task.
 - **Invariants.** No new `WorkflowEvent` variant. Migration
   `20261008040947_harvest_fairness_keys` adds a nullable column and two
   tables. ADR 0006 records the design.

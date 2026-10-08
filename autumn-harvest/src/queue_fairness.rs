@@ -332,6 +332,22 @@ impl FairClock {
             .retain(|k, p| is_active(k) || p.pass > v || p.last_start >= v);
         before - self.keys.len()
     }
+
+    /// Forget every key when the queue has no pending task. Returns the
+    /// number of keys deleted.
+    ///
+    /// This is the idle rule of start-time fair queuing. With no backlog, no
+    /// key is behind another, so every debt is forgiven. Keys that claim once
+    /// never move `V`. Without this rule [`FairClock::prune`] never deletes
+    /// them, and the state grows with each new key.
+    pub fn reset_if_idle(&mut self, any_active: bool) -> usize {
+        if any_active {
+            return 0;
+        }
+        let n = self.keys.len();
+        self.keys.clear();
+        n
+    }
 }
 
 /// The start tag of a key: `max(pass, v)`. A key with no state starts at `v`.

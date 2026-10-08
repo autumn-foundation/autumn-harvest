@@ -142,10 +142,17 @@ See [the measured cost](performance.md#fairness-keys-issue-1976).
 ## Upkeep
 
 The claim writes one state row per queue and key. The retention janitor
-deletes idle rows on each tick, with the rate-limit bucket idle window. It
-deletes a row only when the claim cannot tell it from no row. It runs only
-while the rate-limit bucket GC is on. Call
-`fairness_keys::prune_fairness_state` to run it by hand.
+deletes old rows on each tick, with the rate-limit bucket idle window. It
+runs only while the rate-limit bucket GC is on. Call
+`fairness_keys::prune_fairness_state` to run it by hand. A row goes in two
+cases:
+
+- **An idle key.** The claim cannot tell the row from no row: its key has no
+  pending task and no debt, and it does not set the clock `V`.
+- **An idle queue.** The queue has no pending task, and no claim charged it
+  inside the window. All its rows go, so all debts are forgiven. This is the
+  idle rule of start-time fair queuing. Keys that claim once never move `V`,
+  so without it their rows would stay.
 
 ## Limits
 
