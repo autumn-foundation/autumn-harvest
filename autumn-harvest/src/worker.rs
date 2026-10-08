@@ -20041,7 +20041,8 @@ pub async fn apply_race_loser_cancellations(
             // terminal event already exists (or is about to be appended by
             // that in-flight completion write) and must not be duplicated.
             if let Some((activity_name, queue_name)) =
-                queue::cancel_activity_task(conn, *activity_id).await?
+                queue::cancel_activity_task_with_reason(conn, *activity_id, reason.message())
+                    .await?
             {
                 synthetic_events.push(WorkflowEvent::ActivityFailed {
                     activity_id: *activity_id,

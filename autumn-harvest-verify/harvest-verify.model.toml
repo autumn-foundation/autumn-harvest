@@ -87,7 +87,7 @@
 # under model 2026.09.0, up to boundaries ..."), so a verdict can always be
 # traced to the rules that produced it. Bump the date component when rows change.
 
-version = "2026.09.0"
+version = "2026.10.0"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # AMBIENT TYPES — statics of these types are taint roots
@@ -1068,6 +1068,14 @@ path = "race"
 receiver = "WorkflowContext"
 reason = "context.rs:11038 returns a `RaceBuilder`; `RaceBuilder::run` (context.rs:1600) calls `ctx.race_impl`, which pushes `StartChildWorkflow`/`StartTimer`/`WaitForSignal`/`CancelRaceLosers` (context.rs:8217-8356). Branch selection is recorded, so the set and order of branches must be deterministic."
 [[sink]]
+path = "cancellation_scope"
+receiver = "WorkflowContext"
+reason = "cancellation_scope.rs:531 returns a `CancellationScope`; `ScopeRun` records the `cancel_scope:{seq}` marker and pushes `CancelRaceLosers` (cancellation_scope.rs:340). The builder emits nothing, but its handle is only useful by emitting."
+[[sink]]
+path = "non_cancellable"
+receiver = "WorkflowContext"
+reason = "cancellation_scope.rs:569 returns `NonCancellable`, which pushes the `non_cancellable_open:{seq}` and `non_cancellable_close:{seq}` markers through `record_shield_marker` (cancellation_scope.rs:461) and matches them on replay."
+[[sink]]
 path = "random_f64"
 receiver = "WorkflowContext"
 reason = "context.rs:5141; emits a command transitively: random_f64 -> capture_builtin_validated* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
@@ -1266,6 +1274,14 @@ reason = "context.rs:1137 -> `WorkflowContext::reset_timer`, which pushes `Cance
 path = "await_fire"
 receiver = "TimerHandle"
 reason = "context.rs:1147 -> `WorkflowContext::await_timer_fire`; suspends on a recorded timer."
+[[sink]]
+path = "run"
+receiver = "CancellationScope"
+reason = "cancellation_scope.rs:242 returns `ScopeRun`, which records the `cancel_scope:{seq}` marker and pushes `CancelRaceLosers` (cancellation_scope.rs:340). The cancel decision is recorded."
+[[sink]]
+path = "cancel"
+receiver = "CancellationScope"
+reason = "cancellation_scope.rs:257 sets the flag that makes `ScopeRun` record its cancel marker. A tainted decision to call it changes the command stream."
 [[sink]]
 path = "run"
 receiver = "RaceBuilder"

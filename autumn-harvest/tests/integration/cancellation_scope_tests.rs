@@ -291,6 +291,11 @@ async fn scope_cancel_tears_down_an_activity_a_timer_and_a_child() {
         tasks[0].state, "CANCELLED",
         "the activity task is cancelled"
     );
+    assert_eq!(
+        tasks[0].error.as_deref(),
+        Some("cancelled by its cancellation scope"),
+        "the task row names the scope, not a race"
+    );
     assert!(
         history.events.iter().any(|e| matches!(
             e,

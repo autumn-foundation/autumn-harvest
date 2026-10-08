@@ -542,6 +542,10 @@ impl WorkflowContext {
     /// A cycle that completes keeps its result. A terminate, a paused run
     /// and a replace-on-start policy are never deferred.
     ///
+    /// A block is open from the commit of the cycle that enters it. A cancel
+    /// that commits first is terminal. The engine then discards that cycle,
+    /// and the block's work with it.
+    ///
     /// Workflow code does not see a deferred cancel: `is_cancelled` stays
     /// `false` until the cancel completes.
     ///
