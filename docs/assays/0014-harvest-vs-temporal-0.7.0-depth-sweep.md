@@ -64,7 +64,7 @@ smoke run saw 167 tagged keys mid-run, then a residue of `0/0/0`.
 
 ### Changes after the sweep
 
-Review (PR #2055) found four grader and driver gaps after the sweep. None
+Review (PR #2055) found five apparatus gaps after the sweep. None
 changes a grade. `grade.py` reproduces every grade above from the same raw
 output.
 
@@ -76,6 +76,9 @@ output.
   only. The named signal does not change.
 - `run.sh` records a failed run and goes on, in place of stopping the sweep.
   No run failed.
+- A worker that overruns its 20 s shutdown is now aborted and awaited. Before,
+  the abort did not wait. No run overran: every run's claim and activity
+  counts are exact.
 
 The #1815 samples also cover the worker shutdown, a few claims and scans per
 run. At depth 2,000 that is about 3 claims in 14,000.
@@ -208,6 +211,24 @@ time spent in a claim. It reads 0.91 to 0.99 over all 72 harvest runs, mean
 fix cut the claim latency at depth 2,000 from 35 ms to 6.3 ms. It did not
 add claim concurrency, so the claim loop is still the ceiling.
 
+### Post hoc: the merged fix (`7bf3789`)
+
+PR #2052 merged into `trunk-dev` as `7bf3789` after the sweep. The merge
+resolved conflicts with DR fencing (#1823), so its claim path is not
+byte-identical to `513b7aa`. A short confirmation ran on it at 18:20 UTC,
+with the same binary source and the same server. It is not registered.
+
+| tree | arm | depth | mean workflows/sec | per rep | claim mean ms |
+|:--|:--|--:|--:|:--|--:|
+| `7bf3789` | `postgres` | 250 | 23.08 | 22.77 / 23.70 / 22.77 | 5.65 |
+| `7bf3789` | `postgres` | 2000 | 22.66 | 23.06 / 22.57 / 22.35 | 5.88 |
+
+All six runs are valid. The merged fix stays flat (2,000 over 250: 0.98). It
+reads a little above `513b7aa` at both depths. Against the sweep's Temporal
+cells, the gap is 1.07x at depth 250 and 1.27x at depth 2,000. Temporal did
+not run in this session, so these two ratios cross sessions. Raw output is in
+[`results/posthoc-7bf3789/`](apparatus/0014-harvest-vs-temporal-0.7.0/results/posthoc-7bf3789/).
+
 ## ⚖️ What this licenses
 
 It licenses this: on one 4-core box, at a 3-activity workflow, Temporal
@@ -223,8 +244,9 @@ defaults, and a venue that favours harvest.
 CPU. Temporal reads 24.8 to 28.7 here, against 34.6 to 45.8 in assay #11.
 Harvest reads lower here too. Only ratios measured on one box compare.
 
-`513b7aa` is a PR head, not a release. Its numbers describe what #1971 buys
-when it merges, not what 0.7.0 ships.
+`513b7aa` is a PR head, not a release. PR #2052 has since merged into
+`trunk-dev`, but no release carries it yet. Its numbers describe what #1971
+buys, not what 0.7.0 ships.
 
 ## 🔁 Re-charter
 

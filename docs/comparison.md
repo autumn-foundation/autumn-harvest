@@ -312,7 +312,7 @@ where one exists.
   |:--|--:|
   | default (Postgres claim path), 0.7.0 | 1.78x to 7.17x |
   | Redis dispatch, 0.7.0 | 1.74x to 2.10x |
-  | default, with the #1971 claim fix (PR #2052, not yet released) | 1.16x to 1.36x |
+  | default, with the #1971 claim fix (PR #2052, merged to `trunk-dev`, not yet released) | 1.16x to 1.36x |
 
   Without the claim fix, the default-mode gap grows sharply with backlog
   depth. With it, harvest's own rate stays flat, and the gap grows only from

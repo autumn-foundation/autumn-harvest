@@ -593,18 +593,19 @@ impl Pool {
     /// Stop every worker. Abort one that overruns the shutdown timeout.
     ///
     /// A detached worker would keep polling while the next run resets the
-    /// database, and could add to the activity counter.
+    /// database, and could add to the activity counter. So an aborted worker
+    /// is awaited until it ends.
     async fn stop(self) {
         for worker in &self.workers {
             worker.shutdown();
         }
-        for handle in self.handles {
-            let abort = handle.abort_handle();
-            if tokio::time::timeout(Duration::from_secs(20), handle)
+        for mut handle in self.handles {
+            if tokio::time::timeout(Duration::from_secs(20), &mut handle)
                 .await
                 .is_err()
             {
-                abort.abort();
+                handle.abort();
+                let _ = handle.await;
             }
         }
     }
