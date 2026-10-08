@@ -41,6 +41,11 @@ sqs = ["connectors", "dep:aws-config", "dep:aws-sdk-sqs"]
 # `aws-lc-rs`, which needs cmake and a C compiler. The locked `aws-sdk-kms`
 # 1.99.0 needs Rust 1.88, so the effective MSRV does not rise.
 aws-kms = ["dep:aws-sdk-kms", "dep:async-trait"]
+# HashiCorp Vault Transit binding for the same codec (issue #1981).
+# `autumn_harvest_plugin::vault_transit::VaultTransit` implements `KmsDecrypt`
+# over the Vault HTTP API. It uses the `reqwest` client that this crate already
+# has. `base64` is already in the lockfile, so the feature adds no new crate.
+vault-transit = ["dep:async-trait", "dep:base64"]
 # Zero-setup local dev runtime (issue #525) — the `harvest-dev` binary.
 #
 # Off by default and never in a release build. It provisions an **ephemeral**
@@ -158,6 +163,9 @@ aws-sdk-sqs = { version = "1", default-features = false, features = ["rt-tokio",
 # KMS client for the `aws-kms` feature. Same feature choice as `aws-sdk-sqs`,
 # for the same reason.
 aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"], optional = true }
+# Base64 for the Vault Transit wire format (`vault-transit` feature). It is
+# already in the lockfile through the core crate.
+base64 = { version = "0.22", optional = true }
 
 [[bin]]
 # Zero-setup local dev runtime (issue #525). `cargo dev` is the workspace alias
@@ -183,6 +191,8 @@ tracing-subscriber = "0.3"
 # Issue #798: the export -> bundle -> drift-gate end-to-end test writes a real
 # bundle directory and feeds it to `WorkflowReplayer::replay_bundle`.
 tempfile = "3"
+# The KMS binding tests encode and decode the fake wire formats (issue #1981).
+base64 = "0.22"
 
 # Deterministic (non-criterion) instruction/allocation-count profiling
 # harness for `dag_graph::build_run_graph` -- the pure projection behind

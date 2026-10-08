@@ -456,6 +456,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-kms",
  "aws-sdk-sqs",
+ "base64 0.22.1",
  "chrono",
  "chrono-tz",
  "deadpool",

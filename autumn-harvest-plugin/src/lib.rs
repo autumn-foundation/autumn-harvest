@@ -51,6 +51,9 @@ pub mod dag_retry;
 pub mod dev;
 /// One entry point for a standalone embedding (issue #1613).
 pub mod embedding;
+/// One test suite for every KMS binding (issue #1981).
+#[cfg(all(test, any(feature = "aws-kms", feature = "vault-transit")))]
+mod kms_conformance;
 pub mod lineage;
 pub mod outbox;
 pub mod plugin;
@@ -75,6 +78,8 @@ pub mod status_summary;
 pub mod strict_query;
 pub mod ui;
 pub mod usage;
+#[cfg(feature = "vault-transit")]
+pub mod vault_transit;
 pub mod version_gate_retirement;
 pub mod version_usage;
 pub mod workflow_count;
