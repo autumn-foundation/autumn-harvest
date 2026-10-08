@@ -857,7 +857,8 @@ pub struct WorkloadConfig {
     pub claimers: usize,
     /// Stop after this many claims.
     pub max_claims: u64,
-    /// Stop at this wall-clock bound, even below `max_claims`.
+    /// Start no claim after this wall-clock bound, even below `max_claims`.
+    /// A claim in flight at the bound runs to its end.
     pub budget: Duration,
 }
 
@@ -883,9 +884,6 @@ pub struct WorkloadReport {
     pub enqueues: u64,
     pub empty_polls: u64,
     pub errors: u64,
-    /// Claims still in flight at the budget. The claimer drops them, and the
-    /// transaction of each rolls back, so no task changes.
-    pub cut_at_deadline: u64,
     pub first_error: Option<String>,
     pub elapsed: Duration,
 }
@@ -898,7 +896,6 @@ struct Tally {
     enqueues: AtomicU64,
     empty_polls: AtomicU64,
     errors: AtomicU64,
-    cut_at_deadline: AtomicU64,
     first_error: std::sync::Mutex<Option<String>>,
 }
 
@@ -920,20 +917,20 @@ const MAX_CONSECUTIVE_ERRORS: u32 = 20;
 /// The pause after a failed claim, so a failing claimer does not spin.
 const ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
+/// The bound on one claim. A claim on a 1M-row backlog takes about 17 s.
+///
+/// The budget stops new claims only. A claim in flight at the budget runs to
+/// its end. Dropping it would not stop the server, which keeps the session
+/// open with unflushed counters and makes the snapshot partial.
+const CLAIM_BOUND: Duration = Duration::from_secs(300);
+
 /// The bound on each step after a claim: complete, delete and enqueue. Each
 /// step touches one row, so the bound is far above its normal cost.
 const CYCLE_STEP_BOUND: Duration = Duration::from_secs(60);
 
-/// Run `fut` for at most [`CYCLE_STEP_BOUND`]. Returns `None` at the bound.
-async fn by_step_bound<T>(fut: impl std::future::Future<Output = T>) -> Option<T> {
-    tokio::time::timeout(CYCLE_STEP_BOUND, fut).await.ok()
-}
-
-/// Run `fut` until `deadline`. Returns `None` when the deadline comes first.
-async fn by_deadline<T>(deadline: Instant, fut: impl std::future::Future<Output = T>) -> Option<T> {
-    tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), fut)
-        .await
-        .ok()
+/// Run `fut` for at most `bound`. Returns `None` at the bound.
+async fn bounded<T>(bound: Duration, fut: impl std::future::Future<Output = T>) -> Option<T> {
+    tokio::time::timeout(bound, fut).await.ok()
 }
 
 /// Delete the completed task `id`, as the hygiene sweep does later.
@@ -988,8 +985,8 @@ async fn run_claimer(
     let mut consecutive_errors = 0;
     while Instant::now() < deadline && tally.claims.load(Ordering::Relaxed) < max {
         let claim = queue::claim_task(conn, queues, worker, "", None, &[], &[]);
-        let Some(claimed) = by_deadline(deadline, claim).await else {
-            tally.cut_at_deadline.fetch_add(1, Ordering::Relaxed);
+        let Some(claimed) = bounded(CLAIM_BOUND, claim).await else {
+            tally.error("claim", &"no result within the claim bound");
             break;
         };
         let task = match claimed {
@@ -1016,7 +1013,7 @@ async fn run_claimer(
         // A claimed task finishes its cycle even past the deadline. A cycle
         // cut halfway would change the table depth that the run measures.
         let complete = queue::complete_task(conn, task.id, serde_json::json!({}));
-        match by_step_bound(complete).await {
+        match bounded(CYCLE_STEP_BOUND, complete).await {
             Some(Ok(())) => {
                 tally.completions.fetch_add(1, Ordering::Relaxed);
             }
@@ -1026,7 +1023,7 @@ async fn run_claimer(
             }
             None => tally.error("complete", &"no result within the step bound"),
         }
-        match by_step_bound(reclaim(conn, task.id)).await {
+        match bounded(CYCLE_STEP_BOUND, reclaim(conn, task.id)).await {
             Some(Ok(())) => {
                 tally.reclaims.fetch_add(1, Ordering::Relaxed);
             }
@@ -1037,7 +1034,7 @@ async fn run_claimer(
             None => tally.error("reclaim", &"no result within the step bound"),
         }
         let params = replacement(&task);
-        match by_step_bound(queue::enqueue(conn, &params)).await {
+        match bounded(CYCLE_STEP_BOUND, queue::enqueue(conn, &params)).await {
             Some(Ok(_)) => {
                 consecutive_errors = 0;
                 tally.enqueues.fetch_add(1, Ordering::Relaxed);
@@ -1096,7 +1093,6 @@ pub async fn drive_claims(
         enqueues: tally.enqueues.load(Ordering::Relaxed),
         empty_polls: tally.empty_polls.load(Ordering::Relaxed),
         errors: tally.errors.load(Ordering::Relaxed),
-        cut_at_deadline: tally.cut_at_deadline.load(Ordering::Relaxed),
         first_error,
         elapsed: started.elapsed(),
     }
@@ -1268,6 +1264,12 @@ pub async fn capture_run(
     eprintln!("== {label}: driving claims ==");
     let report = drive_claims(&db.url(), spec, workload).await;
     let snapshot = db.snapshot_and_drop().await;
+    // A partial snapshot misses counters, so its evidence does not add up.
+    assert!(
+        snapshot.lingering.is_empty(),
+        "{label}: the snapshot is partial: {:?}",
+        snapshot.lingering
+    );
     let dropped = !server.database_exists(&name).await;
     let deltas = stats::table_deltas(&baseline, &snapshot.tables);
     std::fs::write(
@@ -1342,7 +1344,7 @@ pub async fn capture_run(
     let _ = writeln!(s, "pg_stat_statements reset: ok");
     let _ = writeln!(
         s,
-        "workload: {} claimers, {} claims, {} completions, {} reclaims, {} enqueues, {} empty polls, {} errors, {} cut at the budget, in {:.1}s ({:.1} claims/s)",
+        "workload: {} claimers, {} claims, {} completions, {} reclaims, {} enqueues, {} empty polls, {} errors, in {:.1}s ({:.1} claims/s)",
         workload.claimers,
         report.claims,
         report.completions,
@@ -1350,7 +1352,6 @@ pub async fn capture_run(
         report.enqueues,
         report.empty_polls,
         report.errors,
-        report.cut_at_deadline,
         report.elapsed.as_secs_f64(),
         report.claims as f64 / report.elapsed.as_secs_f64().max(1e-9)
     );
