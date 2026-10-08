@@ -414,7 +414,7 @@ Three limits, stated plainly:
   backend of each connection it holds, so the server rolls back a
   statement it already runs. That covers pooled connections and the direct
   connection of a `harvest partition` command. It does so on a connection
-  of its own, outside the pool. That happens inside the bump's 2-second
+  of its own, outside the pool. That happens inside the bump's 3-second
   wait. A checkout inside a pass waits at most 2 seconds, on any shard's
   pool. If it gets no connection, the pass stops, so a busy pool cannot
   hold a bump off. If the process
