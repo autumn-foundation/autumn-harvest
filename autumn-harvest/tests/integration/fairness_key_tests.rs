@@ -465,8 +465,15 @@ async fn prune_resets_a_queue_with_no_pending_task() {
 #[tokio::test]
 async fn a_held_lower_row_keeps_the_clock_row_in_an_idle_reset() {
     use diesel_async::RunQueryDsl;
-    let (mut conn, _container) = connect().await;
-    let (mut other, _other_container) = connect().await;
+    // Both connections must reach the same database. Without
+    // `HARVEST_TEST_DATABASE_URL`, each `connect` starts its own container.
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = AsyncPgConnection::establish(&url)
+        .await
+        .expect("connect to the test database");
+    let mut other = AsyncPgConnection::establish(&url)
+        .await
+        .expect("open a second connection");
     let idle = fresh_queue("held");
     diesel::sql_query(format!(
         "INSERT INTO harvest_fairness_state (queue_name, fairness_key, pass, last_start, updated_at) VALUES \
