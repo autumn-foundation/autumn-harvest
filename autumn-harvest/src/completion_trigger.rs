@@ -651,7 +651,7 @@ pub async fn resolve_target_queue(
         });
 
     if let Some(dp) = default_pool
-        && let Ok(mut default_conn) = dp.get().await
+        && let Ok(mut default_conn) = crate::replication::fenced_checkout(&dp).await
     {
         use crate::schema::harvest_schedules::dsl as sched_dsl;
         use diesel::prelude::*;
@@ -789,7 +789,7 @@ pub async fn resolve_cross_shard_target_queue(
         .and_then(|p| p.clone())
         .and_then(|sp| sp.exact_pool_for(target_shard).cloned());
     if let Some(tp) = target_pool {
-        match tp.get().await {
+        match crate::replication::fenced_checkout(&tp).await {
             Ok(mut target_conn) => {
                 return resolve_target_queue(&mut target_conn, target_workflow_name, target_shard)
                     .await;

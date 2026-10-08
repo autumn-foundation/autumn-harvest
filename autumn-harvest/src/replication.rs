@@ -1710,26 +1710,32 @@ mod db {
     /// two. So the wait ends before such a bump commits.
     const PASS_STOP_BOUND: std::time::Duration = std::time::Duration::from_secs(1);
 
-    /// The backends of the pooled connections that a fenced pass holds
-    /// (issue #1823).
+    /// Where a stopped pass opens the connection that ends a backend (issue
+    /// #1823).
+    #[derive(Clone)]
+    enum BackendHome {
+        /// A backend of a connection of this pool.
+        Pool(crate::worker::DbPool),
+        /// A backend of a connection opened from this DSN, outside any pool.
+        Dsn(std::sync::Arc<str>),
+    }
+
+    /// The backends of the connections that a fenced pass holds (issue
+    /// #1823).
     #[derive(Default)]
     struct PassBackends {
         next: std::sync::atomic::AtomicU64,
-        held: std::sync::Mutex<std::collections::HashMap<u64, (crate::worker::DbPool, i32)>>,
+        held: std::sync::Mutex<std::collections::HashMap<u64, (BackendHome, i32)>>,
     }
 
     impl PassBackends {
-        /// Record that the pass holds backend `pid` of `pool`.
-        fn hold(
-            self: &std::sync::Arc<Self>,
-            pool: &crate::worker::DbPool,
-            pid: i32,
-        ) -> HeldBackend {
+        /// Record that the pass holds backend `pid` of `home`.
+        fn hold(self: &std::sync::Arc<Self>, home: BackendHome, pid: i32) -> HeldBackend {
             let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.held
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(id, (pool.clone(), pid));
+                .insert(id, (home, pid));
             HeldBackend {
                 backends: std::sync::Arc::clone(self),
                 id,
@@ -1750,8 +1756,8 @@ mod db {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
             );
-            let stops = held.into_values().map(|(pool, pid)| async move {
-                let outcome = tokio::time::timeout(PASS_STOP_BOUND, end_backend(&pool, pid)).await;
+            let stops = held.into_values().map(|(home, pid)| async move {
+                let outcome = tokio::time::timeout(PASS_STOP_BOUND, end_backend(&home, pid)).await;
                 (pid, outcome)
             });
             for (pid, outcome) in futures::future::join_all(stops).await {
@@ -1769,23 +1775,28 @@ mod db {
         }
     }
 
-    /// End backend `pid` on the database of `pool`, and wait until it exits
+    /// End backend `pid` on the database of `home`, and wait until it exits
     /// (issue #1823).
     ///
-    /// The stopped pass can hold every connection of `pool`. So this opens
+    /// The stopped pass can hold every connection of a pool. So this opens
     /// its own connection outside the pool, as a fence guard does.
-    async fn end_backend(pool: &crate::worker::DbPool, pid: i32) -> HarvestResult<()> {
+    async fn end_backend(home: &BackendHome, pid: i32) -> HarvestResult<()> {
         use deadpool::managed::Manager as _;
         #[derive(diesel::QueryableByName)]
         struct Alive {
             #[diesel(sql_type = BigInt)]
             alive: i64,
         }
-        let mut conn = pool
-            .manager()
-            .create()
-            .await
-            .map_err(|error| crate::error::HarvestError::Database(error.to_string()))?;
+        let mut conn = match home {
+            BackendHome::Pool(pool) => pool
+                .manager()
+                .create()
+                .await
+                .map_err(|error| crate::error::HarvestError::Database(error.to_string()))?,
+            BackendHome::Dsn(dsn) => crate::pg_tls::connect(dsn)
+                .await
+                .map_err(|error| crate::error::HarvestError::Database(error.to_string()))?,
+        };
         diesel::sql_query("SELECT pg_terminate_backend($1)")
             .bind::<Integer, _>(pid)
             .execute(&mut conn)
@@ -1859,7 +1870,8 @@ mod db {
         /// cannot be read.
         pub async fn join_pass(&mut self) -> HarvestResult<()> {
             if self.held.is_none() {
-                self.held = hold_in_pass(&self.pool, &mut self.conn).await?;
+                self.held =
+                    hold_in_pass(BackendHome::Pool(self.pool.clone()), &mut self.conn).await?;
             }
             Ok(())
         }
@@ -1884,10 +1896,10 @@ mod db {
         }
     }
 
-    /// Record `conn`, a connection of `pool`, in the pass this task runs.
+    /// Record `conn`, a connection of `home`, in the pass this task runs.
     /// `None` outside a pass.
     async fn hold_in_pass(
-        pool: &crate::worker::DbPool,
+        home: BackendHome,
         conn: &mut AsyncPgConnection,
     ) -> HarvestResult<Option<HeldBackend>> {
         #[derive(diesel::QueryableByName)]
@@ -1903,7 +1915,7 @@ mod db {
             .load(conn)
             .await
             .map_err(database_error)?;
-        Ok(<[Backend]>::first(&rows).map(|row| backends.hold(pool, row.pid)))
+        Ok(<[Backend]>::first(&rows).map(|row| backends.hold(home, row.pid)))
     }
 
     /// A connection's membership in a fenced pass, from
@@ -1929,7 +1941,21 @@ mod db {
         pool: &crate::worker::DbPool,
         conn: &mut AsyncPgConnection,
     ) -> PassMember {
-        let held = hold_in_pass(pool, conn).await.unwrap_or_else(|error| {
+        join_home(BackendHome::Pool(pool.clone()), conn).await
+    }
+
+    /// [`join_fenced_pass`] for `conn`, a connection opened from `dsn`
+    /// outside any pool (issue #1823).
+    ///
+    /// A stopped pass ends the backend on a new connection from `dsn`. So
+    /// the role of `dsn` can end its own backend.
+    pub async fn join_fenced_pass_direct(dsn: &str, conn: &mut AsyncPgConnection) -> PassMember {
+        join_home(BackendHome::Dsn(std::sync::Arc::from(dsn)), conn).await
+    }
+
+    /// Record `conn` in the pass this task runs, and log a failure.
+    async fn join_home(home: BackendHome, conn: &mut AsyncPgConnection) -> PassMember {
+        let held = hold_in_pass(home, conn).await.unwrap_or_else(|error| {
             tracing::warn!(
                 error = %error,
                 "a connection could not join its DR fence pass"
@@ -2017,6 +2043,55 @@ mod db {
             }
         }
     }
+    /// A fence-aware [`crate::pool::acquire_with_retries`] (issue #1823).
+    ///
+    /// Inside a fenced pass, retries would hold a bump off. So the pass
+    /// makes one [`fenced_acquire`] try within [`crate::pool::acquire_bound`],
+    /// and a failed try abandons it. Outside a pass, this is
+    /// [`crate::pool::acquire_with_retries`].
+    ///
+    /// # Errors
+    ///
+    /// As [`fenced_acquire`] in a pass, and as
+    /// [`crate::pool::acquire_with_retries`] outside one.
+    pub async fn fenced_acquire_with_retries(
+        pool: &crate::worker::DbPool,
+        attempts: u32,
+    ) -> HarvestResult<FencedConn> {
+        if PASS_SCOPE.try_with(|_| ()).is_ok() {
+            return fenced_acquire(pool, crate::pool::acquire_bound(pool)).await;
+        }
+        let conn = crate::pool::acquire_with_retries(pool, attempts).await?;
+        Ok(FencedConn::outside_pass(pool, conn))
+    }
+
+    /// The wait of a [`fenced_get_within`] checkout ran out (issue #1823).
+    #[derive(Debug, Clone, Copy)]
+    pub struct CheckoutElapsed;
+
+    /// A fence-aware `tokio::time::timeout(bound, pool.get())` (issue
+    /// #1823).
+    ///
+    /// The result has the same shape, so a caller keeps its match arms. It
+    /// is [`fenced_acquire`]: inside a fenced pass the wait is at most
+    /// [`FENCED_CHECKOUT_BOUND`], a failed checkout abandons the pass, and
+    /// the pass records the backend.
+    ///
+    /// # Errors
+    ///
+    /// [`CheckoutElapsed`] when the bound runs out. The inner error is any
+    /// other pool error.
+    pub async fn fenced_get_within(
+        pool: &crate::worker::DbPool,
+        bound: std::time::Duration,
+    ) -> Result<HarvestResult<FencedConn>, CheckoutElapsed> {
+        match fenced_acquire(pool, bound).await {
+            Ok(conn) => Ok(Ok(conn)),
+            Err(crate::error::HarvestError::PoolAcquireTimeout { .. }) => Err(CheckoutElapsed),
+            Err(error) => Ok(Err(error)),
+        }
+    }
+
     /// How often a fence guard pings its session (issue #1823). The ping
     /// keeps an idle proxy from closing it, and finds a lost session.
     const FENCE_PASS_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(1);
@@ -2166,7 +2241,8 @@ mod db {
     /// Each end runs on its own connection outside the pool, so a pass that
     /// holds the whole pool cannot starve it. A connection that a pass
     /// checked out before it started joins through [`join_fenced_pass`] or
-    /// [`FencedConn::join_pass`].
+    /// [`FencedConn::join_pass`]. A connection opened from a DSN joins
+    /// through [`join_fenced_pass_direct`].
     ///
     /// Known limit: a backend that this cannot end in time keeps running.
     /// An example is a server this process cannot reach. A warning names
@@ -4261,13 +4337,14 @@ mod db {
 
 #[cfg(feature = "db")]
 pub use db::{
-    FENCE_GUARD_LIMIT, FENCED_CHECKOUT_BOUND, FencePassGuard, FencedConn, PassMember,
-    abandon_fenced_pass, advance_sequences_after_promotion, assert_admin_write_authority,
-    assert_database_fence, assert_fence, assert_fence_group, begin_fenced_group,
-    begin_fenced_groups, begin_fenced_pass, begin_fenced_pass_at, begin_fenced_pass_on,
-    begin_fenced_tick, begin_shard_tick, bump_generation, current_generation,
-    ensure_generation_row, fenced_acquire, fenced_checkout, fenced_wait, freeze_generation_rows_on,
-    join_fenced_pass, measure_rpo, pin_process_fence, pin_worker_fence, probe_dr_markers,
+    CheckoutElapsed, FENCE_GUARD_LIMIT, FENCED_CHECKOUT_BOUND, FencePassGuard, FencedConn,
+    PassMember, abandon_fenced_pass, advance_sequences_after_promotion,
+    assert_admin_write_authority, assert_database_fence, assert_fence, assert_fence_group,
+    begin_fenced_group, begin_fenced_groups, begin_fenced_pass, begin_fenced_pass_at,
+    begin_fenced_pass_on, begin_fenced_tick, begin_shard_tick, bump_generation, current_generation,
+    ensure_generation_row, fenced_acquire, fenced_acquire_with_retries, fenced_checkout,
+    fenced_get_within, fenced_wait, freeze_generation_rows_on, join_fenced_pass,
+    join_fenced_pass_direct, measure_rpo, pin_process_fence, pin_worker_fence, probe_dr_markers,
     query_replication_status, record_replication_heartbeat, resolve_held, run_fenced_pass,
 };
 

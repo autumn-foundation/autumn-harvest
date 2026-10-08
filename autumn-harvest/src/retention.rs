@@ -1469,6 +1469,7 @@ async fn partition_pass_fence(
 /// has archived, summarized and deleted its executions.
 #[cfg(feature = "db")]
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 async fn run_partition_maintenance_pass(
     pools: &ShardedDbPool,
     config: &RetentionConfig,
@@ -1599,8 +1600,10 @@ async fn run_partition_maintenance_pass(
         let now = Utc::now();
         // A lost fence session stops the pass. See
         // `crate::replication::run_fenced_pass`.
-        let maintained = crate::replication::run_fenced_pass(
-            &fence,
+        let maintained = crate::replication::run_fenced_pass(&fence, async {
+            // Issue #1823: the connection predates the pass, so it joins it.
+            // A lost guard then ends its backend.
+            let _member = crate::replication::join_fenced_pass(pool, &mut conn).await;
             crate::partition::maintain_with_progress(
                 &mut conn,
                 now,
@@ -1609,8 +1612,9 @@ async fn run_partition_maintenance_pass(
                 cursor.resume_after,
                 cursor.catch_up_target,
                 &mut tick_partition,
-            ),
-        )
+            )
+            .await
+        })
         .await;
         // A stopped pass can leave a transaction open. Closing the
         // connection makes the server roll it back.

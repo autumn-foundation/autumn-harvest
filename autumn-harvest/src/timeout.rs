@@ -4430,9 +4430,9 @@ pub async fn enforce_external_signals_outbox(
                         // and holding a cold connect to 250 ms would fail it
                         // forever rather than slowly. See
                         // `external_target_location::peer_acquire_bound`.
-                        let mut target_conn = match tokio::time::timeout(
+                        let mut target_conn = match crate::replication::fenced_get_within(
+                            pool,
                             crate::external_target_location::peer_acquire_bound(pool),
-                            pool.get(),
                         )
                         .await
                         {
@@ -4983,9 +4983,9 @@ pub async fn enforce_external_cancels_outbox(
 
                     // Bounded for the same reason as the signal outbox above
                     // (issue #1146, Codex round 1 P1).
-                    let mut target_conn = match tokio::time::timeout(
+                    let mut target_conn = match crate::replication::fenced_get_within(
+                        pool,
                         crate::external_target_location::peer_acquire_bound(pool),
-                        pool.get(),
                     )
                     .await
                     {
@@ -5344,9 +5344,9 @@ pub async fn enforce_external_cancels_outbox(
                         // This check is best-effort already: it logs its own
                         // errors instead of propagating them. It logs a
                         // timed-out acquisition and skips it the same way.
-                        match tokio::time::timeout(
+                        match crate::replication::fenced_get_within(
+                            pool,
                             crate::external_target_location::peer_acquire_bound(pool),
-                            pool.get(),
                         )
                         .await
                         {
@@ -5630,9 +5630,9 @@ pub async fn enforce_external_awaits_outbox(
                     // another pool in the same process. One timeout checker
                     // runs per assigned shard. See
                     // `external_target_location::peer_acquire_bound`.
-                    let mut target_conn = match tokio::time::timeout(
+                    let mut target_conn = match crate::replication::fenced_get_within(
+                        pool,
                         crate::external_target_location::peer_acquire_bound(pool),
-                        pool.get(),
                     )
                     .await
                     {

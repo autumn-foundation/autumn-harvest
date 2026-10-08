@@ -31190,7 +31190,9 @@ impl UnstartedClaim {
             return;
         };
         let mut conn =
-            match crate::pool::acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS).await {
+            match crate::replication::fenced_acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS)
+                .await
+            {
                 Ok(conn) => conn,
                 Err(error) => {
                     tracing::warn!(

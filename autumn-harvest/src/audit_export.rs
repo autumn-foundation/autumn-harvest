@@ -1887,10 +1887,17 @@ async fn build_unexported_index_fenced(
     // then holds no barrier.
     let mut conn = connect_index_builder(dsn, schema, INDEX_BUILD_CONNECT_TIMEOUT).await?;
     let fence = crate::replication::begin_fenced_group(pool, fence_key).await?;
-    let outcome =
-        crate::replication::run_fenced_pass(&fence, Box::pin(ensure_unexported_index(&mut conn)))
-            .await
-            .and_then(|built| built);
+    let outcome = crate::replication::run_fenced_pass(
+        &fence,
+        Box::pin(async {
+            // The connection predates the pass, so it joins it. A lost guard
+            // then ends its backend.
+            let _member = crate::replication::join_fenced_pass_direct(dsn, &mut conn).await;
+            ensure_unexported_index(&mut conn).await
+        }),
+    )
+    .await
+    .and_then(|built| built);
     // On `Err` the session may still hold the advisory lock. Closing the
     // connection releases it either way.
     drop(conn);
@@ -3718,20 +3725,11 @@ async fn acquire_shard_conn_for_export(
     shard_u16: u16,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
     bound: std::time::Duration,
-) -> Option<
-    deadpool::managed::Object<
-        diesel_async::pooled_connection::AsyncDieselConnectionManager<
-            diesel_async::AsyncPgConnection,
-        >,
-    >,
-> {
+) -> Option<crate::replication::FencedConn> {
     // Bounded, never a bare `pool.get()` — see `SHARD_ACQUIRE_BOUND`. Under
     // the tick's fence the wait stays below a bump's lock timeout, and a
     // failed checkout drops the guards (issue #1823).
-    let checkout = tokio::time::timeout(crate::replication::fenced_wait(bound), pool.get()).await;
-    if !matches!(checkout, Ok(Ok(_))) {
-        crate::replication::abandon_fenced_pass();
-    }
+    let checkout = crate::replication::fenced_get_within(pool, bound).await;
     match checkout {
         Ok(Ok(conn)) => Some(conn),
         Ok(Err(error)) => {
@@ -3888,7 +3886,7 @@ async fn export_once_via_pool(
             // pool instead of recycling it. Dropping the raw connection
             // then closes the socket, and Postgres rolls back whatever
             // that session still had open.
-            drop(deadpool::managed::Object::take(conn));
+            drop(deadpool::managed::Object::take(conn.into_pooled()));
             return Ok(0);
         }
     };
@@ -4104,7 +4102,7 @@ async fn export_once_via_pool(
             // behind a locked row would otherwise be recycled anyway. Every
             // later user of a size-one shard pool would then queue behind
             // that same blocked statement.
-            drop(deadpool::managed::Object::take(conn));
+            drop(deadpool::managed::Object::take(conn.into_pooled()));
             return Ok(0);
         }
     };

@@ -758,14 +758,17 @@ mod db {
     /// this checkout waits at most
     /// [`crate::replication::FENCED_CHECKOUT_BOUND`]. A pass that gets
     /// no connection then fails, its guards drop, and the next tick tries
-    /// again. With fencing off, the checkout waits as before.
-    async fn executor_conn(pool: &DbPool) -> HarvestResult<crate::pool::PooledConn> {
+    /// again. With fencing off, the checkout waits as before. The pass
+    /// records the backend, so a lost guard ends it.
+    async fn executor_conn(pool: &DbPool) -> HarvestResult<crate::replication::FencedConn> {
         if crate::replication::FenceRegistry::is_enabled() {
-            return crate::pool::acquire(pool, crate::replication::FENCED_CHECKOUT_BOUND).await;
+            return crate::replication::fenced_acquire(
+                pool,
+                crate::replication::FENCED_CHECKOUT_BOUND,
+            )
+            .await;
         }
-        pool.get()
-            .await
-            .map_err(|e| HarvestError::Database(e.to_string()))
+        crate::replication::fenced_checkout(pool).await
     }
 
     /// Drive every open batch job to terminal status across all shards.

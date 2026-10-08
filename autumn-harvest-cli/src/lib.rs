@@ -6744,10 +6744,13 @@ async fn run_partition_enable(
         // detected at runtime), so one shard's lock timeout must not abort the
         // conversion of the rest.
         // A lost fence session stops the mutation. See `run_fenced_pass`.
-        let enabled = autumn_harvest::replication::run_fenced_pass(
-            &fence,
-            autumn_harvest::partition::enable_partitioning(&mut conn, opts),
-        )
+        let enabled = autumn_harvest::replication::run_fenced_pass(&fence, async {
+            // Issue #1823: the connection predates the pass, so it joins it.
+            // A lost guard then ends its backend.
+            let _member =
+                autumn_harvest::replication::join_fenced_pass_direct(&target.dsn, &mut conn).await;
+            autumn_harvest::partition::enable_partitioning(&mut conn, opts).await
+        })
         .await
         .and_then(|done| done);
         match enabled {
@@ -6808,8 +6811,11 @@ async fn run_partition_maintain(
             }
         };
         // A lost fence session stops the pass. See `run_fenced_pass`.
-        let maintained = autumn_harvest::replication::run_fenced_pass(
-            &fence,
+        let maintained = autumn_harvest::replication::run_fenced_pass(&fence, async {
+            // Issue #1823: the connection predates the pass, so it joins it.
+            // A lost guard then ends its backend.
+            let _member =
+                autumn_harvest::replication::join_fenced_pass_direct(&target.dsn, &mut conn).await;
             autumn_harvest::partition::maintain(
                 &mut conn,
                 autumn_harvest::chrono::Utc::now(),
@@ -6817,8 +6823,9 @@ async fn run_partition_maintain(
                 &sweep,
                 None,
                 None,
-            ),
-        )
+            )
+            .await
+        })
         .await
         .and_then(|done| done);
         match maintained {
@@ -6884,10 +6891,13 @@ async fn run_partition_disable(
             }
         };
         // A lost fence session stops the mutation. See `run_fenced_pass`.
-        let disabled = autumn_harvest::replication::run_fenced_pass(
-            &fence,
-            autumn_harvest::partition::disable_partitioning(&mut conn),
-        )
+        let disabled = autumn_harvest::replication::run_fenced_pass(&fence, async {
+            // Issue #1823: the connection predates the pass, so it joins it.
+            // A lost guard then ends its backend.
+            let _member =
+                autumn_harvest::replication::join_fenced_pass_direct(&target.dsn, &mut conn).await;
+            autumn_harvest::partition::disable_partitioning(&mut conn).await
+        })
         .await
         .and_then(|done| done);
         match disabled {

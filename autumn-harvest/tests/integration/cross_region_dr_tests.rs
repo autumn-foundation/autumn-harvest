@@ -4193,6 +4193,72 @@ async fn a_connection_that_joins_a_lost_pass_has_its_write_ended() {
     );
 }
 
+/// A connection opened from a DSN, outside any pool, can join its pass
+/// (issue #1823). A lost guard then ends its backend too. The partition CLI
+/// writes on such a connection.
+#[tokio::test]
+async fn a_direct_connection_that_joins_a_lost_pass_has_its_write_ended() {
+    use diesel_async::SimpleAsyncConnection as _;
+
+    let (url, db) = require_db!("passdirect");
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    conn.batch_execute(
+        "CREATE TABLE dr_direct (id int PRIMARY KEY); INSERT INTO dr_direct VALUES (1)",
+    )
+    .await
+    .expect("seed the probe row");
+    let mut blocker = connect(&url).await;
+    blocker
+        .batch_execute("BEGIN; SELECT id FROM dr_direct WHERE id = 1 FOR UPDATE")
+        .await
+        .expect("lock the probe row");
+    let pool = dr_pool(&url);
+    let mut writer = connect(&url).await;
+    let guard = autumn_harvest::replication::begin_fenced_pass_at(&pool, ShardId::new(0), pinned)
+        .await
+        .expect("open the pass");
+    let pass = autumn_harvest::replication::run_fenced_pass(Some(&guard), async {
+        let _member = autumn_harvest::replication::join_fenced_pass_direct(&url, &mut writer).await;
+        diesel::sql_query("DELETE FROM dr_direct WHERE id = 1")
+            .execute(&mut writer)
+            .await
+    });
+    let terminate = async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        diesel::sql_query(format!(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname = '{db}' AND application_name = 'harvest_dr_fence_pass'"
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("terminate the guard backend");
+    };
+    let (stopped, ()) = tokio::join!(
+        tokio::time::timeout(std::time::Duration::from_secs(10), pass),
+        terminate
+    );
+    assert!(
+        stopped.is_ok_and(|outcome| outcome.is_err()),
+        "the pass must stop when its guard is lost"
+    );
+
+    bump_generation(&mut conn, ShardId::new(0), "failover", "test")
+        .await
+        .expect("bump");
+    blocker.batch_execute("COMMIT").await.expect("free the row");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let rows = count_rows(&mut conn, "dr_direct").await;
+    drop(guard);
+
+    assert_eq!(
+        rows, 1,
+        "a write on a joined direct connection must not commit after the bump"
+    );
+}
+
 /// A fence stops an activity heartbeat flusher (issue #1823). The flusher
 /// outlives a drain, so the worker token does not reach it. Without this,
 /// it keeps writing `last_heartbeat_at` after another region owns the row.
