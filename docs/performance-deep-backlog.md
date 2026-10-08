@@ -11,9 +11,9 @@ No engine code, query, index or migration changes here. See
 ## TL;DR
 
 * **Claim cost grows with backlog depth, not with work done.** On one seed and
-  one workload, a 1M-row backlog costs **136,370 buffers per claim**. A 4k-row
-  backlog costs 908. That is 150x the buffers for 250x the rows. The mean claim
-  time grows from 36 ms to 15.1 s.
+  one workload, a 1M-row backlog costs **136,365 buffers per claim**. A 4k-row
+  backlog costs 885. That is 154x the buffers for 250x the rows. The mean claim
+  time grows from 17 ms to 15.3 s.
 * **At 1M rows the claim spills to disk.** Each claim sorts about 868k eligible
   rows to return one. The sort writes 155 MB to disk (`work_mem` is 4 MB). Over
   the run, the claim wrote 6.2M temp blocks. The issue's tiny fixture wrote none.
@@ -22,10 +22,10 @@ No engine code, query, index or migration changes here. See
   as its filter. At 1M rows it reads all 250k executions per claim. The e2e
   hook shows the same scan on the issue's own workload: 57,826 sequential scans
   and 38.1M tuples read for 1,440 executions.
-* **The claim CTE is 99.3% of shared buffers at depth** (90.9% at 4k). Every
+* **The claim CTE is 99.3% of shared buffers at depth** (90.4% at 4k). Every
   other statement is below 0.3%. The FK `FOR KEY SHARE` lead from the issue is
   real but small at both depths.
-* **JIT costs 2.3 s of a 15.3 s claim.** The plan cost is above
+* **JIT costs 2.4 s of a 15.6 s claim.** The plan cost is above
   `jit_above_cost`, and the planner plans each claim again.
 
 ## 🎯 Workload
@@ -37,8 +37,9 @@ HARVEST_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
 
 The script seeds a shallow (4k) and a deep (1M) fixture on seed 1956. On each it
 runs 4 claimers for up to 2,000 claims or 600 s. A claimer calls
-`queue::claim_task` over all 64 queues, completes the task, and enqueues a
-replacement. So the backlog keeps its depth. The harness then snapshots both
+`queue::claim_task` over all 64 queues, completes the task, deletes it as the
+hygiene sweep would, and enqueues a replacement. So the table keeps its depth.
+The delete is the one measured statement that the engine does not issue. The harness then snapshots both
 stats views and drops the database. Artifacts are in
 [`docs/perf-artifacts/deep-backlog/`](perf-artifacts/deep-backlog/).
 
@@ -70,7 +71,7 @@ the hygiene migration sets a 2% scale factor, which a healthy table stays near.
 **A fixture that breaks an engine invariant measures the fixture.** The first
 capture seeded 1% of rows as RUNNING with no caps: about 10k RUNNING rows, keys
 far above their cap. Its deep run made 40 claims in 600 s. With RUNNING inside
-the fleet and the caps, the same run makes 156. `running_rows_fit_the_fleet_and_the_key_caps`
+the fleet and the caps, the same run makes 155. `running_rows_fit_the_fleet_and_the_key_caps`
 now guards this.
 
 ## 🔬 Results
@@ -81,35 +82,35 @@ calls.
 
 | | shallow (4k) | deep (1M) | ratio |
 |:--|--:|--:|--:|
-| claims in the run | 2,003 in 27 s | 156 in 600 s | |
-| claim CTE share of shared buffers | 90.9% | 99.3% | |
-| claim CTE buffers per call | 908 | 136,370 | 150x |
-| claim CTE mean time per call | 36 ms | 15,081 ms | 420x |
-| claim CTE temp blocks written | 0 | 6,213,440 | |
-| `harvest_task_queue` tuples read by seq scan, per claim | 4,994 | 1,000,076 | 200x |
+| claims in the run | 2,003 in 18 s | 155 in 600 s | |
+| claim CTE share of shared buffers | 90.4% | 99.3% | |
+| claim CTE buffers per call | 885 | 136,365 | 154x |
+| claim CTE mean time per call | 17 ms | 15,291 ms | 900x |
+| claim CTE temp blocks written | 0 | 6,174,606 | |
+| `harvest_task_queue` tuples read by seq scan, per claim | 4,000 | 1,000,000 | 250x |
 | `harvest_workflow_executions` tuples read by seq scan, per claim | 1,000 | 250,000 | 250x |
-| claim `UPDATE` buffers per call | 27 | 438 | 16x |
+| claim `UPDATE` buffers per call | 26 | 441 | 17x |
 
 ### The plan at 1M rows
 
-From `deep-claim.explain.txt` (one claim, 15.3 s):
+From `deep-claim.explain.txt` (one claim, 15.6 s):
 
 1. **Candidate scan and sort.** A `BitmapAnd` of `idx_harvest_tq_live_created`
    and `idx_harvest_tq_poll` feeds a bitmap heap scan that returns 868,423
-   eligible rows (9.2 s). A `Sort` on the sticky `CASE` key orders them to
+   eligible rows (9.4 s). A `Sort` on the sticky `CASE` key orders them to
    return one row: `external merge  Disk: 155168kB`. This is the sort-elision
    defeat that `docs/performance.md` describes (issues #786 and #1177). Issue
    #1340 left its depth scaling open. At this fixture it is linear in buffers
    and worse than linear in time.
 2. **`concurrency_pending_keys`.** A `Seq Scan` on `harvest_task_queue` reads
-   454,617 keyed rows on every claim (338 ms). This is the per-claim sequential
+   454,617 keyed rows on every claim (359 ms). This is the per-claim sequential
    scan that `pg_stat_user_tables` shows.
 3. **The PAUSED-execution skip.** A `Seq Scan` on `harvest_workflow_executions`
    with `Filter: (state = 'PAUSED')` removes all 250,000 rows (5,320 buffers).
    `idx_harvest_we_state` covers only `RUNNING`, so no index serves it.
-4. **JIT.** 199 functions, 2.3 s of the 15.3 s.
+4. **JIT.** 199 functions, 2.4 s of the 15.6 s.
 
-At 4k rows the same plan sorts 3,573 rows in memory and runs in 18 ms.
+At 4k rows the same plan sorts 3,573 rows in memory and runs in 19 ms.
 
 ### The e2e profile, with per-table counters
 
@@ -166,8 +167,8 @@ needs a human decision and its own before/after on this fixture.
   near 2% dead would read fewer dead tuples.
 * The workload claims over all 64 queues with no build, capability or session
   filters. It does not exercise the dispatch-channel by-id claim.
-* The deep run stops at its 600 s budget after 156 claims. The per-call figures
-  rest on those 160 claim calls.
+* The deep run stops at its 600 s budget after 155 claims. The per-call figures
+  rest on those 159 claim calls.
 
 ## See also
 
