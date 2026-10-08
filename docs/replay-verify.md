@@ -139,6 +139,10 @@ Pass `ReportFormat::<Variant>` in the API. A binary that you write can map a `--
 | `1` | One or more replay failures (configurable via `--fail-on rate=0.95`) |
 | `2` | One or more harness errors (invalid fixture JSON or unregistered workflow) — dominates over exit 1 |
 
+`CiReport::exit_code` returns `0` for an empty fixture directory. The binary in the
+[GitHub Actions snippet](#complete-github-actions-snippet) exits `2` instead, so an empty
+run cannot pass the gate.
+
 ---
 
 ## `--fail-on` threshold mode
@@ -152,7 +156,7 @@ let ci = report.into_ci_report_with_threshold(0.95); // fail only if < 95% pass
 ```
 
 ```bash
-# A downstream binary that you write (see Quick start)
+# The binary from the GitHub Actions snippet below
 my-app replay-verify --fixtures-dir ./fixtures --fail-on rate=0.95
 ```
 
@@ -177,29 +181,53 @@ ReplayVerifier::new()
 
 ## Complete GitHub Actions snippet
 
-`replay-verify` below is the Quick start binary with two flags added. Replace the
-hardcoded directory and format in its `main` with this parser:
+`replay-verify` below is the Quick start binary with three flags added. Replace its
+`main` with this one. It also fails when the directory holds no fixtures, because an
+empty run proves nothing.
 
 ```rust
-let mut fixtures = String::from("./fixtures/replay");
-let mut format = ReportFormat::Text;
-let mut args = std::env::args().skip(1);
-while let Some(flag) = args.next() {
-    let value = args.next().expect("each flag takes a value");
-    match flag.as_str() {
-        "--fixtures-dir" => fixtures = value,
-        "--report" => {
-            format = match value.as_str() {
-                "junit" => ReportFormat::JUnit,
-                "json" => ReportFormat::Json,
-                "github" => ReportFormat::GitHub,
-                _ => ReportFormat::Text,
+#[tokio::main]
+async fn main() {
+    let mut fixtures = String::from("./fixtures/replay");
+    let mut format = ReportFormat::Text;
+    let mut min_pass_rate: Option<f64> = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(flag) = args.next() {
+        let value = args.next().expect("each flag takes a value");
+        match flag.as_str() {
+            "--fixtures-dir" => fixtures = value,
+            "--report" => {
+                format = match value.as_str() {
+                    "junit" => ReportFormat::JUnit,
+                    "json" => ReportFormat::Json,
+                    "github" => ReportFormat::GitHub,
+                    _ => ReportFormat::Text,
+                }
             }
+            "--fail-on" => {
+                let rate = value.strip_prefix("rate=").expect("use --fail-on rate=<0..1>");
+                min_pass_rate = Some(rate.parse().expect("rate must be a number"));
+            }
+            other => panic!("unknown flag {other}"),
         }
-        other => panic!("unknown flag {other}"),
     }
+
+    let report = ReplayVerifier::new()
+        .register(workflows![/* your workflows */])
+        .fixtures_dir(&fixtures)
+        .verify_all()
+        .await;
+    if report.fixtures_total == 0 {
+        eprintln!("no fixtures in {fixtures}");
+        std::process::exit(2);
+    }
+    let ci = match min_pass_rate {
+        Some(rate) => report.into_ci_report_with_threshold(rate),
+        None => report.into_ci_report(),
+    };
+    println!("{}", ci.format_report(format));
+    std::process::exit(ci.exit_code());
 }
-// Then: `.fixtures_dir(&fixtures)` and `ci.format_report(format)`.
 ```
 
 The verifier reads one `HistorySnapshot` per file, so the export step splits the batch
@@ -231,8 +259,8 @@ jobs:
       #       --limit 200 \
       #       --payload-policy full \
       #       --output-file ./batch.json
-      #     # A partial export omits histories, so fail the gate on it.
-      #     jq -e '.status == "complete" and (.failures | length == 0)' ./batch.json
+      #     # A partial or empty export proves nothing, so fail the gate on it.
+      #     jq -e '.status == "complete" and (.failures | length == 0) and (.exports | length > 0)' ./batch.json
       #     mkdir -p ./fixtures/replay
       #     jq -c '.exports[]' ./batch.json | while read -r doc; do
       #       id=$(jq -r '.execution_id' <<<"$doc")
