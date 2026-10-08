@@ -3294,7 +3294,7 @@ pub fn spawn_worker_heartbeat(
             match get_result {
                 Ok(mut conn) => {
                     // A lost barrier stops the beat. The next tick tries again.
-                    let _beat = crate::replication::run_fenced_pass(
+                    let tick = crate::replication::run_fenced_pass(
                         &fence,
                         Box::pin(async {
                             // Issue #1823: the older connection joins the pass.
@@ -3314,23 +3314,32 @@ pub fn spawn_worker_heartbeat(
                                 &registered_codec_key_ids,
                             )
                             .await;
+                            // Issue #1823: the task-stats writes run under the
+                            // same barrier, so they cannot commit after a bump.
+                            run_outlier_tick(
+                                &mut conn,
+                                &registration.worker_id,
+                                &outliers,
+                                worker_shutdown.is_cancelled(),
+                            )
+                            .await
                         }),
                     )
                     .await;
-                    if let Err(error) = run_outlier_tick(
-                        &mut conn,
-                        &registration.worker_id,
-                        &outliers,
-                        worker_shutdown.is_cancelled(),
-                    )
-                    .await
-                    {
-                        tracing::warn!(
-                            worker_id = %registration.worker_id,
-                            error = %error,
-                            "worker task-stats tick failed; outlier gauge cleared"
-                        );
-                        outliers.clear_gauge(&registration.worker_id);
+                    match tick {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(error)) => {
+                            tracing::warn!(
+                                worker_id = %registration.worker_id,
+                                error = %error,
+                                "worker task-stats tick failed; outlier gauge cleared"
+                            );
+                            outliers.clear_gauge(&registration.worker_id);
+                        }
+                        // The guard already logged the lost session. A tick
+                        // with no fresh stats clears its view, as a failed
+                        // tick does.
+                        Err(_lost) => outliers.clear_gauge(&registration.worker_id),
                     }
                 }
                 Err(error) => {
