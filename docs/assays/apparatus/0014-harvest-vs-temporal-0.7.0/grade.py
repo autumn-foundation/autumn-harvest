@@ -21,6 +21,9 @@ TEMPORAL_TREE = "1.25.2"
 TEMPORAL_ARM = "temporal_go"
 DEPTHS = [250, 500, 1000, 2000]
 BASE, FIX, TRUNK = TREES
+# Recorded runs per cell, valid or not. A cell with any other count comes
+# from an interrupted sweep or stale files, so it has no mean.
+EXPECTED_RUNS = 3
 SIGNALS = [
     "claim_mean_ms",
     "persist_mean_ms",
@@ -72,8 +75,13 @@ def mean(values):
     return sum(values) / len(values) if values else None
 
 
+def complete(runs, key):
+    return len(runs.get(key, [])) == EXPECTED_RUNS
+
+
 def cell_mean(runs, tree, arm, depth):
-    return mean(valid_rates(runs, (tree, arm, depth)))
+    key = (tree, arm, depth)
+    return mean(valid_rates(runs, key)) if complete(runs, key) else None
 
 
 def span(runs, key):
@@ -82,6 +90,8 @@ def span(runs, key):
 
 
 def overlap(runs, a, b):
+    if not (complete(runs, a) and complete(runs, b)):
+        return None
     sa, sb = span(runs, a), span(runs, b)
     if sa is None or sb is None:
         return None
@@ -110,6 +120,8 @@ def cell_table(runs):
             f"{r['wfps']:.2f}" + ("" if r["valid"] else " (invalid)") for r in reps
         )
         valid = len(valid_rates(runs, (tree, arm, depth)))
+        if not complete(runs, (tree, arm, depth)):
+            per_rep = f"{per_rep or 'none'} (incomplete: {len(reps)} of {EXPECTED_RUNS} runs)"
         out.append(
             f"| `{tree}` | `{arm}` | {depth} | {fmt(cell_mean(runs, tree, arm, depth))} "
             f"| {per_rep or 'none'} | {valid} |"
