@@ -753,6 +753,14 @@ pub struct HistoryMatcher {
     /// too. A resident workflow therefore must not resume a wait for one of
     /// these names, because the probe could read the new signal differently.
     frontier_probed_signals: HashSet<String>,
+    /// `SignalReceived` event indices that a payload predicate examined and
+    /// rejected (issue #1985).
+    ///
+    /// Such a signal stays deliverable to a later wait. The predicate looked
+    /// at it, so [`Self::has_non_lifecycle_unconsumed`] does not report it as
+    /// drift. A signal that no code examined still flags. The exemption
+    /// travels with the event index, as `late_race_signal_events` does.
+    predicate_rejected_signal_events: HashSet<usize>,
 }
 
 impl HistoryMatcher {
@@ -882,6 +890,7 @@ impl HistoryMatcher {
             timer_scan_stopped_at_command: false,
             terminal_failure_tail,
             frontier_probed_signals: HashSet::new(),
+            predicate_rejected_signal_events: HashSet::new(),
         }
     }
 
@@ -914,6 +923,16 @@ impl HistoryMatcher {
         if !bounded {
             self.frontier_probed_signals.insert(signal_name.to_string());
         }
+    }
+
+    /// Records that a payload-matching wait parked on `signal_name` (issue
+    /// #1985).
+    ///
+    /// A warm resume sends any same-name payload to the parked future and
+    /// does not run the predicate. The name is therefore treated as probed,
+    /// so `ResidentWorkflow::capture` declines.
+    pub(crate) fn note_predicate_signal_wait(&mut self, signal_name: &str) {
+        self.frontier_probed_signals.insert(signal_name.to_string());
     }
 
     /// Index of the first event of this history's **terminal-failure tail**, or
@@ -2043,12 +2062,12 @@ impl HistoryMatcher {
         }
         // Signals buffered early (via drain_early_signals) that were never
         // consumed by wait_for_signal represent unconsumed history, except
-        // for the exact events excused by a lost race.
-        if self
-            .pending_signals
-            .iter()
-            .any(|(_, _, idx)| !self.late_race_signal_events.contains(idx))
-        {
+        // for the exact events excused by a lost race or rejected by a
+        // payload predicate (issue #1985).
+        if self.pending_signals.iter().any(|(_, _, idx)| {
+            !self.late_race_signal_events.contains(idx)
+                && !self.predicate_rejected_signal_events.contains(idx)
+        }) {
             return true;
         }
         // External signals drained early that were never consumed by
@@ -4165,7 +4184,22 @@ impl HistoryMatcher {
     /// `known_limitation_signal_wait_composed_with_cancellable_await_fire_diverges_on_reversed_order`.
     #[allow(clippy::too_many_lines)]
     pub fn match_signal(&mut self, signal_name: &str) -> HistoryMatch {
-        self.match_signal_inner(signal_name, None)
+        self.match_signal_inner(signal_name, None, None)
+    }
+
+    /// [`match_signal`](Self::match_signal) that takes only a payload for
+    /// which `predicate` is `true` (issue #1985).
+    ///
+    /// A same-name signal that fails the predicate stays buffered for a later
+    /// wait. Its event index is excused from the unconsumed-history check.
+    /// The scan then continues. The predicate must be a pure function of the
+    /// payload, or replay can take a different event.
+    pub fn match_signal_where(
+        &mut self,
+        signal_name: &str,
+        predicate: &dyn Fn(&Value) -> bool,
+    ) -> HistoryMatch {
+        self.match_signal_inner(signal_name, None, Some(predicate))
     }
 
     /// [`match_signal`](Self::match_signal) for a **race branch** (issue #950).
@@ -4195,22 +4229,23 @@ impl HistoryMatcher {
     /// that signal, leaving the real `ctx.wait_for_signal` that owns it parked on
     /// a signal already delivered.
     pub fn match_race_signal(&mut self, signal_name: &str, settle_marker: &str) -> HistoryMatch {
-        self.match_signal_inner(signal_name, Some(settle_marker))
+        self.match_signal_inner(signal_name, Some(settle_marker), None)
     }
 
     /// `tolerate_interleaved` carries the race's settlement-marker name when the
     /// caller is a `ctx.race()` branch, and is `None` for a solo
     /// `wait_for_signal`.
+    ///
+    /// `predicate` is `None` for a plain wait. For a payload-matching wait
+    /// (issue #1985), a same-name signal must also satisfy it.
     #[allow(clippy::too_many_lines)]
     fn match_signal_inner(
         &mut self,
         signal_name: &str,
         tolerate_interleaved: Option<&str>,
+        predicate: Option<&dyn Fn(&Value) -> bool>,
     ) -> HistoryMatch {
-        if let Some(index) = self
-            .pending_signals
-            .iter()
-            .position(|(name, _, _)| name == signal_name)
+        if let Some(index) = self.claim_buffered_signal_position(signal_name, predicate)
             && let Some((_name, payload, _idx)) = self.pending_signals.remove(index)
         {
             return HistoryMatch::Matched { output: payload };
@@ -4237,6 +4272,16 @@ impl HistoryMatcher {
             }
 
             match &self.events[scan_cursor] {
+                WorkflowEvent::SignalReceived {
+                    signal_name: recorded_name,
+                    payload,
+                } if recorded_name == signal_name && predicate.is_some_and(|p| !p(payload)) => {
+                    // A payload-matching wait rejects this payload (issue
+                    // #1985). Buffer it for a later wait and keep scanning.
+                    self.predicate_rejected_signal_events.insert(scan_cursor);
+                    self.stash_transparent_external_event(scan_cursor);
+                    scan_cursor += 1;
+                }
                 WorkflowEvent::SignalReceived {
                     signal_name: recorded_name,
                     payload,
@@ -6335,6 +6380,63 @@ impl HistoryMatcher {
                         WorkflowEvent::SignalReceived { signal_name: n, .. } if n == signal_name
                     )
             })
+    }
+
+    /// [`has_unconsumed_signal`](Self::has_unconsumed_signal) for a
+    /// payload-matching wait (issue #1985).
+    ///
+    /// Only a same-name signal whose payload satisfies `predicate` counts. A
+    /// pure read: it consumes nothing and never moves the cursor.
+    #[must_use]
+    pub fn has_unconsumed_signal_where(
+        &self,
+        signal_name: &str,
+        predicate: &dyn Fn(&Value) -> bool,
+    ) -> bool {
+        if self
+            .pending_signals
+            .iter()
+            .any(|(name, payload, _)| name == signal_name && predicate(payload))
+        {
+            return true;
+        }
+        self.events
+            .iter()
+            .enumerate()
+            .skip(self.cursor)
+            .any(|(i, e)| {
+                !self.is_consumed(i)
+                    && matches!(
+                        e,
+                        WorkflowEvent::SignalReceived { signal_name: n, payload }
+                            if n == signal_name && predicate(payload)
+                    )
+            })
+    }
+
+    /// Position in `pending_signals` of the first buffered `signal_name`
+    /// signal that `predicate` accepts (issue #1985).
+    ///
+    /// With no predicate this is the first buffered signal of that name. Each
+    /// same-name payload that the predicate rejects is recorded in
+    /// `predicate_rejected_signal_events`.
+    fn claim_buffered_signal_position(
+        &mut self,
+        signal_name: &str,
+        predicate: Option<&dyn Fn(&Value) -> bool>,
+    ) -> Option<usize> {
+        for (position, (name, payload, index)) in self.pending_signals.iter().enumerate() {
+            if name != signal_name {
+                continue;
+            }
+            match predicate {
+                Some(accepts) if !accepts(payload) => {
+                    self.predicate_rejected_signal_events.insert(*index);
+                }
+                _ => return Some(position),
+            }
+        }
+        None
     }
 
     /// Whether an unconsumed `MarkerRecorded { name }` exists anywhere at or
@@ -14153,5 +14255,100 @@ mod tests {
         let matcher = HistoryMatcher::new(events);
         assert!(matcher.is_consumed(1), "superseded WorkflowFailed");
         assert!(matcher.is_consumed(3), "WorkflowRedriven");
+    }
+
+    // ── match_signal_where (issue #1985) ─────────────────────────────────────
+
+    fn order_signal(id: u64) -> WorkflowEvent {
+        WorkflowEvent::SignalReceived {
+            signal_name: "order".into(),
+            payload: serde_json::json!({ "id": id }),
+        }
+    }
+
+    fn order_id_is(id: u64) -> impl Fn(&Value) -> bool {
+        move |payload: &Value| payload["id"] == id
+    }
+
+    #[test]
+    fn match_signal_where_skips_a_rejected_payload_and_takes_a_later_match() {
+        let mut matcher = HistoryMatcher::new(vec![order_signal(41), order_signal(42)]);
+        let result = matcher.match_signal_where("order", &order_id_is(42));
+        assert_eq!(
+            result,
+            HistoryMatch::Matched {
+                output: serde_json::json!({ "id": 42 })
+            }
+        );
+    }
+
+    #[test]
+    fn match_signal_where_keeps_a_rejected_payload_for_a_later_wait() {
+        let mut matcher = HistoryMatcher::new(vec![order_signal(41), order_signal(42)]);
+        let _ = matcher.match_signal_where("order", &order_id_is(42));
+        assert_eq!(
+            matcher.match_signal("order"),
+            HistoryMatch::Matched {
+                output: serde_json::json!({ "id": 41 })
+            }
+        );
+        assert!(!matcher.has_non_lifecycle_unconsumed());
+    }
+
+    #[test]
+    fn match_signal_where_takes_a_buffered_match_before_scanning() {
+        let mut matcher = HistoryMatcher::new(vec![order_signal(7), order_signal(8)]);
+        let _ = matcher.match_signal_where("order", &order_id_is(8));
+        assert_eq!(
+            matcher.match_signal_where("order", &order_id_is(7)),
+            HistoryMatch::Matched {
+                output: serde_json::json!({ "id": 7 })
+            }
+        );
+    }
+
+    #[test]
+    fn match_signal_where_parks_when_no_payload_matches() {
+        let mut matcher = HistoryMatcher::new(vec![order_signal(41)]);
+        assert_eq!(
+            matcher.match_signal_where("order", &order_id_is(42)),
+            HistoryMatch::NoMatch
+        );
+    }
+
+    #[test]
+    fn a_rejected_signal_is_excused_from_the_unconsumed_history_check() {
+        let mut matcher = HistoryMatcher::new(vec![order_signal(41)]);
+        let _ = matcher.match_signal_where("order", &order_id_is(42));
+        assert!(
+            !matcher.has_non_lifecycle_unconsumed(),
+            "a payload that a predicate examined and rejected is not drift"
+        );
+    }
+
+    #[test]
+    fn a_rejected_signal_still_counts_as_unhandled() {
+        let mut matcher = HistoryMatcher::new(vec![order_signal(41)]);
+        let _ = matcher.match_signal_where("order", &order_id_is(42));
+        let counts = matcher.unconsumed_signals_by_name();
+        assert_eq!(counts.get("order"), Some(&1));
+    }
+
+    #[test]
+    fn an_unexamined_signal_still_flags_after_a_predicate_wait() {
+        let mut matcher = HistoryMatcher::new(vec![order_signal(42), order_signal(43)]);
+        let _ = matcher.match_signal_where("order", &order_id_is(42));
+        assert!(
+            matcher.has_non_lifecycle_unconsumed(),
+            "the predicate never examined order 43, so it still flags"
+        );
+    }
+
+    #[test]
+    fn has_unconsumed_signal_where_ignores_rejected_payloads() {
+        let mut matcher = HistoryMatcher::new(vec![order_signal(41)]);
+        let _ = matcher.match_signal_where("order", &order_id_is(42));
+        assert!(!matcher.has_unconsumed_signal_where("order", &order_id_is(42)));
+        assert!(matcher.has_unconsumed_signal_where("order", &order_id_is(41)));
     }
 }

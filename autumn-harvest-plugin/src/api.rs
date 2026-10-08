@@ -2978,7 +2978,7 @@ struct CreateWorkflowScheduleRequest {
     #[serde(default)]
     jitter_secs: Option<u64>,
     /// Overlap policy string (e.g. `"skip"`, `"buffer_one"`, `"buffer_all"`,
-    /// `"cancel_other"`, `"terminate_other"`). Defaults to `"skip"`.
+    /// `"cancel_other"`, `"terminate_other"`, `"allow_all"`). Defaults to `"skip"`.
     #[serde(default = "default_overlap_policy")]
     overlap_policy: String,
     /// Maximum buffered slots under `BufferAll`. Defaults to `100`.
@@ -27839,7 +27839,8 @@ async fn create_workflow_schedule(
         Ok(p) => p,
         Err(v) => {
             let err_summary = format!(
-                "invalid overlap_policy '{v}'; valid values: skip, buffer_one, buffer_all, cancel_other, terminate_other"
+                "invalid overlap_policy '{v}'; valid values: {}",
+                autumn_harvest::OverlapPolicy::VALID_VALUES
             );
             schedule_create_audit_failed(
                 &api_state,
@@ -28546,7 +28547,8 @@ async fn update_schedule_handler(
             Ok(p) => Some(p),
             Err(v) => {
                 let err_summary = format!(
-                    "invalid overlap_policy '{v}'; valid values: skip, buffer_one, buffer_all, cancel_other, terminate_other"
+                    "invalid overlap_policy '{v}'; valid values: {}",
+                autumn_harvest::OverlapPolicy::VALID_VALUES
                 );
                 schedule_update_audit_failed(
                     &api_state,
@@ -46306,7 +46308,10 @@ async fn preview_candidate_schedule_handler(
         return Ok((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": format!("unknown overlap_policy '{bad}'; valid: skip, buffer_one, buffer_all, cancel_other, terminate_other"),
+                "error": format!(
+                    "unknown overlap_policy '{bad}'; valid: {}",
+                    autumn_harvest::OverlapPolicy::VALID_VALUES
+                ),
                 "field": "overlap_policy"
             })),
         ));

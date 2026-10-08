@@ -807,6 +807,7 @@ impl Schedule {
 /// | `BufferAll` | Backfill/replay; every missed slot must eventually run | Continues | Queued (up to `buffer_all_max`) | Dropped past cap | Durable in DB |
 /// | `CancelOther` | Wedged runs; always prefer the latest firing | Cancelled gracefully | Started immediately | Normal | N/A |
 /// | `TerminateOther` | Same as `CancelOther` but with immediate force-stop | Terminated immediately | Started immediately | Normal | N/A |
+/// | `AllowAll` | Independent runs that may overlap (issue #1985) | Continues | Started immediately | Each started | N/A |
 ///
 /// The default is [`Skip`](OverlapPolicy::Skip), which preserves pre-existing behaviour.
 ///
@@ -815,6 +816,10 @@ impl Schedule {
 ///
 /// `CancelOther` / `TerminateOther` require the cancellation contract from
 /// issue #238, which is implemented in this codebase.
+///
+/// `AllowAll` ignores `max_active_runs`, as Temporal does. Per-workflow
+/// concurrency limits, throttles and admission gates still apply. Runs can
+/// overlap, so `last_completion_result` carryover can be stale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OverlapPolicy {
@@ -831,9 +836,16 @@ pub enum OverlapPolicy {
     CancelOther,
     /// Terminate the in-flight run immediately and start the new one.
     TerminateOther,
+    /// Start the new run and keep the in-flight runs (issue #1985).
+    AllowAll,
 }
 
 impl OverlapPolicy {
+    /// Every accepted value, in declaration order. Error messages and API
+    /// docs quote this list.
+    pub const VALID_VALUES: &'static str =
+        "skip, buffer_one, buffer_all, cancel_other, terminate_other, allow_all";
+
     /// The `snake_case` string used to store this policy in `harvest_schedules`.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -843,6 +855,7 @@ impl OverlapPolicy {
             Self::BufferAll => "buffer_all",
             Self::CancelOther => "cancel_other",
             Self::TerminateOther => "terminate_other",
+            Self::AllowAll => "allow_all",
         }
     }
 
@@ -858,6 +871,7 @@ impl OverlapPolicy {
             "buffer_all" => Self::BufferAll,
             "cancel_other" => Self::CancelOther,
             "terminate_other" => Self::TerminateOther,
+            "allow_all" => Self::AllowAll,
             _ => Self::Skip,
         }
     }
@@ -878,6 +892,7 @@ impl OverlapPolicy {
             "buffer_all" => Ok(Self::BufferAll),
             "cancel_other" => Ok(Self::CancelOther),
             "terminate_other" => Ok(Self::TerminateOther),
+            "allow_all" => Ok(Self::AllowAll),
             _ => Err(s),
         }
     }
@@ -2453,6 +2468,7 @@ mod tests {
             (OverlapPolicy::BufferAll, "buffer_all"),
             (OverlapPolicy::CancelOther, "cancel_other"),
             (OverlapPolicy::TerminateOther, "terminate_other"),
+            (OverlapPolicy::AllowAll, "allow_all"),
         ];
         for (policy, s) in cases {
             assert_eq!(policy.as_str(), s, "as_str mismatch for {policy:?}");
@@ -2462,6 +2478,42 @@ mod tests {
                 "from_db mismatch for {s}"
             );
         }
+    }
+
+    #[test]
+    fn overlap_policy_from_user_input_accepts_every_variant() {
+        let cases = [
+            ("skip", OverlapPolicy::Skip),
+            ("buffer_one", OverlapPolicy::BufferOne),
+            ("buffer_all", OverlapPolicy::BufferAll),
+            ("cancel_other", OverlapPolicy::CancelOther),
+            ("terminate_other", OverlapPolicy::TerminateOther),
+            ("allow_all", OverlapPolicy::AllowAll),
+        ];
+        for (s, policy) in cases {
+            assert_eq!(OverlapPolicy::from_user_input(s), Ok(policy));
+        }
+        assert_eq!(OverlapPolicy::from_user_input("bogus"), Err("bogus"));
+    }
+
+    #[test]
+    fn overlap_policy_valid_values_names_every_variant() {
+        let all = [
+            OverlapPolicy::Skip,
+            OverlapPolicy::BufferOne,
+            OverlapPolicy::BufferAll,
+            OverlapPolicy::CancelOther,
+            OverlapPolicy::TerminateOther,
+            OverlapPolicy::AllowAll,
+        ];
+        let listed: Vec<&str> = OverlapPolicy::VALID_VALUES.split(", ").collect();
+        assert_eq!(listed, all.map(OverlapPolicy::as_str));
+    }
+
+    #[test]
+    fn overlap_policy_allow_all_serialises_as_snake_case() {
+        let json = serde_json::to_string(&OverlapPolicy::AllowAll).expect("serialize");
+        assert_eq!(json, "\"allow_all\"");
     }
 
     #[test]
@@ -2541,6 +2593,7 @@ mod tests {
             OverlapPolicy::BufferAll,
             OverlapPolicy::CancelOther,
             OverlapPolicy::TerminateOther,
+            OverlapPolicy::AllowAll,
         ];
         for policy in policies {
             let json = serde_json::to_string(&policy).expect("serialize");

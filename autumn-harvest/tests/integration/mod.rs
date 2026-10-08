@@ -295,6 +295,10 @@ mod signal_with_start_tests;
 mod sla_breach_tests;
 mod slo_pack_docs;
 mod slot_tuner_tests;
+#[cfg(feature = "db")]
+mod small_primitives_db_tests;
+#[cfg(feature = "testing")]
+mod small_primitives_tests;
 mod sqlite_feasibility_docs;
 #[cfg(feature = "db")]
 mod start_idempotency_tests;

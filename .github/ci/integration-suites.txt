@@ -184,6 +184,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          signal_with_start_tests
 linux        autumn-harvest         integration                      -                          sla_breach_tests
 linux        autumn-harvest         integration                      -                          slot_tuner_tests
+linux        autumn-harvest         integration                      -                          small_primitives_db_tests
 linux        autumn-harvest         integration                      -                          start_idempotency_tests
 linux        autumn-harvest         integration                      -                          start_source_tests
 linux        autumn-harvest         integration                      -                          sticky_default_tests
