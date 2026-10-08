@@ -7,6 +7,17 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::error::{HarvestError, HarvestResult};
+
+/// The task-row header that asks the worker to write the result (issue #1986).
+///
+/// The fan-out sets it on each row through `context_headers`. The activity
+/// handler can see it in `ActivityContext::headers`.
+pub const RESULT_WRITER_HEADER: &str = "x-harvest-result-writer";
+
+/// The discriminator key of a recorded [`StoredResult`].
+pub const STORED_RESULT_KEY: &str = "_harvest_stored_result";
+
 /// How many item failures a fan-out tolerates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -23,8 +34,13 @@ pub enum FailureTolerance {
 impl FailureTolerance {
     /// The largest number of failures a fan-out of `total` items tolerates.
     #[must_use]
-    pub const fn max_failures(self, _total: usize) -> usize {
-        0
+    pub fn max_failures(self, total: usize) -> usize {
+        match self {
+            Self::None => 0,
+            Self::Count(n) => n,
+            // Round down, so the fan-out never tolerates more than asked.
+            Self::Percent(p) => total.saturating_mul(usize::from(p.min(100))) / 100,
+        }
     }
 }
 
@@ -116,31 +132,107 @@ impl StoredResult {
     /// The form that `ActivityCompleted.output` records.
     #[must_use]
     pub fn to_value(&self) -> Value {
-        Value::Null
+        serde_json::json!({
+            STORED_RESULT_KEY: 1,
+            "store_id": self.store_id,
+            "key": self.key,
+            "len": self.len,
+            "checksum": self.checksum,
+        })
     }
 
     /// Parse the form that `ActivityCompleted.output` records.
+    ///
+    /// Returns `None` when `value` does not carry [`STORED_RESULT_KEY`] or a
+    /// field is missing.
     #[must_use]
-    pub const fn from_value(_value: &Value) -> Option<Self> {
-        None
+    pub fn from_value(value: &Value) -> Option<Self> {
+        let obj = value.as_object()?;
+        if obj.get(STORED_RESULT_KEY).and_then(Value::as_i64) != Some(1) {
+            return None;
+        }
+        Some(Self {
+            store_id: obj.get("store_id")?.as_str()?.to_string(),
+            key: obj.get("key")?.as_str()?.to_string(),
+            len: obj.get("len")?.as_u64()?,
+            checksum: obj.get("checksum")?.as_str()?.to_string(),
+        })
     }
 
     /// Read the result back from `store` and decode it with `codecs`.
     ///
+    /// Use the codecs that the worker had. The worker encodes the result
+    /// before it writes it.
+    ///
     /// # Errors
     ///
-    /// Not implemented yet.
+    /// Returns [`HarvestError::PayloadOffload`] when the store fails, the
+    /// store id is not `store`'s, or the length or checksum does not match.
+    /// Returns a codec or serialization error when the blob does not decode.
     pub async fn fetch(
         &self,
-        _store: &dyn crate::payload_store::PayloadStore,
-        _codecs: &crate::payload_codec::PayloadCodecs,
-    ) -> crate::error::HarvestResult<Value> {
-        Err(crate::error::HarvestError::Config("not implemented".into()))
+        store: &dyn crate::payload_store::PayloadStore,
+        codecs: &crate::payload_codec::PayloadCodecs,
+    ) -> HarvestResult<Value> {
+        if store.store_id() != self.store_id {
+            return Err(HarvestError::PayloadOffload(format!(
+                "stored result references store '{}', not '{}'",
+                self.store_id,
+                store.store_id()
+            )));
+        }
+        let bytes = store
+            .get(&self.key)
+            .await
+            .map_err(|e| HarvestError::PayloadOffload(e.0))?;
+        if bytes.len() as u64 != self.len {
+            return Err(HarvestError::PayloadOffload(format!(
+                "length mismatch for stored result '{}' (expected {} bytes, got {})",
+                self.key,
+                self.len,
+                bytes.len()
+            )));
+        }
+        let actual = crate::payload_store::hex_sha256(&bytes);
+        if actual != self.checksum {
+            return Err(HarvestError::PayloadOffload(format!(
+                "checksum mismatch for stored result '{}' (expected {}, got {actual})",
+                self.key, self.checksum
+            )));
+        }
+        let encoded: Value = serde_json::from_slice(&bytes)?;
+        codecs.decode_payload(&encoded)
+    }
+
+    /// Encode `value` with `codecs` and write it to `store` (issue #1986).
+    ///
+    /// The worker calls this for a task row that carries
+    /// [`RESULT_WRITER_HEADER`]. The returned reference is what history
+    /// records. The caller records the blob for retention.
+    #[cfg(feature = "db")]
+    pub(crate) async fn write(
+        store: &dyn crate::payload_store::PayloadStore,
+        codecs: &crate::payload_codec::PayloadCodecs,
+        value: &Value,
+    ) -> HarvestResult<Self> {
+        let encoded = codecs.encode_payload(value)?;
+        let bytes = serde_json::to_vec(&encoded)?;
+        let checksum = crate::payload_store::hex_sha256(&bytes);
+        let key = store
+            .put(&bytes)
+            .await
+            .map_err(|e| HarvestError::PayloadOffload(e.0))?;
+        Ok(Self::new(
+            store.store_id(),
+            key,
+            bytes.len() as u64,
+            checksum,
+        ))
     }
 }
 
 /// The outcome of one fan-out item.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FanOutItem<T> {
     /// The item result, inline.
@@ -152,7 +244,7 @@ pub enum FanOutItem<T> {
 }
 
 /// The manifest of a fan-out: one item per input, in input order.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FanOutResults<T> {
     items: Vec<FanOutItem<T>>,
     tolerated: usize,

@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use autumn_harvest::context::{ActivityContext, WorkflowContext};
 use autumn_harvest::error::HarvestError;
-use autumn_harvest::fan_out::{FailureTolerance, FanOutItem, FanOutOptions, FanOutResults};
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString as _};
+use autumn_harvest::fan_out::{FailureTolerance, FanOutItem, FanOutOptions, FanOutResults};
 use autumn_harvest::info::{ActivityInfo, WorkflowHandlerFn, WorkflowInfo};
 use autumn_harvest::payload_codec::PayloadCodecs;
 use autumn_harvest::payload_store::{
@@ -33,6 +33,15 @@ use crate::integration_e2e::{
     build_runtime_worker, build_test_pool, enqueue_started_workflow_task, insert_named_execution,
     setup_test_database_url_or_env, spawn_test_worker, wait_for_execution_state_with_timeout,
 };
+
+/// Lower-case hex of `bytes`.
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut out, b| {
+        let _ = write!(out, "{b:02x}");
+        out
+    })
+}
 
 /// A content-addressed in-memory store.
 #[derive(Default)]
@@ -61,10 +70,7 @@ impl PayloadStore for MemStore {
     }
 
     fn put(&self, bytes: &[u8]) -> PayloadStoreFuture<'_, String> {
-        let key: String = Sha256::digest(bytes)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let key = hex(&Sha256::digest(bytes));
         self.blobs
             .lock()
             .unwrap()
@@ -84,7 +90,7 @@ impl PayloadStore for MemStore {
     }
 }
 
-/// Item `i` returns a string of `size` bytes that starts with `i`.
+/// Item `i` returns a string of `size` bytes that starts with `i:`.
 /// Items listed in `fail` fail without a retry.
 fn make_blob<'a>(
     _ctx: &'a ActivityContext,
@@ -93,11 +99,19 @@ fn make_blob<'a>(
     Box::pin(async move {
         let i = input["i"].as_u64().unwrap_or(0);
         if input["fail"].as_bool() == Some(true) {
-            return Err(ActivityFailure::non_retryable("Boom", format!("item {i}")).into_error_payload());
+            return Err(
+                ActivityFailure::non_retryable("Boom", format!("item {i}")).into_error_payload()
+            );
         }
         let size = usize::try_from(input["size"].as_u64().unwrap_or(0)).unwrap_or(0);
+        // Hash output does not compress, so Postgres stores the full size.
         let mut body = format!("{i}:");
-        body.push_str(&"x".repeat(size.saturating_sub(body.len())));
+        let mut block = Sha256::digest(body.as_bytes());
+        while body.len() < size {
+            block = Sha256::digest(block);
+            body.push_str(&hex(&block));
+        }
+        body.truncate(size.max(2));
         Ok(json!(body))
     })
 }
@@ -130,7 +144,10 @@ fn fan_out_workflow<'a>(
         if let Some(k) = input["count"].as_u64() {
             options = options.tolerate(FailureTolerance::Count(usize::try_from(k).unwrap()));
         }
-        let results = match ctx.execute_activity_fan_out_raw_with(activities, &options).await {
+        let results = match ctx
+            .execute_activity_fan_out_raw_with(activities, &options)
+            .await
+        {
             Ok(results) => results,
             Err(error @ HarvestError::FanOutFailureThresholdExceeded { .. }) => {
                 return Err(error.to_string());
@@ -237,11 +254,18 @@ async fn run_fan_out(
     input: Value,
     state: &str,
 ) -> (ExecutionId, autumn_harvest::models::WorkflowExecution) {
+    // A unique id per run, so a rerun on a shared database does not collide.
+    let workflow_id: &'static str =
+        Box::leak(format!("{workflow_id}-{}", uuid::Uuid::new_v4()).into_boxed_str());
     let exec_id = insert_named_execution(conn, "writer_fan_out", workflow_id, input.clone()).await;
     enqueue_started_workflow_task(conn, exec_id, input).await;
-    let execution =
-        wait_for_execution_state_with_timeout(database_url, exec_id, state, Duration::from_secs(120))
-            .await;
+    let execution = wait_for_execution_state_with_timeout(
+        database_url,
+        exec_id,
+        state,
+        Duration::from_secs(120),
+    )
+    .await;
     (exec_id, execution)
 }
 
@@ -301,11 +325,26 @@ async fn result_writer_keeps_history_bytes_per_item_fixed() {
     // Result bytes per item are fixed: the same for 20 or 400 items, and for
     // 1 KiB or 64 KiB results.
     let per_item = |total: i64, n: i64| total / n;
-    let narrow_item = per_item(history_bytes(&mut conn, narrow, "ActivityCompleted").await, 20);
-    let wide_item = per_item(history_bytes(&mut conn, wide, "ActivityCompleted").await, 400);
-    let large_item = per_item(history_bytes(&mut conn, large, "ActivityCompleted").await, 20);
-    let plain_item = per_item(history_bytes(&mut conn, plain, "ActivityCompleted").await, 20);
-    assert!(narrow_item <= 512, "a reference is small: {narrow_item} bytes");
+    let narrow_item = per_item(
+        history_bytes(&mut conn, narrow, "ActivityCompleted").await,
+        20,
+    );
+    let wide_item = per_item(
+        history_bytes(&mut conn, wide, "ActivityCompleted").await,
+        400,
+    );
+    let large_item = per_item(
+        history_bytes(&mut conn, large, "ActivityCompleted").await,
+        20,
+    );
+    let plain_item = per_item(
+        history_bytes(&mut conn, plain, "ActivityCompleted").await,
+        20,
+    );
+    assert!(
+        narrow_item <= 512,
+        "a reference is small: {narrow_item} bytes"
+    );
     assert!(
         (narrow_item - wide_item).abs() <= 8,
         "width must not change bytes per item: {narrow_item} vs {wide_item}"
@@ -404,5 +443,8 @@ fn manifest_round_trips_through_json() {
     }))
     .unwrap();
     assert_eq!(results.failed_count(), 1);
-    assert_eq!(serde_json::to_value(&results).unwrap()["tolerated"], json!(1));
+    assert_eq!(
+        serde_json::to_value(&results).unwrap()["tolerated"],
+        json!(1)
+    );
 }

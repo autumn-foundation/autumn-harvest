@@ -2644,6 +2644,7 @@ impl Session<'_> {
                 Some(self.id),
                 Some(self.host_worker_id.clone()),
                 None,
+                false,
             )
             .await
             .map_err(|err| self.broken_session_error(err))?;
@@ -2674,6 +2675,7 @@ impl Session<'_> {
                 Some(self.id),
                 Some(self.host_worker_id.clone()),
                 None,
+                false,
             )
             .await
             .map_err(|err| self.broken_session_error(err))
@@ -2734,6 +2736,7 @@ impl Session<'_> {
                 Some(self.id),
                 Some(self.host_worker_id.clone()),
                 None,
+                false,
             )
             .await
             .map_err(|err| self.broken_session_error(err))?;
@@ -5935,7 +5938,7 @@ impl WorkflowContext {
         input: Value,
         queue: &str,
     ) -> HarvestResult<Value> {
-        self.execute_activity_raw_full(name, input, queue, None, None, None, None, None)
+        self.execute_activity_raw_full(name, input, queue, None, None, None, None, None, false)
             .await
     }
 
@@ -5961,6 +5964,7 @@ impl WorkflowContext {
             None,
             None,
             None,
+            false,
         )
         .await
     }
@@ -5985,6 +5989,7 @@ impl WorkflowContext {
         session_id: Option<SessionId>,
         session_worker_id: Option<String>,
         schedule_to_start_override: Option<std::time::Duration>,
+        result_writer: bool,
     ) -> HarvestResult<Value> {
         let history_match = if self.strict_replay {
             self.match_history(|m| m.match_activity_strict(name, &input))
@@ -6089,7 +6094,7 @@ impl WorkflowContext {
                     session_id,
                     session_worker_id,
                     schedule_to_start_override,
-                    result_writer: false,
+                    result_writer,
                     result_tx: tx,
                 });
                 match rx.await {
@@ -11007,35 +11012,207 @@ impl WorkflowContext {
 
     // ── Fan-out with options (issue #1986) ───────────────────────────────
 
-    /// Fan out with [`FanOutOptions`](crate::fan_out::FanOutOptions).
+    /// Execute N activities in parallel with [`FanOutOptions`].
+    ///
+    /// [`FanOutOptions`]: crate::fan_out::FanOutOptions
+    ///
+    /// The options add three things to the collect-all fan-out:
+    ///
+    /// - **Window.** `max_in_flight` limits the items in flight, as
+    ///   [`execute_activity_fan_out_collect_raw_windowed`](Self::execute_activity_fan_out_collect_raw_windowed)
+    ///   does.
+    /// - **Failure tolerance.** The fan-out completes when at most N items
+    ///   fail. It fails with
+    ///   [`HarvestError::FanOutFailureThresholdExceeded`] when more fail. A
+    ///   windowed fan-out then dispatches no further wave. Activities already
+    ///   in flight keep running, as with the fail-fast helpers.
+    /// - **Result writer.** The worker writes each result through the
+    ///   `PayloadStore`. History records a fixed-size
+    ///   [`StoredResult`](crate::fan_out::StoredResult) for the item, not the
+    ///   value. A worker without a store records the value inline.
+    ///
+    /// The returned [`FanOutResults`](crate::fan_out::FanOutResults) is the
+    /// manifest. It holds one item per input, in input order.
+    ///
+    /// # Replay safety
+    ///
+    /// The fan-out records the same `fan_out:{n}` marker as the other
+    /// helpers. Neither the window nor the tolerance is recorded.
+    ///
+    /// Each wave polls every slot before it counts the failures. So the
+    /// fan-out consumes every recorded slot of the wave, and a workflow can
+    /// catch the threshold error and go on (issue #1791). Failures only
+    /// accumulate, so a replay that sees more results makes the same decision.
+    /// Change a tolerance for in-flight runs behind `ctx.version()`.
     ///
     /// # Errors
     ///
-    /// Not implemented yet.
+    /// - [`HarvestError::FanOutFailureThresholdExceeded`] when more items
+    ///   fail than the tolerance allows. Only `ActivityFailed` and `Timeout`
+    ///   count as item failures.
+    /// - [`HarvestError::Config`] on a fresh dispatch with the result writer
+    ///   and no `PayloadStore`. The check does not run on replay.
+    /// - [`HarvestError::NonDeterministic`] if `activities.len()` differs
+    ///   from the recorded count.
+    /// - [`HarvestError::Cancelled`] if the workflow was cancelled.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
     pub async fn execute_activity_fan_out_raw_with(
         &self,
-        _activities: Vec<(String, Value, String)>,
-        _options: &crate::fan_out::FanOutOptions,
+        activities: Vec<(String, Value, String)>,
+        options: &crate::fan_out::FanOutOptions,
     ) -> HarvestResult<crate::fan_out::FanOutResults<Value>> {
-        Err(HarvestError::Config("not implemented".into()))
+        let writer = options.writes_results();
+        let (slots, tolerated) = self
+            .fan_out_with_impl(activities, options, None, None)
+            .await?;
+        let items = slots
+            .into_iter()
+            .map(|slot| fan_out_item(slot, writer, Ok))
+            .collect::<HarvestResult<Vec<_>>>()?;
+        Ok(crate::fan_out::FanOutResults::new(items, tolerated))
     }
 
-    /// Typed sibling of `execute_activity_fan_out_raw_with`.
+    /// Typed sibling of
+    /// [`execute_activity_fan_out_raw_with`](Self::execute_activity_fan_out_raw_with).
+    ///
+    /// All slots share the same `ActivityInfo`. An inline value decodes to
+    /// `O`. A stored result stays a reference.
     ///
     /// # Errors
     ///
-    /// Not implemented yet.
+    /// Returns [`HarvestError::Config`] for a local activity, and
+    /// [`HarvestError::Serialization`] if an input does not serialize or an
+    /// inline value does not decode. Propagates the errors of
+    /// [`execute_activity_fan_out_raw_with`](Self::execute_activity_fan_out_raw_with).
     pub async fn execute_activity_fan_out_with<I, O>(
         &self,
-        _info: &crate::info::ActivityInfo,
-        _inputs: Vec<I>,
-        _options: &crate::fan_out::FanOutOptions,
+        info: &crate::info::ActivityInfo,
+        inputs: Vec<I>,
+        options: &crate::fan_out::FanOutOptions,
     ) -> HarvestResult<crate::fan_out::FanOutResults<O>>
     where
         I: serde::Serialize,
         O: serde::de::DeserializeOwned,
     {
-        Err(HarvestError::Config("not implemented".into()))
+        if info.is_local {
+            return Err(HarvestError::Config(format!(
+                "activity '{}' is marked local = true; fan-out requires remote activities",
+                info.name
+            )));
+        }
+        let queue = info.default_queue.unwrap_or("default").to_string();
+        let activities = inputs
+            .into_iter()
+            .map(|i| {
+                let json_input = serde_json::to_value(i)?;
+                Ok((info.name.to_string(), json_input, queue.clone()))
+            })
+            .collect::<Result<Vec<_>, serde_json::Error>>()?;
+
+        let writer = options.writes_results();
+        let (slots, tolerated) = self
+            .fan_out_with_impl(
+                activities,
+                options,
+                info.default_retry_policy.clone(),
+                info.default_start_to_close,
+            )
+            .await?;
+        let items = slots
+            .into_iter()
+            .map(|slot| {
+                fan_out_item(slot, writer, |v| {
+                    serde_json::from_value(v).map_err(HarvestError::Serialization)
+                })
+            })
+            .collect::<HarvestResult<Vec<_>>>()?;
+        Ok(crate::fan_out::FanOutResults::new(items, tolerated))
+    }
+
+    /// Shared body of the fan-out helpers that take options.
+    ///
+    /// Returns the classified slots in input order and the tolerated count.
+    /// The structure is the windowed fan-out's: resume the recorded prefix,
+    /// then dispatch the rest in waves. No window means one wave.
+    async fn fan_out_with_impl(
+        &self,
+        activities: Vec<(String, Value, String)>,
+        options: &crate::fan_out::FanOutOptions,
+        retry: Option<crate::policy::RetryPolicy>,
+        timeout: Option<std::time::Duration>,
+    ) -> HarvestResult<(Vec<Result<Value, String>>, usize)> {
+        self.check_cancellation()?;
+
+        let seq = self.next_fan_out_seq();
+        let count = activities.len();
+        let writer = options.writes_results();
+        // Check the store before the marker, so a failed check records
+        // nothing. Replay does not check again: the store can change.
+        if self.peek_fan_out_count(seq, count)? {
+            if writer && self.payload_offload_threshold.is_none() {
+                return Err(HarvestError::Config(
+                    "a fan-out with a result writer needs a PayloadStore; \
+                     register one with HarvestBuilder::payload_store"
+                        .into(),
+                ));
+            }
+            self.record_fan_out_marker(seq, count);
+        }
+
+        let tolerated = options.tolerance().max_failures(count);
+        if activities.is_empty() {
+            return Ok((Vec::new(), tolerated));
+        }
+        let window = options.window().map_or(count, |w| w.max(1));
+
+        // The recorded prefix holds only this fan-out's slots. A fan-out that
+        // stopped on its tolerance can be followed by other activities, so
+        // the scan matches each slot's name and input.
+        let expected: Vec<(&str, &Value)> = activities
+            .iter()
+            .map(|(name, input, _)| (name.as_str(), input))
+            .collect();
+        let scheduled_prefix = self.match_history(|m| m.count_scheduled_prefix_matching(&expected));
+
+        let dispatch = |(name, input, queue): (String, Value, String)| {
+            let retry = retry.clone();
+            async move {
+                classify_fan_out_slot(
+                    self.execute_activity_raw_full(
+                        &name, input, &queue, retry, timeout, None, None, None, writer,
+                    )
+                    .await,
+                )
+            }
+        };
+
+        let mut activities = activities;
+        let mut results = Vec::with_capacity(count);
+        let mut failures = 0;
+        let limit = FailureLimit {
+            tolerated,
+            total: count,
+        };
+        // Phase 1 resumes the recorded prefix as one batch. Phase 2 sends the
+        // rest in waves. See `fan_out_raw_windowed_impl` for why.
+        if scheduled_prefix > 0 {
+            self.check_cancellation()?;
+            let wave = activities
+                .drain(..scheduled_prefix)
+                .map(&dispatch)
+                .collect();
+            join_fan_out_wave(wave, &mut failures, limit, &mut results).await?;
+        }
+        while !activities.is_empty() {
+            self.check_cancellation()?;
+            let take = window.min(activities.len());
+            let wave = activities.drain(..take).map(&dispatch).collect();
+            join_fan_out_wave(wave, &mut failures, limit, &mut results).await?;
+        }
+        Ok((results, tolerated))
     }
 
     // ── Fan-out / parallel child workflows (issue #601) ──────────────────
@@ -12443,6 +12620,7 @@ impl WorkflowContext {
                 None,
                 None,
                 Some(options.acquisition_timeout),
+                false,
             )
             .await?;
         raw.as_str().map(str::to_string).ok_or_else(|| {
@@ -14370,6 +14548,110 @@ impl From<crate::heartbeat::HeartbeatSlot> for HeartbeatSink {
     fn from(slot: crate::heartbeat::HeartbeatSlot) -> Self {
         Self::Stamped(slot)
     }
+}
+
+/// The failure limit of one fan-out (issue #1986).
+#[derive(Clone, Copy)]
+struct FailureLimit {
+    tolerated: usize,
+    total: usize,
+}
+
+/// Split a fan-out slot outcome into an item failure or an engine error.
+///
+/// `ActivityFailed` and `Timeout` are item failures. Every other error
+/// aborts the fan-out, as in the collect-all helpers.
+fn classify_fan_out_slot(slot: HarvestResult<Value>) -> HarvestResult<Result<Value, String>> {
+    match slot {
+        Ok(v) => Ok(Ok(v)),
+        Err(e @ (HarvestError::ActivityFailed { .. } | HarvestError::Timeout { .. })) => {
+            Ok(Err(e.to_string()))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Map one classified slot to a manifest item.
+///
+/// With the result writer, a recorded `StoredResult` becomes `Stored`. Any
+/// other value goes through `decode`.
+fn fan_out_item<T>(
+    slot: Result<Value, String>,
+    writer: bool,
+    decode: impl FnOnce(Value) -> HarvestResult<T>,
+) -> HarvestResult<crate::fan_out::FanOutItem<T>> {
+    use crate::fan_out::{FanOutItem, StoredResult};
+    match slot {
+        Err(error) => Ok(FanOutItem::Failed(error)),
+        Ok(value) => StoredResult::from_value(&value)
+            .filter(|_| writer)
+            .map_or_else(
+                || decode(value).map(FanOutItem::Value),
+                |stored| Ok(FanOutItem::Stored(stored)),
+            ),
+    }
+}
+
+/// Join one fan-out wave and apply the failure limit (issue #1986).
+///
+/// Every wake polls every slot before it decides. `try_join_all` stops at
+/// the first error and leaves later slots unpolled. Their recorded events
+/// are then unconsumed, and a workflow that catches the error drifts (issue
+/// #1791). An engine error still aborts at once, as in the collect-all
+/// helpers.
+async fn join_fan_out_wave<F>(
+    wave: Vec<F>,
+    failures: &mut usize,
+    limit: FailureLimit,
+    results: &mut Vec<Result<Value, String>>,
+) -> HarvestResult<()>
+where
+    F: std::future::Future<Output = HarvestResult<Result<Value, String>>>,
+{
+    use std::task::Poll;
+
+    let mut slots: Vec<_> = wave
+        .into_iter()
+        .map(|f| Box::pin(futures::future::maybe_done(f)))
+        .collect();
+    let prior = *failures;
+    let wave_failures = std::future::poll_fn(|cx| {
+        let mut pending = false;
+        let mut wave_failures = 0;
+        for slot in &mut slots {
+            if slot.as_mut().poll(cx).is_pending() {
+                pending = true;
+                continue;
+            }
+            match slot.as_mut().output_mut() {
+                Some(Ok(Err(_))) => wave_failures += 1,
+                Some(Err(_)) => {
+                    if let Some(Err(error)) = slot.as_mut().take_output() {
+                        return Poll::Ready(Err(error));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if prior + wave_failures > limit.tolerated {
+            Poll::Ready(Err(HarvestError::FanOutFailureThresholdExceeded {
+                tolerated: limit.tolerated,
+                total: limit.total,
+            }))
+        } else if pending {
+            Poll::Pending
+        } else {
+            Poll::Ready(Ok(wave_failures))
+        }
+    })
+    .await?;
+    *failures = prior + wave_failures;
+    for slot in &mut slots {
+        if let Some(outcome) = slot.as_mut().take_output() {
+            results.push(outcome?);
+        }
+    }
+    Ok(())
 }
 
 /// Context passed to every activity function.

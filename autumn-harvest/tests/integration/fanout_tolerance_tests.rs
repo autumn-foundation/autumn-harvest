@@ -91,12 +91,7 @@ fn started(input: &Value) -> WorkflowEvent {
 ///
 /// Each `ScheduleActivity` becomes `ActivityScheduled` plus the result that
 /// `output_fn(input)` gives. `store` sets the context's offload threshold.
-async fn drive<F>(
-    handler: WorkflowHandlerFn,
-    input: Value,
-    store: bool,
-    output_fn: F,
-) -> Drive
+async fn drive<F>(handler: WorkflowHandlerFn, input: Value, store: bool, output_fn: F) -> Drive
 where
     F: Fn(&Value) -> Result<Value, String>,
 {
@@ -217,7 +212,10 @@ async fn count_tolerance_completes_at_n_failures() {
     let items = output["results"]["items"].as_array().unwrap();
     assert_eq!(items.len(), 6);
     assert_eq!(items[0], json!({ "value": 0 }));
-    assert_eq!(items[1], json!({ "failed": "activity failed: item (attempt 1): item 1 failed" }));
+    assert_eq!(
+        items[1],
+        json!({ "failed": "activity failed: item (attempt 1): item 1 failed" })
+    );
     assert_eq!(items[5], json!({ "value": 50 }));
 }
 
@@ -242,13 +240,7 @@ async fn count_tolerance_fails_at_n_plus_one_failures() {
 /// The default tolerance is zero: one failure exceeds it.
 #[tokio::test]
 async fn default_tolerance_fails_on_the_first_failure() {
-    let run = drive(
-        tolerant_handler,
-        json!({ "n": 3 }),
-        false,
-        fail_on(&[2]),
-    )
-    .await;
+    let run = drive(tolerant_handler, json!({ "n": 3 }), false, fail_on(&[2])).await;
     let output = completed_output(&run.outcome);
     assert_eq!(output["exceeded"], json!({ "tolerated": 0, "total": 3 }));
 }
@@ -365,7 +357,9 @@ async fn cancellation_is_not_counted_as_an_item_failure() {
     let ctx = WorkflowContext::for_replay(ExecutionId::new(), history);
     let activities = vec![("item".to_string(), json!(0), "default".to_string())];
     let options = FanOutOptions::new().tolerate(FailureTolerance::Count(5));
-    let result = ctx.execute_activity_fan_out_raw_with(activities, &options).await;
+    let result = ctx
+        .execute_activity_fan_out_raw_with(activities, &options)
+        .await;
     assert!(
         matches!(result, Err(HarvestError::Cancelled(_))),
         "got {result:?}"
@@ -407,8 +401,7 @@ async fn writer_fan_out_flags_commands_and_returns_stored_items() {
     .await;
     assert_eq!(run.writer_flags, vec![true; 4]);
     let output = completed_output(&run.outcome);
-    let results: FanOutResults<Value> =
-        serde_json::from_value(output["results"].clone()).unwrap();
+    let results: FanOutResults<Value> = serde_json::from_value(output["results"].clone()).unwrap();
     assert_eq!(results.failed_count(), 1);
     assert_eq!(results.items()[0], FanOutItem::Stored(stored(0)));
     assert!(matches!(results.items()[2], FanOutItem::Failed(_)));

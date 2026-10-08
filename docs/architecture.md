@@ -955,6 +955,8 @@ See `autumn-harvest/examples/signal_handlers_subscription.rs` for a complete sub
 | `execute_activity_fan_out_collect_windowed(info, inputs, max_in_flight)` | **Bounded** collect-all: at most `W` in flight at a time |
 | `execute_activity_fan_out_raw_windowed(activities, max_in_flight)` | **Bounded** raw fail-fast |
 | `execute_activity_fan_out_collect_raw_windowed(activities, max_in_flight)` | **Bounded** raw collect-all |
+| `execute_activity_fan_out_with(info, inputs, &options)` | Collect-all with `FanOutOptions`: window, failure tolerance, result writer (issue #1986) |
+| `execute_activity_fan_out_raw_with(activities, &options)` | Raw form of the above |
 
 ```rust
 // Typed, homogeneous fan-out — all slots run the same activity
@@ -1005,6 +1007,51 @@ The `_windowed` variants add a `max_in_flight: usize` (`W`) argument to each of 
 - The two `try_join_all` known limitations of the unbounded fan-out (documented in the fan-out sections above) carry over **per-wave** — narrowed to a single wave's width, not widened.
 
 See `autumn-harvest/examples/fanout_batch.rs` for a complete end-to-end example covering all shapes (static N, dynamic N from a prior activity, collect-all with partial failure, and a windowed fan-out over a collection larger than the window).
+
+#### Failure tolerance and result writer (issue #1986)
+
+`FanOutOptions` configures `execute_activity_fan_out_with` and
+`execute_activity_fan_out_raw_with`. Both return `FanOutResults`, the
+manifest. It holds one `FanOutItem` per input, in input order: `Value`,
+`Stored` or `Failed`. It is serializable, so a workflow can pass it to a later
+step.
+
+```rust
+use autumn_harvest::fan_out::{FailureTolerance, FanOutOptions};
+
+let options = FanOutOptions::new()
+    .max_in_flight(50)
+    .tolerate(FailureTolerance::Percent(5))
+    .write_results();
+let manifest = ctx
+    .execute_activity_fan_out_with::<_, ItemResult>(&process_item_info(), items, &options)
+    .await
+    .map_err(|e| e.to_string())?;
+```
+
+- **Failure tolerance.** `FailureTolerance::Count(n)` tolerates `n` failed
+  items. `Percent(p)` tolerates `total * p / 100`, rounded down. The default
+  tolerates none. One failure more fails the fan-out with
+  `HarvestError::FanOutFailureThresholdExceeded { tolerated, total }`. A
+  windowed fan-out then dispatches no further wave. Only `ActivityFailed` and
+  `Timeout` count. Other errors abort, as in the collect-all helpers.
+- **Replay.** The tolerance is not recorded. Each wave polls every slot
+  before it decides, so a workflow can catch the error and go on (issue
+  #1791). The error carries no failure count, because a replay can see more
+  results. Change a tolerance for in-flight runs behind `ctx.version()`.
+- **Result writer.** `write_results()` sets the row header
+  `x-harvest-result-writer`. The worker encodes the result with the payload
+  codecs and writes it through the `PayloadStore`. `ActivityCompleted.output`
+  then holds a fixed-size `StoredResult`. Replay fetches no blob.
+  `StoredResult::fetch` reads one back. A fresh dispatch without a store fails
+  with `HarvestError::Config`. A worker without a store records the value
+  inline, and the item is a `Value`.
+- **History size.** Each item still records its activity events. With the
+  writer, their size does not depend on the result. So history grows by a
+  fixed amount per item, not by the result size. A map run with an item
+  reader would remove the per-item events too. It is not built.
+- **Retention.** Each blob has a `harvest_payload_refs` row. Retention deletes
+  the blob when it purges the run. Read the results before then.
 
 ### External Workflow Family — signal / cancel / await
 

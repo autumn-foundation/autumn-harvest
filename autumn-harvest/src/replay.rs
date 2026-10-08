@@ -2255,6 +2255,34 @@ impl HistoryMatcher {
         n
     }
 
+    /// Count the unconsumed `ActivityScheduled` events at or after the cursor
+    /// that match `expected` in order (issue #1986).
+    ///
+    /// Read-only, like
+    /// [`count_pending_scheduled_activities`](Self::count_pending_scheduled_activities).
+    /// The scan stops at the first event whose name or input differs from the
+    /// next expected slot. A fan-out that stopped early on its failure
+    /// tolerance then never claims an activity that the workflow scheduled
+    /// after it.
+    #[must_use]
+    pub(crate) fn count_scheduled_prefix_matching(&self, expected: &[(&str, &Value)]) -> usize {
+        let mut n = 0;
+        let mut cursor = self.cursor;
+        while cursor < self.events.len() && n < expected.len() {
+            if !self.is_consumed(cursor)
+                && let WorkflowEvent::ActivityScheduled { name, input, .. } = &self.events[cursor]
+            {
+                let (want_name, want_input) = expected[n];
+                if name != want_name || input != want_input {
+                    break;
+                }
+                n += 1;
+            }
+            cursor += 1;
+        }
+        n
+    }
+
     /// Total number of events in history.
     #[must_use]
     pub const fn len(&self) -> usize {
