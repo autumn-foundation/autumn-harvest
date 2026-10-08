@@ -27,7 +27,7 @@ lives in a new crate, `autumn-harvest-agent`.
 | Activity `agent_model_turn` | `LlmClient::chat`, then `ToolPolicy::decide` per call |
 | Activity `agent_tool_call` | `Tool::execute` with a `ToolContext` |
 | Signal with a deadline | `ToolDecision::RequireApproval`, answered by `Approval` |
-| Retry policy | `ErrorKind`: only `RateLimited` and `Transport` retry |
+| Retry policy | `ErrorKind`: `RateLimited`, `Transport` and `Unavailable` retry |
 
 ## Why this framework
 
@@ -60,7 +60,9 @@ lives in a new crate, `autumn-harvest-agent`.
 - A tool result is cut to fit the 2 MiB activity-result cap. A transcript
   that cannot fit the next request ends the run as `transcript_full`.
 - The daemon example keeps its Anthropic-native turn, because it replays
-  thinking blocks verbatim. It takes the approval names and the payload
-  checks from the adapter.
+  thinking blocks verbatim. It takes the approval names, the durable
+  approval wait and the payload checks from the adapter.
+- Plugin-agent 0.3 adds `ErrorKind::Unavailable` for 408, 5xx and 529, so a
+  provider outage retries instead of failing a paid run.
 - The engine release that ships this crate needs plugin-agent 0.3.0 on
   crates.io first.

@@ -13,25 +13,31 @@ framework and why. `docs/agent-adapter.md` shows the pattern end to end.
   with the reply, so replay never asks the policy again.
 - Each approval signal name holds the step, the position and the call id.
   A late decision cannot release a later call.
-- Only `RateLimited` and `Transport` provider failures retry. A tool call
-  runs once. A tool error is a result that the model reads.
+- `RateLimited`, `Transport` and `Unavailable` (408, 5xx, 529) provider
+  failures retry, and so does a model call over its time budget. A tool call
+  runs once. A tool error, or a tool over its time budget, is a result that
+  the model reads.
+- A payload that is not an `Approval` denies the call. It never fails the
+  run. `approval::await_decision` gives this wait to the daemon too.
+- The caps are configurable: `AgentTask::max_request_bytes` and
+  `AgentHarness::max_result_bytes`.
 - Step, token, output-cap and transcript bounds end a run under a named
   `AgentStop`. A tool result is cut to fit the 2 MiB result cap.
 - The crate takes the core engine and plugin-agent with no default
   features. `scripts/check-agent-adapter-no-autumn-web.sh` fails CI if
   `autumn-web` reaches its graph.
 - The `sqlite` feature adds `sqlite::register`, `start` and `decide`.
-- `examples/claude-agent-daemon` now takes its approval signal names and its
-  payload-cap checks from the adapter.
+- `examples/claude-agent-daemon` now takes its approval signal names, its
+  durable approval wait and its payload-cap checks from the adapter.
 - The core crate adds `ActivityContext::new_test_with_state` under the
   `testing` feature.
 
 **Invariants.** No new `WorkflowEvent` variant. No migration. No route
 change.
 
-**Tests.** `crash_mid_loop_resumes_without_rerunning_completed_calls` aborts
-a child process inside a tool call. The parent resumes the run. No completed
-model call or tool call runs again. Other tests cover approve, edit, reject
+**Tests.** Two cross-process tests abort a child inside a tool call and
+inside a model call. The parent resumes the run. No completed model call or
+tool call runs again. Other tests cover approve, edit, reject
 and timeout, a late decision, each bound, retry classification, replay of
 recorded policy decisions, and the engine-path activity handlers.
 

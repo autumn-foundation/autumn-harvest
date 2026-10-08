@@ -11,6 +11,16 @@
 //!
 //! A model can reuse a tool-call id across steps, so the id alone is not
 //! enough.
+//!
+//! Send each decision once. A second decision for a wait that already ended
+//! stays unread in history. It changes nothing, but a strict replay check
+//! can report it as a difference.
+
+use std::time::Duration;
+
+use autumn_harvest::context::WorkflowContext;
+use serde::de::DeserializeOwned;
+use serde_json::Value;
 
 /// The prefix of every approval signal name.
 pub const SIGNAL_TOOL_APPROVAL: &str = "tool_approval";
@@ -38,6 +48,49 @@ pub fn approval_call_id(signal_name: &str) -> Option<&str> {
     parts.next()
 }
 
+/// How one approval wait ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decision<T> {
+    /// A reviewer sent a payload that decodes as `T`.
+    Decided(T),
+    /// A reviewer sent a payload that does not decode as `T`. The text says
+    /// why. Treat it as a refusal: nobody approved anything the run can read.
+    Unreadable(String),
+    /// No decision arrived before the deadline.
+    TimedOut,
+}
+
+/// Wait on the signal `name` until `timeout` passes.
+///
+/// The wait is durable: a restart resumes it, and its deadline holds. The
+/// payload is decoded after it arrives. A payload of the wrong shape is
+/// [`Decision::Unreadable`], so one bad signal cannot fail the run.
+///
+/// # Errors
+///
+/// Returns the engine error when the wait itself fails.
+pub async fn await_decision<T: DeserializeOwned>(
+    ctx: &WorkflowContext,
+    name: &str,
+    timeout: Duration,
+) -> Result<Decision<T>, String> {
+    let payload: Option<Value> = ctx
+        .receive_signal_timeout(name, timeout)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(decode(payload))
+}
+
+/// Decode one received payload. `None` means the deadline passed.
+fn decode<T: DeserializeOwned>(payload: Option<Value>) -> Decision<T> {
+    payload.map_or(Decision::TimedOut, |value| {
+        serde_json::from_value(value).map_or_else(
+            |err| Decision::Unreadable(err.to_string()),
+            Decision::Decided,
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,6 +110,17 @@ mod tests {
         assert_eq!(approval_call_id("tool_approval:x:0:id"), None);
         assert_eq!(approval_call_id("tool_approval:1:y:id"), None);
         assert_eq!(approval_call_id(""), None);
+    }
+
+    #[test]
+    fn a_payload_decodes_or_is_unreadable() {
+        use autumn_plugin_agent::Approval;
+        let ok: Decision<Approval> = decode(Some(serde_json::json!({"verdict": "approve"})));
+        assert_eq!(ok, Decision::Decided(Approval::Approve));
+        let bad: Decision<Approval> = decode(Some(serde_json::json!("approve")));
+        assert!(matches!(bad, Decision::Unreadable(_)));
+        let none: Decision<Approval> = decode(None);
+        assert_eq!(none, Decision::TimedOut);
     }
 
     proptest! {

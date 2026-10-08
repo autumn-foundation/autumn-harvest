@@ -362,6 +362,36 @@ async fn a_denied_call_is_reported_to_the_model_and_the_session_continues() {
     );
 }
 
+/// The approval wait comes from the agent adapter (issue #1973). A payload
+/// that is not an `ApprovalDecision` denies the call. The session goes on.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreadable_decision_denies_the_write_and_the_session_goes_on() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("the workspace is created");
+    std::fs::write(workspace.join("README.md"), "hello").expect("the fixture is written");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut rt = runtime(&dir.path().join("agentd.db"), &workspace, &calls);
+    let exec = rt
+        .start_workflow(WORKFLOW_NAME, task(&workspace))
+        .expect("the session starts");
+    let signal = drive_to_approval(&mut rt, exec).await;
+
+    rt.send_signal(exec, &signal, json!({"verdict": "approve"}))
+        .expect("the signal is recorded");
+    let state = rt.run_until_blocked(exec).await.expect("the run finishes");
+
+    assert!(
+        matches!(state, RunState::Completed(_)),
+        "expected completion, got {state:?}"
+    );
+    assert!(
+        !workspace.join("agent-notes.md").exists(),
+        "an unreadable decision must not release the write"
+    );
+}
+
 #[tokio::test]
 async fn a_restart_resumes_the_session_without_repeating_model_calls() {
     let dir = tempfile::tempdir().expect("a temporary directory");

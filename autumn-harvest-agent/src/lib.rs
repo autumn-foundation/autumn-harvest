@@ -31,14 +31,21 @@
 //!
 //! # Use it on Postgres
 //!
-//! Register [`agent_loop`](workflow::agent_loop) and the two activities, and
-//! install the harness as worker state:
+//! Register the workflow and the two activities, and install the harness as
+//! worker state:
 //!
-//! ```ignore
-//! HarvestBuilder::new()
-//!     .workflows(workflows![agent_loop])
-//!     .activities(activities![agent_model_turn, agent_tool_call])
-//!     .state(AgentHarness::new(client).tool(tool))
+//! ```
+//! # fn demo(client: std::sync::Arc<dyn autumn_plugin_agent::LlmClient>) {
+//! use autumn_harvest::builder::HarvestBuilder;
+//! use autumn_harvest_agent::{AgentHarness, activities, workflows};
+//!
+//! let built = HarvestBuilder::new()
+//!     .workflows(workflows())
+//!     .activities(activities())
+//!     .state(AgentHarness::new(client))
+//!     .build();
+//! assert!(built.state::<AgentHarness>().is_some());
+//! # }
 //! ```
 //!
 //! See `docs/agent-adapter.md` for the whole pattern.
@@ -53,7 +60,10 @@ pub mod workflow;
 
 pub use harness::AgentHarness;
 pub use types::{
-    AgentReport, AgentStop, AgentTask, GatedCall, ModelTurn, ModelTurnRequest, ToolCallRequest,
-    ToolOutcome, TurnStop,
+    AgentReport, AgentStop, AgentTask, ModelTurn, ModelTurnRequest, ToolCallRequest, ToolOutcome,
+    TurnStop,
 };
-pub use workflow::{WORKFLOW_NAME, agent_loop, agent_model_turn, agent_tool_call};
+pub use workflow::{
+    WORKFLOW_NAME, activities, agent_loop, agent_loop_info, agent_model_turn,
+    agent_model_turn_info, agent_tool_call, agent_tool_call_info, workflows,
+};

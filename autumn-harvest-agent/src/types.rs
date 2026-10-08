@@ -45,6 +45,11 @@ pub struct AgentTask {
     pub max_output_tokens: Option<u32>,
     /// How long a gated call waits for a decision before it is denied.
     pub approval_timeout_secs: u64,
+    /// The activity-input cap of the workers, in bytes. Set it when the
+    /// workers use a cap other than the engine default. The loop stops with
+    /// `TranscriptFull` before it sends a request over this size.
+    #[serde(default)]
+    pub max_request_bytes: Option<u64>,
 }
 
 impl AgentTask {
@@ -60,6 +65,7 @@ impl AgentTask {
             max_total_tokens: None,
             max_output_tokens: None,
             approval_timeout_secs: DEFAULT_APPROVAL_TIMEOUT_SECS,
+            max_request_bytes: None,
         }
     }
 
@@ -106,10 +112,28 @@ impl AgentTask {
     }
 
     /// Set how long a gated call waits for a decision.
+    ///
+    /// The value rounds up to whole seconds, so a short wait never becomes
+    /// an immediate deny.
     #[must_use]
     pub const fn approval_timeout(mut self, timeout: Duration) -> Self {
-        self.approval_timeout_secs = timeout.as_secs();
+        let partial = if timeout.subsec_nanos() > 0 { 1 } else { 0 };
+        self.approval_timeout_secs = timeout.as_secs().saturating_add(partial);
         self
+    }
+
+    /// Set the activity-input cap of the workers, in bytes.
+    #[must_use]
+    pub const fn max_request_bytes(mut self, bytes: u64) -> Self {
+        self.max_request_bytes = Some(bytes);
+        self
+    }
+
+    /// The request cap the loop enforces.
+    #[must_use]
+    pub fn request_cap(&self) -> u64 {
+        self.max_request_bytes
+            .unwrap_or(autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES)
     }
 }
 
@@ -159,16 +183,6 @@ impl From<StopReason> for TurnStop {
     }
 }
 
-/// One tool call and the policy decision recorded for it.
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct GatedCall {
-    /// The call the model asked for.
-    pub call: ToolCall,
-    /// The policy decision. Replay reads it and does not ask the policy again.
-    pub decision: ToolDecision,
-}
-
 /// The recorded result of one model-turn activity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelTurn {
@@ -178,11 +192,35 @@ pub struct ModelTurn {
     pub stop: TurnStop,
     /// Provider-reported tokens for this call.
     pub usage: TokenUsage,
-    /// The tool calls of this turn, in order, each with its decision.
-    pub calls: Vec<GatedCall>,
+    /// The policy decision for each tool call of [`content`](Self::content),
+    /// in order. Replay reads it and does not ask the policy again.
+    ///
+    /// The calls themselves are read from `content`, so the arguments are
+    /// recorded once.
+    pub decisions: Vec<ToolDecision>,
 }
 
 impl ModelTurn {
+    /// The tool calls of the turn, in order.
+    #[must_use]
+    pub fn calls(&self) -> Vec<ToolCall> {
+        self.content
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } => Some(ToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                }),
+                ContentPart::Text(_) | ContentPart::ToolResult { .. } => None,
+            })
+            .collect()
+    }
+
     /// The text parts of the turn, joined.
     #[must_use]
     pub fn text(&self) -> String {
@@ -265,7 +303,8 @@ pub struct AgentReport {
     pub text: String,
     /// Tool rounds used.
     pub steps_used: u32,
-    /// Tool calls answered, whether they ran or not.
+    /// Tool calls answered, whether they ran or not. A round cut at the
+    /// request cap answers its remaining calls with an error.
     pub tool_calls: u32,
     /// Provider-reported tokens for the whole run.
     pub usage: TokenUsage,
@@ -319,6 +358,24 @@ mod tests {
     }
 
     #[test]
+    fn a_short_approval_timeout_rounds_up() {
+        let task = AgentTask::new("go").approval_timeout(Duration::from_millis(500));
+        assert_eq!(task.approval_timeout_secs, 1);
+        let task = AgentTask::new("go").approval_timeout(Duration::from_secs(2));
+        assert_eq!(task.approval_timeout_secs, 2);
+    }
+
+    #[test]
+    fn the_request_cap_defaults_to_the_engine_cap() {
+        let task = AgentTask::new("go");
+        assert_eq!(
+            task.request_cap(),
+            autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES
+        );
+        assert_eq!(task.max_request_bytes(10).request_cap(), 10);
+    }
+
+    #[test]
     fn stop_names_are_stable_in_history() {
         assert_eq!(json!(AgentStop::TranscriptFull), json!("transcript_full"));
         assert_eq!(json!(TurnStop::ToolUse), json!("tool_use"));
@@ -348,8 +405,11 @@ mod tests {
             ],
             stop: TurnStop::ToolUse,
             usage: TokenUsage::default(),
-            calls: Vec::new(),
+            decisions: vec![ToolDecision::Allow],
         };
         assert_eq!(turn.text(), "ab");
+        let calls = turn.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "c");
     }
 }

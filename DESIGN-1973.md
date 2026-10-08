@@ -34,7 +34,7 @@ activity. A human approval is a durable wait.
 | R4 | Block forever on an approval nobody sends. | The wait has a durable deadline. A timeout denies the call, and the model sees why. |
 | R5 | Let the policy change its answer on replay. | The decision is part of the recorded reply. |
 | R6 | Fail a run after the model was paid, because the next request is too large. | The loop measures the request first and stops with `TranscriptFull`. |
-| R7 | Retry an authentication failure forever. | The activity marks it non-retryable. Only rate limits and transport faults retry. |
+| R7 | Retry an authentication failure forever. | The activity marks it non-retryable. Only rate limits, transport faults, outages and timeouts retry. |
 | R8 | Pull `autumn-web` in through the back door. | A CI script runs `cargo tree` and fails if `autumn-web` is in the adapter graph. |
 | R9 | Leak the API key into history. | The key lives in the client. History holds messages only. |
 | R10 | Run an unknown tool name. | The tool activity answers with an error result. The policy sees `tool: None`. |
@@ -94,9 +94,12 @@ flowchart LR
 | Test | Proves |
 |------|--------|
 | `crash_mid_loop_resumes_without_rerunning_completed_calls` | A child process aborts inside a tool call. The parent resumes the run. No completed model or tool call runs again. |
-| `approval_*` | Approve, edit, reject and timeout each reach the model as the correct result. |
-| `policy_decision_is_recorded_with_the_turn` | Replay does not ask the policy again. |
-| `*_budget_*` | Step, token and transcript bounds stop the run with a named reason. |
-| `model_errors_are_classified` | Rate limits retry. Authentication failures do not. |
+| `crash_inside_a_model_call_resends_only_that_call` | The same, with the abort inside a model call. |
+| `an_approved_call_…`, `an_edited_call_…`, `a_rejected_call_…`, `a_missed_deadline_…`, `an_unreadable_decision_…` | Each decision reaches the model as the correct result. |
+| `a_late_decision_for_one_wait_never_releases_another` | A late decision cannot release a later call. |
+| `a_restart_replays_recorded_turns_and_recorded_policy_decisions` | Replay does not ask the policy again. |
+| `the_step_budget_…`, `the_token_budget_…`, `a_transcript_too_large_…`, `a_round_whose_results_pass_the_cap_…`, `a_lower_request_cap_…` | Each bound stops the run with a named reason. |
+| `retryable_kinds_are_marked_retryable`, `a_rate_limit_retries_and_an_auth_failure_does_not` | Rate limits, transport faults and outages retry. Other failures do not. |
+| `the_engine_registration_builds`, `the_model_turn_handler_…` | The Postgres path: registration and the `#[activity]` handlers. |
 | proptest `approval_signal_round_trips` | A signal name gives back its call id, for any id. |
 | `scripts/check-agent-adapter-no-autumn-web.sh` | The adapter graph has no `autumn-web`. |

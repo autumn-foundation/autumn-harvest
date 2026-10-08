@@ -6,21 +6,41 @@
 //! after that.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
 use autumn_plugin_agent::hooks::RunInfo;
 use autumn_plugin_agent::policy::AllowAll;
 use autumn_plugin_agent::{
-    AgentError, ChatRequest, ContentPart, ErrorKind, LlmClient, RunId, Tool, ToolCall, ToolContext,
-    ToolPolicy,
+    AgentError, ChatRequest, ErrorKind, LlmClient, RunId, Tool, ToolContext, ToolPolicy,
 };
 
-use crate::types::{GatedCall, ModelTurn, ModelTurnRequest, ToolCallRequest, ToolOutcome};
+use crate::types::{ModelTurn, ModelTurnRequest, ToolCallRequest, ToolOutcome};
 
 /// The default cap on one tool result, in characters. It matches the
 /// plugin-agent loop.
 pub const DEFAULT_TOOL_OUTPUT_LIMIT: usize = 8_000;
+
+/// The default time budget of one model call: 14 minutes.
+///
+/// It is below the 15-minute `start_to_close` of `agent_model_turn`. A slow
+/// call therefore ends as a retryable failure that the harness reports. It
+/// does not end as an engine timeout, which SQLite reports only after the
+/// body returns.
+pub const DEFAULT_MODEL_TIMEOUT: Duration = Duration::from_secs(14 * 60);
+
+/// The default time budget of one tool call: 9 minutes.
+///
+/// It is below the 10-minute `start_to_close` of `agent_tool_call`. A slow
+/// tool therefore gives the model an error result, and the run goes on.
+pub const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(9 * 60);
+
+/// The bytes that the `ToolOutcome` JSON adds around its content.
+const OUTCOME_ENVELOPE_BYTES: u64 = 64;
+
+/// The mark at the end of a cut result.
+const TRUNCATED: &str = "…[truncated]";
 
 /// The model, the tools, and the policy behind the two agent activities.
 ///
@@ -33,6 +53,9 @@ pub struct AgentHarness {
     policy: Arc<dyn ToolPolicy>,
     temperature: Option<f32>,
     tool_output_limit: usize,
+    max_result_bytes: u64,
+    model_timeout: Duration,
+    tool_timeout: Duration,
 }
 
 impl AgentHarness {
@@ -45,6 +68,9 @@ impl AgentHarness {
             policy: Arc::new(AllowAll),
             temperature: None,
             tool_output_limit: DEFAULT_TOOL_OUTPUT_LIMIT,
+            max_result_bytes: DEFAULT_MAX_ACTIVITY_RESULT_BYTES,
+            model_timeout: DEFAULT_MODEL_TIMEOUT,
+            tool_timeout: DEFAULT_TOOL_TIMEOUT,
         }
     }
 
@@ -83,6 +109,28 @@ impl AgentHarness {
         self
     }
 
+    /// Set the activity-result cap of the workers, in bytes. Set it when the
+    /// workers use a cap other than the engine default.
+    #[must_use]
+    pub const fn max_result_bytes(mut self, bytes: u64) -> Self {
+        self.max_result_bytes = bytes;
+        self
+    }
+
+    /// Set the time budget of one model call.
+    #[must_use]
+    pub const fn model_timeout(mut self, timeout: Duration) -> Self {
+        self.model_timeout = timeout;
+        self
+    }
+
+    /// Set the time budget of one tool call.
+    #[must_use]
+    pub const fn tool_timeout(mut self, timeout: Duration) -> Self {
+        self.tool_timeout = timeout;
+        self
+    }
+
     /// Run one model call, then ask the policy about each tool call.
     ///
     /// The decisions are part of the result. Replay reads them back, so a
@@ -90,9 +138,9 @@ impl AgentHarness {
     ///
     /// # Errors
     ///
-    /// Returns an activity error payload. A rate limit or a transport fault is
-    /// retryable. Every other provider failure is not, because a retry cannot
-    /// fix it.
+    /// Returns an activity error payload. A failure that a retry can fix is
+    /// retryable: a rate limit, a transport fault, a provider outage, or the
+    /// time budget. Every other failure is not.
     pub async fn model_turn(&self, request: ModelTurnRequest) -> Result<ModelTurn, String> {
         let chat = ChatRequest {
             messages: request.messages,
@@ -100,11 +148,26 @@ impl AgentHarness {
             max_tokens: request.max_output_tokens,
             temperature: self.temperature,
         };
-        let response = self
-            .client
-            .chat(&chat)
-            .await
-            .map_err(|err| model_failure(&err))?;
+        let response = match tokio::time::timeout(self.model_timeout, self.client.chat(&chat)).await
+        {
+            Ok(response) => response.map_err(|err| model_failure(&err))?,
+            Err(_) => {
+                return Err(ActivityFailure::retryable(
+                    "ModelTimeout",
+                    format!(
+                        "the model did not answer within {}s",
+                        self.model_timeout.as_secs()
+                    ),
+                )
+                .into_error_payload());
+            }
+        };
+        let mut turn = ModelTurn {
+            content: response.content,
+            stop: response.stop_reason.into(),
+            usage: response.usage,
+            decisions: Vec::new(),
+        };
         let info = RunInfo {
             run_id: RunId::new(request.run_id),
             session_id: request.session_id,
@@ -112,35 +175,20 @@ impl AgentHarness {
             max_steps: request.max_steps,
             usage: request.usage.saturating_add(response.usage),
         };
-        let mut calls = Vec::new();
-        for part in &response.content {
-            if let ContentPart::ToolCall {
-                id,
-                name,
-                arguments,
-            } = part
-            {
-                let call = ToolCall {
-                    id: id.clone(),
-                    name: name.clone(),
-                    arguments: arguments.clone(),
-                };
-                let decision = self.policy.decide(&call, self.find(name), &info).await;
-                calls.push(GatedCall { call, decision });
-            }
+        for call in turn.calls() {
+            let decision = self
+                .policy
+                .decide(&call, self.find(&call.name), &info)
+                .await;
+            turn.decisions.push(decision);
         }
-        Ok(ModelTurn {
-            content: response.content,
-            stop: response.stop_reason.into(),
-            usage: response.usage,
-            calls,
-        })
+        Ok(turn)
     }
 
     /// Run one tool call.
     ///
-    /// A tool failure or an unknown tool name is a result the model reads,
-    /// not an activity error. The run keeps going.
+    /// A tool failure, an unknown tool name, or a call over its time budget
+    /// is a result the model reads, not an activity error. The run goes on.
     ///
     /// # Errors
     ///
@@ -157,16 +205,23 @@ impl AgentHarness {
             session_id: request.session_id,
             step: request.step,
         };
-        Ok(match tool.execute(call.arguments, &ctx).await {
-            Ok(output) => ToolOutcome::ok(fit_result(truncate(
-                &output.to_string(),
-                self.tool_output_limit,
-            ))),
-            Err(err) => {
-                tracing::warn!(tool = %call.name, error = %err, "agent tool call failed");
-                ToolOutcome::error(err.message())
-            }
-        })
+        let execution = tool.execute(call.arguments, &ctx);
+        Ok(
+            match tokio::time::timeout(self.tool_timeout, execution).await {
+                Ok(Ok(output)) => ToolOutcome::ok(fit_result(
+                    truncate(&output.to_string(), self.tool_output_limit),
+                    self.max_result_bytes,
+                )),
+                Ok(Err(err)) => {
+                    tracing::warn!(tool = %call.name, error = %err, "agent tool call failed");
+                    ToolOutcome::error(err.message())
+                }
+                Err(_) => ToolOutcome::error(&format!(
+                    "the tool did not finish within {}s",
+                    self.tool_timeout.as_secs()
+                )),
+            },
+        )
     }
 
     fn find(&self, name: &str) -> Option<&dyn Tool> {
@@ -179,44 +234,41 @@ impl AgentHarness {
 
 /// Map a provider failure to an activity error payload.
 ///
-/// Only a rate limit and a transport fault produced no answer that a retry
-/// cannot fix. Everything else fails at once.
+/// A rate limit, a transport fault, and a provider outage produced no answer.
+/// A retry can succeed, so they retry. Every other kind fails at once.
 fn model_failure(err: &AgentError) -> String {
     let kind = format!("{:?}", err.kind());
     let message = err.to_string();
     let failure = match err.kind() {
-        ErrorKind::RateLimited | ErrorKind::Transport => ActivityFailure::retryable(kind, message),
+        ErrorKind::RateLimited | ErrorKind::Transport | ErrorKind::Unavailable => {
+            ActivityFailure::retryable(kind, message)
+        }
         _ => ActivityFailure::non_retryable(kind, message),
     };
     failure.into_error_payload()
 }
 
-/// The most bytes of tool output one result keeps.
+/// The most bytes of tool output one result keeps under `cap`.
 ///
-/// The engine refuses an activity result over
-/// [`DEFAULT_MAX_ACTIVITY_RESULT_BYTES`]. That refusal fails the run, so a
-/// large result must be cut before it is recorded. JSON escapes one byte into
-/// at most six (`\u0000`), so a sixth of the cap always fits.
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "a sixth of 2 MiB fits every usize"
-)]
-pub const MAX_TOOL_RESULT_BYTES: usize = (DEFAULT_MAX_ACTIVITY_RESULT_BYTES / 6) as usize;
+/// JSON escapes one byte into at most six (`\u0000`). A sixth of the cap,
+/// less the outcome envelope, therefore always fits.
+#[must_use]
+pub fn max_tool_result_bytes(cap: u64) -> usize {
+    usize::try_from(cap.saturating_sub(OUTCOME_ENVELOPE_BYTES) / 6).unwrap_or(usize::MAX)
+}
 
 /// Cut `text` so that its recorded outcome fits the result cap.
-fn fit_result(text: String) -> String {
-    if text.len() <= MAX_TOOL_RESULT_BYTES {
+fn fit_result(text: String, cap: u64) -> String {
+    let max = max_tool_result_bytes(cap);
+    if text.len() <= max {
         return text;
     }
-    let mut end = MAX_TOOL_RESULT_BYTES - TRUNCATED.len();
+    let mut end = max.saturating_sub(TRUNCATED.len());
     while !text.is_char_boundary(end) {
         end -= 1;
     }
     format!("{}{TRUNCATED}", &text[..end])
 }
-
-/// The mark at the end of a cut result.
-const TRUNCATED: &str = "…[truncated]";
 
 /// Cut `text` to `limit` characters and mark the cut.
 fn truncate(text: &str, limit: usize) -> String {
@@ -229,12 +281,14 @@ fn truncate(text: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bounds::json_len;
 
     #[test]
     fn retryable_kinds_are_marked_retryable() {
         for (kind, retryable) in [
             (ErrorKind::RateLimited, true),
             (ErrorKind::Transport, true),
+            (ErrorKind::Unavailable, true),
             (ErrorKind::Authentication, false),
             (ErrorKind::Provider, false),
             (ErrorKind::Config, false),
@@ -250,16 +304,18 @@ mod tests {
 
     #[test]
     fn a_result_of_any_content_fits_the_result_cap() {
+        let cap = DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
+        let max = max_tool_result_bytes(cap);
         for unit in ["x", "\u{0}", "é", "\""] {
-            let text = unit.repeat(usize::try_from(DEFAULT_MAX_ACTIVITY_RESULT_BYTES).unwrap());
-            let outcome = ToolOutcome::ok(fit_result(text));
-            assert!(
-                crate::bounds::json_len(&outcome) <= DEFAULT_MAX_ACTIVITY_RESULT_BYTES,
-                "{unit:?}"
-            );
-            assert!(outcome.content.ends_with(TRUNCATED));
+            // At the limit, one byte under it, and far over it.
+            for len in [max - 1, max, max + 1, 2 * max] {
+                let text: String = unit.repeat(len).chars().take(len).collect();
+                let outcome = ToolOutcome::ok(fit_result(text, cap));
+                assert!(json_len(&outcome) <= cap, "{unit:?} {len}");
+            }
         }
-        assert_eq!(fit_result("short".into()), "short");
+        assert_eq!(fit_result("short".into(), cap), "short");
+        assert!(fit_result("x".repeat(100), 300).ends_with(TRUNCATED));
     }
 
     #[test]

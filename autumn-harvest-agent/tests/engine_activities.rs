@@ -62,9 +62,10 @@ async fn the_model_turn_handler_records_the_reply_and_each_decision() {
 
     assert_eq!(turn.stop, TurnStop::ToolUse);
     assert_eq!(turn.usage.input_tokens, 3);
-    assert_eq!(turn.calls[0].decision, ToolDecision::Allow);
+    assert_eq!(turn.calls().len(), 2);
+    assert_eq!(turn.decisions[0], ToolDecision::Allow);
     assert!(matches!(
-        turn.calls[1].decision,
+        turn.decisions[1],
         ToolDecision::RequireApproval { .. }
     ));
     let sent = &model.requests()[0];
@@ -126,4 +127,74 @@ fn the_activities_declare_their_retry_and_timeout() {
     let tool = agent_tool_call_info();
     assert_eq!(tool.name, "agent_tool_call");
     assert_eq!(tool.default_retry_policy.unwrap().max_attempts, 1);
+}
+
+#[tokio::test]
+async fn a_model_call_over_its_budget_is_a_retryable_failure() {
+    #[derive(Debug)]
+    struct Stalled;
+    impl autumn_plugin_agent::LlmClient for Stalled {
+        fn chat<'a>(
+            &'a self,
+            _request: &'a autumn_plugin_agent::ChatRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            autumn_plugin_agent::ChatResponse,
+                            autumn_plugin_agent::AgentError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(std::future::pending())
+        }
+        fn list_models(
+            &self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<Vec<String>, autumn_plugin_agent::AgentError>,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn provider_name(&self) -> &'static str {
+            "stalled"
+        }
+    }
+
+    let harness =
+        AgentHarness::new(Arc::new(Stalled)).model_timeout(std::time::Duration::from_millis(20));
+    let ctx = with_harness(harness);
+    let err =
+        (agent_model_turn_info().handler)(&ctx, serde_json::to_value(turn_request()).unwrap())
+            .await
+            .unwrap_err();
+    let failure = parse_typed_payload(&err).expect("a typed failure");
+    assert_eq!(failure.error_type, "ModelTimeout");
+    assert!(
+        !failure.non_retryable,
+        "a slow provider may answer next time"
+    );
+}
+
+#[test]
+fn the_engine_registration_builds() {
+    use autumn_harvest::builder::HarvestBuilder;
+    use autumn_harvest_agent::{activities, workflows};
+
+    let built = HarvestBuilder::new()
+        .workflows(workflows())
+        .activities(activities())
+        .state(AgentHarness::new(ScriptedModel::new(Vec::new())))
+        .build();
+    assert_eq!(built.workflow_count(), 1);
+    assert!(built.state::<AgentHarness>().is_some());
+    let names: Vec<&str> = activities().iter().map(|a| a.name).collect();
+    assert_eq!(names, ["agent_model_turn", "agent_tool_call"]);
+    assert_eq!(workflows()[0].name, autumn_harvest_agent::WORKFLOW_NAME);
 }

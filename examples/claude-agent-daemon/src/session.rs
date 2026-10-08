@@ -25,7 +25,9 @@ use autumn_harvest_agent::bounds;
 use crate::claude;
 use crate::tools;
 
-/// The approval signal names come from the agent adapter (issue #1973).
+use autumn_harvest_agent::approval::{Decision, await_decision};
+/// The approval signal names and the durable wait come from the agent
+/// adapter (issue #1973).
 ///
 /// A name holds the turn, the position in that turn, and the tool-use id. The
 /// daemon requires that full name as the approval token, so a decision names
@@ -397,21 +399,27 @@ async fn gated_call(
     position: usize,
     call: &ToolCall,
 ) -> Result<ToolOutcome, String> {
-    let decision: Option<ApprovalDecision> = ctx
-        .receive_signal_timeout(
-            &approval_signal(turn, position, &call.id),
-            Duration::from_secs(task.approval_timeout_secs),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+    // The durable wait comes from the adapter. It records the same events as
+    // a plain signal wait, so a history from an older daemon still replays.
+    // A payload that is not an `ApprovalDecision` denies the call instead of
+    // failing the session.
+    let decision = await_decision::<ApprovalDecision>(
+        ctx,
+        &approval_signal(turn, position, &call.id),
+        Duration::from_secs(task.approval_timeout_secs),
+    )
+    .await?;
 
     match decision {
-        Some(d) if d.approved => run_tool_call(ctx, &task.workspace, call).await,
-        Some(d) => Ok(ToolOutcome::error(format!(
+        Decision::Decided(d) if d.approved => run_tool_call(ctx, &task.workspace, call).await,
+        Decision::Decided(d) => Ok(ToolOutcome::error(format!(
             "denied by the operator: {}",
             d.note.unwrap_or_else(|| "no reason given".to_string())
         ))),
-        None => Ok(ToolOutcome::error(format!(
+        Decision::Unreadable(why) => Ok(ToolOutcome::error(format!(
+            "denied: the decision was not readable ({why})"
+        ))),
+        Decision::TimedOut => Ok(ToolOutcome::error(format!(
             "denied: no approval arrived within {}s",
             task.approval_timeout_secs
         ))),

@@ -83,25 +83,33 @@ Register the workflow and both activities. Install the harness as worker
 state, because the activities read it with `ActivityContext::state`:
 
 ```rust
-use autumn_harvest::prelude::*;
-use autumn_harvest_agent::{AgentHarness, agent_loop, agent_model_turn, agent_tool_call};
+use autumn_harvest::builder::HarvestBuilder;
+use autumn_harvest_agent::{AgentHarness, activities, workflows};
 
 let harness = AgentHarness::new(client)
     .tool(lookup)
     .policy(Arc::new(ToolRules::new().effect(ToolEffect::Write, Rule::Ask)));
 
 let built = HarvestBuilder::new()
-    .workflows(workflows![agent_loop])
-    .activities(activities![agent_model_turn, agent_tool_call])
+    .workflows(workflows())
+    .activities(activities())
     .state(harness)
     .build();
 ```
 
+`workflows()` returns `agent_loop`. `activities()` returns `agent_model_turn`
+and `agent_tool_call`. The test `the_engine_registration_builds` builds this
+exact registration.
+
 Start a run under the name `agent_loop` with an `AgentTask` as input. To
 decide on a gated call, send a signal to the run. Build the name with
 `approval::approval_signal(step, position, call_id)` from the recorded
-`ModelTurn`, and send a serialised `Approval` as the payload. A worker with no harness fails the call
-as `AgentHarnessMissing`, which is not retryable.
+`ModelTurn`, and send a serialised `Approval` as the payload. A worker with
+no harness fails the call as `AgentHarnessMissing`, which is not retryable.
+
+A worker with a payload cap other than the default must say so. Set
+`AgentTask::max_request_bytes` to its activity-input cap, and
+`AgentHarness::max_result_bytes` to its activity-result cap.
 
 ## 4. Build the harness
 
@@ -116,10 +124,20 @@ as `AgentHarnessMissing`, which is not retryable.
 - `temperature(t)` — the sampling temperature of each call.
 - `tool_output_limit(chars)` — the cap on one tool result. The default is
   8 000 characters, as in the plugin-agent loop.
+- `max_result_bytes(bytes)` — the activity-result cap of the workers. A
+  larger tool result is cut to fit it. The default is the engine default.
+- `model_timeout(d)` — the time budget of one model call. The default is
+  14 minutes, below the 15-minute `start_to_close`. A call over it is a
+  retryable failure.
+- `tool_timeout(d)` — the time budget of one tool call. The default is
+  9 minutes, below the 10-minute `start_to_close`. A call over it is an
+  error result that the model reads.
 
 `AgentTask` sets the run: `input`, `system`, `history`, `session`,
-`max_steps` (default 8), `max_total_tokens`, `max_output_tokens`, and
-`approval_timeout` (default one hour).
+`max_steps` (default 8), `max_total_tokens`, `max_output_tokens`,
+`approval_timeout` (default one hour, rounded up to whole seconds), and
+`max_request_bytes` (default: the engine default). A system message inside
+`history` is dropped. Only `system` reaches the model as the prompt.
 
 ## 5. Approvals
 
@@ -133,11 +151,17 @@ The name is `tool_approval:<step>:<position>:<call_id>`.
 | `Approval::Edit { arguments }` | The call runs with the reviewer's arguments. |
 | `Approval::Reject { reason }` | The call does not run. The model reads the reason. |
 | No decision before the deadline | The call does not run. The model reads that no approval arrived. |
+| A payload that is not an `Approval` | The call does not run. The model reads that the decision was not readable. The run goes on. |
 
 Each name belongs to one wait. A decision that arrives after its deadline
 stays unread in history. It never releases a later call, even when the model
-reuses a call id. A signal payload is capped at 256 KiB, so keep edited
-arguments under that size.
+reuses a call id. Send each decision once: a second one changes nothing, but
+a strict replay check can report it.
+
+A signal payload is capped at 256 KiB, so keep edited arguments under that
+size. The policy does not check edited arguments again. Whoever can send a
+signal to the run can therefore run a gated tool with any arguments. Guard
+the signal endpoint as you guard the tool.
 
 ## 6. What a crash costs
 
@@ -148,11 +172,16 @@ arguments under that size.
 | A tool call | That one call runs again. Use `ToolContext::run_id` and `call_id` as an idempotency key. |
 | An approval wait | The wait resumes. Its deadline is durable. |
 
-`crash_mid_loop_resumes_without_rerunning_completed_calls` proves the first
-three rows. It runs its own binary as a child, which calls `abort` inside a
-tool call. The parent opens the same database and finishes the run. A log
-that both processes write shows that no completed model call or tool call ran
-twice.
+Two tests prove the model-call and tool-call rows. Each one runs its own
+binary as a child, which calls `abort` in the middle of the loop. The parent
+opens the same database and finishes the run. A log that both processes write
+shows what ran in each process.
+
+- `crash_mid_loop_resumes_without_rerunning_completed_calls` aborts inside the
+  second tool call. In the parent, only that tool call and the last model call
+  run.
+- `crash_inside_a_model_call_resends_only_that_call` aborts inside the second
+  model call. In the parent, only that model call and what follows it run.
 
 The policy runs inside the model-turn activity. Its decision is part of the
 recorded reply, so replay never asks the policy again.
@@ -167,17 +196,24 @@ A bound is a normal end, not an error. `AgentReport.stop` names it:
 | `output_capped` | The last turn hit the output cap. Its tool calls do not run. |
 | `steps_exhausted` | The model asked for tools after `max_steps` rounds. |
 | `tokens_exhausted` | The run spent more than `max_total_tokens`. |
-| `transcript_full` | The next request could not fit the 2 MiB activity-input cap. It was not sent. |
+| `transcript_full` | The next request, or the results of one round, could not fit the request cap. The request was not sent. |
 
-A turn that ends the run with unanswered tool calls is left out of
-`AgentReport.messages`, so that transcript stays valid as the `history` of
-the next run. Only a non-retryable activity failure, for example a rejected
-API key, fails the run.
+A turn that ends the run before its tool calls run is left out of
+`AgentReport.messages`. Its text is not the answer either. A round whose
+results pass the request cap stays in the transcript: each call that did not
+fit gets an error result, so the transcript shows what ran.
 
-Retries follow the plugin-agent `ErrorKind`. `RateLimited` and `Transport`
-retry with backoff, up to four attempts. Every other kind fails the model
-call at once. A tool call runs once, and a tool error is a result that the
-model reads.
+A `transcript_full` transcript is too large for one request. Do not pass it
+whole as the `history` of a new run. Summarise it, or keep its last turns.
+
+Retries follow the plugin-agent `ErrorKind`. `RateLimited`, `Transport` and
+`Unavailable` (408, 5xx, 529) retry with backoff, up to four attempts. So
+does a model call over its time budget. Every other kind fails the model call
+at once. A tool call runs once, and a tool error is a result that the model
+reads.
+
+The run fails when a model call fails for good: a non-retryable kind, for
+example a rejected API key, or four failed attempts.
 
 ## 8. History types
 
@@ -201,5 +237,6 @@ these payloads back, so add a field only with `#[serde(default)]`.
 
 `examples/claude-agent-daemon` speaks the Anthropic Messages API and replays
 thinking blocks verbatim, which the provider-neutral `ChatMessage` cannot
-carry. It therefore keeps its own turn activity, and takes the approval
-signal names and the payload-cap checks from this crate.
+carry. It therefore keeps its own turn activity. It takes three parts from
+this crate: the approval signal names, the durable approval wait
+(`approval::await_decision`), and the payload-cap checks.

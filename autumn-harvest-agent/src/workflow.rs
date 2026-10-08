@@ -15,15 +15,14 @@
 
 use std::time::Duration;
 
-use autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES;
 use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::prelude::*;
 use autumn_plugin_agent::{
     Approval, ChatMessage, ChatRole, ContentPart, TokenUsage, ToolCall, ToolDecision,
 };
 
-use crate::approval::approval_signal;
-use crate::bounds::{exceeds_activity_input, json_len};
+use crate::approval::{Decision, approval_signal, await_decision};
+use crate::bounds::{exceeds_bytes, json_len};
 use crate::harness::AgentHarness;
 use crate::types::{
     AgentReport, AgentStop, AgentTask, ModelTurn, ModelTurnRequest, ToolCallRequest, ToolOutcome,
@@ -45,6 +44,18 @@ struct Progress {
 }
 
 impl Progress {
+    /// Add one model turn to the transcript. Its text becomes the answer.
+    fn push_assistant(&mut self, turn: &ModelTurn) {
+        let text = turn.text();
+        if !text.trim().is_empty() {
+            self.last_text = text;
+        }
+        self.messages.push(ChatMessage {
+            role: ChatRole::Assistant,
+            content: turn.content.clone(),
+        });
+    }
+
     fn report(&self, stop: AgentStop) -> AgentReport {
         AgentReport {
             stop,
@@ -77,7 +88,14 @@ pub async fn agent_loop(ctx: &WorkflowContext, task: AgentTask) -> Result<AgentR
     if let Some(system) = &task.system {
         messages.push(ChatMessage::text(ChatRole::System, system.clone()));
     }
-    messages.extend(task.history.iter().cloned());
+    // A system message inside the history is dropped, as plugin-agent does.
+    // Only `task.system` reaches the model as the system prompt.
+    messages.extend(
+        task.history
+            .iter()
+            .filter(|message| message.role != ChatRole::System)
+            .cloned(),
+    );
     messages.push(ChatMessage::text(ChatRole::User, task.input.clone()));
     let mut progress = Progress {
         run_id: ctx.workflow_id().to_owned(),
@@ -100,7 +118,7 @@ pub async fn agent_loop(ctx: &WorkflowContext, task: AgentTask) -> Result<AgentR
         };
         // A request the engine would refuse is not sent. The refusal is not
         // retryable, so it would fail the run after earlier work was paid for.
-        if exceeds_activity_input(&request) {
+        if exceeds_bytes(&request, task.request_cap()) {
             return Ok(progress.report(AgentStop::TranscriptFull));
         }
         let turn: ModelTurn = ctx
@@ -109,15 +127,12 @@ pub async fn agent_loop(ctx: &WorkflowContext, task: AgentTask) -> Result<AgentR
             .map_err(|e| e.to_string())?;
 
         progress.usage = progress.usage.saturating_add(turn.usage);
-        let text = turn.text();
-        if !text.trim().is_empty() {
-            progress.last_text = text;
-        }
         let over_budget = task
             .max_total_tokens
             .is_some_and(|max| progress.usage.total() > max);
+        let calls = turn.calls();
 
-        if turn.calls.is_empty() {
+        if calls.is_empty() {
             let stop = if over_budget {
                 AgentStop::TokensExhausted
             } else if turn.stop == TurnStop::MaxTokens {
@@ -125,7 +140,7 @@ pub async fn agent_loop(ctx: &WorkflowContext, task: AgentTask) -> Result<AgentR
             } else {
                 AgentStop::Completed
             };
-            progress.messages.push(assistant(turn.content));
+            progress.push_assistant(&turn);
             return Ok(progress.report(stop));
         }
         // A turn with calls that ends here is NOT added to the transcript. A
@@ -145,48 +160,102 @@ pub async fn agent_loop(ctx: &WorkflowContext, task: AgentTask) -> Result<AgentR
 
         let step = progress.steps;
         progress.steps += 1;
-        progress.messages.push(assistant(turn.content));
+        progress.push_assistant(&turn);
 
-        // Every call of one turn is answered in ONE tool message.
-        let mut results = Vec::with_capacity(turn.calls.len());
-        // The results alone can pass the cap a request may carry. They cannot
-        // fit any request then, so the run stops before more calls run.
-        let mut spent = 0_u64;
-        for (position, gated) in turn.calls.into_iter().enumerate() {
-            progress.tool_calls += 1;
-            let call_id = gated.call.id.clone();
-            let outcome = match gated.decision {
-                ToolDecision::Allow => run_tool(ctx, &progress, &task, step, gated.call).await?,
-                ToolDecision::Deny { reason } => {
-                    ToolOutcome::error(&format!("denied by policy: {reason}"))
-                }
-                ToolDecision::RequireApproval { .. } => {
-                    gated_call(ctx, &progress, &task, step, position, gated.call).await?
-                }
-            };
-            let part = ContentPart::ToolResult {
-                tool_call_id: call_id,
-                content: outcome.content,
-            };
-            spent = spent.saturating_add(json_len(&part));
-            results.push(part);
-            if spent > DEFAULT_MAX_ACTIVITY_INPUT_BYTES {
-                // The cut round leaves the transcript, so it stays valid.
-                progress.messages.pop();
-                return Ok(progress.report(AgentStop::TranscriptFull));
-            }
+        if run_round(ctx, &mut progress, &task, step, &turn, calls).await? {
+            return Ok(progress.report(AgentStop::TranscriptFull));
         }
-        progress.messages.push(ChatMessage {
-            role: ChatRole::Tool,
-            content: results,
+    }
+}
+
+/// Answer every call of one round in ONE tool message.
+///
+/// Returns `true` when the results passed the request cap. No more calls run
+/// then, because the results cannot fit any request. Each call still gets an
+/// answer, so the transcript stays valid and shows what ran.
+async fn run_round(
+    ctx: &WorkflowContext,
+    progress: &mut Progress,
+    task: &AgentTask,
+    step: u32,
+    turn: &ModelTurn,
+    calls: Vec<ToolCall>,
+) -> Result<bool, String> {
+    let cap = task.request_cap();
+    let mut results = Vec::with_capacity(calls.len());
+    let mut spent = 0_u64;
+    let mut full = false;
+    for (position, call) in calls.into_iter().enumerate() {
+        progress.tool_calls += 1;
+        let call_id = call.id.clone();
+        let content = if full {
+            ToolOutcome::error(NOT_RUN_FULL).content
+        } else {
+            // A recorded turn always holds one decision per call. A missing
+            // one denies the call rather than guess.
+            let decision =
+                turn.decisions
+                    .get(position)
+                    .cloned()
+                    .unwrap_or_else(|| ToolDecision::Deny {
+                        reason: "no recorded decision".to_owned(),
+                    });
+            let outcome = decide(ctx, progress, task, step, position, call, decision).await?;
+            let size = json_len(&outcome.content);
+            if spent.saturating_add(size) > cap {
+                full = true;
+                ToolOutcome::error(DROPPED_FULL).content
+            } else {
+                spent = spent.saturating_add(size);
+                outcome.content
+            }
+        };
+        results.push(ContentPart::ToolResult {
+            tool_call_id: call_id,
+            content,
         });
+    }
+    progress.messages.push(ChatMessage {
+        role: ChatRole::Tool,
+        content: results,
+    });
+    Ok(full)
+}
+
+/// The answer to a call whose result passed the request cap.
+const DROPPED_FULL: &str =
+    "the call ran, but its result was dropped: the results passed the request cap";
+
+/// The answer to a call that did not run because the round was full.
+const NOT_RUN_FULL: &str = "the call did not run: the results passed the request cap";
+
+/// Act on one recorded policy decision.
+async fn decide(
+    ctx: &WorkflowContext,
+    progress: &Progress,
+    task: &AgentTask,
+    step: u32,
+    position: usize,
+    call: ToolCall,
+    decision: ToolDecision,
+) -> Result<ToolOutcome, String> {
+    match decision {
+        ToolDecision::Allow => run_tool(ctx, progress, task, step, call).await,
+        ToolDecision::Deny { reason } => {
+            Ok(ToolOutcome::error(&format!("denied by policy: {reason}")))
+        }
+        ToolDecision::RequireApproval { .. } => {
+            gated_call(ctx, progress, task, step, position, call).await
+        }
     }
 }
 
 /// Wait for a decision on one gated call, then run it or refuse it.
 ///
 /// The wait races the call's own approval signal against a durable deadline.
-/// A missing decision denies the call, so an unattended run keeps moving.
+/// A missing decision denies the call, so an unattended run keeps moving. A
+/// payload that is not an `Approval` denies the call too. It never fails the
+/// run.
 async fn gated_call(
     ctx: &WorkflowContext,
     progress: &Progress,
@@ -195,30 +264,32 @@ async fn gated_call(
     position: usize,
     mut call: ToolCall,
 ) -> Result<ToolOutcome, String> {
-    let decision: Option<Approval> = ctx
-        .receive_signal_timeout(
-            &approval_signal(step, position, &call.id),
-            Duration::from_secs(task.approval_timeout_secs),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+    let decision = await_decision::<Approval>(
+        ctx,
+        &approval_signal(step, position, &call.id),
+        Duration::from_secs(task.approval_timeout_secs),
+    )
+    .await?;
     match decision {
-        Some(Approval::Approve) => run_tool(ctx, progress, task, step, call).await,
-        Some(Approval::Edit { arguments }) => {
+        Decision::Decided(Approval::Approve) => run_tool(ctx, progress, task, step, call).await,
+        Decision::Decided(Approval::Edit { arguments }) => {
             call.arguments = arguments;
             run_tool(ctx, progress, task, step, call).await
         }
-        Some(Approval::Reject { reason }) => Ok(ToolOutcome::error(&format!(
+        Decision::Decided(Approval::Reject { reason }) => Ok(ToolOutcome::error(&format!(
             "a reviewer rejected this call: {reason}"
         ))),
-        None => Ok(ToolOutcome::error(&format!(
+        Decision::Unreadable(why) => Ok(ToolOutcome::error(&format!(
+            "denied: the decision was not a readable approval ({why})"
+        ))),
+        Decision::TimedOut => Ok(ToolOutcome::error(&format!(
             "denied: no approval arrived within {}s",
             task.approval_timeout_secs
         ))),
     }
 }
 
-/// Progress one tool call as a durable activity.
+/// Run one tool call as a durable activity.
 async fn run_tool(
     ctx: &WorkflowContext,
     progress: &Progress,
@@ -239,13 +310,6 @@ async fn run_tool(
     .map_err(|e| e.to_string())
 }
 
-const fn assistant(content: Vec<ContentPart>) -> ChatMessage {
-    ChatMessage {
-        role: ChatRole::Assistant,
-        content,
-    }
-}
-
 /// The installed harness, or an error that names the fix.
 fn harness(ctx: &ActivityContext) -> Result<&AgentHarness, String> {
     ctx.state::<AgentHarness>().ok_or_else(|| {
@@ -260,8 +324,8 @@ fn harness(ctx: &ActivityContext) -> Result<&AgentHarness, String> {
 /// One model call, as an activity.
 ///
 /// The budget is wide, because one turn of a large model can run for minutes.
-/// A rate limit or a transport fault retries with backoff. Any other failure
-/// fails the call at once.
+/// A rate limit, a transport fault, an outage or a timeout retries with
+/// backoff. Any other failure fails the call at once.
 ///
 /// # Errors
 ///
@@ -291,4 +355,17 @@ pub async fn agent_tool_call(
     request: ToolCallRequest,
 ) -> Result<ToolOutcome, String> {
     harness(ctx)?.tool_call(request).await
+}
+
+/// The workflow to register on a `HarvestBuilder`: `agent_loop`.
+#[must_use]
+pub fn workflows() -> Vec<WorkflowInfo> {
+    vec![agent_loop_info()]
+}
+
+/// The activities to register on a `HarvestBuilder`: `agent_model_turn` and
+/// `agent_tool_call`.
+#[must_use]
+pub fn activities() -> Vec<ActivityInfo> {
+    vec![agent_model_turn_info(), agent_tool_call_info()]
 }

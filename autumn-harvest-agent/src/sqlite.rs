@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
 use autumn_harvest_sqlite::{ExecutionId, SqliteResult, SqliteRuntime};
 use autumn_plugin_agent::Approval;
 use serde::Serialize;
@@ -70,7 +71,27 @@ where
 {
     let request: I =
         serde_json::from_value(input).map_err(|e| format!("malformed activity input: {e}"))?;
-    let handle = tokio::runtime::Handle::current();
+    let handle = multi_thread_handle()?;
     let output = tokio::task::block_in_place(|| handle.block_on(body(request)))?;
     serde_json::to_value(output).map_err(|e| format!("activity output is not JSON: {e}"))
+}
+
+/// The current Tokio runtime, when it can run a body with `block_in_place`.
+///
+/// `block_in_place` panics on a current-thread runtime. A retry cannot fix
+/// that, so the call fails at once and names the fix.
+fn multi_thread_handle() -> Result<tokio::runtime::Handle, String> {
+    let refuse = |why: &str| {
+        ActivityFailure::non_retryable(
+            "MultiThreadRuntimeRequired",
+            format!("{why}: drive the SQLite runtime from a multi-thread Tokio runtime"),
+        )
+        .into_error_payload()
+    };
+    let handle =
+        tokio::runtime::Handle::try_current().map_err(|_| refuse("no Tokio runtime is running"))?;
+    if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
+        return Err(refuse("the Tokio runtime is current-thread"));
+    }
+    Ok(handle)
 }

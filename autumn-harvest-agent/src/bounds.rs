@@ -6,8 +6,11 @@
 //! loop measures the request first and stops under its own reason instead.
 //!
 //! These checks run inside the workflow, so they must answer the same way on
-//! replay. They read no clock and no state outside their argument, and the cap
-//! is a constant of the build.
+//! replay. They read no clock and no state outside their arguments. The cap
+//! comes from recorded input or from a constant of the build.
+//!
+//! The engine cap is configurable. A worker with a cap other than the default
+//! must pass it in, for example as `AgentTask::max_request_bytes`.
 
 use autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES;
 use serde::Serialize;
@@ -21,13 +24,19 @@ pub fn json_len<T: Serialize + ?Sized>(value: &T) -> u64 {
     serde_json::to_vec(value).map_or(0, |json| json.len() as u64)
 }
 
-/// Is `value` too large to send as one activity input?
+/// Is `value` larger than `cap` bytes once serialised?
+#[must_use]
+pub fn exceeds_bytes<T: Serialize + ?Sized>(value: &T, cap: u64) -> bool {
+    json_len(value) > cap
+}
+
+/// Is `value` too large to send as one activity input under the default cap?
 ///
 /// It refuses only what the engine is certain to refuse, and never a value
 /// that fits.
 #[must_use]
 pub fn exceeds_activity_input<T: Serialize + ?Sized>(value: &T) -> bool {
-    json_len(value) > DEFAULT_MAX_ACTIVITY_INPUT_BYTES
+    exceeds_bytes(value, DEFAULT_MAX_ACTIVITY_INPUT_BYTES)
 }
 
 #[cfg(test)]
@@ -46,6 +55,8 @@ mod tests {
         assert!(!exceeds_activity_input(&at_cap));
         let over = string_of(DEFAULT_MAX_ACTIVITY_INPUT_BYTES + 1);
         assert!(exceeds_activity_input(&over));
+        assert!(exceeds_bytes(&"abc", 4));
+        assert!(!exceeds_bytes(&"abc", 5));
     }
 
     #[test]

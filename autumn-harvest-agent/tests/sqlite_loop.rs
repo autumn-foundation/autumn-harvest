@@ -294,7 +294,12 @@ async fn a_tool_result_over_the_result_cap_is_cut_and_the_run_goes_on() {
 
     assert_eq!(report.stop, AgentStop::Completed);
     let result = &tool_results(&report)[0];
-    assert!(result.len() <= autumn_harvest_agent::harness::MAX_TOOL_RESULT_BYTES);
+    assert!(
+        result.len()
+            <= autumn_harvest_agent::harness::max_tool_result_bytes(
+                autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES
+            )
+    );
     assert!(result.ends_with("…[truncated]"));
 }
 
@@ -312,13 +317,28 @@ async fn a_round_whose_results_pass_the_cap_ends_the_run_mid_batch() {
 
     assert_eq!(report.stop, AgentStop::TranscriptFull);
     assert_eq!(model.calls(), 1);
-    // Six results of a sixth of the cap each pass it. The rest never run.
-    assert_eq!(report.tool_calls, 6, "the calls after the cap never run");
+    // Every call gets an answer, so the transcript stays valid and shows
+    // which calls ran. The call that passed the cap ran, but its result is
+    // dropped. The calls after it never ran.
+    let results = tool_results(&report);
+    assert_eq!(results.len(), 8);
+    assert_eq!(report.tool_calls, 8);
+    let dropped = results
+        .iter()
+        .position(|r| r.contains("its result was dropped"))
+        .expect("one result is dropped");
+    assert!(dropped > 0 && dropped < 7, "{dropped}");
     assert!(
-        tool_results(&report).is_empty(),
-        "the cut round leaves the transcript"
+        results[..dropped]
+            .iter()
+            .all(|r| r.ends_with("…[truncated]"))
     );
-    assert_eq!(report.messages.last().unwrap().role, ChatRole::User);
+    assert!(
+        results[dropped + 1..]
+            .iter()
+            .all(|r| r.contains("did not run"))
+    );
+    assert_eq!(report.messages.last().unwrap().role, ChatRole::Tool);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -486,4 +506,124 @@ async fn a_late_decision_for_one_wait_never_releases_another() {
         "the late decision must not release the second call: {state:?}"
     );
     assert_eq!(recorder.runs(), Vec::<serde_json::Value>::new());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreadable_decision_denies_the_call_and_the_run_goes_on() {
+    let (_dir, db) = fresh_db();
+    let recorder = Arc::new(Recorder::default());
+    let model = ScriptedModel::new(vec![
+        calls(&[("w1", "write", json!({}))], 1),
+        answer("finished", 1),
+    ]);
+    let harness = AgentHarness::new(model)
+        .tool(recorded_tool("write", ToolEffect::Write, &recorder))
+        .policy(Arc::new(
+            ToolRules::new().effect(ToolEffect::Write, Rule::Ask),
+        ));
+    let mut rt = runtime(&db, harness);
+    let exec = sqlite::start(&mut rt, &AgentTask::new("write")).unwrap();
+    let RunState::WaitingSignal(signal) = rt.run_until_blocked(exec).await.unwrap() else {
+        panic!("expected an approval wait");
+    };
+
+    // The daemon's decision shape, not an `Approval`.
+    rt.send_signal(exec, &signal, json!({"approved": true}))
+        .unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert_eq!(report.stop, AgentStop::Completed);
+    assert_eq!(recorder.runs(), Vec::<serde_json::Value>::new());
+    assert!(
+        tool_results(&report)[0].contains("not a readable approval"),
+        "{:?}",
+        tool_results(&report)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lower_request_cap_stops_the_run_before_any_model_call() {
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::new(vec![answer("never", 1)]);
+    let mut rt = runtime(&db, AgentHarness::new(model.clone()));
+
+    let task = AgentTask::new("x".repeat(1_000)).max_request_bytes(512);
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert_eq!(report.stop, AgentStop::TranscriptFull);
+    assert_eq!(
+        model.calls(),
+        0,
+        "a request over the worker cap is never sent"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_system_message_in_the_history_never_reaches_the_model() {
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::new(vec![answer("ok", 1)]);
+    let mut rt = runtime(&db, AgentHarness::new(model.clone()));
+
+    let history = vec![
+        autumn_plugin_agent::ChatMessage::text(ChatRole::System, "old prompt"),
+        autumn_plugin_agent::ChatMessage::text(ChatRole::User, "earlier"),
+    ];
+    let task = AgentTask::new("now").system("new prompt").history(history);
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let _ = report(rt.run_until_blocked(exec).await.unwrap());
+
+    let sent = &model.requests()[0].messages;
+    let systems = sent.iter().filter(|m| m.role == ChatRole::System).count();
+    assert_eq!(systems, 1);
+    assert_eq!(sent[0].role, ChatRole::System);
+    assert_eq!(sent.len(), 3, "system, earlier, now");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_tool_is_an_error_result_not_a_failed_run() {
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::new(vec![
+        calls(&[("s", "slow", json!({}))], 1),
+        answer("moved on", 1),
+    ]);
+    let slow = autumn_plugin_agent::FnTool::new(
+        "slow",
+        "Never finishes in time.",
+        json!({"type": "object"}),
+        |_input| async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok(json!("late"))
+        },
+    )
+    .effect(ToolEffect::ReadOnly)
+    .shared();
+    let harness = AgentHarness::new(model)
+        .tool(slow)
+        .tool_timeout(Duration::from_millis(50));
+    let mut rt = runtime(&db, harness);
+
+    let exec = sqlite::start(&mut rt, &AgentTask::new("go")).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert_eq!(report.text, "moved on");
+    assert!(tool_results(&report)[0].contains("did not finish within"));
+}
+
+/// `block_in_place` panics on a current-thread runtime. The activity fails
+/// at once with a typed, non-retryable reason instead.
+#[tokio::test(flavor = "current_thread")]
+async fn a_current_thread_runtime_fails_the_call_and_names_the_fix() {
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::new(vec![answer("never", 1)]);
+    let mut rt = runtime(&db, AgentHarness::new(model.clone()));
+
+    let exec = sqlite::start(&mut rt, &AgentTask::new("go")).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+
+    assert!(
+        matches!(state, RunState::Failed(ref e) if e.contains("multi-thread")),
+        "{state:?}"
+    );
+    assert_eq!(model.calls(), 0);
 }
