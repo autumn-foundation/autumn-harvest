@@ -11719,7 +11719,8 @@ pub(crate) async fn fetch_archived_history(
             TARGET_WORKFLOW,
             Some(&target),
             route,
-            None,
+            // The audit row lives on the shard that held the run.
+            Some(ShardId::new(doc.shard_id)),
             outcome,
             None,
         )

@@ -60,7 +60,10 @@ impl HistoryArchiver for FakeArchiver {
     }
 }
 
-fn doc_with_events(execution_id: ExecutionId, events: Vec<serde_json::Value>) -> HistoryExportDocument {
+fn doc_with_events(
+    execution_id: ExecutionId,
+    events: Vec<serde_json::Value>,
+) -> HistoryExportDocument {
     let mut doc = export_history(HistoryExportRequest {
         workflow_name: "archived_wf".to_string(),
         workflow_id: Some("order-42".to_string()),
@@ -136,9 +139,10 @@ fn get_as_admin(uri: &str) -> Request<Body> {
     let mut data = HashMap::new();
     data.insert("user_id".to_string(), "operator-1".to_string());
     data.insert("role".to_string(), "admin".to_string());
-    request
-        .extensions_mut()
-        .insert(Session::new_for_test("harvest-test-session".to_string(), data));
+    request.extensions_mut().insert(Session::new_for_test(
+        "harvest-test-session".to_string(),
+        data,
+    ));
     request
 }
 
@@ -214,7 +218,11 @@ async fn a_store_failure_is_service_unavailable() {
 #[tokio::test]
 async fn an_invalid_id_is_a_bad_request() {
     let state = state_with(None);
-    let (status, _) = send(state, get_as_admin("/workflows/not-a-uuid/archived-history")).await;
+    let (status, _) = send(
+        state,
+        get_as_admin("/workflows/not-a-uuid/archived-history"),
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
@@ -300,4 +308,22 @@ async fn vantage_escapes_event_data() {
     let (status, html) = send(state, get_as_admin(&ui_path(&id))).await;
     assert_eq!(status, StatusCode::OK);
     assert!(!html.contains("<img src=x"), "event data is escaped");
+}
+
+#[tokio::test]
+async fn vantage_caps_a_long_history() {
+    let id = ExecutionId::new();
+    let events = (0..1001).map(|_| plain_event()).collect();
+    let state = state_with(serving(doc_with_events(id, events)));
+    let (status, html) = send(state, get_as_admin(&ui_path(&id))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("first 1000 events"),
+        "the page says it is capped"
+    );
+    assert_eq!(
+        html.matches("view payload").count(),
+        1000,
+        "1000 rows render"
+    );
 }

@@ -725,6 +725,8 @@ deletes the run from Postgres. Admin only.
 | Status | When |
 |--------|------|
 | 200 | The archive holds the run. The body is the document. |
+| 400 | The id is not a valid execution UUID. |
+| 401 | The caller is not a Harvest admin. |
 | 404 | The archive holds no document for the run. |
 | 503 | No archiver is set, the archiver cannot read back, the store fails, or the read times out. |
 

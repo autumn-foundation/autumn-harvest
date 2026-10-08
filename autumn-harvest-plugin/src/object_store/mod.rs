@@ -52,6 +52,12 @@ pub mod gcs;
 #[cfg(feature = "s3")]
 pub mod s3;
 
+/// The default read limit of [`ObjectHistoryArchiver::fetch`]: 64 MiB.
+///
+/// A read holds the object, its parsed form and the response in memory at the
+/// same time. The limit keeps one read from exhausting the process.
+pub const DEFAULT_MAX_FETCH_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Future returned by [`ObjectBackend`] methods.
 pub type ObjectFuture<'a, T> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, ObjectStoreError>> + Send + 'a>>;
@@ -69,14 +75,47 @@ pub struct ObjectStoreError(pub String);
 /// - [`delete`](ObjectBackend::delete) succeeds when no object is at `key`.
 pub trait ObjectBackend: Send + Sync + 'static {
     /// Write `bytes` to `key`.
-    fn put<'a>(&'a self, key: &'a str, bytes: Vec<u8>, content_type: &'a str)
-    -> ObjectFuture<'a, ()>;
+    fn put<'a>(
+        &'a self,
+        key: &'a str,
+        bytes: Vec<u8>,
+        content_type: &'a str,
+    ) -> ObjectFuture<'a, ()>;
 
     /// Read the object at `key`.
     fn get<'a>(&'a self, key: &'a str) -> ObjectFuture<'a, Option<Vec<u8>>>;
 
     /// Delete the object at `key`.
     fn delete<'a>(&'a self, key: &'a str) -> ObjectFuture<'a, ()>;
+
+    /// Read the object at `key`, or fail when it is over `max_bytes`.
+    ///
+    /// The default reads the whole object and then checks its length. A
+    /// backend that knows the size first should override this, so that it
+    /// refuses a large object before it reads the body.
+    fn get_bounded<'a>(
+        &'a self,
+        key: &'a str,
+        max_bytes: u64,
+    ) -> ObjectFuture<'a, Option<Vec<u8>>> {
+        Box::pin(async move {
+            let found = self.get(key).await?;
+            if let Some(bytes) = &found {
+                check_size(key, bytes.len() as u64, max_bytes)?;
+            }
+            Ok(found)
+        })
+    }
+}
+
+/// Fail when an object of `size` bytes is over `max_bytes`.
+pub(crate) fn check_size(key: &str, size: u64, max_bytes: u64) -> Result<(), ObjectStoreError> {
+    if size > max_bytes {
+        return Err(ObjectStoreError(format!(
+            "object {key} is {size} bytes, over the read limit of {max_bytes} bytes"
+        )));
+    }
+    Ok(())
 }
 
 /// An in-memory [`ObjectBackend`], for tests and local development.
@@ -201,6 +240,7 @@ pub struct ObjectHistoryArchiver<B> {
     backend: Arc<B>,
     prefix: String,
     codecs: Option<PayloadCodecs>,
+    max_fetch_bytes: u64,
 }
 
 impl<B: ObjectBackend> ObjectHistoryArchiver<B> {
@@ -211,6 +251,7 @@ impl<B: ObjectBackend> ObjectHistoryArchiver<B> {
             backend,
             prefix: String::new(),
             codecs: None,
+            max_fetch_bytes: DEFAULT_MAX_FETCH_BYTES,
         }
     }
 
@@ -223,11 +264,22 @@ impl<B: ObjectBackend> ObjectHistoryArchiver<B> {
 
     /// Encode the whole document with `codecs` before upload.
     ///
-    /// The document is encoded under the active key. A fetch needs that key.
+    /// The archiver encodes the document under the active key. A fetch needs
+    /// that key.
     /// Keep a retired key registered while its archives must stay readable.
     #[must_use]
     pub fn with_codecs(mut self, codecs: PayloadCodecs) -> Self {
         self.codecs = Some(codecs);
+        self
+    }
+
+    /// Refuse to read an archive object over `max_bytes`.
+    ///
+    /// The default is [`DEFAULT_MAX_FETCH_BYTES`]. The limit applies to the
+    /// read path only. Retention can still archive a larger run.
+    #[must_use]
+    pub const fn with_max_fetch_bytes(mut self, max_bytes: u64) -> Self {
+        self.max_fetch_bytes = max_bytes;
         self
     }
 
@@ -278,7 +330,7 @@ impl<B: ObjectBackend> HistoryArchiver for ObjectHistoryArchiver<B> {
         Box::pin(async move {
             let Some(bytes) = self
                 .backend
-                .get(&key)
+                .get_bounded(&key, self.max_fetch_bytes)
                 .await
                 .map_err(|err| ArchiveFetchError::Backend(Box::new(err)))?
             else {

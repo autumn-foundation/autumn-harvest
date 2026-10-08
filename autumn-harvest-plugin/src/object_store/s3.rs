@@ -1,14 +1,20 @@
 //! S3 [`ObjectBackend`] on `aws-sdk-s3` (issue #1983).
 //!
-//! The module re-exports [`aws_sdk_s3`], so an application needs no direct
-//! dependency on it. Any S3-compatible store works, for example MinIO. For a
+//! The module re-exports [`aws_sdk_s3`]. An application still needs
+//! `aws-config` to load credentials. Any S3-compatible store works, for
+//! example MinIO.
+//!
+//! Grant `s3:ListBucket` as well as `s3:GetObject`. Without it, AWS answers a
+//! read of a missing key with 403, and the backend reports an error, not a
+//! missing object. For a
 //! store that is not AWS, set `endpoint_url` and `force_path_style(true)` on
 //! the client config.
 //!
 //! ```text
 //! use autumn_harvest_plugin::object_store::s3::{S3Backend, aws_sdk_s3};
 //!
-//! let client = aws_sdk_s3::Client::new(&aws_config::load_from_env().await);
+//! let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+//! let client = aws_sdk_s3::Client::new(&config);
 //! let backend = Arc::new(S3Backend::new(client, "harvest-archive"));
 //! ```
 
@@ -20,7 +26,7 @@ use aws_sdk_s3::primitives::ByteStream;
 /// client with no direct dependency.
 pub use aws_sdk_s3;
 
-use super::{ObjectBackend, ObjectFuture, ObjectStoreError};
+use super::{ObjectBackend, ObjectFuture, ObjectStoreError, check_size};
 
 /// One S3 bucket.
 #[derive(Debug, Clone)]
@@ -38,6 +44,57 @@ impl S3Backend {
             bucket: bucket.into(),
         }
     }
+}
+
+impl S3Backend {
+    /// Read `key`. With a limit, check the object size before the body.
+    async fn read(
+        &self,
+        key: &str,
+        max_bytes: Option<u64>,
+    ) -> Result<Option<Vec<u8>>, ObjectStoreError> {
+        let output = match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(output) => output,
+            Err(SdkError::ServiceError(err)) if is_missing_object(&err) => return Ok(None),
+            Err(err) => return Err(s3_error("get", key, &err)),
+        };
+        if let Some(max_bytes) = max_bytes {
+            let size = output.content_length().unwrap_or(0);
+            check_size(key, u64::try_from(size).unwrap_or(0), max_bytes)?;
+        }
+        let bytes = output
+            .body
+            .collect()
+            .await
+            .map_err(|err| s3_error("get", key, &err))?
+            .into_bytes()
+            .to_vec();
+        if let Some(max_bytes) = max_bytes {
+            check_size(key, bytes.len() as u64, max_bytes)?;
+        }
+        Ok(Some(bytes))
+    }
+}
+
+/// Whether a `GetObject` error means that no object is at the key.
+///
+/// Some S3-compatible stores send a bare 404 with no `NoSuchKey` code. A 404
+/// for a missing bucket stays an error, because that is a configuration fault.
+fn is_missing_object(
+    err: &aws_sdk_s3::error::ServiceError<GetObjectError, aws_sdk_s3::config::http::HttpResponse>,
+) -> bool {
+    use aws_sdk_s3::error::ProvideErrorMetadata as _;
+    if matches!(err.err(), GetObjectError::NoSuchKey(_)) {
+        return true;
+    }
+    err.raw().status().as_u16() == 404 && err.err().code() != Some("NoSuchBucket")
 }
 
 fn s3_error<E>(op: &str, key: &str, err: &E) -> ObjectStoreError
@@ -72,30 +129,15 @@ impl ObjectBackend for S3Backend {
     }
 
     fn get<'a>(&'a self, key: &'a str) -> ObjectFuture<'a, Option<Vec<u8>>> {
-        Box::pin(async move {
-            let output = match self
-                .client
-                .get_object()
-                .bucket(&self.bucket)
-                .key(key)
-                .send()
-                .await
-            {
-                Ok(output) => output,
-                Err(SdkError::ServiceError(err))
-                    if matches!(err.err(), GetObjectError::NoSuchKey(_)) =>
-                {
-                    return Ok(None);
-                }
-                Err(err) => return Err(s3_error("get", key, &err)),
-            };
-            let bytes = output
-                .body
-                .collect()
-                .await
-                .map_err(|err| s3_error("get", key, &err))?;
-            Ok(Some(bytes.into_bytes().to_vec()))
-        })
+        Box::pin(self.read(key, None))
+    }
+
+    fn get_bounded<'a>(
+        &'a self,
+        key: &'a str,
+        max_bytes: u64,
+    ) -> ObjectFuture<'a, Option<Vec<u8>>> {
+        Box::pin(self.read(key, Some(max_bytes)))
     }
 
     fn delete<'a>(&'a self, key: &'a str) -> ObjectFuture<'a, ()> {

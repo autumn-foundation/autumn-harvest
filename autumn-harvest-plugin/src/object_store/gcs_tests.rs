@@ -9,7 +9,9 @@ use autumn_web::reexports::axum::http::{HeaderMap, StatusCode};
 use autumn_web::reexports::axum::routing::get;
 
 use super::super::ObjectBackend;
-use super::{GceMetadataToken, GcsBackend, GcsTokenSource, NoAuth, StaticToken, encode_object_name};
+use super::{
+    GceMetadataToken, GcsBackend, GcsTokenSource, NoAuth, StaticToken, encode_object_name,
+};
 
 #[derive(Clone, Default)]
 struct Seen {
@@ -21,7 +23,9 @@ async fn serve(router: Router) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        autumn_web::reexports::axum::serve(listener, router).await.unwrap();
+        autumn_web::reexports::axum::serve(listener, router)
+            .await
+            .unwrap();
     });
     format!("http://{addr}")
 }
@@ -30,9 +34,21 @@ async fn serve(router: Router) -> String {
 fn fake_gcs(seen: Seen) -> Router {
     Router::new()
         .route(
+            "/storage/v1/b/{bucket}",
+            get(|Path(bucket): Path<String>| async move {
+                if bucket == "b" {
+                    (StatusCode::OK, "{}")
+                } else {
+                    (StatusCode::NOT_FOUND, "")
+                }
+            }),
+        )
+        .route(
             "/storage/v1/b/{bucket}/o/{name}",
             get(
-                |State(seen): State<Seen>, Path((_, name)): Path<(String, String)>, headers: HeaderMap| async move {
+                |State(seen): State<Seen>,
+                 Path((_, name)): Path<(String, String)>,
+                 headers: HeaderMap| async move {
                     let auth = headers
                         .get("authorization")
                         .map(|v| v.to_str().unwrap().to_string());
@@ -50,7 +66,10 @@ fn fake_gcs(seen: Seen) -> Router {
 
 #[test]
 fn object_names_are_percent_encoded() {
-    assert_eq!(encode_object_name("history/a b.json"), "history%2Fa%20b.json");
+    assert_eq!(
+        encode_object_name("history/a b.json"),
+        "history%2Fa%20b.json"
+    );
     assert_eq!(encode_object_name("blobs/abc-_.~"), "blobs%2Fabc-_.~");
     assert_eq!(encode_object_name("../x?y#z"), "..%2Fx%3Fy%23z");
 }
@@ -81,6 +100,14 @@ async fn a_missing_object_is_none_and_other_errors_fail() {
     assert!(backend.get("missing").await.unwrap().is_none());
     let err = backend.get("boom").await.unwrap_err();
     assert!(err.to_string().contains("403"), "{err}");
+}
+
+#[tokio::test]
+async fn a_missing_bucket_is_an_error_not_a_missing_object() {
+    let endpoint = serve(fake_gcs(Seen::default())).await;
+    let backend = GcsBackend::new("no-such-bucket", NoAuth).with_endpoint(&endpoint);
+    let err = backend.get("missing").await.unwrap_err();
+    assert!(err.to_string().contains("does not exist"), "{err}");
 }
 
 #[tokio::test]
@@ -117,7 +144,7 @@ async fn metadata_token_refreshes_near_expiry() {
             "/computeMetadata/v1/instance/service-accounts/default/token",
             get(|State(seen): State<Seen>| async move {
                 seen.hits.fetch_add(1, Ordering::SeqCst);
-                r#"{"access_token":"short","expires_in":30,"token_type":"Bearer"}"#
+                r#"{"access_token":"short","expires_in":0,"token_type":"Bearer"}"#
             }),
         )
         .with_state(seen.clone());
@@ -125,5 +152,21 @@ async fn metadata_token_refreshes_near_expiry() {
     let source = GceMetadataToken::new().with_endpoint(&endpoint);
     source.token().await.unwrap();
     source.token().await.unwrap();
-    assert_eq!(seen.hits.load(Ordering::SeqCst), 2, "a token near expiry is not reused");
+    assert_eq!(
+        seen.hits.load(Ordering::SeqCst),
+        2,
+        "an expired token is not reused"
+    );
+}
+
+#[tokio::test]
+async fn bounded_get_refuses_a_large_object() {
+    let endpoint = serve(fake_gcs(Seen::default())).await;
+    let backend = GcsBackend::new("b", NoAuth).with_endpoint(&endpoint);
+    assert_eq!(
+        backend.get_bounded("ok", 5).await.unwrap().unwrap(),
+        b"bytes"
+    );
+    let err = backend.get_bounded("ok", 4).await.unwrap_err();
+    assert!(err.to_string().contains("read limit"), "{err}");
 }

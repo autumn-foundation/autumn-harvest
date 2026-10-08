@@ -12,7 +12,9 @@ use autumn_harvest::{RetentionConfig, WorkflowEvent};
 use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
 use autumn_harvest_plugin::object_store::{ObjectBackend, ObjectHistoryArchiver};
 use autumn_harvest_plugin::ui::harvest_ui_router;
-use autumn_harvest_plugin::{HarvestMode, HarvestRunner, HarvestRunnerResources, HarvestRuntimeConfig};
+use autumn_harvest_plugin::{
+    HarvestMode, HarvestRunner, HarvestRunnerResources, HarvestRuntimeConfig,
+};
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -58,7 +60,10 @@ async fn send(app: &axum::Router, method: &str, uri: &str) -> (StatusCode, Strin
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read body");
-    (status, String::from_utf8(bytes.to_vec()).expect("utf-8 body"))
+    (
+        status,
+        String::from_utf8(bytes.to_vec()).expect("utf-8 body"),
+    )
 }
 
 /// Archive one run through retention, then read it back three ways.
@@ -164,6 +169,13 @@ pub async fn retention_archive_reads_back_through_api_and_vantage<B: ObjectBacke
     }
     assert!(deleted, "retention archives the run and deletes it");
 
+    let (status, html) = send(&app, "GET", &format!("/ui/workflows/{exec_id}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{html}");
+    assert!(
+        html.contains(&format!("{exec_id}/archived-history")),
+        "the 404 page links to the archive: {html}"
+    );
+
     let raw = backend
         .get(&format!("history/{exec_id}.json"))
         .await
@@ -172,17 +184,29 @@ pub async fn retention_archive_reads_back_through_api_and_vantage<B: ObjectBacke
     let text = String::from_utf8(raw.clone()).expect("utf-8 object");
     assert!(!text.contains(MARKER), "the archive object is ciphertext");
     let envelope: serde_json::Value = serde_json::from_slice(&raw).expect("JSON object");
-    assert!(is_codec_envelope(&envelope), "the object is a codec envelope");
+    assert!(
+        is_codec_envelope(&envelope),
+        "the object is a codec envelope"
+    );
 
-    let (status, body) = send(&app, "GET", &format!("/workflows/{exec_id}/archived-history")).await;
+    let (status, body) = send(
+        &app,
+        "GET",
+        &format!("/workflows/{exec_id}/archived-history"),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let doc: serde_json::Value = serde_json::from_str(&body).expect("JSON body");
     assert_eq!(doc["execution_id"], exec_id.to_string());
     assert_eq!(doc["workflow_name"], "archived_wf");
     assert_eq!(doc["events"][0]["data"]["output"]["secret"], MARKER);
 
-    let (status, html) =
-        send(&app, "GET", &format!("/ui/workflows/{exec_id}/archived-history")).await;
+    let (status, html) = send(
+        &app,
+        "GET",
+        &format!("/ui/workflows/{exec_id}/archived-history"),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{html}");
     assert!(html.contains("Archived history"), "page title");
     assert!(html.contains(MARKER), "decoded event data");

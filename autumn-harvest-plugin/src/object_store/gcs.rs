@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 
-use super::{ObjectBackend, ObjectFuture, ObjectStoreError};
+use super::{ObjectBackend, ObjectFuture, ObjectStoreError, check_size};
 
 /// The public GCS endpoint.
 pub const DEFAULT_ENDPOINT: &str = "https://storage.googleapis.com";
@@ -34,14 +34,15 @@ pub const DEFAULT_METADATA_ENDPOINT: &str = "http://metadata.google.internal";
 
 const METADATA_TOKEN_PATH: &str = "/computeMetadata/v1/instance/service-accounts/default/token";
 
-/// A cached token is not used in its last minute.
+/// The source refreshes a cached token one minute before it expires. For a
+/// shorter lifetime, it refreshes at half the lifetime.
 const TOKEN_EXPIRY_MARGIN: Duration = Duration::from_secs(60);
 
 /// The default timeout for one HTTP call.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// RFC 3986 unreserved characters stay. All other bytes are encoded, `/`
-/// included, so a whole object name is one path segment.
+/// RFC 3986 unreserved characters stay. The set encodes all other bytes, `/`
+/// included. A whole object name is then one path segment.
 const OBJECT_NAME: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'_')
@@ -102,7 +103,8 @@ struct MetadataToken {
 
 /// Reads the service-account token from the GCE metadata server.
 ///
-/// The token is cached. A cached token is not used in its last minute.
+/// The source caches the token and refreshes it one minute before it
+/// expires. One call fetches a new token while the others wait for it.
 pub struct GceMetadataToken {
     http: reqwest::Client,
     endpoint: String,
@@ -113,8 +115,16 @@ impl GceMetadataToken {
     /// Use the metadata server at [`DEFAULT_METADATA_ENDPOINT`].
     #[must_use]
     pub fn new() -> Self {
+        // The metadata server is plain HTTP on the local link. Do not send
+        // the token request through a proxy, and do not follow redirects.
+        let http = reqwest::Client::builder()
+            .timeout(HTTP_TIMEOUT)
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_default();
         Self {
-            http: http_client(),
+            http,
             endpoint: DEFAULT_METADATA_ENDPOINT.to_string(),
             cached: tokio::sync::Mutex::new(None),
         }
@@ -142,9 +152,11 @@ impl GceMetadataToken {
                 "GCE metadata token request failed: HTTP {status}"
             )));
         }
-        response
-            .json::<MetadataToken>()
+        let body = response
+            .bytes()
             .await
+            .map_err(|err| ObjectStoreError(format!("GCE metadata token request failed: {err}")))?;
+        serde_json::from_slice::<MetadataToken>(&body)
             .map_err(|err| ObjectStoreError(format!("GCE metadata token is invalid: {err}")))
     }
 }
@@ -174,7 +186,8 @@ impl GcsTokenSource for GceMetadataToken {
             }
             let fresh = self.fetch().await?;
             let lifetime = Duration::from_secs(fresh.expires_in);
-            let usable_until = Instant::now() + lifetime.saturating_sub(TOKEN_EXPIRY_MARGIN);
+            let margin = TOKEN_EXPIRY_MARGIN.min(lifetime / 2);
+            let usable_until = Instant::now() + lifetime.saturating_sub(margin);
             *cached = Some((fresh.access_token.clone(), usable_until));
             Ok(Some(fresh.access_token))
         })
@@ -246,6 +259,55 @@ impl GcsBackend {
         )
     }
 
+    /// Read `key`. With a limit, check the declared size before the body.
+    async fn read(
+        &self,
+        key: &str,
+        max_bytes: Option<u64>,
+    ) -> Result<Option<Vec<u8>>, ObjectStoreError> {
+        let request = self.http.get(format!("{}?alt=media", self.object_url(key)));
+        let response = self.send("get", key, request).await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            // GCS also answers 404 for a missing bucket. That is a
+            // configuration fault, so check the bucket before "not found".
+            self.check_bucket().await?;
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(status_error("get", key, response).await);
+        }
+        if let (Some(max_bytes), Some(size)) = (max_bytes, response.content_length()) {
+            check_size(key, size, max_bytes)?;
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|err| ObjectStoreError(format!("GCS get of {key} failed: {err}")))?;
+        if let Some(max_bytes) = max_bytes {
+            check_size(key, bytes.len() as u64, max_bytes)?;
+        }
+        Ok(Some(bytes.to_vec()))
+    }
+
+    /// Fail when the bucket does not exist.
+    async fn check_bucket(&self) -> Result<(), ObjectStoreError> {
+        let url = format!(
+            "{}/storage/v1/b/{}",
+            self.endpoint,
+            encode_object_name(&self.bucket)
+        );
+        let response = self
+            .send("bucket check", &self.bucket, self.http.get(url))
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(ObjectStoreError(format!(
+                "GCS bucket {} does not exist",
+                self.bucket
+            )));
+        }
+        Ok(())
+    }
+
     async fn send(
         &self,
         op: &str,
@@ -303,21 +365,15 @@ impl ObjectBackend for GcsBackend {
     }
 
     fn get<'a>(&'a self, key: &'a str) -> ObjectFuture<'a, Option<Vec<u8>>> {
-        Box::pin(async move {
-            let request = self.http.get(format!("{}?alt=media", self.object_url(key)));
-            let response = self.send("get", key, request).await?;
-            if response.status() == reqwest::StatusCode::NOT_FOUND {
-                return Ok(None);
-            }
-            if !response.status().is_success() {
-                return Err(status_error("get", key, response).await);
-            }
-            let bytes = response
-                .bytes()
-                .await
-                .map_err(|err| ObjectStoreError(format!("GCS get of {key} failed: {err}")))?;
-            Ok(Some(bytes.to_vec()))
-        })
+        Box::pin(self.read(key, None))
+    }
+
+    fn get_bounded<'a>(
+        &'a self,
+        key: &'a str,
+        max_bytes: u64,
+    ) -> ObjectFuture<'a, Option<Vec<u8>>> {
+        Box::pin(self.read(key, Some(max_bytes)))
     }
 
     fn delete<'a>(&'a self, key: &'a str) -> ObjectFuture<'a, ()> {

@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use autumn_harvest::WorkflowEvent;
 use autumn_harvest::aead_codec::{AeadCodec, DataKey};
 use autumn_harvest::history_export::{
     HistoryExportDocument, HistoryExportRequest, HistoryPayloadPolicy, export_history,
@@ -10,7 +11,6 @@ use autumn_harvest::payload_codec::{PayloadCodecs, is_codec_envelope};
 use autumn_harvest::payload_store::PayloadStore;
 use autumn_harvest::retention::{ArchiveFetchError, HistoryArchiver};
 use autumn_harvest::types::ExecutionId;
-use autumn_harvest::WorkflowEvent;
 
 use super::{MemoryBackend, ObjectBackend, ObjectHistoryArchiver, ObjectPayloadStore};
 
@@ -150,7 +150,11 @@ async fn archiver_without_codecs_uploads_plain_json() {
     let archiver = ObjectHistoryArchiver::new(Arc::clone(&backend));
     let id = ExecutionId::new();
     archiver.archive(&sample_doc(id)).await.unwrap();
-    let raw = backend.get(&archiver.object_key(&id)).await.unwrap().unwrap();
+    let raw = backend
+        .get(&archiver.object_key(&id))
+        .await
+        .unwrap()
+        .unwrap();
     let text = String::from_utf8(raw).unwrap();
     assert!(text.contains(MARKER), "codec off: the object is plain JSON");
 }
@@ -164,9 +168,16 @@ async fn archiver_with_codecs_uploads_ciphertext() {
     let doc = sample_doc(id);
     archiver.archive(&doc).await.unwrap();
 
-    let raw = backend.get(&archiver.object_key(&id)).await.unwrap().unwrap();
+    let raw = backend
+        .get(&archiver.object_key(&id))
+        .await
+        .unwrap()
+        .unwrap();
     let text = String::from_utf8(raw.clone()).unwrap();
-    assert!(!text.contains(MARKER), "codec on: no plaintext in the object");
+    assert!(
+        !text.contains(MARKER),
+        "codec on: no plaintext in the object"
+    );
     let value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
     assert!(is_codec_envelope(&value), "the object is a codec envelope");
 
@@ -177,8 +188,7 @@ async fn archiver_with_codecs_uploads_ciphertext() {
 #[tokio::test]
 async fn archiver_fetch_without_the_key_is_an_error() {
     let backend = Arc::new(MemoryBackend::default());
-    let writer =
-        ObjectHistoryArchiver::new(Arc::clone(&backend)).with_codecs(aead_codecs("k-a"));
+    let writer = ObjectHistoryArchiver::new(Arc::clone(&backend)).with_codecs(aead_codecs("k-a"));
     let id = ExecutionId::new();
     writer.archive(&sample_doc(id)).await.unwrap();
 
@@ -187,4 +197,33 @@ async fn archiver_fetch_without_the_key_is_an_error() {
     assert!(matches!(err, ArchiveFetchError::Backend(_)), "{err}");
     let plain = ObjectHistoryArchiver::new(backend);
     assert!(plain.fetch(&id).await.is_err(), "no codecs: cannot decode");
+}
+
+#[tokio::test]
+async fn default_bounded_get_refuses_a_large_object() {
+    let backend = MemoryBackend::default();
+    backend
+        .put("k", vec![0; 10], "application/octet-stream")
+        .await
+        .unwrap();
+    assert_eq!(
+        backend.get_bounded("k", 10).await.unwrap().unwrap().len(),
+        10
+    );
+    let err = backend.get_bounded("k", 9).await.unwrap_err();
+    assert!(err.0.contains("read limit"), "{err}");
+    assert!(backend.get_bounded("missing", 9).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn archiver_fetch_refuses_an_object_over_the_limit() {
+    let backend = Arc::new(MemoryBackend::default());
+    let id = ExecutionId::new();
+    ObjectHistoryArchiver::new(Arc::clone(&backend))
+        .archive(&sample_doc(id))
+        .await
+        .unwrap();
+    let small = ObjectHistoryArchiver::new(backend).with_max_fetch_bytes(16);
+    let err = small.fetch(&id).await.unwrap_err();
+    assert!(err.to_string().contains("read limit"), "{err}");
 }

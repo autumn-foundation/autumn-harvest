@@ -314,11 +314,12 @@ pub type ArchiveFetchFuture<'a> = std::pin::Pin<
 
 /// Error returned by [`HistoryArchiver::fetch`] (issue #1983).
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ArchiveFetchError {
     /// The archiver can write but cannot read back.
     #[error("the history archiver does not support read-back")]
     Unsupported,
-    /// The store or the decode failed.
+    /// The store or the decode fails.
     #[error("archived history read failed: {0}")]
     Backend(Box<dyn std::error::Error + Send + Sync>),
 }
@@ -2908,9 +2909,9 @@ async fn run_shard_tick(
             let mut doc = None;
             if !config.dry_run && archiver.is_some() {
                 let exec_id = crate::types::ExecutionId::from_uuid(candidate.id);
-                // Inflate offloaded envelopes before archiving so the archived
-                // document contains real payloads, not blob references that will
-                // be deleted moments later. Issue #524.
+                // Inflate offloaded references before archiving. The archive then
+                // holds the payload bytes, not references to blobs that retention
+                // deletes next. Issue #524.
                 //
                 // Do not decode codec envelopes. The archive keeps the stored
                 // form, so a codec keeps the payloads ciphertext. A decode with

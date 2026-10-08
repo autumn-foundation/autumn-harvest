@@ -67,9 +67,9 @@ Implement `fetch` to make an archive readable through the management API and
 Vantage. See [Reading an archive back](#reading-an-archive-back-issue-1983).
 
 Payload fields in the document are in their stored form. With a payload codec
-on, they are codec envelopes (ciphertext). Before issue #1983, retention
-decoded them with the identity codec. With a real codec, that decode failed,
-and retention never archived or deleted the run.
+on, they are codec envelopes (ciphertext). Retention does not decode payload
+fields before it archives them. A decode needs every codec key, and the
+archive must keep ciphertext.
 
 ### Example: Archiving to local files
 
@@ -182,7 +182,9 @@ use autumn_harvest_plugin::object_store::{ObjectHistoryArchiver, ObjectPayloadSt
 
 let builder = autumn_harvest::HarvestBuilder::new();
 let codecs = builder.payload_codecs().clone();
-let client = aws_sdk_s3::Client::new(&aws_config::load_from_env().await);
+// `aws-config` is a direct dependency of the application.
+let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+let client = aws_sdk_s3::Client::new(&config);
 let backend = Arc::new(S3Backend::new(client, "harvest-archive"));
 
 let builder = builder
@@ -206,7 +208,9 @@ implement `GcsTokenSource`.
 | `ObjectPayloadStore` | `{prefix}{sha256-hex}` | Identical bytes share one object. Retention deletes a blob when no run refers to it. |
 | `ObjectHistoryArchiver` | `{prefix}{execution_id}.json` | A second archive of a run overwrites the object. |
 
-A missing object reads as "not found". A delete of a missing object succeeds.
+`ObjectHistoryArchiver::fetch` reads a missing object as `None`, and the API
+returns 404. `ObjectPayloadStore::get` returns an error, because a missing
+blob is data loss. A delete of a missing object succeeds.
 
 `ObjectPayloadStore` records the store id `"default"` in each reference, like
 the trait default. To keep reading references that another store wrote, set
@@ -251,8 +255,18 @@ An archiver that implements `fetch` makes a pruned run readable again:
   is set, the "not found" page of a pruned run links there.
 
 Payload fields decode under the same gate as live history. The read times out
-after `archival_timeout_secs`. Use the document for display and replay
-debugging. `WorkflowReplayer` reads the same export format.
+after `archival_timeout_secs`. `ObjectHistoryArchiver` refuses an object over
+64 MiB by default; `with_max_fetch_bytes` changes the limit. Vantage shows the
+first 1000 events. The API returns all of them. Use the document for display
+and replay debugging. `WorkflowReplayer` reads the same export format, but it
+does not decode payload fields. With a codec on, replay the API response with
+decode-on-read on, not the raw object.
+
+> [!IMPORTANT]
+> **PII erasure does not reach the archive.** `erase-payloads` works on rows in
+> Postgres. After retention deletes a run, the archive object is the only copy.
+> To erase it, delete or overwrite the object in the bucket. A bucket lifecycle
+> rule can also expire archives after a fixed age.
 
 ---
 

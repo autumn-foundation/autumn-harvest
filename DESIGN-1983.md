@@ -24,8 +24,8 @@ Issue #1983 asks for three things:
 - **Defect.** Retention loads the history for the archive with
   `store::load_history`. That loader decodes with the identity-only registry.
   With a real codec, it fails on the first envelope. Retention then skips the
-  run on every tick. The archiver never gets a document. The offload path has
-  the same defect. So "codec on" plus "archive" never worked.
+  run on every tick. The archiver never gets a document. The offload branch
+  has the same defect: `load_history_inflated` with the default registry. So "codec on" plus "archive" never worked.
 - The official MinIO images on Docker Hub and `dl.min.io` are gone (HTTP 410
   and "repository does not exist"). `pgsty/minio` is the maintained community
   build. `fsouza/fake-gcs-server` is on Docker Hub.
@@ -55,6 +55,8 @@ Issue #1983 asks for three things:
 | R7 | A missing object returns an error, not "not found". | Both backends map 404 / `NoSuchKey` to `None`. The API returns 404. |
 | R8 | Delete fails on a missing blob, and retention GC loops. | Delete of a missing object is success on both backends. |
 | R9 | A slow store hangs a request. | The API bounds `fetch` with the retention archival timeout. |
+| R11 | A large archive object exhausts memory on read. | `fetch` refuses an object over 64 MiB by default. Vantage shows the first 1000 events. |
+| R12 | Erasure misses a run that is only in the archive. | The docs state the gap. The operator deletes the object, or a bucket lifecycle rule expires it. |
 | R10 | CI cannot pull the emulator image. | The CI job pre-pulls both images with retries, as for ElasticMQ. |
 
 ### 0.4 Six thinking hats — B4 + B5 + B6
@@ -63,7 +65,7 @@ Issue #1983 asks for three things:
 |-----|-------|
 | White | `aws-sdk-s3` 1.122 resolves with Rust 1.88. It adds nine crates, all MIT or Apache-2.0. The GCS JSON API needs three calls: upload, download, delete. |
 | Red | One trait and two backends is easy to explain. Embedders stop writing their own adapter. |
-| Black | Archives encoded under a key are not re-encrypted by the rotation sweep (R4). GCS auth is a seam: a static token and the GCE metadata server ship. A service-account JSON key needs an embedder token source. |
+| Black | The rotation sweep does not re-encrypt archives (R4). GCS auth is a seam: a static token and the GCE metadata server ship. A service-account JSON key needs an embedder token source. |
 | Yellow | The fix to retention makes archival work with a codec for all archivers, not only the new ones. The read path reuses the history-export document. Replay tools already read it. |
 | Green | B2, B3, B7 in §0.2. A later "tiered history" issue can reuse `ObjectBackend` to export partitions. |
 | Blue | Red: tests for the retention defect, the adapters, the emulators, the route and the page. Green: implement. Refactor: docs, contract, CI legs. Then a multi-angle review. |
@@ -83,8 +85,9 @@ Features: `object-store` (generic adapters), `s3` and `gcs` (backends).
 - `ObjectHistoryArchiver<B>` implements `HistoryArchiver`. The key is
   `{prefix}{execution_id}.json`. A re-archive overwrites the same key.
 - `S3Backend` wraps an `aws_sdk_s3::Client` and a bucket.
-- `GcsBackend` uses the JSON API. It takes a base URL, a bucket and a
+- `GcsBackend::new(bucket, tokens)` uses the JSON API. `tokens` is a
   `GcsTokenSource` (`NoAuth`, `StaticToken`, `GceMetadataToken`).
+  `with_endpoint` sets an emulator URL.
 
 ### 1.2 Codec
 
@@ -104,7 +107,7 @@ Features: `object-store` (generic adapters), `s3` and `gcs` (backends).
   returns `ArchiveFetchError::Unsupported`.
 - API: `GET /workflows/{id}/archived-history`, admin only. 200 with the
   document; 404 when the archive has no such run; 503 when no archiver is
-  set, the archiver cannot fetch, or the store fails. Payload fields decode
+  set, the archiver cannot fetch, the store fails, or the read times out. Payload fields decode
   under the same gate as `GET /workflows/{id}/history`.
 - Vantage: `/ui/workflows/{id}/archived-history` shows the metadata and the
   event table. The "not found" page for a run links to it.

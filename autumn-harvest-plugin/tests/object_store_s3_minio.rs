@@ -14,16 +14,14 @@ mod object_store_e2e;
 
 use std::sync::Arc;
 
+use autumn_harvest::WorkflowEvent;
 use autumn_harvest::aead_codec::{AeadCodec, DataKey};
-use autumn_harvest::history_export::{
-    HistoryExportRequest, HistoryPayloadPolicy, export_history,
-};
+use autumn_harvest::history_export::{HistoryExportRequest, HistoryPayloadPolicy, export_history};
 use autumn_harvest::payload_codec::{PayloadCodecs, is_codec_envelope};
 use autumn_harvest::payload_store::{PayloadOffloader, PayloadStore};
 use autumn_harvest::retention::HistoryArchiver;
 use autumn_harvest::telemetry::NoOpMetrics;
 use autumn_harvest::types::ExecutionId;
-use autumn_harvest::WorkflowEvent;
 use autumn_harvest_plugin::object_store::s3::{S3Backend, aws_sdk_s3};
 use autumn_harvest_plugin::object_store::{ObjectHistoryArchiver, ObjectPayloadStore};
 use object_store_e2e::MARKER;
