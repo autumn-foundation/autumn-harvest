@@ -120,8 +120,8 @@ async fn foreign_rename(_ctx: &WorkflowContext, name: String) -> Result<String, 
     Ok(name)
 }
 
-/// Registers an update that never finishes and one that panics, then waits
-/// for `go`.
+/// Registers an update that never finishes, an update that panics and a
+/// query that panics, then waits for `go`.
 fn faulty_update_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -133,6 +133,7 @@ fn faulty_update_workflow<'a>(
         ctx.register_update_handler_no_validator("boom", |_input: Value| async move {
             panic!("boom handler")
         });
+        ctx.register_query("explode", || panic!("query boom"));
         ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
     })
 }
@@ -604,6 +605,21 @@ async fn query_before_the_first_drive_sees_the_initial_state() {
     assert_eq!(
         run.query("seen", Value::Null).await.expect("query"),
         json!([])
+    );
+}
+
+/// A panic in an imperative query handler returns `QueryHandlerPanicked`.
+/// The test does not unwind.
+#[tokio::test]
+async fn query_handler_panic_is_contained() {
+    let env = WorkflowTestEnv::new();
+    let mut run = env.start(faulty_update_workflow, json!(null));
+    assert_eq!(run.run_until_blocked().await, TestRunStatus::Blocked);
+
+    let err = run.query("explode", Value::Null).await.expect_err("panic");
+    assert!(
+        matches!(err, HarvestError::QueryHandlerPanicked(ref m) if m.contains("query boom")),
+        "{err:?}"
     );
 }
 

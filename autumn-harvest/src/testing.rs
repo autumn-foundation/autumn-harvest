@@ -5660,8 +5660,8 @@ impl WorkflowTestRun<'_> {
     ///
     /// - [`HarvestError::QueryHandlerNotFound`] if no handler has the name.
     /// - [`HarvestError::QueryHandlerFailed`] if the handler returns an error.
-    /// - [`HarvestError::QueryHandlerPanicked`] if the replay or a declarative
-    ///   handler panics.
+    /// - [`HarvestError::QueryHandlerPanicked`] if the replay or the handler
+    ///   panics.
     /// - [`HarvestError::QueryTimedOut`] if the replay times out.
     ///
     /// [`HarvestError::QueryHandlerNotFound`]: crate::error::HarvestError::QueryHandlerNotFound
@@ -5669,9 +5669,15 @@ impl WorkflowTestRun<'_> {
     /// [`HarvestError::QueryHandlerPanicked`]: crate::error::HarvestError::QueryHandlerPanicked
     /// [`HarvestError::QueryTimedOut`]: crate::error::HarvestError::QueryTimedOut
     pub async fn query(&self, name: &str, args: Value) -> crate::error::HarvestResult<Value> {
-        self.rebuild_state(name)
-            .await?
-            .execute_query_with_args(name, args)
+        let ctx = self.rebuild_state(name).await?;
+        // `execute_query_with_args` contains a panic only in a declarative
+        // handler. The harness contains one in an imperative handler too.
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ctx.execute_query_with_args(name, args)
+        }))
+        .map_err(|panic| {
+            crate::error::HarvestError::QueryHandlerPanicked(crate::error::panic_message(panic))
+        })?
     }
 
     /// Replay the history into a fresh context so its handlers see the

@@ -1920,13 +1920,11 @@ const RESERVED_SEARCH_ATTR_PREFIX: &str = "_harvest";
 /// the clock of the workflow body.
 #[cfg(any(test, feature = "testing"))]
 fn snapshot_timer_clock(
-    clock: Option<&Arc<std::sync::atomic::AtomicU64>>,
-) -> Option<Arc<std::sync::atomic::AtomicU64>> {
-    clock.map(|elapsed| {
-        Arc::new(std::sync::atomic::AtomicU64::new(
-            elapsed.load(std::sync::atomic::Ordering::Relaxed),
-        ))
-    })
+    elapsed: &Arc<std::sync::atomic::AtomicU64>,
+) -> Arc<std::sync::atomic::AtomicU64> {
+    Arc::new(std::sync::atomic::AtomicU64::new(
+        elapsed.load(std::sync::atomic::Ordering::Relaxed),
+    ))
 }
 
 fn validate_search_attr_key(key: &str) -> HarvestResult<()> {
@@ -13187,7 +13185,7 @@ impl WorkflowContext {
                 inner.parent_execution_id = parent_execution_id;
                 #[cfg(any(test, feature = "testing"))]
                 {
-                    inner.timer_clock_elapsed_secs = snapshot_timer_clock(timer_clock.as_ref());
+                    inner.timer_clock_elapsed_secs = timer_clock.as_ref().map(snapshot_timer_clock);
                 }
             }
             handler_fn(ctx, input)
@@ -13269,8 +13267,10 @@ impl WorkflowContext {
                 inner.parent_execution_id = self.parent_execution_id;
                 #[cfg(any(test, feature = "testing"))]
                 {
-                    inner.timer_clock_elapsed_secs =
-                        snapshot_timer_clock(self.timer_clock_elapsed_secs.as_ref());
+                    inner.timer_clock_elapsed_secs = self
+                        .timer_clock_elapsed_secs
+                        .as_ref()
+                        .map(snapshot_timer_clock);
                 }
             }
             h(ctx, input)
