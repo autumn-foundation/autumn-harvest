@@ -758,35 +758,30 @@ pub(crate) async fn require_oidc_session(
         return next.run(request).await;
     }
     let session = request.extensions().get::<Session>().cloned();
-    if let Some(session) = session
-        && let Some(subject) = session_subject(&session, &login).await
-    {
-        set_actor(&mut request, &subject, login.issuer());
-        // The login roles reach the role layer as a grant, never through the
-        // shared session key. A host grant, such as from mTLS, still wins.
-        if request
-            .extensions()
-            .get::<crate::roles::RoleGrant>()
-            .is_none()
-        {
-            let roles = session
-                .get(SESSION_OIDC_ROLES_KEY)
-                .await
-                .map(|v| crate::roles::parse_role_list(&v))
-                .unwrap_or_default();
-            request
-                .extensions_mut()
-                .insert(crate::roles::RoleGrant::new(roles));
-        }
-        return next.run(request).await;
-    }
     // Host middleware can give roles, for example from an mTLS certificate.
-    // The role layer then reads them.
+    // A host grant wins over a live session, as in the role layer. It then
+    // decides both the roles and the actor, so the host actor stays.
     if request
         .extensions()
         .get::<crate::roles::RoleGrant>()
         .is_some()
     {
+        return next.run(request).await;
+    }
+    if let Some(session) = session
+        && let Some(subject) = session_subject(&session, &login).await
+    {
+        set_actor(&mut request, &subject, login.issuer());
+        // The login roles reach the role layer as a grant, never through the
+        // shared session key.
+        let roles = session
+            .get(SESSION_OIDC_ROLES_KEY)
+            .await
+            .map(|v| crate::roles::parse_role_list(&v))
+            .unwrap_or_default();
+        request
+            .extensions_mut()
+            .insert(crate::roles::RoleGrant::new(roles));
         return next.run(request).await;
     }
     let method = request.method().clone();
@@ -1073,6 +1068,27 @@ mod tests {
         let out = call(granted, Method::GET, None, "oidc:admin").await;
         // The grant passes. The forged `oidc:` actor does not.
         assert_eq!(out, (StatusCode::OK, "-".to_string()));
+    }
+
+    /// A host grant wins over a live OIDC session. Its host actor stays.
+    #[tokio::test]
+    async fn a_host_grant_keeps_its_host_actor_over_a_live_session() {
+        let granted = echo_actor()
+            .layer(axum::middleware::from_fn_with_state(
+                (login(), false),
+                require_oidc_session,
+            ))
+            .layer(axum::middleware::from_fn(
+                |mut request: Request, next: Next| async move {
+                    request
+                        .extensions_mut()
+                        .insert(crate::roles::RoleGrant::new([ROLE_VIEWER]));
+                    next.run(request).await
+                },
+            ));
+        let live = session(Some("user-42"), ROLE_VIEWER, now_unix());
+        let out = call(granted, Method::GET, Some(live), "cert:svc-orders").await;
+        assert_eq!(out, (StatusCode::OK, "cert:svc-orders".to_string()));
     }
 
     #[tokio::test]
