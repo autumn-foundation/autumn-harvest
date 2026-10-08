@@ -95,8 +95,12 @@ sink:await_external_workflow@WorkflowContext
 sink:await_external_workflow_value@WorkflowContext
 sink:await_fire@TimerHandle
 sink:business_days_from_now@WorkflowContext
+# Issue #1984: the scope API is new, and no corpus or fixture workflow calls
+# it yet. Each row models an API the corpus does not use.
+sink:cancel@CancellationScope
 sink:cancel@TimerHandle
 sink:cancel_timer@WorkflowContext
+sink:cancellation_scope@WorkflowContext
 sink:complete@Session
 sink:continue_as_new@WorkflowContext
 sink:continue_as_new_as@WorkflowContext
@@ -121,6 +125,8 @@ sink:execute_local_activity@WorkflowContext
 sink:execute_local_activity_raw@WorkflowContext
 sink:execute_local_activity_with_opts@WorkflowContext
 sink:mutex@WorkflowContext
+# Issue #1984: see `cancel@CancellationScope` above.
+sink:non_cancellable@WorkflowContext
 sink:patched@WorkflowContext
 sink:race@WorkflowContext
 sink:random_f64@WorkflowContext
@@ -131,6 +137,8 @@ sink:request_cancel_external_workflow@WorkflowContext
 sink:request_cancel_external_workflow_by_id@WorkflowContext
 sink:reset@TimerHandle
 sink:reset_timer@WorkflowContext
+# Issue #1984: see `cancel@CancellationScope` above.
+sink:run@CancellationScope
 sink:run@RaceBuilder
 sink:should_continue_as_new@WorkflowContext
 sink:signal_external_workflow@WorkflowContext
