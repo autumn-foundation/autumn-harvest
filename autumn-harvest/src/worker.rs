@@ -335,6 +335,8 @@ impl WorkerRuntimeConfig {
     ///
     /// Returns [`HarvestError::Config`] if `queues` is empty, or if
     /// `cancellation_grace_period` exceeds [`MAX_CANCELLATION_GRACE_PERIOD`].
+    /// With `fairness_keys` on, it also rejects a queue name that the weight
+    /// API does not accept.
     pub fn validate(&self) -> HarvestResult<()> {
         if self.queues.is_empty() {
             return Err(HarvestError::Config(
@@ -374,6 +376,16 @@ impl WorkerRuntimeConfig {
                  before the fairness lag, so an old flood can outrank a newer key; \
                  see docs/fairness-keys.md"
             );
+        }
+        // A fair worker's queues must be names that the weight API accepts
+        // (issue #1976). Otherwise no operator could set a weight for their
+        // keys.
+        if self.fairness_keys {
+            for queue in &self.queues {
+                crate::queue_pause::validate_queue_name(queue).map_err(|e| {
+                    HarvestError::Config(format!("fairness_keys: queue {queue:?}: {e}"))
+                })?;
+            }
         }
         // A degenerate band (min_slots > max_slots, or a configured value
         // outside the band) never fails worker startup — it degrades to an
@@ -40704,6 +40716,20 @@ mod tests {
             err.to_string().contains("cancellation_grace_period"),
             "{err}"
         );
+    }
+
+    /// A fair worker only polls queues whose keys the weight API can address
+    /// (issue #1976).
+    #[test]
+    fn runtime_config_validate_checks_queue_names_with_fairness_keys() {
+        let mut cfg = default_runtime_config();
+        cfg.queues = vec![" padded ".to_owned()];
+        assert!(cfg.validate().is_ok(), "fairness off accepts any name");
+        cfg.fairness_keys = true;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("fairness_keys"), "{err}");
+        cfg.queues = vec!["shared".to_owned()];
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

@@ -21,6 +21,10 @@ WorkerConfig::default()
 Turn it on for every worker that polls the queue. A worker with it off
 ignores keys and does not charge them.
 
+A fair worker checks its queue names at start, with the rule of the weight
+API: not blank, no outer whitespace, at most 255 bytes. Otherwise no
+operator could set a weight for the keys of that queue.
+
 ## Set a key
 
 Set the key when you start a run:
