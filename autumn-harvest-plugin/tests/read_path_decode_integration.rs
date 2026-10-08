@@ -271,9 +271,9 @@ async fn get_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
 
 // ── Seeding helpers ──────────────────────────────────────────────────────────
 
-/// Undo the identity codec's collision-escape nesting (issue #1253) on the
-/// `WorkflowStarted` event's `input` and on the execution row's `input`
-/// (issue #1979), restoring both to `encoded_input` exactly as given.
+/// Undo the identity codec's collision-escape nesting (issue #1253). This
+/// restores the `WorkflowStarted` event's `input` and the execution row's
+/// `input` (issue #1979) to `encoded_input` exactly as given.
 ///
 /// `seed_running` starts the workflow through `start_or_load_workflow_execution`,
 /// the real engine path. It always encodes the `WorkflowStarted` event

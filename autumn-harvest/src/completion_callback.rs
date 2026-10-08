@@ -2573,9 +2573,9 @@ mod direct_worker_install_tests {
 /// `codecs` decodes the output column for the webhook body (issue #1979).
 ///
 /// # Errors
-/// Returns `HarvestError` on a database failure, or if serializing the
-/// envelope/event-filter/retry-policy JSON for a matching target fails, or a
-/// codec error when the output column cannot be decoded.
+/// Returns `HarvestError` on a database failure. It also fails if serializing
+/// the envelope, event-filter or retry-policy JSON for a matching target
+/// fails. A codec error means the output column cannot be decoded.
 #[cfg(feature = "db")]
 pub async fn enqueue_completion_deliveries(
     conn: &mut diesel_async::AsyncPgConnection,
