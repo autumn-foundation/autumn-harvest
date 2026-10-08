@@ -62,7 +62,7 @@ impl S3Backend {
             .await
         {
             Ok(output) => output,
-            Err(SdkError::ServiceError(err)) if is_missing_object(&err) => return Ok(None),
+            Err(err) if is_missing_object(&err) => return Ok(None),
             Err(err) => return Err(s3_error("get", key, &err)),
         };
         if let Some(max_bytes) = max_bytes {
@@ -88,13 +88,18 @@ impl S3Backend {
 /// Some S3-compatible stores send a bare 404 with no `NoSuchKey` code. A 404
 /// for a missing bucket stays an error, because that is a configuration fault.
 fn is_missing_object(
-    err: &aws_sdk_s3::error::ServiceError<GetObjectError, aws_sdk_s3::config::http::HttpResponse>,
+    err: &SdkError<GetObjectError, aws_sdk_s3::config::http::HttpResponse>,
 ) -> bool {
     use aws_sdk_s3::error::ProvideErrorMetadata as _;
-    if matches!(err.err(), GetObjectError::NoSuchKey(_)) {
+    let Some(service) = err.as_service_error() else {
+        return false;
+    };
+    if matches!(service, GetObjectError::NoSuchKey(_)) {
         return true;
     }
-    err.raw().status().as_u16() == 404 && err.err().code() != Some("NoSuchBucket")
+    err.raw_response()
+        .is_some_and(|raw| raw.status().as_u16() == 404)
+        && service.code() != Some("NoSuchBucket")
 }
 
 fn s3_error<E>(op: &str, key: &str, err: &E) -> ObjectStoreError
