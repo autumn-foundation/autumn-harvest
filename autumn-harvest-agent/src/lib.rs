@@ -92,7 +92,8 @@ pub use model::{AgentModel, BoxFuture, ChatRequest, ChatResponse};
 pub use policy::{AllowAll, Rule, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules};
 pub use tool::{FnTool, Tool, ToolContext, ToolEffect};
 pub use types::{
-    AgentReport, AgentStop, AgentTask, ModelTurn, ModelTurnRequest, ToolCallRequest, ToolOutcome,
+    AgentReport, AgentStop, AgentTask, ModelTurn, ModelTurnRequest, RunIdSource, ToolCallRequest,
+    ToolOutcome,
 };
 pub use workflow::{
     WORKFLOW_NAME, activities, agent_deliver, agent_deliver_info, agent_loop, agent_loop_info,

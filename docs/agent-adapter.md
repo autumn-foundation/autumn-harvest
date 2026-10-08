@@ -389,7 +389,10 @@ The workflow sends each report once, and replay does not send it again. The
 activity itself can retry, for example after a send that timed out. So a
 `Delivery` that must not repeat a message dedupes on `Report::key()`: the
 run id and the segment. The run id is the execution id, so a later run
-under the same workflow id gets new keys.
+under the same workflow id gets new keys. A task recorded before this
+change has no `run_id_source` field. It keeps the workflow id, so its run
+replays as it ran. A task built from JSON can set
+`"run_id_source": "execution_id"`.
 
 ### Memory
 

@@ -91,6 +91,23 @@ pub struct AgentTask {
     /// in the scope, and those runs can have write tools.
     #[serde(default)]
     pub unattended_memory_writes: bool,
+    /// Where the run id comes from. [`AgentTask::new`] uses the execution
+    /// id. A recorded task with no field keeps the workflow id, so a run
+    /// started before the change replays as it ran.
+    #[serde(default)]
+    pub run_id_source: RunIdSource,
+}
+
+/// Where the run id of a task comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunIdSource {
+    /// The workflow id. A later run can reuse it, so two runs can share a run
+    /// id. Only a task recorded before the execution id decodes to it.
+    #[default]
+    WorkflowId,
+    /// The execution id, which no other run shares.
+    ExecutionId,
 }
 
 impl AgentTask {
@@ -114,6 +131,7 @@ impl AgentTask {
             read_only: false,
             unattended: false,
             unattended_memory_writes: false,
+            run_id_source: RunIdSource::ExecutionId,
         }
     }
 
@@ -572,5 +590,13 @@ mod tests {
         let task: AgentTask = serde_json::from_value(old).unwrap();
         assert_eq!(task.loop_guard, LoopGuard::disabled());
         assert_eq!(AgentTask::new("go").loop_guard, LoopGuard::default());
+    }
+
+    #[test]
+    fn a_task_from_before_execution_ids_keeps_the_workflow_id() {
+        let old = json!({"input": "go", "max_steps": 8, "approval_timeout_secs": 60});
+        let task: AgentTask = serde_json::from_value(old).unwrap();
+        assert_eq!(task.run_id_source, RunIdSource::WorkflowId);
+        assert_eq!(AgentTask::new("go").run_id_source, RunIdSource::ExecutionId);
     }
 }

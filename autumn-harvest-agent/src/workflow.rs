@@ -33,8 +33,8 @@ use crate::memory::MemoryScope;
 use crate::message::{ChatMessage, ChatRole, ContentPart, RunId, StopReason, TokenUsage, ToolCall};
 use crate::policy::ToolDecision;
 use crate::types::{
-    AgentReport, AgentStop, AgentTask, ModelTurn, ModelTurnRequest, ToolCallRequest, ToolOutcome,
-    without_system,
+    AgentReport, AgentStop, AgentTask, ModelTurn, ModelTurnRequest, RunIdSource, ToolCallRequest,
+    ToolOutcome, without_system,
 };
 
 /// The registered workflow name.
@@ -130,9 +130,11 @@ pub(crate) async fn drive(
     source: ReportSource,
 ) -> Result<(AgentReport, u32), String> {
     let mut progress = Progress {
-        // The execution id, not the workflow id: a later run can reuse a
-        // workflow id, and the run id must name one run.
-        run_id: ctx.execution_id().to_string(),
+        run_id: match task.run_id_source {
+            RunIdSource::ExecutionId => ctx.execution_id().to_string(),
+            // A run recorded before the change keeps its recorded run id.
+            RunIdSource::WorkflowId => ctx.workflow_id().to_owned(),
+        },
         // A system message inside the history is dropped. Only `task.system`
         // reaches the model as the system prompt.
         messages: without_system(&task.history),

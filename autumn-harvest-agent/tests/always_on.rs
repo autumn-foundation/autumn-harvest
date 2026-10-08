@@ -897,3 +897,21 @@ async fn two_runs_under_one_workflow_id_get_distinct_report_keys() {
     assert_eq!(reports.len(), 2);
     assert_ne!(reports[0].key(), reports[1].key(), "a reused workflow id");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_task_recorded_before_execution_ids_keeps_the_workflow_id() {
+    let (_dir, db) = fresh_db();
+    let inbox = Arc::new(Inbox::default());
+    let model = ScriptedModel::new(vec![answer("done", 1)]);
+    let mut rt = runtime(&db, AgentHarness::new(model).delivery(inbox.clone()));
+
+    // A task as #2037 recorded it: no `run_id_source` field.
+    let mut task = serde_json::to_value(AgentTask::new("go").deliver()).unwrap();
+    task.as_object_mut().unwrap().remove("run_id_source");
+    let exec = rt
+        .start_workflow_with_id(autumn_harvest_agent::WORKFLOW_NAME, "nightly", task)
+        .unwrap();
+    let _ = report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert_eq!(inbox.reports()[0].run_id.as_str(), "nightly");
+}
