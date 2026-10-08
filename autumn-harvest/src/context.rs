@@ -3347,9 +3347,11 @@ impl WorkflowContext {
         accepted: Option<&std::collections::HashSet<usize>>,
     ) -> HarvestResult<()> {
         if self.canary_mode
-            && !self.match_history(|m| match accepted {
-                Some(set) => m.has_unconsumed_signal_accepting(signal_name, set),
-                None => m.has_unconsumed_signal(signal_name),
+            && !self.match_history(|m| {
+                accepted.map_or_else(
+                    || m.has_unconsumed_signal(signal_name),
+                    |set| m.has_unconsumed_signal_accepting(signal_name, set),
+                )
             })
         {
             return Ok(());

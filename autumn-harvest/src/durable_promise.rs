@@ -355,6 +355,7 @@ impl<'a> DurablePromise<'a> {
 /// # Errors
 ///
 /// Returns [`crate::HarvestError::Config`] when a rule fails.
+#[cfg(feature = "db")]
 pub(crate) fn settlement_idempotency_key<'a>(
     signal_name: &'a str,
     payload: &Value,
@@ -533,6 +534,7 @@ mod tests {
         assert!(PromiseSettlement::decode::<u32>(serde_json::json!({"id": 1})).is_err());
     }
 
+    #[cfg(feature = "db")]
     #[test]
     fn settlement_rules_force_the_promise_key() {
         let name = "harvest.promise:k";
@@ -548,6 +550,7 @@ mod tests {
         assert!(settlement_idempotency_key(name, &ok, Some("other")).is_err());
     }
 
+    #[cfg(feature = "db")]
     #[test]
     fn settlement_rules_reject_a_malformed_payload() {
         let name = "harvest.promise:k";
@@ -563,6 +566,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "db")]
     #[test]
     fn settlement_rules_reserve_the_key_prefix_and_pass_other_signals() {
         let payload = serde_json::json!({"any": "thing"});

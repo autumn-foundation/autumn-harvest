@@ -36,7 +36,7 @@ fn signal(name: &str, payload: Value) -> WorkflowEvent {
     }
 }
 
-fn completed(result: Value) -> WorkflowEvent {
+const fn completed(result: Value) -> WorkflowEvent {
     WorkflowEvent::WorkflowCompleted { output: result }
 }
 
@@ -249,7 +249,7 @@ fn promise_recorded(id: &PromiseId) -> WorkflowEvent {
 async fn test_durable_promise_resolves_with_a_value() {
     let settlement = PromiseSettlement::resolved(json!({ "approved_by": "ops" }));
     let outcome = WorkflowTestEnv::new()
-        .queue_signal(&approval_signal_name(), settlement.to_value())
+        .queue_signal(approval_signal_name(), settlement.to_value())
         .run(approval_workflow, Value::Null)
         .await;
     assert_eq!(
@@ -263,7 +263,7 @@ async fn test_durable_promise_resolves_with_a_value() {
 async fn test_durable_promise_surfaces_a_rejection() {
     let settlement = PromiseSettlement::rejected("budget exceeded");
     let outcome = WorkflowTestEnv::new()
-        .queue_signal(&approval_signal_name(), settlement.to_value())
+        .queue_signal(approval_signal_name(), settlement.to_value())
         .run(approval_workflow, Value::Null)
         .await;
     assert_eq!(outcome.result, Ok(json!({ "rejected": "budget exceeded" })));
@@ -273,7 +273,7 @@ async fn test_durable_promise_surfaces_a_rejection() {
 async fn test_durable_promise_wait_timeout_returns_the_settlement() {
     let settlement = PromiseSettlement::resolved(json!(true));
     let outcome = WorkflowTestEnv::new()
-        .queue_signal(&approval_signal_name(), settlement.to_value())
+        .queue_signal(approval_signal_name(), settlement.to_value())
         .run(approval_timeout_workflow, Value::Null)
         .await;
     assert_eq!(outcome.result, Ok(json!({ "resolved": true })));
@@ -290,7 +290,7 @@ async fn test_durable_promise_new_promise_token_names_this_run() {
         .expect("the token is a string")
         .parse()
         .expect("the token parses");
-    assert!(!id.key().is_empty());
+    assert_ne!(id.key(), "");
     assert_succeeded(&outcome.replay_check(new_promise_workflow).await);
 }
 

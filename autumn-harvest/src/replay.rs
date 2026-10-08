@@ -763,6 +763,9 @@ pub struct HistoryMatcher {
     predicate_rejected_signal_events: HashSet<usize>,
 }
 
+/// A signal predicate over `(event index, payload)` (issue #1985).
+type SignalPredicate<'a> = &'a dyn Fn(usize, &Value) -> bool;
+
 impl HistoryMatcher {
     /// Create a new matcher from a list of recorded events.
     #[must_use]
@@ -4264,7 +4267,7 @@ impl HistoryMatcher {
         &mut self,
         signal_name: &str,
         tolerate_interleaved: Option<&str>,
-        predicate: Option<&dyn Fn(usize, &Value) -> bool>,
+        predicate: Option<SignalPredicate<'_>>,
     ) -> HistoryMatch {
         if let Some(index) = self.claim_buffered_signal_position(signal_name, predicate)
             && let Some((_name, payload, _idx)) = self.pending_signals.remove(index)
@@ -6471,7 +6474,7 @@ impl HistoryMatcher {
     fn claim_buffered_signal_position(
         &mut self,
         signal_name: &str,
-        predicate: Option<&dyn Fn(usize, &Value) -> bool>,
+        predicate: Option<SignalPredicate<'_>>,
     ) -> Option<usize> {
         for (position, (name, payload, index)) in self.pending_signals.iter().enumerate() {
             if name != signal_name {

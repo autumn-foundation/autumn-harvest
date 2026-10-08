@@ -5308,8 +5308,8 @@ pub struct OverdueInputs<'a> {
 /// `retain_for_retry = catchup && reason == "max_active_runs_reached"`, and only
 /// `OverlapPolicy::Skip` produces that reason. Every other config *advances*
 /// `next_run_at`: non-catchup Skip drops-and-advances, BufferOne/BufferAll
-/// advance, CancelOther/TerminateOther cancel/terminate and proceed. AllowAll
-/// proceeds too (issue #1985). So the
+/// advance, CancelOther/TerminateOther cancel/terminate and proceed.
+/// `AllowAll` proceeds too (issue #1985). So the
 /// `at_capacity` suppression applies **only** when
 /// `overlap_policy == Skip && catchup && at_capacity` — for every other config a
 /// past `next_run_at` while at capacity is a GENUINE stall the gauge must flag.

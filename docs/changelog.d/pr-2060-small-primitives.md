@@ -40,8 +40,8 @@ once with `durable_promise::resolve` / `reject`, `ctx.resolve_promise` /
 - `harvest-verify` classifies the six new `WorkflowContext` methods.
 
 **`AllowAll` overlap.** `OverlapPolicy::AllowAll` (`allow_all`) starts a new
-run on every firing. It ignores `max_active_runs` in the tick and in the
-manual DAG trigger, as Temporal does.
+run on every firing. It ignores `max_active_runs` in the tick, the manual
+DAG trigger and the backfill, as Temporal does.
 
 - One tick starts at most `ALLOW_ALL_MAX_STARTS_PER_TICK` (100) runs. The
   next tick resumes deferred catch-up slots.

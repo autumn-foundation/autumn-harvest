@@ -30667,6 +30667,20 @@ async fn schedule_backfill(
     .map(Json)
 }
 
+/// The run cap that a backfill enforces for `schedule`.
+///
+/// `AllowAll` ignores `max_active_runs` (issue #1985), so its backfill has no
+/// run cap. The `max_runs` budget and the backfill count limit still apply.
+fn backfill_max_active(schedule: &autumn_harvest::models::HarvestSchedule) -> i64 {
+    if autumn_harvest::OverlapPolicy::from_db(&schedule.overlap_policy)
+        == autumn_harvest::OverlapPolicy::AllowAll
+    {
+        i64::MAX
+    } else {
+        i64::from(schedule.max_active_runs)
+    }
+}
+
 /// The backfill implementation, with the audited `route_or_command` supplied by
 /// the caller.
 ///
@@ -30808,7 +30822,7 @@ pub(crate) async fn schedule_backfill_inner(
         )));
     }
 
-    let max_active = i64::from(schedule.max_active_runs);
+    let max_active = backfill_max_active(&schedule);
 
     if schedule.is_paused && request.include_paused && kind == ScheduleKind::Dag && !request.dry_run
     {
@@ -56092,6 +56106,23 @@ mod tests {
             last_catchup_dropped: 0,
             last_catchup_at: None,
             retry_policy: None,
+        }
+    }
+
+    #[test]
+    fn backfill_capacity_is_unbounded_only_for_allow_all() {
+        for (policy, expected) in [
+            ("skip", 2),
+            ("buffer_all", 2),
+            ("cancel_other", 2),
+            ("allow_all", i64::MAX),
+        ] {
+            let schedule = autumn_harvest::models::HarvestSchedule {
+                max_active_runs: 2,
+                overlap_policy: policy.to_string(),
+                ..test_harvest_schedule()
+            };
+            assert_eq!(backfill_max_active(&schedule), expected, "{policy}");
         }
     }
 
