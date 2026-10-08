@@ -2855,13 +2855,13 @@
             "description": "The write reached only some shards. The body is the 200 body plus partial_failures, which names the shards that did not apply it."
           },
           "400": {
-            "description": "Blank or oversized queue name, invalid fairness key, weight out of range, malformed body, or a queue that already holds 1000 overrides on every shard."
+            "description": "Blank or oversized queue name, invalid fairness key, weight out of range, or malformed body."
           },
           "401": {
             "description": "Admin access required."
           },
           "409": {
-            "description": "Some shards applied the weight, and at least one shard already holds 1000 overrides for the queue. A retry does not converge. Clear an override on that shard first. The body is the 207 body."
+            "description": "At least one shard already holds 1000 overrides for the queue and refused a new key. A retry does not converge. Clear an override on that shard first. When some shards applied the weight, the body is the 207 body. When no shard applied it, the body is a problem response."
           },
           "500": {
             "description": "Every shard failed. No weight is in effect."

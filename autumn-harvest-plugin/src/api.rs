@@ -38605,10 +38605,13 @@ async fn set_fairness_weight_handler(
     .await;
 
     let Some(row) = applied else {
-        // A cap rejection on every shard is the caller's to fix, so it is a
-        // 400. Any other failure means an outage, so it is a 500.
+        // A cap rejection on every shard is a 409, as on a partial cap: the
+        // caller must clear an override first. Any other failure means an
+        // outage, so it is a 500.
         if let Some(message) = cap_error.filter(|_| !outage) {
-            return map_error(HarvestError::Config(message)).into_response();
+            return AutumnError::bad_request_msg(message)
+                .with_status(axum::http::StatusCode::CONFLICT)
+                .into_response();
         }
         return AutumnError::internal_server_error_msg(format!(
             "fairness weight set failed: {}",

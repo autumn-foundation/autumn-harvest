@@ -475,3 +475,44 @@ async fn all_three_routes_require_admin() {
         );
     }
 }
+
+// ── (e) the override cap is a 409 ────────────────────────────────────────────
+
+/// A queue that holds 1,000 overrides on every shard refuses a new key. The
+/// caller must clear an override first, so the refusal is a 409, as on a
+/// partial cap. It is not a 400: the request itself is well formed.
+#[tokio::test]
+async fn a_new_key_at_the_override_cap_on_every_shard_is_a_409() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, true);
+    let queue = format!("cap-{}", uuid::Uuid::new_v4().simple());
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        diesel::sql_query(
+            "INSERT INTO harvest_fairness_weights (queue_name, fairness_key, weight, updated_by) \
+             SELECT $1, 'k' || g, 2.0, 'seed' FROM generate_series(1, 1000) g",
+        )
+        .bind::<diesel::sql_types::Text, _>(&queue)
+        .execute(&mut conn)
+        .await
+        .expect("seed 1000 overrides");
+    }
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/admin/queues/{queue}/fairness/one-too-many"),
+        Some(json!({ "weight": 3.0 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    // An existing key still updates at the cap.
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/admin/queues/{queue}/fairness/k1"),
+        Some(json!({ "weight": 3.0 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+}
