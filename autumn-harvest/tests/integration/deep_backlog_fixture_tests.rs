@@ -481,6 +481,45 @@ async fn the_snapshot_is_taken_before_the_database_is_dropped() {
     );
 }
 
+#[tokio::test]
+async fn a_counter_reset_leaves_setup_traffic_out_of_the_snapshot() {
+    let Some(server) = server().await else { return };
+    let db = server.create_database().await;
+    let mut conn = fixture::connect(&db.url()).await;
+    // Setup traffic on this session: the migration already ran, and a seed
+    // writes many rows.
+    fixture::seed(&mut conn, &ci_spec(3)).await;
+    if let Err(e) = stats::reset_counters(&mut conn).await {
+        assert!(
+            std::env::var("HARVEST_TEST_DATABASE_URL").is_ok(),
+            "the test container allows the reset: {e}"
+        );
+        eprintln!("SKIP the reset test: {e}");
+        return;
+    }
+    drop(conn);
+    let snapshot = db.snapshot_and_drop().await;
+    let tq = snapshot
+        .tables
+        .iter()
+        .find(|t| t.relname == "harvest_task_queue")
+        .expect("task queue stats");
+    assert_eq!(
+        (tq.n_tup_ins, tq.n_tup_upd, tq.n_tup_del),
+        (0, 0, 0),
+        "the seed writes are out of the snapshot: {tq:?}"
+    );
+    let Statements::Captured(rows) = &snapshot.statements else {
+        panic!("statements were not captured: {:?}", snapshot.statements);
+    };
+    assert!(
+        !rows
+            .iter()
+            .any(|s| s.query.contains("INSERT INTO harvest_task_queue")),
+        "the seed statements are out of the snapshot"
+    );
+}
+
 /// Seed the full Ledger fixture and write the evidence artifacts.
 ///
 /// The test runs a shallow and a deep fixture on one seed. Both get the same

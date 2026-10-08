@@ -24,8 +24,8 @@ No engine code, query, index or migration changes here. See
 * **The PAUSED-execution skip scans every execution on every claim.** In the
   plan, `harvest_workflow_executions` gets a `Seq Scan` with `state = 'PAUSED'`
   as its filter. At 1M rows it reads all 250k executions per claim. The e2e
-  hook shows the same scan on the issue's own workload: 57,826 sequential scans
-  and 38.1M tuples read for 1,440 executions.
+  hook shows the same scan on the issue's own workload: 56,075 sequential scans
+  and 35.4M tuples read for 1,440 executions.
 * **The claim CTE is 99.9% of shared buffers at depth** (90.4% at 4k). The FK
   `FOR KEY SHARE` lead from the issue is real but small at both depths.
 * **JIT costs 2.6 s of a 17.4 s claim.** The plan cost is above
@@ -139,18 +139,19 @@ claim is the steadier figure here.
 ### The e2e profile, with per-table counters
 
 Issue #1956 could not capture `seq_tup_read`, because the e2e bench dropped its
-databases first. With `HARVEST_BENCH_STATS_DIR` set, its teardown now writes
-both views before the drop. One `throughput` cell at 1 shard (1,200 measured
-workflows) gives:
+databases first. With `HARVEST_BENCH_STATS_DIR` set, each shard resets both
+views after its migrations, and teardown writes them before the drop. So the
+files hold the scenario only, warmup included. One `throughput` cell at 1 shard
+(1,200 measured workflows) gives:
 
 | table | seq_scan | seq_tup_read |
 |:--|--:|--:|
-| `harvest_workflow_executions` | 57,826 | 38,115,332 |
-| `harvest_task_queue` | 22 | 458 |
+| `harvest_workflow_executions` | 56,075 | 35,370,013 |
+| `harvest_task_queue` | 0 | 0 |
 
-The claim CTE takes 30.2% of buffers at 149 buffers per call. The issue measured
-22.3% at 81. An earlier run of this cell gave 22.7% at 85, so the share moves
-from run to run. The executions scans read 38.1M tuples for 1,440 executions.
+The claim CTE takes 30.9% of buffers at 147 buffers per call. The issue measured
+22.3% at 81, cluster-wide and setup included, so the two do not compare
+directly. The executions scans read 35.4M tuples for 1,440 executions.
 The PAUSED skip is one such scan per claim. Files:
 `e2e-throughput-1shards-s0-*.txt`.
 

@@ -181,6 +181,21 @@ pub async fn reset_statements(conn: &mut AsyncPgConnection) -> Result<(), String
     .map_err(|e| format!("reset pg_stat_statements for this database: {e}"))
 }
 
+/// Clear both views for this database, so a later snapshot holds only what
+/// runs after this call.
+///
+/// # Errors
+/// Returns the server error when the role cannot reset the counters.
+pub async fn reset_counters(conn: &mut AsyncPgConnection) -> Result<(), String> {
+    // Unflushed counters of this session would land after the reset and
+    // bring the setup back. So they flush first.
+    flush_counters(conn).await;
+    conn.batch_execute("SELECT pg_stat_reset()")
+        .await
+        .map_err(|e| format!("reset the table counters of this database: {e}"))?;
+    reset_statements(conn).await
+}
+
 /// Wait until every other session on this database has flushed its counters,
 /// up to [`QUIESCE_BOUND`].
 ///

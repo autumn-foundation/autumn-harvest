@@ -2885,6 +2885,14 @@ pub mod db {
             drop_created(&[(admin_url.to_owned(), name)]).await;
             return Err(SkipReason(format!("migrate shard database: {e}")));
         }
+        // With a stats snapshot to come, clear the setup out of both views.
+        // The teardown snapshot then holds the scenario only, warmup included.
+        let raw = std::env::var(STATS_DIR_ENV_VAR).ok();
+        if stats_dir_from(raw.as_deref()).is_some()
+            && let Err(e) = super::super::pg_stats_snapshot::reset_counters(&mut conn).await
+        {
+            eprintln!("warning: shard {name}: {e}. Its stats snapshot includes the setup.");
+        }
         Ok((url, name, conn))
     }
 
