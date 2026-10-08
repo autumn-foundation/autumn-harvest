@@ -42,7 +42,7 @@ checkpoint decision.
 
 **Tests.**
 
-- `entity::tests` (20): serialization, rollback, decode errors, delete,
+- `entity::tests` (21): serialization, rollback, decode errors, delete,
   checkpoint carry, the input-cap budget and its offload rule,
   recorded-decision replay, replay stability against a naive loop, the
   deadline probe, cancellation, bad input and queries.

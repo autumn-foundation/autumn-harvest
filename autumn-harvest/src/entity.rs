@@ -406,8 +406,10 @@ fn claim_waiting_ops<S: Serialize>(
         return Ok(true);
     };
     // The base input has an empty `pending` array. Each op adds its own
-    // bytes and at most one separator, so the sum is an upper bound.
-    let mut size = json_len(checkpoint)?;
+    // bytes and at most one separator, so the sum is an upper bound. The
+    // checkpoint counter goes up by one before the write, which can add a
+    // digit.
+    let mut size = json_len(checkpoint)? + counter_growth(checkpoint.stats.checkpoints);
     for op in &*waiting {
         size += json_len(op)? + 1;
     }
@@ -422,6 +424,12 @@ fn claim_waiting_ops<S: Serialize>(
         }
     }
     Ok(true)
+}
+
+/// The bytes that `n + 1` adds over `n` in decimal JSON.
+fn counter_growth(n: u64) -> u64 {
+    let digits = |v: u64| u64::from(v.checked_ilog10().unwrap_or(0) + 1);
+    n.checked_add(1).map_or(1, |next| digits(next) - digits(n))
 }
 
 fn json_len<T: Serialize + ?Sized>(value: &T) -> HarvestResult<u64> {
@@ -655,6 +663,16 @@ mod tests {
             Some(100),
             "offload above the cap leaves a rejected band"
         );
+    }
+
+    #[test]
+    fn the_counter_growth_counts_a_new_digit() {
+        assert_eq!(counter_growth(0), 0);
+        assert_eq!(counter_growth(8), 0);
+        assert_eq!(counter_growth(9), 1);
+        assert_eq!(counter_growth(10), 0);
+        assert_eq!(counter_growth(99), 1);
+        assert_eq!(counter_growth(u64::MAX), 1);
     }
 
     #[test]
