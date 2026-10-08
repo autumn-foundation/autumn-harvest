@@ -20,8 +20,8 @@ No engine code, query, index or migration changes here. See
 * **The PAUSED-execution skip scans every execution on every claim.** In the
   plan, `harvest_workflow_executions` gets a `Seq Scan` with `state = 'PAUSED'`
   as its filter. At 1M rows it reads all 250k executions per claim. The e2e
-  hook shows the same scan on the issue's own workload: 61k sequential scans and
-  41.8M tuples read for 1,440 executions.
+  hook shows the same scan on the issue's own workload: 57,826 sequential scans
+  and 38.1M tuples read for 1,440 executions.
 * **The claim CTE is 99.3% of shared buffers at depth** (90.9% at 4k). Every
   other statement is below 0.3%. The FK `FOR KEY SHARE` lead from the issue is
   real but small at both depths.
@@ -120,11 +120,13 @@ workflows) gives:
 
 | table | seq_scan | seq_tup_read |
 |:--|--:|--:|
-| `harvest_workflow_executions` | 60,972 | 41,834,787 |
+| `harvest_workflow_executions` | 57,826 | 38,115,332 |
+| `harvest_task_queue` | 22 | 458 |
 
-The claim CTE is again 22.7% of buffers at 85 buffers per call, which matches
-the issue's profile. The executions scan is the PAUSED skip above, and others
-like it: 41.8M tuples read for 1,440 executions. Files:
+The claim CTE takes 30.2% of buffers at 149 buffers per call. The issue measured
+22.3% at 81. An earlier run of this cell gave 22.7% at 85, so the share moves
+from run to run. The executions scans read 38.1M tuples for 1,440 executions.
+The PAUSED skip is one such scan per claim. Files:
 `e2e-throughput-1shards-s0-*.txt`.
 
 The snapshot is marked `PARTIAL`. Several pool sessions of the e2e fleet keep
