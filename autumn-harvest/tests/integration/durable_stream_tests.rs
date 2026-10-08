@@ -17,7 +17,7 @@ use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::HandlerRegistry;
 use chrono::Utc;
 use diesel::sql_types::{Text, Uuid as SqlUuid};
-use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 use serde_json::{Value, json};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -267,6 +267,42 @@ async fn one_append_can_exceed_the_bind_parameter_limit() {
         .await
         .expect("a large batch must not exceed the bind limit");
     assert_eq!(written, 30_000);
+}
+
+#[tokio::test]
+async fn a_failed_append_stores_no_chunk() {
+    // The inline worker paths call the store on a bare connection. A failure
+    // in a later batch must not leave the earlier batches committed.
+    let (url, _c) = setup_database().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let exec_id = ExecutionId::new();
+    insert_execution(&mut conn, exec_id, "stream_atomic").await;
+    let trigger = format!("fail_stream_{}", exec_id.as_uuid().simple());
+    conn.batch_execute(&format!(
+        "CREATE FUNCTION {trigger}() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN IF NEW.workflow_exec_id = '{id}' AND NEW.stream_offset = 1500 THEN \
+           RAISE EXCEPTION 'injected failure'; END IF; RETURN NEW; END $$; \
+         CREATE TRIGGER {trigger} BEFORE INSERT ON harvest_stream_chunks \
+           FOR EACH ROW EXECUTE FUNCTION {trigger}();",
+        id = exec_id.as_uuid()
+    ))
+    .await
+    .expect("install failing trigger");
+
+    let chunks: Vec<_> = (0..2_000).map(|i| chunk(i, json!(i))).collect();
+    let result = store::append_stream_chunks(&mut conn, exec_id, &chunks, 100_000).await;
+    conn.batch_execute(&format!(
+        "DROP TRIGGER {trigger} ON harvest_stream_chunks; DROP FUNCTION {trigger}();"
+    ))
+    .await
+    .expect("drop trigger");
+
+    assert!(result.is_err(), "the second batch fails");
+    assert_eq!(
+        read_all(&mut conn, exec_id).await.len(),
+        0,
+        "the first batch must roll back with the second"
+    );
 }
 
 #[tokio::test]

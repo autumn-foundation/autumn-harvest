@@ -10513,14 +10513,20 @@ async fn persist_durable_stream_from_commands(
     if chunks.is_empty() {
         return Ok(());
     }
-    store::append_stream_chunks(
-        conn,
-        exec_id,
-        &chunks,
-        crate::context::DURABLE_STREAM_MAX_CHUNKS,
-    )
-    .await?;
-    crate::notify::notify_durable_stream(conn, exec_id.as_uuid()).await
+    // One transaction for the rows and the wake. The inline paths call this
+    // on a bare connection, and inside a persist transaction it is a
+    // savepoint.
+    Box::pin(conn.transaction::<(), HarvestError, _>(async |c| {
+        store::append_stream_chunks(
+            c,
+            exec_id,
+            &chunks,
+            crate::context::DURABLE_STREAM_MAX_CHUNKS,
+        )
+        .await?;
+        crate::notify::notify_durable_stream(c, exec_id.as_uuid()).await
+    }))
+    .await
 }
 
 /// Per-decision-cycle ceiling on the number of `ctx.publish_progress` chunks the

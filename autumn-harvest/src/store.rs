@@ -2850,6 +2850,10 @@ pub struct DurableStreamChunk {
 /// adds nothing, also when a later worker has a larger cap. No stored chunk
 /// then follows a dropped one.
 ///
+/// **Atomic.** All statements run in one transaction, or in a savepoint
+/// inside the caller's transaction. A failed batch leaves no earlier batch
+/// behind, also on a bare connection.
+///
 /// Returns the number of real chunks that this call inserted.
 ///
 /// # Errors
@@ -2861,11 +2865,25 @@ pub async fn append_stream_chunks(
     chunks: &[DurableStreamChunk],
     max_chunks: u32,
 ) -> HarvestResult<usize> {
-    use crate::schema::harvest_stream_chunks::dsl;
-
     if chunks.is_empty() {
         return Ok(0);
     }
+    Box::pin(
+        conn.transaction::<usize, crate::error::HarvestError, _>(async |c| {
+            append_stream_chunks_in_tx(c, exec_id, chunks, max_chunks).await
+        }),
+    )
+    .await
+}
+
+/// The body of [`append_stream_chunks`]. The caller holds the transaction.
+async fn append_stream_chunks_in_tx(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    chunks: &[DurableStreamChunk],
+    max_chunks: u32,
+) -> HarvestResult<usize> {
+    use crate::schema::harvest_stream_chunks::dsl;
 
     let truncated: bool = diesel::select(diesel::dsl::exists(
         dsl::harvest_stream_chunks
