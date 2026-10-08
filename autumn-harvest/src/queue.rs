@@ -13640,7 +13640,8 @@ mod tests {
             );
             assert!(fair.ends_with("SELECT * FROM claimed"));
         }
-        let src = include_str!("queue.rs");
+        // A Windows checkout has CRLF line ends.
+        let src = include_str!("queue.rs").replace("\r\n", "\n");
         let body = &src[src
             .find("async fn recheck_and_charge(")
             .expect("helper exists")..];
