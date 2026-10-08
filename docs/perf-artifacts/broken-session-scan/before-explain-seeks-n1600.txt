@@ -1,0 +1,33 @@
+=== running-member probe ===
+SELECT EXISTS (SELECT 1 FROM harvest_task_queue WHERE session_id = '00000020-0000-0000-0000-000000000010' AND state = 'RUNNING')
+Result  (cost=130.59..130.60 rows=1 width=1) (actual time=5.253..5.254 rows=1 loops=1)
+  Output: $0
+  Buffers: shared hit=840
+  InitPlan 1 (returns $0)
+    ->  Index Scan using idx_harvest_tq_running_started on public.harvest_task_queue  (cost=0.28..130.59 rows=1 width=0) (actual time=5.250..5.250 rows=1 loops=1)
+          Filter: (harvest_task_queue.session_id = '00000020-0000-0000-0000-000000000010'::uuid)
+          Rows Removed by Filter: 2400
+          Buffers: shared hit=840
+Query Identifier: -6173977677883294418
+Planning:
+  Buffers: shared hit=270
+Planning Time: 0.870 ms
+Execution Time: 5.272 ms
+
+=== member-task load ===
+SELECT * FROM harvest_task_queue WHERE session_id = '00000020-0000-0000-0000-000000000000' AND state IN ('PENDING', 'RUNNING')
+Bitmap Heap Scan on public.harvest_task_queue  (cost=400.13..2662.67 rows=1 width=659) (actual time=1.043..6.586 rows=1 loops=1)
+  Output: id, queue_name, task_type, workflow_exec_id, activity_name, input, state, priority, worker_id, attempt, max_attempts, scheduled_at, started_at, completed_at, last_heartbeat_at, heartbeat_timeout, start_to_close, schedule_to_start, retry_policy, output, error, sticky_worker_id, sticky_until, sticky_timeout, trace_context, concurrency_key, concurrency_cap, heartbeat_details, required_build_id, activity_id, rate_limit_key, crash_strikes, schedule_to_close_at, required_capabilities, context_headers, created_at, wake_requested, session_id, capability_misses, capability_miss_workers, capability_miss_handler, timer_fires_at, new_start
+  Recheck Cond: (harvest_task_queue.state = ANY ('{PENDING,RUNNING}'::text[]))
+  Filter: (harvest_task_queue.session_id = '00000020-0000-0000-0000-000000000000'::uuid)
+  Rows Removed by Filter: 10399
+  Heap Blocks: exact=1134
+  Buffers: shared hit=1220
+  ->  Bitmap Index Scan on idx_harvest_tq_live_created  (cost=0.00..400.13 rows=10369 width=0) (actual time=0.843..0.844 rows=11416 loops=1)
+        Buffers: shared hit=86
+Query Identifier: 4758206364690157448
+Planning:
+  Buffers: shared hit=128
+Planning Time: 0.376 ms
+Execution Time: 6.663 ms
+

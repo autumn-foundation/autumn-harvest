@@ -74,14 +74,14 @@ async fn create_fresh_db(admin_url: &str, name: &str) -> String {
 //
 // Production shape after a partial fleet outage. Sessions are pinned to a
 // small set of hosts, so worker rows are shared heavily across sessions.
-// Skew by session index `i % 20`:
-//   0..=8   (45%) host row missing (de-registered / GC'd)
-//   9..=11  (15%) host heartbeat stale
-//   12..=13 (10%) host Draining
-//   14..=15 (10%) host healthy, lease expired, no RUNNING member
-//   16      ( 5%) host healthy, lease expired, member RUNNING (not broken)
-//   17..=19 (15%) healthy decoys (not candidates)
-// Every 7th broken session also has a terminal owning execution.
+// Shape is chosen by session index modulo 20.
+// Indexes 0 to 8 (45%) have no host row: de-registered or collected.
+// Indexes 9 to 11 (15%) have a stale host heartbeat.
+// Indexes 12 and 13 (10%) have a Draining or Stopped host.
+// Indexes 14 and 15 (10%) have a healthy host and an expired lease with no RUNNING member.
+// Index 16 (5%) has a healthy host, an expired lease and a RUNNING member. It is not broken.
+// Indexes 17 to 19 (15%) are healthy decoys. They are not candidates.
+// Every 7th session also has a terminal owning execution.
 // Sessions with an odd index carry a second member task.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -281,7 +281,34 @@ async fn seed_fixture(conn: &mut AsyncPgConnection, n: i64) {
             .expect("mark execution terminal");
         }
     }
+    seed_bystanders(conn, n * BYSTANDERS_PER_SESSION).await;
     diesel::sql_query("ANALYZE").execute(conn).await.unwrap();
+}
+
+/// Queue rows unrelated to any session. A production queue is mostly these:
+/// 90% terminal, 7% pending, 3% running, `session_id` NULL. They are what a
+/// `session_id` seek must skip when no index serves it.
+const BYSTANDERS_PER_SESSION: i64 = 50;
+
+async fn seed_bystanders(conn: &mut AsyncPgConnection, rows: i64) {
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+             (id, queue_name, task_type, input, state, scheduled_at, created_at, \
+              completed_at, started_at, worker_id) \
+         SELECT ('00000099-0000-0000-0000-' || lpad(g::text, 12, '0'))::uuid, \
+                'default', 'activity', '{}'::jsonb, \
+                CASE WHEN g % 100 < 90 THEN 'COMPLETED' \
+                     WHEN g % 100 < 97 THEN 'PENDING' ELSE 'RUNNING' END, \
+                NOW() - (g || ' seconds')::interval, NOW() - (g || ' seconds')::interval, \
+                CASE WHEN g % 100 < 90 THEN NOW() END, \
+                CASE WHEN g % 100 >= 97 THEN NOW() END, \
+                CASE WHEN g % 100 >= 97 THEN 'bystander-worker' END \
+         FROM generate_series(1, $1::bigint) AS g",
+    )
+    .bind::<BigInt, _>(rows)
+    .execute(conn)
+    .await
+    .expect("seed bystander queue rows");
 }
 
 // ── pg_stat_statements capture ─────────────────────────────────────────────
@@ -348,6 +375,16 @@ fn is_reverify_statement(q: &str) -> bool {
         || (q.contains("exists") && q.contains("harvest_task_queue"))
 }
 
+/// The two `harvest_task_queue` seeks keyed on `session_id`: the
+/// running-member probe and the member-task load.
+fn is_session_seek_statement(q: &str) -> bool {
+    let q = q.to_ascii_lowercase();
+    q.contains("harvest_task_queue")
+        && q.contains("session_id")
+        && !q.contains("update ")
+        && !q.contains("insert ")
+}
+
 #[derive(diesel::QueryableByName)]
 struct PlanLine {
     #[diesel(sql_type = Text, column_name = "QUERY PLAN")]
@@ -380,12 +417,12 @@ async fn dump_state(conn: &mut AsyncPgConnection) -> String {
          UNION ALL \
          SELECT format('task %s session=%s state=%s err=%s', \
                        t.activity_id::text, t.session_id::text, t.state, \
-                       coalesce(t.last_error, '-')) \
+                       coalesce(t.error, '-')) \
          FROM harvest_task_queue t \
          UNION ALL \
-         SELECT format('events %s %s', e.execution_id::text, \
-                       string_agg(e.event_data->>'type', ',' ORDER BY e.event_id)) \
-         FROM harvest_events e GROUP BY e.execution_id \
+         SELECT format('events %s %s', e.workflow_exec_id::text, \
+                       string_agg(e.event_type, ',' ORDER BY e.event_id)) \
+         FROM harvest_events e GROUP BY e.workflow_exec_id \
          ORDER BY 1",
     )
     .load(conn)
@@ -404,10 +441,18 @@ struct Point {
     wal_bytes: i64,
     failed: usize,
     candidates: i64,
+    seek_calls: i64,
+    seek_buffers: i64,
+    tq_seq_scans: i64,
+    tq_seq_tup_read: i64,
+    tq_idx_scans: i64,
 }
 
 async fn measure(admin: &str, label: &str, n: i64, out_dir: &std::path::Path, full: bool) -> Point {
-    let db_name = format!("broken_session_perf_{label}_{n}_{}", Uuid::new_v4().simple());
+    let db_name = format!(
+        "broken_session_perf_{label}_{n}_{}",
+        Uuid::new_v4().simple()
+    );
     let url = create_fresh_db(admin, &db_name).await;
     let mut seed = AsyncPgConnection::establish(&url).await.unwrap();
     let _ = diesel::sql_query("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
@@ -438,18 +483,68 @@ async fn measure(admin: &str, label: &str, n: i64, out_dir: &std::path::Path, fu
             &sessions::broken_session_candidates_query().replace("$1", &STALE_SECS.to_string()),
         )
         .await;
-        std::fs::write(out_dir.join(format!("{label}-explain-candidates.txt")), plan).unwrap();
+        std::fs::write(
+            out_dir.join(format!("{label}-explain-candidates.txt")),
+            plan,
+        )
+        .unwrap();
+    }
+
+    if full {
+        let ghost = session_uuid(0);
+        let running = session_uuid(16);
+        let mut plans = String::new();
+        for (name, sql) in [
+            (
+                "running-member probe",
+                format!(
+                    "SELECT EXISTS (SELECT 1 FROM harvest_task_queue \
+                     WHERE session_id = '{running}' AND state = 'RUNNING')"
+                ),
+            ),
+            (
+                "member-task load",
+                format!(
+                    "SELECT * FROM harvest_task_queue WHERE session_id = '{ghost}' \
+                     AND state IN ('PENDING', 'RUNNING')"
+                ),
+            ),
+        ] {
+            let _ = writeln!(
+                plans,
+                "=== {name} ===\n{sql}\n{}",
+                explain(&mut stats, &sql).await
+            );
+        }
+        std::fs::write(
+            out_dir.join(format!("{label}-explain-seeks-n{n}.txt")),
+            plans,
+        )
+        .unwrap();
     }
 
     reset_stats(&mut stats, &db_name).await;
+    let scans_before = task_queue_scans(&mut stats).await;
     let wal_before = wal_lsn(&mut stats).await;
-    let failed = sessions::enforce_broken_sessions(&mut pass, STALE_SECS, &PayloadCodecs::default())
-        .await
-        .expect("enforce_broken_sessions");
+    let failed =
+        sessions::enforce_broken_sessions(&mut pass, STALE_SECS, &PayloadCodecs::default())
+            .await
+            .expect("enforce_broken_sessions");
     let wal_after = wal_lsn(&mut stats).await;
+    let scans_after = task_queue_scans(&mut stats).await;
+    if full {
+        std::fs::write(
+            out_dir.join(format!("{label}-index-stats-n{n}.txt")),
+            index_scans(&mut stats).await,
+        )
+        .unwrap();
+    }
     let rows = snapshot(&mut stats, &db_name).await;
 
-    let reverify: Vec<&StatRow> = rows.iter().filter(|r| is_reverify_statement(&r.query)).collect();
+    let reverify: Vec<&StatRow> = rows
+        .iter()
+        .filter(|r| is_reverify_statement(&r.query))
+        .collect();
     if full {
         let mut out = String::new();
         for r in &rows {
@@ -484,7 +579,63 @@ async fn measure(admin: &str, label: &str, n: i64, out_dir: &std::path::Path, fu
         wal_bytes: wal_after - wal_before,
         failed,
         candidates,
+        seek_calls: rows
+            .iter()
+            .filter(|r| is_session_seek_statement(&r.query))
+            .map(|r| r.calls)
+            .sum(),
+        seek_buffers: rows
+            .iter()
+            .filter(|r| is_session_seek_statement(&r.query))
+            .map(|r| r.total_buffers)
+            .sum(),
+        tq_seq_scans: scans_after.seq_scan - scans_before.seq_scan,
+        tq_seq_tup_read: scans_after.seq_tup_read - scans_before.seq_tup_read,
+        tq_idx_scans: scans_after.idx_scan - scans_before.idx_scan,
     }
+}
+
+#[derive(diesel::QueryableByName, Clone, Copy)]
+struct TableScans {
+    #[diesel(sql_type = BigInt)]
+    seq_scan: i64,
+    #[diesel(sql_type = BigInt)]
+    seq_tup_read: i64,
+    #[diesel(sql_type = BigInt)]
+    idx_scan: i64,
+}
+
+async fn task_queue_scans(conn: &mut AsyncPgConnection) -> TableScans {
+    // Cumulative statistics reach the shared view after a short idle delay.
+    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+    diesel::sql_query(
+        "SELECT coalesce(seq_scan, 0)::bigint AS seq_scan, \
+                coalesce(seq_tup_read, 0)::bigint AS seq_tup_read, \
+                coalesce(idx_scan, 0)::bigint AS idx_scan \
+         FROM pg_stat_user_tables WHERE relname = 'harvest_task_queue'",
+    )
+    .get_result(conn)
+    .await
+    .expect("table stats")
+}
+
+async fn index_scans(conn: &mut AsyncPgConnection) -> String {
+    #[derive(diesel::QueryableByName)]
+    struct I {
+        #[diesel(sql_type = Text)]
+        line: String,
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+    let rows: Vec<I> = diesel::sql_query(
+        "SELECT format('%s idx_scan=%s size_bytes=%s', indexrelname, idx_scan, \
+                       pg_relation_size(indexrelid)) AS line \
+         FROM pg_stat_user_indexes WHERE relname = 'harvest_task_queue' \
+         ORDER BY indexrelname",
+    )
+    .load(conn)
+    .await
+    .expect("index stats");
+    rows.into_iter().map(|r| r.line + "\n").collect()
 }
 
 async fn wal_lsn(conn: &mut AsyncPgConnection) -> i64 {
@@ -517,13 +668,14 @@ async fn zz_capture_broken_session_scan_perf_evidence() {
     let mut table = format!(
         "-- {label}: enforce_broken_sessions, pg_stat_statements sweep --\n\
          n\tcandidates\tfailed_members\ttotal_calls\treverify_calls\treverify_buffers\t\
-         total_buffers\ttemp_blks_written\twal_bytes\n"
+         total_buffers\ttemp_blks_written\twal_bytes\tseek_calls\tseek_buffers\t\
+         tq_seq_scans\ttq_seq_tup_read\ttq_idx_scans\n"
     );
     for n in [100_i64, 400, 1_600] {
         let p = measure(&admin, &label, n, &out_dir, true).await;
         let _ = writeln!(
             table,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             p.n,
             p.candidates,
             p.failed,
@@ -532,7 +684,12 @@ async fn zz_capture_broken_session_scan_perf_evidence() {
             p.reverify_buffers,
             p.total_buffers,
             p.temp_written,
-            p.wal_bytes
+            p.wal_bytes,
+            p.seek_calls,
+            p.seek_buffers,
+            p.tq_seq_scans,
+            p.tq_seq_tup_read,
+            p.tq_idx_scans
         );
     }
     eprintln!("{table}");
