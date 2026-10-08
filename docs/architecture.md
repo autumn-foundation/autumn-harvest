@@ -1067,8 +1067,8 @@ for item in manifest.items() {
   workflow worker has no store. An activity worker without a store records the
   value inline, and the item is a `Value`. It fails an activity whose result
   carries the reserved key `_harvest_stored_result`. An older worker records
-  such a result as is. A transactional activity (`run_transactional`) also
-  records its result inline.
+  such a result as is. A transactional activity (`run_transactional`) writes
+  its result the same way, inside its own transaction.
 - **Result cap.** With a store, the result cap (issue #252) does not apply to
   a writer row. Every result goes to the store.
 - **History size.** Each item still records its activity events. With the

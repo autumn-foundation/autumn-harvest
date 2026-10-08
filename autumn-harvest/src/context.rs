@@ -419,6 +419,10 @@ pub struct TransactionalState {
     /// inside the transaction so an oversized result is caught before
     /// `ActivityCompleted` is committed.
     pub(crate) max_result_bytes: u64,
+    /// The task row asks for the fan-out result writer (issue #1986).
+    pub(crate) result_writer: bool,
+    /// The worker's offloader, whose store the result writer uses.
+    pub(crate) offloader: Option<Arc<crate::payload_store::PayloadOffloader>>,
 }
 const LOCAL_ACTIVITY_HEARTBEAT_REASON: &str =
     "local activities do not support heartbeats; use a regular activity";
@@ -16229,6 +16233,12 @@ impl ActivityContext {
         // observes a `set_active_key` that lands mid-activity.
         let codecs = self.payload_codecs.clone();
         let max_result_bytes = txn.max_result_bytes;
+        let result_writer = txn.result_writer;
+        let writer_store = txn
+            .offloader
+            .as_ref()
+            .filter(|_| result_writer)
+            .map(|offloader| Arc::clone(offloader.store()));
 
         let mut conn = crate::replication::fenced_checkout(&txn.pool)
             .await
@@ -16247,15 +16257,50 @@ impl ActivityContext {
                 let user_result = f(conn).await.map_err(TxError::User)?;
 
                 // Serialize the result for the event log.
-                let output =
+                let mut output =
                     serde_json::to_value(&user_result).map_err(HarvestError::Serialization)?;
+
+                // Issue #1986: a fan-out row with the result writer records a
+                // reference. The upload runs before the execution row lock.
+                // Its reference row commits with the event, so retention can
+                // delete the blob. A rollback leaves one blob without a row,
+                // as a rolled-back offload does.
+                let stored = match &writer_store {
+                    Some(store) => Some(
+                        crate::fan_out::StoredResult::write(
+                            store.as_ref(),
+                            &codecs,
+                            activity_id,
+                            &output,
+                        )
+                        .await?,
+                    ),
+                    None => None,
+                };
+                if result_writer
+                    && stored.is_none()
+                    && output.get(crate::fan_out::STORED_RESULT_KEY).is_some()
+                {
+                    use crate::failure::IntoActivityErrorString as _;
+                    return Err(TxError::Payload(
+                        crate::failure::ActivityFailure::non_retryable(
+                            "ReservedResultKey",
+                            format!(
+                                "transactional activity result carries the reserved key \
+                                 '{}' and this worker has no PayloadStore to write it",
+                                crate::fan_out::STORED_RESULT_KEY
+                            ),
+                        )
+                        .into_error_payload(),
+                    ));
+                }
 
                 // Enforce the result-size cap before committing.  The worker's
                 // post-handler cap check runs after the handler returns, which
                 // is too late for transactional activities — the event would
                 // already be committed.  Rolling back here ensures an oversized
                 // result never lands in harvest_events.
-                if max_result_bytes > 0 {
+                if max_result_bytes > 0 && stored.is_none() {
                     let observed = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
                     if observed > max_result_bytes {
                         use crate::failure::IntoActivityErrorString as _;
@@ -16308,6 +16353,20 @@ impl ActivityContext {
                          rolling back user writes"
                         ))));
                     }
+                }
+
+                if let Some(stored) = &stored {
+                    crate::store::insert_payload_refs(
+                        conn,
+                        exec_id,
+                        &[crate::payload_store::OffloadedRef {
+                            blob_key: stored.key.clone(),
+                            store_id: stored.store_id.clone(),
+                            byte_len: stored.len,
+                        }],
+                    )
+                    .await?;
+                    output = stored.to_recorded_value();
                 }
 
                 // Append ActivityCompleted within the same transaction.

@@ -18926,6 +18926,8 @@ async fn process_activity_task(
             activity_id,
             claim: activity_claim.clone(),
             max_result_bytes: effective_result_cap,
+            result_writer: task_writes_result(task),
+            offloader: registry.payload_offloader_arc(),
         });
 
     let telemetry = registry.telemetry().clone();

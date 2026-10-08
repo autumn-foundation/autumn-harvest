@@ -31,6 +31,8 @@ Issue #1986 adds two options to the activity fan-out helpers. The new
     worker has no store. An activity worker without a store records the value
     inline, and fails a result that carries the reserved key.
   - With a store, the result cap (issue #252) does not apply to a writer row.
+  - A transactional activity (`run_transactional`) writes its result the
+    same way. Its reference row commits with its own transaction.
 - New entry points: `execute_activity_fan_out_with` and
   `execute_activity_fan_out_raw_with`. They return `FanOutResults`, a
   serializable manifest.

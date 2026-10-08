@@ -55,6 +55,7 @@ Issue #1986 asks for two options on the activity fan-out helpers:
 | R14 | Upload while the row lock is held. A slow store then blocks the run. | The worker uploads once, before any lock. |
 | R15 | Share a blob key across runs. Retention of one run deletes a blob that another run still needs. | The blob holds the activity id, so each key is unique. |
 | R16 | Read a business value that carries the reserved key as a reference. | A new worker without a store fails such a result. |
+| R17 | Let a transactional activity commit its own result inline, past the writer. | `run_transactional` writes the blob and commits the reference row in its own transaction. |
 
 ### 0.4 Six thinking hats
 

@@ -137,7 +137,19 @@ fn make_blob<'a>(
     })
 }
 
-/// Input: `{ "n", "size", "writer", "count"?, "fail"?: [indices] }`.
+/// `make_blob`, committed through `run_transactional`.
+fn make_blob_in_a_transaction<'a>(
+    ctx: &'a ActivityContext,
+    input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let value = make_blob(ctx, input).await?;
+        ctx.run_transactional(move |_conn| Box::pin(async move { Ok(value) }))
+            .await
+    })
+}
+
+/// Input: `{ "n", "size", "writer", "activity"?, "count"?, "fail"?: [indices] }`.
 fn fan_out_workflow<'a>(
     ctx: &'a WorkflowContext,
     input: Value,
@@ -155,7 +167,8 @@ fn fan_out_workflow<'a>(
                     "size": input["size"],
                     "fail": failing.contains(&i),
                 });
-                ("make_blob".to_string(), item, "default".to_string())
+                let activity = input["activity"].as_str().unwrap_or("make_blob");
+                (activity.to_string(), item, "default".to_string())
             })
             .collect();
         let window = usize::try_from(input["w"].as_u64().unwrap_or(50)).unwrap_or(50);
@@ -217,8 +230,8 @@ fn registry(store: Arc<MemStore>) -> Arc<HandlerRegistry> {
         error_schema: None,
         retry_policy: None,
     };
-    let activity = ActivityInfo {
-        name: "make_blob",
+    let activity = |name, handler| ActivityInfo {
+        name,
         module: "fanout_result_writer_db_tests",
         default_retry_policy: None,
         default_start_to_close: None,
@@ -237,14 +250,20 @@ fn registry(store: Arc<MemStore>) -> Arc<HandlerRegistry> {
         max_input_bytes: None,
         max_result_bytes: None,
         requires: None,
-        handler: make_blob,
+        handler,
     };
     // A 1 MiB threshold keeps the plain control run inline.
     let offloader = PayloadOffloader::new(store, 1024 * 1024, Arc::new(NoOpMetrics));
     Arc::new(
-        HandlerRegistry::new(vec![workflow], vec![activity])
-            .with_payload_offloader(Some(Arc::new(offloader)))
-            .with_payload_codecs(xor_codecs()),
+        HandlerRegistry::new(
+            vec![workflow],
+            vec![
+                activity("make_blob", make_blob),
+                activity("make_blob_in_a_transaction", make_blob_in_a_transaction),
+            ],
+        )
+        .with_payload_offloader(Some(Arc::new(offloader)))
+        .with_payload_codecs(xor_codecs()),
     )
 }
 
@@ -483,6 +502,38 @@ async fn fan_out_options_on_a_real_worker() {
         AtomicUsize::load(&store.puts, Ordering::SeqCst) - puts_before,
         58,
         "no blob for a failed item"
+    );
+
+    // ── A transactional activity honours the writer ────────────────────────
+    let puts_before = AtomicUsize::load(&store.puts, Ordering::SeqCst);
+    let (tx_run, tx_out) = run_fan_out(
+        db,
+        &mut conn,
+        "transactional",
+        json!({ "n": 5, "size": 4096, "writer": true, "activity": "make_blob_in_a_transaction" }),
+        "COMPLETED",
+    )
+    .await;
+    assert_eq!(
+        stored_items(&tx_out),
+        json!(5),
+        "every transactional result is stored"
+    );
+    assert_eq!(
+        store::load_payload_refs(&mut conn, tx_run)
+            .await
+            .unwrap()
+            .len(),
+        5
+    );
+    assert_eq!(
+        AtomicUsize::load(&store.puts, Ordering::SeqCst) - puts_before,
+        5
+    );
+    let (tx_item, _) = per_event(&mut conn, tx_run, "ActivityCompleted").await;
+    assert!(
+        tx_item <= 512,
+        "a transactional reference is small: {tx_item} bytes"
     );
 
     // ── Done when #1 on a worker: N completes, N+1 fails ────────────────────
