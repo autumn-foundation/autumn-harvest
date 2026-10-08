@@ -302,10 +302,10 @@ async fn post_sse(client: &TestClient, body: Value) -> TestResponse {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-/// The issue #597 end-to-end example: an agent starts a multi-step workflow,
-/// observes >= 2 progress updates over streaming MCP, sends a signal that
-/// unblocks a `wait_for_signal`, and reads a terminal status — all through
-/// the generated MCP tools. `mcp_update_tools_run_the_handler_synchronously`
+/// The issue #597 end-to-end example, through the generated MCP tools only.
+/// An agent starts a multi-step workflow and sees >= 2 progress updates over
+/// streaming MCP. It sends a signal that unblocks a `wait_for_signal`, then
+/// reads a terminal status. `mcp_update_tools_run_the_handler_synchronously`
 /// covers the update step (issue #2035).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agent_drives_a_durable_workflow_via_mcp_tools() {
