@@ -850,6 +850,8 @@ diesel::table! {
         /// #1227, Finding 4) so the claim query can exclude the row until its
         /// backoff elapses instead of leaving it to dominate every batch.
         next_attempt_at -> Nullable<Timestamptz>,
+        /// Tenant of the source run (issue #1977). The target run gets it.
+        tenant -> Nullable<Text>,
     }
 }
 

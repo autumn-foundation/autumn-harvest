@@ -2109,6 +2109,7 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                                 .unwrap_or(Value::Null),
                             max_workflow_input_bytes: i64::try_from(max_workflow_input_bytes)
                                 .unwrap_or(i64::MAX),
+                            tenant: execution.tenant.clone(),
                         })
                         .get_result::<crate::models::CompletionTriggerOutboxDb>(conn)
                         .await
@@ -2198,6 +2199,7 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                         concurrency_limit: concurrency_limit.map(|l| i32::try_from(l).unwrap_or(i32::MAX)),
                         priority: serde_json::to_value(Priority::default()).unwrap_or(Value::Null),
                         max_workflow_input_bytes: i64::try_from(max_workflow_input_bytes).unwrap_or(i64::MAX),
+                        tenant: execution.tenant.clone(),
                     })
                     .get_result::<crate::models::CompletionTriggerOutboxDb>(conn)
                     .await
@@ -2560,10 +2562,13 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
 
         // Provenance ref is the triggering (source) execution id (#740).
         let source_exec_id_str = task.source_exec_id.to_string();
-        // The outbox row lives on the source shard, so `conn` reads the
-        // source run (issue #1977). A source that retention removed has no
-        // tenant to pass on.
-        let source_tenant = source_run_tenant(conn, task.source_exec_id).await;
+        // The row keeps the source tenant (issue #1977). A row written before
+        // that column existed reads the source run instead. The outbox row
+        // lives on the source shard, so `conn` reaches it.
+        let source_tenant = match task.tenant.clone() {
+            Some(tenant) => Some(tenant),
+            None => source_run_tenant(conn, task.source_exec_id).await,
+        };
         let params = crate::execution::StartWorkflowParams {
             concurrency_key: task.concurrency_key,
             concurrency_limit: task

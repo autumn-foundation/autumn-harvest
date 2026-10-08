@@ -719,7 +719,8 @@ credential is *tenant-bound*. Harvest then confines it without an authorizer.
 - **A Harvest token.** Mint it with `tenant`:
   `POST /admin/tokens {"name": "acme-ci", "scope": "mutate", "tenant": "acme"}`,
   `harvest token create acme-ci --scope mutate --tenant acme`, or
-  `harvest token bootstrap --tenant acme`. A tenant key is 1 to 128 bytes of
+  `harvest token bootstrap --tenant acme`. `harvest token rotate` does not
+  copy the old tenant, so pass `--tenant` again. A tenant key is 1 to 128 bytes of
   visible ASCII, with no spaces.
 - **The embedder's own principal.** In the auth middleware that wraps the
   Harvest router, insert
@@ -767,7 +768,9 @@ refused requests.
 - Children, cross-shard children, retries, continue-as-new successors,
   reset forks and re-runs copy the tenant of their source run. A rebalance
   moves it with the row. PII erasure does not touch it.
-- Completion-trigger targets copy the tenant of their source run.
+- Completion-trigger targets copy the tenant of their source run. A
+  cross-shard trigger keeps it on its outbox row, so it survives retention
+  of the source run.
 - In-process code sets `StartWorkflowParams::tenant`,
   `SignalWithStartParams::tenant`, `UpdateWithStartParams::tenant`, or the
   `tenant` field of the typed start options. Set it only from a verified

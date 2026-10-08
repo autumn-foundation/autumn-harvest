@@ -1930,6 +1930,11 @@ enum TokenCommand {
         /// Optional RFC 3339 expiry for the replacement token.
         #[arg(long)]
         expires_at: Option<String>,
+        /// Tenant claim of the replacement token (issue #1977). Rotation does
+        /// not copy the old tenant. Pass it again, as `harvest token list`
+        /// shows it, or the replacement is not tenant-bound.
+        #[arg(long)]
+        tenant: Option<String>,
     },
     /// Seed the FIRST token offline (issue #942). Prints a fresh secret ONCE
     /// and the exact `INSERT INTO harvest_api_tokens ...` SQL for you to run
@@ -12441,6 +12446,7 @@ fn token_request(command: &TokenCommand) -> ApiRequest {
             old_id,
             scope,
             expires_at,
+            tenant,
         } => {
             let mut body = serde_json::json!({
                 "name": format!("rotation-of-{old_id}"),
@@ -12448,6 +12454,9 @@ fn token_request(command: &TokenCommand) -> ApiRequest {
             });
             if let Some(exp) = expires_at {
                 body["expires_at"] = serde_json::json!(exp);
+            }
+            if let Some(tenant) = tenant {
+                body["tenant"] = serde_json::json!(tenant);
             }
             ApiRequest::post("/admin/tokens", Some(body))
         }
@@ -17039,6 +17048,23 @@ mod token_bootstrap_tests {
                 "{bad:?}"
             );
         }
+    }
+
+    /// `token rotate --tenant` keeps the replacement tenant-bound (issue
+    /// #1977). Without the flag the body carries no tenant.
+    #[test]
+    fn token_rotate_sends_the_tenant() {
+        let body = |args: &[&str]| {
+            let cli = Cli::try_parse_from(args).expect("parses");
+            let Commands::Token { command } = cli.command else {
+                panic!("expected token rotate");
+            };
+            token_request(&command).body.expect("a mint body")
+        };
+        let bound = body(&["harvest", "token", "rotate", "old", "--tenant", "acme"]);
+        assert_eq!(bound["tenant"], "acme");
+        let unbound = body(&["harvest", "token", "rotate", "old"]);
+        assert!(unbound.get("tenant").is_none(), "{unbound}");
     }
 
     /// `token create --tenant` sends the tenant in the mint body (issue #1977).

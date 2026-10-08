@@ -1463,6 +1463,8 @@ pub struct CompletionTriggerOutboxDb {
     pub max_workflow_input_bytes: i64,
     pub created_at: DateTime<Utc>,
     pub next_attempt_at: Option<DateTime<Utc>>,
+    /// Tenant of the source run (issue #1977). The target run gets it.
+    pub tenant: Option<String>,
 }
 
 /// Insertable model for registering a deferred completion trigger outbox task.
@@ -1480,6 +1482,8 @@ pub struct NewCompletionTriggerOutboxDb {
     pub concurrency_limit: Option<i32>,
     pub priority: serde_json::Value,
     pub max_workflow_input_bytes: i64,
+    /// Tenant of the source run (issue #1977). The target run gets it.
+    pub tenant: Option<String>,
 }
 
 // ── Cross-shard child workflows (issue #956) ─────────────────────────────────

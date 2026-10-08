@@ -24,8 +24,16 @@ ALTER TABLE harvest_api_tokens
 ALTER TABLE harvest_workflow_executions
     ADD COLUMN IF NOT EXISTS tenant TEXT;
 
+-- The relay starts the target run later, maybe after retention has removed
+-- the source run. So the outbox row keeps the source tenant itself.
+ALTER TABLE harvest_completion_trigger_outbox
+    ADD COLUMN IF NOT EXISTS tenant TEXT;
+
 COMMENT ON COLUMN harvest_api_tokens.tenant IS
     'Tenant claim of the token (issue #1977). NULL means not tenant-bound.';
+
+COMMENT ON COLUMN harvest_completion_trigger_outbox.tenant IS
+    'Tenant of the source run (issue #1977). The target run gets it.';
 
 COMMENT ON COLUMN harvest_workflow_executions.tenant IS
     'Verified tenant of the run (issue #1977). NULL means no tenant.';

@@ -90,6 +90,8 @@ amendment:
 
 - `harvest_api_tokens.tenant TEXT NULL`, with a `CHECK` on length 1 to 128.
 - `harvest_workflow_executions.tenant TEXT NULL`. No index. No default.
+- `harvest_completion_trigger_outbox.tenant TEXT NULL`. The relay can run
+  after retention removes the source run, so the row keeps the tenant.
 - `SET LOCAL lock_timeout = '5s'` before each `ALTER`.
 
 The executions `table!` had 64 columns, the limit of diesel's

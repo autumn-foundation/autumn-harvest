@@ -12,8 +12,9 @@ cancel B's runs. The red test
 before the fix and gets `403` after it.
 
 **Tenant-bound credentials.** `POST /admin/tokens` takes `tenant`. The list
-route shows it. `harvest token create --tenant` and
-`harvest token bootstrap --tenant` set it. An embedder attaches
+route shows it. `harvest token create --tenant`,
+`harvest token rotate --tenant` and `harvest token bootstrap --tenant` set
+it. An embedder attaches
 `autumn_harvest_plugin::tenant::VerifiedTenant` in its own auth layer. One
 rule, `autumn_harvest::tenant::validate_tenant`, checks every tenant key: 1
 to 128 bytes of visible ASCII, with no spaces.
@@ -64,8 +65,10 @@ candidate scan resolves the cutoff per row with one more `COALESCE` arm, and
 the per-candidate check uses `effective_max_age_for`. `validate` applies the
 type-override bounds and the tenant key rule.
 
-**Migration.** `20261008041103_harvest_tenant_binding` adds the two nullable
-columns. No index, no data migration, no `WorkflowEvent` variant, no replay
+**Migration.** `20261008041103_harvest_tenant_binding` adds three nullable
+columns: on tokens, on executions, and on the completion-trigger outbox. The
+outbox column keeps the tenant when retention removes the source run before
+the relay. No index, no data migration, no `WorkflowEvent` variant, no replay
 impact.
 
 **Tests.** `autumn-harvest-plugin/tests/tenant_binding_integration.rs` covers

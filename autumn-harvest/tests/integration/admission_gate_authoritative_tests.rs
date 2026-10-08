@@ -4256,3 +4256,61 @@ async fn gate_blocks_fresh_update_with_start_create() {
         "a blocked fresh update-with-start must roll back with NO execution row"
     );
 }
+
+/// Issue #1977: the relay gives the target run the tenant stored on the
+/// outbox row. Retention may have removed the source run before the relay
+/// runs, so the row, not the source, must carry the tenant.
+#[tokio::test]
+async fn outbox_relay_keeps_the_tenant_after_the_source_is_gone() {
+    #[derive(diesel::QueryableByName)]
+    struct TenantRow {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        tenant: Option<String>,
+    }
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    install_global_router(ShardRouter::default());
+    set_global_admission_gate_cache(None);
+
+    let trigger_id = Uuid::new_v4();
+    insert_trigger(&mut conn, trigger_id).await;
+    // The source id names no row: retention already removed the source run.
+    diesel::sql_query(
+        "INSERT INTO harvest_completion_trigger_outbox
+            (source_exec_id, trigger_id, target_shard, target_workflow_name,
+             target_workflow_id, target_input, queue_name, priority,
+             max_workflow_input_bytes, tenant)
+         VALUES ($1, $2, 0, 'ag_target_wf', 'ct-outbox-tenant', '{}'::jsonb, 'default',
+                 '0'::jsonb, 1048576, 'acme')",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(ExecutionId::new_for_shard(ShardId::new(0)).as_uuid())
+    .bind::<diesel::sql_types::Uuid, _>(trigger_id)
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    let metrics = CapturingMetrics::default();
+    let relayed = autumn_harvest::completion_trigger::enforce_completion_triggers_outbox(
+        &mut conn,
+        &metrics,
+        &Some(ShardedDbPool::single(pool.clone())),
+        &[ShardId::new(0)],
+    )
+    .await
+    .unwrap();
+    assert_eq!(relayed, 1);
+
+    let rows: Vec<TenantRow> = diesel::sql_query(
+        "SELECT tenant FROM harvest_workflow_executions WHERE workflow_id = 'ct-outbox-tenant'",
+    )
+    .load(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 1, "the relay starts the target");
+    assert_eq!(rows[0].tenant.as_deref(), Some("acme"));
+}
