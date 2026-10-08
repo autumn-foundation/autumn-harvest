@@ -140,7 +140,10 @@ mod executor_span_tests;
 #[cfg(feature = "testing")]
 mod external_completion_tests;
 mod external_outbox_scan_tests;
+#[cfg(feature = "db")]
+mod fanout_result_writer_db_tests;
 mod fanout_tests;
+mod fanout_tolerance_tests;
 mod force_fail_tests;
 mod formal_models_coverage;
 mod fuzz_nightly_wiring;

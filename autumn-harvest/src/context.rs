@@ -494,6 +494,11 @@ pub enum WorkflowCommand {
         /// dispatch, which continues to use the activity's registered
         /// `default_schedule_to_start`.
         schedule_to_start_override: Option<std::time::Duration>,
+        /// Write the result through the `PayloadStore` (issue #1986).
+        ///
+        /// When `true`, the worker records a `StoredResult` reference, not
+        /// the value. Only a fan-out with `write_results` sets it.
+        result_writer: bool,
         /// The worker sends the result back through this channel.
         result_tx: oneshot::Sender<Result<Value, String>>,
     },
@@ -6084,6 +6089,7 @@ impl WorkflowContext {
                     session_id,
                     session_worker_id,
                     schedule_to_start_override,
+                    result_writer: false,
                     result_tx: tx,
                 });
                 match rx.await {
@@ -10999,6 +11005,39 @@ impl WorkflowContext {
         Ok(typed)
     }
 
+    // ── Fan-out with options (issue #1986) ───────────────────────────────
+
+    /// Fan out with [`FanOutOptions`](crate::fan_out::FanOutOptions).
+    ///
+    /// # Errors
+    ///
+    /// Not implemented yet.
+    pub async fn execute_activity_fan_out_raw_with(
+        &self,
+        _activities: Vec<(String, Value, String)>,
+        _options: &crate::fan_out::FanOutOptions,
+    ) -> HarvestResult<crate::fan_out::FanOutResults<Value>> {
+        Err(HarvestError::Config("not implemented".into()))
+    }
+
+    /// Typed sibling of `execute_activity_fan_out_raw_with`.
+    ///
+    /// # Errors
+    ///
+    /// Not implemented yet.
+    pub async fn execute_activity_fan_out_with<I, O>(
+        &self,
+        _info: &crate::info::ActivityInfo,
+        _inputs: Vec<I>,
+        _options: &crate::fan_out::FanOutOptions,
+    ) -> HarvestResult<crate::fan_out::FanOutResults<O>>
+    where
+        I: serde::Serialize,
+        O: serde::de::DeserializeOwned,
+    {
+        Err(HarvestError::Config("not implemented".into()))
+    }
+
     // ── Fan-out / parallel child workflows (issue #601) ──────────────────
 
     /// Validate every child's serialized input against the payload cap
@@ -12002,6 +12041,7 @@ impl WorkflowContext {
                             session_id: None,
                             session_worker_id: None,
                             schedule_to_start_override: None,
+                            result_writer: false,
                             result_tx: tx,
                         });
                     } else {

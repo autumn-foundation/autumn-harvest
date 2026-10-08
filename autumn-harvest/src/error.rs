@@ -330,6 +330,18 @@ pub enum HarvestError {
         compensation_errors: Vec<String>,
     },
 
+    /// More fan-out items failed than the tolerance allows (issue #1986).
+    ///
+    /// The error carries no failure count. A replay that sees more results
+    /// gives a higher count, and a workflow that branches on it drifts.
+    #[error("fan-out failed: more than {tolerated} of {total} items failed")]
+    FanOutFailureThresholdExceeded {
+        /// The largest number of failures the fan-out tolerates.
+        tolerated: usize,
+        /// The number of items in the fan-out.
+        total: usize,
+    },
+
     /// The workflow's published input schema (issue #373) rejected
     /// `start_input` on a **genuine fresh start** initiated through
     /// [`crate::execution::signal_with_start_workflow_execution`].

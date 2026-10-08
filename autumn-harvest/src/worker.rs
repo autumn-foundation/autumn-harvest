@@ -44209,6 +44209,7 @@ mod tests {
                 session_id: None,
                 session_worker_id: None,
                 schedule_to_start_override: None,
+                result_writer: false,
                 result_tx: tx,
             },
         ];
@@ -44231,6 +44232,7 @@ mod tests {
             session_id: Some(session_id),
             session_worker_id: Some("worker-7".to_string()),
             schedule_to_start_override: Some(std::time::Duration::from_secs(30)),
+            result_writer: false,
             result_tx: tx,
         }];
         let scheduled = extract_all_scheduled_activities(&commands)
@@ -44333,6 +44335,7 @@ mod tests {
             session_id: None,
             session_worker_id: None,
             schedule_to_start_override: None,
+            result_writer: false,
             result_tx: oneshot::channel::<Result<serde_json::Value, String>>().0,
         });
         assert!(
@@ -44463,6 +44466,7 @@ mod tests {
             session_id: None,
             session_worker_id: None,
             schedule_to_start_override: None,
+            result_writer: false,
             result_tx: oneshot::channel::<Result<serde_json::Value, String>>().0,
         }
     }
@@ -47516,6 +47520,7 @@ mod tests {
             session_id: None,
             session_worker_id: None,
             schedule_to_start_override: None,
+            result_writer: false,
             result_tx,
         }
     }
@@ -51377,6 +51382,7 @@ mod tests {
             session_id: None,
             session_worker_id: None,
             schedule_to_start_override: None,
+            result_writer: false,
             result_tx: oneshot::channel::<Result<Value, String>>().0,
         }
     }
