@@ -14617,6 +14617,9 @@ async fn finalize_activity_completion_write(
                 activity_id,
                 output: output.clone(),
             };
+            // A stored reference is already out of line. Ordinary offload
+            // would upload it again under a low threshold.
+            let offloader = offloader.filter(|_| stored.is_none());
             store::append_events_offloaded_with_codecs(
                 conn,
                 exec_id,

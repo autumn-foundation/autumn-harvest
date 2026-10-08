@@ -204,7 +204,7 @@ fn fan_out_workflow<'a>(
     })
 }
 
-fn registry(store: Arc<MemStore>) -> Arc<HandlerRegistry> {
+fn registry(store: Arc<MemStore>, threshold: u64) -> Arc<HandlerRegistry> {
     let workflow = WorkflowInfo {
         quota: None,
         declared_activities: None,
@@ -252,8 +252,7 @@ fn registry(store: Arc<MemStore>) -> Arc<HandlerRegistry> {
         requires: None,
         handler,
     };
-    // A 1 MiB threshold keeps the plain control run inline.
-    let offloader = PayloadOffloader::new(store, 1024 * 1024, Arc::new(NoOpMetrics));
+    let offloader = PayloadOffloader::new(store, threshold, Arc::new(NoOpMetrics));
     Arc::new(
         HandlerRegistry::new(
             vec![workflow],
@@ -344,7 +343,8 @@ async fn fan_out_options_on_a_real_worker() {
         "worker-fan-out-options",
         4,
         50,
-        registry(Arc::clone(&store)),
+        // A 1 MiB threshold keeps the plain control run inline.
+        registry(Arc::clone(&store), 1024 * 1024),
     );
     let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&database_url));
     let db = database_url.as_str();
@@ -562,6 +562,50 @@ async fn fan_out_options_on_a_real_worker() {
 
     worker.shutdown();
     handle.await.expect("worker joins");
+
+    // ── A zero offload threshold does not offload the reference again ──────
+    let worker = build_runtime_worker(
+        "worker-fan-out-threshold-zero",
+        4,
+        50,
+        registry(Arc::clone(&store), 0),
+    );
+    let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&database_url));
+    let puts_before = AtomicUsize::load(&store.puts, Ordering::SeqCst);
+    let (zero, _) = run_fan_out(
+        db,
+        &mut conn,
+        "threshold-zero",
+        json!({ "n": 3, "size": 64, "writer": true }),
+        "COMPLETED",
+    )
+    .await;
+    let refs = store::load_payload_refs(&mut conn, zero).await.unwrap();
+    let completed_refs = AtomicUsize::load(&store.puts, Ordering::SeqCst) - puts_before;
+    worker.shutdown();
+    handle.await.expect("worker joins");
+    // Each item writes its result once. The workflow input and output are
+    // offloaded too, under a zero threshold, so count only item blobs.
+    let history = store::load_history_with_codecs(&mut conn, zero, &xor_codecs())
+        .await
+        .expect("load history");
+    let stored = history
+        .events
+        .iter()
+        .filter(|e| {
+            matches!(e, autumn_harvest::event::WorkflowEvent::ActivityCompleted { output, .. }
+            if StoredResult::from_recorded_value(output).is_some())
+        })
+        .count();
+    assert_eq!(
+        stored, 3,
+        "each completion records a reference, not an offload envelope"
+    );
+    assert!(
+        completed_refs >= 3 && refs.len() == completed_refs,
+        "every upload has one reference row: {completed_refs} uploads, {} rows",
+        refs.len()
+    );
 }
 
 /// The manifest type is serializable, so a workflow can hand it on.
