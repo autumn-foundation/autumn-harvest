@@ -286,6 +286,37 @@ pub fn stats_dir_from(raw: Option<&str>) -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
+/// What a teardown with stats left undone, by kind.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TeardownReport {
+    /// Stats snapshots that failed. The databases may still be dropped.
+    pub stats: Vec<String>,
+    /// Databases that could not be dropped.
+    pub drops: Vec<String>,
+}
+
+/// One report note per failure kind, so a failed snapshot never reads as a
+/// leaked database.
+#[must_use]
+pub fn teardown_notes(report: &TeardownReport) -> Vec<String> {
+    let mut notes = Vec::new();
+    if !report.drops.is_empty() {
+        notes.push(format!(
+            "could not drop {} benchmark database(s): {}",
+            report.drops.len(),
+            report.drops.join("; ")
+        ));
+    }
+    if !report.stats.is_empty() {
+        notes.push(format!(
+            "stats snapshot failed for {} shard(s): {}",
+            report.stats.len(),
+            report.stats.join("; ")
+        ));
+    }
+    notes
+}
+
 /// The file label of one shard snapshot, unique per scenario and shard.
 #[must_use]
 pub fn stats_label(scenario: BenchScenario, shards: usize, shard: usize) -> String {
@@ -1677,6 +1708,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_failed_snapshot_is_not_reported_as_a_leaked_database() {
+        let snapshot_only = TeardownReport {
+            stats: vec!["throughput-1shards-s0 stats snapshot: timed out".to_string()],
+            drops: Vec::new(),
+        };
+        let notes = teardown_notes(&snapshot_only);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("stats snapshot"), "{notes:?}");
+        assert!(!notes[0].contains("could not drop"), "{notes:?}");
+
+        let both = TeardownReport {
+            stats: vec!["s0: write failed".to_string()],
+            drops: vec!["db_1: still present".to_string()],
+        };
+        let notes = teardown_notes(&both);
+        assert_eq!(notes.len(), 2, "one note per failure kind: {notes:?}");
+        assert!(notes.iter().any(|n| n.starts_with("could not drop 1")));
+        assert!(notes.iter().any(|n| n.contains("stats snapshot")));
+        assert_eq!(
+            teardown_notes(&TeardownReport::default()),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
     fn the_stats_snapshot_is_opt_in() {
         assert_eq!(stats_dir_from(None), None);
         assert_eq!(stats_dir_from(Some("  ")), None);
@@ -2542,11 +2598,12 @@ pub mod db {
         MAX_CONCURRENT_ACTIVITIES, MAX_CONCURRENT_WORKFLOWS, Metric,
         PACED_STARTS_PER_SEC_PER_SHARD, POLL_INTERVAL_MS, POOL_SIZE_PER_SHARD, Pacing,
         SCENARIO_BUDGET_SECS, SHARD_URLS_ENV_VAR, SIGNAL_PARK_SETTLE, SIGNAL_SOCKET_TIMEOUT,
-        SIGNAL_WORKFLOWS_PER_SHARD, STATS_DIR_ENV_VAR, ScenarioReport, WORKERS_PER_SHARD,
-        clock_offset_soundness, dispatch_population_soundness, latency_soundness, mean_inflight,
-        measured_samples, pacing_verdict, per_shard_inflight_soundness, per_shard_pacing_verdict,
-        stats_dir_from, stats_label, steady_state_slice, steady_state_throughput,
-        steady_state_window, sweep_step, throughput_soundness, warmup_batch_for, warmup_soundness,
+        SIGNAL_WORKFLOWS_PER_SHARD, STATS_DIR_ENV_VAR, ScenarioReport, TeardownReport,
+        WORKERS_PER_SHARD, clock_offset_soundness, dispatch_population_soundness,
+        latency_soundness, mean_inflight, measured_samples, pacing_verdict,
+        per_shard_inflight_soundness, per_shard_pacing_verdict, stats_dir_from, stats_label,
+        steady_state_slice, steady_state_throughput, steady_state_window, sweep_step,
+        teardown_notes, throughput_soundness, warmup_batch_for, warmup_soundness,
     };
 
     // ── Skip / provisioning ───────────────────────────────────────────────
@@ -3032,10 +3089,10 @@ pub mod db {
         /// shard before the drop. The drop discards `pg_stat_user_tables`, so
         /// the snapshot comes first (issue #1956). Unset, this is
         /// [`Self::teardown`].
-        pub async fn teardown_with_stats(mut self, scenario: BenchScenario) -> Vec<String> {
-            let mut failures = self.snapshot_stats(scenario).await;
-            failures.extend(self.teardown().await);
-            failures
+        pub async fn teardown_with_stats(mut self, scenario: BenchScenario) -> TeardownReport {
+            let stats = self.snapshot_stats(scenario).await;
+            let drops = self.teardown().await;
+            TeardownReport { stats, drops }
         }
 
         /// Write each shard's stats views to [`STATS_DIR_ENV_VAR`], if set.
@@ -3875,14 +3932,8 @@ pub mod db {
     /// Append a note when the run could not drop its own databases, so an
     /// operator who supplied a shared server learns about the leftovers from
     /// the report rather than from `\\l` a week later.
-    fn with_teardown_note(mut notes: Vec<String>, failures: &[String]) -> Vec<String> {
-        if !failures.is_empty() {
-            notes.push(format!(
-                "could not drop {} benchmark database(s): {}",
-                failures.len(),
-                failures.join("; ")
-            ));
-        }
+    fn with_teardown_note(mut notes: Vec<String>, report: &TeardownReport) -> Vec<String> {
+        notes.extend(teardown_notes(report));
         notes
     }
 
@@ -4024,7 +4075,7 @@ pub mod db {
         fleet.stop().await;
         let topology = cluster.topology;
         drop(sharded);
-        let teardown_failures = cluster.teardown_with_stats(BenchScenario::Throughput).await;
+        let teardown = cluster.teardown_with_stats(BenchScenario::Throughput).await;
         let wall_clock_note = budget_note(scenario_started, deadline, &mut unsound);
 
         #[allow(
@@ -4069,7 +4120,7 @@ pub mod db {
                         .to_owned(),
                     wall_clock_note,
                 ],
-                &teardown_failures,
+                &teardown,
             ),
             unsound,
         })
@@ -4428,7 +4479,7 @@ pub mod db {
         fleet.stop().await;
         let topology = cluster.topology;
         drop(sharded);
-        let teardown_failures = cluster
+        let teardown = cluster
             .teardown_with_stats(BenchScenario::DispatchLatency)
             .await;
 
@@ -4483,7 +4534,7 @@ pub mod db {
                     ),
                     wall_clock_note,
                 ],
-                &teardown_failures,
+                &teardown,
             ),
             unsound,
         })
@@ -4730,7 +4781,7 @@ pub mod db {
         fleet.stop().await;
         let topology = cluster.topology;
         drop(sharded);
-        let teardown_failures = cluster
+        let teardown = cluster
             .teardown_with_stats(BenchScenario::SignalRoundtrip)
             .await;
         let wall_clock_note = budget_note(scenario_started, deadline, &mut unsound);
@@ -4769,7 +4820,7 @@ pub mod db {
                     ),
                     wall_clock_note,
                 ],
-                &teardown_failures,
+                &teardown,
             ),
             unsound,
         })
