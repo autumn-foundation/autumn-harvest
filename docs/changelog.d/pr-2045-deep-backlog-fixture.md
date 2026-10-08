@@ -1,4 +1,4 @@
-## Testing — Seeded deep-backlog fixture and stats snapshot before drop (issue #1956)
+## Testing — Seeded deep-backlog fixture and stats snapshot before drop (issue #1956, PR #2045)
 
 Issue #1956 found that no committed fixture was production-shaped. The e2e
 bench also dropped its databases at exit, so `pg_stat_user_tables` was lost.
