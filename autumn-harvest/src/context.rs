@@ -1439,12 +1439,8 @@ impl<'a> MutexHandle<'a> {
         // Issue #1984: a cancelled scope drops a parked acquire. Its waiter
         // row then stays at the head of the FIFO queue and blocks the key.
         // So a scope cannot acquire a mutex.
-        if self.context.in_cancellable_scope() {
-            return Err(HarvestError::Config(format!(
-                "ctx.mutex({}).acquire() cannot run inside a cancellation scope",
-                self.key
-            )));
-        }
+        self.context
+            .reject_in_cancellable_scope(&format!("ctx.mutex({}).acquire()", self.key))?;
 
         match self
             .context
@@ -9699,6 +9695,7 @@ impl WorkflowContext {
     ) -> HarvestResult<()> {
         use crate::replay::HistoryMatch;
 
+        self.reject_in_cancellable_scope("ctx.signal_external_workflow")?;
         let history_match = self.match_history(|m| m.match_external_signal(&target, signal_name));
 
         match history_match {
@@ -9965,6 +9962,7 @@ impl WorkflowContext {
     async fn request_cancel_external_target(&self, target: ExternalTarget) -> HarvestResult<()> {
         use crate::replay::HistoryMatch;
 
+        self.reject_in_cancellable_scope("ctx.request_cancel_external_workflow")?;
         let history_match = self.match_history(|m| m.match_external_cancel(&target));
 
         match history_match {
@@ -10124,6 +10122,7 @@ impl WorkflowContext {
             });
         }
 
+        self.reject_in_cancellable_scope("ctx.await_external_workflow")?;
         let history_match = self.match_history(|m| m.match_external_await(target));
 
         match history_match {
@@ -13989,6 +13988,24 @@ impl WorkflowContext {
             .push(frame);
         let _pop = Pop(&self.scope_stack);
         f()
+    }
+
+    /// Reject `operation` inside a cancellable scope (issue #1984).
+    ///
+    /// A cancelled scope drops its body. The operations named here have a
+    /// durable result that arrives later, and that late result would stay
+    /// unconsumed on replay. So a scope cannot start them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Config`] inside a cancellable scope.
+    pub(crate) fn reject_in_cancellable_scope(&self, operation: &str) -> HarvestResult<()> {
+        if self.in_cancellable_scope() {
+            return Err(HarvestError::Config(format!(
+                "{operation} cannot run inside a cancellation scope"
+            )));
+        }
+        Ok(())
     }
 
     /// Whether a cancellable scope is on the scope stack.

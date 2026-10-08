@@ -245,7 +245,8 @@ pub(crate) fn route_command(
 ///
 /// Local activities, external activities and detached children are not
 /// cancelled, but the body still stops. A scope runs one body only. A body
-/// cannot acquire a durable mutex: a dropped acquire would block the key.
+/// cannot acquire a durable mutex, signal, cancel or await an external
+/// workflow: each has a durable result that a dropped body would strand.
 #[derive(Clone)]
 pub struct CancellationScope<'a> {
     ctx: &'a WorkflowContext,
@@ -1545,5 +1546,47 @@ mod tests {
         }]);
 
         assert!(scope.shared.lock().members.is_empty());
+    }
+
+    /// External workflow operations have a durable result that arrives
+    /// later. A scope rejects them, so a cancel cannot strand that result.
+    #[tokio::test]
+    async fn external_workflow_operations_inside_a_scope_are_rejected() {
+        let ctx = WorkflowContext::new_test();
+        let target = ExecutionId::new();
+
+        let signal = bounded(ctx.cancellation_scope().run(ctx.signal_external_workflow(
+            target,
+            "go",
+            Value::Null,
+        )))
+        .await;
+        let cancel = bounded(
+            ctx.cancellation_scope()
+                .run(ctx.request_cancel_external_workflow(target)),
+        )
+        .await;
+        let awaited = bounded(
+            ctx.cancellation_scope()
+                .run(ctx.await_external_workflow_value(target)),
+        )
+        .await;
+
+        assert!(
+            matches!(signal, Ok(Err(HarvestError::Config(_)))),
+            "{signal:?}"
+        );
+        assert!(
+            matches!(cancel, Ok(Err(HarvestError::Config(_)))),
+            "{cancel:?}"
+        );
+        assert!(
+            matches!(awaited, Ok(Err(HarvestError::Config(_)))),
+            "{awaited:?}"
+        );
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "nothing reaches the worker"
+        );
     }
 }
