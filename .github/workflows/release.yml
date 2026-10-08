@@ -39,9 +39,14 @@ on:
     branches: [trunk, trunk-dev]
     paths:
       - .github/workflows/release.yml
+      # The image inputs. A dependency change can add a shared library that
+      # the distroless runtime lacks. CI runs the runner acceptance suite on
+      # each source change.
       - Dockerfile
       - .dockerignore
       - rust-toolchain.toml
+      - Cargo.lock
+      - "**/Cargo.toml"
       - autumn-harvest-plugin/migrations/harvest/**
 
 # Read-only by default. Each job that needs more asks for it.

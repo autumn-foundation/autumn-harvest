@@ -1174,7 +1174,7 @@ const CHART: &str = "charts/autumn-harvest-worker";
 
 /// The image build runs third-party `build.rs` code. It must hold no token
 /// that can push, sign or attest. A pull request that changes the
-/// `Dockerfile` or `.dockerignore` runs it as a dry run.
+/// `Dockerfile`, `.dockerignore` or a dependency runs it as a dry run.
 #[test]
 fn release_builds_the_image_without_a_write_token() {
     let doc = parse_workflow(RELEASE_WORKFLOW);
@@ -1214,7 +1214,7 @@ fn release_builds_the_image_without_a_write_token() {
         .flatten()
         .filter_map(Value::as_str)
         .collect();
-    for path in ["Dockerfile", ".dockerignore"] {
+    for path in ["Dockerfile", ".dockerignore", "Cargo.lock", "**/Cargo.toml"] {
         assert!(
             paths.contains(&path),
             "a change to {path} must run the dry run: {paths:?}"

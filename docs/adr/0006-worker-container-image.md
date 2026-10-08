@@ -80,8 +80,10 @@ third-party build code holds no write token.
   readiness, and stops it with SIGTERM. It saves the image as a workflow
   artifact.
 - A pull request that changes the `Dockerfile`, `.dockerignore`,
-  `rust-toolchain.toml`, the plugin migrations or `release.yml` runs
-  `image` as a dry run.
+  `rust-toolchain.toml`, `Cargo.lock`, a `Cargo.toml`, the plugin
+  migrations or `release.yml` runs `image` as a dry run. A dependency
+  change can add a shared library that the runtime lacks. CI runs the
+  runner acceptance suite on each source change.
 - `publish-image` runs on a tag push only, after `validate` and both sign
   jobs. It pushes the image to GHCR and signs the pushed digest with
   keyless Sigstore. It verifies the signature against the identity of this
