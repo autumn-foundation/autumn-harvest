@@ -8076,8 +8076,12 @@ pub async fn rerun_workflow_execution_with_codecs(
                 // Documented gap: priority (issue #249) lives on the task-queue
                 // row, not the execution row, so it cannot be recovered here.
                 priority: Priority::default(),
-                // Same gap as priority. The re-run takes its quota key.
-                fairness_key: None,
+                // The re-run keeps the source run's tenant: a valid source
+                // quota key is its fairness key (issue #1976).
+                fairness_key: crate::queue_fairness::fairness_key_for(
+                    None,
+                    source.quota_key.as_deref(),
+                ),
                 max_workflow_input_bytes: request.max_workflow_input_bytes,
                 start_at: None,
                 delay: None,
