@@ -455,10 +455,10 @@ fn should_check_durable_cancellation(
 // ---------------------------------------------------------------------------
 
 /// Why a [`WorkflowCommand::CancelRaceLosers`] cancels its operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LoserCancelReason {
     /// A sibling branch of a race won.
-    #[default]
     RaceLoser,
     /// The cancellation scope that started the operations was cancelled
     /// (issue #1984).
@@ -1420,6 +1420,7 @@ impl<'a> MutexHandle<'a> {
     /// # Errors
     ///
     /// - [`HarvestError::MutexSelfDeadlock`] if the workflow already holds `key`.
+    /// - [`HarvestError::Config`] inside a cancellation scope (issue #1984).
     /// - [`HarvestError::NonDeterministic`] if recorded history diverges from the
     ///   expected `MutexGranted` for this key.
     pub async fn acquire(self) -> HarvestResult<MutexGuard<'a>> {
@@ -1433,6 +1434,16 @@ impl<'a> MutexHandle<'a> {
             return Err(HarvestError::MutexSelfDeadlock {
                 key: self.key.clone(),
             });
+        }
+
+        // Issue #1984: a cancelled scope drops a parked acquire, but its
+        // waiter row would stay at the head of the FIFO queue and block the
+        // key. So a scope cannot acquire a mutex.
+        if self.context.in_cancellable_scope() {
+            return Err(HarvestError::Config(format!(
+                "ctx.mutex({}).acquire() cannot run inside a cancellation scope",
+                self.key
+            )));
         }
 
         match self
@@ -14017,15 +14028,15 @@ impl WorkflowContext {
         withdrawn.into_iter().map(|buffered| buffered.cmd).collect()
     }
 
-    /// Keep only the members whose start event is in history.
-    pub(crate) fn recorded_scope_members(
+    /// Keep only the members that are still open in history.
+    pub(crate) fn open_scope_members(
         &self,
         members: &crate::cancellation_scope::ScopeMembers,
     ) -> crate::cancellation_scope::ScopeMembers {
         self.matcher
             .lock()
             .expect("matcher lock poisoned")
-            .recorded_members(members)
+            .open_members(members)
     }
 
     /// Find the details of an unconsumed marker without consuming it.

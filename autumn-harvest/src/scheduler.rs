@@ -3628,6 +3628,9 @@ async fn cancel_in_flight_runs(
     for raw_id in running_ids {
         let exec_id = ExecutionId::from_uuid(raw_id);
         match cancel_workflow_execution(conn, exec_id, reason, metrics).await {
+            // Issue #1984: a deferred cancel frees no slot until the run's
+            // open non-cancellable block closes.
+            Ok(cancelled) if cancelled.deferred => {}
             Ok(_) => count += 1,
             Err(error) => {
                 tracing::warn!(

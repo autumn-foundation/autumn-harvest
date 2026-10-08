@@ -248,6 +248,7 @@ Vantage translates raw `WorkflowEvent` type strings to friendlier labels:
 | `WorkflowCompleted` | Workflow completed |
 | `WorkflowFailed` | Workflow failed |
 | `WorkflowCancelled` | Workflow cancelled |
+| `WorkflowCancelRequested` | Cancel requested (deferred) |
 | `ActivityScheduled` | Activity scheduled: `{name}` |
 | `ActivityCompleted` | Activity completed |
 | `ActivityFailed` | Activity failed: `{error}` (truncated) |

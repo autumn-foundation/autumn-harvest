@@ -19995,16 +19995,6 @@ async fn persist_bookkeeping_and_requeue_workflow(
 /// external-cancel delivery pattern, issue #492) — never before, so a rolled
 /// back cancellation cannot have already started trigger workflows.
 #[doc(hidden)] // exposed for the #779 event-id-accounting integration test; not a stable API
-/// Whether `cmd` records the close marker of a non-cancellable block
-/// (issue #1984).
-fn closes_a_non_cancellable_block(cmd: &WorkflowCommand) -> bool {
-    matches!(
-        cmd,
-        WorkflowCommand::RecordMarker { name, .. }
-            if name.starts_with(crate::cancellation_scope::SHIELD_CLOSE_MARKER_PREFIX)
-    )
-}
-
 pub async fn apply_race_loser_cancellations(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -23628,6 +23618,9 @@ enum WorkflowPersistFlow {
         /// action it pre-computed for a plain `ContinuedAsNew`, using this
         /// flag, once this arm is reached.
         continue_as_new_redirected_to_failure: bool,
+        /// `true` when a deferred cancel (issue #1984) ended the run in place
+        /// of this cycle's failure or continue-as-new outcome.
+        deferred_cancel_ended_run: bool,
     },
 }
 
@@ -26910,14 +26903,23 @@ async fn process_workflow_task(
     // failure must never roll back the persisted decision).
     let is_terminal_with_commands =
         !pending_cmds.is_empty() && !matches!(&outcome, WorkflowOutcome::Suspended { .. });
-    // Issue #1984: a deferred cancel can complete only in a cycle that closes
-    // a non-cancellable block, so only such a cycle pays for the check.
-    let closes_non_cancellable_block = match &outcome {
-        WorkflowOutcome::Suspended { commands } => {
-            commands.iter().any(closes_a_non_cancellable_block)
-        }
-        _ => false,
-    };
+    // Issue #1984: a cancel that an open non-cancellable block deferred. The
+    // request is in the history that this cycle replayed. A request that
+    // lands later makes this cycle's event ids collide, so the cycle retries
+    // and then sees it.
+    let deferred_cancel_reason =
+        crate::execution::DeferredCancelState::of(&history_events).requested;
+    // A run that stays running completes the cancel once no block is open.
+    let check_deferred_cancel =
+        deferred_cancel_reason.is_some() && matches!(&outcome, WorkflowOutcome::Suspended { .. });
+    // A run that would fail or continue as new is cancelled instead, so a
+    // retry or a successor run cannot drop the cancel.
+    let deferred_cancel_ends_run = deferred_cancel_reason.filter(|_| {
+        matches!(
+            &outcome,
+            WorkflowOutcome::Failed { .. } | WorkflowOutcome::ContinuedAsNew { .. }
+        )
+    });
     let counter_action = schedule_counter_action(&outcome);
     // Issue #684: collect update.completed/failed metric data now, while
     // `history_events`, `outcome`, and `pending_cmds` are all still in scope
@@ -27050,6 +27052,35 @@ async fn process_workflow_task(
                 }
 
                 let mut pending_cancel_metrics = Vec::new();
+                if let Some(reason) = &deferred_cancel_ends_run {
+                    let (_, starts, checks, terminal_metric) =
+                        crate::execution::cancel_workflow_execution_collect_now(
+                            conn,
+                            prepared.exec_id,
+                            reason,
+                            Some(telemetry.metrics.as_ref()),
+                        )
+                        .await?;
+                    pending_cancel_metrics.extend(terminal_metric.map(
+                        |(workflow_name, queue_name)| {
+                            crate::execution::StartCancelledRun::terminated(
+                                workflow_name,
+                                queue_name,
+                            )
+                        },
+                    ));
+                    return Ok(WorkflowPersistFlow::Persisted {
+                        retry_scheduled: false,
+                        deferred_checks: checks
+                            .into_iter()
+                            .map(|(id, name)| (id, Some(name)))
+                            .collect(),
+                        race_deferred_triggers: starts,
+                        pending_cancel_metrics,
+                        continue_as_new_redirected_to_failure: false,
+                        deferred_cancel_ended_run: true,
+                    });
+                }
                 // Issue #1161: `false` unless the ContinuedAsNew outcome below
                 // (reached via either branch) redirects to a terminal failure —
                 // see `persist_workflow_outcome`'s parameter doc.
@@ -27105,10 +27136,9 @@ async fn process_workflow_task(
                     build_id,
                 )
                 .await?;
-                // Issue #1984: this cycle closed a non-cancellable block. When a
-                // cancel is pending and no block is open, cancel the run in this
-                // same transaction.
-                if closes_non_cancellable_block
+                // Issue #1984: a cancel is pending. When no block is open after
+                // this cycle, cancel the run in this same transaction.
+                if check_deferred_cancel
                     && let Some((_, starts, checks, terminal_metric)) =
                         crate::execution::complete_deferred_cancel(
                             conn,
@@ -27140,6 +27170,7 @@ async fn process_workflow_task(
                     race_deferred_triggers,
                     pending_cancel_metrics,
                     continue_as_new_redirected_to_failure,
+                    deferred_cancel_ended_run: false,
                 })
             })
             .await
@@ -27159,7 +27190,15 @@ async fn process_workflow_task(
             race_deferred_triggers,
             pending_cancel_metrics,
             continue_as_new_redirected_to_failure,
+            deferred_cancel_ended_run,
         }) => {
+            // Issue #1984: the cycle cancelled the run instead of its own
+            // outcome. `pending_cancel_metrics` carries the terminal metric.
+            if deferred_cancel_ended_run {
+                pending_workflow_metrics.status = WorkflowStatus::Suspended;
+                pending_workflow_metrics.is_continued_as_new = false;
+                pending_workflow_metrics.terminal = TerminalMetricsKind::Suspended;
+            }
             // Issue #1161 (Codex P2 on PR #1399): a ContinuedAsNew outcome
             // redirected internally to a terminal failure. Correct the
             // metrics and schedule-failure-counter action this cycle
@@ -27258,7 +27297,7 @@ async fn process_workflow_task(
             // `counter_action` was pre-computed as `None` for the ORIGINAL
             // `ContinuedAsNew` outcome. That is wrong once this cycle's real
             // persisted result was a terminal failure.
-            let effective_counter = if retry_scheduled {
+            let effective_counter = if retry_scheduled || deferred_cancel_ended_run {
                 None
             } else if continue_as_new_redirected_to_failure {
                 Some(true)

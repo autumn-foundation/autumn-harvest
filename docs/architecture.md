@@ -1290,7 +1290,7 @@ let out: Quote = winner.decode()?;       // winner.index tells you which branch 
 ```rust
 let scope = ctx.cancellation_scope();
 let (charged, ()) = tokio::join!(
-    scope.run(ctx.execute_activity_raw("charge", input, "payments")),
+    scope.run(ctx.execute_activity_raw("charge", input.clone(), "payments")),
     async {
         let _ = ctx.wait_for_signal("abort").await;
         scope.cancel();               // activity, timer and child members are cancelled
@@ -1305,9 +1305,9 @@ if let Err(HarvestError::Cancelled(_)) = charged {
 
 **Determinism contract.** The decision is the marker `cancel_scope:{seq}`. Its details name the members and the `horizon`, the history length that the cancelling cycle saw. The same transaction runs `CancelRaceLosers { reason: ScopeCancelled, .. }`, the race teardown. The body's commands from the cancelling cycle are withdrawn, so nothing that the body started in that cycle reaches the worker. On replay the scope finds its marker before the first poll. It polls the body with the matcher cut at the horizon, holds the body's commands, and consumes the members' events when it reaches the marker. A completion that arrived during the cancelling cycle therefore cannot change the replayed outcome.
 
-**Non-cancellable block.** The block records `non_cancellable_open:{seq}` and `non_cancellable_close:{seq}`. A cancel that finds an open block appends `WorkflowCancelRequested` once and keeps the run `RUNNING` (`CancelledWorkflowExecution::deferred`). Replay skips that event, and workflow code does not see it. The decision cycle that closes the last open block runs the terminal cancel in the same transaction. If the run completes or fails in that cycle instead, that outcome stands. A terminate, `TerminateIfRunning`, signal-with-start replace and latest-wins supersede are never deferred.
+**Non-cancellable block.** The block records `non_cancellable_open:{seq}` and `non_cancellable_close:{seq}`. A cancel that finds an open block on a `RUNNING` run appends `WorkflowCancelRequested` once and keeps the run running (`CancelledWorkflowExecution::deferred`, and `deferred` in the REST response). Replay skips that event, and workflow code does not see it. The first suspended cycle with no open block runs the terminal cancel in the same transaction. A cycle that would fail or continue as new is cancelled instead, so no retry or successor drops the cancel. A cycle that completes keeps its result. A paused run is not deferred, because it cannot close its block. A terminate, `TerminateIfRunning`, signal-with-start replace and latest-wins supersede are never deferred.
 
-**Limits.** A block cannot nest inside a cancellable scope (`HarvestError::Config`); a scope can nest inside a block. A cancel that finds no open block is terminal at once, so durable cleanup after such a cancel is still not possible. Local activities, external activities and detached children are not cancelled by a scope. A block dropped before it completes still records its close marker, except when the cycle suspends.
+**Limits.** A block cannot nest inside a cancellable scope (`HarvestError::Config`); a scope can nest inside a block. A scope cannot acquire a durable mutex, because a dropped acquire would block the key's FIFO queue. A cancel that finds no open block is terminal at once, so durable cleanup after such a cancel is still not possible. Local activities, external activities and detached children are not cancelled by a scope; replay consumes a late external result. A block dropped before it completes still records its close marker, except when the cycle suspends.
 
 ### Local Activities
 

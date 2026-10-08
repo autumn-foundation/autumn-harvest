@@ -113,7 +113,8 @@ roll.
   `ctx.non_cancellable` block writes the new `WorkflowCancelRequested`
   event. A worker of an earlier version cannot read it. Only a run whose
   code calls `ctx.non_cancellable` gets the event, and that code needs the
-  new version. Deploy such code after the roll.
+  new version. Deploy such code after the roll. A rollback strands a run
+  that already holds the event, so finish or terminate those runs first.
 - **Codec key rotation, shard rebalancing, DR fencing and
   `harvest partition enable`.** 0.6 does not know these features. Start
   them after the roll. The codec fleet gate above enforces this for key

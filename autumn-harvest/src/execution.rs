@@ -397,9 +397,10 @@ impl StartedWorkflowExecution {
 pub struct CancelledWorkflowExecution {
     /// Cancelled workflow execution ID.
     pub exec_id: ExecutionId,
-    /// Final execution state.
+    /// Final execution state, or the live state when `deferred` is `true`.
     pub state: String,
-    /// Stored cancellation reason.
+    /// Stored cancellation reason. When `deferred` is `true`, the reason
+    /// that the deferred cancel will apply.
     pub reason: String,
     /// `true` when this request performed the terminal transition.
     pub newly_cancelled: bool,
@@ -540,6 +541,9 @@ impl DeferredCancelState {
                 WorkflowEvent::WorkflowCancelRequested { reason } if requested.is_none() => {
                     requested = Some(reason.clone());
                 }
+                // A reset copies the source history. A request from the source
+                // run does not apply to the new run.
+                WorkflowEvent::WorkflowResetFork { .. } => requested = None,
                 _ => {}
             }
         }
@@ -581,6 +585,27 @@ mod deferred_cancel_state_tests {
 
         assert_eq!(state.open_blocks, 1);
         assert_eq!(state.requested.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn a_reset_fork_drops_a_request_from_the_source_run() {
+        let events = [
+            marker("non_cancellable_open:1"),
+            WorkflowEvent::WorkflowCancelRequested {
+                reason: "source".into(),
+            },
+            WorkflowEvent::WorkflowResetFork {
+                reset_from_exec_id: crate::types::ExecutionId::new(),
+                reset_to_event_id: 1,
+                reason: "replay".into(),
+                operator_id: "ops".into(),
+            },
+        ];
+
+        let state = DeferredCancelState::of(&events);
+
+        assert_eq!(state.open_blocks, 1);
+        assert_eq!(state.requested, None);
     }
 
     #[test]
@@ -3873,6 +3898,43 @@ pub(crate) async fn complete_deferred_cancel(
     }
 }
 
+/// Defer a cancel while the run has an open non-cancellable block
+/// (issue #1984).
+///
+/// The first request is recorded as `WorkflowCancelRequested`, and a later
+/// request adds nothing. State and tasks stay as they are. A paused run
+/// cannot close its block, so its cancel is not deferred. Returns the reason
+/// that the deferred cancel will apply, or `None` when the cancel goes ahead.
+async fn defer_cancel_for_open_block(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    state: &str,
+    history: &store::EventHistory,
+    reason: &str,
+) -> HarvestResult<Option<String>> {
+    if state != "RUNNING" {
+        return Ok(None);
+    }
+    let pending = DeferredCancelState::of(&history.events);
+    if pending.open_blocks == 0 {
+        return Ok(None);
+    }
+    if let Some(first) = pending.requested {
+        return Ok(Some(first));
+    }
+    store::append_events_with_codecs(
+        conn,
+        exec_id,
+        &[WorkflowEvent::WorkflowCancelRequested {
+            reason: reason.to_string(),
+        }],
+        history.next_event_id,
+        &crate::store::DEFAULT_PAYLOAD_CODECS,
+    )
+    .await?;
+    Ok(Some(reason.to_string()))
+}
+
 #[allow(clippy::too_many_lines)]
 async fn cancel_workflow_execution_collect_mode(
     conn: &mut AsyncPgConnection,
@@ -3948,28 +4010,16 @@ async fn cancel_workflow_execution_collect_mode(
             let history = store::load_history_undecoded(conn, exec_id).await?;
 
             // Issue #1984: an open non-cancellable block defers the cancel.
-            // The request is recorded once. State and tasks stay as they are.
-            if defer_for_open_blocks {
-                let pending = DeferredCancelState::of(&history.events);
-                if pending.open_blocks > 0 {
-                    if pending.requested.is_none() {
-                        store::append_events_with_codecs(
-                            conn,
-                            exec_id,
-                            &[WorkflowEvent::WorkflowCancelRequested {
-                                reason: reason.clone(),
-                            }],
-                            history.next_event_id,
-                            &crate::store::DEFAULT_PAYLOAD_CODECS,
-                        )
-                        .await?;
-                    }
-                    return Ok((
-                        CancelledWorkflowExecution::deferred(exec_id, execution, reason),
-                        Vec::new(),
-                        Vec::new(),
-                    ));
-                }
+            if defer_for_open_blocks
+                && let Some(applied) =
+                    defer_cancel_for_open_block(conn, exec_id, &execution.state, &history, &reason)
+                        .await?
+            {
+                return Ok((
+                    CancelledWorkflowExecution::deferred(exec_id, execution, applied),
+                    Vec::new(),
+                    Vec::new(),
+                ));
             }
 
             let deleted_pending = diesel::delete(
@@ -6167,6 +6217,26 @@ async fn cascade_cancel_detached_child(
 ) -> HarvestResult<(bool, Vec<DeferredTriggerStart>, Vec<(ExecutionId, String)>)> {
     let mut deferred_starts = Vec::new();
     let mut closed_executions = Vec::new();
+
+    // Issue #1984: an open non-cancellable block defers this cancel, as it
+    // does for a cross-shard child.
+    let state: Option<String> = harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .select(harvest_workflow_executions::state)
+        .for_update()
+        .first(conn)
+        .await
+        .optional()
+        .map_err(database_error)?;
+    if let Some(state) = state {
+        let history = store::load_history_undecoded(conn, exec_id).await?;
+        if defer_cancel_for_open_block(conn, exec_id, &state, &history, reason)
+            .await?
+            .is_some()
+        {
+            return Ok((true, deferred_starts, closed_executions));
+        }
+    }
 
     let updated = diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))

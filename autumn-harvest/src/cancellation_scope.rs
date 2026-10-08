@@ -35,10 +35,10 @@ pub(crate) fn shield_close_marker_name(seq: u32) -> String {
 }
 
 /// Name prefix of the marker that opens a non-cancellable block.
-pub const SHIELD_OPEN_MARKER_PREFIX: &str = "non_cancellable_open:";
+pub(crate) const SHIELD_OPEN_MARKER_PREFIX: &str = "non_cancellable_open:";
 
 /// Name prefix of the marker that closes a non-cancellable block.
-pub const SHIELD_CLOSE_MARKER_PREFIX: &str = "non_cancellable_close:";
+pub(crate) const SHIELD_CLOSE_MARKER_PREFIX: &str = "non_cancellable_close:";
 
 /// The operations that a scope cancels.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,7 +56,8 @@ impl ScopeMembers {
     fn add_from(&mut self, cmd: &WorkflowCommand) {
         match cmd {
             WorkflowCommand::ScheduleActivity { activity_id, .. }
-            | WorkflowCommand::WaitForActivity { activity_id, .. } => {
+            | WorkflowCommand::WaitForActivity { activity_id, .. }
+            | WorkflowCommand::ScheduleExternalActivity { activity_id, .. } => {
                 if !self.activities.contains(activity_id) {
                     self.activities.push(*activity_id);
                 }
@@ -200,7 +201,8 @@ pub(crate) fn route_command(
 /// ```
 ///
 /// Local activities, external activities and detached children are not
-/// cancelled, but the body still stops. A scope runs one body only.
+/// cancelled, but the body still stops. A scope runs one body only. A body
+/// cannot acquire a durable mutex: a dropped acquire would block the key.
 #[derive(Clone)]
 pub struct CancellationScope<'a> {
     ctx: &'a WorkflowContext,
@@ -328,7 +330,7 @@ impl<F: Future> ScopeRun<'_, F> {
             ))
         } else {
             withdrawn = ctx.withdraw_scope_commands(seq);
-            let members = ctx.recorded_scope_members(&self.shared.lock().members);
+            let members = ctx.open_scope_members(&self.shared.lock().members);
             ctx.consume_cancelled_member_frontier(&members);
             let marker = CancelMarker {
                 reason: SCOPE_CANCEL_REASON.to_string(),
@@ -530,8 +532,10 @@ impl WorkflowContext {
     /// The block records a marker when it opens and when it closes. A
     /// workflow cancel that arrives while a block is open is deferred. The
     /// cancel request is recorded as `WorkflowCancelRequested`, and the run
-    /// continues. When the last open block closes, the engine cancels the
-    /// run at the end of that cycle. A terminate is never deferred.
+    /// continues. The first suspended cycle with no open block cancels the
+    /// run. A cycle that would fail or continue as new is cancelled instead.
+    /// A cycle that completes keeps its result. A terminate, a paused run
+    /// and a replace-on-start policy are never deferred.
     ///
     /// Workflow code does not see a deferred cancel: `is_cancelled` stays
     /// `false` until the cancel completes.
@@ -703,6 +707,10 @@ mod tests {
             "{result:?}"
         );
         let commands = ctx.drain_commands();
+        assert!(
+            marker(&commands, "cancel_scope:1").is_some(),
+            "{commands:?}"
+        );
         let losers = losers(&commands).expect("the scope must cancel its members");
         assert_eq!(losers.timers, vec![TimerId::new("deadline")]);
         assert_eq!(
@@ -1078,5 +1086,271 @@ mod tests {
         );
         let losers = losers(&ctx.drain_commands()).expect("the inner scope cancels");
         assert_eq!(losers.activities, vec![a]);
+    }
+
+    /// A member kind for the per-kind replay test.
+    enum Kind {
+        Activity,
+        Timer,
+        Child,
+    }
+
+    /// Cancels a scope over one in-flight member when `abort` arrives.
+    async fn abort_member(ctx: &WorkflowContext, kind: &Kind) -> HarvestResult<()> {
+        let scope = ctx.cancellation_scope();
+        let body = async {
+            match kind {
+                Kind::Activity => ctx
+                    .execute_activity_raw("charge", Value::Null, "default")
+                    .await
+                    .map(drop),
+                Kind::Timer => ctx.timer("deadline", 60).await,
+                Kind::Child => ctx
+                    .spawn_child_workflow_raw("child", Value::Null)
+                    .await
+                    .map(drop),
+            }
+        };
+        let (result, ()) = tokio::join!(scope.run(body), async {
+            let _ = ctx.wait_for_signal("abort").await;
+            scope.cancel();
+        });
+        result?
+    }
+
+    /// AC3 per kind: the cancel cycle records the marker. A replay of the
+    /// persisted history returns the same result and adds nothing.
+    async fn replay_member_kind(kind: Kind) {
+        let exec_id = ExecutionId::new();
+        let a = ActivityExecId::new();
+        let child = ExecutionId::new();
+        let start = match kind {
+            Kind::Activity => scheduled(a, "charge"),
+            Kind::Timer => WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new("deadline"),
+                duration_secs: 60,
+            },
+            Kind::Child => WorkflowEvent::ChildWorkflowStarted {
+                child_id: child,
+                workflow_name: "child".into(),
+                input: Value::Null,
+            },
+        };
+        let mut history = vec![
+            started(),
+            start,
+            WorkflowEvent::SignalReceived {
+                signal_name: "abort".into(),
+                payload: Value::Null,
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(exec_id, history.clone());
+        let live = bounded(abort_member(&ctx, &kind)).await;
+        assert!(matches!(live, Err(HarvestError::Cancelled(_))), "{live:?}");
+        let commands = ctx.drain_commands();
+        let details = marker(&commands, "cancel_scope:1").expect("the cancel is recorded");
+        assert!(losers(&commands).is_some(), "{commands:?}");
+
+        history.push(WorkflowEvent::MarkerRecorded {
+            name: "cancel_scope:1".into(),
+            details,
+        });
+        match kind {
+            Kind::Activity => history.push(WorkflowEvent::ActivityFailed {
+                activity_id: a,
+                error: "cancelled by its cancellation scope".into(),
+                attempt: 1,
+                error_type: "Error".into(),
+                non_retryable: true,
+                details: None,
+            }),
+            Kind::Child => history.push(WorkflowEvent::child_workflow_failed(
+                child,
+                "cancelled by its cancellation scope",
+            )),
+            Kind::Timer => {}
+        }
+
+        let ctx = WorkflowContext::for_replay(exec_id, history);
+        let replayed = bounded(abort_member(&ctx, &kind)).await;
+        assert!(
+            matches!(replayed, Err(HarvestError::Cancelled(_))),
+            "{replayed:?}"
+        );
+        assert!(ctx.take_nd_details().is_none());
+        let commands = ctx.drain_commands();
+        assert!(commands.is_empty(), "replay must add nothing: {commands:?}");
+        assert!(!ctx.history_has_unconsumed_events());
+    }
+
+    #[tokio::test]
+    async fn replay_of_a_cancelled_activity_member_is_deterministic() {
+        replay_member_kind(Kind::Activity).await;
+    }
+
+    #[tokio::test]
+    async fn replay_of_a_cancelled_timer_member_is_deterministic() {
+        replay_member_kind(Kind::Timer).await;
+    }
+
+    #[tokio::test]
+    async fn replay_of_a_cancelled_child_member_is_deterministic() {
+        replay_member_kind(Kind::Child).await;
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_cancel_marker_is_non_deterministic() {
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started(),
+                WorkflowEvent::MarkerRecorded {
+                    name: "cancel_scope:1".into(),
+                    details: json!("not a cancel record"),
+                },
+            ],
+        );
+
+        let result = bounded(run_then_cancel(&ctx, async { 1 })).await;
+
+        assert!(
+            matches!(result, Err(HarvestError::NonDeterministic { .. })),
+            "{result:?}"
+        );
+    }
+
+    /// An outer cancel also cancels an operation of a nested scope.
+    #[tokio::test]
+    async fn an_outer_cancel_reaches_a_nested_scope_member() {
+        let a = ActivityExecId::new();
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![started(), scheduled(a, "charge")],
+        );
+        let inner = ctx.cancellation_scope();
+
+        let result = bounded(run_then_cancel(
+            &ctx,
+            inner.run(ctx.execute_activity_raw("charge", Value::Null, "default")),
+        ))
+        .await;
+
+        assert!(
+            matches!(result, Err(HarvestError::Cancelled(_))),
+            "{result:?}"
+        );
+        let commands = ctx.drain_commands();
+        assert!(
+            marker(&commands, "cancel_scope:1").is_none(),
+            "{commands:?}"
+        );
+        assert!(
+            marker(&commands, "cancel_scope:2").is_some(),
+            "{commands:?}"
+        );
+        let losers = losers(&commands).expect("the outer scope cancels");
+        assert_eq!(losers.activities, vec![a]);
+    }
+
+    /// Reverse-brainstorm R5: a block dropped before it completes closes.
+    #[tokio::test]
+    async fn a_dropped_non_cancellable_block_still_closes() {
+        let ctx = WorkflowContext::new_test();
+
+        let parked = tokio::time::timeout(
+            Duration::from_millis(50),
+            ctx.non_cancellable(ctx.timer("cleanup", 60)),
+        )
+        .await;
+
+        assert!(parked.is_err(), "the block parks on its timer");
+        let commands = ctx.drain_commands();
+        assert!(
+            marker(&commands, "non_cancellable_open:1").is_some(),
+            "{commands:?}"
+        );
+        assert!(
+            marker(&commands, "non_cancellable_close:1").is_some(),
+            "{commands:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mutex_acquire_inside_a_scope_is_rejected() {
+        let ctx = WorkflowContext::new_test();
+        let scope = ctx.cancellation_scope();
+
+        let result = bounded(scope.run(async { ctx.mutex("key").acquire().await.map(drop) })).await;
+
+        assert!(
+            matches!(result, Ok(Err(HarvestError::Config(_)))),
+            "{result:?}"
+        );
+    }
+
+    /// An external activity in a cancelled scope delivers its result later.
+    /// Replay consumes it, so the next command still matches.
+    #[tokio::test]
+    async fn a_late_external_result_of_a_cancelled_member_is_consumed() {
+        let exec_id = ExecutionId::new();
+        let a = ActivityExecId::new();
+        let token = crate::types::ExternalActivityToken::new();
+        async fn wf(ctx: &WorkflowContext) -> HarvestResult<Value> {
+            let scope = ctx.cancellation_scope();
+            let (approved, ()) = tokio::join!(
+                scope.run(ctx.execute_activity_external("approve", Value::Null, "default", 3600)),
+                async {
+                    let _ = ctx.wait_for_signal("abort").await;
+                    scope.cancel();
+                }
+            );
+            assert!(matches!(approved, Err(HarvestError::Cancelled(_))));
+            ctx.execute_activity_raw("after", Value::Null, "default")
+                .await
+        }
+        let mut history = vec![
+            started(),
+            WorkflowEvent::ActivityAwaitingExternal {
+                activity_id: a,
+                token,
+                name: "approve".into(),
+                input: Value::Null,
+                queue: "default".into(),
+                schedule_to_close_secs: 3600,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "abort".into(),
+                payload: Value::Null,
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(exec_id, history.clone());
+        let live = tokio::time::timeout(Duration::from_millis(50), wf(&ctx)).await;
+        assert!(live.is_err(), "the workflow parks on `after`");
+        let commands = ctx.drain_commands();
+        let details = marker(&commands, "cancel_scope:1").expect("the cancel is recorded");
+        let after = scheduled_id(&commands, "after");
+
+        history.push(WorkflowEvent::MarkerRecorded {
+            name: "cancel_scope:1".into(),
+            details,
+        });
+        history.push(scheduled(after, "after"));
+        history.push(WorkflowEvent::ActivityCompletedExternally {
+            activity_id: a,
+            token,
+            output: json!("approved late"),
+        });
+        history.push(WorkflowEvent::ActivityCompleted {
+            activity_id: after,
+            output: json!("done"),
+        });
+
+        let ctx = WorkflowContext::for_replay(exec_id, history);
+        let replayed = bounded(wf(&ctx)).await;
+        assert_eq!(replayed.ok(), Some(json!("done")));
+        assert!(ctx.take_nd_details().is_none());
+        assert!(ctx.drain_commands().is_empty());
+        assert!(!ctx.history_has_unconsumed_events());
     }
 }

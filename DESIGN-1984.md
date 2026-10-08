@@ -89,7 +89,8 @@ its next poll:
 2. **Live.** It removes the commands its body issued in this cycle
    (`ReleaseMutex` stays). It records the marker `cancel_scope:{seq}` with the
    reason, the horizon and the member ids. It pushes
-   `CancelRaceLosers { reason: Scope, .. }` for the members. It returns
+   `CancelRaceLosers { reason: ScopeCancelled, .. }` for the open members.
+   It returns
    `Err(Cancelled)` and drops the body.
 3. **Replay.** At the first poll the scope finds its marker ahead. Then it
    polls the body with the matcher cut at the horizon, and it holds the body's
@@ -105,10 +106,20 @@ The shield records `non_cancellable_open:{seq}` before its first poll of the
 body and `non_cancellable_close:{seq}` when the body completes.
 
 `cancel_workflow_execution_collect` counts open shields in history. If one is
-open, it appends `WorkflowCancelRequested { reason }` once, keeps the state
-and the tasks, and returns `deferred = true`. Each persisted cycle that stays
-running checks for a pending request with no open shield, and then runs the
-terminal cancel in the same transaction.
+open and the run is `RUNNING`, it appends `WorkflowCancelRequested { reason }`
+once, keeps the state and the tasks, and returns `deferred = true`. A paused
+run cannot close its block, so its cancel is not deferred.
+
+The worker reads the request from the history that the cycle replayed:
+
+- A cycle that suspends completes the cancel when no block is open. This
+  covers a block that closed in an inline local-activity loop.
+- A cycle that fails or continues as new is cancelled instead, so a retry or
+  a successor cannot drop the cancel.
+- A cycle that completes keeps its result.
+
+The same-shard parent-close cascade defers in the same way as the
+cross-shard path. A reset drops a request that it copies from the source.
 
 ### 1.3 Worker
 
@@ -117,7 +128,9 @@ cancel reason name it. No other worker path changes.
 
 ### 1.4 Limits
 
-- A shield cannot nest inside a cancellable scope.
+- A shield cannot nest inside a cancellable scope. A scope cannot acquire a
+  durable mutex: a dropped acquire would block the key's waiter queue.
 - A cancel that arrives when no shield is open is still terminal at once.
-- Local activities and external activities in a scope are not cancelled.
-  The scope still drops the body.
+- Local activities, external activities and detached children in a scope
+  are not cancelled. The scope still drops the body, and replay consumes a
+  late external result.

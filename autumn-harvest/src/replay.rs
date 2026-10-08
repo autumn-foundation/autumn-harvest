@@ -6383,8 +6383,12 @@ impl HistoryMatcher {
         }
     }
 
-    /// Keep only the scope members whose start event is in history.
-    pub(crate) fn recorded_members(
+    /// Keep only the scope members that are still open (issue #1984).
+    ///
+    /// A member is open when its start event is in history and its terminal
+    /// is not. A warm (resident) cycle and a cold replay then name the same
+    /// members.
+    pub(crate) fn open_members(
         &self,
         members: &crate::cancellation_scope::ScopeMembers,
     ) -> crate::cancellation_scope::ScopeMembers {
@@ -6393,14 +6397,30 @@ impl HistoryMatcher {
         let mut timers = HashSet::new();
         for event in &self.events {
             match event {
-                WorkflowEvent::ActivityScheduled { activity_id, .. } => {
+                WorkflowEvent::ActivityScheduled { activity_id, .. }
+                | WorkflowEvent::ActivityAwaitingExternal { activity_id, .. } => {
                     activities.insert(*activity_id);
+                }
+                WorkflowEvent::ActivityCompleted { activity_id, .. }
+                | WorkflowEvent::ActivityFailed { activity_id, .. }
+                | WorkflowEvent::ActivityTimedOut { activity_id, .. }
+                | WorkflowEvent::ActivityCompletedExternally { activity_id, .. }
+                | WorkflowEvent::ActivityFailedExternally { activity_id, .. } => {
+                    activities.remove(activity_id);
                 }
                 WorkflowEvent::ChildWorkflowStarted { child_id, .. } => {
                     children.insert(*child_id);
                 }
+                WorkflowEvent::ChildWorkflowCompleted { child_id, .. }
+                | WorkflowEvent::ChildWorkflowFailed { child_id, .. } => {
+                    children.remove(child_id);
+                }
                 WorkflowEvent::TimerStarted { timer_id, .. } => {
                     timers.insert(timer_id.as_str());
+                }
+                WorkflowEvent::TimerFired { timer_id }
+                | WorkflowEvent::TimerCancelled { timer_id } => {
+                    timers.remove(timer_id.as_str());
                 }
                 _ => {}
             }
@@ -6521,7 +6541,11 @@ impl HistoryMatcher {
                 | WorkflowEvent::ActivityHeartbeat { activity_id, .. }
                 | WorkflowEvent::ActivityCompleted { activity_id, .. }
                 | WorkflowEvent::ActivityFailed { activity_id, .. }
-                | WorkflowEvent::ActivityTimedOut { activity_id, .. } => {
+                | WorkflowEvent::ActivityTimedOut { activity_id, .. }
+                | WorkflowEvent::ActivityAwaitingExternal { activity_id, .. }
+                | WorkflowEvent::ActivityCompletedExternally { activity_id, .. }
+                | WorkflowEvent::ActivityFailedExternally { activity_id, .. }
+                | WorkflowEvent::ActivityExternalDeadlineExtended { activity_id, .. } => {
                     members.activities.contains(activity_id)
                 }
                 WorkflowEvent::ChildWorkflowStarted { child_id, .. }
