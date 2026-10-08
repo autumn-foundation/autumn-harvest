@@ -62,6 +62,15 @@ moment the tool cannot tell what changed is the worst option available.
 (This is why the `lint` checkout uses `fetch-depth: 0`: without real
 history there is no merge base, and the step would silently stop gating.)
 
+A PR ratchets against its merge base, or against the commit that added
+the gate if the merge base predates it. Only the release PR from
+`trunk-dev` into `trunk` hits the second case, and only while `trunk` is
+older than the gate. Its merge base is then the last release, so the
+legacy population from before the gate would count as new. The gate
+commit still checks the whole release cumulatively. A push run on
+`trunk-dev` can be cancelled, and two clean PRs can merge into a new
+finding, so the release PR is the last place to catch either.
+
 **It reads every comment, via a lexer.** Leading and trailing `//`,
 `///`, `//!` and `/* */` (nested and doc forms included) all count — a
 defect introduced as `let n = 1; // TODO: fix` is gated exactly like one

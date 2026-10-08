@@ -46836,13 +46836,13 @@ async fn list_workers_handler(
     // shard survive while the freshest Draining row on another is dropped before
     // dedup — returning the obsolete snapshot. The queue filter (read from the
     // worker's advertised JSON, identical across rows) is kept here. `shard_id`
-    // is deliberately dropped from the per-shard query below and reapplied
-    // after, source-aware (issue #1213) — it is NOT shard-invariant: an
+    // is deliberately dropped from the per-shard query below. It is reapplied
+    // after, source-aware (issue #1213). It is NOT shard-invariant. An
     // empty-array (auto/legacy) row means "covers whatever shard it was read
-    // from", so evaluating it against the caller's requested shard while
-    // reading from every OTHER shard in the fan-out would falsely match. Use
-    // i64::MAX as the per-shard limit so list_workers performs no truncation
-    // before the global sort+truncate below.
+    // from". The fan-out also reads such rows from every OTHER shard. An
+    // evaluation of those rows against the caller's requested shard would
+    // falsely match. Use i64::MAX as the per-shard limit so list_workers
+    // performs no truncation before the global sort+truncate below.
     let requested_shard_id = filters.shard_id;
     let per_shard_filters = WorkerFilters {
         limit: i64::MAX,
@@ -46862,8 +46862,9 @@ async fn list_workers_handler(
                 .await
                 .map_err(|e| e.to_string())?;
             // Issue #1213: evaluate shard coverage against the shard this row
-            // was actually read from, not blindly against the caller's
-            // requested shard — see the source-aware predicate doc above.
+            // was actually read from. Do not evaluate it blindly against the
+            // caller's requested shard. See the source-aware predicate doc
+            // above.
             if let Some(requested) = requested_shard_id {
                 rows.retain(|r| {
                     autumn_harvest::workers::shard_assignments_cover_from_source(

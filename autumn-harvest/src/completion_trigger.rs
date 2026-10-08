@@ -806,8 +806,8 @@ pub async fn resolve_cross_shard_target_queue(
 }
 
 /// Backoff stamped on an outbox row's `next_attempt_at` when a relay attempt
-/// hits `QuotaExceeded` (issue #1227, Finding 4; follow-up to #946/#1221's
-/// Codex round-6 review). Mirrors `throttle.rs`/`debounce.rs`'s
+/// hits `QuotaExceeded` (issue #1227, Finding 4; a follow-up to #946 and
+/// #1221). Mirrors `throttle.rs`/`debounce.rs`'s
 /// identically-named, identically-valued constant, kept separate per file
 /// purely for log/intent clarity.
 #[cfg(feature = "db")]
@@ -828,13 +828,13 @@ const fn backoff_secs(delay: chrono::Duration) -> f64 {
 const OUTBOX_CLAIM_BATCH_LIMIT: i64 = 50;
 
 /// Slots of `OUTBOX_CLAIM_BATCH_LIMIT` reserved for retry-eligible rows
-/// (issue #1227, Finding 4, Codex round-2 P2 on PR #1386) so a sustained
-/// arrival of fresh (never-attempted) rows can never fill every batch and
-/// strand a previously-blocked row even after its target's quota frees up.
-/// 20% of the batch -- large enough that a retry backlog visibly drains
-/// across a handful of ticks rather than one row at a time, small enough
-/// that a genuine flood of fresh work still gets the large majority of each
-/// batch.
+/// (issue #1227, Finding 4, PR #1386). With them, a sustained arrival of
+/// fresh (never-attempted) rows can never fill every batch. So it can never
+/// strand a previously-blocked row after its target's quota frees up.
+/// The reservation is 20% of the batch. It is large enough that a retry
+/// backlog visibly drains across a handful of ticks, not one row at a time.
+/// It is small enough that a genuine flood of fresh work still gets the
+/// large majority of each batch.
 #[cfg(feature = "db")]
 const OUTBOX_RETRY_RESERVED_SLOTS: i64 = 10;
 
@@ -866,24 +866,26 @@ enum RelayOutcome {
     /// relay does NOT re-record it — `reason` is kept only for the tracing log.
     Blocked { reason: String },
     /// A declared per-tenant quota (issue #946, Task #7 hardening) is exhausted
-    /// on the target at relay time. Unlike `Blocked` (an operator-lifted
-    /// admission gate, with no natural "retry later" cadence, so the row is
-    /// dropped) this is TEMPORARY -- the tenant's usage frees up as an
-    /// existing execution completes or is deleted -- so the outbox row is
-    /// left claimable (never deleted, the fires row never touched) rather than
-    /// dropped or propagated as an error. `enforce_completion_triggers_outbox`
-    /// naturally re-attempts the row on a later scan; the core start
-    /// primitive already recorded `harvest.quota.rejected` inside
+    /// on the target at relay time. `Blocked` is an operator-lifted admission
+    /// gate with no natural "retry later" cadence, so its row is dropped.
+    /// This outcome is TEMPORARY instead. The tenant's usage frees up as an
+    /// existing execution completes or is deleted. So the outbox row stays
+    /// claimable: it is never deleted, and the fires row is never touched.
+    /// The row is not dropped or propagated as an error either.
+    /// `enforce_completion_triggers_outbox` naturally re-attempts the row on
+    /// a later scan. The core start primitive already recorded
+    /// `harvest.quota.rejected` inside
     /// `start_or_load_workflow_execution_collect`, so the relay does NOT
     /// re-record it here.
     ///
     /// The row's `next_attempt_at` is stamped to `now() + QUOTA_REDEFER_BACKOFF`
     /// (issue #1227, Finding 4) so the claim query excludes it until the
-    /// backoff elapses. Pre-#1227 the row was left with no cadence tracking
-    /// at all, so a target durably at quota cap (e.g. a `max_dead_letters`
-    /// cap, which only clears via manual operator action) could dominate
-    /// every unordered `LIMIT 50` claim batch on every scanner tick, starving
-    /// any OTHER, unrelated relay sharing the batch.
+    /// backoff elapses. Pre-#1227 the row had no cadence tracking at all.
+    /// A target durably at quota cap could then dominate every unordered
+    /// `LIMIT 50` claim batch on every scanner tick. That row starved any
+    /// OTHER, unrelated relay sharing the batch. One example is a
+    /// `max_dead_letters` cap, which clears only through manual operator
+    /// action.
     QuotaBlocked {
         key: String,
         resource: crate::quota::QuotaResource,
@@ -980,13 +982,14 @@ async fn relay_gate_checked_start(
     // is a separate connection whose own transaction commits independently.
     //
     // The claim's `WHERE` re-checks the SAME backoff eligibility predicate the
-    // caller's batch `SELECT` already filtered on (Codex round-1 P2 on PR
-    // #1386): with multiple scanner replicas, that outer `SELECT` takes no
-    // lock, so a row loaded into replica A's batch can be claimed and
-    // QuotaBlocked-restamped by replica B in between -- without this
+    // caller's batch `SELECT` already filtered on (issue #1227, PR #1386).
+    // With multiple scanner replicas, that outer `SELECT` takes no lock. So
+    // after replica A loads a row into its batch, replica B can claim and
+    // QuotaBlocked-restamp that row before A claims it. Without this
     // re-check, A's `id`-only claim would still succeed once B's transaction
-    // commits and releases the row, driving an extra admission attempt on a
-    // row whose backoff a peer just (re)armed, one bypass per stale reader.
+    // commits and releases the row. That drives an extra admission attempt
+    // on a row whose backoff a peer just (re)armed, one bypass per stale
+    // reader.
     //
     // Compares against Postgres's own `NOW()`, not a host-sampled
     // `chrono::Utc::now()` (issue #1392). Every replica's clock can drift
@@ -1001,10 +1004,10 @@ async fn relay_gate_checked_start(
             .optional()
             .map_err(crate::error::database_error)?;
             if claimed.is_none() {
-                // Either a sibling relay path / peer replica owns this row
-                // right now, or its backoff has not elapsed (including one a
-                // concurrent replica just armed after this row was loaded
-                // into the caller's batch).
+                // Either a sibling relay path or a peer replica owns this row
+                // right now, or its backoff has not elapsed. That includes a
+                // backoff that a concurrent replica just armed after this row
+                // was loaded into the caller's batch.
                 return Ok(RelayOutcome::Skipped);
             }
 
@@ -2236,13 +2239,14 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
 }
 
 /// Backoff stamped on an outbox row that could not even be ATTEMPTED this
-/// scan (issue #1227, Finding 4, Codex round-4 P1 on PR #1386): a missing
+/// scan (issue #1227, Finding 4, PR #1386). The causes are a missing
 /// target-shard pool, a connection-acquisition failure, or any other
 /// unexpected error surfacing from `relay_gate_checked_start` outside its own
-/// `QuotaExceeded` handling. Same value as `QUOTA_REDEFER_BACKOFF`, kept as a
-/// separate constant because the two recover for unrelated reasons (a quota
-/// clears on tenant capacity change; a transport/pool failure clears on
-/// infra recovery) -- nothing depends on them staying numerically equal.
+/// `QuotaExceeded` handling. It has the same value as `QUOTA_REDEFER_BACKOFF`.
+/// It is a separate constant because the two recover for unrelated reasons.
+/// A quota clears on a tenant capacity change. A transport or pool failure
+/// clears on infra recovery. Nothing depends on them staying numerically
+/// equal.
 #[cfg(feature = "db")]
 const OUTBOX_RELAY_FAILURE_BACKOFF: chrono::Duration = chrono::Duration::seconds(5);
 
@@ -2259,30 +2263,31 @@ const OUTBOX_RELAY_BACKOFF_STAMP_QUERY: &str = "UPDATE harvest_completion_trigge
 
 /// Stamp `next_attempt_at` on an outbox row this scan could not even attempt
 /// to relay. Without this, a row whose target shard is durably unreachable
-/// (pool never configured, or persistently refusing connections) would sit
-/// with `next_attempt_at IS NULL` forever -- the "fresh" tier's own priority
-/// (rounds 1-3 above) would then let it dominate every claim batch exactly
-/// the way a persistently-blocked quota row did before Finding 4, this time
-/// for a failure class the quota-specific stamp inside
+/// would sit with `next_attempt_at IS NULL` forever. The pool was never
+/// configured, or it persistently refuses connections. The "fresh" tier's
+/// own priority in [`enforce_completion_triggers_outbox`] would then let the
+/// row dominate every claim batch. A persistently-blocked quota row did
+/// exactly that before issue #1227, Finding 4. This time the cause is a
+/// failure class that the quota-specific stamp inside
 /// `relay_gate_checked_start` never covers.
 ///
 /// Best-effort: a failure writing this bookkeeping column is logged, not
-/// propagated -- it must never fail the whole scanner tick over a
-/// diagnostics-only write, and the row is simply retried sooner than
-/// intended rather than lost.
+/// propagated. A diagnostics-only write must never fail the whole scanner
+/// tick. The row is then simply retried sooner than intended, not lost.
 ///
-/// Claims the row `FOR UPDATE SKIP LOCKED` before writing (Codex round-5 P2
-/// on PR #1386): the caller's batch `SELECT` above takes no lock, so this
-/// row can also be the one [`relay_gate_checked_start`] is holding under ITS
-/// own claim for the entire relay -- a peer replica reached the same row via
-/// a missing-pool or connection-acquisition failure and calls this function
-/// concurrently. A plain `UPDATE ... WHERE id = $1` has no "skip" option and
-/// would simply block until the relay's claim transaction commits or rolls
-/// back, stalling this replica's whole scan (and every later scanner duty
-/// behind it) on a possibly-slow cross-shard relay -- defeating the very
-/// non-blocking design `SKIP LOCKED` exists for. Losing the race (row
-/// already claimed elsewhere) is not an error: the relay owns the row's
-/// outcome right now and will leave it in a consistent state itself.
+/// Claims the row `FOR UPDATE SKIP LOCKED` before writing (issue #1227,
+/// PR #1386). The caller's batch `SELECT` takes no lock. So this row can
+/// also be the one that [`relay_gate_checked_start`] holds under ITS own
+/// claim for the entire relay. A peer replica can reach the same row through
+/// a missing-pool or connection-acquisition failure. It then calls this
+/// function concurrently with that relay. A plain `UPDATE ... WHERE id = $1`
+/// has no "skip" option. It would simply block until the relay's claim
+/// transaction commits or rolls back. That stalls this replica's whole scan,
+/// and every later scanner duty behind it, on a possibly-slow cross-shard
+/// relay. It defeats the very non-blocking design that `SKIP LOCKED` exists
+/// for. Losing the race is not an error: the row is already claimed
+/// elsewhere. The relay owns the row's outcome right now. It leaves the row
+/// in a consistent state itself.
 #[cfg(feature = "db")]
 async fn stamp_outbox_relay_backoff(conn: &mut diesel_async::AsyncPgConnection, task_id: Uuid) {
     use diesel_async::RunQueryDsl;
@@ -2358,42 +2363,43 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
     };
 
     // Load up to `OUTBOX_CLAIM_BATCH_LIMIT` pending outbox tasks for shards
-    // assigned to this worker, as two separately-capped tiers rather than one
-    // combined query (issue #1227 Finding 4 and its two Codex follow-up
-    // rounds on PR #1386):
+    // assigned to this worker. Load them as two separately-capped tiers, not
+    // one combined query (issue #1227 Finding 4 and its follow-ups on
+    // PR #1386).
     //
-    // Pre-#1227 there was no `next_attempt_at` filter at all: a row blocked
-    // against a durably exhausted quota was left completely untouched on a
-    // `QuotaBlocked` outcome, so it could dominate every unordered
-    // `LIMIT 50` batch on every tick, starving any OTHER, unrelated relay
+    // Pre-#1227 there was no `next_attempt_at` filter at all. A
+    // `QuotaBlocked` outcome left a row blocked against a durably exhausted
+    // quota completely untouched. So that row could dominate every unordered
+    // `LIMIT 50` batch on every tick. It starved any OTHER, unrelated relay
     // that happened to sort after it.
     //
-    // Ordering by `created_at` ALONE (round-1's first attempt) was not
-    // enough: once `WorkerRuntimeConfig::poll_interval` is at or above
-    // `QUOTA_REDEFER_BACKOFF` (5s), a persistently-blocked row's backoff has
-    // always re-elapsed by the next tick, so it goes straight back to being
-    // one of the 50 OLDEST eligible rows -- the exact same batch reloads
-    // forever and a newer, healthy row never gets a turn (round-1 P1).
+    // The first attempt ordered by `created_at` ALONE, which was not enough.
+    // Suppose `WorkerRuntimeConfig::poll_interval` is at or above
+    // `QUOTA_REDEFER_BACKOFF` (5s). A persistently-blocked row's backoff has
+    // then always re-elapsed by the next tick. So the row goes straight back
+    // to being one of the 50 OLDEST eligible rows. The exact same batch
+    // reloads forever, and a newer, healthy row never gets a turn.
     //
-    // Switching to a single `next_attempt_at IS NULL` ("fresh") -vs- retry
-    // ordering (round-1's fix) traded one starvation direction for the
-    // other: a *sustained* arrival of ≥50 fresh rows between ticks fills
-    // every batch with fresh rows and a previously-blocked row can never be
-    // reclaimed again even after its target's quota frees up (round-2 P2).
+    // The next fix switched to a single `next_attempt_at IS NULL` ("fresh")
+    // -vs- retry ordering. It traded one starvation direction for the other.
+    // A *sustained* arrival of ≥50 fresh rows between ticks fills every batch
+    // with fresh rows. A previously-blocked row can then never be reclaimed
+    // again, even after its target's quota frees up.
     //
-    // Reserving `OUTBOX_RETRY_RESERVED_SLOTS` of the batch for retry-eligible
-    // rows -- independently-limited queries, combined -- gives each tier a
-    // floor neither backlog can starve: fresh rows always get at least
-    // `OUTBOX_CLAIM_BATCH_LIMIT - OUTBOX_RETRY_RESERVED_SLOTS` slots
-    // regardless of how large the retry backlog is, and retries always get
-    // at least `OUTBOX_RETRY_RESERVED_SLOTS` regardless of how fast fresh
-    // rows arrive. The fresh query filling short of its own limit already
-    // gives the retry tier the difference (its own `retry_limit` grows to
-    // match); the retry tier filling short of ITS limit -- the common case,
-    // since most scans have no quota-blocked backlog at all -- backfills a
-    // third query of more fresh rows, so a reservation the retry backlog
-    // never needed doesn't silently cap every scan at 40 of the configured
-    // 50 (round-3 P2 on PR #1386).
+    // The current design reserves `OUTBOX_RETRY_RESERVED_SLOTS` of the batch
+    // for retry-eligible rows. Each tier is an independently-limited query,
+    // and the results are combined. This gives each tier a floor that neither
+    // backlog can starve. Fresh rows always get at least
+    // `OUTBOX_CLAIM_BATCH_LIMIT - OUTBOX_RETRY_RESERVED_SLOTS` slots,
+    // regardless of how large the retry backlog is. Retries always get at
+    // least `OUTBOX_RETRY_RESERVED_SLOTS`, regardless of how fast fresh rows
+    // arrive. The fresh query can fill short of its own limit. The retry tier
+    // then already gets the difference, because its own `retry_limit` grows
+    // to match. The retry tier can also fill short of ITS limit. That is the
+    // common case, since most scans have no quota-blocked backlog at all. A
+    // third query then backfills more fresh rows. So a reservation that the
+    // retry backlog never needed does not silently cap every scan at 40 of
+    // the configured 50 (PR #1386).
     let mut pending_tasks = outbox_dsl::harvest_completion_trigger_outbox
         .filter(outbox_dsl::target_shard.eq_any(&shards))
         .filter(outbox_dsl::next_attempt_at.is_null())
@@ -2424,12 +2430,12 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
         .await
         .map_err(crate::error::database_error)?;
 
-    // Codex round-3 P2 on PR #1386: the reservation above is a FLOOR for
-    // retries, not a fixed carve-out -- when the retry backlog is smaller
-    // than `OUTBOX_RETRY_RESERVED_SLOTS` (the common case: most scans have no
-    // quota-blocked backlog at all), the unused reservation must go back to
-    // fresh work instead of silently capping every scan at 40 of the
-    // configured 50, permanently cutting outbox throughput by up to 20%.
+    // The reservation above is a FLOOR for retries, not a fixed carve-out
+    // (issue #1227, PR #1386). The retry backlog is often smaller than
+    // `OUTBOX_RETRY_RESERVED_SLOTS`. That is the common case: most scans have
+    // no quota-blocked backlog at all. The unused reservation must then go
+    // back to fresh work. Otherwise it silently caps every scan at 40 of the
+    // configured 50 and permanently cuts outbox throughput by up to 20%.
     let unused_retry_capacity =
         retry_limit - i64::try_from(retry_rows.len()).unwrap_or(retry_limit);
     pending_tasks.extend(retry_rows);
@@ -2491,11 +2497,11 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
             .as_ref()
             .and_then(|sp| sp.exact_pool_for(target_shard).cloned())
         else {
-            // Issue #1227 Finding 4, Codex round-4 P1: a missing pool never
-            // resolves itself between scans (this node's own topology, not a
-            // transient race), so without a backoff this row would sit fresh
-            // forever and dominate the fresh tier ahead of a newer row
-            // targeting a healthy shard.
+            // Issue #1227 Finding 4: a missing pool never resolves itself
+            // between scans. It reflects this node's own topology, not a
+            // transient race. Without a backoff, this row would sit fresh
+            // forever. It would dominate the fresh tier ahead of a newer row
+            // that targets a healthy shard.
             stamp_outbox_relay_backoff(conn, task.id).await;
             continue;
         };
@@ -2764,13 +2770,12 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
                     "[completion_trigger outbox] Failed to start workflow execution cross-shard: {:?}",
                     e
                 );
-                // Issue #1227 Finding 4, Codex round-4 P1: any OTHER error
-                // reaching here (genuinely unexpected -- QuotaExceeded is
-                // handled inside relay_gate_checked_start, and
-                // PayloadTooLarge is a permanent error handled above) still
-                // gets a backoff rather than being retried at full poll
-                // cadence, same rationale as the pool/connection failures
-                // above.
+                // Issue #1227 Finding 4: any OTHER error reaching here still
+                // gets a backoff, not a retry at full poll cadence. Such an
+                // error is genuinely unexpected. QuotaExceeded is handled
+                // inside relay_gate_checked_start, and PayloadTooLarge is a
+                // permanent error handled above. The rationale is the same
+                // as for the pool and connection failures above.
                 stamp_outbox_relay_backoff(conn, task.id).await;
             }
         }

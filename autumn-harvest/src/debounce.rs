@@ -524,8 +524,8 @@ struct FireDueRow {
     #[diesel(sql_type = diesel::sql_types::Integer)]
     shard_id: i32,
     /// Needed to compute [`redefer_target`] if this row's fire is blocked by
-    /// a quota (issue #1227, Finding 3) — fetched here, under the same
-    /// `FOR UPDATE` claim, rather than a second round trip.
+    /// a quota (issue #1227, Finding 3). It is fetched here, under the same
+    /// `FOR UPDATE` claim, rather than in a second round trip.
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
     max_fire_at: DateTime<Utc>,
 }
@@ -842,24 +842,24 @@ const QUOTA_REDEFER_BACKOFF: Duration = Duration::from_secs(5);
 /// Clamps `proposed` to the row's own `max_fire_at`, preserving the
 /// pre-existing `max_wait` contract, **unless `max_fire_at` has already
 /// passed**. Once the deadline itself is in the past, `LEAST(proposed,
-/// max_fire_at)` would always evaluate to that past `max_fire_at` — writing
-/// an already-expired `effective_fire_at` back to the row, which
-/// re-qualifies it as due on the very next scanner tick and defeats the
-/// backoff entirely for exactly the case where it matters most (a row stuck
-/// past its deadline on a persistently exhausted quota). Past that point the
-/// row instead gets the bounded backoff **unclamped**: the `max_wait` cap
-/// has already been blown by the quota block, so there is no deadline left
-/// to honor, and the alternative — dropping the row — would silently
-/// discard a debounced start the caller is still waiting on.
+/// max_fire_at)` would always evaluate to that past `max_fire_at`. That
+/// writes an already-expired `effective_fire_at` back to the row. The row
+/// then re-qualifies as due on the very next scanner tick. That defeats the
+/// backoff entirely for exactly the case where it matters most: a row stuck
+/// past its deadline on a persistently exhausted quota. Past that point the
+/// row instead gets the bounded backoff **unclamped**. The quota block has
+/// already blown the `max_wait` cap, so there is no deadline left to honor.
+/// The alternative is to drop the row. That would silently discard a
+/// debounced start the caller is still waiting on.
 ///
 /// Deliberately NOT gated behind `#[cfg(feature = "db")]` like its caller
-/// (`redefer_debounce_row`): this function is pure `DateTime` arithmetic with
-/// no database dependency, and the ungated unit tests below need to call it
+/// (`redefer_debounce_row`). This function is pure `DateTime` arithmetic with
+/// no database dependency. The ungated unit tests below need to call it
 /// regardless of which features are enabled. Its only PRODUCTION caller is
-/// still `db`-gated, though, so it would be flagged dead code by a
-/// downstream crate's non-test build with `db` off (as `autumn-harvest-sqlite`
-/// does) -- the standard `#[cfg_attr(not(feature = "db"), allow(dead_code))]`
-/// used throughout this crate for exactly that shape.
+/// still `db`-gated, though. So a downstream crate's non-test build with `db`
+/// off would flag it as dead code (as `autumn-harvest-sqlite` does). Hence the
+/// standard `#[cfg_attr(not(feature = "db"), allow(dead_code))]`, used
+/// throughout this crate for exactly that shape.
 #[cfg_attr(not(feature = "db"), allow(dead_code))]
 fn redefer_target(
     now: DateTime<Utc>,

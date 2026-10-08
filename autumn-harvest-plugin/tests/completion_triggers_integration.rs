@@ -1936,15 +1936,15 @@ async fn test_trigger_outbox_retry_and_sweep() {
         .is_some();
     assert!(outbox_still_exists);
 
-    // Issue #1227 Finding 4 (Codex round-4 P1 on PR #1386): a missing target-shard
-    // pool now stamps `next_attempt_at` with a backoff (`OUTBOX_RELAY_FAILURE_BACKOFF`)
-    // so a durably-unreachable shard can't dominate every claim batch forever. The
-    // row above just got stamped by the failed sweep, so the very next sweep call
-    // (with no time elapsed) would not yet reclaim it -- back the timestamp into the
-    // past to simulate the backoff having elapsed, i.e. this test is exercising
-    // "the connection issue clears and a LATER scan retries successfully", not
-    // "retried on the very next tick with zero delay" (the hot-spin issue #1227
-    // itself fixed).
+    // Issue #1227 Finding 4 (PR #1386): a missing target-shard pool now stamps
+    // `next_attempt_at` with a backoff (`OUTBOX_RELAY_FAILURE_BACKOFF`). So a
+    // durably-unreachable shard cannot dominate every claim batch forever. The
+    // failed sweep just stamped the row above. So the very next sweep call, with
+    // no time elapsed, would not yet reclaim it. Back the timestamp into the past
+    // to simulate that the backoff has elapsed. This test exercises "the
+    // connection issue clears and a LATER scan retries successfully". It does not
+    // exercise "retried on the very next tick with zero delay". That zero-delay
+    // retry is the hot-spin that issue #1227 itself fixed.
     diesel::update(
         outbox_dsl::harvest_completion_trigger_outbox
             .filter(outbox_dsl::source_exec_id.eq(source_exec_id.as_uuid())),

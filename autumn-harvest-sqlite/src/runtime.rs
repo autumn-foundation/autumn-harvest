@@ -1972,11 +1972,11 @@ const SEALED_STATE: &str = "CONTINUED_AS_NEW";
 /// already-terminal prior (`COMPLETED`/`FAILED`) is sealed WITHOUT a cancellation
 /// event and has no PENDING tasks or unfired timers left to clean up. Every prior
 /// being sealed — RUNNING or already-terminal — also has its undelivered staged
-/// signals deleted: a signal can be staged while the prior is RUNNING and then
-/// outlive it even if the prior reaches COMPLETED/FAILED on its own (the workflow
-/// never awaited that signal name), so the row is just as unreachable — and,
-/// absent any retention/GC pass on this backend, would otherwise survive forever —
-/// regardless of which state sealed it. Then seal to [`SEALED_STATE`] so the prior
+/// signals deleted. A signal can be staged while the prior is RUNNING. It can then
+/// outlive the prior even if the prior reaches COMPLETED/FAILED on its own (the
+/// workflow never awaited that signal name). The row is then just as unreachable,
+/// regardless of which state sealed it. This backend has no retention/GC pass, so
+/// the row would otherwise survive forever. Then seal to [`SEALED_STATE`] so the prior
 /// leaves the active set. Byte-identical
 /// to the pre-#1080 single-prior inline path — extracted so the `TerminateIfRunning`
 /// arm can loop it over EVERY active row for the key

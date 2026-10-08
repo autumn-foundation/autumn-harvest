@@ -12386,16 +12386,16 @@ async fn persist_all_started_child_workflows(
         // capability-miss pre-check and handler resolution already
         // succeeded, so capability is proven -- only the quota-governed
         // key's admission is blocked (Codex round-3 review).
-        // Issue #1227 (follow-up to #946/#1221's Codex round-6 review):
-        // a park immediately followed by an unconditional wake degenerates
-        // into a zero-delay retry loop against a durably exhausted quota
-        // (e.g. `max_dead_letters`, which only clears via manual operator
-        // action) -- hot-spinning this parent's decision cycle on every
-        // poll with no backoff at all. Route through the same bounded
-        // jittered backoff `recover_from_child_quota_exceeded` already
-        // gives the three other `QuotaExceeded` catch sites in this file
-        // instead of re-implementing the park+wake pattern its own doc
-        // comment warns against.
+        // Issue #1227 (follow-up to #946/#1221): a park immediately
+        // followed by an unconditional wake degenerates into a zero-delay
+        // retry loop against a durably exhausted quota. An example is
+        // `max_dead_letters`, which only clears via manual operator action.
+        // The loop hot-spins this parent's decision cycle on every poll
+        // with no backoff at all. So route through the bounded jittered
+        // backoff of `recover_from_child_quota_exceeded`. That helper
+        // already serves the three other `QuotaExceeded` catch sites in
+        // this file. Do not re-implement the park+wake pattern that its
+        // own doc comment warns against.
         Err(error @ HarvestError::QuotaExceeded { .. }) => {
             recover_from_child_quota_exceeded(conn, task_id, parent_exec_id, &error).await?;
             return Ok(());
@@ -13331,12 +13331,12 @@ async fn persist_child_timeout_race(
             // capacity condition. The whole transaction above rolled back
             // (no child row, no timer row, no parent events persisted).
             //
-            // Issue #1227 (follow-up to #946/#1221's Codex round-6 review):
-            // park immediately followed by an unconditional wake is a
-            // zero-delay retry loop against a durably exhausted quota, so
-            // route through `recover_from_child_quota_exceeded`'s bounded
-            // jittered backoff rather than re-implementing the anti-pattern
-            // its own doc comment warns against.
+            // Issue #1227 (follow-up to #946/#1221): park immediately
+            // followed by an unconditional wake is a zero-delay retry loop
+            // against a durably exhausted quota. So route through the
+            // bounded jittered backoff of `recover_from_child_quota_exceeded`.
+            // Do not re-implement the anti-pattern that its own doc comment
+            // warns against.
             Err(error @ HarvestError::QuotaExceeded { .. }) => {
                 recover_from_child_quota_exceeded(conn, task_id, parent_exec_id, &error).await?;
                 return Ok(());
@@ -13877,13 +13877,14 @@ async fn persist_mixed_suspension_batch(
         // key, never a genuine failure of THIS parent. The whole transaction
         // above rolled back (no child rows, no timer rows, no events).
         //
-        // Issue #1227 (follow-up sweep after the original fix, which named
-        // only the two OTHER child-persist paths as "mirrored" here): a park
+        // Issue #1227 (follow-up sweep): the original fix named only the
+        // two OTHER child-persist paths as "mirrored" here. A park
         // immediately followed by an unconditional wake is the same
-        // zero-delay retry loop those two paths were rewritten to avoid, so
-        // this third site gets the identical fix -- route through
-        // `recover_from_child_quota_exceeded`'s bounded jittered backoff
-        // rather than re-implementing the anti-pattern.
+        // zero-delay retry loop that those two paths were rewritten to
+        // avoid. So this third site gets the identical fix. It routes
+        // through the bounded jittered backoff of
+        // `recover_from_child_quota_exceeded` and does not re-implement
+        // the anti-pattern.
         Err(error @ HarvestError::QuotaExceeded { .. }) => {
             recover_from_child_quota_exceeded(conn, task_id, exec_id, &error).await?;
             return Ok(());
