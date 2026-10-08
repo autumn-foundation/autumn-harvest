@@ -302,3 +302,62 @@ async fn every_backoff_requeue_rejects_a_pending_task() {
         );
     }
 }
+
+#[derive(diesel::QueryableByName)]
+struct Attempt {
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    attempt: i32,
+}
+
+/// Issue #1815: the claim-fenced panic requeue writes only under the current
+/// claim. A stale dispatcher leaves a peer's claim alone and reports it.
+#[tokio::test]
+async fn the_fenced_panic_requeue_leaves_a_peer_claim_alone() {
+    let (mut conn, _c) = setup_db().await;
+    let task = claimed_task_with_stale_markers(&mut conn).await;
+    let attempt = diesel::sql_query("SELECT attempt FROM harvest_task_queue WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(task)
+        .get_result::<Attempt>(&mut conn)
+        .await
+        .expect("read attempt")
+        .attempt;
+
+    let stale = queue::TaskClaim::new(task, "w0", attempt);
+    let applied = queue::requeue_claimed_workflow_task_after_panic(
+        &mut conn,
+        &stale,
+        Duration::seconds(60),
+        "stale",
+    )
+    .await
+    .expect("stale requeue");
+    assert!(!applied, "a stale claim must not apply");
+    let row = read_row(&mut conn, task).await;
+    assert_eq!(row.state, "RUNNING");
+    assert_eq!(row.worker_id.as_deref(), Some("w1"));
+    assert!(
+        !row.backoff_in_future,
+        "the peer's claim must not be deferred"
+    );
+
+    let current = queue::TaskClaim::new(task, "w1", attempt);
+    let applied = queue::requeue_claimed_workflow_task_after_panic(
+        &mut conn,
+        &current,
+        Duration::seconds(60),
+        "why",
+    )
+    .await
+    .expect("current requeue");
+    assert!(applied, "the current claim must apply");
+    let row = read_row(&mut conn, task).await;
+    assert_eq!(row.state, "PENDING");
+    assert_eq!(row.worker_id, None);
+    assert_eq!(row.error.as_deref(), Some("why"));
+    assert_eq!(row.crash_strikes, 0);
+    assert!(row.backoff_in_future);
+    assert_eq!(
+        row.sticky_worker_id, None,
+        "a panic releases sticky affinity"
+    );
+}

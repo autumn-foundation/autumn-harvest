@@ -43,6 +43,8 @@
 
 use metrics::{Key, Label, counter, gauge, histogram};
 
+use crate::worker_outlier::OutlierDimension;
+
 use crate::telemetry::{
     ActivityPauseAction, ActivityStatus, BUILD_ID_LABEL_NONE, ConnectorOutcome,
     METRIC_ACTIVITY_ATTEMPTS, METRIC_ACTIVITY_CONCURRENCY_DEFERRED,
@@ -100,6 +102,11 @@ use crate::telemetry::{
     METRIC_WORKFLOW_UNFINISHED_HANDLERS, MetricsRecorder, PoisonReason, SessionAcquisitionOutcome,
     SlotType, TunerDecision, WebhookOutcome, WorkflowStatus,
 };
+use crate::telemetry::{
+    DbOp, METRIC_DB_POOL_IDLE, METRIC_DB_POOL_IN_USE, METRIC_DB_POOL_WAIT,
+    METRIC_DB_QUERY_DURATION, METRIC_LABEL_DIMENSION, METRIC_LABEL_OP, METRIC_WORKER_OUTLIER,
+    METRIC_WORKER_POLLERS,
+};
 
 /// [`MetricsRecorder`] implementation that forwards every sample to the
 /// global [`metrics`] registry.
@@ -109,7 +116,15 @@ use crate::telemetry::{
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MetricsRsRecorder;
 
+/// The [`MetricsRecorder::sink_key`] of every [`MetricsRsRecorder`]: they all
+/// write to the one global `metrics` registry. A heap address is never 1.
+const METRICS_RS_GLOBAL_SINK: usize = 1;
+
 impl MetricsRecorder for MetricsRsRecorder {
+    fn sink_key(&self) -> Option<usize> {
+        Some(METRICS_RS_GLOBAL_SINK)
+    }
+
     fn record_workflow_started(&self, workflow_name: &str, queue: &str) {
         counter!(
             METRIC_WORKFLOW_STARTED,
@@ -466,6 +481,35 @@ impl MetricsRecorder for MetricsRsRecorder {
             METRIC_LABEL_SLOT_TYPE => slot_type.as_str(),
         )
         .set(available as f64);
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn record_db_pool(&self, shard: u16, in_use: u64, idle: u64) {
+        gauge!(METRIC_DB_POOL_IN_USE, METRIC_LABEL_SHARD => shard.to_string()).set(in_use as f64);
+        gauge!(METRIC_DB_POOL_IDLE, METRIC_LABEL_SHARD => shard.to_string()).set(idle as f64);
+    }
+
+    fn record_db_pool_wait(&self, shard: u16, seconds: f64) {
+        histogram!(METRIC_DB_POOL_WAIT, METRIC_LABEL_SHARD => shard.to_string()).record(seconds);
+    }
+
+    fn record_db_query_duration(&self, op: DbOp, shard: u16, seconds: f64) {
+        histogram!(
+            METRIC_DB_QUERY_DURATION,
+            METRIC_LABEL_OP => op.as_str(),
+            METRIC_LABEL_SHARD => shard.to_string()
+        )
+        .record(seconds);
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn record_worker_pollers(&self, queue: &str, pollers: u64) {
+        gauge!(METRIC_WORKER_POLLERS, METRIC_LABEL_QUEUE => queue.to_owned()).set(pollers as f64);
+    }
+
+    fn record_worker_outlier(&self, dimension: OutlierDimension, flagged: bool) {
+        gauge!(METRIC_WORKER_OUTLIER, METRIC_LABEL_DIMENSION => dimension.as_str())
+            .set(if flagged { 1.0 } else { 0.0 });
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -1605,6 +1649,11 @@ mod tests {
         let rec = MetricsRsRecorder;
         rec.record_workflow_started("wf", "q");
         rec.record_workflow_completed("wf", "q", 1.0, WorkflowStatus::Completed);
+        rec.record_db_pool(0, 1, 2);
+        rec.record_db_pool_wait(0, 0.01);
+        rec.record_db_query_duration(DbOp::Persist, 0, 0.02);
+        rec.record_worker_pollers("q", 1);
+        rec.record_worker_outlier(OutlierDimension::LatencyP99, false);
         rec.record_workflow_history_size("wf", 2);
         rec.record_workflow_history_bloat("wf");
         rec.record_workflow_continue_as_new("wf");
@@ -2564,6 +2613,159 @@ mod tests {
             )],
             "the active-workflow gauge bridge must set harvest.workflow.active \
              with exactly the workflow+state label constants and value 5.0"
+        );
+    }
+
+    /// Issue #1815: the saturation and outlier bridges register the documented
+    /// names and bounded labels, and pass each value through unchanged.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn bridges_saturation_and_outlier_metrics_with_bounded_labels_and_values() {
+        type Sample = (String, Vec<(String, String)>, f64);
+        type Sink = std::sync::Arc<std::sync::Mutex<Vec<Sample>>>;
+
+        struct Recording {
+            name: String,
+            labels: Vec<(String, String)>,
+            sink: Sink,
+        }
+        impl Recording {
+            fn push(&self, value: f64) {
+                self.sink
+                    .lock()
+                    .unwrap()
+                    .push((self.name.clone(), self.labels.clone(), value));
+            }
+        }
+        impl metrics::GaugeFn for Recording {
+            fn increment(&self, _: f64) {}
+            fn decrement(&self, _: f64) {}
+            fn set(&self, value: f64) {
+                self.push(value);
+            }
+        }
+        impl metrics::HistogramFn for Recording {
+            fn record(&self, value: f64) {
+                self.push(value);
+            }
+        }
+
+        #[derive(Default)]
+        struct CapturingRecorder {
+            samples: Sink,
+        }
+        impl CapturingRecorder {
+            fn recording(&self, key: &metrics::Key) -> std::sync::Arc<Recording> {
+                std::sync::Arc::new(Recording {
+                    name: key.name().to_owned(),
+                    labels: key
+                        .labels()
+                        .map(|l| (l.key().to_owned(), l.value().to_owned()))
+                        .collect(),
+                    sink: std::sync::Arc::clone(&self.samples),
+                })
+            }
+        }
+        impl metrics::Recorder for &CapturingRecorder {
+            fn describe_counter(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_gauge(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_histogram(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn register_counter(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Counter {
+                metrics::Counter::noop()
+            }
+            fn register_gauge(
+                &self,
+                key: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Gauge {
+                metrics::Gauge::from_arc(self.recording(key))
+            }
+            fn register_histogram(
+                &self,
+                key: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Histogram {
+                metrics::Histogram::from_arc(self.recording(key))
+            }
+        }
+
+        let capture = CapturingRecorder::default();
+        metrics::with_local_recorder(&&capture, || {
+            let rec = MetricsRsRecorder;
+            rec.record_db_pool(3, 4, 6);
+            rec.record_db_pool_wait(3, 0.25);
+            rec.record_db_query_duration(DbOp::Claim, 3, 0.5);
+            rec.record_worker_pollers("email", 1);
+            rec.record_worker_outlier(OutlierDimension::FailureRatio, true);
+            rec.record_worker_outlier(OutlierDimension::LatencyP99, false);
+        });
+
+        let label = |k: &str, v: &str| vec![(k.to_owned(), v.to_owned())];
+        let samples = capture.samples.lock().unwrap().clone();
+        assert_eq!(
+            samples,
+            vec![
+                (
+                    METRIC_DB_POOL_IN_USE.to_owned(),
+                    label(METRIC_LABEL_SHARD, "3"),
+                    4.0
+                ),
+                (
+                    METRIC_DB_POOL_IDLE.to_owned(),
+                    label(METRIC_LABEL_SHARD, "3"),
+                    6.0
+                ),
+                (
+                    METRIC_DB_POOL_WAIT.to_owned(),
+                    label(METRIC_LABEL_SHARD, "3"),
+                    0.25
+                ),
+                (
+                    METRIC_DB_QUERY_DURATION.to_owned(),
+                    vec![
+                        (METRIC_LABEL_OP.to_owned(), "claim".to_owned()),
+                        (METRIC_LABEL_SHARD.to_owned(), "3".to_owned()),
+                    ],
+                    0.5
+                ),
+                (
+                    METRIC_WORKER_POLLERS.to_owned(),
+                    label(METRIC_LABEL_QUEUE, "email"),
+                    1.0
+                ),
+                (
+                    METRIC_WORKER_OUTLIER.to_owned(),
+                    label(METRIC_LABEL_DIMENSION, "failure_ratio"),
+                    1.0
+                ),
+                (
+                    METRIC_WORKER_OUTLIER.to_owned(),
+                    label(METRIC_LABEL_DIMENSION, "latency_p99"),
+                    0.0
+                ),
+            ]
         );
     }
 

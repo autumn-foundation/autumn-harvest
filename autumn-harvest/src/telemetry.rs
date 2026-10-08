@@ -300,6 +300,49 @@ pub const METRIC_WORKER_SLOT_TARGET: &str = "harvest.worker.slot_target";
 /// the live target rather than what the controller requested.
 pub const METRIC_WORKER_TUNER_DECISIONS: &str = "harvest.worker.tuner_decisions";
 
+/// Gauge: database connections that a worker's pool lends out now (issue #1815).
+///
+/// An in-process sampler reads the deadpool status. No query runs. Labelled
+/// `{shard}`. Each replica owns its pool, so a sum across replicas is valid.
+/// Colocated shards that share one pool report the same value. Runtimes in one
+/// process that share a sink report the sum of their distinct pools.
+pub const METRIC_DB_POOL_IN_USE: &str = "harvest.db.pool.in_use";
+
+/// Gauge: open database connections that wait idle in a worker's pool (issue
+/// #1815). Companion to [`METRIC_DB_POOL_IN_USE`], with the same labels.
+pub const METRIC_DB_POOL_IDLE: &str = "harvest.db.pool.idle";
+
+/// Histogram: seconds a caller waits to get a pooled connection (issue #1815).
+///
+/// Labelled `{shard}`. The claim path, the timeout scanner and the activity
+/// heartbeat flush record it. A high value with no idle connection shows that
+/// the pool is too small for the load.
+pub const METRIC_DB_POOL_WAIT: &str = "harvest.db.pool.wait_duration";
+
+/// Histogram: seconds that one database operation takes (issue #1815).
+///
+/// Labelled `{op}`, one of [`DbOp::as_str`]. Each op times one unit of work,
+/// not one SQL statement. Do not mix this up with [`METRIC_QUERY_DURATION`],
+/// which times workflow query handlers.
+pub const METRIC_DB_QUERY_DURATION: &str = "harvest.db.query.duration";
+
+/// Gauge: poll loops that claim work from a queue on this worker (issue #1815).
+///
+/// Labelled `{queue}`. One poll loop claims from all the worker's queues, so
+/// each queue reports the same count. The count covers every worker that
+/// shares the metrics recorder. It drops when a worker drains. This is the Harvest form of
+/// `temporal_num_pollers`.
+pub const METRIC_WORKER_POLLERS: &str = "harvest.worker.pollers";
+
+/// Gauge: 1 when this worker is an outlier against its peers, else 0 (issue
+/// #1815).
+///
+/// Labelled `{dimension}`, one of
+/// [`OutlierDimension::as_str`](crate::worker_outlier::OutlierDimension::as_str).
+/// Each worker reports itself, so the series has no worker label. The scrape
+/// `instance` label tells the workers apart. See [`crate::worker_outlier`].
+pub const METRIC_WORKER_OUTLIER: &str = "harvest.worker.outlier";
+
 /// Gauge: measured RPO for a shard — how many seconds of acknowledged work a
 /// failover to the standby region would lose right now (issue #954).
 ///
@@ -2013,6 +2056,11 @@ pub const METRIC_LABEL_SLOT_TYPE: &str = "slot_type";
 /// Metric label: adaptive slot-tuner decision (`"grow"` / `"shrink"` / `"hold"`,
 /// issue #548).
 pub const METRIC_LABEL_DECISION: &str = "decision";
+/// Metric label: the database operation, bounded by [`DbOp`] (issue #1815).
+pub const METRIC_LABEL_OP: &str = "op";
+/// Metric label: the outlier dimension, bounded by
+/// [`OutlierDimension`](crate::worker_outlier::OutlierDimension) (issue #1815).
+pub const METRIC_LABEL_DIMENSION: &str = "dimension";
 /// Metric label: the operator action taken on an activity-type pause
 /// (`"pause"` / `"resume"`, issue #807).
 ///
@@ -2598,6 +2646,52 @@ impl TunerDecision {
             Self::Grow => "grow",
             Self::Shrink => "shrink",
             Self::Hold => "hold",
+        }
+    }
+}
+
+/// A key for the sink one metrics recorder writes to (issue #1815).
+///
+/// It is [`MetricsRecorder::sink_key`] when the recorder names its sink, else
+/// the address of the recorder's shared allocation. An aggregate that feeds an
+/// unlabelled gauge, such as the poller count, is kept per key. Workers that
+/// feed one sink then share the aggregate, and a runtime with its own sink
+/// stays apart. A holder of an address key must also hold a clone of the
+/// `Arc`, so the address is not reused.
+#[cfg(feature = "db")]
+#[must_use]
+pub(crate) fn recorder_key(metrics: &Arc<dyn MetricsRecorder>) -> usize {
+    metrics
+        .sink_key()
+        .unwrap_or_else(|| Arc::as_ptr(metrics).cast::<()>() as usize)
+}
+
+/// A timed database operation (issue #1815), used as the bounded `op` label on
+/// [`METRIC_DB_QUERY_DURATION`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbOp {
+    /// One task claim on the poll path.
+    Claim,
+    /// The commit of one workflow-task outcome.
+    Persist,
+    /// One timeout-scanner pass on one shard.
+    Scan,
+    /// One activity heartbeat write.
+    Heartbeat,
+}
+
+impl DbOp {
+    /// Every op, in a stable order.
+    pub const ALL: [Self; 4] = [Self::Claim, Self::Persist, Self::Scan, Self::Heartbeat];
+
+    /// Stable string representation, suitable for metric tag values.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Claim => "claim",
+            Self::Persist => "persist",
+            Self::Scan => "scan",
+            Self::Heartbeat => "heartbeat",
         }
     }
 }
@@ -3434,6 +3528,47 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (slot_type, in_use, available);
     }
 
+    /// A periodic snapshot of one shard pool (issue #1815).
+    ///
+    /// Maps to the gauges `harvest_db_pool_in_use{shard}` and
+    /// `harvest_db_pool_idle{shard}`.
+    fn record_db_pool(&self, shard: u16, in_use: u64, idle: u64) {
+        let _ = (shard, in_use, idle);
+    }
+
+    /// The wait for one pooled connection (issue #1815).
+    ///
+    /// Maps to the histogram `harvest_db_pool_wait_duration{shard}`.
+    fn record_db_pool_wait(&self, shard: u16, seconds: f64) {
+        let _ = (shard, seconds);
+    }
+
+    /// The duration of one database operation (issue #1815).
+    ///
+    /// Maps to the histogram `harvest_db_query_duration{op, shard}`. The
+    /// shard keeps a slow shard of a multi-shard worker visible.
+    fn record_db_query_duration(&self, op: DbOp, shard: u16, seconds: f64) {
+        let _ = (op, shard, seconds);
+    }
+
+    /// The poll loops on this worker that claim from `queue` (issue #1815).
+    ///
+    /// Maps to the gauge `harvest_worker_pollers{queue}`.
+    fn record_worker_pollers(&self, queue: &str, pollers: u64) {
+        let _ = (queue, pollers);
+    }
+
+    /// Whether this worker is an outlier on one dimension (issue #1815).
+    ///
+    /// Maps to the gauge `harvest_worker_outlier{dimension}`, 1 or 0.
+    fn record_worker_outlier(
+        &self,
+        dimension: crate::worker_outlier::OutlierDimension,
+        flagged: bool,
+    ) {
+        let _ = (dimension, flagged);
+    }
+
     /// The adaptive slot tuner's current resize target for one slot type
     /// (issue #548).
     ///
@@ -4235,6 +4370,17 @@ pub trait MetricsRecorder: Send + Sync {
         true
     }
 
+    /// The identity of the sink this recorder writes to (issue #1815).
+    ///
+    /// Two recorders that feed one sink must return the same value, even when
+    /// they are separate allocations. For example, every metrics-rs recorder
+    /// writes to the one global registry. The engine keeps unlabelled
+    /// aggregates, such as the poller count, per sink. The default `None`
+    /// treats each recorder allocation as its own sink.
+    fn sink_key(&self) -> Option<usize> {
+        None
+    }
+
     // ── Custom / user-emitted metrics (issue #532) ────────────────────────
 
     /// Record a custom counter emitted by workflow or activity author code.
@@ -4737,6 +4883,33 @@ mod tests {
         assert_eq!(METRIC_CANARY_ROUNDTRIP, "harvest.canary.roundtrip");
         assert_eq!(METRIC_CANARY_SUCCESS, "harvest.canary.success");
         assert_eq!(METRIC_CANARY_FAILURE, "harvest.canary.failure");
+    }
+
+    /// Issue #1815: DB-pool, query-latency, poller and outlier metric names.
+    #[test]
+    fn saturation_metric_constants_have_correct_names() {
+        assert_eq!(METRIC_DB_POOL_IN_USE, "harvest.db.pool.in_use");
+        assert_eq!(METRIC_DB_POOL_IDLE, "harvest.db.pool.idle");
+        assert_eq!(METRIC_DB_POOL_WAIT, "harvest.db.pool.wait_duration");
+        assert_eq!(METRIC_DB_QUERY_DURATION, "harvest.db.query.duration");
+        assert_eq!(METRIC_WORKER_POLLERS, "harvest.worker.pollers");
+        assert_eq!(METRIC_WORKER_OUTLIER, "harvest.worker.outlier");
+        assert_eq!(METRIC_LABEL_OP, "op");
+        assert_eq!(METRIC_LABEL_DIMENSION, "dimension");
+        let ops: Vec<&str> = DbOp::ALL.iter().map(|op| op.as_str()).collect();
+        assert_eq!(ops, ["claim", "persist", "scan", "heartbeat"]);
+    }
+
+    /// Issue #1815: the new recorder methods have no-op defaults, so every
+    /// existing `MetricsRecorder` still compiles.
+    #[test]
+    fn record_saturation_metrics_have_noop_defaults() {
+        let rec = NoOpMetrics;
+        rec.record_db_pool(0, 3, 7);
+        rec.record_db_pool_wait(0, 0.01);
+        rec.record_db_query_duration(DbOp::Claim, 0, 0.002);
+        rec.record_worker_pollers("default", 1);
+        rec.record_worker_outlier(crate::worker_outlier::OutlierDimension::FailureRatio, true);
     }
 
     #[test]

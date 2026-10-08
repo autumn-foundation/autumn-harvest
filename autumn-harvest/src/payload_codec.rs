@@ -706,6 +706,31 @@ pub struct PayloadCodecs {
     any_keys: Arc<AtomicBool>,
 }
 
+/// When the key set or the active key last changed (issue #1815).
+///
+/// `generation` counts the changes, so a change back to an earlier key set is
+/// still a change. `changed_at` is the instant of the last change, taken under
+/// the write lock that makes it. `None` until the first change.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeyEpoch {
+    /// How many times the key set or the active key changed.
+    pub generation: u64,
+    /// When the last change happened.
+    pub changed_at: Option<std::time::Instant>,
+}
+
+/// The registered key ids, the active key id and the [`KeyEpoch`], read under
+/// one lock (issue #1815).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyState {
+    /// The registered key ids, sorted.
+    pub registered: Vec<String>,
+    /// The active key id.
+    pub active: String,
+    /// When the key set or the active key last changed.
+    pub epoch: KeyEpoch,
+}
+
 /// The multi-key half of the codec registry (issue #948): every registered
 /// keyed codec plus the single active key id used for new writes.
 struct KeyRegistry {
@@ -722,6 +747,18 @@ struct KeyRegistry {
     /// let it race a batch's own commit. Several shards can pin the same key
     /// at once, so this counts rather than flags.
     sweep_pins: BTreeMap<String, u64>,
+    /// When `keys` or `active` last changed (issue #1815).
+    epoch: KeyEpoch,
+}
+
+impl KeyRegistry {
+    /// Record a change to `keys` or `active`. Call it under the write lock.
+    fn changed(&mut self) {
+        self.epoch = KeyEpoch {
+            generation: self.epoch.generation.saturating_add(1),
+            changed_at: Some(std::time::Instant::now()),
+        };
+    }
 }
 
 impl Default for PayloadCodecs {
@@ -736,6 +773,7 @@ impl Default for PayloadCodecs {
                 keys: BTreeMap::new(),
                 active: CODEC_LEGACY_KEY_ID.to_string(),
                 sweep_pins: BTreeMap::new(),
+                epoch: KeyEpoch::default(),
             })),
             any_keys: Arc::new(AtomicBool::new(false)),
         }
@@ -837,6 +875,21 @@ impl PayloadCodecs {
         self.default = codec;
     }
 
+    /// The id of the default codec, which encodes new payloads (issue #1815).
+    #[must_use]
+    pub fn default_codec_id(&self) -> &'static str {
+        self.default.codec_id()
+    }
+
+    /// Every registered codec id, sorted (issue #1815).
+    ///
+    /// The default codec is always one of them. Keyed codecs are not. See
+    /// [`PayloadCodecs::registered_key_ids`] for those.
+    #[must_use]
+    pub fn codec_ids(&self) -> Vec<&'static str> {
+        self.codecs.keys().copied().collect()
+    }
+
     // ── Key rotation (issue #948) ────────────────────────────────────────
 
     fn keys_read(&self) -> RwLockReadGuard<'_, KeyRegistry> {
@@ -906,6 +959,7 @@ impl PayloadCodecs {
         if first {
             guard.active = key_id.to_string();
         }
+        guard.changed();
         // Publish the mirror while STILL holding the write guard. Storing it
         // after `drop(guard)` leaves it unordered against the map mutation, so
         // a concurrent `retire_key_local` that removed the last key can compute
@@ -965,7 +1019,10 @@ impl PayloadCodecs {
                  `PayloadCodecs::register_key` first"
             )));
         }
-        guard.active = key_id.to_string();
+        if guard.active != key_id {
+            guard.active = key_id.to_string();
+            guard.changed();
+        }
         drop(guard);
         Ok(())
     }
@@ -983,6 +1040,29 @@ impl PayloadCodecs {
     #[must_use]
     pub fn registered_key_ids(&self) -> Vec<String> {
         self.keys_read().keys.keys().cloned().collect()
+    }
+
+    /// The registered key ids, sorted, and the active key id, read under one
+    /// lock (issue #1815).
+    ///
+    /// `register_key` changes both under one write lock. Two separate reads can
+    /// see the old key set with the new active key, a pair that never existed.
+    #[must_use]
+    pub fn key_ids(&self) -> (Vec<String>, String) {
+        let state = self.key_state();
+        (state.registered, state.active)
+    }
+
+    /// [`Self::key_ids`] with the [`KeyEpoch`] of the last change, read under
+    /// the same lock (issue #1815).
+    #[must_use]
+    pub fn key_state(&self) -> KeyState {
+        let guard = self.keys_read();
+        KeyState {
+            registered: guard.keys.keys().cloned().collect(),
+            active: guard.active.clone(),
+            epoch: guard.epoch,
+        }
     }
 
     /// Whether any keyed codec is registered (issue #948).
@@ -1090,7 +1170,11 @@ impl PayloadCodecs {
                  activate a different key first"
             )));
         }
-        guard.keys.remove(key_id);
+        // Issue #1815: a key that is not registered leaves the cohort as it
+        // was, so the epoch stays.
+        if guard.keys.remove(key_id).is_some() {
+            guard.changed();
+        }
         let any_left = !guard.keys.is_empty();
         // Under the guard, for the reason spelled out in `register_key`: the
         // mirror and the map must be mutated inside the same critical section
@@ -3523,6 +3607,64 @@ mod tests {
         codecs
             .retire_key_local("k1")
             .expect("retirable once both pins are released");
+    }
+
+    /// Issue #1815: `key_ids` returns the key set and the active key together.
+    #[test]
+    fn key_ids_returns_the_registered_and_active_keys() {
+        let codecs = PayloadCodecs::default();
+        assert_eq!(
+            codecs.key_ids(),
+            (Vec::new(), CODEC_LEGACY_KEY_ID.to_owned())
+        );
+        for key in ["k2", "k1"] {
+            codecs
+                .register_key(key, Arc::new(IdentityCodec))
+                .expect("register a key");
+        }
+        codecs.set_active_key("k2").expect("activate k2");
+        assert_eq!(
+            codecs.key_ids(),
+            (vec!["k1".to_owned(), "k2".to_owned()], "k2".to_owned())
+        );
+    }
+
+    /// Issue #1815: every key change moves the epoch when it happens, so a
+    /// worker can tell when the policy behind its cohort changed. Activating
+    /// the key that is already active changes nothing. Retiring a key that is
+    /// not registered changes nothing either.
+    #[test]
+    fn a_key_change_moves_the_key_epoch() {
+        let codecs = PayloadCodecs::default();
+        let start = codecs.key_state().epoch;
+        assert_eq!((start.generation, start.changed_at), (0, None));
+        let before = std::time::Instant::now();
+        codecs
+            .register_key("k1", Arc::new(IdentityCodec))
+            .expect("register k1");
+        let registered = codecs.key_state().epoch;
+        assert_eq!(registered.generation, 1);
+        assert!(registered.changed_at.is_some_and(|at| at >= before));
+        codecs
+            .register_key("k2", Arc::new(IdentityCodec))
+            .expect("register k2");
+        codecs.set_active_key("k2").expect("activate k2");
+        assert_eq!(codecs.key_state().epoch.generation, 3);
+        codecs.set_active_key("k2").expect("activate k2 again");
+        assert_eq!(codecs.key_state().epoch.generation, 3, "no change, no move");
+        codecs.retire_key_local("k1").expect("retire k1");
+        let state = codecs.key_state();
+        assert_eq!(state.epoch.generation, 4);
+        codecs.retire_key_local("k1").expect("retire k1 again");
+        codecs
+            .retire_key_local("absent")
+            .expect("retire an unknown key");
+        let state = codecs.key_state();
+        assert_eq!(state.epoch.generation, 4, "no removal, no move");
+        assert_eq!(
+            (state.registered, state.active),
+            (vec!["k2".to_owned()], "k2".to_owned())
+        );
     }
 
     /// The `any_keys` mirror must be published **under** the map lock.

@@ -38,6 +38,10 @@ const REQUIRED_ALERTS: &[&str] = &[
     "harvest_audit_export_lag_high",
     // Issue #1268 — the availability companion to the lag gauge.
     "harvest_audit_export_unobservable",
+    // Issue #1815 — gray failure, DB pool wait and DB op latency.
+    "harvest_worker_gray_failure",
+    "harvest_db_pool_wait_high",
+    "harvest_db_query_latency_high",
 ];
 
 const REQUIRED_DRILLS: &[&str] = &[
@@ -127,6 +131,16 @@ const STABLE_PROMETHEUS_METRICS: &[&str] = &[
     // Issue #1796 — post-commit notify health.
     "harvest_notify_send_failures",
     "harvest_notify_queue_usage",
+    // Issue #1815 — DB pool, DB op latency and the per-worker outlier gauge.
+    "harvest_db_pool_in_use",
+    "harvest_db_pool_idle",
+    "harvest_db_pool_wait_duration_bucket",
+    "harvest_db_pool_wait_duration_count",
+    "harvest_db_pool_wait_duration_sum",
+    "harvest_db_query_duration_bucket",
+    "harvest_db_query_duration_count",
+    "harvest_db_query_duration_sum",
+    "harvest_worker_outlier",
 ];
 
 #[test]

@@ -4477,6 +4477,39 @@ pub async fn requeue_claimed_workflow_task_after_deadlock(
     delay: chrono::Duration,
     reason: &str,
 ) -> HarvestResult<bool> {
+    requeue_claimed_workflow_task_with_backoff(conn, claim, delay, reason).await
+}
+
+/// Re-pend a panicked workflow task under its claim (issues #782, #1815).
+///
+/// Writes the same columns as [`requeue_workflow_task_after_panic`]. The
+/// update also requires `claim` to be current. A reclaim can move the row
+/// while the panicked cycle runs. A stale dispatcher then writes nothing, so
+/// it cannot re-pend a peer's newer claim.
+///
+/// Returns `Ok(false)` when the claim is no longer held.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub async fn requeue_claimed_workflow_task_after_panic(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+    delay: chrono::Duration,
+    reason: &str,
+) -> HarvestResult<bool> {
+    requeue_claimed_workflow_task_with_backoff(conn, claim, delay, reason).await
+}
+
+/// The claim-fenced backoff re-pend behind the deadlock and panic paths.
+///
+/// Returns `Ok(false)` when the claim is no longer held.
+async fn requeue_claimed_workflow_task_with_backoff(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+    delay: chrono::Duration,
+    reason: &str,
+) -> HarvestResult<bool> {
     use crate::schema::harvest_task_queue::dsl;
     use diesel::dsl::sql;
     use diesel::sql_types::{Double, Timestamptz};

@@ -21,6 +21,10 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::error::{HarvestError, HarvestResult};
+use crate::telemetry::MetricsRecorder;
+use crate::worker_outlier::{
+    OutlierConfig, OutlierDimension, TaskOutcomeWindow, WorkerTaskStats, outlier_dimensions,
+};
 
 // ---------------------------------------------------------------------------
 // WorkerRegistration
@@ -396,12 +400,17 @@ pub async fn register_worker<S: std::hash::BuildHasher + Send + Sync>(
 /// evidence is not yet cleared — which reads as covered, agrees across both
 /// miss reads, and escalates.
 ///
+/// The same transaction drops the worker's task-stats row (issue #1815). A
+/// restarted process starts with an empty outcome window. Without the
+/// delete, the previous process's row stays fresh until the first heartbeat.
+/// Its failures then reach peers and `GET /admin/status` under a live worker.
+///
 /// Returns the number of task rows whose evidence was cleared.
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError`] on serialization or database failure. Either write
-/// failing rolls back both.
+/// Returns [`HarvestError`] on serialization or database failure. Any write
+/// failing rolls back all of them.
 pub async fn register_worker_and_clear_stale_miss_evidence(
     conn: &mut AsyncPgConnection,
     registration: &WorkerRegistration,
@@ -425,6 +434,7 @@ pub async fn register_worker_and_clear_stale_miss_evidence(
             registered_codec_key_ids,
         )
         .await?;
+        delete_worker_task_stats(tx, &registration.worker_id).await?;
         crate::queue::invalidate_capability_miss_evidence_for_worker(
             tx,
             &registration.worker_id,
@@ -433,6 +443,18 @@ pub async fn register_worker_and_clear_stale_miss_evidence(
         .await
     }))
     .await
+}
+
+/// Delete the task-stats row of `worker_id` (issue #1815).
+async fn delete_worker_task_stats(
+    conn: &mut AsyncPgConnection,
+    worker_id: &str,
+) -> HarvestResult<usize> {
+    diesel::sql_query("DELETE FROM harvest_worker_task_stats WHERE worker_id = $1")
+        .bind::<diesel::sql_types::Text, _>(worker_id)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)
 }
 
 /// Refresh `last_heartbeat_at` for a drained worker and clear its queues
@@ -580,6 +602,1378 @@ pub async fn heartbeat_worker_status(
         .await
         .optional()
         .map_err(crate::error::database_error)
+}
+
+/// How long a task-stats row outlives its last write (issue #1815).
+///
+/// A worker with a random id leaves an orphan row each time it restarts, and
+/// nothing deletes its `harvest_workers` row. The outlier tick prunes rows
+/// older than this, so the table stays bounded by the live fleet. A fleet with
+/// a slower heartbeat keeps rows for its freshness window instead.
+pub const WORKER_TASK_STATS_RETENTION: Duration = Duration::from_secs(3600);
+
+/// The live peer rows that each shard heartbeat of one worker read last
+/// (issue #1815).
+///
+/// Each shard heartbeat of a worker compares the worker over the rows that
+/// every shard heartbeat stored here. So a peer that lives on another of the
+/// worker's shards still counts, and all heartbeats see the same peer set. A
+/// slot expires when its shard heartbeat stops reading, so a lost shard cannot
+/// keep stale peers alive.
+#[derive(Debug, Default)]
+pub struct ShardPeerViews(
+    Mutex<std::collections::BTreeMap<usize, (std::time::Instant, Vec<LiveWorkerTaskStats>)>>,
+);
+
+impl ShardPeerViews {
+    fn slots(
+        &self,
+    ) -> std::sync::MutexGuard<
+        '_,
+        std::collections::BTreeMap<usize, (std::time::Instant, Vec<LiveWorkerTaskStats>)>,
+    > {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Replace the rows that shard heartbeat `slot` read now.
+    pub fn store(&self, slot: usize, rows: Vec<LiveWorkerTaskStats>) {
+        self.store_at(slot, std::time::Instant::now(), rows);
+    }
+
+    /// Replace the rows that shard heartbeat `slot` read at `at`.
+    pub fn store_at(&self, slot: usize, at: std::time::Instant, rows: Vec<LiveWorkerTaskStats>) {
+        self.slots().insert(slot, (at, rows));
+    }
+
+    /// Drop the rows of `slot`, for example after its shard heartbeat fails.
+    pub fn clear(&self, slot: usize) {
+        self.slots().remove(&slot);
+    }
+
+    /// Drop the rows of `slot`. When no other slot holds rows stored within
+    /// `max_age`, run `on_idle`.
+    ///
+    /// `on_idle` runs under the slot lock. So when the last two slots release
+    /// at once, at least one of them sees no fresh slot left. A tick that
+    /// stores a view also publishes under this lock, so a clear cannot
+    /// overwrite a verdict from a newer view.
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn release(&self, slot: usize, max_age: Duration, on_idle: impl FnOnce()) {
+        let now = std::time::Instant::now();
+        let mut slots = self.slots();
+        slots.remove(&slot);
+        let idle = !slots
+            .values()
+            .any(|(at, _)| now.saturating_duration_since(*at) <= max_age);
+        if idle {
+            on_idle();
+        }
+    }
+
+    /// Replace the rows of `slot`, then pass the merged rows to `then` and
+    /// return its result.
+    ///
+    /// `then` runs under the slot lock. The heartbeats of one worker then
+    /// publish in the order in which they store, so the last verdict comes
+    /// from the newest view.
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn store_then<R>(
+        &self,
+        slot: usize,
+        rows: Vec<LiveWorkerTaskStats>,
+        max_age: Duration,
+        then: impl FnOnce(&[LiveWorkerTaskStats]) -> R,
+    ) -> R {
+        let now = std::time::Instant::now();
+        let mut slots = self.slots();
+        slots.insert(slot, (now, rows));
+        let merged = Self::merge(&slots, now, max_age);
+        then(&merged)
+    }
+
+    /// The rows of every slot stored within `max_age`, one per worker. When
+    /// two shards hold a row for the same worker, the newest row wins.
+    #[must_use]
+    pub fn merged(&self, max_age: Duration) -> Vec<LiveWorkerTaskStats> {
+        Self::merge(&self.slots(), std::time::Instant::now(), max_age)
+    }
+
+    fn merge(
+        slots: &std::collections::BTreeMap<usize, (std::time::Instant, Vec<LiveWorkerTaskStats>)>,
+        now: std::time::Instant,
+        max_age: Duration,
+    ) -> Vec<LiveWorkerTaskStats> {
+        let mut by_worker: std::collections::BTreeMap<String, LiveWorkerTaskStats> =
+            std::collections::BTreeMap::new();
+        let fresh = slots
+            .values()
+            .filter(|(at, _)| now.saturating_duration_since(*at) <= max_age)
+            .flat_map(|(_, rows)| rows.iter());
+        for row in fresh {
+            match by_worker.get(&row.worker_id) {
+                Some(kept) if !row.is_fresher_than(kept) => {}
+                _ => {
+                    by_worker.insert(row.worker_id.clone(), row.clone());
+                }
+            }
+        }
+        by_worker.into_values().collect()
+    }
+}
+
+/// The outlier verdicts of the local workers that share one recorder (issue
+/// #1815).
+///
+/// The gauge has no worker label, and two `Worker`s in one process can share
+/// one recorder. The gauge therefore reports the OR of their verdicts. A
+/// healthy worker's tick then cannot clear a sick worker's flag.
+#[derive(Debug, Default)]
+pub struct ProcessOutlierFlags(Mutex<std::collections::HashMap<String, Vec<OutlierDimension>>>);
+
+impl ProcessOutlierFlags {
+    /// The instance that every worker using `metrics` shares.
+    ///
+    /// Workers that share a recorder share one gauge, so they share one set of
+    /// verdicts. A runtime with its own recorder gets its own set, so one
+    /// runtime's sick worker cannot raise another runtime's gauge.
+    ///
+    /// The registry holds each set weakly. A set lives while a probe holds it,
+    /// and each probe also holds its recorder. So a live set's key cannot be
+    /// reused, and a stopped runtime's set leaves the registry.
+    #[must_use]
+    pub fn for_recorder(metrics: &Arc<dyn MetricsRecorder>) -> Arc<Self> {
+        static BY_RECORDER: std::sync::LazyLock<
+            Mutex<std::collections::HashMap<usize, std::sync::Weak<ProcessOutlierFlags>>>,
+        > = std::sync::LazyLock::new(Mutex::default);
+        let mut by_recorder = BY_RECORDER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        by_recorder.retain(|_, flags| flags.strong_count() > 0);
+        let key = crate::telemetry::recorder_key(metrics);
+        if let Some(flags) = by_recorder.get(&key).and_then(std::sync::Weak::upgrade) {
+            return flags;
+        }
+        let flags = Arc::new(Self::default());
+        by_recorder.insert(key, Arc::downgrade(&flags));
+        drop(by_recorder);
+        flags
+    }
+
+    /// Record `worker_id`'s verdict and return the dimensions on which any
+    /// local worker is an outlier.
+    #[must_use]
+    pub fn set(&self, worker_id: &str, flagged: &[OutlierDimension]) -> Vec<OutlierDimension> {
+        self.update(worker_id, Some(flagged), |_| {})
+    }
+
+    /// Forget `worker_id`, for example when its heartbeat stops, and return
+    /// the dimensions on which any remaining local worker is an outlier.
+    #[must_use]
+    pub fn remove(&self, worker_id: &str) -> Vec<OutlierDimension> {
+        self.update(worker_id, None, |_| {})
+    }
+
+    /// Set (`Some`) or forget (`None`) `worker_id`'s verdict, then pass the OR
+    /// of all verdicts to `emit` and return it.
+    ///
+    /// `emit` runs while the lock is held. Two workers that update at once
+    /// then emit in the order of their updates, so a stale 0 cannot overwrite
+    /// a newer 1.
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn update(
+        &self,
+        worker_id: &str,
+        flagged: Option<&[OutlierDimension]>,
+        emit: impl FnOnce(&[OutlierDimension]),
+    ) -> Vec<OutlierDimension> {
+        let mut verdicts = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match flagged {
+            Some(flagged) => {
+                verdicts.insert(worker_id.to_owned(), flagged.to_vec());
+            }
+            None => {
+                verdicts.remove(worker_id);
+            }
+        }
+        let any: Vec<OutlierDimension> = OutlierDimension::ALL
+            .into_iter()
+            .filter(|d| verdicts.values().any(|v| v.contains(d)))
+            .collect();
+        emit(&any);
+        any
+    }
+}
+
+/// What the liveness heartbeat needs to publish task stats and to flag this
+/// worker as an outlier (issue #1815).
+#[derive(Clone)]
+pub struct OutlierProbe {
+    /// This worker's rolling task window.
+    pub window: Arc<TaskOutcomeWindow>,
+    /// Receives the outlier gauge.
+    pub metrics: Arc<dyn MetricsRecorder>,
+    /// The detection thresholds.
+    pub config: OutlierConfig,
+    /// A peer whose heartbeat or stats are older than this is not compared.
+    pub fleet_stale_secs: i64,
+    /// This worker's cohort key, from [`worker_cohort`]. The heartbeat reads
+    /// only the peers in this cohort. See [`OutlierProbe::cohort_key`].
+    pub cohort: String,
+    /// The worker's payload codecs. [`OutlierProbe::cohort_key`] adds their
+    /// registered key ids on every tick, because a reload can change them.
+    pub codecs: Option<crate::payload_codec::PayloadCodecs>,
+    /// Whether this heartbeat compares the worker and sets the gauge.
+    ///
+    /// A multi-shard worker runs one heartbeat per shard, and each one
+    /// compares. They all merge the same peer set from `shard_peers`, so the
+    /// unlabelled gauge does not flap between peer sets. When one shard fails,
+    /// a healthy shard keeps the verdict live.
+    pub compare: bool,
+    /// This heartbeat's slot in `shard_peers`, one slot per shard.
+    pub slot: usize,
+    /// The peer rows of all this worker's shard heartbeats.
+    pub shard_peers: Arc<ShardPeerViews>,
+    /// The verdicts of every local worker that shares `metrics`. Use
+    /// [`ProcessOutlierFlags::for_recorder`] outside tests.
+    pub process_flags: Arc<ProcessOutlierFlags>,
+}
+
+impl std::fmt::Debug for OutlierProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OutlierProbe")
+            .field("config", &self.config)
+            .field("fleet_stale_secs", &self.fleet_stale_secs)
+            .field("cohort", &self.cohort)
+            .field("codecs", &self.codecs.is_some())
+            .field("compare", &self.compare)
+            .field("slot", &self.slot)
+            .finish_non_exhaustive()
+    }
+}
+
+impl OutlierProbe {
+    /// Enter the window into this probe's cohort, before any task runs
+    /// (issue #1815).
+    ///
+    /// A codec reload before the first heartbeat then changes the cohort, and
+    /// the window drops the samples taken before it.
+    #[must_use]
+    pub fn seeded(self) -> Self {
+        let (cohort, epoch) = self.cohort_and_epoch();
+        self.window.enter_cohort_at(&cohort, epoch);
+        self
+    }
+
+    /// The cohort key this tick writes and reads (issue #1815).
+    ///
+    /// It is [`OutlierProbe::cohort`] with the codecs' registered key ids
+    /// and active key id added. A worker cannot decode a payload under a key
+    /// id it lacks, so the ids are part of the cohort. The active key encodes
+    /// new payloads. A reload can register, retire or activate a key while the
+    /// worker runs, so they are read now, not at startup.
+    #[must_use]
+    pub fn cohort_key(&self) -> String {
+        self.cohort_and_epoch().0
+    }
+
+    /// [`Self::cohort_key`] and the epoch of the last codec key change, from
+    /// one read (issue #1815).
+    ///
+    /// The codec registry stamps each key change when it happens. The window
+    /// then keeps a task dispatched after the change, even when this tick
+    /// notices the change later. A change back to an earlier key still moves
+    /// the epoch.
+    #[must_use]
+    pub fn cohort_and_epoch(&self) -> (String, crate::worker_outlier::CohortEpoch) {
+        let Some(codecs) = &self.codecs else {
+            return (
+                self.cohort.clone(),
+                crate::worker_outlier::CohortEpoch::default(),
+            );
+        };
+        let state = codecs.key_state();
+        let epoch = crate::worker_outlier::CohortEpoch {
+            generation: state.epoch.generation,
+            changed_at: state.epoch.changed_at,
+        };
+        (self.key_with_codecs(codecs, &state), epoch)
+    }
+
+    /// [`OutlierProbe::cohort`] with the codec ids and `state` added.
+    fn key_with_codecs(
+        &self,
+        codecs: &crate::payload_codec::PayloadCodecs,
+        state: &crate::payload_codec::KeyState,
+    ) -> String {
+        match serde_json::from_str::<serde_json::Value>(&self.cohort) {
+            Ok(serde_json::Value::Object(mut key)) => {
+                // A worker decodes only the codecs it has registered. One
+                // without a peer's codec fails that peer's history.
+                key.insert(
+                    "codec_ids".to_owned(),
+                    serde_json::json!(codecs.codec_ids()),
+                );
+                key.insert(
+                    "default_codec_id".to_owned(),
+                    serde_json::json!(codecs.default_codec_id()),
+                );
+                // The active key encodes new payloads, so an activation
+                // changes how this worker runs a task. One read gives a pair
+                // that the registry held at one time.
+                key.insert(
+                    "codec_key_ids".to_owned(),
+                    serde_json::json!(state.registered),
+                );
+                key.insert(
+                    "active_codec_key_id".to_owned(),
+                    serde_json::json!(state.active),
+                );
+                serde_json::Value::Object(key).to_string()
+            }
+            _ => self.cohort.clone(),
+        }
+    }
+
+    /// Record `flagged` as this worker's verdict and set the gauge to the OR
+    /// of every local worker's verdict.
+    fn publish(&self, worker_id: &str, flagged: &[OutlierDimension]) {
+        let _ = self
+            .process_flags
+            .update(worker_id, Some(flagged), |any| self.emit(any));
+    }
+
+    /// A slot older than this belongs to a shard heartbeat that stopped
+    /// reading, so the comparison leaves its rows out.
+    fn view_max_age(&self) -> Duration {
+        Duration::from_secs(u64::try_from(self.fleet_stale_secs).unwrap_or(0))
+    }
+
+    fn emit(&self, any: &[OutlierDimension]) {
+        for dimension in OutlierDimension::ALL {
+            self.metrics
+                .record_worker_outlier(dimension, any.contains(&dimension));
+        }
+    }
+
+    /// Drop this heartbeat's peer rows. When no shard heartbeat of this
+    /// worker holds fresh rows, also clear the verdict and refresh the gauge.
+    ///
+    /// A tick that cannot compare calls this. A healthy shard heartbeat keeps
+    /// the verdict live. With none left, an unknown state reads as "not an
+    /// outlier", so a stale 1 cannot keep an alert firing.
+    pub fn clear_gauge(&self, worker_id: &str) {
+        self.shard_peers
+            .release(self.slot, self.view_max_age(), || {
+                if self.compare {
+                    self.publish(worker_id, &[]);
+                }
+            });
+    }
+
+    /// Drop this heartbeat's peer rows when it stops. The last heartbeat of
+    /// this worker to stop also forgets its verdict and refreshes the gauge.
+    ///
+    /// A stopped worker then cannot keep the process-wide OR at 1.
+    pub fn retire(&self, worker_id: &str) {
+        self.shard_peers
+            .release(self.slot, self.view_max_age(), || {
+                if self.compare {
+                    let _ = self
+                        .process_flags
+                        .update(worker_id, None, |any| self.emit(any));
+                }
+            });
+    }
+}
+
+/// Retires a worker's outlier verdict when the heartbeat future drops
+/// (issue #1815).
+///
+/// An owner can abort the heartbeat task, so its loop does not always reach
+/// its end. The drop still runs, so the verdict is always retired.
+struct RetireOnDrop {
+    probe: OutlierProbe,
+    worker_id: String,
+}
+
+impl RetireOnDrop {
+    const fn new(probe: OutlierProbe, worker_id: String) -> Self {
+        Self { probe, worker_id }
+    }
+}
+
+impl Drop for RetireOnDrop {
+    fn drop(&mut self) {
+        self.probe.retire(&self.worker_id);
+    }
+}
+
+/// One live worker's published task stats (issue #1815).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveWorkerTaskStats {
+    /// The worker id.
+    pub worker_id: String,
+    /// The worker's cohort key, from [`worker_cohort`].
+    ///
+    /// Workers in one cohort poll the same queues with the same weights. They
+    /// also share a build, labels and slots per task kind, so they do the same
+    /// work. A
+    /// worker is compared only with peers in its own cohort.
+    pub cohort: String,
+    /// The published snapshot.
+    pub stats: WorkerTaskStats,
+    /// The worker's own snapshot sequence, from [`next_snapshot_seq`].
+    ///
+    /// Only the worker writes it. So two rows of one worker on two shards
+    /// compare correctly, even when the shard database clocks differ.
+    pub snapshot_seq: i64,
+}
+
+impl LiveWorkerTaskStats {
+    /// Whether `self` should replace `kept` as a worker's snapshot: the newer
+    /// one wins. A window shrinks as old samples expire, so the newer snapshot
+    /// can hold fewer tasks and still be the correct one.
+    #[must_use]
+    pub const fn is_fresher_than(&self, kept: &Self) -> bool {
+        self.snapshot_seq > kept.snapshot_seq
+    }
+}
+
+/// The next task-stats snapshot sequence of this process (issue #1815).
+///
+/// The sequence starts at the host clock in microseconds and then counts up
+/// by one. So it rises within a process, even if the host clock steps back.
+/// Only one worker's rows are compared with each other, so hosts need not
+/// agree.
+///
+/// A restarted worker can keep its id and start below the rows of its
+/// previous process. [`upsert_worker_task_stats`] therefore stores a value
+/// above the old row, and [`observe_snapshot_seq`] moves the counter above it.
+pub fn next_snapshot_seq() -> i64 {
+    SNAPSHOT_SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Move the snapshot sequence above `stored`, a value already in a stats row
+/// (issue #1815).
+///
+/// Every later snapshot of this process then outranks that row on every shard.
+pub fn observe_snapshot_seq(stored: i64) {
+    SNAPSHOT_SEQ.fetch_max(stored.saturating_add(1), Ordering::Relaxed);
+}
+
+static SNAPSHOT_SEQ: std::sync::LazyLock<std::sync::atomic::AtomicI64> =
+    std::sync::LazyLock::new(|| {
+        let micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_micros());
+        std::sync::atomic::AtomicI64::new(i64::try_from(micros).unwrap_or(0))
+    });
+
+/// The cohort key of a worker (issue #1815): a JSON object of everything that
+/// decides which tasks the worker can claim, and in which mix.
+///
+/// - `queues`: without weights, the sorted queue list. Such a worker claims
+///   from all its queues in one query. With weights, the sorted
+///   `[queue, weight]` pairs with a positive weight, duplicates kept, and the
+///   zero-weight queues in their configured order. Such a worker tries its
+///   queues in a weighted order, so its task mix follows the weights. A
+///   listed-twice queue is drawn more often. Zero-weight queues are tried
+///   last, in that order. A queue missing from the map has weight 1, as
+///   [`effective_queue_weights`](crate::queue_fairness::effective_queue_weights)
+///   gives. An entry for a queue the worker does not poll is ignored.
+/// - `build_id`: the claim predicate routes a task with `required_build_id`
+///   only to a matching build.
+/// - `labels`: the claim predicate matches `required_capabilities` against
+///   these labels, sorted by key.
+/// - `sessions`: the worker's session capacity. Session member activities are
+///   pinned to the session's host, so only a worker with capacity gets them.
+/// - `priority_aging_secs` and `ineligible_activities`: the claim query orders
+///   and filters tasks by them.
+/// - `slots`: the worker's [`SlotPolicy`]. A worker with no slot for one kind
+///   claims only the other. Under load, the claim gate gives each worker a
+///   task mix that follows its slots, so two sizes are two cohorts.
+/// - `circuit_breakers`: each activity with a breaker policy, with that
+///   policy. Such an activity skips the claim-time rate-limit gate, and its
+///   breaker fails it fast while open. The open state stays out of the key.
+/// - `dispatch_channel`: the shards whose claims a dispatch channel serves.
+///   A channel orders delivery by priority and ignores `queue_weights`. The
+///   Postgres claim applies the weights. A multi-shard worker can use a
+///   channel on some shards only. So each route set gives its own task mix.
+/// - `retry_budgets`: the retry-budget policy of each registered activity. A
+///   tighter budget defers more retries, so the worker runs fewer of them.
+/// - `adaptive_limits`: the adaptive-limit policy of each registered activity.
+///   A type at its limit is left out of the claim, so the limit shapes the
+///   task mix.
+/// - `outcome_window_ms` and `peer_stale_secs`: both follow the heartbeat
+///   interval. Workers with two windows compare two time ranges, and workers
+///   with two freshness limits can disagree on the live peer set.
+/// - `execution`: the workflow cache, the task budgets, the panic limit and
+///   the cancellation grace period. See [`ExecutionPolicy`].
+/// - `payload`: the payload caps, the history policy, the offloader, the codec
+///   keys and the interceptors. See [`PayloadPolicy`].
+///
+/// So workers on two builds are not compared during a rolling deployment. A
+/// build that fails everywhere is a fleet alert, not a gray failure.
+pub fn worker_cohort(policy: &CohortPolicy<'_>) -> String {
+    let CohortPolicy {
+        queues,
+        queue_weights: weights,
+        build_id,
+        labels,
+        slots,
+        session_slots,
+        priority_aging_secs,
+        ineligible_activities,
+        shard_assignments,
+        registered_workflows,
+        registered_activities,
+        circuit_breakers,
+        dispatch_channel,
+        retry_budgets,
+        adaptive_limits,
+        outcome_window,
+        peer_stale_secs,
+        execution,
+        payload,
+    } = policy;
+    let routing = if weights.is_empty() {
+        let mut names: Vec<&str> = queues.iter().map(String::as_str).collect();
+        names.sort_unstable();
+        names.dedup();
+        serde_json::json!(names)
+    } else {
+        // The weighted draw keeps every entry, so a listed-twice queue is
+        // drawn more often and keeps its multiplicity here. Zero-weight queues
+        // are tried last in their configured order, so that order stays too.
+        let pairs = crate::queue_fairness::effective_queue_weights(queues, weights);
+        let (fallback, mut drawn): (Vec<_>, Vec<_>) =
+            pairs.into_iter().partition(|(_, weight)| *weight == 0);
+        drawn.sort_unstable();
+        let fallback: Vec<&str> = fallback.into_iter().map(|(queue, _)| queue).collect();
+        serde_json::json!({ "drawn": drawn, "fallback": fallback })
+    };
+    let labels: std::collections::BTreeMap<&str, &str> = labels
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let mut shards: Vec<i32> = shard_assignments
+        .iter()
+        .map(|shard| shard.as_i32())
+        .collect();
+    shards.sort_unstable();
+    shards.dedup();
+    let budgets = budget_policies(retry_budgets, registered_activities);
+    serde_json::json!({
+        "queues": routing,
+        "build_id": build_id,
+        "labels": labels,
+        "slots": slots.key(),
+        "sessions": (*session_slots).max(0),
+        "priority_aging_secs": priority_aging_secs,
+        "ineligible_activities": sorted_names(ineligible_activities),
+        "shards": shards,
+        "workflows": sorted_names(registered_workflows),
+        "activities": sorted_names(registered_activities),
+        "circuit_breakers": breaker_policies(circuit_breakers),
+        "dispatch_channel": sorted_shards(dispatch_channel),
+        "retry_budgets": budgets,
+        "adaptive_limits": limit_policies(adaptive_limits, registered_activities),
+        "outcome_window": duration_key(*outcome_window),
+        "peer_stale_secs": peer_stale_secs,
+        "execution": execution.key(),
+        "payload": payload.key(),
+    })
+    .to_string()
+}
+
+/// The retry-budget policy of each registered activity, sorted by name, for a
+/// cohort key. An activity without a budget has `null`.
+fn budget_policies(
+    config: &crate::retry_budget::RetryBudgetConfig,
+    activities: &[String],
+) -> Vec<serde_json::Value> {
+    sorted_names(activities)
+        .into_iter()
+        .map(|name| {
+            let policy = config.policy_for(name).map(|policy| {
+                serde_json::json!([policy.ratio, policy.max_tokens, policy.min_retries_per_sec])
+            });
+            serde_json::json!([name, policy])
+        })
+        .collect()
+}
+
+/// The adaptive-limit policy of each registered activity, sorted by name, for
+/// a cohort key (issue #1815). An activity without a limit has `null`.
+fn limit_policies(
+    config: &crate::adaptive_limit::AdaptiveLimitConfig,
+    activities: &[String],
+) -> Vec<serde_json::Value> {
+    sorted_names(activities)
+        .into_iter()
+        .map(|name| serde_json::json!([name, config.policy_for(name)]))
+        .collect()
+}
+
+/// Each activity with a circuit-breaker policy and that policy, sorted by
+/// name, for a cohort key. The open mode is part of the policy, because it
+/// decides whether an open breaker defers or fails an attempt (issue #1809).
+fn breaker_policies(
+    registry: &crate::circuit_breaker::CircuitBreakerRegistry,
+) -> Vec<serde_json::Value> {
+    registry
+        .tracked_activity_names()
+        .iter()
+        .filter_map(|name| {
+            registry.policy(name).map(|policy| {
+                serde_json::json!([
+                    name,
+                    policy.failure_threshold,
+                    duration_key(policy.window),
+                    duration_key(policy.cooldown),
+                    policy.open_mode,
+                ])
+            })
+        })
+        .collect()
+}
+
+/// `duration` for a cohort key, as `[secs, subsec_nanos]` (issue #1815).
+///
+/// A deadline decides an outcome to the nanosecond, so the key keeps the full
+/// duration. The pair cannot overflow, unlike a single nanosecond count.
+pub(crate) fn duration_key(duration: std::time::Duration) -> serde_json::Value {
+    serde_json::json!([duration.as_secs(), duration.subsec_nanos()])
+}
+
+/// `shards`, sorted and deduplicated, for a cohort key.
+fn sorted_shards(shards: &[i32]) -> Vec<i32> {
+    let mut shards = shards.to_vec();
+    shards.sort_unstable();
+    shards.dedup();
+    shards
+}
+
+/// `names`, sorted and deduplicated, for a cohort key.
+fn sorted_names(names: &[String]) -> Vec<&str> {
+    let mut names: Vec<&str> = names.iter().map(String::as_str).collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+/// The settings that decide which tasks a worker can claim, and in which mix
+/// (issue #1815). [`worker_cohort`] keys a worker's cohort on all of them.
+///
+/// The fields mirror the inputs of
+/// [`queue::claim_task_of_kind_on_shard`](crate::queue::claim_task_of_kind_on_shard)
+/// and of the poll loop around it. Two inputs stay out on purpose. The worker
+/// id is unique to each worker. The state of its circuit breakers is the
+/// worker's own health, which the comparison measures. Their policies are
+/// configuration, so they are in. A new claim input belongs here.
+#[derive(Debug, Clone)]
+pub struct CohortPolicy<'a> {
+    /// The queues the worker polls.
+    pub queues: &'a [String],
+    /// The worker's `queue_weights`.
+    pub queue_weights: &'a std::collections::HashMap<String, u32>,
+    /// The worker's build id.
+    pub build_id: &'a str,
+    /// The worker's capability labels.
+    pub labels: &'a std::collections::HashMap<String, String>,
+    /// The worker's slots per task kind.
+    pub slots: SlotPolicy,
+    /// The worker's session capacity.
+    pub session_slots: i32,
+    /// The worker's priority aging, which orders a mixed-priority backlog.
+    pub priority_aging_secs: Option<u32>,
+    /// Activities the worker does not claim, because its labels do not meet
+    /// their requirements.
+    pub ineligible_activities: &'a [String],
+    /// The shards the worker claims from. Each shard holds its own tasks.
+    pub shard_assignments: &'a [crate::types::ShardId],
+    /// The workflows the worker has handlers for. A task without a handler is
+    /// released, so it never counts.
+    pub registered_workflows: &'a [String],
+    /// The activities the worker has handlers for.
+    pub registered_activities: &'a [String],
+    /// The worker's circuit breakers. Only their policies enter the key.
+    pub circuit_breakers: &'a crate::circuit_breaker::CircuitBreakerRegistry,
+    /// The shards on which the worker reads task references from a dispatch
+    /// channel. The Postgres claim serves every other shard.
+    pub dispatch_channel: &'a [i32],
+    /// The worker's retry budgets. The key holds the policy of each
+    /// registered activity.
+    pub retry_budgets: &'a crate::retry_budget::RetryBudgetConfig,
+    /// The worker's adaptive concurrency limits. The key holds the policy of
+    /// each registered activity. The live limit is the worker's own health,
+    /// so it stays out.
+    pub adaptive_limits: &'a crate::adaptive_limit::AdaptiveLimitConfig,
+    /// How long the worker keeps task outcomes: see
+    /// [`crate::worker_outlier::window_max_age`].
+    pub outcome_window: std::time::Duration,
+    /// How old a peer row may be and still count, in seconds.
+    pub peer_stale_secs: i64,
+    /// The worker settings that decide how a claimed task runs.
+    pub execution: ExecutionPolicy,
+    /// The registry settings that decide whether a task's payloads pass.
+    pub payload: PayloadPolicy,
+}
+
+/// The registry settings that decide whether a task's payloads pass, and so
+/// its outcome and its latency (issue #1815).
+///
+/// The worker enforces each cap itself. An oversized activity result fails
+/// the attempt, and an oversized input or signal fails the workflow task that
+/// sends it. The history policy decides when a workflow continues as new or
+/// fails on its hard cap. An offloader moves a large payload out instead of
+/// failing it. An interceptor can change any outcome.
+///
+/// The registered codec key ids are not here: they can change at runtime, so
+/// [`OutlierProbe::cohort_key`] reads them on every tick.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PayloadPolicy {
+    /// `max_activity_input_bytes`.
+    pub max_activity_input_bytes: u64,
+    /// `max_workflow_input_bytes`.
+    pub max_workflow_input_bytes: u64,
+    /// `max_activity_result_bytes`.
+    pub max_activity_result_bytes: u64,
+    /// `max_signal_payload_bytes`.
+    pub max_signal_payload_bytes: u64,
+    /// `max_current_details_bytes`.
+    pub max_current_details_bytes: usize,
+    /// The history policy's continue-as-new event threshold.
+    pub continue_as_new_threshold: u64,
+    /// The history policy's event hard cap.
+    pub event_hard_cap: Option<u64>,
+    /// The history policy's byte hard cap.
+    pub byte_hard_cap: Option<u64>,
+    /// The history policy's history-bloat warning fraction.
+    pub history_bloat_warn_fraction: f64,
+    /// Whether the history policy records decision boundaries (issue
+    /// #1833). Each persist then appends one more event, so tasks write more
+    /// and the history reaches its caps sooner.
+    pub decision_boundaries: bool,
+    /// The fleet-wide workflow execution timeout ceiling. It caps a run's
+    /// dispatch deadline and a continue-as-new successor's timeout.
+    pub max_workflow_execution_timeout: Option<std::time::Duration>,
+    /// The history policy's continue-as-new deadline fraction.
+    pub continue_as_new_deadline_fraction: f64,
+    /// The payload offloader's threshold. `None` without an offloader.
+    pub offload_threshold: Option<u64>,
+    /// The payload offloader's store id. `None` without an offloader. Replay
+    /// rejects an envelope that another store wrote.
+    pub offload_store_id: Option<String>,
+    /// The `policy()` of each activity interceptor, in chain order.
+    pub activity_interceptors: Vec<String>,
+    /// The execution policy of each registered activity, sorted by name. It
+    /// holds the effective payload caps and whether the activity runs locally.
+    /// It also holds the rate limit, the concurrency limit and any WASM
+    /// binding.
+    pub activities: Vec<(String, serde_json::Value)>,
+    /// The registry defaults a local activity runs with: its retry policy, its
+    /// start-to-close timeout and the retry-after ceiling. A local activity has
+    /// no task row, so the worker applies its own defaults.
+    pub local_activity_defaults: serde_json::Value,
+    /// The module host's policy with the `hot-code-swap` feature: capabilities,
+    /// limits, activity allowlist and queue-override permission. A refusal or
+    /// an exhausted limit fails the workflow.
+    pub module_host: serde_json::Value,
+    /// The policy of each registered workflow, sorted by name: its effective
+    /// input cap and whether it is a unified DAG. The worker enforces the cap,
+    /// and a continue-as-new into a DAG is refused.
+    pub workflows: Vec<(String, serde_json::Value)>,
+    /// Each declarative query and update handler, sorted. The task context
+    /// carries the handlers of its workflow, and a worker without a handler
+    /// fails a request that a peer runs.
+    pub declarative_handlers: Vec<serde_json::Value>,
+    /// The workflow log policy as `[max_lines, max_message_bytes]`. `Null`
+    /// when workflow logs are off. A worker with logs on persists each line
+    /// inside the task.
+    pub workflow_log_policy: serde_json::Value,
+}
+
+impl PayloadPolicy {
+    fn key(&self) -> serde_json::Value {
+        serde_json::json!({
+            "max_activity_input_bytes": self.max_activity_input_bytes,
+            "max_workflow_input_bytes": self.max_workflow_input_bytes,
+            "max_activity_result_bytes": self.max_activity_result_bytes,
+            "max_signal_payload_bytes": self.max_signal_payload_bytes,
+            "max_current_details_bytes": self.max_current_details_bytes,
+            "continue_as_new_threshold": self.continue_as_new_threshold,
+            "event_hard_cap": self.event_hard_cap,
+            "byte_hard_cap": self.byte_hard_cap,
+            "history_bloat_warn_fraction": self.history_bloat_warn_fraction,
+            "decision_boundaries": self.decision_boundaries,
+            "max_workflow_execution_timeout": self.max_workflow_execution_timeout.map(duration_key),
+            "continue_as_new_deadline_fraction": self.continue_as_new_deadline_fraction,
+            "offload_threshold": self.offload_threshold,
+            "offload_store_id": self.offload_store_id,
+            "activity_interceptors": self.activity_interceptors,
+            "activities": self.activities,
+            "local_activity_defaults": self.local_activity_defaults,
+            "module_host": self.module_host,
+            "workflows": self.workflows,
+            "declarative_handlers": self.declarative_handlers,
+            "workflow_log_policy": self.workflow_log_policy,
+        })
+    }
+}
+
+/// The worker settings that decide how a claimed task runs, and so its
+/// outcome and its latency (issue #1815).
+///
+/// Each one changes what the outcome window records for the same task. The
+/// workflow cache decides whether a task replays its full history. The two
+/// budgets decide whether a task times out, and a timeout is a failure. The
+/// panic limit and the poison-pill threshold decide how many failing attempts
+/// run before quarantine. The cancellation grace period bounds how long a
+/// cancelled activity unwinds before its outcome is recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutionPolicy {
+    /// `sticky_timeout`. Zero turns the workflow cache off.
+    pub sticky_timeout: std::time::Duration,
+    /// `workflow_cache_size`.
+    pub workflow_cache_size: usize,
+    /// `resident_workflows`.
+    pub resident_workflows: bool,
+    /// `workflow_task_timeout`.
+    pub workflow_task_timeout: std::time::Duration,
+    /// `max_local_activity_start_to_close`.
+    pub max_local_activity_start_to_close: std::time::Duration,
+    /// `workflow_panic_max_attempts`.
+    pub workflow_panic_max_attempts: u32,
+    /// `poison_pill_threshold`. The worker's timeout path quarantines a
+    /// workflow task that times out this many times in a row.
+    pub poison_pill_threshold: i32,
+    /// `cancellation_grace_period`. A timed-out activity that ignores its
+    /// cancellation runs this long before the timeout is recorded. So the
+    /// period adds to the latency that the window records.
+    pub cancellation_grace_period: std::time::Duration,
+    /// `dr_fencing`. A fenced worker checks its shard generation in each
+    /// claim query and before each history persist. That check adds to the
+    /// latency that the window records.
+    pub dr_fencing: bool,
+}
+
+impl Default for ExecutionPolicy {
+    /// Test defaults. A worker passes its own settings.
+    fn default() -> Self {
+        Self {
+            sticky_timeout: std::time::Duration::from_secs(10),
+            workflow_cache_size: 1000,
+            resident_workflows: false,
+            workflow_task_timeout: std::time::Duration::from_secs(10),
+            max_local_activity_start_to_close: std::time::Duration::from_secs(10),
+            workflow_panic_max_attempts: 3,
+            poison_pill_threshold: 3,
+            cancellation_grace_period: std::time::Duration::from_secs(5),
+            dr_fencing: false,
+        }
+    }
+}
+
+impl ExecutionPolicy {
+    fn key(self) -> serde_json::Value {
+        serde_json::json!({
+            "sticky_timeout": duration_key(self.sticky_timeout),
+            "workflow_cache_size": self.workflow_cache_size,
+            "resident_workflows": self.resident_workflows,
+            "workflow_task_timeout": duration_key(self.workflow_task_timeout),
+            "max_local_activity": duration_key(self.max_local_activity_start_to_close),
+            "workflow_panic_max_attempts": self.workflow_panic_max_attempts,
+            // Every threshold at or below 0 turns quarantine off, so they are
+            // one setting.
+            "poison_pill_threshold": self.poison_pill_threshold.max(0),
+            "cancellation_grace_period": duration_key(self.cancellation_grace_period),
+            "dr_fencing": self.dr_fencing,
+        })
+    }
+}
+
+/// How a worker sizes its slots per task kind, as its cohort key records it
+/// (issue #1815).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlotPolicy {
+    /// Fixed slots per kind. A kind with 0 slots is not claimed.
+    Fixed {
+        /// `max_concurrent_workflows`.
+        workflow: usize,
+        /// `max_concurrent_activities`.
+        activity: usize,
+    },
+    /// A slot tuner sizes both kinds within one band, so the worker claims
+    /// both kinds. Each kind starts at its configured maximum, clamped into
+    /// the band, and the tuner resizes it from there.
+    Tuned {
+        /// The band floor, after normalization.
+        min: usize,
+        /// The band cap, after normalization.
+        max: usize,
+        /// The initial workflow target.
+        workflow: usize,
+        /// The initial activity target.
+        activity: usize,
+        /// The tuner's policy: see [`crate::slot_tuner::SlotTuner::policy`].
+        tuner: String,
+    },
+}
+
+impl SlotPolicy {
+    /// The policy of a worker with these slot settings.
+    ///
+    /// A tuner clamps each configured maximum into its band and resizes it
+    /// later, so the configured maximums do not describe a tuned worker.
+    #[must_use]
+    pub fn of(
+        workflow_max: usize,
+        activity_max: usize,
+        tuner: Option<&crate::slot_tuner::SlotTunerConfig>,
+    ) -> Self {
+        tuner.map_or(
+            Self::Fixed {
+                workflow: workflow_max,
+                activity: activity_max,
+            },
+            |config| {
+                let (min, max) =
+                    crate::slot_tuner::effective_band(config.min_slots, config.max_slots);
+                Self::Tuned {
+                    min,
+                    max,
+                    workflow: crate::slot_tuner::initial_target(workflow_max, min, max),
+                    activity: crate::slot_tuner::initial_target(activity_max, min, max),
+                    tuner: config.tuner.policy(),
+                }
+            },
+        )
+    }
+
+    fn key(&self) -> serde_json::Value {
+        match self {
+            Self::Fixed { workflow, activity } => {
+                serde_json::json!({ "workflow": workflow, "activity": activity })
+            }
+            Self::Tuned {
+                min,
+                max,
+                workflow,
+                activity,
+                tuner,
+            } => serde_json::json!({
+                "tuned": {
+                    "min": min,
+                    "max": max,
+                    "workflow": workflow,
+                    "activity": activity,
+                    "tuner": tuner,
+                }
+            }),
+        }
+    }
+}
+
+/// What one task-stats write did (issue #1815).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotWrite {
+    /// The snapshot is stored.
+    Stored,
+    /// A newer snapshot of this process is already stored, so this one is
+    /// dropped. Two heartbeats of one worker can write one row, when
+    /// colocated shards share a database.
+    Superseded,
+    /// A row that this process did not write holds a higher sequence, for
+    /// example from the worker's previous process. The counter now runs above
+    /// it, so a fresh snapshot written next is stored.
+    Foreign,
+}
+
+/// Read the cohort key, capture `window` for it and give it the next
+/// snapshot sequence, as one step (issue #1815).
+///
+/// Two heartbeats of one worker then cannot pair an older window with a newer
+/// sequence. A new cohort starts the window empty.
+///
+/// `cohort_key` runs inside the step too. A codec reload can change the key
+/// between two shard heartbeats. A heartbeat that read the old key could
+/// otherwise capture after the one that read the new key. It would move the
+/// window back to the old cohort and publish it with the higher sequence.
+///
+/// A codec write does not take this step's lock. So a change can also land
+/// between the key read and the snapshot. A task dispatched under the new key
+/// would then be published under the old one. The step therefore reads the
+/// key again after each snapshot, and captures again until the key holds.
+///
+/// Returns `None` when the key changes after every snapshot. Each snapshot
+/// that the step returns is confirmed by a later key read. A snapshot with no
+/// such read could hold tasks of a newer cohort, so it is not published.
+pub fn capture_task_stats(
+    window: &TaskOutcomeWindow,
+    cohort_key: impl Fn() -> (String, crate::worker_outlier::CohortEpoch),
+) -> Option<(String, WorkerTaskStats, i64)> {
+    // Codec changes are operator actions, so a few reads always settle. The
+    // bound only stops a pathological writer from holding the heartbeat.
+    const MAX_CAPTURES: usize = 5;
+    static CAPTURE: Mutex<()> = Mutex::new(());
+    let _capture = CAPTURE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (mut cohort, mut epoch) = cohort_key();
+    for _ in 0..MAX_CAPTURES {
+        let stats = window.snapshot_in_cohort_at(&cohort, epoch);
+        let (now, now_epoch) = cohort_key();
+        if now == cohort && now_epoch == epoch {
+            return Some((cohort, stats, next_snapshot_seq()));
+        }
+        (cohort, epoch) = (now, now_epoch);
+    }
+    None
+}
+
+/// Write one worker's task stats snapshot with sequence `seq` (issue #1815).
+///
+/// The write is an upsert. It fails on the foreign key when the worker row is
+/// missing. The next heartbeat heals the worker row and then retries.
+///
+/// The upsert replaces only a row with a lower sequence, so a snapshot that
+/// arrives late never replaces a newer one. A rejected write reads the stored
+/// sequence and moves the counter above it.
+///
+/// # Errors
+///
+/// Returns [`HarvestError`] on database failure.
+pub async fn write_task_stats_snapshot(
+    conn: &mut AsyncPgConnection,
+    worker_id: &str,
+    cohort: &str,
+    stats: &WorkerTaskStats,
+    seq: i64,
+) -> HarvestResult<SnapshotWrite> {
+    let to_i32 = |n: u32| i32::try_from(n).unwrap_or(i32::MAX);
+    let stored = diesel::sql_query(
+        "INSERT INTO harvest_worker_task_stats \
+             (worker_id, window_tasks, window_failures, p99_latency_ms, snapshot_seq, \
+              cohort, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, NOW()) \
+         ON CONFLICT (worker_id) DO UPDATE SET \
+             cohort = EXCLUDED.cohort, \
+             window_tasks = EXCLUDED.window_tasks, \
+             window_failures = EXCLUDED.window_failures, \
+             p99_latency_ms = EXCLUDED.p99_latency_ms, \
+             snapshot_seq = EXCLUDED.snapshot_seq, \
+             updated_at = EXCLUDED.updated_at \
+         WHERE harvest_worker_task_stats.snapshot_seq < EXCLUDED.snapshot_seq \
+         RETURNING snapshot_seq",
+    )
+    .bind::<diesel::sql_types::Text, _>(worker_id)
+    .bind::<diesel::sql_types::Integer, _>(to_i32(stats.tasks))
+    .bind::<diesel::sql_types::Integer, _>(to_i32(stats.failures))
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(
+        stats
+            .p99_latency_ms
+            .map(|ms| i64::try_from(ms).unwrap_or(i64::MAX)),
+    )
+    .bind::<diesel::sql_types::BigInt, _>(seq)
+    .bind::<diesel::sql_types::Text, _>(cohort)
+    .get_result::<StoredSnapshotSeq>(conn)
+    .await
+    .optional()
+    .map_err(crate::error::database_error)?;
+    if stored.is_some() {
+        return Ok(SnapshotWrite::Stored);
+    }
+    let existing: StoredSnapshotSeq = diesel::sql_query(
+        "SELECT snapshot_seq FROM harvest_worker_task_stats WHERE worker_id = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(worker_id)
+    .get_result(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    // This process has issued every sequence below its counter. A stored
+    // sequence at or above the counter came from another process.
+    let issued = std::sync::atomic::AtomicI64::load(&SNAPSHOT_SEQ, Ordering::Relaxed);
+    let foreign = existing.snapshot_seq >= issued;
+    observe_snapshot_seq(existing.snapshot_seq);
+    Ok(if foreign {
+        SnapshotWrite::Foreign
+    } else {
+        SnapshotWrite::Superseded
+    })
+}
+
+/// Write one worker's current task stats (issue #1815).
+///
+/// The snapshot takes the next sequence. A row from a previous process of the
+/// same worker can hold a higher one. The write then retries once, above it.
+///
+/// # Errors
+///
+/// Returns [`HarvestError`] on database failure.
+pub async fn upsert_worker_task_stats(
+    conn: &mut AsyncPgConnection,
+    worker_id: &str,
+    cohort: &str,
+    stats: &WorkerTaskStats,
+) -> HarvestResult<()> {
+    for _ in 0..2 {
+        let seq = next_snapshot_seq();
+        if write_task_stats_snapshot(conn, worker_id, cohort, stats, seq).await?
+            != SnapshotWrite::Foreign
+        {
+            break;
+        }
+    }
+    Ok(())
+}
+
+#[derive(diesel::QueryableByName)]
+struct StoredSnapshotSeq {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    snapshot_seq: i64,
+}
+
+/// Delete task-stats rows older than [`WORKER_TASK_STATS_RETENTION`] (issue
+/// #1815). Returns the number of rows deleted.
+///
+/// A slow cohort can count a row as live for longer than the retention. Each
+/// row therefore keeps its own cohort's `peer_stale_secs` when that is longer.
+/// A worker with a fast heartbeat then cannot delete a slow peer's live row. A
+/// key without the field falls back to `fallback_stale_secs`.
+///
+/// # Errors
+///
+/// Returns [`HarvestError`] on database failure, or when a stored cohort key
+/// is not JSON.
+pub async fn prune_worker_task_stats(
+    conn: &mut AsyncPgConnection,
+    fallback_stale_secs: i64,
+) -> HarvestResult<usize> {
+    let retention = i64::try_from(WORKER_TASK_STATS_RETENTION.as_secs()).unwrap_or(i64::MAX);
+    diesel::sql_query(format!(
+        "DELETE FROM harvest_worker_task_stats s \
+         WHERE s.updated_at < NOW() - (GREATEST($1::bigint, {}) * INTERVAL '1 second')",
+        cohort_stale_secs_sql("$2")
+    ))
+    .bind::<diesel::sql_types::BigInt, _>(retention)
+    .bind::<diesel::sql_types::BigInt, _>(
+        fallback_stale_secs.clamp(0, crate::poison_pill::MAX_WORKER_STALE_SECS),
+    )
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)
+}
+
+/// The SQL for the `peer_stale_secs` of row `s`'s cohort, bounded to
+/// `0..=MAX_WORKER_STALE_SECS` (issue #1815). A key without the field uses
+/// the bind parameter `fallback`.
+fn cohort_stale_secs_sql(fallback: &str) -> String {
+    format!(
+        "LEAST(GREATEST(COALESCE((s.cohort::jsonb ->> 'peer_stale_secs')::bigint, {fallback}), 0), {})",
+        crate::poison_pill::MAX_WORKER_STALE_SECS
+    )
+}
+
+#[derive(diesel::QueryableByName)]
+struct TaskStatsRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    worker_id: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    cohort: String,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    window_tasks: i32,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    window_failures: i32,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
+    p99_latency_ms: Option<i64>,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    snapshot_seq: i64,
+}
+
+/// The task stats of every `Active` worker with a fresh heartbeat and fresh
+/// stats (issue #1815), ordered by worker id.
+///
+/// A draining, stopped or stale worker is left out. So is a frozen stats row,
+/// for example from a worker that a rollback took back to an older build. Old
+/// stats then cannot move the peer median.
+///
+/// With `cohort`, only the rows of that cohort are read. A heartbeat compares
+/// its worker only with its cohort, so it reads only those rows. Without it,
+/// every cohort is read.
+///
+/// # Errors
+///
+/// Returns [`HarvestError`] on database failure.
+pub async fn load_live_worker_task_stats(
+    conn: &mut AsyncPgConnection,
+    worker_stale_secs: i64,
+    cohort: Option<&str>,
+) -> HarvestResult<Vec<LiveWorkerTaskStats>> {
+    load_task_stats(conn, worker_stale_secs, cohort, false).await
+}
+
+/// [`load_live_worker_task_stats`] for every cohort, each with its own
+/// freshness limit (issue #1815).
+///
+/// Each cohort key records `peer_stale_secs`, which follows that cohort's
+/// heartbeat interval. A row counts as fresh for as long as its own cohort's
+/// heartbeat counts it, so `GET /admin/status` sees the same peer set as the
+/// workers. A key without the field falls back to `fallback_stale_secs`.
+///
+/// # Errors
+///
+/// Returns [`HarvestError`] on database failure, or when a stored cohort key
+/// is not JSON.
+pub async fn load_live_worker_task_stats_per_cohort(
+    conn: &mut AsyncPgConnection,
+    fallback_stale_secs: i64,
+) -> HarvestResult<Vec<LiveWorkerTaskStats>> {
+    load_task_stats(conn, fallback_stale_secs, None, true).await
+}
+
+/// The query behind [`load_live_worker_task_stats`] and
+/// [`load_live_worker_task_stats_per_cohort`].
+async fn load_task_stats(
+    conn: &mut AsyncPgConnection,
+    worker_stale_secs: i64,
+    cohort: Option<&str>,
+    per_cohort_freshness: bool,
+) -> HarvestResult<Vec<LiveWorkerTaskStats>> {
+    let stale = worker_stale_secs.clamp(0, crate::poison_pill::MAX_WORKER_STALE_SECS);
+    // A plain equality, not `$3 IS NULL OR ...`, so the cohort index applies.
+    let cohort_filter = if cohort.is_some() {
+        "AND s.cohort = $3 "
+    } else {
+        ""
+    };
+    let limit = if per_cohort_freshness {
+        cohort_stale_secs_sql("$2")
+    } else {
+        "$2::bigint".to_owned()
+    };
+    let query = diesel::sql_query(format!(
+        "SELECT s.worker_id, s.cohort, s.window_tasks, s.window_failures, s.p99_latency_ms, \
+                s.snapshot_seq \
+         FROM harvest_worker_task_stats s \
+         JOIN harvest_workers w ON w.worker_id = s.worker_id \
+         WHERE w.status = $1 \
+           AND w.last_heartbeat_at > NOW() - ({limit} * INTERVAL '1 second') \
+           AND s.updated_at > NOW() - ({limit} * INTERVAL '1 second') \
+           {cohort_filter}\
+         ORDER BY s.worker_id"
+    ))
+    .into_boxed::<diesel::pg::Pg>()
+    .bind::<diesel::sql_types::Text, _>(WorkerStatus::Active.as_str())
+    .bind::<diesel::sql_types::BigInt, _>(stale);
+    let query = match cohort {
+        Some(cohort) => query.bind::<diesel::sql_types::Text, _>(cohort.to_owned()),
+        None => query,
+    };
+    let rows: Vec<TaskStatsRow> = query
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(rows
+        .into_iter()
+        .map(|r| LiveWorkerTaskStats {
+            cohort: r.cohort,
+            worker_id: r.worker_id,
+            stats: WorkerTaskStats {
+                tasks: u32::try_from(r.window_tasks).unwrap_or(0),
+                failures: u32::try_from(r.window_failures).unwrap_or(0),
+                p99_latency_ms: r.p99_latency_ms.and_then(|ms| u64::try_from(ms).ok()),
+            },
+            snapshot_seq: r.snapshot_seq,
+        })
+        .collect())
+}
+
+/// Publish this worker's task stats and run one outlier tick (issue #1815).
+///
+/// The tick prunes old rows and reads the live peers into
+/// `probe.shard_peers`. When `probe.compare` holds, it then compares the
+/// worker with the peers of all its shards and sets the outlier gauge.
+///
+/// The comparison merges the peer rows of all this worker's shards. It uses
+/// only peers in the worker's own queue cohort. A draining worker, or a worker
+/// missing from the live set, is not an outlier. The gauge reports the OR of
+/// every local worker's verdict, on every dimension. With metrics off, the
+/// tick publishes and prunes, and skips the peer read.
+///
+/// Returns the dimensions on which this worker is an outlier.
+///
+/// # Errors
+///
+/// Returns [`HarvestError`] on database failure. The caller then clears the
+/// verdict with [`OutlierProbe::clear_gauge`].
+pub async fn run_outlier_tick(
+    conn: &mut AsyncPgConnection,
+    worker_id: &str,
+    probe: &OutlierProbe,
+    draining: bool,
+) -> HarvestResult<Vec<OutlierDimension>> {
+    // A row of the worker's previous process can hold a higher sequence. The
+    // first write then moves the counter above it, and a fresh capture follows.
+    let mut cohort = None;
+    for _ in 0..2 {
+        let Some((key, own, seq)) = capture_task_stats(&probe.window, || probe.cohort_and_epoch())
+        else {
+            cohort = None;
+            break;
+        };
+        let write = write_task_stats_snapshot(conn, worker_id, &key, &own, seq).await?;
+        cohort = Some(key);
+        if write != SnapshotWrite::Foreign {
+            break;
+        }
+    }
+    // Every shard heartbeat prunes its own database, whether it compares or not.
+    prune_worker_task_stats(conn, probe.fleet_stale_secs).await?;
+    // The codec keys did not hold during the capture, so this tick has no
+    // cohort to compare in. It clears its view like a failed tick. The next
+    // tick captures again.
+    let Some(cohort) = cohort else {
+        probe.clear_gauge(worker_id);
+        return Ok(Vec::new());
+    };
+    if !probe.metrics.is_enabled() {
+        return Ok(Vec::new());
+    }
+    let live = load_live_worker_task_stats(conn, probe.fleet_stale_secs, Some(&cohort)).await?;
+    if !probe.compare {
+        probe.shard_peers.store(probe.slot, live);
+        return Ok(Vec::new());
+    }
+    let flagged = probe
+        .shard_peers
+        .store_then(probe.slot, live, probe.view_max_age(), |live| {
+            let flagged = if draining {
+                Vec::new()
+            } else {
+                live.iter()
+                    .find(|row| row.worker_id == worker_id)
+                    .map(|me| {
+                        let peers: Vec<WorkerTaskStats> = live
+                            .iter()
+                            .filter(|row| row.worker_id != worker_id && row.cohort == me.cohort)
+                            .map(|row| row.stats)
+                            .collect();
+                        // The newest self row, which a sibling shard
+                        // heartbeat can hold, not this tick's own capture.
+                        outlier_dimensions(&me.stats, &peers, &probe.config)
+                    })
+                    .unwrap_or_default()
+            };
+            probe.publish(worker_id, &flagged);
+            flagged
+        });
+    Ok(flagged)
 }
 
 /// Transition a worker's lifecycle status.
@@ -1842,8 +3236,12 @@ pub fn spawn_worker_heartbeat(
     // task has already started. A heartbeat must advertise the current
     // registry, not the one at spawn time.
     codecs: crate::payload_codec::PayloadCodecs,
+    // Issue #1815: publishes task stats and sets the outlier gauge each tick.
+    outliers: OutlierProbe,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // Retires the verdict on every exit, an abort included.
+        let _retire = RetireOnDrop::new(outliers.clone(), registration.worker_id.clone());
         let labels_json = serde_json::to_value(&registration.labels).unwrap_or_default();
         let mut schedule = HeartbeatSchedule::new(interval);
         while schedule.wait(&cancel).await {
@@ -1887,6 +3285,21 @@ pub fn spawn_worker_heartbeat(
                         &registered_codec_key_ids,
                     )
                     .await;
+                    if let Err(error) = run_outlier_tick(
+                        &mut conn,
+                        &registration.worker_id,
+                        &outliers,
+                        worker_shutdown.is_cancelled(),
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            worker_id = %registration.worker_id,
+                            error = %error,
+                            "worker task-stats tick failed; outlier gauge cleared"
+                        );
+                        outliers.clear_gauge(&registration.worker_id);
+                    }
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -1894,6 +3307,7 @@ pub fn spawn_worker_heartbeat(
                         error = %error,
                         "worker heartbeat failed to get pool connection"
                     );
+                    outliers.clear_gauge(&registration.worker_id);
                 }
             }
         }
@@ -1988,6 +3402,1546 @@ pub fn local_hostname() -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A live row published `age_secs` ago.
+    fn live_aged(worker_id: &str, tasks: u32, age_secs: i64) -> super::LiveWorkerTaskStats {
+        super::LiveWorkerTaskStats {
+            worker_id: worker_id.to_owned(),
+            cohort: "[\"q\"]".to_owned(),
+            stats: crate::worker_outlier::WorkerTaskStats {
+                tasks,
+                failures: 0,
+                p99_latency_ms: Some(1),
+            },
+            // A newer row has a higher sequence, as `next_snapshot_seq` gives.
+            snapshot_seq: 1_000_000 - age_secs,
+        }
+    }
+
+    fn live(worker_id: &str, tasks: u32) -> super::LiveWorkerTaskStats {
+        live_aged(worker_id, tasks, 0)
+    }
+
+    /// Issue #1815: shard clocks can differ, so the worker's own sequence
+    /// decides which of its snapshots is newer.
+    #[test]
+    fn the_worker_sequence_orders_snapshots_across_skewed_shards() {
+        let first = super::next_snapshot_seq();
+        let second = super::next_snapshot_seq();
+        assert!(second > first, "the sequence rises");
+        let mut older = live("w", 90);
+        older.snapshot_seq = first;
+        let mut newer = live("w", 10);
+        newer.snapshot_seq = second;
+        assert!(newer.is_fresher_than(&older));
+        assert!(!older.is_fresher_than(&newer));
+    }
+
+    /// Issue #1815: the comparing heartbeat sees peers from every shard, once
+    /// each, with the newest snapshot of a worker that both shards hold. The
+    /// newest one wins even with fewer tasks, because a window shrinks.
+    #[test]
+    fn shard_peer_views_merge_every_slot_once_per_worker() {
+        let views = super::ShardPeerViews::default();
+        let window = std::time::Duration::from_secs(60);
+        views.store(0, vec![live("me", 50), live_aged("a", 99, 30)]);
+        views.store(
+            1,
+            vec![live_aged("me", 90, 30), live("b", 30), live("a", 20)],
+        );
+        let merged: Vec<(String, u32)> = views
+            .merged(window)
+            .into_iter()
+            .map(|r| (r.worker_id, r.stats.tasks))
+            .collect();
+        assert_eq!(
+            merged,
+            vec![("a".into(), 20), ("b".into(), 30), ("me".into(), 50)]
+        );
+        // A later read from one slot replaces that slot only.
+        views.store(1, vec![]);
+        assert_eq!(views.merged(window).len(), 2);
+    }
+
+    /// Issue #1815: a slot whose shard heartbeat failed or went quiet no
+    /// longer supplies peers.
+    #[test]
+    fn shard_peer_views_drop_cleared_and_expired_slots() {
+        let views = super::ShardPeerViews::default();
+        let window = std::time::Duration::from_secs(60);
+        views.store(0, vec![live("me", 50)]);
+        views.store(1, vec![live("a", 20)]);
+        views.clear(1);
+        assert_eq!(views.merged(window).len(), 1, "a cleared slot is gone");
+
+        let old = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(120))
+            .expect("the clock is past two minutes");
+        views.store_at(1, old, vec![live("a", 20)]);
+        let ids: Vec<String> = views
+            .merged(window)
+            .into_iter()
+            .map(|r| r.worker_id)
+            .collect();
+        assert_eq!(ids, vec!["me".to_string()], "an expired slot is skipped");
+    }
+
+    fn probe_for_slot(
+        slot: usize,
+        shard_peers: &std::sync::Arc<super::ShardPeerViews>,
+        process_flags: &std::sync::Arc<super::ProcessOutlierFlags>,
+    ) -> super::OutlierProbe {
+        super::OutlierProbe {
+            window: std::sync::Arc::default(),
+            metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
+            config: crate::worker_outlier::OutlierConfig::default(),
+            fleet_stale_secs: 60,
+            cohort: "[\"q\"]".to_owned(),
+            codecs: None,
+            compare: true,
+            slot,
+            shard_peers: std::sync::Arc::clone(shard_peers),
+            process_flags: std::sync::Arc::clone(process_flags),
+        }
+    }
+
+    /// Issue #1815: a failed shard heartbeat leaves the verdict to a healthy
+    /// one. The last failed heartbeat clears it.
+    #[test]
+    fn a_failed_shard_keeps_the_verdict_while_another_shard_is_healthy() {
+        use crate::worker_outlier::OutlierDimension::FailureRatio;
+        let peers = std::sync::Arc::default();
+        let flags = std::sync::Arc::default();
+        let first = probe_for_slot(0, &peers, &flags);
+        let second = probe_for_slot(1, &peers, &flags);
+        first.shard_peers.store(0, vec![live("me", 50)]);
+        second.shard_peers.store(1, vec![live("me", 50)]);
+        let _ = flags.set("me", &[FailureRatio]);
+
+        first.clear_gauge("me");
+        assert_eq!(
+            flags.set("peer", &[]),
+            vec![FailureRatio],
+            "a healthy shard still holds the verdict"
+        );
+        second.clear_gauge("me");
+        assert!(flags.set("peer", &[]).is_empty(), "no shard can compare");
+    }
+
+    fn cohort_of(
+        queues: &[&str],
+        weights: &[(&str, u32)],
+        build: &str,
+        labels: &[(&str, &str)],
+    ) -> String {
+        let queues: Vec<String> = queues.iter().map(|n| (*n).to_owned()).collect();
+        let weights: std::collections::HashMap<String, u32> =
+            weights.iter().map(|(q, w)| ((*q).to_owned(), *w)).collect();
+        let labels: std::collections::HashMap<String, String> = labels
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        super::worker_cohort(&super::CohortPolicy {
+            queues: &queues,
+            queue_weights: &weights,
+            build_id: build,
+            labels: &labels,
+            slots: super::SlotPolicy::of(1, 1, None),
+            session_slots: 0,
+            priority_aging_secs: None,
+            ineligible_activities: &[],
+            shard_assignments: &[],
+            registered_workflows: &[],
+            registered_activities: &[],
+            circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
+            dispatch_channel: &[],
+            retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
+            adaptive_limits: &crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
+            outcome_window: std::time::Duration::from_secs(300),
+            peer_stale_secs: 120,
+            execution: super::ExecutionPolicy::default(),
+            payload: super::PayloadPolicy::default(),
+        })
+    }
+
+    /// Issue #1815: a worker with no slot for one task kind claims only the
+    /// other kind. An activity-only worker and a workflow-only worker do
+    /// disjoint work, so they are in different cohorts.
+    #[test]
+    fn the_cohort_key_includes_the_task_kinds() {
+        let queues = vec!["a".to_owned()];
+        let none = std::collections::HashMap::<String, u32>::new();
+        let labels = std::collections::HashMap::<String, String>::new();
+        let slots = |workflows, activities| {
+            super::worker_cohort(&super::CohortPolicy {
+                queues: &queues,
+                queue_weights: &none,
+                build_id: "v1",
+                labels: &labels,
+                slots: super::SlotPolicy::of(workflows, activities, None),
+                session_slots: 0,
+                priority_aging_secs: None,
+                ineligible_activities: &[],
+                shard_assignments: &[],
+                registered_workflows: &[],
+                registered_activities: &[],
+                circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
+                dispatch_channel: &[],
+                retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
+                adaptive_limits: &crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
+                outcome_window: std::time::Duration::from_secs(300),
+                peer_stale_secs: 120,
+                execution: super::ExecutionPolicy::default(),
+                payload: super::PayloadPolicy::default(),
+            })
+        };
+        assert_ne!(slots(10, 0), slots(0, 10));
+        assert_ne!(slots(10, 10), slots(10, 0));
+        assert_ne!(slots(10, 10), slots(0, 10));
+        assert_eq!(slots(10, 10), slots(10, 10));
+    }
+
+    /// Issue #1815: session member activities are pinned to the session's
+    /// host. A worker with session capacity gets that work and one without
+    /// does not, so they are in different cohorts.
+    #[test]
+    fn the_cohort_key_includes_the_session_capacity() {
+        let queues = vec!["a".to_owned()];
+        let none = std::collections::HashMap::<String, u32>::new();
+        let labels = std::collections::HashMap::<String, String>::new();
+        let sessions = |n| {
+            super::worker_cohort(&super::CohortPolicy {
+                queues: &queues,
+                queue_weights: &none,
+                build_id: "v1",
+                labels: &labels,
+                slots: super::SlotPolicy::of(10, 10, None),
+                session_slots: n,
+                priority_aging_secs: None,
+                ineligible_activities: &[],
+                shard_assignments: &[],
+                registered_workflows: &[],
+                registered_activities: &[],
+                circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
+                dispatch_channel: &[],
+                retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
+                adaptive_limits: &crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
+                outcome_window: std::time::Duration::from_secs(300),
+                peer_stale_secs: 120,
+                execution: super::ExecutionPolicy::default(),
+                payload: super::PayloadPolicy::default(),
+            })
+        };
+        assert_ne!(sessions(0), sessions(4));
+        assert_ne!(sessions(4), sessions(8));
+        assert_eq!(
+            sessions(0),
+            sessions(-1),
+            "a negative capacity is no capacity"
+        );
+    }
+
+    /// Issue #1815: the claim query orders a mixed-priority backlog by the
+    /// priority aging, and skips the activities a worker is not eligible for.
+    /// Workers that differ in either claim different tasks, so they are in
+    /// different cohorts.
+    #[test]
+    fn the_cohort_key_includes_priority_aging_and_eligibility() {
+        let queues = vec!["a".to_owned()];
+        let none = std::collections::HashMap::<String, u32>::new();
+        let labels = std::collections::HashMap::<String, String>::new();
+        let gpu = vec!["render".to_owned(), "encode".to_owned()];
+        let gpu_reordered = vec!["encode".to_owned(), "render".to_owned()];
+        let cohort = |aging, ineligible: &[String]| {
+            super::worker_cohort(&super::CohortPolicy {
+                queues: &queues,
+                queue_weights: &none,
+                build_id: "v1",
+                labels: &labels,
+                slots: super::SlotPolicy::of(10, 10, None),
+                session_slots: 0,
+                priority_aging_secs: aging,
+                ineligible_activities: ineligible,
+                shard_assignments: &[],
+                registered_workflows: &[],
+                registered_activities: &[],
+                circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
+                dispatch_channel: &[],
+                retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
+                adaptive_limits: &crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
+                outcome_window: std::time::Duration::from_secs(300),
+                peer_stale_secs: 120,
+                execution: super::ExecutionPolicy::default(),
+                payload: super::PayloadPolicy::default(),
+            })
+        };
+        assert_ne!(cohort(None, &[]), cohort(Some(30), &[]));
+        assert_ne!(cohort(Some(30), &[]), cohort(Some(60), &[]));
+        assert_ne!(cohort(None, &[]), cohort(None, &gpu));
+        assert_eq!(cohort(None, &gpu), cohort(None, &gpu_reordered));
+    }
+
+    /// Issue #1815: workers on other shards, or with other handlers, claim or
+    /// complete other tasks, so they are in different cohorts.
+    #[test]
+    fn the_cohort_key_includes_shards_and_handlers() {
+        use crate::types::ShardId;
+        let queues = vec!["a".to_owned()];
+        let none = std::collections::HashMap::<String, u32>::new();
+        let labels = std::collections::HashMap::<String, String>::new();
+        let cohort = |shards: &[ShardId], workflows: &[String], activities: &[String]| {
+            super::worker_cohort(&super::CohortPolicy {
+                queues: &queues,
+                queue_weights: &none,
+                build_id: "v1",
+                labels: &labels,
+                slots: super::SlotPolicy::of(10, 10, None),
+                session_slots: 0,
+                priority_aging_secs: None,
+                ineligible_activities: &[],
+                shard_assignments: shards,
+                registered_workflows: workflows,
+                registered_activities: activities,
+                circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
+                dispatch_channel: &[],
+                retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
+                adaptive_limits: &crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
+                outcome_window: std::time::Duration::from_secs(300),
+                peer_stale_secs: 120,
+                execution: super::ExecutionPolicy::default(),
+                payload: super::PayloadPolicy::default(),
+            })
+        };
+        let names = |list: &[&str]| list.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+        let (one, two) = ([ShardId::new(1)], [ShardId::new(2)]);
+        let both = [ShardId::new(2), ShardId::new(1)];
+        assert_ne!(cohort(&one, &[], &[]), cohort(&two, &[], &[]));
+        assert_eq!(
+            cohort(&both, &[], &[]),
+            cohort(&[ShardId::new(1), ShardId::new(2)], &[], &[]),
+            "shard order does not matter"
+        );
+        assert_ne!(
+            cohort(&one, &names(&["order"]), &[]),
+            cohort(&one, &names(&["order", "refund"]), &[])
+        );
+        assert_ne!(
+            cohort(&one, &[], &names(&["charge"])),
+            cohort(&one, &[], &names(&["charge", "render"]))
+        );
+    }
+
+    /// Issue #1815: a slot tuner clamps the configured maximums into its band
+    /// and resizes them later. A tuned worker is keyed on its band, so a tuned
+    /// worker with a configured 0 is not taken for a worker without workflows.
+    #[test]
+    fn a_tuned_worker_is_keyed_on_its_band() {
+        use super::SlotPolicy;
+        use crate::slot_tuner::SlotTunerConfig;
+        let band = SlotTunerConfig::new(5, 50);
+        let tuned = |workflows, activities| SlotPolicy::of(workflows, activities, Some(&band));
+        assert_eq!(
+            tuned(0, 10),
+            tuned(3, 10),
+            "both clamp to the same initial targets"
+        );
+        assert_ne!(
+            tuned(100, 1),
+            tuned(1, 100),
+            "the initial target per kind follows the configured maximum"
+        );
+        assert_ne!(
+            tuned(0, 10),
+            SlotPolicy::of(0, 10, None),
+            "a tuned worker claims workflows"
+        );
+        let wider = SlotTunerConfig::new(5, 60);
+        assert_ne!(tuned(0, 10), SlotPolicy::of(0, 10, Some(&wider)));
+    }
+
+    /// Issue #1815: two tuners can share a name and still resize slots
+    /// differently. A tuned worker is keyed on the policy of its tuner, not
+    /// only on its name.
+    #[test]
+    fn a_tuned_worker_is_keyed_on_its_tuner_policy() {
+        use super::SlotPolicy;
+        use crate::slot_tuner::{DefaultSlotTuner, SlotTunerConfig};
+        let policy = |tuner: DefaultSlotTuner| {
+            SlotPolicy::of(
+                10,
+                10,
+                Some(&SlotTunerConfig::with_tuner(
+                    5,
+                    50,
+                    std::sync::Arc::new(tuner),
+                )),
+            )
+        };
+        let default = policy(DefaultSlotTuner::default());
+        assert_eq!(
+            default,
+            SlotPolicy::of(10, 10, Some(&SlotTunerConfig::new(5, 50))),
+            "the same settings give the same key"
+        );
+        assert_ne!(
+            default,
+            policy(DefaultSlotTuner {
+                grow_step: 8,
+                ..DefaultSlotTuner::default()
+            }),
+            "the grow step changes the key"
+        );
+        assert_ne!(
+            default,
+            policy(DefaultSlotTuner {
+                shrink_step: 1,
+                ..DefaultSlotTuner::default()
+            }),
+            "the shrink step changes the key"
+        );
+        assert_ne!(
+            default,
+            policy(DefaultSlotTuner {
+                permit_wait_grow_threshold: std::time::Duration::from_millis(500),
+                ..DefaultSlotTuner::default()
+            }),
+            "the wait threshold changes the key"
+        );
+    }
+
+    /// Issue #1815: an activity with a circuit-breaker policy skips the
+    /// claim-time rate-limit gate and fails fast while its breaker is open.
+    /// Workers with different policies are therefore in different cohorts.
+    #[test]
+    fn the_cohort_key_includes_the_circuit_breaker_policies() {
+        use crate::circuit_breaker::CircuitBreakerRegistry;
+        use crate::policy::CircuitBreakerPolicy;
+        let queues = vec!["a".to_owned()];
+        let none = std::collections::HashMap::<String, u32>::new();
+        let labels = std::collections::HashMap::<String, String>::new();
+        let cohort = |breakers: &CircuitBreakerRegistry| {
+            super::worker_cohort(&super::CohortPolicy {
+                queues: &queues,
+                queue_weights: &none,
+                build_id: "v1",
+                labels: &labels,
+                slots: super::SlotPolicy::of(10, 10, None),
+                session_slots: 0,
+                priority_aging_secs: None,
+                ineligible_activities: &[],
+                shard_assignments: &[],
+                registered_workflows: &[],
+                registered_activities: &[],
+                circuit_breakers: breakers,
+                dispatch_channel: &[],
+                retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
+                adaptive_limits: &crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
+                outcome_window: std::time::Duration::from_secs(300),
+                peer_stale_secs: 120,
+                execution: super::ExecutionPolicy::default(),
+                payload: super::PayloadPolicy::default(),
+            })
+        };
+        let tracking = |threshold| {
+            CircuitBreakerRegistry::new(std::collections::HashMap::from([(
+                "charge".to_owned(),
+                CircuitBreakerPolicy::new(
+                    threshold,
+                    std::time::Duration::from_secs(30),
+                    std::time::Duration::from_secs(60),
+                ),
+            )]))
+        };
+        assert_ne!(
+            cohort(&CircuitBreakerRegistry::empty()),
+            cohort(&tracking(5)),
+            "a tracked activity changes the cohort"
+        );
+        assert_ne!(
+            cohort(&tracking(5)),
+            cohort(&tracking(10)),
+            "the policy changes the cohort"
+        );
+        assert_eq!(cohort(&tracking(5)), cohort(&tracking(5)));
+        // Issue #1809: an open breaker defers or fails its attempts. The mode
+        // changes the failure ratio, so it changes the cohort.
+        let fail_fast = CircuitBreakerRegistry::new(std::collections::HashMap::from([(
+            "charge".to_owned(),
+            CircuitBreakerPolicy::new(
+                5,
+                std::time::Duration::from_secs(30),
+                std::time::Duration::from_secs(60),
+            )
+            .with_open_mode(crate::policy::CircuitOpenMode::FailFast),
+        )]));
+        assert_ne!(
+            cohort(&tracking(5)),
+            cohort(&fail_fast),
+            "the open mode changes the cohort"
+        );
+    }
+
+    /// Issue #1815: a dispatch channel delivers by priority and ignores
+    /// `queue_weights`, while the Postgres claim applies them. Workers on the
+    /// two routes do different work, so they are in different cohorts.
+    #[test]
+    fn the_cohort_key_includes_the_dispatch_route() {
+        let queues = vec!["a".to_owned(), "b".to_owned()];
+        let weights = std::collections::HashMap::from([("b".to_owned(), 5_u32)]);
+        let labels = std::collections::HashMap::<String, String>::new();
+        let breakers = crate::circuit_breaker::CircuitBreakerRegistry::empty();
+        let cohort = |dispatch_channel| {
+            super::worker_cohort(&super::CohortPolicy {
+                queues: &queues,
+                queue_weights: &weights,
+                build_id: "v1",
+                labels: &labels,
+                slots: super::SlotPolicy::of(10, 10, None),
+                session_slots: 0,
+                priority_aging_secs: None,
+                ineligible_activities: &[],
+                shard_assignments: &[],
+                registered_workflows: &[],
+                registered_activities: &[],
+                circuit_breakers: &breakers,
+                dispatch_channel,
+                retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
+                adaptive_limits: &crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
+                outcome_window: std::time::Duration::from_secs(300),
+                peer_stale_secs: 120,
+                execution: super::ExecutionPolicy::default(),
+                payload: super::PayloadPolicy::default(),
+            })
+        };
+        assert_ne!(cohort(&[0]), cohort(&[]));
+        // A multi-shard worker can use a channel on some shards only.
+        assert_ne!(cohort(&[1]), cohort(&[2]));
+        assert_eq!(cohort(&[2, 1]), cohort(&[1, 2, 2]));
+    }
+
+    /// Issue #1815: a type at its adaptive limit is left out of the claim.
+    /// Workers with different limit policies for a registered activity run
+    /// different task mixes, so they are in different cohorts.
+    #[test]
+    fn the_cohort_key_includes_the_adaptive_limits() {
+        use crate::adaptive_limit::AdaptiveLimitConfig;
+        use crate::policy::AdaptiveLimitPolicy;
+        let queues = vec!["a".to_owned()];
+        let none = std::collections::HashMap::<String, u32>::new();
+        let labels = std::collections::HashMap::<String, String>::new();
+        let breakers = crate::circuit_breaker::CircuitBreakerRegistry::empty();
+        let budgets = crate::retry_budget::RetryBudgetConfig::default();
+        let activities = vec!["charge".to_owned()];
+        let cohort = |limits: &AdaptiveLimitConfig| {
+            super::worker_cohort(&super::CohortPolicy {
+                queues: &queues,
+                queue_weights: &none,
+                build_id: "v1",
+                labels: &labels,
+                slots: super::SlotPolicy::of(10, 10, None),
+                session_slots: 0,
+                priority_aging_secs: None,
+                ineligible_activities: &[],
+                shard_assignments: &[],
+                registered_workflows: &[],
+                registered_activities: &activities,
+                circuit_breakers: &breakers,
+                dispatch_channel: &[],
+                retry_budgets: &budgets,
+                adaptive_limits: limits,
+                outcome_window: std::time::Duration::from_secs(300),
+                peer_stale_secs: 120,
+                execution: super::ExecutionPolicy::default(),
+                payload: super::PayloadPolicy::default(),
+            })
+        };
+        let off = AdaptiveLimitConfig::disabled();
+        let limited = AdaptiveLimitConfig::disabled()
+            .with_activity("charge", Some(AdaptiveLimitPolicy::new(1, 10)));
+        let wider = AdaptiveLimitConfig::disabled()
+            .with_activity("charge", Some(AdaptiveLimitPolicy::new(1, 20)));
+        let unrelated = AdaptiveLimitConfig::disabled()
+            .with_activity("refund", Some(AdaptiveLimitPolicy::new(1, 10)));
+        assert_ne!(cohort(&off), cohort(&limited), "a limit");
+        assert_ne!(cohort(&limited), cohort(&wider), "a different limit");
+        assert_eq!(cohort(&off), cohort(&unrelated), "an unregistered activity");
+    }
+
+    /// Issue #1815: a retry budget defers retries, and a deferred retry does
+    /// not count. Workers with different budgets for an activity run
+    /// different retry mixes, so they are in different cohorts.
+    #[test]
+    fn the_cohort_key_includes_the_retry_budgets() {
+        use crate::policy::RetryBudgetPolicy;
+        use crate::retry_budget::RetryBudgetConfig;
+        let queues = vec!["a".to_owned()];
+        let none = std::collections::HashMap::<String, u32>::new();
+        let labels = std::collections::HashMap::<String, String>::new();
+        let breakers = crate::circuit_breaker::CircuitBreakerRegistry::empty();
+        let activities = vec!["charge".to_owned()];
+        let cohort = |budgets: &RetryBudgetConfig| {
+            super::worker_cohort(&super::CohortPolicy {
+                queues: &queues,
+                queue_weights: &none,
+                build_id: "v1",
+                labels: &labels,
+                slots: super::SlotPolicy::of(10, 10, None),
+                session_slots: 0,
+                priority_aging_secs: None,
+                ineligible_activities: &[],
+                shard_assignments: &[],
+                registered_workflows: &[],
+                registered_activities: &activities,
+                circuit_breakers: &breakers,
+                dispatch_channel: &[],
+                retry_budgets: budgets,
+                adaptive_limits: &crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
+                outcome_window: std::time::Duration::from_secs(300),
+                peer_stale_secs: 120,
+                execution: super::ExecutionPolicy::default(),
+                payload: super::PayloadPolicy::default(),
+            })
+        };
+        let default = RetryBudgetConfig::default();
+        let tight = RetryBudgetConfig::default()
+            .with_activity("charge", Some(RetryBudgetPolicy::new(0.01, 1.0, 0.0)));
+        let unrelated = RetryBudgetConfig::default()
+            .with_activity("render", Some(RetryBudgetPolicy::new(0.01, 1.0, 0.0)));
+        assert_ne!(cohort(&default), cohort(&tight), "a tighter budget");
+        assert_ne!(
+            cohort(&default),
+            cohort(&RetryBudgetConfig::disabled()),
+            "no budget"
+        );
+        assert_eq!(
+            cohort(&default),
+            cohort(&unrelated),
+            "a budget for an activity the worker does not run"
+        );
+    }
+
+    /// Issue #1815: the heartbeat interval sets the outcome window and the
+    /// peer freshness limit. Workers with two of either compare different
+    /// time ranges or different peer sets, so they are in different cohorts.
+    #[test]
+    fn the_cohort_key_includes_the_window_and_freshness() {
+        let queues = vec!["a".to_owned()];
+        let none = std::collections::HashMap::<String, u32>::new();
+        let labels = std::collections::HashMap::<String, String>::new();
+        let breakers = crate::circuit_breaker::CircuitBreakerRegistry::empty();
+        let budgets = crate::retry_budget::RetryBudgetConfig::default();
+        let cohort = |outcome_window, peer_stale_secs| {
+            super::worker_cohort(&super::CohortPolicy {
+                queues: &queues,
+                queue_weights: &none,
+                build_id: "v1",
+                labels: &labels,
+                slots: super::SlotPolicy::of(10, 10, None),
+                session_slots: 0,
+                priority_aging_secs: None,
+                ineligible_activities: &[],
+                shard_assignments: &[],
+                registered_workflows: &[],
+                registered_activities: &[],
+                circuit_breakers: &breakers,
+                dispatch_channel: &[],
+                retry_budgets: &budgets,
+                adaptive_limits: &crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
+                outcome_window,
+                peer_stale_secs,
+                execution: super::ExecutionPolicy::default(),
+                payload: super::PayloadPolicy::default(),
+            })
+        };
+        let five_minutes = std::time::Duration::from_secs(300);
+        assert_ne!(
+            cohort(five_minutes, 120),
+            cohort(std::time::Duration::from_secs(1200), 120),
+            "another window"
+        );
+        assert_ne!(
+            cohort(five_minutes, 120),
+            cohort(five_minutes, 1200),
+            "another freshness limit"
+        );
+    }
+
+    /// Issue #1815: a deadline decides an outcome to the nanosecond. Two
+    /// workers whose budgets differ below a millisecond are in different
+    /// cohorts.
+    #[test]
+    fn the_cohort_key_keeps_sub_millisecond_durations() {
+        use super::ExecutionPolicy;
+        use std::time::Duration;
+        let queues = vec!["a".to_owned()];
+        let none = std::collections::HashMap::<String, u32>::new();
+        let labels = std::collections::HashMap::<String, String>::new();
+        let breakers = crate::circuit_breaker::CircuitBreakerRegistry::empty();
+        let budgets = crate::retry_budget::RetryBudgetConfig::default();
+        let cohort = |execution, outcome_window| {
+            super::worker_cohort(&super::CohortPolicy {
+                queues: &queues,
+                queue_weights: &none,
+                build_id: "v1",
+                labels: &labels,
+                slots: super::SlotPolicy::of(10, 10, None),
+                session_slots: 0,
+                priority_aging_secs: None,
+                ineligible_activities: &[],
+                shard_assignments: &[],
+                registered_workflows: &[],
+                registered_activities: &[],
+                circuit_breakers: &breakers,
+                dispatch_channel: &[],
+                retry_budgets: &budgets,
+                adaptive_limits: &crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
+                outcome_window,
+                peer_stale_secs: 120,
+                execution,
+                payload: super::PayloadPolicy::default(),
+            })
+        };
+        let short = Duration::from_micros(1_100);
+        let long = Duration::from_micros(1_900);
+        let window = Duration::from_secs(300);
+        let base = ExecutionPolicy::default();
+        for (a, b) in [
+            (
+                ExecutionPolicy {
+                    sticky_timeout: short,
+                    ..base
+                },
+                ExecutionPolicy {
+                    sticky_timeout: long,
+                    ..base
+                },
+            ),
+            (
+                ExecutionPolicy {
+                    workflow_task_timeout: short,
+                    ..base
+                },
+                ExecutionPolicy {
+                    workflow_task_timeout: long,
+                    ..base
+                },
+            ),
+            (
+                ExecutionPolicy {
+                    max_local_activity_start_to_close: short,
+                    ..base
+                },
+                ExecutionPolicy {
+                    max_local_activity_start_to_close: long,
+                    ..base
+                },
+            ),
+            (
+                ExecutionPolicy {
+                    cancellation_grace_period: short,
+                    ..base
+                },
+                ExecutionPolicy {
+                    cancellation_grace_period: long,
+                    ..base
+                },
+            ),
+        ] {
+            assert_ne!(cohort(a, window), cohort(b, window), "{a:?}");
+        }
+        assert_ne!(
+            cohort(base, window + short),
+            cohort(base, window + long),
+            "the outcome window"
+        );
+    }
+
+    /// Issue #1815: the workflow cache, the task budgets, the panic limit
+    /// and the cancellation grace period change what the window records for
+    /// the same task. Workers that differ
+    /// in any of them are in different cohorts.
+    #[test]
+    fn the_cohort_key_includes_the_execution_policy() {
+        use super::ExecutionPolicy;
+        use std::time::Duration;
+        let queues = vec!["a".to_owned()];
+        let none = std::collections::HashMap::<String, u32>::new();
+        let labels = std::collections::HashMap::<String, String>::new();
+        let breakers = crate::circuit_breaker::CircuitBreakerRegistry::empty();
+        let budgets = crate::retry_budget::RetryBudgetConfig::default();
+        let cohort = |execution| {
+            super::worker_cohort(&super::CohortPolicy {
+                queues: &queues,
+                queue_weights: &none,
+                build_id: "v1",
+                labels: &labels,
+                slots: super::SlotPolicy::of(10, 10, None),
+                session_slots: 0,
+                priority_aging_secs: None,
+                ineligible_activities: &[],
+                shard_assignments: &[],
+                registered_workflows: &[],
+                registered_activities: &[],
+                circuit_breakers: &breakers,
+                dispatch_channel: &[],
+                retry_budgets: &budgets,
+                adaptive_limits: &crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
+                outcome_window: Duration::from_secs(300),
+                peer_stale_secs: 120,
+                execution,
+                payload: super::PayloadPolicy::default(),
+            })
+        };
+        let base = ExecutionPolicy::default();
+        let variants = [
+            ExecutionPolicy {
+                sticky_timeout: Duration::ZERO,
+                ..base
+            },
+            ExecutionPolicy {
+                workflow_cache_size: 1,
+                ..base
+            },
+            ExecutionPolicy {
+                resident_workflows: true,
+                ..base
+            },
+            ExecutionPolicy {
+                workflow_task_timeout: Duration::from_secs(1),
+                ..base
+            },
+            ExecutionPolicy {
+                max_local_activity_start_to_close: Duration::from_secs(1),
+                ..base
+            },
+            ExecutionPolicy {
+                workflow_panic_max_attempts: 1,
+                ..base
+            },
+            ExecutionPolicy {
+                poison_pill_threshold: 10,
+                ..base
+            },
+            ExecutionPolicy {
+                poison_pill_threshold: 0,
+                ..base
+            },
+            ExecutionPolicy {
+                cancellation_grace_period: Duration::from_secs(1),
+                ..base
+            },
+            ExecutionPolicy {
+                dr_fencing: true,
+                ..base
+            },
+        ];
+        for variant in variants {
+            assert_ne!(cohort(base), cohort(variant), "{variant:?}");
+        }
+        assert_eq!(cohort(base), cohort(ExecutionPolicy::default()));
+        let off = |threshold| ExecutionPolicy {
+            poison_pill_threshold: threshold,
+            ..base
+        };
+        assert_eq!(
+            cohort(off(0)),
+            cohort(off(-1)),
+            "every threshold at or below 0 turns quarantine off"
+        );
+    }
+
+    /// One payload policy per field, each differing from the default in that
+    /// field alone.
+    fn payload_variants() -> Vec<super::PayloadPolicy> {
+        use super::PayloadPolicy;
+        let base = PayloadPolicy::default();
+        vec![
+            PayloadPolicy {
+                max_activity_input_bytes: 1,
+                ..base.clone()
+            },
+            PayloadPolicy {
+                max_workflow_input_bytes: 1,
+                ..base.clone()
+            },
+            PayloadPolicy {
+                max_activity_result_bytes: 1,
+                ..base.clone()
+            },
+            PayloadPolicy {
+                max_signal_payload_bytes: 1,
+                ..base.clone()
+            },
+            PayloadPolicy {
+                max_current_details_bytes: 1,
+                ..base.clone()
+            },
+            PayloadPolicy {
+                continue_as_new_threshold: 1,
+                ..base.clone()
+            },
+            PayloadPolicy {
+                event_hard_cap: Some(1),
+                ..base.clone()
+            },
+            PayloadPolicy {
+                byte_hard_cap: Some(1),
+                ..base.clone()
+            },
+            PayloadPolicy {
+                history_bloat_warn_fraction: 0.5,
+                ..base.clone()
+            },
+            PayloadPolicy {
+                decision_boundaries: true,
+                ..base.clone()
+            },
+            PayloadPolicy {
+                max_workflow_execution_timeout: Some(std::time::Duration::from_secs(1)),
+                ..base.clone()
+            },
+            PayloadPolicy {
+                continue_as_new_deadline_fraction: 0.5,
+                ..base.clone()
+            },
+            PayloadPolicy {
+                offload_threshold: Some(1),
+                ..base.clone()
+            },
+            PayloadPolicy {
+                offload_store_id: Some("s3-west".to_owned()),
+                ..base.clone()
+            },
+            PayloadPolicy {
+                activity_interceptors: vec!["a::Retry".to_owned()],
+                ..base.clone()
+            },
+            PayloadPolicy {
+                activity_interceptors: vec!["a::Retry".to_owned(), "a::Audit".to_owned()],
+                ..base.clone()
+            },
+            PayloadPolicy {
+                activities: vec![("charge".to_owned(), serde_json::json!({"result_cap": 1024}))],
+                ..base.clone()
+            },
+            PayloadPolicy {
+                local_activity_defaults: serde_json::json!({"start_to_close_ms": 500}),
+                ..base.clone()
+            },
+            PayloadPolicy {
+                module_host: serde_json::json!({"allow_queue_override": true}),
+                ..base.clone()
+            },
+            PayloadPolicy {
+                workflows: vec![("order".to_owned(), serde_json::json!({"dag": true}))],
+                ..base.clone()
+            },
+            PayloadPolicy {
+                declarative_handlers: vec![serde_json::json!(["update", "order", "approve"])],
+                ..base.clone()
+            },
+            PayloadPolicy {
+                workflow_log_policy: serde_json::json!([1000, 4096]),
+                ..base
+            },
+        ]
+    }
+
+    /// Issue #1815: the payload caps, the history policy, the offloader, the
+    /// codec keys and the interceptors decide whether a task's payloads pass.
+    /// Workers that differ in any of them are in different cohorts.
+    #[test]
+    fn the_cohort_key_includes_the_payload_policy() {
+        use super::PayloadPolicy;
+        let queues = vec!["a".to_owned()];
+        let none = std::collections::HashMap::<String, u32>::new();
+        let labels = std::collections::HashMap::<String, String>::new();
+        let breakers = crate::circuit_breaker::CircuitBreakerRegistry::empty();
+        let budgets = crate::retry_budget::RetryBudgetConfig::default();
+        let cohort = |payload: PayloadPolicy| {
+            super::worker_cohort(&super::CohortPolicy {
+                queues: &queues,
+                queue_weights: &none,
+                build_id: "v1",
+                labels: &labels,
+                slots: super::SlotPolicy::of(10, 10, None),
+                session_slots: 0,
+                priority_aging_secs: None,
+                ineligible_activities: &[],
+                shard_assignments: &[],
+                registered_workflows: &[],
+                registered_activities: &[],
+                circuit_breakers: &breakers,
+                dispatch_channel: &[],
+                retry_budgets: &budgets,
+                adaptive_limits: &crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
+                outcome_window: std::time::Duration::from_secs(300),
+                peer_stale_secs: 120,
+                execution: super::ExecutionPolicy::default(),
+                payload,
+            })
+        };
+        let base = PayloadPolicy::default();
+        let variants = payload_variants();
+        for variant in variants {
+            assert_ne!(cohort(base.clone()), cohort(variant.clone()), "{variant:?}");
+        }
+        assert_eq!(cohort(base), cohort(PayloadPolicy::default()));
+        let chain = |names: &[&str]| PayloadPolicy {
+            activity_interceptors: names.iter().map(|n| (*n).to_owned()).collect(),
+            ..PayloadPolicy::default()
+        };
+        assert_ne!(
+            cohort(chain(&["a::Retry"])),
+            cohort(chain(&["a::Audit"])),
+            "two chains of one interceptor each"
+        );
+        assert_ne!(
+            cohort(chain(&["a::Retry", "a::Audit"])),
+            cohort(chain(&["a::Audit", "a::Retry"])),
+            "the chain order"
+        );
+    }
+
+    /// Issue #1815: a reload can register a codec key while the worker runs.
+    /// The next tick's cohort key carries it, so the worker leaves peers that
+    /// cannot decode the same payloads.
+    #[test]
+    fn the_cohort_key_follows_the_codec_keys_at_runtime() {
+        use crate::payload_codec::{IdentityCodec, PayloadCodecs};
+        let codecs = PayloadCodecs::default();
+        let probe = super::OutlierProbe {
+            codecs: Some(codecs.clone()),
+            cohort: r#"{"queues":["a"]}"#.to_owned(),
+            ..probe_for_slot(0, &std::sync::Arc::default(), &std::sync::Arc::default())
+        };
+        let before = probe.cohort_key();
+        assert!(before.contains("\"codec_key_ids\":[]"), "{before}");
+
+        codecs
+            .register_key("k1", std::sync::Arc::new(IdentityCodec))
+            .expect("register a key");
+        let after = probe.cohort_key();
+        assert_ne!(before, after, "the key follows the registration");
+        assert!(after.contains("\"codec_key_ids\":[\"k1\"]"), "{after}");
+        assert!(after.contains("\"queues\":[\"a\"]"), "{after}");
+
+        let without = super::OutlierProbe {
+            codecs: None,
+            ..probe
+        };
+        assert_eq!(without.cohort_key(), without.cohort);
+    }
+
+    /// Issue #1815: the active key decides which codec encodes new payloads.
+    /// Workers with different active keys are in different cohorts, and an
+    /// activation restarts the window.
+    #[test]
+    fn the_cohort_key_follows_the_active_codec_key() {
+        use crate::payload_codec::{IdentityCodec, PayloadCodecs};
+        let codecs = PayloadCodecs::default();
+        for key in ["k1", "k2"] {
+            codecs
+                .register_key(key, std::sync::Arc::new(IdentityCodec))
+                .expect("register a key");
+        }
+        codecs.set_active_key("k1").expect("activate k1");
+        let probe = super::OutlierProbe {
+            codecs: Some(codecs.clone()),
+            cohort: r#"{"queues":["a"]}"#.to_owned(),
+            ..probe_for_slot(0, &std::sync::Arc::default(), &std::sync::Arc::default())
+        };
+        let on_k1 = probe.cohort_key();
+        codecs.set_active_key("k2").expect("activate k2");
+        assert_ne!(
+            on_k1,
+            probe.cohort_key(),
+            "an activation changes the cohort"
+        );
+    }
+
+    /// Issue #1815: the key set and the active key come from one read.
+    ///
+    /// `register_key` changes both under one write lock. Two reads could pair
+    /// an empty key set with a new active key. Each window clear then restarts
+    /// detection. The race is a few instructions wide, so this checks the
+    /// source rather than timing.
+    #[test]
+    fn the_cohort_key_reads_the_codec_keys_under_one_lock() {
+        // A Windows checkout has CRLF line ends. The end search needs LF.
+        let src = include_str!("workers.rs").replace("\r\n", "\n");
+        let start = src
+            .find("pub fn cohort_and_epoch(&self)")
+            .expect("cohort_and_epoch exists");
+        let body = &src[start..];
+        let body = &body[..body.find("\n    }\n").expect("cohort_and_epoch ends")];
+        assert!(body.contains("codecs.key_state()"), "one snapshot read");
+        for split in ["registered_key_ids()", "active_key_id()"] {
+            assert!(!body.contains(split), "no separate read: {split}");
+        }
+    }
+
+    /// Issue #1815: the heartbeat seeds the window with the cohort at start.
+    /// A codec reload before the first tick then restarts the window too.
+    #[test]
+    fn a_codec_key_change_before_the_first_tick_restarts_the_window() {
+        use crate::payload_codec::{IdentityCodec, PayloadCodecs};
+        let codecs = PayloadCodecs::default();
+        let probe = super::OutlierProbe {
+            codecs: Some(codecs.clone()),
+            cohort: r#"{"queues":["a"]}"#.to_owned(),
+            ..probe_for_slot(0, &std::sync::Arc::default(), &std::sync::Arc::default())
+        }
+        .seeded();
+        for _ in 0..30 {
+            probe
+                .window
+                .record(true, std::time::Duration::from_millis(40));
+        }
+        codecs
+            .register_key("k1", std::sync::Arc::new(IdentityCodec))
+            .expect("register a key");
+        let (_, first, _) = super::capture_task_stats(&probe.window, || probe.cohort_and_epoch())
+            .expect("the key holds");
+        assert_eq!(first, crate::worker_outlier::WorkerTaskStats::default());
+    }
+
+    /// Issue #1815: samples taken under the old codec keys do not reach the
+    /// new cohort, so they cannot flag the worker among its new peers.
+    #[test]
+    fn a_codec_key_change_restarts_the_outcome_window() {
+        use crate::payload_codec::{IdentityCodec, PayloadCodecs};
+        let codecs = PayloadCodecs::default();
+        let probe = super::OutlierProbe {
+            codecs: Some(codecs.clone()),
+            cohort: r#"{"queues":["a"]}"#.to_owned(),
+            ..probe_for_slot(0, &std::sync::Arc::default(), &std::sync::Arc::default())
+        };
+        for _ in 0..30 {
+            probe
+                .window
+                .record(true, std::time::Duration::from_millis(40));
+        }
+        let (_, old, _) = super::capture_task_stats(&probe.window, || probe.cohort_and_epoch())
+            .expect("the key holds");
+        assert_eq!(old.failures, 30);
+
+        codecs
+            .register_key("k1", std::sync::Arc::new(IdentityCodec))
+            .expect("register a key");
+        let (_, new, _) = super::capture_task_stats(&probe.window, || probe.cohort_and_epoch())
+            .expect("the key holds");
+        assert_eq!(new, crate::worker_outlier::WorkerTaskStats::default());
+    }
+
+    /// Issue #1815: a change to another active key and back again before a
+    /// tick leaves the same cohort key. The codec epoch still moves, so the
+    /// samples taken before the changes do not stay in the cohort.
+    #[test]
+    fn a_codec_key_change_and_back_restarts_the_window() {
+        use crate::payload_codec::{IdentityCodec, PayloadCodecs};
+        let codecs = PayloadCodecs::default();
+        for key in ["k1", "k2"] {
+            codecs
+                .register_key(key, std::sync::Arc::new(IdentityCodec))
+                .expect("register a key");
+        }
+        let probe = super::OutlierProbe {
+            codecs: Some(codecs.clone()),
+            cohort: r#"{"queues":["a"]}"#.to_owned(),
+            ..probe_for_slot(0, &std::sync::Arc::default(), &std::sync::Arc::default())
+        }
+        .seeded();
+        let before = probe.cohort_key();
+        for _ in 0..30 {
+            probe
+                .window
+                .record(true, std::time::Duration::from_millis(40));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        codecs.set_active_key("k2").expect("activate k2");
+        codecs.set_active_key("k1").expect("activate k1 again");
+        assert_eq!(probe.cohort_key(), before, "the same key string");
+        let (_, stats, _) = super::capture_task_stats(&probe.window, || probe.cohort_and_epoch())
+            .expect("the key holds");
+        assert_eq!(stats, crate::worker_outlier::WorkerTaskStats::default());
+    }
+
+    /// Issue #1815: the cohort key is read inside the serialized capture. A
+    /// heartbeat that reads its key later always captures later, so a key
+    /// read before a codec reload can never outrank one read after it.
+    #[test]
+    fn the_cohort_key_is_read_inside_the_capture() {
+        use std::sync::mpsc;
+        let window = std::sync::Arc::new(crate::worker_outlier::TaskOutcomeWindow::default());
+        let (reading, read_started) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        let old_window = std::sync::Arc::clone(&window);
+        let old = std::thread::spawn(move || {
+            let first = std::cell::Cell::new(true);
+            super::capture_task_stats(&old_window, || {
+                // Only the first read waits. The capture reads the key again
+                // after its snapshot.
+                if first.replace(false) {
+                    reading.send(()).expect("signal the read");
+                    released
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .expect("released");
+                }
+                (
+                    "old".to_owned(),
+                    crate::worker_outlier::CohortEpoch::default(),
+                )
+            })
+        });
+        read_started
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the old heartbeat reads its key");
+        let new_window = std::sync::Arc::clone(&window);
+        let new = std::thread::spawn(move || {
+            super::capture_task_stats(&new_window, || {
+                (
+                    "new".to_owned(),
+                    crate::worker_outlier::CohortEpoch::default(),
+                )
+            })
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !new.is_finished(),
+            "a capture waits while another heartbeat reads its key"
+        );
+        release.send(()).expect("release the old heartbeat");
+        let (old_key, _, old_seq) = old.join().expect("old joins").expect("old key holds");
+        let (new_key, _, new_seq) = new.join().expect("new joins").expect("new key holds");
+        assert_eq!((old_key.as_str(), new_key.as_str()), ("old", "new"));
+        assert!(new_seq > old_seq, "the later key has the higher sequence");
+    }
+
+    /// Issue #1815: a codec change can land between the key read and the
+    /// snapshot. A task dispatched under the new key must then be published
+    /// under that key, not under the key read before the change.
+    #[test]
+    fn a_codec_change_during_the_capture_publishes_under_the_new_key() {
+        use crate::worker_outlier::{CohortEpoch, TaskOutcomeWindow};
+        use std::time::{Duration, Instant};
+        let window = TaskOutcomeWindow::default();
+        let reads = std::cell::Cell::new(0_u32);
+        let changed_at = std::cell::Cell::new(None);
+        let (key, stats, _) = super::capture_task_stats(&window, || {
+            reads.set(reads.get() + 1);
+            if reads.get() == 1 {
+                // The old key is read. The codec then changes, and a task
+                // dispatched under the new key ends before the snapshot.
+                let at = Instant::now();
+                changed_at.set(Some(at));
+                window.record_at(at, true, Duration::ZERO);
+                return ("old".to_owned(), CohortEpoch::default());
+            }
+            (
+                "new".to_owned(),
+                CohortEpoch {
+                    generation: 1,
+                    changed_at: changed_at.get(),
+                },
+            )
+        })
+        .expect("the new key holds");
+        assert_eq!(key, "new", "the snapshot carries the key it was taken in");
+        assert_eq!(
+            (stats.tasks, stats.failures),
+            (1, 1),
+            "the task dispatched under the new key stays"
+        );
+    }
+
+    /// Issue #1815: a codec writer can change the key on every read. The
+    /// capture then never publishes a snapshot that no later read confirms.
+    #[test]
+    fn a_key_that_never_holds_publishes_no_snapshot() {
+        use crate::worker_outlier::{CohortEpoch, TaskOutcomeWindow};
+        let window = TaskOutcomeWindow::default();
+        let reads = std::cell::RefCell::new(Vec::new());
+        let captured = super::capture_task_stats(&window, || {
+            let mut reads = reads.borrow_mut();
+            let key = format!("k{}", reads.len());
+            reads.push(key.clone());
+            (key, CohortEpoch::default())
+        });
+        let reads = reads.into_inner();
+        assert!(
+            captured.is_none(),
+            "no key held, so nothing is published: {captured:?} after {reads:?}"
+        );
+    }
+
+    /// Issue #1815: a worker decodes history only with the codecs it has
+    /// registered. Workers that differ in their codecs, or in the default
+    /// codec, are therefore in different cohorts.
+    #[test]
+    fn the_cohort_key_includes_the_ordinary_codecs() {
+        use crate::payload_codec::{CodecError, PayloadCodec, PayloadCodecs};
+        struct Rot;
+        impl PayloadCodec for Rot {
+            fn codec_id(&self) -> &'static str {
+                "rot"
+            }
+            fn encode(&self, raw: &[u8]) -> Result<Vec<u8>, CodecError> {
+                Ok(raw.to_vec())
+            }
+            fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, CodecError> {
+                Ok(encoded.to_vec())
+            }
+        }
+        let key_for = |codecs: PayloadCodecs| {
+            super::OutlierProbe {
+                codecs: Some(codecs),
+                cohort: r#"{"queues":["a"]}"#.to_owned(),
+                ..probe_for_slot(0, &std::sync::Arc::default(), &std::sync::Arc::default())
+            }
+            .cohort_key()
+        };
+        let plain = key_for(PayloadCodecs::default());
+        assert!(plain.contains("\"codec_ids\":[\"identity\"]"), "{plain}");
+        assert!(
+            plain.contains("\"default_codec_id\":\"identity\""),
+            "{plain}"
+        );
+
+        let mut registered = PayloadCodecs::default();
+        registered.register(std::sync::Arc::new(Rot));
+        let registered = key_for(registered);
+        assert_ne!(plain, registered, "a registered codec changes the key");
+        assert!(
+            registered.contains("\"codec_ids\":[\"identity\",\"rot\"]"),
+            "{registered}"
+        );
+
+        let mut defaulted = PayloadCodecs::default();
+        defaulted.set_default(std::sync::Arc::new(Rot));
+        let defaulted = key_for(defaulted);
+        assert_ne!(registered, defaulted, "the default codec changes the key");
+        assert!(
+            defaulted.contains("\"default_codec_id\":\"rot\""),
+            "{defaulted}"
+        );
+    }
+
+    /// Issue #1815: under load, the claim gate gives each worker a task mix
+    /// that follows its slots per kind. Workers with different slot counts
+    /// therefore do different work, so they are in different cohorts.
+    #[test]
+    fn the_cohort_key_includes_the_slots_per_kind() {
+        let queues = vec!["a".to_owned()];
+        let none = std::collections::HashMap::<String, u32>::new();
+        let labels = std::collections::HashMap::<String, String>::new();
+        let slots = |workflows, activities| {
+            super::worker_cohort(&super::CohortPolicy {
+                queues: &queues,
+                queue_weights: &none,
+                build_id: "v1",
+                labels: &labels,
+                slots: super::SlotPolicy::of(workflows, activities, None),
+                session_slots: 0,
+                priority_aging_secs: None,
+                ineligible_activities: &[],
+                shard_assignments: &[],
+                registered_workflows: &[],
+                registered_activities: &[],
+                circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
+                dispatch_channel: &[],
+                retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
+                adaptive_limits: &crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
+                outcome_window: std::time::Duration::from_secs(300),
+                peer_stale_secs: 120,
+                execution: super::ExecutionPolicy::default(),
+                payload: super::PayloadPolicy::default(),
+            })
+        };
+        assert_ne!(slots(100, 1), slots(1, 100));
+        assert_ne!(slots(100, 100), slots(50, 100));
+    }
+
+    /// Issue #1815: workers that poll the same queues with different weights
+    /// do different work, so they are in different cohorts.
+    #[test]
+    fn the_cohort_key_includes_the_queue_weights() {
+        let unweighted = cohort_of(&["b", "a", "a"], &[], "", &[]);
+        assert_eq!(
+            unweighted,
+            cohort_of(&["a", "b"], &[], "", &[]),
+            "order and duplicates do not matter"
+        );
+
+        let bulk_first = cohort_of(&["a", "b"], &[("b", 5)], "", &[]);
+        let equal = cohort_of(&["a", "b"], &[("a", 1)], "", &[]);
+        assert_ne!(bulk_first, unweighted, "weights change the cohort");
+        assert_ne!(bulk_first, equal, "different weights, different cohorts");
+        // An unweighted worker claims from all its queues at once. A weighted
+        // worker tries its queues in a weighted order, so even equal weights
+        // form their own cohort.
+        assert_ne!(equal, unweighted);
+        // A queue missing from the map has weight 1, and an entry for a queue
+        // the worker does not poll is ignored.
+        assert_eq!(
+            equal,
+            cohort_of(&["b", "a"], &[("b", 1), ("z", 9)], "", &[])
+        );
+        // The weighted draw keeps every entry, so a listed-twice queue is
+        // drawn more often. The order of weighted queues does not matter.
+        let twice = cohort_of(&["a", "a", "b"], &[("a", 1)], "", &[]);
+        assert_ne!(twice, equal, "a duplicate weighted queue changes the mix");
+        assert_eq!(twice, cohort_of(&["b", "a", "a"], &[("a", 1)], "", &[]));
+        // Zero-weight queues are tried last, in their configured order.
+        let fallback = cohort_of(&["a", "y", "z"], &[("y", 0), ("z", 0)], "", &[]);
+        assert_ne!(
+            fallback,
+            cohort_of(&["a", "z", "y"], &[("y", 0), ("z", 0)], "", &[]),
+            "the fallback order decides which idle queue is drained first"
+        );
+        assert_eq!(
+            fallback,
+            cohort_of(&["y", "a", "z"], &[("y", 0), ("z", 0)], "", &[])
+        );
+    }
+
+    /// Issue #1815: the claim predicate routes tasks by build id and by
+    /// capability labels. Workers that differ in either can get different
+    /// work, so they are in different cohorts.
+    #[test]
+    fn the_cohort_key_includes_the_build_and_the_labels() {
+        let base = cohort_of(&["a"], &[], "v1", &[("gpu", "a100"), ("zone", "eu")]);
+        assert_ne!(
+            base,
+            cohort_of(&["a"], &[], "v2", &[("gpu", "a100"), ("zone", "eu")])
+        );
+        assert_ne!(
+            base,
+            cohort_of(&["a"], &[], "v1", &[("gpu", "h100"), ("zone", "eu")])
+        );
+        assert_ne!(base, cohort_of(&["a"], &[], "v1", &[("zone", "eu")]));
+        assert_eq!(
+            base,
+            cohort_of(&["a"], &[], "v1", &[("zone", "eu"), ("gpu", "a100")]),
+            "label order does not matter"
+        );
+    }
+
+    /// Records whether each gauge write ran while `views` was locked.
+    struct LockProbe {
+        views: std::sync::Arc<super::ShardPeerViews>,
+        locked: std::sync::Mutex<Vec<bool>>,
+    }
+
+    impl crate::telemetry::MetricsRecorder for LockProbe {
+        fn record_worker_outlier(
+            &self,
+            _dimension: crate::worker_outlier::OutlierDimension,
+            _is_outlier: bool,
+        ) {
+            let locked = self.views.0.try_lock().is_err();
+            self.locked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(locked);
+        }
+    }
+
+    /// Issue #1815: a tick that clears the verdict does so under the view
+    /// lock. A healthy tick then cannot store a view and publish a verdict
+    /// between the idle check and the clear.
+    #[test]
+    fn clearing_the_verdict_holds_the_shard_view_lock() {
+        use crate::worker_outlier::OutlierDimension::FailureRatio;
+        let views: std::sync::Arc<super::ShardPeerViews> = std::sync::Arc::default();
+        let recorder = std::sync::Arc::new(LockProbe {
+            views: std::sync::Arc::clone(&views),
+            locked: std::sync::Mutex::default(),
+        });
+        let flags = std::sync::Arc::default();
+        let mut probe = probe_for_slot(0, &views, &flags);
+        probe.metrics = recorder.clone();
+        let _ = flags.set("me", &[FailureRatio]);
+
+        probe.clear_gauge("me");
+        probe.retire("me");
+        let locked = recorder
+            .locked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(!locked.is_empty(), "the gauge is written");
+        assert!(
+            locked.iter().all(|held| *held),
+            "every gauge write holds the view lock: {locked:?}"
+        );
+    }
+
+    /// Issue #1815: an aborted heartbeat still retires its verdict, so a
+    /// stopped worker cannot hold the shared gauge at 1.
+    #[tokio::test]
+    async fn an_aborted_heartbeat_retires_its_verdict() {
+        use crate::worker_outlier::OutlierDimension::FailureRatio;
+        let peers = std::sync::Arc::default();
+        let flags: std::sync::Arc<super::ProcessOutlierFlags> = std::sync::Arc::default();
+        let probe = probe_for_slot(0, &peers, &flags);
+        let _ = flags.set("me", &[FailureRatio]);
+        let task = tokio::spawn(async move {
+            let _retire = super::RetireOnDrop::new(probe, "me".to_owned());
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        task.abort();
+        let _ = task.await;
+        assert!(flags.set("peer", &[]).is_empty(), "the verdict is retired");
+    }
+
+    /// Issue #1815: a healthy worker in the same process cannot clear a sick
+    /// worker's flag, and clearing the sick worker's verdict clears the OR.
+    #[test]
+    fn process_outlier_flags_report_the_or_of_local_workers() {
+        use crate::worker_outlier::OutlierDimension::{FailureRatio, LatencyP99};
+        let flags = super::ProcessOutlierFlags::default();
+        assert_eq!(flags.set("sick", &[FailureRatio]), vec![FailureRatio]);
+        assert_eq!(flags.set("healthy", &[]), vec![FailureRatio]);
+        assert_eq!(
+            flags.set("slow", &[LatencyP99]),
+            vec![FailureRatio, LatencyP99]
+        );
+        assert_eq!(flags.set("sick", &[]), vec![LatencyP99]);
+        // A stopped worker leaves the map, so its flag cannot linger.
+        assert_eq!(flags.remove("slow"), Vec::new());
+        // The emit callback sees the OR computed under the same lock.
+        let mut seen = Vec::new();
+        let any = flags.update("sick", Some(&[FailureRatio]), |any| seen = any.to_vec());
+        assert_eq!(seen, any);
+        assert_eq!(seen, vec![FailureRatio]);
+    }
+
+    /// Issue #1815: workers that share a recorder share verdicts, and a
+    /// runtime with its own recorder does not.
+    #[test]
+    fn process_outlier_flags_are_kept_per_recorder() {
+        use std::sync::Arc;
+        let a: Arc<dyn crate::telemetry::MetricsRecorder> = Arc::new(crate::telemetry::NoOpMetrics);
+        let b: Arc<dyn crate::telemetry::MetricsRecorder> = Arc::new(crate::telemetry::NoOpMetrics);
+        let a_flags = super::ProcessOutlierFlags::for_recorder(&a);
+        let a_again = super::ProcessOutlierFlags::for_recorder(&Arc::clone(&a));
+        assert!(Arc::ptr_eq(&a_flags, &a_again));
+        let b_flags = super::ProcessOutlierFlags::for_recorder(&b);
+        assert!(!Arc::ptr_eq(&a_flags, &b_flags));
+
+        // The registry holds each set weakly, so a stopped runtime's set goes.
+        let weak = Arc::downgrade(&a_flags);
+        drop((a_flags, a_again));
+        assert_eq!(weak.strong_count(), 0, "the registry holds the set weakly");
+        let fresh = super::ProcessOutlierFlags::for_recorder(&a);
+        assert_eq!(
+            Arc::strong_count(&fresh),
+            1,
+            "a fresh set replaces the dropped one"
+        );
+    }
+
     /// The fleet lookup that gates the capability-miss redelivery budget
     /// (issue #804) must keep using the SAME liveness predicate as the
     /// poison-pill orphan reclaimer, and must scope to the task's own queue.

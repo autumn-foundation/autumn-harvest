@@ -5747,9 +5747,12 @@ pub async fn enforce_timeouts_once(
     payload_codecs: &crate::payload_codec::PayloadCodecs,
     codec_rotation_batch_size: i64,
 ) -> HarvestResult<usize> {
+    // Issue #1815: `conn` names no shard, so the scan carries each assigned
+    // shard, as the background checker on the single pool does.
     enforce_timeouts_once_on_conn_shard(
         conn,
         None,
+        &scan_metric_shards(None, None, shard_assignments),
         TaskScan::All,
         metrics,
         unknown_target_grace_window,
@@ -5770,10 +5773,74 @@ pub async fn enforce_timeouts_once(
 /// per-shard scanners in this pass then reuse `conn` for that shard instead
 /// of checking out a second connection. See
 /// [`crate::shard::connect_or_reuse`].
+///
+/// `metric_shards` are the `shard` labels of the pass's `scan` sample (issue
+/// #1815). They stay separate from `conn_shard`, because a checker without a
+/// pool shard still labels its samples with its assigned shards. See
+/// [`scan_metric_shards`].
 // `&Option` because the body forwards `sharded_pool` to many public
 // scanners that take `&Option<ShardedDbPool>`.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::ref_option)]
+#[allow(clippy::too_many_arguments, clippy::ref_option)]
 pub(crate) async fn enforce_timeouts_once_on_conn_shard(
+    conn: &mut AsyncPgConnection,
+    conn_shard: Option<crate::types::ShardId>,
+    metric_shards: &[u16],
+    task_scan: TaskScan<'_>,
+    metrics: &(dyn MetricsRecorder + Send + Sync),
+    unknown_target_grace_window: Duration,
+    sharded_pool: &Option<crate::shard::ShardedDbPool>,
+    shard_assignments: &[crate::types::ShardId],
+    circuit_breakers: Option<&crate::circuit_breaker::CircuitBreakerRegistry>,
+    max_workflow_history_events: Option<u64>,
+    session_worker_stale_secs: i64,
+    payload_codecs: &crate::payload_codec::PayloadCodecs,
+    codec_rotation_batch_size: i64,
+) -> HarvestResult<usize> {
+    // Issue #1815: one pass is one `scan` op, whether it succeeds or fails.
+    let started = std::time::Instant::now();
+    let result = Box::pin(enforce_timeouts_pass(
+        conn,
+        conn_shard,
+        task_scan,
+        metrics,
+        unknown_target_grace_window,
+        sharded_pool,
+        shard_assignments,
+        circuit_breakers,
+        max_workflow_history_events,
+        session_worker_stale_secs,
+        payload_codecs,
+        codec_rotation_batch_size,
+    ))
+    .await;
+    let elapsed = started.elapsed().as_secs_f64();
+    for label in metric_shards {
+        metrics.record_db_query_duration(crate::telemetry::DbOp::Scan, *label, elapsed);
+    }
+    result
+}
+
+/// The `shard` labels of a timeout checker's pool waits and scans (issue
+/// #1815).
+///
+/// A checker on a shard pool uses that shard. A checker on the single pool
+/// scans the database that serves every assigned shard. It then uses each
+/// assigned shard, as the claim path and the pool gauges do. A worker with
+/// no assignment uses shard 0.
+fn scan_metric_shards(
+    pool_shard: Option<crate::types::ShardId>,
+    shard: Option<crate::types::ShardId>,
+    assignments: &[crate::types::ShardId],
+) -> Vec<u16> {
+    pool_shard.or(shard).map_or_else(
+        || crate::worker::single_pool_shard_labels(assignments),
+        |shard| vec![crate::worker::shard_metric_label(shard)],
+    )
+}
+
+/// The body of one [`enforce_timeouts_once_on_conn_shard`] pass.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::ref_option)]
+async fn enforce_timeouts_pass(
     conn: &mut AsyncPgConnection,
     conn_shard: Option<crate::types::ShardId>,
     task_scan: TaskScan<'_>,
@@ -6327,6 +6394,8 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
         )
     })
     .collect();
+    // Issue #1815: the `shard` labels of this loop's pool waits and scans.
+    let metric_shards = scan_metric_shards(pool_shard, shard, &shard_assignments);
     // The tick series and the pass series carry the same shard label.
     let shard_label = owners[0].shard_label();
     // Keep the worker dispatch binding for hints (issue #1431).
@@ -6364,6 +6433,7 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
             // bound above only limits a merely-slow acquisition. Without this
             // select, a shutdown request during that wait would still queue
             // behind the full `interval` before this loop noticed it.
+            let wait_started = std::time::Instant::now();
             let get_result = tokio::select! {
                 () = cancel.cancelled() => {
                     tracing::debug!("timeout checker cancelled while acquiring a connection");
@@ -6371,6 +6441,14 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
                 }
                 result = tokio::time::timeout(interval, pool.get()) => result,
             };
+            // Issue #1815: a wait that ends in an error or a timeout counts too.
+            // A single-pool checker has no `pool_shard`, so it records under each
+            // assigned shard. That matches the claim path and the pool gauges.
+            // The scan sample of the pass uses the same labels.
+            let waited = wait_started.elapsed().as_secs_f64();
+            for label in &metric_shards {
+                telemetry.metrics.record_db_pool_wait(*label, waited);
+            }
             match get_result {
                 Ok(Ok(mut conn)) => {
                     let abdicated =
@@ -6412,6 +6490,7 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
                         let failed = match enforce_timeouts_once_on_conn_shard(
                             &mut conn,
                             pool_shard,
+                            &metric_shards,
                             TaskScan::Batch {
                                 cursor: &mut cursor,
                                 limit: task_batch_size,
@@ -6821,6 +6900,26 @@ pub async fn enforce_workflow_history_ceiling_with_codecs(
 
 #[cfg(test)]
 mod tests {
+
+    /// Issue #1815: a single-pool checker labels its pool waits and scans
+    /// with each assigned shard, as the claim path and the pool gauges do. It
+    /// never reports under a shard the worker does not serve.
+    #[test]
+    fn a_single_pool_checker_labels_its_assigned_shards() {
+        use super::scan_metric_shards;
+        use crate::types::ShardId;
+        let shard = ShardId::new;
+        assert_eq!(scan_metric_shards(None, None, &[shard(7)]), vec![7]);
+        assert_eq!(
+            scan_metric_shards(None, None, &[shard(7), shard(3)]),
+            vec![3, 7]
+        );
+        assert_eq!(scan_metric_shards(None, None, &[]), vec![0]);
+        assert_eq!(
+            scan_metric_shards(Some(shard(5)), Some(shard(5)), &[shard(5)]),
+            vec![5]
+        );
+    }
     // ── Timeout retry rule (issue #1809, ADR 0005) ───────────────────────
 
     /// A confirmed timeout releases a probe slot either way. Only a probe whose
