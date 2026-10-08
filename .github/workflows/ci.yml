@@ -758,26 +758,30 @@ jobs:
           python3 docs/audits/openapi-response-coverage.py --self-test
           python3 docs/audits/openapi-response-coverage.py
 
-      # Comment hygiene. The release PR (trunk-dev into trunk) runs Tier A
-      # only. Each change in it already passed Tier B on its way into
-      # trunk-dev, on its PR and again on its push. A ratchet against trunk
-      # counts the whole release as new. That includes the legacy debt from
-      # before the gate existed. The guard checks the head repo, so a fork
-      # branch named trunk-dev still gets the full ratchet.
+      # Comment hygiene. A PR ratchets against its merge base, or against
+      # the commit that added this gate if the merge base predates it. Only
+      # the release PR (trunk-dev into trunk) hits the second case, and only
+      # while trunk is older than the gate. Its merge base is then the last
+      # release. That counts the legacy debt from before the gate as new.
+      # The gate commit still checks the whole release cumulatively. That
+      # matters because a push run on trunk-dev can be cancelled, and two
+      # clean PRs can merge into a new finding.
       - name: Comment hygiene (docs/audits/comment-hygiene.py)
         env:
           BASE_REF: ${{ github.base_ref }}
-          HEAD_REF: ${{ github.head_ref }}
-          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
         run: |
           python3 docs/audits/comment-hygiene.py --self-test
           BEFORE="${{ github.event.before }}"
-          if [ "$BASE_REF" = "trunk" ] && [ "$HEAD_REF" = "trunk-dev" ] \
-            && [ "$HEAD_REPO" = "$GITHUB_REPOSITORY" ]; then
-            python3 docs/audits/comment-hygiene.py --tier-a-only
-          elif [ -n "$BASE_REF" ]; then
+          if [ -n "$BASE_REF" ]; then
             git fetch --no-tags origin "$BASE_REF"
-            python3 docs/audits/comment-hygiene.py --base FETCH_HEAD
+            BASE=FETCH_HEAD
+            GATE=$(git log --diff-filter=A --format=%H -1 -- docs/audits/comment-hygiene.py)
+            MB=$(git merge-base FETCH_HEAD HEAD || true)
+            if [ -n "$GATE" ] && [ -n "$MB" ] \
+              && ! git merge-base --is-ancestor "$GATE" "$MB"; then
+              BASE="$GATE"
+            fi
+            python3 docs/audits/comment-hygiene.py --base "$BASE"
           elif [ -n "$BEFORE" ] \
             && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
             # The whole push, not just its last commit. `HEAD~1` would let a
