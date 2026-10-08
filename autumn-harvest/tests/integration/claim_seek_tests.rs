@@ -36,8 +36,14 @@ async fn connect(url: &str) -> AsyncPgConnection {
 }
 
 async fn setup_db() -> (AsyncPgConnection, Option<ContainerAsync<Postgres>>) {
+    let (conn, _url, container) = setup_db_with_url().await;
+    (conn, container)
+}
+
+/// [`setup_db`], plus the URL, for a test that needs more connections.
+async fn setup_db_with_url() -> (AsyncPgConnection, String, Option<ContainerAsync<Postgres>>) {
     if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
-        return (connect(&url).await, None);
+        return (connect(&url).await, url, None);
     }
     let container = Postgres::default()
         .with_tag("16")
@@ -51,7 +57,7 @@ async fn setup_db() -> (AsyncPgConnection, Option<ContainerAsync<Postgres>>) {
     conn.batch_execute(&autumn_harvest::test_init_sql())
         .await
         .expect("migrations");
-    (conn, Some(container))
+    (conn, url, Some(container))
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -767,6 +773,8 @@ async fn the_claim_leaves_the_session_planner_settings_unchanged() {
         jit: String,
         #[diesel(sql_type = diesel::sql_types::Text)]
         plan_cache_mode: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        enable_bitmapscan: String,
     }
     let (mut conn, _container) = setup_db().await;
     let qs = queues(1);
@@ -777,21 +785,31 @@ async fn the_claim_leaves_the_session_planner_settings_unchanged() {
         &format!("'{q}', 'activity', 'noop', NOW() - INTERVAL '1 second'"),
     )
     .await;
-    exec(&mut conn, "SET jit = on; SET plan_cache_mode = auto").await;
+    exec(
+        &mut conn,
+        "SET jit = on; SET plan_cache_mode = auto; SET enable_bitmapscan = on",
+    )
+    .await;
     let claimed = claim(&mut conn, &qs, None).await;
     let empty = claim(&mut conn, &qs, None).await;
     let after: Settings = diesel::sql_query(
         "SELECT current_setting('jit') AS jit, \
-                current_setting('plan_cache_mode') AS plan_cache_mode",
+                current_setting('plan_cache_mode') AS plan_cache_mode, \
+                current_setting('enable_bitmapscan') AS enable_bitmapscan",
     )
     .get_result(&mut conn)
     .await
     .expect("read settings");
-    exec(&mut conn, "RESET jit; RESET plan_cache_mode").await;
+    exec(
+        &mut conn,
+        "RESET jit; RESET plan_cache_mode; RESET enable_bitmapscan",
+    )
+    .await;
     delete_queues(&mut conn, &qs).await;
     assert!(claimed.is_some() && empty.is_none(), "one row, then none");
     assert_eq!(after.jit, "on", "SET LOCAL must not leak into the session");
     assert_eq!(after.plan_cache_mode, "auto", "SET LOCAL must not leak");
+    assert_eq!(after.enable_bitmapscan, "on", "SET LOCAL must not leak");
 }
 
 /// The default claim reuses one prepared statement per connection (issue
@@ -882,6 +900,87 @@ async fn an_added_column_does_not_break_a_cached_claim() {
         claimed,
         ids.into_iter().map(Some).collect::<Vec<_>>(),
         "the two claims take the two rows"
+    );
+}
+
+/// Concurrent claimers never exceed a concurrency cap through the window
+/// (issues #247, #1971).
+///
+/// The head of the queue is a deep run on one capped key, so heads fill and
+/// claims fall back. Eight claimers race on separate connections and never
+/// complete their claims.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_claimers_never_exceed_a_cap_at_depth() {
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    const CAP: i64 = 3;
+    let (mut conn, url, _container) = setup_db_with_url().await;
+    let qs = queues(2);
+    let key = unique("capped");
+    exec(
+        &mut conn,
+        &format!(
+            "INSERT INTO harvest_task_queue \
+               (queue_name, task_type, activity_name, input, state, priority, max_attempts, \
+                scheduled_at, concurrency_key, concurrency_cap) \
+             SELECT ({q})[1 + (i % 2)], 'activity', 'noop', '{{}}'::jsonb, 'PENDING', 1, 3, \
+                    NOW() - INTERVAL '1 hour', '{key}', {CAP} \
+             FROM generate_series(1, 400) AS i; \
+             INSERT INTO harvest_task_queue \
+               (queue_name, task_type, activity_name, input, state, max_attempts, scheduled_at) \
+             SELECT ({q})[1 + (i % 2)], 'activity', 'noop', '{{}}'::jsonb, 'PENDING', 3, \
+                    NOW() - make_interval(secs => i % 600) \
+             FROM generate_series(1, 2000) AS i; \
+             ANALYZE harvest_task_queue;",
+            q = text_array(&qs)
+        ),
+    )
+    .await;
+    let mut tasks = Vec::new();
+    for worker in 0..8 {
+        let (url, qs) = (url.clone(), qs.clone());
+        tasks.push(tokio::spawn(async move {
+            let mut conn = connect(&url).await;
+            let name = format!("{WORKER}-{worker}");
+            for _ in 0..20 {
+                queue::claim_task(&mut conn, &qs, &name, "", None, &[], &[])
+                    .await
+                    .expect("claim");
+            }
+        }));
+    }
+    for task in tasks {
+        task.await.expect("claimer");
+    }
+    let running: Count = diesel::sql_query(format!(
+        "SELECT count(*)::bigint AS n FROM harvest_task_queue \
+         WHERE concurrency_key = '{key}' AND state = 'RUNNING'"
+    ))
+    .get_result(&mut conn)
+    .await
+    .expect("running count");
+    let claimed: Count = diesel::sql_query(format!(
+        "SELECT count(*)::bigint AS n FROM harvest_task_queue \
+         WHERE queue_name = ANY({}) AND state = 'RUNNING'",
+        text_array(&qs)
+    ))
+    .get_result(&mut conn)
+    .await
+    .expect("claimed count");
+    delete_queues(&mut conn, &qs).await;
+    assert!(
+        running.n <= CAP,
+        "{} rows run on a key capped at {CAP}",
+        running.n
+    );
+    assert_eq!(running.n, CAP, "the cap is reached, not undershot");
+    assert!(
+        claimed.n > CAP,
+        "claims past the capped head take other rows: {}",
+        claimed.n
     );
 }
 

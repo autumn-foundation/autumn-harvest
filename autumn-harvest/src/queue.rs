@@ -913,9 +913,14 @@ pub const DEADLINE_EXCEEDED_ERROR: &str = "deadline_exceeded";
 ///
 /// The predicate is the timeout scanner's own: a `RUNNING` run with a past
 /// `deadline_at` or `chain_deadline_at`. A `PAUSED` run is not in the set,
-/// because a resume moves its deadline forward. The two partial deadline
-/// indexes serve the read. The set is small, because the scanner clears it
-/// once per poll interval.
+/// because a resume moves its deadline forward. The set is small, because
+/// the scanner clears it once per poll interval.
+///
+/// Each deadline has its own partial index, so the CTE reads each one in its
+/// own branch. An `OR` needs a bitmap scan to use both indexes. The claim
+/// turns bitmap scans off (issue #1971), so an `OR` would scan every run. A
+/// run past both deadlines appears twice. The gates test membership only, so
+/// the duplicate has no effect.
 ///
 /// The CTE is `MATERIALIZED`, so it runs once per claim, not once per row. It
 /// only reads the run rows and takes no lock. A lock here would invert the
@@ -924,8 +929,10 @@ macro_rules! expired_runs_cte_sql {
     () => {
         "expired_runs AS MATERIALIZED ( \
              SELECT id FROM harvest_workflow_executions \
-             WHERE state = 'RUNNING' \
-               AND (deadline_at < NOW() OR chain_deadline_at < NOW()) \
+             WHERE state = 'RUNNING' AND deadline_at < NOW() \
+             UNION ALL \
+             SELECT id FROM harvest_workflow_executions \
+             WHERE state = 'RUNNING' AND chain_deadline_at < NOW() \
          )"
     };
 }
@@ -1205,10 +1212,11 @@ macro_rules! claim_candidate_gates_sql {
 
 /// The full candidate scan of the claim query.
 ///
-/// `$name` names the CTE. `$counts` names the running-count CTE. `$extra` is
-/// a predicate after the queue-pause test.
+/// `$name` names the CTE. `$counts` names the running-count CTE. `$rows` is
+/// the queue and state test. `$extra` is a predicate after the queue-pause
+/// test.
 macro_rules! claim_candidate_scan_sql {
-    ($name:literal, $counts:literal, [$($extra:tt)*]) => {
+    ($name:literal, $counts:literal, [$($rows:tt)*], [$($extra:tt)*]) => {
         concat!(
             $name,
             " AS ( \
@@ -1218,9 +1226,9 @@ macro_rules! claim_candidate_scan_sql {
              CROSS JOIN worker_info \
              CROSS JOIN paused_queues \
              CROSS JOIN paused_activities \
-             WHERE queue_name = ANY($2) \
-               AND state = 'PENDING' \
-               AND scheduled_at <= NOW() \
+             WHERE ",
+            $($rows)*,
+            "AND scheduled_at <= NOW() \
                AND NOT (harvest_task_queue.queue_name = ANY(paused_queues.names)) ",
             $($extra)*,
             claim_candidate_gates_sql!($counts),
@@ -1498,7 +1506,7 @@ macro_rules! claim_seek_row_sql {
     };
 }
 
-/// The window predicate of the window candidate scan (issue #1971).
+/// The row source of the window candidate scan (issue #1971).
 ///
 /// The array holds the window rows that pass the guard. A window row may be
 /// the candidate only when no row outside the window can sort before it. A
@@ -1507,9 +1515,7 @@ macro_rules! claim_seek_row_sql {
 /// head.
 ///
 /// The candidate scan reads the table rows by primary key through the
-/// array. That plan does not depend on the table statistics. A join to the
-/// window CTE did depend on them. After an `ANALYZE` that saw almost no
-/// `PENDING` row, the planner put the table on the outer side of the join.
+/// array. See `claim_seek_rows_sql!` for why no other index can serve it.
 macro_rules! claim_seek_guard_sql {
     () => {
         "AND harvest_task_queue.id = ANY(ARRAY( \
@@ -1524,6 +1530,35 @@ macro_rules! claim_seek_guard_sql {
                        ) \
                    ) \
                )) "
+    };
+}
+
+/// The queue and state test of the window candidate scan (issue #1971).
+///
+/// The scan must read its rows by primary key. Any other plan reads the
+/// whole backlog. The planner guesses the size of the id array and the
+/// number of `PENDING` rows. With stale statistics it picked other plans:
+///
+/// - A partial index that holds `id`, such as `idx_harvest_tq_live_created`:
+///   a full index scan with the id test, 17K buffers.
+/// - A join to the window ids, with the table on the outer side: 30K buffers.
+///
+/// So the test gives the planner no partial index:
+///
+/// - No queue test. The head scans read the polled queues only. No code
+///   changes the queue of a row, so a row lock cannot move it to another
+///   queue. A queue test also let Postgres 16 run
+///   `idx_harvest_tq_coverage_sample` once per pair of queue and id: 27K
+///   buffers at 64 queues.
+/// - The state test compares with a scalar subquery. Postgres proves a
+///   partial-index predicate from a constant only, so no partial index
+///   matches. The row lock still rechecks the state.
+///
+/// Only the primary key and a scan of the whole table remain. The primary
+/// key costs one probe per window row.
+macro_rules! claim_seek_rows_sql {
+    () => {
+        "harvest_task_queue.state = (SELECT 'PENDING'::text) "
     };
 }
 
@@ -1586,14 +1621,12 @@ macro_rules! claim_full_scan_fallback_sql {
 // `COALESCE(..., 0)` reproduces the correlated subquery's implicit zero for a
 // key with no matching RUNNING rows (`concurrency_running_counts` never
 // materializes a zero-count row; `GROUP BY` only emits groups that exist).
-// The `claimed` CTE's own authoritative, `pg_try_advisory_xact_lock`-guarded
-// recheck below is a **separate, single-row** re-evaluation of the identical
-// correlated subquery against the one candidate this soft filter selected —
-// it is NOT rewritten, on purpose: it already runs at most once per claim
-// (never once per row), so it carries none of the cost this fix addresses,
-// and it is the one piece of this predicate that must stay a fresh,
-// serializable-under-the-advisory-lock read rather than a snapshot taken
-// before the lock was acquired. See
+// The `claimed` CTE has its own recheck under `pg_try_advisory_xact_lock`.
+// It runs the same correlated subquery on the one candidate only. It is not
+// rewritten, on purpose. It runs at most once per claim, so it carries none
+// of the cost this fix addresses. It still reads the snapshot of the claim
+// statement, which predates the lock. `release_claim_if_over_cap` repeats the count after the claim, in a
+// fresh snapshot, so the cap holds through commit. See
 // `claim_query_concurrency_gate_matches_the_authoritative_recheck` below for
 // the shape this pre-filter is held to, and
 // `tests/integration/concurrency_key_tests.rs` for the DB-backed correctness
@@ -1677,12 +1710,14 @@ pub const fn claim_task_query() -> &'static str {
         claim_candidate_scan_sql!(
             "seek_candidate",
             "seek_running_counts",
+            [claim_seek_rows_sql!()],
             [claim_seek_guard_sql!()]
         ),
         ", ",
         claim_candidate_scan_sql!(
             "legacy_candidate",
             "concurrency_running_counts",
+            ["queue_name = ANY($2) AND state = 'PENDING' "],
             [claim_full_scan_fallback_sql!()]
         ),
         ", candidate AS ( SELECT * FROM seek_candidate \
@@ -1698,7 +1733,12 @@ pub const fn claim_task_query() -> &'static str {
 const fn claim_task_full_scan_query() -> &'static str {
     concat!(
         claim_leading_ctes_sql!(),
-        claim_candidate_scan_sql!("candidate", "concurrency_running_counts", [""]),
+        claim_candidate_scan_sql!(
+            "candidate",
+            "concurrency_running_counts",
+            ["queue_name = ANY($2) AND state = 'PENDING' "],
+            [""]
+        ),
         ", ",
         claim_trailing_ctes_sql!()
     )
@@ -1720,14 +1760,24 @@ const fn claim_task_full_scan_query() -> &'static str {
 /// has the same shape: bounded head scans, a lookup by primary key and a
 /// gated full scan. An `ANALYZE` of the table invalidates it.
 ///
+/// **No bitmap scans.** A head scan must read the index in claim order and
+/// stop at the window. A bitmap scan reads every due row of the head and
+/// sorts them. The planner picks it when it estimates a head below the
+/// window size. A generic plan, skewed queues or stale statistics all give
+/// that estimate. On the issue #1956 fixture, the bitmap form read 2,515
+/// buffers at 10K pending rows. With stale statistics it read 11,704. The
+/// ordered scan does not depend on the estimate. Every other read in the
+/// claim is a lookup by key, so it needs no bitmap.
+///
 /// `SET LOCAL` ends with the transaction, so the session settings of the
 /// connection do not change. The settings travel with the claim, as the
 /// isolation level does, so they do not depend on the pool configuration.
 /// They also cover the post-claim rechecks. Those are short statements on
-/// one row, so a generic plan without JIT suits them too. Both settings go
-/// in one batch, so they cost one round trip.
-pub const CLAIM_PLAN_SETTINGS_SQL: &str =
-    "SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan";
+/// one row, so these settings suit them too. All settings go in one batch,
+/// so they cost one round trip.
+pub const CLAIM_PLAN_SETTINGS_SQL: &str = "SET LOCAL jit = off; \
+     SET LOCAL plan_cache_mode = force_generic_plan; \
+     SET LOCAL enable_bitmapscan = off";
 
 /// One default claim statement with its binds (issue #1971).
 ///
@@ -2389,6 +2439,59 @@ pub(crate) async fn release_claim_via(
     Ok(released > 0)
 }
 
+/// SQL for [`release_claim_if_over_cap`], exposed for shape tests.
+///
+/// One statement, so it takes a fresh `READ COMMITTED` snapshot. The count
+/// includes the row that this transaction just claimed.
+#[must_use]
+pub const fn release_claim_if_over_cap_query() -> &'static str {
+    "UPDATE harvest_task_queue \
+     SET state = 'PENDING', \
+         worker_id = NULL, \
+         started_at = NULL, \
+         attempt = GREATEST(attempt - 1, 0) \
+     WHERE id = $1 \
+       AND state = 'RUNNING' \
+       AND worker_id = $2 \
+       AND concurrency_key IS NOT NULL \
+       AND concurrency_cap IS NOT NULL \
+       AND ( \
+           SELECT COUNT(*) FROM harvest_task_queue recheck \
+           WHERE recheck.concurrency_key = harvest_task_queue.concurrency_key \
+             AND recheck.task_type = harvest_task_queue.task_type \
+             AND recheck.state = 'RUNNING' \
+             AND recheck.worker_id IS NOT NULL \
+       ) > harvest_task_queue.concurrency_cap"
+}
+
+/// Releases a just-claimed task when its concurrency key is over its cap.
+///
+/// # Why a second statement is required
+///
+/// The claim takes the advisory lock of the key, then counts the `RUNNING`
+/// rows of the key. Both happen in one statement, so the count reads the
+/// snapshot from the start of the statement. A claim on the same key can
+/// commit after that snapshot and before the lock. The count then misses
+/// that claim, and the cap is exceeded by one.
+///
+/// This statement takes a fresh snapshot while the transaction still holds
+/// the advisory lock. Every claim on the key that committed before the lock
+/// is visible. A later claim must wait for this commit to take the lock, so
+/// it sees this claim. So the cap holds through commit.
+///
+/// A released claim keeps its rate-limit debit, as the pause releases do.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+async fn release_claim_if_over_cap(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    worker_id: &str,
+) -> HarvestResult<bool> {
+    release_claim_via(conn, release_claim_if_over_cap_query(), task_id, worker_id).await
+}
+
 /// The post-claim re-checks shared by [`claim_task_on_shard`] and
 /// [`claim_task_by_id_on_shard`].
 ///
@@ -2470,6 +2573,16 @@ async fn apply_post_claim_rechecks(
     if task.task_type == TaskType::Workflow.as_str()
         && task.workflow_exec_id.is_some()
         && crate::execution::release_claim_if_workflow_paused(conn, task.id, worker_id).await?
+    {
+        return Ok(ClaimOutcome::Released(task.id));
+    }
+
+    // Authoritative concurrency-cap re-check. The claim counts the key under
+    // the snapshot of its own statement. See `release_claim_if_over_cap`.
+    // Gated on a capped key, so other claims pay no extra round trip.
+    if task.concurrency_key.is_some()
+        && task.concurrency_cap.is_some()
+        && release_claim_if_over_cap(conn, task.id, worker_id).await?
     {
         return Ok(ClaimOutcome::Released(task.id));
     }
@@ -10065,8 +10178,8 @@ mod tests {
     fn expired_run_set_matches_the_scanner_and_takes_no_lock() {
         for clause in [
             "expired_runs AS MATERIALIZED",
-            "WHERE state = 'RUNNING'",
-            "deadline_at < NOW() OR chain_deadline_at < NOW()",
+            "WHERE state = 'RUNNING' AND deadline_at < NOW() UNION ALL",
+            "WHERE state = 'RUNNING' AND chain_deadline_at < NOW()",
         ] {
             assert!(
                 EXPIRED_RUNS_CTE_SQL.contains(clause),
@@ -10306,6 +10419,84 @@ mod tests {
         }
     }
 
+    /// The post-claim cap re-check counts what the claim counts, and gives
+    /// back only this worker's own capped claim.
+    #[test]
+    fn the_cap_recheck_counts_what_the_claim_counts() {
+        let release = release_claim_if_over_cap_query();
+        for clause in [
+            "WHERE id = $1 AND state = 'RUNNING' AND worker_id = $2",
+            "attempt = GREATEST(attempt - 1, 0)",
+            "concurrency_key IS NOT NULL AND concurrency_cap IS NOT NULL",
+            "recheck.concurrency_key = harvest_task_queue.concurrency_key",
+            "recheck.task_type = harvest_task_queue.task_type",
+            "recheck.state = 'RUNNING' AND recheck.worker_id IS NOT NULL",
+            ") > harvest_task_queue.concurrency_cap",
+        ] {
+            assert!(
+                release.contains(clause),
+                "missing {clause:?} in:\n{release}"
+            );
+        }
+        let claim = claim_task_query();
+        for clause in [
+            "recheck.task_type = candidate.task_type",
+            "AND recheck.state = 'RUNNING' AND recheck.worker_id IS NOT NULL",
+            ") < candidate.concurrency_cap",
+        ] {
+            assert!(claim.contains(clause), "the claim lacks {clause:?}");
+        }
+    }
+
+    /// The window scan gives the planner no partial index (issue #1971).
+    ///
+    /// The head scans already test the polled queues. A queue test or a
+    /// constant state test lets stale statistics pick a partial index, which
+    /// reads the whole backlog.
+    #[test]
+    fn the_window_scan_matches_no_partial_index() {
+        let sql = claim_task_query();
+        let seek = cte(sql, "seek_candidate", "legacy_candidate");
+        let legacy = cte(sql, "legacy_candidate", "candidate");
+        assert!(!seek.contains("WHERE queue_name = ANY($2)"), "{seek}");
+        assert!(
+            seek.contains("WHERE harvest_task_queue.state = (SELECT 'PENDING'::text) AND"),
+            "no partial index may match the window scan: {seek}"
+        );
+        assert!(legacy.contains("WHERE queue_name = ANY($2) AND state = 'PENDING'"));
+        let heads = cte(sql, "seek_heads", "seek_bounds");
+        assert_eq!(heads.matches("unnest($2::text[])").count(), 1, "{heads}");
+        assert!(
+            heads.contains("queue_name = ANY($2)"),
+            "the pin head: {heads}"
+        );
+    }
+
+    /// The head scans spell the index keys of `idx_harvest_tq_claim_seek`
+    /// (issue #1971).
+    ///
+    /// Postgres matches an index expression by its text. A head predicate
+    /// that drifts from the index silently loses the bounded scan.
+    #[test]
+    fn claim_seek_heads_match_the_index_expression() {
+        const MIGRATION: &str =
+            include_str!("../migrations/20261008042107_harvest_task_queue_claim_seek_index/up.sql");
+        assert!(MIGRATION.contains(
+            "(queue_name, task_type, (new_start AND attempt = 0), priority DESC, scheduled_at)"
+        ));
+        assert!(MIGRATION.contains("WHERE state = 'PENDING'"));
+        let heads = cte(claim_task_query(), "seek_heads", "seek_bounds");
+        for key in [
+            "WHERE queue_name = q.name",
+            "AND task_type = k.head_kind",
+            "AND state = 'PENDING'",
+            "AND (new_start AND attempt = 0) = k.new_start_head",
+            "ORDER BY priority DESC, scheduled_at ASC",
+        ] {
+            assert!(heads.contains(key), "missing {key:?} in:\n{heads}");
+        }
+    }
+
     /// The claim sets its planner settings for its own transaction only
     /// (issue #1971).
     #[test]
@@ -10315,6 +10506,7 @@ mod tests {
         }
         assert!(CLAIM_PLAN_SETTINGS_SQL.contains("jit = off"));
         assert!(CLAIM_PLAN_SETTINGS_SQL.contains("plan_cache_mode = force_generic_plan"));
+        assert!(CLAIM_PLAN_SETTINGS_SQL.contains("enable_bitmapscan = off"));
     }
 
     /// The claim result lists every `TaskQueueItem` field (issue #1971).
