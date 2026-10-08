@@ -2345,6 +2345,7 @@ async fn a_fenced_child_sweep_abandons_its_pass_on_a_busy_target_pool() {
         concurrency_key: None,
         max_concurrent: None,
         trace_context: None,
+        tenant: None,
     };
     let mut conn = shard_conn(&sharded, PARENT_SHARD).await;
     autumn_harvest::cross_shard_child::record_cross_shard_child(

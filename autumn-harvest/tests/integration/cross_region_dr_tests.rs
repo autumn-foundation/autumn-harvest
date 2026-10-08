@@ -2243,6 +2243,7 @@ async fn a_detached_trigger_relay_writes_nothing_on_a_fenced_source() {
         retry_policy: None,
         max_workflow_attempts_ceiling: None,
         codecs: autumn_harvest::payload_codec::PayloadCodecs::default(),
+        tenant: None,
     }
     .spawn();
     // The relay is fire-and-forget. Give it time to run.
