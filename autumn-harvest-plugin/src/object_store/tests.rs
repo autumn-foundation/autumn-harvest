@@ -227,3 +227,54 @@ async fn archiver_fetch_refuses_an_object_over_the_limit() {
     let err = small.fetch(&id).await.unwrap_err();
     assert!(err.to_string().contains("read limit"), "{err}");
 }
+
+/// A codec that expands on decode, like a compression codec.
+struct Expander;
+
+impl autumn_harvest::payload_codec::PayloadCodec for Expander {
+    fn codec_id(&self) -> &'static str {
+        "expander"
+    }
+
+    fn encode(&self, raw: &[u8]) -> Result<Vec<u8>, autumn_harvest::payload_codec::CodecError> {
+        Ok(raw.to_vec())
+    }
+
+    fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, autumn_harvest::payload_codec::CodecError> {
+        // Trailing whitespace keeps the JSON valid and adds 1 MiB.
+        let mut out = encoded.to_vec();
+        out.extend(std::iter::repeat_n(b' ', 1024 * 1024));
+        Ok(out)
+    }
+}
+
+#[tokio::test]
+async fn archiver_fetch_bounds_the_decoded_document() {
+    let mut codecs = PayloadCodecs::default();
+    codecs.set_default(Arc::new(Expander));
+    let backend = Arc::new(MemoryBackend::default());
+    let id = ExecutionId::new();
+    ObjectHistoryArchiver::new(Arc::clone(&backend))
+        .with_codecs(codecs.clone())
+        .archive(&sample_doc(id))
+        .await
+        .unwrap();
+    let stored = backend
+        .get(&format!("{id}.json"))
+        .await
+        .unwrap()
+        .unwrap()
+        .len() as u64;
+
+    let roomy = ObjectHistoryArchiver::new(Arc::clone(&backend)).with_codecs(codecs.clone());
+    assert!(
+        roomy.fetch(&id).await.unwrap().is_some(),
+        "the default limit fits"
+    );
+
+    let tight = ObjectHistoryArchiver::new(backend)
+        .with_codecs(codecs)
+        .with_max_fetch_bytes(stored + 1024);
+    let err = tight.fetch(&id).await.unwrap_err();
+    assert!(err.to_string().contains("read limit"), "{err}");
+}

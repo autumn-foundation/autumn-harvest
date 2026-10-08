@@ -1749,6 +1749,7 @@ async fn workflow_detail_ui(
     Query(params): Query<WorkflowDetailParams>,
     headers: axum::http::HeaderMap,
     maybe_session: Option<Extension<Session>>,
+    token: Option<Extension<crate::api_token::TokenPrincipal>>,
 ) -> axum::response::Response {
     let hint_session = extension_session(maybe_session.clone());
     let page = render_workflow_detail_page(
@@ -1768,10 +1769,23 @@ async fn workflow_detail_ui(
     match page {
         Ok(markup) => markup.into_response(),
         Err(err) => {
-            let is_admin = crate::api::has_harvest_admin_access(&api_state, hint_session).await;
+            let token = token.map(|Extension(token)| token);
+            let is_admin = caller_is_harvest_admin(&api_state, token, hint_session).await;
             archived_history_hint(&api_state, &id, err, is_admin)
         }
     }
+}
+
+/// Whether the caller passes `require_harvest_admin` (issue #1983).
+///
+/// The guard admits a verified API token first, then an admin session. This
+/// check does the same, so a token-authenticated admin also gets the link.
+async fn caller_is_harvest_admin(
+    api_state: &HarvestApiState,
+    token: Option<crate::api_token::TokenPrincipal>,
+    session: Option<Session>,
+) -> bool {
+    token.is_some() || crate::api::has_harvest_admin_access(api_state, session).await
 }
 
 /// Turn a 404 on the detail page into a link to the archive (issue #1983).
@@ -12776,6 +12790,16 @@ mod tests {
                 assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
                 assert!(!body(response).await.contains("archived-history"));
             }
+        }
+
+        #[tokio::test]
+        async fn a_token_principal_counts_as_admin() {
+            let token = crate::api_token::TokenPrincipal {
+                id: uuid::Uuid::nil(),
+                scope: crate::api_token::TokenScope::Read,
+            };
+            assert!(caller_is_harvest_admin(&state(true), Some(token), None).await);
+            assert!(!caller_is_harvest_admin(&state(true), None, None).await);
         }
 
         #[tokio::test]

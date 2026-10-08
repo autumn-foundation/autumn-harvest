@@ -303,13 +303,20 @@ impl<B: ObjectBackend> ObjectHistoryArchiver<B> {
     fn decode(&self, bytes: &[u8]) -> Result<HistoryExportDocument, String> {
         let value: serde_json::Value =
             serde_json::from_slice(bytes).map_err(|err| err.to_string())?;
-        let value = match &self.codecs {
-            Some(codecs) => codecs
-                .decode_payload(&value)
-                .map_err(|err| err.to_string())?,
-            None => value,
+        let Some(codecs) = &self.codecs else {
+            return serde_json::from_value(value).map_err(|err| err.to_string());
         };
-        serde_json::from_value(value).map_err(|err| err.to_string())
+        let Some(plain) = codecs
+            .decode_payload_bytes(&value)
+            .map_err(|err| err.to_string())?
+        else {
+            return serde_json::from_value(value).map_err(|err| err.to_string());
+        };
+        // A compressing codec can expand a small object. Bound the decoded
+        // bytes too, before the parse builds the document in memory.
+        check_size("decoded archive", plain.len() as u64, self.max_fetch_bytes)
+            .map_err(|err| err.0)?;
+        serde_json::from_slice(&plain).map_err(|err| err.to_string())
     }
 }
 
