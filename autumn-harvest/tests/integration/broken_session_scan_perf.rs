@@ -443,6 +443,8 @@ struct Point {
     candidates: i64,
     seek_calls: i64,
     seek_buffers: i64,
+    session_enqueue_wal: i64,
+    plain_enqueue_wal: i64,
     tq_seq_scans: i64,
     tq_seq_tup_read: i64,
     tq_idx_scans: i64,
@@ -540,6 +542,11 @@ async fn measure(admin: &str, label: &str, n: i64, out_dir: &std::path::Path, fu
         .unwrap();
     }
     let rows = snapshot(&mut stats, &db_name).await;
+    let (session_enqueue_wal, plain_enqueue_wal) = if full {
+        enqueue_wal_cost(&mut seed, &mut stats).await
+    } else {
+        (0, 0)
+    };
 
     let reverify: Vec<&StatRow> = rows
         .iter()
@@ -589,6 +596,8 @@ async fn measure(admin: &str, label: &str, n: i64, out_dir: &std::path::Path, fu
             .filter(|r| is_session_seek_statement(&r.query))
             .map(|r| r.total_buffers)
             .sum(),
+        session_enqueue_wal,
+        plain_enqueue_wal,
         tq_seq_scans: scans_after.seq_scan - scans_before.seq_scan,
         tq_seq_tup_read: scans_after.seq_tup_read - scans_before.seq_tup_read,
         tq_idx_scans: scans_after.idx_scan - scans_before.idx_scan,
@@ -638,6 +647,34 @@ async fn index_scans(conn: &mut AsyncPgConnection) -> String {
     rows.into_iter().map(|r| r.line + "\n").collect()
 }
 
+const ENQUEUE_PROBE_ROWS: i64 = 500;
+
+/// WAL bytes for `ENQUEUE_PROBE_ROWS` session-pinned enqueues and the same
+/// number of plain ones. The difference is the write tax of any index keyed
+/// on `session_id`. Runs after the pass, so the state dump is unaffected.
+async fn enqueue_wal_cost(
+    writer: &mut AsyncPgConnection,
+    meter: &mut AsyncPgConnection,
+) -> (i64, i64) {
+    let mut run = async |pinned: bool| {
+        let before = wal_lsn(meter).await;
+        for _ in 0..ENQUEUE_PROBE_ROWS {
+            let mut params =
+                EnqueueParams::new("probe", TaskType::Activity, serde_json::json!(null));
+            if pinned {
+                params = params.with_session_id(Uuid::new_v4());
+            }
+            queue::enqueue(writer, &params)
+                .await
+                .expect("probe enqueue");
+        }
+        wal_lsn(meter).await - before
+    };
+    let session = run(true).await;
+    let plain = run(false).await;
+    (session, plain)
+}
+
 async fn wal_lsn(conn: &mut AsyncPgConnection) -> i64 {
     #[derive(diesel::QueryableByName)]
     struct L {
@@ -669,13 +706,14 @@ async fn zz_capture_broken_session_scan_perf_evidence() {
         "-- {label}: enforce_broken_sessions, pg_stat_statements sweep --\n\
          n\tcandidates\tfailed_members\ttotal_calls\treverify_calls\treverify_buffers\t\
          total_buffers\ttemp_blks_written\twal_bytes\tseek_calls\tseek_buffers\t\
-         tq_seq_scans\ttq_seq_tup_read\ttq_idx_scans\n"
+         session_enqueue_wal\tplain_enqueue_wal\ttq_seq_scans\ttq_seq_tup_read\t\
+         tq_idx_scans\n"
     );
     for n in [100_i64, 400, 1_600] {
         let p = measure(&admin, &label, n, &out_dir, true).await;
         let _ = writeln!(
             table,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             p.n,
             p.candidates,
             p.failed,
@@ -687,6 +725,8 @@ async fn zz_capture_broken_session_scan_perf_evidence() {
             p.wal_bytes,
             p.seek_calls,
             p.seek_buffers,
+            p.session_enqueue_wal,
+            p.plain_enqueue_wal,
             p.tq_seq_scans,
             p.tq_seq_tup_read,
             p.tq_idx_scans
