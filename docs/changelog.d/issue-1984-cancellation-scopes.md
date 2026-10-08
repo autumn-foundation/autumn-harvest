@@ -45,7 +45,7 @@ never reach the worker, so an operation cannot start and leak in that cycle.
 
 **Limits.** A non-cancellable block cannot nest inside a cancellable scope.
 A scope cannot acquire a durable mutex, or signal, cancel or await an
-external workflow. A cancel that finds no open block is
+external workflow. A scope cannot create a session. A cancel that finds no open block is
 still terminal at once. A scope does not cancel local activities, external
 activities or detached children.
 

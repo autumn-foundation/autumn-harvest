@@ -3005,6 +3005,9 @@ pub struct WorkflowContext {
     /// `cancel(); await_fire()` (live or on replay) resolves
     /// [`TimerOutcome::Cancelled`] instead of re-arming a cancelled timer.
     cancellable_timer_state: Mutex<std::collections::HashMap<String, TimerLogicalState>>,
+    /// The arm count of each handle timer id (issue #1984). A scope cancel uses
+    /// it to cancel only the arm that its body made.
+    timer_arm_epochs: Mutex<std::collections::HashMap<String, u64>>,
     /// Per-run set of `timer_id`s used by the classic `ctx.timer`/`sleep_until`
     /// API this task (issue #768, Codex P2 round 16). Populated by
     /// [`Self::timer`]; consulted by [`Self::start_timer`] / [`Self::reset_timer`]
@@ -3632,6 +3635,7 @@ impl WorkflowContext {
             log_policy: None,
             saga_seq: Mutex::new(0),
             cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
+            timer_arm_epochs: Mutex::new(std::collections::HashMap::new()),
             classic_timer_ids: Mutex::new(std::collections::HashSet::new()),
             held_mutex_keys: Mutex::new(std::collections::HashSet::new()),
             suspending: std::sync::atomic::AtomicBool::new(false),
@@ -3809,6 +3813,7 @@ impl WorkflowContext {
             log_policy: None,
             saga_seq: Mutex::new(0),
             cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
+            timer_arm_epochs: Mutex::new(std::collections::HashMap::new()),
             classic_timer_ids: Mutex::new(std::collections::HashSet::new()),
             held_mutex_keys: Mutex::new(std::collections::HashSet::new()),
             suspending: std::sync::atomic::AtomicBool::new(false),
@@ -3884,6 +3889,7 @@ impl WorkflowContext {
             log_policy: None,
             saga_seq: Mutex::new(0),
             cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
+            timer_arm_epochs: Mutex::new(std::collections::HashMap::new()),
             classic_timer_ids: Mutex::new(std::collections::HashSet::new()),
             held_mutex_keys: Mutex::new(std::collections::HashSet::new()),
             suspending: std::sync::atomic::AtomicBool::new(false),
@@ -7100,8 +7106,15 @@ impl WorkflowContext {
             .insert(timer_id.to_string(), state);
         // Issue #1984: a scope cancel also cancels the timers that its body arms.
         if armed {
+            let epoch = *self
+                .timer_arm_epochs
+                .lock()
+                .expect("timer_arm_epochs lock poisoned")
+                .entry(timer_id.to_string())
+                .and_modify(|epoch| *epoch += 1)
+                .or_insert(1);
             let stack = self.scope_stack.lock().expect("scope stack lock poisoned");
-            crate::cancellation_scope::note_armed_timer(&stack, timer_id);
+            crate::cancellation_scope::note_armed_timer(&stack, timer_id, epoch);
         }
     }
 
@@ -7138,6 +7151,23 @@ impl WorkflowContext {
                 *entry = TimerLogicalState::Cancelled;
             }
         }
+    }
+
+    /// Mark each recorded arm cancelled while it is still the current arm (issue #1984).
+    ///
+    /// A later arm of the same id has a new epoch, so a scope cancel leaves it.
+    pub(crate) fn mark_scope_arms_cancelled(&self, arms: &[(TimerId, u64)]) {
+        let current: Vec<TimerId> = {
+            let epochs = self
+                .timer_arm_epochs
+                .lock()
+                .expect("timer_arm_epochs lock poisoned");
+            arms.iter()
+                .filter(|(id, epoch)| epochs.get(id.as_str()) == Some(epoch))
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        self.mark_scope_timers_cancelled(&current);
     }
 
     /// Whether the workflow logically cancelled `timer_id` this task without a
@@ -12431,8 +12461,13 @@ impl WorkflowContext {
     /// - [`HarvestError::SessionBroken`] if the session's host worker dies or
     ///   drains before the acquire activity's result is recorded (surfaced
     ///   identically to a broken session discovered later, mid-pipeline).
+    /// - [`HarvestError::Config`] if called inside a cancellation scope
+    ///   (issue #1984).
     pub async fn create_session(&self, options: SessionOptions) -> HarvestResult<Session<'_>> {
         self.check_cancellation()?;
+        // Issue #1984: a scope cancel drops the body, and a dropped session is
+        // never released. Reject the operation, as for a mutex.
+        self.reject_in_cancellable_scope("ctx.create_session")?;
 
         let seq = self.next_session_seq();
         let session_id = self.resolve_session_id(seq)?;

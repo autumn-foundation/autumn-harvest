@@ -152,9 +152,9 @@ struct ScopeInner {
     holding: bool,
     held: Vec<WorkflowCommand>,
     members: ScopeMembers,
-    /// The handle timers that the body arms, matched or live.
+    /// The handle timer arms that the body makes, matched or live, by epoch.
     /// A replay that matches an arm pushes no command, so `members` can miss it.
-    armed_timers: Vec<TimerId>,
+    armed_timers: Vec<(TimerId, u64)>,
 }
 
 impl ScopeShared {
@@ -216,19 +216,19 @@ pub(crate) fn route_command(
     Some((cmd, tags))
 }
 
-/// Record that the body arms the handle timer `timer_id`.
+/// Record that the body makes arm `epoch` of the handle timer `timer_id`.
 ///
 /// Each cancellable scope up to the nearest shield records it. Live and
-/// replay call this at the same point in the body.
-pub(crate) fn note_armed_timer(stack: &[ScopeFrame], timer_id: &str) {
+/// replay call this at the same point in the body. The epoch keeps a later
+/// arm of the same id by other code out of the scope.
+pub(crate) fn note_armed_timer(stack: &[ScopeFrame], timer_id: &str, epoch: u64) {
     for frame in stack.iter().rev() {
         let ScopeFrame::Cancellable(shared) = frame else {
             break;
         };
         let mut inner = shared.lock();
-        if !inner.armed_timers.iter().any(|id| id.as_str() == timer_id) {
-            inner.armed_timers.push(TimerId::new(timer_id));
-        }
+        inner.armed_timers.retain(|(id, _)| id.as_str() != timer_id);
+        inner.armed_timers.push((TimerId::new(timer_id), epoch));
     }
 }
 
@@ -266,6 +266,8 @@ pub(crate) fn note_armed_timer(stack: &[ScopeFrame], timer_id: &str) {
 /// cancelled, but the body still stops. A scope runs one body only. A body
 /// cannot acquire a durable mutex, signal, cancel or await an external
 /// workflow: each has a durable result that a dropped body would strand.
+/// A body cannot create a session either, because a dropped session is
+/// never released.
 #[derive(Clone)]
 pub struct CancellationScope<'a> {
     ctx: &'a WorkflowContext,
@@ -387,7 +389,7 @@ impl<F: Future> ScopeRun<'_, F> {
                 ctx.mark_scope_timers_cancelled(&marker.members.timers);
                 // The held commands are the commands that the live cycle withdrew.
                 ctx.mark_scope_timers_cancelled(&armed_timer_ids(&self.shared.lock().held));
-                ctx.mark_scope_timers_cancelled(&self.armed_timers());
+                ctx.mark_scope_arms_cancelled(&self.armed_timers());
                 marker.reason
             })
         } else if self.replay.is_some() || ctx.has_unconsumed_marker(&name) {
@@ -413,7 +415,7 @@ impl<F: Future> ScopeRun<'_, F> {
             });
             ctx.mark_scope_timers_cancelled(&marker.members.timers);
             ctx.mark_scope_timers_cancelled(&armed_timer_ids(&withdrawn));
-            ctx.mark_scope_timers_cancelled(&self.armed_timers());
+            ctx.mark_scope_arms_cancelled(&self.armed_timers());
             if !marker.members.is_empty() {
                 ctx.push_command(WorkflowCommand::CancelRaceLosers {
                     reason: LoserCancelReason::ScopeCancelled,
@@ -430,7 +432,7 @@ impl<F: Future> ScopeRun<'_, F> {
         result.and_then(|reason| Err(HarvestError::Cancelled(reason)))
     }
 
-    fn armed_timers(&self) -> Vec<TimerId> {
+    fn armed_timers(&self) -> Vec<(TimerId, u64)> {
         self.shared.lock().armed_timers.clone()
     }
 
@@ -489,13 +491,7 @@ impl<F: Future> Future for ScopeRun<'_, F> {
                 return Poll::Ready(Err(err));
             }
         }
-        // A cancel that is pending before this poll wins over a body that
-        // completes in it. Replay sees the same flag, so both take one path.
-        let cancel_pending = {
-            let mut inner = this.shared.lock();
-            inner.waker = Some(cx.waker().clone());
-            inner.cancel_requested
-        };
+        this.shared.lock().waker = Some(cx.waker().clone());
 
         let ctx = this.ctx;
         let horizon = this.replay.as_ref().map(|marker| marker.horizon);
@@ -505,8 +501,11 @@ impl<F: Future> Future for ScopeRun<'_, F> {
                 Some(horizon) => ctx.with_history_horizon(horizon, || body.as_mut().poll(cx)),
                 None => body.as_mut().poll(cx),
             });
+            // A cancel that comes before or during this poll wins over a body
+            // that completes in it. This includes a cancel by the body itself.
+            // Replay sees the same flag, so both take one path.
             if let Poll::Ready(value) = polled {
-                if horizon.is_none() && !cancel_pending {
+                if horizon.is_none() && !this.shared.lock().cancel_requested {
                     this.finish();
                     return Poll::Ready(Ok(value));
                 }
@@ -935,6 +934,51 @@ mod tests {
         );
     }
 
+    /// The body's timer fires. Other code then arms the same id. The scope
+    /// cancel leaves that later arm armed.
+    #[tokio::test]
+    async fn scope_cancel_leaves_a_later_arm_of_the_same_id() {
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started(),
+                WorkflowEvent::TimerStarted {
+                    timer_id: TimerId::new("deadline"),
+                    duration_secs: 60,
+                },
+                WorkflowEvent::TimerFired {
+                    timer_id: TimerId::new("deadline"),
+                },
+            ],
+        );
+        let scope = ctx.cancellation_scope();
+        let body = async {
+            let fired = ctx.start_timer("deadline", 60).await_fire().await;
+            assert!(fired.is_ok(), "{fired:?}");
+            std::future::pending::<()>().await;
+        };
+        let sibling = async {
+            tokio::task::yield_now().await;
+            let _handle = ctx.start_timer("deadline", 30);
+            scope.cancel();
+        };
+
+        let (result, ()) = bounded(async { tokio::join!(scope.run(body), sibling) }).await;
+
+        assert!(
+            matches!(result, Err(HarvestError::Cancelled(_))),
+            "{result:?}"
+        );
+        assert_eq!(arms(&ctx.drain_commands()), 1, "the sibling arms once");
+        let _handle = ctx.start_timer("deadline", 30);
+        let commands = ctx.drain_commands();
+        assert_eq!(
+            arms(&commands),
+            0,
+            "the sibling arm stays armed: {commands:?}"
+        );
+    }
+
     #[tokio::test]
     async fn scope_cancel_cancels_an_in_flight_child_workflow() {
         let child = ExecutionId::new();
@@ -1092,6 +1136,49 @@ mod tests {
         );
         assert!(ctx.take_nd_details().is_none());
         assert!(ctx.drain_commands().is_empty());
+        assert!(!ctx.history_has_unconsumed_events());
+    }
+
+    /// A cancel by the body itself wins over the value it returns in that poll.
+    #[tokio::test]
+    async fn a_cancel_by_the_body_beats_its_ready_value() {
+        let live = WorkflowContext::new_test();
+        let scope = live.cancellation_scope();
+
+        let result = bounded(scope.run(async {
+            scope.cancel();
+            7
+        }))
+        .await;
+
+        assert!(
+            matches!(result, Err(HarvestError::Cancelled(_))),
+            "{result:?}"
+        );
+        let details = marker(&live.drain_commands(), "cancel_scope:1").expect("recorded");
+
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started(),
+                WorkflowEvent::MarkerRecorded {
+                    name: "cancel_scope:1".into(),
+                    details,
+                },
+            ],
+        );
+        let scope = ctx.cancellation_scope();
+        let replayed = bounded(scope.run(async {
+            scope.cancel();
+            7
+        }))
+        .await;
+
+        assert!(
+            matches!(replayed, Err(HarvestError::Cancelled(_))),
+            "{replayed:?}"
+        );
+        assert!(ctx.take_nd_details().is_none());
         assert!(!ctx.history_has_unconsumed_events());
     }
 
@@ -1740,6 +1827,28 @@ mod tests {
         assert!(
             matches!(awaited, Ok(Err(HarvestError::Config(_)))),
             "{awaited:?}"
+        );
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "nothing reaches the worker"
+        );
+    }
+
+    /// A dropped session is never released, so a scope rejects it.
+    #[tokio::test]
+    async fn a_session_inside_a_scope_is_rejected() {
+        let ctx = WorkflowContext::new_test();
+
+        let result = bounded(
+            ctx.cancellation_scope()
+                .run(ctx.create_session(crate::context::SessionOptions::new("gpu"))),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Ok(Err(HarvestError::Config(_)))),
+            "{:?}",
+            result.as_ref().map(Result::is_ok)
         );
         assert!(
             ctx.drain_commands().is_empty(),

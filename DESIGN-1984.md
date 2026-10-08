@@ -131,7 +131,8 @@ cancel reason name it. No other worker path changes.
 - A shield cannot nest inside a cancellable scope. A scope cannot acquire a
   durable mutex: a dropped acquire would block the key's waiter queue. A
   scope cannot signal, cancel or await an external workflow: a dropped body
-  would strand the late result.
+  would strand the late result. A scope cannot create a session: a dropped
+  session is never released.
 - A cancel that arrives when no shield is open is still terminal at once.
   A shield is open from the commit of the cycle that enters it. A cancel
   that commits first discards that cycle, the shield's work included.
