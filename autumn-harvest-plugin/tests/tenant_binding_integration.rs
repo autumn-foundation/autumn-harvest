@@ -191,6 +191,7 @@ struct Call<'a> {
     body: Option<Value>,
     bearer: Option<&'a str>,
     tenant: Option<&'a str>,
+    key: Option<&'a str>,
 }
 
 impl<'a> Call<'a> {
@@ -201,6 +202,7 @@ impl<'a> Call<'a> {
             body: None,
             bearer: None,
             tenant: None,
+            key: None,
         }
     }
 
@@ -218,6 +220,11 @@ impl<'a> Call<'a> {
         self.tenant = Some(tenant);
         self
     }
+
+    const fn key(mut self, key: &'a str) -> Self {
+        self.key = Some(key);
+        self
+    }
 }
 
 async fn send(app: &App, call: Call<'_>) -> (StatusCode, Value) {
@@ -230,6 +237,9 @@ async fn send(app: &App, call: Call<'_>) -> (StatusCode, Value) {
     }
     if let Some(t) = call.tenant {
         builder = builder.header("x-harvest-tenant", t);
+    }
+    if let Some(k) = call.key {
+        builder = builder.header("idempotency-key", k);
     }
     let body = call
         .body
@@ -939,6 +949,70 @@ async fn tenant_start_conflict_leaks_no_execution() {
         assert_eq!(run_state(&mut conn, globex).await, "RUNNING");
     }
     assert_eq!(deny_summaries(&mut conn).await.len(), expected_rows);
+}
+
+/// A keyed start does not replay a key that another tenant committed. The
+/// committed-replay probe answers before the engine runs, so the probe must
+/// check the tenant itself. A replay it answers writes a `succeeded` start
+/// audit row, so that row shows a leaked replay.
+#[tokio::test]
+async fn a_tenant_start_does_not_replay_another_tenants_idempotency_key() {
+    #[derive(diesel::QueryableByName)]
+    struct N {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    let state = api_state(&pool);
+    let app = standalone_app(&state);
+    let boundary = boundary_app(&state);
+    let globex = mint_for_tenant(&boundary, "mutate", "globex").await;
+    let acme = mint_for_tenant(&boundary, "mutate", "acme").await;
+    let start = format!("/workflows/{WORKFLOW}/start");
+    let key = unique("key");
+
+    let (status, body) = send(
+        &app,
+        Call::new("POST", &start)
+            .bearer(&globex)
+            .key(&key)
+            .body(json!({ "input": {} })),
+    )
+    .await;
+    assert!(status.is_success(), "{status}: {body:?}");
+    let owned = body["execution_id"].as_str().unwrap().to_string();
+
+    // A valid body and a malformed body take different probe paths.
+    for request in [json!({ "input": {} }), json!("not a start request")] {
+        let (status, resp) = send(
+            &app,
+            Call::new("POST", &start)
+                .bearer(&acme)
+                .key(&key)
+                .body(request.clone()),
+        )
+        .await;
+        assert!(!status.is_success(), "{request}: {status}: {resp:?}");
+        assert!(
+            !resp.to_string().contains(&owned),
+            "{request}: the answer must not name the run: {resp:?}"
+        );
+    }
+
+    let replays = diesel::sql_query(
+        "SELECT count(*) AS n FROM harvest_audit_log \
+         WHERE operation = 'workflow.start' AND status = 'succeeded' \
+         AND target_id = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(&owned)
+    .get_result::<N>(&mut conn)
+    .await
+    .unwrap()
+    .n;
+    assert_eq!(replays, 1, "only the globex start may succeed on its run");
 }
 
 /// A bad tenant header from a bound caller is `400`, before any lookup.

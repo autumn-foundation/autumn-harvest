@@ -769,7 +769,7 @@ so a `read` tenant token cannot cancel.
 | Any route not in the list: list routes, admin routes, token mint and revoke, Vantage, signal-with-start, update-with-start, reset, erase, legal hold | `403` |
 | A run of another tenant, or a run with no tenant | `404`, the same as an unknown id |
 | A start whose workflow id is in use by a run of another tenant, with any reuse or conflict policy | `409`. The engine refuses before it attaches, cancels, replaces or seals the run. |
-| A start that resolves to a run of another tenant through an idempotency key | `409`. The engine refuses before it returns the run. |
+| A start that resolves to a run of another tenant through an idempotency key | `409`, or the body error for a malformed body. The committed-replay check and the engine both refuse to return the run. |
 | A start of a throttled, debounced or batched workflow | `400`. A deferred start cannot carry the tenant. |
 
 Every `409` of a bound start has the body `{"error": "workflow id is in
@@ -777,6 +777,12 @@ use"}`. It names no run and no state. Each `403`, each refused run and each
 `409` writes one `authz.deny` audit row. The answer body names no tenant and
 no reason. The rate limiter runs before the binding layer, so it also bounds
 refused requests.
+
+After a start succeeds, the binding layer reads the owner of the run that the
+answer names. A different owner turns the answer into the `409`. If that read
+fails, a fresh start keeps its answer, because the engine checked and stamped
+the tenant. A retry of it would start a second run. A replayed answer gets
+`503` instead, because a retry of a replay starts no run.
 
 ### Where the tenant goes
 

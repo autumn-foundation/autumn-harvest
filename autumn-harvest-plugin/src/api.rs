@@ -16712,6 +16712,9 @@ async fn probe_committed_start_replay(
     // only when the *retry* carried an explicit placement, so an unpinned keyed
     // replay keeps its pre-#697 response shape byte-for-byte.
     report_shard: Option<i32>,
+    // The verified tenant of the caller (issue #1977). A claim on a run of
+    // another tenant is a miss, so the engine refuses the start.
+    tenant: Option<&str>,
 ) -> Option<axum::response::Response> {
     use axum::response::IntoResponse as _;
     let pool = api_state.storage_pool().ok()?;
@@ -16742,16 +16745,20 @@ async fn probe_committed_start_replay(
     // `Some` claim implies the row existed at lookup time. Re-read its identity
     // for the no-op response; if it vanished or the read errors, return `None`
     // so the caller re-reserves / reclaims as needed.
-    let (dup_workflow_id, dup_state) = harvest_workflow_executions::table
+    let (dup_workflow_id, dup_state, dup_tenant) = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::id.eq(claim_exec_id.as_uuid()))
         .select((
             harvest_workflow_executions::workflow_id,
             harvest_workflow_executions::state,
+            harvest_workflow_executions::tenant,
         ))
-        .first::<(String, String)>(&mut probe_conn)
+        .first::<(String, String, Option<String>)>(&mut probe_conn)
         .await
         .optional()
         .ok()??;
+    if tenant.is_some() && dup_tenant.as_deref() != tenant {
+        return None;
+    }
     // Best-effort dedup audit (intentional asymmetry with the fresh-start arm's
     // 503-on-audit-failure): the original start was already audited when it
     // created the run, so a failed audit here is a no-op read and never fails
@@ -17010,6 +17017,7 @@ async fn handle_malformed_start_body(
     workflow_name: &str,
     headers: &axum::http::HeaderMap,
     rejection: JsonRejection,
+    tenant: Option<&str>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
     let header_key = match extract_start_idempotency_header_key(headers) {
@@ -17063,6 +17071,7 @@ async fn handle_malformed_start_body(
         route,
         // The body did not parse, so no placement can be read from it.
         None,
+        tenant,
     )
     .await
     {
@@ -17095,8 +17104,14 @@ pub(crate) async fn start_workflow(
     let request = match body {
         Ok(Json(req)) => req,
         Err(rejection) => {
-            return handle_malformed_start_body(&api_state, &workflow_name, &headers, rejection)
-                .await;
+            return handle_malformed_start_body(
+                &api_state,
+                &workflow_name,
+                &headers,
+                rejection,
+                tenant,
+            )
+            .await;
         }
     };
 
@@ -17526,6 +17541,7 @@ pub(crate) async fn start_workflow(
             request_id.as_deref(),
             route,
             pinned_shard_id,
+            tenant,
         )
         .await
     {

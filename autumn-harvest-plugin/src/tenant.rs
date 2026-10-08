@@ -404,9 +404,15 @@ pub(crate) async fn enforce_tenant_binding(
     let Ok(bytes) = axum::body::to_bytes(body, usize::MAX).await else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
-    let started = serde_json::from_slice::<serde_json::Value>(&bytes)
-        .ok()
+    let answer = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
+    let started = answer
+        .as_ref()
         .and_then(|v| v.get("execution_id")?.as_str()?.parse::<ExecutionId>().ok());
+    // The committed-replay probe answers before the engine tenant check runs.
+    let replayed = answer
+        .as_ref()
+        .and_then(|v| v.get("deduplicated")?.as_bool())
+        .unwrap_or(false);
     let Some(exec_id) = started else {
         // Fail closed: a start answer that names no run cannot be checked.
         tracing::error!(path = %path, "harvest: tenant start answer names no run");
@@ -414,6 +420,9 @@ pub(crate) async fn enforce_tenant_binding(
     };
     match stored_tenant(&api_state, exec_id).await {
         Ok(Some(Some(owner))) if owner == tenant => Response::from_parts(parts, Body::from(bytes)),
+        // A replay names a run that no tenant check covers. A retry of a
+        // replay starts no run, so a `503` is safe.
+        Err(StoreUnavailable) if replayed => unavailable(),
         // The start has committed, and the engine has checked and stamped the
         // tenant. A `503` here makes a retry start a second run.
         Err(StoreUnavailable) => {
@@ -487,6 +496,51 @@ mod tests {
             .expect("body");
         let value: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
         assert_eq!(value["execution_id"], exec_id.to_string());
+    }
+
+    /// A replayed answer names a run that an earlier start committed. No tenant
+    /// check proves that run is the caller's own, so it never skips the owner
+    /// check.
+    #[tokio::test]
+    async fn a_replayed_start_fails_closed_on_an_unavailable_owner_check() {
+        use tower::ServiceExt as _;
+        let exec_id = ExecutionId::new_for_shard(autumn_harvest::types::ShardId::new(0));
+        let body = serde_json::json!({
+            "execution_id": exec_id.to_string(),
+            "deduplicated": true,
+        })
+        .to_string();
+        let app = axum::Router::new()
+            .route(
+                "/workflows/{name}/start",
+                axum::routing::post(move || {
+                    let body = body.clone();
+                    async move { (StatusCode::OK, body) }
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                HarvestApiState::new(),
+                enforce_tenant_binding,
+            ))
+            .layer(axum::middleware::from_fn(
+                |mut request: Request, next: Next| async move {
+                    let tenant = VerifiedTenant::new("acme").expect("valid tenant");
+                    request.extensions_mut().insert(tenant);
+                    next.run(request).await
+                },
+            ));
+        let request = Request::post("/workflows/wf/start")
+            .body(Body::empty())
+            .expect("request");
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains(&exec_id.to_string()),
+            "the answer must not name the run"
+        );
     }
 
     #[test]
