@@ -16,13 +16,13 @@ activity. A human approval is a durable wait.
 |---|------|---------|
 | B1 | Target `rig-core`. | Rejected. It has no approval primitive and no tool-effect model. Its agent loop is not split into steps that an activity can own. |
 | B2 | Target `autumn-plugin-agent` 0.2 as published. | Rejected. That version needs `autumn-web`, and the issue forbids it. |
-| B3 | Target `autumn-plugin-agent` 0.3. Put `autumn-web` behind a default `autumn` feature. | **Adopted.** The crate has a provider-neutral `LlmClient`, a `Tool` trait with `ToolEffect`, a `ToolPolicy` with allow, ask and deny, and a serialisable `Approval`. Each one maps to an engine primitive. |
-| B4 | Copy the plugin-agent primitives into the engine. | Rejected. Two copies drift, and the issue asks for an adapter, not a fork. |
+| B3 | Target `autumn-plugin-agent` 0.3. Put `autumn-web` behind a default `autumn` feature. | Tried, then rejected in review (see §0.4). Harvest would rely on two Autumn plugins. |
+| B4 | Own a small agent contract in the engine. Use the plugin-agent primitives as the guide for its shape. | **Adopted** (see §0.4). Each primitive maps to an engine primitive, and the engine owns its history types. |
 | B5 | Put the adapter in `autumn-harvest-plugin`. | Rejected. That crate needs `autumn-web`. |
 | B6 | A new crate, `autumn-harvest-agent`, on the core crate with no default features. | **Adopted.** It works on Postgres and on SQLite. |
 | B7 | Evaluate the tool policy in the workflow. | Rejected. A policy is async and can read state. Replay must not ask it again. |
 | B8 | Evaluate the tool policy in the model-turn activity, and record each decision with the reply. | **Adopted.** Replay reads the recorded decision. |
-| B9 | Record the plugin-agent `ChatResponse` in history. | Rejected. That type has no serde contract. An upstream change would break replay. The adapter owns its history types. |
+| B9 | Record a framework's own response type in history. | Rejected. An upstream change would break replay. The adapter owns its history types. |
 
 ### 0.2 Reverse brainstorm — how can this adapter do harm?
 
@@ -35,43 +35,53 @@ activity. A human approval is a durable wait.
 | R5 | Let the policy change its answer on replay. | The decision is part of the recorded reply. |
 | R6 | Fail a run after the model was paid, because the next request is too large. | The loop measures the request first and stops with `TranscriptFull`. |
 | R7 | Retry an authentication failure forever. | The activity marks it non-retryable. Only rate limits, transport faults, outages and timeouts retry. |
-| R8 | Pull `autumn-web` in through the back door. | A CI script runs `cargo tree` and fails if `autumn-web` is in the adapter graph. |
+| R8 | Pull `autumn-web` or an Autumn plugin in through the back door. | A CI script runs `cargo tree` and fails on any Autumn crate outside the engine. |
 | R9 | Leak the API key into history. | The key lives in the client. History holds messages only. |
 | R10 | Run an unknown tool name. | The tool activity answers with an error result. The policy sees `tool: None`. |
 
 ### 0.3 Six thinking hats
 
 - **White (facts).** The engine has workflows, activities, signals with
-  timeouts, and the SQLite backend. Plugin-agent 0.2 has the agent
-  primitives, but it needs `autumn-web`. Cargo-deny forbids git sources, so the
-  engine can use plugin-agent only from crates.io.
+  timeouts, and the SQLite backend. `autumn-plugin-agent` has good agent
+  primitives, but it is an Autumn plugin.
 - **Red (feelings).** A user wants one call that makes an agent durable. A
-  second loop to learn is friction.
-- **Black (risks).** The engine PR waits until plugin-agent 0.3.0 is on
-  crates.io. Replay breaks if a history type changes shape. The daemon has
-  12 000 lines of tests, and a rewrite can break them.
-- **Yellow (benefits).** One adapter serves every provider that plugin-agent
-  serves. A crash costs at most the one uncommitted step.
+  second Autumn plugin under the engine feels wrong.
+- **Black (risks).** Replay breaks if a history type changes shape. The
+  daemon has 12 000 lines of tests, and a rewrite can break them.
+- **Yellow (benefits).** One contract serves every provider. A crash costs
+  at most the one uncommitted step.
 - **Green (ideas).** The policy decision rides with the reply. The approval
-  payload is the plugin-agent `Approval`, so approve, edit and reject all work.
-  The daemon takes the extracted approval and payload-cap parts and keeps its
-  Anthropic-native turn.
-- **Blue (process).** Split plugin-agent first. Then write the adapter tests
-  (RED), the adapter (GREEN), and the clean-up (REFACTOR). Then move the daemon
-  onto the extracted parts, and write the ADR and the guide.
+  payload is an `Approval`, so approve, edit and reject all work. The daemon
+  takes the approval names, the approval wait and the payload-cap checks.
+- **Blue (process).** Write the adapter tests (RED), the adapter (GREEN),
+  and the clean-up (REFACTOR). Then move the daemon onto the extracted parts,
+  and write the ADR and the guide.
+
+### 0.4 Revision after review
+
+The first version depended on `autumn-plugin-agent` 0.3, with `autumn-web`
+behind a new default feature. The maintainer rejected that: the engine must
+not rely on two Autumn plugins. The plugin-agent primitives are a guide post,
+not a dependency.
+
+The adapter now owns `AgentModel`, `Tool`, `ToolPolicy`, `Approval` and the
+message types. The loop, the activities and the tests did not change shape.
+`scripts/check-agent-adapter-deps.sh` now fails on any Autumn crate outside
+the engine.
 
 ---
 
 ## 1. Decision
 
-The target framework is `autumn-plugin-agent`. ADR 0006 records why.
+The adapter owns its agent primitives, modelled on `autumn-plugin-agent`.
+ADR 0006 records why.
 
 ## 2. Design
 
 ```mermaid
 flowchart LR
   T[AgentTask] --> W["#[workflow] agent_loop"]
-  W -->|ModelTurnRequest| M["agent_model_turn activity\nLlmClient::chat + ToolPolicy"]
+  W -->|ModelTurnRequest| M["agent_model_turn activity\nAgentModel::chat + ToolPolicy"]
   M -->|ModelTurn: reply + decisions| W
   W -->|Allow| X["agent_tool_call activity\nTool::execute"]
   W -->|RequireApproval| S["durable wait\nsignal + deadline"]
@@ -81,12 +91,12 @@ flowchart LR
   W --> R[AgentReport]
 ```
 
-- `AgentHarness` holds the `LlmClient`, the tools and the policy. Postgres
+- `AgentHarness` holds the `AgentModel`, the tools and the policy. Postgres
   reads it with `ActivityContext::state`. SQLite gets it through
   `sqlite::register`.
 - The workflow reads only recorded results, so replay is deterministic.
 - The history types (`ModelTurn`, `ToolOutcome`, `AgentReport`) belong to the
-  adapter, so a plugin-agent change cannot alter a stored payload.
+  adapter, so no outside change can alter a stored payload.
 - The daemon example uses `approval` and `bounds` from the adapter.
 
 ## 3. Test plan
@@ -102,4 +112,4 @@ flowchart LR
 | `retryable_kinds_are_marked_retryable`, `a_rate_limit_retries_and_an_auth_failure_does_not` | Rate limits, transport faults and outages retry. Other failures do not. |
 | `the_engine_registration_builds`, `the_model_turn_handler_…` | The Postgres path: registration and the `#[activity]` handlers. |
 | proptest `approval_signal_round_trips` | A signal name gives back its call id, for any id. |
-| `scripts/check-agent-adapter-no-autumn-web.sh` | The adapter graph has no `autumn-web`. |
+| `scripts/check-agent-adapter-deps.sh` | The adapter depends on no Autumn crate outside the engine. |

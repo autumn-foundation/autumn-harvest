@@ -1,26 +1,24 @@
 //! The activity bodies: one model call and one tool call.
 //!
-//! [`AgentHarness`] holds the plugin-agent parts that do real work: the
-//! [`LlmClient`], the [`Tool`]s, and the [`ToolPolicy`]. The engine runs its
+//! [`AgentHarness`] holds the parts that do real work: the
+//! [`AgentModel`], the [`Tool`]s, and the [`ToolPolicy`]. The engine runs its
 //! two methods as activities, so each result is recorded once and replayed
 //! after that.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::error::AgentError;
+use crate::message::RunId;
+use crate::model::{AgentModel, ChatRequest};
+use crate::policy::{AllowAll, RunInfo, ToolDecision, ToolPolicy};
+use crate::tool::{Tool, ToolContext};
 use autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
-use autumn_plugin_agent::hooks::RunInfo;
-use autumn_plugin_agent::policy::AllowAll;
-use autumn_plugin_agent::{
-    AgentError, ChatRequest, ErrorKind, LlmClient, RunId, Tool, ToolContext, ToolDecision,
-    ToolPolicy,
-};
 
 use crate::types::{ModelTurn, ModelTurnRequest, ToolCallRequest, ToolOutcome};
 
-/// The default cap on one tool result, in characters. It matches the
-/// plugin-agent loop.
+/// The default cap on one tool result, in characters.
 pub const DEFAULT_TOOL_OUTPUT_LIMIT: usize = 8_000;
 
 /// The default time budget of one model call: 13 minutes.
@@ -56,7 +54,7 @@ const TRUNCATED: &str = "…[truncated]";
 /// `HarvestBuilder::state`. On SQLite, pass it to `sqlite::register`.
 #[derive(Debug, Clone)]
 pub struct AgentHarness {
-    client: Arc<dyn LlmClient>,
+    client: Arc<dyn AgentModel>,
     tools: Vec<Arc<dyn Tool>>,
     policy: Arc<dyn ToolPolicy>,
     temperature: Option<f32>,
@@ -70,7 +68,7 @@ pub struct AgentHarness {
 impl AgentHarness {
     /// A harness with no tools and the [`AllowAll`] policy.
     #[must_use]
-    pub fn new(client: Arc<dyn LlmClient>) -> Self {
+    pub fn new(client: Arc<dyn AgentModel>) -> Self {
         Self {
             client,
             tools: Vec::new(),
@@ -179,7 +177,7 @@ impl AgentHarness {
         };
         let mut turn = ModelTurn {
             content: response.content,
-            stop: response.stop_reason.into(),
+            stop: response.stop_reason,
             usage: response.usage,
             decisions: Vec::new(),
         };
@@ -273,11 +271,10 @@ impl AgentHarness {
 fn model_failure(err: &AgentError) -> String {
     let kind = format!("{:?}", err.kind());
     let message = err.to_string();
-    let failure = match err.kind() {
-        ErrorKind::RateLimited | ErrorKind::Transport | ErrorKind::Unavailable => {
-            ActivityFailure::retryable(kind, message)
-        }
-        _ => ActivityFailure::non_retryable(kind, message),
+    let failure = if err.kind().is_retryable() {
+        ActivityFailure::retryable(kind, message)
+    } else {
+        ActivityFailure::non_retryable(kind, message)
     };
     failure.into_error_payload()
 }
@@ -320,6 +317,7 @@ fn truncate(text: &str, limit: usize) -> String {
 mod tests {
     use super::*;
     use crate::bounds::json_len;
+    use crate::error::ErrorKind;
 
     #[test]
     fn retryable_kinds_are_marked_retryable() {

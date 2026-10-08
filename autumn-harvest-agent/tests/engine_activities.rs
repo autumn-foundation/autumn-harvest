@@ -13,10 +13,9 @@ use autumn_harvest::context::{ActivityContext, SharedStateMap};
 use autumn_harvest::failure::parse_typed_payload;
 use autumn_harvest_agent::workflow::{agent_model_turn_info, agent_tool_call_info};
 use autumn_harvest_agent::{
-    AgentHarness, ModelTurn, ModelTurnRequest, ToolCallRequest, ToolOutcome, TurnStop,
+    AgentHarness, ChatMessage, ChatRole, ModelTurn, ModelTurnRequest, Rule, StopReason, TokenUsage,
+    ToolCall, ToolCallRequest, ToolDecision, ToolEffect, ToolOutcome, ToolRules,
 };
-use autumn_plugin_agent::policy::{Rule, ToolRules};
-use autumn_plugin_agent::{ChatMessage, ChatRole, TokenUsage, ToolCall, ToolDecision, ToolEffect};
 use common::{Recorder, ScriptedModel, calls, recorded_tool};
 use serde_json::json;
 
@@ -60,7 +59,7 @@ async fn the_model_turn_handler_records_the_reply_and_each_decision() {
         .unwrap();
     let turn: ModelTurn = serde_json::from_value(raw).unwrap();
 
-    assert_eq!(turn.stop, TurnStop::ToolUse);
+    assert_eq!(turn.stop, StopReason::ToolUse);
     assert_eq!(turn.usage.input_tokens, 3);
     assert_eq!(turn.calls().len(), 2);
     assert_eq!(turn.decisions[0], ToolDecision::Allow);
@@ -133,37 +132,22 @@ fn the_activities_declare_their_retry_and_timeout() {
 async fn a_model_call_over_its_budget_is_a_retryable_failure() {
     #[derive(Debug)]
     struct Stalled;
-    impl autumn_plugin_agent::LlmClient for Stalled {
+    impl autumn_harvest_agent::AgentModel for Stalled {
         fn chat<'a>(
             &'a self,
-            _request: &'a autumn_plugin_agent::ChatRequest,
+            _request: &'a autumn_harvest_agent::ChatRequest,
         ) -> std::pin::Pin<
             Box<
                 dyn std::future::Future<
                         Output = Result<
-                            autumn_plugin_agent::ChatResponse,
-                            autumn_plugin_agent::AgentError,
+                            autumn_harvest_agent::ChatResponse,
+                            autumn_harvest_agent::AgentError,
                         >,
                     > + Send
                     + 'a,
             >,
         > {
             Box::pin(std::future::pending())
-        }
-        fn list_models(
-            &self,
-        ) -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<
-                        Output = Result<Vec<String>, autumn_plugin_agent::AgentError>,
-                    > + Send
-                    + '_,
-            >,
-        > {
-            Box::pin(async { Ok(Vec::new()) })
-        }
-        fn provider_name(&self) -> &'static str {
-            "stalled"
         }
     }
 
@@ -202,7 +186,7 @@ fn the_engine_registration_builds() {
 #[tokio::test]
 async fn a_huge_tool_error_still_fits_the_result_cap() {
     use autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
-    use autumn_plugin_agent::{AgentError, ErrorKind, FnTool};
+    use autumn_harvest_agent::{AgentError, ErrorKind, FnTool};
 
     let failing = FnTool::new(
         "fail",
@@ -244,12 +228,12 @@ async fn a_huge_tool_error_still_fits_the_result_cap() {
 async fn a_stalled_policy_denies_the_call_instead_of_hanging_the_turn() {
     #[derive(Debug)]
     struct Stalled;
-    impl autumn_plugin_agent::ToolPolicy for Stalled {
+    impl autumn_harvest_agent::ToolPolicy for Stalled {
         fn decide<'a>(
             &'a self,
             _call: &'a ToolCall,
-            _tool: Option<&'a dyn autumn_plugin_agent::Tool>,
-            _info: &'a autumn_plugin_agent::hooks::RunInfo,
+            _tool: Option<&'a dyn autumn_harvest_agent::Tool>,
+            _info: &'a autumn_harvest_agent::RunInfo,
         ) -> futures::future::BoxFuture<'a, ToolDecision> {
             Box::pin(std::future::pending())
         }
@@ -272,12 +256,12 @@ async fn a_stalled_policy_denies_the_call_instead_of_hanging_the_turn() {
 async fn one_deadline_bounds_every_policy_decision_of_a_turn() {
     #[derive(Debug)]
     struct Stalled;
-    impl autumn_plugin_agent::ToolPolicy for Stalled {
+    impl autumn_harvest_agent::ToolPolicy for Stalled {
         fn decide<'a>(
             &'a self,
             _call: &'a ToolCall,
-            _tool: Option<&'a dyn autumn_plugin_agent::Tool>,
-            _info: &'a autumn_plugin_agent::hooks::RunInfo,
+            _tool: Option<&'a dyn autumn_harvest_agent::Tool>,
+            _info: &'a autumn_harvest_agent::RunInfo,
         ) -> futures::future::BoxFuture<'a, ToolDecision> {
             Box::pin(std::future::pending())
         }

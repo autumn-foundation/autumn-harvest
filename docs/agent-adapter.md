@@ -1,24 +1,25 @@
 # Durable agents: the agent adapter
 
-`autumn-harvest-agent` runs an `autumn-plugin-agent` agent as a durable
-workflow (issue #1973). The agent loop is the workflow. Each model call and
-each tool call is an activity. A human approval is a durable wait.
+`autumn-harvest-agent` runs an agent as a durable workflow (issue #1973).
+The agent loop is the workflow. Each model call and each tool call is an
+activity. A human approval is a durable wait.
 
 A crash costs at most the one step that was in flight. A restart reads every
 completed model call, policy decision and tool call from history. It does not
 pay for them again.
 
-The crate depends on the core engine and on plugin-agent, both with no
-default features. It has no `autumn-web` dependency.
-[ADR 0006](adr/0006-agent-adapter-framework.md) records why it targets
-plugin-agent.
+The crate owns its agent primitives: `AgentModel`, `Tool`, `ToolPolicy`,
+`Approval` and the message types. They follow the shape of the
+`autumn-plugin-agent` primitives, but the crate does not depend on it. It
+depends on the core engine only, with no default features.
+[ADR 0006](adr/0006-agent-adapter-framework.md) records why.
 
 ## 1. The mapping
 
 ```mermaid
 flowchart LR
   T[AgentTask] --> W["workflow agent_loop"]
-  W -->|ModelTurnRequest| M["activity agent_model_turn\nLlmClient::chat + ToolPolicy::decide"]
+  W -->|ModelTurnRequest| M["activity agent_model_turn\nAgentModel::chat + ToolPolicy::decide"]
   M -->|ModelTurn: reply + one decision per call| W
   W -->|Allow| X["activity agent_tool_call\nTool::execute"]
   W -->|RequireApproval| S["signal tool_approval:step:position:call_id\nwith a deadline"]
@@ -60,7 +61,7 @@ The core of it:
 use std::sync::Arc;
 use autumn_harvest_agent::{AgentHarness, AgentTask, sqlite};
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
-use autumn_plugin_agent::Approval;
+use autumn_harvest_agent::Approval;
 
 let mut rt = SqliteRuntime::open("agent.db")?;
 sqlite::register(&mut rt, Arc::new(harness));
@@ -113,17 +114,18 @@ A worker with a payload cap other than the default must say so. Set
 
 ## 4. Build the harness
 
-`AgentHarness` holds the plugin-agent parts that do real work:
+`AgentHarness` holds the parts that do real work:
 
-- `new(client)` — any `LlmClient`: `OpenAiCompatibleClient`,
-  `AnthropicClient`, or your own.
+- `new(model)` — any `AgentModel`. Implement its one `chat` method for your
+  provider, or bridge a framework you already use. The crate ships no HTTP
+  client.
 - `tool(tool)` / `tools(iter)` — any `Tool`. `FnTool` wraps an async
   function.
 - `policy(policy)` — any `ToolPolicy`. The default is `AllowAll`.
   `ToolRules` gives per-tool and per-effect rules.
 - `temperature(t)` — the sampling temperature of each call.
 - `tool_output_limit(chars)` — the cap on one tool result. The default is
-  8 000 characters, as in the plugin-agent loop.
+  8 000 characters.
 - `max_result_bytes(bytes)` — the activity-result cap of the workers. A
   larger tool result is cut to fit it. The default is the engine default.
 - `model_timeout(d)` — the time budget of one model call. The default is
@@ -213,10 +215,11 @@ fit gets an error result, so the transcript shows what ran.
 A `transcript_full` transcript is too large for one request. Do not pass it
 whole as the `history` of a new run. Summarise it, or keep its last turns.
 
-Retries follow the plugin-agent `ErrorKind`. `RateLimited`, `Transport` and
-`Unavailable` (408, 5xx, 529) retry with backoff, up to four attempts. So
-does a model call over its time budget. Every other kind fails the model call
-at once. A tool call runs once, and a tool error is a result that the model
+Retries follow `ErrorKind::is_retryable`. `RateLimited`, `Transport` and
+`Unavailable` retry with backoff, up to four attempts. So does a model call
+over its time budget. Every other kind fails the model call at once. Your
+`AgentModel` picks the kind, so map a provider timeout, 5xx or overload to
+`Unavailable`. A tool call runs once, and a tool error is a result that the model
 reads.
 
 The run fails when a model call fails for good: a non-retryable kind, for
@@ -226,8 +229,8 @@ example a rejected API key, or four failed attempts.
 
 The adapter owns the payloads it records: `AgentTask`, `ModelTurnRequest`,
 `ModelTurn`, `ToolCallRequest`, `ToolOutcome` and `AgentReport`. They hold
-only plugin-agent types that already have a serde contract. Replay reads
-these payloads back, so add a field only with `#[serde(default)]`.
+only types this crate defines, so the crate owns their serde shape. Replay
+reads these payloads back, so add a field only with `#[serde(default)]`.
 
 ## 9. Limits
 

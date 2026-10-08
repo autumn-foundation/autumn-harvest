@@ -417,8 +417,8 @@ jobs:
         run: cargo clippy -p autumn-harvest-agent --all-targets --no-deps -- -D warnings
       - name: Clippy autumn-harvest-agent (sqlite feature)
         run: cargo clippy -p autumn-harvest-agent --all-targets --features sqlite --no-deps -- -D warnings
-      - name: Check autumn-harvest-agent has no autumn-web dependency
-        run: ./scripts/check-agent-adapter-no-autumn-web.sh
+      - name: Check autumn-harvest-agent depends on no Autumn crate outside the engine
+        run: ./scripts/check-agent-adapter-deps.sh
       # Same issue #962 rule as every other crate on this page: a workspace
       # member gets NO clippy coverage without its own step, and these three
       # standalone example crates (each its own `examples/*/Cargo.toml`

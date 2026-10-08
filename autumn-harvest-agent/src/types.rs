@@ -1,18 +1,17 @@
 //! The payloads the loop records in history.
 //!
-//! This crate owns these types. Each one holds only plugin-agent types that
-//! the agent crate already persists: `ChatMessage`, `ContentPart`, `ToolCall`,
-//! `TokenUsage`, `ToolDecision` and `SessionId`. A change to a plugin-agent
-//! type with no serde contract therefore cannot alter a stored payload.
+//! This crate owns these types and every type they hold. Their serde shape
+//! is a contract with recorded history.
 //!
 //! Replay reads these payloads back. Add a field only with `#[serde(default)]`,
 //! so that a history written before the field still decodes.
 
 use std::time::Duration;
 
-use autumn_plugin_agent::{
-    ChatMessage, ChatRole, ContentPart, SessionId, StopReason, TokenUsage, ToolCall, ToolDecision,
+use crate::message::{
+    ChatMessage, ChatRole, ContentPart, SessionId, StopReason, TokenUsage, ToolCall,
 };
+use crate::policy::ToolDecision;
 use serde::{Deserialize, Serialize};
 
 /// The default bound on tool rounds.
@@ -158,38 +157,13 @@ pub struct ModelTurnRequest {
     pub max_output_tokens: Option<u32>,
 }
 
-/// Why the model stopped one turn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TurnStop {
-    /// The model finished its turn.
-    EndTurn,
-    /// The model asked for tool calls.
-    ToolUse,
-    /// The turn hit the output cap.
-    MaxTokens,
-    /// The provider sent a reason the client does not know.
-    Unknown,
-}
-
-impl From<StopReason> for TurnStop {
-    fn from(reason: StopReason) -> Self {
-        match reason {
-            StopReason::EndTurn => Self::EndTurn,
-            StopReason::ToolUse => Self::ToolUse,
-            StopReason::MaxTokens => Self::MaxTokens,
-            StopReason::Unknown => Self::Unknown,
-        }
-    }
-}
-
 /// The recorded result of one model-turn activity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelTurn {
     /// The assistant content, as the client returned it.
     pub content: Vec<ContentPart>,
     /// Why the model stopped.
-    pub stop: TurnStop,
+    pub stop: StopReason,
     /// Provider-reported tokens for this call.
     pub usage: TokenUsage,
     /// The policy decision for each tool call of [`content`](Self::content),
@@ -378,9 +352,6 @@ mod tests {
     #[test]
     fn stop_names_are_stable_in_history() {
         assert_eq!(json!(AgentStop::TranscriptFull), json!("transcript_full"));
-        assert_eq!(json!(TurnStop::ToolUse), json!("tool_use"));
-        assert_eq!(TurnStop::from(StopReason::MaxTokens), TurnStop::MaxTokens);
-        assert_eq!(TurnStop::from(StopReason::Unknown), TurnStop::Unknown);
     }
 
     #[test]
@@ -403,7 +374,7 @@ mod tests {
                 },
                 ContentPart::Text("b".into()),
             ],
-            stop: TurnStop::ToolUse,
+            stop: StopReason::ToolUse,
             usage: TokenUsage::default(),
             decisions: vec![ToolDecision::Allow],
         };

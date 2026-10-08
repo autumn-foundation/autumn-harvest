@@ -17,15 +17,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use autumn_harvest_agent::AgentReport;
+use autumn_harvest_agent::RunInfo;
+use autumn_harvest_agent::{
+    AgentError, AgentModel, ChatRequest, ChatResponse, ContentPart, ErrorKind, FnTool, StopReason,
+    TokenUsage, Tool, ToolCall, ToolDecision, ToolEffect, ToolPolicy,
+};
 #[cfg(feature = "sqlite")]
 use autumn_harvest_agent::{AgentHarness, sqlite};
 #[cfg(feature = "sqlite")]
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
-use autumn_plugin_agent::hooks::RunInfo;
-use autumn_plugin_agent::{
-    AgentError, ChatRequest, ChatResponse, ContentPart, ErrorKind, FnTool, LlmClient, StopReason,
-    TokenUsage, Tool, ToolCall, ToolDecision, ToolEffect, ToolPolicy,
-};
 use futures::future::BoxFuture;
 use serde_json::{Value, json};
 
@@ -57,7 +57,7 @@ impl ScriptedModel {
     }
 }
 
-impl LlmClient for ScriptedModel {
+impl AgentModel for ScriptedModel {
     fn chat<'a>(
         &'a self,
         request: &'a ChatRequest,
@@ -71,16 +71,6 @@ impl LlmClient for ScriptedModel {
             .pop_front()
             .unwrap_or_else(|| Err(AgentError::new(ErrorKind::Provider, "script ran out")));
         Box::pin(async move { reply })
-    }
-
-    fn list_models(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, AgentError>> + Send + '_>> {
-        Box::pin(async { Ok(vec!["scripted".to_owned()]) })
-    }
-
-    fn provider_name(&self) -> &'static str {
-        "scripted"
     }
 }
 

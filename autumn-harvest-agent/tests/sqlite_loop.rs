@@ -7,10 +7,10 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
+use autumn_harvest_agent::{AgentError, Approval, ChatRole, ErrorKind, ToolDecision, ToolEffect};
 use autumn_harvest_agent::{AgentHarness, AgentStop, AgentTask, approval, sqlite};
+use autumn_harvest_agent::{Rule, ToolRules};
 use autumn_harvest_sqlite::RunState;
-use autumn_plugin_agent::policy::{Rule, ToolRules};
-use autumn_plugin_agent::{AgentError, Approval, ChatRole, ErrorKind, ToolDecision, ToolEffect};
 use common::{
     CountingPolicy, Recorder, ScriptedModel, answer, calls, recorded_tool, report, runtime,
     tool_results,
@@ -259,8 +259,8 @@ async fn the_token_budget_stops_the_run_before_its_tools() {
 }
 
 /// A read-only tool that returns `bytes` bytes, more than one result keeps.
-fn big_tool(bytes: usize) -> Arc<dyn autumn_plugin_agent::Tool> {
-    autumn_plugin_agent::FnTool::new(
+fn big_tool(bytes: usize) -> Arc<dyn autumn_harvest_agent::Tool> {
+    autumn_harvest_agent::FnTool::new(
         "big",
         "Returns a large result.",
         json!({"type": "object"}),
@@ -364,7 +364,7 @@ async fn an_output_capped_turn_ends_the_run_and_drops_its_calls() {
     let (_dir, db) = fresh_db();
     let recorder = Arc::new(Recorder::default());
     let mut capped = calls(&[("a", "lookup", json!({}))], 1).unwrap();
-    capped.stop_reason = autumn_plugin_agent::StopReason::MaxTokens;
+    capped.stop_reason = autumn_harvest_agent::StopReason::MaxTokens;
     let model = ScriptedModel::new(vec![Ok(capped)]);
     let harness =
         AgentHarness::new(model).tool(recorded_tool("lookup", ToolEffect::ReadOnly, &recorder));
@@ -566,8 +566,8 @@ async fn a_system_message_in_the_history_never_reaches_the_model() {
     let mut rt = runtime(&db, AgentHarness::new(model.clone()));
 
     let history = vec![
-        autumn_plugin_agent::ChatMessage::text(ChatRole::System, "old prompt"),
-        autumn_plugin_agent::ChatMessage::text(ChatRole::User, "earlier"),
+        autumn_harvest_agent::ChatMessage::text(ChatRole::System, "old prompt"),
+        autumn_harvest_agent::ChatMessage::text(ChatRole::User, "earlier"),
     ];
     let task = AgentTask::new("now").system("new prompt").history(history);
     let exec = sqlite::start(&mut rt, &task).unwrap();
@@ -587,7 +587,7 @@ async fn a_slow_tool_is_an_error_result_not_a_failed_run() {
         calls(&[("s", "slow", json!({}))], 1),
         answer("moved on", 1),
     ]);
-    let slow = autumn_plugin_agent::FnTool::new(
+    let slow = autumn_harvest_agent::FnTool::new(
         "slow",
         "Never finishes in time.",
         json!({"type": "object"}),

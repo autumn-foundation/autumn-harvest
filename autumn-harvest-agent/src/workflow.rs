@@ -15,18 +15,17 @@
 
 use std::time::Duration;
 
+use crate::message::{ChatMessage, ChatRole, ContentPart, StopReason, TokenUsage, ToolCall};
+use crate::policy::ToolDecision;
 use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::prelude::*;
-use autumn_plugin_agent::{
-    Approval, ChatMessage, ChatRole, ContentPart, TokenUsage, ToolCall, ToolDecision,
-};
 
-use crate::approval::{Decision, approval_signal, await_decision};
+use crate::approval::{Approval, Decision, approval_signal, await_decision};
 use crate::bounds::{exceeds_bytes, json_len};
 use crate::harness::AgentHarness;
 use crate::types::{
     AgentReport, AgentStop, AgentTask, ModelTurn, ModelTurnRequest, ToolCallRequest, ToolOutcome,
-    TurnStop, without_system,
+    without_system,
 };
 
 /// The registered workflow name.
@@ -88,7 +87,7 @@ pub async fn agent_loop(ctx: &WorkflowContext, task: AgentTask) -> Result<AgentR
     if let Some(system) = &task.system {
         messages.push(ChatMessage::text(ChatRole::System, system.clone()));
     }
-    // A system message inside the history is dropped, as plugin-agent does.
+    // A system message inside the history is dropped.
     // Only `task.system` reaches the model as the system prompt.
     messages.extend(
         task.history
@@ -135,7 +134,7 @@ pub async fn agent_loop(ctx: &WorkflowContext, task: AgentTask) -> Result<AgentR
         if calls.is_empty() {
             let stop = if over_budget {
                 AgentStop::TokensExhausted
-            } else if turn.stop == TurnStop::MaxTokens {
+            } else if turn.stop == StopReason::MaxTokens {
                 AgentStop::OutputCapped
             } else {
                 AgentStop::Completed
@@ -148,7 +147,7 @@ pub async fn agent_loop(ctx: &WorkflowContext, task: AgentTask) -> Result<AgentR
         // next run that continues it.
         //
         // A turn cut at the output cap can hold a partial call. It never runs.
-        if turn.stop == TurnStop::MaxTokens {
+        if turn.stop == StopReason::MaxTokens {
             return Ok(progress.report(AgentStop::OutputCapped));
         }
         if over_budget {

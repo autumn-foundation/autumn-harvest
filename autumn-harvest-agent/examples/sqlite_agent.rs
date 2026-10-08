@@ -14,13 +14,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use autumn_harvest_agent::{AgentHarness, AgentReport, AgentTask, approval, sqlite};
-use autumn_harvest_sqlite::{RunState, SqliteRuntime};
-use autumn_plugin_agent::policy::{Rule, ToolRules};
-use autumn_plugin_agent::{
-    AgentError, Approval, ChatRequest, ChatResponse, ContentPart, FnTool, LlmClient, StopReason,
+use autumn_harvest_agent::{
+    AgentError, AgentModel, Approval, ChatRequest, ChatResponse, ContentPart, FnTool, StopReason,
     TokenUsage, ToolEffect,
 };
+use autumn_harvest_agent::{AgentHarness, AgentReport, AgentTask, approval, sqlite};
+use autumn_harvest_agent::{Rule, ToolRules};
+use autumn_harvest_sqlite::{RunState, SqliteRuntime};
 use serde_json::{Value, json};
 
 /// A stand-in model. Turn one asks for two tools. Turn two answers.
@@ -29,7 +29,7 @@ struct OfflineModel {
     calls: AtomicUsize,
 }
 
-impl LlmClient for OfflineModel {
+impl AgentModel for OfflineModel {
     fn chat<'a>(
         &'a self,
         request: &'a ChatRequest,
@@ -66,16 +66,6 @@ impl LlmClient for OfflineModel {
             }
         };
         Box::pin(async move { Ok(response) })
-    }
-
-    fn list_models(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, AgentError>> + Send + '_>> {
-        Box::pin(async { Ok(vec!["offline".to_owned()]) })
-    }
-
-    fn provider_name(&self) -> &'static str {
-        "offline"
     }
 }
 

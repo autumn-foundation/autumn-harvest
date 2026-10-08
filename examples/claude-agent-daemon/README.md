@@ -283,7 +283,7 @@ approval by hand from a trimmed view is still yours to do.
   adapter (issue #1973). The daemon takes its approval signal names
   (`approval_signal`, `approval_call_id`) and its payload-cap checks from it.
   The daemon keeps its own Anthropic-native turn, because it replays thinking
-  blocks verbatim. For a provider-neutral loop over `autumn-plugin-agent`,
+  blocks verbatim. For a provider-neutral loop over any `AgentModel`,
   start from [`docs/agent-adapter.md`](../../docs/agent-adapter.md).
 - **[`src/session.rs`](src/session.rs)** — the agent loop, as a `#[workflow]`.
   Ordinary Rust: a `for` loop over turns, a model call, a tool call per

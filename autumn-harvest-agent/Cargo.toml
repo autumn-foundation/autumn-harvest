@@ -1,6 +1,6 @@
 [package]
 name = "autumn-harvest-agent"
-description = "Durable agent loop for autumn-harvest: autumn-plugin-agent model and tool calls as activities"
+description = "Durable agent loop for autumn-harvest: model and tool calls as activities, approvals as durable waits"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -20,10 +20,9 @@ sqlite = ["dep:autumn-harvest-sqlite"]
 # The backend-neutral core only: no Diesel, no Postgres, no autumn-web.
 autumn-harvest = { version = "0.7.0", path = "../autumn-harvest", default-features = false }
 autumn-harvest-sqlite = { version = "0.7.0", path = "../autumn-harvest-sqlite", optional = true }
-# The agent core without the Autumn plugin, so no autumn-web.
-autumn-plugin-agent = { version = "0.3", default-features = false }
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 

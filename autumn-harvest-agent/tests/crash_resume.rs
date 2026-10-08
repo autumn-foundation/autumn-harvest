@@ -17,8 +17,8 @@ use std::process::Command;
 use std::sync::Arc;
 
 use autumn_harvest_agent::{AgentHarness, AgentReport, AgentStop, AgentTask, sqlite};
+use autumn_harvest_agent::{FnTool, Tool, ToolEffect};
 use autumn_harvest_sqlite::{ExecutionId, RunState};
-use autumn_plugin_agent::{FnTool, Tool, ToolEffect};
 use common::{Reply, ScriptedModel, answer, calls, report, runtime};
 use serde_json::{Value, json};
 
@@ -69,16 +69,16 @@ struct LoggedModel {
     abort_on: Option<usize>,
 }
 
-impl autumn_plugin_agent::LlmClient for LoggedModel {
+impl autumn_harvest_agent::AgentModel for LoggedModel {
     fn chat<'a>(
         &'a self,
-        request: &'a autumn_plugin_agent::ChatRequest,
+        request: &'a autumn_harvest_agent::ChatRequest,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
                     Output = Result<
-                        autumn_plugin_agent::ChatResponse,
-                        autumn_plugin_agent::AgentError,
+                        autumn_harvest_agent::ChatResponse,
+                        autumn_harvest_agent::AgentError,
                     >,
                 > + Send
                 + 'a,
@@ -89,22 +89,6 @@ impl autumn_plugin_agent::LlmClient for LoggedModel {
             std::process::abort();
         }
         self.inner.chat(request)
-    }
-
-    fn list_models(
-        &self,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<Vec<String>, autumn_plugin_agent::AgentError>>
-                + Send
-                + '_,
-        >,
-    > {
-        self.inner.list_models()
-    }
-
-    fn provider_name(&self) -> &'static str {
-        "logged"
     }
 }
 

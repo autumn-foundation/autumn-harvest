@@ -1,26 +1,28 @@
 //! A durable agent loop for autumn-harvest.
 //!
-//! This crate adapts [`autumn_plugin_agent`] to the engine. The agent loop is a
-//! workflow. Each model call and each tool call is an activity. A tool call
-//! that the policy gates waits on a durable signal with a deadline.
+//! The agent loop is a workflow. Each model call and each tool call is an
+//! activity. A tool call that the policy gates waits on a durable signal with
+//! a deadline. A crash costs at most the one step that was in flight: replay
+//! reads every completed model call, policy decision and tool call from
+//! history.
 //!
-//! A crash costs at most the one step that was in flight. Replay reads every
-//! completed model call, policy decision and tool call from history.
-//!
-//! The crate depends on the core engine with no default features and on
-//! plugin-agent with no default features. It has no `autumn-web` dependency.
+//! The crate owns its agent primitives: [`AgentModel`], [`Tool`],
+//! [`ToolPolicy`], [`Approval`] and the message types. It depends on the core
+//! engine only, with no default features. It has no Autumn plugin dependency.
+//! An app implements [`AgentModel`] for its provider, or bridges a framework
+//! it already uses.
 //!
 //! # Use it on SQLite
 //!
 //! ```no_run
-//! # async fn demo(client: std::sync::Arc<dyn autumn_plugin_agent::LlmClient>)
+//! # async fn demo(model: std::sync::Arc<dyn autumn_harvest_agent::AgentModel>)
 //! # -> Result<(), autumn_harvest_sqlite::SqliteError> {
 //! use std::sync::Arc;
 //! use autumn_harvest_agent::{AgentHarness, AgentTask, sqlite};
 //! use autumn_harvest_sqlite::{RunState, SqliteRuntime};
 //!
 //! let mut rt = SqliteRuntime::open("agent.db")?;
-//! sqlite::register(&mut rt, Arc::new(AgentHarness::new(client)));
+//! sqlite::register(&mut rt, Arc::new(AgentHarness::new(model)));
 //! let exec = sqlite::start(&mut rt, &AgentTask::new("Summarise the README"))?;
 //! if let RunState::Completed(report) = rt.run_until_blocked(exec).await? {
 //!     println!("{report}");
@@ -35,14 +37,14 @@
 //! worker state:
 //!
 //! ```
-//! # fn demo(client: std::sync::Arc<dyn autumn_plugin_agent::LlmClient>) {
+//! # fn demo(model: std::sync::Arc<dyn autumn_harvest_agent::AgentModel>) {
 //! use autumn_harvest::builder::HarvestBuilder;
 //! use autumn_harvest_agent::{AgentHarness, activities, workflows};
 //!
 //! let built = HarvestBuilder::new()
 //!     .workflows(workflows())
 //!     .activities(activities())
-//!     .state(AgentHarness::new(client))
+//!     .state(AgentHarness::new(model))
 //!     .build();
 //! assert!(built.state::<AgentHarness>().is_some());
 //! # }
@@ -52,16 +54,29 @@
 
 pub mod approval;
 pub mod bounds;
+pub mod error;
 pub mod harness;
+pub mod message;
+pub mod model;
+pub mod policy;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
+pub mod tool;
 pub mod types;
 pub mod workflow;
 
+pub use approval::Approval;
+pub use error::{AgentError, ErrorKind};
 pub use harness::AgentHarness;
+pub use message::{
+    ChatMessage, ChatRole, ContentPart, RunId, SessionId, StopReason, TokenUsage, ToolCall,
+    ToolDefinition,
+};
+pub use model::{AgentModel, BoxFuture, ChatRequest, ChatResponse};
+pub use policy::{AllowAll, Rule, RunInfo, ToolDecision, ToolPolicy, ToolRules};
+pub use tool::{FnTool, Tool, ToolContext, ToolEffect};
 pub use types::{
     AgentReport, AgentStop, AgentTask, ModelTurn, ModelTurnRequest, ToolCallRequest, ToolOutcome,
-    TurnStop,
 };
 pub use workflow::{
     WORKFLOW_NAME, activities, agent_loop, agent_loop_info, agent_model_turn,

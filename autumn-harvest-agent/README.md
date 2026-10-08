@@ -2,8 +2,9 @@
 
 A durable agent loop for [autumn-harvest](../README.md) (issue #1973).
 
-It adapts [`autumn-plugin-agent`](https://crates.io/crates/autumn-plugin-agent)
-to the engine:
+It owns a small agent contract (`AgentModel`, `Tool`, `ToolPolicy`,
+`Approval`). It follows the shape of the `autumn-plugin-agent` primitives,
+but it does not depend on that crate. On the engine:
 
 - The agent loop is the workflow `agent_loop`.
 - Each model call is the activity `agent_model_turn`. It also records the
@@ -11,8 +12,9 @@ to the engine:
 - Each tool call is the activity `agent_tool_call`.
 - A call that the policy gates waits on a durable signal with a deadline.
 
-A crash costs at most the one step that was in flight. The crate has no
-`autumn-web` dependency.
+A crash costs at most the one step that was in flight. The crate depends on
+the core engine only. It has no Autumn plugin and no `autumn-web` dependency.
+An app implements `AgentModel` for its provider.
 
 ```sh
 cargo run -p autumn-harvest-agent --features sqlite --example sqlite_agent

@@ -1,11 +1,12 @@
 ## Feature — A durable agent loop: `autumn-harvest-agent` (issue #1973)
 
-**What shipped.** A new optional crate, `autumn-harvest-agent`. It adapts
-`autumn-plugin-agent` 0.3 to the engine. The agent loop is the workflow
-`agent_loop`. Each model call is the activity `agent_model_turn`, and each
-tool call is the activity `agent_tool_call`. A call that the tool policy
-gates waits on a durable signal with a deadline. ADR 0006 names the target
-framework and why. `docs/agent-adapter.md` shows the pattern end to end.
+**What shipped.** A new optional crate, `autumn-harvest-agent`. The agent
+loop is the workflow `agent_loop`. Each model call is the activity
+`agent_model_turn`, and each tool call is the activity `agent_tool_call`. A
+call that the tool policy gates waits on a durable signal with a deadline.
+The crate owns its agent primitives (`AgentModel`, `Tool`, `ToolPolicy`,
+`Approval`), modelled on `autumn-plugin-agent` with no dependency on it.
+ADR 0006 records why. `docs/agent-adapter.md` shows the pattern end to end.
 
 **Design.**
 
@@ -13,8 +14,8 @@ framework and why. `docs/agent-adapter.md` shows the pattern end to end.
   with the reply, so replay never asks the policy again.
 - Each approval signal name holds the step, the position and the call id.
   A late decision cannot release a later call.
-- `RateLimited`, `Transport` and `Unavailable` (408, 5xx, 529) provider
-  failures retry, and so does a model call over its time budget. A tool call
+- `RateLimited`, `Transport` and `Unavailable` model failures retry, and
+  so does a model call over its time budget. A tool call
   runs once. A tool error, or a tool over its time budget, is a result that
   the model reads.
 - A payload that is not an `Approval` denies the call. It never fails the
@@ -26,9 +27,9 @@ framework and why. `docs/agent-adapter.md` shows the pattern end to end.
   `AgentStop`. A tool result, or a tool error, is cut to fit the result cap
   (2 MiB by default). A stalled tool policy denies the call after
   `policy_timeout`.
-- The crate takes the core engine and plugin-agent with no default
-  features. `scripts/check-agent-adapter-no-autumn-web.sh` fails CI if
-  `autumn-web` reaches its graph.
+- The crate depends on the core engine only, with no default features.
+  `scripts/check-agent-adapter-deps.sh` fails CI if it depends on any Autumn
+  crate outside the engine.
 - The `sqlite` feature adds `sqlite::register`, `start` and `decide`.
 - `examples/claude-agent-daemon` now takes its approval signal names, its
   durable approval wait and its payload-cap checks from the adapter.
@@ -43,6 +44,3 @@ inside a model call. The parent resumes the run. No completed model call or
 tool call runs again. Other tests cover approve, edit, reject
 and timeout, a late decision, each bound, retry classification, replay of
 recorded policy decisions, and the engine-path activity handlers.
-
-**Release order.** Publish `autumn-plugin-agent` 0.3.0 before an engine
-release that includes this crate.

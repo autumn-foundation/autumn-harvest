@@ -1,4 +1,4 @@
-# ADR 0006: The agent adapter targets autumn-plugin-agent
+# ADR 0006: The agent adapter owns its primitives
 
 ## Status
 
@@ -9,61 +9,69 @@ Accepted (issue #1973).
 - Managed agent products share one pattern. The agent loop is a workflow.
   Model calls and tool calls are steps. Human approval is a durable wait.
 - The engine has workflows, activities, and signals with deadlines. It had
-  no adapter that wires an agent framework to them.
+  no adapter that wires an agent loop to them.
 - ADR 0002 keeps execution Rust-native. A Python framework is out of scope.
+- `autumn-plugin-agent` has a good set of agent primitives: a
+  provider-neutral model trait, tools with an effect level, a tool policy
+  with allow, ask and deny, and a serialisable approval. It is an Autumn
+  plugin.
 - `examples/claude-agent-daemon` shows the pattern, but it is an example
   and speaks one provider.
-- `cargo-deny` allows crates.io sources only. A dependency must be a
-  published crate.
 
 ## Decision
 
-The adapter targets `autumn-plugin-agent` 0.3, with no default features. It
-lives in a new crate, `autumn-harvest-agent`.
+The adapter is a new crate, `autumn-harvest-agent`. It depends on the core
+engine only. It takes no agent framework as a dependency.
 
-| Engine primitive | plugin-agent primitive |
-|---|---|
-| Workflow `agent_loop` | The agent loop, its step and token budgets |
-| Activity `agent_model_turn` | `LlmClient::chat`, then `ToolPolicy::decide` per call |
-| Activity `agent_tool_call` | `Tool::execute` with a `ToolContext` |
-| Signal with a deadline | `ToolDecision::RequireApproval`, answered by `Approval` |
-| Retry policy | `ErrorKind`: `RateLimited`, `Transport` and `Unavailable` retry |
+It owns a small agent contract, modelled on the `autumn-plugin-agent`
+primitives:
 
-## Why this framework
+| `autumn-harvest-agent` | Guide in `autumn-plugin-agent` | Engine primitive |
+|---|---|---|
+| `AgentModel` (one `chat` method) | `LlmClient` | Activity `agent_model_turn` |
+| `Tool`, `ToolEffect`, `FnTool` | `Tool`, `ToolEffect`, `FnTool` | Activity `agent_tool_call` |
+| `ToolPolicy`, `ToolRules`, `ToolDecision` | the same names | Recorded with the model turn |
+| `Approval` | `Approval` | Signal with a deadline |
+| `ErrorKind::is_retryable` | `ErrorKind` | Retry policy |
+| `agent_loop` | `Agent` loop and budgets | Workflow |
 
-- **It has the parts the engine needs.** A provider-neutral `LlmClient`
-  (OpenAI-compatible and Anthropic), a `Tool` trait with a `ToolEffect`, a
-  `ToolPolicy` with allow, ask and deny, and a serialisable `Approval`.
-  Each one maps to one engine primitive.
-- **Its persisted types are stable.** `ChatMessage`, `ContentPart`,
-  `ToolCall`, `TokenUsage` and `ToolDecision` already have a serde contract,
-  because its session stores persist them.
-- **It needs no web stack.** Version 0.3 puts `autumn-web` behind a default
-  `autumn` feature. With no default features, nothing pulls it in.
-- **It is in the same family.** One team owns both crates, so a change that
-  the adapter needs can land upstream.
+An app implements `AgentModel` for its provider, or bridges a framework it
+already uses. The adapter ships no HTTP client.
+
+## Why the adapter owns the contract
+
+- **One Autumn plugin is enough.** The engine already has
+  `autumn-harvest-plugin`. An engine crate that also needs a second plugin
+  ties two plugin release trains together.
+- **History needs a stable contract.** The message types are recorded in
+  workflow history, and replay reads them back. The engine must own their
+  serde shape.
+- **The engine needs no web stack.** The contract has no `autumn-web` and no
+  HTTP client.
+- **A bridge is small.** One `AgentModel` impl adapts any client, including
+  the `autumn-plugin-agent` `LlmClient`.
 
 ## Rejected options
 
-- **`rig-core`.** No approval primitive and no tool-effect model. Its loop
-  does not split into steps that an activity can own.
-- **`autumn-plugin-agent` 0.2.** It needs `autumn-web`.
-- **A copy of the primitives in the engine.** Two copies drift.
+- **Depend on `autumn-plugin-agent`.** Harvest would rely on two Autumn
+  plugins, and that crate would need a breaking feature split to drop
+  `autumn-web`. The engine would also not own its history types.
+- **`rig-core`.** It has no approval primitive and no tool-effect model, and
+  its loop does not split into steps that an activity can own.
 - **The adapter in `autumn-harvest-plugin`.** That crate needs `autumn-web`.
 
 ## Consequences
 
+- `scripts/check-agent-adapter-deps.sh` fails CI if the adapter depends on
+  any Autumn crate outside the engine.
 - The policy runs inside the model-turn activity. Its decision is recorded
   with the reply, so replay never asks the policy again.
-- The adapter owns its history types. An upstream type without a serde
-  contract never reaches history.
 - A tool result is cut to fit the activity-result cap (2 MiB by default,
   configurable). A transcript that cannot fit the next request ends the run
   as `transcript_full`.
 - The daemon example keeps its Anthropic-native turn, because it replays
   thinking blocks verbatim. It takes the approval names, the durable
   approval wait and the payload checks from the adapter.
-- Plugin-agent 0.3 adds `ErrorKind::Unavailable` for 408, 5xx and 529, so a
-  provider outage retries instead of failing a paid run.
-- The engine release that ships this crate needs plugin-agent 0.3.0 on
-  crates.io first.
+- The always-on primitives of `autumn-plugin-agent` (heartbeats,
+  follow-ups, delivery, memory, the loop guard) can map onto engine
+  primitives the same way: schedules, durable timers and activities.

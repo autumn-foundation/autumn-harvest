@@ -20,7 +20,28 @@ use std::time::Duration;
 
 use autumn_harvest::context::WorkflowContext;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// A reviewer's answer for one gated call. It is the signal payload.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "verdict", rename_all = "snake_case")]
+pub enum Approval {
+    /// Run the call as the model asked.
+    Approve,
+    /// Run the call with these arguments. The policy does not check them
+    /// again, so guard the signal path as you guard the tool.
+    Edit {
+        /// The arguments to use.
+        arguments: serde_json::Value,
+    },
+    /// Do not run the call. The model reads the reason.
+    Reject {
+        /// Why, for the model.
+        reason: String,
+    },
+}
 
 /// The prefix of every approval signal name.
 pub const SIGNAL_TOOL_APPROVAL: &str = "tool_approval";
@@ -114,7 +135,6 @@ mod tests {
 
     #[test]
     fn a_payload_decodes_or_is_unreadable() {
-        use autumn_plugin_agent::Approval;
         let ok: Decision<Approval> = decode(Some(serde_json::json!({"verdict": "approve"})));
         assert_eq!(ok, Decision::Decided(Approval::Approve));
         let bad: Decision<Approval> = decode(Some(serde_json::json!("approve")));

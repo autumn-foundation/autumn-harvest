@@ -9,11 +9,11 @@ use std::sync::Arc;
 
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
 use autumn_harvest_sqlite::{ExecutionId, SqliteResult, SqliteRuntime};
-use autumn_plugin_agent::Approval;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
+use crate::approval::Approval;
 use crate::harness::AgentHarness;
 use crate::types::AgentTask;
 use crate::workflow::{
