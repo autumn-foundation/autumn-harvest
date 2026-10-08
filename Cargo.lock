@@ -413,6 +413,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "autumn-harvest-agent"
+version = "0.7.0"
+dependencies = [
+ "autumn-harvest",
+ "autumn-harvest-sqlite",
+ "autumn-plugin-agent",
+ "chrono",
+ "futures",
+ "proptest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "autumn-harvest-cli"
 version = "0.7.0"
 dependencies = [
@@ -593,6 +610,21 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.6",
+]
+
+[[package]]
+name = "autumn-plugin-agent"
+version = "0.3.0"
+dependencies = [
+ "futures",
+ "http 1.4.0",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "toml 1.1.3+spec-1.1.0",
+ "tracing",
 ]
 
 [[package]]
@@ -1626,6 +1658,7 @@ name = "claude-agent-daemon"
 version = "0.7.0"
 dependencies = [
  "autumn-harvest",
+ "autumn-harvest-agent",
  "autumn-harvest-sqlite",
  "clap",
  "libc",

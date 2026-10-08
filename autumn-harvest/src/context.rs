@@ -16128,6 +16128,30 @@ impl ActivityContext {
         .with_max_attempts(1)
     }
 
+    /// Like [`new_test`](Self::new_test) but with registered state, so a test
+    /// can run an activity that reads [`state`](Self::state) (issue #1973).
+    ///
+    /// Build `state` the way `HarvestBuilder::state` does: one boxed value per
+    /// type, keyed by its `TypeId`.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn new_test_with_state(state: SharedState) -> Self {
+        let id = ActivityExecId::new();
+        let identity = ActivityIdentity {
+            activity_id: id,
+            ..ActivityIdentity::for_test()
+        };
+        Self::new(
+            state,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            identity,
+        )
+        .with_idempotency_key(IdempotencyKey::from_activity_exec_id(id))
+        .with_attempt(1)
+        .with_max_attempts(1)
+    }
+
     /// Like [`new_test`](Self::new_test) but intentionally omits the
     /// idempotency key.  Used only in tests that verify the error path.
     #[cfg(any(test, feature = "testing"))]
@@ -29986,6 +30010,17 @@ mod activity_info_tests {
         assert_eq!(info.attempt, 1);
         assert_eq!(info.max_attempts, 1);
         assert_eq!(info.task_id, None);
+    }
+
+    /// `new_test_with_state()` exposes the state it was given, and nothing else.
+    #[test]
+    fn new_test_with_state_exposes_its_state() {
+        let mut map: crate::context::SharedStateMap = std::collections::HashMap::new();
+        map.insert(std::any::TypeId::of::<u32>(), Box::new(7_u32));
+        let ctx = ActivityContext::new_test_with_state(std::sync::Arc::new(map));
+        assert_eq!(ctx.state::<u32>(), Some(&7));
+        assert_eq!(ctx.state::<String>(), None);
+        assert_eq!(ctx.info().attempt, 1);
     }
 
     #[test]

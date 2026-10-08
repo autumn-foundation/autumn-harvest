@@ -339,6 +339,7 @@ for a compile-checked polling loop that works with and without the `db` feature.
 | [`autumn-harvest-cli`](autumn-harvest-cli/) | `harvest` CLI: thin operator client for the management API |
 | [`autumn-harvest-redis`](autumn-harvest-redis/) | Optional Redis Streams dispatch channel — carries references to claimable rows; Postgres stays the source of truth |
 | [`autumn-harvest-sqlite`](autumn-harvest-sqlite/) | Optional SQLite storage backend for single-process and embedded deployments |
+| [`autumn-harvest-agent`](autumn-harvest-agent/) | Optional durable agent loop: `autumn-plugin-agent` model and tool calls as activities, approvals as durable waits ([guide](docs/agent-adapter.md)) |
 
 Use `autumn-harvest-plugin` if you're building an Autumn app. For a non-web
 context — a worker or CLI process with no HTTP surface at all — use the bare

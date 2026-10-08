@@ -18,10 +18,11 @@ use crate::guard;
 use crate::inspect;
 use crate::protocol::{self, Request, Response};
 use crate::session::{
-    self, ApprovalDecision, SIGNAL_TOOL_APPROVAL, SessionReport, SessionTask, ToolCall,
-    ToolOutcome, ToolRequest, TurnReply, TurnRequest, WORKFLOW_NAME,
+    self, ApprovalDecision, SessionReport, SessionTask, ToolCall, ToolOutcome, ToolRequest,
+    TurnReply, TurnRequest, WORKFLOW_NAME,
 };
 use crate::tools;
+use autumn_harvest_agent::approval::SIGNAL_TOOL_APPROVAL;
 
 /// The resolved workspace identity a session records.
 fn workspace_id(workspace: &Path) -> String {
