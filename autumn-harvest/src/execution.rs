@@ -1381,6 +1381,13 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         && terminate_via_pre_check
         && !reject_fresh_if_debounced
     {
+        // A tenant conflict outranks a closed gate (issue #1977).
+        if request.tenant.is_some()
+            && let Some(prior) =
+                try_load_by_key(conn, request.workflow_name, request.workflow_id).await?
+        {
+            refuse_other_tenant(&request, &prior)?;
+        }
         admit_fresh_start(
             mode,
             metrics,
@@ -1754,6 +1761,10 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                 request.workflow_id,
             )
             .await?;
+            // A tenant conflict outranks a closed gate (issue #1977).
+            if let Some(prior) = prior.as_ref() {
+                refuse_other_tenant(&request, prior)?;
+            }
             if start_will_create_new_execution(
                 prior.as_ref().map(|e| e.state.as_str()),
                 request.reuse_policy,

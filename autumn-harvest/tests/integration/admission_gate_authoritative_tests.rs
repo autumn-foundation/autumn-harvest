@@ -4314,3 +4314,74 @@ async fn outbox_relay_keeps_the_tenant_after_the_source_is_gone() {
     assert_eq!(rows.len(), 1, "the relay starts the target");
     assert_eq!(rows[0].tenant.as_deref(), Some("acme"));
 }
+
+/// Issue #1977: a tenant start that meets a live run of another tenant is a
+/// tenant conflict, not an admission. A closed gate must not answer it with
+/// `AdmissionBlocked`, for the pre-check path and for the locked path.
+#[tokio::test]
+async fn a_closed_gate_still_reports_a_tenant_conflict() {
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    install_global_router(ShardRouter::default());
+
+    for (reuse, conflict) in [
+        (
+            autumn_harvest::WorkflowIdReusePolicy::TerminateIfRunning,
+            autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
+        ),
+        (
+            autumn_harvest::WorkflowIdReusePolicy::AllowDuplicate,
+            autumn_harvest::types::WorkflowIdConflictPolicy::TerminateExisting,
+        ),
+    ] {
+        let workflow_id = format!("tenant-gate-{}", Uuid::new_v4());
+        let globex = autumn_harvest::StartWorkflowParams {
+            tenant: Some("globex"),
+            ..autumn_harvest::StartWorkflowParams::new(
+                "ag_target_wf",
+                &workflow_id,
+                ExecutionId::new_for_shard(ShardId::new(0)),
+                serde_json::json!({}),
+                "default",
+            )
+        };
+        autumn_harvest::start_or_load_workflow_execution(&mut conn, globex, None)
+            .await
+            .expect("start the globex run");
+
+        set_global_admission_gate_cache(Some(fleet_cache("tenant-gate-incident")));
+        let acme = autumn_harvest::StartWorkflowParams {
+            tenant: Some("acme"),
+            reuse_policy: reuse,
+            conflict_policy: conflict,
+            ..autumn_harvest::StartWorkflowParams::new(
+                "ag_target_wf",
+                &workflow_id,
+                ExecutionId::new_for_shard(ShardId::new(0)),
+                serde_json::json!({}),
+                "default",
+            )
+        };
+        let outcome = autumn_harvest::start_or_load_workflow_execution_with_metrics(
+            &mut conn,
+            acme,
+            None,
+            Some(autumn_harvest::admission_gate::GateMode::Check),
+        )
+        .await;
+        set_global_admission_gate_cache(None);
+
+        assert!(
+            matches!(
+                outcome,
+                Err(autumn_harvest::HarvestError::TenantConflict { .. })
+            ),
+            "{reuse:?}/{conflict:?}: {outcome:?}"
+        );
+    }
+}
