@@ -72,8 +72,10 @@ survives.
   SFQ idle rule does. Keys that claim once never move `V`, so only the
   reset bounds them.
 - Fairness is shard-local. A key bounds load, not access.
-- `claim_task_batched` ignores keys. A successor default (#1971) must carry
-  the lag sort key.
+- `claim_task_batched` ignores keys.
+- A fair claim skips the seek window of #1971 and runs the full scan, as
+  priority ageing does. The window guard proves a pick from priority and
+  due time only, and the lag can put any row first.
 
 ## Alternatives rejected
 

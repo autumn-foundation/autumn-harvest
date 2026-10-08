@@ -42,7 +42,7 @@ claim statement.**
 |-----|-------|
 | White | The default claim scans and sorts the eligible backlog (#1971). Rate-limit buckets already show a hot row per key, charged in the claim. Workflow task rows are woken in place, so one row carries a run's key for its life. Temporal: weights per key, up to 1,000 overrides. |
 | Red | "A noisy tenant cannot hold a queue" is easy to sell. Operators want a weight knob without a restart. |
-| Black | Each keyed claim writes one state row. Concurrent claims on one key wait for that row. Fairness is shard-local. Dispatch-channel claims do not sort by key, but they charge it. The batched path (not wired) ignores keys; #1971 must carry the sort key. |
+| Black | Each keyed claim writes one state row. Concurrent claims on one key wait for that row. Fairness is shard-local. Dispatch-channel claims do not sort by key, but they charge it. The batched path (not wired) ignores keys. A fair claim skips the #1971 seek window and runs the full scan. |
 | Yellow | No new bind. Weights apply at the next claim. A single key gives the old order, so priority and due time keep their meaning within a key. |
 | Green | B1–B6 in §0.1. Per-start weights are a later option. |
 | Blue | Spec: a pure model and property tests. Red: a DB test where a flood holds tenant B past the bound. Green: migration, propagation, fair splice, worker toggle. Then overrides, prune, bench, docs, review. |

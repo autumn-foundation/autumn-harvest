@@ -135,9 +135,11 @@ row. Concurrent claims of one key wait for that row, for one statement. A
 queue of mostly unkeyed work has one key, so its fair claims queue on one
 row. Leave fairness off for such a queue.
 
-The per-row cost grows with the backlog, because the default claim sorts the
-whole eligible backlog (issue #1971). A bounded candidate set bounds it too.
-See [the measured cost](performance.md#fairness-keys-issue-1976).
+A fair claim does not use the seek window of issue #1971. That window reads
+a bounded head of each queue, and its guard proves a pick from priority and
+due time only. The lag can put any row first, so a fair claim runs the full
+scan instead, as a claim with priority ageing does. Its cost thus grows with
+the backlog. See [the measured cost](performance.md#fairness-keys-issue-1976).
 
 ## Upkeep
 
@@ -168,7 +170,9 @@ cases:
   old flood's rows carry the largest ageing boost. They can outrank a newer
   key until its rows age too. A worker with both options logs a warning.
 - `queue::claim_task_batched` ignores keys. It is not the default claim
-  path. Issue #1971 must carry the lag sort key if it becomes the default.
+  path.
+- A fair claim skips the seek window, so it does not get the flat claim cost
+  of issue #1971.
 - A dispatch-channel claim names its row, so it does not sort by key. It
   still charges the key.
 - In a mixed fleet, an older worker or API node ignores keys. A run started
