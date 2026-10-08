@@ -1655,16 +1655,11 @@ mod db {
     async fn resolve_shard_conn(
         sharded_pool: &crate::shard::ShardedDbPool,
         shard: crate::types::ShardId,
-    ) -> Result<
-        deadpool::managed::Object<
-            diesel_async::pooled_connection::AsyncDieselConnectionManager<AsyncPgConnection>,
-        >,
-        String,
-    > {
+    ) -> Result<crate::replication::FencedConn, String> {
         let Some(pool) = sharded_pool.exact_pool_for(shard) else {
             return Err("no connection pool for this shard in this process".to_string());
         };
-        pool.get()
+        crate::replication::fenced_checkout(pool)
             .await
             .map_err(|e| format!("connection unavailable: {e}"))
     }
@@ -2036,7 +2031,7 @@ mod db {
         // write here does not un-retire the key.
         for shard in expected_shards {
             if let Some(pool) = sharded_pool.exact_pool_for(*shard)
-                && let Ok(mut conn) = pool.get().await
+                && let Ok(mut conn) = crate::replication::fenced_checkout(pool).await
                 && let Err(e) = write_key_state_retired(&mut conn, key_id).await
             {
                 tracing::warn!(

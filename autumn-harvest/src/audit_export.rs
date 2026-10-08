@@ -3625,7 +3625,7 @@ pub async fn fire_due_audit_exports(
                 };
                 // Bounded, never a bare `pool.get()` — see `SHARD_ACQUIRE_BOUND`.
                 let mut shard_conn =
-                    match tokio::time::timeout(SHARD_ACQUIRE_BOUND, pool.get()).await {
+                    match crate::replication::fenced_get_within(&pool, SHARD_ACQUIRE_BOUND).await {
                         Ok(Ok(c)) => c,
                         Ok(Err(e)) => {
                             tracing::error!(

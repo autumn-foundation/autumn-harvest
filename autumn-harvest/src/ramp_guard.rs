@@ -1000,7 +1000,9 @@ async fn read_pool_ramps(
 ) -> crate::error::HarvestResult<PoolRead> {
     use diesel_async::RunQueryDsl;
 
-    let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+    let mut conn = crate::replication::fenced_checkout(pool)
+        .await
+        .map_err(crate::error::database_error)?;
     let timeout_ms = bound.as_millis().max(1);
     conn.build_transaction()
         .read_only()
@@ -1326,7 +1328,9 @@ async fn record_abort_tombstones(
     );
     let caller_target = caller_target.as_str();
     let write = async {
-        let mut conn = pool.get().await.map_err(|e| e.to_string())?;
+        let mut conn = crate::replication::fenced_checkout(pool)
+            .await
+            .map_err(|e| e.to_string())?;
         conn.build_transaction()
         .read_committed()
         .run(async |conn| -> crate::error::HarvestResult<()> {
@@ -1482,7 +1486,9 @@ async fn stamp_report_id(
 
     let timeout_ms = bound.as_millis().max(1);
     let stamp = async {
-        let mut conn = pool.get().await.map_err(|e| e.to_string())?;
+        let mut conn = crate::replication::fenced_checkout(pool)
+            .await
+            .map_err(|e| e.to_string())?;
         conn.transaction(
             async |conn| -> crate::error::HarvestResult<Option<uuid::Uuid>> {
                 bound_and_fence(conn, timeout_ms).await?;
@@ -1556,7 +1562,9 @@ async fn prune_finished_markers(
     let ids: Vec<String> = ramp_ids.iter().map(ToString::to_string).collect();
     let timeout_ms = bound.as_millis().max(1);
     let prune = async {
-        let mut conn = pool.get().await.map_err(|e| e.to_string())?;
+        let mut conn = crate::replication::fenced_checkout(pool)
+            .await
+            .map_err(|e| e.to_string())?;
         conn.transaction(async |conn| -> crate::error::HarvestResult<()> {
             bound_and_fence(conn, timeout_ms).await?;
             diesel::sql_query(prune_abort_markers_query())
@@ -1663,7 +1671,7 @@ async fn clear_on_pool(
     let (queue, base, target) = key;
     // A checkout that fails or times out sent nothing to the server, so it
     // is a plain failure. Only the clear itself can be ambiguous.
-    let mut conn = match tokio::time::timeout(bound, pool.get()).await {
+    let mut conn = match crate::replication::fenced_get_within(pool, bound).await {
         Ok(Ok(conn)) => conn,
         Ok(Err(error)) => {
             tracing::warn!(queue = %queue, pool = index, error = %error, "ramp guard clear checkout failed");
@@ -1753,7 +1761,9 @@ async fn mark_reported_on_pool(
     bound: Duration,
 ) -> bool {
     let mark = async {
-        let mut conn = pool.get().await.map_err(|e| e.to_string())?;
+        let mut conn = crate::replication::fenced_checkout(pool)
+            .await
+            .map_err(|e| e.to_string())?;
         mark_abort_reported(&mut conn, queue, ramp_id, bound)
             .await
             .map_err(|e| e.to_string())
@@ -1798,7 +1808,9 @@ async fn claim_on_pool(
     bound: Duration,
 ) -> ClaimOutcome {
     let claim = async {
-        let mut conn = pool.get().await.map_err(|e| e.to_string())?;
+        let mut conn = crate::replication::fenced_checkout(pool)
+            .await
+            .map_err(|e| e.to_string())?;
         claim_unreported_abort(&mut conn, queue, ramp_id, lease, bound)
             .await
             .map_err(|e| e.to_string())
@@ -1897,7 +1909,9 @@ async fn record_abort(
     let write = async {
         use diesel_async::AsyncConnection;
 
-        let mut conn = audit_pool.get().await.map_err(|e| e.to_string())?;
+        let mut conn = crate::replication::fenced_checkout(audit_pool)
+            .await
+            .map_err(|e| e.to_string())?;
         conn.transaction(async |conn| -> crate::error::HarvestResult<ReportOutcome> {
             if let Some(ramp_id) = ramp_id
                 && !record_abort_report(conn, &abort.queue, ramp_id).await?

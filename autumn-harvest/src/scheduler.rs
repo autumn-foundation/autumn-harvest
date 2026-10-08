@@ -1399,8 +1399,7 @@ pub async fn tick_once_sharded_with_backoff(
         if crate::replication::shard_writes_held(Some(scheduler_fence_key(shard, single_pool))) {
             continue;
         }
-        let mut conn = shard_pool
-            .get()
+        let mut conn = crate::replication::fenced_checkout(shard_pool)
             .await
             .map_err(|error| HarvestError::Database(error.to_string()))?;
         // Held until this shard's pass ends. See `scheduler_fence`. It opens
@@ -1538,8 +1537,7 @@ pub async fn trigger_unified_dag(
 ) -> HarvestResult<StartedWorkflowExecution> {
     use diesel_async::AsyncConnection;
 
-    let mut db = pool
-        .get()
+    let mut db = crate::replication::fenced_checkout(&pool)
         .await
         .map_err(|error| HarvestError::Database(error.to_string()))?;
 
