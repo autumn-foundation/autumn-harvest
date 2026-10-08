@@ -464,6 +464,18 @@ impl RedisProbe {
         }
     }
 
+    /// Every key under this run's prefix.
+    ///
+    /// `RedisDispatch` wraps its keys in a hash tag, as in
+    /// `{prefix:dispatch:queue}`. A plain `prefix*` glob misses them, so this
+    /// reads both families. Returns `None` on a probe error.
+    async fn keys(&self, conn: &mut redis::aio::MultiplexedConnection) -> Option<Vec<String>> {
+        let mut keys: Vec<String> = conn.keys(format!("{}*", self.prefix)).await.ok()?;
+        let tagged: Vec<String> = conn.keys(format!("{{{}:*", self.prefix)).await.ok()?;
+        keys.extend(tagged);
+        Some(keys)
+    }
+
     /// Delete the keys under this run's prefix only. Never `FLUSHALL`.
     ///
     /// Returns false when the cleanup fails. A run must not start on a
@@ -472,7 +484,7 @@ impl RedisProbe {
         let Ok(mut conn) = self.client.get_multiplexed_async_connection().await else {
             return false;
         };
-        let Ok(keys) = conn.keys::<_, Vec<String>>(format!("{}*", self.prefix)).await else {
+        let Some(keys) = self.keys(&mut conn).await else {
             return false;
         };
         for key in keys {
@@ -489,15 +501,14 @@ impl RedisProbe {
     /// invalid, so it cannot read as a clean drain.
     async fn residue(&self) -> Option<Residue> {
         let mut conn = self.client.get_multiplexed_async_connection().await.ok()?;
-        let keys: Vec<String> = conn.keys(format!("{}*", self.prefix)).await.ok()?;
+        let keys = self.keys(&mut conn).await?;
         let mut residue = Residue {
             entries: 0,
             pending: 0,
             markers: 0,
         };
-        let marker_prefix = format!("{}:dispatch:marker:", self.prefix);
         for key in keys {
-            if key.starts_with(&marker_prefix) {
+            if key.contains("}:marker:") {
                 residue.markers += 1;
                 continue;
             }

@@ -32,6 +32,10 @@ Build every binary before the first run. Do not build, run git or run any
 other job while the sweep runs.
 
 ```bash
+# 513b7aa is the head of PR #2052. A plain clone does not hold it, so fetch
+# the pull ref first.
+git fetch origin pull/2052/head
+
 # One harvest binary per tree. The path dependencies resolve inside each
 # checkout, so copy this directory into each one first.
 for t in 0aeb887 513b7aa 9f444b7; do
