@@ -886,8 +886,9 @@ pub const NEW_START_HANDICAP_SECS: u32 = 30;
 /// wins. Priority ageing (`priority_aging_secs`) reads `scheduled_at`, not
 /// this term. An ageing interval below the handicap can lift an aged new
 /// start above a fresh continuation.
-/// The claim already sorts on a `CASE` key, so this adds no sort that
-/// an index could have saved. See `docs/performance.md`, issue #1177.
+/// The full scan already sorts on a `CASE` key, so this adds no sort that
+/// an index could have saved. See `docs/performance.md`, issue #1177. The
+/// seek window walks `scheduled_at` inside each head instead (issue #1971).
 macro_rules! claim_order_due_sql {
     () => {
         "(scheduled_at + CASE WHEN new_start AND attempt = 0 \
@@ -897,6 +898,9 @@ macro_rules! claim_order_due_sql {
 
 /// The `claim_order_due_sql!` text as a value, for shape tests.
 pub const CLAIM_ORDER_DUE_SQL: &str = claim_order_due_sql!();
+
+/// Rows the claim reads from the head of each queue (issue #1971).
+pub const CLAIM_SEEK_WINDOW: i64 = 32;
 
 /// The error prefix on a task that the timeout scanner fails (issue #1824).
 ///
@@ -909,9 +913,14 @@ pub const DEADLINE_EXCEEDED_ERROR: &str = "deadline_exceeded";
 ///
 /// The predicate is the timeout scanner's own: a `RUNNING` run with a past
 /// `deadline_at` or `chain_deadline_at`. A `PAUSED` run is not in the set,
-/// because a resume moves its deadline forward. The two partial deadline
-/// indexes serve the read. The set is small, because the scanner clears it
-/// once per poll interval.
+/// because a resume moves its deadline forward. The set is small, because
+/// the scanner clears it once per poll interval.
+///
+/// Each deadline has its own partial index, so the CTE reads each one in its
+/// own branch. An `OR` needs a bitmap scan to use both indexes. The default
+/// claim turns bitmap scans off (issue #1971), so an `OR` would scan every run. A
+/// run past both deadlines appears twice. The gates test membership only, so
+/// the duplicate has no effect.
 ///
 /// The CTE is `MATERIALIZED`, so it runs once per claim, not once per row. It
 /// only reads the run rows and takes no lock. A lock here would invert the
@@ -920,8 +929,10 @@ macro_rules! expired_runs_cte_sql {
     () => {
         "expired_runs AS MATERIALIZED ( \
              SELECT id FROM harvest_workflow_executions \
-             WHERE state = 'RUNNING' \
-               AND (deadline_at < NOW() OR chain_deadline_at < NOW()) \
+             WHERE state = 'RUNNING' AND deadline_at < NOW() \
+             UNION ALL \
+             SELECT id FROM harvest_workflow_executions \
+             WHERE state = 'RUNNING' AND chain_deadline_at < NOW() \
          )"
     };
 }
@@ -1017,6 +1028,555 @@ pub const EXPIRED_RUNS_CTE_SQL: &str = expired_runs_cte_sql!();
 /// The `expired_run_gate_sql!` text as a value, for shape tests.
 pub const EXPIRED_RUN_GATE_SQL: &str = expired_run_gate_sql!();
 
+/// The [`CLAIM_SEEK_WINDOW`] value as SQL text, for `concat!`.
+macro_rules! claim_seek_window_sql {
+    () => {
+        "32"
+    };
+}
+
+/// The claim gates that read only the row and constant arrays (issue #1971).
+///
+/// Both candidate scans apply them, and so does each head scan of the seek
+/// window. A row they reject is ineligible. So a head scan may skip it, and
+/// the window guard stays exact.
+macro_rules! claim_row_local_gates_sql {
+    () => {
+        concat!(
+            "AND ( \
+                   schedule_to_close_at IS NULL \
+                   OR schedule_to_close_at > NOW() \
+               ) \
+               AND ( \
+                   sticky_worker_id IS NULL \
+                   OR sticky_worker_id = $1 \
+                   OR sticky_until IS NULL \
+                   OR sticky_until <= NOW() \
+               ) \
+               AND ( \
+                   session_id IS NULL \
+                   OR sticky_worker_id = $1 \
+               ) \
+               AND ( \
+                   task_type != 'activity' \
+                   OR activity_name IS NULL \
+                   OR required_capabilities IS NOT NULL \
+                   OR NOT (activity_name = ANY($6)) \
+               ) ",
+            saturated_activity_gate_sql!(),
+            "AND ( \
+                   task_type != 'activity' \
+                   OR activity_name IS NULL \
+                   OR NOT (activity_name = ANY(paused_activities.names)) \
+               ) "
+        )
+    };
+}
+
+/// The row-local gates in the form that a head scan applies (issue #1971).
+///
+/// Each gate here is implied by a gate of `claim_row_local_gates_sql!`, so
+/// a row it skips is ineligible. The three activity-name gates sit in one
+/// `CASE`. Their arrays come from a CTE, a bind and a subquery, so the
+/// planner cannot read them at plan time. In their plain form it may then estimate
+/// that almost no row passes, for example when one activity type fills the
+/// queue. It then reads the whole head with a bitmap scan instead of
+/// stopping after the window. The planner gives a `CASE` a fixed default
+/// estimate, so the head stays a bounded index scan.
+///
+/// A head scan reads past each row that these gates skip. A long run of
+/// skipped rows at a queue head costs one heap read per row on each claim.
+/// Live pins to other workers are one example.
+macro_rules! claim_head_gates_sql {
+    () => {
+        "AND ( \
+             schedule_to_close_at IS NULL \
+             OR schedule_to_close_at > NOW() \
+         ) \
+         AND ( \
+             sticky_worker_id IS NULL \
+             OR sticky_worker_id = $1 \
+             OR sticky_until IS NULL \
+             OR sticky_until <= NOW() \
+         ) \
+         AND ( \
+             session_id IS NULL \
+             OR sticky_worker_id = $1 \
+         ) \
+         AND CASE \
+             WHEN task_type = 'activity' \
+                  AND activity_name = ANY(paused_activities.names) THEN FALSE \
+             WHEN task_type = 'activity' AND required_capabilities IS NULL \
+                  AND activity_name = ANY($6) THEN FALSE \
+             WHEN task_type = 'activity' AND activity_name = ANY(ARRAY( \
+                  SELECT substr(marked, 2) FROM unnest($6::text[]) AS marked \
+                  WHERE left(marked, 1) = chr(1) \
+             )) THEN FALSE \
+             ELSE TRUE \
+         END "
+    };
+}
+
+/// The claim sort key, by rank, then priority, then due time.
+macro_rules! claim_order_by_sql {
+    () => {
+        concat!(
+            "ORDER BY \
+                 CASE \
+                     WHEN sticky_worker_id = $1 AND sticky_until > NOW() THEN 1 \
+                     ELSE 0 \
+                 END DESC, \
+                 CASE \
+                     WHEN $4::BIGINT IS NOT NULL AND $4::BIGINT > 0 \
+                     THEN priority + FLOOR(EXTRACT(EPOCH FROM (NOW() - scheduled_at)) / $4::BIGINT)::INT \
+                     ELSE priority \
+                 END DESC, ",
+            claim_order_due_sql!(),
+            " ASC "
+        )
+    };
+}
+
+/// The claim gates of one candidate scan, after the queue-pause test.
+///
+/// `$counts` names the running-count CTE that the concurrency gate reads.
+/// Both candidate scans use this text, so every gate is the same in each.
+macro_rules! claim_candidate_gates_sql {
+    ($counts:literal) => {
+        concat!(
+            claim_row_local_gates_sql!(),
+            "AND ( \
+                   concurrency_key IS NULL \
+                   OR concurrency_cap IS NULL \
+                   OR COALESCE(( \
+                       SELECT rc.running_count FROM ",
+            $counts,
+            " rc \
+                       WHERE rc.concurrency_key = harvest_task_queue.concurrency_key \
+                         AND rc.task_type = harvest_task_queue.task_type \
+                   ), 0) < harvest_task_queue.concurrency_cap \
+               ) \
+               AND ( \
+                   required_build_id IS NULL \
+                   OR ($3 <> '' AND ( \
+                       required_build_id = $3 \
+                       OR EXISTS ( \
+                           SELECT 1 FROM harvest_build_compat \
+                           WHERE build_id = $3 \
+                             AND compatible_with = harvest_task_queue.required_build_id \
+                       ) \
+                   )) \
+               ) \
+               AND ( \
+                   task_type <> 'workflow' \
+                   OR workflow_exec_id IS NULL \
+                   OR NOT EXISTS ( \
+                       SELECT 1 FROM harvest_workflow_executions e \
+                       WHERE e.id = harvest_task_queue.workflow_exec_id \
+                         AND e.state = 'PAUSED' \
+                   ) \
+               ) ",
+            expired_run_gate_sql!(),
+            "AND ( \
+                   required_capabilities IS NULL \
+                   OR NOT EXISTS ( \
+                       SELECT 1 \
+                       FROM jsonb_array_elements(required_capabilities) AS r(value) \
+                       WHERE ( \
+                           r.value ? 'Exact' AND ( \
+                               worker_info.labels->>(r.value->'Exact'->>'key') IS NULL \
+                               OR worker_info.labels->>(r.value->'Exact'->>'key') != (r.value->'Exact'->>'value') \
+                           ) \
+                       ) OR ( \
+                           r.value ? 'In' AND ( \
+                               worker_info.labels->>(r.value->'In'->>'key') IS NULL \
+                               OR NOT ( \
+                                   (r.value->'In'->'values') @> jsonb_build_array(worker_info.labels->>(r.value->'In'->>'key')) \
+                               ) \
+                           ) \
+                       ) \
+                   ) \
+               ) \
+               AND ( \
+                   rate_limit_key IS NULL \
+                   OR harvest_task_queue.activity_name = ANY($5) \
+                   OR EXISTS ( \
+                       SELECT 1 FROM harvest_rate_limit_buckets b \
+                       WHERE b.key = harvest_task_queue.rate_limit_key \
+                         AND LEAST(COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_burst ELSE NULL END, b.burst), b.tokens + GREATEST(0, EXTRACT(EPOCH FROM (LEAST(COALESCE(b.override_expires_at, b.last_refilled_at), NOW()) - b.last_refilled_at))) * COALESCE(b.override_refill_rate, b.refill_rate) + GREATEST(0, EXTRACT(EPOCH FROM (NOW() - GREATEST(COALESCE(b.override_expires_at, b.last_refilled_at), b.last_refilled_at)))) * b.refill_rate) >= 1.0 \
+                   ) \
+               ) ",
+        )
+    };
+}
+
+/// A candidate scan of the claim query: the full scan or the window scan.
+///
+/// `$name` names the CTE. `$counts` names the running-count CTE. `$rows` is
+/// the row test: the queue and state test for the full scan, the state test
+/// alone for the window scan. `$extra` is a predicate after the queue-pause
+/// test.
+macro_rules! claim_candidate_scan_sql {
+    ($name:literal, $counts:literal, [$($rows:tt)*], [$($extra:tt)*]) => {
+        concat!(
+            $name,
+            " AS ( \
+             SELECT id, task_type, concurrency_key, concurrency_cap, rate_limit_key, activity_name, \
+                    workflow_exec_id \
+             FROM harvest_task_queue \
+             CROSS JOIN worker_info \
+             CROSS JOIN paused_queues \
+             CROSS JOIN paused_activities \
+             WHERE ",
+            $($rows)*,
+            "AND scheduled_at <= NOW() \
+               AND NOT (harvest_task_queue.queue_name = ANY(paused_queues.names)) ",
+            $($extra)*,
+            claim_candidate_gates_sql!($counts),
+            claim_order_by_sql!(),
+            "LIMIT 1 FOR UPDATE SKIP LOCKED \
+        )"
+        )
+    };
+}
+
+/// The running count per concurrency key, for the keys in `$keys`.
+macro_rules! claim_running_counts_sql {
+    ($name:literal, $keys:literal) => {
+        concat!(
+            $name,
+            " AS MATERIALIZED ( \
+             SELECT t.concurrency_key, t.task_type, COUNT(*) AS running_count \
+             FROM harvest_task_queue t \
+             WHERE t.state = 'RUNNING' \
+               AND t.worker_id IS NOT NULL \
+               AND t.concurrency_key IN (SELECT concurrency_key FROM ",
+            $keys,
+            ") \
+             GROUP BY t.concurrency_key, t.task_type \
+         )"
+        )
+    };
+}
+
+/// The CTEs that every claim form starts with.
+macro_rules! claim_leading_ctes_sql {
+    () => {
+        concat!(
+            "WITH worker_info AS ( \
+             SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels \
+         ), \
+         paused_queues AS MATERIALIZED ( \
+             SELECT COALESCE(array_agg(queue_name), ARRAY[]::text[]) AS names \
+             FROM harvest_queue_pauses \
+             WHERE queue_name = ANY($2) \
+         ), \
+         paused_activities AS MATERIALIZED ( \
+             SELECT COALESCE(array_agg(activity_name), ARRAY[]::text[]) AS names \
+             FROM harvest_activity_pauses \
+         ), \
+         concurrency_pending_keys AS MATERIALIZED ( \
+             SELECT DISTINCT concurrency_key, task_type \
+             FROM harvest_task_queue \
+             WHERE queue_name = ANY($2) \
+               AND state = 'PENDING' \
+               AND scheduled_at <= NOW() \
+               AND concurrency_key IS NOT NULL \
+               AND concurrency_cap IS NOT NULL \
+         ), ",
+            claim_running_counts_sql!("concurrency_running_counts", "concurrency_pending_keys"),
+            ", ",
+            expired_runs_cte_sql!(),
+            ", "
+        )
+    };
+}
+
+/// The result columns of the claim query, one per [`TaskQueueItem`] field
+/// (issue #1971).
+///
+/// The default claim reuses one prepared statement per connection. If the
+/// result followed the table, a migration that adds a column would change
+/// the result type. Postgres then fails the cached statement with "cached
+/// plan must not change result type". A fixed list keeps the result type.
+/// `claim_result_columns_match_the_task_queue_item_fields` pins the list.
+macro_rules! claim_result_columns_sql {
+    () => {
+        "claimed.id, claimed.queue_name, claimed.task_type, \
+             claimed.workflow_exec_id, claimed.activity_name, claimed.activity_id, \
+             claimed.input, claimed.state, claimed.priority, claimed.worker_id, \
+             claimed.attempt, claimed.max_attempts, claimed.scheduled_at, \
+             claimed.started_at, claimed.completed_at, claimed.last_heartbeat_at, \
+             claimed.heartbeat_details, claimed.heartbeat_timeout, \
+             claimed.start_to_close, claimed.schedule_to_start, \
+             claimed.retry_policy, claimed.output, claimed.error, \
+             claimed.sticky_worker_id, claimed.sticky_until, \
+             claimed.sticky_timeout, claimed.trace_context, \
+             claimed.concurrency_key, claimed.concurrency_cap, \
+             claimed.required_build_id, claimed.rate_limit_key, \
+             claimed.crash_strikes, claimed.schedule_to_close_at, \
+             claimed.required_capabilities, claimed.context_headers, \
+             claimed.created_at, claimed.wake_requested, claimed.session_id, \
+             claimed.capability_misses, claimed.capability_miss_workers, \
+             claimed.capability_miss_handler, claimed.timer_fires_at, \
+             claimed.handler_started_attempt, claimed.timed_out_claims, \
+             claimed.handler_started_at, claimed.new_start"
+    };
+}
+
+/// The CTEs after `candidate`: the deadline re-check, the debit and the
+/// claim itself.
+macro_rules! claim_trailing_ctes_sql {
+    () => {
+        concat!(
+            fresh_run_deadline_ctes_sql!(),
+            ", \
+        rate_limit_debit AS ( \
+            UPDATE harvest_rate_limit_buckets b \
+            SET tokens = LEAST(COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_burst ELSE NULL END, b.burst), b.tokens + GREATEST(0, EXTRACT(EPOCH FROM (LEAST(COALESCE(b.override_expires_at, b.last_refilled_at), NOW()) - b.last_refilled_at))) * COALESCE(b.override_refill_rate, b.refill_rate) + GREATEST(0, EXTRACT(EPOCH FROM (NOW() - GREATEST(COALESCE(b.override_expires_at, b.last_refilled_at), b.last_refilled_at)))) * b.refill_rate) - 1.0, \
+                last_refilled_at = NOW() \
+            FROM candidate \
+            WHERE b.key = candidate.rate_limit_key \
+              AND NOT (candidate.activity_name = ANY($5)) \
+              AND NOT (SELECT expired FROM run_expired_now) \
+              AND LEAST(COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_burst ELSE NULL END, b.burst), b.tokens + GREATEST(0, EXTRACT(EPOCH FROM (LEAST(COALESCE(b.override_expires_at, b.last_refilled_at), NOW()) - b.last_refilled_at))) * COALESCE(b.override_refill_rate, b.refill_rate) + GREATEST(0, EXTRACT(EPOCH FROM (NOW() - GREATEST(COALESCE(b.override_expires_at, b.last_refilled_at), b.last_refilled_at)))) * b.refill_rate) >= 1.0 \
+            RETURNING b.key AS debited_key \
+        ), \
+        claimed AS ( \
+            UPDATE harvest_task_queue \
+            SET state = 'RUNNING', worker_id = $1, started_at = NOW(), attempt = attempt + 1, \
+                wake_requested = FALSE \
+            FROM candidate \
+            WHERE harvest_task_queue.id = candidate.id \
+              AND ( \
+                  candidate.concurrency_key IS NULL \
+                  OR ( \
+                      pg_try_advisory_xact_lock(hashtext(candidate.concurrency_key)::bigint) \
+                      AND ( \
+                          candidate.concurrency_cap IS NULL \
+                          OR ( \
+                              SELECT COUNT(*) FROM harvest_task_queue recheck \
+                              WHERE recheck.concurrency_key = candidate.concurrency_key \
+                                AND recheck.task_type = candidate.task_type \
+                                AND recheck.state = 'RUNNING' \
+                                AND recheck.worker_id IS NOT NULL \
+                          ) < candidate.concurrency_cap \
+                      ) \
+                  ) \
+              ) \
+              AND ( \
+                  candidate.rate_limit_key IS NULL \
+                  OR candidate.activity_name = ANY($5) \
+                  OR EXISTS (SELECT 1 FROM rate_limit_debit WHERE debited_key = candidate.rate_limit_key) \
+              ) \
+              AND NOT (SELECT expired FROM run_expired_now) \
+            RETURNING harvest_task_queue.* \
+        ) \
+        SELECT ",
+            claim_result_columns_sql!(),
+            " FROM claimed"
+        )
+    };
+}
+
+/// The bounded window of the default claim (issue #1971).
+///
+/// `seek_heads` reads up to [`CLAIM_SEEK_WINDOW`] rows from each head. Each
+/// polled queue has four heads: one per task type, for continuations and
+/// for new starts. Each queue head is one ordered range of
+/// `idx_harvest_tq_claim_seek`, so a claim for one kind never reads the
+/// other kind. The pin head reads every live pin of this worker through
+/// `idx_harvest_tq_sticky_poll` and keeps the best rows. Each head scan
+/// applies the row-local gates of `claim_head_gates_sql!`, so a row that
+/// this claim cannot take does not use a window slot.
+///
+/// Inside one queue head the due time follows `scheduled_at`. So each head
+/// is in claim order, `priority DESC, due ASC`. A row outside a head sorts at
+/// or after the last row of that head. `seek_bounds` keeps that last row for
+/// each full head. A head that is not full holds every due row it covers.
+///
+/// Priority ageing reorders rows at claim time, so the window cannot serve it.
+/// With `$4 > 0` the window is empty and the full scan runs.
+///
+/// The guard compares `priority` and the due time. Both are `NOT NULL`
+/// (`priority`, `scheduled_at`, `new_start` and `attempt`), so a comparison
+/// is never NULL. The head order and the window key copy the sort terms of
+/// `claim_order_by_sql!` without ageing. A new sort term there needs a head
+/// for it here, or the guard stops being exact.
+///
+/// Each window row carries its claim key and concurrency columns. The column
+/// names start with `seek_`, so they never shadow a table column in a gate.
+/// `seek_running_counts` counts `RUNNING` rows for the window keys only. The
+/// backlog-wide count CTEs then run only with the full scan.
+macro_rules! claim_seek_ctes_sql {
+    () => {
+        concat!(
+            "seek_heads AS MATERIALIZED ( \
+             SELECT h.seek_id, h.seek_rank, h.seek_priority, h.seek_due, h.seek_pinned, \
+                    h.seek_concurrency_key, h.seek_concurrency_cap, h.seek_task_type, \
+                    row_number() OVER ( \
+                        PARTITION BY h.head_queue, h.head_kind, h.head_new_start \
+                        ORDER BY h.seek_priority DESC, h.seek_due ASC \
+                    ) AS seek_rn \
+             FROM ( \
+                 SELECT s.*, FALSE AS seek_pinned, q.name AS head_queue, \
+                        k.head_kind, k.new_start_head AS head_new_start \
+                 FROM (SELECT DISTINCT name FROM unnest($2::text[]) AS u(name)) AS q \
+                 CROSS JOIN paused_queues \
+                 CROSS JOIN paused_activities \
+                 CROSS JOIN (VALUES ('workflow', FALSE), ('workflow', TRUE), \
+                                    ('activity', FALSE), ('activity', TRUE)) \
+                     AS k(head_kind, new_start_head) \
+                 CROSS JOIN LATERAL ( \
+                     SELECT ",
+            claim_seek_row_sql!(),
+            " \
+                     FROM harvest_task_queue \
+                     WHERE queue_name = q.name \
+                       AND task_type = k.head_kind \
+                       AND state = 'PENDING' \
+                       AND (new_start AND attempt = 0) = k.new_start_head \
+                       AND scheduled_at <= NOW() ",
+            claim_head_gates_sql!(),
+            "ORDER BY priority DESC, scheduled_at ASC \
+                     LIMIT ",
+            claim_seek_window_sql!(),
+            " \
+                 ) s \
+                 WHERE NOT (q.name = ANY(paused_queues.names)) \
+                 UNION ALL \
+                 SELECT p.*, TRUE, NULL, NULL, NULL \
+                 FROM paused_queues \
+                 CROSS JOIN paused_activities \
+                 CROSS JOIN LATERAL ( \
+                     SELECT ",
+            claim_seek_row_sql!(),
+            " \
+                     FROM harvest_task_queue \
+                     WHERE sticky_worker_id = $1 \
+                       AND harvest_task_queue.state = 'PENDING' \
+                       AND queue_name = ANY($2) \
+                       AND sticky_until > NOW() \
+                       AND scheduled_at <= NOW() \
+                       AND NOT (queue_name = ANY(paused_queues.names)) ",
+            claim_head_gates_sql!(),
+            "ORDER BY priority DESC, seek_due ASC \
+                     LIMIT ",
+            claim_seek_window_sql!(),
+            " \
+                 ) p \
+             ) h \
+             WHERE $4::BIGINT IS NULL OR $4::BIGINT <= 0 \
+         ), \
+         seek_bounds AS MATERIALIZED ( \
+             SELECT seek_pinned AS bound_pinned, seek_priority AS bound_priority, \
+                    seek_due AS bound_due \
+             FROM seek_heads \
+             WHERE seek_rn = ",
+            claim_seek_window_sql!(),
+            " \
+         ), \
+         seek_pending_keys AS MATERIALIZED ( \
+             SELECT DISTINCT seek_concurrency_key AS concurrency_key, seek_task_type AS task_type \
+             FROM seek_heads \
+             WHERE seek_concurrency_key IS NOT NULL \
+               AND seek_concurrency_cap IS NOT NULL \
+         ), ",
+            claim_running_counts_sql!("seek_running_counts", "seek_pending_keys"),
+            ", "
+        )
+    };
+}
+
+/// The columns of one window row, read from the table row in a head scan.
+///
+/// The rank and the due time are the claim key expressions of
+/// `claim_order_by_sql!`, without ageing.
+macro_rules! claim_seek_row_sql {
+    () => {
+        concat!(
+            "id AS seek_id, \
+             CASE WHEN sticky_worker_id = $1 AND sticky_until > NOW() THEN 1 ELSE 0 END AS seek_rank, \
+             priority AS seek_priority, ",
+            claim_order_due_sql!(),
+            " AS seek_due, \
+             concurrency_key AS seek_concurrency_key, \
+             concurrency_cap AS seek_concurrency_cap, \
+             task_type AS seek_task_type"
+        )
+    };
+}
+
+/// The row source of the window candidate scan (issue #1971).
+///
+/// The array holds the window rows that pass the guard. A window row may be
+/// the candidate only when no row outside the window can sort before it. A
+/// row pinned to this worker outranks every other row, but a full pin head
+/// bounds it. Any other row must sort at or before the last row of each full
+/// head.
+///
+/// The candidate scan reads the table rows by primary key through the
+/// array. See `claim_seek_rows_sql!` for why no other index can serve it.
+macro_rules! claim_seek_guard_sql {
+    () => {
+        "AND harvest_task_queue.id = ANY(ARRAY( \
+                   SELECT w.seek_id FROM seek_heads w \
+                   WHERE NOT EXISTS (SELECT 1 FROM seek_bounds b WHERE \
+                       (b.bound_pinned OR w.seek_rank = 0) \
+                       AND ( \
+                           (b.bound_pinned AND w.seek_rank = 0) \
+                           OR w.seek_priority < b.bound_priority \
+                           OR (w.seek_priority = b.bound_priority \
+                               AND w.seek_due > b.bound_due) \
+                       ) \
+                   ) \
+               )) "
+    };
+}
+
+/// The state test of the window candidate scan (issue #1971).
+///
+/// The scan must read its rows by primary key. Any other plan reads the
+/// whole backlog. The planner guesses the size of the id array and the
+/// number of `PENDING` rows. With stale statistics it picked other plans:
+///
+/// - A partial index that holds `id`, such as `idx_harvest_tq_live_created`:
+///   a full index scan with the id test, 17K buffers.
+/// - A join to the window ids, with the table on the outer side: 30K buffers.
+///
+/// So the test gives the planner no partial index:
+///
+/// - No queue test. The head scans read the polled queues only. No code
+///   changes the queue of a row, so a row lock cannot move it to another
+///   queue. A queue test also let Postgres 16 run
+///   `idx_harvest_tq_coverage_sample` once per pair of queue and id: 27K
+///   buffers at 64 queues.
+/// - The state test compares with a scalar subquery. Postgres cannot prove
+///   `state = 'PENDING'` from it, so no partial index on `PENDING` rows
+///   matches. The row lock still rechecks the state.
+///
+/// The other row tests prove none of the partial-index predicates that do
+/// not test the state. Only the primary key and a scan of the whole table
+/// remain. The primary key costs one probe per window row.
+macro_rules! claim_seek_rows_sql {
+    () => {
+        "harvest_task_queue.state = (SELECT 'PENDING'::text) "
+    };
+}
+
+/// The gate on the full scan (issue #1971).
+///
+/// The full scan runs only when the window found no candidate and cannot
+/// prove that none exists: a head was full, or ageing is on. Postgres plans
+/// this as a one-time filter, so otherwise the scan never runs.
+macro_rules! claim_full_scan_fallback_sql {
+    () => {
+        "AND NOT EXISTS (SELECT 1 FROM seek_candidate) \
+               AND (EXISTS (SELECT 1 FROM seek_bounds) \
+               OR ($4::BIGINT IS NOT NULL AND $4::BIGINT > 0)) "
+    };
+}
+
 // NOTE (issue #619 / Ledger perf pass, buffers -98% @10k): the queue-pause
 // exclusion used to be a per-row correlated `NOT EXISTS`, embedded verbatim
 // and drift-locked literally to
@@ -1063,14 +1623,12 @@ pub const EXPIRED_RUN_GATE_SQL: &str = expired_run_gate_sql!();
 // `COALESCE(..., 0)` reproduces the correlated subquery's implicit zero for a
 // key with no matching RUNNING rows (`concurrency_running_counts` never
 // materializes a zero-count row; `GROUP BY` only emits groups that exist).
-// The `claimed` CTE's own authoritative, `pg_try_advisory_xact_lock`-guarded
-// recheck below is a **separate, single-row** re-evaluation of the identical
-// correlated subquery against the one candidate this soft filter selected —
-// it is NOT rewritten, on purpose: it already runs at most once per claim
-// (never once per row), so it carries none of the cost this fix addresses,
-// and it is the one piece of this predicate that must stay a fresh,
-// serializable-under-the-advisory-lock read rather than a snapshot taken
-// before the lock was acquired. See
+// The `claimed` CTE has its own recheck under `pg_try_advisory_xact_lock`.
+// It runs the same correlated subquery on the one candidate only. It is not
+// rewritten, on purpose. It runs at most once per claim, so it carries none
+// of the cost this fix addresses. It still reads the snapshot of the claim
+// statement, which predates the lock. `release_claim_if_over_cap` repeats the count after the claim, in a
+// fresh snapshot, so the cap holds through commit. See
 // `claim_query_concurrency_gate_matches_the_authoritative_recheck` below for
 // the shape this pre-filter is held to, and
 // `tests/integration/concurrency_key_tests.rs` for the DB-backed correctness
@@ -1078,6 +1636,18 @@ pub const EXPIRED_RUN_GATE_SQL: &str = expired_run_gate_sql!();
 /// The task-claim query — extracted as a `const fn` (mirroring the
 /// `timeout.rs` `*_query()` convention) so its eligibility predicate is
 /// shape-testable without a database.
+///
+/// # Seek window (issue #1971)
+///
+/// The query has two candidate scans. `seek_candidate` reads the rows of a
+/// bounded window from the head of each queue. `legacy_candidate` is the full
+/// scan. The full scan runs only when the window cannot prove its pick. See
+/// `claim_seek_ctes_sql!`, `claim_seek_guard_sql!` and
+/// `claim_full_scan_fallback_sql!`. Both scans come from
+/// `claim_candidate_scan_sql!`, so they apply the same gates and the same
+/// sort. So the claim picks the same row as one full scan would. Its cost no
+/// longer grows with the backlog when the window decides.
+/// `docs/performance.md` has the measurements.
 ///
 /// Binds: `$1` worker id, `$2` queue names, `$3` worker build id,
 /// `$4` priority-aging seconds, `$5` circuit-breaker-tracked activities,
@@ -1105,7 +1675,8 @@ pub const EXPIRED_RUN_GATE_SQL: &str = expired_run_gate_sql!();
 /// is a realistic operator action, not an edge case. See
 /// `docs/performance.md`'s Known limitations section for the measured
 /// comparison against `paused_queues`. That page explains why no
-/// query-shape fix is proposed here.
+/// query-shape fix is proposed here. Since issue #1971 the seek window
+/// sorts only window rows, so the spill does not occur when it decides.
 ///
 /// **Both activity-name gates (`$6` and `paused_activities`) are guarded by
 /// `task_type != 'activity' OR activity_name IS NULL` and this is load-bearing,
@@ -1136,192 +1707,156 @@ pub const EXPIRED_RUN_GATE_SQL: &str = expired_run_gate_sql!();
 #[must_use]
 pub const fn claim_task_query() -> &'static str {
     concat!(
-        "WITH worker_info AS ( \
-             SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels \
-         ), \
-         paused_queues AS MATERIALIZED ( \
-             SELECT COALESCE(array_agg(queue_name), ARRAY[]::text[]) AS names \
-             FROM harvest_queue_pauses \
-             WHERE queue_name = ANY($2) \
-         ), \
-         paused_activities AS MATERIALIZED ( \
-             SELECT COALESCE(array_agg(activity_name), ARRAY[]::text[]) AS names \
-             FROM harvest_activity_pauses \
-         ), \
-         concurrency_pending_keys AS MATERIALIZED ( \
-             SELECT DISTINCT concurrency_key, task_type \
-             FROM harvest_task_queue \
-             WHERE queue_name = ANY($2) \
-               AND state = 'PENDING' \
-               AND scheduled_at <= NOW() \
-               AND concurrency_key IS NOT NULL \
-               AND concurrency_cap IS NOT NULL \
-         ), \
-         concurrency_running_counts AS MATERIALIZED ( \
-             SELECT t.concurrency_key, t.task_type, COUNT(*) AS running_count \
-             FROM harvest_task_queue t \
-             WHERE t.state = 'RUNNING' \
-               AND t.worker_id IS NOT NULL \
-               AND t.concurrency_key IN (SELECT concurrency_key FROM concurrency_pending_keys) \
-             GROUP BY t.concurrency_key, t.task_type \
-         ), ",
-        expired_runs_cte_sql!(),
-        ", \
-         candidate AS ( \
-             SELECT id, task_type, concurrency_key, concurrency_cap, rate_limit_key, activity_name, \
-                    workflow_exec_id \
-             FROM harvest_task_queue \
-             CROSS JOIN worker_info \
-             CROSS JOIN paused_queues \
-             CROSS JOIN paused_activities \
-             WHERE queue_name = ANY($2) \
-               AND state = 'PENDING' \
-               AND scheduled_at <= NOW() \
-               AND NOT (harvest_task_queue.queue_name = ANY(paused_queues.names)) \
-               AND ( \
-                   schedule_to_close_at IS NULL \
-                   OR schedule_to_close_at > NOW() \
-               ) \
-               AND ( \
-                   sticky_worker_id IS NULL \
-                   OR sticky_worker_id = $1 \
-                   OR sticky_until IS NULL \
-                   OR sticky_until <= NOW() \
-               ) \
-               AND ( \
-                   session_id IS NULL \
-                   OR sticky_worker_id = $1 \
-               ) \
-               AND ( \
-                   concurrency_key IS NULL \
-                   OR concurrency_cap IS NULL \
-                   OR COALESCE(( \
-                       SELECT rc.running_count FROM concurrency_running_counts rc \
-                       WHERE rc.concurrency_key = harvest_task_queue.concurrency_key \
-                         AND rc.task_type = harvest_task_queue.task_type \
-                   ), 0) < harvest_task_queue.concurrency_cap \
-               ) \
-               AND ( \
-                   required_build_id IS NULL \
-                   OR ($3 <> '' AND ( \
-                       required_build_id = $3 \
-                       OR EXISTS ( \
-                           SELECT 1 FROM harvest_build_compat \
-                           WHERE build_id = $3 \
-                             AND compatible_with = harvest_task_queue.required_build_id \
-                       ) \
-                   )) \
-               ) \
-               AND ( \
-                   task_type <> 'workflow' \
-                   OR workflow_exec_id IS NULL \
-                   OR NOT EXISTS ( \
-                       SELECT 1 FROM harvest_workflow_executions e \
-                       WHERE e.id = harvest_task_queue.workflow_exec_id \
-                         AND e.state = 'PAUSED' \
-                   ) \
-               ) ",
-        expired_run_gate_sql!(),
-        "               AND ( \
-                   task_type != 'activity' \
-                   OR activity_name IS NULL \
-                   OR required_capabilities IS NOT NULL \
-                   OR NOT (activity_name = ANY($6)) \
-               ) ",
-        saturated_activity_gate_sql!(),
-        "AND ( \
-                   task_type != 'activity' \
-                   OR activity_name IS NULL \
-                   OR NOT (activity_name = ANY(paused_activities.names)) \
-               ) \
-               AND ( \
-                   required_capabilities IS NULL \
-                   OR NOT EXISTS ( \
-                       SELECT 1 \
-                       FROM jsonb_array_elements(required_capabilities) AS r(value) \
-                       WHERE ( \
-                           r.value ? 'Exact' AND ( \
-                               worker_info.labels->>(r.value->'Exact'->>'key') IS NULL \
-                               OR worker_info.labels->>(r.value->'Exact'->>'key') != (r.value->'Exact'->>'value') \
-                           ) \
-                       ) OR ( \
-                           r.value ? 'In' AND ( \
-                               worker_info.labels->>(r.value->'In'->>'key') IS NULL \
-                               OR NOT ( \
-                                   (r.value->'In'->'values') @> jsonb_build_array(worker_info.labels->>(r.value->'In'->>'key')) \
-                               ) \
-                           ) \
-                       ) \
-                   ) \
-               ) \
-               AND ( \
-                   rate_limit_key IS NULL \
-                   OR harvest_task_queue.activity_name = ANY($5) \
-                   OR EXISTS ( \
-                       SELECT 1 FROM harvest_rate_limit_buckets b \
-                       WHERE b.key = harvest_task_queue.rate_limit_key \
-                         AND LEAST(COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_burst ELSE NULL END, b.burst), b.tokens + GREATEST(0, EXTRACT(EPOCH FROM (LEAST(COALESCE(b.override_expires_at, b.last_refilled_at), NOW()) - b.last_refilled_at))) * COALESCE(b.override_refill_rate, b.refill_rate) + GREATEST(0, EXTRACT(EPOCH FROM (NOW() - GREATEST(COALESCE(b.override_expires_at, b.last_refilled_at), b.last_refilled_at)))) * b.refill_rate) >= 1.0 \
-                   ) \
-               ) \
-             ORDER BY \
-                 CASE \
-                     WHEN sticky_worker_id = $1 AND sticky_until > NOW() THEN 1 \
-                     ELSE 0 \
-                 END DESC, \
-                 CASE \
-                     WHEN $4::BIGINT IS NOT NULL AND $4::BIGINT > 0 \
-                     THEN priority + FLOOR(EXTRACT(EPOCH FROM (NOW() - scheduled_at)) / $4::BIGINT)::INT \
-                     ELSE priority \
-                 END DESC, ",
-        claim_order_due_sql!(),
-        " ASC \
-             LIMIT 1 FOR UPDATE SKIP LOCKED \
-        ), ",
-        fresh_run_deadline_ctes_sql!(),
-        ", \
-        rate_limit_debit AS ( \
-            UPDATE harvest_rate_limit_buckets b \
-            SET tokens = LEAST(COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_burst ELSE NULL END, b.burst), b.tokens + GREATEST(0, EXTRACT(EPOCH FROM (LEAST(COALESCE(b.override_expires_at, b.last_refilled_at), NOW()) - b.last_refilled_at))) * COALESCE(b.override_refill_rate, b.refill_rate) + GREATEST(0, EXTRACT(EPOCH FROM (NOW() - GREATEST(COALESCE(b.override_expires_at, b.last_refilled_at), b.last_refilled_at)))) * b.refill_rate) - 1.0, \
-                last_refilled_at = NOW() \
-            FROM candidate \
-            WHERE b.key = candidate.rate_limit_key \
-              AND NOT (candidate.activity_name = ANY($5)) \
-              AND NOT (SELECT expired FROM run_expired_now) \
-              AND LEAST(COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_burst ELSE NULL END, b.burst), b.tokens + GREATEST(0, EXTRACT(EPOCH FROM (LEAST(COALESCE(b.override_expires_at, b.last_refilled_at), NOW()) - b.last_refilled_at))) * COALESCE(b.override_refill_rate, b.refill_rate) + GREATEST(0, EXTRACT(EPOCH FROM (NOW() - GREATEST(COALESCE(b.override_expires_at, b.last_refilled_at), b.last_refilled_at)))) * b.refill_rate) >= 1.0 \
-            RETURNING b.key AS debited_key \
-        ), \
-        claimed AS ( \
-            UPDATE harvest_task_queue \
-            SET state = 'RUNNING', worker_id = $1, started_at = NOW(), attempt = attempt + 1, \
-                wake_requested = FALSE \
-            FROM candidate \
-            WHERE harvest_task_queue.id = candidate.id \
-              AND ( \
-                  candidate.concurrency_key IS NULL \
-                  OR ( \
-                      pg_try_advisory_xact_lock(hashtext(candidate.concurrency_key)::bigint) \
-                      AND ( \
-                          candidate.concurrency_cap IS NULL \
-                          OR ( \
-                              SELECT COUNT(*) FROM harvest_task_queue recheck \
-                              WHERE recheck.concurrency_key = candidate.concurrency_key \
-                                AND recheck.task_type = candidate.task_type \
-                                AND recheck.state = 'RUNNING' \
-                                AND recheck.worker_id IS NOT NULL \
-                          ) < candidate.concurrency_cap \
-                      ) \
-                  ) \
-              ) \
-              AND ( \
-                  candidate.rate_limit_key IS NULL \
-                  OR candidate.activity_name = ANY($5) \
-                  OR EXISTS (SELECT 1 FROM rate_limit_debit WHERE debited_key = candidate.rate_limit_key) \
-              ) \
-              AND NOT (SELECT expired FROM run_expired_now) \
-            RETURNING harvest_task_queue.* \
-        ) \
-        SELECT * FROM claimed"
+        claim_leading_ctes_sql!(),
+        claim_seek_ctes_sql!(),
+        claim_candidate_scan_sql!(
+            "seek_candidate",
+            "seek_running_counts",
+            [claim_seek_rows_sql!()],
+            [claim_seek_guard_sql!()]
+        ),
+        ", ",
+        claim_candidate_scan_sql!(
+            "legacy_candidate",
+            "concurrency_running_counts",
+            ["queue_name = ANY($2) AND state = 'PENDING' "],
+            [claim_full_scan_fallback_sql!()]
+        ),
+        ", candidate AS ( SELECT * FROM seek_candidate \
+         UNION ALL SELECT * FROM legacy_candidate ), ",
+        claim_trailing_ctes_sql!()
     )
+}
+
+/// The claim query without the seek window: one full candidate scan.
+///
+/// The by-id claim (issue #1312) names one row, so a window cannot help it.
+/// It splices its predicate into this form.
+const fn claim_task_full_scan_query() -> &'static str {
+    concat!(
+        claim_leading_ctes_sql!(),
+        claim_candidate_scan_sql!(
+            "candidate",
+            "concurrency_running_counts",
+            ["queue_name = ANY($2) AND state = 'PENDING' "],
+            [""]
+        ),
+        ", ",
+        claim_trailing_ctes_sql!()
+    )
+}
+
+/// The planner settings for the rest of the claim transaction (issue #1971).
+///
+/// **JIT off.** The claim plan holds two candidate scans. Postgres adds the
+/// estimated cost of the full scan to the plan, even when its one-time
+/// filter skips it. At a deep backlog that estimate passes
+/// `jit_above_cost`. JIT then compiles about 330 functions on every claim,
+/// for a statement that runs in about 2 ms. With 8 claimers that cut
+/// throughput at 10K pending rows from 127 to 1.6 claims per second.
+///
+/// **Generic plan.** [`CachedClaimQuery`] keeps one prepared statement per
+/// connection. A custom plan costs about 6 ms of planning on each claim. On
+/// a small backlog that is more than the claim costs to run. Postgres may
+/// keep a custom plan anyway,
+/// because it compares estimated costs, not planning time. The generic plan
+/// has the same shape: bounded head scans, a lookup by primary key and a
+/// gated full scan. An `ANALYZE` of the table invalidates it.
+///
+/// **No bitmap scans.** A head scan must read the index in claim order and
+/// stop at the window. A bitmap scan reads every due row of the head and
+/// sorts them. The planner picks it when it estimates a head below the
+/// window size. A generic plan, skewed queues or stale statistics all give
+/// that estimate. On the issue #1956 fixture, the bitmap form read 2,515
+/// buffers at 10K pending rows. With stale statistics it read 11,704. The
+/// ordered scan does not depend on the estimate.
+///
+/// The full scan reads the whole backlog with or without bitmap scans. A
+/// bitmap scan helps it, though: at 100K pending rows with ageing on, it
+/// read 16K buffers with bitmap scans and 46K without. Ageing skips the
+/// window, so an ageing claim sends [`CLAIM_AGEING_PLAN_SETTINGS_SQL`]
+/// instead.
+///
+/// `SET LOCAL` ends with the transaction, so the session settings of the
+/// connection do not change. The settings travel with the claim, as the
+/// isolation level does, so they do not depend on the pool configuration.
+/// They also cover the post-claim rechecks. Those are short statements on
+/// one row, so these settings suit them too. All settings go in one batch,
+/// so they cost one round trip.
+pub const CLAIM_PLAN_SETTINGS_SQL: &str = "SET LOCAL jit = off; \
+     SET LOCAL plan_cache_mode = force_generic_plan; \
+     SET LOCAL enable_bitmapscan = off";
+
+/// The planner settings of a claim with priority ageing on (issue #1971).
+///
+/// Ageing always runs the full scan, which reads faster with bitmap scans.
+/// See [`CLAIM_PLAN_SETTINGS_SQL`]. Postgres does not plan a cached
+/// statement again when a planner setting changes. So the ageing claim
+/// carries [`CLAIM_AGEING_MARKER`], and the connection caches it as a
+/// separate statement with its own plan.
+pub const CLAIM_AGEING_PLAN_SETTINGS_SQL: &str =
+    "SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan";
+
+/// The comment in front of the ageing claim statement (issue #1971).
+///
+/// It changes the statement text only, so the ageing claim gets its own
+/// cached statement. See [`CLAIM_AGEING_PLAN_SETTINGS_SQL`].
+pub const CLAIM_AGEING_MARKER: &str = "/* claim: priority ageing */ ";
+
+/// One default claim statement with its binds (issue #1971).
+///
+/// `diesel::sql_query` marks every statement as unsafe to cache, so each
+/// claim would parse and plan the statement again. This type pushes the same
+/// SQL and binds, and lets diesel cache the statement by its text. The SQL
+/// text is one of a few constant strings, so the cache stays small.
+///
+/// The claim returns a fixed column list. A migration that adds a column
+/// therefore does not change the result type of the cached statement.
+struct CachedClaimQuery<'a> {
+    sql: &'static str,
+    /// Priority ageing is on. The statement then starts with
+    /// [`CLAIM_AGEING_MARKER`].
+    ageing: bool,
+    worker_id: &'a str,
+    queues: &'a [String],
+    worker_build_id: &'a str,
+    aging_secs: Option<i64>,
+    circuit_breaker_activities: &'a [String],
+    ineligible_activities: &'a [String],
+    fence: Option<(Vec<i32>, Vec<i64>)>,
+}
+
+impl diesel::query_builder::QueryId for CachedClaimQuery<'_> {
+    type QueryId = ();
+    const HAS_STATIC_QUERY_ID: bool = false;
+}
+
+impl diesel::query_builder::Query for CachedClaimQuery<'_> {
+    type SqlType = diesel::sql_types::Untyped;
+}
+
+impl diesel::query_builder::QueryFragment<diesel::pg::Pg> for CachedClaimQuery<'_> {
+    fn walk_ast<'b>(
+        &'b self,
+        mut out: diesel::query_builder::AstPass<'_, 'b, diesel::pg::Pg>,
+    ) -> diesel::QueryResult<()> {
+        use diesel::sql_types::{Array, BigInt, Integer, Nullable, Text};
+        if self.ageing {
+            out.push_sql(CLAIM_AGEING_MARKER);
+        }
+        out.push_sql(self.sql);
+        out.push_bind_param_value_only::<Text, _>(self.worker_id)?;
+        out.push_bind_param_value_only::<Array<Text>, _>(self.queues)?;
+        out.push_bind_param_value_only::<Text, _>(self.worker_build_id)?;
+        out.push_bind_param_value_only::<Nullable<BigInt>, _>(&self.aging_secs)?;
+        out.push_bind_param_value_only::<Array<Text>, _>(self.circuit_breaker_activities)?;
+        out.push_bind_param_value_only::<Array<Text>, _>(self.ineligible_activities)?;
+        if let Some((shards, generations)) = &self.fence {
+            out.push_bind_param_value_only::<Array<Integer>, _>(shards)?;
+            out.push_bind_param_value_only::<Array<BigInt>, _>(generations)?;
+        }
+        Ok(())
+    }
 }
 
 /// Resolve the cross-region DR fence binding for a claim (issue #954).
@@ -1395,7 +1930,7 @@ fn fence_binding(shard: Option<crate::types::ShardId>) -> Option<(Vec<i32>, Vec<
 #[must_use]
 pub fn claim_task_query_fenced() -> &'static str {
     static FENCED: std::sync::LazyLock<String> =
-        std::sync::LazyLock::new(|| splice_dr_fence(claim_task_query(), "$7", "$8"));
+        std::sync::LazyLock::new(|| splice_dr_fence(claim_task_query(), "$7", "$8", 2));
     &FENCED
 }
 
@@ -1403,8 +1938,8 @@ pub fn claim_task_query_fenced() -> &'static str {
 ///
 /// `shard_bind` and `generation_bind` name the two new bind positions. The
 /// single-row claim and the batched claim both use this splice. So one probe
-/// text guards every claim path.
-fn splice_dr_fence(base: &str, shard_bind: &str, generation_bind: &str) -> String {
+/// text guards every claim path. `base` has `scans` candidate scans.
+fn splice_dr_fence(base: &str, shard_bind: &str, generation_bind: &str, scans: usize) -> String {
     // One row when every listed shard is at its pinned generation and the
     // database holds no other row, and none otherwise. The lists hold the
     // claim's shard and its colocated peers. A row this process did not pin
@@ -1425,16 +1960,15 @@ fn splice_dr_fence(base: &str, shard_bind: &str, generation_bind: &str) -> Strin
         .expect("claim query starts with WITH");
     let spliced = format!("{fence_cte}{base}");
 
-    // One anchor, one substitution: `CROSS JOIN worker_info ` appears
-    // exactly once, in the candidate scan's FROM list. Asserting the count
-    // before replacing turns a future edit that duplicates or renames the
-    // anchor into a loud panic at first use instead of a silently unfenced
-    // claim.
+    // `CROSS JOIN worker_info ` appears once in the FROM list of each
+    // candidate scan. Each scan joins the fence. The count assertion turns an
+    // edit that duplicates or renames the anchor into a panic at first use.
+    // Without it, a claim could silently run unfenced.
     let anchor = "CROSS JOIN worker_info ";
     assert_eq!(
         spliced.matches(anchor).count(),
-        1,
-        "claim query fence anchor must appear exactly once"
+        scans,
+        "claim query fence anchor must appear once per candidate scan"
     );
     spliced.replace(anchor, "CROSS JOIN worker_info CROSS JOIN fence ")
 }
@@ -1570,9 +2104,10 @@ pub async fn claim_task_of_kind_on_shard(
     // from picking the same row.
     //
     // Phase 2 (UPDATE): for capped keys, acquire pg_try_advisory_xact_lock
-    // only for the single selected candidate and re-verify the cap. This
-    // closes the race window where two workers could both pass the cap check
-    // in the same poll cycle before either commits. If the advisory lock fails
+    // only for the single selected candidate and re-verify the cap. The
+    // re-check reads the snapshot of the claim statement, which predates the
+    // lock. `release_claim_if_over_cap` counts again after the claim, in a
+    // fresh snapshot, to close that gap. If the advisory lock fails
     // (another worker holds it) or the re-check shows the cap is now
     // saturated, the UPDATE matches 0 rows and the transaction commits with no
     // change; the PENDING row is immediately available for the next poll.
@@ -1695,60 +2230,40 @@ pub async fn claim_task_of_kind_on_shard(
     let outcome: ClaimOutcome = tx
         .run(
             async |conn: &mut AsyncPgConnection| -> HarvestResult<ClaimOutcome> {
-                // Cross-region DR fence (issue #954). Two fully separate
-                // arms, not one boxed builder. `BoxedSqlQuery::bind`
-                // heap-allocates per bind and dispatches dynamically. The
-                // unfenced arm serves every process with no DR marker. It
-                // must not pay for an unused feature on the engine's hottest
-                // statement.
-                let result: Vec<TaskQueueItem> = match fence_binding(shard) {
-                    None => {
-                        let query = kind.map_or_else(claim_task_query, |kind| {
-                            claim_task_query_for_kind(kind, false)
-                        });
-                        diesel::sql_query(query)
-                            .bind::<diesel::sql_types::Text, _>(worker_id)
-                            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
-                            .bind::<diesel::sql_types::Text, _>(worker_build_id)
-                            .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(
-                                aging_secs_i64,
-                            )
-                            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
-                                circuit_breaker_activities,
-                            )
-                            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
-                                ineligible_activities,
-                            )
-                            .load(conn)
-                            .await
-                    }
-                    Some((fence_shards, generations)) => {
-                        let query = kind.map_or_else(claim_task_query_fenced, |kind| {
-                            claim_task_query_for_kind(kind, true)
-                        });
-                        diesel::sql_query(query)
-                            .bind::<diesel::sql_types::Text, _>(worker_id)
-                            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
-                            .bind::<diesel::sql_types::Text, _>(worker_build_id)
-                            .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(
-                                aging_secs_i64,
-                            )
-                            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
-                                circuit_breaker_activities,
-                            )
-                            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
-                                ineligible_activities,
-                            )
-                            .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(
-                                fence_shards,
-                            )
-                            .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(
-                                generations,
-                            )
-                            .load(conn)
-                            .await
-                    }
+                let ageing = aging_secs_i64.is_some_and(|secs| secs > 0);
+                let settings = if ageing {
+                    CLAIM_AGEING_PLAN_SETTINGS_SQL
+                } else {
+                    CLAIM_PLAN_SETTINGS_SQL
+                };
+                diesel_async::SimpleAsyncConnection::batch_execute(conn, settings)
+                    .await
+                    .map_err(crate::error::database_error)?;
+                // Cross-region DR fence (issues #954, #1823). The unfenced
+                // form binds no fence values, so a process with no DR marker
+                // sends the same statement as before. `CachedClaimQuery` binds
+                // without a boxed builder, so neither form pays a heap
+                // allocation per bind.
+                let fence = fence_binding(shard);
+                let sql = match (fence.is_some(), kind) {
+                    (false, None) => claim_task_query(),
+                    (false, Some(kind)) => claim_task_query_for_kind(kind, false),
+                    (true, None) => claim_task_query_fenced(),
+                    (true, Some(kind)) => claim_task_query_for_kind(kind, true),
+                };
+                let result: Vec<TaskQueueItem> = CachedClaimQuery {
+                    sql,
+                    ageing,
+                    worker_id,
+                    queues,
+                    worker_build_id,
+                    aging_secs: aging_secs_i64,
+                    circuit_breaker_activities,
+                    ineligible_activities,
+                    fence,
                 }
+                .load(conn)
+                .await
                 .map_err(crate::error::database_error)?;
 
                 let Some(task) = result.into_iter().next() else {
@@ -1780,15 +2295,16 @@ pub async fn claim_task_of_kind_on_shard(
 
 /// The `candidate` CTE predicate that the by-id claim adds.
 ///
-/// The anchor is the queue-pause array test, which appears exactly once in the
-/// base query. Splicing after it keeps the added predicate inside `candidate`
-/// and leaves every other gate as the same text.
+/// The anchor is the queue-pause array test. It appears once in each
+/// candidate scan, so once in the full-scan form. Splicing after it keeps the
+/// added predicate inside `candidate` and leaves every other gate as the same
+/// text.
 const BY_ID_ANCHOR: &str = "AND NOT (harvest_task_queue.queue_name = ANY(paused_queues.names)) ";
 
 /// The `concurrency_pending_keys` predicate that the by-id claim adds.
 ///
-/// The anchor is the last test of that CTE, which appears exactly once in the
-/// base query.
+/// The anchor is the last test of that CTE. It appears exactly once in the
+/// full-scan form.
 const BY_ID_KEYS_ANCHOR: &str = "AND concurrency_cap IS NOT NULL ";
 
 /// Splice the by-id predicates into `base`.
@@ -1836,8 +2352,10 @@ fn splice_by_id_predicate(base: &str, bind: &str) -> String {
 
 /// [`claim_task_query`] restricted to one named row (issue #1312).
 ///
-/// Identical to the base query plus two predicates on the row id: one in the
-/// `candidate` CTE and one in `concurrency_pending_keys`. Every one of the
+/// Identical to the full-scan form of the claim query plus two predicates on
+/// the row id: one in the `candidate` CTE and one in
+/// `concurrency_pending_keys`. The full-scan form has no seek window (issue
+/// #1971), because a window cannot help a claim of one row. Every one of the
 /// thirteen claim gates still applies. A dispatch reference names a row; it
 /// never authorizes a claim. Binds `$7` task id on top of the base query's
 /// `$1..$6`.
@@ -1850,38 +2368,62 @@ fn splice_by_id_predicate(base: &str, bind: &str) -> String {
 #[must_use]
 pub fn claim_task_by_id_query() -> &'static str {
     static BY_ID: std::sync::LazyLock<String> =
-        std::sync::LazyLock::new(|| splice_by_id_predicate(claim_task_query(), "$7"));
+        std::sync::LazyLock::new(|| splice_by_id_predicate(claim_task_full_scan_query(), "$7"));
     &BY_ID
 }
 
 /// [`claim_task_by_id_query`] with the cross-region DR fence spliced in.
 ///
-/// Derived from [`claim_task_query_fenced`], which already binds `$7` shard id
-/// and `$8` pinned generation, so both by-id predicates bind `$9`.
+/// The fence binds `$7` shard id and `$8` pinned generation, so both by-id
+/// predicates bind `$9`.
 #[must_use]
 pub fn claim_task_by_id_query_fenced() -> &'static str {
-    static BY_ID_FENCED: std::sync::LazyLock<String> =
-        std::sync::LazyLock::new(|| splice_by_id_predicate(claim_task_query_fenced(), "$9"));
+    static BY_ID_FENCED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        splice_by_id_predicate(
+            &splice_dr_fence(claim_task_full_scan_query(), "$7", "$8", 1),
+            "$9",
+        )
+    });
     &BY_ID_FENCED
 }
 
-/// Splice a literal task-kind predicate into the `candidate` CTE of `base`.
+/// The pin-head predicate that the kind splice extends (issue #1971).
 ///
-/// The by-id anchor appears exactly once in the base query. The assertion
-/// makes an edit that breaks it panic at first use.
+/// It appears once, in the pin head of the seek window. The other scans
+/// spell the state test without the table name, so they never match it.
+const SEEK_HEAD_ANCHOR: &str = "AND harvest_task_queue.state = 'PENDING' ";
+
+/// The queue-head predicate that the kind splice extends (issue #1971).
+///
+/// It appears once, after the queue heads. A kind filter there drops the
+/// heads of the other kind before their index scans run.
+const SEEK_QUEUE_HEADS_ANCHOR: &str = "WHERE NOT (q.name = ANY(paused_queues.names)) ";
+
+/// Splice a literal task-kind predicate into every scan of `base`.
+///
+/// The predicate goes into both candidate scans and the pin head. The queue
+/// heads get a filter on their kind instead, so the heads of the other kind
+/// never run. The window then holds only rows of this kind. The assertions
+/// make an edit that breaks an anchor panic at first use.
 fn splice_kind_predicate(base: &str, kind: TaskType) -> String {
-    assert_eq!(
-        base.matches(BY_ID_ANCHOR).count(),
-        1,
-        "claim query kind anchor must appear exactly once"
-    );
-    base.replace(
-        BY_ID_ANCHOR,
-        &format!(
-            "{BY_ID_ANCHOR}AND harvest_task_queue.task_type = '{}' ",
-            kind.as_str()
-        ),
-    )
+    let anchors = [
+        (BY_ID_ANCHOR, 2, "harvest_task_queue.task_type"),
+        (SEEK_HEAD_ANCHOR, 1, "harvest_task_queue.task_type"),
+        (SEEK_QUEUE_HEADS_ANCHOR, 1, "k.head_kind"),
+    ];
+    let mut spliced = base.to_owned();
+    for (anchor, count, column) in anchors {
+        assert_eq!(
+            spliced.matches(anchor).count(),
+            count,
+            "claim query kind anchor {anchor:?} must appear {count} time(s)"
+        );
+        spliced = spliced.replace(
+            anchor,
+            &format!("{anchor}AND {column} = '{}' ", kind.as_str()),
+        );
+    }
+    spliced
 }
 
 /// [`claim_task_query`] limited to one task kind (issue #1787).
@@ -1957,6 +2499,64 @@ pub(crate) async fn release_claim_via(
         .await
         .map_err(crate::error::database_error)?;
     Ok(released > 0)
+}
+
+/// SQL for [`release_claim_if_over_cap`], exposed for shape tests.
+///
+/// One statement, so it takes a fresh `READ COMMITTED` snapshot. The count
+/// includes the row that this transaction just claimed.
+#[must_use]
+pub const fn release_claim_if_over_cap_query() -> &'static str {
+    "UPDATE harvest_task_queue \
+     SET state = 'PENDING', \
+         worker_id = NULL, \
+         started_at = NULL, \
+         attempt = GREATEST(attempt - 1, 0) \
+     WHERE id = $1 \
+       AND state = 'RUNNING' \
+       AND worker_id = $2 \
+       AND concurrency_key IS NOT NULL \
+       AND concurrency_cap IS NOT NULL \
+       AND ( \
+           SELECT COUNT(*) FROM harvest_task_queue recheck \
+           WHERE recheck.concurrency_key = harvest_task_queue.concurrency_key \
+             AND recheck.task_type = harvest_task_queue.task_type \
+             AND recheck.state = 'RUNNING' \
+             AND recheck.worker_id IS NOT NULL \
+       ) > harvest_task_queue.concurrency_cap"
+}
+
+/// Releases a just-claimed task when its concurrency key is over its cap.
+///
+/// # Why a second statement is required
+///
+/// The claim takes the advisory lock of the key, then counts the `RUNNING`
+/// rows of the key. Both happen in one statement, so the count reads the
+/// snapshot from the start of the statement. A claim on the same key can
+/// commit after that snapshot and before the lock. The count then misses
+/// that claim. Several claimers can each miss earlier claims in turn, so the
+/// key can run more than one task over its cap.
+///
+/// This statement takes a fresh snapshot while the transaction still holds
+/// the advisory lock. Every claim on the key that committed before the lock
+/// is visible. A later claim cannot take the lock until this transaction
+/// commits. It skips the row, or it takes the lock after the commit and
+/// sees this claim. So the cap holds through commit.
+///
+/// Every claim path runs this re-check: the default, the by-id and the
+/// batched claim.
+///
+/// A released claim keeps its rate-limit debit, as the pause releases do.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+async fn release_claim_if_over_cap(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    worker_id: &str,
+) -> HarvestResult<bool> {
+    release_claim_via(conn, release_claim_if_over_cap_query(), task_id, worker_id).await
 }
 
 /// The post-claim re-checks shared by [`claim_task_on_shard`] and
@@ -2044,6 +2644,16 @@ async fn apply_post_claim_rechecks(
         return Ok(ClaimOutcome::Released(task.id));
     }
 
+    // Authoritative concurrency-cap re-check. The claim counts the key under
+    // the snapshot of its own statement. See `release_claim_if_over_cap`.
+    // Gated on a capped key, so other claims pay no extra round trip.
+    if task.concurrency_key.is_some()
+        && task.concurrency_cap.is_some()
+        && release_claim_if_over_cap(conn, task.id, worker_id).await?
+    {
+        return Ok(ClaimOutcome::Released(task.id));
+    }
+
     Ok(ClaimOutcome::Claimed(Box::new(task)))
 }
 
@@ -2051,7 +2661,7 @@ async fn apply_post_claim_rechecks(
 ///
 /// The dispatch channel carries a reference to a row. This claims that row
 /// with the full claim predicate. Every gate [`claim_task_on_shard`] applies
-/// still applies. So do both authoritative post-claim re-checks and the
+/// still applies. So do the authoritative post-claim re-checks and the
 /// queue-pause advisory barrier. The query text, the transaction shape and the
 /// isolation level are the same. A reference is a latency hint, never an
 /// authorization.
@@ -8301,7 +8911,7 @@ pub fn claim_task_batched_candidates_query() -> &'static str {
 #[must_use]
 pub fn claim_task_batched_candidates_query_fenced() -> &'static str {
     static FENCED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-        splice_dr_fence(claim_task_batched_candidates_query(), "$13", "$14")
+        splice_dr_fence(claim_task_batched_candidates_query(), "$13", "$14", 1)
     });
     &FENCED
 }
@@ -8588,8 +9198,10 @@ pub fn claim_batched_candidate_attempt_query() -> &'static str {
 /// transaction-scoped and reentrant. Re-acquiring it here is a no-op, not
 /// a second lock. Holding it from here blocks every other claimer from
 /// starting new `RUNNING` work under this key, until this transaction
-/// ends. So the `COUNT` this probe reads stays valid through the later
-/// claim attempt.
+/// ends. The probe counts under the snapshot of its own statement, which
+/// predates the lock, so it can miss a claim that committed just before.
+/// The claim attempt counts again in a fresh snapshot, under the lock, and
+/// that count is the authoritative one.
 #[must_use]
 pub const fn claim_batched_candidate_concurrency_probe_query() -> &'static str {
     "SELECT ( \
@@ -9339,8 +9951,15 @@ mod tests {
         );
         assert_eq!(
             fenced.matches("CROSS JOIN fence").count(),
+            2,
+            "each candidate scan joins the fence once (issue #1971)"
+        );
+        assert_eq!(
+            claim_task_by_id_query_fenced()
+                .matches("CROSS JOIN fence")
+                .count(),
             1,
-            "the candidate CTE joins the fence exactly once"
+            "the by-id form has one candidate scan"
         );
         // The probe must stay a PLAIN read. A shared row lock here would make
         // every claim in the fleet a `MultiXactId` producer on the single
@@ -9399,7 +10018,7 @@ mod tests {
         assert_eq!(unspliced, base, "the splice must change nothing else");
     }
 
-    /// The single-row fenced query keeps its exact pre-#1823 text.
+    /// The single-row fenced query differs from the base only by the fence.
     #[test]
     fn the_shared_splice_keeps_the_single_row_fenced_query_text() {
         let unspliced = claim_task_query_fenced()
@@ -9412,7 +10031,8 @@ mod tests {
                 "WITH ",
                 1,
             )
-            .replacen("CROSS JOIN fence ", "", 1);
+            .replace("CROSS JOIN fence ", "");
+        // Both candidate scans of the seek claim join the fence (issue #1971).
         assert_eq!(unspliced, claim_task_query());
     }
 
@@ -9816,23 +10436,33 @@ mod tests {
     #[test]
     fn every_claim_query_sorts_on_the_claim_order_due_time() {
         let order_key = format!("END DESC, {CLAIM_ORDER_DUE_SQL} ASC");
+        // Each candidate scan sorts on the claim key. A seek form has two
+        // scans, and its window copies the same due time (issue #1971). Only
+        // its queue heads walk `scheduled_at`, because inside one head the due
+        // time follows it.
         let variants = [
-            claim_task_query(),
-            claim_task_query_fenced(),
-            claim_task_by_id_query(),
-            claim_task_by_id_query_fenced(),
-            claim_task_query_for_kind(TaskType::Workflow, false),
-            claim_task_query_for_kind(TaskType::Activity, false),
-            claim_task_query_for_kind(TaskType::Workflow, true),
-            claim_task_query_for_kind(TaskType::Activity, true),
+            (claim_task_query(), true),
+            (claim_task_query_fenced(), true),
+            (claim_task_by_id_query(), false),
+            (claim_task_by_id_query_fenced(), false),
+            (claim_task_query_for_kind(TaskType::Workflow, false), true),
+            (claim_task_query_for_kind(TaskType::Activity, false), true),
+            (claim_task_query_for_kind(TaskType::Workflow, true), true),
+            (claim_task_query_for_kind(TaskType::Activity, true), true),
         ];
-        for sql in variants {
+        for (sql, seek) in variants {
             assert_eq!(
                 sql.matches(&order_key).count(),
-                1,
+                if seek { 2 } else { 1 },
                 "the due time must sort right after the priority key; got:\n{sql}"
             );
-            assert!(!sql.contains("scheduled_at ASC"), "got:\n{sql}");
+            let window_key = format!("{CLAIM_ORDER_DUE_SQL} AS seek_due");
+            assert_eq!(sql.matches(&window_key).count(), if seek { 2 } else { 0 });
+            assert_eq!(
+                sql.matches("scheduled_at ASC").count(),
+                usize::from(seek),
+                "got:\n{sql}"
+            );
         }
         let batched = claim_task_batched_candidates_query();
         assert!(batched.contains(&format!("{CLAIM_ORDER_DUE_SQL} AS claim_due_at")));
@@ -9845,8 +10475,8 @@ mod tests {
     fn expired_run_set_matches_the_scanner_and_takes_no_lock() {
         for clause in [
             "expired_runs AS MATERIALIZED",
-            "WHERE state = 'RUNNING'",
-            "deadline_at < NOW() OR chain_deadline_at < NOW()",
+            "WHERE state = 'RUNNING' AND deadline_at < NOW() UNION ALL",
+            "WHERE state = 'RUNNING' AND chain_deadline_at < NOW()",
         ] {
             assert!(
                 EXPIRED_RUNS_CTE_SQL.contains(clause),
@@ -9928,24 +10558,28 @@ mod tests {
         );
     }
 
-    /// Every claim variant carries the expired-run set and its gate exactly
-    /// once, inside `candidate` (issue #1824).
+    /// Every claim variant carries the expired-run set once, and its gate
+    /// once in each candidate scan (issues #1824, #1971).
     #[test]
     fn every_claim_query_skips_expired_runs() {
         let variants = [
-            claim_task_query(),
-            claim_task_query_fenced(),
-            claim_task_by_id_query(),
-            claim_task_by_id_query_fenced(),
-            claim_task_query_for_kind(TaskType::Workflow, false),
-            claim_task_query_for_kind(TaskType::Activity, false),
-            claim_task_query_for_kind(TaskType::Workflow, true),
-            claim_task_query_for_kind(TaskType::Activity, true),
-            claim_task_batched_candidates_query(),
+            (claim_task_query(), 2),
+            (claim_task_query_fenced(), 2),
+            (claim_task_by_id_query(), 1),
+            (claim_task_by_id_query_fenced(), 1),
+            (claim_task_query_for_kind(TaskType::Workflow, false), 2),
+            (claim_task_query_for_kind(TaskType::Activity, false), 2),
+            (claim_task_query_for_kind(TaskType::Workflow, true), 2),
+            (claim_task_query_for_kind(TaskType::Activity, true), 2),
+            (claim_task_batched_candidates_query(), 1),
         ];
-        for sql in variants {
+        for (sql, scans) in variants {
             assert_eq!(sql.matches(EXPIRED_RUNS_CTE_SQL).count(), 1, "got:\n{sql}");
-            assert_eq!(sql.matches(EXPIRED_RUN_GATE_SQL).count(), 1, "got:\n{sql}");
+            assert_eq!(
+                sql.matches(EXPIRED_RUN_GATE_SQL).count(),
+                scans,
+                "got:\n{sql}"
+            );
         }
         let base = claim_task_query();
         let candidate = base.find("candidate AS (").expect("candidate CTE");
@@ -9953,8 +10587,316 @@ mod tests {
         let claimed = base.find("claimed AS (").expect("claimed CTE");
         assert!(
             candidate < gate && gate < claimed,
-            "the gate sits in candidate"
+            "the gate sits in a candidate scan"
         );
+    }
+
+    // ── Seek window (issue #1971) ──────────────────────────────────────────
+
+    /// The text of one top-level CTE of `sql`, from its name to the next CTE.
+    fn cte<'a>(sql: &'a str, name: &str, next: &str) -> &'a str {
+        let start = [format!("WITH {name} AS"), format!(", {name} AS")]
+            .iter()
+            .find_map(|head| sql.find(head.as_str()))
+            .unwrap_or_else(|| panic!("no {name} CTE in:\n{sql}"));
+        let end = sql[start + 2..]
+            .find(&format!(", {next} AS"))
+            .unwrap_or_else(|| panic!("no {next} CTE after {name} in:\n{sql}"));
+        &sql[start..start + 2 + end]
+    }
+
+    /// The default claim reads a bounded, index-ordered window per queue head.
+    ///
+    /// Each head is one equality range of `idx_harvest_tq_claim_seek`. The
+    /// window must never read the whole due backlog.
+    #[test]
+    fn claim_query_reads_a_bounded_seek_window_per_queue_head() {
+        assert_eq!(
+            claim_seek_window_sql!(),
+            CLAIM_SEEK_WINDOW.to_string(),
+            "the SQL window and the public constant name one size"
+        );
+        let sql = claim_task_query();
+        let heads = cte(sql, "seek_heads", "seek_bounds");
+        for clause in [
+            "seek_heads AS MATERIALIZED",
+            "FROM (SELECT DISTINCT name FROM unnest($2::text[]) AS u(name)) AS q",
+            "CROSS JOIN LATERAL",
+            "WHERE queue_name = q.name",
+            "AND (new_start AND attempt = 0) = k.new_start_head",
+            "ORDER BY priority DESC, scheduled_at ASC",
+            "WHERE sticky_worker_id = $1",
+            "ORDER BY priority DESC, seek_due ASC",
+            "WHERE NOT (q.name = ANY(paused_queues.names))",
+        ] {
+            assert!(heads.contains(clause), "missing {clause:?} in:\n{heads}");
+        }
+        assert_eq!(
+            heads.matches(&format!("LIMIT {CLAIM_SEEK_WINDOW}")).count(),
+            2,
+            "the queue heads and the pin head are each bounded; got:\n{heads}"
+        );
+        assert!(
+            heads.contains("WHERE $4::BIGINT IS NULL OR $4::BIGINT <= 0"),
+            "ageing reorders at claim time, so it empties the window; got:\n{heads}"
+        );
+    }
+
+    /// The window candidate passes the guard against every full head.
+    #[test]
+    fn claim_query_guards_the_window_against_every_full_head() {
+        let sql = claim_task_query();
+        assert!(
+            cte(sql, "seek_bounds", "seek_pending_keys")
+                .contains(&format!("WHERE seek_rn = {CLAIM_SEEK_WINDOW}")),
+            "only a full head bounds the rows outside the window; got:\n{sql}"
+        );
+        let seek = cte(sql, "seek_candidate", "legacy_candidate");
+        for clause in [
+            "AND harvest_task_queue.id = ANY(ARRAY( SELECT w.seek_id FROM seek_heads w",
+            "NOT EXISTS (SELECT 1 FROM seek_bounds b",
+            "FROM seek_running_counts rc",
+            "FOR UPDATE SKIP LOCKED",
+        ] {
+            assert!(seek.contains(clause), "missing {clause:?} in:\n{seek}");
+        }
+        assert!(
+            !seek.contains("concurrency_running_counts"),
+            "the window must not read the backlog-wide count CTE; got:\n{seek}"
+        );
+    }
+
+    /// The full scan runs only when the window cannot decide.
+    #[test]
+    fn claim_query_falls_back_to_the_full_scan_only_when_the_window_cannot_decide() {
+        let sql = claim_task_query();
+        let legacy = cte(sql, "legacy_candidate", "candidate");
+        assert!(
+            legacy.contains(
+                "AND NOT EXISTS (SELECT 1 FROM seek_candidate) \
+                 AND (EXISTS (SELECT 1 FROM seek_bounds) \
+                 OR ($4::BIGINT IS NOT NULL AND $4::BIGINT > 0)) "
+            ),
+            "the fallback needs an empty window result and a full head or ageing; \
+             got:\n{legacy}"
+        );
+        assert!(legacy.contains("FROM concurrency_running_counts rc"));
+        assert!(
+            sql.contains(
+                "candidate AS ( SELECT * FROM seek_candidate \
+                 UNION ALL SELECT * FROM legacy_candidate )"
+            ),
+            "got:\n{sql}"
+        );
+    }
+
+    /// Both candidate scans carry the same gates, so the window cannot pick a
+    /// row that the full scan would reject.
+    #[test]
+    fn both_candidate_scans_carry_every_gate() {
+        let sql = claim_task_query();
+        let seek = cte(sql, "seek_candidate", "legacy_candidate");
+        let legacy = cte(sql, "legacy_candidate", "candidate");
+        for gate in [
+            "NOT (harvest_task_queue.queue_name = ANY(paused_queues.names))",
+            "schedule_to_close_at IS NULL",
+            "sticky_until <= NOW()",
+            "session_id IS NULL",
+            "required_build_id IS NULL",
+            "e.state = 'PAUSED'",
+            EXPIRED_RUN_GATE_SQL,
+            "OR NOT (activity_name = ANY($6))",
+            "OR NOT (activity_name = ANY(paused_activities.names))",
+            "jsonb_array_elements(required_capabilities)",
+            "harvest_rate_limit_buckets b",
+            "FOR UPDATE SKIP LOCKED",
+        ] {
+            assert!(seek.contains(gate), "window scan lacks {gate:?}");
+            assert!(legacy.contains(gate), "full scan lacks {gate:?}");
+        }
+    }
+
+    /// The post-claim cap re-check counts what the claim counts, and gives
+    /// back only this worker's own capped claim.
+    #[test]
+    fn the_cap_recheck_counts_what_the_claim_counts() {
+        let release = release_claim_if_over_cap_query();
+        for clause in [
+            "WHERE id = $1 AND state = 'RUNNING' AND worker_id = $2",
+            "attempt = GREATEST(attempt - 1, 0)",
+            "concurrency_key IS NOT NULL AND concurrency_cap IS NOT NULL",
+            "recheck.concurrency_key = harvest_task_queue.concurrency_key",
+            "recheck.task_type = harvest_task_queue.task_type",
+            "recheck.state = 'RUNNING' AND recheck.worker_id IS NOT NULL",
+            ") > harvest_task_queue.concurrency_cap",
+        ] {
+            assert!(
+                release.contains(clause),
+                "missing {clause:?} in:\n{release}"
+            );
+        }
+        let claim = claim_task_query();
+        for clause in [
+            "recheck.task_type = candidate.task_type",
+            "AND recheck.state = 'RUNNING' AND recheck.worker_id IS NOT NULL",
+            ") < candidate.concurrency_cap",
+        ] {
+            assert!(claim.contains(clause), "the claim lacks {clause:?}");
+        }
+    }
+
+    /// The window scan gives the planner no partial index (issue #1971).
+    ///
+    /// The head scans already test the polled queues. A queue test or a
+    /// constant state test lets stale statistics pick a partial index, which
+    /// reads the whole backlog.
+    #[test]
+    fn the_window_scan_matches_no_partial_index() {
+        let sql = claim_task_query();
+        let seek = cte(sql, "seek_candidate", "legacy_candidate");
+        let legacy = cte(sql, "legacy_candidate", "candidate");
+        assert!(!seek.contains("WHERE queue_name = ANY($2)"), "{seek}");
+        assert!(
+            seek.contains("WHERE harvest_task_queue.state = (SELECT 'PENDING'::text) AND"),
+            "no partial index may match the window scan: {seek}"
+        );
+        assert!(legacy.contains("WHERE queue_name = ANY($2) AND state = 'PENDING'"));
+        let heads = cte(sql, "seek_heads", "seek_bounds");
+        assert_eq!(heads.matches("unnest($2::text[])").count(), 1, "{heads}");
+        assert!(
+            heads.contains("queue_name = ANY($2)"),
+            "the pin head: {heads}"
+        );
+    }
+
+    /// The head scans spell the index keys of `idx_harvest_tq_claim_seek`
+    /// (issue #1971).
+    ///
+    /// Postgres matches an index expression by its text. A head predicate
+    /// that drifts from the index silently loses the bounded scan.
+    #[test]
+    fn claim_seek_heads_match_the_index_expression() {
+        const MIGRATION: &str =
+            include_str!("../migrations/20261008042107_harvest_task_queue_claim_seek_index/up.sql");
+        assert!(MIGRATION.contains(
+            "(queue_name, task_type, (new_start AND attempt = 0), priority DESC, scheduled_at)"
+        ));
+        assert!(MIGRATION.contains("WHERE state = 'PENDING'"));
+        let heads = cte(claim_task_query(), "seek_heads", "seek_bounds");
+        for key in [
+            "WHERE queue_name = q.name",
+            "AND task_type = k.head_kind",
+            "AND state = 'PENDING'",
+            "AND (new_start AND attempt = 0) = k.new_start_head",
+            "ORDER BY priority DESC, scheduled_at ASC",
+        ] {
+            assert!(heads.contains(key), "missing {key:?} in:\n{heads}");
+        }
+    }
+
+    /// The claim sets its planner settings for its own transaction only
+    /// (issue #1971).
+    #[test]
+    fn claim_plan_settings_are_transaction_scoped() {
+        for setting in CLAIM_PLAN_SETTINGS_SQL.split("; ") {
+            assert!(setting.starts_with("SET LOCAL "), "{setting}");
+        }
+        assert!(CLAIM_PLAN_SETTINGS_SQL.contains("jit = off"));
+        assert!(CLAIM_PLAN_SETTINGS_SQL.contains("plan_cache_mode = force_generic_plan"));
+        assert!(CLAIM_PLAN_SETTINGS_SQL.contains("enable_bitmapscan = off"));
+        for setting in CLAIM_AGEING_PLAN_SETTINGS_SQL.split("; ") {
+            assert!(setting.starts_with("SET LOCAL "), "{setting}");
+        }
+        assert!(CLAIM_AGEING_PLAN_SETTINGS_SQL.contains("jit = off"));
+        assert!(CLAIM_AGEING_PLAN_SETTINGS_SQL.contains("plan_cache_mode = force_generic_plan"));
+        assert!(
+            !CLAIM_AGEING_PLAN_SETTINGS_SQL.contains("enable_bitmapscan"),
+            "the ageing claim runs the full scan, which reads faster with bitmap scans"
+        );
+    }
+
+    /// The ageing claim is a separate cached statement (issue #1971).
+    ///
+    /// Postgres keeps a cached plan when a planner setting changes. Only a
+    /// different statement text gets the ageing claim its own plan.
+    #[test]
+    fn the_ageing_claim_has_its_own_statement_text() {
+        let text = |ageing: bool| {
+            let query = CachedClaimQuery {
+                sql: claim_task_query(),
+                ageing,
+                worker_id: "w",
+                queues: &[],
+                worker_build_id: "",
+                aging_secs: ageing.then_some(60),
+                circuit_breaker_activities: &[],
+                ineligible_activities: &[],
+                fence: None,
+            };
+            diesel::debug_query::<diesel::pg::Pg, _>(&query).to_string()
+        };
+        let (plain, ageing) = (text(false), text(true));
+        assert!(plain.starts_with("WITH "), "{plain}");
+        assert!(
+            ageing.starts_with(&format!("{CLAIM_AGEING_MARKER}WITH ")),
+            "{ageing}"
+        );
+    }
+
+    /// The claim result lists every `TaskQueueItem` field (issue #1971).
+    ///
+    /// The list is fixed so that a cached claim statement keeps its result
+    /// type. A field added to the model must be added to the list too.
+    #[test]
+    fn claim_result_columns_match_the_task_queue_item_fields() {
+        use diesel::SelectableHelper;
+        let select = diesel::debug_query::<diesel::pg::Pg, _>(
+            &crate::schema::harvest_task_queue::table.select(TaskQueueItem::as_select()),
+        )
+        .to_string();
+        let model: Vec<String> = select
+            .trim_start_matches("SELECT ")
+            .split(" FROM ")
+            .next()
+            .expect("select list")
+            .split(", ")
+            .map(|c| c.replace("\"harvest_task_queue\".", "").replace('"', ""))
+            .collect();
+        let listed: Vec<String> = claim_result_columns_sql!()
+            .split(", ")
+            .map(|c| c.trim().trim_start_matches("claimed.").to_owned())
+            .collect();
+        assert_eq!(listed, model);
+        assert!(
+            claim_task_query().ends_with(concat!(
+                "SELECT ",
+                claim_result_columns_sql!(),
+                " FROM claimed"
+            )),
+            "the claim must return the fixed column list"
+        );
+    }
+
+    /// A kind-filtered claim applies its kind to every head scan too.
+    #[test]
+    fn kind_claim_query_filters_every_head_scan() {
+        for kind in [TaskType::Workflow, TaskType::Activity] {
+            for fenced in [false, true] {
+                let sql = claim_task_query_for_kind(kind, fenced);
+                let heads = cte(sql, "seek_heads", "seek_bounds");
+                let kind = kind.as_str();
+                for filter in [
+                    format!("{SEEK_HEAD_ANCHOR}AND harvest_task_queue.task_type = '{kind}' "),
+                    format!("{SEEK_QUEUE_HEADS_ANCHOR}AND k.head_kind = '{kind}' "),
+                ] {
+                    assert_eq!(
+                        heads.matches(&filter).count(),
+                        1,
+                        "missing {filter:?}; got:\n{heads}"
+                    );
+                }
+            }
+        }
     }
 
     /// The per-candidate attempt query must reuse the exact production
@@ -10409,14 +11351,14 @@ mod tests {
     fn claim_task_query_honors_the_effective_rate_limit_override() {
         let sql = claim_task_query();
         let effective = effective_available_tokens_expr("b");
-        // Three occurrences: the candidate EXISTS gate, and the
-        // rate_limit_debit CTE's own SET (the debit) and WHERE (the re-check
-        // immediately before debiting).
+        // Four occurrences. Each candidate scan has one EXISTS gate (issue
+        // #1971). The rate_limit_debit CTE has its SET (the debit) and its
+        // WHERE (the re-check immediately before debiting).
         assert_eq!(
             sql.matches(&effective).count(),
-            3,
+            4,
             "claim_task_query must apply the effective-rate-limit formula at \
-             the EXISTS gate and both halves of the rate_limit_debit CTE; \
+             each EXISTS gate and both halves of the rate_limit_debit CTE; \
              got:\n{sql}"
         );
     }
@@ -13164,7 +14106,7 @@ mod tests {
 
     #[test]
     fn by_id_claim_query_is_the_base_query_plus_exactly_two_predicates() {
-        let base = claim_task_query();
+        let base = claim_task_full_scan_query();
         let by_id = claim_task_by_id_query();
         let candidate_predicate = "AND harvest_task_queue.id = $7 ";
         let keys_predicate = "AND id = $7 ";
@@ -13176,7 +14118,11 @@ mod tests {
                 .replace(candidate_predicate, "")
                 .replace(keys_predicate, ""),
             base,
-            "the by-id query must differ from the base query by two predicates only"
+            "the by-id query must differ from the full-scan form by two predicates only"
+        );
+        assert!(
+            !by_id.contains("seek_heads"),
+            "a by-id claim names one row and needs no seek window"
         );
     }
 
@@ -13214,7 +14160,7 @@ mod tests {
             fenced
                 .replace(candidate_predicate, "")
                 .replace(keys_predicate, ""),
-            claim_task_query_fenced()
+            splice_dr_fence(claim_task_full_scan_query(), "$7", "$8", 1)
         );
     }
 
@@ -13263,8 +14209,9 @@ mod tests {
         );
     }
 
-    /// The kind form differs from its base by one literal predicate (issue
-    /// #1787). Every gate the base query proves therefore holds for it too.
+    /// The kind form differs from its base by one literal predicate, spliced
+    /// into each scan (issues #1787, #1971). Every gate the base query proves
+    /// therefore holds for it too.
     #[test]
     fn kind_claim_query_is_the_base_query_plus_one_predicate() {
         for (kind, literal) in [
@@ -13272,13 +14219,23 @@ mod tests {
             (TaskType::Activity, "'activity'"),
         ] {
             let predicate = format!("AND harvest_task_queue.task_type = {literal} ");
+            let head_filter = format!("AND k.head_kind = {literal} ");
             for (fenced, base) in [
                 (false, claim_task_query()),
                 (true, claim_task_query_fenced()),
             ] {
                 let query = claim_task_query_for_kind(kind, fenced);
-                assert_eq!(query.matches(&predicate).count(), 1, "{kind} {fenced}");
-                assert_eq!(query.replacen(&predicate, "", 1), base, "{kind} {fenced}");
+                assert_eq!(
+                    query.matches(&predicate).count(),
+                    3,
+                    "two candidate scans and the pin head; {kind} {fenced}"
+                );
+                assert_eq!(query.matches(&head_filter).count(), 1, "{kind} {fenced}");
+                assert_eq!(
+                    query.replace(&predicate, "").replace(&head_filter, ""),
+                    base,
+                    "{kind} {fenced}"
+                );
             }
         }
     }
@@ -13294,16 +14251,31 @@ mod tests {
     }
 
     #[test]
-    fn the_kind_predicate_lands_inside_the_candidate_cte() {
+    fn the_kind_predicate_lands_inside_every_scan() {
         let query = claim_task_query_for_kind(TaskType::Activity, false);
-        let predicate = query
-            .find("AND harvest_task_queue.task_type = 'activity'")
-            .expect("predicate");
-        let candidate = query.find("candidate AS (").expect("candidate CTE");
+        let predicate = "AND harvest_task_queue.task_type = 'activity'";
+        assert_eq!(
+            cte(query, "seek_heads", "seek_bounds")
+                .matches("AND k.head_kind = 'activity'")
+                .count(),
+            1,
+            "the queue heads of the other kind must not run"
+        );
+        for (name, next, count) in [
+            ("seek_heads", "seek_bounds", 1),
+            ("seek_candidate", "legacy_candidate", 1),
+            ("legacy_candidate", "candidate", 1),
+        ] {
+            assert_eq!(
+                cte(query, name, next).matches(predicate).count(),
+                count,
+                "the kind predicate must sit inside {name}"
+            );
+        }
         let claimed = query.find("claimed AS (").expect("claimed CTE");
         assert!(
-            candidate < predicate && predicate < claimed,
-            "the kind predicate must sit inside the candidate CTE"
+            !query[claimed..].contains(predicate),
+            "the claim itself never filters on kind"
         );
     }
 
