@@ -28,8 +28,8 @@
 //! # Limits
 //!
 //! - The checkpoint input is the whole state. A state larger than the
-//!   workflow input cap fails the run at its first checkpoint, unless payload
-//!   offload is on.
+//!   workflow input cap fails the run at its first checkpoint. Payload
+//!   offload lifts this limit only when its threshold is at or below the cap.
 //! - Continue-as-new works only in a root workflow. An entity cannot be a
 //!   child workflow.
 //! - [`Entity::max_ops_per_run`], an `execution_timeout` and the
@@ -635,6 +635,26 @@ mod tests {
         let cp: EntityCheckpoint<Vec<i64>> =
             serde_json::from_value(json!({"state": null, "pending": null})).unwrap();
         assert_eq!(cp, EntityCheckpoint::default());
+    }
+
+    /// The budget is the cap, unless every size is accepted.
+    #[test]
+    fn the_checkpoint_budget_follows_the_cap_and_the_offload_threshold() {
+        let budget = |cap: u64, threshold: Option<u64>| {
+            WorkflowContext::for_replay(ExecutionId::new(), vec![])
+                .with_payload_caps(cap, cap, cap, cap)
+                .with_payload_offload_threshold(threshold)
+                .continue_as_new_input_budget()
+        };
+        assert_eq!(budget(0, None), None, "no cap");
+        assert_eq!(budget(100, None), Some(100), "no offload");
+        assert_eq!(budget(100, Some(50)), None, "offload below the cap");
+        assert_eq!(budget(100, Some(100)), None, "offload at the cap");
+        assert_eq!(
+            budget(100, Some(200)),
+            Some(100),
+            "offload above the cap leaves a rejected band"
+        );
     }
 
     #[test]

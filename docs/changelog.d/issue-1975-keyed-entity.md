@@ -42,10 +42,10 @@ checkpoint decision.
 
 **Tests.**
 
-- `entity::tests` (19): serialization, rollback, decode errors, delete,
-  checkpoint carry, the input-cap budget, recorded-decision replay, replay
-  stability against a naive loop, the deadline probe, cancellation, bad
-  input and queries.
+- `entity::tests` (20): serialization, rollback, decode errors, delete,
+  checkpoint carry, the input-cap budget and its offload rule,
+  recorded-decision replay, replay stability against a naive loop, the
+  deadline probe, cancellation, bad input and queries.
 - `tests/integration/entity_tests.rs` (Postgres): a worker crash in the
   middle of an op, with a later op held back; two clients racing on a new
   key; thirty ops across live history checkpoints, with a duplicate key.

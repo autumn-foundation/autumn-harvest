@@ -3985,15 +3985,21 @@ impl WorkflowContext {
         self.history_policy
     }
 
-    /// The largest same-type continue-as-new input this run can write inline.
+    /// The largest same-type continue-as-new input this run can write.
     ///
-    /// Returns `None` when no cap applies: the cap is `0`, or payload offload
-    /// is on. The entity loop uses it to size a checkpoint (issue #1975).
+    /// Returns `None` when every size is accepted. That is true when the cap
+    /// is `0`. It is also true when the offload threshold is at or below the
+    /// cap, because each input above the cap is then offloaded. A higher
+    /// threshold leaves a size band that is rejected, so the cap applies.
+    /// The entity loop uses it to size a checkpoint (issue #1975).
     pub(crate) const fn continue_as_new_input_budget(&self) -> Option<u64> {
-        if self.payload_max_workflow_input == 0 || self.payload_offload_threshold.is_some() {
-            None
-        } else {
-            Some(self.payload_max_workflow_input)
+        let cap = self.payload_max_workflow_input;
+        if cap == 0 {
+            return None;
+        }
+        match self.payload_offload_threshold {
+            Some(threshold) if threshold <= cap => None,
+            _ => Some(cap),
         }
     }
 

@@ -95,8 +95,9 @@ A native primitive stays at rank 13, behind customer pull.
 - The idempotency dedupe holds while the earlier runs are retained. A key
   used before a delete also dedupes after it, so use unique keys.
 - The checkpoint input holds the whole state. A state larger than the
-  workflow input cap fails the run at a checkpoint, unless payload offload
-  is on. Keep state small, or trim it in the handler.
+  workflow input cap fails the run at a checkpoint. Payload offload
+  lifts this limit only when its threshold is at or below the cap. Keep
+  state small, or trim it in the handler.
 - Continue-as-new works only in a root workflow, so an entity cannot be a
   child workflow.
 - These values are part of replay: `max_ops_per_run`, the
