@@ -45309,8 +45309,8 @@ async fn stream_workflow_progress(
 
 /// Rows that one table read of the durable stream returns (issue #1974).
 ///
-/// The producer reads the next page only when the send buffer has room, so
-/// one stream holds at most this page plus the buffer in memory.
+/// The producer reads the next page only when the send buffer has room. One
+/// stream therefore holds at most this page and the buffer in memory.
 const DURABLE_STREAM_PAGE: i64 = 256;
 
 /// Longest wait for a client to take one durable stream frame (issue #1974).
