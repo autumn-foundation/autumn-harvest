@@ -947,3 +947,41 @@ async fn durable_promise_rules_hold_on_signal_with_start() {
         );
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn signal_with_start_settles_a_named_promise_in_a_new_run() {
+    use autumn_harvest::durable_promise::PromiseSettlement;
+    use autumn_harvest::execution::signal_with_start_workflow_execution;
+
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+    let name = "harvest.promise:approval";
+    let settlement = PromiseSettlement::resolved(json!(1)).to_value();
+
+    let first = signal_with_start_workflow_execution(
+        &mut conn,
+        sws_params("sws-run", name, settlement.clone(), None),
+    )
+    .await
+    .expect("first run");
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'COMPLETED', completed_at = now() \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(first.exec_id.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("finish the first run");
+
+    let second = signal_with_start_workflow_execution(
+        &mut conn,
+        sws_params("sws-run", name, settlement, None),
+    )
+    .await
+    .expect("second run");
+    assert_ne!(second.exec_id, first.exec_id, "a new run starts");
+    assert!(
+        second.signal_delivered,
+        "the new run's promise must get its own settlement"
+    );
+}
