@@ -2025,6 +2025,6 @@ standalone note rather than part of the claim-path attribution table above:
   -8.3%, callgrind).
 * [`docs/performance-standalone-activity-overhead.md`](performance-standalone-activity-overhead.md)
   — the cost of a one-step workflow against a bare activity (issue #1987).
-  Rows per job: 17 with a regular activity, 10 with a local activity, 3
-  for a bare task row and 6 for a modelled standalone job.
+  It writes 17 rows per job with a regular activity and 10 with a local
+  activity. A bare task row writes 3, and a modelled standalone job 6.
   [ADR 0006](adr/0006-standalone-activity.md) records the decision.

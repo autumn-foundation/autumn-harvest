@@ -22,8 +22,9 @@
 //! heartbeat, because both write rows on a timer. It stops the worker and
 //! waits for its connections to close before it reads any counter. It
 //! counts only WAL records on the arm's own tables. An idle-worker control
-//! then writes no row and no WAL. Statement calls are context only, because
-//! idle polls add calls. The capture removes the idle call rate from them.
+//! then writes only the worker's two stop updates, which the capture
+//! subtracts. Statement calls are context only, because idle polls add
+//! calls. The capture removes the idle call rate from them.
 //!
 //! Each arm gets a fresh, migrated database, dropped after the arm.
 //! `HARVEST_TEST_DATABASE_URL` is an admin URL. Without it the harness
@@ -616,7 +617,8 @@ async fn stop_worker(
         let others = int(
             conn,
             "SELECT COUNT(*) AS v FROM pg_stat_activity \
-             WHERE datname = current_database() AND pid <> pg_backend_pid()",
+             WHERE datname = current_database() AND pid <> pg_backend_pid() \
+               AND backend_type = 'client backend'",
         )
         .await;
         if others == 0 {
@@ -802,7 +804,7 @@ async fn run_record_job(conn: &mut AsyncPgConnection, queues: &[String]) {
         .await
         .expect("claim a record task")
         .expect("a record task is pending");
-    // The statement that `queue::mark_claim_handler_started` issues.
+    // The row write that `queue::mark_claim_handler_started` makes.
     let marked = diesel::sql_query(
         "UPDATE harvest_task_queue \
          SET handler_started_attempt = $3, handler_started_at = clock_timestamp() \
@@ -1011,7 +1013,12 @@ async fn zz_capture_standalone_activity_overhead_evidence() {
         let _ = writeln!(out, "{}", cost_row(label, m, idle));
     }
     let _ = writeln!(out, "\n| Ratio | Rows written | WAL bytes |\n|---|--:|--:|");
-    for (label, x, floor) in [("A / C", &a, &c), ("B / C", &b, &c), ("B / D", &b, &d)] {
+    for (label, x, floor) in [
+        ("A / C", &a, &c),
+        ("B / C", &b, &c),
+        ("B / D", &b, &d),
+        ("A / D", &a, &d),
+    ] {
         let (rows, wal) = ratio(x, floor);
         let _ = writeln!(out, "| {label} | {rows:.2}x | {wal:.2}x |");
     }

@@ -122,7 +122,12 @@ fn the_perf_page_publishes_the_asserted_structure() {
 fn the_ratio_table_matches_the_cost_table() {
     let doc = read(PERF_DOC);
     let ratios = table_rows(&doc, "| Ratio | Rows written |");
-    for (arm, floor) in [(ARM_A, ARM_C), (ARM_B, ARM_C), (ARM_B, ARM_D)] {
+    for (arm, floor) in [
+        (ARM_A, ARM_C),
+        (ARM_B, ARM_C),
+        (ARM_B, ARM_D),
+        (ARM_A, ARM_D),
+    ] {
         let (rows, wal) = cost(&doc, arm);
         let (f_rows, f_wal) = cost(&doc, floor);
         let label = format!("{} / {}", arm.label, floor.label);
@@ -134,6 +139,71 @@ fn the_ratio_table_matches_the_cost_table() {
                 "the `{label}` ratio does not match the cost table"
             );
         }
+    }
+}
+
+#[test]
+fn the_quoting_docs_match_the_cost_table() {
+    let doc = read(PERF_DOC);
+    let adr = read(ADR_DOC);
+    let fragment = read("docs/changelog.d/issue-1987-standalone-activity.md");
+    let guide = read(GUIDE_DOC);
+    let index = read("docs/performance.md");
+    let (d_rows, d_wal) = cost(&doc, ARM_D);
+    for arm in [ARM_A, ARM_B] {
+        let (rows, wal) = cost(&doc, arm);
+        for (name, text) in [("ADR", &adr), ("changelog fragment", &fragment)] {
+            for ratio in [rows / d_rows, wal / d_wal] {
+                let quoted = format!("{ratio:.2}x");
+                assert!(
+                    text.contains(&quoted),
+                    "the {name} must quote the arm {} / D ratio {quoted}",
+                    arm.label
+                );
+            }
+        }
+    }
+    for arm in ARMS {
+        let (rows, wal) = cost(&doc, arm);
+        let adr_row = format!("| {rows:.2} | {wal:.0} |");
+        let fragment_row = format!("| {rows:.0} | {wal:.0} |");
+        assert!(
+            adr.lines()
+                .any(|l| l.starts_with(&format!("| {} |", arm.label)) && l.ends_with(&adr_row)),
+            "the ADR table must quote arm {} as `{adr_row}`",
+            arm.label
+        );
+        assert!(
+            fragment.lines().any(
+                |l| l.starts_with(&format!("| {} |", arm.label)) && l.ends_with(&fragment_row)
+            ),
+            "the changelog table must quote arm {} as `{fragment_row}`",
+            arm.label
+        );
+    }
+    for (pattern, arm) in [
+        ("One-step workflow, regular activity", ARM_A),
+        ("One-step workflow, local activity", ARM_B),
+        ("Modelled standalone job", ARM_D),
+    ] {
+        let rows = format!("| {:.0} |", cost(&doc, arm).0);
+        assert!(
+            guide
+                .lines()
+                .any(|l| l.contains(pattern) && l.ends_with(&rows)),
+            "the guide row `{pattern}` must end with `{rows}`"
+        );
+    }
+    let (a_rows, _) = cost(&doc, ARM_A);
+    let (b_rows, _) = cost(&doc, ARM_B);
+    for quoted in [
+        format!("{a_rows:.0} rows per job with a regular activity"),
+        format!("{b_rows:.0} with a local"),
+    ] {
+        assert!(
+            index.contains(&quoted),
+            "docs/performance.md must quote `{quoted}`"
+        );
     }
 }
 

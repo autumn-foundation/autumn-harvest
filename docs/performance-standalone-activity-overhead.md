@@ -13,16 +13,20 @@ follows from it.
 ## TL;DR
 
 * A one-step workflow with a regular activity (arm A) writes **5.67x** the
-  rows and **5.78x** the WAL of a bare task row (arm C).
+  rows and **5.77x** the WAL of a bare task row (arm C).
 * A one-step workflow with a local activity (arm B) is the cheapest
   existing pattern. It writes **3.33x** the rows and **3.39x** the WAL of
   arm C.
 * Arm C is a floor that no real API reaches. Arm D adds what a real
   standalone-activity API must also write: a job record and the
-  handler-start marker. Arm B writes **1.67x** the rows and **1.55x** the
+  handler-start marker. Arm B writes **1.67x** the rows and **1.56x** the
   WAL of arm D.
 * `DESIGN-1987.md` §0.6 fixed a 2.0x line against arm D before arm D ran.
   Verdict: **Document the one-step-workflow pattern.**
+* The verdict covers jobs that fit a local activity. A job that needs a
+  regular activity uses arm A, which is **2.83x** the rows and **2.65x**
+  the WAL of arm D. That gap is above the line. §0.6 did not name arm A,
+  so the gap is recorded, not decided. See [Scope](#scope-of-the-verdict).
 * The first line, §0.4, compared against arm C. It could not fail, and it
   gave **Build a standalone-activity API**. That verdict stays on record.
 
@@ -62,16 +66,17 @@ All arms run the same handler body on the same input.
 
 | Arm | Rows written | WAL bytes | Statement calls | Calls net of idle |
 |---|--:|--:|--:|--:|
-| A | 17.00 | 13434 | 146.14 | 96.33 |
-| B | 10.00 | 7884 | 84.86 | 62.24 |
+| A | 17.00 | 13429 | 145.94 | 114.80 |
+| B | 10.00 | 7890 | 83.86 | 63.75 |
 | C | 3.00 | 2326 | 10.00 | 10.00 |
 | D | 6.00 | 5073 | 18.00 | 18.00 |
 
 | Ratio | Rows written | WAL bytes |
 |---|--:|--:|
-| A / C | 5.67x | 5.78x |
+| A / C | 5.67x | 5.77x |
 | B / C | 3.33x | 3.39x |
-| B / D | 1.67x | 1.55x |
+| B / D | 1.67x | 1.56x |
+| A / D | 2.83x | 2.65x |
 
 Where the rows go, per job:
 
@@ -84,7 +89,7 @@ Where the rows go, per job:
 
 * **Rows written** and **WAL bytes** are the deciders. Rows are exact.
   Three repetitions gave the same rows. WAL varied by less than 1%
-  (A 13395-13437, B 7878-7933, C 2326-2327, D 5072-5073).
+  (A 13429-13562, B 7890-7918, C 2326, D 5072-5073).
 * Arm B's 3 task-row updates are the claim, the completion and a reset of
   the capability-miss counters (`reset_capability_misses_after_inline_progress`).
   The reset runs even when the counters are already 0. A guard on it would
@@ -92,7 +97,7 @@ Where the rows go, per job:
 * **Statement calls** are context only. A live worker polls, so its calls
   depend on how long the run takes. "Calls net of idle" removes the idle
   worker's call rate over the same window. Across three repetitions it
-  was 96.33-114.78 for arm A and 62.24-67.39 for arm B. Arms C and D run
+  was 101.30-114.80 for arm A and 59.88-67.18 for arm B. Arms C and D run
   no worker, so their two columns are equal. Their calls do not include
   the worker's claim and dispatch path.
 * **The harness does not measure latency.** Each arm enqueues all its
@@ -125,9 +130,9 @@ Where the rows go, per job:
   upkeep and other databases.
 * **Statement calls** come from `pg_stat_statements`. Harness queries carry
   a `/* harness */` tag, and the capture drops them.
-* **Arms C and D** run through the `queue` API with no worker. Arm D issues
-  the handler-start and record-completion writes as raw SQL. They are the
-  same statements that the worker issues.
+* **Arms C and D** run through the `queue` API with no worker. Arm D makes
+  the handler-start and record-completion writes in raw SQL. They write the
+  same rows as the worker, with fewer columns set.
 
 ## Reproduce
 
@@ -154,6 +159,18 @@ preloaded and `fsync=off`.
 CI runs the structural tests, one per arm. They need only a plain
 database. `standalone_activity_docs` ties this page to those tests, to the
 capture and to the ADR.
+
+## Scope of the verdict
+
+Arm B is the decider, because §0.6 named the cheapest existing pattern. A
+local activity cannot heartbeat, cannot use another queue and has a
+start-to-close cap. A job that needs any of these uses arm A.
+
+Against arm D, arm A is 2.83x on rows and 2.65x on WAL. The fixed cost of
+arm A is 11 more rows than arm D per job. For a job that runs for minutes,
+that cost is small next to the job itself. It matters for short jobs at a
+high rate that must run on another queue. No measurement here covers that
+class. The ADR lists it as an open question.
 
 ## Limits
 

@@ -144,6 +144,17 @@ and four updates. Arm B writes 10, so rows give about 1.67x. WAL is the
 less certain figure. This re-charter is not a blind test. Its value is the
 right comparator, not surprise. The ADR states both verdicts.
 
+### 0.7 Scope found in PR review (after arm D ran)
+
+Review pointed out that §0.6 names arm B only. A job that needs a
+heartbeat, another queue or a long start-to-close cannot use arm B. It
+uses arm A. Arm A against arm D is 2.83x on rows and 2.65x on WAL, above
+the line.
+
+The §0.6 rule is not changed. Its verdict covers jobs that fit a local
+activity. The ADR and the perf page publish the arm A gap as an open
+question, with no line, because no line was fixed for it in advance.
+
 ---
 
 ## 1. Design

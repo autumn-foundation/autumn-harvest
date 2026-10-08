@@ -23,8 +23,8 @@ Per job:
 
 | Arm | Shape | Rows written | WAL bytes |
 |---|---|--:|--:|
-| A | One-step workflow, regular activity | 17.00 | 13434 |
-| B | One-step workflow, local activity | 10.00 | 7884 |
+| A | One-step workflow, regular activity | 17.00 | 13429 |
+| B | One-step workflow, local activity | 10.00 | 7890 |
 | C | Bare floor: one task row | 3.00 | 2326 |
 | D | Realistic floor: task row, job record, handler-start marker | 6.00 | 5073 |
 
@@ -37,19 +37,26 @@ the write cost of the cheapest existing pattern.
   line could not fail. Code reading already put arm B at 6 inserts or
   more, against 3 rows for arm C. Arm C also leaves out writes that any
   real API needs.
-- **§0.6, arm B against arm D.** B is 1.67x on rows and 1.55x on WAL. This
+- **§0.6, arm B against arm D.** B is 1.67x on rows and 1.56x on WAL. This
   line decides.
+- **Arm A against arm D.** A is 2.83x on rows and 2.65x on WAL. §0.6 did
+  not name arm A, so this ratio has no line. It is above 2.0x.
 
 ## Decision
 
 **Document the one-step-workflow pattern.** Do not build a
 standalone-activity start path now.
 
-A standalone API would cut the local-activity pattern from 10 rows per job
-to about 6. That is 1.67x, less than the 2.0x line asks for. The one-step
-pattern also keeps every workflow feature with no new code: idempotent
-start, result fetch, cancel, retention, search attributes, the UI and the
-management API.
+The decision covers jobs that fit a local activity. For them, a standalone
+API would cut the cost from 10 rows per job to about 6. That is 1.67x,
+less than the 2.0x line asks for.
+
+The one-step pattern also keeps every workflow feature with no new code.
+These include idempotent start, result fetch, cancel and retention. They
+also include search attributes, the UI and the management API.
+
+A job that needs a regular activity costs 2.83x arm D. That gap is not
+decided here. See the open questions below.
 
 The [activities guide](../getting-started/activities.md#run-one-durable-job)
 shows the pattern and its local-activity fast path.
@@ -64,6 +71,11 @@ shows the pattern and its local-activity fast path.
   already 0. A guard on that update is a cheap engine fast path. It takes
   arm B from 10 rows to 9.
 - Open questions, if a future measurement reopens a build:
+  - **Regular-activity jobs.** Arm A is 2.83x arm D. For a long job the
+    fixed cost is small next to the job. A short job at a high rate on
+    another queue has no fast path today. Measure that class before a
+    build. An engine fast path for one-step workflows is the other
+    candidate.
   - **Job record.** The janitor deletes terminal activity task rows after
     7 days by default. A task row alone cannot hold a job record for
     longer.
