@@ -831,7 +831,8 @@ async fn run_once(settings: &Settings, arm: Arm, depth: usize) -> RunOutcome {
         },
         elapsed_secs: elapsed,
         completed,
-        activity_runs: ACTIVITY_RUNS.load(Ordering::Relaxed),
+        // Qualified, because Diesel's `load` shadows the atomic method.
+        activity_runs: AtomicU64::load(&ACTIVITY_RUNS, Ordering::Relaxed),
         residue,
         probe_failed,
         truncated,
