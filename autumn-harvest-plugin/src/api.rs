@@ -30823,6 +30823,10 @@ pub(crate) async fn schedule_backfill_inner(
     }
 
     let max_active = backfill_max_active(&schedule);
+    // `AllowAll` has no run cap, so the shard-wide counts below are not
+    // needed. Skipping them also stops a shard outage from failing the
+    // whole backfill (issue #1985).
+    let uncapped = max_active == i64::MAX;
 
     if schedule.is_paused && request.include_paused && kind == ScheduleKind::Dag && !request.dry_run
     {
@@ -30956,57 +30960,61 @@ pub(crate) async fn schedule_backfill_inner(
     // Count running executions once before the loop; track dispatched_this_call separately
     // so we don't re-query on every timestamp. This value gates max_active_runs,
     // so non-dry-run dispatch must not treat count failures as zero.
-    let running_at_start = match query_running_count(&pool, &kind, &name, schedule_id).await {
-        Ok(count) => count,
-        Err(count_failures) => {
-            let status = "partial";
-            let error_summary = Some("one or more shard failures");
-            write_backfill_log(
-                &pool,
-                schedule_id,
-                &actor,
-                &source,
-                request.from,
-                request.to,
-                false,
-                total,
-                0,
-                0,
-                total,
-                status,
-                error_summary,
-                started_at,
-            )
-            .await;
-            let id_str = schedule_id.to_string();
-            write_audit(
-                &pool,
-                &actor,
-                &source,
-                req_id.as_deref(),
-                route,
-                &id_str,
-                STATUS_FAILED,
-                error_summary,
-            )
-            .await;
+    let running_at_start = if uncapped {
+        0
+    } else {
+        match query_running_count(&pool, &kind, &name, schedule_id).await {
+            Ok(count) => count,
+            Err(count_failures) => {
+                let status = "partial";
+                let error_summary = Some("one or more shard failures");
+                write_backfill_log(
+                    &pool,
+                    schedule_id,
+                    &actor,
+                    &source,
+                    request.from,
+                    request.to,
+                    false,
+                    total,
+                    0,
+                    0,
+                    total,
+                    status,
+                    error_summary,
+                    started_at,
+                )
+                .await;
+                let id_str = schedule_id.to_string();
+                write_audit(
+                    &pool,
+                    &actor,
+                    &source,
+                    req_id.as_deref(),
+                    route,
+                    &id_str,
+                    STATUS_FAILED,
+                    error_summary,
+                )
+                .await;
 
-            return Ok(ScheduleBackfillResponse {
-                status: status.to_string(),
-                schedule_id,
-                kind,
-                name,
-                from: request.from,
-                to: request.to,
-                planned_timestamps: fire_times.clone(),
-                total,
-                dispatched: 0,
-                skipped: 0,
-                failed: total,
-                skipped_reasons,
-                partial_shard_failures: count_failures,
-                paused_schedule_warning,
-            });
+                return Ok(ScheduleBackfillResponse {
+                    status: status.to_string(),
+                    schedule_id,
+                    kind,
+                    name,
+                    from: request.from,
+                    to: request.to,
+                    planned_timestamps: fire_times.clone(),
+                    total,
+                    dispatched: 0,
+                    skipped: 0,
+                    failed: total,
+                    skipped_reasons,
+                    partial_shard_failures: count_failures,
+                    paused_schedule_warning,
+                });
+            }
         }
     };
     // A throttled scheduled/backfill fire (issue #607) durably defers before any
@@ -31022,7 +31030,7 @@ pub(crate) async fn schedule_backfill_inner(
     // matching the earlier fix's precedent of scoping throttle-aware overlap
     // counting (`tick_one_workflow_schedule`/`drain_buffered_schedule_runs` in
     // scheduler.rs) to workflows only.
-    let running_at_start = if kind == ScheduleKind::Workflow {
+    let running_at_start = if kind == ScheduleKind::Workflow && !uncapped {
         match query_pending_throttle_count(&pool, &name).await {
             Ok(pending) => running_at_start + pending,
             Err(count_failures) => {

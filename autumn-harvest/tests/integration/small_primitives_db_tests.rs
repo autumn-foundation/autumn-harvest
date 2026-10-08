@@ -535,6 +535,33 @@ async fn skip_manual_trigger_is_rejected_at_max_active_runs() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn allow_all_drains_a_buffered_slot_at_max_active_runs() {
+    use autumn_harvest::schema::harvest_schedules::dsl;
+    let (url, _c) = setup().await;
+    let schedule_id = insert_schedule(&url, "overlap_wf", "allow_all", false).await;
+    start_with_schedule(&url, "overlap_wf", "already-running", Some(schedule_id)).await;
+    let slot = (Utc::now() - chrono::Duration::seconds(120)).to_rfc3339();
+    let mut conn = connect(&url).await;
+    diesel::update(dsl::harvest_schedules.find(schedule_id))
+        .set((
+            dsl::buffered_runs.eq(json!([slot])),
+            dsl::next_run_at.eq(Utc::now() + chrono::Duration::seconds(600)),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("leave a slot in the buffer");
+
+    tick(&url).await;
+
+    assert_eq!(
+        executions(&url, "overlap_wf").await.len(),
+        2,
+        "the buffered slot must start although the schedule is at its cap"
+    );
+    assert_eq!(buffered_count(&url, schedule_id).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn allow_all_fires_every_catchup_slot_in_one_tick() {
     let (url, _c) = setup().await;
     insert_schedule(&url, "overlap_wf", "allow_all", true).await;

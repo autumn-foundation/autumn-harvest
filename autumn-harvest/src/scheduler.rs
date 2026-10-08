@@ -6407,6 +6407,7 @@ async fn drain_buffered_schedule_runs(
 /// Return the free run slots of a buffered row, or `None` if it cannot drain.
 ///
 /// A row cannot drain when its buffer is empty or it is at `max_active_runs`.
+/// An `AllowAll` row always drains.
 #[cfg(feature = "db")]
 async fn buffered_drain_capacity(
     conn: &mut AsyncPgConnection,
@@ -6415,6 +6416,12 @@ async fn buffered_drain_capacity(
 ) -> HarvestResult<Option<i64>> {
     if parse_buffered_runs(&schedule.buffered_runs).is_empty() {
         return Ok(None);
+    }
+    // `AllowAll` ignores `max_active_runs` (issue #1985). A policy switch
+    // clears the buffer, but a tick that races the switch can still leave a
+    // slot in it. Drain it under the per-tick limit.
+    if OverlapPolicy::from_db(&schedule.overlap_policy) == OverlapPolicy::AllowAll {
+        return Ok(Some(i64::from(ALLOW_ALL_MAX_STARTS_PER_TICK)));
     }
     // Tick-exact running basis (RUNNING/PAUSED count, `schedule_id`-scoped
     // cross-type successors included per issue #1160, plus the #607
