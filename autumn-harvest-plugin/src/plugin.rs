@@ -668,13 +668,17 @@ impl HarvestPlugin {
     /// The generated MCP tool routes get the same session check: a `GET`
     /// tool needs a `read` role, any other tool a `mutate` role.
     ///
-    /// It replaces an earlier [`Self::api_with_auth`]. A later
+    /// It replaces an earlier [`Self::api_with_auth`] or
+    /// [`Self::api_with_role_auth`], read-only layer included. A later
     /// [`Self::api_with_auth`] replaces it. See [`crate::oidc`].
     #[cfg(feature = "oidc")]
     #[must_use]
     pub fn api_with_oidc(mut self, path: impl Into<String>, login: crate::oidc::OidcLogin) -> Self {
         self.api_path = Some(path.into());
         self.api_middleware = None;
+        // The read-only role of `api_with_role_auth` reads host session keys.
+        // The login replaces that host auth, so the custom roles decide alone.
+        self.role_auth_enabled = false;
         // `build` installs the OIDC tool gate. It needs the API state.
         self.mcp_tool_middleware = None;
         self.oidc = Some(login);
@@ -3456,6 +3460,16 @@ mod tests {
             call(axum::http::Method::POST, operator).await,
             axum::http::StatusCode::OK
         );
+    }
+
+    #[cfg(feature = "oidc")]
+    #[test]
+    fn api_with_oidc_replaces_the_legacy_read_only_role() {
+        let plugin = HarvestPlugin::new()
+            .api_with_role_auth("/api", autumn_web::auth::RequireAuth::new("test"));
+        assert!(plugin.role_auth_enabled);
+        let plugin = plugin.api_with_oidc("/api", oidc_login());
+        assert!(!plugin.role_auth_enabled);
     }
 
     #[cfg(feature = "oidc")]

@@ -679,7 +679,8 @@ loopback. The scope must include `openid`.
 - The claim map reads the signed ID token only.
 - Logout does not end the session at the identity provider.
 - `api_with_oidc` and `api_with_auth` replace each other. The last call
-  wins, and the roles of a replaced login go with it. The roles of a login
+  wins, and the roles of a replaced login go with it. `api_with_oidc` also
+  turns off the read-only layer of an earlier `api_with_role_auth`. The roles of a login
   replace any set by `with_roles`.
 
 ### mTLS on the management API
