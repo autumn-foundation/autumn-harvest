@@ -7988,7 +7988,8 @@ pub async fn rerun_workflow_execution_with_codecs(
             // polluting `?search_attr=` filtering and misleading compliance
             // tooling into believing the new run had been erased. Drop them.
             // (`context_headers` is NULLed rather than tombstoned by the row
-            // scrub, so it needs no equivalent test.)
+            // scrub. So it needs no equivalent test.)
+            //
             // The start path below encodes memo and input itself, so it needs
             // the plaintext (issue #1979). A tombstone is not an envelope, so
             // it decodes to itself and the filter still sees it.

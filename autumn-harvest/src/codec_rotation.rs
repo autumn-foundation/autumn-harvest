@@ -697,13 +697,13 @@ mod db {
     /// Count `harvest_events` rows and codec-column cells per codec key id on
     /// this connection's shard (issue #948, issue #1979).
     ///
-    /// An event row is counted once per distinct key id it references, so an
-    /// event whose `input` and `output` sit under different keys contributes to
+    /// An event row counts once per distinct key id it references. So an
+    /// event whose `input` and `output` sit under different keys counts for
     /// both. A codec-column cell, one row's value in one of
-    /// [`CODEC_COLUMNS`], counts once. Values with no ciphertext — plaintext,
-    /// offload reference envelopes (#524), erasure tombstones (#495) —
-    /// contribute nothing, which is what keeps this census in agreement with
-    /// what the sweep can actually convert.
+    /// [`CODEC_COLUMNS`], counts once. A value with no ciphertext counts for
+    /// nothing: plaintext, an offload reference envelope (#524) or an erasure
+    /// tombstone (#495). That keeps this census in step with what the sweep
+    /// can convert.
     ///
     /// This is a sequential scan of the largest tables in the schema. It backs an
     /// admin-gated, operator-invoked read and the retirement gate — both
