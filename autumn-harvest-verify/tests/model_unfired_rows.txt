@@ -77,10 +77,6 @@ reduction:min
 reduction:product
 reduction:remove@HashMap
 reduction:remove@HashSet
-# Issue #1985: no corpus crate calls this new method yet.
-sanctioned:new_promise@WorkflowContext
-# Issue #1985: no corpus crate calls this new method yet.
-sanctioned:promise@WorkflowContext
 sanitizer:collect
 sanitizer:into_sorted_vec@BinaryHeap
 sanitizer:reverse@Vec
