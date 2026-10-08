@@ -178,12 +178,15 @@ pub struct WorkerConfigView {
     pub query_timeout_ms: u64,
     /// Priority-aging period in seconds (`null` = aging disabled).
     pub priority_aging_secs: Option<u32>,
-    /// Whether cross-region DR write-authority fencing is enabled (issue #954).
+    /// The cross-region DR fencing mode: `auto`, `enabled` or `disabled`
+    /// (issues #954, #1823).
     ///
     /// The single most consequential DR setting to be able to read back from a
-    /// running fleet: with it off, a failover fence does not bite on this
-    /// worker at all.
-    pub dr_fencing: bool,
+    /// running fleet. `auto` fences on a database that carries a DR marker.
+    /// `disabled` refuses to start on one. This is the configured mode. The
+    /// startup log line `pinned shard write-authority generation` shows that
+    /// the process actually fenced.
+    pub dr_fencing: crate::replication::DrFencing,
     /// DR sampler cadence, milliseconds — the RPO's resolution floor and the
     /// bound on fence-detection latency (issue #954).
     pub replication_sample_interval_ms: u64,

@@ -1098,7 +1098,8 @@ async fn probe_peer_shard(
 ) -> Result<ProbeOutcome, (String, UninspectedReasonKind)> {
     let probe = tokio::time::timeout(FANOUT_PEER_BOUND, async {
         let acquire_bound = peer_acquire_bound(shard_pool);
-        let mut conn = match tokio::time::timeout(acquire_bound, shard_pool.get()).await {
+        let mut conn = match crate::replication::fenced_get_within(shard_pool, acquire_bound).await
+        {
             Ok(Ok(conn)) => conn,
             Ok(Err(e)) => {
                 return Err((

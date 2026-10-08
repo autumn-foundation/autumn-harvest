@@ -651,7 +651,7 @@ pub async fn resolve_target_queue(
         });
 
     if let Some(dp) = default_pool
-        && let Ok(mut default_conn) = dp.get().await
+        && let Ok(mut default_conn) = crate::replication::fenced_checkout(&dp).await
     {
         use crate::schema::harvest_schedules::dsl as sched_dsl;
         use diesel::prelude::*;
@@ -789,7 +789,7 @@ pub async fn resolve_cross_shard_target_queue(
         .and_then(|p| p.clone())
         .and_then(|sp| sp.exact_pool_for(target_shard).cloned());
     if let Some(tp) = target_pool {
-        match tp.get().await {
+        match crate::replication::fenced_checkout(&tp).await {
             Ok(mut target_conn) => {
                 return resolve_target_queue(&mut target_conn, target_workflow_name, target_shard)
                     .await;
@@ -1243,7 +1243,7 @@ impl DeferredTriggerStart {
             return;
         };
         tokio::spawn(async move {
-            let conn_res = pool.get().await;
+            let conn_res = crate::replication::fenced_checkout(&pool).await;
             let mut target_conn = match conn_res {
                 Ok(c) => c,
                 Err(e) => {
@@ -1285,7 +1285,7 @@ impl DeferredTriggerStart {
                 );
                 return;
             };
-            let mut source_conn = match source_pool.get().await {
+            let mut source_conn = match crate::replication::fenced_checkout(&source_pool).await {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::error!(
@@ -1329,18 +1329,51 @@ impl DeferredTriggerStart {
                 )
             };
 
-            if let Err(e) = relay_gate_checked_start(
-                &mut target_conn,
-                &mut source_conn,
-                params,
-                self.outbox_id,
-                self.source_exec_id,
-                self.trigger_id,
-                metrics_ref,
-                &self.codecs,
-            )
+            // Issue #1823: this relay runs detached, after its caller's fence
+            // ends. It writes the source and the target shard, so it holds the
+            // fence of both while it writes. A fenced or held shard leaves the
+            // outbox row for the scanner. The relay takes the slots of both
+            // guards at once, so it never waits for a slot while it holds one.
+            let fence = match crate::replication::begin_fenced_groups(&[
+                (&source_pool, self.source_shard),
+                (&pool, self.target_shard),
+            ])
             .await
             {
+                Ok(guards) => guards,
+                Err(error) => {
+                    tracing::warn!(
+                        source_shard = self.source_shard.as_i32(),
+                        target_shard = self.target_shard.as_i32(),
+                        %error,
+                        "[completion_trigger] the DR fence forbids this relay; leaving the outbox row for the scanner"
+                    );
+                    return;
+                }
+            };
+            // Both connections predate the pass. They join it, so a lost
+            // guard ends their backends too.
+            let relayed = crate::replication::run_fenced_pass(
+                &fence,
+                Box::pin(async {
+                    target_conn.join_pass().await?;
+                    source_conn.join_pass().await?;
+                    relay_gate_checked_start(
+                        &mut target_conn,
+                        &mut source_conn,
+                        params,
+                        self.outbox_id,
+                        self.source_exec_id,
+                        self.trigger_id,
+                        metrics_ref,
+                        &self.codecs,
+                    )
+                    .await
+                }),
+            )
+            .await
+            .and_then(|relayed| relayed);
+            if let Err(e) = relayed {
                 // A start error (e.g. PayloadTooLarge) leaves the outbox row for the
                 // scanner to handle (which deletes an oversized-payload row).
                 tracing::error!(
@@ -2443,7 +2476,8 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
     };
     let resolved_queues = if !names_needing_lookup.is_empty()
         && let Some(sp) = sharded_pool.as_ref()
-        && let Ok(mut default_conn) = sp.pool_for(sp.default_shard()).get().await
+        && let Ok(mut default_conn) =
+            crate::replication::fenced_checkout(sp.pool_for(sp.default_shard())).await
     {
         resolve_target_queues_batch(&mut default_conn, &names_needing_lookup).await
     } else {
@@ -2466,7 +2500,9 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
             continue;
         };
 
-        let mut target_conn = match target_pool.get().await {
+        // Under a fenced pass the checkout is bounded, and a timeout abandons
+        // the pass (issue #1823). See `replication::fenced_checkout`.
+        let mut target_conn = match crate::replication::fenced_checkout(&target_pool).await {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(

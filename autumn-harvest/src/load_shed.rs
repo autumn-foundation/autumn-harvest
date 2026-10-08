@@ -513,7 +513,7 @@ async fn read_pool_ages(
     queues: &[String],
     circuit_breaker_activities: &[String],
 ) -> Option<Vec<(String, f64)>> {
-    let mut conn = match pool.get().await {
+    let mut conn = match crate::replication::fenced_checkout(pool).await {
         Ok(conn) => conn,
         Err(error) => {
             tracing::warn!(error = %error, "load shed sample could not get a connection");
@@ -582,7 +582,7 @@ async fn record_transition(
         // the API process, and the actor and route mark it as automatic.
         source: crate::audit::SOURCE_API,
     };
-    let result = match audit_pool.get().await {
+    let result = match crate::replication::fenced_checkout(audit_pool).await {
         Ok(mut conn) => crate::audit::insert_audit(&mut conn, &record)
             .await
             .map_err(|e| e.to_string()),
