@@ -394,6 +394,9 @@ pub struct EnqueueParams {
     /// (issue #1824). The workflow start path sets it. Every other path
     /// keeps `false`, so its row is a continuation in the claim order.
     pub new_start: bool,
+    /// The fairness key of the task (issue #1976). `None` is the default
+    /// key. A worker with fairness keys on rotates claims across keys.
+    pub fairness_key: Option<String>,
 }
 
 impl EnqueueParams {
@@ -433,6 +436,7 @@ impl EnqueueParams {
             context_headers: None,
             session_id: None,
             new_start: false,
+            fairness_key: None,
         }
     }
 
@@ -543,6 +547,7 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         context_headers: params.context_headers.clone(),
         session_id: params.session_id,
         new_start: params.new_start,
+        fairness_key: params.fairness_key.as_deref(),
     };
 
     diesel::insert_into(harvest_task_queue::table)
@@ -594,7 +599,7 @@ const POSTGRES_MAX_BIND_PARAMS: usize = 65_535;
 /// number by exhaustive field destructure. Adding or removing a
 /// `NewTaskQueueItem` field breaks that test at compile time until this
 /// constant is updated too, so it cannot silently drift.
-const NEW_TASK_QUEUE_ITEM_COLUMNS: usize = 28;
+const NEW_TASK_QUEUE_ITEM_COLUMNS: usize = 29;
 
 /// Largest row count one `enqueue_batch` `INSERT` may carry.
 ///
@@ -805,6 +810,7 @@ pub async fn enqueue_batch(
                     context_headers: p.context_headers.clone(),
                     session_id: p.session_id,
                     new_start: p.new_start,
+                    fairness_key: p.fairness_key.as_deref(),
                 }
             })
             .collect();
@@ -1525,7 +1531,7 @@ pub async fn claim_task_on_shard(
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on query failure.
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub async fn claim_task_of_kind_on_shard(
     conn: &mut AsyncPgConnection,
     queues: &[String],
@@ -1536,6 +1542,54 @@ pub async fn claim_task_of_kind_on_shard(
     ineligible_activities: &[String],
     shard: Option<crate::types::ShardId>,
     kind: Option<TaskType>,
+) -> HarvestResult<Option<TaskQueueItem>> {
+    claim_task_with_fairness(
+        conn,
+        queues,
+        worker_id,
+        worker_build_id,
+        priority_aging_secs,
+        circuit_breaker_activities,
+        ineligible_activities,
+        shard,
+        kind,
+        ClaimFairness::Off,
+    )
+    .await
+}
+
+/// How a claim orders rows across fairness keys (issue #1976).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClaimFairness {
+    /// The claim ignores fairness keys. The statement is the unchanged one.
+    #[default]
+    Off,
+    /// The claim rotates across the fairness keys of each queue in weighted
+    /// round robin, and charges the key it claims. See
+    /// [`crate::queue_fairness::FairClock`].
+    Keys,
+}
+
+/// [`claim_task_of_kind_on_shard`] with a fairness mode (issue #1976).
+///
+/// [`ClaimFairness::Off`] issues the unchanged statement.
+/// [`ClaimFairness::Keys`] issues the fair form.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+pub async fn claim_task_with_fairness(
+    conn: &mut AsyncPgConnection,
+    queues: &[String],
+    worker_id: &str,
+    worker_build_id: &str,
+    priority_aging_secs: Option<u32>,
+    circuit_breaker_activities: &[String],
+    ineligible_activities: &[String],
+    shard: Option<crate::types::ShardId>,
+    kind: Option<TaskType>,
+    fairness: ClaimFairness,
 ) -> HarvestResult<Option<TaskQueueItem>> {
     // Two-phase claim using a CTE to avoid holding advisory locks during
     // broad WHERE filtering.
@@ -1678,9 +1732,7 @@ pub async fn claim_task_of_kind_on_shard(
                 // engine's hottest statement.
                 let result: Vec<TaskQueueItem> = match fence_binding(shard) {
                     None => {
-                        let query = kind.map_or_else(claim_task_query, |kind| {
-                            claim_task_query_for_kind(kind, false)
-                        });
+                        let query = claim_query_for(kind, false, fairness);
                         diesel::sql_query(query)
                             .bind::<diesel::sql_types::Text, _>(worker_id)
                             .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
@@ -1698,9 +1750,7 @@ pub async fn claim_task_of_kind_on_shard(
                             .await
                     }
                     Some((fence_shard, generation)) => {
-                        let query = kind.map_or_else(claim_task_query_fenced, |kind| {
-                            claim_task_query_for_kind(kind, true)
-                        });
+                        let query = claim_query_for(kind, true, fairness);
                         diesel::sql_query(query)
                             .bind::<diesel::sql_types::Text, _>(worker_id)
                             .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
@@ -1853,6 +1903,26 @@ fn splice_kind_predicate(base: &str, kind: TaskType) -> String {
             kind.as_str()
         ),
     )
+}
+
+/// The claim statement for one `(kind, fenced, fairness)` choice.
+///
+/// [`ClaimFairness::Off`] returns the unchanged statement for `kind` and
+/// `fenced`.
+#[must_use]
+pub fn claim_query_for(
+    kind: Option<TaskType>,
+    fenced: bool,
+    fairness: ClaimFairness,
+) -> &'static str {
+    let base = match (kind, fenced) {
+        (None, false) => claim_task_query(),
+        (None, true) => claim_task_query_fenced(),
+        (Some(kind), fenced) => claim_task_query_for_kind(kind, fenced),
+    };
+    match fairness {
+        ClaimFairness::Off | ClaimFairness::Keys => base,
+    }
 }
 
 /// [`claim_task_query`] limited to one task kind (issue #1787).
@@ -12690,6 +12760,7 @@ mod tests {
             context_headers: None,
             session_id: None,
             new_start: false,
+            fairness_key: None,
         };
         let NewTaskQueueItem {
             id: _,
@@ -12720,13 +12791,14 @@ mod tests {
             context_headers: _,
             session_id: _,
             new_start: _,
+            fairness_key: _,
         } = sample;
         // The field destructure above is the compile-time proof that
         // NEW_TASK_QUEUE_ITEM_COLUMNS counts every field. This const block
         // is a second, independent compile-time check: the chunk size
         // computed from that count never crosses Postgres's ceiling.
         const {
-            assert!(NEW_TASK_QUEUE_ITEM_COLUMNS == 28);
+            assert!(NEW_TASK_QUEUE_ITEM_COLUMNS == 29);
             assert!(
                 ROWS_PER_INSERT_CHUNK * NEW_TASK_QUEUE_ITEM_COLUMNS <= POSTGRES_MAX_BIND_PARAMS
             );

@@ -332,6 +332,9 @@ diesel::table! {
         /// (issue #1824). Set only by the workflow start path. The claim
         /// order reads it while `attempt = 0`.
         new_start -> Bool,
+        /// The fairness key of the task (issue #1976). `NULL` is the
+        /// default key.
+        fairness_key -> Nullable<Text>,
     }
 }
 

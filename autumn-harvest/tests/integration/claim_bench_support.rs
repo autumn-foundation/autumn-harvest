@@ -4324,6 +4324,7 @@ pub mod db {
             context_headers: None,
             session_id: None,
             new_start: false,
+            fairness_key: None,
         }
     }
 

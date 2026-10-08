@@ -598,6 +598,10 @@ pub struct TaskQueueItem {
     /// #1824). See [`crate::queue::CLAIM_ORDER_DUE_SQL`].
     #[serde(default)]
     pub new_start: bool,
+    /// The fairness key of the task (issue #1976). `None` is the default
+    /// key. See [`crate::queue_fairness::FairClock`].
+    #[serde(default)]
+    pub fairness_key: Option<String>,
 }
 
 /// Insert struct for enqueuing a new task.
@@ -642,6 +646,8 @@ pub struct NewTaskQueueItem<'a> {
     /// `true` on the first workflow task of a freshly admitted run (issue
     /// #1824).
     pub new_start: bool,
+    /// The fairness key of the task (issue #1976).
+    pub fairness_key: Option<&'a str>,
 }
 
 /// Database representation of a rate limit bucket.
