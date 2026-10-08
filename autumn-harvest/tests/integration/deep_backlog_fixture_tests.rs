@@ -157,6 +157,33 @@ fn the_seed_sql_is_a_pure_function_of_the_spec() {
     }
 }
 
+#[test]
+fn claim_slots_never_exceed_the_cap_under_contention() {
+    use std::sync::atomic::AtomicU64;
+    let slots = std::sync::Arc::new(AtomicU64::new(0));
+    let taken: u64 = std::thread::scope(|scope| {
+        // Collect first, so all threads run at once before any join.
+        #[allow(clippy::needless_collect)]
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let slots = std::sync::Arc::clone(&slots);
+                scope.spawn(move || {
+                    (0..1_000)
+                        .filter(|_| fixture::try_reserve(&slots, 100))
+                        .count() as u64
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("thread")).sum()
+    });
+    assert_eq!(taken, 100, "exactly the cap is reserved, never more");
+    fixture::release(&slots);
+    assert!(
+        fixture::try_reserve(&slots, 100),
+        "a released slot is free again"
+    );
+}
+
 // ── Pure tests: the snapshot renderer ─────────────────────────────────────
 
 fn statement(query: &str, calls: i64, hit: i64, read: i64) -> StatementStats {

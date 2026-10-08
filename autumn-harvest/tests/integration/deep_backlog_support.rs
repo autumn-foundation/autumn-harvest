@@ -890,6 +890,8 @@ pub struct WorkloadReport {
 
 #[derive(Default)]
 struct Tally {
+    /// Claim slots taken: claims made plus claims in flight.
+    slots: AtomicU64,
     claims: AtomicU64,
     completions: AtomicU64,
     reclaims: AtomicU64,
@@ -916,6 +918,24 @@ const MAX_CONSECUTIVE_ERRORS: u32 = 20;
 
 /// The pause after a failed claim, so a failing claimer does not spin.
 const ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Reserve one of `max` claim slots. Returns `false` when all are taken.
+#[must_use]
+pub fn try_reserve(slots: &AtomicU64, max: u64) -> bool {
+    let mut taken = slots.load(Ordering::Acquire);
+    while taken < max {
+        match slots.compare_exchange_weak(taken, taken + 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(now) => taken = now,
+        }
+    }
+    false
+}
+
+/// Give back a slot that [`try_reserve`] took, after a claim found nothing.
+pub fn release(slots: &AtomicU64) {
+    slots.fetch_sub(1, Ordering::AcqRel);
+}
 
 /// The bound on one claim. A claim on a 1M-row backlog takes about 17 s.
 ///
@@ -983,9 +1003,12 @@ async fn run_claimer(
     tally: &Tally,
 ) {
     let mut consecutive_errors = 0;
-    while Instant::now() < deadline && tally.claims.load(Ordering::Relaxed) < max {
+    // A slot is reserved before the claim starts, so concurrent claimers
+    // never pass `max` in all. A claim that takes no task gives its slot back.
+    while Instant::now() < deadline && try_reserve(&tally.slots, max) {
         let claim = queue::claim_task(conn, queues, worker, "", None, &[], &[]);
         let Some(claimed) = bounded(CLAIM_BOUND, claim).await else {
+            release(&tally.slots);
             tally.error("claim", &"no result within the claim bound");
             break;
         };
@@ -995,11 +1018,13 @@ async fn run_claimer(
                 task
             }
             Ok(None) => {
+                release(&tally.slots);
                 tally.empty_polls.fetch_add(1, Ordering::Relaxed);
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 continue;
             }
             Err(e) => {
+                release(&tally.slots);
                 tally.error("claim", &e);
                 consecutive_errors += 1;
                 if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
