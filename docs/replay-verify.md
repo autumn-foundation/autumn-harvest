@@ -120,7 +120,7 @@ async fn main() {
 
 ## Report formats
 
-Pass `--report <format>` on the CLI or `ReportFormat::<Variant>` in the API:
+Pass `ReportFormat::<Variant>` in the API. A binary that you write can map a `--report <format>` flag to it (see the [GitHub Actions snippet](#complete-github-actions-snippet)):
 
 | Format | Description |
 |--------|-------------|
@@ -177,9 +177,33 @@ ReplayVerifier::new()
 
 ## Complete GitHub Actions snippet
 
-`replay-verify` below is the binary from the Quick start. Your binary parses its own
-flags. The verifier reads one `HistorySnapshot` per file, so the export step splits the
-batch envelope into one file per run.
+`replay-verify` below is the Quick start binary with two flags added. Replace the
+hardcoded directory and format in its `main` with this parser:
+
+```rust
+let mut fixtures = String::from("./fixtures/replay");
+let mut format = ReportFormat::Text;
+let mut args = std::env::args().skip(1);
+while let Some(flag) = args.next() {
+    let value = args.next().expect("each flag takes a value");
+    match flag.as_str() {
+        "--fixtures-dir" => fixtures = value,
+        "--report" => {
+            format = match value.as_str() {
+                "junit" => ReportFormat::JUnit,
+                "json" => ReportFormat::Json,
+                "github" => ReportFormat::GitHub,
+                _ => ReportFormat::Text,
+            }
+        }
+        other => panic!("unknown flag {other}"),
+    }
+}
+// Then: `.fixtures_dir(&fixtures)` and `ci.format_report(format)`.
+```
+
+The verifier reads one `HistorySnapshot` per file, so the export step splits the batch
+envelope into one file per run.
 
 ```yaml
 # .github/workflows/replay-verify.yml
