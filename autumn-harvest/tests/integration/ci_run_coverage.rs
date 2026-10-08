@@ -863,6 +863,41 @@ fn issue_1799_suites_have_covering_rows() {
     }
 }
 
+/// Plugin suites that issue #1959 wired.
+const ISSUE_1959_PLUGIN: &[&str] = &["mcp_tools_integration", "webhook_durable_integration"];
+
+/// The suites that issue #1959 wired must run in CI and must keep their two
+/// fixes. On a current-thread runtime, `TestApp::plugin` deadlocks. `TestDb`
+/// starts Postgres 11, where the worker claim query fails on `MATERIALIZED`.
+#[test]
+fn issue_1959_suites_run_in_ci() {
+    let rows = parse_manifest();
+    for &stem in ISSUE_1959_PLUGIN {
+        let src = read_source(&plugin_tests_dir().join(format!("{stem}.rs")));
+        let code = strip_line_comments(&src);
+        assert!(
+            plugin_covered(&rows, stem, &plugin_required_features(&src)),
+            "plugin:{stem} needs a covering `linux` manifest row"
+        );
+        assert!(
+            !all_tests_ignored(&src),
+            "plugin:{stem} must not `#[ignore]` every test"
+        );
+        assert!(
+            !allowlisted(&format!("plugin:{stem}")),
+            "plugin:{stem} is wired; remove its ALLOWLIST entry and lower ALLOWLIST_MAX_LEN"
+        );
+        assert!(
+            !code.contains("#[tokio::test]"),
+            "plugin:{stem} must use the multi-thread flavor, not a current-thread runtime"
+        );
+        assert!(
+            !code.contains("TestDb::"),
+            "plugin:{stem} must pin a supported Postgres, not the `TestDb` default (Postgres 11)"
+        );
+    }
+}
+
 #[test]
 fn claim_budget_gate_has_a_covering_manifest_row() {
     // The gate is the whole point of issue #786; it must actually run in CI.
