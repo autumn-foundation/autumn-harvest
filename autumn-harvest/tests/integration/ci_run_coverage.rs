@@ -169,17 +169,9 @@ fn is_db_harness_only(source: &str) -> bool {
 // This guard PROVED it bites: during development `nd_block_tests` was left
 // out and the guard failed naming it (the TDD red step).
 
-// mcp_tools_integration / webhook_durable_integration: paved-path DB tests
-// (autumn_web::test::TestDb + run_pending(MIGRATIONS)) that are feature-gated
-// AND have every test #[ignore]d, so no CI run can execute them. Issue #1959
-// tracks the fix.
-const ALLOWLIST_MCP_IGNORED_REASON: &str = "mcp-feature-gated (only `compileonly` in the manifest) AND all tests are #[ignore]d \
-     (TestDb/run_pending paved-path DB harness) — no CI run can execute it; tracked in #1959";
 const ALLOWLIST_KAFKA_BROKER_REASON: &str = "kafka-feature-gated: DOES run in CI, via a dedicated Linux-only \
      ci.yml step (it needs an apt libcurl/cmake install first, and the manifest's compile mode would try to build \
      vendored librdkafka on macOS/Windows). Not a coverage gap — see the `Run plugin Kafka broker connector tests` step.";
-const ALLOWLIST_WEBHOOKS_IGNORED_REASON: &str = "webhooks-feature-gated — not run in CI (no manifest row) — AND all tests are #[ignore]d \
-     (TestDb/run_pending paved-path DB harness); tracked in #1959";
 const ALLOWLIST_CHAOS_REASON: &str = "chaos-feature-gated (issue #940): not in the manifest's `test` job. \
      The `chaos` feature is off by default, and the seeded sweep is slow, so each PR does not run it. \
      It runs only in the nightly and manual job in .github/workflows/chaos.yml, with at least 5 seeds. \
@@ -205,14 +197,9 @@ const ALLOWLIST: &[(&str, &str)] = &[
         "plugin:connector_kafka_broker",
         ALLOWLIST_KAFKA_BROKER_REASON,
     ),
-    ("plugin:mcp_tools_integration", ALLOWLIST_MCP_IGNORED_REASON),
     (
         "plugin:outbox_start_relay_perf",
         ALLOWLIST_PERF_EVIDENCE_REASON,
-    ),
-    (
-        "plugin:webhook_durable_integration",
-        ALLOWLIST_WEBHOOKS_IGNORED_REASON,
     ),
     // `webhook_receiver_integration` is intentionally absent: its current-thread
     // `TestApp::plugin` deadlock was fixed (multi-thread flavor) and its tests
@@ -237,7 +224,9 @@ const ALLOWLIST: &[(&str, &str)] = &[
 /// for suites that CI already ran.
 /// Then 6: issue #1799 wired the other 49 suites, 27 core and 22 plugin.
 /// Four of them needed a test fix first.
-const ALLOWLIST_MAX_LEN: usize = 6;
+/// Then 4: issue #1959 wired `plugin:mcp_tools_integration` and
+/// `plugin:webhook_durable_integration`. No debt entry is left.
+const ALLOWLIST_MAX_LEN: usize = 4;
 
 fn allowlisted(key: &str) -> bool {
     ALLOWLIST.iter().any(|&(k, _)| k == key)
@@ -517,20 +506,19 @@ fn manifest_parser_finds_known_rows() {
 
 #[test]
 fn compileonly_row_is_not_credited_as_covered() {
-    let rows = parse_manifest();
-    // `mcp_tools_integration` is `compileonly` in the manifest — it must not be
-    // treated as covered.
+    let row = |osclass: &str| SuiteRow {
+        osclass: osclass.into(),
+        krate: "autumn-harvest-plugin".into(),
+        target: "some_db_suite".into(),
+        features: "-".into(),
+        filter: "-".into(),
+    };
     assert!(
-        rows.iter()
-            .any(|r| r.target == "mcp_tools_integration" && r.osclass == "compileonly"),
-        "expected `mcp_tools_integration` to be a `compileonly` manifest row"
-    );
-    assert!(
-        !plugin_covered(&rows, "mcp_tools_integration", &[]),
+        !plugin_covered(&[row("compileonly")], "some_db_suite", &[]),
         "a `compileonly` target must NOT be credited as covered"
     );
     // Sanity: a genuine `linux` run target IS covered.
-    assert!(plugin_covered(&rows, "api_scheduler_integration", &[]));
+    assert!(plugin_covered(&[row("linux")], "some_db_suite", &[]));
 }
 
 // ── A `module::filter` sub-selection must not credit the whole module ────────
@@ -661,22 +649,19 @@ fn allos_row_without_db_does_not_cover_a_db_module() {
 // ── Fail-CLOSED classifier & honesty about env-gated / no-DB HTTP tests ──────
 
 #[test]
-fn paved_path_db_tests_are_classified_and_flagged_all_ignored() {
+fn paved_path_db_tests_are_classified_as_db_gated() {
     let dir = plugin_tests_dir();
-    // These spin a real container via `autumn_web::test::TestDb` +
-    // `run_pending(MIGRATIONS)` — the paved path the original three-token list
-    // missed. They must now classify as DB tests, and each is fully `#[ignore]`d.
-    // (`webhook_receiver_integration` was un-ignored + wired to a `linux`
-    // manifest row, so it no longer belongs in this all-ignored list.)
-    for stem in ["mcp_tools_integration", "webhook_durable_integration"] {
+    // These suites migrate with `run_pending(MIGRATIONS)`, the paved path that
+    // the original three-token list missed. They must classify as DB tests.
+    for stem in [
+        "mcp_tools_integration",
+        "webhook_durable_integration",
+        "webhook_receiver_integration",
+    ] {
         let src = read_source(&dir.join(format!("{stem}.rs")));
         assert!(
             needs_live_db(&src),
-            "{stem} uses the TestDb/run_pending paved DB path and must be classified as DB-gated"
-        );
-        assert!(
-            all_tests_ignored(&src),
-            "{stem}: all its tests are #[ignore]d — a run could not execute it"
+            "{stem} uses the run_pending paved DB path and must be classified as DB-gated"
         );
     }
 }
@@ -701,6 +686,11 @@ fn all_tests_ignored_counts_code_and_not_prose() {
     assert!(
         !all_tests_ignored(source),
         "a doc comment that names an ignored case must not hide the live case"
+    );
+    let every_case_ignored = "#[tokio::test]\n#[ignore = \"docker\"]\nasync fn a() {}\n";
+    assert!(
+        all_tests_ignored(every_case_ignored),
+        "a suite that ignores every test runs nothing"
     );
 }
 
@@ -866,9 +856,11 @@ fn issue_1799_suites_have_covering_rows() {
 /// Plugin suites that issue #1959 wired.
 const ISSUE_1959_PLUGIN: &[&str] = &["mcp_tools_integration", "webhook_durable_integration"];
 
-/// The suites that issue #1959 wired must run in CI and must keep their two
+/// The suites that issue #1959 wired must run in CI and must keep their three
 /// fixes. On a current-thread runtime, `TestApp::plugin` deadlocks. `TestDb`
 /// starts Postgres 11, where the worker claim query fails on `MATERIALIZED`.
+/// A `run_pending` call for `autumn_harvest::MIGRATIONS` after the framework
+/// set skips six Harvest migrations that share a framework version.
 #[test]
 fn issue_1959_suites_run_in_ci() {
     let rows = parse_manifest();
@@ -894,6 +886,10 @@ fn issue_1959_suites_run_in_ci() {
         assert!(
             !code.contains("TestDb::"),
             "plugin:{stem} must pin a supported Postgres, not the `TestDb` default (Postgres 11)"
+        );
+        assert!(
+            !code.contains("autumn_harvest::MIGRATIONS"),
+            "plugin:{stem} must load the Harvest schema with `test_init_sql()`"
         );
     }
 }
@@ -1322,7 +1318,6 @@ fn names_an_owner_needs_a_login_or_an_issue_number() {
 #[test]
 fn a_new_reason_counts_as_debt() {
     assert!(entry_is_debt("a reason that no list names"));
-    assert!(entry_is_debt(ALLOWLIST_MCP_IGNORED_REASON));
     assert!(!entry_is_debt(ALLOWLIST_CHAOS_REASON));
 }
 
