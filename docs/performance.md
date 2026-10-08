@@ -1817,6 +1817,9 @@ from the benchmark are directly comparable.
 * [`docs/performance-task-queue-hygiene.md`](performance-task-queue-hygiene.md) —
   claim latency after 1M terminal task rows, before and after the
   terminal-task janitor and table tuning (issue #1811).
+* [`docs/performance-deep-backlog.md`](performance-deep-backlog.md) — the claim
+  path on a seeded, skewed 1M-row backlog with 10% dead tuples (issue #1956).
+  It measures the depth scaling that issue #1340 left open.
 
 ### Other profiling notes
 
