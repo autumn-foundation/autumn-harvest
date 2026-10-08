@@ -6437,9 +6437,10 @@ impl HistoryMatcher {
     /// Every unclaimed `signal_name` signal, as `(event index, payload)`
     /// (issue #1985).
     ///
-    /// This is the buffered signals plus the unconsumed `SignalReceived`
-    /// events at or after the cursor. A payload-matching wait runs its
-    /// predicate over this list. A pure read.
+    /// This is the buffered signals, then the unconsumed `SignalReceived`
+    /// events at or after the cursor. That is the order in which
+    /// [`match_signal_where`](Self::match_signal_where) examines them. A
+    /// payload-matching wait runs its predicate over this list. A pure read.
     #[must_use]
     pub fn signal_candidates(&self, signal_name: &str) -> Vec<(usize, Value)> {
         let buffered = self

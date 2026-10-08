@@ -827,3 +827,96 @@ async fn durable_promise_rules_hold_on_the_plain_signal_path() {
         "another signal cannot take the promise key"
     );
 }
+
+/// Signal-with-start parameters for `promise_wf` that carry `payload` on the
+/// signal `signal_name`.
+fn sws_params<'a>(
+    workflow_id: &'a str,
+    signal_name: &'a str,
+    payload: Value,
+    idempotency_key: Option<&str>,
+) -> autumn_harvest::execution::SignalWithStartParams<'a> {
+    autumn_harvest::execution::SignalWithStartParams {
+        workflow_name: "promise_wf",
+        workflow_id,
+        exec_id: ExecutionId::new(),
+        input: Value::Null,
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: None,
+        memo: None,
+        search_attrs: None,
+        reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+        trace_context: None,
+        max_execution_timeout_ceiling: None,
+        chain_execution_timeout: None,
+        max_workflow_chain_timeout_ceiling: None,
+        concurrency_key: None,
+        concurrency_limit: None,
+        concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+        signal_name,
+        signal_payload: payload,
+        idempotency_key: idempotency_key.map(str::to_owned),
+        max_workflow_input_bytes: 0,
+        max_signal_payload_bytes: 0,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+        sla: None,
+        workflow_retry_policy: None,
+        max_workflow_attempts_ceiling: None,
+        reject_fresh_if_debounced: false,
+        workflow_info: None,
+        start_source_override: None,
+        start_source_ref_override: None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn durable_promise_rules_hold_on_signal_with_start() {
+    use autumn_harvest::durable_promise::PromiseSettlement;
+    use autumn_harvest::execution::signal_with_start_workflow_execution;
+
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+    let name = "harvest.promise:approval";
+    let settlement = PromiseSettlement::resolved(json!(1)).to_value();
+
+    let first = signal_with_start_workflow_execution(
+        &mut conn,
+        sws_params("sws-1", name, settlement.clone(), None),
+    )
+    .await
+    .expect("first settlement");
+    let second = signal_with_start_workflow_execution(
+        &mut conn,
+        sws_params("sws-1", name, settlement.clone(), None),
+    )
+    .await
+    .expect("second settlement");
+    assert!(
+        first.signal_delivered,
+        "a keyless settlement gets the promise key"
+    );
+    assert!(!second.signal_delivered, "so a second one is a no-op");
+
+    for (workflow_id, payload, key) in [
+        ("sws-2", json!("ops"), None),
+        ("sws-3", settlement.clone(), Some("my-key")),
+    ] {
+        let refused = signal_with_start_workflow_execution(
+            &mut conn,
+            sws_params(workflow_id, name, payload, key),
+        )
+        .await;
+        assert!(refused.is_err(), "{workflow_id} must be refused");
+        assert!(
+            executions(&url, "promise_wf")
+                .await
+                .iter()
+                .all(|r| r.workflow_id != workflow_id),
+            "a refused signal-with-start must not start {workflow_id}"
+        );
+    }
+}

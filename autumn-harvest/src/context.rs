@@ -9198,6 +9198,8 @@ impl WorkflowContext {
         signal_name: &str,
         predicate: Option<&dyn Fn(&Value) -> bool>,
     ) -> HarvestResult<Result<Value, oneshot::Receiver<Value>>> {
+        // Candidates are in match order. The predicate stops at the first
+        // accepted payload, so it never sees a later signal.
         let accepted: Option<std::collections::HashSet<usize>> = predicate.map(|accepts| {
             let candidates = self
                 .matcher
@@ -9206,8 +9208,9 @@ impl WorkflowContext {
                 .signal_candidates(signal_name);
             candidates
                 .into_iter()
-                .filter(|(_, payload)| accepts(payload))
+                .find(|(_, payload)| accepts(payload))
                 .map(|(index, _)| index)
+                .into_iter()
                 .collect()
         });
         let history_match = self.match_history(|m| match &accepted {
@@ -22797,6 +22800,28 @@ mod tests {
         .await
         .expect("a predicate that reads the context must not deadlock")
         .expect("the matching signal replays");
+        assert_eq!(matched, serde_json::json!({"id": 42}));
+    }
+
+    #[tokio::test]
+    async fn wait_for_signal_matching_stops_at_the_first_match() {
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started_event(),
+                order_signal(serde_json::json!({"id": 42})),
+                order_signal(serde_json::json!("not an order")),
+            ],
+        );
+        let matched = ctx
+            .wait_for_signal_matching("order", |p| {
+                p["id"]
+                    .as_u64()
+                    .expect("the predicate never sees a later payload")
+                    == 42
+            })
+            .await
+            .expect("the first signal matches");
         assert_eq!(matched, serde_json::json!({"id": 42}));
     }
 
