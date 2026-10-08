@@ -367,8 +367,9 @@ the new generation and stops. Each shard has its own lock. A pass on one
 shard does not delay a bump of another shard on the same database.
 The bump waits at most 5 seconds. A pass that runs longer makes the bump
 fail with a lock timeout. Run `harvest dr fence` again. After the bump gets
-the lock, it waits 2 more seconds before it commits. A pass that lost its
-barrier stops in that time, and a short write it sent commits first.
+the lock, it waits 6 more seconds before it commits. A pass that lost its
+barrier stops in that time, and it ends the backends of the statements it
+sent.
 
 These direct-database commands are exempt, by design:
 
@@ -414,8 +415,9 @@ Three limits, stated plainly:
   backend of each connection it holds, so the server rolls back a
   statement it already runs. That covers pooled connections and the direct
   connection of a `harvest partition` command. It does so on a connection
-  of its own, outside the pool. That happens inside the bump's 3-second
-  wait. A checkout inside a pass waits at most 2 seconds, on any shard's
+  of its own, outside the pool. That happens inside the bump's 6-second
+  wait, which covers one keepalive interval, one ping bound and the
+  1-second stop bound, plus 1 second of slack. A checkout inside a pass waits at most 2 seconds, on any shard's
   pool. If it gets no connection, the pass stops, so a busy pool cannot
   hold a bump off. If the process
   cannot end a backend in time, it logs a warning, and that statement can

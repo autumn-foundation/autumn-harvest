@@ -4352,10 +4352,10 @@ async fn a_fenced_pass_does_not_block_another_shards_bump() {
         .await
         .expect("open the pass on shard 2");
 
-    // Above the bump's 3-second writer grace, below its 5-second lock
-    // timeout plus that grace. A blocked bump then fails on its lock timeout.
+    // Above the bump's 6-second writer grace. A blocked bump fails on its
+    // 5-second lock timeout before the grace starts.
     let bump = tokio::time::timeout(
-        std::time::Duration::from_secs(6),
+        std::time::Duration::from_secs(10),
         bump_generation(&mut conn, ShardId::new(1), "failover", "test"),
     )
     .await;

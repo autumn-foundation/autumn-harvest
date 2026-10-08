@@ -81,15 +81,6 @@
 #[cfg(feature = "db")]
 const BUMP_LOCK_TIMEOUT_MS: u64 = 5_000;
 
-/// How long a bump waits after it takes the pass lock (issue #1823).
-///
-/// A pass whose guard session ends sees the loss within one keepalive
-/// interval of one second. It then ends the backends it holds, for at most
-/// one more second. The third second is slack for scheduling and connection
-/// time. So a stopped pass's backends end before the bump commits.
-#[cfg(feature = "db")]
-const BUMP_WRITER_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
-
 /// Per-statement ceiling for `advance_sequences_after_promotion`.
 ///
 /// Generous, because a `MAX(col)` over a large un-indexed serial column on a
@@ -1435,9 +1426,9 @@ mod db {
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 
     use super::{
-        BUMP_LOCK_TIMEOUT_MS, BUMP_WRITER_GRACE, DrMarkers, FenceRegistry,
-        PROMOTE_STATEMENT_TIMEOUT_MS, ReplicationStatus, ShardGeneration, SlotLag, StandbyLag,
-        WatermarkReading, qualified, quote_ident,
+        BUMP_LOCK_TIMEOUT_MS, DrMarkers, FenceRegistry, PROMOTE_STATEMENT_TIMEOUT_MS,
+        ReplicationStatus, ShardGeneration, SlotLag, StandbyLag, WatermarkReading, qualified,
+        quote_ident,
     };
     use crate::error::{HarvestResult, database_error};
     use crate::types::ShardId;
@@ -1572,8 +1563,9 @@ mod db {
     /// racy read: this cannot commit while an in-flight persist holds the row,
     /// and every persist that starts afterwards sees the new epoch.
     ///
-    /// A bump takes at least three seconds. That wait lets a pass
-    /// that lost its guard stop before the bump commits.
+    /// A bump takes at least six seconds. That wait lets a pass
+    /// that lost its guard stop before the bump commits. See
+    /// [`BUMP_WRITER_GRACE`].
     ///
     /// # Errors
     ///
@@ -1706,9 +1698,9 @@ mod db {
     }
 
     /// How long a stopped pass waits for the backends it ends (issue #1823).
-    /// A guard sees its loss within one keepalive interval. This wait adds at
-    /// most one more, and a bump waits three seconds. So the wait ends before
-    /// such a bump commits.
+    /// A guard sees its loss at its next ping. This wait adds at most one
+    /// more second, and a bump waits out both ([`BUMP_WRITER_GRACE`]). So the
+    /// wait ends before such a bump commits.
     const PASS_STOP_BOUND: std::time::Duration = std::time::Duration::from_secs(1);
 
     /// Where a stopped pass opens the connection that ends a backend (issue
@@ -2100,6 +2092,23 @@ mod db {
     /// network path that drops packets gives no socket error. A ping that
     /// does not return in this time counts as a lost session.
     const FENCE_PASS_PING_BOUND: std::time::Duration = std::time::Duration::from_secs(3);
+    /// How long a bump waits after it takes the pass lock (issue #1823).
+    ///
+    /// A guard whose session ends just after a ping finds the loss at its
+    /// next ping. That ping starts one keepalive interval later and can wait
+    /// its whole bound on a path that drops packets. The pass then ends its
+    /// backends, for at most [`PASS_STOP_BOUND`]. One more second is slack
+    /// for scheduling and connection time. So the stopped pass's backends
+    /// end before the bump commits.
+    ///
+    /// The sum is computed from those bounds, so it follows any change to
+    /// them.
+    const BUMP_WRITER_GRACE: std::time::Duration = std::time::Duration::from_secs(
+        FENCE_PASS_KEEPALIVE.as_secs()
+            + FENCE_PASS_PING_BOUND.as_secs()
+            + PASS_STOP_BOUND.as_secs()
+            + 1,
+    );
     /// The server ends a guard session that sends no ping for this long
     /// (issue #1823). It is far above the ping interval. A process cut off
     /// from the server then frees its pass locks, so a bump can commit.
@@ -2236,9 +2245,10 @@ mod db {
     /// So before it drops `pass`, this ends the backend of each connection
     /// that `pass` holds from [`fenced_checkout`] or [`fenced_acquire`]. The
     /// server then rolls back that statement and its transaction. The loss
-    /// is seen within one keepalive interval, and the ends take at most one
-    /// more. A bump waits three seconds after it takes the lock. So the
-    /// backends end before the bump commits.
+    /// is seen at the next keepalive ping, within its bound, and the ends
+    /// take at most one more second. A bump waits longer than all three
+    /// after it takes the lock ([`BUMP_WRITER_GRACE`]). So the backends end
+    /// before the bump commits.
     ///
     /// Each end runs on its own connection outside the pool, so a pass that
     /// holds the whole pool cannot starve it. A connection that a pass
