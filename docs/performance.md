@@ -2174,6 +2174,8 @@ standalone note rather than part of the claim-path attribution table above:
   maintainer override after falling short of the autonomous gate.
 * [`docs/performance-schema-validation-lazy-path.md`](performance-schema-validation-lazy-path.md)
   — lazy JSON-Pointer path construction in schema validation (issue #373).
+* [`docs/performance-schema-validate-kind-gated-lookups.md`](performance-schema-validate-kind-gated-lookups.md)
+  — kind-gated keyword lookups in schema validation (Ir -18.8%).
 * [`docs/performance-det-check.md`](performance-det-check.md) — fusing a
   redundant per-line comment scan in `harvest det-check` (issue #778).
 * [`docs/performance-det-check-line-trim.md`](performance-det-check-line-trim.md)
