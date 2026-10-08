@@ -284,23 +284,53 @@ pub async fn prune_fairness_state(
     batch_size: usize,
     preview: bool,
 ) -> HarvestResult<u64> {
+    let batch = i64::try_from(batch_size).unwrap_or(i64::MAX).max(1);
+    let queue = queue_name.map(str::to_owned);
+    if !preview {
+        return Ok(delete_prune_batches(conn, queue.as_deref(), cutoff, batch).await?);
+    }
+    // A preview runs the live batches, then rolls them back. A one-pass
+    // count would miss rows that qualify only in a later batch, such as the
+    // clock rows of an idle queue.
+    let ended = conn
+        .transaction::<(), PreviewEnd, _>(async move |conn| {
+            let n = delete_prune_batches(conn, queue.as_deref(), cutoff, batch).await?;
+            Err(PreviewEnd::Count(n))
+        })
+        .await;
+    match ended {
+        Err(PreviewEnd::Count(n)) => Ok(n),
+        Err(PreviewEnd::Failed(e)) => Err(e.into()),
+        Ok(()) => Ok(0),
+    }
+}
+
+/// How a preview transaction ends. It always rolls back, so the count
+/// leaves the transaction as its error.
+enum PreviewEnd {
+    Count(u64),
+    Failed(diesel::result::Error),
+}
+
+impl From<diesel::result::Error> for PreviewEnd {
+    fn from(e: diesel::result::Error) -> Self {
+        Self::Failed(e)
+    }
+}
+
+/// Delete prune victims in batches of `batch` rows, up to
+/// [`MAX_PRUNE_BATCHES`] batches. Stops at the first short batch. Returns
+/// the number of rows deleted.
+async fn delete_prune_batches(
+    conn: &mut AsyncPgConnection,
+    queue_name: Option<&str>,
+    cutoff: DateTime<Utc>,
+    batch: i64,
+) -> Result<u64, diesel::result::Error> {
     #[derive(diesel::QueryableByName)]
     struct Count {
         #[diesel(sql_type = diesel::sql_types::BigInt)]
         n: i64,
-    }
-    let batch = i64::try_from(batch_size).unwrap_or(i64::MAX).max(1);
-    let max_batches = i64::try_from(MAX_PRUNE_BATCHES).unwrap_or(1);
-    if preview {
-        let count: Count = diesel::sql_query(format!(
-            "WITH {PRUNE_VICTIMS_SQL} SELECT COUNT(*) AS n FROM victims"
-        ))
-        .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
-        .bind::<diesel::sql_types::BigInt, _>(batch.saturating_mul(max_batches))
-        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(queue_name)
-        .get_result(conn)
-        .await?;
-        return Ok(u64::try_from(count.n).unwrap_or(0));
     }
     let sql = format!(
         "WITH {PRUNE_VICTIMS_SQL}, gone AS ( \

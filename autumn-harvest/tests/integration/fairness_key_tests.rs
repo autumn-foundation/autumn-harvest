@@ -509,6 +509,47 @@ async fn a_held_lower_row_keeps_the_clock_row_in_an_idle_reset() {
     assert_eq!(left, ["clock", "low"], "the clock row and V hold");
 }
 
+/// A preview counts what a live call deletes, across its batches.
+///
+/// The clock row of an idle queue qualifies only after the rows below it
+/// go. One pass would miss it, so the preview must run the batches too.
+#[tokio::test]
+async fn prune_preview_matches_the_live_count_across_batches() {
+    let (mut conn, _container) = connect().await;
+    let idle = fresh_queue("preview");
+    let rows: Vec<String> = (0..101)
+        .map(|i| {
+            format!(
+                "('{idle}', 'k{i}', {pass}, {start}, NOW() - INTERVAL '30 minutes')",
+                pass = f64::from(i) + 1.0,
+                start = f64::from(i)
+            )
+        })
+        .collect();
+    diesel::sql_query(format!(
+        "INSERT INTO harvest_fairness_state (queue_name, fairness_key, pass, last_start, updated_at) \
+         VALUES {}",
+        rows.join(", ")
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("seed state");
+    let cutoff = Utc::now() - Duration::minutes(10);
+    let preview = prune_fairness_state(&mut conn, Some(&idle), cutoff, 100, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        list_fairness_state(&mut conn, &idle).await.unwrap().len(),
+        101,
+        "a preview deletes nothing"
+    );
+    let live = prune_fairness_state(&mut conn, Some(&idle), cutoff, 100, false)
+        .await
+        .unwrap();
+    assert_eq!(live, 101);
+    assert_eq!(preview, live);
+}
+
 /// A claim without fairness keys writes no state.
 #[tokio::test]
 async fn fairness_off_writes_no_state() {
