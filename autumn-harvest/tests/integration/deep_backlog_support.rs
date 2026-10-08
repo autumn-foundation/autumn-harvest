@@ -1076,6 +1076,65 @@ pub fn env_u64(name: &str, default: u64) -> u64 {
     }
 }
 
+#[derive(QueryableByName)]
+struct ExplainRow {
+    #[diesel(sql_type = Text, column_name = "QUERY PLAN")]
+    query_plan: String,
+}
+
+/// `EXPLAIN (ANALYZE, BUFFERS, SETTINGS)` of one engine claim over every queue.
+///
+/// The SQL is [`queue::claim_task_query`], the statement [`queue::claim_task`]
+/// runs, with its six binds as literals. `EXPLAIN ANALYZE` runs the claim,
+/// so it runs in a transaction that rolls back. The plan names the node that
+/// costs most, which `pg_stat_statements` cannot do.
+///
+/// # Panics
+/// Panics when the claim query grows a seventh bind, so the literals no
+/// longer match it.
+pub async fn explain_claim(conn: &mut AsyncPgConnection, spec: &FixtureSpec) -> String {
+    use diesel_async::RunQueryDsl;
+    let queue_list = spec
+        .queue_names()
+        .iter()
+        .map(|q| format!("'{q}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let literals = [
+        format!("'{PREFIX}-worker-0'"),
+        format!("ARRAY[{queue_list}]::text[]"),
+        "''".to_string(),
+        "NULL".to_string(),
+        "ARRAY[]::text[]".to_string(),
+        "ARRAY[]::text[]".to_string(),
+    ];
+    let raw = queue::claim_task_query();
+    assert!(
+        !raw.contains(&format!("${}", literals.len() + 1)),
+        "claim_task_query() has more than {} binds; extend the literals",
+        literals.len()
+    );
+    // Replace `$6` before `$1`, so `$1` cannot match the front of `$10`.
+    let mut sql = raw.to_string();
+    for (i, literal) in literals.iter().enumerate().rev() {
+        sql = sql.replace(&format!("${}", i + 1), literal);
+    }
+    let _ = conn.batch_execute("BEGIN").await;
+    let plan = diesel::sql_query(format!("EXPLAIN (ANALYZE, BUFFERS, SETTINGS) {sql}"))
+        .load::<ExplainRow>(conn)
+        .await;
+    let _ = conn.batch_execute("ROLLBACK").await;
+    plan.map_or_else(
+        |e| format!("EXPLAIN failed: {e}"),
+        |rows| {
+            rows.into_iter()
+                .map(|r| r.query_plan)
+                .collect::<Vec<_>>()
+                .join("\n")
+        },
+    )
+}
+
 /// The server version and the settings that move claim cost.
 ///
 /// JIT matters most. The claim plan costs more than `jit_above_cost` on a deep
@@ -1117,6 +1176,16 @@ pub async fn capture_run(
     let mut conn = connect(&db.url()).await;
     let seeded = seed(&mut conn, spec).await;
     let settings = server_settings(&mut conn).await;
+    // Before the reset, so this claim stays out of the workload statements.
+    std::fs::write(
+        out_dir.join(format!("{label}-claim.explain.txt")),
+        format!(
+            "-- EXPLAIN (ANALYZE, BUFFERS, SETTINGS) of one claim over every queue, \
+             after the seed, rolled back --\n{}\n",
+            explain_claim(&mut conn, spec).await
+        ),
+    )
+    .expect("write the claim plan");
     let shape = &seeded.shape;
     std::fs::write(
         out_dir.join(format!("{label}-post-seed-pg_stat_user_tables.txt")),
