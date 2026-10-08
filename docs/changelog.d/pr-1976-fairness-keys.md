@@ -17,8 +17,9 @@ claim statement is byte-identical.
   term, the key lag, after the effective priority. A map of the lags is built
   once per claim. No new bind. A separate upsert charges the key after
   the post-claim rechecks. A fair claim over several queues runs one
-  statement per queue. New entry points: `claim_task_with_fairness` and
-  `claim_task_by_id_with_fairness`.
+  statement per queue. A fair claim skips the seek window of issue #1971 and
+  runs the full scan, so its cost grows with the backlog. New entry points:
+  `claim_task_with_fairness` and `claim_task_by_id_with_fairness`.
 - **Runtime weights.** `fairness_keys::{set,clear,list}_fairness_weight(s)`,
   `GET/POST/DELETE /admin/queues/{queue}/fairness[/{key}]` and
   `harvest queue fairness {show,set,clear}`. A weight is from 0.001 to 1000.

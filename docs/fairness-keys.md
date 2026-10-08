@@ -139,7 +139,8 @@ A fair claim does not use the seek window of issue #1971. That window reads
 a bounded head of each queue, and its guard proves a pick from priority and
 due time only. The lag can put any row first, so a fair claim runs the full
 scan instead, as a claim with priority ageing does. Its cost thus grows with
-the backlog. See [the measured cost](performance.md#fairness-keys-issue-1976).
+the backlog: at 100,000 pending rows a fair claim took 132 ms against 8 ms.
+See [the measured cost](performance.md#fairness-keys-issue-1976).
 
 ## Upkeep
 

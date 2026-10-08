@@ -3422,8 +3422,9 @@ deployment. A worker with
 a slot tuner is keyed on the tuner's band, its initial target per kind and
 the tuner's `policy()` instead, because the tuner sizes its slots from there. Session capacity counts
 too, because session member activities are pinned to the session's host. So do
-`priority_aging_secs` and the activities the worker's labels make it
-ineligible for, because the claim query orders and filters tasks by them. So
+`priority_aging_secs`, `fairness_keys` and the activities the worker's labels
+make it ineligible for, because the claim query orders and filters tasks by
+them. So
 do the shards and the registered handlers, because a task without a handler is
 released and never counts. So do the circuit-breaker policies, because an
 activity with a breaker skips the claim-time rate-limit gate. The open state

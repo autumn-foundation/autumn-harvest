@@ -1602,33 +1602,33 @@ backlog.
 
 Run it with `HARVEST_CLAIM_BENCH_SECTION=fairness cargo bench -p
 autumn-harvest --features db --bench claim_bench`. Measured on the reference
-environment, with 8 claimers and a 90 s budget per row, before issue #1971.
-The baseline is the full-scan claim, so the table isolates the cost of the
-fair SQL:
+environment, with 8 claimers and a 90 s budget per row. The baseline is the
+default claim, which the seek window serves:
 
 | Backlog | Keys | Queues | Baseline p50 | Fair p50 | Delta |
 |--:|--:|--:|--:|--:|--:|
-| 1,000 | 256 | 1 | 14.29 ms | 18.09 ms | +27% |
-| 10,000 | 256 | 1 | 328.16 ms | 396.02 ms | +21% |
-| 10,000 | 10,000 | 1 | 352.01 ms | 379.99 ms | +8% |
-| 1,000 | 256 | 4 | 12.83 ms | 14.89 ms | +16% |
-| 10,000 | 256 | 4 | 340.03 ms | 328.07 ms | -4% |
-| 10,000 | 1 | 4 | 327.94 ms | 320.00 ms | -2% |
-| 10,000 | 10,000 | 4 | 319.99 ms | 310.05 ms | -3% |
-| 100,000 ⚠ | 256 | 4 | 5100.00 ms | 5263.77 ms | +3% |
+| 1,000 | 256 | 1 | 5.48 ms | 11.50 ms | +110% |
+| 10,000 | 256 | 1 | 5.84 ms | 51.83 ms | +788% |
+| 10,000 | 10,000 | 1 | 6.30 ms | 59.97 ms | +851% |
+| 1,000 | 256 | 4 | 7.77 ms | 7.74 ms | -0% |
+| 10,000 | 256 | 4 | 8.46 ms | 18.95 ms | +124% |
+| 10,000 | 1 | 4 | 7.63 ms | 20.25 ms | +165% |
+| 10,000 | 10,000 | 4 | 8.70 ms | 18.54 ms | +113% |
+| 100,000 | 256 | 4 | 8.00 ms | 132.02 ms | +1551% |
 
-`⚠`: the row hit the wall-clock budget, so it is not a full sample.
-
-- **Read the 1-queue rows for the cost of the SQL.** There both modes run
-  one statement over the same rows. The fair claim costs 8% to 27% more.
-- **Do not read the 4-queue rows as a speed-up.** A fair claim over several
-  queues runs one statement per queue. Each statement sorts a quarter of the
-  backlog. That offsets the cost of the fair SQL. It does not make the fair
-  SQL cheaper.
+- **The baseline stays flat. The fair claim grows with the backlog.** The
+  seek window reads a bounded head of each queue. A fair claim reads every
+  eligible row, as a claim with priority ageing does. At 100,000 rows the
+  fair claim takes 132 ms against 8 ms.
+- **Read the 1-queue rows for the cost of one statement.** The 4-queue rows
+  run one fair statement per queue. Each one sorts a quarter of the backlog,
+  so they grow more slowly.
 - **The key count does not drive the cost.** The map lookup is a binary
-  search. 10,000 keys cost no more than 256 keys.
-- **The cost grows with the backlog**, as the baseline does. The claim sorts
-  the whole eligible backlog (issue #1971).
+  search. 10,000 keys cost about the same as 256 keys.
+- **Before issue #1971** the default claim ran the full scan too. The fair
+  SQL then cost 8% to 27% more than the default claim on one queue.
+- **A bounded fair claim needs its own window.** It would need a head per
+  key and a guard on the lag. That is a separate change.
 
 ### Rejected forms of the lag lookup
 

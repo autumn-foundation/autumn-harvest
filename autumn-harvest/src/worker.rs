@@ -35050,6 +35050,7 @@ impl Worker {
                     ),
                     session_slots: self.config.max_concurrent_sessions,
                     priority_aging_secs: self.config.priority_aging_secs,
+                    fairness_keys: self.config.fairness_keys,
                     ineligible_activities: &self.ineligible_activities,
                     shard_assignments: &self.config.shard_assignments,
                     registered_workflows: &registered_workflows,

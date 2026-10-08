@@ -1092,8 +1092,8 @@ static SNAPSHOT_SEQ: std::sync::LazyLock<std::sync::atomic::AtomicI64> =
 ///   these labels, sorted by key.
 /// - `sessions`: the worker's session capacity. Session member activities are
 ///   pinned to the session's host, so only a worker with capacity gets them.
-/// - `priority_aging_secs` and `ineligible_activities`: the claim query orders
-///   and filters tasks by them.
+/// - `priority_aging_secs`, `fairness_keys` and `ineligible_activities`: the
+///   claim query orders and filters tasks by them.
 /// - `slots`: the worker's [`SlotPolicy`]. A worker with no slot for one kind
 ///   claims only the other. Under load, the claim gate gives each worker a
 ///   task mix that follows its slots, so two sizes are two cohorts.
@@ -1128,6 +1128,7 @@ pub fn worker_cohort(policy: &CohortPolicy<'_>) -> String {
         slots,
         session_slots,
         priority_aging_secs,
+        fairness_keys,
         ineligible_activities,
         shard_assignments,
         registered_workflows,
@@ -1175,6 +1176,7 @@ pub fn worker_cohort(policy: &CohortPolicy<'_>) -> String {
         "slots": slots.key(),
         "sessions": (*session_slots).max(0),
         "priority_aging_secs": priority_aging_secs,
+        "fairness_keys": fairness_keys,
         "ineligible_activities": sorted_names(ineligible_activities),
         "shards": shards,
         "workflows": sorted_names(registered_workflows),
@@ -1292,6 +1294,9 @@ pub struct CohortPolicy<'a> {
     pub session_slots: i32,
     /// The worker's priority aging, which orders a mixed-priority backlog.
     pub priority_aging_secs: Option<u32>,
+    /// Whether the worker claims with fairness keys (issue #1976). A fair claim
+    /// orders a shared queue by tenant, so it takes a different task mix.
+    pub fairness_keys: bool,
     /// Activities the worker does not claim, because its labels do not meet
     /// their requirements.
     pub ineligible_activities: &'a [String],
@@ -3589,6 +3594,7 @@ mod tests {
             slots: super::SlotPolicy::of(1, 1, None),
             session_slots: 0,
             priority_aging_secs: None,
+            fairness_keys: false,
             ineligible_activities: &[],
             shard_assignments: &[],
             registered_workflows: &[],
@@ -3621,6 +3627,7 @@ mod tests {
                 slots: super::SlotPolicy::of(workflows, activities, None),
                 session_slots: 0,
                 priority_aging_secs: None,
+                fairness_keys: false,
                 ineligible_activities: &[],
                 shard_assignments: &[],
                 registered_workflows: &[],
@@ -3658,6 +3665,7 @@ mod tests {
                 slots: super::SlotPolicy::of(10, 10, None),
                 session_slots: n,
                 priority_aging_secs: None,
+                fairness_keys: false,
                 ineligible_activities: &[],
                 shard_assignments: &[],
                 registered_workflows: &[],
@@ -3701,6 +3709,7 @@ mod tests {
                 slots: super::SlotPolicy::of(10, 10, None),
                 session_slots: 0,
                 priority_aging_secs: aging,
+                fairness_keys: false,
                 ineligible_activities: ineligible,
                 shard_assignments: &[],
                 registered_workflows: &[],
@@ -3721,6 +3730,41 @@ mod tests {
         assert_eq!(cohort(None, &gpu), cohort(None, &gpu_reordered));
     }
 
+    /// Issue #1976: a fair worker orders a shared queue by tenant, so it
+    /// claims a different task mix. It is in a different cohort.
+    #[test]
+    fn the_cohort_key_includes_the_fairness_mode() {
+        let queues = vec!["a".to_owned()];
+        let none = std::collections::HashMap::<String, u32>::new();
+        let labels = std::collections::HashMap::<String, String>::new();
+        let cohort = |fairness_keys| {
+            super::worker_cohort(&super::CohortPolicy {
+                queues: &queues,
+                queue_weights: &none,
+                build_id: "v1",
+                labels: &labels,
+                slots: super::SlotPolicy::of(10, 10, None),
+                session_slots: 0,
+                priority_aging_secs: None,
+                fairness_keys,
+                ineligible_activities: &[],
+                shard_assignments: &[],
+                registered_workflows: &[],
+                registered_activities: &[],
+                circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry::empty(),
+                dispatch_channel: &[],
+                retry_budgets: &crate::retry_budget::RetryBudgetConfig::default(),
+                adaptive_limits: &crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
+                outcome_window: std::time::Duration::from_secs(300),
+                peer_stale_secs: 120,
+                execution: super::ExecutionPolicy::default(),
+                payload: super::PayloadPolicy::default(),
+            })
+        };
+        assert_ne!(cohort(false), cohort(true));
+        assert_eq!(cohort(true), cohort(true));
+    }
+
     /// Issue #1815: workers on other shards, or with other handlers, claim or
     /// complete other tasks, so they are in different cohorts.
     #[test]
@@ -3738,6 +3782,7 @@ mod tests {
                 slots: super::SlotPolicy::of(10, 10, None),
                 session_slots: 0,
                 priority_aging_secs: None,
+                fairness_keys: false,
                 ineligible_activities: &[],
                 shard_assignments: shards,
                 registered_workflows: workflows,
@@ -3868,6 +3913,7 @@ mod tests {
                 slots: super::SlotPolicy::of(10, 10, None),
                 session_slots: 0,
                 priority_aging_secs: None,
+                fairness_keys: false,
                 ineligible_activities: &[],
                 shard_assignments: &[],
                 registered_workflows: &[],
@@ -3939,6 +3985,7 @@ mod tests {
                 slots: super::SlotPolicy::of(10, 10, None),
                 session_slots: 0,
                 priority_aging_secs: None,
+                fairness_keys: false,
                 ineligible_activities: &[],
                 shard_assignments: &[],
                 registered_workflows: &[],
@@ -3981,6 +4028,7 @@ mod tests {
                 slots: super::SlotPolicy::of(10, 10, None),
                 session_slots: 0,
                 priority_aging_secs: None,
+                fairness_keys: false,
                 ineligible_activities: &[],
                 shard_assignments: &[],
                 registered_workflows: &[],
@@ -4028,6 +4076,7 @@ mod tests {
                 slots: super::SlotPolicy::of(10, 10, None),
                 session_slots: 0,
                 priority_aging_secs: None,
+                fairness_keys: false,
                 ineligible_activities: &[],
                 shard_assignments: &[],
                 registered_workflows: &[],
@@ -4079,6 +4128,7 @@ mod tests {
                 slots: super::SlotPolicy::of(10, 10, None),
                 session_slots: 0,
                 priority_aging_secs: None,
+                fairness_keys: false,
                 ineligible_activities: &[],
                 shard_assignments: &[],
                 registered_workflows: &[],
@@ -4127,6 +4177,7 @@ mod tests {
                 slots: super::SlotPolicy::of(10, 10, None),
                 session_slots: 0,
                 priority_aging_secs: None,
+                fairness_keys: false,
                 ineligible_activities: &[],
                 shard_assignments: &[],
                 registered_workflows: &[],
@@ -4218,6 +4269,7 @@ mod tests {
                 slots: super::SlotPolicy::of(10, 10, None),
                 session_slots: 0,
                 priority_aging_secs: None,
+                fairness_keys: false,
                 ineligible_activities: &[],
                 shard_assignments: &[],
                 registered_workflows: &[],
@@ -4407,6 +4459,7 @@ mod tests {
                 slots: super::SlotPolicy::of(10, 10, None),
                 session_slots: 0,
                 priority_aging_secs: None,
+                fairness_keys: false,
                 ineligible_activities: &[],
                 shard_assignments: &[],
                 registered_workflows: &[],
@@ -4784,6 +4837,7 @@ mod tests {
                 slots: super::SlotPolicy::of(workflows, activities, None),
                 session_slots: 0,
                 priority_aging_secs: None,
+                fairness_keys: false,
                 ineligible_activities: &[],
                 shard_assignments: &[],
                 registered_workflows: &[],
