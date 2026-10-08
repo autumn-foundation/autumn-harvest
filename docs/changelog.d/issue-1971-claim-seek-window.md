@@ -2,7 +2,7 @@
 
 **Claim order does not change.** The claim picks the same row as before.
 Its cost changes. One fix changes behavior: a capped concurrency key can no
-longer run one task over its cap.
+longer run tasks over its cap.
 
 **The problem.** The default claim statement scanned and sorted every due
 `PENDING` row of the polled queues on each claim. At a 100K backlog the sort
@@ -24,7 +24,8 @@ first:
 - A guard proves that no row outside the window sorts before the window
   candidate. The proof uses the last row of each full head. The candidate
   scan reads the rows that pass by primary key. Its row test gives the
-  planner no partial index, so stale statistics cannot change the plan.
+  planner no partial index on `PENDING` rows. So stale statistics leave only
+  the primary-key probe or a scan of the whole table.
 - When the guard cannot prove it, or priority ageing is on, the same
   statement runs the old full scan. A one-time filter gates it, so it does
   not run otherwise.
@@ -42,13 +43,19 @@ first:
   and `SET LOCAL enable_bitmapscan = off`. The plan carries the cost
   estimate of the full scan, which passed `jit_above_cost`. A bitmap scan
   would read every due row of a queue head instead of the window.
+- A claim with priority ageing on always runs the full scan, which reads
+  faster with bitmap scans. It sends
+  `queue::CLAIM_AGEING_PLAN_SETTINGS_SQL`, without the bitmap setting, and
+  caches as its own statement.
 - The `expired_runs` CTE reads each deadline index in its own branch. An
   `OR` of the two needs a bitmap scan.
 - **Cap fix.** The claim counted a capped key under the snapshot of its own
-  statement, which predates the advisory lock of the key. A claim that
-  committed in between was not counted. A claim on a capped key now counts
+  statement, which predates the advisory lock of the key. The count missed
+  a claim that committed in between. A claim on a capped key now counts
   again after the claim, in a fresh snapshot, and gives the row back over
-  the cap. This adds one round trip to such a claim only.
+  the cap. Every claim path runs this re-check: the default, the by-id and
+  the batched claim. It adds one round trip to a claim on a capped key
+  only.
 
 **Measured** on the deep-backlog generator of issue #1956 (PR #2045),
 Postgres 16. Buffers per claim, from `EXPLAIN`, polling the four largest
@@ -79,11 +86,12 @@ No column change, no data migration, no `WorkflowEvent` variant, no replay
 impact. See [0.8.0 §1.2](../upgrading/0.8.0.md#12-the-claim-reads-a-bounded-window-and-sets-its-own-planner-settings).
 
 **Tests.** `claim_seek_tests` covers the depth sweep, the issue #1215 spill
-and a one-type backlog. It covers stale statistics, a kind-filtered claim
-behind the other kind, the cached statement before and after a column is
-added, and concurrent claimers on a capped key at depth. It covers the
-claim order: a continuation storm, a deep pin, a saturated head, `$6` and
-saturated types at the head, ageing, a kind filter and randomized drains
-against a reference order. The claim-query shape tests in `queue.rs` pin
-the window, the guard, the fallback gate, the result columns, the splices,
-the window row test and the cap re-check.
+and a one-type backlog. It covers stale statistics and a kind-filtered
+claim behind the other kind. It covers the cached statement before and
+after a column is added, and concurrent claimers on a capped key at depth.
+It covers the claim order: a continuation storm, a deep pin, a saturated
+head, `$6` and saturated types at the head, ageing, a kind filter and
+randomized drains against a reference order. The shape tests in `queue.rs`
+pin the window, the guard, the fallback gate and the result columns. They
+also pin the splices, the window row test, the ageing statement and the cap
+re-check.

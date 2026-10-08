@@ -917,8 +917,8 @@ pub const DEADLINE_EXCEEDED_ERROR: &str = "deadline_exceeded";
 /// the scanner clears it once per poll interval.
 ///
 /// Each deadline has its own partial index, so the CTE reads each one in its
-/// own branch. An `OR` needs a bitmap scan to use both indexes. The claim
-/// turns bitmap scans off (issue #1971), so an `OR` would scan every run. A
+/// own branch. An `OR` needs a bitmap scan to use both indexes. The default
+/// claim turns bitmap scans off (issue #1971), so an `OR` would scan every run. A
 /// run past both deadlines appears twice. The gates test membership only, so
 /// the duplicate has no effect.
 ///
@@ -1210,10 +1210,11 @@ macro_rules! claim_candidate_gates_sql {
     };
 }
 
-/// The full candidate scan of the claim query.
+/// A candidate scan of the claim query: the full scan or the window scan.
 ///
 /// `$name` names the CTE. `$counts` names the running-count CTE. `$rows` is
-/// the queue and state test. `$extra` is a predicate after the queue-pause
+/// the row test: the queue and state test for the full scan, the state test
+/// alone for the window scan. `$extra` is a predicate after the queue-pause
 /// test.
 macro_rules! claim_candidate_scan_sql {
     ($name:literal, $counts:literal, [$($rows:tt)*], [$($extra:tt)*]) => {
@@ -1533,7 +1534,7 @@ macro_rules! claim_seek_guard_sql {
     };
 }
 
-/// The queue and state test of the window candidate scan (issue #1971).
+/// The state test of the window candidate scan (issue #1971).
 ///
 /// The scan must read its rows by primary key. Any other plan reads the
 /// whole backlog. The planner guesses the size of the id array and the
@@ -1550,12 +1551,13 @@ macro_rules! claim_seek_guard_sql {
 ///   queue. A queue test also let Postgres 16 run
 ///   `idx_harvest_tq_coverage_sample` once per pair of queue and id: 27K
 ///   buffers at 64 queues.
-/// - The state test compares with a scalar subquery. Postgres proves a
-///   partial-index predicate from a constant only, so no partial index
+/// - The state test compares with a scalar subquery. Postgres cannot prove
+///   `state = 'PENDING'` from it, so no partial index on `PENDING` rows
 ///   matches. The row lock still rechecks the state.
 ///
-/// Only the primary key and a scan of the whole table remain. The primary
-/// key costs one probe per window row.
+/// The other row tests prove none of the partial-index predicates that do
+/// not test the state. Only the primary key and a scan of the whole table
+/// remain. The primary key costs one probe per window row.
 macro_rules! claim_seek_rows_sql {
     () => {
         "harvest_task_queue.state = (SELECT 'PENDING'::text) "
@@ -1754,8 +1756,9 @@ const fn claim_task_full_scan_query() -> &'static str {
 /// throughput at 10K pending rows from 127 to 1.6 claims per second.
 ///
 /// **Generic plan.** [`CachedClaimQuery`] keeps one prepared statement per
-/// connection. A custom plan costs about 6 ms of planning on each claim,
-/// more than the claim itself. Postgres may keep a custom plan anyway,
+/// connection. A custom plan costs about 6 ms of planning on each claim. On
+/// a small backlog that is more than the claim costs to run. Postgres may
+/// keep a custom plan anyway,
 /// because it compares estimated costs, not planning time. The generic plan
 /// has the same shape: bounded head scans, a lookup by primary key and a
 /// gated full scan. An `ANALYZE` of the table invalidates it.
@@ -1766,8 +1769,13 @@ const fn claim_task_full_scan_query() -> &'static str {
 /// window size. A generic plan, skewed queues or stale statistics all give
 /// that estimate. On the issue #1956 fixture, the bitmap form read 2,515
 /// buffers at 10K pending rows. With stale statistics it read 11,704. The
-/// ordered scan does not depend on the estimate. Every other read in the
-/// claim is a lookup by key, so it needs no bitmap.
+/// ordered scan does not depend on the estimate.
+///
+/// The full scan reads the whole backlog with or without bitmap scans. A
+/// bitmap scan helps it, though: at 100K pending rows with ageing on, it
+/// read 16K buffers with bitmap scans and 46K without. Ageing skips the
+/// window, so an ageing claim sends [`CLAIM_AGEING_PLAN_SETTINGS_SQL`]
+/// instead.
 ///
 /// `SET LOCAL` ends with the transaction, so the session settings of the
 /// connection do not change. The settings travel with the claim, as the
@@ -1778,6 +1786,22 @@ const fn claim_task_full_scan_query() -> &'static str {
 pub const CLAIM_PLAN_SETTINGS_SQL: &str = "SET LOCAL jit = off; \
      SET LOCAL plan_cache_mode = force_generic_plan; \
      SET LOCAL enable_bitmapscan = off";
+
+/// The planner settings of a claim with priority ageing on (issue #1971).
+///
+/// Ageing always runs the full scan, which reads faster with bitmap scans.
+/// See [`CLAIM_PLAN_SETTINGS_SQL`]. Postgres does not plan a cached
+/// statement again when a planner setting changes. So the ageing claim
+/// carries [`CLAIM_AGEING_MARKER`], and the connection caches it as a
+/// separate statement with its own plan.
+pub const CLAIM_AGEING_PLAN_SETTINGS_SQL: &str =
+    "SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan";
+
+/// The comment in front of the ageing claim statement (issue #1971).
+///
+/// It changes the statement text only, so the ageing claim gets its own
+/// cached statement. See [`CLAIM_AGEING_PLAN_SETTINGS_SQL`].
+pub const CLAIM_AGEING_MARKER: &str = "/* claim: priority ageing */ ";
 
 /// One default claim statement with its binds (issue #1971).
 ///
@@ -1790,6 +1814,9 @@ pub const CLAIM_PLAN_SETTINGS_SQL: &str = "SET LOCAL jit = off; \
 /// therefore does not change the result type of the cached statement.
 struct CachedClaimQuery<'a> {
     sql: &'static str,
+    /// Priority ageing is on. The statement then starts with
+    /// [`CLAIM_AGEING_MARKER`].
+    ageing: bool,
     worker_id: &'a str,
     queues: &'a [String],
     worker_build_id: &'a str,
@@ -1814,6 +1841,9 @@ impl diesel::query_builder::QueryFragment<diesel::pg::Pg> for CachedClaimQuery<'
         mut out: diesel::query_builder::AstPass<'_, 'b, diesel::pg::Pg>,
     ) -> diesel::QueryResult<()> {
         use diesel::sql_types::{Array, BigInt, Integer, Nullable, Text};
+        if self.ageing {
+            out.push_sql(CLAIM_AGEING_MARKER);
+        }
         out.push_sql(self.sql);
         out.push_bind_param_value_only::<Text, _>(self.worker_id)?;
         out.push_bind_param_value_only::<Array<Text>, _>(self.queues)?;
@@ -2053,9 +2083,10 @@ pub async fn claim_task_of_kind_on_shard(
     // from picking the same row.
     //
     // Phase 2 (UPDATE): for capped keys, acquire pg_try_advisory_xact_lock
-    // only for the single selected candidate and re-verify the cap. This
-    // closes the race window where two workers could both pass the cap check
-    // in the same poll cycle before either commits. If the advisory lock fails
+    // only for the single selected candidate and re-verify the cap. The
+    // re-check reads the snapshot of the claim statement, which predates the
+    // lock. `release_claim_if_over_cap` counts again after the claim, in a
+    // fresh snapshot, to close that gap. If the advisory lock fails
     // (another worker holds it) or the re-check shows the cap is now
     // saturated, the UPDATE matches 0 rows and the transaction commits with no
     // change; the PENDING row is immediately available for the next poll.
@@ -2178,7 +2209,13 @@ pub async fn claim_task_of_kind_on_shard(
     let outcome: ClaimOutcome = tx
         .run(
             async |conn: &mut AsyncPgConnection| -> HarvestResult<ClaimOutcome> {
-                diesel_async::SimpleAsyncConnection::batch_execute(conn, CLAIM_PLAN_SETTINGS_SQL)
+                let ageing = aging_secs_i64.is_some_and(|secs| secs > 0);
+                let settings = if ageing {
+                    CLAIM_AGEING_PLAN_SETTINGS_SQL
+                } else {
+                    CLAIM_PLAN_SETTINGS_SQL
+                };
+                diesel_async::SimpleAsyncConnection::batch_execute(conn, settings)
                     .await
                     .map_err(crate::error::database_error)?;
                 // Cross-region DR fence (issue #954). The unfenced form binds
@@ -2195,6 +2232,7 @@ pub async fn claim_task_of_kind_on_shard(
                 };
                 let result: Vec<TaskQueueItem> = CachedClaimQuery {
                     sql,
+                    ageing,
                     worker_id,
                     queues,
                     worker_build_id,
@@ -2472,12 +2510,17 @@ pub const fn release_claim_if_over_cap_query() -> &'static str {
 /// rows of the key. Both happen in one statement, so the count reads the
 /// snapshot from the start of the statement. A claim on the same key can
 /// commit after that snapshot and before the lock. The count then misses
-/// that claim, and the cap is exceeded by one.
+/// that claim. Several claimers can each miss earlier claims in turn, so the
+/// key can run more than one task over its cap.
 ///
 /// This statement takes a fresh snapshot while the transaction still holds
 /// the advisory lock. Every claim on the key that committed before the lock
-/// is visible. A later claim must wait for this commit to take the lock, so
-/// it sees this claim. So the cap holds through commit.
+/// is visible. A later claim cannot take the lock until this transaction
+/// commits. It skips the row, or it takes the lock after the commit and
+/// sees this claim. So the cap holds through commit.
+///
+/// Every claim path runs this re-check: the default, the by-id and the
+/// batched claim.
 ///
 /// A released claim keeps its rate-limit debit, as the pause releases do.
 ///
@@ -2594,7 +2637,7 @@ async fn apply_post_claim_rechecks(
 ///
 /// The dispatch channel carries a reference to a row. This claims that row
 /// with the full claim predicate. Every gate [`claim_task_on_shard`] applies
-/// still applies. So do both authoritative post-claim re-checks and the
+/// still applies. So do the authoritative post-claim re-checks and the
 /// queue-pause advisory barrier. The query text, the transaction shape and the
 /// isolation level are the same. A reference is a latency hint, never an
 /// authorization.
@@ -9078,8 +9121,10 @@ pub fn claim_batched_candidate_attempt_query() -> &'static str {
 /// transaction-scoped and reentrant. Re-acquiring it here is a no-op, not
 /// a second lock. Holding it from here blocks every other claimer from
 /// starting new `RUNNING` work under this key, until this transaction
-/// ends. So the `COUNT` this probe reads stays valid through the later
-/// claim attempt.
+/// ends. The probe counts under the snapshot of its own statement, which
+/// predates the lock, so it can miss a claim that committed just before.
+/// The claim attempt counts again in a fresh snapshot, under the lock, and
+/// that count is the authoritative one.
 #[must_use]
 pub const fn claim_batched_candidate_concurrency_probe_query() -> &'static str {
     "SELECT ( \
@@ -10507,6 +10552,43 @@ mod tests {
         assert!(CLAIM_PLAN_SETTINGS_SQL.contains("jit = off"));
         assert!(CLAIM_PLAN_SETTINGS_SQL.contains("plan_cache_mode = force_generic_plan"));
         assert!(CLAIM_PLAN_SETTINGS_SQL.contains("enable_bitmapscan = off"));
+        for setting in CLAIM_AGEING_PLAN_SETTINGS_SQL.split("; ") {
+            assert!(setting.starts_with("SET LOCAL "), "{setting}");
+        }
+        assert!(CLAIM_AGEING_PLAN_SETTINGS_SQL.contains("jit = off"));
+        assert!(CLAIM_AGEING_PLAN_SETTINGS_SQL.contains("plan_cache_mode = force_generic_plan"));
+        assert!(
+            !CLAIM_AGEING_PLAN_SETTINGS_SQL.contains("enable_bitmapscan"),
+            "the ageing claim runs the full scan, which reads faster with bitmap scans"
+        );
+    }
+
+    /// The ageing claim is a separate cached statement (issue #1971).
+    ///
+    /// Postgres keeps a cached plan when a planner setting changes. Only a
+    /// different statement text gets the ageing claim its own plan.
+    #[test]
+    fn the_ageing_claim_has_its_own_statement_text() {
+        let text = |ageing: bool| {
+            let query = CachedClaimQuery {
+                sql: claim_task_query(),
+                ageing,
+                worker_id: "w",
+                queues: &[],
+                worker_build_id: "",
+                aging_secs: ageing.then_some(60),
+                circuit_breaker_activities: &[],
+                ineligible_activities: &[],
+                fence: None,
+            };
+            diesel::debug_query::<diesel::pg::Pg, _>(&query).to_string()
+        };
+        let (plain, ageing) = (text(false), text(true));
+        assert!(plain.starts_with("WITH "), "{plain}");
+        assert!(
+            ageing.starts_with(&format!("{CLAIM_AGEING_MARKER}WITH ")),
+            "{ageing}"
+        );
     }
 
     /// The claim result lists every `TaskQueueItem` field (issue #1971).

@@ -129,7 +129,8 @@ backlog. Ties may go either way, as before. `priority`, `scheduled_at`,
 
 The window candidate scan reads the rows that pass the guard by primary key,
 through `id = ANY(ARRAY(...))`. Its row test gives the planner no partial
-index, so the plan does not depend on the table statistics. See §1.8.
+index on `PENDING` rows. So stale statistics leave only the primary-key
+probe or a scan of the whole table. See §1.8.
 
 ### 1.4 The fallback
 
@@ -144,6 +145,7 @@ Otherwise the scan never runs. `candidate` is the union of the two. The
 - Kind (#1787): the kind predicate goes into both candidate scans and the
   pin head. The queue heads of the other kind are dropped before they run.
 - By id (#1312): the by-id claim names one row. It keeps the full-scan form.
+  It runs the post-claim cap re-check of §1.9.
 
 ### 1.6 Planner settings
 
@@ -180,14 +182,21 @@ The synthetic test fixture hid three plan traps. The generator of PR #2045
 |---|---|---|---|
 | Bitmap head scan | The planner estimated a head below 32 rows: a generic plan, queue skew, stale statistics. | 2,515 buffers at 10K; 11,704 with stale statistics. | `SET LOCAL enable_bitmapscan = off`. `expired_runs` reads each deadline index in its own branch. |
 | Multi-array index scan | A queue test let Postgres 16 use `idx_harvest_tq_coverage_sample` with two arrays, one descent per pair. | 27K buffers at 1K pending rows, 64 queues. | No queue test in the window scan. |
-| Partial index on `id` | A constant state test let stale statistics pick `idx_harvest_tq_live_created`, or a table-outer join. | 17K to 30K buffers. | The state test compares with a scalar subquery, so no partial index matches. |
+| Partial index on `id` | A constant state test let stale statistics pick `idx_harvest_tq_live_created`, or a table-outer join. | 17K to 30K buffers. | The state test compares with a scalar subquery. Postgres cannot prove `state = 'PENDING'` from it, so no partial index on `PENDING` rows matches. |
 
 ### 1.9 The concurrency cap
 
 The cap test at depth found a race older than this change. The `claimed`
 CTE counts the key under the snapshot of its statement, which predates the
 advisory lock. A post-claim statement now counts again in a fresh snapshot,
-under the lock, and gives the row back over the cap.
+under the lock, and gives the row back over the cap. The default, by-id and
+batched claims all run it, through `apply_post_claim_rechecks`.
+
+An ageing claim always runs the full scan, which reads faster with bitmap
+scans: 16K buffers against 46K at 100K pending rows. So it sends
+`CLAIM_AGEING_PLAN_SETTINGS_SQL`, without the bitmap setting. Postgres keeps
+a cached plan when a setting changes, so the ageing claim starts with
+`CLAIM_AGEING_MARKER` and caches as its own statement.
 
 ## 2. Test plan
 
@@ -198,7 +207,8 @@ under the lock, and gives the row back over the cap.
 | Red | Shape tests for `seek_heads`, the guard and the fallback | Fail: no window. | Pass. |
 | Red, added in green | `a_single_activity_type_backlog_keeps_the_window_bounded` | Fail with plain head gates: 1,393 to 10,916 buffers. | Pass. |
 | Added after review | `stale_statistics_keep_the_window_bounded`, `a_kind_filtered_claim_stays_flat_behind_the_other_kind`, `the_claim_statement_is_prepared_once_per_connection`, `an_added_column_does_not_break_a_cached_claim` | Each covers one review finding (R13 to R16). | Pass. |
-| Added on the #1956 fixture | `stale_statistics_keep_the_window_bounded` under CI, `the_window_scan_matches_no_partial_index` | Fail: 11,704, then 30,278 buffers. | Pass: 479 buffers. |
+| Added on the #1956 fixture | `stale_statistics_keep_the_window_bounded` under CI | Fail: 11,704, then 30,278 buffers. | Pass: 479 buffers. |
+| Added on the #1956 fixture | `the_window_scan_matches_no_partial_index`, `the_ageing_claim_has_its_own_statement_text` | Fail: the window scan has a queue test and a constant state test; the ageing claim shares the statement. | Pass. |
 | Added on the #1956 fixture | `concurrent_claimers_never_exceed_a_cap_at_depth`, `the_cap_recheck_counts_what_the_claim_counts` | Fail: 4 rows run on a key capped at 3. | Pass. |
 | Both | Order tests and the randomized drain | Pass. | Pass. |
 | Both | Existing claim suites: concurrency, pause, build routing, DR fence, run deadline, continuation priority, batched | Pass. | Pass. |
@@ -206,7 +216,7 @@ under the lock, and gives the row back over the cap.
 ## 3. Measurement
 
 `docs/performance.md` gets a section with claim buffers and latency at 1K,
-10K and 100K, before and after. It also states the fairness change (none
+10K, 100K and 1M, on 4 and 64 queues, before and after. It also states the fairness change (none
 with ageing off) and the fallback cases.
 
 ## 4. Follow-ups (not in this change)
@@ -222,11 +232,11 @@ with ageing off) and the fallback cases.
    that polls many queues reads a bounded total.
 6. Cache the by-id claim statement the same way (issue #1312 path).
 7. Count `RUNNING` rows per window key through
-   `harvest_task_queue_concurrency_key_running`. The planner now walks every
+   `harvest_task_queue_concurrency_key_running`. The planner walks every
    `RUNNING` row, about 900 buffers with a full fleet.
 8. Switch `claim_seek_tests` to the generator of PR #2045 once it merges.
-9. Gate saturated keys in the head scans. A hashed set of the
-   `(concurrency_key, task_type, concurrency_cap)` triples at their cap is
-   built from the same `RUNNING` walk. The head scans then skip those rows,
+9. Gate saturated keys in the head scans. The same `RUNNING` walk builds a
+   hashed set of the `(concurrency_key, task_type, concurrency_cap)` triples
+   at their cap. The head scans then skip those rows,
    and a head of hot-key rows no longer falls back. On the #1956 fixture at
    1M, one claim in 800 fell back this way under `pgbench`.
