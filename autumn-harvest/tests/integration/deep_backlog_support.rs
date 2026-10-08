@@ -1250,7 +1250,11 @@ pub async fn capture_run(
         ),
     )
     .expect("write the post-seed tables");
-    let reset = stats::reset_statements(&mut conn).await;
+    // Without a reset, the statements view holds the seed and the plan too.
+    // Evidence from such a run is not workload-only, so the capture stops.
+    stats::reset_statements(&mut conn)
+        .await
+        .unwrap_or_else(|e| panic!("the Ledger capture needs pg_stat_statements: {e}"));
     drop(conn);
 
     eprintln!("== {label}: driving claims ==");
@@ -1327,11 +1331,7 @@ pub async fn capture_run(
         WORKER_SLOTS
     );
     let _ = writeln!(s, "server: {settings}");
-    let _ = writeln!(
-        s,
-        "pg_stat_statements reset: {}",
-        reset.as_ref().map_or_else(String::as_str, |()| "ok")
-    );
+    let _ = writeln!(s, "pg_stat_statements reset: ok");
     let _ = writeln!(
         s,
         "workload: {} claimers, {} claims, {} completions, {} reclaims, {} enqueues, {} empty polls, {} errors, {} cut at the budget, in {:.1}s ({:.1} claims/s)",

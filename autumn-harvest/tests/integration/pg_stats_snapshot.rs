@@ -335,8 +335,7 @@ pub async fn capture(conn: &mut AsyncPgConnection) -> StatsSnapshot {
 
 /// Connect to `url`, capture both views, and write them to `dir`.
 ///
-/// The e2e bench calls this from its teardown, before the drop. It never
-/// panics, so a failed snapshot cannot skip the drop.
+/// It never panics, so a failed snapshot cannot skip a drop after it.
 ///
 /// # Errors
 /// Returns an error when the connection, the read or a file write fails.
@@ -344,8 +343,22 @@ pub async fn snapshot_to_dir(url: &str, dir: &Path, label: &str) -> Result<Vec<P
     let mut conn = AsyncPgConnection::establish(url)
         .await
         .map_err(|e| format!("connect for the stats snapshot: {e}"))?;
-    let snapshot = try_capture(&mut conn).await?;
-    drop(conn);
+    snapshot_conn_to_dir(&mut conn, dir, label).await
+}
+
+/// Capture both views on `conn` and write them to `dir`.
+///
+/// The e2e bench calls this on each shard's lease, before the drop. A
+/// session flushes its own counters, so the lease needs no wait.
+///
+/// # Errors
+/// Returns an error when the read or a file write fails.
+pub async fn snapshot_conn_to_dir(
+    conn: &mut AsyncPgConnection,
+    dir: &Path,
+    label: &str,
+) -> Result<Vec<PathBuf>, String> {
+    let snapshot = try_capture(conn).await?;
     write_snapshot(dir, label, &snapshot, TOP_STATEMENTS)
         .map_err(|e| format!("write the stats snapshot: {e}"))
 }

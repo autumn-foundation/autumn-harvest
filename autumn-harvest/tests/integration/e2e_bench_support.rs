@@ -2595,7 +2595,7 @@ pub mod db {
         /// Idle connections held for the cluster's lifetime, so a concurrent
         /// run on a shared server can see the databases are in use. Same
         /// rationale as the claim harness's lease.
-        leases: Vec<AsyncPgConnection>,
+        leases: BTreeMap<ShardId, AsyncPgConnection>,
     }
 
     static DB_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -2868,7 +2868,7 @@ pub mod db {
             .await;
         }
         let mut urls = BTreeMap::new();
-        let mut leases = Vec::new();
+        let mut leases = BTreeMap::new();
         let mut created = Vec::new();
         for (idx, admin) in admin_urls.iter().take(count).enumerate() {
             let shard = ShardId::new(i32::try_from(idx).unwrap_or(0));
@@ -2878,7 +2878,7 @@ pub mod db {
                 Ok((url, name, lease)) => {
                     urls.insert(shard, url);
                     created.push(((*admin).to_owned(), name));
-                    leases.push(lease);
+                    leases.insert(shard, lease);
                 }
                 // Shard 3 of 4 failing is the common case (one server slower
                 // to accept connections). Without this, shards 0-2 are
@@ -2953,7 +2953,7 @@ pub mod db {
         };
 
         let mut urls = BTreeMap::new();
-        let mut leases = Vec::new();
+        let mut leases = BTreeMap::new();
         let mut created = Vec::new();
         // Every shard shares this one server, so each gets its own sweep and
         // lock hold. This is skipped only on the testcontainer path. Nothing
@@ -2965,7 +2965,7 @@ pub mod db {
                 Ok((url, name, lease)) => {
                     urls.insert(shard, url);
                     created.push((admin_url.clone(), name));
-                    leases.push(lease);
+                    leases.insert(shard, lease);
                 }
                 Err(e) => {
                     drop(leases);
@@ -3032,7 +3032,7 @@ pub mod db {
         /// shard before the drop. The drop discards `pg_stat_user_tables`, so
         /// the snapshot comes first (issue #1956). Unset, this is
         /// [`Self::teardown`].
-        pub async fn teardown_with_stats(self, scenario: BenchScenario) -> Vec<String> {
+        pub async fn teardown_with_stats(mut self, scenario: BenchScenario) -> Vec<String> {
             let mut failures = self.snapshot_stats(scenario).await;
             failures.extend(self.teardown().await);
             failures
@@ -3040,21 +3040,27 @@ pub mod db {
 
         /// Write each shard's stats views to [`STATS_DIR_ENV_VAR`], if set.
         ///
-        /// A failed or timed-out snapshot is a reported failure, never a
-        /// panic, so the drop after it always runs. The leases stay open
-        /// meanwhile, so a concurrent stale sweep cannot drop a shard first.
-        async fn snapshot_stats(&self, scenario: BenchScenario) -> Vec<String> {
-            use super::super::pg_stats_snapshot::{SNAPSHOT_BOUND, snapshot_to_dir};
+        /// Each snapshot runs on the shard's own lease. The lease is then this
+        /// session, so it flushes its own counters on every server version.
+        /// It also keeps the shard visible to a concurrent stale sweep until
+        /// the drop. A failed or timed-out snapshot is a reported failure,
+        /// never a panic, so the drop after it always runs.
+        async fn snapshot_stats(&mut self, scenario: BenchScenario) -> Vec<String> {
+            use super::super::pg_stats_snapshot::{SNAPSHOT_BOUND, snapshot_conn_to_dir};
             let raw = std::env::var(STATS_DIR_ENV_VAR).ok();
             let Some(dir) = stats_dir_from(raw.as_deref()) else {
                 return Vec::new();
             };
             let mut failures = Vec::new();
-            let shards = self.urls.len();
-            for (shard, url) in &self.urls {
+            let shards = self.leases.len();
+            for (shard, lease) in &mut self.leases {
                 let index = usize::try_from(shard.as_i32()).unwrap_or_default();
                 let label = stats_label(scenario, shards, index);
-                match tokio::time::timeout(SNAPSHOT_BOUND, snapshot_to_dir(url, &dir, &label)).await
+                match tokio::time::timeout(
+                    SNAPSHOT_BOUND,
+                    snapshot_conn_to_dir(lease, &dir, &label),
+                )
+                .await
                 {
                     Ok(Ok(_)) => {}
                     Ok(Err(e)) => failures.push(format!("{label} stats snapshot: {e}")),
