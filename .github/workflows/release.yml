@@ -509,7 +509,9 @@ jobs:
       # Install cosign before the registry credential is on disk.
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       # Read the digest back from the registry. It is the digest that a
-      # user pulls. `cosign` and the attestation read the login.
+      # user pulls. The hash of the raw manifest bytes is that digest on
+      # every buildx release, so no format template is needed. `cosign` and
+      # the attestation read the login.
       - name: Push the image
         id: push
         env:
@@ -520,8 +522,8 @@ jobs:
           echo "$TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
           docker tag "$LOCAL" "${IMAGE}:${VERSION}"
           docker push "${IMAGE}:${VERSION}"
-          digest="$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" \
-            --format '{{json .Manifest}}' | jq -r .digest)"
+          digest="sha256:$(docker buildx imagetools inspect --raw "${IMAGE}:${VERSION}" \
+            | sha256sum | cut -d ' ' -f 1)"
           if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             echo "::error::no digest for ${IMAGE}:${VERSION}: '${digest}'"
             exit 1
