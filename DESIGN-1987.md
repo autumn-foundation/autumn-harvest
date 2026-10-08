@@ -19,11 +19,11 @@ a guide section.
 
 ## 0. Planning record
 
-### 0.1 Brainstorm — what can "bare activity" mean, and what can we measure?
+### 0.1 Brainstorm — what can "bare activity" mean, and what can the harness measure?
 
 | # | Idea | Verdict |
 |---|------|---------|
-| B1 | Wall-clock time from start to completion. | Rejected as the decider. The house standard does not admit wall-clock on a shared-vCPU host (`activity_enqueue_batch_perf.rs`). Reported as context only. |
+| B1 | Wall-clock time from start to completion. | Rejected. `activity_enqueue_batch_perf.rs` does not admit wall-clock on a shared-vCPU host. See §0.5. |
 | B2 | `pg_stat_statements` call counts with a live worker. | Kept, with a control. Idle claim polls and samplers add calls. An idle-worker control of the same length measures that noise. |
 | B3 | Rows written and WAL bytes per job. | **Adopted as the decider.** An idle claim poll changes no row and writes no WAL. The figures do not depend on poll timing. |
 | B4 | Structural counts: events, task rows and claims per job. | **Adopted and asserted.** They are exact. A test pins them. |
@@ -43,7 +43,7 @@ a guide section.
 | R5 | Publish numbers that the harness never produced. | The harness writes the raw capture to `docs/perf-artifacts/standalone-activity-overhead/`. A docs guard checks that the published structural counts equal the asserted constants. |
 | R6 | Pick the decision rule after the numbers. | §0.4 fixes the rule before the first measurement. |
 | R7 | Compare against a floor that no real API could reach. | The ADR states that the floor omits the job record that a real API must store. The floor flatters "build", so a "document" verdict against it is conservative. |
-| R8 | Turn on `decision_boundaries` in one arm only. | All arms run with the worker defaults. The ADR states the extra two events when it is on. |
+| R8 | Turn on `decision_boundaries` in one arm only. | All arms run with the worker defaults. The perf page states the extra `DecisionCommitted` events when it is on. |
 
 ### 0.3 Six thinking hats — build or document?
 
@@ -91,6 +91,45 @@ the line.
 
 Before the fixes, the first capture read B/C 3.58x on rows and 4.22x on
 WAL. After them, it reads 3.33x and 3.39x. The verdict is the same.
+
+### 0.6 Re-charter: a realistic floor (fixed before arm D runs)
+
+Review found that the §0.4 line could not fail. Code reading already gave
+arm B at least 6 inserts and arm C 3 rows, so B was always above 2.0x C.
+§0.2 R7 admitted that arm C flatters "build". §0.4 therefore compared
+against the wrong floor. Its verdict stays on record, on its own terms.
+This section asks the question again against a floor that a real
+standalone-activity API could reach.
+
+**Arm D: realistic floor.** A real API must keep what a workflow activity
+already guarantees, but no more:
+
+- a job record that a client reads by id: one `harvest_workflow_executions`
+  row, inserted with the task row in one transaction and set to
+  `COMPLETED` with the output in the completion transaction;
+- the handler-start marker that timeout retries need (ADR 0005): one
+  fenced update of the task row after the claim;
+- no `harvest_events` rows, because there is nothing to replay.
+
+Arm D runs through the `queue` API, as arm C does. The handler-start and
+record-completion writes are the same statements that the worker issues,
+in raw SQL.
+
+**Rule.** Compare arm B against arm D, on rows written and WAL bytes per
+job.
+
+- At most **2.0x** on both: the existing fast path is enough. **Document
+  the pattern.**
+- Above 2.0x on either: **build**.
+
+2.0x is the same line as §0.4. A new start path adds a surface to every
+operator tool. It is worth that only if it at least halves the write cost
+of the cheapest existing pattern.
+
+**Prediction from code reading.** Arm D writes about 6 rows: two inserts
+and four updates. Arm B writes 10, so rows give about 1.67x. WAL is the
+less certain figure. This re-charter is not a blind test. Its value is the
+right comparator, not surprise. The ADR states both verdicts.
 
 ---
 
