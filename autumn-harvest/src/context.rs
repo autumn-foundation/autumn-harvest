@@ -1436,9 +1436,9 @@ impl<'a> MutexHandle<'a> {
             });
         }
 
-        // Issue #1984: a cancelled scope drops a parked acquire, but its
-        // waiter row would stay at the head of the FIFO queue and block the
-        // key. So a scope cannot acquire a mutex.
+        // Issue #1984: a cancelled scope drops a parked acquire. Its waiter
+        // row then stays at the head of the FIFO queue and blocks the key.
+        // So a scope cannot acquire a mutex.
         if self.context.in_cancellable_scope() {
             return Err(HarvestError::Config(format!(
                 "ctx.mutex({}).acquire() cannot run inside a cancellation scope",
