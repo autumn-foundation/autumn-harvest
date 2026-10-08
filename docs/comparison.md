@@ -314,12 +314,13 @@ where one exists.
   | Redis dispatch, 0.7.0 | 1.74x to 2.10x |
   | default, with the #1971 claim fix (PR #2052, not yet released) | 1.16x to 1.36x |
 
-  The default-mode gap grows with backlog depth until the claim fix lands.
-  After the fix it stays flat.
+  Without the claim fix, the default-mode gap grows sharply with backlog
+  depth. With it, harvest's own rate stays flat, and the gap grows only from
+  1.16x to 1.36x.
 
   The bounds matter more than the ratios. It is one workflow shape on one
   small box, with Temporal at its defaults and its four services sharing four
-  cores. That venue favours harvest, so a better-tuned Temporal would widen
+  cores. That venue favours harvest, so a better-tuned Temporal could widen
   the gap. A competitor's own published figure is not a substitute: its
   hardware, configuration and unit (often per action) differ. The assay
   states what the result may and may not be read to mean. Its predecessor,

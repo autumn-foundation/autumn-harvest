@@ -42,8 +42,9 @@ Registered questions:
 
 ### Changes after the pre-registration, before any run
 
-Review (Codex, PR #2055) found five apparatus defects after `535c943`. Each
-fix landed before the first run. None changes a line or the workload.
+Seven changes landed after `535c943`, all before the first run. Two fix
+compile errors. The rest answer review (Codex, PR #2055). None changes a line
+or the workload.
 
 | commit | change |
 |:--|:--|
@@ -125,9 +126,12 @@ All 84 runs are valid: every workflow completed, activity runs equal
 Its load average at start was 3.76, as in its siblings. Its claim p99 was
 241 ms, against 17 to 19 ms in its siblings. That is the claim signature of
 depth 1,000 and 2,000 on the unfixed trees, here at depth 500. Assay #12 saw
-the same bimodal pattern on this arm at depth 1,000. The cause is not tested
-here. Without the outlier the cell would read 13.81, and no line reads this
-cell.
+a wide, possibly bimodal spread on this arm at depth 1,000. This assay shows
+a similar split: `0aeb887` / `postgres` / 1000 has one run at 10.93 with a
+claim p99 of 25 ms, against 209 and 218 ms in its siblings. The cause is not
+tested here. Without the outlier the cell would read 13.81. L2 reads the
+cell, but its grade does not depend on it: 13.81 is still below `redis_pg`'s
+14.61.
 
 ## 🏁 Verdict
 
@@ -153,6 +157,8 @@ What the lines say:
    falls from 13.86 to 4.05. At depth 2,000 the fix is 5.23x faster.
 3. **After the fix, Temporal still wins at every depth, by 1.16x to 1.36x.**
    Assay #11 predicted "roughly 2x". The measured gap is smaller.
+Items 4 and 5 are post hoc. No line registered them.
+
 4. **The fix also helps the shallow backlog.** At depth 250, `513b7aa`
    reads 21.30 against 13.86 on its base. Its claim mean is 6.2 ms against
    9.8 ms.

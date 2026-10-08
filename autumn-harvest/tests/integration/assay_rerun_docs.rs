@@ -160,7 +160,7 @@ fn benchmarks_points_at_the_rerun_without_naming_the_engine() {
     // and links the ledger.
     let page = flat(&read("docs/benchmarks.md"));
     assert!(
-        page.contains("(assays/README.md)") && page.contains("entries 10, 11 and 14"),
+        page.contains("(assays/README.md)") && page.contains("entries 11 and 14"),
         "docs/benchmarks.md must point at ledger entry 14 through the ledger"
     );
     assert!(

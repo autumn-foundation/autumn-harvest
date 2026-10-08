@@ -86,15 +86,16 @@ What it shows:
 * **0.7.0 is slower than 0.6.0 at one and two shards on this host.** It is
   14% lower at one shard and 11% lower at two. At four shards the two are
   level. Each figure is one sweep, and the 0.7.0 sweep's noise control read
-  7.9%, so the size of the change is uncertain. Its direction holds at both
+  7.9%, so the size of the change is uncertain. The direction is the same at both
   shard counts.
 * **0.7.0 dispatches faster at low shard counts.** The dispatch p50 is 16.12
   ms against 45.31 at one shard, and 26.17 against 42.86 at two.
 * **0.6.0 broke down at four shards on this host.** Its dispatch p50 read
   4,020 ms. The harness marked the cell sound, because the pace and the clock
   held. 0.7.0 reads 69.98 ms in the same cell.
-* **0.7.0's tails are wider.** The 1-shard dispatch p99 and signal p99 are
-  both higher than 0.6.0's on this host.
+* **At one and two shards, 0.7.0's tails are wider.** Its dispatch p99 and
+  signal p99 are higher than 0.6.0's on this host. At four shards 0.6.0
+  broke down, so that cell does not compare.
 
 This suite cannot attribute any of these changes. `docs/performance.md` and
 the assay ledger are where a cause gets found.

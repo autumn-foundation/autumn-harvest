@@ -121,9 +121,10 @@ suite ships in the repo — see [Reproducing](#reproducing).
 Harvest lost them.** They are reported in the assay ledger rather than here.
 The engine is deliberately not named on this page: issue #1309's acceptance
 criterion is that no competitor figure appears on it, and
-`benchmarks_docs.rs` enforces that. See [the assay ledger](assays/README.md),
-entries 10, 11 and 14. Entry 14, the 0.7.0 rerun, is the current one. The
-ledger links its report without this page naming the engine. Each entry
+`benchmarks_docs.rs` enforces that. See [the assay ledger](assays/README.md):
+entries 11 and 14 are the cross-engine runs, and entry 10 compares harvest's
+own modes. Entry 14, the 0.7.0 rerun, is the current one. The ledger links
+its report without this page naming the engine. Each entry
 carries its pre-registration, which fixed in advance what its numbers may not
 be read to mean.
 
@@ -134,9 +135,10 @@ Two things from entry 14 bear on this page's own numbers:
   250-row and a 2,000-row backlog. The claim-path fix (#1971) holds it at
   21.1 to 22.1 at every depth. This page's closed loop keeps the backlog
   shallow on purpose, so it does not show the collapse.
-* **The claim loop is the ceiling.** In every harvest run of entry 14, the
-  worker spent 91% to 99% of its wall time inside a claim. Throughput then
-  follows the claim latency, with 7 claims per workflow.
+* **The claim loop looks like the ceiling.** In every harvest run of entry
+  14, the worker spent 91% to 99% of its wall time inside a claim. That fits
+  one claim in flight at a time, with throughput set by the claim latency.
+  This reading is post hoc, not a registered line.
 
 ### Results by release
 
