@@ -1,3 +1,9 @@
+{{- /* `profile` is the only profile selector. The init check reads it, so `env` must not override it. */}}
+{{- range .Values.env }}
+{{- if has .name (list "AUTUMN_ENV" "AUTUMN_PROFILE") }}
+{{- fail (printf "env: do not set %s. Set `profile`: the migration check reads it." .name) }}
+{{- end }}
+{{- end }}
 {{- $floor := add .Values.drain.preStopSleepSeconds .Values.drain.shutdownSeconds 10 }}
 {{- if lt (int .Values.drain.terminationGracePeriodSeconds) (int $floor) }}
 {{- fail (printf "drain.terminationGracePeriodSeconds must be at least %d (preStopSleepSeconds + shutdownSeconds + 10)" (int $floor)) }}

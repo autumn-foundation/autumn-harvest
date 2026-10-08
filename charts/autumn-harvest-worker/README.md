@@ -69,7 +69,7 @@ explains the probe and drain values.
 |---|---|---|
 | `database.existingSecret` | none, required | The Secret that holds the database URL. |
 | `database.secretKey` | `DATABASE_URL` | The key in the Secret. |
-| `profile` | `prod` | `AUTUMN_PROFILE`. Do not use `dev` in a shared cluster: its admin API has no auth. |
+| `profile` | `prod` | `AUTUMN_PROFILE`, the only profile selector. The chart refuses `AUTUMN_ENV` or `AUTUMN_PROFILE` in `env`. Do not use `dev` in a shared cluster: its admin API has no auth. |
 | `image.repository` | `ghcr.io/autumn-foundation/autumn-harvest` | The worker image. |
 | `image.tag` | the chart `appVersion` | The image tag. |
 | `image.digest` | none | A digest wins over the tag. |

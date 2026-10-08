@@ -24,9 +24,11 @@ fullnameOverride: ""
 command: []
 args: []
 
-# The deployment profile, set as `AUTUMN_PROFILE`. `AUTUMN_ENV` in `env`
-# overrides it. Outside `dev`, the runner applies no migrations and each
-# admin route needs an API token.
+# The deployment profile, set as `AUTUMN_PROFILE`. It is the only profile
+# selector: the chart refuses `AUTUMN_ENV` or `AUTUMN_PROFILE` in `env`, and
+# the migration check reads this value. Do not set them through `envFrom`.
+# Outside `dev`, the runner applies no migrations and each admin route needs
+# an API token.
 # Do not use `dev` in a shared cluster: its admin API has no auth.
 profile: prod
 
