@@ -129,10 +129,10 @@ pub enum ClaimGate {
     /// Rows carry a `fairness_key`, and the claim runs with fairness keys on
     /// (issue #1976).
     ///
-    /// The fair claim adds one `MATERIALIZED` CTE, a `jsonb` map of key lags.
-    /// It also adds one map lookup per candidate row, one sort term and one
-    /// state upsert. This row measures that cost against `baseline`. It is a claim
-    /// mode, not a gate, so `all_gates` does not include it.
+    /// The fair claim joins a hashed table of the lags of keys in debt. It
+    /// also adds one sort term and one state upsert. This row measures that
+    /// cost against `baseline`. It is a claim mode, not a gate, so
+    /// `all_gates` does not include it.
     FairnessKeys,
 }
 

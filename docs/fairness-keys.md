@@ -125,8 +125,8 @@ take up to `C` claims in a row. The charge of each claim is still exact.
 
 ## Cost
 
-Each fair claim adds one `MATERIALIZED` CTE. It folds the lags of the keys
-in debt into a `jsonb` map. Each candidate row then does one map lookup for
+Each fair claim joins a derived table of the keys in debt, with their
+lags. The planner hashes it, so each candidate row does one hash probe for
 its sort term. After the rechecks, the claim upserts the claimed key's state
 row. Concurrent claims of one key wait for that row, for one statement. A
 queue of mostly unkeyed work has one key, so its fair claims queue on one

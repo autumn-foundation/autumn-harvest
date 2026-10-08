@@ -96,15 +96,18 @@ The key lives on task rows only. `harvest_workflow_executions` is at Diesel's
 ### 1.4 Claim
 
 `splice_fairness` derives the fair form from any claim variant (base, fenced,
-kind, by-id). It adds one `MATERIALIZED` CTE, `fair_map`, and one sort term
-before the due time. No bind is added. The charge, `FAIR_CHARGE_SQL`, is a
-separate upsert in the same transaction. It runs only when the post-claim
-rechecks keep the row.
+kind, by-id). It joins a derived table of lags, `fair_lag`, adds one sort term
+before the due time, and names `harvest_task_queue` in the row lock. No bind
+is added. The charge, `FAIR_CHARGE_SQL`, is a separate upsert in the same
+transaction. It runs only when the post-claim rechecks keep the row.
 
-`fair_map` folds the lags of the keys in debt into a `jsonb` map. A join on the
-state rows was the first form. The planner ran it as a nested loop: every state
-row once per candidate row. That cost 2x claim throughput at 8 claimers. The
-map costs one lookup per candidate row.
+Three forms of the lag lookup were measured:
+
+| Form | Cost |
+|---|---|
+| Join on a CTE of the state rows | The planner ran a nested loop: every state row once per candidate row. 2x claim time at 8 claimers. |
+| One `jsonb` map in a CTE | Each lookup copied the whole map. 4.4 s per claim at 10,000 keys. |
+| Join on a derived table | Hashed. 26 ms per claim at 10,000 keys. Chosen. |
 
 A lag is relative to its own queue's clock. A fair claim over several queues
 therefore runs one statement per queue, in a random order.
