@@ -107,7 +107,8 @@ pub enum MemoryOp {
         /// The entry text.
         text: String,
     },
-    /// Replace the one entry that contains `old`.
+    /// Replace the one entry that contains `old`. When no entry contains
+    /// `old` but one equals `text`, the edit is already done.
     Replace {
         /// The block label.
         block: String,
@@ -116,7 +117,8 @@ pub enum MemoryOp {
         /// The new entry text.
         text: String,
     },
-    /// Remove the one entry that contains `old`.
+    /// Remove the one entry that contains `old`. When no entry contains
+    /// `old`, nothing changes and the edit succeeds.
     Remove {
         /// The block label.
         block: String,
@@ -157,6 +159,10 @@ pub fn apply_op(block: &mut MemoryBlock, op: &MemoryOp) -> Result<(), AgentError
         }
         MemoryOp::Replace { old, text, .. } => {
             let text = non_empty(text)?;
+            // A call that ran again after a crash finds its own result.
+            if !has_match(block, old) && block.entries.iter().any(|entry| entry == text) {
+                return Ok(());
+            }
             let index = find_unique(block, old)?;
             check_fits(block, Some(index), text)?;
             if let Some(entry) = block.entries.get_mut(index) {
@@ -164,11 +170,22 @@ pub fn apply_op(block: &mut MemoryBlock, op: &MemoryOp) -> Result<(), AgentError
             }
         }
         MemoryOp::Remove { old, .. } => {
+            // An entry that is gone already is the result the call wants.
+            // A call that ran again after a crash therefore succeeds.
+            if !old.trim().is_empty() && !has_match(block, old) {
+                return Ok(());
+            }
             let index = find_unique(block, old)?;
             block.entries.remove(index);
         }
     }
     Ok(())
+}
+
+/// Does any entry contain `old`?
+fn has_match(block: &MemoryBlock, old: &str) -> bool {
+    let old = old.trim();
+    block.entries.iter().any(|entry| entry.contains(old))
 }
 
 fn non_empty(text: &str) -> Result<&str, AgentError> {
@@ -527,11 +544,19 @@ mod tests {
                 .contains("2 entries")
         );
         assert!(
-            apply_op(&mut b, &remove("milk"))
-                .unwrap_err()
-                .message()
-                .contains("no entry")
+            apply_op(
+                &mut b,
+                &MemoryOp::Replace {
+                    block: "memory".into(),
+                    old: "milk".into(),
+                    text: "oat milk".into(),
+                }
+            )
+            .unwrap_err()
+            .message()
+            .contains("no entry")
         );
+        apply_op(&mut b, &remove("milk")).unwrap();
         assert!(apply_op(&mut b, &add("  ")).is_err());
     }
 
@@ -623,5 +648,26 @@ mod tests {
         let debug = format!("{store:?}");
         assert!(!debug.contains("secret"), "{debug}");
         assert!(debug.contains("scopes: 1"), "{debug}");
+    }
+
+    #[test]
+    fn a_replace_or_remove_that_runs_again_succeeds() {
+        let mut b = block();
+        apply_op(&mut b, &add("tea")).unwrap();
+        let replace = MemoryOp::Replace {
+            block: "memory".into(),
+            old: "tea".into(),
+            text: "green".into(),
+        };
+        apply_op(&mut b, &replace).unwrap();
+        apply_op(&mut b, &replace).unwrap();
+        assert_eq!(b.entries, vec!["green".to_owned()]);
+        let remove = MemoryOp::Remove {
+            block: "memory".into(),
+            old: "green".into(),
+        };
+        apply_op(&mut b, &remove).unwrap();
+        apply_op(&mut b, &remove).unwrap();
+        assert_eq!(b.entries, Vec::<String>::new());
     }
 }

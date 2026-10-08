@@ -157,6 +157,7 @@ pub(crate) async fn drive(
                     .is_some_and(|settings| settings.allow_actions));
         let segment = AgentTask {
             read_only,
+            unattended: task.unattended || woken,
             history: Vec::new(),
             ..task.clone()
         };

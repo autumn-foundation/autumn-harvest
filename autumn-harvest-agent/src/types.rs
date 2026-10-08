@@ -25,6 +25,10 @@ pub const DEFAULT_MAX_STEPS: u32 = 8;
 pub const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 3_600;
 
 /// The input of one agent run: the workflow input.
+//
+// The flags are independent switches on a recorded payload. A flat bool per
+// switch keeps the wire shape plain, so the lint is allowed here.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentTask {
     /// The user message that starts this run.
@@ -59,27 +63,34 @@ pub struct AgentTask {
     #[serde(default)]
     pub deliver: bool,
     /// The memory scope. With a scope, the run reads a memory snapshot and
-    /// gets the `memory` tool. A read-only segment gets the tool only with
-    /// [`read_only_memory_writes`](Self::read_only_memory_writes).
+    /// gets the `memory` tool. A read-only or unattended segment gets the
+    /// tool only with
+    /// [`unattended_memory_writes`](Self::unattended_memory_writes).
     #[serde(default)]
     pub memory_scope: Option<MemoryScope>,
     /// The follow-up settings. With settings, the run gets the
     /// `schedule_followup` tool.
     #[serde(default)]
     pub followups: Option<Followups>,
-    /// The loop guard.
-    #[serde(default)]
+    /// The loop guard. [`AgentTask::new`] turns it on. A recorded task with
+    /// no `loop_guard` field decodes with the guard off, so a run started
+    /// before the guard existed replays as it ran.
+    #[serde(default = "LoopGuard::disabled")]
     pub loop_guard: LoopGuard,
     /// Refuse every tool call that writes or acts outside the app.
     #[serde(default)]
     pub read_only: bool,
-    /// Let a read-only segment write its memory.
+    /// No person watches this run. A heartbeat tick sets it. Every
+    /// follow-up segment is unattended too.
+    #[serde(default)]
+    pub unattended: bool,
+    /// Let a read-only or unattended segment write its memory.
     ///
-    /// Off by default. A read-only run often reads untrusted data, such as an
+    /// Off by default. Such a run often reads untrusted data, such as an
     /// inbox. A note it writes shows in the system prompt of every later run
     /// in the scope, and those runs can have write tools.
     #[serde(default)]
-    pub read_only_memory_writes: bool,
+    pub unattended_memory_writes: bool,
 }
 
 impl AgentTask {
@@ -101,7 +112,8 @@ impl AgentTask {
             followups: None,
             loop_guard: LoopGuard::default(),
             read_only: false,
-            read_only_memory_writes: false,
+            unattended: false,
+            unattended_memory_writes: false,
         }
     }
 
@@ -142,18 +154,25 @@ impl AgentTask {
 
     /// The memory scope whose `memory` tool this task offers, if any.
     pub(crate) fn memory_tool_scope(&self) -> Option<MemoryScope> {
-        if self.read_only && !self.read_only_memory_writes {
+        if (self.read_only || self.unattended) && !self.unattended_memory_writes {
             None
         } else {
             self.memory_scope.clone()
         }
     }
 
-    /// Let a read-only segment write its memory. See
-    /// [`read_only_memory_writes`](Self::read_only_memory_writes).
+    /// Mark the run as one that no person watches.
     #[must_use]
-    pub const fn read_only_memory_writes(mut self) -> Self {
-        self.read_only_memory_writes = true;
+    pub const fn unattended(mut self) -> Self {
+        self.unattended = true;
+        self
+    }
+
+    /// Let a read-only or unattended segment write its memory. See
+    /// [`unattended_memory_writes`](Self::unattended_memory_writes).
+    #[must_use]
+    pub const fn unattended_memory_writes(mut self) -> Self {
+        self.unattended_memory_writes = true;
         self
     }
 
@@ -545,5 +564,13 @@ mod tests {
         let report: AgentReport = serde_json::from_value(old).unwrap();
         assert_eq!(report.followups, 0);
         assert!(!report.followup_dropped);
+    }
+
+    #[test]
+    fn a_task_from_before_the_loop_guard_replays_without_it() {
+        let old = json!({"input": "go", "max_steps": 8, "approval_timeout_secs": 60});
+        let task: AgentTask = serde_json::from_value(old).unwrap();
+        assert_eq!(task.loop_guard, LoopGuard::disabled());
+        assert_eq!(AgentTask::new("go").loop_guard, LoopGuard::default());
     }
 }

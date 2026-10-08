@@ -810,3 +810,59 @@ async fn approval_names_count_steps_across_segments() {
     assert_eq!(run.text, "Done.");
     assert_eq!(writes.runs().len(), 1);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn allow_actions_does_not_grant_memory_writes() {
+    let (_dir, db) = fresh_db();
+    let store = Arc::new(InMemoryMemoryStore::new());
+    let scope = MemoryScope::new("u");
+    let model = ScriptedModel::new(vec![answer(HEARTBEAT_OK, 1)]);
+    let mut rt = runtime(&db, AgentHarness::new(model.clone()).memory(store));
+
+    let tick = HeartbeatTask::new().memory(scope).allow_actions();
+    let exec = sqlite::start_heartbeat(&mut rt, &tick).unwrap();
+    let _ = heartbeat_report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert!(
+        !model.requests()[0]
+            .tools
+            .iter()
+            .any(|t| t.name == MEMORY_TOOL),
+        "an unattended tick writes memory only with allow_memory_writes"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_followup_segment_with_actions_gets_no_memory_tool() {
+    let (_dir, db) = fresh_db();
+    let store = Arc::new(InMemoryMemoryStore::new());
+    let model = ScriptedModel::new(vec![
+        calls(
+            &[(
+                "f",
+                FOLLOWUP_TOOL,
+                json!({"prompt": "check", "delay_minutes": 1}),
+            )],
+            1,
+        ),
+        answer("Later.", 1),
+        answer("Checked.", 1),
+    ]);
+    let mut rt = runtime(&db, AgentHarness::new(model.clone()).memory(store));
+
+    let task = AgentTask::new("go")
+        .memory(MemoryScope::new("u"))
+        .followups(Followups::new(Duration::from_secs(600)).allow_actions());
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let _ = rt.run_until_blocked(exec).await.unwrap();
+    let _ = report(rt.run_until_blocked_as_of(exec, later(120)).await.unwrap());
+
+    let has_memory = |i: usize| {
+        model.requests()[i]
+            .tools
+            .iter()
+            .any(|t| t.name == MEMORY_TOOL)
+    };
+    assert!(has_memory(0), "the attended segment keeps the tool");
+    assert!(!has_memory(2), "the woken segment is unattended");
+}

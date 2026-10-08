@@ -156,8 +156,8 @@ segment), `max_total_tokens` (per run), `max_output_tokens`,
 `approval_timeout` (default one hour, rounded up to whole seconds) and
 `max_request_bytes` (default: the engine default). Its content is `input`,
 `system`, `history` and `session`. Section 10 explains the always-on
-settings: `deliver`, `memory`, `followups`, `loop_guard`, `read_only` and
-`read_only_memory_writes`.
+settings: `deliver`, `memory`, `followups`, `loop_guard`, `read_only`,
+`unattended` and `unattended_memory_writes`.
 
 The loop drops a system message inside `history`. Only `system` reaches
 the model as the prompt.
@@ -303,9 +303,10 @@ read-only by default:
   data would reach the system prompt of every later run in the scope.
 
 `HeartbeatTask::allow_actions` and `Followups::allow_actions` lift the
-first two rules. `HeartbeatTask::allow_memory_writes` and
-`AgentTask::read_only_memory_writes` lift the third. `AgentTask::read_only`
-applies the same rules to any run.
+first two rules only. The memory rule has its own opt-in:
+`HeartbeatTask::allow_memory_writes` or `AgentTask::unattended_memory_writes`.
+`AgentTask::read_only` applies all three rules to any run.
+`AgentTask::unattended` applies the memory rule.
 
 ### Heartbeats
 
@@ -404,9 +405,11 @@ snapshot.
 
 The snapshot escapes each entry onto one line, so an entry cannot close its
 block or add a prompt section. The snapshot tells the model that the
-entries are its own notes, not instructions from the user. An `add` of an
-entry that already exists changes nothing, so a retried call does not
-store it twice.
+entries are its own notes, not instructions from the user.
+
+Each edit is safe to run again after a crash. An `add` of an entry that
+already exists changes nothing. A `replace` whose `text` is already there
+succeeds. A `remove` of an entry that is gone succeeds.
 
 ### Loop guard
 
@@ -414,7 +417,9 @@ The loop guard counts identical calls: same tool, same arguments, same
 result. With the defaults, the third identical call in the last 30 calls
 adds a warning to its result. The fifth stops the run as `loop_detected`,
 and no later call in that round runs. One guard covers the whole run,
-follow-ups included. `LoopGuard::disabled()` turns it off.
+follow-ups included. `LoopGuard::disabled()` turns it off. A recorded task
+with no `loop_guard` field decodes with the guard off, so a run started
+before the guard existed replays as it ran.
 
 The guard is not a cost control. A model that changes its arguments, or a
 tool whose result changes, does not trip it. Use `max_steps`,

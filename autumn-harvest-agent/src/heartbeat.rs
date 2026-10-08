@@ -227,7 +227,8 @@ impl HeartbeatTask {
         task.max_output_tokens = self.max_output_tokens;
         task.approval_timeout_secs = self.approval_timeout_secs;
         task.read_only = !self.allow_actions;
-        task.read_only_memory_writes = self.allow_memory_writes;
+        task.unattended = true;
+        task.unattended_memory_writes = self.allow_memory_writes;
         task
     }
 }
@@ -320,9 +321,14 @@ mod tests {
     }
 
     #[test]
-    fn allow_actions_lifts_read_only() {
-        let task = HeartbeatTask::new().allow_actions().agent_task();
+    fn allow_actions_lifts_read_only_but_not_the_memory_rule() {
+        let task = HeartbeatTask::new()
+            .memory(MemoryScope::new("u"))
+            .allow_actions()
+            .agent_task();
         assert!(!task.read_only);
+        assert!(task.unattended);
+        assert_eq!(task.memory_tool_scope(), None);
     }
 
     #[test]
