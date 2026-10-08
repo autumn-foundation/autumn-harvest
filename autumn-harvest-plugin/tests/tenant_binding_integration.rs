@@ -49,6 +49,9 @@ use tower::ServiceExt;
 
 type App = axum::Router;
 
+/// The `(tenant_key, tenant_verified)` pairs an authorizer saw.
+type Seen = Arc<Mutex<Vec<(Option<String>, bool)>>>;
+
 async fn setup_database() -> (String, Option<ContainerAsync<Postgres>>) {
     if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
         return (url, None);
@@ -614,7 +617,7 @@ async fn authorizer_sees_the_verified_tenant() {
     let mut conn = pool.get().await.unwrap();
     scrub(&mut conn).await;
     let state = api_state(&pool);
-    let seen: Arc<Mutex<Vec<(Option<String>, bool)>>> = Arc::default();
+    let seen: Seen = Arc::default();
     let sink = seen.clone();
     let app = authorized_app(&state, move |req| {
         sink.lock()

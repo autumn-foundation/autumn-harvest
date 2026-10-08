@@ -186,6 +186,13 @@ impl<'a> AuthzRequest<'a> {
         self
     }
 
+    /// Set the tenant key. `verified` applies only to a present key.
+    const fn with_tenant(mut self, tenant: Option<&'a str>, verified: bool) -> Self {
+        self.tenant_key = tenant;
+        self.tenant_verified = verified && tenant.is_some();
+        self
+    }
+
     /// Set the shard.
     #[must_use]
     pub const fn with_shard(mut self, shard: Option<ShardId>) -> Self {
@@ -716,10 +723,13 @@ fn tenant_key(request: &Request) -> Result<Option<String>, ()> {
 /// layer has already refused a header that names another tenant. `Err`
 /// means an unusable header.
 fn request_tenant(request: &Request) -> Result<(Option<String>, bool), ()> {
-    match request.extensions().get::<crate::tenant::VerifiedTenant>() {
-        Some(t) => Ok((Some(t.as_str().to_string()), true)),
-        None => tenant_key(request).map(|t| (t, false)),
-    }
+    request
+        .extensions()
+        .get::<crate::tenant::VerifiedTenant>()
+        .map_or_else(
+            || tenant_key(request).map(|t| (t, false)),
+            |t| Ok((Some(t.as_str().to_string()), true)),
+        )
 }
 
 fn forbidden() -> Response {
@@ -818,11 +828,8 @@ pub(crate) async fn enforce_authorizer(
 
     for shard in candidates {
         let authz = AuthzRequest::new(principal, route_class, &method, &path, request.extensions())
+            .with_tenant(tenant.as_deref(), tenant_verified)
             .with_shard(shard);
-        let authz = match tenant.as_deref() {
-            Some(t) if tenant_verified => authz.with_verified_tenant(t),
-            t => authz.with_tenant_key(t),
-        };
         let AuthzDecision::Deny(reason) = authorizer.0.authorize(&authz).await else {
             continue;
         };
