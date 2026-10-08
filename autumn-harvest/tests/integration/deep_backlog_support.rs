@@ -395,6 +395,8 @@ pub struct SeedReport {
     pub elapsed: Duration,
     /// The shape right after the seed, before any reader prunes a page.
     pub shape: FixtureShape,
+    /// `pg_stat_user_tables` right after the seed.
+    pub tables: Vec<stats::TableStats>,
 }
 
 /// The measured shape of a seeded fixture.
@@ -498,7 +500,8 @@ pub async fn seed(conn: &mut AsyncPgConnection, spec: &FixtureSpec) -> SeedRepor
         .tables
         .iter()
         .find(|t| t.relname == "harvest_task_queue")
-        .expect("pg_stat_user_tables lists harvest_task_queue");
+        .expect("pg_stat_user_tables lists harvest_task_queue")
+        .clone();
     let heap_bytes = count(conn, "SELECT pg_relation_size('harvest_task_queue') AS n").await;
     SeedReport {
         executions: spec.executions(),
@@ -510,6 +513,7 @@ pub async fn seed(conn: &mut AsyncPgConnection, spec: &FixtureSpec) -> SeedRepor
             heap_bytes,
             ..census
         },
+        tables: snapshot.tables,
     }
 }
 
@@ -919,12 +923,11 @@ pub async fn capture_run(
     let mut conn = connect(&db.url()).await;
     let seeded = seed(&mut conn, spec).await;
     let shape = &seeded.shape;
-    let post_seed = stats::capture(&mut conn).await;
     std::fs::write(
         out_dir.join(format!("{label}-post-seed-pg_stat_user_tables.txt")),
         format!(
             "-- pg_stat_user_tables after seeding, before the workload --\n{}",
-            stats::render_tables(&post_seed.tables)
+            stats::render_tables(&seeded.tables)
         ),
     )
     .expect("write the post-seed tables");
@@ -935,7 +938,7 @@ pub async fn capture_run(
     let report = drive_claims(&db.url(), spec, workload).await;
     let snapshot = db.snapshot_and_drop().await;
     let dropped = !server.database_exists(&name).await;
-    let deltas = stats::table_deltas(&post_seed.tables, &snapshot.tables);
+    let deltas = stats::table_deltas(&seeded.tables, &snapshot.tables);
     std::fs::write(
         out_dir.join(format!("{label}-workload-pg_stat_user_tables.txt")),
         format!(
