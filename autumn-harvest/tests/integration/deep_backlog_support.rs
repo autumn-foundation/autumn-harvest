@@ -883,7 +883,8 @@ pub struct WorkloadReport {
     pub enqueues: u64,
     pub empty_polls: u64,
     pub errors: u64,
-    /// Calls still in flight at the budget. The claimer drops them.
+    /// Claims still in flight at the budget. The claimer drops them, and the
+    /// transaction of each rolls back, so no task changes.
     pub cut_at_deadline: u64,
     pub first_error: Option<String>,
     pub elapsed: Duration,
@@ -918,6 +919,15 @@ const MAX_CONSECUTIVE_ERRORS: u32 = 20;
 
 /// The pause after a failed claim, so a failing claimer does not spin.
 const ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+/// The bound on each step after a claim: complete, delete and enqueue. Each
+/// step touches one row, so the bound is far above its normal cost.
+const CYCLE_STEP_BOUND: Duration = Duration::from_secs(60);
+
+/// Run `fut` for at most [`CYCLE_STEP_BOUND`]. Returns `None` at the bound.
+async fn by_step_bound<T>(fut: impl std::future::Future<Output = T>) -> Option<T> {
+    tokio::time::timeout(CYCLE_STEP_BOUND, fut).await.ok()
+}
 
 /// Run `fut` until `deadline`. Returns `None` when the deadline comes first.
 async fn by_deadline<T>(deadline: Instant, fut: impl std::future::Future<Output = T>) -> Option<T> {
@@ -1003,12 +1013,10 @@ async fn run_claimer(
             }
         };
         tally.claims.fetch_add(1, Ordering::Relaxed);
+        // A claimed task finishes its cycle even past the deadline. A cycle
+        // cut halfway would change the table depth that the run measures.
         let complete = queue::complete_task(conn, task.id, serde_json::json!({}));
-        match by_deadline(deadline, complete).await {
-            None => {
-                tally.cut_at_deadline.fetch_add(1, Ordering::Relaxed);
-                break;
-            }
+        match by_step_bound(complete).await {
             Some(Ok(())) => {
                 tally.completions.fetch_add(1, Ordering::Relaxed);
             }
@@ -1016,12 +1024,9 @@ async fn run_claimer(
                 tally.error("complete", &e);
                 consecutive_errors += 1;
             }
+            None => tally.error("complete", &"no result within the step bound"),
         }
-        match by_deadline(deadline, reclaim(conn, task.id)).await {
-            None => {
-                tally.cut_at_deadline.fetch_add(1, Ordering::Relaxed);
-                break;
-            }
+        match by_step_bound(reclaim(conn, task.id)).await {
             Some(Ok(())) => {
                 tally.reclaims.fetch_add(1, Ordering::Relaxed);
             }
@@ -1029,13 +1034,10 @@ async fn run_claimer(
                 tally.error("reclaim", &e);
                 consecutive_errors += 1;
             }
+            None => tally.error("reclaim", &"no result within the step bound"),
         }
         let params = replacement(&task);
-        match by_deadline(deadline, queue::enqueue(conn, &params)).await {
-            None => {
-                tally.cut_at_deadline.fetch_add(1, Ordering::Relaxed);
-                break;
-            }
+        match by_step_bound(queue::enqueue(conn, &params)).await {
             Some(Ok(_)) => {
                 consecutive_errors = 0;
                 tally.enqueues.fetch_add(1, Ordering::Relaxed);
@@ -1044,6 +1046,7 @@ async fn run_claimer(
                 tally.error("enqueue", &e);
                 consecutive_errors += 1;
             }
+            None => tally.error("enqueue", &"no result within the step bound"),
         }
         if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
             break;
@@ -1232,6 +1235,8 @@ pub async fn capture_run(
     let seeded = seed(&mut conn, spec).await;
     let settings = server_settings(&mut conn).await;
     // Before the reset, so this claim stays out of the workload statements.
+    // `EXPLAIN ANALYZE` scans tables, and a rollback keeps those counters. So
+    // the workload baseline is read after it.
     std::fs::write(
         out_dir.join(format!("{label}-claim.explain.txt")),
         format!(
@@ -1241,6 +1246,9 @@ pub async fn capture_run(
         ),
     )
     .expect("write the claim plan");
+    let baseline = stats::read_table_stats(&mut conn)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
     let shape = &seeded.shape;
     std::fs::write(
         out_dir.join(format!("{label}-post-seed-pg_stat_user_tables.txt")),
@@ -1261,7 +1269,7 @@ pub async fn capture_run(
     let report = drive_claims(&db.url(), spec, workload).await;
     let snapshot = db.snapshot_and_drop().await;
     let dropped = !server.database_exists(&name).await;
-    let deltas = stats::table_deltas(&seeded.tables, &snapshot.tables);
+    let deltas = stats::table_deltas(&baseline, &snapshot.tables);
     std::fs::write(
         out_dir.join(format!("{label}-workload-pg_stat_user_tables.txt")),
         format!(

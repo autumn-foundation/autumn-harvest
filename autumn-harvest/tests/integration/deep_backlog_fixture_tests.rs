@@ -398,6 +398,11 @@ async fn the_snapshot_is_taken_before_the_database_is_dropped() {
         "the workload claims tasks: {workload:?}"
     );
     assert_eq!(workload.errors, 0, "the workload fails: {workload:?}");
+    assert_eq!(
+        (workload.completions, workload.reclaims, workload.enqueues),
+        (workload.claims, workload.claims, workload.claims),
+        "every claimed task finishes its cycle: {workload:?}"
+    );
     {
         let mut conn = fixture::connect(&db.url()).await;
         assert_eq!(
@@ -468,6 +473,11 @@ async fn zz_capture_deep_backlog_ledger_evidence() {
         let (text, report) = fixture::capture_run(&server, label, &spec, &workload, &out_dir).await;
         summary.push_str(&text);
         assert!(report.claims > 0, "{label}: the workload claimed nothing");
+        assert_eq!(
+            (report.completions, report.reclaims, report.enqueues),
+            (report.claims, report.claims, report.claims),
+            "{label}: every claimed task finishes its cycle, so the depth holds"
+        );
         assert_eq!(
             report.errors, 0,
             "{label}: the workload failed: {:?}",
