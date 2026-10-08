@@ -4086,6 +4086,73 @@ async fn the_column_sweep_keeps_to_its_budget_and_finishes_over_several_ticks() 
     );
 }
 
+/// An activity task stores its input and output in clear. A clear argument
+/// can still have the shape of a valid envelope. The sweep must not decode
+/// or rewrite it, and the census must not count it.
+#[tokio::test]
+async fn the_column_sweep_leaves_clear_activity_task_rows_alone() {
+    #[derive(diesel::QueryableByName)]
+    struct TaskCells {
+        #[diesel(sql_type = diesel::sql_types::Jsonb)]
+        input: Value,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
+        output: Option<Value>,
+    }
+
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_key_registry();
+    let seeded = seed_codec_columns(&mut conn, &codecs, "k1").await;
+    let activity_input = encode_under(&codecs, "k1", &json!({"arg": "envelope-shaped"}));
+    let activity_output = encode_under(&codecs, "k1", &json!({"ret": "envelope-shaped"}));
+    let activity_id = Uuid::new_v4();
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+         (id, queue_name, task_type, workflow_exec_id, input, output, state) \
+         VALUES ($1, 'default', 'activity', $2, $3, $4, 'COMPLETED')",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(activity_id)
+    .bind::<diesel::sql_types::Uuid, _>(seeded.exec_id.as_uuid())
+    .bind::<diesel::sql_types::Jsonb, _>(&activity_input)
+    .bind::<diesel::sql_types::Jsonb, _>(&activity_output)
+    .execute(&mut conn)
+    .await
+    .expect("insert activity task");
+    codecs.set_active_key("k2").expect("flip");
+
+    for _ in 0..12 {
+        let rewritten = sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+            .await
+            .expect("sweep");
+        if rewritten == 0 {
+            break;
+        }
+    }
+    let stored: TaskCells =
+        diesel::sql_query("SELECT input, output FROM harvest_task_queue WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(activity_id)
+            .get_result(&mut conn)
+            .await
+            .expect("load activity task");
+    assert_eq!(
+        stored.input, activity_input,
+        "the activity input is untouched"
+    );
+    assert_eq!(
+        stored.output,
+        Some(activity_output),
+        "the activity output is untouched"
+    );
+    let by_key = autumn_harvest::codec_rotation::count_rows_by_key_id(&mut conn)
+        .await
+        .expect("census");
+    assert_eq!(
+        by_key.get("k1").copied().unwrap_or(0),
+        0,
+        "the census does not count a clear activity row"
+    );
+}
+
 /// The event pass and the column pass share one tick budget. A short event
 /// tail must leave the column pass only the rest of it.
 #[tokio::test]

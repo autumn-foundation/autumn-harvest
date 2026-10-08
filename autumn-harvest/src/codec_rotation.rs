@@ -111,6 +111,8 @@ pub struct CodecColumn {
     table: &'static str,
     id_column: &'static str,
     column: &'static str,
+    /// A SQL predicate on the table alias `t` that selects the encoded rows.
+    rows: &'static str,
 }
 
 impl CodecColumn {
@@ -131,7 +133,21 @@ impl CodecColumn {
     pub const fn column(&self) -> &'static str {
         self.column
     }
+
+    /// The SQL predicate, on the table alias `t`, that selects the rows
+    /// whose cell is encoded. `TRUE` when every row is.
+    #[must_use]
+    pub const fn rows(&self) -> &'static str {
+        self.rows
+    }
 }
+
+/// Every row of the table holds an encoded cell.
+const ALL_ROWS: &str = "TRUE";
+
+/// Only a workflow task's row is encoded. An activity task keeps its input
+/// and output in clear.
+const WORKFLOW_TASK_ROWS: &str = "t.task_type = 'workflow'";
 
 /// Every codec column the sweep converts and the census counts (issue #1979).
 ///
@@ -139,8 +155,10 @@ impl CodecColumn {
 /// `harvest_execution_summaries.result` is a verbatim copy of
 /// `harvest_workflow_executions.output`, so it holds the same ciphertext.
 /// `harvest_task_queue` holds the workflow task's input and output, encoded
-/// the same way. An activity task row stays in clear, but a column cannot be
-/// half swept, so the whole column is listed. The sweep skips plaintext.
+/// the same way. An activity task row stays in clear. A clear activity
+/// argument can still have the shape of a valid envelope. So those entries
+/// select workflow rows only, and the sweep and the census never touch an
+/// activity row.
 ///
 /// A column belongs here exactly when `docs/security-posture.md` marks it
 /// Covered, except `harvest_events.event_data`, which the event pass covers.
@@ -150,41 +168,49 @@ pub const CODEC_COLUMNS: &[CodecColumn] = &[
         table: "harvest_workflow_executions",
         id_column: "id",
         column: "input",
+        rows: ALL_ROWS,
     },
     CodecColumn {
         table: "harvest_workflow_executions",
         id_column: "id",
         column: "output",
+        rows: ALL_ROWS,
     },
     CodecColumn {
         table: "harvest_workflow_executions",
         id_column: "id",
         column: "memo",
+        rows: ALL_ROWS,
     },
     CodecColumn {
         table: "harvest_signals",
         id_column: "id",
         column: "payload",
+        rows: ALL_ROWS,
     },
     CodecColumn {
         table: "harvest_dead_letters",
         id_column: "id",
         column: "input",
+        rows: ALL_ROWS,
     },
     CodecColumn {
         table: "harvest_execution_summaries",
         id_column: "execution_id",
         column: "result",
+        rows: ALL_ROWS,
     },
     CodecColumn {
         table: "harvest_task_queue",
         id_column: "id",
         column: "input",
+        rows: WORKFLOW_TASK_ROWS,
     },
     CodecColumn {
         table: "harvest_task_queue",
         id_column: "id",
         column: "output",
+        rows: WORKFLOW_TASK_ROWS,
     },
 ];
 
@@ -760,10 +786,11 @@ mod db {
                 "SELECT {key_id} AS key_id, COUNT(*)::BIGINT AS row_count \
                  FROM {table} t \
                  CROSS JOIN LATERAL (SELECT t.{col}) AS f(value) \
-                 WHERE f.value IS NOT NULL AND {ENVELOPE_PREDICATE} \
+                 WHERE {rows} AND f.value IS NOT NULL AND {ENVELOPE_PREDICATE} \
                  GROUP BY 1",
                 table = column.table,
                 col = column.column,
+                rows = column.rows,
             ));
         }
         let sql = format!(
@@ -1344,13 +1371,14 @@ mod db {
                 "SELECT t.{id} AS id, t.{col} AS value \
                  FROM {table} t \
                  CROSS JOIN LATERAL (SELECT t.{col}) AS f(value) \
-                 WHERE f.value IS NOT NULL AND {ENVELOPE_PREDICATE} \
+                 WHERE {rows} AND f.value IS NOT NULL AND {ENVELOPE_PREDICATE} \
                    AND {key_id} <> $2 \
                    AND ($3::UUID IS NULL OR t.{id} > $3) \
                  ORDER BY t.{id} LIMIT $4",
                 id = column.id_column,
                 col = column.column,
                 table = column.table,
+                rows = column.rows,
             );
             let cells: Vec<ColumnCell> = diesel::sql_query(&sql)
                 .bind::<Text, _>(crate::payload_codec::CODEC_LEGACY_KEY_ID)
@@ -1474,12 +1502,13 @@ mod db {
             "SELECT EXISTS ( \
                  SELECT 1 FROM {table} t \
                  CROSS JOIN LATERAL (SELECT t.{col}) AS f(value) \
-                 WHERE t.{id} = $3 AND f.value IS NOT NULL AND {ENVELOPE_PREDICATE} \
-                   AND {key_id} <> $2 \
+                 WHERE t.{id} = $3 AND {rows} AND f.value IS NOT NULL \
+                   AND {ENVELOPE_PREDICATE} AND {key_id} <> $2 \
              ) AS present",
             table = column.table,
             col = column.column,
             id = column.id_column,
+            rows = column.rows,
         );
         let probe: Present = diesel::sql_query(&sql)
             .bind::<Text, _>(crate::payload_codec::CODEC_LEGACY_KEY_ID)
@@ -1520,10 +1549,12 @@ mod db {
 
         // The identifiers come from the compile-time `CODEC_COLUMNS` list.
         let sql = format!(
-            "UPDATE {table} SET {col} = $1 WHERE {id} = $2 AND {col} = $3",
+            "UPDATE {table} t SET {col} = $1 \
+             WHERE t.{id} = $2 AND t.{col} = $3 AND {rows}",
             table = column.table,
             col = column.column,
             id = column.id_column,
+            rows = column.rows,
         );
         let candidate = candidate.clone();
         let original = original.clone();

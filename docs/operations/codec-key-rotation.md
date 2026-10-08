@@ -377,6 +377,9 @@ places this feature does not sweep:
   codec columns (issue #1979): `harvest_workflow_executions.{input,output,memo}`,
   `harvest_signals.payload`, `harvest_dead_letters.input`,
   `harvest_execution_summaries.result` and `harvest_task_queue.{input,output}`.
+  In `harvest_task_queue` they cover workflow-task rows only. An activity task
+  row stays in clear, so the sweep never rewrites it and the census never
+  counts it, even when an activity argument has the shape of an envelope.
   Harvest writes no envelope to any other column. An envelope that a writer
   outside Harvest put there is not swept or censused. A
   `harvest_shard_migrations.staged_task` snapshot can hold a task row's
