@@ -125,6 +125,10 @@ mod debugger_tests;
 mod decision_boundary_db_tests;
 #[cfg(feature = "testing")]
 mod decision_boundary_replay_tests;
+#[cfg(feature = "db")]
+mod deep_backlog_fixture_tests;
+#[cfg(feature = "db")]
+mod deep_backlog_support;
 mod delayed_start_tests;
 mod det_check_tests;
 mod determinism_static_analysis_docs;
@@ -206,6 +210,8 @@ mod payload_offload_db_tests;
 #[cfg(feature = "testing")]
 mod payload_offload_replay_tests;
 mod performance_docs;
+#[cfg(feature = "db")]
+mod pg_stats_snapshot;
 #[cfg(feature = "db")]
 mod pg_timeouts_tests;
 #[cfg(feature = "db")]

@@ -115,6 +115,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          ctx_info_tests
 linux        autumn-harvest         integration                      -                          dag_execution_timeout_tests
 linux        autumn-harvest         integration                      -                          debounce_tests
+linux        autumn-harvest         integration                      -                          deep_backlog_fixture_tests
 linux        autumn-harvest         integration                      -                          delayed_start_tests
 linux        autumn-harvest         integration                      -                          drain_release_tests
 linux        autumn-harvest         integration                      -                          dst_differential_tests

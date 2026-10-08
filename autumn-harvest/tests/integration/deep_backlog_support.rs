@@ -1,0 +1,1021 @@
+//! Seeded deep-backlog fixture generator (issue #1956).
+//!
+//! The fixture is a production-shaped `harvest_task_queue`:
+//!
+//! * At least 1M live task rows at Ledger scale ([`LEDGER_LIVE_ROWS`]).
+//! * Skewed queues and concurrency keys. A power transform of a uniform draw,
+//!   `idx = floor(n * u^k)`, gives rank 0 a share of `(1/n)^(1/k)`.
+//! * A dead-tuple ratio from real `UPDATE` and `DELETE` churn.
+//!
+//! Every value comes from `md5` of the seed, a tag and a row ordinal. The SQL
+//! calls no volatile function, so one seed gives one fixture. Rows go in
+//! hash order, so related rows spread across heap pages as in production.
+//!
+//! Autovacuum is off on the fixture tables. Otherwise it can remove the dead
+//! tuples while a measurement runs. The fixture is a snapshot of a table
+//! that autovacuum has not reached yet.
+
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use diesel::QueryableByName;
+use diesel::sql_types::{BigInt, Text};
+use diesel_async::{AsyncConnection, AsyncPgConnection, SimpleAsyncConnection};
+use testcontainers::{ContainerAsync, ImageExt};
+use testcontainers_modules::postgres::Postgres;
+use testcontainers_modules::testcontainers::runners::AsyncRunner;
+
+use autumn_harvest::queue::{self, EnqueueParams, TaskType};
+
+use super::pg_stats_snapshot::{self as stats, Statements, StatsSnapshot};
+use super::throwaway_db::ThrowawayDb;
+
+/// Live task rows at Ledger scale. Issue #1956 asks for at least 1M.
+pub const LEDGER_LIVE_ROWS: u64 = 1_000_000;
+
+/// Live task rows of the shallow control run. The issue #1956 e2e profile
+/// drained queues of about this depth.
+pub const SHALLOW_LIVE_ROWS: u64 = 4_000;
+
+/// Prefix of every name the fixture writes.
+pub const PREFIX: &str = "deep-backlog";
+
+/// Prefix of every database the fixture creates.
+const DB_PREFIX: &str = "harvest_deep_backlog";
+
+/// The fixed origin of every seeded timestamp. A fixed origin keeps the rows
+/// deterministic. It is in the past, so a `PENDING` row is due.
+const EPOCH: &str = "TIMESTAMPTZ '2026-01-01 00:00:00+00'";
+
+/// The `scheduled_at` of a row that waits for a retry backoff or a timer.
+const FAR_FUTURE: &str = "TIMESTAMPTZ '2100-01-01 00:00:00+00'";
+
+/// Distinct activity names, picked with a mild skew.
+const ACTIVITY_NAMES: u64 = 8;
+
+/// How long [`FixtureServer::start`] may take to start a container.
+const CONTAINER_START_BOUND: Duration = Duration::from_secs(240);
+
+/// The shape of one fixture. [`FixtureSpec::ledger`] gives the defaults.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FixtureSpec {
+    /// Every value in the fixture derives from this seed.
+    pub seed: u64,
+    /// Task rows left after the churn.
+    pub live_rows: u64,
+    /// Task rows per workflow execution. One of them is the workflow task.
+    pub tasks_per_execution: u64,
+    /// Distinct queues. An execution and its tasks share one queue.
+    pub queues: u64,
+    /// Power-skew exponent of the queue pick. `1.0` is uniform.
+    pub queue_skew: f64,
+    /// Distinct concurrency keys, as in a multi-tenant deployment.
+    pub keys: u64,
+    /// Power-skew exponent of the key pick. A large value makes a hot tenant.
+    pub key_skew: f64,
+    /// Share of executions whose tasks carry a concurrency key.
+    pub keyed_share: f64,
+    /// `concurrency_cap` on every keyed row.
+    pub key_cap: i32,
+    /// Target `n_dead_tup / (n_live_tup + n_dead_tup)` on the task queue.
+    pub dead_ratio: f64,
+    /// Share of live rows that are `RUNNING`.
+    pub running_share: f64,
+    /// Share of live rows that are terminal and wait for the hygiene sweep.
+    pub terminal_share: f64,
+    /// Share of live rows that are `PENDING` but due in the future.
+    pub future_share: f64,
+    /// Rows in `harvest_workers`. The claim reads them on every call.
+    pub workers: u64,
+}
+
+/// The churn that makes the dead tuples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Churn {
+    /// Live rows updated once, as a claim that a worker released.
+    pub updated: u64,
+    /// Extra terminal rows inserted and deleted, as a hygiene sweep.
+    pub deleted: u64,
+}
+
+impl FixtureSpec {
+    /// The Ledger defaults at [`LEDGER_LIVE_ROWS`].
+    ///
+    /// The dead ratio is 10%. The hygiene migration sets the autovacuum scale
+    /// factor of the task queue to 2%. So a table that autovacuum keeps up
+    /// with stays near 2%. A table at 10% models autovacuum lag, for example
+    /// behind a long transaction that holds the xmin horizon.
+    #[must_use]
+    pub const fn ledger(seed: u64) -> Self {
+        Self {
+            seed,
+            live_rows: LEDGER_LIVE_ROWS,
+            tasks_per_execution: 4,
+            queues: 64,
+            queue_skew: 3.0,
+            keys: 4096,
+            key_skew: 4.0,
+            keyed_share: 0.5,
+            key_cap: 32,
+            dead_ratio: 0.10,
+            running_share: 0.01,
+            terminal_share: 0.04,
+            future_share: 0.05,
+            workers: 64,
+        }
+    }
+
+    /// The same shape with `live_rows` live rows.
+    #[must_use]
+    pub const fn at_scale(mut self, live_rows: u64) -> Self {
+        self.live_rows = live_rows;
+        self
+    }
+
+    /// Check that the spec can be seeded.
+    ///
+    /// # Errors
+    /// Returns the first field that is out of range.
+    pub fn validate(&self) -> Result<(), String> {
+        let unit = |name: &str, v: f64| {
+            if (0.0..=1.0).contains(&v) {
+                Ok(())
+            } else {
+                Err(format!("{name} = {v} is not in [0, 1]"))
+            }
+        };
+        for (name, v) in [
+            ("live_rows", self.live_rows),
+            ("tasks_per_execution", self.tasks_per_execution),
+            ("queues", self.queues),
+            ("keys", self.keys),
+            ("workers", self.workers),
+        ] {
+            if v == 0 {
+                return Err(format!("{name} must be at least 1"));
+            }
+        }
+        for (name, v) in [("queue_skew", self.queue_skew), ("key_skew", self.key_skew)] {
+            if !v.is_finite() || v < 1.0 {
+                return Err(format!("{name} = {v} must be a finite value of at least 1"));
+            }
+        }
+        if !(0.0..1.0).contains(&self.dead_ratio) {
+            return Err(format!("dead_ratio = {} is not in [0, 1)", self.dead_ratio));
+        }
+        unit("keyed_share", self.keyed_share)?;
+        unit("running_share", self.running_share)?;
+        unit("terminal_share", self.terminal_share)?;
+        unit("future_share", self.future_share)?;
+        let states = self.running_share + self.terminal_share + self.future_share;
+        if states > 1.0 {
+            return Err(format!("the state shares sum to {states}, above 1"));
+        }
+        if self.key_cap < 1 {
+            return Err(format!("key_cap = {} must be at least 1", self.key_cap));
+        }
+        Ok(())
+    }
+
+    /// Workflow executions that own the live rows.
+    #[must_use]
+    pub const fn executions(&self) -> u64 {
+        self.live_rows.div_ceil(self.tasks_per_execution)
+    }
+
+    /// The churn that gives [`Self::dead_ratio`]. Half the dead tuples come
+    /// from updates and half from deletes.
+    #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    pub fn churn(&self) -> Churn {
+        let dead = (self.live_rows as f64 * self.dead_ratio / (1.0 - self.dead_ratio)).round();
+        let dead = dead as u64;
+        let updated = (dead / 2).min(self.live_rows);
+        Churn {
+            updated,
+            deleted: dead - updated,
+        }
+    }
+
+    /// Every queue name, head queue first.
+    #[must_use]
+    pub fn queue_names(&self) -> Vec<String> {
+        (0..self.queues)
+            .map(|i| format!("{PREFIX}-q-{i}"))
+            .collect()
+    }
+
+    /// A uniform draw in `[0, 1)` from the seed, a tag and an ordinal.
+    fn uniform(&self, tag: &str, ordinal: &str) -> String {
+        format!(
+            "(('x' || substr(md5('{}:{tag}:' || ({ordinal})::text), 1, 8))::bit(32)::bigint::float8 \
+             / 4294967296.0)",
+            self.seed
+        )
+    }
+
+    /// A rank in `[0, n)` with power skew `k`. Rank 0 is the hottest.
+    fn skewed(&self, tag: &str, ordinal: &str, n: u64, k: f64) -> String {
+        format!(
+            "LEAST(floor({n} * power({u}, {k:?}))::bigint, {last})",
+            u = self.uniform(tag, ordinal),
+            last = n - 1
+        )
+    }
+
+    /// A deterministic UUID from the seed, a tag and an ordinal.
+    fn uuid(&self, tag: &str, ordinal: &str) -> String {
+        format!("md5('{}:{tag}:' || ({ordinal})::text)::uuid", self.seed)
+    }
+
+    /// The seed script, one statement per entry: [`Self::seed_script`],
+    /// load phase first.
+    #[must_use]
+    pub fn seed_sql(&self) -> Vec<String> {
+        let script = self.seed_script();
+        script.load.into_iter().chain(script.churn).collect()
+    }
+
+    /// The seed script in two phases. A pure function of the spec.
+    ///
+    /// The churn runs in one transaction, so neither statement prunes the
+    /// dead tuples of the other.
+    #[must_use]
+    #[allow(clippy::too_many_lines)]
+    pub fn seed_script(&self) -> SeedScript {
+        let live = self.live_rows;
+        let churn = self.churn();
+        let execs = self.executions();
+        let tpe = self.tasks_per_execution;
+        let total = live + churn.deleted;
+        // The execution of task ordinal `i`. A deleted row belongs to the
+        // execution of a live row, as an earlier attempt of the same run.
+        let exec_of = format!(
+            "(CASE WHEN i < {live} THEN i / {tpe} ELSE ((i - {live}) / {tpe}) % {execs} END)"
+        );
+        let queue = self.skewed("queue", "e", self.queues, self.queue_skew);
+        let key = self.skewed("key", "e", self.keys, self.key_skew);
+        let keyed = format!("{} < {:?}", self.uniform("keyed", "e"), self.keyed_share);
+        let activity = self.skewed("activity", "i", ACTIVITY_NAMES, 2.0);
+        let state_u = self.uniform("state", "i");
+        let future_u = self.uniform("future", "i");
+        let prio_u = self.uniform("priority", "i");
+        let running = self.running_share;
+        let terminal = running + self.terminal_share;
+        // Among PENDING rows, the share that is due in the future.
+        let pending_share = 1.0 - terminal;
+        let future = if pending_share > 0.0 {
+            self.future_share / pending_share
+        } else {
+            0.0
+        };
+        let exec_id = self.uuid("exec", "e");
+        let task_id = self.uuid("task", "i");
+        let activity_id = self.uuid("activity-id", "i");
+        let workers = self.workers;
+        let cap = self.key_cap;
+        let seed = self.seed;
+        let load = vec![
+            "TRUNCATE harvest_task_queue, harvest_workflow_executions, harvest_workers CASCADE"
+                .to_string(),
+            "ALTER TABLE harvest_task_queue SET (autovacuum_enabled = false)".to_string(),
+            "ALTER TABLE harvest_workflow_executions SET (autovacuum_enabled = false)".to_string(),
+            format!(
+                "INSERT INTO harvest_workers \
+                   (worker_id, max_concurrency, host, build_id, queues, labels) \
+                 SELECT '{PREFIX}-worker-' || i, 16, '{PREFIX}-host', '', '[]'::jsonb, '{{}}'::jsonb \
+                 FROM generate_series(0, {last}) AS s(i)",
+                last = workers - 1
+            ),
+            format!(
+                "INSERT INTO harvest_workflow_executions \
+                   (id, workflow_name, workflow_id, run_id, shard_id, state, input, queue_name, \
+                    started_at, created_at) \
+                 SELECT {exec_id}, '{PREFIX}-wf', '{PREFIX}-' || e, {run_id}, 0, 'RUNNING', \
+                        '{{}}'::jsonb, '{PREFIX}-q-' || {queue}, \
+                        {EPOCH} + e * INTERVAL '1 millisecond', \
+                        {EPOCH} + e * INTERVAL '1 millisecond' \
+                 FROM generate_series(0, {last}) AS s(e) \
+                 ORDER BY md5('{seed}:exec-order:' || e::text)",
+                run_id = self.uuid("run", "e"),
+                last = execs - 1,
+            ),
+            format!(
+                "INSERT INTO harvest_task_queue \
+                   (id, queue_name, task_type, workflow_exec_id, activity_name, activity_id, input, \
+                    state, priority, worker_id, attempt, max_attempts, scheduled_at, started_at, \
+                    completed_at, last_heartbeat_at, concurrency_key, concurrency_cap, created_at) \
+                 SELECT {task_id}, '{PREFIX}-q-' || {queue}, \
+                        CASE WHEN i < {live} AND i % {tpe} = 0 THEN 'workflow' ELSE 'activity' END, \
+                        {exec_id}, \
+                        CASE WHEN i < {live} AND i % {tpe} = 0 THEN NULL \
+                             ELSE '{PREFIX}-activity-' || {activity} END, \
+                        CASE WHEN i < {live} AND i % {tpe} = 0 THEN NULL ELSE {activity_id} END, \
+                        jsonb_build_object('seq', i, 'pad', repeat('x', 96)), \
+                        st, \
+                        CASE WHEN {prio_u} < 0.9 THEN 0 ELSE 1 + (i % 9)::int END, \
+                        CASE WHEN st = 'RUNNING' THEN '{PREFIX}-worker-' || (i % {workers}) END, \
+                        CASE WHEN st = 'PENDING' THEN 0 ELSE 1 END, 3, \
+                        CASE WHEN st = 'PENDING' AND {future_u} < {future:?} THEN {FAR_FUTURE} \
+                             ELSE {EPOCH} + i * INTERVAL '1 millisecond' END, \
+                        CASE WHEN st <> 'PENDING' THEN {EPOCH} + i * INTERVAL '1 millisecond' END, \
+                        CASE WHEN st IN ('COMPLETED', 'FAILED') \
+                             THEN {EPOCH} + i * INTERVAL '1 millisecond' END, \
+                        CASE WHEN st = 'RUNNING' THEN {EPOCH} + i * INTERVAL '1 millisecond' END, \
+                        CASE WHEN {keyed} THEN '{PREFIX}-k-' || {key} END, \
+                        CASE WHEN {keyed} THEN {cap} END, \
+                        {EPOCH} + i * INTERVAL '1 millisecond' \
+                 FROM ( \
+                   SELECT i, e, \
+                          CASE WHEN i >= {live} THEN 'COMPLETED' \
+                               WHEN {state_u} < {running:?} THEN 'RUNNING' \
+                               WHEN {state_u} < {terminal:?} \
+                                 THEN CASE WHEN i % 5 = 0 THEN 'FAILED' ELSE 'COMPLETED' END \
+                               ELSE 'PENDING' END AS st \
+                   FROM generate_series(0, {last}) AS s(i), LATERAL (SELECT {exec_of} AS e) AS x \
+                 ) AS t \
+                 ORDER BY md5('{seed}:task-order:' || i::text)",
+                last = total - 1,
+            ),
+        ];
+        let churn = vec![
+            format!(
+                "BEGIN; \
+                 UPDATE harvest_task_queue \
+                    SET attempt = attempt + 1, error = '{PREFIX}: released by a worker' \
+                  WHERE (input->>'seq')::bigint < {updated}; \
+                 DELETE FROM harvest_task_queue WHERE (input->>'seq')::bigint >= {live}; \
+                 COMMIT",
+                updated = churn.updated,
+            ),
+            "ANALYZE harvest_task_queue".to_string(),
+            "ANALYZE harvest_workflow_executions".to_string(),
+            "ANALYZE harvest_workers".to_string(),
+        ];
+        SeedScript { load, churn }
+    }
+}
+
+/// The seed script of [`FixtureSpec::seed_script`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeedScript {
+    /// Create the rows. Every row is live after this phase.
+    pub load: Vec<String>,
+    /// Make the dead tuples, then `ANALYZE`.
+    pub churn: Vec<String>,
+}
+
+/// The share of rank 0 under power skew `k` over `n` ranks: `(1/n)^(1/k)`.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn head_share(n: u64, k: f64) -> f64 {
+    (1.0 / n as f64).powf(1.0 / k)
+}
+
+/// The share of `rank` under power skew `k` over `n` ranks.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn rank_share(rank: u64, n: u64, k: f64) -> f64 {
+    let cdf = |r: u64| (r as f64 / n as f64).powf(1.0 / k);
+    cdf(rank + 1) - cdf(rank)
+}
+
+/// What [`seed`] wrote.
+#[derive(Debug, Clone)]
+pub struct SeedReport {
+    pub executions: u64,
+    pub churn: Churn,
+    pub elapsed: Duration,
+    /// The shape right after the seed, before any reader prunes a page.
+    pub shape: FixtureShape,
+}
+
+/// The measured shape of a seeded fixture.
+#[derive(Debug, Clone)]
+pub struct FixtureShape {
+    pub live_rows: u64,
+    /// Rows per queue, largest first.
+    pub queue_counts: Vec<(String, i64)>,
+    /// Rows of the hottest key over all keyed rows.
+    pub top_key_share: f64,
+    pub keyed_rows: u64,
+    /// Rows per state, largest first.
+    pub states: Vec<(String, i64)>,
+    /// `pg_stat_user_tables.n_live_tup` of the task queue.
+    pub n_live_tup: i64,
+    /// `pg_stat_user_tables.n_dead_tup` of the task queue.
+    pub n_dead_tup: i64,
+    pub heap_bytes: i64,
+}
+
+impl FixtureShape {
+    /// The share of live rows in the queue at `rank`, largest first.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn queue_share(&self, rank: usize) -> f64 {
+        self.queue_counts
+            .get(rank)
+            .map_or(0.0, |(_, n)| *n as f64 / self.live_rows.max(1) as f64)
+    }
+
+    /// `n_dead_tup / (n_live_tup + n_dead_tup)`, as autovacuum sees it.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn dead_ratio(&self) -> f64 {
+        let all = self.n_live_tup + self.n_dead_tup;
+        if all == 0 {
+            0.0
+        } else {
+            self.n_dead_tup as f64 / all as f64
+        }
+    }
+
+    /// Live rows in `state`.
+    #[must_use]
+    pub fn state_count(&self, state: &str) -> i64 {
+        self.states
+            .iter()
+            .find(|(s, _)| s == state)
+            .map_or(0, |(_, n)| *n)
+    }
+}
+
+#[derive(QueryableByName)]
+struct CountRow {
+    #[diesel(sql_type = BigInt)]
+    n: i64,
+}
+
+#[derive(QueryableByName)]
+struct KeyCount {
+    #[diesel(sql_type = Text)]
+    k: String,
+    #[diesel(sql_type = BigInt)]
+    n: i64,
+}
+
+#[derive(QueryableByName)]
+struct TextRow {
+    #[diesel(sql_type = Text)]
+    t: String,
+}
+
+/// Connect to `url`.
+///
+/// # Panics
+/// Panics when the server is unreachable.
+pub async fn connect(url: &str) -> AsyncPgConnection {
+    AsyncPgConnection::establish(url)
+        .await
+        .unwrap_or_else(|e| panic!("connect to the fixture database: {e}"))
+}
+
+/// Seed `spec` into the database of `conn`. The database must be migrated.
+///
+/// The census runs between the load and the churn. A read after the churn
+/// prunes pages, and pruning lowers `n_dead_tup`. So the dead-tuple stats
+/// are read once, right after `ANALYZE`, before any scan of the heap.
+///
+/// # Panics
+/// Panics when the spec is invalid or a statement fails.
+pub async fn seed(conn: &mut AsyncPgConnection, spec: &FixtureSpec) -> SeedReport {
+    spec.validate()
+        .unwrap_or_else(|e| panic!("invalid fixture spec: {e}"));
+    let started = Instant::now();
+    let script = spec.seed_script();
+    run_all(conn, &script.load).await;
+    let census = census(conn, spec.live_rows).await;
+    run_all(conn, &script.churn).await;
+    let snapshot = stats::capture(conn).await;
+    let tq = snapshot
+        .tables
+        .iter()
+        .find(|t| t.relname == "harvest_task_queue")
+        .expect("pg_stat_user_tables lists harvest_task_queue");
+    let heap_bytes = count(conn, "SELECT pg_relation_size('harvest_task_queue') AS n").await;
+    SeedReport {
+        executions: spec.executions(),
+        churn: spec.churn(),
+        elapsed: started.elapsed(),
+        shape: FixtureShape {
+            n_live_tup: tq.n_live_tup,
+            n_dead_tup: tq.n_dead_tup,
+            heap_bytes,
+            ..census
+        },
+    }
+}
+
+async fn run_all(conn: &mut AsyncPgConnection, statements: &[String]) {
+    for sql in statements {
+        conn.batch_execute(sql)
+            .await
+            .unwrap_or_else(|e| panic!("fixture SQL failed: {e}\n--- sql ---\n{sql}"));
+    }
+}
+
+async fn count(conn: &mut AsyncPgConnection, sql: &str) -> i64 {
+    use diesel_async::RunQueryDsl;
+    diesel::sql_query(sql)
+        .get_result::<CountRow>(conn)
+        .await
+        .unwrap_or_else(|e| panic!("fixture count failed: {e}\n--- sql ---\n{sql}"))
+        .n
+}
+
+async fn grouped(conn: &mut AsyncPgConnection, sql: &str) -> Vec<(String, i64)> {
+    use diesel_async::RunQueryDsl;
+    diesel::sql_query(sql)
+        .load::<KeyCount>(conn)
+        .await
+        .unwrap_or_else(|e| panic!("fixture group failed: {e}\n--- sql ---\n{sql}"))
+        .into_iter()
+        .map(|row| (row.k, row.n))
+        .collect()
+}
+
+/// Count the rows that stay live after the churn. The table stats stay zero
+/// here, because [`seed`] reads them later.
+#[allow(clippy::cast_sign_loss, clippy::cast_precision_loss)]
+async fn census(conn: &mut AsyncPgConnection, live: u64) -> FixtureShape {
+    let live_filter = format!("(input->>'seq')::bigint < {live}");
+    let live_rows = count(
+        conn,
+        &format!("SELECT COUNT(*) AS n FROM harvest_task_queue WHERE {live_filter}"),
+    )
+    .await as u64;
+    let queue_counts = grouped(
+        conn,
+        &format!(
+            "SELECT queue_name AS k, COUNT(*) AS n FROM harvest_task_queue WHERE {live_filter} \
+             GROUP BY queue_name ORDER BY n DESC, k"
+        ),
+    )
+    .await;
+    let keys = grouped(
+        conn,
+        &format!(
+            "SELECT concurrency_key AS k, COUNT(*) AS n FROM harvest_task_queue \
+             WHERE {live_filter} AND concurrency_key IS NOT NULL \
+             GROUP BY concurrency_key ORDER BY n DESC, k LIMIT 1"
+        ),
+    )
+    .await;
+    let keyed_rows = count(
+        conn,
+        &format!(
+            "SELECT COUNT(*) AS n FROM harvest_task_queue \
+             WHERE {live_filter} AND concurrency_key IS NOT NULL"
+        ),
+    )
+    .await as u64;
+    let top_key_share =
+        <[_]>::first(&keys).map_or(0.0, |(_, n)| *n as f64 / keyed_rows.max(1) as f64);
+    let states = grouped(
+        conn,
+        &format!(
+            "SELECT state AS k, COUNT(*) AS n FROM harvest_task_queue WHERE {live_filter} \
+             GROUP BY state ORDER BY n DESC, k"
+        ),
+    )
+    .await;
+    FixtureShape {
+        live_rows,
+        queue_counts,
+        top_key_share,
+        keyed_rows,
+        states,
+        n_live_tup: 0,
+        n_dead_tup: 0,
+        heap_bytes: 0,
+    }
+}
+
+/// An `md5` over the seeded content and the physical row order.
+///
+/// Columns with a server default are left out, because the seed does not
+/// write them.
+///
+/// # Panics
+/// Panics when the query fails.
+pub async fn fingerprint(conn: &mut AsyncPgConnection) -> String {
+    use diesel_async::RunQueryDsl;
+    diesel::sql_query(
+        "SELECT md5(
+           (SELECT string_agg(
+              (id, queue_name, task_type, workflow_exec_id, activity_name, activity_id, input,
+               state, priority, worker_id, attempt, max_attempts, scheduled_at, started_at,
+               completed_at, last_heartbeat_at, concurrency_key, concurrency_cap, error,
+               created_at)::text, E'\\n' ORDER BY ctid)
+            FROM harvest_task_queue)
+           || (SELECT string_agg(
+                 (id, workflow_name, workflow_id, run_id, state, queue_name, started_at)::text,
+                 E'\\n' ORDER BY ctid)
+               FROM harvest_workflow_executions)
+         ) AS t",
+    )
+    .get_result::<TextRow>(conn)
+    .await
+    .unwrap_or_else(|e| panic!("fixture fingerprint failed: {e}"))
+    .t
+}
+
+/// A Postgres server for fixture databases.
+///
+/// With `HARVEST_TEST_DATABASE_URL` set, that URL is an admin URL. Otherwise
+/// the server is a `postgres:16` container with `pg_stat_statements`
+/// preloaded.
+pub struct FixtureServer {
+    admin_url: String,
+    _container: Option<ContainerAsync<Postgres>>,
+}
+
+impl FixtureServer {
+    /// Use the env server, or start a container.
+    ///
+    /// # Errors
+    /// Returns why no server is available. A caller skips on an error.
+    pub async fn start() -> Result<Self, String> {
+        if let Ok(admin_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+            return Ok(Self {
+                admin_url,
+                _container: None,
+            });
+        }
+        let start = Postgres::default()
+            .with_tag("16")
+            // `with_cmd` replaces the image command, so `fsync=off` is repeated.
+            .with_cmd([
+                "-c",
+                "shared_preload_libraries=pg_stat_statements",
+                "-c",
+                "fsync=off",
+            ])
+            .start();
+        let container = tokio::time::timeout(CONTAINER_START_BOUND, start)
+            .await
+            .map_err(|_| "the postgres:16 container did not start in time".to_string())?
+            .map_err(|e| format!("no Docker daemon and HARVEST_TEST_DATABASE_URL unset ({e})"))?;
+        let host = container
+            .get_host()
+            .await
+            .map_err(|e| format!("container host: {e}"))?;
+        let port = container
+            .get_host_port_ipv4(5432)
+            .await
+            .map_err(|e| format!("container port: {e}"))?;
+        Ok(Self {
+            admin_url: format!("postgres://postgres:postgres@{host}:{port}/postgres"),
+            _container: Some(container),
+        })
+    }
+
+    /// Create and migrate a fresh database.
+    pub async fn create_database(&self) -> FixtureDb {
+        FixtureDb {
+            db: ThrowawayDb::create_on(&self.admin_url, DB_PREFIX).await,
+        }
+    }
+
+    /// Whether a database named `name` exists on this server.
+    ///
+    /// # Panics
+    /// Panics when the server is unreachable.
+    pub async fn database_exists(&self, name: &str) -> bool {
+        use diesel_async::RunQueryDsl;
+        let mut admin = connect(&self.admin_url).await;
+        diesel::sql_query("SELECT COUNT(*) AS n FROM pg_database WHERE datname = $1")
+            .bind::<Text, _>(name)
+            .get_result::<CountRow>(&mut admin)
+            .await
+            .map_or(0, |row| row.n)
+            > 0
+    }
+}
+
+/// A fixture database. [`Self::snapshot_and_drop`] reads the stats views and
+/// then drops it. On an unwind, the inner guard drops it with no snapshot.
+pub struct FixtureDb {
+    db: ThrowawayDb,
+}
+
+impl FixtureDb {
+    #[must_use]
+    pub fn url(&self) -> String {
+        self.db.url()
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        self.db.name()
+    }
+
+    /// Capture both stats views, then drop the database.
+    ///
+    /// The method takes `self`, so no caller can drop first and read later.
+    /// Close every pool on the database before the call.
+    pub async fn snapshot_and_drop(self) -> StatsSnapshot {
+        let mut conn = connect(&self.db.url()).await;
+        let snapshot = stats::capture(&mut conn).await;
+        drop(conn);
+        drop(self.db);
+        snapshot
+    }
+}
+
+/// The claim workload a Ledger run drives.
+#[derive(Debug, Clone)]
+pub struct WorkloadConfig {
+    /// Concurrent claimers, each on its own connection.
+    pub claimers: usize,
+    /// Stop after this many claims.
+    pub max_claims: u64,
+    /// Stop at this wall-clock bound, even below `max_claims`.
+    pub budget: Duration,
+}
+
+impl WorkloadConfig {
+    /// The Ledger workload. `HARVEST_DEEP_BACKLOG_SECS` sets the budget.
+    #[must_use]
+    pub fn ledger() -> Self {
+        Self {
+            claimers: 4,
+            max_claims: 2_000,
+            budget: Duration::from_secs(env_u64("HARVEST_DEEP_BACKLOG_SECS", 600)),
+        }
+    }
+}
+
+/// What [`drive_claims`] did.
+#[derive(Debug, Clone, Default)]
+pub struct WorkloadReport {
+    pub claims: u64,
+    pub completions: u64,
+    pub enqueues: u64,
+    pub empty_polls: u64,
+    pub errors: u64,
+    pub first_error: Option<String>,
+    pub elapsed: Duration,
+}
+
+#[derive(Default)]
+struct Tally {
+    claims: AtomicU64,
+    completions: AtomicU64,
+    enqueues: AtomicU64,
+    empty_polls: AtomicU64,
+    errors: AtomicU64,
+    first_error: std::sync::Mutex<Option<String>>,
+}
+
+impl Tally {
+    fn error(&self, what: &str, e: &dyn std::fmt::Display) {
+        self.errors.fetch_add(1, Ordering::Relaxed);
+        let mut first = self.first_error.lock().expect("poisoned");
+        if first.is_none() {
+            *first = Some(format!("{what}: {e}"));
+        }
+    }
+}
+
+/// A replacement for a completed task, so the backlog keeps its depth.
+fn replacement(task: &autumn_harvest::models::TaskQueueItem) -> EnqueueParams {
+    let kind = if task.task_type == "workflow" {
+        TaskType::Workflow
+    } else {
+        TaskType::Activity
+    };
+    let mut params = EnqueueParams::new(
+        task.queue_name.clone(),
+        kind,
+        serde_json::json!({ "replaces": task.id }),
+    );
+    params.workflow_exec_id = task.workflow_exec_id;
+    params.activity_name.clone_from(&task.activity_name);
+    params.concurrency_key.clone_from(&task.concurrency_key);
+    params.max_concurrent = task.concurrency_cap.and_then(|cap| u32::try_from(cap).ok());
+    params
+}
+
+/// Drive the engine claim path against the fixture at `url`.
+///
+/// Each claimer claims with [`queue::claim_task`] over every queue, completes
+/// the task, and enqueues a replacement. So the measured statements are the
+/// engine statements, and the backlog keeps its depth.
+///
+/// # Panics
+/// Panics when a claimer cannot connect.
+pub async fn drive_claims(
+    url: &str,
+    spec: &FixtureSpec,
+    config: &WorkloadConfig,
+) -> WorkloadReport {
+    let tally = Arc::new(Tally::default());
+    let queues = Arc::new(spec.queue_names());
+    let started = Instant::now();
+    let deadline = started + config.budget;
+    let mut handles = Vec::new();
+    for n in 0..config.claimers {
+        let tally = Arc::clone(&tally);
+        let queues = Arc::clone(&queues);
+        let url = url.to_string();
+        let max = config.max_claims;
+        handles.push(tokio::spawn(async move {
+            let mut conn = connect(&url).await;
+            let worker = format!("{PREFIX}-worker-{n}");
+            while Instant::now() < deadline && tally.claims.load(Ordering::Relaxed) < max {
+                let claimed =
+                    queue::claim_task(&mut conn, &queues, &worker, "", None, &[], &[]).await;
+                let task = match claimed {
+                    Ok(Some(task)) => task,
+                    Ok(None) => {
+                        tally.empty_polls.fetch_add(1, Ordering::Relaxed);
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        continue;
+                    }
+                    Err(e) => {
+                        tally.error("claim", &e);
+                        continue;
+                    }
+                };
+                tally.claims.fetch_add(1, Ordering::Relaxed);
+                match queue::complete_task(&mut conn, task.id, serde_json::json!({})).await {
+                    Ok(()) => {
+                        tally.completions.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => tally.error("complete", &e),
+                }
+                match queue::enqueue(&mut conn, &replacement(&task)).await {
+                    Ok(_) => {
+                        tally.enqueues.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => tally.error("enqueue", &e),
+                }
+            }
+        }));
+    }
+    for handle in handles {
+        handle.await.expect("a claimer task panicked");
+    }
+    let first_error = tally.first_error.lock().expect("poisoned").clone();
+    WorkloadReport {
+        claims: tally.claims.load(Ordering::Relaxed),
+        completions: tally.completions.load(Ordering::Relaxed),
+        enqueues: tally.enqueues.load(Ordering::Relaxed),
+        empty_polls: tally.empty_polls.load(Ordering::Relaxed),
+        errors: tally.errors.load(Ordering::Relaxed),
+        first_error,
+        elapsed: started.elapsed(),
+    }
+}
+
+/// Where the Ledger capture writes. `HARVEST_DEEP_BACKLOG_OUT` overrides the
+/// default, `docs/perf-artifacts/deep-backlog`.
+#[must_use]
+pub fn artifact_dir() -> PathBuf {
+    std::env::var_os("HARVEST_DEEP_BACKLOG_OUT").map_or_else(
+        || {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("docs/perf-artifacts/deep-backlog")
+        },
+        PathBuf::from,
+    )
+}
+
+/// The `u64` in env var `name`, or `default` when it is unset or not a number.
+#[must_use]
+pub fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+/// Seed `spec`, drive `workload`, snapshot, drop, and write the artifacts.
+///
+/// Returns the summary text for `fixture-summary.txt`.
+///
+/// # Panics
+/// Panics when seeding fails or an artifact cannot be written.
+#[allow(clippy::cast_precision_loss)]
+pub async fn capture_run(
+    server: &FixtureServer,
+    label: &str,
+    spec: &FixtureSpec,
+    workload: &WorkloadConfig,
+    out_dir: &Path,
+) -> String {
+    eprintln!("== {label}: seeding {} live rows ==", spec.live_rows);
+    let db = server.create_database().await;
+    let name = db.name().to_string();
+    let mut conn = connect(&db.url()).await;
+    let seeded = seed(&mut conn, spec).await;
+    let shape = &seeded.shape;
+    let post_seed = stats::capture(&mut conn).await;
+    std::fs::write(
+        out_dir.join(format!("{label}-post-seed-pg_stat_user_tables.txt")),
+        format!(
+            "-- pg_stat_user_tables after seeding, before the workload --\n{}",
+            stats::render_tables(&post_seed.tables)
+        ),
+    )
+    .expect("write the post-seed tables");
+    let reset = stats::reset_statements(&mut conn).await;
+    drop(conn);
+
+    eprintln!("== {label}: driving claims ==");
+    let report = drive_claims(&db.url(), spec, workload).await;
+    let snapshot = db.snapshot_and_drop().await;
+    let dropped = !server.database_exists(&name).await;
+    let deltas = stats::table_deltas(&post_seed.tables, &snapshot.tables);
+    std::fs::write(
+        out_dir.join(format!("{label}-workload-pg_stat_user_tables.txt")),
+        format!(
+            "-- pg_stat_user_tables, workload deltas (n_live_tup and n_dead_tup are final) --\n{}",
+            stats::render_tables(&deltas)
+        ),
+    )
+    .expect("write the workload tables");
+    std::fs::write(
+        out_dir.join(format!("{label}-pg_stat_statements.txt")),
+        format!(
+            "-- pg_stat_statements over the workload, this database only, top 25 by buffers --\n{}",
+            stats::render_statements(&snapshot.statements, 25)
+        ),
+    )
+    .expect("write the statements");
+
+    let mut s = String::new();
+    let _ = writeln!(s, "## {label}\n");
+    let _ = writeln!(s, "spec: {spec:?}");
+    let _ = writeln!(
+        s,
+        "seeded: {} live rows, {} executions, churn {:?}, in {:.1}s",
+        shape.live_rows,
+        seeded.executions,
+        seeded.churn,
+        seeded.elapsed.as_secs_f64()
+    );
+    let _ = writeln!(
+        s,
+        "task queue: {} live rows, heap {:.1} MiB, n_live_tup {}, n_dead_tup {}, dead ratio {:.3} (target {:.3})",
+        shape.live_rows,
+        shape.heap_bytes as f64 / 1_048_576.0,
+        shape.n_live_tup,
+        shape.n_dead_tup,
+        shape.dead_ratio(),
+        spec.dead_ratio
+    );
+    let _ = writeln!(
+        s,
+        "queues: head share {:.3} (expected {:.3}), {} queues hold rows",
+        shape.queue_share(0),
+        head_share(spec.queues, spec.queue_skew),
+        shape.queue_counts.len()
+    );
+    for (q, n) in shape.queue_counts.iter().take(5) {
+        let _ = writeln!(s, "  {q}: {n}");
+    }
+    let _ = writeln!(
+        s,
+        "keys: {} keyed rows, hot key share {:.3} (expected {:.3})",
+        shape.keyed_rows,
+        shape.top_key_share,
+        head_share(spec.keys, spec.key_skew)
+    );
+    let _ = writeln!(s, "states: {:?}", shape.states);
+    let _ = writeln!(
+        s,
+        "pg_stat_statements reset: {}",
+        reset.as_ref().map_or_else(|e| e.as_str(), |()| "ok")
+    );
+    let _ = writeln!(
+        s,
+        "workload: {} claimers, {} claims, {} completions, {} enqueues, {} empty polls, {} errors in {:.1}s ({:.1} claims/s)",
+        workload.claimers,
+        report.claims,
+        report.completions,
+        report.enqueues,
+        report.empty_polls,
+        report.errors,
+        report.elapsed.as_secs_f64(),
+        report.claims as f64 / report.elapsed.as_secs_f64().max(1e-9)
+    );
+    if let Some(e) = &report.first_error {
+        let _ = writeln!(s, "first error: {e}");
+    }
+    if let Statements::Captured(rows) = &snapshot.statements {
+        let total: i64 = rows.iter().map(stats::StatementStats::total_buffers).sum();
+        let _ = writeln!(s, "statements: {} rows, {total} shared buffers", rows.len());
+    }
+    let _ = writeln!(s, "database dropped after the snapshot: {dropped}\n");
+    s
+}

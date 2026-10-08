@@ -111,12 +111,23 @@ impl ThrowawayDb {
     /// the `HARVEST_TEST_DATABASE_URL` server. Returns `None` when the
     /// variable is unset.
     pub async fn create(prefix: &str) -> Option<Self> {
-        use diesel_async::{AsyncConnection, AsyncPgConnection, SimpleAsyncConnection};
         let admin_url = std::env::var("HARVEST_TEST_DATABASE_URL").ok()?;
+        Some(Self::create_on(&admin_url, prefix).await)
+    }
+
+    /// Create and migrate a database named `prefix` plus a unique suffix on
+    /// the server of `admin_url`. A caller that starts its own server uses
+    /// this form.
+    ///
+    /// # Panics
+    /// Panics when the server is unreachable or the migration fails.
+    pub async fn create_on(admin_url: &str, prefix: &str) -> Self {
+        use diesel_async::{AsyncConnection, AsyncPgConnection, SimpleAsyncConnection};
+        let admin_url = admin_url.to_string();
         let name = format!("{prefix}_{}", uuid::Uuid::new_v4().simple());
         let mut admin = AsyncPgConnection::establish(&admin_url)
             .await
-            .expect("HARVEST_TEST_DATABASE_URL must be reachable");
+            .expect("the admin server must be reachable");
         admin
             .batch_execute(&format!("CREATE DATABASE \"{name}\""))
             .await
@@ -128,7 +139,19 @@ impl ThrowawayDb {
         conn.batch_execute(&autumn_harvest::test_init_sql())
             .await
             .expect("migrate the throwaway database");
-        Some(db)
+        db
+    }
+
+    /// The name of the throwaway database.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The admin URL of the server that holds the database.
+    #[must_use]
+    pub fn admin_url(&self) -> &str {
+        &self.admin_url
     }
 
     /// The connection URL of the throwaway database.

@@ -270,6 +270,28 @@ pub fn positive_override(raw: Option<&str>, default: usize) -> usize {
 /// Comma-separated shard counts to run. Unset runs [`SHARD_COUNTS`].
 pub const SHARD_FILTER_ENV_VAR: &str = "HARVEST_BENCH_SHARDS";
 
+/// A directory for per-shard stats snapshots (issue #1956).
+///
+/// When set, teardown writes `pg_stat_statements` and `pg_stat_user_tables`
+/// of each shard database here, before it drops the database. Unset writes
+/// nothing.
+pub const STATS_DIR_ENV_VAR: &str = "HARVEST_BENCH_STATS_DIR";
+
+/// The stats directory from the raw value of [`STATS_DIR_ENV_VAR`]. A blank
+/// value means no snapshot.
+#[must_use]
+pub fn stats_dir_from(raw: Option<&str>) -> Option<std::path::PathBuf> {
+    raw.map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// The file label of one shard snapshot, unique per scenario and shard.
+#[must_use]
+pub fn stats_label(scenario: BenchScenario, shards: usize, shard: usize) -> String {
+    format!("{}-{shards}shards-s{shard}", scenario.as_str())
+}
+
 /// Parse a comma-separated scenario filter into the scenarios it selects.
 ///
 /// An empty or absent filter selects everything; an unrecognised id selects
@@ -1655,6 +1677,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_stats_snapshot_is_opt_in() {
+        assert_eq!(stats_dir_from(None), None);
+        assert_eq!(stats_dir_from(Some("  ")), None);
+        assert_eq!(
+            stats_dir_from(Some(" /tmp/e2e-stats ")),
+            Some(std::path::PathBuf::from("/tmp/e2e-stats"))
+        );
+    }
+
+    #[test]
+    fn a_stats_label_names_the_scenario_the_shard_count_and_the_shard() {
+        assert_eq!(
+            stats_label(BenchScenario::Throughput, 4, 2),
+            "throughput-4shards-s2"
+        );
+        assert_ne!(
+            stats_label(BenchScenario::Throughput, 1, 0),
+            stats_label(BenchScenario::DispatchLatency, 1, 0),
+            "two scenarios never write to one file"
+        );
+    }
+
+    #[test]
     fn every_scenario_has_a_stable_distinct_id() {
         let ids: Vec<&str> = BenchScenario::all().iter().map(|s| s.as_str()).collect();
         assert_eq!(ids.len(), 4, "issue #941 AC1 names four scenarios");
@@ -2497,11 +2542,11 @@ pub mod db {
         MAX_CONCURRENT_ACTIVITIES, MAX_CONCURRENT_WORKFLOWS, Metric,
         PACED_STARTS_PER_SEC_PER_SHARD, POLL_INTERVAL_MS, POOL_SIZE_PER_SHARD, Pacing,
         SCENARIO_BUDGET_SECS, SHARD_URLS_ENV_VAR, SIGNAL_PARK_SETTLE, SIGNAL_SOCKET_TIMEOUT,
-        SIGNAL_WORKFLOWS_PER_SHARD, ScenarioReport, WORKERS_PER_SHARD, clock_offset_soundness,
-        dispatch_population_soundness, latency_soundness, mean_inflight, measured_samples,
-        pacing_verdict, per_shard_inflight_soundness, per_shard_pacing_verdict, steady_state_slice,
-        steady_state_throughput, steady_state_window, sweep_step, throughput_soundness,
-        warmup_batch_for, warmup_soundness,
+        SIGNAL_WORKFLOWS_PER_SHARD, STATS_DIR_ENV_VAR, ScenarioReport, WORKERS_PER_SHARD,
+        clock_offset_soundness, dispatch_population_soundness, latency_soundness, mean_inflight,
+        measured_samples, pacing_verdict, per_shard_inflight_soundness, per_shard_pacing_verdict,
+        stats_dir_from, stats_label, steady_state_slice, steady_state_throughput,
+        steady_state_window, sweep_step, throughput_soundness, warmup_batch_for, warmup_soundness,
     };
 
     // ── Skip / provisioning ───────────────────────────────────────────────
@@ -2979,6 +3024,31 @@ pub mod db {
             // Release our own backends first, or `DROP DATABASE` blocks on them.
             self.leases.clear();
             drop_created(&self.created).await
+        }
+
+        /// [`Self::teardown`], with a stats snapshot of each shard first.
+        ///
+        /// With [`STATS_DIR_ENV_VAR`] set, each shard's stats views are
+        /// written before the drop. The drop discards `pg_stat_user_tables`,
+        /// so the snapshot must come first (issue #1956). Unset, this is
+        /// [`Self::teardown`].
+        pub async fn teardown_with_stats(mut self, scenario: BenchScenario) -> Vec<String> {
+            self.leases.clear();
+            let mut failures = Vec::new();
+            let raw = std::env::var(STATS_DIR_ENV_VAR).ok();
+            if let Some(dir) = stats_dir_from(raw.as_deref()) {
+                let shards = self.urls.len();
+                for (idx, url) in self.urls.values().enumerate() {
+                    let label = stats_label(scenario, shards, idx);
+                    if let Err(e) =
+                        super::super::pg_stats_snapshot::snapshot_to_dir(url, &dir, &label).await
+                    {
+                        failures.push(format!("{label}: {e}"));
+                    }
+                }
+            }
+            failures.extend(drop_created(&self.created).await);
+            failures
         }
 
         pub async fn connect(&self, shard: ShardId) -> AsyncPgConnection {
@@ -3933,7 +4003,7 @@ pub mod db {
         fleet.stop().await;
         let topology = cluster.topology;
         drop(sharded);
-        let teardown_failures = cluster.teardown().await;
+        let teardown_failures = cluster.teardown_with_stats(BenchScenario::Throughput).await;
         let wall_clock_note = budget_note(scenario_started, deadline, &mut unsound);
 
         #[allow(
@@ -4337,7 +4407,9 @@ pub mod db {
         fleet.stop().await;
         let topology = cluster.topology;
         drop(sharded);
-        let teardown_failures = cluster.teardown().await;
+        let teardown_failures = cluster
+            .teardown_with_stats(BenchScenario::DispatchLatency)
+            .await;
 
         // NOT sorted. `offsets_before` is in shard order and both lists are
         // rendered as per-shard in the notes, so sorting this one silently
@@ -4507,7 +4579,9 @@ pub mod db {
                 // server -- exactly what `teardown` exists to prevent.
                 fleet.stop().await;
                 drop(sharded);
-                let _ = cluster.teardown().await;
+                let _ = cluster
+                    .teardown_with_stats(BenchScenario::SignalRoundtrip)
+                    .await;
                 return Err(SkipReason(format!("bind the signal endpoint: {e}")));
             }
         };
@@ -4637,7 +4711,9 @@ pub mod db {
         fleet.stop().await;
         let topology = cluster.topology;
         drop(sharded);
-        let teardown_failures = cluster.teardown().await;
+        let teardown_failures = cluster
+            .teardown_with_stats(BenchScenario::SignalRoundtrip)
+            .await;
         let wall_clock_note = budget_note(scenario_started, deadline, &mut unsound);
 
         let publish = unsound.is_empty();
