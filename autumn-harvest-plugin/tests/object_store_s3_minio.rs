@@ -188,5 +188,9 @@ async fn s3_archiver_uploads_ciphertext_and_fetches_it_back() {
 #[tokio::test]
 async fn s3_retention_archive_reads_back_through_api_and_vantage() {
     let minio = minio().await;
-    object_store_e2e::retention_archive_reads_back_through_api_and_vantage(backend(&minio)).await;
+    // The end-to-end future is large, so box it.
+    Box::pin(
+        object_store_e2e::retention_archive_reads_back_through_api_and_vantage(backend(&minio)),
+    )
+    .await;
 }

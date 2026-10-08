@@ -116,10 +116,14 @@ fn state_with(archiver: Option<Arc<dyn HistoryArchiver>>) -> HarvestApiState {
     state
 }
 
-fn serving(doc: HistoryExportDocument) -> Option<Arc<dyn HistoryArchiver>> {
+fn serving(doc: HistoryExportDocument) -> Arc<dyn HistoryArchiver> {
     let mut docs = HashMap::new();
     docs.insert(doc.execution_id, doc);
-    Some(Arc::new(FakeArchiver(Mode::Serve(docs))))
+    Arc::new(FakeArchiver(Mode::Serve(docs)))
+}
+
+fn state_serving(doc: HistoryExportDocument) -> HarvestApiState {
+    state_with(Some(serving(doc)))
 }
 
 fn app(state: HarvestApiState) -> Router {
@@ -164,7 +168,7 @@ fn ui_path(id: &ExecutionId) -> String {
 #[tokio::test]
 async fn unauthenticated_request_is_blocked() {
     let id = ExecutionId::new();
-    let state = state_with(serving(doc_with_events(id, vec![plain_event()])));
+    let state = state_serving(doc_with_events(id, vec![plain_event()]));
     let (status, _) = send(state.clone(), get(&api_path(&id))).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     let (status, _) = send(state, get(&ui_path(&id))).await;
@@ -174,7 +178,7 @@ async fn unauthenticated_request_is_blocked() {
 #[tokio::test]
 async fn archived_history_is_served() {
     let id = ExecutionId::new();
-    let state = state_with(serving(doc_with_events(id, vec![plain_event()])));
+    let state = state_serving(doc_with_events(id, vec![plain_event()]));
     let (status, body) = send(state, get_as_admin(&api_path(&id))).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -187,7 +191,7 @@ async fn archived_history_is_served() {
 
 #[tokio::test]
 async fn a_run_missing_from_the_archive_is_not_found() {
-    let state = state_with(serving(doc_with_events(ExecutionId::new(), vec![])));
+    let state = state_serving(doc_with_events(ExecutionId::new(), vec![]));
     let (status, body) = send(state, get_as_admin(&api_path(&ExecutionId::new()))).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
 }
@@ -247,7 +251,7 @@ fn encoded_doc(codecs: &PayloadCodecs, id: ExecutionId) -> HistoryExportDocument
 async fn payloads_decode_under_the_read_path_gate() {
     let codecs = codecs();
     let id = ExecutionId::new();
-    let state = state_with(serving(encoded_doc(&codecs, id)));
+    let state = state_serving(encoded_doc(&codecs, id));
     state.set_payload_codecs(codecs);
     state.set_decode_payloads_on_read(true);
     let (status, body) = send(state, get_as_admin(&api_path(&id))).await;
@@ -260,7 +264,7 @@ async fn payloads_decode_under_the_read_path_gate() {
 async fn payloads_stay_encoded_when_decode_on_read_is_off() {
     let codecs = codecs();
     let id = ExecutionId::new();
-    let state = state_with(serving(encoded_doc(&codecs, id)));
+    let state = state_serving(encoded_doc(&codecs, id));
     state.set_payload_codecs(codecs);
     let (status, body) = send(state, get_as_admin(&api_path(&id))).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -272,7 +276,7 @@ async fn payloads_stay_encoded_when_decode_on_read_is_off() {
 #[tokio::test]
 async fn vantage_shows_the_archived_history() {
     let id = ExecutionId::new();
-    let state = state_with(serving(doc_with_events(id, vec![plain_event()])));
+    let state = state_serving(doc_with_events(id, vec![plain_event()]));
     let (status, html) = send(state, get_as_admin(&ui_path(&id))).await;
     assert_eq!(status, StatusCode::OK, "{html}");
     assert!(html.contains("Archived history"), "page title");
@@ -285,7 +289,7 @@ async fn vantage_shows_the_archived_history() {
 
 #[tokio::test]
 async fn vantage_reports_a_missing_archive() {
-    let state = state_with(serving(doc_with_events(ExecutionId::new(), vec![])));
+    let state = state_serving(doc_with_events(ExecutionId::new(), vec![]));
     let (status, html) = send(state, get_as_admin(&ui_path(&ExecutionId::new()))).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{html}");
 }
@@ -304,7 +308,7 @@ async fn vantage_escapes_event_data() {
         output: serde_json::json!({ "html": "<img src=x onerror=alert(1)>" }),
     })
     .unwrap();
-    let state = state_with(serving(doc_with_events(id, vec![event])));
+    let state = state_serving(doc_with_events(id, vec![event]));
     let (status, html) = send(state, get_as_admin(&ui_path(&id))).await;
     assert_eq!(status, StatusCode::OK);
     assert!(!html.contains("<img src=x"), "event data is escaped");
@@ -314,7 +318,7 @@ async fn vantage_escapes_event_data() {
 async fn vantage_caps_a_long_history() {
     let id = ExecutionId::new();
     let events = (0..1001).map(|_| plain_event()).collect();
-    let state = state_with(serving(doc_with_events(id, events)));
+    let state = state_serving(doc_with_events(id, events));
     let (status, html) = send(state, get_as_admin(&ui_path(&id))).await;
     assert_eq!(status, StatusCode::OK);
     assert!(

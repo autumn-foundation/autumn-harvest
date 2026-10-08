@@ -179,5 +179,7 @@ async fn gcs_archiver_uploads_ciphertext_and_fetches_it_back() {
 #[tokio::test]
 async fn gcs_retention_archive_reads_back_through_api_and_vantage() {
     let gcs = fake_gcs().await;
-    object_store_e2e::retention_archive_reads_back_through_api_and_vantage(backend(&gcs)).await;
+    // The end-to-end future is large, so box it.
+    Box::pin(object_store_e2e::retention_archive_reads_back_through_api_and_vantage(backend(&gcs)))
+        .await;
 }
