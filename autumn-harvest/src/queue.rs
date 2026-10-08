@@ -27,6 +27,11 @@ use crate::types::{ExecutionId, Priority};
 // ---------------------------------------------------------------------------
 
 /// Discriminator for the kind of task enqueued.
+///
+/// Mirrored by `autumn_harvest_redis::envelope::TaskType`, a
+/// serde-wire-format twin for the Redis backend. That copy derives
+/// `Serialize`/`Deserialize` for its JSON envelope; this one does not, so
+/// the two cannot share one definition. Keep the variants in sync by hand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskType {
     /// A top-level workflow execution.
