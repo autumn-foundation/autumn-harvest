@@ -403,3 +403,71 @@ async fn an_invalid_tenant_fails_the_start() {
         );
     }
 }
+
+/// A reconciled `MIGRATED` seal of another tenant is a prior run too (issue
+/// #1977). A tenant start must not attach to it, report it, or replace it.
+#[tokio::test]
+async fn a_tenant_start_refuses_a_reconciled_seal_of_another_tenant() {
+    let (url, _container) = setup_db().await;
+    let names = ["tp_seal"];
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn, &names).await;
+
+    for (policy, seal_state) in [
+        (
+            autumn_harvest::WorkflowIdReusePolicy::RejectDuplicate,
+            "COMPLETED",
+        ),
+        (
+            autumn_harvest::WorkflowIdReusePolicy::AllowDuplicateFailedOnly,
+            "COMPLETED",
+        ),
+        (
+            autumn_harvest::WorkflowIdReusePolicy::AllowDuplicateFailedOnly,
+            "FAILED",
+        ),
+    ] {
+        let workflow_id = format!("seal-{}", uuid::Uuid::new_v4());
+        let seal = start(
+            &mut conn,
+            "tp_seal",
+            &workflow_id,
+            json!({}),
+            Some("globex"),
+            None,
+        )
+        .await;
+        diesel::sql_query(
+            "UPDATE harvest_workflow_executions SET state = 'MIGRATED', \
+             migrated_to_shard = 1, migrated_at = now(), \
+             migrated_run_terminal_at = now(), migrated_run_terminal_state = $2 \
+             WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(seal.as_uuid())
+        .bind::<Text, _>(seal_state)
+        .execute(&mut conn)
+        .await
+        .expect("seal the run");
+
+        let params = StartWorkflowParams {
+            tenant: Some("acme"),
+            reuse_policy: policy,
+            ..StartWorkflowParams::new(
+                "tp_seal",
+                &workflow_id,
+                ExecutionId::new_for_shard(ShardId::new(0)),
+                json!({}),
+                "default",
+            )
+        };
+        let result = start_or_load_workflow_execution(&mut conn, params, None).await;
+        assert!(
+            matches!(
+                result,
+                Err(autumn_harvest::HarvestError::TenantConflict { .. })
+            ),
+            "{policy:?} over a {seal_state} seal: {result:?}"
+        );
+    }
+    scrub(&mut conn, &names).await;
+}

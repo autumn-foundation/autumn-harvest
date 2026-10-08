@@ -1675,6 +1675,9 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                     .optional()
                     .map_err(database_error)?;
                 if let Some(seal) = reconciled_seal {
+                    // A seal of another tenant is still that tenant's run
+                    // (issue #1977). Do not report, attach to or replace it.
+                    refuse_other_tenant(&request, &seal)?;
                     if request.reuse_policy == WorkflowIdReusePolicy::RejectDuplicate {
                         // Report the effective terminal state, not the
                         // seal's own `MIGRATED` marker (issue #1596 review,
