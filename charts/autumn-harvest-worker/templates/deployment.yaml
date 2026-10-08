@@ -1,0 +1,134 @@
+{{- $floor := add .Values.drain.preStopSleepSeconds .Values.drain.shutdownSeconds 10 }}
+{{- if lt (int .Values.drain.terminationGracePeriodSeconds) (int $floor) }}
+{{- fail (printf "drain.terminationGracePeriodSeconds must be at least %d (preStopSleepSeconds + shutdownSeconds + 10)" (int $floor)) }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "harvest-worker.fullname" . }}
+  labels:
+    {{- include "harvest-worker.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    {{- toYaml .Values.strategy | nindent 4 }}
+  selector:
+    matchLabels:
+      {{- include "harvest-worker.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "harvest-worker.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: worker
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "harvest-worker.serviceAccountName" . }}
+      # The worker does not call the Kubernetes API.
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ .Values.drain.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- if .Values.migrations.checkOnStart }}
+      initContainers:
+        - name: check-migrations
+          image: {{ include "harvest-worker.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /usr/local/bin/harvest
+            - migrate
+            - status
+            - --check
+            {{- if .Values.migrations.includeDirs }}
+            {{- include "harvest-worker.includeDirs" . | trim | nindent 12 }}
+            {{- end }}
+          env:
+            {{- include "harvest-worker.migrationEnv" . | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+      {{- end }}
+      containers:
+        - name: worker
+          image: {{ include "harvest-worker.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.command }}
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.args }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.containerPort }}
+              protocol: TCP
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "harvest-worker.databaseSecret" . }}
+                  key: {{ .Values.database.secretKey }}
+            - name: AUTUMN_PROFILE
+              value: {{ .Values.profile | quote }}
+            - name: STANDALONE_RUNNER_ADDR
+              value: {{ printf "0.0.0.0:%d" (int .Values.containerPort) | quote }}
+            {{- with .Values.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          livenessProbe:
+            httpGet:
+              path: {{ printf "%s/health/live" .Values.probes.basePath }}
+              port: http
+            {{- toYaml .Values.probes.liveness | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: {{ printf "%s/health/ready" .Values.probes.basePath }}
+              port: http
+            {{- toYaml .Values.probes.readiness | nindent 12 }}
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: {{ .Values.drain.preStopSleepSeconds }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # The root filesystem is read-only.
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

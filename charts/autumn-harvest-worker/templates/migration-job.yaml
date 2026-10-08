@@ -1,0 +1,63 @@
+{{- if .Values.migrations.enabled }}
+# Helm runs this Job before it installs or upgrades the worker. Concurrent
+# runs are safe: `harvest migrate run` locks the migration ledger.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "harvest-worker.fullname" . }}-migrate
+  labels:
+    {{- include "harvest-worker.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migrate
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-5"
+    # Keep a finished Job, so its log stays readable until the next upgrade.
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  backoffLimit: {{ .Values.migrations.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.migrations.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "harvest-worker.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: migrate
+    spec:
+      restartPolicy: Never
+      {{- with .Values.migrations.serviceAccountName }}
+      serviceAccountName: {{ . }}
+      {{- end }}
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: migrate
+          image: {{ include "harvest-worker.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /usr/local/bin/harvest
+            - migrate
+            - run
+            {{- if .Values.migrations.includeDirs }}
+            {{- include "harvest-worker.includeDirs" . | trim | nindent 12 }}
+            {{- end }}
+          env:
+            {{- include "harvest-worker.migrationEnv" . | nindent 12 }}
+          {{- with .Values.migrations.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

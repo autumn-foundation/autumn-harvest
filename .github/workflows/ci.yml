@@ -738,6 +738,25 @@ jobs:
           python3 docs/audits/action-sha-pin.py --self-test
           python3 docs/audits/action-sha-pin.py
 
+      # Issue #1989. Lint the worker chart, then check the image contract.
+      # The audit renders the chart with `helm template`. The pinned tarball
+      # and its checksum keep a new Helm release from reddening lint.
+      - name: Worker chart and image contract (docs/audits/worker-image-contract.py)
+        env:
+          HELM_VERSION: "3.21.0"
+          HELM_SHA256: "0093eb572e3d2380f094df162ddb525e219249de88957afe24cfbb19632acd36"
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/helm.tar.gz" \
+            "https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  ${RUNNER_TEMP}/helm.tar.gz" | sha256sum -c -
+          mkdir -p "${RUNNER_TEMP}/helm-bin"
+          tar -xzf "${RUNNER_TEMP}/helm.tar.gz" -C "${RUNNER_TEMP}/helm-bin" --strip-components=1 linux-amd64/helm
+          export PATH="${RUNNER_TEMP}/helm-bin:${PATH}"
+          helm lint --strict charts/autumn-harvest-worker -f charts/autumn-harvest-worker/ci/lint-values.yaml
+          python3 docs/audits/worker-image-contract.py --self-test
+          python3 docs/audits/worker-image-contract.py
+
       # Issue #1828. The rolling-deploy contract page and the
       # `mixed-version-smoke` job must both exist and name each other.
       - name: Mixed-version contract guard (docs/audits/mixed-version-contract.py)

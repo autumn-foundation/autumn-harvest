@@ -1,0 +1,4 @@
+# Values for `helm lint` and `helm template` in CI. The chart refuses to
+# render without a database secret.
+database:
+  existingSecret: harvest-database

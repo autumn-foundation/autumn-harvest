@@ -1,0 +1,14 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "harvest-worker.fullname" . }}
+  labels:
+    {{- include "harvest-worker.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "harvest-worker.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: worker
+{{- end }}

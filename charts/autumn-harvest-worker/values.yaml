@@ -1,0 +1,133 @@
+# Values for the standalone Harvest worker chart (issue #1989).
+#
+# The default image runs the reference `standalone-runner`. It holds demo
+# workflows only. To run your own workflows, build a worker image on the
+# Harvest image and set `image.repository` and `image.tag`. The README of
+# this chart states what such an image must do.
+
+replicaCount: 2
+
+image:
+  repository: ghcr.io/autumn-foundation/autumn-harvest
+  # Empty means the chart appVersion.
+  tag: ""
+  # A digest, such as `sha256:...`, wins over the tag. Use the digest that
+  # `cosign verify` checked.
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# The worker command. Empty means the image `CMD`.
+command: []
+args: []
+
+# The deployment profile, set as `AUTUMN_PROFILE`. Outside `dev`, the
+# runner applies no migrations and each admin route needs an API token.
+# Do not use `dev` in a shared cluster: its admin API has no auth.
+profile: prod
+
+database:
+  # Required. A Secret in the release namespace that holds the database URL.
+  # Create it before the install. The migration hook reads it too.
+  existingSecret: ""
+  # The key in the Secret that holds the URL.
+  secretKey: DATABASE_URL
+
+# The port that the worker listens on. The chart sets
+# `STANDALONE_RUNNER_ADDR` to `0.0.0.0:<port>`.
+containerPort: 8082
+
+service:
+  type: ClusterIP
+  port: 8082
+
+probes:
+  # The path where the worker mounts the Harvest router.
+  basePath: /api/harvest
+  # `GET <basePath>/health/live`. It does no I/O.
+  liveness:
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  # `GET <basePath>/health/ready`. It checks the database in a 1 s budget.
+  # Keep `timeoutSeconds` above that budget.
+  readiness:
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 3
+
+drain:
+  # The pod keeps serving for this time after Kubernetes removes it from the
+  # endpoints. Use the propagation delay of your ingress.
+  preStopSleepSeconds: 10
+  # The time that the process needs after SIGTERM. The reference runner
+  # needs 35 s: 10 s for open responses and 25 s for the worker drain.
+  shutdownSeconds: 35
+  # Must be at least preStopSleepSeconds + shutdownSeconds + 10. The chart
+  # refuses a lower value.
+  terminationGracePeriodSeconds: 60
+
+migrations:
+  # Run `harvest migrate run` as a pre-install and pre-upgrade hook.
+  enabled: true
+  # Run `harvest migrate status --check` as an init container. A pod then
+  # starts only on a migrated database.
+  checkOnStart: true
+  # Extra migration directories in the image. The default holds the
+  # connector dead-letter table of the plugin.
+  includeDirs:
+    - /usr/share/autumn-harvest/migrations/harvest
+  # A Secret for a role that may run DDL. Empty means `database`.
+  existingSecret: ""
+  secretKey: ""
+  # A service account for the hook. It must exist before the install,
+  # because the hook runs before the chart creates its own.
+  serviceAccountName: ""
+  backoffLimit: 1
+  activeDeadlineSeconds: 600
+  resources: {}
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+
+# Extra environment for the worker container.
+env: []
+envFrom: []
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+resources: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []

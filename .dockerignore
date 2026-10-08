@@ -1,0 +1,10 @@
+# Build context of the worker image (issue #1989). Keep the context small and
+# keep local secrets out of it.
+.git
+.claude
+.env*
+**/target
+**/node_modules
+clients/typescript/dist
+research_notes
+reports

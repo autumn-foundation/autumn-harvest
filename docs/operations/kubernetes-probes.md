@@ -170,6 +170,13 @@ use at least 70 seconds.
 For `HarvestEmbedding`, use the server drain time of your process in place
 of the two autumn-web values.
 
+## Helm chart
+
+[`charts/autumn-harvest-worker`](../../charts/autumn-harvest-worker/README.md)
+installs a standalone worker with these probe and drain settings. It also
+runs the migrations as a hook. [ADR 0006](../adr/0006-worker-container-image.md)
+states what the worker image holds (issue #1989).
+
 ## Shutdown sequence (`HarvestPlugin`)
 
 1. Kubernetes marks the pod `Terminating` and removes it from endpoints.
