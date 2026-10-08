@@ -1263,9 +1263,8 @@ mod db {
 
     /// Read an execution's durable stream chunks (issue #1974) as JSON pages.
     ///
-    /// A stream can hold 100,000 chunks of up to 7,000 bytes. One
-    /// `jsonb_agg` of all of them can pass the 255 MB `jsonb` limit, so this
-    /// reads pages in offset order.
+    /// A stream can hold 10,000 chunks of up to 7,000 bytes, about 70 MB.
+    /// Pages of 1,000 rows keep each query result and each insert small.
     async fn read_stream_chunk_pages(
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,

@@ -135,16 +135,16 @@ pub fn workflow_progress_channel(exec_id: Uuid) -> String {
 /// # Examples
 ///
 /// ```
-/// # use autumn_harvest::notify::workflow_stream_channel;
+/// # use autumn_harvest::notify::durable_stream_channel;
 /// # use uuid::Uuid;
 /// let id = Uuid::parse_str("0191c1a2-3b4c-7d5e-8f60-112233445566").unwrap();
 /// assert_eq!(
-///     workflow_stream_channel(id),
+///     durable_stream_channel(id),
 ///     "harvest_stream_0191c1a23b4c7d5e8f60112233445566"
 /// );
 /// ```
 #[must_use]
-pub fn workflow_stream_channel(exec_id: Uuid) -> String {
+pub fn durable_stream_channel(exec_id: Uuid) -> String {
     format!("harvest_stream_{}", exec_id.simple())
 }
 
@@ -1603,12 +1603,12 @@ pub async fn notify_workflow_progress(
 /// # Errors
 ///
 /// Returns [`HarvestError::Database`] if `pg_notify` fails.
-pub async fn notify_workflow_stream(
+pub async fn notify_durable_stream(
     conn: &mut AsyncPgConnection,
     workflow_exec_id: Uuid,
 ) -> HarvestResult<()> {
     diesel::sql_query("SELECT pg_notify($1, '')")
-        .bind::<Text, _>(workflow_stream_channel(workflow_exec_id))
+        .bind::<Text, _>(durable_stream_channel(workflow_exec_id))
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -2021,9 +2021,9 @@ impl WorkflowProgressListener {
     }
 }
 
-/// Outcome of waiting on a [`WorkflowStreamListener`] (issue #1974).
+/// Outcome of waiting on a [`DurableStreamListener`] (issue #1974).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamWaitOutcome {
+pub enum DurableStreamWait {
     /// At least one wake arrived. New chunks can be in the table.
     Woken,
     /// No wake arrived before the timeout.
@@ -2032,22 +2032,44 @@ pub enum StreamWaitOutcome {
     ChannelClosed,
 }
 
+/// Wake state that the forwarder task shares with a [`DurableStreamListener`].
+struct DurableStreamWakes {
+    /// Holds one permit after one or more wakes. Wakes merge into it.
+    notify: tokio::sync::Notify,
+    /// Set when the `LISTEN` connection closes.
+    closed: std::sync::atomic::AtomicBool,
+}
+
 /// Listener for one execution's durable stream wakes (issue #1974).
 ///
 /// The `GET /workflows/{id}/stream/durable` route opens it before its first
 /// read. Postgres then sends a wake for each later commit, so the read loop
 /// misses no chunk.
-pub struct WorkflowStreamListener {
+///
+/// **It never stalls the connection.** A forwarder task reads every
+/// notification at once and merges it into one pending wake. A reader that
+/// waits for a slow client therefore never stops the driver from reading the
+/// socket. A stopped driver would hold back the shared Postgres NOTIFY queue
+/// for the whole cluster.
+pub struct DurableStreamListener {
     /// Client handle kept alive so the LISTEN connection stays open.
     _client: tokio_postgres::Client,
-    /// Receiver for notifications forwarded by the connection driver task.
-    rx: tokio::sync::mpsc::Receiver<tokio_postgres::Notification>,
+    /// Wake state shared with the forwarder task.
+    wakes: std::sync::Arc<DurableStreamWakes>,
     /// Background connection driver handle kept alive for the connection's lifetime.
     _connection_handle: tokio::task::JoinHandle<()>,
+    /// Forwarder task. Aborted on drop.
+    forwarder: tokio::task::JoinHandle<()>,
 }
 
-impl WorkflowStreamListener {
-    /// Connect to Postgres and `LISTEN` on [`workflow_stream_channel`].
+impl Drop for DurableStreamListener {
+    fn drop(&mut self) {
+        self.forwarder.abort();
+    }
+}
+
+impl DurableStreamListener {
+    /// Connect to Postgres and `LISTEN` on [`durable_stream_channel`].
     ///
     /// TLS follows the `sslmode` rules of [`WorkflowProgressListener::connect`].
     ///
@@ -2057,33 +2079,58 @@ impl WorkflowStreamListener {
     /// Returns [`HarvestError::Config`] if the URL or its TLS settings are
     /// not valid.
     pub async fn connect(database_url: &str, exec_id: Uuid) -> HarvestResult<Self> {
-        let ListenConnection { client, rx, driver } =
-            open_listen_connection(database_url, "postgres workflow stream listener error").await?;
-        let channel = quote_pg_identifier(&workflow_stream_channel(exec_id));
+        let ListenConnection {
+            client,
+            mut rx,
+            driver,
+        } = open_listen_connection(database_url, "postgres durable stream listener error").await?;
+        let channel = quote_pg_identifier(&durable_stream_channel(exec_id));
         client
             .batch_execute(&format!("LISTEN {channel}"))
             .await
             .map_err(|e| {
                 HarvestError::Database(format!("LISTEN {channel} failed: {}", error_chain(&e)))
             })?;
+        let wakes = std::sync::Arc::new(DurableStreamWakes {
+            notify: tokio::sync::Notify::new(),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let forwarder_wakes = std::sync::Arc::clone(&wakes);
+        let forwarder = tokio::spawn(async move {
+            while rx.recv().await.is_some() {
+                forwarder_wakes.notify.notify_one();
+            }
+            forwarder_wakes
+                .closed
+                .store(true, std::sync::atomic::Ordering::Release);
+            forwarder_wakes.notify.notify_one();
+        });
         Ok(Self {
             _client: client,
-            rx,
+            wakes,
             _connection_handle: driver,
+            forwarder,
         })
     }
 
-    /// Wait up to `timeout` for a wake. Wakes that are already queued merge
+    /// Wait up to `timeout` for a wake. All wakes since the last call merge
     /// into one, because one table read serves all of them.
-    pub async fn wait_timeout(&mut self, timeout: Duration) -> StreamWaitOutcome {
-        match tokio::time::timeout(timeout, self.rx.recv()).await {
-            Err(_elapsed) => StreamWaitOutcome::TimedOut,
-            Ok(None) => StreamWaitOutcome::ChannelClosed,
-            Ok(Some(_)) => {
-                while self.rx.try_recv().is_ok() {}
-                StreamWaitOutcome::Woken
-            }
+    pub async fn wait_timeout(&self, timeout: Duration) -> DurableStreamWait {
+        if self.is_closed() {
+            return DurableStreamWait::ChannelClosed;
         }
+        match tokio::time::timeout(timeout, self.wakes.notify.notified()).await {
+            Err(_elapsed) => DurableStreamWait::TimedOut,
+            Ok(()) if self.is_closed() => DurableStreamWait::ChannelClosed,
+            Ok(()) => DurableStreamWait::Woken,
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        std::sync::atomic::AtomicBool::load(
+            &self.wakes.closed,
+            std::sync::atomic::Ordering::Acquire,
+        )
     }
 }
 

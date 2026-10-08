@@ -1663,7 +1663,7 @@
       "path": "/workflows/{id}/stream/durable",
       "category": "workflow",
       "read_only": true,
-      "description": "Server-Sent Events stream of the DURABLE output chunks a workflow stores via ctx.publish_durable_progress (issue #1974). The worker stores each chunk in harvest_stream_chunks in the same transaction as its decision cycle. Each chunk has a 0-based offset, the call ordinal, which is the SSE id. The stream sends every stored chunk above the resume cursor in offset order, then tails new chunks. A reader that disconnects resumes with ?after=<offset> or the Last-Event-ID header and gets every later chunk with no gap and no duplicate. The producer sends with back-pressure, so a slow client loses no chunk. A terminal run still streams its stored chunks, then event:end. Chunks are not in harvest_events and do not count toward the history caps. A stream holds at most 100000 chunks; above the cap the newest are dropped and one terminal marker frame is stored at offset 9223372036854775807. AUTH: the same posture as GET /workflows/{id}/stream. The route is NOT admin-gated, exec_id is a bearer capability for the stored chunk content, and each reader holds one Postgres LISTEN connection.",
+      "description": "Server-Sent Events stream of the DURABLE output chunks a workflow stores via ctx.publish_durable_progress (issue #1974). The worker stores each chunk in harvest_stream_chunks in the same transaction as its decision cycle. Each chunk has a 0-based offset, the call ordinal, which is the SSE id. The stream sends every stored chunk above the resume cursor in offset order, then tails new chunks. A reader that disconnects resumes with ?after=<offset> or the Last-Event-ID header. It gets every later chunk with no gap and no duplicate. The producer waits for a slow client and drops no chunk. A client that takes no frame for 60 s loses the stream and resumes. A run that is terminal at connect streams its stored chunks, then event:end, with no LISTEN connection. Chunks are not in harvest_events and do not count toward the history caps. A stream holds at most 10000 chunks. Above the cap the newest are dropped, and one terminal marker frame is stored at offset 9223372036854775807. AUTH: the route has the posture of GET /workflows/{id}/stream and is NOT admin-gated. exec_id is a bearer capability for ALL stored chunk content. Embedders that expose sensitive output MUST add per-execution authorization. A reader of a live run holds one Postgres LISTEN connection, so cap concurrent streams per user.",
       "params": [
         {
           "name": "id",
@@ -1678,13 +1678,20 @@
           "type": "integer",
           "required": false,
           "description": "Exclusive resume offset. The stream sends chunks with a higher offset. It wins over the Last-Event-ID header. Omit both to start at the first chunk."
+        },
+        {
+          "name": "Last-Event-ID",
+          "in": "header",
+          "type": "integer",
+          "required": false,
+          "description": "Exclusive resume offset that a browser EventSource sends on reconnect. The after query parameter wins when both are present."
         }
       ],
       "request_body": null,
       "success_response": {
         "content_type": "text/event-stream",
         "status": 200,
-        "note": "Content-Type: text/event-stream. Frames: event:progress (id = the chunk offset, data = the stored chunk JSON), a terminal event:end with {\"reason\": <terminal-state>}, or event:error. Offsets are contiguous from 0 and the first stored copy of a chunk is canonical. A cap marker has data {\"_harvest_stream_truncated\": true, \"max_chunks\": N}.",
+        "note": "Content-Type: text/event-stream. Frames: event:progress (id = the chunk offset, data = the stored chunk JSON), a terminal event:end with {\"reason\": <terminal-state>}, or event:error. The offsets of real chunks are contiguous, and the first stored copy of a chunk is canonical. Delivery is at-least-once across reconnects, so dedup by offset. A cap marker has data {\"_harvest_stream_truncated\": true, \"max_chunks\": N}.",
         "free_form": true
       },
       "error_responses": [

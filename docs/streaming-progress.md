@@ -220,6 +220,10 @@ embedder's responsibility.
 The durable mode stores each chunk and lets a reader resume at any offset. The
 best-effort mode stays the default.
 
+Each publish below runs after the activity returns, so the tokens arrive in
+one burst. Publish between steps, for example once per agent turn, for a live
+stream.
+
 ```rust
 #[workflow]
 async fn answer(ctx: &WorkflowContext, prompt: Prompt) -> Result<Answer, String> {
@@ -255,7 +259,10 @@ same transaction as the decision cycle. The table is not `harvest_events`.
 ### Offsets
 
 Each chunk has a 0-based **offset**: the ordinal of the call in the workflow
-body. The SSE `id:` carries it. Offsets are contiguous: 0, 1, 2 and so on.
+body. The SSE `id:` carries it. The offsets of real chunks are contiguous:
+0, 1, 2 and so on. A reset, a fork or a retry is a new execution whose replay
+claims the offsets of the copied history, so its first chunk can have an
+offset above 0.
 
 A re-driven decision cycle runs the body again and gives each chunk the same
 offset. The store keeps the first copy, so a reader never sees a chunk twice
@@ -272,22 +279,32 @@ any workflow code.
   on reconnect) or `?after=<offset>`. The query parameter wins. The stream
   sends every chunk with a higher offset. With neither, it starts at offset 0.
 - **No drop under back-pressure.** The producer waits for a slow client. It
-  reads the next page of 256 rows only after the client takes the last one.
-- **Terminal runs.** A reader that connects after the run ends still gets
-  every stored chunk above its cursor, then `event: end`.
-- **Write errors.** A failed chunk write fails the decision cycle, like a
-  failed `set_current_details` write. The mode does not commit a cycle with a
-  missing chunk.
+  reads the next page of 256 rows only when the send buffer has room. A
+  client that takes no frame for 60 s loses the stream. It resumes with
+  `Last-Event-ID` and loses nothing.
+- **Delivery is at-least-once across reconnects.** Dedup by offset if the
+  client can reconnect with an old cursor.
+- **Terminal runs.** A reader that connects after the run ends gets every
+  stored chunk above its cursor, then `event: end`. It holds no `LISTEN`
+  connection.
+- **Write errors.** The mode never commits a cycle with a missing chunk. A
+  failed chunk write follows the persist policy of `set_current_details`: a
+  deadlock or serialization conflict re-runs the cycle, and another database
+  error fails the execution.
 
 ### Limits
 
-- **Chunk size.** The 7,000-byte cap of the best-effort mode applies. An
-  oversize chunk becomes the `_harvest_progress_truncated` marker.
-- **Chunk count.** 100,000 chunks for each execution
+- **Chunk size.** The 7,000-byte cap of the best-effort mode applies. It
+  bounds row size and memory. An oversize chunk becomes the
+  `_harvest_progress_truncated` marker.
+- **Chunk count.** 10,000 chunks for each execution
   (`DURABLE_STREAM_MAX_CHUNKS`). Above the cap the newest chunks drop. One
   terminal marker frame then has the offset `9223372036854775807` and the
-  data `{"_harvest_stream_truncated": true, "max_chunks": 100000}`. The stored
-  chunks stay a gap-free prefix.
+  data `{"_harvest_stream_truncated": true, "max_chunks": 10000}`. The stored
+  chunks stay a gap-free prefix. Put several tokens in one chunk for a long
+  run.
+- **Handler contexts.** A chunk from an update or query handler is not
+  stored, as for `publish_progress`.
 - **Postgres only.** The SQLite runtime ignores durable chunks.
 - **Plain JSON at rest.** Payload codecs do not encrypt stored chunks. Do not
   put secrets in a chunk.
@@ -302,9 +319,10 @@ GET /api/harvest/workflows/{id}/stream/durable[?after=<offset>]
 The frames are the frames of `/stream`. The `id:` of a `progress` frame is the
 offset. A malformed `after` or `Last-Event-ID` returns `400`. The auth posture
 is the same as `/stream`: the route is not admin-gated, and `exec_id` is a
-bearer capability for **all stored** chunk content. Each reader holds one
-Postgres `LISTEN` connection, and a pooled connection for one page read at a
-time.
+bearer capability for **all stored** chunk content. If chunks carry sensitive
+output, add your own per-execution authorization. A reader of a live run holds
+one Postgres `LISTEN` connection, and a pooled connection for one page read at
+a time. Cap concurrent streams per user.
 
 ```console
 $ curl -N -H 'Last-Event-ID: 41' \
@@ -317,8 +335,8 @@ event: end
 data: {"reason":"completed"}
 ```
 
-In a no-DB test, `TestRunOutcome::durable_progress()` returns the chunks that
-the run would store.
+In a no-DB test, `TestRunOutcome::recorded_durable_progress()` returns the
+chunks that the run would store.
 
 ## Out of scope
 
@@ -328,7 +346,7 @@ Explicitly **not** provided by the best-effort mode (see the issue for rationale
   [durable mode](#durable-mode-issue-1974).
 - **At-least-once / exactly-once delivery, cross-reconnect ordering guarantees,
   or buffering for late subscribers** — best-effort only. The durable mode
-  gives all three.
+  gives ordered, at-least-once delivery with backfill.
 - **Final-result delivery** — use the await-completion long-poll (#527).
 - **Snapshot state reads** — use a query handler or `set_current_details`
   (#473/#593).

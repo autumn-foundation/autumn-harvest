@@ -57,7 +57,7 @@ async fn insert_execution(conn: &mut AsyncPgConnection, exec_id: ExecutionId, na
     .expect("insert execution");
 }
 
-fn chunk(offset: i64, value: Value) -> DurableStreamChunk {
+const fn chunk(offset: i64, value: Value) -> DurableStreamChunk {
     DurableStreamChunk {
         offset,
         chunk: value,
@@ -266,7 +266,7 @@ async fn chunks_never_outlive_their_execution() {
         .execute(&mut conn)
         .await
         .expect("delete execution");
-    assert!(read_all(&mut conn, exec_id).await.is_empty());
+    assert_eq!(read_all(&mut conn, exec_id).await, Vec::new());
 }
 
 #[tokio::test]
@@ -300,7 +300,7 @@ async fn erase_workflow_payloads_deletes_stream_chunks_and_reports_the_count() {
         .await
         .expect("erase a terminal execution");
     assert_eq!(outcome.stream_chunks_deleted, 2, "{outcome:?}");
-    assert!(read_all(&mut conn, exec_id).await.is_empty());
+    assert_eq!(read_all(&mut conn, exec_id).await, Vec::new());
 }
 
 // ── Worker end to end ───────────────────────────────────────────────────────
@@ -457,4 +457,51 @@ async fn worker_stores_each_durable_chunk_once_at_a_contiguous_offset() {
         !format!("{:?}", history.events).contains("world"),
         "a durable chunk never enters harvest_events"
     );
+}
+
+// ── Wake channel ────────────────────────────────────────────────────────────
+
+/// A committed wake reaches the listener. A rolled-back wake does not.
+/// Several wakes merge into one.
+#[tokio::test]
+async fn the_listener_wakes_on_commit_only_and_merges_wakes() {
+    use autumn_harvest::notify::{DurableStreamListener, DurableStreamWait};
+
+    let (url, _c) = setup_database().await;
+    let exec_id = ExecutionId::new();
+    let listener = DurableStreamListener::connect(&url, exec_id.as_uuid())
+        .await
+        .expect("listen");
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+
+    let rolled_back = Box::pin(conn.transaction::<(), autumn_harvest::HarvestError, _>(
+        async |c| {
+            autumn_harvest::notify::notify_durable_stream(c, exec_id.as_uuid()).await?;
+            Err(autumn_harvest::HarvestError::Database("roll back".into()))
+        },
+    ))
+    .await;
+    assert!(rolled_back.is_err());
+    assert_eq!(
+        listener.wait_timeout(Duration::from_millis(300)).await,
+        DurableStreamWait::TimedOut,
+        "a rolled-back cycle must not wake a reader"
+    );
+
+    for _ in 0..3 {
+        autumn_harvest::notify::notify_durable_stream(&mut conn, exec_id.as_uuid())
+            .await
+            .expect("notify");
+    }
+    assert_eq!(
+        listener.wait_timeout(Duration::from_secs(5)).await,
+        DurableStreamWait::Woken
+    );
+    // The forwarder can see the three wakes in separate reads. At most one
+    // more wake can then be pending, never three.
+    let mut extra = 0;
+    while listener.wait_timeout(Duration::from_millis(300)).await == DurableStreamWait::Woken {
+        extra += 1;
+    }
+    assert!(extra <= 1, "wakes must merge, got {extra} extra");
 }

@@ -2879,12 +2879,19 @@ pub async fn append_stream_chunks(
         return Ok(0);
     }
 
-    // Count stored rows that this batch does not offer again. A re-driven
-    // batch is already stored, so counting it would charge the cap twice.
-    let batch_offsets: Vec<i64> = chunks.iter().map(|c| c.offset).collect();
+    // Count stored rows outside this batch's offset range. A re-driven batch
+    // is already stored, so counting it would charge the cap twice. A batch
+    // holds consecutive call ordinals, so a range check is exact. It is also
+    // an index range scan, not a per-row comparison with every batch offset.
+    let lowest = chunks.iter().map(|c| c.offset).min().unwrap_or(0);
+    let highest = chunks.iter().map(|c| c.offset).max().unwrap_or(0);
     let existing: i64 = dsl::harvest_stream_chunks
         .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
-        .filter(dsl::stream_offset.ne_all(batch_offsets))
+        .filter(
+            dsl::stream_offset
+                .lt(lowest)
+                .or(dsl::stream_offset.gt(highest)),
+        )
         .count()
         .get_result(conn)
         .await

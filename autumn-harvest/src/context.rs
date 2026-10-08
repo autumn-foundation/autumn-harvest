@@ -168,7 +168,7 @@ pub const PROGRESS_CHUNK_MAX_BYTES: usize = 7000;
 /// The store drops chunks above the cap and stores one terminal marker. The
 /// context queues at most `cap + 1` commands in one cycle, so the store can
 /// see the overflow.
-pub const DURABLE_STREAM_MAX_CHUNKS: u32 = 100_000;
+pub const DURABLE_STREAM_MAX_CHUNKS: u32 = 10_000;
 
 /// Serialize a progress chunk and apply [`PROGRESS_CHUNK_MAX_BYTES`].
 ///
@@ -4879,6 +4879,23 @@ impl WorkflowContext {
     pub(crate) fn replay_suppresses_side_effects(&self) -> bool {
         let matcher = self.matcher.lock().expect("matcher lock poisoned");
         matcher.is_replaying() || matcher.has_terminal_failure_tail()
+    }
+
+    /// Replay gate of [`publish_durable_progress`](Self::publish_durable_progress)
+    /// (issue #1974).
+    ///
+    /// The raw cursor check of [`Self::replay_suppresses_side_effects`] counts
+    /// a signal or an update that waits at the cursor as history to replay.
+    /// Code before the matching `wait_for_signal` then looks replayed, also
+    /// on its first run, and its chunks are never stored. A best-effort side
+    /// effect can accept that loss. A durable chunk cannot.
+    ///
+    /// So this gate first runs `prepare_match`. It moves such events into
+    /// their stashes, exactly as the next history match does. It does not run
+    /// the signal-handler pump, so it changes no workflow-visible state.
+    pub(crate) fn durable_replay_suppresses(&self) -> bool {
+        let mut matcher = self.matcher.lock().expect("matcher lock poisoned");
+        matcher.prepare_match() || matcher.has_terminal_failure_tail()
     }
 
     /// Cursor-only "is there recorded history left to consume?" — the
@@ -13828,7 +13845,7 @@ impl WorkflowContext {
         let offset = self
             .durable_progress_ordinal
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if self.replay_suppresses_side_effects() {
+        if self.durable_replay_suppresses() {
             return Ok(());
         }
         // Bound the queue at cap + 1. The extra command lets the store see
@@ -25886,7 +25903,7 @@ mod tests {
         let ctx = WorkflowContext::new_test();
         ctx.publish_progress(serde_json::json!("x")).expect("live");
         let cmds = ctx.drain_commands();
-        assert!(durable_chunks(&cmds).is_empty());
+        assert_eq!(durable_chunks(&cmds), Vec::new());
         assert!(matches!(
             cmds.as_slice(),
             [WorkflowCommand::PublishProgress { .. }]
@@ -25913,6 +25930,26 @@ mod tests {
             durable_chunks(&ctx.drain_commands()),
             vec![(1, serde_json::json!("new"))],
             "the replayed call pushes nothing but still claims offset 0"
+        );
+    }
+
+    #[test]
+    fn durable_progress_is_live_when_a_buffered_signal_waits_at_the_cursor() {
+        // Regression (issue #1974 review). A signal that arrives before the
+        // first cycle sits at the cursor. The raw cursor check then reports
+        // replay, and the chunks before `wait_for_signal` were never stored.
+        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now());
+        let signal = WorkflowEvent::SignalReceived {
+            signal_name: "go".to_string(),
+            payload: serde_json::json!({}),
+        };
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), vec![started, signal]);
+        ctx.publish_durable_progress(serde_json::json!("first"))
+            .expect("publish");
+        assert_eq!(
+            durable_chunks(&ctx.drain_commands()),
+            vec![(0, serde_json::json!("first"))],
+            "a buffered signal is not replayed history, so the chunk is live"
         );
     }
 
@@ -25998,6 +26035,13 @@ mod tests {
             durable_chunks(&ctx.drain_commands()),
             vec![(1, serde_json::json!(1))],
             "a resident cycle does not re-run the body, so the counter continues"
+        );
+        ctx.begin_resident_cycle(&[]);
+        assert_eq!(
+            ctx.durable_progress_queued
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the queue bound is per cycle, so a resident cycle resets it"
         );
     }
 

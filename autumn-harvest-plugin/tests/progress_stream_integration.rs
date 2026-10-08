@@ -143,8 +143,8 @@ fn progress_multicycle_workflow<'a>(
     })
 }
 
-/// Publishes five durable chunks, parks on a one-second timer, then publishes
-/// five more (issue #1974).
+/// Publishes five durable chunks, waits for the `go` signal, then publishes
+/// five more (issue #1974). The signal lets a test hold the run live.
 fn durable_stream_workflow<'a>(
     ctx: &'a autumn_harvest::context::WorkflowContext,
     input: Value,
@@ -154,9 +154,7 @@ fn durable_stream_workflow<'a>(
             ctx.publish_durable_progress(json!({"token": i}))
                 .map_err(|e| e.to_string())?;
         }
-        ctx.timer("durable_gap", 1)
-            .await
-            .map_err(|e| e.to_string())?;
+        ctx.wait_for_signal("go").await.map_err(|e| e.to_string())?;
         for i in 5..10 {
             ctx.publish_durable_progress(json!({"token": i}))
                 .map_err(|e| e.to_string())?;
@@ -224,13 +222,17 @@ fn test_registry() -> Arc<HandlerRegistry> {
 }
 
 fn build_app(pool: &DbPool, url: &str) -> axum::Router {
+    // Shorten the terminal-close poll cadence so `event: end` follows the last
+    // chunk quickly (bounded by min(keepalive, PROGRESS_STREAM_KEEPALIVE)).
+    build_app_with_keepalive(pool, url, Duration::from_millis(150))
+}
+
+fn build_app_with_keepalive(pool: &DbPool, url: &str, keepalive: Duration) -> axum::Router {
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     // Required so the stream handler can open a LISTEN connection for the shard.
     api_state.set_workflow_result_notification_database_url(url.to_string());
-    // Shorten the terminal-close poll cadence so `event: end` follows the last
-    // chunk quickly (bounded by min(keepalive, PROGRESS_STREAM_KEEPALIVE)).
-    api_state.set_sse_keepalive_interval(Duration::from_millis(150));
+    api_state.set_sse_keepalive_interval(keepalive);
     api_state.install(HarvestApiRuntime::new(
         test_registry(),
         Arc::new(DagCatalog::default()),
@@ -709,6 +711,14 @@ fn expected_tokens(range: std::ops::Range<u64>) -> Vec<(u64, Value)> {
     range.map(|i| (i, json!({"token": i}))).collect()
 }
 
+/// Send the `go` signal of [`durable_stream_workflow`].
+async fn send_go_signal(pool: &DbPool, exec_id: ExecutionId) {
+    let mut conn = pool.get().await.unwrap();
+    autumn_harvest::signal::send_signal(&mut conn, exec_id, "go", json!({}))
+        .await
+        .expect("signal");
+}
+
 async fn wait_for_state(pool: &DbPool, exec_id: ExecutionId, want: &str) {
     let mut conn = pool.get().await.unwrap();
     tokio::time::timeout(Duration::from_secs(20), async {
@@ -731,6 +741,10 @@ async fn wait_for_state(pool: &DbPool, exec_id: ExecutionId, want: &str) {
 
 /// AC: a reader that disconnects and reconnects with its last offset receives
 /// every later chunk, with no gap and no duplicate.
+///
+/// The run waits for a signal, so it is still live at the reconnect. The
+/// second reader therefore gets chunks 3 and 4 from the table and chunks 5 to
+/// 9 from the live tail.
 #[tokio::test]
 async fn durable_stream_resume_has_no_gap_and_no_duplicate() {
     let (url, _guard) = setup_database().await;
@@ -756,10 +770,20 @@ async fn durable_stream_resume_has_no_gap_and_no_duplicate() {
     assert_eq!(first, expected_tokens(0..3), "frames: {first_frames:#?}");
     let last_seen = first.last().map(|(o, _)| o.to_string()).unwrap();
 
-    // Second connection resumes from the last offset while the run is live.
+    // Second connection resumes from the last offset. The run waits for the
+    // signal, so it is live.
     let resp = durable_response(&app, exec_id, "", Some(&last_seen)).await;
     assert_eq!(resp.status(), StatusCode::OK);
-    let (second_frames, _) = read_sse(resp, Duration::from_secs(20)).await;
+    let reader = tokio::spawn(read_sse(resp, Duration::from_secs(20)));
+    let state: String = harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .select(harvest_workflow_executions::state)
+        .first(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(state, "RUNNING", "the reconnect must hit a live run");
+    send_go_signal(&pool, exec_id).await;
+    let (second_frames, _) = reader.await.expect("reader task");
     worker.shutdown();
     let _ = worker_handle.await;
 
@@ -772,6 +796,43 @@ async fn durable_stream_resume_has_no_gap_and_no_duplicate() {
         second_frames.last().and_then(|f| f.event.as_deref()),
         Some("end"),
         "the stream ends after the terminal state"
+    );
+}
+
+/// The `LISTEN` wake delivers a live chunk long before the keepalive tick.
+/// The tick also reads the table, so with a short keepalive a broken wake
+/// would go unseen.
+#[tokio::test]
+async fn durable_stream_wakes_on_notify_before_the_keepalive_tick() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app_with_keepalive(&pool, &url, Duration::from_secs(30));
+    let mut conn = pool.get().await.unwrap();
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    start_or_load_workflow_execution(
+        &mut conn,
+        start_params_named(exec_id, "durable_stream_wf", "durable-wake"),
+        None,
+    )
+    .await
+    .unwrap();
+    let resp = durable_response(&app, exec_id, "", None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let (worker, worker_handle) = spawn_worker(&pool, "durable-wake-worker");
+
+    let started = std::time::Instant::now();
+    let (frames, _) = read_sse_limit(resp, Duration::from_secs(20), 5).await;
+    let elapsed = started.elapsed();
+    send_go_signal(&pool, exec_id).await;
+    worker.shutdown();
+    let _ = worker_handle.await;
+
+    assert_eq!(durable_progress(&frames), expected_tokens(0..5));
+    // The route caps the tick at 5 s, so 3 s proves that the wake came first.
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "the wake must deliver the chunks, not the keepalive tick: {elapsed:?}"
     );
 }
 
@@ -793,6 +854,7 @@ async fn durable_stream_backfills_a_terminal_run_from_any_offset() {
     .await
     .unwrap();
     let (worker, worker_handle) = spawn_worker(&pool, "durable-terminal-worker");
+    send_go_signal(&pool, exec_id).await;
     wait_for_state(&pool, exec_id, "COMPLETED").await;
     worker.shutdown();
     let _ = worker_handle.await;

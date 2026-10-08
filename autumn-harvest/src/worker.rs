@@ -10520,7 +10520,7 @@ async fn persist_durable_stream_from_commands(
         crate::context::DURABLE_STREAM_MAX_CHUNKS,
     )
     .await?;
-    crate::notify::notify_workflow_stream(conn, exec_id.as_uuid()).await
+    crate::notify::notify_durable_stream(conn, exec_id.as_uuid()).await
 }
 
 /// Per-decision-cycle ceiling on the number of `ctx.publish_progress` chunks the

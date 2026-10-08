@@ -4986,7 +4986,7 @@ fn accumulate_recorded_logs(
 #[derive(Default)]
 struct RecordedSideOutput {
     logs: std::collections::BTreeMap<u64, RecordedLogLine>,
-    durable_progress: std::collections::BTreeMap<u64, RecordedProgressChunk>,
+    durable_progress: std::collections::BTreeMap<u64, RecordedDurableChunk>,
 }
 
 impl RecordedSideOutput {
@@ -4997,7 +4997,7 @@ impl RecordedSideOutput {
             if let WorkflowCommand::PublishDurableProgress { offset, chunk } = cmd {
                 self.durable_progress
                     .entry(*offset)
-                    .or_insert_with(|| RecordedProgressChunk {
+                    .or_insert_with(|| RecordedDurableChunk {
                         offset: *offset,
                         chunk: chunk.clone(),
                     });
@@ -5012,7 +5012,7 @@ impl RecordedSideOutput {
 
 /// One durable stream chunk that a test run would have stored (issue #1974).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RecordedProgressChunk {
+pub struct RecordedDurableChunk {
     /// The 0-based call ordinal. Production uses it as the SSE `id:`.
     pub offset: u64,
     /// The chunk, size-capped by the context.
@@ -5107,7 +5107,7 @@ pub struct TestRunOutcome {
     recorded_logs: Vec<RecordedLogLine>,
     /// The durable stream chunks this run would have stored (issue #1974),
     /// in offset order, first copy kept.
-    durable_progress: Vec<RecordedProgressChunk>,
+    durable_progress: Vec<RecordedDurableChunk>,
 }
 
 /// Reconstruct the final virtual-clock elapsed (in seconds) from the durable
@@ -5206,7 +5206,7 @@ impl TestRunOutcome {
     /// The harness models the keep-first dedup by offset. It does not model
     /// the per-execution cap. The database tests cover the cap.
     #[must_use]
-    pub fn durable_progress(&self) -> &[RecordedProgressChunk] {
+    pub fn recorded_durable_progress(&self) -> &[RecordedDurableChunk] {
         &self.durable_progress
     }
 
@@ -7074,6 +7074,34 @@ mod tests {
     use chrono::Utc;
     use std::future::Future;
     use std::pin::Pin;
+
+    /// Issue #1974: two cycles that offer the same offset keep the first
+    /// chunk, as the store's `ON CONFLICT DO NOTHING` does.
+    #[test]
+    fn recorded_durable_chunks_keep_the_first_copy_of_an_offset() {
+        let publish = |offset: u64, chunk: Value| {
+            crate::context::WorkflowCommand::PublishDurableProgress { offset, chunk }
+        };
+        let mut side = RecordedSideOutput::default();
+        side.accumulate(&[publish(0, Value::from("a")), publish(1, Value::from("b"))]);
+        side.accumulate(&[
+            publish(1, Value::from("changed")),
+            publish(2, Value::from("c")),
+        ]);
+        let recorded: Vec<(u64, Value)> = side
+            .durable_progress
+            .into_values()
+            .map(|c| (c.offset, c.chunk))
+            .collect();
+        assert_eq!(
+            recorded,
+            vec![
+                (0, Value::from("a")),
+                (1, Value::from("b")),
+                (2, Value::from("c")),
+            ]
+        );
+    }
 
     /// Awaits a foreign 3 s sleep, past the deadlock timeout (issue #1797).
     fn deadlocking_workflow(

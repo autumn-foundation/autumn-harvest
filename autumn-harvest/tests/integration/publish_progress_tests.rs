@@ -264,15 +264,16 @@ async fn durable_progress_leaves_zero_event_footprint() {
 
 #[tokio::test]
 async fn durable_progress_harness_records_each_chunk_once_in_offset_order() {
-    // Three decision cycles. Each later cycle replays the earlier calls, so a
-    // missing dedup would record "starting" three times.
+    // Three decision cycles. Each later cycle replays the earlier calls and
+    // pushes no command for them, so each chunk is recorded once at its call
+    // ordinal. `testing.rs` unit-tests the keep-first dedup itself.
     let outcome = WorkflowTestEnv::new()
         .mock_activity("step_one", |_| Ok(json!("result_one")))
         .mock_activity("step_two", |_| Ok(json!("result_two")))
         .run(durable_progress_workflow, json!(null))
         .await;
     let recorded: Vec<(u64, Value)> = outcome
-        .durable_progress()
+        .recorded_durable_progress()
         .iter()
         .map(|c| (c.offset, c.chunk.clone()))
         .collect();
