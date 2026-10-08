@@ -19,6 +19,10 @@ regular file. The six crates are `autumn-harvest`, `autumn-harvest-plugin`,
 of both files, and `package.json` lists them. `build-typescript-client.sh`
 fails when the tarball does not hold them.
 
+**CLI release archive.** The `binaries` job in `release.yml` copies both root
+license files into each `harvest` archive. The integration test
+`supply_chain_ci::release_archive_ships_both_license_texts` pins that step.
+
 **Gate.** `scripts/check-license-files.sh` runs in the CI `lint` job. It reads
 the publishable crates from `cargo metadata`, so the gate checks a new crate
 with no edit to the script. For each crate, it checks the declared license,
