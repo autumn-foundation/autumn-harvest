@@ -181,8 +181,8 @@ async fn fair_claim_matches_the_model_sequence() {
         }
     }
 
-    // Interleave due times so the tie-break matters. Row i of key j is due
-    // at 1000 - (4 * i + j) ms ago.
+    // Interleave due times so the tie-break matters. Row i of key j became
+    // due 10,000 - 10 * (4 * i + j) ms ago.
     let mut backlogs: BTreeMap<String, VecDeque<i64>> = BTreeMap::new();
     for i in 0..15i64 {
         for (j, (key, _)) in weights.iter().enumerate() {
@@ -217,6 +217,7 @@ async fn fair_claim_matches_the_model_sequence() {
 
     // The stored state matches the model too.
     let state = list_fairness_state(&mut conn, &queue_name).await.unwrap();
+    assert_eq!(state.len(), weights.len(), "one state row per key");
     for row in state {
         let model = clock.state(&row.fairness_key).expect("model has the key");
         assert!(
@@ -301,7 +302,7 @@ async fn override_cap_is_1000_per_queue() {
                 .is_err()
         );
     }
-    for bad_key in ["", " k", "k ", &"x".repeat(256)] {
+    for bad_key in ["", " k", "k ", &"x".repeat(257), ".", ".."] {
         assert!(
             set_fairness_weight(&mut conn, &queue_name, bad_key, 1.0, "t")
                 .await
@@ -355,10 +356,10 @@ async fn prune_deletes_only_rows_the_claim_cannot_tell_apart() {
     let queue_name = fresh_queue("prune");
     diesel::sql_query(format!(
         "INSERT INTO harvest_fairness_state (queue_name, fairness_key, pass, last_start, updated_at) VALUES \
-         ('{queue_name}', 'clock', 10, 9, NOW() - INTERVAL '1 day'), \
-         ('{queue_name}', 'idle', 5, 4, NOW() - INTERVAL '1 day'), \
-         ('{queue_name}', 'debt', 12, 8, NOW() - INTERVAL '1 day'), \
-         ('{queue_name}', 'busy', 3, 2, NOW() - INTERVAL '1 day'), \
+         ('{queue_name}', 'clock', 10, 9, NOW() - INTERVAL '30 minutes'), \
+         ('{queue_name}', 'idle', 5, 4, NOW() - INTERVAL '30 minutes'), \
+         ('{queue_name}', 'debt', 12, 8, NOW() - INTERVAL '30 minutes'), \
+         ('{queue_name}', 'busy', 3, 2, NOW() - INTERVAL '30 minutes'), \
          ('{queue_name}', 'fresh', 3, 2, NOW())"
     ))
     .execute(&mut conn)
@@ -366,7 +367,9 @@ async fn prune_deletes_only_rows_the_claim_cannot_tell_apart() {
     .expect("seed state");
     enqueue_keyed(&mut conn, &queue_name, Some("busy"), Duration::seconds(1)).await;
 
-    let cutoff = Utc::now() - Duration::hours(1);
+    // The janitor's idle window is at least 1 h. Rows 30 min old thus stay
+    // out of its reach while this test runs on a shared database.
+    let cutoff = Utc::now() - Duration::minutes(10);
     let preview = prune_fairness_state(&mut conn, Some(&queue_name), cutoff, 100, true)
         .await
         .unwrap();
@@ -443,21 +446,11 @@ async fn by_id_claim_and_unkeyed_rows_charge_their_keys() {
     assert!(state.contains_key(""), "unkeyed rows use the default key");
 }
 
-/// A multi-queue claim keeps one clock per queue and drains both queues.
-#[tokio::test]
-async fn multi_queue_claim_keeps_a_clock_per_queue() {
-    let (mut conn, _container) = connect().await;
-    let q1 = fresh_queue("mq1");
-    let q2 = fresh_queue("mq2");
-    for i in 0..10 {
-        enqueue_keyed(&mut conn, &q1, Some("a"), Duration::seconds(100 - i)).await;
-        enqueue_keyed(&mut conn, &q2, Some("a"), Duration::seconds(100 - i)).await;
-    }
-    let queues = [q1.clone(), q2.clone()];
-    let mut claimed = 0;
-    while queue::claim_task_with_fairness(
-        &mut conn,
-        &queues,
+/// Claim once from `queues` with fairness keys on.
+async fn claim_from(conn: &mut AsyncPgConnection, queues: &[String]) -> Option<TaskQueueItem> {
+    queue::claim_task_with_fairness(
+        conn,
+        queues,
         "fair-test-worker",
         "",
         None,
@@ -468,20 +461,146 @@ async fn multi_queue_claim_keeps_a_clock_per_queue() {
         ClaimFairness::Keys,
     )
     .await
-    .unwrap()
-    .is_some()
-    {
-        claimed += 1;
+    .expect("claim")
+}
+
+/// A multi-queue fair claim keeps one clock per queue and starves no queue.
+///
+/// Queue 1 has two keys, so one of them is always at lag 0. Queue 2 has one
+/// key, which keeps lag 1 after each claim. One statement over both queues
+/// would never serve queue 2. The claim therefore tries one queue at a time.
+#[tokio::test]
+async fn multi_queue_fair_claim_starves_no_queue() {
+    let (mut conn, _container) = connect().await;
+    let q1 = fresh_queue("mq1");
+    let q2 = fresh_queue("mq2");
+    set_fairness_weight(&mut conn, &q1, "b", 2.0, "test")
+        .await
+        .unwrap();
+    for i in 0..60 {
+        let age = Duration::seconds(1_000 - i);
+        enqueue_keyed(&mut conn, &q1, Some("a"), age).await;
+        enqueue_keyed(&mut conn, &q1, Some("b"), age).await;
+        enqueue_keyed(&mut conn, &q2, Some("k"), age).await;
     }
-    assert_eq!(claimed, 20);
-    for q in [&q1, &q2] {
-        let state = list_fairness_state(&mut conn, q).await.unwrap();
-        assert_eq!(state.len(), 1);
-        assert!(
-            (state[0].pass - 10.0).abs() < 1e-9,
-            "each queue charged 10 claims"
+    let queues = [q1.clone(), q2.clone()];
+    let mut from_q2 = 0;
+    for _ in 0..40 {
+        let task = claim_from(&mut conn, &queues).await.expect("work remains");
+        if task.queue_name == q2 {
+            from_q2 += 1;
+        }
+    }
+    // Each claim tries the queues in a random order, so q2 gets about half.
+    assert!(from_q2 >= 8, "q2 got {from_q2} of 40 claims");
+
+    let q2_state = list_fairness_state(&mut conn, &q2).await.unwrap();
+    assert_eq!(q2_state.len(), 1, "each queue keeps its own key state");
+}
+
+/// Priority sorts before the fairness lag.
+#[tokio::test]
+async fn priority_sorts_before_the_fairness_lag() {
+    let (mut conn, _container) = connect().await;
+    let queue_name = fresh_queue("prio");
+    for i in 0..5 {
+        let mut params = EnqueueParams::new(
+            queue_name.as_str(),
+            TaskType::Activity,
+            serde_json::json!({}),
         );
+        params.activity_name = Some("fair_noop".to_owned());
+        params.scheduled_at = Utc::now() - Duration::seconds(100 - i);
+        params.fairness_key = Some("high".to_owned());
+        params.priority = 10;
+        queue::enqueue(&mut conn, &params).await.unwrap();
     }
+    enqueue_keyed(&mut conn, &queue_name, Some("low"), Duration::seconds(500)).await;
+    let first: Vec<String> = drain_keys(&mut conn, &queue_name).await;
+    assert_eq!(first, ["high", "high", "high", "high", "high", "low"]);
+}
+
+/// A weight below 1 gives a key less than an equal share.
+#[tokio::test]
+async fn a_weight_below_one_gives_a_smaller_share() {
+    let (mut conn, _container) = connect().await;
+    let queue_name = fresh_queue("half");
+    set_fairness_weight(&mut conn, &queue_name, "slow", 0.5, "test")
+        .await
+        .unwrap();
+    for i in 0..100i64 {
+        let age = Duration::seconds(1_000) - Duration::milliseconds(i);
+        enqueue_keyed(&mut conn, &queue_name, Some("slow"), age).await;
+        enqueue_keyed(&mut conn, &queue_name, Some("fast"), age).await;
+    }
+    let mut slow = 0;
+    for _ in 0..90 {
+        if claim(&mut conn, &queue_name, ClaimFairness::Keys)
+            .await
+            .unwrap()
+            .fairness_key
+            .as_deref()
+            == Some("slow")
+        {
+            slow += 1;
+        }
+    }
+    // Weights 0.5 and 1 give a 1:2 split: 30 of 90, within the pair bound.
+    assert!((28..=32).contains(&slow), "slow got {slow} of 90");
+}
+
+/// Every fair statement variant is valid SQL that Postgres can plan.
+#[tokio::test]
+async fn every_fair_statement_variant_prepares() {
+    use queue::{claim_by_id_query_for, claim_query_for};
+    let (mut conn, _container) = connect().await;
+    let mut variants = Vec::new();
+    for kind in [None, Some(TaskType::Workflow), Some(TaskType::Activity)] {
+        for fenced in [false, true] {
+            variants.push(claim_query_for(kind, fenced, ClaimFairness::Keys));
+        }
+    }
+    for fenced in [false, true] {
+        variants.push(claim_by_id_query_for(fenced, ClaimFairness::Keys));
+    }
+    variants.push(queue::FAIR_CHARGE_SQL);
+    for (i, sql) in variants.into_iter().enumerate() {
+        let name = format!("fair_variant_{i}_{}", Uuid::new_v4().simple());
+        diesel::sql_query(format!("PREPARE {name} AS {sql}"))
+            .execute(&mut conn)
+            .await
+            .unwrap_or_else(|e| panic!("variant {i} does not prepare: {e}"));
+        diesel::sql_query(format!("DEALLOCATE {name}"))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+}
+
+/// A kind-filtered fair claim takes only rows of that kind and charges them.
+#[tokio::test]
+async fn kind_filtered_fair_claim_charges_its_key() {
+    let (mut conn, _container) = connect().await;
+    let queue_name = fresh_queue("kind");
+    enqueue_keyed(&mut conn, &queue_name, Some("k"), Duration::seconds(5)).await;
+    let task = queue::claim_task_with_fairness(
+        &mut conn,
+        std::slice::from_ref(&queue_name),
+        "fair-test-worker",
+        "",
+        None,
+        &[],
+        &[],
+        None,
+        Some(TaskType::Activity),
+        ClaimFairness::Keys,
+    )
+    .await
+    .unwrap()
+    .expect("the activity row is claimable");
+    assert_eq!(task.task_type, "activity");
+    let state = list_fairness_state(&mut conn, &queue_name).await.unwrap();
+    assert_eq!(state.len(), 1);
 }
 
 /// Concurrent fair claimers neither deadlock nor lose a charge, and tenant B
@@ -539,6 +658,10 @@ async fn concurrent_fair_claims_keep_every_charge() {
         .collect();
     // Weight 1: each charge adds 1, and a key enters at V, so the pass is at
     // least the claim count.
-    assert!(state["a"] >= 300.0 - 1e-9, "a lost a charge: {state:?}");
+    // A stays in debt from its first claim, so its pass counts its claims.
+    assert!(
+        (state["a"] - 300.0).abs() < 1e-9,
+        "a lost or doubled a charge: {state:?}"
+    );
     assert!(state["b"] >= 5.0 - 1e-9, "b lost a charge: {state:?}");
 }

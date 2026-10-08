@@ -1573,13 +1573,74 @@ pub enum ClaimFairness {
 /// [`claim_task_of_kind_on_shard`] with a fairness mode (issue #1976).
 ///
 /// [`ClaimFairness::Off`] issues the unchanged statement.
-/// [`ClaimFairness::Keys`] issues the fair form.
+/// [`ClaimFairness::Keys`] issues the fair form, one queue per statement.
+///
+/// # One queue at a time
+///
+/// A key's lag is relative to its own queue's clock, so lags of two queues do
+/// not compare. A queue with one active key keeps a lag of `1 / w`, while a
+/// queue with several keys always has one at lag 0. One statement over both
+/// queues would thus starve the first. So a fair claim over several queues
+/// tries them one at a time, in a random order, as queue weights do.
 ///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on query failure.
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub async fn claim_task_with_fairness(
+    conn: &mut AsyncPgConnection,
+    queues: &[String],
+    worker_id: &str,
+    worker_build_id: &str,
+    priority_aging_secs: Option<u32>,
+    circuit_breaker_activities: &[String],
+    ineligible_activities: &[String],
+    shard: Option<crate::types::ShardId>,
+    kind: Option<TaskType>,
+    fairness: ClaimFairness,
+) -> HarvestResult<Option<TaskQueueItem>> {
+    if fairness == ClaimFairness::Keys && queues.len() > 1 {
+        use rand::seq::SliceRandom as _;
+        let mut order: Vec<&String> = queues.iter().collect();
+        order.shuffle(&mut rand::thread_rng());
+        for queue in order {
+            let claimed = claim_task_one_statement(
+                conn,
+                std::slice::from_ref(queue),
+                worker_id,
+                worker_build_id,
+                priority_aging_secs,
+                circuit_breaker_activities,
+                ineligible_activities,
+                shard,
+                kind,
+                fairness,
+            )
+            .await?;
+            if claimed.is_some() {
+                return Ok(claimed);
+            }
+        }
+        return Ok(None);
+    }
+    claim_task_one_statement(
+        conn,
+        queues,
+        worker_id,
+        worker_build_id,
+        priority_aging_secs,
+        circuit_breaker_activities,
+        ineligible_activities,
+        shard,
+        kind,
+        fairness,
+    )
+    .await
+}
+
+/// One claim statement over `queues`, then the rechecks and the charge.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+async fn claim_task_one_statement(
     conn: &mut AsyncPgConnection,
     queues: &[String],
     worker_id: &str,
@@ -1776,7 +1837,7 @@ pub async fn claim_task_with_fairness(
                     return Ok(ClaimOutcome::Empty);
                 };
 
-                apply_post_claim_rechecks(conn, task, worker_id).await
+                recheck_and_charge(conn, task, worker_id, fairness).await
             },
         )
         .await?;
@@ -1964,39 +2025,34 @@ fn fair_variant(kind: Option<TaskType>, fenced: bool) -> &'static str {
 
 /// The fairness CTE of the fair claim (issue #1976).
 ///
-/// `fair_map` is one row with two `jsonb` maps over the polled queues:
+/// `fair_map` is one row with one `jsonb` map. It maps each key of the polled
+/// queue to its lag `pass - V`, where `V` is the queue's largest
+/// `last_start`. Only keys with a positive lag are in it. A missing key has
+/// lag 0.
 ///
-/// - `fm_lag`: `queue || chr(31) || key` to the key's lag `pass - V`. Only
-///   keys with a positive lag are in it. A missing key has lag 0.
-/// - `fm_clock`: queue to its clock `V`, the largest `last_start`.
+/// A fair claim polls one queue per statement (see
+/// [`claim_task_with_fairness`]), so the map needs no queue in its key. A
+/// by-id claim may pass several queues, but it names one row, so its order
+/// does not matter.
 ///
 /// The row is cross-joined like `paused_queues`, so each candidate row does
-/// one flat map lookup. A join on the state rows made the planner scan every
-/// state row once per candidate row. The values go through `float8::text`,
-/// which round-trips a `float8` exactly. A fairness key holds no control
-/// character, so the `chr(31)` separator cannot make two keys collide.
+/// one map lookup. A join on the state rows made the planner scan every
+/// state row once per candidate row. The lag goes through `float8::text`,
+/// which round-trips exactly under the default `extra_float_digits`. A
+/// lower setting changes only the sort, by at most one unit in the last
+/// place.
 pub const FAIR_CTES_SQL: &str = "fair_map AS MATERIALIZED ( \
-         SELECT \
-             COALESCE(( \
-                 SELECT jsonb_object_agg(s.queue_name || chr(31) || s.fairness_key, \
-                                         (s.pass - c.v)::text) \
-                 FROM harvest_fairness_state s \
-                 JOIN ( \
-                     SELECT queue_name, MAX(last_start) AS v \
-                     FROM harvest_fairness_state \
-                     WHERE queue_name = ANY($2) \
-                     GROUP BY queue_name \
-                 ) c ON c.queue_name = s.queue_name \
-                 WHERE s.pass > c.v \
-             ), '{}'::jsonb) AS fm_lag, \
-             COALESCE(( \
-                 SELECT jsonb_object_agg(queue_name, v::text) FROM ( \
-                     SELECT queue_name, MAX(last_start) AS v \
-                     FROM harvest_fairness_state \
-                     WHERE queue_name = ANY($2) \
-                     GROUP BY queue_name \
-                 ) per_queue \
-             ), '{}'::jsonb) AS fm_clock \
+         SELECT COALESCE(( \
+             SELECT jsonb_object_agg(s.fairness_key, (s.pass - c.v)::text) \
+             FROM harvest_fairness_state s \
+             JOIN ( \
+                 SELECT queue_name, MAX(last_start) AS v \
+                 FROM harvest_fairness_state \
+                 WHERE queue_name = ANY($2) \
+                 GROUP BY queue_name \
+             ) c ON c.queue_name = s.queue_name \
+             WHERE s.pass > c.v \
+         ), '{}'::jsonb) AS fm_lag \
      ), ";
 
 /// The cross join that gives each candidate row the fairness maps.
@@ -2004,23 +2060,11 @@ pub const FAIR_JOINS_SQL: &str = "CROSS JOIN fair_map ";
 
 /// The lag of a candidate row's key: `max(pass - V, 0)`.
 ///
-/// The fair claim sorts on the lag, not on the start tag. Each queue's front
-/// key then has a small lag. One queue's large clock thus does not push its
-/// rows behind another queue in a multi-queue claim. A key with no state, or
-/// with `pass <= V`, has lag 0. See [`crate::queue_fairness::fair_lag`].
-pub const FAIR_LAG_SQL: &str = "COALESCE((fair_map.fm_lag ->> (harvest_task_queue.queue_name \
-     || chr(31) || COALESCE(harvest_task_queue.fairness_key, '')))::float8, 0)";
-
-/// The clock `V` of the claimed row's queue in this claim's snapshot.
-///
-/// A queue with no state has `V = 0`. The charge starts a key at
-/// `max(pass, V)`. See [`crate::queue_fairness::fair_start`].
-macro_rules! fair_v_sql {
-    () => {
-        "(SELECT COALESCE((fair_map.fm_clock ->> candidate.fair_queue)::float8, 0) \
-          FROM fair_map)"
-    };
-}
+/// The fair claim sorts on the lag, not on the start tag. A key with no
+/// state, or with `pass <= V`, has lag 0. See
+/// [`crate::queue_fairness::fair_lag`].
+pub const FAIR_LAG_SQL: &str = "COALESCE((fair_map.fm_lag \
+     ->> COALESCE(harvest_task_queue.fairness_key, ''))::float8, 0)";
 
 /// The weight of the key `(q, k)`: its override, else the default `1`.
 macro_rules! fair_weight_sql {
@@ -2036,60 +2080,91 @@ macro_rules! fair_weight_sql {
     };
 }
 
-/// The charge of the claimed row's key (issue #1976).
+/// Charge one claim to the key of a claimed row (issue #1976).
 ///
-/// It runs only when `claimed` returns a row, so a lost claim charges
-/// nothing. A key with no row starts at the snapshot's `V`. The upsert waits
-/// for a concurrent charge of the same key. It then starts at
-/// `max(pass, V)` from the current `pass`, as
-/// [`crate::queue_fairness::FairClock`] does. Two charges thus never share one
-/// slot.
+/// Binds `$1` queue and `$2` key. A key with no row starts at the queue's
+/// clock `V`. An existing key starts at `max(pass, V)`. The new `pass` is the
+/// start plus `1 / weight`. This is [`crate::queue_fairness::FairClock::charge`]
+/// in SQL.
+///
+/// The claim runs it in its own transaction, after the post-claim rechecks
+/// accept the row. A recheck that gives the row back thus charges nothing.
+/// The upsert waits for a concurrent charge of the same key, then starts from
+/// the current `pass`. Two charges thus never share one slot.
 ///
 /// The claim locks the task row first, then the state row. No other writer
 /// locks a state row first, so the order cannot deadlock.
 pub const FAIR_CHARGE_SQL: &str = concat!(
-    "fair_charge AS ( \
-         INSERT INTO harvest_fairness_state AS fs \
-             (queue_name, fairness_key, pass, last_start, updated_at) \
-         SELECT candidate.fair_queue, candidate.fair_key, ",
-    fair_v_sql!(),
-    " + 1.0 / ",
-    fair_weight_sql!("candidate.fair_queue", "candidate.fair_key"),
-    ", ",
-    fair_v_sql!(),
-    ", NOW() \
-         FROM candidate JOIN claimed ON claimed.id = candidate.id \
-         ON CONFLICT (queue_name, fairness_key) DO UPDATE \
-         SET last_start = GREATEST(fs.pass, EXCLUDED.last_start), \
-             pass = GREATEST(fs.pass, EXCLUDED.last_start) + 1.0 / ",
-    fair_weight_sql!("EXCLUDED.queue_name", "EXCLUDED.fairness_key"),
-    ", updated_at = NOW() \
-     ) "
+    "INSERT INTO harvest_fairness_state AS fs \
+         (queue_name, fairness_key, pass, last_start, updated_at) \
+     SELECT $1, $2, clock.v + 1.0 / ",
+    fair_weight_sql!("$1", "$2"),
+    ", clock.v, NOW() \
+     FROM (SELECT COALESCE(MAX(last_start), 0) AS v \
+           FROM harvest_fairness_state WHERE queue_name = $1) clock \
+     ON CONFLICT (queue_name, fairness_key) DO UPDATE \
+     SET last_start = GREATEST(fs.pass, EXCLUDED.last_start), \
+         pass = GREATEST(fs.pass, EXCLUDED.last_start) + 1.0 / ",
+    fair_weight_sql!("$1", "$2"),
+    ", updated_at = NOW()"
 );
+
+/// Charge the key of `task` (issue #1976). See [`FAIR_CHARGE_SQL`].
+async fn charge_fairness_key(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+) -> HarvestResult<()> {
+    diesel::sql_query(FAIR_CHARGE_SQL)
+        .bind::<diesel::sql_types::Text, _>(&task.queue_name)
+        .bind::<diesel::sql_types::Text, _>(
+            task.fairness_key
+                .as_deref()
+                .unwrap_or(crate::queue_fairness::DEFAULT_FAIRNESS_KEY),
+        )
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(())
+}
+
+/// Run the post-claim rechecks, then charge the key of a row they accept.
+async fn recheck_and_charge(
+    conn: &mut AsyncPgConnection,
+    task: TaskQueueItem,
+    worker_id: &str,
+    fairness: ClaimFairness,
+) -> HarvestResult<ClaimOutcome> {
+    let outcome = apply_post_claim_rechecks(conn, task, worker_id).await?;
+    if fairness == ClaimFairness::Keys
+        && let ClaimOutcome::Claimed(task) = &outcome
+    {
+        charge_fairness_key(conn, task).await?;
+    }
+    Ok(outcome)
+}
 
 /// Anchors of [`splice_fairness`]. Each appears exactly once in every claim
 /// variant.
 const FAIR_CTE_ANCHOR: &str = "candidate AS ( ";
-const FAIR_SELECT_ANCHOR: &str = "activity_name, workflow_exec_id FROM harvest_task_queue ";
 const FAIR_JOIN_ANCHOR: &str = "CROSS JOIN paused_activities ";
 const FAIR_ORDER_ANCHOR: &str = concat!("END DESC, ", claim_order_due_sql!(), " ASC");
-const FAIR_TAIL_ANCHOR: &str = "SELECT * FROM claimed";
 
 /// Splice the fair claim into a claim statement (issue #1976).
 ///
-/// Five edits, each at an anchor that appears exactly once:
+/// Three edits, each at an anchor that appears exactly once:
 ///
 /// 1. `fair_map` goes before `candidate`.
-/// 2. `candidate` selects the queue and the key of each row.
-/// 3. `candidate` cross-joins `fair_map`.
-/// 4. The sort takes the lag after the effective priority and before the due
+/// 2. `candidate` cross-joins `fair_map`.
+/// 3. The sort takes the lag after the effective priority and before the due
 ///    time. Sticky rank and priority keep their meaning. Within one key the
 ///    order is the old order.
-/// 5. `fair_charge` goes after `claimed`.
+///
+/// The statement does not charge the key. The claim does that after the
+/// post-claim rechecks. See [`FAIR_CHARGE_SQL`].
 ///
 /// No bind is added, so the fenced and by-id binds keep their numbers. Every
-/// gate stays the same text. `fair_claim_query_preserves_every_gate` pins
-/// that.
+/// gate stays the same text. `fair_claim_query_preserves_every_gate_and_bind`
+/// pins that.
 ///
 /// # Panics
 ///
@@ -2097,13 +2172,7 @@ const FAIR_TAIL_ANCHOR: &str = "SELECT * FROM claimed";
 /// a future edit of the base query fail loudly, not claim unfairly.
 #[must_use]
 pub fn splice_fairness(base: &str) -> String {
-    for anchor in [
-        FAIR_CTE_ANCHOR,
-        FAIR_SELECT_ANCHOR,
-        FAIR_JOIN_ANCHOR,
-        FAIR_ORDER_ANCHOR,
-        FAIR_TAIL_ANCHOR,
-    ] {
+    for anchor in [FAIR_CTE_ANCHOR, FAIR_JOIN_ANCHOR, FAIR_ORDER_ANCHOR] {
         assert_eq!(
             base.matches(anchor).count(),
             1,
@@ -2115,13 +2184,6 @@ pub fn splice_fairness(base: &str) -> String {
         &format!("{FAIR_CTES_SQL}{FAIR_CTE_ANCHOR}"),
     )
     .replace(
-        FAIR_SELECT_ANCHOR,
-        "activity_name, workflow_exec_id, \
-             harvest_task_queue.queue_name AS fair_queue, \
-             COALESCE(harvest_task_queue.fairness_key, '') AS fair_key \
-             FROM harvest_task_queue ",
-    )
-    .replace(
         FAIR_JOIN_ANCHOR,
         &format!("{FAIR_JOIN_ANCHOR}{FAIR_JOINS_SQL}"),
     )
@@ -2131,10 +2193,6 @@ pub fn splice_fairness(base: &str) -> String {
             "END DESC, {FAIR_LAG_SQL} ASC, {} ASC",
             claim_order_due_sql!()
         ),
-    )
-    .replace(
-        FAIR_TAIL_ANCHOR,
-        &format!(", {FAIR_CHARGE_SQL}{FAIR_TAIL_ANCHOR}"),
     )
 }
 
@@ -2421,7 +2479,7 @@ pub async fn claim_task_by_id_with_fairness(
                     return Ok(ClaimOutcome::Empty);
                 };
 
-                apply_post_claim_rechecks(conn, task, worker_id).await
+                recheck_and_charge(conn, task, worker_id, fairness).await
             },
         )
         .await?;
@@ -13568,19 +13626,34 @@ mod tests {
             assert_eq!(fair.matches(order.as_str()).count(), 1, "{fair}");
             assert_eq!(fair.matches(FAIR_CTES_SQL).count(), 1);
             assert_eq!(fair.matches(FAIR_JOINS_SQL).count(), 1);
-            assert!(fair.contains("AS fair_key FROM harvest_task_queue"));
         }
     }
 
+    /// A post-claim recheck can give the row back. The claim statement must
+    /// therefore never charge; the separate charge runs after the rechecks.
     #[test]
-    fn fair_charge_runs_once_and_only_after_a_claim() {
+    fn the_fair_claim_statement_never_charges() {
         for (_, fair) in fair_pairs() {
-            assert_eq!(fair.matches("fair_charge AS (").count(), 1);
-            assert!(fair.contains("FROM candidate JOIN claimed ON claimed.id = candidate.id"));
+            assert!(
+                !fair.contains("INSERT INTO harvest_fairness_state"),
+                "{fair}"
+            );
             assert!(fair.ends_with("SELECT * FROM claimed"));
-            // The upsert restarts from the current pass after a wait.
-            assert!(fair.contains("GREATEST(fs.pass, EXCLUDED.last_start)"));
         }
+        let src = include_str!("queue.rs");
+        let body = &src[src
+            .find("async fn recheck_and_charge(")
+            .expect("helper exists")..];
+        let body = &body[..body.find("\n}\n").expect("helper ends")];
+        let recheck = body
+            .find("apply_post_claim_rechecks")
+            .expect("rechecks run");
+        let charge = body.find("charge_fairness_key(conn").expect("charge runs");
+        assert!(recheck < charge, "the charge must follow the rechecks");
+        assert!(
+            body.contains("ClaimOutcome::Claimed(task)"),
+            "only a kept claim charges"
+        );
     }
 
     #[test]
@@ -13589,18 +13662,15 @@ mod tests {
         // a missing key has lag 0.
         assert!(FAIR_CTES_SQL.contains("(s.pass - c.v)::text"));
         assert!(FAIR_CTES_SQL.contains("WHERE s.pass > c.v"));
-        assert!(FAIR_LAG_SQL.ends_with("::float8, 0)"));
-        // V is the largest last_start of the queue; no state gives V = 0.
         assert!(FAIR_CTES_SQL.contains("MAX(last_start) AS v"));
-        // A new key starts at V; an existing key at max(pass, V).
-        assert!(FAIR_CHARGE_SQL.contains("fair_map.fm_clock ->> candidate.fair_queue"));
+        assert!(FAIR_LAG_SQL.ends_with("::float8, 0)"));
+        // A new key starts at V. An existing key starts at max(pass, V).
+        assert!(FAIR_CHARGE_SQL.contains("SELECT COALESCE(MAX(last_start), 0) AS v"));
         assert!(
             FAIR_CHARGE_SQL.contains("SET last_start = GREATEST(fs.pass, EXCLUDED.last_start)")
         );
         // A key with no override has weight 1.
         assert!(FAIR_CHARGE_SQL.contains("), 1.0)"));
-        // The maps hold exact float8 text.
-        assert!(FAIR_CTES_SQL.contains("v::text"));
     }
 
     #[test]

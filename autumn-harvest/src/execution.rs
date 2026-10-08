@@ -125,7 +125,7 @@ pub struct StartWorkflowParams<'a> {
     ///
     /// Stored on the run's task rows. A worker with fairness keys on rotates
     /// its claims across the keys of a queue. `None` takes the run's quota
-    /// key, if any. Does not affect the event history or replay.
+    /// key, if any. The key does not change the event history or replay.
     pub fairness_key: Option<String>,
     /// Maximum allowed byte size for the workflow input payload (issue #252).
     ///

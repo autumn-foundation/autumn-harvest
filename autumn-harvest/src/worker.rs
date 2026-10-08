@@ -364,6 +364,17 @@ impl WorkerRuntimeConfig {
                 }
             }
         }
+        // Priority ageing sorts before the fairness lag (issue #1976). An old
+        // flood's rows then carry the largest ageing boost, so they can
+        // outrank a newer key until its rows age too. Warn, as the two do not
+        // combine well in a shared queue.
+        if self.fairness_keys && self.priority_aging_secs.is_some_and(|k| k > 0) {
+            tracing::warn!(
+                "fairness_keys and priority_aging_secs are both on: ageing sorts \
+                 before the fairness lag, so an old flood can outrank a newer key; \
+                 see docs/fairness-keys.md"
+            );
+        }
         // A degenerate band (min_slots > max_slots, or a configured value
         // outside the band) never fails worker startup — it degrades to an
         // inert (but harmless) tuner, matching the queue_weights precedent

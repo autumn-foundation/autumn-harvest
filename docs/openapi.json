@@ -2699,7 +2699,7 @@
             }
           },
           {
-            "description": "The fairness key, matched exactly. An empty key, a key with outer whitespace or a control character, or a key longer than 255 bytes is a 400.",
+            "description": "The fairness key, matched exactly. An empty key, the key `.` or `..`, a key with outer whitespace or a control character, or a key longer than 256 bytes is a 400.",
             "in": "path",
             "name": "fairness_key",
             "required": true,
@@ -2783,7 +2783,7 @@
             }
           },
           {
-            "description": "The fairness key, matched exactly. An empty key, a key with outer whitespace or a control character, or a key longer than 255 bytes is a 400.",
+            "description": "The fairness key, matched exactly. An empty key, the key `.` or `..`, a key with outer whitespace or a control character, or a key longer than 256 bytes is a 400.",
             "in": "path",
             "name": "fairness_key",
             "required": true,
@@ -2829,7 +2829,7 @@
                 }
               }
             },
-            "description": "The body is the stored override, from the first shard that applied it. updated_by is the authenticated actor. A full write returns ok: true and status: \"complete\", and omits partial_failures. A write that reaches only some shards returns 207 with ok: false and status: \"partial\". Send the request again; it is idempotent."
+            "description": "The body is the stored override, from the first shard that applied it. updated_by is the authenticated actor. A full write returns ok: true and status: \"complete\", and omits partial_failures. A write that reaches only some shards returns 207 with ok: false and status: \"partial\". Send the request again; it is idempotent. A shard at the override cap makes it a 409. A failure on every shard that is not the cap is a 500."
           },
           "207": {
             "content": {
@@ -2855,10 +2855,13 @@
             "description": "The write reached only some shards. The body is the 200 body plus partial_failures, which names the shards that did not apply it."
           },
           "400": {
-            "description": "Blank or oversized queue name, invalid fairness key, weight out of range, malformed body, or a queue that already holds 1000 overrides."
+            "description": "Blank or oversized queue name, invalid fairness key, weight out of range, malformed body, or a queue that already holds 1000 overrides on every shard."
           },
           "401": {
             "description": "Admin access required."
+          },
+          "409": {
+            "description": "Some shards applied the weight, and at least one shard already holds 1000 overrides for the queue. A retry does not converge. Clear an override on that shard first. The body is the 207 body."
           },
           "500": {
             "description": "Every shard failed. No weight is in effect."
@@ -8185,7 +8188,7 @@
                     "description": "true = all-or-nothing; false = best-effort per-item results."
                   },
                   "items": {
-                    "description": "Array of { workflow_name, workflow_id?, input?, search_attributes?, idempotency_key? } objects."
+                    "description": "Array of { workflow_name, workflow_id?, input?, search_attributes?, idempotency_key?, context_headers?, priority?, fairness_key? } objects. An item with an invalid fairness_key, or a fairness_key on a throttled workflow, is rejected before any item starts."
                   }
                 },
                 "required": [
@@ -13344,7 +13347,7 @@
                     "description": "Overall execution timeout in seconds."
                   },
                   "fairness_key": {
-                    "description": "The fairness key of the run (issue #1976). A worker with fairness keys on rotates claims across the keys of a queue in weighted round robin. Omitted takes the run's quota key. Must be non-empty, have no outer whitespace, and be at most 255 bytes. A key bounds load, not access.",
+                    "description": "The fairness key of the run (issue #1976). A worker with fairness keys on rotates claims across the keys of a queue in weighted round robin. Omitted takes the run's quota key. Must be non-empty, must not be `.` or `..`, must have no outer whitespace or control character, and must be at most 256 bytes. A key bounds load, not access.",
                     "type": "string"
                   },
                   "idempotency_key": {

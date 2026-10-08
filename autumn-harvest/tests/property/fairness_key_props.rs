@@ -137,6 +137,39 @@ proptest! {
         );
     }
 
+    /// Property 6: new keys take only the claims they need.
+    ///
+    /// A one-task key arrives before every `k`-th claim, as with a per-user
+    /// quota key. Each is served at once. A backlogged key of any weight gets
+    /// every other claim. This is max-min fair: the new keys ask for less than
+    /// an equal share, so they get all they ask for.
+    #[test]
+    fn new_keys_below_capacity_leave_the_rest_to_a_backlogged_key(
+        wa in weight(),
+        every in 2usize..10,
+        claims in 10usize..400,
+    ) {
+        let mut clock = FairClock::default();
+        let mut backlogs: BTreeMap<String, VecDeque<u64>> = BTreeMap::new();
+        let mut w: BTreeMap<String, f64> = BTreeMap::new();
+        backlogs.insert("a".to_owned(), (0..10_000).collect());
+        w.insert("a".to_owned(), wa);
+        let mut served_a = 0usize;
+        let mut newcomers = 0usize;
+        for i in 0..claims {
+            if i % every == 0 {
+                let k = format!("n{i}");
+                backlogs.insert(k.clone(), VecDeque::from([u64::MAX - i as u64]));
+                w.insert(k, 1.0);
+                newcomers += 1;
+            }
+            if claim_next(&mut clock, &mut backlogs, &w).unwrap() == "a" {
+                served_a += 1;
+            }
+        }
+        prop_assert_eq!(served_a, claims - newcomers, "every new key is served once, a gets the rest");
+    }
+
     /// Property 2: two backlogged keys stay within `1/w_i + 1/w_j`.
     #[test]
     fn backlogged_keys_share_by_weight(
@@ -255,4 +288,22 @@ fn a_flood_delays_a_new_tenant_by_at_most_one_claim() {
         first == "b" || second == "b",
         "B must be served within one claim; got {first}, {second}"
     );
+}
+
+/// Prune deletes an idle key without debt, and the claim sees no change.
+#[test]
+fn prune_deletes_an_idle_key_without_changing_any_start_tag() {
+    let mut clock = FairClock::default();
+    clock.charge("idle", 1.0);
+    for _ in 0..3 {
+        clock.charge("busy", 1.0);
+    }
+    let before = [clock.start_tag("idle"), clock.start_tag("busy")];
+    let v = clock.vclock();
+    assert_eq!(clock.prune(|k| k == "busy"), 1, "the idle key goes");
+    assert!(clock.state("idle").is_none());
+    assert!(clock.state("busy").is_some(), "an active key stays");
+    assert_eq!(clock.vclock().to_bits(), v.to_bits());
+    let after = [clock.start_tag("idle"), clock.start_tag("busy")];
+    assert_eq!(before.map(f64::to_bits), after.map(f64::to_bits));
 }

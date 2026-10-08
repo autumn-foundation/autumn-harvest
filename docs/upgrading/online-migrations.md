@@ -30,6 +30,8 @@ A waiting `ACCESS EXCLUSIVE` lock on any of them stalls the fleet.
 - `harvest_workers`, `harvest_queue_pauses`, `harvest_activity_pauses`,
   `harvest_shard_generation` and `harvest_rate_limit_buckets`: every claim
   reads them.
+- `harvest_fairness_state` and `harvest_fairness_weights`: every claim of a
+  worker with fairness keys on reads them, and it writes the state table.
 - `harvest_audit_log`: each operator action writes it.
 - `harvest_workflow_outbox`: the application writes it in its own
   transactions, in the application database.

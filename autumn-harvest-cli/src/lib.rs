@@ -3004,7 +3004,7 @@ enum FairnessCommand {
         /// Fairness key, matched exactly.
         fairness_key: String,
         /// The weight, from 0.001 to 1000.
-        #[arg(long)]
+        #[arg(long, value_parser = parse_fairness_weight)]
         weight: f64,
     },
     /// Clear the weight of one fairness key. The key goes back to weight 1.
@@ -13215,6 +13215,20 @@ fn retirement_shard_array_cell(item: &Value, field: &str) -> String {
         .join(",")
 }
 
+/// Parse `--weight`. A non-finite number would reach the server as JSON
+/// `null`, so the CLI rejects it with a clear message.
+fn parse_fairness_weight(raw: &str) -> Result<f64, String> {
+    let weight: f64 = raw
+        .trim()
+        .parse()
+        .map_err(|e| format!("weight must be a number: {e}"))?;
+    if weight.is_finite() {
+        Ok(weight)
+    } else {
+        Err("weight must be a finite number from 0.001 to 1000".to_owned())
+    }
+}
+
 #[cfg(test)]
 mod reuse_policy_tests {
     use super::*;
@@ -14206,6 +14220,14 @@ mod reuse_policy_tests {
             !queue_mutation_should_gate(&parse(&["queue", "fairness", "show", "q"])),
             "the read route has no partial-application contract to gate on"
         );
+    }
+
+    #[test]
+    fn fairness_weight_parser_rejects_non_finite_numbers() {
+        assert_eq!(parse_fairness_weight(" 2.5 "), Ok(2.5));
+        for bad in ["inf", "-inf", "NaN", "abc"] {
+            assert!(parse_fairness_weight(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

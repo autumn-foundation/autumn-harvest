@@ -2949,6 +2949,12 @@ pub mod db {
     /// cost rather than degenerating into lock contention.
     const KEY_CARDINALITY: usize = 256;
 
+    /// Distinct fairness keys the `fairness_keys` scenario seeds (issue
+    /// #1976). The bench's fairness section sweeps it. Default 256, the same
+    /// as the other keyed gates.
+    pub static FAIRNESS_KEY_CARDINALITY: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(KEY_CARDINALITY);
+
     /// Concurrency cap high enough never to block, so the `COUNT(*)` subquery
     /// and advisory lock are exercised without throttling the measurement.
     const NON_BLOCKING_CAP: i64 = 1_000_000;
@@ -3886,7 +3892,12 @@ pub mod db {
         // One tenant per key, spread over the same cardinality as the other
         // keyed gates (issue #1976).
         let fair_expr = if wants_fairness_key(gate) {
-            format!("'{BENCH_PREFIX}-fk-' || (i % {KEY_CARDINALITY})")
+            let keys = std::sync::atomic::AtomicUsize::load(
+                &FAIRNESS_KEY_CARDINALITY,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .max(1);
+            format!("'{BENCH_PREFIX}-fk-' || (i % {keys})")
         } else {
             "NULL".to_string()
         };

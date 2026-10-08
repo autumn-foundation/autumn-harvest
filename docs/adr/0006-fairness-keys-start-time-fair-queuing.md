@@ -30,8 +30,11 @@ byte-identical.
 Each `(queue, key)` has a `pass` and a `last_start` in
 `harvest_fairness_state`. The queue clock `V` is the largest `last_start`.
 The claim sorts on the lag `max(pass, V) - V` after sticky rank and
-priority, and before the due time. The same statement upserts the claimed
-key: `last_start = start`, `pass = start + 1/w`.
+priority, and before the due time. After the post-claim rechecks keep the
+row, a second statement in the same transaction upserts the claimed key:
+`last_start = start`, `pass = start + 1/w`. A lag is relative to its own
+queue's clock, so a fair claim over several queues runs one statement per
+queue.
 
 `V` comes from the key rows, so no per-queue row is hot. A new key starts at
 `V`, so idle time earns no credit.
@@ -53,6 +56,12 @@ survives.
 - A key with no debt waits at most one claim per other active key. The
   model proof is `a_new_key_is_served_within_the_active_key_count`. The DB
   proof is `tenant_flood_holds_tenant_b_within_the_bound_with_fairness_keys`.
+  The bound counts claims. At a fixed service rate, one claim stands for one
+  task duration.
+- New keys get a claim before any key in debt. While they arrive more slowly
+  than the queue drains, that is max-min fair. When they arrive as fast as
+  the queue drains, they take every claim. Two variants that advance `V` on
+  a new key's claim broke the pair bound on the model, so SFQ stays.
 - Each fair claim writes one state row. Concurrent claims of one key wait
   for that row. The claim benchmark measures the cost.
 - State rows grow with keys. The retention janitor prunes idle rows that
@@ -70,3 +79,4 @@ survives.
 | Order keys by running count over weight | Short tasks keep every count near zero, so ties go to the flood. |
 | Fair-queuing tag stamped at enqueue | A runtime weight change misses rows already enqueued. Enqueue gets a hot row. |
 | A per-queue clock row | Every keyed claim in a queue would lock one row. |
+| Advance `V` on a new key's claim | Two variants broke the pair bound in `fairness_key_props`. |

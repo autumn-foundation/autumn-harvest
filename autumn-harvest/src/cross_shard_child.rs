@@ -1598,7 +1598,12 @@ async fn start_child_on_target(
                 params.required_build_id = spec.assigned_build_id.clone();
                 params.concurrency_key = spec.concurrency_key.clone();
                 params.max_concurrent = spec.max_concurrent;
-                params.fairness_key.clone_from(&spec.fairness_key);
+                // A spec from before issue #1976 has no fairness key. It then
+                // takes the child's quota key, as a local child does.
+                params.fairness_key = crate::queue_fairness::fairness_key_for(
+                    spec.fairness_key.as_deref(),
+                    spec.quota_key.as_deref(),
+                );
                 params.trace_context = spec.trace_context.clone();
                 queue::enqueue(conn, &params).await?;
                 Ok((None, Vec::new()))

@@ -791,7 +791,7 @@ follows. Rows 14 to 18 list the known exceptions.
 | 10 | Execution row, then quota advisory lock | Each scanner fire and each direct start (`quota_lock_order.rs`) | A scanner that took every quota key first would wait on the uncommitted row of a direct start. | — |
 | 11 | Rate-limit bucket rows in byte order (`COLLATE "C"`) | Throttle scanner batch (`pre_lock_rate_limit_buckets_for_claimed_batch`, issue #1230). Dynamic-rate bucket registration sorts by key (issue #1127). | One statement locks the batch in sorted order. A locale collation would change the order. | `dedupes_and_sorts_the_same_regardless_of_claim_order` |
 | 12 | Two `ctx.mutex` keys in sorted key order | Workflow code (author rule, see "Cross-key deadlock" in the Durable Mutex section) | A durable mutex is held across transactions. Postgres does not detect this cycle, so no retry resolves it. Only the lease expiry ends it. | — |
-| 13 | Task row (`SKIP LOCKED`), then the `harvest_fairness_state` row of its key | The fair claim's `fair_charge` upsert (`queue::splice_fairness`, issue #1976) | Each fair claim locks its task row first. Prune takes state rows with `SKIP LOCKED`, and the weight API never locks a state row. | `concurrent_fair_claims_keep_every_charge` |
+| 13 | Task row (`SKIP LOCKED`), then the `harvest_fairness_state` row of its key | The fair claim's charge (`queue::FAIR_CHARGE_SQL`, issue #1976), the last statement of the claim transaction | Each fair claim locks its task row first. Prune takes state rows with `SKIP LOCKED`, and the weight API never locks a state row. | `concurrent_fair_claims_keep_every_charge` |
 
 **Known cycles.** In each row, Postgres aborts one side as a whole. That side
 is safe to run again. Only rows 14 and 15 run again automatically.

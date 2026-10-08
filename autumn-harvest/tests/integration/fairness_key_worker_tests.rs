@@ -210,11 +210,15 @@ async fn a_runs_done_before_b(fairness: bool) -> usize {
     wait_for_execution_state_with_timeout(&url, b, "COMPLETED", Duration::from_secs(120)).await;
 
     let ids: Vec<Uuid> = a_runs.iter().map(ExecutionId::as_uuid).collect();
+    // Count the A runs that completed before B. Counting after B completes
+    // would also count runs that finish while this query runs.
     let done: Count = diesel::sql_query(
-        "SELECT COUNT(*) AS n FROM harvest_workflow_executions \
-         WHERE id = ANY($1) AND state = 'COMPLETED'",
+        "SELECT COUNT(*) AS n FROM harvest_workflow_executions a \
+         WHERE a.id = ANY($1) AND a.state = 'COMPLETED' \
+           AND a.completed_at < (SELECT completed_at FROM harvest_workflow_executions WHERE id = $2)",
     )
     .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&ids)
+    .bind::<diesel::sql_types::Uuid, _>(b.as_uuid())
     .get_result(&mut conn)
     .await
     .unwrap();

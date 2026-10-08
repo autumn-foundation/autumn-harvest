@@ -143,19 +143,29 @@ pub const MAX_FAIRNESS_WEIGHT: f64 = 1000.0;
 pub const MAX_FAIRNESS_OVERRIDES_PER_QUEUE: usize = 1000;
 
 /// The longest fairness key, in bytes.
-pub const MAX_FAIRNESS_KEY_LEN: usize = 255;
+///
+/// It equals the quota key cap, so a valid quota key fits as a fairness key.
+pub const MAX_FAIRNESS_KEY_LEN: usize = 256;
 
 /// Check a fairness key that a caller supplies.
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError::Config`] for an empty key, a key with outer
-/// whitespace or a control character, or a key longer than
-/// [`MAX_FAIRNESS_KEY_LEN`] bytes. The empty key is [`DEFAULT_FAIRNESS_KEY`].
+/// Returns [`HarvestError::Config`] for an empty key or for the key `.` or
+/// `..`. It also rejects a key with outer whitespace or a control character,
+/// and a key longer than [`MAX_FAIRNESS_KEY_LEN`] bytes. The empty key is
+/// [`DEFAULT_FAIRNESS_KEY`].
 pub fn validate_fairness_key(key: &str) -> HarvestResult<()> {
     if key.is_empty() {
         return Err(HarvestError::Config(
             "fairness key must not be empty".to_owned(),
+        ));
+    }
+    // The admin routes carry the key in a URL path segment. URL parsing
+    // removes a `.` or `..` segment, so no route could address such a key.
+    if key == "." || key == ".." {
+        return Err(HarvestError::Config(
+            "fairness key must not be `.` or `..`".to_owned(),
         ));
     }
     if key.trim() != key {
@@ -163,8 +173,8 @@ pub fn validate_fairness_key(key: &str) -> HarvestResult<()> {
             "fairness key must not start or end with whitespace".to_owned(),
         ));
     }
-    // The fair claim joins queue and key with `chr(31)`. A key with no
-    // control character cannot collide with another key in that map.
+    // A control character in a key would reach logs, audit rows and CLI
+    // output unescaped.
     if key.chars().any(char::is_control) {
         return Err(HarvestError::Config(
             "fairness key must not contain a control character".to_owned(),
@@ -181,11 +191,16 @@ pub fn validate_fairness_key(key: &str) -> HarvestResult<()> {
 
 /// The fairness key of a new run: the explicit key, else the quota key.
 ///
-/// A quota key names a tenant already, so it is the natural default. A run
-/// with neither key gets `None`, which is [`DEFAULT_FAIRNESS_KEY`].
+/// A quota key names a tenant already, so it is the natural default. A quota
+/// key that fails [`validate_fairness_key`] is not used. Every stored key is
+/// thus one that the weight API can address, and an inherited key passes
+/// validation again on a workflow retry. A run with neither key gets `None`,
+/// which is [`DEFAULT_FAIRNESS_KEY`].
 #[must_use]
 pub fn fairness_key_for(explicit: Option<&str>, quota_key: Option<&str>) -> Option<String> {
-    explicit.or(quota_key).map(str::to_owned)
+    explicit
+        .or_else(|| quota_key.filter(|k| validate_fairness_key(k).is_ok()))
+        .map(str::to_owned)
 }
 
 /// Check a weight override.
@@ -225,7 +240,7 @@ pub struct FairPass {
 /// - The claim takes the row whose key has the smallest lag
 ///   `start - V`. The due time breaks a tie.
 /// - A claim charges the key: `last_start = start` and
-///   `pass = start + 1 / weight`.
+///   `pass = start + 1 / weight`. See [`fair_charge`].
 ///
 /// The SQL in `queue::splice_fairness` follows the same rules. The DB test
 /// `fair_claim_matches_the_model_sequence` compares the two.
@@ -297,8 +312,9 @@ impl FairClock {
     /// The start tag comes from the current state, as the SQL upsert does
     /// after it waits for a concurrent charge of the same key.
     pub fn charge(&mut self, key: &str, weight: f64) -> FairPass {
-        let start = self.start_tag(key);
-        let next = fair_charge(start, weight);
+        let v = self.vclock();
+        let pass = self.keys.get(key).map(|p| p.pass);
+        let next = fair_charge(pass, v, weight);
         self.keys.insert(key.to_owned(), next);
         next
     }
@@ -330,9 +346,20 @@ pub fn fair_lag(pass: Option<f64>, v: f64) -> f64 {
     pass.map_or(0.0, |p| (p - v).max(0.0))
 }
 
-/// The state after one claim that starts at `start` with `weight`.
+/// The state of a key after one claim (issue #1976).
+///
+/// `pass` is the key's stored pass, if any, and `v` is the queue clock. The
+/// key starts at `max(pass, v)`. Its new pass is that start plus
+/// `1 / weight`, and its `last_start` is that start.
+///
+/// A new key starts at `v`, so its first claim comes before any key in debt.
+/// While new keys arrive more slowly than the queue drains, a backlogged key
+/// gets every other claim. When new keys arrive as fast as the queue drains,
+/// they take every claim, as in any per-key fair queue. See the `Limits`
+/// section of `docs/fairness-keys.md`.
 #[must_use]
-pub fn fair_charge(start: f64, weight: f64) -> FairPass {
+pub fn fair_charge(pass: Option<f64>, v: f64, weight: f64) -> FairPass {
+    let start = fair_start(pass, v);
     FairPass {
         pass: start + 1.0 / weight,
         last_start: start,
@@ -520,6 +547,20 @@ mod tests {
     }
 
     #[test]
+    fn an_invalid_quota_key_is_not_a_fairness_key() {
+        for bad in ["", " acme", "acme\u{1f}", ".", ".."] {
+            assert_eq!(fairness_key_for(None, Some(bad)), None, "{bad:?}");
+        }
+        let at_cap = "q".repeat(MAX_FAIRNESS_KEY_LEN);
+        assert_eq!(fairness_key_for(None, Some(&at_cap)), Some(at_cap.clone()));
+        // A quota key at the quota cap is a valid fairness key.
+        assert_eq!(
+            u64::try_from(MAX_FAIRNESS_KEY_LEN).unwrap(),
+            crate::quota::MAX_QUOTA_KEY_BYTES
+        );
+    }
+
+    #[test]
     fn fairness_key_validation_rejects_reserved_and_malformed_keys() {
         assert!(validate_fairness_key("tenant-a").is_ok());
         assert!(validate_fairness_key(&"x".repeat(MAX_FAIRNESS_KEY_LEN)).is_ok());
@@ -527,6 +568,9 @@ mod tests {
         assert!(validate_fairness_key(" a").is_err());
         assert!(validate_fairness_key("a\n").is_err());
         assert!(validate_fairness_key("a\u{1f}b").is_err());
+        assert!(validate_fairness_key(".").is_err());
+        assert!(validate_fairness_key("..").is_err());
+        assert!(validate_fairness_key("...").is_ok());
         assert!(validate_fairness_key(&"x".repeat(MAX_FAIRNESS_KEY_LEN + 1)).is_err());
     }
 

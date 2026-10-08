@@ -59,15 +59,19 @@ the largest `last_start` in the queue. It never decreases.
 - Start tag of a key: `S = max(pass, V)`. A key with no row has `S = V`.
 - The claim takes the row with the smallest lag `S - V` after sticky rank
   and effective priority. Due time breaks a tie.
-- The claim charges the key: `last_start = S`, `pass = S + 1 / weight`.
+- After the post-claim rechecks accept the row, the claim charges the key:
+  `last_start = S`, `pass = S + 1 / weight`.
 
-Properties, proven by `queue_fairness_props`:
+Properties, proven by `fairness_key_props`:
 
 1. A key that becomes active is served within `N` claims (`N` active keys).
 2. Two backlogged keys stay within `1/w_i + 1/w_j` of each other in
    `served / weight`.
 3. `V` never decreases. Idle time earns no credit.
 4. With one key, the order is the order without fairness.
+5. New keys take only the claims they need. While they arrive more slowly
+   than the queue drains, a backlogged key gets every other claim.
+6. Prune changes no start tag.
 
 ### 1.2 Key source
 
@@ -75,8 +79,9 @@ Properties, proven by `queue_fairness_props`:
 from `StartWorkflowParams::fairness_key`. If that is `None`, the run's quota
 key is the key. Activities take the key of their workflow task. A child, a
 continue-as-new run or a workflow retry takes the parent's key, else its own
-quota key. A reset fork or a DLQ redrive takes the source run's quota key. A
-row with no key uses the default key `''`.
+quota key. A reset fork, a DLQ redrive or a re-run takes the source run's
+quota key. A quota key that fails `validate_fairness_key` is not used. A row
+with no key uses the default key `''`.
 
 The key lives on task rows only. `harvest_workflow_executions` is at Diesel's
 64-column limit, and a workflow task row lives as long as its run.
@@ -91,17 +96,37 @@ The key lives on task rows only. `harvest_workflow_executions` is at Diesel's
 ### 1.4 Claim
 
 `splice_fairness` derives the fair form from any claim variant (base, fenced,
-kind, by-id). It adds one `MATERIALIZED` CTE, `fair_map`, one sort term before
-the due time, and one `fair_charge` upsert after `claimed`. No bind is added.
+kind, by-id). It adds one `MATERIALIZED` CTE, `fair_map`, and one sort term
+before the due time. No bind is added. The charge, `FAIR_CHARGE_SQL`, is a
+separate upsert in the same transaction. It runs only when the post-claim
+rechecks keep the row.
 
-`fair_map` folds the key state into a flat `jsonb` map of lags. A join on the
+`fair_map` folds the lags of the keys in debt into a `jsonb` map. A join on the
 state rows was the first form. The planner ran it as a nested loop: every state
 row once per candidate row. That cost 2x claim throughput at 8 claimers. The
 map costs one lookup per candidate row.
 
+A lag is relative to its own queue's clock. A fair claim over several queues
+therefore runs one statement per queue, in a random order.
+
+### 1.6 Review record
+
+Four review agents and a Codex review read the first push. The changes:
+
+| Finding | Change |
+|---|---|
+| The charge ran inside the claim statement, so a recheck that gave the row back still charged the key. | The charge is a separate statement after the rechecks. |
+| Lags of two queues do not compare. A queue with one active key starved a sibling queue. | One statement per queue, in a random order. |
+| A quota key can be 256 bytes, or hold whitespace or control characters. | The cap is 256 bytes. An invalid quota key is not used as a fairness key. |
+| The admin routes cannot address `.` or `..`. | The validator rejects them. |
+| A deferred start dropped an explicit key. An atomic batch with a bad key was not atomic. | The HTTP start rejects the combination. Batch pre-validation checks each key. |
+| Prune probed the backlog once per state row. | One hashed anti-join, in bounded batches. Two state indexes. |
+| A stream of new keys can hold a backlogged key. | Two clock variants were tried on the model and broke the pair bound. SFQ stays. Property 5 pins its max-min behaviour. The docs state the limit. |
+| Priority ageing sorts before the lag. | Documented. A worker with both options warns. |
+
 ### 1.5 Runtime API
 
-`queue_fairness::{set_fairness_weight, clear_fairness_weight,
+`fairness_keys::{set_fairness_weight, clear_fairness_weight,
 list_fairness_weights, prune_fairness_state}`, the admin HTTP routes and the
 `harvest queue fairness` CLI commands. A change applies at the next claim.
 

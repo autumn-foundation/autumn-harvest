@@ -9,7 +9,11 @@
 //! the next fair claim of its key. No worker restart is needed.
 //!
 //! A fairness key bounds load, not access. Any caller that may start a
-//! workflow may set any key. Confine callers with the authorizer hook.
+//! workflow may set any key. The authorizer hook does not see the key, so set
+//! or strip it in your own service before a start reaches Harvest.
+//!
+//! Each shard keeps its own weights. These functions write the shard of the
+//! connection that you pass. The admin HTTP routes write every shard.
 
 use chrono::{DateTime, Utc};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
@@ -240,6 +244,12 @@ pub async fn list_fairness_state(
         .collect())
 }
 
+/// The most prune batches one call runs.
+///
+/// Key churn above one batch per tick still drains, and one call stays
+/// bounded.
+pub const MAX_PRUNE_BATCHES: usize = 10;
+
 /// Delete the state of idle keys that the claim cannot tell from no state.
 ///
 /// A row goes when all of these hold:
@@ -252,9 +262,11 @@ pub async fn list_fairness_state(
 /// Such a key starts at `V` with or without its row, so prune changes no
 /// claim. The property test `prune_is_invisible_to_the_claim` proves that on
 /// the model. Rows are locked `SKIP LOCKED`, so prune never waits for a claim.
-/// With `preview`, nothing is deleted and the count is what a real pass would
-/// delete. Returns the number of rows, at most `batch_size`. With
-/// `queue_name`, only that queue is pruned.
+///
+/// Prune deletes in batches of `batch_size`, up to [`MAX_PRUNE_BATCHES`]
+/// batches, and stops at the first short batch. With `preview`, nothing is
+/// deleted, and the count is what one call would delete. With `queue_name`,
+/// only that queue is pruned. Returns the number of rows.
 ///
 /// # Errors
 ///
@@ -272,34 +284,59 @@ pub async fn prune_fairness_state(
         n: i64,
     }
     let batch = i64::try_from(batch_size).unwrap_or(i64::MAX).max(1);
-    let sql = if preview {
-        format!("WITH {PRUNE_VICTIMS_SQL} SELECT COUNT(*) AS n FROM victims")
-    } else {
-        format!(
-            "WITH {PRUNE_VICTIMS_SQL}, gone AS ( \
-                 DELETE FROM harvest_fairness_state d USING victims v \
-                 WHERE d.queue_name = v.queue_name AND d.fairness_key = v.fairness_key \
-                 RETURNING 1 \
-             ) SELECT COUNT(*) AS n FROM gone"
-        )
-    };
-    let count: Count = diesel::sql_query(sql)
+    let max_batches = i64::try_from(MAX_PRUNE_BATCHES).unwrap_or(1);
+    if preview {
+        let count: Count = diesel::sql_query(format!(
+            "WITH {PRUNE_VICTIMS_SQL} SELECT COUNT(*) AS n FROM victims"
+        ))
         .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
-        .bind::<diesel::sql_types::BigInt, _>(batch)
+        .bind::<diesel::sql_types::BigInt, _>(batch.saturating_mul(max_batches))
         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(queue_name)
         .get_result(conn)
         .await?;
-    Ok(u64::try_from(count.n).unwrap_or(0))
+        return Ok(u64::try_from(count.n).unwrap_or(0));
+    }
+    let sql = format!(
+        "WITH {PRUNE_VICTIMS_SQL}, gone AS ( \
+             DELETE FROM harvest_fairness_state d USING victims v \
+             WHERE d.queue_name = v.queue_name AND d.fairness_key = v.fairness_key \
+             RETURNING 1 \
+         ) SELECT COUNT(*) AS n FROM gone"
+    );
+    let mut total = 0u64;
+    for _ in 0..MAX_PRUNE_BATCHES {
+        let count: Count = diesel::sql_query(&sql)
+            .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
+            .bind::<diesel::sql_types::BigInt, _>(batch)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(queue_name)
+            .get_result(conn)
+            .await?;
+        total += u64::try_from(count.n).unwrap_or(0);
+        if count.n < batch {
+            break;
+        }
+    }
+    Ok(total)
 }
 
 /// The rows that [`prune_fairness_state`] may delete. Binds `$1` cutoff,
-/// `$2` batch size and `$3` queue (`NULL` for every queue).
+/// `$2` row limit and `$3` queue (`NULL` for every queue).
+///
+/// `active` reads the pending keys of the pruned queues once. The planner
+/// can then hash it for the anti-join. A probe per state row would scan the
+/// pending backlog once per row.
 const PRUNE_VICTIMS_SQL: &str = "\
     clock AS ( \
         SELECT queue_name, MAX(last_start) AS v \
         FROM harvest_fairness_state \
         WHERE $3::TEXT IS NULL OR queue_name = $3 \
         GROUP BY queue_name \
+    ), \
+    active AS MATERIALIZED ( \
+        SELECT DISTINCT t.queue_name, COALESCE(t.fairness_key, '') AS fairness_key \
+        FROM harvest_task_queue t \
+        WHERE t.state = 'PENDING' \
+          AND t.queue_name IN (SELECT queue_name FROM clock) \
     ), \
     victims AS ( \
         SELECT s.queue_name, s.fairness_key \
@@ -309,10 +346,9 @@ const PRUNE_VICTIMS_SQL: &str = "\
           AND s.last_start < c.v \
           AND s.updated_at < $1 \
           AND NOT EXISTS ( \
-              SELECT 1 FROM harvest_task_queue t \
-              WHERE t.queue_name = s.queue_name \
-                AND t.state = 'PENDING' \
-                AND COALESCE(t.fairness_key, '') = s.fairness_key \
+              SELECT 1 FROM active a \
+              WHERE a.queue_name = s.queue_name \
+                AND a.fairness_key = s.fairness_key \
           ) \
         ORDER BY s.updated_at \
         LIMIT $2 \
@@ -336,5 +372,6 @@ mod tests {
         assert!(PRUNE_VICTIMS_SQL.contains("s.last_start < c.v"));
         assert!(PRUNE_VICTIMS_SQL.contains("SKIP LOCKED"));
         assert!(PRUNE_VICTIMS_SQL.contains("t.state = 'PENDING'"));
+        assert!(PRUNE_VICTIMS_SQL.contains("active AS MATERIALIZED"));
     }
 }

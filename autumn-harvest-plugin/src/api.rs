@@ -17760,6 +17760,29 @@ pub(crate) async fn start_workflow(
             .into_response();
     }
 
+    // Issue #1976: a deferred start (throttle, debounce or batch) fires later
+    // through its own start path. That path takes the run's quota key, so an
+    // explicit fairness key would apply only to a start that runs at once.
+    // Reject the combination, as for `idempotency_key`.
+    if let Some(key) = request.fairness_key.as_deref() {
+        if throttle_applies || is_debounced_start || has_batch_policy {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "fairness_key cannot be combined with throttle/debounce/batch start"
+                })),
+            )
+                .into_response();
+        }
+        if let Err(err) = autumn_harvest::queue_fairness::validate_fairness_key(key) {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": err.to_string() })),
+            )
+                .into_response();
+        }
+    }
+
     // issue #685: a non-default `conflict_policy` resolves a collision with an
     // *active* (RUNNING/PAUSED) prior at request time (attach / fail / cancel +
     // start fresh). Throttle / debounce / batch all DEFER the start — no start
@@ -19976,6 +19999,26 @@ async fn batch_start_workflows(
                  batch (atomic=false) instead",
                 item.workflow_name
             ))
+        } else if let Some(Err(err)) = item
+            .fairness_key
+            .as_deref()
+            .map(autumn_harvest::queue_fairness::validate_fairness_key)
+        {
+            // Issue #1976: check the key before any item starts, so an atomic
+            // batch with a bad key inserts nothing.
+            Some(err.to_string())
+        } else if item.fairness_key.is_some()
+            && workflow_resolving_throttle(
+                &runtime.registry,
+                &item.workflow_name,
+                item.input.as_ref().unwrap_or(&Value::Null),
+            )
+            .is_some()
+        {
+            // A throttled start can defer. The deferred start takes the quota
+            // key, so it would drop the explicit key. Reject the combination,
+            // as the standalone start route does.
+            Some("fairness_key cannot be combined with a throttled start".to_string())
         } else {
             // Debounce for an explicit-id item is NOT rejected here: an idempotent
             // retry (existing workflow_id) must still return the existing run.
@@ -38433,14 +38476,17 @@ async fn apply_fairness_weight_across_shards(
 ) -> (
     Option<::autumn_harvest::fairness_keys::FairnessWeight>,
     Option<String>,
+    bool,
 ) {
     let mut applied = None;
     let mut cap_error = None;
+    let mut outage = false;
     for (shard_id, pool) in targets {
         let mut conn = match acquire_conn(pool).await {
             Ok(conn) => conn,
             Err(e) => {
                 failures.push(format!("shard {shard_id}: {e}"));
+                outage = true;
                 continue;
             }
         };
@@ -38460,10 +38506,13 @@ async fn apply_fairness_weight_across_shards(
                 failures.push(format!("shard {shard_id}: {message}"));
                 cap_error.get_or_insert(message);
             }
-            Err(e) => failures.push(format!("shard {shard_id}: {e}")),
+            Err(e) => {
+                failures.push(format!("shard {shard_id}: {e}"));
+                outage = true;
+            }
         }
     }
-    (applied, cap_error)
+    (applied, cap_error, outage)
 }
 
 /// `POST /admin/queues/{queue_name}/fairness/{fairness_key}` — set a weight.
@@ -38525,7 +38574,7 @@ async fn set_fairness_weight_handler(
     };
     let (actor, source, request_id) = audit;
 
-    let (applied, cap_error) = apply_fairness_weight_across_shards(
+    let (applied, cap_error, outage) = apply_fairness_weight_across_shards(
         &targets,
         &queue,
         &fairness_key,
@@ -38556,8 +38605,9 @@ async fn set_fairness_weight_handler(
     .await;
 
     let Some(row) = applied else {
-        // A cap rejection is the caller's to fix, so it is a 400.
-        if let Some(message) = cap_error {
+        // A cap rejection on every shard is the caller's to fix, so it is a
+        // 400. Any other failure means an outage, so it is a 500.
+        if let Some(message) = cap_error.filter(|_| !outage) {
             return map_error(HarvestError::Config(message)).into_response();
         }
         return AutumnError::internal_server_error_msg(format!(
@@ -38567,7 +38617,12 @@ async fn set_fairness_weight_handler(
         .into_response();
     };
     let partial = (!failures.is_empty()).then(|| failures.join("; "));
-    let (status_code, ok, status) = queue_pause_partial_status(partial.as_deref());
+    let (mut status_code, ok, status) = queue_pause_partial_status(partial.as_deref());
+    // A shard at the override cap refuses the key on every retry. A 207 says
+    // "send again", so a cap miss is a 409: clear an override there first.
+    if cap_error.is_some() {
+        status_code = axum::http::StatusCode::CONFLICT;
+    }
     let mut payload = serde_json::to_value(&row).unwrap_or(Value::Null);
     if let Some(map) = payload.as_object_mut() {
         map.insert("ok".to_string(), Value::Bool(ok));
