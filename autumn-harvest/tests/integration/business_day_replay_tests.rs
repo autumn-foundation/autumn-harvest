@@ -347,14 +347,21 @@ async fn replay_business_day_frozen_rejection_survives_a_calendar_extension() {
     // The SAME failure, not merely *a* failure: assert the recorded message is
     // reproduced verbatim, so a recompute that failed for some other reason
     // could not pass this test.
-    match &report.status {
-        ReplayStatus::WorkflowFailed { error, .. } => assert!(
-            error.contains("resolution requires a date after 2026-07-03"),
-            "the frozen coverage rejection must be reproduced verbatim, got: {error}"
-        ),
-        other => panic!(
+    // Issue #952: this history ends in a terminal `WorkflowFailed`, so a replay
+    // that reproduces the failure is a clean replay (`ReplaySucceeded`) and the
+    // reproduced error is read through `failure_message()`.
+    assert!(
+        !matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "a frozen rejection must not surface as non-determinism:\n{report}"
+    );
+    let error = report.failure_message().unwrap_or_else(|| {
+        panic!(
             "a frozen rejection must replay as the same failure even once the \
-             calendar is extended, got {other:?}:\n{report}"
-        ),
-    }
+             calendar is extended:\n{report}"
+        )
+    });
+    assert!(
+        error.contains("resolution requires a date after 2026-07-03"),
+        "the frozen coverage rejection must be reproduced verbatim, got: {error}"
+    );
 }

@@ -1,22 +1,31 @@
-//! Redis Streams task queue adapter for `autumn-harvest`.
+//! Redis Streams dispatch channel and standalone task queue for `autumn-harvest`.
 //!
-//! This crate provides a high-throughput "escape hatch" for the
-//! `autumn-harvest` workflow engine. The default Postgres-backed queue (using
-//! `SELECT ... FOR UPDATE SKIP LOCKED`) is operationally simple but eventually
-//! hits a ceiling around ten thousand task claims per second due to lock
-//! contention. Moving the ephemeral task queue onto Redis Streams lifts that
-//! ceiling while leaving Postgres as the sole source of truth for workflow
-//! state and event history.
+//! The crate has two parts. The worker uses only the first.
+//!
+//! - [`RedisDispatch`] is a dispatch channel for the worker (issue #1312). A
+//!   stream entry carries a task reference only. Postgres keeps every
+//!   `harvest_task_queue` row and stays the source of truth. See *Worker
+//!   integration* below.
+//! - [`RedisTaskQueue`] is a standalone task queue on Redis Streams. The
+//!   worker does not use it. See *Standalone adapter* below.
+//!
+//! The default Postgres queue claims with `SELECT ... FOR UPDATE SKIP LOCKED`.
+//! It is simple to operate, but its claim throughput has a ceiling
+//! (`docs/performance.md`). The dispatch channel takes read load off that
+//! claim path, and Postgres stays the source of truth. For the measured
+//! throughput of the standalone adapter, see
+//! `docs/assays/0001-redis-adapter-throughput-ceiling.md`.
 //!
 //! ## Scope
 //!
-//! - **In scope**: enqueue, claim, complete, fail, retry-with-delay, heartbeat,
-//!   and visibility-timeout based recovery for the task queue.
-//! - **Out of scope**: workflow state, event history, signals, timers,
-//!   schedules, the DAG runtime. These continue to live on Postgres exactly as
-//!   they do today.
+//! - **In scope, dispatch channel**: publish, read, ack and release task
+//!   references.
+//! - **In scope, standalone adapter**: enqueue, claim, complete, fail,
+//!   retry-with-delay, heartbeat, and recovery after a visibility timeout.
+//! - **Out of scope for both parts**: workflow state, event history, signals,
+//!   timers, schedules and the DAG runtime. These stay on Postgres.
 //!
-//! ## Usage sketch
+//! ## Standalone usage sketch
 //!
 //! ```no_run
 //! use std::time::Duration;
@@ -49,28 +58,99 @@
 //! # }
 //! ```
 //!
-//! ## Worker integration status
+//! ## Worker integration
 //!
-//! `autumn-harvest`'s worker currently calls Postgres queue functions directly
-//! and interleaves them with event-store writes inside a single Diesel
-//! transaction. Threading this crate through the existing `worker.rs` requires
-//! splitting those transactional boundaries -- in particular, the worker's
-//! "append events + update queue row" pattern becomes "append events, commit,
-//! then ack the Redis stream" with idempotency on replay. That refactor is a
-//! follow-up step and is intentionally not part of this crate's first
-//! delivery; this crate ships the adapter and its tests so the integration
-//! work can build on a stable foundation.
+//! [`RedisDispatch`] wires this crate into the `autumn-harvest` worker as a
+//! **dispatch channel** (issue #1312). It implements
+//! `autumn_harvest::dispatch::TaskDispatch`.
+//!
+//! Postgres keeps every `harvest_task_queue` row and stays the source of
+//! truth. A stream entry carries a reference only: the task id, the queue and
+//! the due time. A worker reads a reference, claims the named row in Postgres
+//! with the full claim predicate, and then acks the reference. Workflow state
+//! and event history stay in the Postgres transactions that exist today, so
+//! no transactional boundary moves.
+//!
+//! The channel is a latency and throughput optimization, never a durability
+//! store. The worker's reconcile sweep republishes due `PENDING` rows, so a
+//! lost entry, a dropped hint or a Redis restart all converge. If Redis is
+//! unreachable the worker falls back to the Postgres claim path.
+//!
+//! ### Limits in v1
+//!
+//! - **Single-node client.** The key family is hash-tagged per queue (issue
+//!   #1429). A queue's stream, delayed set, payload hash and markers all
+//!   carry the same `{prefix:dispatch:queue}` tag. The multi-key scripts
+//!   (`PUBLISH_LUA`, `REQUEUE_LUA`, `PROMOTE_MARKED_LUA`) therefore stay in
+//!   one Redis Cluster slot. The dispatch read (`next`) does too: it reads
+//!   one queue's stream per call, never combining several queues into one
+//!   multi-key `XREADGROUP` (Codex review, issue #1429). This crate still
+//!   connects with a single-node
+//!   [`redis::Client`]/[`ConnectionManager`](redis::aio::ConnectionManager),
+//!   not a cluster-aware client. It does not yet follow `MOVED`/`ASK`
+//!   redirects across a multi-node Cluster deployment. A cluster-aware
+//!   client is a separate follow-up.
+//! - **Upgrading from a pre-#1429 deployment leaves old keys behind.** Every
+//!   dispatch key moved from `{prefix}:dispatch:{queue}...` to the tagged
+//!   `{prefix:dispatch:queue}...` form above. No code reads the old,
+//!   untagged names any more. An old worker's live stream, delayed-set and
+//!   payload entries at those keys are therefore orphaned once every old
+//!   worker has stopped. Unlike the dedupe marker, they carry no TTL. No
+//!   task is lost: Postgres stays the source of truth, and the reconcile
+//!   sweep republishes every `PENDING` row under the new keys regardless.
+//!   The old keys just sit there. An operator upgrading a deployment with
+//!   a large backlog should `SCAN` for the old `{prefix}:dispatch:*`
+//!   pattern and `DEL` what it finds. Do that once no old worker is still
+//!   running.
+//! - **TLS through rustls (issue #1834).** A `rediss://` URL connects over
+//!   TLS and verifies the server against the platform trust store.
+//!   `SSL_CERT_FILE` or `SSL_CERT_DIR` replaces that store with a private CA
+//!   bundle.
+//!   [`RedisDispatch::connect_with_tls`] takes a private CA and a client
+//!   certificate for mutual TLS (see [`RedisTlsOptions`]). There is no
+//!   option to skip verification. A plain `redis://` URL still sends the
+//!   password in cleartext.
+//! - **One channel per shard, not one channel that spans shards.** A single
+//!   [`RedisDispatch`] instance still addresses one key family and expects
+//!   every reference it carries to belong to one database. A multi-shard
+//!   runtime therefore installs one instance per shard rather than widening
+//!   this type (issue #1429; see `autumn-harvest-plugin`'s per-shard
+//!   install and `autumn_harvest::dispatch::install_for_shard`).
+//! - **Priority is best effort.** One stream per queue delivers in arrival
+//!   order. A read sized to exactly one queue's ready backlog therefore sees
+//!   no priority signal at all. `COUNT` caps what Redis returns, before this
+//!   channel ever sees the candidates. The reconcile sweep publishes in
+//!   priority order instead. A read that spans queues also favors the
+//!   highest-priority candidates over lower ones (issue #1429). It does so
+//!   only among whatever surplus that span already produces, with no extra
+//!   round trip. Neither is a per-priority stream.
+//! - **Sticky affinity is best effort.** Any worker in the consumer group may
+//!   read any reference. The Postgres claim predicate still enforces the
+//!   affinity gate, and a rejected reference is released with backoff.
+//!
+//! ### Standalone adapter
+//!
+//! [`RedisTaskQueue`] and [`TaskQueueAdapter`] are unchanged and stay
+//! supported for callers that use this crate as a task queue on its own. The
+//! two key families do not overlap.
 
 #![cfg_attr(not(feature = "test-utils"), allow(rustdoc::private_intra_doc_links))]
 
 mod adapter;
+mod dispatch;
 mod envelope;
 mod error;
 mod naming;
 mod redis_queue;
+mod tls;
 
 pub use adapter::{ClaimedTask, TaskQueueAdapter};
+pub use dispatch::{RedisDispatch, RedisDispatchConfig};
 pub use envelope::{EnqueueParams, TaskEnvelope, TaskType};
 pub use error::{RedisAdapterError, RedisAdapterResult};
-pub use naming::{dlq_key, scheduled_payloads_key, scheduled_zset_key, stream_key};
+pub use naming::{
+    dispatch_delayed_key, dispatch_marker_key, dispatch_payloads_key, dispatch_stream_key, dlq_key,
+    scheduled_payloads_key, scheduled_zset_key, stream_key,
+};
 pub use redis_queue::{RedisTaskQueue, RedisTaskQueueConfig};
+pub use tls::RedisTlsOptions;

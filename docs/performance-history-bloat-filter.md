@@ -121,7 +121,7 @@ Postgres has no way to know a `COUNT(*)` has already reached a threshold
 without finishing the count — there is no early exit, and that is true no
 matter which access path answers the query. Against the 448,175-event
 execution in the fixture, this reads
-[**3,976 total buffers**](../perf-artifacts/history-bloat-filter/before-count-star-bloated.explain.txt)
+[**3,976 total buffers**](perf-artifacts/history-bloat-filter/before-count-star-bloated.explain.txt)
 via a Parallel Index Only Scan (2 workers) against `idx_harvest_events_exec_last`
 — an index that exists for an unrelated endpoint (issue #486's
 `no_progress_minutes` stall filter), not this one, but which the planner is
@@ -138,7 +138,7 @@ no access path lets `COUNT(*)` stop early: the query still has to visit
 every one of the 448,175 matching rows to answer a yes/no question about
 whether there are at least 10,000 of them. For the 5-event healthy execution
 the same form reads
-[5 buffers](../perf-artifacts/history-bloat-filter/before-count-star-healthy.explain.txt)
+[5 buffers](perf-artifacts/history-bloat-filter/before-count-star-healthy.explain.txt)
 via an Index Only Scan — cheap, because there is almost nothing to count.
 The predicate's cost is entirely a function of how *large* the history is,
 which is backwards for a filter whose whole purpose is to find large
@@ -160,14 +160,14 @@ EXISTS (
 exit, because "does a row exist at this offset" is answerable the moment that
 one row is produced, not after every row is counted. Against the identical
 448,175-event execution this reads
-[**94 total buffers**](../perf-artifacts/history-bloat-filter/after-bounded-exists-bloated.explain.txt)
+[**94 total buffers**](perf-artifacts/history-bloat-filter/after-bounded-exists-bloated.explain.txt)
 (both `pg_stat_statements.total_buffers` and the individual `EXPLAIN
 (ANALYZE, BUFFERS)` capture agree exactly) — a **97.64% reduction** — via an
 Index Only Scan against `idx_harvest_events_exec (workflow_exec_id,
 event_id)`, reading exactly 10,000 rows (`Heap Fetches: 0`, `actual
 rows=10000`) regardless of the other 438,175 events that exist beyond the
 threshold. For the healthy execution both forms read
-[the same 5 buffers](../perf-artifacts/history-bloat-filter/after-bounded-exists-healthy.explain.txt)
+[the same 5 buffers](perf-artifacts/history-bloat-filter/after-bounded-exists-healthy.explain.txt)
 — no regression for the common, un-bloated case.
 
 ### Why `ORDER BY` is load-bearing
@@ -187,7 +187,7 @@ EXISTS (SELECT 1 FROM harvest_events WHERE workflow_exec_id = id OFFSET 9999 LIM
 
 **Against this page's current, freshly-`VACUUM`'d reference fixture, dropping
 `ORDER BY` costs almost nothing.** The no-`ORDER BY` form reads
-[**93 total buffers**](../perf-artifacts/history-bloat-filter/after-bounded-exists-no-order-by-bloated.explain.txt)
+[**93 total buffers**](perf-artifacts/history-bloat-filter/after-bounded-exists-no-order-by-bloated.explain.txt)
 against the identical 448,175-event execution — statistically indistinguishable
 from (and, in this particular capture, one buffer *cheaper* than) the
 `ORDER BY`'d form's 94, via an Index Only Scan with `Heap Fetches: 0`. This

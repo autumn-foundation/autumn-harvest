@@ -17,7 +17,7 @@
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
 //! against it directly (single-threaded, each test scrubs the executions table
 //! first); otherwise a fresh testcontainers Postgres is booted with the full
-//! migration bundle (`autumn_harvest::full_migrations_sql()`).
+//! migration bundle (`autumn_harvest::test_init_sql()`).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -41,7 +41,7 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 /// Capturing metrics recorder — records `(workflow, count)` from
@@ -757,4 +757,51 @@ async fn insert_completed_with_deadline(
         .await
         .expect("append probe history");
     exec_id
+}
+
+// The worker writes its own id to `sticky_worker_id` when it seals a run.
+// Retention also uses that column as its lease. The candidate scan once
+// required the column to be NULL, so no worker-sealed run was ever deleted.
+// Only a live retention lease may exclude a row.
+#[tokio::test]
+async fn a_worker_sealed_run_is_a_retention_candidate() {
+    let (url, _container) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn).await;
+
+    let two_days_ago = Utc::now() - chrono::Duration::days(2);
+    let sealed = insert_completed(&mut conn, "sealed_wf", "w1", two_days_ago).await;
+    let leased = insert_completed(&mut conn, "leased_wf", "w2", two_days_ago).await;
+    for (id, holder) in [
+        (sealed, "worker-7f3a"),
+        (
+            leased,
+            "retention-lease-4b1e2c9a-0000-0000-0000-000000000000",
+        ),
+    ] {
+        diesel::sql_query(
+            "UPDATE harvest_workflow_executions SET sticky_worker_id = $2 WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(id)
+        .bind::<Text, _>(holder)
+        .execute(&mut conn)
+        .await
+        .expect("stamp sticky_worker_id");
+    }
+
+    let metrics = Arc::new(CapturingMetrics::default());
+    let result = run_one_tick(
+        pool,
+        history_only(Some(Duration::from_secs(86_400))),
+        Arc::clone(&metrics),
+    )
+    .await;
+
+    assert_eq!(
+        surviving_names(&mut conn).await,
+        vec!["leased_wf".to_string()],
+        "the worker-sealed run is deleted; a row under another janitor's live lease is not"
+    );
+    assert_eq!(result.deleted_count, 1);
 }

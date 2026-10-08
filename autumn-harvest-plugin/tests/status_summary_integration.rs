@@ -17,7 +17,6 @@ use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::DbPool;
 use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -34,7 +33,7 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 type HarvestApiApp = axum::Router;
@@ -81,7 +80,7 @@ async fn setup_two_shards() -> ((String, String), ContainerAsync<Postgres>) {
             .expect("shard connect");
         diesel_async::SimpleAsyncConnection::batch_execute(
             &mut conn,
-            autumn_harvest::full_migrations_sql(),
+            &autumn_harvest::test_init_sql(),
         )
         .await
         .expect("migrate shard");
@@ -106,14 +105,14 @@ fn build_app(storage: HarvestDbPool) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(storage);
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 /// Router with NO auth boundary — used to prove the admin guard rejects.
 fn build_unauthenticated_app(storage: HarvestDbPool) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(storage);
-    harvest_api_router(api_state).with_state(AppState::for_test())
+    harvest_api_router(api_state)
 }
 
 fn single_app(url: &str) -> HarvestApiApp {
@@ -155,7 +154,7 @@ async fn seed_execution(url: &str, shard: i32, workflow_name: &str, state: &str)
         workflow_id: &wf_id,
         run_id: Uuid::new_v4(),
         shard_id: shard,
-        input: serde_json::json!({}),
+        input: serde_json::json!({}).into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -320,7 +319,10 @@ async fn healthy_fleet_reports_healthy_with_five_subsystems() {
         assert!(names.contains(&expected), "{expected} subsystem present");
     }
     assert!(body["as_of"].is_string());
-    assert!(body["unavailable_shards"].as_array().unwrap().is_empty());
+    assert_eq!(
+        body["unavailable_shards"].as_array().unwrap().as_slice(),
+        [] as [serde_json::Value; 0]
+    );
     // Every healthy subsystem has a null drill_down.
     assert!(
         body["subsystems"]
@@ -400,10 +402,10 @@ async fn one_shard_down_degrades_and_names_the_shard() {
         unavailable.iter().any(|u| u["shard_id"] == 1),
         "the down shard is named in unavailable_shards"
     );
-    assert!(
-        !unavailable.iter().find(|u| u["shard_id"] == 1).unwrap()["reason"]
+    assert_ne!(
+        unavailable.iter().find(|u| u["shard_id"] == 1).unwrap()["reason"]
             .as_str()
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+        ""
     );
 }

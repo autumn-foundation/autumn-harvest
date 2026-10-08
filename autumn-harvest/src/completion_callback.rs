@@ -40,7 +40,7 @@
 //! explicitly allowed.
 
 use chrono::{DateTime, Utc};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -253,7 +253,14 @@ const fn is_ipv6_non_routable(ip: Ipv6Addr) -> bool {
     if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
         return true;
     }
-    if let Some(v4) = ip.to_ipv4_mapped() {
+    // `to_ipv4()` (unlike `to_ipv4_mapped()`) unwraps BOTH IPv4-in-IPv6
+    // forms. One is the modern IPv4-mapped form (`::ffff:a.b.c.d`, RFC 4291
+    // `::ffff:0:0/96`). The other is the deprecated IPv4-compatible form
+    // (`::a.b.c.d`, the bare `::/96` prefix). `to_ipv4_mapped()` alone returns
+    // `None` for the latter. That lets a loopback/private IPv4 embedded that
+    // way skip this check entirely. A genuine global-unicast IPv6 address
+    // still yields `None` here.
+    if let Some(v4) = ip.to_ipv4() {
         return is_ipv4_non_routable(v4);
     }
     let seg0 = ip.segments()[0];
@@ -516,6 +523,37 @@ mod ssrf_tests {
             assert!(
                 matches!(err, SsrfRejection::IpNotRoutable { .. }),
                 "expected {addr} to be rejected as non-routable, got {err:?}"
+            );
+        }
+    }
+
+    // `is_ipv6_non_routable` only unwraps the IPv4-*mapped* form
+    // (`::ffff:a.b.c.d`, RFC 4291 `::ffff:0:0/96`) via `to_ipv4_mapped()` before
+    // checking `is_ipv4_non_routable`. The older IPv4-*compatible* form
+    // (`::a.b.c.d`, the bare `::/96` prefix) encodes the exact same embedded
+    // IPv4 address. But `to_ipv4_mapped()` returns `None` for it. So a
+    // loopback or private IPv4 written this way skips the embedded-IPv4 check
+    // entirely and is classified routable. That bypasses the very guarantee
+    // in `validate_target_url`'s doc comment, which says such a target "even
+    // then is rejected if it is loopback/private/link-local/etc." as its rule.
+    // `Ipv6Addr::to_ipv4()` (unlike `to_ipv4_mapped()`) unwraps both
+    // forms. It still returns `None` for a genuine global-unicast IPv6 address
+    // (verified against `2001:db8::1` and a real public IPv6 literal). So
+    // swapping it in is a same-length, non-widening fix.
+    #[test]
+    fn rejects_ipv4_compatible_ipv6_embedding_a_loopback_or_private_address() {
+        let policy = SsrfPolicy::default().with_allow_ip_literals(true);
+        for addr in [
+            "::127.0.0.1",
+            "::10.0.0.5",
+            "::192.168.1.1",
+            "::169.254.1.1",
+        ] {
+            let err = validate_target_url(&format!("https://[{addr}]/hook"), &policy).unwrap_err();
+            assert!(
+                matches!(err, SsrfRejection::IpNotRoutable { .. }),
+                "expected IPv4-compatible {addr} to be rejected as non-routable \
+                 (it encodes a loopback/private IPv4 address), got {err:?}"
             );
         }
     }
@@ -889,6 +927,7 @@ type HmacSha256 = Hmac<Sha256>;
 pub fn sign(secret: &CallbackSecret, body: &[u8]) -> String {
     use std::fmt::Write as _;
 
+    #[expect(clippy::expect_used, reason = "HMAC accepts a key of any length")]
     let mut mac =
         HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
     mac.update(body);
@@ -1353,7 +1392,10 @@ mod config_resolution_tests {
             TerminalState::TimedOut,
             TerminalState::Terminated,
         ] {
-            assert!(resolve_effective_targets(&all, state).is_empty());
+            assert_eq!(
+                resolve_effective_targets(&all, state),
+                [] as [(usize, &crate::completion_callback::CallbackTarget); 0]
+            );
         }
     }
 
@@ -1395,6 +1437,8 @@ pub type DeliverFuture<'a> =
 pub struct DeliveryAttempt {
     pub status: Option<u16>,
     pub transport_error: Option<String>,
+    /// The receiver's `Retry-After` delay, if it sent one (issue #1832).
+    pub retry_after: Option<std::time::Duration>,
 }
 
 impl DeliveryAttempt {
@@ -1403,6 +1447,7 @@ impl DeliveryAttempt {
         Self {
             status: Some(status),
             transport_error: None,
+            retry_after: None,
         }
     }
 
@@ -1411,13 +1456,35 @@ impl DeliveryAttempt {
         Self {
             status: None,
             transport_error: Some(message),
+            retry_after: None,
         }
+    }
+
+    /// Attach the receiver's `Retry-After` delay.
+    #[must_use]
+    pub const fn with_retry_after(mut self, delay: std::time::Duration) -> Self {
+        self.retry_after = Some(delay);
+        self
     }
 
     /// `true` only for a 2xx response status.
     #[must_use]
     pub fn is_success(&self) -> bool {
         matches!(self.status, Some(s) if (200..300).contains(&s))
+    }
+
+    /// `true` for a 4xx status that a retry cannot fix (issue #1832).
+    ///
+    /// 408, 421, 425 and 429 are transient. RFC 9110, RFC 8470 and RFC 6585 let
+    /// a client retry them. A 413 with `Retry-After` is transient too (RFC 9110
+    /// section 15.5.14). Every other 4xx is permanent.
+    #[must_use]
+    pub fn is_permanent_failure(&self) -> bool {
+        match self.status {
+            Some(408 | 421 | 425 | 429) | None => false,
+            Some(413) => self.retry_after.is_none(),
+            Some(s) => (400..500).contains(&s),
+        }
     }
 }
 
@@ -1435,6 +1502,85 @@ pub trait CompletionCallbackDeliverer: Send + Sync + 'static {
         body: &'a [u8],
         headers: &'a [(&'static str, String)],
     ) -> DeliverFuture<'a>;
+}
+
+/// Parse a `Retry-After` header value into a delay from `now` (issue #1832).
+///
+/// The value is delta-seconds or an HTTP-date (RFC 9110 section 10.2.3).
+/// All three HTTP-date forms are read: IMF-fixdate, RFC 850 and asctime.
+/// A date in the past gives a zero delay. Any other value gives `None`.
+#[must_use]
+pub fn parse_retry_after(value: &str, now: DateTime<Utc>) -> Option<std::time::Duration> {
+    let value = value.trim();
+    if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+        // All digits, so only overflow fails. Overflow saturates.
+        let secs = value.parse::<u64>().unwrap_or(u64::MAX);
+        return Some(std::time::Duration::from_secs(secs));
+    }
+    let at = parse_http_date(value, now)?;
+    Some((at - now).to_std().unwrap_or(std::time::Duration::ZERO))
+}
+
+/// Parse an HTTP-date in any of its three forms (RFC 9110 section 5.6.7).
+fn parse_http_date(value: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    if let Ok(at) = DateTime::parse_from_rfc2822(value) {
+        return Some(at.with_timezone(&Utc));
+    }
+    // asctime, for example `Sun Nov  6 08:49:37 1994`. It is always in GMT.
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(value, "%a %b %e %H:%M:%S %Y") {
+        return Some(naive.and_utc());
+    }
+    parse_rfc850_date(value, now)
+}
+
+/// Parse an RFC 850 date, for example `Sunday, 06-Nov-94 08:49:37 GMT`.
+///
+/// The two-digit year gives the latest date that is not more than 50 years
+/// after `now` (RFC 9110 section 5.6.7). The cutoff compares the full
+/// timestamp, not only the year, and the window slides across a century
+/// boundary. Chrono's `%y` uses a fixed pivot instead, so this code sets the
+/// century itself. The weekday must match the date that results.
+fn parse_rfc850_date(value: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let (weekday, rest) = value.split_once(", ")?;
+    let (date, time) = rest.split_once(' ')?;
+    let (day_month, two_digit_year) = date.rsplit_once('-')?;
+    if two_digit_year.len() != 2 {
+        return None;
+    }
+    let yy: i32 = two_digit_year.parse().ok()?;
+    let at_year = |year: i32| {
+        chrono::NaiveDateTime::parse_from_str(
+            &format!("{day_month}-{year} {time}"),
+            "%d-%b-%Y %H:%M:%S GMT",
+        )
+        .ok()
+        .map(|naive| naive.and_utc())
+    };
+    let now_year = chrono::Datelike::year(&now);
+    let century = now_year - now_year.rem_euclid(100);
+    let cutoff = now.checked_add_months(chrono::Months::new(50 * 12))?;
+    // Read the month, day and time in a leap year, so 29 February parses.
+    let in_leap_year = at_year(2000)?;
+    let key = |at: DateTime<Utc>| {
+        (
+            chrono::Datelike::year(&at),
+            chrono::Datelike::month(&at),
+            chrono::Datelike::day(&at),
+            at.time(),
+        )
+    };
+    let (_, month, day, time) = key(in_leap_year);
+    let cutoff_key = key(cutoff);
+    // The candidates are 100 years apart, so the latest one at or before
+    // the cutoff is the only one inside the 100-year window. Compare the
+    // calendar fields, so a date that is invalid in its year is not skipped.
+    let year = [century + 100, century, century - 100]
+        .into_iter()
+        .map(|base| base + yy)
+        .find(|year| (*year, month, day, time) <= cutoff_key)?;
+    let at = at_year(year)?;
+    let weekday: chrono::Weekday = weekday.parse().ok()?;
+    (chrono::Datelike::weekday(&at) == weekday).then_some(at)
 }
 
 #[cfg(test)]
@@ -1460,6 +1606,131 @@ mod deliverer_trait_tests {
     fn transport_error_is_never_success() {
         assert!(!DeliveryAttempt::transport_error("connection refused".to_string()).is_success());
     }
+
+    #[test]
+    fn constructors_carry_no_retry_after() {
+        assert_eq!(DeliveryAttempt::success(429).retry_after, None);
+        assert_eq!(
+            DeliveryAttempt::transport_error("x".to_string()).retry_after,
+            None
+        );
+    }
+
+    fn now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn parse_retry_after_reads_delta_seconds() {
+        let ten = Some(std::time::Duration::from_secs(10));
+        assert_eq!(parse_retry_after("10", now()), ten);
+        assert_eq!(parse_retry_after(" 10 ", now()), ten);
+        assert_eq!(
+            parse_retry_after("0", now()),
+            Some(std::time::Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_reads_an_http_date() {
+        // 2026-01-01T00:00:00Z is a Thursday.
+        assert_eq!(
+            parse_retry_after("Thu, 01 Jan 2026 00:00:30 GMT", now()),
+            Some(std::time::Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_reads_the_obsolete_date_forms() {
+        // RFC 9110 section 5.6.7: a recipient must accept RFC 850 and asctime.
+        let thirty = Some(std::time::Duration::from_secs(30));
+        assert_eq!(
+            parse_retry_after("Thursday, 01-Jan-26 00:00:30 GMT", now()),
+            thirty
+        );
+        assert_eq!(parse_retry_after("Thu Jan  1 00:00:30 2026", now()), thirty);
+    }
+
+    #[test]
+    fn parse_retry_after_resolves_an_rfc_850_year_relative_to_now() {
+        // RFC 9110 section 5.6.7: a two-digit year is in the current
+        // century unless that puts it more than 50 years ahead.
+        // 2075 is 49 years ahead of 2026, so `75` means 2075.
+        let in_2075 = parse_retry_after("Tuesday, 01-Jan-75 00:00:00 GMT", now())
+            .expect("a valid RFC 850 date");
+        assert!(in_2075 > std::time::Duration::from_secs(48 * 365 * 86_400));
+        // 2077 is 51 years ahead, so `77` means 1977, in the past.
+        assert_eq!(
+            parse_retry_after("Saturday, 01-Jan-77 00:00:00 GMT", now()),
+            Some(std::time::Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_applies_the_rfc_850_cutoff_to_the_full_date() {
+        // The cutoff is 50 years after `now` to the second, not to the year.
+        let now = DateTime::parse_from_rfc3339("2026-10-06T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        // 2076-10-07 is past the cutoff, so `76` means 1976.
+        assert_eq!(
+            parse_retry_after("Thursday, 07-Oct-76 00:00:00 GMT", now),
+            Some(std::time::Duration::ZERO)
+        );
+        // 2076-10-05 is inside the cutoff, so `76` means 2076.
+        let ahead =
+            parse_retry_after("Monday, 05-Oct-76 00:00:00 GMT", now).expect("a valid RFC 850 date");
+        assert!(ahead > std::time::Duration::from_secs(49 * 365 * 86_400));
+    }
+
+    #[test]
+    fn parse_retry_after_resolves_an_rfc_850_year_across_a_century() {
+        // In 2076, `10` means 2110: 34 years ahead, inside the window.
+        let now = DateTime::parse_from_rfc3339("2076-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let ahead = parse_retry_after("Wednesday, 01-Jan-10 00:00:00 GMT", now)
+            .expect("a valid RFC 850 date");
+        assert!(ahead > std::time::Duration::from_secs(33 * 365 * 86_400));
+    }
+
+    #[test]
+    fn parse_retry_after_rejects_a_date_that_does_not_exist_in_its_year() {
+        // In 2076, `00` means 2100, which has no 29 February. The parser must
+        // not fall back to 2000, where the date and the weekday are valid.
+        let now = DateTime::parse_from_rfc3339("2076-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            parse_retry_after("Tuesday, 29-Feb-00 00:00:00 GMT", now),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_saturates_an_overflowing_number() {
+        assert_eq!(
+            parse_retry_after("99999999999999999999", now()),
+            Some(std::time::Duration::from_secs(u64::MAX))
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_treats_a_past_date_as_zero() {
+        assert_eq!(
+            parse_retry_after("Wed, 31 Dec 2025 23:59:00 GMT", now()),
+            Some(std::time::Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_rejects_garbage() {
+        for value in ["", "soon", "-1", "1.5", "10s", "0x10"] {
+            assert_eq!(parse_retry_after(value, now()), None, "value {value:?}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1478,8 +1749,8 @@ pub enum OutcomeAction {
         last_status: Option<u16>,
         last_error: Option<String>,
     },
-    /// Non-2xx or transport error, and `attempt >= max_attempts` — mark the
-    /// delivery `FAILED` and route to the DLQ.
+    /// `attempt >= max_attempts`, or a permanent 4xx (issue #1832). Mark the
+    /// delivery `FAILED` and route it to the DLQ.
     DeadLetter {
         last_status: Option<u16>,
         last_error: Option<String>,
@@ -1518,6 +1789,11 @@ fn delivery_stream_seed(delivery_id: Uuid) -> u64 {
 /// (typically [`delivery_stream_seed`] of the delivery's id) drives
 /// `retry_policy.jitter` — without it, a configured `JitterPolicy` would be
 /// silently ignored and every delivery would back off in perfect lockstep.
+///
+/// A permanent 4xx dead-letters at once. A `Retry-After` hint sets the
+/// minimum backoff, clamped to
+/// [`DEFAULT_RETRY_AFTER_CEILING`](crate::builder::DEFAULT_RETRY_AFTER_CEILING)
+/// (issue #1832).
 #[must_use]
 pub fn classify_outcome(
     outcome: &DeliveryAttempt,
@@ -1533,14 +1809,20 @@ pub fn classify_outcome(
         return OutcomeAction::Delivered { status };
     }
 
-    if attempt >= max_attempts {
+    if attempt >= max_attempts || outcome.is_permanent_failure() {
         return OutcomeAction::DeadLetter {
             last_status: outcome.status,
             last_error: outcome.transport_error.clone(),
         };
     }
 
-    let delay = crate::policy::compute_retry_delay_with_seed(retry_policy, attempt, seed);
+    let mut delay = crate::policy::compute_retry_delay_with_seed(retry_policy, attempt, seed);
+    // `Retry-After` is a floor, never a cap. The engine's `Retry-After`
+    // ceiling (issue #744) bounds it. So a receiver cannot delay a delivery
+    // past 15 minutes per retry.
+    if let Some(retry_after) = outcome.retry_after {
+        delay = delay.max(retry_after.min(crate::builder::DEFAULT_RETRY_AFTER_CEILING));
+    }
     let next_attempt_at =
         now + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::seconds(0));
 
@@ -1557,8 +1839,10 @@ mod classify_outcome_tests {
     use crate::policy::RetryPolicy;
     use std::time::Duration as StdDuration;
 
+    /// Exact backoff, so the delay tests do not depend on the seed (issue #1792).
     fn test_policy() -> RetryPolicy {
         RetryPolicy::exponential(5, StdDuration::from_secs(1))
+            .with_jitter(crate::policy::JitterPolicy::None)
     }
 
     fn now() -> DateTime<Utc> {
@@ -1720,6 +2004,122 @@ mod classify_outcome_tests {
         );
     }
 
+    fn backoff_delay(action: &OutcomeAction) -> StdDuration {
+        let OutcomeAction::Backoff {
+            next_attempt_at, ..
+        } = action
+        else {
+            panic!("expected Backoff, got {action:?}");
+        };
+        (*next_attempt_at - now()).to_std().unwrap()
+    }
+
+    #[test]
+    fn permanent_4xx_dead_letters_on_the_first_attempt() {
+        // Issue #1832 AC: a receiver that returns 400 is not retried.
+        for status in [400_u16, 401, 403, 404, 410, 422] {
+            let outcome = DeliveryAttempt::success(status);
+            let action = classify_outcome(&outcome, 1, 5, &test_policy(), 0, now());
+            assert_eq!(
+                action,
+                OutcomeAction::DeadLetter {
+                    last_status: Some(status),
+                    last_error: None,
+                },
+                "a {status} response must dead-letter on attempt 1"
+            );
+        }
+    }
+
+    #[test]
+    fn transient_4xx_still_backs_off() {
+        // 408, 421, 425 and 429 invite a retry (RFC 9110, RFC 8470, RFC 6585).
+        for status in [408_u16, 421, 425, 429] {
+            let outcome = DeliveryAttempt::success(status);
+            let action = classify_outcome(&outcome, 1, 5, &test_policy(), 0, now());
+            assert!(
+                matches!(action, OutcomeAction::Backoff { .. }),
+                "a {status} response must back off, got {action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_413_with_retry_after_is_temporary() {
+        // RFC 9110 section 15.5.14: `Retry-After` marks a 413 as temporary.
+        let outcome = DeliveryAttempt::success(413).with_retry_after(StdDuration::from_secs(30));
+        let action = classify_outcome(&outcome, 1, 5, &test_policy(), 0, now());
+        assert_eq!(backoff_delay(&action), StdDuration::from_secs(30));
+        // Without the header, a 413 is permanent.
+        let outcome = DeliveryAttempt::success(413);
+        let action = classify_outcome(&outcome, 1, 5, &test_policy(), 0, now());
+        assert!(matches!(action, OutcomeAction::DeadLetter { .. }));
+    }
+
+    #[test]
+    fn permanent_4xx_dead_letters_even_with_retry_after() {
+        let outcome = DeliveryAttempt::success(400).with_retry_after(StdDuration::from_secs(10));
+        let action = classify_outcome(&outcome, 1, 5, &test_policy(), 0, now());
+        assert!(matches!(action, OutcomeAction::DeadLetter { .. }));
+    }
+
+    #[test]
+    fn retry_after_is_the_floor_of_the_backoff() {
+        // Issue #1832 AC: 429 with `Retry-After: 10` waits 10 s or more.
+        // The policy alone gives 1 s on attempt 1.
+        let outcome = DeliveryAttempt::success(429).with_retry_after(StdDuration::from_secs(10));
+        let action = classify_outcome(&outcome, 1, 5, &test_policy(), 0, now());
+        assert!(
+            backoff_delay(&action) >= StdDuration::from_secs(10),
+            "Retry-After must delay the retry, got {action:?}"
+        );
+    }
+
+    #[test]
+    fn retry_after_is_clamped_to_the_retry_after_ceiling() {
+        let outcome =
+            DeliveryAttempt::success(503).with_retry_after(StdDuration::from_secs(86_400));
+        let action = classify_outcome(&outcome, 1, 5, &test_policy(), 0, now());
+        assert_eq!(
+            backoff_delay(&action),
+            crate::builder::DEFAULT_RETRY_AFTER_CEILING
+        );
+    }
+
+    #[test]
+    fn retry_after_wins_over_a_fixed_policy_interval() {
+        // A fixed policy has `max_interval == initial_interval`. The hint
+        // must still apply, so the ceiling is not `max_interval`.
+        let policy = RetryPolicy::fixed(5, StdDuration::from_secs(2))
+            .with_jitter(crate::policy::JitterPolicy::None);
+        let outcome = DeliveryAttempt::success(429).with_retry_after(StdDuration::from_secs(10));
+        let action = classify_outcome(&outcome, 1, 5, &policy, 0, now());
+        assert_eq!(backoff_delay(&action), StdDuration::from_secs(10));
+    }
+
+    #[test]
+    fn short_retry_after_keeps_the_longer_policy_backoff() {
+        // Attempt 4 of exponential(1 s) gives 8 s, more than the 2 s hint.
+        let outcome = DeliveryAttempt::success(429).with_retry_after(StdDuration::from_secs(2));
+        let action = classify_outcome(&outcome, 4, 10, &test_policy(), 0, now());
+        assert_eq!(backoff_delay(&action), StdDuration::from_secs(8));
+    }
+
+    #[test]
+    fn retry_after_applies_to_a_transport_error_too() {
+        let outcome = DeliveryAttempt::transport_error("reset".to_string())
+            .with_retry_after(StdDuration::from_secs(20));
+        let action = classify_outcome(&outcome, 1, 5, &test_policy(), 0, now());
+        assert_eq!(backoff_delay(&action), StdDuration::from_secs(20));
+    }
+
+    #[test]
+    fn retry_after_does_not_extend_past_max_attempts() {
+        let outcome = DeliveryAttempt::success(429).with_retry_after(StdDuration::from_secs(10));
+        let action = classify_outcome(&outcome, 5, 5, &test_policy(), 0, now());
+        assert!(matches!(action, OutcomeAction::DeadLetter { .. }));
+    }
+
     #[test]
     fn delivery_stream_seed_is_deterministic_and_distinguishes_deliveries() {
         let a = Uuid::new_v4();
@@ -1802,12 +2202,25 @@ impl CompletionCallbackBuilderConfig {
     /// SSRF policy. Called at `HarvestBuilder::try_build()` time.
     ///
     /// # Errors
-    /// Returns the first `(url, rejection)` pair that fails validation.
+    /// Returns the first `(url, rejection)` pair that fails validation. The
+    /// `url` is REDACTED to its origin (`scheme://host/<redacted>`), not the
+    /// full target (issue #1274). This pair becomes
+    /// [`crate::builder::HarvestBuilderError::CallbackTargetRejected`], whose
+    /// `Display` a startup failure writes straight to the logs.
+    ///
+    /// A completion-callback target often carries a bearer token or signing
+    /// key in its path or query, like a SIEM ingest URL (issue #953). Every
+    /// [`SsrfRejection`] variant discriminates on an origin property, so the
+    /// origin explains the rejection, and the redacted remainder is exactly
+    /// the secret.
     pub fn validate_default_targets(&self) -> Result<(), (String, SsrfRejection)> {
         let policy = self.ssrf_policy();
         for target in &self.default_targets {
             if let Err(rejection) = validate_target_url(&target.url, &policy) {
-                return Err((target.url.clone(), rejection));
+                return Err((
+                    crate::audit_export::redact_webhook_url(&target.url),
+                    rejection,
+                ));
             }
         }
         Ok(())
@@ -1822,7 +2235,10 @@ mod builder_config_tests {
     fn default_config_has_empty_allowlist_and_no_default_targets() {
         let config = CompletionCallbackBuilderConfig::default();
         assert!(config.allowlist.is_empty());
-        assert!(config.default_targets.is_empty());
+        assert_eq!(
+            config.default_targets,
+            [] as [crate::completion_callback::CallbackTarget; 0]
+        );
         assert!(!config.allow_http);
         assert!(!config.allow_ip_literals);
         assert!(config.secret.is_none());
@@ -1872,11 +2288,47 @@ mod builder_config_tests {
             ..Default::default()
         };
         let (url, rejection) = config.validate_default_targets().unwrap_err();
-        assert_eq!(url, "https://evil.com/hook");
+        // REDACTED to its origin, not the full target (issue #1274).
+        // A completion-callback URL often carries a bearer token in its
+        // path or query. This pair feeds a startup error's `Display`.
+        assert_eq!(url, "https://evil.com/<redacted>");
         assert!(matches!(
             rejection,
             SsrfRejection::HostNotAllowlisted { .. }
         ));
+    }
+
+    #[test]
+    fn validate_default_targets_redacts_a_credential_bearing_target() {
+        let config = CompletionCallbackBuilderConfig {
+            allowlist: HostAllowlist::new().with_pattern("api.example.com"),
+            default_targets: vec![CallbackTarget::new(
+                "https://evil.com/hook?token=s3cr3t",
+                EventFilter::AnyTerminal,
+            )],
+            ..Default::default()
+        };
+        let (url, _rejection) = config.validate_default_targets().unwrap_err();
+        assert_eq!(url, "https://evil.com/<redacted>");
+        assert!(!url.contains("s3cr3t"));
+    }
+
+    #[test]
+    fn validate_default_targets_strips_userinfo_from_a_rejected_target() {
+        // The allowlisted host means `UserinfoNotAllowed` is the rejection
+        // reason, not a host mismatch (issue #1274).
+        let config = CompletionCallbackBuilderConfig {
+            allowlist: HostAllowlist::new().with_pattern("api.example.com"),
+            default_targets: vec![CallbackTarget::new(
+                "https://user:s3cret@api.example.com/hook",
+                EventFilter::AnyTerminal,
+            )],
+            ..Default::default()
+        };
+        let (url, rejection) = config.validate_default_targets().unwrap_err();
+        assert_eq!(url, "https://api.example.com/<redacted>");
+        assert!(!url.contains("s3cret"));
+        assert_eq!(rejection, SsrfRejection::UserinfoNotAllowed);
     }
 
     #[test]
@@ -2160,10 +2612,14 @@ pub async fn enqueue_completion_deliveries(
         // here skips just this one target rather than aborting the
         // terminal transaction.
         if let Err(rejection) = validate_target_url(&target.url, &config.ssrf_policy) {
+            // REDACTED to its origin, not logged whole (issue #1274). A
+            // completion-callback target often carries a bearer token in
+            // its path or query, and `tracing::warn!` output routinely
+            // reaches long-lived log storage.
             tracing::warn!(
                 execution_id = %exec_id,
                 callback_index,
-                target_url = %target.url,
+                target_url = %crate::audit_export::redact_webhook_url(&target.url),
                 ?rejection,
                 "completion callback target failed SSRF re-validation at enqueue time; skipping"
             );
@@ -2429,10 +2885,115 @@ async fn dead_letter_entry_with_current_payload(
     })
 }
 
+/// Bulk-record every `Delivered` outcome from one scanner tick in a single
+/// round trip: `UPDATE ... FROM unnest($ids, $attempts, $statuses)`. The
+/// join is on `(id, attempt)`, exactly like the per-row path's
+/// `.find(row.id).filter(attempt.eq(row.attempt))` guard. A row whose
+/// `attempt` no longer matches is silently skipped by the join instead
+/// of updated -- the same no-op the per-row guard produced. That can
+/// happen when a later reclaim supersedes the row; see `apply_outcome`'s
+/// doc comment.
+///
+/// A no-op on an empty batch: the caller only invokes this when at least
+/// one row resolved `Delivered`.
+#[cfg(feature = "db")]
+async fn apply_delivered_outcomes_batch(
+    conn: &mut diesel_async::AsyncPgConnection,
+    rows: &[(Uuid, i32, u16)],
+    now: DateTime<Utc>,
+) -> crate::error::HarvestResult<()> {
+    use diesel_async::RunQueryDsl;
+
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.0).collect();
+    let attempts: Vec<i32> = rows.iter().map(|r| r.1).collect();
+    let statuses: Vec<i32> = rows.iter().map(|r| i32::from(r.2)).collect();
+
+    diesel::sql_query(
+        "UPDATE harvest_completion_deliveries d \
+         SET state = 'DELIVERED', last_status = v.last_status, last_error = NULL, \
+             delivered_at = $1, updated_at = $1 \
+         FROM unnest($2::uuid[], $3::int4[], $4::int4[]) AS v(id, attempt, last_status) \
+         WHERE d.id = v.id AND d.attempt = v.attempt",
+    )
+    .bind::<diesel::sql_types::Timestamptz, _>(now)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(ids)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(attempts)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(statuses)
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    Ok(())
+}
+
+/// One row's worth of a `Backoff` outcome, staged for
+/// [`apply_backoff_outcomes_batch`]: `(id, attempt, next_attempt_at,
+/// last_status, last_error)`.
+#[cfg(feature = "db")]
+type BackoffOutcomeRow = (Uuid, i32, DateTime<Utc>, Option<u16>, Option<String>);
+
+/// Bulk-record every `Backoff` outcome from one scanner tick in a single
+/// round trip. Same join-on-`(id, attempt)` guard as
+/// [`apply_delivered_outcomes_batch`]; see its doc comment.
+#[cfg(feature = "db")]
+async fn apply_backoff_outcomes_batch(
+    conn: &mut diesel_async::AsyncPgConnection,
+    rows: &[BackoffOutcomeRow],
+    now: DateTime<Utc>,
+) -> crate::error::HarvestResult<()> {
+    use diesel_async::RunQueryDsl;
+
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.0).collect();
+    let attempts: Vec<i32> = rows.iter().map(|r| r.1).collect();
+    let next_attempt_ats: Vec<DateTime<Utc>> = rows.iter().map(|r| r.2).collect();
+    let last_statuses: Vec<Option<i32>> = rows.iter().map(|r| r.3.map(i32::from)).collect();
+    let last_errors: Vec<Option<String>> = rows.iter().map(|r| r.4.clone()).collect();
+
+    diesel::sql_query(
+        "UPDATE harvest_completion_deliveries d \
+         SET state = 'PENDING', next_attempt_at = v.next_attempt_at, \
+             last_status = v.last_status, last_error = v.last_error, updated_at = $1 \
+         FROM unnest($2::uuid[], $3::int4[], $4::timestamptz[], $5::int4[], $6::text[]) \
+              AS v(id, attempt, next_attempt_at, last_status, last_error) \
+         WHERE d.id = v.id AND d.attempt = v.attempt",
+    )
+    .bind::<diesel::sql_types::Timestamptz, _>(now)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(ids)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(attempts)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Timestamptz>, _>(next_attempt_ats)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Nullable<diesel::sql_types::Integer>>, _>(
+        last_statuses,
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Nullable<diesel::sql_types::Text>>, _>(
+        last_errors,
+    )
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    Ok(())
+}
+
 /// Record the outcome of one delivery attempt: `DELIVERED` (single
 /// `UPDATE`), rescheduled with backoff (single `UPDATE`), or dead-lettered
 /// (`UPDATE` + `harvest_dead_letters` insert, in one transaction so the two
 /// writes are atomic).
+///
+/// Only the `DeadLetter` branch is still reachable from the main per-tick
+/// scanner loop. `Delivered` and `Backoff` outcomes there are recorded via
+/// [`apply_delivered_outcomes_batch`] / [`apply_backoff_outcomes_batch`]
+/// instead: one round trip per outcome kind per tick, not one per row.
+/// The pre-dispatch exceptional paths (SSRF re-check failure, payload
+/// serialization failure) still call this directly with `DeadLetter`.
+/// They run per-row, before the batch's outcomes are even classified.
 #[cfg(feature = "db")]
 async fn apply_outcome(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -2566,6 +3127,7 @@ async fn completion_deliveries_table_exists(
 /// "processed" for scanner-tick accounting, mirroring
 /// `enforce_timeouts_once`'s `count` semantics).
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_lines)] // claim + re-read + dispatch + classify + batched-apply is one tick
 async fn fire_due_on_conn(
     conn: &mut diesel_async::AsyncPgConnection,
     config: &CallbackRuntimeConfig,
@@ -2625,9 +3187,11 @@ async fn fire_due_on_conn(
         // operator gets a visible, actionable DLQ entry instead of a task
         // that appears to make no progress.
         if let Err(rejection) = validate_target_url(&row.target_url, &config.ssrf_policy) {
+            // REDACTED to its origin, not logged whole (issue #1274). See
+            // the matching note in `enqueue_completion_deliveries` above.
             tracing::warn!(
                 delivery_id = %row.id,
-                target_url = %row.target_url,
+                target_url = %crate::audit_export::redact_webhook_url(&row.target_url),
                 rejection = ?rejection,
                 "completion-callback target URL no longer allowed by the live SSRF policy; dead-lettering"
             );
@@ -2694,6 +3258,20 @@ async fn fire_due_on_conn(
     // finished" for the whole batch.
     let backoff_now = Utc::now();
 
+    // Classify every attempt's outcome first, sorting rows into three
+    // buckets by action kind. Then write each bucket in one round trip,
+    // instead of one `apply_outcome` call per row. The classify/apply
+    // split itself is unchanged; only how the resulting actions get
+    // written is new. `Delivered` and `Backoff` are the common paths and
+    // are batched below. `DeadLetter` keeps the per-row transaction
+    // `apply_outcome` already used. Its fence-check + `FOR UPDATE`
+    // re-read + DLQ insert are a documented atomicity guarantee, named
+    // on `dead_letter_entry_with_current_payload`. This change does not
+    // touch that guarantee.
+    let mut delivered_rows: Vec<(Uuid, i32, u16)> = Vec::new();
+    let mut backoff_rows: Vec<BackoffOutcomeRow> = Vec::new();
+    let mut dead_letter_rows: Vec<(ClaimedDeliveryRow, OutcomeAction)> = Vec::new();
+
     for ((row, _body, _headers), attempt_outcome) in dispatchable.into_iter().zip(attempt_outcomes)
     {
         let retry_policy: crate::policy::RetryPolicy = match serde_json::from_value(
@@ -2722,8 +3300,34 @@ async fn fire_due_on_conn(
             backoff_now,
         );
 
-        apply_outcome(conn, &row, action).await?;
+        match action {
+            OutcomeAction::Delivered { status } => {
+                delivered_rows.push((row.id, row.attempt, status));
+            }
+            OutcomeAction::Backoff {
+                next_attempt_at,
+                last_status,
+                last_error,
+            } => {
+                backoff_rows.push((
+                    row.id,
+                    row.attempt,
+                    next_attempt_at,
+                    last_status,
+                    last_error,
+                ));
+            }
+            OutcomeAction::DeadLetter { .. } => {
+                dead_letter_rows.push((row, action));
+            }
+        }
         processed += 1;
+    }
+
+    apply_delivered_outcomes_batch(conn, &delivered_rows, backoff_now).await?;
+    apply_backoff_outcomes_batch(conn, &backoff_rows, backoff_now).await?;
+    for (row, action) in dead_letter_rows {
+        apply_outcome(conn, &row, action).await?;
     }
 
     Ok(processed)
@@ -2751,26 +3355,46 @@ pub async fn fire_due_completion_deliveries(
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
     shard_assignments: &[crate::types::ShardId],
 ) -> crate::error::HarvestResult<usize> {
+    fire_due_completion_deliveries_on_conn_shard(
+        conn,
+        None,
+        sharded_pool.as_ref(),
+        shard_assignments,
+    )
+    .await
+}
+
+/// [`fire_due_completion_deliveries`] for a caller that knows `conn`'s shard.
+/// See [`crate::shard::connect_or_reuse`].
+#[cfg(feature = "db")]
+pub(crate) async fn fire_due_completion_deliveries_on_conn_shard(
+    conn: &mut diesel_async::AsyncPgConnection,
+    conn_shard: Option<crate::types::ShardId>,
+    sharded_pool: Option<&crate::shard::ShardedDbPool>,
+    shard_assignments: &[crate::types::ShardId],
+) -> crate::error::HarvestResult<usize> {
     let Some(config) = read_global_callback_config() else {
         return Ok(0);
     };
 
     let mut total = 0usize;
 
+    // Scans each assigned shard's own `harvest_completion_deliveries` table
+    // in turn (issue #1362).
     match sharded_pool {
         Some(sp) if !shard_assignments.is_empty() => {
             for shard in shard_assignments {
-                let Some(pool) = sp.exact_pool_for(*shard).cloned() else {
+                let Some(mut shard_conn) = crate::shard::connect_or_reuse(
+                    conn,
+                    conn_shard,
+                    sp,
+                    *shard,
+                    "completion_callback",
+                    crate::shard::ShardConnectError::LogAndSkip,
+                )
+                .await?
+                else {
                     continue;
-                };
-                let mut shard_conn = match pool.get().await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!(
-                            "[completion_callback] failed to get connection to shard {shard:?}: {e:?}"
-                        );
-                        continue;
-                    }
                 };
                 total += fire_due_on_conn(&mut shard_conn, &config, Some(shard.as_i32())).await?;
             }
@@ -2878,6 +3502,24 @@ pub async fn redrive_delivery(
     exec_id: crate::types::ExecutionId,
     delivery_id: Uuid,
 ) -> crate::error::HarvestResult<DeliveryRedriveOutcome> {
+    redrive_delivery_at(conn, exec_id, delivery_id, None).await
+}
+
+/// [`redrive_delivery`] with a time for the next attempt (issue #1832).
+///
+/// A bulk DLQ redrive spreads its deliveries with `not_before`, so they do
+/// not all reach one receiver at one instant. `None` makes the delivery due
+/// at once.
+///
+/// # Errors
+/// Returns `HarvestError` on a database failure.
+#[cfg(feature = "db")]
+pub async fn redrive_delivery_at(
+    conn: &mut diesel_async::AsyncPgConnection,
+    exec_id: crate::types::ExecutionId,
+    delivery_id: Uuid,
+    not_before: Option<DateTime<Utc>>,
+) -> crate::error::HarvestResult<DeliveryRedriveOutcome> {
     use diesel::prelude::*;
     use diesel_async::AsyncConnection;
     use diesel_async::RunQueryDsl;
@@ -2921,7 +3563,7 @@ pub async fn redrive_delivery(
             .set((
                 dsl::state.eq("PENDING"),
                 dsl::max_attempts.eq(extended_max_attempts),
-                dsl::next_attempt_at.eq(Utc::now()),
+                dsl::next_attempt_at.eq(not_before.unwrap_or_else(Utc::now)),
                 dsl::last_status.eq(None::<i32>),
                 dsl::last_error.eq(None::<String>),
                 dsl::updated_at.eq(Utc::now()),

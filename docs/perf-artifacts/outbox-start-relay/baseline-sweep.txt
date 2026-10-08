@@ -1,0 +1,25 @@
+-- outbox start relay, pg_stat_statements sweep (BASELINE: per-row mark, before
+   batching, commit 8439bff / harness introduced at this commit; code as of
+   44592ba's parent) --
+   Captured with: HARVEST_TEST_DATABASE_URL set to a local Postgres 16 with
+   pg_stat_statements preloaded; cargo test -p autumn-harvest-plugin
+   --test outbox_start_relay_perf -- --ignored --nocapture --test-threads=1
+
+n	delivered	claim_calls	total_calls	total_buffers
+5	5	1	8	117
+20	20	1	23	451
+50	50	2	55	1236
+
+-- n=50, top statements by calls (verified against the classification bug fix
+   in tests/outbox_start_relay_perf.rs's is_mark_statement -- see after-sweep.txt's
+   header note) --
+calls=  50 ( 90.9%)  buffers=  568 ( 46.0%)  UPDATE harvest_workflow_outbox SET delivery_attempts = delivery_attempts + $4, last_error ...
+calls=   2 (  3.6%)  buffers=  668 ( 54.0%)  WITH due AS ( SELECT id FROM harvest_workflow_outbox WHERE delivered_at IS NULL AND next_attempt_at ...
+calls=   1 (  1.8%)  buffers=    0 (  0.0%)  SELECT $1
+calls=   1 (  1.8%)  buffers=    0 (  0.0%)  SET TIME ZONE 'UTC'
+calls=   1 (  1.8%)  buffers=    0 (  0.0%)  SET CLIENT_ENCODING TO 'UTF8'
+
+The per-row mark UPDATE is 90.9% of statement calls and 46.0% of buffers for
+a 50-row batch drain -- clears the 5% profile floor by roughly 9x on calls,
+and clears the "elimination of an N+1" impact floor by itself (statement
+count for the mark step is O(n): one UPDATE per delivered/failed row).

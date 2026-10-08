@@ -320,21 +320,9 @@ async fn observe_shard(
     pool: Option<DbPool>,
     query: &WorkflowCountQuery,
 ) -> ShardObservation<WorkflowCountRow> {
-    let Some(pool) = pool else {
-        return ShardObservation {
-            shard_id,
-            rows: Vec::new(),
-            error: Some(format!("shard {shard_id} has no configured storage pool")),
-        };
-    };
-    let Ok(mut conn) = pool.get().await else {
-        return ShardObservation {
-            shard_id,
-            rows: Vec::new(),
-            error: Some(format!(
-                "database connection for shard {shard_id} could not be acquired"
-            )),
-        };
+    let mut conn = match shard_fanout::acquire_shard_conn(shard_id, pool).await {
+        Ok(conn) => conn,
+        Err(observation) => return observation,
     };
     match count_workflow_executions_grouped(&mut conn, shard_id, query).await {
         Ok(rows) => ShardObservation {
@@ -586,7 +574,7 @@ mod tests {
         let params = WorkflowCountParams::from_query_pairs(&[], STATES).unwrap();
         assert_eq!(params.group_by, vec![WorkflowCountDimension::State]);
         assert_eq!(params.limit_groups, DEFAULT_LIMIT_GROUPS);
-        assert!(params.states.is_empty());
+        assert_eq!(params.states, [] as [std::string::String; 0]);
         assert!(params.workflow_name.is_none());
     }
 

@@ -75,7 +75,7 @@ async fn insert_named_running(
             workflow_id,
             run_id: Uuid::new_v4(),
             shard_id: 0,
-            input: serde_json::json!({}),
+            input: serde_json::json!({}).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -200,7 +200,7 @@ fn default_params(exec_id: ExecutionId, workflow_id: &str) -> StartWorkflowParam
         workflow_name: "chain_cap_workflow",
         workflow_id,
         exec_id,
-        input: serde_json::json!({}),
+        input: serde_json::json!({}).into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -529,18 +529,6 @@ fn chain_can_registry() -> Arc<HandlerRegistry> {
 async fn continue_as_new_carries_chain_deadline_verbatim() {
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
-
-    // Scrub the shared e2e identity so this test is isolated.
-    for stmt in [
-        "DELETE FROM harvest_events WHERE workflow_exec_id IN (SELECT id FROM harvest_workflow_executions WHERE workflow_name = 'e2e_test_workflow')",
-        "DELETE FROM harvest_task_queue WHERE workflow_exec_id IN (SELECT id FROM harvest_workflow_executions WHERE workflow_name = 'e2e_test_workflow')",
-        "DELETE FROM harvest_workflow_executions WHERE workflow_name = 'e2e_test_workflow'",
-    ] {
-        diesel::sql_query(stmt)
-            .execute(&mut conn)
-            .await
-            .expect("scrub");
-    }
 
     let origin = insert_workflow_execution(&mut conn).await;
     // Stamp the origin's chain cap: a FUTURE absolute deadline so the successor

@@ -45,7 +45,7 @@ const CANARY_WF: &str = "__harvest_canary_probe__default";
 const NORMAL_WF: &str = "normal_wf";
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 // ── Recording metrics ──────────────────────────────────────────────────────
@@ -237,7 +237,7 @@ async fn provision_ephemeral_db(base_url: &str) -> String {
     let mut conn = AsyncPgConnection::establish(&new_url)
         .await
         .expect("connect to ephemeral database");
-    conn.batch_execute(autumn_harvest::full_migrations_sql())
+    conn.batch_execute(&autumn_harvest::test_init_sql())
         .await
         .expect("apply migration bundle to ephemeral database");
     new_url
@@ -352,6 +352,9 @@ fn make_worker(
     ));
     Worker::new(
         WorkerRuntimeConfig {
+            codec_rotation_batch_size: 0,
+            scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
+            dr: autumn_harvest::replication::DrConfig::default(),
             worker_id: uuid::Uuid::new_v4().to_string(),
             queues: vec!["default".to_string()],
             queue_weights: std::collections::HashMap::new(),
@@ -369,6 +372,7 @@ fn make_worker(
             build_id: "canary-test".to_string(),
             deployment_name: None,
             workflow_cache_size: 100,
+            resident_workflows: true,
             priority_aging_secs: None,
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
@@ -407,7 +411,7 @@ async fn start_workflow(
             workflow_name,
             workflow_id,
             exec_id: ExecutionId::new_for_shard(ShardId::new(0)),
-            input: Value::Null,
+            input: Value::Null.into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,

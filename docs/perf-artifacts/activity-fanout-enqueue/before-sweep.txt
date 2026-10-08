@@ -1,0 +1,5 @@
+-- before: fan-out enqueue, pg_stat_statements call/buffer sweep --
+n	enqueue_calls	enqueue_buffers	request_calls	request_buffers	wal_bytes
+5	5	1217	10	1217	6776
+20	20	1404	40	1404	23768
+200	200	3455	400	3455	231120

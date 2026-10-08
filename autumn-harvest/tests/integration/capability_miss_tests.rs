@@ -84,7 +84,7 @@ use uuid::Uuid;
 // ---------------------------------------------------------------------------
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 async fn setup_db() -> (String, Option<ContainerAsync<Postgres>>) {
@@ -270,6 +270,9 @@ fn build_worker_tuned(
     Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
+                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
+                dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: worker_id.to_string(),
                 queues: queues.iter().map(|q| (*q).to_string()).collect(),
                 notification_database_url: None,
@@ -285,6 +288,7 @@ fn build_worker_tuned(
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
+                resident_workflows: true,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold,
@@ -340,7 +344,7 @@ async fn seed_execution(
         workflow_id: &format!("wf-{}", exec_id.as_uuid()),
         run_id: Uuid::new_v4(),
         shard_id: 0,
-        input: input.clone(),
+        input: input.clone().into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -923,28 +927,27 @@ fn decoy_workflow(_ctx: &WorkflowContext, _input: serde_json::Value) -> BoxFut<'
 /// peer whose evidence it clears (issue #804 round 27).
 ///
 /// A **pool**, not a URL, for the exact reason [`CLAIM_THEFT_INJECTION`]
-/// documents: the whole body has only `executor::SUSPENSION_TIMEOUT` (100 ms)
-/// to reach a command-emitting suspension, and a fresh
+/// documents. The whole body has a bounded window to reach a
+/// command-emitting suspension. That window was 100 ms, and since issue
+/// #1797 it is `executor::DEADLOCK_TIMEOUT`. A fresh
 /// `AsyncPgConnection::establish` per dispatch pays a full TCP+auth handshake
-/// inside that window — slow enough under load to blow the budget outright
-/// (issue #1182, Codex round-3: this test failed the exact same way the
-/// primary #1182 regression did, `"workflow suspended without emitted
-/// commands"`, because the raw connect never resolved in time and the miss
-/// this test exists to exercise was never reached). A pooled, pre-warmed
+/// inside that window. Under load that was slow enough to blow the budget
+/// (issue #1182). This test then failed exactly like the primary #1182
+/// regression, with `"workflow suspended without emitted commands"`. The raw
+/// connect never resolved in time, so the body never reached the miss. A pooled, pre-warmed
 /// checkout reuses a live connection and pays only the `UPDATE`.
 ///
 /// A `OnceLock` rather than a parameter because a `WorkflowHandlerFn` is a bare
 /// `fn` pointer with a fixed signature and cannot capture.
 ///
 /// A **pool**, not a URL, for exactly the reason [`CLAIM_THEFT_INJECTION`]
-/// documents one round later: the invalidation has to land inside the dispatch
-/// window, and the whole body has only `executor::SUSPENSION_TIMEOUT` (100 ms)
-/// to reach a command-emitting suspension. A fresh
-/// `AsyncPgConnection::establish` pays a full TCP+auth handshake *inside* that
-/// window on a database this suite shares; blow the 100 ms and the dispatch is
-/// failed with "workflow suspended without emitted commands", the run goes
-/// terminal, and this test fails claiming the decision used a stale snapshot
-/// when in truth the body never reached the miss at all. The pool must be
+/// documents one round later. The invalidation has to land inside the
+/// dispatch window. The whole body has a bounded window to reach a
+/// command-emitting suspension (`executor::DEADLOCK_TIMEOUT` since #1797).
+/// A fresh `AsyncPgConnection::establish` pays a full TCP+auth handshake
+/// *inside* that window, on a database this suite shares. If it blows the
+/// window, the body never reaches the miss. This test then fails and claims
+/// the decision used a stale snapshot, which is false. The pool must be
 /// pre-warmed before the worker starts — see [`prewarm_race_injection`].
 static RACE_INJECTION: std::sync::OnceLock<(DbPool, String)> = std::sync::OnceLock::new();
 
@@ -1016,11 +1019,11 @@ fn workflow_invalidates_peer_then_misses(
 /// [`prewarm_claim_theft_injection`]. `deadpool` builds lazily, so an unwarmed
 /// pool pays that same TCP+auth handshake on its *first* `get()`, and this test
 /// performs exactly one dispatch: without the pre-warm the handshake lands
-/// inside the very window the pool exists to protect. The whole body has only
-/// `executor::SUSPENSION_TIMEOUT` (100 ms) to reach a command-emitting
-/// suspension; blow that and the dispatch is failed with "workflow suspended
-/// without emitted commands", the theft never happens, and this test fails as a
-/// bare `wait_for_task_owner` timeout that names none of the above.
+/// inside the very window the pool exists to protect. The whole body has a
+/// bounded window to reach a command-emitting suspension
+/// (`executor::DEADLOCK_TIMEOUT` since issue #1797). If it blows that window,
+/// the dispatch never reaches the theft. This test then fails as a bare
+/// `wait_for_task_owner` timeout that names none of the above.
 static CLAIM_THEFT_INJECTION: std::sync::OnceLock<DbPool> = std::sync::OnceLock::new();
 
 /// Force [`CLAIM_THEFT_INJECTION`]'s lazy `deadpool` to establish a connection
@@ -1399,7 +1402,10 @@ async fn activity_capability_miss_is_released_for_a_capable_peer() {
         Some(serde_json::json!("activity done")),
         "the workflow returned the capable peer's activity output"
     );
-    assert!(dead_letter_errors(&url, exec_id).await.is_empty());
+    assert_eq!(
+        dead_letter_errors(&url, exec_id).await,
+        [] as [std::string::String; 0]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1534,7 +1540,10 @@ async fn a_post_handler_release_does_not_re_emit_workflow_started() {
         "`harvest.workflow.started` must be emitted EXACTLY ONCE for this \
          execution across the whole incapable-then-capable dispatch sequence"
     );
-    assert!(dead_letter_errors(&url, exec_id).await.is_empty());
+    assert_eq!(
+        dead_letter_errors(&url, exec_id).await,
+        [] as [std::string::String; 0]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1666,7 +1675,10 @@ async fn a_local_activity_miss_releases_before_committing_its_batch() {
         "the capable worker DOES commit the breadcrumb -- without this the \
          phase-1 assertion would hold for the wrong reason"
     );
-    assert!(dead_letter_errors(&url, exec_id).await.is_empty());
+    assert_eq!(
+        dead_letter_errors(&url, exec_id).await,
+        [] as [std::string::String; 0]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2852,14 +2864,13 @@ async fn a_claim_lost_mid_dispatch_makes_no_terminal_decision() {
 /// Deterministic companion to
 /// [`a_claim_lost_mid_dispatch_makes_no_terminal_decision`] (issue #1182).
 ///
-/// That test relies on winning a real race between a slow in-body database
-/// round trip and `executor::SUSPENSION_TIMEOUT`, so it exercises
-/// [`handle_suspended_workflow`]'s catch-all branch -- reached when a live
-/// dispatch cycle suspends having emitted **zero** commands at all -- only
-/// when the round trip happens to land on the wrong side of that 100 ms
-/// budget. Under a loaded CI runner it reliably does (issue #1182); under a
-/// fast one it can just as reliably not, silently skipping this branch for
-/// months without anyone noticing. This test drives the exact same primitive
+/// That test used to win a real race between a slow in-body database round
+/// trip and the old 100 ms suspension timer. Only then did it exercise
+/// [`handle_suspended_workflow`]'s catch-all branch, which a live dispatch
+/// cycle reaches when it suspends with **zero** commands. Issue #1797 removed
+/// that timer, so a slow round trip no longer produces the empty suspension.
+/// The branch is still reachable, for example by a false `await_condition`
+/// with no command. This test drives the exact same primitive
 /// the branch now delegates to,
 /// [`fail_suspended_workflow_if_still_claimed`], directly and
 /// unconditionally: the claim theft is committed for real *before* the call,
@@ -2897,8 +2908,7 @@ async fn a_stale_dispatcher_with_zero_emitted_commands_makes_no_terminal_decisio
         .expect("transfer the claim");
 
     // The live dispatch cycle suspended having emitted no commands at all --
-    // the shape produced when a handler's whole `SUSPENSION_TIMEOUT` budget is
-    // spent on something other than a command-emitting await point. This is
+    // the shape a false `await_condition` with no command produces. This is
     // `handle_suspended_workflow`'s catch-all `else` branch, driven here via
     // the exact error text it builds for an empty command set.
     let error = "workflow suspended without emitted commands; resumption is not implemented yet";
@@ -2910,6 +2920,7 @@ async fn a_stale_dispatcher_with_zero_emitted_commands_makes_no_terminal_decisio
         1, // next_event_id: irrelevant on ClaimLost, and re-derived under the guard
         "dispatcher-a",
         error,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await;
 
@@ -3027,6 +3038,7 @@ async fn a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_
                 1,
                 "dispatcher-a",
                 "workflow suspended without emitted commands; resumption is not implemented yet",
+                &autumn_harvest::payload_codec::PayloadCodecs::default(),
             )
             .await
             .expect_err("SKIP LOCKED never waits, so the row reads as contended immediately")
@@ -3046,6 +3058,7 @@ async fn a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_
                 ambiguous_task_id,
                 "dispatcher-a",
                 task.crash_strikes,
+                task.attempt,
             )
             .await?;
             Ok::<_, autumn_harvest::HarvestError>((probe_elapsed, released))
@@ -3179,6 +3192,7 @@ async fn an_ambiguous_claim_rolls_back_every_earlier_write_in_the_same_transacti
                 1,
                 "dispatcher-a",
                 error,
+                &autumn_harvest::payload_codec::PayloadCodecs::default(),
             )
             .await?;
 
@@ -3289,6 +3303,7 @@ async fn a_task_row_first_peer_touching_the_execution_row_never_deadlocks_the_re
                 1,
                 "dispatcher-a",
                 "workflow suspended without emitted commands; resumption is not implemented yet",
+                &autumn_harvest::payload_codec::PayloadCodecs::default(),
             )
             .await
             .expect_err("SKIP LOCKED never waits, so the row reads as contended immediately")
@@ -3304,6 +3319,7 @@ async fn a_task_row_first_peer_touching_the_execution_row_never_deadlocks_the_re
                 ambiguous_task_id,
                 "dispatcher-a",
                 task.crash_strikes,
+                task.attempt,
             )
             .await
         }
@@ -3404,6 +3420,7 @@ async fn a_failed_evidence_cleanup_rolls_back_the_registration() {
     let cleared = autumn_harvest::workers::register_worker_and_clear_stale_miss_evidence(
         &mut conn,
         &registration,
+        &[],
     )
     .await
     .expect("the happy path commits both writes");
@@ -3429,6 +3446,7 @@ async fn a_failed_evidence_cleanup_rolls_back_the_registration() {
     let failed = autumn_harvest::workers::register_worker_and_clear_stale_miss_evidence(
         &mut conn,
         &registration,
+        &[],
     )
     .await;
 
@@ -3476,6 +3494,7 @@ async fn tick_once(
         &Mutex::new(None),
         0,
         registration_pending,
+        &[],
     )
     .await;
 }
@@ -4028,7 +4047,8 @@ async fn a_timed_out_workflow_task_reset_preserves_the_capability_miss_budget() 
     .expect("seed a claimed, previously-missed task");
     assert_eq!(load_task(&url, task_id).await.capability_misses, 4);
 
-    autumn_harvest::worker::reset_timed_out_workflow_task(&pool, task_id, "slow-but-capable").await;
+    autumn_harvest::worker::reset_timed_out_workflow_task(&pool, task_id, "slow-but-capable", 0, 0)
+        .await;
 
     let task = load_task(&url, task_id).await;
     assert_eq!(
@@ -4091,11 +4111,12 @@ async fn a_same_worker_reclaim_after_a_requeue_is_not_released_by_the_stale_disp
     .expect("requeue then re-claim with the same worker");
 
     // The stale dispatcher, still holding its pre-requeue snapshot, releases.
+    // It passes the new claim's attempt, so only `crash_strikes` differs and
+    // this test pins that guard alone. Issue #1917 covers `attempt`.
     let mut conn = connect(&url).await;
     let released = queue::release_task_for_capability_miss(
         &mut conn,
-        task.id,
-        "worker-a",
+        &queue::TaskClaim::new(task.id, "worker-a", 3),
         Duration::from_secs(1),
         CapabilityMissPhase::BeforeHandler,
         task.crash_strikes,
@@ -4189,8 +4210,7 @@ async fn the_release_reports_the_cardinality_it_actually_committed() {
 
     let released = queue::release_task_for_capability_miss(
         &mut conn,
-        task_id,
-        "incapable",
+        &queue::TaskClaim::new(task_id, "incapable", load_task(&url, task_id).await.attempt),
         Duration::from_secs(1),
         CapabilityMissPhase::BeforeHandler,
         // The claim epoch this seeded row was claimed at (Codex round-37 P1).
@@ -4248,8 +4268,7 @@ async fn release_never_writes_the_error_column() {
 
     let released = queue::release_task_for_capability_miss(
         &mut conn,
-        task_id,
-        "incapable",
+        &queue::TaskClaim::new(task_id, "incapable", load_task(&url, task_id).await.attempt),
         Duration::from_secs(1),
         // A workflow-type lookup miss is `BeforeHandler`: the crash-strike
         // counter is preserved (Codex round-12 P1) and `attempt` is restored
@@ -4293,8 +4312,7 @@ async fn release_never_writes_the_error_column() {
 
     let released2 = queue::release_task_for_capability_miss(
         &mut conn,
-        task2,
-        "incapable",
+        &queue::TaskClaim::new(task2, "incapable", load_task(&url, task2).await.attempt),
         Duration::from_secs(1),
         // A workflow-type lookup miss is `BeforeHandler`: the crash-strike
         // counter is preserved (Codex round-12 P1) and `attempt` is restored
@@ -4345,8 +4363,11 @@ async fn release_is_a_noop_when_the_claim_was_already_taken() {
 
     let released = queue::release_task_for_capability_miss(
         &mut conn,
-        task_id,
-        "worker-we-are",
+        &queue::TaskClaim::new(
+            task_id,
+            "worker-we-are",
+            load_task(&url, task_id).await.attempt,
+        ),
         Duration::from_secs(1),
         CapabilityMissPhase::BeforeHandler,
         // The claim epoch this seeded row was claimed at (Codex round-37 P1).
@@ -4758,8 +4779,7 @@ async fn releasing_a_pre_handler_miss_preserves_the_poison_pill_crash_strikes() 
 
     let released = queue::release_task_for_capability_miss(
         &mut conn,
-        task_id,
-        "incapable",
+        &queue::TaskClaim::new(task_id, "incapable", load_task(&url, task_id).await.attempt),
         Duration::from_secs(1),
         CapabilityMissPhase::BeforeHandler,
         // The claim epoch this seeded row was claimed at (Codex round-37 P1).
@@ -4807,8 +4827,7 @@ async fn releasing_a_pre_handler_miss_preserves_the_poison_pill_crash_strikes() 
 
     let released2 = queue::release_task_for_capability_miss(
         &mut conn,
-        task2,
-        "incapable",
+        &queue::TaskClaim::new(task2, "incapable", load_task(&url, task2).await.attempt),
         Duration::from_secs(1),
         CapabilityMissPhase::AfterHandler,
         // The claim epoch this seeded row was claimed at (Codex round-37 P1).
@@ -5014,6 +5033,7 @@ async fn a_claim_transferred_before_the_terminal_write_is_not_failed_by_the_stal
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
         },
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await
     .expect("the guarded write must not error");
@@ -5103,6 +5123,7 @@ async fn a_task_row_locked_by_a_concurrent_transaction_withdraws_without_waiting
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
             },
+            &autumn_harvest::payload_codec::PayloadCodecs::default(),
         )
         .await
         .expect("the guarded write must not error")
@@ -5196,6 +5217,7 @@ async fn a_same_worker_reclaim_after_a_requeue_is_not_failed_by_the_stale_escala
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
         },
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await
     .expect("the guarded write must not error");
@@ -5254,6 +5276,7 @@ async fn a_claim_still_held_through_the_terminal_write_still_fails_the_task() {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
         },
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await
     .expect("the guarded write must not error");
@@ -5342,6 +5365,7 @@ async fn a_terminal_write_appends_at_the_event_id_current_under_the_lock() {
         // its own test below.
         None,
         |_| {},
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await
     .expect("the terminal write must not collide with the consumed event id");
@@ -5446,6 +5470,7 @@ async fn a_peer_that_re_registers_before_the_lock_withdraws_the_escalation() {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
         },
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await
     .expect("the guarded write must not error");
@@ -5522,6 +5547,7 @@ async fn evidence_that_still_supports_escalation_under_the_lock_still_commits() 
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
         },
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await
     .expect("the guarded write must not error");
@@ -5612,6 +5638,7 @@ async fn the_persisted_reason_comes_from_the_in_transaction_resolution() {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
         },
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await
     .expect("the guarded write must not error");
@@ -5757,6 +5784,13 @@ async fn the_startup_invalidation_is_index_servable_not_a_backlog_scan() {
          register_worker's transaction, so a backlog scan delays publishing the \
          very worker that resolves the miss. Plan was:\n{plan}"
     );
+    // The live-row index of issue #1795 also matches `state IN (...)`. A walk
+    // over it still reads every live row, so the plan must name this index.
+    assert!(
+        plan.contains("idx_harvest_tq_capability_miss_workers"),
+        "the startup invalidation must use the capability-miss partial index, \
+         not an index over every live row. Plan was:\n{plan}"
+    );
 }
 
 /// The empty-array guard in the invalidation's `WHERE` clause is
@@ -5799,11 +5833,13 @@ async fn dropping_the_empty_array_guard_returns_the_invalidation_to_a_full_scan(
     let without_guard = statement.replace(guard, "");
 
     let plan = explain_plan(&mut conn, &without_guard).await;
+    // Another index can still serve `state IN (...)`, for example the
+    // live-row index of issue #1795. So the check names the partial index.
     assert!(
-        plan.contains("Seq Scan on harvest_task_queue"),
+        !plan.contains("idx_harvest_tq_capability_miss_workers"),
         "without the empty-array guard the planner cannot match the partial \
-         index, so this variant must fall back to a scan — that is precisely \
-         why the conjunct is not redundant. Plan was:\n{plan}"
+         index, so this variant must fall back to a wider scan — that is \
+         precisely why the conjunct is not redundant. Plan was:\n{plan}"
     );
 }
 
@@ -5945,7 +5981,10 @@ async fn cross_type_continue_as_new_missing_target_is_released_for_a_capable_pee
         "the predecessor seals cleanly once a capable peer runs the transition: {:?}",
         sealed.error
     );
-    assert!(dead_letter_errors(&url, exec_id).await.is_empty());
+    assert_eq!(
+        dead_letter_errors(&url, exec_id).await,
+        [] as [std::string::String; 0]
+    );
 }
 
 // -- Codex round-46 P1: evidence is keyed to the handler it is about ---------

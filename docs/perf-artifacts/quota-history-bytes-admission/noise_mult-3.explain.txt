@@ -1,0 +1,58 @@
+-- quota_usage_query() @ target=1000 active/178000 events, noise_mult=3 --
+Result  (cost=16422.23..16422.24 rows=1 width=24) (actual time=69.343..69.352 rows=1 loops=1)
+  Output: $1, COALESCE($2, '0'::bigint), $3
+  Buffers: shared hit=12745
+  CTE active
+    ->  Bitmap Heap Scan on public.harvest_workflow_executions  (cost=22.50..146.00 rows=893 width=16) (actual time=0.069..0.411 rows=1000 loops=1)
+          Output: harvest_workflow_executions.id
+          Recheck Cond: ((harvest_workflow_executions.workflow_name = 'order_saga'::text) AND (harvest_workflow_executions.quota_key = 'acme'::text))
+          Filter: (harvest_workflow_executions.state = ANY ('{RUNNING,PAUSED}'::text[]))
+          Heap Blocks: exact=27
+          Buffers: shared hit=29
+          ->  Bitmap Index Scan on idx_harvest_we_quota_active  (cost=0.00..22.28 rows=1000 width=0) (actual time=0.045..0.045 rows=1000 loops=1)
+                Index Cond: ((harvest_workflow_executions.workflow_name = 'order_saga'::text) AND (harvest_workflow_executions.quota_key = 'acme'::text))
+                Buffers: shared hit=2
+  InitPlan 2 (returns $1)
+    ->  Aggregate  (cost=20.09..20.10 rows=1 width=8) (actual time=0.783..0.784 rows=1 loops=1)
+          Output: count(*)
+          Buffers: shared hit=29
+          ->  CTE Scan on active  (cost=0.00..17.86 rows=893 width=0) (actual time=0.072..0.656 rows=1000 loops=1)
+                Output: active.id
+                Buffers: shared hit=29
+  InitPlan 3 (returns $2)
+    ->  Aggregate  (cost=16198.55..16198.56 rows=1 width=8) (actual time=68.507..68.510 rows=1 loops=1)
+          Output: sum(pg_column_size(e.event_data))
+          Buffers: shared hit=12713
+          ->  Hash Join  (cost=24.59..15927.90 rows=54129 width=409) (actual time=0.794..59.776 rows=178000 loops=1)
+                Output: e.event_data
+                Inner Unique: true
+                Hash Cond: (e.workflow_exec_id = active_1.id)
+                Buffers: shared hit=12713
+                ->  Seq Scan on public.harvest_events e  (cost=0.00..14763.00 rows=205000 width=425) (actual time=0.008..29.009 rows=205000 loops=1)
+                      Output: e.id, e.workflow_exec_id, e.event_id, e.event_type, e.event_data, e."timestamp"
+                      Buffers: shared hit=12713
+                ->  Hash  (cost=22.09..22.09 rows=200 width=16) (actual time=0.769..0.771 rows=1000 loops=1)
+                      Output: active_1.id
+                      Buckets: 1024  Batches: 1  Memory Usage: 55kB
+                      ->  HashAggregate  (cost=20.09..22.09 rows=200 width=16) (actual time=0.445..0.610 rows=1000 loops=1)
+                            Output: active_1.id
+                            Group Key: active_1.id
+                            Batches: 1  Memory Usage: 145kB
+                            ->  CTE Scan on active active_1  (cost=0.00..17.86 rows=893 width=16) (actual time=0.000..0.092 rows=1000 loops=1)
+                                  Output: active_1.id
+  InitPlan 4 (returns $3)
+    ->  Aggregate  (cost=57.56..57.57 rows=1 width=8) (actual time=0.041..0.041 rows=1 loops=1)
+          Output: count(*)
+          Buffers: shared hit=3
+          ->  Bitmap Heap Scan on public.harvest_dead_letters  (cost=4.79..57.43 rows=50 width=0) (actual time=0.032..0.034 rows=50 loops=1)
+                Recheck Cond: ((harvest_dead_letters.workflow_name = 'order_saga'::text) AND (harvest_dead_letters.quota_key = 'acme'::text))
+                Heap Blocks: exact=1
+                Buffers: shared hit=3
+                ->  Bitmap Index Scan on idx_harvest_dl_quota  (cost=0.00..4.78 rows=50 width=0) (actual time=0.023..0.023 rows=50 loops=1)
+                      Index Cond: ((harvest_dead_letters.workflow_name = 'order_saga'::text) AND (harvest_dead_letters.quota_key = 'acme'::text))
+                      Buffers: shared hit=2
+Query Identifier: -1228677868546665955
+Planning:
+  Buffers: shared hit=22
+Planning Time: 0.871 ms
+Execution Time: 69.462 ms

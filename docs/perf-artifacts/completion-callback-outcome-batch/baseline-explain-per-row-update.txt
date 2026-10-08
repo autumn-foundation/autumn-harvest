@@ -1,0 +1,10 @@
+Update on public.harvest_completion_deliveries  (cost=0.15..8.17 rows=0 width=0) (actual time=0.064..0.064 rows=0 loops=1)
+  Buffers: shared hit=13
+  ->  Index Scan using harvest_completion_deliveries_pkey on public.harvest_completion_deliveries  (cost=0.15..8.17 rows=1 width=90) (actual time=0.025..0.027 rows=1 loops=1)
+        Output: 'DELIVERED'::text, 204, NULL::text, now(), now(), ctid
+        Index Cond: (harvest_completion_deliveries.id = '79ed4faf-efdb-4b00-b43c-61eee4ca6438'::uuid)
+        Filter: (harvest_completion_deliveries.attempt = 1)
+        Buffers: shared hit=4
+Query Identifier: 7484637725034456726
+Planning Time: 0.071 ms
+Execution Time: 0.082 ms

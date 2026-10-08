@@ -1,0 +1,15 @@
+-- after: pg_stat_statements @ one real GET /admin/schedules request, 500 schedules, 3 shared calendars --
+TOTAL across matching statement shapes: calls=4 buffers=16
+
+calls=1 shared_blks_hit=8 shared_blks_read=0 total_buffers=8
+query=SELECT "harvest_workflow_executions"."workflow_name", COUNT(*) FROM "harvest_workflow_executions" WHERE (("harvest_workflow_executions"."workflow_name" = ANY($1)) AND ("harvest_workflow_executions"."state" = ANY($2))) GROUP BY "harvest_workflow_executions"."workflow_name"
+
+calls=1 shared_blks_hit=5 shared_blks_read=0 total_buffers=5
+query=SELECT to_regclass($1) IS NOT NULL AS present
+
+calls=1 shared_blks_hit=2 shared_blks_read=0 total_buffers=2
+query=SELECT workflow_name, COUNT(*) AS n FROM harvest_start_throttle WHERE workflow_name = ANY($1) GROUP BY workflow_name
+
+calls=1 shared_blks_hit=1 shared_blks_read=0 total_buffers=1
+query=SELECT "harvest_calendar_exclusions"."calendar_name", "harvest_calendar_exclusions"."excluded_date" FROM "harvest_calendar_exclusions" WHERE ("harvest_calendar_exclusions"."calendar_name" = ANY($1))
+

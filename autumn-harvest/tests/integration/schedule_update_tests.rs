@@ -42,7 +42,7 @@ async fn setup_db() -> (AsyncPgConnection, String, ContainerAsync<Postgres>) {
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@{host}:{port}/postgres");
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
-    conn.batch_execute(autumn_harvest::full_migrations_sql())
+    conn.batch_execute(&autumn_harvest::test_init_sql())
         .await
         .expect("migration");
     (conn, url, container)
@@ -492,6 +492,49 @@ async fn invalid_merged_schedule_writes_nothing() {
         snapshot,
         "a rejected patch must write nothing"
     );
+}
+
+/// A PATCH keeps the stored jitter on a cadence change (issue #1792). The
+/// merged jitter must still fit the new cadence. A cron with the 10 s default
+/// moved to a 5 s interval would otherwise defer each fire past the next slot.
+#[tokio::test]
+async fn patch_rejects_stored_jitter_that_the_new_cadence_cannot_hold() {
+    let (mut conn, _url, _c) = setup_db().await;
+    let ws = WorkflowSchedule::new("upd_jitter_wf", Schedule::Cron("0 3 * * *".to_string()));
+    assert_eq!(ws.jitter, autumn_harvest::policy::DEFAULT_CRON_JITTER);
+    let before = register_and_load(&mut conn, &ws).await;
+    let snapshot = serde_json::to_value(&before).unwrap();
+
+    let patch = WorkflowSchedulePatch {
+        schedule: Some(Schedule::Interval(std::time::Duration::from_secs(5))),
+        ..Default::default()
+    };
+    let err = update_workflow_schedule(&mut conn, before.id, &patch)
+        .await
+        .expect_err("a 10 s jitter on a 5 s interval must be rejected");
+    assert!(
+        matches!(err, autumn_harvest::HarvestError::Config(_)),
+        "validation failure must surface as Config, got {err:?}"
+    );
+    let after = load_by_id(&mut conn, before.id).await;
+    assert_eq!(
+        serde_json::to_value(&after).unwrap(),
+        snapshot,
+        "a rejected patch must write nothing"
+    );
+
+    // The same cadence change with a jitter that fits succeeds.
+    let patch = WorkflowSchedulePatch {
+        schedule: Some(Schedule::Interval(std::time::Duration::from_secs(5))),
+        jitter: Some(std::time::Duration::from_secs(1)),
+        ..Default::default()
+    };
+    let row = expect_updated(
+        update_workflow_schedule(&mut conn, before.id, &patch)
+            .await
+            .expect("a fitting jitter must be accepted"),
+    );
+    assert_eq!(row.jitter_secs, 1);
 }
 
 /// Tri-state nullable fields: explicit clear via `Some(None)`, absence leaves

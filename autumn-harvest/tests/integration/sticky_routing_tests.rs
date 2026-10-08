@@ -80,12 +80,12 @@ fn sticky_routing_config_zero_lease_ttl_is_valid() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn worker_config_default_has_sticky_routing_disabled() {
+fn worker_config_default_has_sticky_routing_enabled() {
     let config = WorkerConfig::default();
-    assert!(
-        config.sticky_timeout.is_zero(),
-        "sticky routing must be off by default; got sticky_timeout={:?}",
-        config.sticky_timeout
+    assert_eq!(
+        config.sticky_timeout,
+        Duration::from_secs(5),
+        "sticky routing must be on by default (issue #1798)"
     );
 }
 
@@ -382,7 +382,7 @@ mod db_tests {
     use uuid::Uuid;
 
     fn init_sql() -> Vec<u8> {
-        autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+        autumn_harvest::test_init_sql().as_bytes().to_vec()
     }
 
     async fn setup() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
@@ -410,7 +410,7 @@ mod db_tests {
             workflow_id: &Uuid::new_v4().to_string(),
             run_id: Uuid::new_v4(),
             shard_id: 0,
-            input: serde_json::json!({}),
+            input: serde_json::json!({}).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,

@@ -727,6 +727,32 @@ pub struct HistoryMatcher {
     /// blocked scan as a divergence in NORMAL worker replay too, not only under
     /// strict `WorkflowReplayer` mode (Codex P2 round 12, issue #768).
     timer_scan_stopped_at_command: bool,
+    /// Index of the first event of a **terminal-failure tail** (issue #952), or
+    /// `None` when this history does not end in a failure.
+    ///
+    /// A failing decision cycle's history is truncated by construction: the
+    /// commands the cycle issued were never turned into events, and no further
+    /// event can ever be appended to the sealed run. So a trailing terminal
+    /// `WorkflowFailed` (together with any post-terminal bookkeeping appended
+    /// after it) is made transparent in [`Self::new`] — every `match_*` at that
+    /// cursor answers `NoMatch` ("the run is failing") instead of `Diverged` —
+    /// and, once every pre-terminal event is consumed, the cursor is said to be
+    /// at the **failing frontier** ([`Self::at_terminal_failure_frontier`]),
+    /// where the strict-replay layers above stop reporting divergence.
+    ///
+    /// Deliberately failure-only: a `WorkflowCompleted`/`WorkflowCancelled`
+    /// history is verified in full, and a `WorkflowFailed` that is *reopened* by
+    /// a `WorkflowRedriven` (#510) is not a tail — that case keeps its own,
+    /// redrive-anchored transparency rule.
+    terminal_failure_tail: Option<usize>,
+    /// Signal names that a non-blocking claim probed while no unconsumed
+    /// command event bounded its scan (issue #1798).
+    ///
+    /// Such a probe sees every signal recorded up to the end of history. A
+    /// cold replay of a longer history lets the same probe see later signals
+    /// too. A resident workflow therefore must not resume a wait for one of
+    /// these names, because the probe could read the new signal differently.
+    frontier_probed_signals: HashSet<String>,
 }
 
 impl HistoryMatcher {
@@ -736,10 +762,24 @@ impl HistoryMatcher {
         // Pre-mark pause/resume events as consumed so they are transparent to
         // every cursor-based scan (issue #383). They carry no workflow command,
         // so settling them up front keeps the matcher's scan loops unchanged.
+        //
+        // Post-terminal bookkeeping gets the same treatment (issue #1262).
+        // A workflow-level retry's `WorkflowRetryScheduled` (#523) and a
+        // parent-close cascade's `ChildWorkflowCascadeApplied` (#347)
+        // carry no workflow command. The workflow function never consumes
+        // either. Both are always transparent, not only while searching
+        // for a redrive's superseded terminal. Left opaque, a
+        // retried-then-redriven run's cursor gets stuck on the
+        // bookkeeping event itself, before it ever reaches the marker or
+        // dispatch behind it.
+        //
+        // A decision boundary (issue #1833) is transparent too. It carries
+        // no command, so replay must read a history the same way with or
+        // without boundaries.
         let mut transparent_events: HashSet<usize> = events
             .iter()
             .enumerate()
-            .filter(|(_, e)| Self::is_pause_lifecycle_event(e))
+            .filter(|(_, e)| Self::is_command_free_bookkeeping(e))
             .map(|(i, _)| i)
             .collect();
         // DLQ redrive (issue #510): a `WorkflowRedriven` event reopens a run that
@@ -753,11 +793,17 @@ impl HistoryMatcher {
         // made transparent. A bare trailing `WorkflowFailed` with no following
         // redrive stays non-transparent — it is a genuinely failed run and its
         // replay (queries, the replayer harness) must be unaffected.
+        let mut last_redrive: Option<usize> = None;
         for (i, event) in events.iter().enumerate() {
             if Self::is_redrive_lifecycle_event(event) {
+                last_redrive = Some(i);
                 transparent_events.insert(i);
-                // Scan backward to the nearest WorkflowFailed, skipping events
-                // already settled transparent (e.g. an interleaved pause pair).
+                // Scan backward to the nearest WorkflowFailed. Skip events
+                // already settled transparent: an interleaved pause pair, or
+                // post-terminal bookkeeping (already marked transparent
+                // above) appended AFTER the terminal. Without that skip a
+                // retried-then-redriven run would leave its superseded
+                // terminal opaque and diverge against it.
                 let mut j = i;
                 while j > 0 {
                     j -= 1;
@@ -769,6 +815,52 @@ impl HistoryMatcher {
                     }
                     break;
                 }
+            }
+        }
+        // Issue #952 x #510: a redrive REOPENS a run that a failing cycle sealed,
+        // and that cycle recorded the awaited work it abandoned (see
+        // `crate::event::ABANDONED_DISPATCH_REASON`). Those records exist to keep
+        // the audit trail honest about a run that is over — they must never
+        // become history the reopened run replays, or the redriven cycle would
+        // read back "this activity/child failed" and could never re-issue the
+        // dispatch the operator redrove it to complete. Mark each abandoned pair
+        // transparent so the reopened run emits it live, exactly as it did
+        // before #952 recorded anything at all.
+        //
+        // Bounded by the LAST redrive (Codex P1 round 1): only a cycle a
+        // redrive actually superseded is re-opened work. A run that was
+        // redriven and then failed AGAIN wrote fresh abandoned pairs after that
+        // redrive; those belong to the terminal-failure tail's own cycle and
+        // stay opaque, so a replay resolves them from their synthetic terminal
+        // and re-derives the failure path the recorded run took instead of
+        // parking on a dispatch that never resolves.
+        if let Some(redrive_idx) = last_redrive {
+            for i in Self::abandoned_dispatch_indices(&events[..redrive_idx]) {
+                transparent_events.insert(i);
+            }
+            // Issue #1262: an abandoned pair is not the only record a
+            // failing cycle writes before its terminal `WorkflowFailed`.
+            // The cycle can also record a `MarkerRecorded` or
+            // `SideEffectRecorded` event after the dispatch a redrive
+            // wants to re-issue — for example a `ctx.version()` call.
+            // Left opaque, that record blocks the cursor. A re-issued
+            // dispatch compares against it positionally and reports
+            // `Diverged` instead of appending live. Swallow the rest of
+            // that same superseded cycle's tail too.
+            for i in
+                Self::superseded_cycle_tail_indices(&events[..redrive_idx], &transparent_events)
+            {
+                transparent_events.insert(i);
+            }
+        }
+        // Terminal-failure tail (issue #952): a run sealed FAILED can never
+        // grow another event, so everything from its terminal event onward is
+        // transparent to command-dispatch replay — mirroring how the
+        // pause/resume and redrive events above are pre-marked consumed.
+        let terminal_failure_tail = Self::terminal_failure_tail_start(&events);
+        if let Some(start) = terminal_failure_tail {
+            for i in start..events.len() {
+                transparent_events.insert(i);
             }
         }
         let race_reserved_signal_events = Self::build_race_reserved_signal_events(&events);
@@ -788,7 +880,281 @@ impl HistoryMatcher {
             deprecated_patches: HashMap::new(),
             patch_ids_recorded_this_cycle: HashSet::new(),
             timer_scan_stopped_at_command: false,
+            terminal_failure_tail,
+            frontier_probed_signals: HashSet::new(),
         }
+    }
+
+    /// Appends events that a resident workflow consumed live (issue #1798).
+    ///
+    /// A warm decision sends the new result to the parked future instead of
+    /// replaying it. The matcher still records the events as consumed and
+    /// moves its cursor past them. Its position, event count and history
+    /// scans then match a cold replay of the full history.
+    pub(crate) fn append_consumed(&mut self, events: &[WorkflowEvent]) {
+        for event in events {
+            self.consumed_out_of_order_events.insert(self.events.len());
+            self.events.push(event.clone());
+        }
+        self.cursor = self.events.len();
+    }
+
+    /// Whether a non-blocking claim probed `signal_name` with a scan window
+    /// that reached the end of history (issue #1798).
+    #[must_use]
+    pub(crate) fn signal_probed_at_frontier(&self, signal_name: &str) -> bool {
+        self.frontier_probed_signals.contains(signal_name)
+    }
+
+    /// Records a non-blocking probe of `signal_name` when no unconsumed
+    /// command event bounds its scan window (issue #1798).
+    fn note_signal_probe(&mut self, signal_name: &str) {
+        let bounded = (self.cursor..self.events.len())
+            .any(|index| !self.is_consumed(index) && Self::is_command_event(&self.events[index]));
+        if !bounded {
+            self.frontier_probed_signals.insert(signal_name.to_string());
+        }
+    }
+
+    /// Index of the first event of this history's **terminal-failure tail**, or
+    /// `None` if it has none (issue #952).
+    ///
+    /// Walks backwards from the end over events that carry no workflow command
+    /// and are never consumed by the workflow function — operator pause/resume
+    /// (#383) and post-terminal bookkeeping appended *after* a terminal event
+    /// (`WorkflowRetryScheduled` from a workflow-level retry (#523),
+    /// `ChildWorkflowCascadeApplied` from a parent-close cascade (#347)). It
+    /// also skips a decision boundary (#1833), which follows the terminal of
+    /// the last decision. If the first event it lands on is a `WorkflowFailed`,
+    /// that index opens the tail.
+    ///
+    /// A `WorkflowRedriven` (#510) is deliberately **not** skipped: a redriven
+    /// run is reopened, not failing, and keeps the narrower redrive-anchored
+    /// transparency instead.
+    ///
+    /// Public so [`crate::testing`] can ask the same question of a snapshot's
+    /// events without building a matcher — one definition, two callers.
+    #[must_use]
+    pub fn terminal_failure_tail_start(events: &[WorkflowEvent]) -> Option<usize> {
+        let mut idx = events.len();
+        while idx > 0 {
+            idx -= 1;
+            let event = &events[idx];
+            if Self::is_command_free_bookkeeping(event) {
+                continue;
+            }
+            // `idx > 0` guard: a history whose FIRST event is the terminal
+            // failure is not a run that failed after doing something — it is a
+            // truncated or corrupt export (a real run always opens with
+            // `WorkflowStarted`). Excusing everything a candidate build does
+            // against such a fixture would let a malformed export pass the gate
+            // unconditionally, so it keeps the pre-#952 strict treatment.
+            return (idx > 0 && matches!(event, WorkflowEvent::WorkflowFailed { .. }))
+                .then_some(idx);
+        }
+        None
+    }
+
+    /// Events that carry no workflow command and that replay never consumes:
+    /// pause and resume (#383), post-terminal bookkeeping, and decision
+    /// boundaries (#1833).
+    const fn is_command_free_bookkeeping(event: &WorkflowEvent) -> bool {
+        Self::is_pause_lifecycle_event(event)
+            || Self::is_post_terminal_bookkeeping(event)
+            || event.is_decision_boundary()
+    }
+
+    /// Events appended **after** a run's terminal event as durable bookkeeping.
+    /// They have no workflow-command counterpart and are never consumed by the
+    /// workflow function, so they cannot end a terminal-failure tail.
+    const fn is_post_terminal_bookkeeping(event: &WorkflowEvent) -> bool {
+        matches!(
+            event,
+            WorkflowEvent::WorkflowRetryScheduled { .. }
+                | WorkflowEvent::ChildWorkflowCascadeApplied { .. }
+        )
+    }
+
+    /// Indices of the **abandoned-dispatch records** a failing cycle wrote
+    /// (issue #952): each `ActivityFailed` / `ChildWorkflowFailed` carrying
+    /// [`crate::event::ABANDONED_DISPATCH_REASON`], together with the
+    /// `ActivityScheduled` / `ChildWorkflowStarted` for the same id that
+    /// precedes it.
+    ///
+    /// `events` is the **prefix of history the caller wants scanned** (see
+    /// [`Self::new`]: everything before the last `WorkflowRedriven`), so the
+    /// returned indices are always valid indices into the full history too.
+    ///
+    /// The reason constant is the engine's own reserved marker — the same device
+    /// as the `__signal_timeout:{seq}:{name}` timer ids (#476) and the
+    /// `fan_out:{n}` markers (#601). For a child terminal, whose `error` carries
+    /// the CHILD's own author string, the reason is matched together with the
+    /// exact shape the engine writes (untyped, non-retryable) so an author
+    /// message that happens to collide keeps its genuine terminal.
+    ///
+    /// An activity author can also quote the reason AND match the shape (issue
+    /// #1265): `ActivityFailure::non_retryable` reproduces both. The
+    /// synthetic path never dispatches. It never writes `ActivityStarted` or
+    /// `ActivityHeartbeat` for the id. A real attempt does. This is a
+    /// structural check, not another field-value guess. A candidate activity
+    /// with either event earlier in `events` keeps its genuine terminal
+    /// instead of being marked transparent. History is chronological, so one
+    /// forward scan sees a real start before its own first-attempt failure.
+    ///
+    /// See also [`Self::superseded_cycle_tail_indices`], called right after
+    /// this function in [`Self::new`] (issue #1262). It covers the same
+    /// failing cycle's other records: a marker, a side effect, a detached
+    /// spawn, a timer arm or cancel. This function does not cover those.
+    fn abandoned_dispatch_indices(events: &[WorkflowEvent]) -> Vec<usize> {
+        let mut started_activities: HashSet<ActivityExecId> = HashSet::new();
+        let mut abandoned_activities: HashSet<ActivityExecId> = HashSet::new();
+        let mut abandoned_children: HashSet<ExecutionId> = HashSet::new();
+        let mut indices: Vec<usize> = Vec::new();
+        for (i, event) in events.iter().enumerate() {
+            match event {
+                WorkflowEvent::ActivityStarted { activity_id, .. }
+                | WorkflowEvent::ActivityHeartbeat { activity_id, .. } => {
+                    started_activities.insert(*activity_id);
+                }
+                // An activity's `error` is the ACTIVITY author's own message,
+                // exactly as a child's is (Codex P2 round 2), so the reason
+                // string alone is not proof the engine wrote this event. Pair it
+                // with the full shape `abandoned_dispatch_events` writes —
+                // first attempt, untyped `"Error"` class, non-retryable, no
+                // structured details — so a genuine activity failure that
+                // happens to return this message keeps its real terminal
+                // instead of being re-dispatched (and its side effects
+                // repeated) by a redriven run. A real `ActivityStarted` /
+                // `ActivityHeartbeat` for this id is the same guard, checked
+                // structurally instead of by field value (issue #1265).
+                WorkflowEvent::ActivityFailed {
+                    activity_id,
+                    error,
+                    attempt: 1,
+                    error_type,
+                    non_retryable: true,
+                    details: None,
+                } if error == crate::event::ABANDONED_DISPATCH_REASON
+                    && error_type == "Error"
+                    && !started_activities.contains(activity_id) =>
+                {
+                    abandoned_activities.insert(*activity_id);
+                    indices.push(i);
+                }
+                // A child's `error` is normally the CHILD's own author-produced
+                // string, so the reason alone is not proof the engine wrote this
+                // event. Pair it with the exact shape the engine writes — untyped
+                // and non-retryable — so a child that coincidentally returns the
+                // same message keeps its genuine terminal.
+                WorkflowEvent::ChildWorkflowFailed {
+                    child_id,
+                    error,
+                    error_type: None,
+                    details: None,
+                    non_retryable: Some(true),
+                } if error == crate::event::ABANDONED_DISPATCH_REASON => {
+                    abandoned_children.insert(*child_id);
+                    indices.push(i);
+                }
+                _ => {}
+            }
+        }
+        if indices.is_empty() {
+            return indices;
+        }
+        for (i, event) in events.iter().enumerate() {
+            match event {
+                WorkflowEvent::ActivityScheduled { activity_id, .. }
+                    if abandoned_activities.contains(activity_id) =>
+                {
+                    indices.push(i);
+                }
+                WorkflowEvent::ChildWorkflowStarted { child_id, .. }
+                    if abandoned_children.contains(child_id) =>
+                {
+                    indices.push(i);
+                }
+                _ => {}
+            }
+        }
+        indices
+    }
+
+    /// Indices of a superseded failing cycle's remaining pre-terminal
+    /// records (issue #1262).
+    ///
+    /// [`Self::abandoned_dispatch_indices`] already covers the abandoned
+    /// dispatch pairs. This function covers the rest. `worker::terminal_command_policy`
+    /// classifies these as `PreTerminalEvent`: a record a failing cycle
+    /// writes plainly, at its own command-emission position. It has no
+    /// synthetic terminal and no completion to pair it with. Today that
+    /// set is `MarkerRecorded`, `SideEffectRecorded`,
+    /// `ChildWorkflowSpawnedDetached`, `TimerStarted`, and
+    /// `TimerCancelled`.
+    ///
+    /// A decision cycle's events are contiguous. No durable wait settles
+    /// mid-cycle. A wait settles only between cycles. So this walks
+    /// backward from `events.len()` (the caller passes the pre-redrive
+    /// prefix) and swallows a run of these events. It skips an index the
+    /// caller already marked transparent, such as the terminal
+    /// `WorkflowFailed` or an abandoned pair.
+    ///
+    /// The walk cannot cross into an earlier cycle unless that cycle's own
+    /// wait already resolved. It stops at the first event that is not
+    /// already transparent and not one of the kinds above. A settled
+    /// completion, such as `ActivityCompleted` or `TimerFired` from an
+    /// earlier arm, marks the boundary of that earlier, non-superseded
+    /// cycle. Its own markers must stay positionally matchable. If the
+    /// walk swallows one of those, it silently breaks `ctx.version()` and
+    /// `ctx.patched()` determinism for a cycle the redrive never touched
+    /// (issues #687 and #603).
+    ///
+    /// The function fails closed. An event that is neither already
+    /// transparent nor one of the recognized kinds stops the walk at
+    /// once. The function does not guess at an event kind it does not
+    /// recognize; it leaves that event opaque.
+    fn superseded_cycle_tail_indices(
+        events: &[WorkflowEvent],
+        transparent_events: &HashSet<usize>,
+    ) -> Vec<usize> {
+        let mut indices = Vec::new();
+        let mut idx = events.len();
+        while idx > 0 {
+            idx -= 1;
+            if transparent_events.contains(&idx) {
+                continue;
+            }
+            match events[idx] {
+                WorkflowEvent::MarkerRecorded { .. }
+                | WorkflowEvent::SideEffectRecorded { .. }
+                | WorkflowEvent::ChildWorkflowSpawnedDetached { .. }
+                | WorkflowEvent::TimerStarted { .. }
+                | WorkflowEvent::TimerCancelled { .. } => {
+                    indices.push(idx);
+                }
+                _ => break,
+            }
+        }
+        indices
+    }
+
+    /// Whether this history ends in a terminal failure (issue #952).
+    #[must_use]
+    pub const fn has_terminal_failure_tail(&self) -> bool {
+        self.terminal_failure_tail.is_some()
+    }
+
+    /// Whether the cursor has consumed every pre-terminal event of a history
+    /// that ends in a terminal failure — the **failing frontier** (issue #952).
+    ///
+    /// Past this point the recorded history says only "the run failed here", so
+    /// a new command, an early return, or a park is not a divergence: there is
+    /// nothing left to compare against. Callers use it to suppress strict-replay
+    /// divergence reporting; it is never used to skip a *positional* match
+    /// against a real recorded event.
+    #[must_use]
+    pub fn at_terminal_failure_frontier(&self) -> bool {
+        self.has_terminal_failure_tail() && !self.is_replaying()
     }
 
     /// Returns whether the most recent cancellable-timer forward scan STOPPED at
@@ -1000,6 +1366,15 @@ impl HistoryMatcher {
         matches!(event, WorkflowEvent::WorkflowRedriven { .. })
     }
 
+    /// Whether command-dispatch replay passes over the event at `index`: a
+    /// pause pair, post-terminal bookkeeping, or a record that a redrive
+    /// superseded. The fuzz harness skips the superseded records when it
+    /// mirrors a history (issue #1835).
+    #[cfg(feature = "fuzzing")]
+    pub(crate) fn is_transparent(&self, index: usize) -> bool {
+        self.transparent_events.contains(&index)
+    }
+
     /// Returns `true` if the event at `index` has already been consumed out-of-order.
     fn is_consumed(&self, index: usize) -> bool {
         self.consumed_out_of_order_events.contains(&index)
@@ -1049,6 +1424,182 @@ impl HistoryMatcher {
             pending.terminal = Some(terminal);
         }
         self.consumed_signal_events.insert(cursor);
+    }
+
+    fn stash_external_cancel_request(
+        &mut self,
+        cursor: usize,
+        cancel_id: ExternalCancelId,
+        target: crate::types::ExternalTarget,
+    ) {
+        self.pending_external_cancels.push(StashedExternalCancel {
+            cancel_id,
+            target,
+            terminal: None,
+        });
+        self.consumed_signal_events.insert(cursor);
+    }
+
+    fn stash_external_cancel_terminal(
+        &mut self,
+        cursor: usize,
+        cancel_id: ExternalCancelId,
+        terminal: StashedCancelTerminal,
+    ) {
+        if let Some(pending) = self
+            .pending_external_cancels
+            .iter_mut()
+            .find(|pending| pending.cancel_id == cancel_id)
+        {
+            pending.terminal = Some(terminal);
+        }
+        self.consumed_signal_events.insert(cursor);
+    }
+
+    fn stash_external_await_request(
+        &mut self,
+        cursor: usize,
+        await_id: ExternalAwaitId,
+        target: ExecutionId,
+    ) {
+        self.pending_external_awaits.push(StashedExternalAwait {
+            await_id,
+            target,
+            terminal: None,
+        });
+        self.consumed_signal_events.insert(cursor);
+    }
+
+    fn stash_external_await_terminal(
+        &mut self,
+        cursor: usize,
+        await_id: ExternalAwaitId,
+        terminal: StashedAwaitTerminal,
+    ) {
+        if let Some(pending) = self
+            .pending_external_awaits
+            .iter_mut()
+            .find(|pending| pending.await_id == await_id)
+        {
+            pending.terminal = Some(terminal);
+        }
+        self.consumed_signal_events.insert(cursor);
+    }
+
+    /// Stashes a "transparent" external-primitive event at `cursor` — a plain
+    /// signal, or an `ExternalSignal`/`ExternalCancel`/`ExternalAwait` triplet
+    /// member — so the owning primitive's own matcher can find it later, and
+    /// marks the event consumed so the calling scan does not treat it as its
+    /// own terminal or as an unconsumed ordering point (issue #492, issue
+    /// #757).
+    ///
+    /// This only mutates stash/consumed-event state; it does not touch a
+    /// cursor or return a value. Callers keep full control of their own
+    /// control flow (loop-continue, an early `return`, or a `TimerScanStep`)
+    /// and call this only for the subset of the 10 variants below that their
+    /// own scan treats as transparent — e.g. `match_external_signal` excludes
+    /// `ExternalSignalRequested`/`Delivered`/`Failed`, since those are its own
+    /// subject rather than a transparent sibling event there. Panics (via the
+    /// final `unreachable!`) if called for the event at `cursor` when that
+    /// event is not one of the 10 handled variants — every call site's own
+    /// match arm pattern is what guarantees that never happens.
+    fn stash_transparent_external_event(&mut self, cursor: usize) {
+        match &self.events[cursor] {
+            WorkflowEvent::SignalReceived {
+                signal_name,
+                payload,
+            } => {
+                let signal_name = signal_name.clone();
+                let payload = payload.clone();
+                self.stash_signal(cursor, signal_name, payload);
+            }
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id,
+                target,
+                signal_name,
+                payload,
+                idempotency_key,
+            } => {
+                self.stash_external_signal_request(
+                    cursor,
+                    *signal_id,
+                    target.clone(),
+                    signal_name.clone(),
+                    payload.clone(),
+                    idempotency_key.clone(),
+                );
+            }
+            WorkflowEvent::ExternalSignalDelivered { signal_id } => {
+                self.stash_external_signal_terminal(
+                    cursor,
+                    *signal_id,
+                    StashedSignalTerminal::Delivered,
+                );
+            }
+            WorkflowEvent::ExternalSignalFailed {
+                signal_id,
+                reason_code,
+            } => {
+                self.stash_external_signal_terminal(
+                    cursor,
+                    *signal_id,
+                    StashedSignalTerminal::Failed(reason_code.clone()),
+                );
+            }
+            WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
+                self.stash_external_cancel_request(cursor, *cancel_id, target.clone());
+            }
+            WorkflowEvent::ExternalCancelDelivered { cancel_id } => {
+                self.stash_external_cancel_terminal(
+                    cursor,
+                    *cancel_id,
+                    StashedCancelTerminal::Delivered,
+                );
+            }
+            WorkflowEvent::ExternalCancelFailed {
+                cancel_id,
+                reason_code,
+            } => {
+                self.stash_external_cancel_terminal(
+                    cursor,
+                    *cancel_id,
+                    StashedCancelTerminal::Failed(reason_code.clone()),
+                );
+            }
+            WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
+                self.stash_external_await_request(cursor, *await_id, *target);
+            }
+            WorkflowEvent::ExternalAwaitResolved { await_id, output } => {
+                self.stash_external_await_terminal(
+                    cursor,
+                    *await_id,
+                    StashedAwaitTerminal::Resolved(output.clone()),
+                );
+            }
+            WorkflowEvent::ExternalAwaitFailed {
+                await_id,
+                reason_code,
+                message,
+                error_type,
+                details,
+                non_retryable,
+            } => {
+                self.stash_external_await_terminal(
+                    cursor,
+                    *await_id,
+                    StashedAwaitTerminal::Failed {
+                        reason_code: reason_code.clone(),
+                        message: message.clone(),
+                        error_type: error_type.clone(),
+                        details: details.clone(),
+                        non_retryable: *non_retryable,
+                    },
+                );
+            }
+            other => unreachable!(
+                "stash_transparent_external_event called for a non-transparent event: {other:?}"
+            ),
+        }
     }
 
     /// Returns `true` for events transparent to main workflow command replay.
@@ -1201,151 +1752,21 @@ impl HistoryMatcher {
                     first_interleaved_command.get_or_insert(scan_cursor);
                     scan_cursor += 1;
                 }
-                // Signals can arrive at any time; stash them for later
-                // wait_for_signal calls and continue scanning.
-                WorkflowEvent::SignalReceived {
-                    signal_name,
-                    payload,
-                } => {
-                    let signal_name = signal_name.clone();
-                    let payload = payload.clone();
-                    self.stash_signal(scan_cursor, signal_name, payload);
-                    scan_cursor += 1;
-                }
-                // ExternalSignal event triplets can be interleaved with an
-                // in-flight activity (e.g. tokio::join!(signal, activity)).
-                // Stash them so match_external_signal can find them later.
-                WorkflowEvent::ExternalSignalRequested {
-                    signal_id,
-                    target,
-                    signal_name,
-                    payload,
-                    idempotency_key,
-                } => {
-                    self.stash_external_signal_request(
-                        scan_cursor,
-                        *signal_id,
-                        target.clone(),
-                        signal_name.clone(),
-                        payload.clone(),
-                        idempotency_key.clone(),
-                    );
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalSignalDelivered { signal_id } => {
-                    let id = *signal_id;
-                    if let Some(p) = self
-                        .pending_external_signals
-                        .iter_mut()
-                        .find(|p| p.signal_id == id)
-                    {
-                        p.terminal = Some(StashedSignalTerminal::Delivered);
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalSignalFailed {
-                    signal_id,
-                    reason_code,
-                } => {
-                    let id = *signal_id;
-                    let code = reason_code.clone();
-                    if let Some(p) = self
-                        .pending_external_signals
-                        .iter_mut()
-                        .find(|p| p.signal_id == id)
-                    {
-                        p.terminal = Some(StashedSignalTerminal::Failed(code));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                // ExternalCancel event triplets are transparent to activity scans (issue #492).
-                WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
-                    let stashed = StashedExternalCancel {
-                        cancel_id: *cancel_id,
-                        target: target.clone(),
-                        terminal: None,
-                    };
-                    self.pending_external_cancels.push(stashed);
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalCancelDelivered { cancel_id } => {
-                    let id = *cancel_id;
-                    if let Some(p) = self
-                        .pending_external_cancels
-                        .iter_mut()
-                        .find(|p| p.cancel_id == id)
-                    {
-                        p.terminal = Some(StashedCancelTerminal::Delivered);
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalCancelFailed {
-                    cancel_id,
-                    reason_code,
-                } => {
-                    let id = *cancel_id;
-                    let code = reason_code.clone();
-                    if let Some(p) = self
-                        .pending_external_cancels
-                        .iter_mut()
-                        .find(|p| p.cancel_id == id)
-                    {
-                        p.terminal = Some(StashedCancelTerminal::Failed(code));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
-                    let stashed = StashedExternalAwait {
-                        await_id: *await_id,
-                        target: *target,
-                        terminal: None,
-                    };
-                    self.pending_external_awaits.push(stashed);
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitResolved { await_id, output } => {
-                    let id = *await_id;
-                    let out = output.clone();
-                    if let Some(p) = self
-                        .pending_external_awaits
-                        .iter_mut()
-                        .find(|p| p.await_id == id)
-                    {
-                        p.terminal = Some(StashedAwaitTerminal::Resolved(out));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitFailed {
-                    await_id,
-                    reason_code,
-                    message,
-                    error_type,
-                    details,
-                    non_retryable,
-                } => {
-                    let id = *await_id;
-                    let term = StashedAwaitTerminal::Failed {
-                        reason_code: reason_code.clone(),
-                        message: message.clone(),
-                        error_type: error_type.clone(),
-                        details: details.clone(),
-                        non_retryable: *non_retryable,
-                    };
-                    if let Some(p) = self
-                        .pending_external_awaits
-                        .iter_mut()
-                        .find(|p| p.await_id == id)
-                    {
-                        p.terminal = Some(term);
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
+                // Signals, and ExternalSignal/ExternalCancel/ExternalAwait event
+                // triplets, can be interleaved with an in-flight activity (e.g.
+                // tokio::join!(signal, activity)). Stash them so their own
+                // matchers can find them later (issue #492, issue #757).
+                WorkflowEvent::SignalReceived { .. }
+                | WorkflowEvent::ExternalSignalRequested { .. }
+                | WorkflowEvent::ExternalSignalDelivered { .. }
+                | WorkflowEvent::ExternalSignalFailed { .. }
+                | WorkflowEvent::ExternalCancelRequested { .. }
+                | WorkflowEvent::ExternalCancelDelivered { .. }
+                | WorkflowEvent::ExternalCancelFailed { .. }
+                | WorkflowEvent::ExternalAwaitRequested { .. }
+                | WorkflowEvent::ExternalAwaitResolved { .. }
+                | WorkflowEvent::ExternalAwaitFailed { .. } => {
+                    self.stash_transparent_external_event(scan_cursor);
                     scan_cursor += 1;
                 }
                 // Update events are transparent to the activity scan.
@@ -1463,152 +1884,24 @@ impl HistoryMatcher {
                     first_interleaved_command.get_or_insert(scan_cursor);
                     scan_cursor += 1;
                 }
-                // Signals can be ingested while a local activity is retrying
-                WorkflowEvent::SignalReceived {
-                    signal_name,
-                    payload,
-                } => {
-                    let signal_name = signal_name.clone();
-                    let payload = payload.clone();
-                    self.stash_signal(scan_cursor, signal_name, payload);
-                    scan_cursor += 1;
-                }
+                // Signals can be ingested while a local activity is retrying.
                 // ExternalSignal events can be interleaved before the local
                 // activity's terminal event when a crash recovery case writes
                 // signal events first (the RunLocalActivity + SignalExternalWorkflow
-                // mixed batch).  Stash them so match_external_signal can find them
-                // after the local activity resolves.
-                WorkflowEvent::ExternalSignalRequested {
-                    signal_id,
-                    target,
-                    signal_name,
-                    payload,
-                    idempotency_key,
-                } => {
-                    self.stash_external_signal_request(
-                        scan_cursor,
-                        *signal_id,
-                        target.clone(),
-                        signal_name.clone(),
-                        payload.clone(),
-                        idempotency_key.clone(),
-                    );
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalSignalDelivered { signal_id } => {
-                    let id = *signal_id;
-                    if let Some(p) = self
-                        .pending_external_signals
-                        .iter_mut()
-                        .find(|p| p.signal_id == id)
-                    {
-                        p.terminal = Some(StashedSignalTerminal::Delivered);
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalSignalFailed {
-                    signal_id,
-                    reason_code,
-                } => {
-                    let id = *signal_id;
-                    let code = reason_code.clone();
-                    if let Some(p) = self
-                        .pending_external_signals
-                        .iter_mut()
-                        .find(|p| p.signal_id == id)
-                    {
-                        p.terminal = Some(StashedSignalTerminal::Failed(code));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                // ExternalCancel events are also transparent to local activity scans (issue #492).
-                WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
-                    let stashed = StashedExternalCancel {
-                        cancel_id: *cancel_id,
-                        target: target.clone(),
-                        terminal: None,
-                    };
-                    self.pending_external_cancels.push(stashed);
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalCancelDelivered { cancel_id } => {
-                    let id = *cancel_id;
-                    if let Some(p) = self
-                        .pending_external_cancels
-                        .iter_mut()
-                        .find(|p| p.cancel_id == id)
-                    {
-                        p.terminal = Some(StashedCancelTerminal::Delivered);
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalCancelFailed {
-                    cancel_id,
-                    reason_code,
-                } => {
-                    let id = *cancel_id;
-                    let code = reason_code.clone();
-                    if let Some(p) = self
-                        .pending_external_cancels
-                        .iter_mut()
-                        .find(|p| p.cancel_id == id)
-                    {
-                        p.terminal = Some(StashedCancelTerminal::Failed(code));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
-                    let stashed = StashedExternalAwait {
-                        await_id: *await_id,
-                        target: *target,
-                        terminal: None,
-                    };
-                    self.pending_external_awaits.push(stashed);
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitResolved { await_id, output } => {
-                    let id = *await_id;
-                    let out = output.clone();
-                    if let Some(p) = self
-                        .pending_external_awaits
-                        .iter_mut()
-                        .find(|p| p.await_id == id)
-                    {
-                        p.terminal = Some(StashedAwaitTerminal::Resolved(out));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitFailed {
-                    await_id,
-                    reason_code,
-                    message,
-                    error_type,
-                    details,
-                    non_retryable,
-                } => {
-                    let id = *await_id;
-                    let term = StashedAwaitTerminal::Failed {
-                        reason_code: reason_code.clone(),
-                        message: message.clone(),
-                        error_type: error_type.clone(),
-                        details: details.clone(),
-                        non_retryable: *non_retryable,
-                    };
-                    if let Some(p) = self
-                        .pending_external_awaits
-                        .iter_mut()
-                        .find(|p| p.await_id == id)
-                    {
-                        p.terminal = Some(term);
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
+                // mixed batch). ExternalCancel/ExternalAwait triplets are
+                // likewise transparent here (issue #492, issue #757). Stash
+                // them all so their own matchers can find them later.
+                WorkflowEvent::SignalReceived { .. }
+                | WorkflowEvent::ExternalSignalRequested { .. }
+                | WorkflowEvent::ExternalSignalDelivered { .. }
+                | WorkflowEvent::ExternalSignalFailed { .. }
+                | WorkflowEvent::ExternalCancelRequested { .. }
+                | WorkflowEvent::ExternalCancelDelivered { .. }
+                | WorkflowEvent::ExternalCancelFailed { .. }
+                | WorkflowEvent::ExternalAwaitRequested { .. }
+                | WorkflowEvent::ExternalAwaitResolved { .. }
+                | WorkflowEvent::ExternalAwaitFailed { .. } => {
+                    self.stash_transparent_external_event(scan_cursor);
                     scan_cursor += 1;
                 }
                 ev if Self::is_update_event(ev) => {
@@ -1717,6 +2010,10 @@ impl HistoryMatcher {
     /// `WorkflowCancelled`, `WorkflowContinuedAsNew`), or if there are buffered
     /// signals that were never delivered via `wait_for_signal`.
     ///
+    /// The strict and canary executors use this check. The worker path uses
+    /// the narrower [`first_unconsumed_command_event`](Self::first_unconsumed_command_event)
+    /// (issue #1791).
+    ///
     /// Used by [`crate::context::WorkflowContext::history_has_unconsumed_events`] to avoid
     /// false non-determinism reports when replaying full histories that include
     /// a terminal event appended after workflow completion.
@@ -1767,6 +2064,113 @@ impl HistoryMatcher {
         // External awaits drained early that were never consumed by
         // await_external_workflow represent unconsumed history (issue #757).
         !self.pending_external_awaits.is_empty()
+    }
+
+    /// Returns `true` for the command events that the end-of-cycle drift
+    /// check counts (issue #1791).
+    ///
+    /// Each event anchors a workflow call that replay re-issues at the same
+    /// position. Most are written from a workflow command. `MutexGranted` is
+    /// written when a parked `acquire()` gets its lock. A deterministic replay
+    /// consumes each of them. Signals, results and lifecycle events come from
+    /// outside the workflow code and are not in this set.
+    const fn is_command_event(event: &WorkflowEvent) -> bool {
+        matches!(
+            event,
+            WorkflowEvent::ActivityScheduled { .. }
+                | WorkflowEvent::LocalActivityScheduled { .. }
+                | WorkflowEvent::TimerStarted { .. }
+                | WorkflowEvent::TimerCancelled { .. }
+                | WorkflowEvent::ChildWorkflowStarted { .. }
+                | WorkflowEvent::ChildWorkflowSpawnedDetached { .. }
+                | WorkflowEvent::MarkerRecorded { .. }
+                | WorkflowEvent::SideEffectRecorded { .. }
+                | WorkflowEvent::ExternalSignalRequested { .. }
+                | WorkflowEvent::ExternalCancelRequested { .. }
+                | WorkflowEvent::ExternalAwaitRequested { .. }
+                | WorkflowEvent::ActivityAwaitingExternal { .. }
+                | WorkflowEvent::MutexGranted { .. }
+        )
+    }
+
+    /// Returns the first recorded command event that the replay did not
+    /// consume, as `(event_index, event_name)` (issue #1791).
+    ///
+    /// The live executor calls this at the end of a cycle. A hit means the
+    /// code no longer issues a command that the recorded run issued.
+    ///
+    /// This check is narrower than
+    /// [`has_non_lifecycle_unconsumed`](Self::has_non_lifecycle_unconsumed).
+    /// A live history can hold a signal or a result, such as `TimerFired`,
+    /// that the code has not awaited yet. Those events are not drift on the
+    /// live path.
+    #[must_use]
+    pub fn first_unconsumed_command_event(&self) -> Option<(usize, String)> {
+        let at_or_after_cursor = (self.cursor..self.events.len())
+            .find(|&index| !self.is_consumed(index) && Self::is_command_event(&self.events[index]));
+        // A request drained early into an external stash is marked consumed.
+        // It is still drift if no command claimed it from the stash. With all
+        // stashes empty, no event can match, so the history scan is skipped.
+        // A warm cycle then stays O(1) in history length (issue #1798).
+        let any_stashed = !(self.pending_external_signals.is_empty()
+            && self.pending_external_cancels.is_empty()
+            && self.pending_external_awaits.is_empty());
+        let stashed = self
+            .events
+            .iter()
+            .enumerate()
+            .take(if any_stashed { self.events.len() } else { 0 })
+            .filter(|(_, event)| self.is_unclaimed_stashed_request(event))
+            .map(|(index, _)| index);
+        at_or_after_cursor
+            .into_iter()
+            .chain(stashed)
+            .min()
+            .map(|index| (index, Self::command_event_name(&self.events[index])))
+    }
+
+    /// Names a command event for an ND diagnostic, in the format the
+    /// `Diverged` arms use, for example `ActivityScheduled(send_email)`.
+    fn command_event_name(event: &WorkflowEvent) -> String {
+        match event {
+            WorkflowEvent::ActivityScheduled { name, .. } => format!("ActivityScheduled({name})"),
+            WorkflowEvent::LocalActivityScheduled { name, .. } => {
+                format!("LocalActivityScheduled({name})")
+            }
+            WorkflowEvent::TimerStarted { timer_id, .. } => format!("TimerStarted({timer_id})"),
+            WorkflowEvent::TimerCancelled { timer_id } => format!("TimerCancelled({timer_id})"),
+            WorkflowEvent::ChildWorkflowStarted { workflow_name, .. } => {
+                format!("ChildWorkflowStarted({workflow_name})")
+            }
+            WorkflowEvent::ChildWorkflowSpawnedDetached { workflow_name, .. } => {
+                format!("ChildWorkflowSpawnedDetached({workflow_name})")
+            }
+            WorkflowEvent::ActivityAwaitingExternal { name, .. } => {
+                format!("ActivityAwaitingExternal({name})")
+            }
+            WorkflowEvent::MutexGranted { key, .. } => format!("MutexGranted({key})"),
+            other => Self::actual_event_name(other),
+        }
+    }
+
+    /// Returns `true` if `event` is an `External*Requested` event that is
+    /// still in an external stash.
+    fn is_unclaimed_stashed_request(&self, event: &WorkflowEvent) -> bool {
+        match event {
+            WorkflowEvent::ExternalSignalRequested { signal_id, .. } => self
+                .pending_external_signals
+                .iter()
+                .any(|p| p.signal_id == *signal_id),
+            WorkflowEvent::ExternalCancelRequested { cancel_id, .. } => self
+                .pending_external_cancels
+                .iter()
+                .any(|p| p.cancel_id == *cancel_id),
+            WorkflowEvent::ExternalAwaitRequested { await_id, .. } => self
+                .pending_external_awaits
+                .iter()
+                .any(|p| p.await_id == *await_id),
+            _ => false,
+        }
     }
 
     /// End-of-drive count of genuinely-unconsumed `SignalReceived` events,
@@ -1896,159 +2300,22 @@ impl HistoryMatcher {
     fn drain_early_signals(&mut self) {
         while self.cursor < self.events.len() {
             match &self.events[self.cursor] {
-                WorkflowEvent::SignalReceived {
-                    signal_name,
-                    payload,
-                } => {
-                    let signal_name = signal_name.clone();
-                    let payload = payload.clone();
-                    self.stash_signal(self.cursor, signal_name, payload);
-                    self.cursor += 1;
-                    self.advance_to_next_unconsumed_event();
-                }
-                // Drain ExternalSignal event pairs so they can be matched by
-                // match_external_signal regardless of where they fall in history
-                // relative to ActivityScheduled / TimerStarted events (mixed batches).
-                WorkflowEvent::ExternalSignalRequested {
-                    signal_id,
-                    target,
-                    signal_name,
-                    payload,
-                    idempotency_key,
-                } => {
-                    self.stash_external_signal_request(
-                        self.cursor,
-                        *signal_id,
-                        target.clone(),
-                        signal_name.clone(),
-                        payload.clone(),
-                        idempotency_key.clone(),
-                    );
-                    self.cursor += 1;
-                    self.advance_to_next_unconsumed_event();
-                }
-                WorkflowEvent::ExternalSignalDelivered { signal_id } => {
-                    let id = *signal_id;
-                    if let Some(p) = self
-                        .pending_external_signals
-                        .iter_mut()
-                        .find(|p| p.signal_id == id)
-                    {
-                        p.terminal = Some(StashedSignalTerminal::Delivered);
-                    }
-                    self.consumed_signal_events.insert(self.cursor);
-                    self.cursor += 1;
-                    self.advance_to_next_unconsumed_event();
-                }
-                WorkflowEvent::ExternalSignalFailed {
-                    signal_id,
-                    reason_code,
-                } => {
-                    let id = *signal_id;
-                    let code = reason_code.clone();
-                    if let Some(p) = self
-                        .pending_external_signals
-                        .iter_mut()
-                        .find(|p| p.signal_id == id)
-                    {
-                        p.terminal = Some(StashedSignalTerminal::Failed(code));
-                    }
-                    self.consumed_signal_events.insert(self.cursor);
-                    self.cursor += 1;
-                    self.advance_to_next_unconsumed_event();
-                }
-                // Drain ExternalCancel event pairs (issue #492) symmetrically.
-                WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
-                    let stashed = StashedExternalCancel {
-                        cancel_id: *cancel_id,
-                        target: target.clone(),
-                        terminal: None,
-                    };
-                    self.pending_external_cancels.push(stashed);
-                    self.consumed_signal_events.insert(self.cursor);
-                    self.cursor += 1;
-                    self.advance_to_next_unconsumed_event();
-                }
-                WorkflowEvent::ExternalCancelDelivered { cancel_id } => {
-                    let id = *cancel_id;
-                    if let Some(p) = self
-                        .pending_external_cancels
-                        .iter_mut()
-                        .find(|p| p.cancel_id == id)
-                    {
-                        p.terminal = Some(StashedCancelTerminal::Delivered);
-                    }
-                    self.consumed_signal_events.insert(self.cursor);
-                    self.cursor += 1;
-                    self.advance_to_next_unconsumed_event();
-                }
-                WorkflowEvent::ExternalCancelFailed {
-                    cancel_id,
-                    reason_code,
-                } => {
-                    let id = *cancel_id;
-                    let code = reason_code.clone();
-                    if let Some(p) = self
-                        .pending_external_cancels
-                        .iter_mut()
-                        .find(|p| p.cancel_id == id)
-                    {
-                        p.terminal = Some(StashedCancelTerminal::Failed(code));
-                    }
-                    self.consumed_signal_events.insert(self.cursor);
-                    self.cursor += 1;
-                    self.advance_to_next_unconsumed_event();
-                }
-                // External await event triplets are drained early too (issue #757).
-                WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
-                    let stashed = StashedExternalAwait {
-                        await_id: *await_id,
-                        target: *target,
-                        terminal: None,
-                    };
-                    self.pending_external_awaits.push(stashed);
-                    self.consumed_signal_events.insert(self.cursor);
-                    self.cursor += 1;
-                    self.advance_to_next_unconsumed_event();
-                }
-                WorkflowEvent::ExternalAwaitResolved { await_id, output } => {
-                    let id = *await_id;
-                    let out = output.clone();
-                    if let Some(p) = self
-                        .pending_external_awaits
-                        .iter_mut()
-                        .find(|p| p.await_id == id)
-                    {
-                        p.terminal = Some(StashedAwaitTerminal::Resolved(out));
-                    }
-                    self.consumed_signal_events.insert(self.cursor);
-                    self.cursor += 1;
-                    self.advance_to_next_unconsumed_event();
-                }
-                WorkflowEvent::ExternalAwaitFailed {
-                    await_id,
-                    reason_code,
-                    message,
-                    error_type,
-                    details,
-                    non_retryable,
-                } => {
-                    let id = *await_id;
-                    let term = StashedAwaitTerminal::Failed {
-                        reason_code: reason_code.clone(),
-                        message: message.clone(),
-                        error_type: error_type.clone(),
-                        details: details.clone(),
-                        non_retryable: *non_retryable,
-                    };
-                    if let Some(p) = self
-                        .pending_external_awaits
-                        .iter_mut()
-                        .find(|p| p.await_id == id)
-                    {
-                        p.terminal = Some(term);
-                    }
-                    self.consumed_signal_events.insert(self.cursor);
+                // Drain signals, and ExternalSignal/ExternalCancel/ExternalAwait
+                // event pairs (issue #492, issue #757), so they can be matched
+                // by their own primitives regardless of where they fall in
+                // history relative to ActivityScheduled / TimerStarted events
+                // (mixed batches).
+                WorkflowEvent::SignalReceived { .. }
+                | WorkflowEvent::ExternalSignalRequested { .. }
+                | WorkflowEvent::ExternalSignalDelivered { .. }
+                | WorkflowEvent::ExternalSignalFailed { .. }
+                | WorkflowEvent::ExternalCancelRequested { .. }
+                | WorkflowEvent::ExternalCancelDelivered { .. }
+                | WorkflowEvent::ExternalCancelFailed { .. }
+                | WorkflowEvent::ExternalAwaitRequested { .. }
+                | WorkflowEvent::ExternalAwaitResolved { .. }
+                | WorkflowEvent::ExternalAwaitFailed { .. } => {
+                    self.stash_transparent_external_event(self.cursor);
                     self.cursor += 1;
                     self.advance_to_next_unconsumed_event();
                 }
@@ -2389,13 +2656,8 @@ impl HistoryMatcher {
                     scan_cursor += 1;
                 }
                 // Signals can arrive while an external activity is pending.
-                WorkflowEvent::SignalReceived {
-                    signal_name,
-                    payload,
-                } => {
-                    let signal_name = signal_name.clone();
-                    let payload = payload.clone();
-                    self.stash_signal(scan_cursor, signal_name, payload);
+                WorkflowEvent::SignalReceived { .. } => {
+                    self.stash_transparent_external_event(scan_cursor);
                     scan_cursor += 1;
                 }
                 // A second ActivityAwaitingExternal for the same activity can
@@ -2403,9 +2665,14 @@ impl HistoryMatcher {
                 // awaiting external completion: the worker re-runs
                 // persist_scheduled_external_activity, but record_external_task
                 // is idempotent (ON CONFLICT DO NOTHING).  Skip the duplicate.
+                //
+                // Consume the duplicate too. No other call claims it, and the
+                // end-of-cycle drift guard would otherwise report it as a
+                // skipped call while the activity is still pending (#1791).
                 WorkflowEvent::ActivityAwaitingExternal {
                     activity_id: id, ..
                 } if *id == activity_id => {
+                    self.consumed_out_of_order_events.insert(scan_cursor);
                     scan_cursor += 1;
                 }
                 WorkflowEvent::ChildWorkflowSpawnedDetached { .. } => {
@@ -2419,140 +2686,21 @@ impl HistoryMatcher {
                 // ExternalSignal event triplets can be interleaved when the
                 // workflow sends a concurrent external signal while awaiting
                 // external activity completion (e.g. tokio::join! with
-                // signal_external_workflow).  Stash them so
-                // match_external_signal can find them after the activity
-                // resolves, rather than breaking the scan prematurely.
-                WorkflowEvent::ExternalSignalRequested {
-                    signal_id,
-                    target,
-                    signal_name,
-                    payload,
-                    idempotency_key,
-                } => {
-                    self.stash_external_signal_request(
-                        scan_cursor,
-                        *signal_id,
-                        target.clone(),
-                        signal_name.clone(),
-                        payload.clone(),
-                        idempotency_key.clone(),
-                    );
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalSignalDelivered { signal_id } => {
-                    let id = *signal_id;
-                    if let Some(p) = self
-                        .pending_external_signals
-                        .iter_mut()
-                        .find(|p| p.signal_id == id)
-                    {
-                        p.terminal = Some(StashedSignalTerminal::Delivered);
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalSignalFailed {
-                    signal_id,
-                    reason_code,
-                } => {
-                    let id = *signal_id;
-                    let code = reason_code.clone();
-                    if let Some(p) = self
-                        .pending_external_signals
-                        .iter_mut()
-                        .find(|p| p.signal_id == id)
-                    {
-                        p.terminal = Some(StashedSignalTerminal::Failed(code));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                // ExternalCancel events are transparent to external activity scans (issue #492).
-                WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
-                    let stashed = StashedExternalCancel {
-                        cancel_id: *cancel_id,
-                        target: target.clone(),
-                        terminal: None,
-                    };
-                    self.pending_external_cancels.push(stashed);
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalCancelDelivered { cancel_id } => {
-                    let id = *cancel_id;
-                    if let Some(p) = self
-                        .pending_external_cancels
-                        .iter_mut()
-                        .find(|p| p.cancel_id == id)
-                    {
-                        p.terminal = Some(StashedCancelTerminal::Delivered);
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalCancelFailed {
-                    cancel_id,
-                    reason_code,
-                } => {
-                    let id = *cancel_id;
-                    let code = reason_code.clone();
-                    if let Some(p) = self
-                        .pending_external_cancels
-                        .iter_mut()
-                        .find(|p| p.cancel_id == id)
-                    {
-                        p.terminal = Some(StashedCancelTerminal::Failed(code));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
-                    let stashed = StashedExternalAwait {
-                        await_id: *await_id,
-                        target: *target,
-                        terminal: None,
-                    };
-                    self.pending_external_awaits.push(stashed);
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitResolved { await_id, output } => {
-                    let id = *await_id;
-                    let out = output.clone();
-                    if let Some(p) = self
-                        .pending_external_awaits
-                        .iter_mut()
-                        .find(|p| p.await_id == id)
-                    {
-                        p.terminal = Some(StashedAwaitTerminal::Resolved(out));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitFailed {
-                    await_id,
-                    reason_code,
-                    message,
-                    error_type,
-                    details,
-                    non_retryable,
-                } => {
-                    let id = *await_id;
-                    let term = StashedAwaitTerminal::Failed {
-                        reason_code: reason_code.clone(),
-                        message: message.clone(),
-                        error_type: error_type.clone(),
-                        details: details.clone(),
-                        non_retryable: *non_retryable,
-                    };
-                    if let Some(p) = self
-                        .pending_external_awaits
-                        .iter_mut()
-                        .find(|p| p.await_id == id)
-                    {
-                        p.terminal = Some(term);
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
+                // signal_external_workflow), and ExternalCancel/ExternalAwait
+                // triplets are likewise transparent here (issue #492, issue
+                // #757). Stash them so their own matchers can find them after
+                // the activity resolves, rather than breaking the scan
+                // prematurely.
+                WorkflowEvent::ExternalSignalRequested { .. }
+                | WorkflowEvent::ExternalSignalDelivered { .. }
+                | WorkflowEvent::ExternalSignalFailed { .. }
+                | WorkflowEvent::ExternalCancelRequested { .. }
+                | WorkflowEvent::ExternalCancelDelivered { .. }
+                | WorkflowEvent::ExternalCancelFailed { .. }
+                | WorkflowEvent::ExternalAwaitRequested { .. }
+                | WorkflowEvent::ExternalAwaitResolved { .. }
+                | WorkflowEvent::ExternalAwaitFailed { .. } => {
+                    self.stash_transparent_external_event(scan_cursor);
                     scan_cursor += 1;
                 }
                 _ => break,
@@ -2738,14 +2886,19 @@ impl HistoryMatcher {
                     };
                     return self.settle_terminal(scan_cursor, first_interleaved_command, result);
                 }
-                // Signals can arrive while the external signal delivery is in-flight.
-                WorkflowEvent::SignalReceived {
-                    signal_name: sn,
-                    payload,
-                } => {
-                    let sn = sn.clone();
-                    let payload = payload.clone();
-                    self.stash_signal(scan_cursor, sn, payload);
+                // Signals can arrive while the external signal delivery is
+                // in-flight, and ExternalCancel/ExternalAwait triplets are
+                // likewise transparent to the signal forward scan (issue #492,
+                // issue #757). ExternalSignal* itself is this function's own
+                // subject, matched above — not part of this transparent set.
+                WorkflowEvent::SignalReceived { .. }
+                | WorkflowEvent::ExternalCancelRequested { .. }
+                | WorkflowEvent::ExternalCancelDelivered { .. }
+                | WorkflowEvent::ExternalCancelFailed { .. }
+                | WorkflowEvent::ExternalAwaitRequested { .. }
+                | WorkflowEvent::ExternalAwaitResolved { .. }
+                | WorkflowEvent::ExternalAwaitFailed { .. } => {
+                    self.stash_transparent_external_event(scan_cursor);
                     scan_cursor += 1;
                 }
                 // Update events are transparent to the external signal scan.
@@ -2754,94 +2907,6 @@ impl HistoryMatcher {
                 }
                 WorkflowEvent::ChildWorkflowSpawnedDetached { .. } => {
                     first_interleaved_command.get_or_insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                // ExternalCancel events are transparent to the signal forward scan (issue #492).
-                WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
-                    let stashed = StashedExternalCancel {
-                        cancel_id: *cancel_id,
-                        target: target.clone(),
-                        terminal: None,
-                    };
-                    self.pending_external_cancels.push(stashed);
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalCancelDelivered { cancel_id } => {
-                    let id = *cancel_id;
-                    if let Some(p) = self
-                        .pending_external_cancels
-                        .iter_mut()
-                        .find(|p| p.cancel_id == id)
-                    {
-                        p.terminal = Some(StashedCancelTerminal::Delivered);
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalCancelFailed {
-                    cancel_id,
-                    reason_code,
-                } => {
-                    let id = *cancel_id;
-                    let code = reason_code.clone();
-                    if let Some(p) = self
-                        .pending_external_cancels
-                        .iter_mut()
-                        .find(|p| p.cancel_id == id)
-                    {
-                        p.terminal = Some(StashedCancelTerminal::Failed(code));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
-                    let stashed = StashedExternalAwait {
-                        await_id: *await_id,
-                        target: *target,
-                        terminal: None,
-                    };
-                    self.pending_external_awaits.push(stashed);
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitResolved { await_id, output } => {
-                    let id = *await_id;
-                    let out = output.clone();
-                    if let Some(p) = self
-                        .pending_external_awaits
-                        .iter_mut()
-                        .find(|p| p.await_id == id)
-                    {
-                        p.terminal = Some(StashedAwaitTerminal::Resolved(out));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitFailed {
-                    await_id,
-                    reason_code,
-                    message,
-                    error_type,
-                    details,
-                    non_retryable,
-                } => {
-                    let id = *await_id;
-                    let term = StashedAwaitTerminal::Failed {
-                        reason_code: reason_code.clone(),
-                        message: message.clone(),
-                        error_type: error_type.clone(),
-                        details: details.clone(),
-                        non_retryable: *non_retryable,
-                    };
-                    if let Some(p) = self
-                        .pending_external_awaits
-                        .iter_mut()
-                        .find(|p| p.await_id == id)
-                    {
-                        p.terminal = Some(term);
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
                     scan_cursor += 1;
                 }
                 _ => break,
@@ -3624,161 +3689,28 @@ impl HistoryMatcher {
 
             // Signals can arrive while a timer is pending; stash them for
             // later wait_for_signal calls and continue scanning.
-            if let WorkflowEvent::SignalReceived {
-                signal_name,
-                payload,
-            } = &self.events[scan_cursor]
-            {
-                let signal_name = signal_name.clone();
-                let payload = payload.clone();
-                self.stash_signal(scan_cursor, signal_name, payload);
+            if let WorkflowEvent::SignalReceived { .. } = &self.events[scan_cursor] {
+                self.stash_transparent_external_event(scan_cursor);
                 scan_cursor += 1;
                 continue;
             }
 
             // ExternalSignal event triplets can be interleaved with an in-flight
-            // timer (e.g. tokio::join!(signal_external, sleep)). Stash them so
-            // match_external_signal can find them after the timer resolves.
+            // timer (e.g. tokio::join!(signal_external, sleep)), and
+            // ExternalCancel/ExternalAwait triplets are likewise transparent to
+            // timer scans (issue #492, issue #757). Stash them so their own
+            // matchers can find them after the timer resolves.
             match &self.events[scan_cursor] {
-                WorkflowEvent::ExternalSignalRequested {
-                    signal_id,
-                    target,
-                    signal_name,
-                    payload,
-                    idempotency_key,
-                } => {
-                    self.stash_external_signal_request(
-                        scan_cursor,
-                        *signal_id,
-                        target.clone(),
-                        signal_name.clone(),
-                        payload.clone(),
-                        idempotency_key.clone(),
-                    );
-                    scan_cursor += 1;
-                    continue;
-                }
-                WorkflowEvent::ExternalSignalDelivered { signal_id } => {
-                    let id = *signal_id;
-                    if let Some(p) = self
-                        .pending_external_signals
-                        .iter_mut()
-                        .find(|p| p.signal_id == id)
-                    {
-                        p.terminal = Some(StashedSignalTerminal::Delivered);
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                    continue;
-                }
-                WorkflowEvent::ExternalSignalFailed {
-                    signal_id,
-                    reason_code,
-                } => {
-                    let id = *signal_id;
-                    let code = reason_code.clone();
-                    if let Some(p) = self
-                        .pending_external_signals
-                        .iter_mut()
-                        .find(|p| p.signal_id == id)
-                    {
-                        p.terminal = Some(StashedSignalTerminal::Failed(code));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                    continue;
-                }
-                // ExternalCancel events are transparent to timer scans (issue #492).
-                WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
-                    let stashed = StashedExternalCancel {
-                        cancel_id: *cancel_id,
-                        target: target.clone(),
-                        terminal: None,
-                    };
-                    self.pending_external_cancels.push(stashed);
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                    continue;
-                }
-                WorkflowEvent::ExternalCancelDelivered { cancel_id } => {
-                    let id = *cancel_id;
-                    if let Some(p) = self
-                        .pending_external_cancels
-                        .iter_mut()
-                        .find(|p| p.cancel_id == id)
-                    {
-                        p.terminal = Some(StashedCancelTerminal::Delivered);
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                    continue;
-                }
-                WorkflowEvent::ExternalCancelFailed {
-                    cancel_id,
-                    reason_code,
-                } => {
-                    let id = *cancel_id;
-                    let code = reason_code.clone();
-                    if let Some(p) = self
-                        .pending_external_cancels
-                        .iter_mut()
-                        .find(|p| p.cancel_id == id)
-                    {
-                        p.terminal = Some(StashedCancelTerminal::Failed(code));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                    continue;
-                }
-                WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
-                    let stashed = StashedExternalAwait {
-                        await_id: *await_id,
-                        target: *target,
-                        terminal: None,
-                    };
-                    self.pending_external_awaits.push(stashed);
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                    continue;
-                }
-                WorkflowEvent::ExternalAwaitResolved { await_id, output } => {
-                    let id = *await_id;
-                    let out = output.clone();
-                    if let Some(p) = self
-                        .pending_external_awaits
-                        .iter_mut()
-                        .find(|p| p.await_id == id)
-                    {
-                        p.terminal = Some(StashedAwaitTerminal::Resolved(out));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                    continue;
-                }
-                WorkflowEvent::ExternalAwaitFailed {
-                    await_id,
-                    reason_code,
-                    message,
-                    error_type,
-                    details,
-                    non_retryable,
-                } => {
-                    let id = *await_id;
-                    let term = StashedAwaitTerminal::Failed {
-                        reason_code: reason_code.clone(),
-                        message: message.clone(),
-                        error_type: error_type.clone(),
-                        details: details.clone(),
-                        non_retryable: *non_retryable,
-                    };
-                    if let Some(p) = self
-                        .pending_external_awaits
-                        .iter_mut()
-                        .find(|p| p.await_id == id)
-                    {
-                        p.terminal = Some(term);
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
+                WorkflowEvent::ExternalSignalRequested { .. }
+                | WorkflowEvent::ExternalSignalDelivered { .. }
+                | WorkflowEvent::ExternalSignalFailed { .. }
+                | WorkflowEvent::ExternalCancelRequested { .. }
+                | WorkflowEvent::ExternalCancelDelivered { .. }
+                | WorkflowEvent::ExternalCancelFailed { .. }
+                | WorkflowEvent::ExternalAwaitRequested { .. }
+                | WorkflowEvent::ExternalAwaitResolved { .. }
+                | WorkflowEvent::ExternalAwaitFailed { .. } => {
+                    self.stash_transparent_external_event(scan_cursor);
                     scan_cursor += 1;
                     continue;
                 }
@@ -4103,150 +4035,21 @@ impl HistoryMatcher {
             {
                 TimerScanStep::Cross
             }
-            // Signals can arrive while a timer is armed; stash them for a later
-            // wait_for_signal and cross.
-            WorkflowEvent::SignalReceived {
-                signal_name,
-                payload,
-            } => {
-                let signal_name = signal_name.clone();
-                let payload = payload.clone();
-                self.stash_signal(scan, signal_name, payload);
-                TimerScanStep::Cross
-            }
-            // External-signal / external-cancel triplets can interleave with an
-            // in-flight timer; stash so their own matchers find them afterwards.
-            WorkflowEvent::ExternalSignalRequested {
-                signal_id,
-                target,
-                signal_name,
-                payload,
-                idempotency_key,
-            } => {
-                self.stash_external_signal_request(
-                    scan,
-                    *signal_id,
-                    target.clone(),
-                    signal_name.clone(),
-                    payload.clone(),
-                    idempotency_key.clone(),
-                );
-                TimerScanStep::Cross
-            }
-            WorkflowEvent::ExternalSignalDelivered { signal_id } => {
-                let id = *signal_id;
-                if let Some(p) = self
-                    .pending_external_signals
-                    .iter_mut()
-                    .find(|p| p.signal_id == id)
-                {
-                    p.terminal = Some(StashedSignalTerminal::Delivered);
-                }
-                self.consumed_signal_events.insert(scan);
-                TimerScanStep::Cross
-            }
-            WorkflowEvent::ExternalSignalFailed {
-                signal_id,
-                reason_code,
-            } => {
-                let id = *signal_id;
-                let code = reason_code.clone();
-                if let Some(p) = self
-                    .pending_external_signals
-                    .iter_mut()
-                    .find(|p| p.signal_id == id)
-                {
-                    p.terminal = Some(StashedSignalTerminal::Failed(code));
-                }
-                self.consumed_signal_events.insert(scan);
-                TimerScanStep::Cross
-            }
-            WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
-                let stashed = StashedExternalCancel {
-                    cancel_id: *cancel_id,
-                    target: target.clone(),
-                    terminal: None,
-                };
-                self.pending_external_cancels.push(stashed);
-                self.consumed_signal_events.insert(scan);
-                TimerScanStep::Cross
-            }
-            WorkflowEvent::ExternalCancelDelivered { cancel_id } => {
-                let id = *cancel_id;
-                if let Some(p) = self
-                    .pending_external_cancels
-                    .iter_mut()
-                    .find(|p| p.cancel_id == id)
-                {
-                    p.terminal = Some(StashedCancelTerminal::Delivered);
-                }
-                self.consumed_signal_events.insert(scan);
-                TimerScanStep::Cross
-            }
-            WorkflowEvent::ExternalCancelFailed {
-                cancel_id,
-                reason_code,
-            } => {
-                let id = *cancel_id;
-                let code = reason_code.clone();
-                if let Some(p) = self
-                    .pending_external_cancels
-                    .iter_mut()
-                    .find(|p| p.cancel_id == id)
-                {
-                    p.terminal = Some(StashedCancelTerminal::Failed(code));
-                }
-                self.consumed_signal_events.insert(scan);
-                TimerScanStep::Cross
-            }
-            // External await event triplets are transparent to the timer scan (issue #757).
-            WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
-                let stashed = StashedExternalAwait {
-                    await_id: *await_id,
-                    target: *target,
-                    terminal: None,
-                };
-                self.pending_external_awaits.push(stashed);
-                self.consumed_signal_events.insert(scan);
-                TimerScanStep::Cross
-            }
-            WorkflowEvent::ExternalAwaitResolved { await_id, output } => {
-                let id = *await_id;
-                let out = output.clone();
-                if let Some(p) = self
-                    .pending_external_awaits
-                    .iter_mut()
-                    .find(|p| p.await_id == id)
-                {
-                    p.terminal = Some(StashedAwaitTerminal::Resolved(out));
-                }
-                self.consumed_signal_events.insert(scan);
-                TimerScanStep::Cross
-            }
-            WorkflowEvent::ExternalAwaitFailed {
-                await_id,
-                reason_code,
-                message,
-                error_type,
-                details,
-                non_retryable,
-            } => {
-                let id = *await_id;
-                let term = StashedAwaitTerminal::Failed {
-                    reason_code: reason_code.clone(),
-                    message: message.clone(),
-                    error_type: error_type.clone(),
-                    details: details.clone(),
-                    non_retryable: *non_retryable,
-                };
-                if let Some(p) = self
-                    .pending_external_awaits
-                    .iter_mut()
-                    .find(|p| p.await_id == id)
-                {
-                    p.terminal = Some(term);
-                }
-                self.consumed_signal_events.insert(scan);
+            // Signals can arrive while a timer is armed, and ExternalSignal /
+            // ExternalCancel / ExternalAwait triplets can interleave with an
+            // in-flight timer too (issue #492, issue #757); stash them for
+            // their own matchers and cross.
+            WorkflowEvent::SignalReceived { .. }
+            | WorkflowEvent::ExternalSignalRequested { .. }
+            | WorkflowEvent::ExternalSignalDelivered { .. }
+            | WorkflowEvent::ExternalSignalFailed { .. }
+            | WorkflowEvent::ExternalCancelRequested { .. }
+            | WorkflowEvent::ExternalCancelDelivered { .. }
+            | WorkflowEvent::ExternalCancelFailed { .. }
+            | WorkflowEvent::ExternalAwaitRequested { .. }
+            | WorkflowEvent::ExternalAwaitResolved { .. }
+            | WorkflowEvent::ExternalAwaitFailed { .. } => {
+                self.stash_transparent_external_event(scan);
                 TimerScanStep::Cross
             }
             // Update events are transparent to the timer scan.
@@ -4362,6 +4165,48 @@ impl HistoryMatcher {
     /// `known_limitation_signal_wait_composed_with_cancellable_await_fire_diverges_on_reversed_order`.
     #[allow(clippy::too_many_lines)]
     pub fn match_signal(&mut self, signal_name: &str) -> HistoryMatch {
+        self.match_signal_inner(signal_name, None)
+    }
+
+    /// [`match_signal`](Self::match_signal) for a **race branch** (issue #950).
+    ///
+    /// Identical scanning, with one difference: an interleaved event this scan
+    /// does not recognise never diverges — it is crossed as a sibling command
+    /// and the scan continues, and reaching the end of history without the
+    /// signal returns [`HistoryMatch::NoMatch`] rather than a divergence.
+    ///
+    /// `match_signal`'s divergence-on-stray-event behaviour exists for a *solo*
+    /// `wait_for_signal`: if the workflow expected a signal at this cursor and
+    /// history holds something else, that is a real code/history disagreement,
+    /// and parking on a signal that will never arrive would hang the workflow
+    /// forever (issue #768 round 13). Inside a `ctx.race()` neither premise
+    /// holds. Sibling branches legitimately record their own dispatch and
+    /// terminal events around this one — that is the whole point of a mixed
+    /// batch — and a signal branch that simply lost the race has **no recorded
+    /// event at all**, which is the normal outcome, not a divergence. A race
+    /// branch also cannot hang the workflow on a never-arriving signal: some
+    /// other branch resolves it, and the `race_winner:{seq}` marker fixes the
+    /// outcome for every later replay.
+    /// `settle_marker` is this race's own `race_winner:{seq}` marker name; it
+    /// **bounds** the scan. A `SignalReceived` recorded at or after that marker
+    /// was delivered once the race had already resolved, so it cannot be this
+    /// branch's resolution — it belongs to a later waiter. Without the bound a
+    /// *losing* signal branch would scan to end-of-history and silently consume
+    /// that signal, leaving the real `ctx.wait_for_signal` that owns it parked on
+    /// a signal already delivered.
+    pub fn match_race_signal(&mut self, signal_name: &str, settle_marker: &str) -> HistoryMatch {
+        self.match_signal_inner(signal_name, Some(settle_marker))
+    }
+
+    /// `tolerate_interleaved` carries the race's settlement-marker name when the
+    /// caller is a `ctx.race()` branch, and is `None` for a solo
+    /// `wait_for_signal`.
+    #[allow(clippy::too_many_lines)]
+    fn match_signal_inner(
+        &mut self,
+        signal_name: &str,
+        tolerate_interleaved: Option<&str>,
+    ) -> HistoryMatch {
         if let Some(index) = self
             .pending_signals
             .iter()
@@ -4378,6 +4223,13 @@ impl HistoryMatcher {
 
         let mut scan_cursor = self.cursor;
         let mut first_interleaved_command = None;
+        // `first_interleaved_command` is the rewind target: on a win the cursor
+        // returns to the first sibling command crossed, so each one is claimed by
+        // its own matcher in program order. It is NOT a verdict — a crossed
+        // command may belong to a sibling branch of this decision (a #950 mixed
+        // batch, which parks) or be stray (issue #768 round 13, which must
+        // nd-block), and this scan runs too early to tell. See the sibling-command
+        // arm below for why that verdict is deferred to the end of the cycle.
         while scan_cursor < self.events.len() {
             if self.is_consumed(scan_cursor) {
                 scan_cursor += 1;
@@ -4397,13 +4249,8 @@ impl HistoryMatcher {
 
                     return HistoryMatch::Matched { output };
                 }
-                WorkflowEvent::SignalReceived {
-                    signal_name: recorded_name,
-                    payload,
-                } => {
-                    let recorded_name = recorded_name.clone();
-                    let payload = payload.clone();
-                    self.stash_signal(scan_cursor, recorded_name, payload);
+                WorkflowEvent::SignalReceived { .. } => {
+                    self.stash_transparent_external_event(scan_cursor);
                     scan_cursor += 1;
                 }
                 ev if Self::is_update_event(ev) => {
@@ -4448,177 +4295,138 @@ impl HistoryMatcher {
                 {
                     scan_cursor += 1;
                 }
-                // A detached-spawn or a cancellable-timer arm/cancel (issue #768)
-                // — e.g. a `[CancelTimer, TimerStarted]` reset, or a
-                // `[CancelTimer, WaitForSignal]` batch from a
-                // `cancel_timer()`/`reset()` in the same cycle as a
-                // `wait_for_signal`, or a push signal handler resetting a timer
-                // — is transparent to the signal scan. A `reset()` records
-                // `[TimerCancelled, TimerStarted]`, so BOTH must be skipped: on a
-                // `wait_for_signal` polled before a same-cycle reset branch, the
-                // history before the signal is `TimerCancelled, TimerStarted`, and
-                // stopping on the re-arm would wrongly report a missing signal
-                // (Codex P2, issue #768). Rewind WITHOUT consuming so each event's
-                // own claimer (`match_timer_cancel` / `match_timer_arm`) can still
-                // claim it exactly once (mirrors `scan_activity_terminal`).
-                WorkflowEvent::ChildWorkflowSpawnedDetached { .. }
+                // Issue #950: a race branch's scan stops at its OWN settlement
+                // marker. This arm MUST precede the generic sibling-command arm
+                // below, which also matches `MarkerRecorded` and would otherwise
+                // swallow the bound — letting a losing signal branch scan past
+                // the resolved race and consume a signal belonging to a later
+                // `ctx.wait_for_signal`.
+                WorkflowEvent::MarkerRecorded { name, .. }
+                    if tolerate_interleaved == Some(name.as_str()) =>
+                {
+                    return HistoryMatch::NoMatch;
+                }
+                // An interleaved sibling COMMAND. Cross it as an interleaved
+                // command (rewind to it on a win, so its own matcher claims it in
+                // program order) and keep scanning for the awaited signal.
+                //
+                // Two histories put a command here and they are NOT
+                // distinguishable at this point:
+                //
+                //   * a sibling branch of THIS decision (issue #950) —
+                //     `join!(ctx.wait_for_signal(..), ctx.timer(..))` or
+                //     `join!(ctx.wait_for_signal(..), ctx.execute_activity(..))`.
+                //     `join!` polls the signal first, so the batch records the
+                //     sibling's `TimerStarted`/`ActivityScheduled` and nothing for
+                //     the signal wait; on the next drive this scan starts ON that
+                //     event, and the sibling's own `match_timer_strict` /
+                //     `scan_activity_terminal` claims it later in the same cycle.
+                //     The correct outcome is a park.
+                //   * a STRAY command left by code that no longer runs (issue #768
+                //     round 13, and the `[TimerCancelled, TimerStarted]` pair a
+                //     same-cycle `reset()` records). Nothing claims it, and
+                //     parking would wait forever on a signal that never arrives.
+                //
+                // What separates them is not the event, it is whether anything in
+                // this decision claims it — which this scan cannot know, because it
+                // runs BEFORE the sibling branches are polled. So it crosses
+                // everything NON-CONSUMINGLY. Each event stays claimable exactly
+                // once by `match_timer_cancel` / `match_timer_arm` / etc. The
+                // end-of-cycle drift guard in `executor.rs` gives the verdict.
+                // Strict and canary replay use
+                // `history_has_unconsumed_events()`. The worker path uses
+                // `first_unconsumed_command_event()` (issue #1791).
+                //
+                // Round 13's protection is preserved in OUTCOME — pinned by
+                // `interleaved_sibling_signal_stray_timer_started_still_diverges`
+                // — while the mixed batch parks, pinned by
+                // `mixed_join_signal_timer_and_activity_parks_after_the_activity_resolves`.
+                // Deciding here instead is what left an advertised mixed
+                // composition nd-blocked on its first wake (Codex round 3 on PR
+                // #1245); it is also the choice already made for
+                // `wait_for_signal_timeout`'s strict-`Suspended` arm.
+                //
+                // This completes the "full mixed-batch parity for the signal
+                // wait" that issue #1071 scoped out; the sets mirror
+                // `match_timer_strict` / `scan_activity_terminal` — keep them in
+                // sync.
+                WorkflowEvent::ActivityScheduled { .. }
+                | WorkflowEvent::ChildWorkflowStarted { .. }
+                | WorkflowEvent::LocalActivityScheduled { .. }
+                | WorkflowEvent::MarkerRecorded { .. }
+                | WorkflowEvent::SideEffectRecorded { .. }
+                | WorkflowEvent::ChildWorkflowSpawnedDetached { .. }
                 | WorkflowEvent::TimerCancelled { .. }
                 | WorkflowEvent::TimerStarted { .. } => {
                     first_interleaved_command.get_or_insert(scan_cursor);
                     scan_cursor += 1;
                 }
+                // Progress and terminal events of those concurrent siblings —
+                // and a foreign timer's fire (a sibling deadline that fired
+                // before the awaited signal arrived, e.g. a concurrent
+                // `receive_signal_timeout`/`ctx.timer` in the same batch whose
+                // `TimerFired` is recorded ahead of the delivered
+                // `SignalReceived`, issue #1071 manifestation #3) — are
+                // transparent to this scan. Cross them NON-CONSUMINGLY, leaving
+                // each for its own matcher to claim, and keep scanning for the
+                // awaited signal. The same treatment `match_timer_strict` and
+                // `scan_activity_terminal` give their sibling terminals; keep the
+                // three sets in sync (issue #1071 / #950).
+                //
+                // Crossing non-consumingly is what keeps round 13's protection
+                // intact without a scan-time guess: a lone stale `TimerFired` (or
+                // any other event here) that no branch of this decision claims is
+                // still unconsumed at suspend and nd-blocks there.
+                WorkflowEvent::ActivityStarted { .. }
+                | WorkflowEvent::ActivityHeartbeat { .. }
+                | WorkflowEvent::ActivityCompleted { .. }
+                | WorkflowEvent::ActivityFailed { .. }
+                | WorkflowEvent::ActivityTimedOut { .. }
+                | WorkflowEvent::ChildWorkflowCompleted { .. }
+                | WorkflowEvent::ChildWorkflowFailed { .. }
+                | WorkflowEvent::LocalActivityCompleted { .. }
+                | WorkflowEvent::LocalActivityFailed { .. }
+                | WorkflowEvent::TimerFired { .. } => {
+                    scan_cursor += 1;
+                }
                 // ExternalSignal event triplets can appear before SignalReceived
                 // when a mixed batch (e.g. tokio::join!(wait_for_signal, signal_external))
-                // wrote signal events first.  Stash them for later match_external_signal.
-                WorkflowEvent::ExternalSignalRequested {
-                    signal_id,
-                    target,
-                    signal_name: sn,
-                    payload,
-                    idempotency_key,
-                } => {
-                    self.stash_external_signal_request(
-                        scan_cursor,
-                        *signal_id,
-                        target.clone(),
-                        sn.clone(),
-                        payload.clone(),
-                        idempotency_key.clone(),
-                    );
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalSignalDelivered { signal_id } => {
-                    self.stash_external_signal_terminal(
-                        scan_cursor,
-                        *signal_id,
-                        StashedSignalTerminal::Delivered,
-                    );
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalSignalFailed {
-                    signal_id,
-                    reason_code,
-                } => {
-                    self.stash_external_signal_terminal(
-                        scan_cursor,
-                        *signal_id,
-                        StashedSignalTerminal::Failed(reason_code.clone()),
-                    );
-                    scan_cursor += 1;
-                }
-                // ExternalCancel events are transparent to signal wait scans (issue #492).
-                WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
-                    let stashed = StashedExternalCancel {
-                        cancel_id: *cancel_id,
-                        target: target.clone(),
-                        terminal: None,
-                    };
-                    self.pending_external_cancels.push(stashed);
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalCancelDelivered { cancel_id } => {
-                    let id = *cancel_id;
-                    if let Some(p) = self
-                        .pending_external_cancels
-                        .iter_mut()
-                        .find(|p| p.cancel_id == id)
-                    {
-                        p.terminal = Some(StashedCancelTerminal::Delivered);
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalCancelFailed {
-                    cancel_id,
-                    reason_code,
-                } => {
-                    let id = *cancel_id;
-                    let code = reason_code.clone();
-                    if let Some(p) = self
-                        .pending_external_cancels
-                        .iter_mut()
-                        .find(|p| p.cancel_id == id)
-                    {
-                        p.terminal = Some(StashedCancelTerminal::Failed(code));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
-                    let stashed = StashedExternalAwait {
-                        await_id: *await_id,
-                        target: *target,
-                        terminal: None,
-                    };
-                    self.pending_external_awaits.push(stashed);
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitResolved { await_id, output } => {
-                    let id = *await_id;
-                    let out = output.clone();
-                    if let Some(p) = self
-                        .pending_external_awaits
-                        .iter_mut()
-                        .find(|p| p.await_id == id)
-                    {
-                        p.terminal = Some(StashedAwaitTerminal::Resolved(out));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitFailed {
-                    await_id,
-                    reason_code,
-                    message,
-                    error_type,
-                    details,
-                    non_retryable,
-                } => {
-                    let id = *await_id;
-                    let term = StashedAwaitTerminal::Failed {
-                        reason_code: reason_code.clone(),
-                        message: message.clone(),
-                        error_type: error_type.clone(),
-                        details: details.clone(),
-                        non_retryable: *non_retryable,
-                    };
-                    if let Some(p) = self
-                        .pending_external_awaits
-                        .iter_mut()
-                        .find(|p| p.await_id == id)
-                    {
-                        p.terminal = Some(term);
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                // A foreign timer's fire — a sibling deadline timer that fired
-                // before the awaited signal arrived (e.g. a concurrent
-                // `receive_signal_timeout`/`ctx.timer` in the same suspension
-                // batch, whose `TimerFired` is recorded ahead of the delivered
-                // `SignalReceived`) — is transparent to the signal scan. Cross
-                // it NON-CONSUMINGLY, leaving it for its own timer matcher, and
-                // keep scanning for the awaited signal (issue #1071
-                // manifestation #3). This does NOT set `first_interleaved_command`,
-                // so the round-13 stray-`TimerStarted` park-forever guard below
-                // (an interleaved timer with NO resolving signal → diverge) is
-                // untouched: a lone `TimerStarted` still diverges.
-                //
-                // DELIBERATE PARTIAL SCOPE (issue #1071): only the TIMER sibling
-                // is tolerated in `match_signal` — the sole case the issue's
-                // three comments name. An interleaved activity/child/local-activity
-                // sibling in a `join!(wait_for_signal, activity)` mixed batch is
-                // NOT crossed here and still falls through to `other =>` as a
-                // divergence. Full mixed-batch parity for the signal wait is out
-                // of scope; the fuller interleaved sets live in
-                // `match_timer_strict` / `scan_activity_terminal` /
-                // `match_signal_or_timer`.
-                WorkflowEvent::TimerFired { .. } => {
+                // wrote signal events first, and ExternalCancel/ExternalAwait
+                // triplets are likewise transparent here (issue #492, issue
+                // #757). Stash them for their own matchers.
+                WorkflowEvent::ExternalSignalRequested { .. }
+                | WorkflowEvent::ExternalSignalDelivered { .. }
+                | WorkflowEvent::ExternalSignalFailed { .. }
+                | WorkflowEvent::ExternalCancelRequested { .. }
+                | WorkflowEvent::ExternalCancelDelivered { .. }
+                | WorkflowEvent::ExternalCancelFailed { .. }
+                | WorkflowEvent::ExternalAwaitRequested { .. }
+                | WorkflowEvent::ExternalAwaitResolved { .. }
+                | WorkflowEvent::ExternalAwaitFailed { .. } => {
+                    self.stash_transparent_external_event(scan_cursor);
                     scan_cursor += 1;
                 }
                 other => {
+                    // Issue #950: inside a race, an unrecognised event is a
+                    // sibling branch's own command/terminal, not a divergence —
+                    // cross it as an interleaved command (so a later win rewinds
+                    // the cursor to it for its own claimer) and keep scanning,
+                    // bounded by the race's own settlement marker.
+                    //
+                    // Checked BEFORE the `is_some()` early-return below. That
+                    // guard is what makes the SOLO wait stop after one crossed
+                    // event, and since this arm is what SETS
+                    // `first_interleaved_command`, ordering it second would let a
+                    // race branch cross exactly one event and then bail — while
+                    // the normal shape is two (`ActivityScheduled` +
+                    // `ActivityStarted`) before the signal.
+                    // The settlement-marker bound is applied by its own arm
+                    // above, ahead of the sibling-command arm.
+                    if tolerate_interleaved.is_some() {
+                        first_interleaved_command.get_or_insert(scan_cursor);
+                        scan_cursor += 1;
+                        continue;
+                    }
                     if first_interleaved_command.is_some() {
                         return HistoryMatch::NoMatch;
                     }
@@ -4633,26 +4441,29 @@ impl HistoryMatcher {
         }
 
         // The signal scan reached the end of history without finding the
-        // signal. If it crossed one or more UNCONSUMED interleaved
-        // timer/detached-spawn commands (issue #768) on the way, those events
-        // are a divergence boundary — NOT a swallowed suspend. An already-
-        // consumed reset's timers (claimed by a companion `match_timer_cancel`/
-        // `match_timer_arm` earlier this cycle) are skipped at the top of the
-        // loop and never set `first_interleaved_command`, so a genuine
-        // "signal has not arrived yet" suspend still returns `NoMatch` and
-        // parks correctly. But a STRAY unconsumed `TimerStarted`/`TimerCancelled`
-        // where the workflow expected a signal must diverge (→ NonDeterministic
-        // / #603 nd-block) rather than push a `WaitForSignal` command and park
-        // the workflow forever on a signal that will never arrive
-        // (round 13 regression fix, issue #768).
-        if let Some(first) = first_interleaved_command {
-            return HistoryMatch::Diverged {
-                expected: format!("SignalReceived({signal_name})"),
-                actual: Self::actual_event_name(&self.events[first]),
-                event_index: i32::try_from(first).ok(),
-            };
-        }
-
+        // signal: the awaited signal has not arrived yet, so this wait parks.
+        //
+        // Any interleaved command crossed on the way (a sibling's
+        // `ActivityScheduled`/`ChildWorkflowStarted`, or a `TimerStarted`/
+        // `TimerCancelled`/detached spawn) was crossed NON-CONSUMINGLY, so it is
+        // left for its own claimer. That is what makes returning `NoMatch` here
+        // safe for BOTH readings of a crossed command:
+        //
+        //   * a sibling branch of this decision claims it later in the same
+        //     cycle (the #950 mixed batch) → the frontier is clean when the body
+        //     suspends and the park is correct;
+        //   * nothing claims it (a stray left by code that no longer runs,
+        //     issue #768) → it is still unconsumed at suspend. The
+        //     end-of-cycle drift guard in `executor.rs` then fails the cycle.
+        //     The run does not park forever on a signal that never arrives.
+        //     Strict and canary replay use `history_has_unconsumed_events()`.
+        //     The worker path uses `first_unconsumed_command_event()` (issue
+        //     #1791). The #603 gate then ND-blocks the run.
+        //
+        // Deciding that here instead would mean guessing, since this scan runs
+        // before the sibling branches of the same decision are polled — which is
+        // exactly how an advertised `join!(wait_for_signal, ctx.timer)` came to
+        // be nd-blocked on its first wake (Codex round 3 on PR #1245).
         HistoryMatch::NoMatch
     }
 
@@ -4707,6 +4518,7 @@ impl HistoryMatcher {
     /// handler names, not just within one name.
     pub(crate) fn claim_pending_signal(&mut self, signal_name: &str) -> Vec<(usize, Value)> {
         self.prepare_match();
+        self.note_signal_probe(signal_name);
 
         let (matched, remaining): (VecDeque<_>, VecDeque<_>) =
             std::mem::take(&mut self.pending_signals)
@@ -4755,6 +4567,7 @@ impl HistoryMatcher {
     /// versa) will not re-deliver it.
     pub(crate) fn try_claim_pending_signal(&mut self, signal_name: &str) -> Option<Value> {
         self.prepare_match();
+        self.note_signal_probe(signal_name);
         let index = self.pending_signals.iter().position(|(name, _, idx)| {
             name == signal_name && !self.race_reserved_signal_events.contains(idx)
         })?;
@@ -4938,13 +4751,8 @@ impl HistoryMatcher {
 
                 // Other signals can arrive while the race is pending; stash
                 // them for later signal waits and continue scanning.
-                WorkflowEvent::SignalReceived {
-                    signal_name: recorded_name,
-                    payload,
-                } => {
-                    let recorded_name = recorded_name.clone();
-                    let payload = payload.clone();
-                    self.stash_signal(scan_cursor, recorded_name, payload);
+                WorkflowEvent::SignalReceived { .. } => {
+                    self.stash_transparent_external_event(scan_cursor);
                     scan_cursor += 1;
                 }
 
@@ -4989,122 +4797,19 @@ impl HistoryMatcher {
                 }
 
                 // ExternalSignal event triplets can be interleaved with the
-                // pending race; stash them for later match_external_signal.
-                WorkflowEvent::ExternalSignalRequested {
-                    signal_id,
-                    target,
-                    signal_name: sn,
-                    payload,
-                    idempotency_key,
-                } => {
-                    self.stash_external_signal_request(
-                        scan_cursor,
-                        *signal_id,
-                        target.clone(),
-                        sn.clone(),
-                        payload.clone(),
-                        idempotency_key.clone(),
-                    );
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalSignalDelivered { signal_id } => {
-                    self.stash_external_signal_terminal(
-                        scan_cursor,
-                        *signal_id,
-                        StashedSignalTerminal::Delivered,
-                    );
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalSignalFailed {
-                    signal_id,
-                    reason_code,
-                } => {
-                    self.stash_external_signal_terminal(
-                        scan_cursor,
-                        *signal_id,
-                        StashedSignalTerminal::Failed(reason_code.clone()),
-                    );
-                    scan_cursor += 1;
-                }
-
-                // ExternalCancel events are transparent to signal-or-timer race
-                // scans (issue #492).
-                WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
-                    self.pending_external_cancels.push(StashedExternalCancel {
-                        cancel_id: *cancel_id,
-                        target: target.clone(),
-                        terminal: None,
-                    });
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalCancelDelivered { cancel_id } => {
-                    if let Some(s) = self
-                        .pending_external_cancels
-                        .iter_mut()
-                        .find(|s| s.cancel_id == *cancel_id)
-                    {
-                        s.terminal = Some(StashedCancelTerminal::Delivered);
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalCancelFailed {
-                    cancel_id,
-                    reason_code,
-                } => {
-                    if let Some(s) = self
-                        .pending_external_cancels
-                        .iter_mut()
-                        .find(|s| s.cancel_id == *cancel_id)
-                    {
-                        s.terminal = Some(StashedCancelTerminal::Failed(reason_code.clone()));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
-                    self.pending_external_awaits.push(StashedExternalAwait {
-                        await_id: *await_id,
-                        target: *target,
-                        terminal: None,
-                    });
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitResolved { await_id, output } => {
-                    if let Some(s) = self
-                        .pending_external_awaits
-                        .iter_mut()
-                        .find(|s| s.await_id == *await_id)
-                    {
-                        s.terminal = Some(StashedAwaitTerminal::Resolved(output.clone()));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitFailed {
-                    await_id,
-                    reason_code,
-                    message,
-                    error_type,
-                    details,
-                    non_retryable,
-                } => {
-                    if let Some(s) = self
-                        .pending_external_awaits
-                        .iter_mut()
-                        .find(|s| s.await_id == *await_id)
-                    {
-                        s.terminal = Some(StashedAwaitTerminal::Failed {
-                            reason_code: reason_code.clone(),
-                            message: message.clone(),
-                            error_type: error_type.clone(),
-                            details: details.clone(),
-                            non_retryable: *non_retryable,
-                        });
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
+                // pending race, and ExternalCancel/ExternalAwait triplets are
+                // likewise transparent to signal-or-timer race scans (issue
+                // #492, issue #757). Stash them for their own matchers.
+                WorkflowEvent::ExternalSignalRequested { .. }
+                | WorkflowEvent::ExternalSignalDelivered { .. }
+                | WorkflowEvent::ExternalSignalFailed { .. }
+                | WorkflowEvent::ExternalCancelRequested { .. }
+                | WorkflowEvent::ExternalCancelDelivered { .. }
+                | WorkflowEvent::ExternalCancelFailed { .. }
+                | WorkflowEvent::ExternalAwaitRequested { .. }
+                | WorkflowEvent::ExternalAwaitResolved { .. }
+                | WorkflowEvent::ExternalAwaitFailed { .. } => {
+                    self.stash_transparent_external_event(scan_cursor);
                     scan_cursor += 1;
                 }
 
@@ -5189,15 +4894,22 @@ impl HistoryMatcher {
     /// Whether the recorded continue-as-new target type equals `expected`
     /// (issue #803).
     ///
-    /// Cursor-independent (it scans, rather than reading at the cursor) so it
-    /// can be consulted *after* [`Self::match_continue_as_new`] has advanced
-    /// past the event. Exists solely to back a `debug_assert!` on the
-    /// `Matched` arm, where the successor type is emitted from the live
-    /// argument rather than echoed from history; a history with no recorded
-    /// continuation reports `true` (there is nothing to contradict).
+    /// It scans back from the cursor, so it can be consulted *after*
+    /// [`Self::match_continue_as_new`] has advanced past the event. Exists
+    /// solely to back a `debug_assert!` on the `Matched` arm, where the
+    /// successor type is emitted from the live argument rather than echoed
+    /// from history; a history with no recorded continuation reports `true`
+    /// (there is nothing to contradict).
+    ///
+    /// It reads the last continuation before the cursor, which is the one
+    /// just matched. A malformed history can hold two continuations. The
+    /// fuzz target found that reading the first one then fired the assert on
+    /// a correct match (issue #1835).
     pub(crate) fn recorded_continue_as_new_type_matches(&self, expected: Option<&str>) -> bool {
-        self.events
+        let end = self.cursor.min(self.events.len());
+        self.events[..end]
             .iter()
+            .rev()
             .find_map(|e| match e {
                 WorkflowEvent::WorkflowContinuedAsNew {
                     new_workflow_type, ..
@@ -5703,13 +5415,8 @@ impl HistoryMatcher {
 
                 // Signals arriving while the race is pending are stashed for
                 // later signal waits.
-                WorkflowEvent::SignalReceived {
-                    signal_name,
-                    payload,
-                } => {
-                    let signal_name = signal_name.clone();
-                    let payload = payload.clone();
-                    self.stash_signal(scan_cursor, signal_name, payload);
+                WorkflowEvent::SignalReceived { .. } => {
+                    self.stash_transparent_external_event(scan_cursor);
                     scan_cursor += 1;
                 }
 
@@ -5733,122 +5440,20 @@ impl HistoryMatcher {
                     scan_cursor += 1;
                 }
 
-                // ExternalSignal event triplets can be interleaved; stash them
-                // for later match_external_signal.
-                WorkflowEvent::ExternalSignalRequested {
-                    signal_id,
-                    target,
-                    signal_name: sn,
-                    payload,
-                    idempotency_key,
-                } => {
-                    self.stash_external_signal_request(
-                        scan_cursor,
-                        *signal_id,
-                        target.clone(),
-                        sn.clone(),
-                        payload.clone(),
-                        idempotency_key.clone(),
-                    );
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalSignalDelivered { signal_id } => {
-                    self.stash_external_signal_terminal(
-                        scan_cursor,
-                        *signal_id,
-                        StashedSignalTerminal::Delivered,
-                    );
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalSignalFailed {
-                    signal_id,
-                    reason_code,
-                } => {
-                    self.stash_external_signal_terminal(
-                        scan_cursor,
-                        *signal_id,
-                        StashedSignalTerminal::Failed(reason_code.clone()),
-                    );
-                    scan_cursor += 1;
-                }
-
-                // ExternalCancel events are transparent to the race scan (#492).
-                WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
-                    self.pending_external_cancels.push(StashedExternalCancel {
-                        cancel_id: *cancel_id,
-                        target: target.clone(),
-                        terminal: None,
-                    });
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalCancelDelivered { cancel_id } => {
-                    if let Some(s) = self
-                        .pending_external_cancels
-                        .iter_mut()
-                        .find(|s| s.cancel_id == *cancel_id)
-                    {
-                        s.terminal = Some(StashedCancelTerminal::Delivered);
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalCancelFailed {
-                    cancel_id,
-                    reason_code,
-                } => {
-                    if let Some(s) = self
-                        .pending_external_cancels
-                        .iter_mut()
-                        .find(|s| s.cancel_id == *cancel_id)
-                    {
-                        s.terminal = Some(StashedCancelTerminal::Failed(reason_code.clone()));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
-                    self.pending_external_awaits.push(StashedExternalAwait {
-                        await_id: *await_id,
-                        target: *target,
-                        terminal: None,
-                    });
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitResolved { await_id, output } => {
-                    if let Some(s) = self
-                        .pending_external_awaits
-                        .iter_mut()
-                        .find(|s| s.await_id == *await_id)
-                    {
-                        s.terminal = Some(StashedAwaitTerminal::Resolved(output.clone()));
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ExternalAwaitFailed {
-                    await_id,
-                    reason_code,
-                    message,
-                    error_type,
-                    details,
-                    non_retryable,
-                } => {
-                    if let Some(s) = self
-                        .pending_external_awaits
-                        .iter_mut()
-                        .find(|s| s.await_id == *await_id)
-                    {
-                        s.terminal = Some(StashedAwaitTerminal::Failed {
-                            reason_code: reason_code.clone(),
-                            message: message.clone(),
-                            error_type: error_type.clone(),
-                            details: details.clone(),
-                            non_retryable: *non_retryable,
-                        });
-                    }
-                    self.consumed_signal_events.insert(scan_cursor);
+                // ExternalSignal event triplets can be interleaved, and
+                // ExternalCancel/ExternalAwait triplets are likewise
+                // transparent to the race scan (issue #492, issue #757).
+                // Stash them for their own matchers.
+                WorkflowEvent::ExternalSignalRequested { .. }
+                | WorkflowEvent::ExternalSignalDelivered { .. }
+                | WorkflowEvent::ExternalSignalFailed { .. }
+                | WorkflowEvent::ExternalCancelRequested { .. }
+                | WorkflowEvent::ExternalCancelDelivered { .. }
+                | WorkflowEvent::ExternalCancelFailed { .. }
+                | WorkflowEvent::ExternalAwaitRequested { .. }
+                | WorkflowEvent::ExternalAwaitResolved { .. }
+                | WorkflowEvent::ExternalAwaitFailed { .. } => {
+                    self.stash_transparent_external_event(scan_cursor);
                     scan_cursor += 1;
                 }
 
@@ -6699,6 +6304,58 @@ impl HistoryMatcher {
     /// tolerated set is encountered) the cursor is left unchanged if nothing
     /// was skipped, or parked at the first tolerated event otherwise — in
     /// both cases safe to call speculatively.
+    /// Whether any unclaimed `SignalReceived { signal_name }` remains — either
+    /// already stashed in `pending_signals`, or still unconsumed at/after the
+    /// current cursor (issue #950).
+    ///
+    /// A **pure read**: consumes nothing and never moves the cursor. Used by the
+    /// strict/canary replay frontier test for a signal wait, where "cursor at end
+    /// of history" is the wrong question: a mixed suspension batch legitimately
+    /// leaves a SIBLING branch's events unconsumed ahead of the cursor while the
+    /// signal wait itself has nothing to match. What actually distinguishes a
+    /// healthy in-flight park from a real divergence is whether a matching signal
+    /// is still available anywhere.
+    #[must_use]
+    pub fn has_unconsumed_signal(&self, signal_name: &str) -> bool {
+        if self
+            .pending_signals
+            .iter()
+            .any(|(name, _, _)| name == signal_name)
+        {
+            return true;
+        }
+        self.events
+            .iter()
+            .enumerate()
+            .skip(self.cursor)
+            .any(|(i, e)| {
+                !self.is_consumed(i)
+                    && matches!(
+                        e,
+                        WorkflowEvent::SignalReceived { signal_name: n, .. } if n == signal_name
+                    )
+            })
+    }
+
+    /// Whether an unconsumed `MarkerRecorded { name }` exists anywhere at or
+    /// after the current cursor (issue #950).
+    ///
+    /// A **pure read**: unlike [`Self::peek_u64_marker`] it consumes nothing and
+    /// never moves the cursor, so it is safe to call mid-decision (e.g. between
+    /// a race's branch checks) where a consuming peek would steal the marker
+    /// from the settling step that owns it.
+    #[must_use]
+    pub fn has_unconsumed_marker(&self, marker_name: &str) -> bool {
+        self.events
+            .iter()
+            .enumerate()
+            .skip(self.cursor)
+            .any(|(i, e)| {
+                !self.is_consumed(i)
+                    && matches!(e, WorkflowEvent::MarkerRecorded { name, .. } if name == marker_name)
+            })
+    }
+
     pub fn peek_u64_marker(&mut self, marker_name: &str) -> Option<u64> {
         if !self.prepare_match() {
             return None;
@@ -8841,7 +8498,7 @@ mod tests {
 
         // Calling again must not re-deliver the same event.
         let second = matcher.claim_pending_signal("cancel");
-        assert!(second.is_empty());
+        assert_eq!(second, [] as [(usize, serde_json::Value); 0]);
     }
 
     #[test]
@@ -8981,7 +8638,7 @@ mod tests {
         }];
         let mut matcher = HistoryMatcher::new(events);
         let claimed = matcher.claim_pending_signal("cancel");
-        assert!(claimed.is_empty());
+        assert_eq!(claimed, [] as [(usize, serde_json::Value); 0]);
     }
 
     #[test]
@@ -9572,18 +9229,46 @@ mod tests {
     }
 
     #[test]
-    fn matcher_signal_scan_diverges_on_unconsumed_stray_timer() {
-        // Round 13 regression fix (issue #768): a `wait_for_signal` over a
-        // history carrying a STRAY, unconsumed `TimerStarted` and NO matching
-        // signal must DIVERGE — not silently reach the end of the scan and
-        // return `NoMatch` (which `wait_for_signal` would turn into a
-        // `WaitForSignal` command + `rx.await`, parking a genuinely-diverged
-        // workflow forever instead of nd-blocking, #603).
+    fn matcher_signal_scan_leaves_a_stray_timer_unconsumed_for_the_cycle_guard() {
+        // Round 13 (issue #768) requires that a `wait_for_signal` over a history
+        // carrying a STRAY, unconsumed `TimerStarted` and no matching signal
+        // nd-blocks rather than parking forever on a signal that will never
+        // arrive (#603).
+        //
+        // Issue #950 moved WHERE that is decided. The matcher used to diverge
+        // here, but at scan time a stray timer is indistinguishable from the
+        // timer of an advertised `join!(wait_for_signal, ctx.timer)` mixed batch,
+        // whose sibling branch has not been polled yet — so diverging here
+        // nd-blocked a supported composition on its first wake (Codex round 3 on
+        // PR #1245). The scan now returns `NoMatch` and, crucially, leaves the
+        // event UNCONSUMED. The end-of-cycle drift guard in `executor.rs` sees
+        // that nothing claimed it and fails the cycle.
+        //
+        // So this asserts the two halves the cycle guard needs, not a verdict:
+        // park, and the stray event still unclaimed. Two integration tests pin
+        // the issue #768 outcome end to end:
+        //
+        // - `interleaved_sibling_signal_stray_timer_started_still_diverges`
+        //   pins strict replay (`history_has_unconsumed_events()`).
+        // - `stray_timer_before_signal_wait_blocks_instead_of_parking` pins the
+        //   worker path (`first_unconsumed_command_event()`, issue #1791).
         let events = vec![ts("timer-1", 10)];
         let mut m = HistoryMatcher::new(events);
+        assert_eq!(
+            m.match_signal("my-signal"),
+            HistoryMatch::NoMatch,
+            "the scan must park rather than guess; the stray timer is caught at \
+             the end of the cycle"
+        );
         assert!(
-            matches!(m.match_signal("my-signal"), HistoryMatch::Diverged { .. }),
-            "a stray unconsumed TimerStarted where a signal was expected must diverge, not suspend"
+            !m.is_consumed(0),
+            "the stray timer must be left UNCONSUMED. Both end-of-cycle drift \
+             guards key on it"
+        );
+        assert_eq!(
+            m.first_unconsumed_command_event(),
+            Some((0, "TimerStarted(timer-1)".to_string())),
+            "the worker-path guard must see the same stray timer (issue #1791)"
         );
     }
 
@@ -9852,11 +9537,15 @@ mod tests {
         );
     }
 
+    // ── Terminal-failure tail transparency tests (issue #952) ─────────────
+
+    /// Superseded by issue #952: a bare trailing `WorkflowFailed` used to stay
+    /// opaque, which made every in-progress `match_*` on a failed run diverge
+    /// (see the two known-limitation tests in `tests/integration/replayer_tests.rs`).
+    /// It is now transparent — a failing cycle's history is truncated by
+    /// construction, so there is nothing past the failure point to verify.
     #[test]
-    fn bare_trailing_failed_stays_non_transparent() {
-        // Regression guard: a genuinely failed run (no following WorkflowRedriven)
-        // must keep its terminal WorkflowFailed non-transparent so the replay of
-        // failed workflows (queries, the replayer harness) is unaffected.
+    fn bare_trailing_failed_is_transparent() {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
@@ -9869,8 +9558,1278 @@ mod tests {
         ];
         let matcher = HistoryMatcher::new(events);
         assert!(
+            matcher.is_consumed(1),
+            "a bare trailing WorkflowFailed must be transparent to in-progress matches"
+        );
+        assert!(matcher.has_terminal_failure_tail());
+    }
+
+    #[test]
+    fn in_progress_match_past_a_trailing_failed_is_no_match_not_diverged() {
+        // The whole point of the tail: a workflow that issues a match attempt
+        // and only then fails (a payload-cap / missing-handler / missing-store
+        // check) must observe "the run is failing" (NoMatch), not a divergence.
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::workflow_failed("payload too large"),
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        matcher.advance(); // past WorkflowStarted
+        assert_eq!(
+            matcher.match_child_workflow("some_child", &Value::Null),
+            HistoryMatch::NoMatch,
+            "a match attempt at the failing frontier must not diverge"
+        );
+        assert!(
+            matcher.at_terminal_failure_frontier(),
+            "all pre-terminal events consumed → the cursor is at the failing frontier"
+        );
+    }
+
+    #[test]
+    fn terminal_failure_tail_spans_post_terminal_bookkeeping() {
+        // A workflow-level retry (#523) appends WorkflowRetryScheduled AFTER the
+        // sealed run's WorkflowFailed. The tail must still be recognised, and
+        // every event in it transparent, or the retried run's history would keep
+        // false-flagging.
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::workflow_failed("boom"),
+            WorkflowEvent::WorkflowRetryScheduled {
+                retry_exec_id: ExecutionId::new(),
+                attempt: 2,
+                fire_at: chrono::Utc::now(),
+            },
+        ];
+        let matcher = HistoryMatcher::new(events);
+        assert!(
+            matcher.is_consumed(1),
+            "the WorkflowFailed must be transparent"
+        );
+        assert!(
+            matcher.is_consumed(2),
+            "post-terminal bookkeeping in the tail must be transparent too"
+        );
+    }
+
+    #[test]
+    fn a_failed_event_followed_by_real_history_is_not_a_tail() {
+        // Guard against over-reach: only the LAST terminal block is transparent.
+        // A WorkflowFailed with genuine command history after it (the #510
+        // redrive shape, here without the redrive marker) must keep today's
+        // behaviour — the redrive-anchored rule, not the tail rule, decides.
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::workflow_failed("boom"),
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "charge".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+        ];
+        let matcher = HistoryMatcher::new(events);
+        assert!(
             !matcher.is_consumed(1),
-            "a bare trailing WorkflowFailed must not be marked transparent"
+            "a WorkflowFailed with real history after it is not a terminal tail"
+        );
+        assert!(!matcher.has_terminal_failure_tail());
+    }
+
+    #[test]
+    fn completed_and_cancelled_tails_are_not_terminal_failure_tails() {
+        // The relaxation is failure-only: a COMPLETED history is verified in
+        // full, so its terminal event must stay opaque (an extra command at that
+        // cursor is a genuine early-completion divergence).
+        for terminal in [
+            WorkflowEvent::WorkflowCompleted {
+                output: Value::Null,
+            },
+            WorkflowEvent::WorkflowCancelled {
+                reason: "operator".into(),
+            },
+        ] {
+            let events = vec![
+                WorkflowEvent::WorkflowStarted {
+                    input: Value::Null,
+                    timestamp: chrono::Utc::now(),
+                    last_completion_result: None,
+                    last_error: None,
+                    scheduled_time: None,
+                },
+                terminal,
+            ];
+            let matcher = HistoryMatcher::new(events);
+            assert!(
+                !matcher.has_terminal_failure_tail(),
+                "only WorkflowFailed opens a terminal-failure tail"
+            );
+            assert!(!matcher.is_consumed(1));
+        }
+    }
+
+    #[test]
+    fn redrive_tail_is_not_a_terminal_failure_tail() {
+        // A redriven run is REOPENED, not failing: the #510 rule already makes
+        // its superseded terminal transparent, and the failing-frontier
+        // relaxations (which suppress strict-replay divergence reporting) must
+        // NOT apply to it.
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::workflow_failed("boom"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let matcher = HistoryMatcher::new(events);
+        assert!(
+            !matcher.has_terminal_failure_tail(),
+            "a redrive reopens the run; it is not a failing tail"
+        );
+        assert!(
+            matcher.is_consumed(1) && matcher.is_consumed(2),
+            "the #510 redrive-anchored transparency is unchanged"
+        );
+    }
+
+    /// Issue #952 x #510: a redrive REOPENS the run, so the abandoned-dispatch
+    /// records its failing cycle wrote must become transparent — otherwise the
+    /// reopened cycle reads back "this dispatch failed" and can never re-issue
+    /// the work the operator redrove it to complete.
+    #[test]
+    fn a_redrive_makes_abandoned_dispatch_records_transparent() {
+        let child_id = ExecutionId::new();
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "worker_child".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                error_type: None,
+                details: None,
+                non_retryable: Some(true),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "charge".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityFailed {
+                activity_id,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                attempt: 1,
+                error_type: "Error".into(),
+                details: None,
+                non_retryable: true,
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        for idx in 1..=4 {
+            assert!(
+                matcher.is_consumed(idx),
+                "event {idx} of the abandoned pair must be transparent after a redrive"
+            );
+        }
+        matcher.advance(); // past WorkflowStarted
+        assert_eq!(
+            matcher.match_child_workflow("worker_child", &Value::Null),
+            HistoryMatch::NoMatch,
+            "the reopened run must re-dispatch the child live"
+        );
+    }
+
+    /// Issue #1262: a failing cycle can record more than an abandoned
+    /// dispatch pair before it fails. Here it also records a
+    /// `MarkerRecorded` event after the dispatch. The marker is not an
+    /// abandoned-dispatch shape, so it needs its own transparency rule.
+    /// Without one, the cursor lands on the marker and reports `Diverged`
+    /// instead of allowing a live re-dispatch.
+    #[test]
+    fn a_marker_recorded_after_an_abandoned_dispatch_still_re_dispatches_live() {
+        let child_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "worker_child".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                error_type: None,
+                details: None,
+                non_retryable: Some(true),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "m".into(),
+                details: Value::Null,
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert!(
+            matcher.is_consumed(3),
+            "the marker the failing cycle wrote after the dispatch must be transparent too"
+        );
+        matcher.advance(); // past WorkflowStarted
+        assert_eq!(
+            matcher.match_child_workflow("worker_child", &Value::Null),
+            HistoryMatch::NoMatch,
+            "a durable record trailing the abandoned dispatch must not block re-dispatch"
+        );
+    }
+
+    /// Issue #1262: the same defect occurs with no abandoned-dispatch pair
+    /// at all. A failing cycle can record a plain marker and then fail,
+    /// with no dispatch in between. The marker alone must not block the
+    /// redrive.
+    #[test]
+    fn a_bare_marker_before_a_redriven_terminal_still_re_dispatches_live() {
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "m".into(),
+                details: Value::Null,
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert!(
+            matcher.is_consumed(1),
+            "a bare marker recorded by the failing cycle must be transparent on redrive"
+        );
+        matcher.advance(); // past WorkflowStarted
+        assert_eq!(
+            matcher.match_child_workflow("worker_child", &Value::Null),
+            HistoryMatch::NoMatch,
+            "the reopened run must re-dispatch live instead of diverging on the marker"
+        );
+    }
+
+    /// Negative control (issue #1262): a marker from an earlier,
+    /// non-superseded cycle must stay opaque across the redrive. That
+    /// cycle's own dispatch already completed before the failing cycle
+    /// started. If the walk swallows this marker instead, it silently
+    /// breaks `ctx.version()` and `ctx.patched()` positional matching for
+    /// a cycle the redrive never touched.
+    #[test]
+    fn a_marker_from_an_earlier_completed_cycle_stays_opaque_across_a_redrive() {
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "version:early".into(),
+                details: Value::Null,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "charge".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            // This completion ends the earlier cycle: everything before it,
+            // including the marker above, is settled, non-superseded history.
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: Value::Null,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "m".into(),
+                details: Value::Null,
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let matcher = HistoryMatcher::new(events);
+        assert!(
+            !matcher.is_consumed(1),
+            "the earlier cycle's own marker must stay positionally matchable"
+        );
+        assert!(
+            matcher.is_consumed(4),
+            "the failing cycle's own marker, past the last completion, must be transparent"
+        );
+    }
+
+    /// Issue #1262, stronger negative control: an earlier cycle's version
+    /// marker must not just stay unconsumed. It must still answer
+    /// `match_version` with the recorded value after a redrive. A silent
+    /// value flip would be worse than a divergence: `match_version` never
+    /// reports `Diverged`, so a bug here has no loud symptom.
+    #[test]
+    fn a_redriven_run_still_reads_an_earlier_cycles_version_marker() {
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "version:early".into(),
+                details: serde_json::json!(1),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "charge".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            // This completion ends the earlier cycle: the version marker
+            // above is settled, non-superseded history.
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: Value::Null,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "m".into(),
+                details: Value::Null,
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        matcher.advance(); // past WorkflowStarted, cursor at the version marker
+        assert_eq!(
+            matcher.match_version("early", 1, 1),
+            1,
+            "the earlier cycle's own version marker must still be read positionally"
+        );
+    }
+
+    /// Issue #1262: `SideEffectRecorded` needs the same transparency as
+    /// `MarkerRecorded`. Both are durable, completion-free records. A
+    /// failing cycle can write either after the dispatch a redrive
+    /// re-issues.
+    #[test]
+    fn a_side_effect_recorded_after_an_abandoned_dispatch_still_re_dispatches_live() {
+        let child_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "worker_child".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                error_type: None,
+                details: None,
+                non_retryable: Some(true),
+            },
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Uuid,
+                name: None,
+                value: serde_json::json!("11111111-1111-1111-1111-111111111111"),
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert!(
+            matcher.is_consumed(3),
+            "a side effect the failing cycle wrote after the dispatch must be transparent too"
+        );
+        matcher.advance(); // past WorkflowStarted
+        assert_eq!(
+            matcher.match_child_workflow("worker_child", &Value::Null),
+            HistoryMatch::NoMatch,
+            "a trailing side effect must not block re-dispatch"
+        );
+    }
+
+    /// Issue #1262: the failing cycle can write more than one trailing
+    /// record. The walk must swallow the whole run, not just the last one.
+    #[test]
+    fn a_run_of_several_markers_after_an_abandoned_dispatch_is_fully_swallowed() {
+        let child_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "worker_child".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                error_type: None,
+                details: None,
+                non_retryable: Some(true),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "m1".into(),
+                details: Value::Null,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "m2".into(),
+                details: Value::Null,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "m3".into(),
+                details: Value::Null,
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        for idx in [3_usize, 4, 5] {
+            assert!(
+                matcher.is_consumed(idx),
+                "marker {idx} in the trailing run must be transparent"
+            );
+        }
+        matcher.advance(); // past WorkflowStarted
+        assert_eq!(
+            matcher.match_child_workflow("worker_child", &Value::Null),
+            HistoryMatch::NoMatch,
+            "a run of trailing markers must not block re-dispatch"
+        );
+    }
+
+    /// Issue #1262: a marker sandwiched between two abandoned-dispatch
+    /// pairs. The walk must skip over the already-transparent second pair
+    /// to keep swallowing the marker behind it, not stop at the first
+    /// already-transparent index it meets.
+    #[test]
+    fn a_marker_sandwiched_between_two_abandoned_dispatch_pairs_is_swallowed() {
+        let first_child = ExecutionId::new();
+        let second_child = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: first_child,
+                workflow_name: "worker_child".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id: first_child,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                error_type: None,
+                details: None,
+                non_retryable: Some(true),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "m".into(),
+                details: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: second_child,
+                workflow_name: "worker_child".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id: second_child,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                error_type: None,
+                details: None,
+                non_retryable: Some(true),
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        for idx in 1..=6 {
+            assert!(
+                matcher.is_consumed(idx),
+                "event {idx} must be transparent: two abandoned pairs sandwiching a marker"
+            );
+        }
+        matcher.advance(); // past WorkflowStarted
+        assert_eq!(
+            matcher.match_child_workflow("worker_child", &Value::Null),
+            HistoryMatch::NoMatch,
+            "the sandwiched marker must not block re-dispatch of either child"
+        );
+    }
+
+    /// Issue #1262: an abandoned ACTIVITY dispatch, not a child workflow,
+    /// with a trailing marker. The new transparency rule is shape-agnostic,
+    /// so it must cover this event kind too.
+    #[test]
+    fn a_marker_after_an_abandoned_activity_dispatch_still_re_dispatches_live() {
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "charge".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityFailed {
+                activity_id,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                attempt: 1,
+                error_type: "Error".into(),
+                details: None,
+                non_retryable: true,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "m".into(),
+                details: Value::Null,
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert!(
+            matcher.is_consumed(3),
+            "the marker trailing an abandoned activity dispatch must be transparent too"
+        );
+        matcher.advance(); // past WorkflowStarted
+        assert_eq!(
+            matcher.match_activity("charge"),
+            HistoryMatch::NoMatch,
+            "a trailing marker must not block re-dispatch of an abandoned activity"
+        );
+    }
+
+    /// Issue #1262: a SECOND failing cycle, after the first redrive, writes
+    /// its own abandoned pair and marker. Those belong to the newest
+    /// terminal-failure tail, not the superseded cycle the first redrive
+    /// reopened, so they must stay positionally matchable.
+    #[test]
+    fn a_marker_written_after_the_last_redrive_stays_opaque() {
+        let superseded_child = ExecutionId::new();
+        let latest_child = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: superseded_child,
+                workflow_name: "worker_child".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id: superseded_child,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                error_type: None,
+                details: None,
+                non_retryable: Some(true),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "m".into(),
+                details: Value::Null,
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: latest_child,
+                workflow_name: "worker_child".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id: latest_child,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                error_type: None,
+                details: None,
+                non_retryable: Some(true),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "m2".into(),
+                details: Value::Null,
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+        ];
+        let matcher = HistoryMatcher::new(events);
+        for idx in [1_usize, 2, 3] {
+            assert!(
+                matcher.is_consumed(idx),
+                "event {idx} preceded the redrive, so it must be transparent"
+            );
+        }
+        for idx in [6_usize, 7, 8] {
+            assert!(
+                !matcher.is_consumed(idx),
+                "event {idx} was written by the cycle that failed AFTER the \
+                 redrive, so it must stay positionally matchable"
+            );
+        }
+    }
+
+    /// Issue #1262: `TimerStarted`, `TimerCancelled`, and
+    /// `ChildWorkflowSpawnedDetached` are the other event kinds
+    /// `worker::terminal_command_policy` classifies `PreTerminalEvent` —
+    /// the same class as `MarkerRecorded` / `SideEffectRecorded`. A
+    /// failing cycle can write any of them after the dispatch a redrive
+    /// re-issues, and the walk must swallow them too.
+    #[test]
+    fn timer_and_detached_spawn_records_after_an_abandoned_dispatch_are_swallowed() {
+        let child_id = ExecutionId::new();
+        let detached_child_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "worker_child".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                error_type: None,
+                details: None,
+                non_retryable: Some(true),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new("cooldown"),
+                duration_secs: 30,
+            },
+            WorkflowEvent::TimerCancelled {
+                timer_id: TimerId::new("cooldown"),
+            },
+            WorkflowEvent::ChildWorkflowSpawnedDetached {
+                child_id: detached_child_id,
+                workflow_name: "fire_and_forget".into(),
+                input: Value::Null,
+                parent_close_policy: crate::types::ParentClosePolicy::Abandon,
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        for idx in 1..=6 {
+            assert!(
+                matcher.is_consumed(idx),
+                "event {idx} must be transparent: a timer/detached-spawn tail"
+            );
+        }
+        matcher.advance(); // past WorkflowStarted
+        assert_eq!(
+            matcher.match_child_workflow("worker_child", &Value::Null),
+            HistoryMatch::NoMatch,
+            "a trailing timer/detached-spawn run must not block re-dispatch"
+        );
+    }
+
+    /// A redrive reopens only the cycles it superseded (Codex P1 round 1,
+    /// issue #952 x #510). A run that was redriven and then failed AGAIN wrote
+    /// fresh abandoned-dispatch records *after* that redrive: those belong to
+    /// the terminal-failure tail's own cycle, so they stay positionally
+    /// matchable and the replay resolves the branch from its synthetic terminal
+    /// instead of parking on a dispatch that will never resolve.
+    #[test]
+    fn abandoned_records_written_after_the_last_redrive_stay_opaque() {
+        let superseded_child = ExecutionId::new();
+        let latest_child = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: superseded_child,
+                workflow_name: "worker_child".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id: superseded_child,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                error_type: None,
+                details: None,
+                non_retryable: Some(true),
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: latest_child,
+                workflow_name: "worker_child".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id: latest_child,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                error_type: None,
+                details: None,
+                non_retryable: Some(true),
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        for idx in [1_usize, 2] {
+            assert!(
+                matcher.is_consumed(idx),
+                "event {idx} preceded the redrive, so it must be transparent"
+            );
+        }
+        for idx in [5_usize, 6] {
+            assert!(
+                !matcher.is_consumed(idx),
+                "event {idx} was written by the cycle that failed AFTER the \
+                 redrive, so it must stay positionally matchable"
+            );
+        }
+        matcher.advance(); // past WorkflowStarted
+        assert!(
+            matches!(
+                matcher.match_child_workflow("worker_child", &Value::Null),
+                HistoryMatch::Failed { ref error, .. } if error == crate::event::ABANDONED_DISPATCH_REASON
+            ),
+            "the re-dispatched child must resolve from its own synthetic terminal"
+        );
+    }
+
+    /// An ACTIVITY's error string is the activity author's own message, so the
+    /// reserved reason alone can be produced by ordinary user code (Codex P2
+    /// round 2). Only the full shape the engine writes counts as synthetic — a
+    /// genuine failure that happens to carry the same message keeps its real
+    /// terminal, so a redriven run replays it instead of re-dispatching the
+    /// activity and repeating its side effects.
+    #[test]
+    fn a_genuine_activity_failure_quoting_the_reason_is_not_an_abandoned_record() {
+        let engine_written = ActivityExecId::new();
+        let author_written = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: author_written,
+                name: "charge".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            // Same message, but a real activity terminal: a retried attempt,
+            // retryable, and carrying structured details.
+            WorkflowEvent::ActivityFailed {
+                activity_id: author_written,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                attempt: 2,
+                error_type: "Error".into(),
+                details: Some(serde_json::json!({"code": 42})),
+                non_retryable: false,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: engine_written,
+                name: "refund".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityFailed {
+                activity_id: engine_written,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                attempt: 1,
+                error_type: "Error".into(),
+                details: None,
+                non_retryable: true,
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let matcher = HistoryMatcher::new(events);
+        for idx in [1_usize, 2] {
+            assert!(
+                !matcher.is_consumed(idx),
+                "event {idx} is a genuine activity failure and must stay matchable"
+            );
+        }
+        for idx in [3_usize, 4] {
+            assert!(
+                matcher.is_consumed(idx),
+                "event {idx} carries the engine's exact abandoned shape, so a redrive \
+                 must make it transparent"
+            );
+        }
+    }
+
+    /// A genuine activity failure can quote the reserved reason. It can also
+    /// land on attempt 1, non-retryable, with no details — the full shape
+    /// the matcher checks (issue #1265). The synthetic path never writes an
+    /// `ActivityStarted` between the schedule and the failure: an abandoned
+    /// dispatch never actually ran. An intervening `ActivityStarted` is proof
+    /// this is a real terminal, and it must stay matchable. Otherwise a
+    /// redrive marks it transparent, the real `ActivityStarted` stays opaque,
+    /// and the reopened run parks on it instead of re-dispatching.
+    #[test]
+    fn a_genuine_activity_failure_with_an_intervening_started_is_not_an_abandoned_record() {
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "charge".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityStarted {
+                activity_id,
+                worker_id: WorkerId::new("worker-1"),
+            },
+            // Quotes the engine's exact abandoned shape, but a real activity
+            // ran and failed this way on its own.
+            WorkflowEvent::ActivityFailed {
+                activity_id,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                attempt: 1,
+                error_type: "Error".into(),
+                details: None,
+                non_retryable: true,
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let matcher = HistoryMatcher::new(events);
+        for idx in [1_usize, 2, 3] {
+            assert!(
+                !matcher.is_consumed(idx),
+                "event {idx} is a genuine activity failure and must stay matchable"
+            );
+        }
+    }
+
+    /// Two redrives, each with an activity, must not cross-contaminate (issue
+    /// #1265). Activity ids are fresh per dispatch. A real `ActivityStarted`
+    /// for one activity must never suppress the synthetic pair of an
+    /// unrelated, earlier one, even across a redrive boundary.
+    #[test]
+    fn a_later_genuine_activity_does_not_mask_an_earlier_synthetic_pair() {
+        let synthetic_activity = ActivityExecId::new();
+        let genuine_activity = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: synthetic_activity,
+                name: "charge".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityFailed {
+                activity_id: synthetic_activity,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                attempt: 1,
+                error_type: "Error".into(),
+                details: None,
+                non_retryable: true,
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: genuine_activity,
+                name: "refund".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityStarted {
+                activity_id: genuine_activity,
+                worker_id: WorkerId::new("worker-1"),
+            },
+            WorkflowEvent::ActivityFailed {
+                activity_id: genuine_activity,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                attempt: 1,
+                error_type: "Error".into(),
+                details: None,
+                non_retryable: true,
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let matcher = HistoryMatcher::new(events);
+        for idx in [1_usize, 2] {
+            assert!(
+                matcher.is_consumed(idx),
+                "event {idx} is the pre-redrive synthetic pair and must stay transparent"
+            );
+        }
+        for idx in [5_usize, 6, 7] {
+            assert!(
+                !matcher.is_consumed(idx),
+                "event {idx} is a genuine activity failure and must stay matchable"
+            );
+        }
+    }
+
+    /// Without a redrive the same records are ordinary, positionally-matched
+    /// history: they are what makes a failing cycle's own replay resolvable.
+    #[test]
+    fn abandoned_dispatch_records_stay_opaque_without_a_redrive() {
+        let child_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "worker_child".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                error_type: None,
+                details: None,
+                non_retryable: Some(true),
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert!(!matcher.is_consumed(1) && !matcher.is_consumed(2));
+        matcher.advance();
+        assert!(
+            matches!(
+                matcher.match_child_workflow("worker_child", &Value::Null),
+                HistoryMatch::Failed { .. }
+            ),
+            "the failing cycle's own replay resolves the branch from its record"
+        );
+    }
+
+    /// A retried-then-redriven run: the redrive scan must skip the
+    /// post-terminal `WorkflowRetryScheduled` to reach the terminal it
+    /// supersedes.
+    #[test]
+    fn a_redrive_after_a_workflow_retry_still_supersedes_the_terminal() {
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::workflow_failed("boom"),
+            WorkflowEvent::WorkflowRetryScheduled {
+                retry_exec_id: ExecutionId::new(),
+                attempt: 2,
+                fire_at: chrono::Utc::now(),
+            },
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let matcher = HistoryMatcher::new(events);
+        assert!(
+            matcher.is_consumed(1),
+            "the superseded terminal must be transparent even behind a retry record"
+        );
+    }
+
+    /// Issue #1262: post-terminal bookkeeping (`WorkflowRetryScheduled`,
+    /// `ChildWorkflowCascadeApplied`) carries no workflow command. The
+    /// workflow function never consumes it. It must be transparent on its
+    /// own, not only while a redrive searches for its superseded
+    /// terminal. A bare retry-then-redrive history with nothing else in
+    /// between must not diverge on the bookkeeping event itself.
+    #[test]
+    fn a_retry_then_redrive_with_no_dispatch_still_re_dispatches_live() {
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::workflow_failed("boom"),
+            WorkflowEvent::WorkflowRetryScheduled {
+                retry_exec_id: ExecutionId::new(),
+                attempt: 2,
+                fire_at: chrono::Utc::now(),
+            },
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert!(
+            matcher.is_consumed(2),
+            "post-terminal bookkeeping must be transparent on its own"
+        );
+        matcher.advance(); // past WorkflowStarted
+        assert_eq!(
+            matcher.match_activity("charge"),
+            HistoryMatch::NoMatch,
+            "a retry record between the terminal and the redrive must not block re-dispatch"
+        );
+    }
+
+    /// Issue #1262: the exact combination that motivated the fix above. A
+    /// failing cycle records an abandoned dispatch and a trailing marker.
+    /// The sealed run also picks up a workflow-level retry record before
+    /// the operator redrives it. The bookkeeping event must not stop the
+    /// tail walk before it reaches the marker behind it.
+    #[test]
+    fn a_marker_behind_retry_bookkeeping_still_re_dispatches_live() {
+        let child_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "worker_child".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id,
+                error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+                error_type: None,
+                details: None,
+                non_retryable: Some(true),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "m".into(),
+                details: Value::Null,
+            },
+            WorkflowEvent::workflow_failed("budget exceeded"),
+            WorkflowEvent::WorkflowRetryScheduled {
+                retry_exec_id: ExecutionId::new(),
+                attempt: 2,
+                fire_at: chrono::Utc::now(),
+            },
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        for idx in 1..=5 {
+            assert!(
+                matcher.is_consumed(idx),
+                "event {idx} must be transparent behind the retry bookkeeping too"
+            );
+        }
+        matcher.advance(); // past WorkflowStarted
+        assert_eq!(
+            matcher.match_child_workflow("worker_child", &Value::Null),
+            HistoryMatch::NoMatch,
+            "retry bookkeeping must not stop the walk before it reaches the marker"
+        );
+    }
+
+    #[test]
+    fn failing_frontier_requires_every_pre_terminal_event_consumed() {
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "charge".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: Value::Null,
+            },
+            WorkflowEvent::workflow_failed("boom"),
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        matcher.advance(); // past WorkflowStarted
+        assert!(
+            !matcher.at_terminal_failure_frontier(),
+            "the recorded activity is still unconsumed — not at the frontier"
+        );
+        assert!(matches!(
+            matcher.match_activity("charge"),
+            HistoryMatch::Matched { .. }
+        ));
+        assert!(
+            matcher.at_terminal_failure_frontier(),
+            "with the activity consumed the cursor sits in the transparent tail"
         );
     }
 
@@ -12269,5 +13228,930 @@ mod tests {
             matcher2.match_external_await(target),
             HistoryMatch::ExternalAwaitInProgress { .. }
         ));
+    }
+
+    // ── Issue #1338: characterization tests for the 10 sites consolidated onto
+    // `stash_transparent_external_event`. Before this suite, `ExternalCancel`
+    // triplet transparency (issue #492) had zero direct test coverage at any
+    // of the 10 sites, and `ExternalAwait` triplet transparency (issue #757)
+    // was covered only at `scan_activity_terminal` (the test above). These
+    // pin per-site behavior so a future event-family addition that misses a
+    // site is caught here instead of only in production (the exact failure
+    // class issue #1338 documents from `33595ff5`). ──────────────────────
+
+    /// Builds a fresh `ExternalCancelRequested` + `ExternalCancelDelivered`
+    /// pair for the characterization tests below, returning the id/target a
+    /// test needs for its own follow-up `match_external_cancel` assertion
+    /// alongside the two events to splice into that test's own history.
+    fn external_cancel_triplet() -> (
+        ExternalCancelId,
+        crate::types::ExternalTarget,
+        WorkflowEvent,
+        WorkflowEvent,
+    ) {
+        let cancel_id = ExternalCancelId::new();
+        let target = crate::types::ExternalTarget::ExecutionId(ExecutionId::new());
+        let requested = WorkflowEvent::ExternalCancelRequested {
+            cancel_id,
+            target: target.clone(),
+        };
+        let delivered = WorkflowEvent::ExternalCancelDelivered { cancel_id };
+        (cancel_id, target, requested, delivered)
+    }
+
+    /// Builds a fresh `ExternalAwaitRequested` + `ExternalAwaitResolved` pair,
+    /// mirroring `external_cancel_triplet` for issue #757's event family.
+    fn external_await_triplet() -> (ExternalAwaitId, ExecutionId, WorkflowEvent, WorkflowEvent) {
+        let await_id = ExternalAwaitId::new();
+        let target = ExecutionId::new();
+        let requested = WorkflowEvent::ExternalAwaitRequested { await_id, target };
+        let resolved = WorkflowEvent::ExternalAwaitResolved {
+            await_id,
+            output: serde_json::json!({"done": true}),
+        };
+        (await_id, target, requested, resolved)
+    }
+
+    #[test]
+    fn scan_activity_terminal_stashes_interleaved_external_cancel_triplet() {
+        let activity_id = ActivityExecId::new();
+        let (_, target, requested, delivered) = external_cancel_triplet();
+        let events = vec![
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "compute".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            requested,
+            delivered,
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!(7),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_activity("compute"),
+            HistoryMatch::Matched {
+                output: serde_json::json!(7)
+            }
+        );
+        assert_eq!(
+            matcher.match_external_cancel(&target),
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
+    }
+
+    #[test]
+    fn scan_local_activity_terminal_stashes_interleaved_external_cancel_triplet() {
+        let activity_id = ActivityExecId::new();
+        let (_, target, requested, delivered) = external_cancel_triplet();
+        let output = serde_json::json!({"ok": true});
+        let events = vec![
+            WorkflowEvent::LocalActivityScheduled {
+                activity_id,
+                name: "format_data".into(),
+                input: Value::Null,
+                retry_policy: None,
+                resolved: false,
+                start_to_close_nanos: None,
+            },
+            requested,
+            delivered,
+            WorkflowEvent::LocalActivityCompleted {
+                activity_id,
+                output: output.clone(),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_local_activity("format_data"),
+            HistoryMatch::Matched { output }
+        );
+        assert_eq!(
+            matcher.match_external_cancel(&target),
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
+    }
+
+    #[test]
+    fn scan_local_activity_terminal_stashes_interleaved_external_await_triplet() {
+        let activity_id = ActivityExecId::new();
+        let (_, target, requested, resolved) = external_await_triplet();
+        let output = serde_json::json!({"ok": true});
+        let events = vec![
+            WorkflowEvent::LocalActivityScheduled {
+                activity_id,
+                name: "format_data".into(),
+                input: Value::Null,
+                retry_policy: None,
+                resolved: false,
+                start_to_close_nanos: None,
+            },
+            requested,
+            resolved,
+            WorkflowEvent::LocalActivityCompleted {
+                activity_id,
+                output: output.clone(),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_local_activity("format_data"),
+            HistoryMatch::Matched { output }
+        );
+        assert_eq!(
+            matcher.match_external_await(target),
+            HistoryMatch::Matched {
+                output: serde_json::json!({"done": true})
+            }
+        );
+    }
+
+    #[test]
+    fn drain_early_signals_stashes_interleaved_external_cancel_triplet() {
+        // Direct unit test of `drain_early_signals` (Site 3, issue #1338) —
+        // this call site mutates `self.cursor` in place (rather than a local
+        // scan_cursor) and does an extra `advance_to_next_unconsumed_event()`
+        // per arm, so it is pinned directly rather than only through a public
+        // wrapper that might resolve the pair via a different site first.
+        let (cancel_id, _, requested, delivered) = external_cancel_triplet();
+        let events = vec![requested, delivered];
+        let mut matcher = HistoryMatcher::new(events);
+        matcher.drain_early_signals();
+        assert_eq!(matcher.cursor, 2);
+        assert_eq!(matcher.pending_external_cancels.len(), 1);
+        assert_eq!(matcher.pending_external_cancels[0].cancel_id, cancel_id);
+        assert!(matches!(
+            matcher.pending_external_cancels[0].terminal,
+            Some(StashedCancelTerminal::Delivered)
+        ));
+    }
+
+    #[test]
+    fn drain_early_signals_stashes_interleaved_external_await_triplet() {
+        // Direct unit test of `drain_early_signals` (Site 3, issue #1338) for
+        // the `ExternalAwait` family (issue #757), mirroring the cancel test
+        // above.
+        let (await_id, _, requested, resolved) = external_await_triplet();
+        let events = vec![requested, resolved];
+        let mut matcher = HistoryMatcher::new(events);
+        matcher.drain_early_signals();
+        assert_eq!(matcher.cursor, 2);
+        assert_eq!(matcher.pending_external_awaits.len(), 1);
+        assert_eq!(matcher.pending_external_awaits[0].await_id, await_id);
+        assert!(matches!(
+            matcher.pending_external_awaits[0].terminal,
+            Some(StashedAwaitTerminal::Resolved(_))
+        ));
+    }
+
+    #[test]
+    fn match_external_activity_stashes_interleaved_external_cancel_triplet() {
+        let activity_id = ActivityExecId::new();
+        let token = ExternalActivityToken::new();
+        let (_, target, requested, delivered) = external_cancel_triplet();
+        let output = serde_json::json!({"accepted": true});
+        let events = vec![
+            WorkflowEvent::ActivityAwaitingExternal {
+                activity_id,
+                token,
+                name: "ship_order".into(),
+                input: Value::Null,
+                queue: "fulfillment".into(),
+                schedule_to_close_secs: 60,
+            },
+            requested,
+            delivered,
+            WorkflowEvent::ActivityCompletedExternally {
+                activity_id,
+                token,
+                output: output.clone(),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_external_activity("ship_order"),
+            HistoryMatch::Matched { output }
+        );
+        assert_eq!(
+            matcher.match_external_cancel(&target),
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
+    }
+
+    #[test]
+    fn match_external_activity_stashes_interleaved_external_await_triplet() {
+        let activity_id = ActivityExecId::new();
+        let token = ExternalActivityToken::new();
+        let (_, target, requested, resolved) = external_await_triplet();
+        let output = serde_json::json!({"accepted": true});
+        let events = vec![
+            WorkflowEvent::ActivityAwaitingExternal {
+                activity_id,
+                token,
+                name: "ship_order".into(),
+                input: Value::Null,
+                queue: "fulfillment".into(),
+                schedule_to_close_secs: 60,
+            },
+            requested,
+            resolved,
+            WorkflowEvent::ActivityCompletedExternally {
+                activity_id,
+                token,
+                output: output.clone(),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_external_activity("ship_order"),
+            HistoryMatch::Matched { output }
+        );
+        assert_eq!(
+            matcher.match_external_await(target),
+            HistoryMatch::Matched {
+                output: serde_json::json!({"done": true})
+            }
+        );
+    }
+
+    #[test]
+    fn match_external_signal_stashes_interleaved_external_cancel_triplet() {
+        let signal_id = ExternalSignalId::new();
+        let signal_target = ExecutionId::new();
+        let (_, cancel_target, requested, delivered) = external_cancel_triplet();
+        let events = vec![
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id,
+                target: crate::types::ExternalTarget::ExecutionId(signal_target),
+                signal_name: "poke".into(),
+                payload: serde_json::json!({"n": 1}),
+                idempotency_key: None,
+            },
+            requested,
+            delivered,
+            WorkflowEvent::ExternalSignalDelivered { signal_id },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_external_signal(
+                &crate::types::ExternalTarget::ExecutionId(signal_target),
+                "poke"
+            ),
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
+        assert_eq!(
+            matcher.match_external_cancel(&cancel_target),
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
+    }
+
+    #[test]
+    fn match_external_signal_stashes_interleaved_external_await_triplet() {
+        let signal_id = ExternalSignalId::new();
+        let signal_target = ExecutionId::new();
+        let (_, await_target, requested, resolved) = external_await_triplet();
+        let events = vec![
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id,
+                target: crate::types::ExternalTarget::ExecutionId(signal_target),
+                signal_name: "poke".into(),
+                payload: serde_json::json!({"n": 1}),
+                idempotency_key: None,
+            },
+            requested,
+            resolved,
+            WorkflowEvent::ExternalSignalDelivered { signal_id },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_external_signal(
+                &crate::types::ExternalTarget::ExecutionId(signal_target),
+                "poke"
+            ),
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
+        assert_eq!(
+            matcher.match_external_await(await_target),
+            HistoryMatch::Matched {
+                output: serde_json::json!({"done": true})
+            }
+        );
+    }
+
+    #[test]
+    fn match_timer_strict_stashes_interleaved_external_cancel_triplet() {
+        let timer_id = TimerId::new("cooldown");
+        let (_, target, requested, delivered) = external_cancel_triplet();
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 30,
+            },
+            requested,
+            delivered,
+            WorkflowEvent::TimerFired { timer_id },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_timer("cooldown"),
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
+        assert_eq!(
+            matcher.match_external_cancel(&target),
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
+    }
+
+    #[test]
+    fn match_timer_strict_stashes_interleaved_external_await_triplet() {
+        let timer_id = TimerId::new("cooldown");
+        let (_, target, requested, resolved) = external_await_triplet();
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 30,
+            },
+            requested,
+            resolved,
+            WorkflowEvent::TimerFired { timer_id },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_timer("cooldown"),
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
+        assert_eq!(
+            matcher.match_external_await(target),
+            HistoryMatch::Matched {
+                output: serde_json::json!({"done": true})
+            }
+        );
+    }
+
+    #[test]
+    fn timer_scan_cross_or_stop_stashes_interleaved_external_cancel_triplet() {
+        let timer_id = TimerId::new("idle");
+        let (_, target, requested, delivered) = external_cancel_triplet();
+        let events = vec![
+            requested,
+            delivered,
+            WorkflowEvent::TimerCancelled { timer_id },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_timer_cancel("idle"),
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
+        assert_eq!(
+            matcher.match_external_cancel(&target),
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
+    }
+
+    #[test]
+    fn timer_scan_cross_or_stop_stashes_interleaved_external_await_triplet() {
+        let timer_id = TimerId::new("idle");
+        let (_, target, requested, resolved) = external_await_triplet();
+        let events = vec![
+            requested,
+            resolved,
+            WorkflowEvent::TimerCancelled { timer_id },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_timer_cancel("idle"),
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
+        assert_eq!(
+            matcher.match_external_await(target),
+            HistoryMatch::Matched {
+                output: serde_json::json!({"done": true})
+            }
+        );
+    }
+
+    #[test]
+    fn match_signal_inner_stashes_interleaved_external_cancel_triplet() {
+        let timer_id = TimerId::new("distractor");
+        let (_, target, requested, delivered) = external_cancel_triplet();
+        let events = vec![
+            // A non-transparent event first, so drain_early_signals halts here
+            // and match_signal_inner's own scan is what crosses the pair below.
+            WorkflowEvent::TimerCancelled { timer_id },
+            requested,
+            delivered,
+            WorkflowEvent::SignalReceived {
+                signal_name: "approved".into(),
+                payload: serde_json::json!({"ok": true}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_signal("approved"),
+            HistoryMatch::Matched {
+                output: serde_json::json!({"ok": true})
+            }
+        );
+        assert_eq!(
+            matcher.match_external_cancel(&target),
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
+    }
+
+    #[test]
+    fn match_signal_inner_stashes_interleaved_external_await_triplet() {
+        let timer_id = TimerId::new("distractor");
+        let (_, target, requested, resolved) = external_await_triplet();
+        let events = vec![
+            WorkflowEvent::TimerCancelled { timer_id },
+            requested,
+            resolved,
+            WorkflowEvent::SignalReceived {
+                signal_name: "approved".into(),
+                payload: serde_json::json!({"ok": true}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_signal("approved"),
+            HistoryMatch::Matched {
+                output: serde_json::json!({"ok": true})
+            }
+        );
+        assert_eq!(
+            matcher.match_external_await(target),
+            HistoryMatch::Matched {
+                output: serde_json::json!({"done": true})
+            }
+        );
+    }
+
+    #[test]
+    fn signal_or_timer_stashes_interleaved_external_cancel_triplet() {
+        let timer_id = TimerId::new("__signal_timeout:1:approval");
+        let (_, target, requested, delivered) = external_cancel_triplet();
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            requested,
+            delivered,
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: serde_json::json!({"approved": true}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_signal_or_timer("approval", timer_id.as_str(), Some(300)),
+            SignalOrTimerMatch::SignalWon {
+                payload: serde_json::json!({"approved": true})
+            }
+        );
+        assert_eq!(
+            matcher.match_external_cancel(&target),
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
+    }
+
+    #[test]
+    fn signal_or_timer_stashes_interleaved_external_await_triplet() {
+        let timer_id = TimerId::new("__signal_timeout:1:approval");
+        let (_, target, requested, resolved) = external_await_triplet();
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            requested,
+            resolved,
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: serde_json::json!({"approved": true}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_signal_or_timer("approval", timer_id.as_str(), Some(300)),
+            SignalOrTimerMatch::SignalWon {
+                payload: serde_json::json!({"approved": true})
+            }
+        );
+        assert_eq!(
+            matcher.match_external_await(target),
+            HistoryMatch::Matched {
+                output: serde_json::json!({"done": true})
+            }
+        );
+    }
+
+    #[test]
+    fn child_or_timer_stashes_interleaved_external_cancel_triplet() {
+        let timer_id = child_timer_id();
+        let child_id = ExecutionId::new();
+        let (_, target, requested, delivered) = external_cancel_triplet();
+        let events = vec![
+            child_started_event(child_id),
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            requested,
+            delivered,
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"processed": true}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_child_or_timer(
+            "process_order",
+            &serde_json::json!({"id": 42}),
+            timer_id.as_str(),
+            Some(300),
+        );
+        assert_eq!(
+            result,
+            ChildOrTimerMatch::ChildCompleted {
+                output: serde_json::json!({"processed": true})
+            }
+        );
+        assert_eq!(
+            matcher.match_external_cancel(&target),
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
+    }
+
+    #[test]
+    fn child_or_timer_stashes_interleaved_external_await_triplet() {
+        let timer_id = child_timer_id();
+        let child_id = ExecutionId::new();
+        let (_, target, requested, resolved) = external_await_triplet();
+        let events = vec![
+            child_started_event(child_id),
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            requested,
+            resolved,
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"processed": true}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_child_or_timer(
+            "process_order",
+            &serde_json::json!({"id": 42}),
+            timer_id.as_str(),
+            Some(300),
+        );
+        assert_eq!(
+            result,
+            ChildOrTimerMatch::ChildCompleted {
+                output: serde_json::json!({"processed": true})
+            }
+        );
+        assert_eq!(
+            matcher.match_external_await(target),
+            HistoryMatch::Matched {
+                output: serde_json::json!({"done": true})
+            }
+        );
+    }
+
+    // ── End-of-cycle command drift check (issue #1791) ────────────────────
+
+    fn scheduled(name: &str) -> WorkflowEvent {
+        WorkflowEvent::ActivityScheduled {
+            activity_id: ActivityExecId::new(),
+            name: name.into(),
+            input: Value::Null,
+            queue: "default".into(),
+        }
+    }
+
+    fn signal(name: &str) -> WorkflowEvent {
+        WorkflowEvent::SignalReceived {
+            signal_name: name.into(),
+            payload: Value::Null,
+        }
+    }
+
+    #[test]
+    fn first_unconsumed_command_event_reports_a_trailing_activity() {
+        let mut m = HistoryMatcher::new(vec![scheduled("a"), scheduled("b")]);
+        assert!(
+            !matches!(m.match_activity("a"), HistoryMatch::Diverged { .. }),
+            "the setup must match activity a"
+        );
+        assert_eq!(
+            m.first_unconsumed_command_event(),
+            Some((1, "ActivityScheduled(b)".to_string())),
+            "the code dropped activity b, so its event is drift"
+        );
+    }
+
+    #[test]
+    fn first_unconsumed_command_event_ignores_events_from_outside_the_code() {
+        // A live history can hold a signal, a fired timer or a result that
+        // the code has not awaited yet. None of them is drift.
+        let m = HistoryMatcher::new(vec![
+            signal("go"),
+            tf("t"),
+            WorkflowEvent::ActivityCompleted {
+                activity_id: ActivityExecId::new(),
+                output: Value::Null,
+            },
+        ]);
+        assert_eq!(m.first_unconsumed_command_event(), None);
+    }
+
+    #[test]
+    fn first_unconsumed_command_event_is_none_after_a_full_replay() {
+        let mut m = HistoryMatcher::new(vec![ts("t", 10), tf("t")]);
+        assert!(matches!(m.match_timer("t"), HistoryMatch::Matched { .. }));
+        assert_eq!(m.first_unconsumed_command_event(), None);
+    }
+
+    #[test]
+    fn first_unconsumed_command_event_reports_a_stray_timer_before_a_signal() {
+        // The signal scan crosses the stray timer and does not consume it.
+        let mut m = HistoryMatcher::new(vec![ts("t", 10), tf("t"), signal("go")]);
+        assert!(matches!(m.match_signal("go"), HistoryMatch::Matched { .. }));
+        assert_eq!(
+            m.first_unconsumed_command_event(),
+            Some((0, "TimerStarted(t)".to_string()))
+        );
+    }
+
+    #[test]
+    fn first_unconsumed_command_event_reports_an_external_activity_and_a_mutex_grant() {
+        // Both events anchor a replayed call: `execute_activity_external()`
+        // and `mutex(key).acquire()`. A dropped call leaves them unconsumed.
+        let external = WorkflowEvent::ActivityAwaitingExternal {
+            activity_id: ActivityExecId::new(),
+            token: crate::types::ExternalActivityToken::new(),
+            name: "approve".into(),
+            input: Value::Null,
+            queue: "default".into(),
+            schedule_to_close_secs: 60,
+        };
+        let grant = WorkflowEvent::MutexGranted {
+            key: "account-1".into(),
+            lock_seq: 1,
+            acquired_at: Utc::now(),
+        };
+        let m = HistoryMatcher::new(vec![external]);
+        assert_eq!(
+            m.first_unconsumed_command_event(),
+            Some((0, "ActivityAwaitingExternal(approve)".to_string()))
+        );
+        let mut m = HistoryMatcher::new(vec![grant]);
+        assert_eq!(
+            m.first_unconsumed_command_event(),
+            Some((0, "MutexGranted(account-1)".to_string()))
+        );
+        assert!(matches!(
+            m.match_mutex_granted("account-1"),
+            MutexGrantMatch::Granted { .. }
+        ));
+        assert_eq!(m.first_unconsumed_command_event(), None);
+    }
+
+    #[test]
+    fn first_unconsumed_command_event_ignores_a_duplicate_external_anchor() {
+        // A signal wake while an external activity is pending writes a
+        // duplicate anchor for the same activity. The scan consumes it.
+        let awaiting = WorkflowEvent::ActivityAwaitingExternal {
+            activity_id: ActivityExecId::new(),
+            token: crate::types::ExternalActivityToken::new(),
+            name: "approve".into(),
+            input: Value::Null,
+            queue: "default".into(),
+            schedule_to_close_secs: 60,
+        };
+        let mut m = HistoryMatcher::new(vec![awaiting.clone(), signal("nudge"), awaiting]);
+        assert!(matches!(
+            m.match_external_activity("approve"),
+            HistoryMatch::AwaitingExternalCompletion { .. }
+        ));
+        assert_eq!(m.first_unconsumed_command_event(), None);
+    }
+
+    #[test]
+    fn first_unconsumed_command_event_reports_an_unclaimed_stashed_request() {
+        // An early drain marks the request consumed and stashes it. Only
+        // the stash shows that no command claimed it.
+        let signal_id = ExternalSignalId::new();
+        let target = crate::types::ExternalTarget::ExecutionId(ExecutionId::new());
+        let mut m = HistoryMatcher::new(vec![
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id,
+                target: target.clone(),
+                signal_name: "poke".into(),
+                payload: Value::Null,
+                idempotency_key: None,
+            },
+            WorkflowEvent::ExternalSignalDelivered { signal_id },
+        ]);
+        m.prepare_match();
+        assert_eq!(
+            m.first_unconsumed_command_event(),
+            Some((0, "ExternalSignalRequested".to_string()))
+        );
+        assert!(matches!(
+            m.match_external_signal(&target, "poke"),
+            HistoryMatch::Matched { .. }
+        ));
+        assert_eq!(m.first_unconsumed_command_event(), None);
+    }
+
+    // ── Decision-boundary transparency tests (issue #1833) ────────────────
+
+    fn decision_boundary() -> WorkflowEvent {
+        WorkflowEvent::DecisionCommitted {
+            build_id: crate::types::BuildId::new("build-a"),
+            worker_id: crate::types::WorkerId::new("worker-a"),
+        }
+    }
+
+    /// Puts a `DecisionCommitted` after every event, as a worst case.
+    fn with_boundaries(events: &[WorkflowEvent]) -> Vec<WorkflowEvent> {
+        events
+            .iter()
+            .flat_map(|event| [event.clone(), decision_boundary()])
+            .collect()
+    }
+
+    fn started_event() -> WorkflowEvent {
+        WorkflowEvent::workflow_started(Value::Null, chrono::Utc::now())
+    }
+
+    /// One history that uses each main command kind once.
+    fn mixed_history(child_id: ExecutionId) -> Vec<WorkflowEvent> {
+        let activity_id = ActivityExecId::new();
+        vec![
+            started_event(),
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "charge".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!({"charged": true}),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: crate::types::TimerId::new("t-1"),
+                duration_secs: 60,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: crate::types::TimerId::new("t-1"),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approve".into(),
+                payload: serde_json::json!({"ok": true}),
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "child".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!(7),
+            },
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Custom,
+                name: Some("token".into()),
+                value: serde_json::json!("abc"),
+            },
+            WorkflowEvent::WorkflowCompleted {
+                output: serde_json::json!("done"),
+            },
+        ]
+    }
+
+    /// Runs the commands of `mixed_history` and records each answer.
+    fn drive_mixed(matcher: &mut HistoryMatcher) -> Vec<HistoryMatch> {
+        matcher.advance(); // WorkflowStarted
+        vec![
+            matcher.match_activity("charge"),
+            matcher.match_timer("t-1"),
+            matcher.match_signal("approve"),
+            matcher.match_child_workflow("child", &Value::Null),
+            matcher.match_side_effect("token"),
+        ]
+    }
+
+    #[test]
+    fn decision_boundaries_do_not_change_any_match_result() {
+        let child_id = ExecutionId::new();
+        let plain = mixed_history(child_id);
+        let mut without = HistoryMatcher::new(plain.clone());
+        let mut with = HistoryMatcher::new(with_boundaries(&plain));
+
+        let expected = drive_mixed(&mut without);
+        assert!(
+            expected
+                .iter()
+                .all(|m| matches!(m, HistoryMatch::Matched { .. })),
+            "fixture must match cleanly without boundaries: {expected:?}"
+        );
+        assert_eq!(drive_mixed(&mut with), expected);
+        assert!(!with.has_non_lifecycle_unconsumed());
+        assert_eq!(with.first_unconsumed_command_event(), None);
+    }
+
+    #[test]
+    fn decision_boundaries_keep_event_indices() {
+        let events = with_boundaries(&[started_event()]);
+        let matcher = HistoryMatcher::new(events);
+        assert_eq!(matcher.event_count(), 2, "a boundary still counts");
+        assert!(matcher.is_consumed(1), "a boundary is pre-consumed");
+    }
+
+    #[test]
+    fn trailing_boundary_after_completion_is_not_unconsumed() {
+        let events = vec![
+            started_event(),
+            WorkflowEvent::WorkflowCompleted {
+                output: Value::Null,
+            },
+            decision_boundary(),
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        matcher.advance();
+        assert!(!matcher.has_non_lifecycle_unconsumed());
+    }
+
+    #[test]
+    fn trailing_boundary_keeps_the_terminal_failure_tail() {
+        let events = vec![
+            started_event(),
+            WorkflowEvent::workflow_failed("boom"),
+            decision_boundary(),
+        ];
+        assert_eq!(
+            HistoryMatcher::terminal_failure_tail_start(&events),
+            Some(1)
+        );
+        let matcher = HistoryMatcher::new(events);
+        assert!(matcher.has_terminal_failure_tail());
+        assert!(matcher.is_consumed(1));
+    }
+
+    #[test]
+    fn boundary_between_failed_and_redrive_keeps_redrive_transparency() {
+        let events = vec![
+            started_event(),
+            WorkflowEvent::workflow_failed("boom"),
+            decision_boundary(),
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let matcher = HistoryMatcher::new(events);
+        assert!(matcher.is_consumed(1), "superseded WorkflowFailed");
+        assert!(matcher.is_consumed(3), "WorkflowRedriven");
     }
 }

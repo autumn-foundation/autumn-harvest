@@ -84,6 +84,43 @@ pub struct EffectiveConfigView {
     pub features: FeatureFlagsView,
     /// Resolved database pool sizing.
     pub pool: PoolConfigView,
+    /// Redis dispatch channel section (issue #1429). `None` when the caller
+    /// does not evaluate Redis dispatch at all, such as a direct embedder
+    /// that skips `autumn-harvest-plugin`.
+    pub dispatch: Option<DispatchConfigView>,
+}
+
+/// Redis dispatch channel section of the effective-config snapshot (issue #1429).
+///
+/// Secret-free by construction: [`endpoint`](Self::endpoint) carries only the
+/// credential-free form a `HarvestRedisConfig::redacted_url` call already
+/// produces, never the raw URL.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DispatchConfigView {
+    /// Whether the Redis dispatch channel is installed and live for this process.
+    pub installed: bool,
+    /// The channel endpoint, credential-free. `None` when dispatch is off.
+    pub endpoint: Option<String>,
+    /// Prefix for every key the channel owns, for a single-shard install.
+    /// `None` on a multi-shard install, which has one prefix per shard; see
+    /// [`key_prefixes`](Self::key_prefixes) instead.
+    pub key_prefix: Option<String>,
+    /// One key-family prefix per shard, for a multi-shard install (issue
+    /// #1429 review). `None` on a single-shard install, which reports its
+    /// one prefix through [`key_prefix`](Self::key_prefix) instead. A
+    /// multi-shard install has no single key family for
+    /// `/admin/config` to report under `key_prefix` alone.
+    pub key_prefixes: Option<Vec<String>>,
+    /// Redis Streams consumer group the workers join.
+    pub consumer_group: Option<String>,
+    /// Time a delivered reference may stay unacked before recovery.
+    pub visibility_timeout_ms: Option<u64>,
+    /// Wait for one blocking read when the channel is idle.
+    pub poll_interval_ms: Option<u64>,
+    /// Interval for the reconcile sweep over due `PENDING` rows.
+    pub reconcile_interval_ms: Option<u64>,
+    /// Row cap for one reconcile sweep per queue.
+    pub reconcile_batch: Option<usize>,
 }
 
 /// Secret-free projection of [`WorkerConfig`].
@@ -108,6 +145,10 @@ pub struct WorkerConfigView {
     pub shutdown_timeout_ms: u64,
     /// In-memory workflow LRU cache size (entries).
     pub workflow_cache_size: usize,
+    /// Whether cache entries keep suspended workflows resident (issue #1798).
+    /// Reports the effective value, so it is `false` while sticky routing is
+    /// off.
+    pub resident_workflows: bool,
     /// Whether sticky cross-worker routing is enabled (`sticky_timeout > 0`).
     pub sticky_routing_enabled: bool,
     /// Sticky routing lease TTL, milliseconds (0 = disabled).
@@ -121,8 +162,8 @@ pub struct WorkerConfigView {
     /// Builder-level default activity retry `max_attempts` (issue #620);
     /// `null` when no builder-default retry floor is configured.
     pub default_activity_retry_max_attempts: Option<u32>,
-    /// Builder-level default activity `start_to_close`, milliseconds (issue #620);
-    /// `null` when no builder-default timeout floor is configured.
+    /// Builder-level default activity `start_to_close`, milliseconds (issue #620).
+    /// Defaults to 600000 (issue #1808). `null` after `without_default_activity_start_to_close()`.
     pub default_activity_start_to_close_ms: Option<u64>,
     /// Ceiling on an author-supplied `Retry-After` delay hint, milliseconds
     /// (issue #744). Always present (not opt-in); default 15 minutes.
@@ -137,6 +178,27 @@ pub struct WorkerConfigView {
     pub query_timeout_ms: u64,
     /// Priority-aging period in seconds (`null` = aging disabled).
     pub priority_aging_secs: Option<u32>,
+    /// The cross-region DR fencing mode: `auto`, `enabled` or `disabled`
+    /// (issues #954, #1823).
+    ///
+    /// The single most consequential DR setting to be able to read back from a
+    /// running fleet. `auto` fences on a database that carries a DR marker.
+    /// `disabled` refuses to start on one. This is the configured mode. The
+    /// startup log line `pinned shard write-authority generation` shows that
+    /// the process actually fenced.
+    pub dr_fencing: crate::replication::DrFencing,
+    /// DR sampler cadence, milliseconds — the RPO's resolution floor and the
+    /// bound on fence-detection latency (issue #954).
+    pub replication_sample_interval_ms: u64,
+    /// Trailing watermark retention, milliseconds — the ceiling on measurable
+    /// replication lag (issue #954).
+    pub replication_watermark_retain_ms: u64,
+    /// Slot-name prefix identifying this shard's DR replication (issue #954).
+    ///
+    /// Worth reading back from a live fleet: a prefix that matches nothing
+    /// reports the shard as having no standby, and a prefix that is too broad
+    /// counts an unrelated walsender as one.
+    pub replication_slot_prefix: String,
     /// Maximum workflow start delay, milliseconds.
     pub max_workflow_start_delay_ms: u64,
     /// Grace window before cross-workflow signaling fails for an unknown target, milliseconds.
@@ -180,6 +242,49 @@ pub struct WorkerConfigView {
     pub slot_tuner_enabled: bool,
     /// Advertised concurrent worker-session capacity (0 = sessions disabled).
     pub max_concurrent_sessions: i32,
+    /// Rows examined per shard, per scanner tick, by the lazy payload-codec
+    /// re-encryption sweep (issue #948). `0` = the sweep is disabled.
+    ///
+    /// The registry itself is deliberately NOT reported here: it holds live
+    /// codec handles that may close over key material. The operator-chosen key
+    /// *identifiers* and per-key rows-remaining are served by
+    /// `GET /admin/codec/rotation`.
+    pub codec_rotation_batch_size: i64,
+    /// Whether one replica per shard runs the timeout checker (issue #1795).
+    pub scanner_election: bool,
+    /// Scanner lease TTL in milliseconds, as configured. The checker caps it
+    /// and applies the three-tick floor.
+    pub scanner_lease_ttl_ms: u64,
+    /// Random spread of each scanner sleep, as the checker uses it. A
+    /// configured value is clamped to `[0, 0.9]`, and a non-finite one is 0.
+    pub scanner_jitter: f64,
+    /// Mean time between timeout-checker ticks, in milliseconds. `None`
+    /// means the worker poll interval.
+    pub timeout_scan_interval_ms: Option<u64>,
+    /// Most rows per timeout reason that one timeout pass enforces, as
+    /// configured. The checker raises 0 to 1.
+    pub timeout_scan_batch_size: u32,
+    /// Whether the worker runs the rebalance-resume scanner (issue #1839).
+    pub rebalance_resume_enabled: bool,
+    /// Time between rebalance-resume passes, in milliseconds (issue #1839).
+    pub rebalance_resume_interval_ms: u64,
+    /// Age of a `COMMITTED` shard migration before the rebalance-resume
+    /// scanner settles it, in milliseconds, after the floor (issue #1839).
+    pub rebalance_stall_after_ms: u64,
+    /// Retry budget policy for activity types without an override
+    /// (issue #1793). `null` = no default budget.
+    pub retry_budget_default: Option<crate::policy::RetryBudgetPolicy>,
+    /// Per-activity-type retry budget overrides (issue #1793). A `null`
+    /// policy turns the budget off for that type.
+    pub retry_budget_overrides:
+        std::collections::BTreeMap<String, Option<crate::policy::RetryBudgetPolicy>>,
+    /// Adaptive limit policy for activity types without an override
+    /// (issue #1836). `null` = no default limit.
+    pub adaptive_limit_default: Option<crate::policy::AdaptiveLimitPolicy>,
+    /// Per-activity-type adaptive limit overrides (issue #1836). A `null`
+    /// policy turns the limit off for that type.
+    pub adaptive_limit_overrides:
+        std::collections::BTreeMap<String, Option<crate::policy::AdaptiveLimitPolicy>>,
     /// Max panic strikes before a panicking workflow task fails terminally
     /// (0 = terminal on first panic).
     pub workflow_panic_max_attempts: u32,
@@ -268,6 +373,11 @@ impl WorkerConfigView {
     /// [`sharded_pool_configured`]: Self::sharded_pool_configured
     /// [`sharded_pool_shard_count`]: Self::sharded_pool_shard_count
     #[must_use]
+    // The body is one exhaustive destructure plus one field-for-field mapping,
+    // so the line count is the size of `WorkerConfig`, not of any control flow.
+    // Splitting it would mean splitting the `..`-free pattern that IS the #695
+    // coverage guard, which is the one thing this function must not do.
+    #[allow(clippy::too_many_lines)]
     pub fn from_worker_config_with_resolved_sharding(
         worker: &WorkerConfig,
         poll_interval: Duration,
@@ -300,6 +410,7 @@ impl WorkerConfigView {
             max_concurrent_activities,
             shutdown_timeout,
             workflow_cache_size,
+            resident_workflows,
             sticky_timeout,
             cancellation_grace_period,
             shard_assignments,
@@ -312,6 +423,10 @@ impl WorkerConfigView {
             deployment_name,
             query_timeout,
             priority_aging_secs,
+            dr_fencing,
+            replication_sample_interval,
+            replication_watermark_retain,
+            replication_slot_prefix,
             max_workflow_start_delay,
             unknown_target_grace_window,
             poison_pill_threshold,
@@ -328,6 +443,14 @@ impl WorkerConfigView {
                 sharded_pool: _,
             max_concurrent_sessions,
             workflow_panic_max_attempts,
+            codec_rotation_batch_size,
+            scanner,
+            retry_budget,
+            adaptive_limit,
+            // REDACTED — the registry holds live codec handles that may close
+            // over key material. Only the operator-chosen key IDENTIFIERS are
+            // safe to report, and those are served by
+            // `GET /admin/codec/rotation` (issue #948), never from here.
         } = worker;
 
         Self {
@@ -338,6 +461,7 @@ impl WorkerConfigView {
             poll_interval_ms: dur_ms(poll_interval),
             shutdown_timeout_ms: dur_ms(*shutdown_timeout),
             workflow_cache_size: *workflow_cache_size,
+            resident_workflows: *resident_workflows && !sticky_timeout.is_zero(),
             sticky_routing_enabled: !sticky_timeout.is_zero(),
             sticky_timeout_ms: dur_ms(*sticky_timeout),
             cancellation_grace_period_ms: dur_ms(*cancellation_grace_period),
@@ -364,6 +488,10 @@ impl WorkerConfigView {
             deployment_name: deployment_name.clone(),
             query_timeout_ms: dur_ms(*query_timeout),
             priority_aging_secs: *priority_aging_secs,
+            dr_fencing: *dr_fencing,
+            replication_sample_interval_ms: dur_ms(*replication_sample_interval),
+            replication_watermark_retain_ms: dur_ms(*replication_watermark_retain),
+            replication_slot_prefix: replication_slot_prefix.clone(),
             max_workflow_start_delay_ms: dur_ms(*max_workflow_start_delay),
             unknown_target_grace_window_ms: dur_ms(*unknown_target_grace_window),
             poison_pill_threshold: *poison_pill_threshold,
@@ -381,6 +509,23 @@ impl WorkerConfigView {
             mutex_lease_ttl_ms: dur_ms(*mutex_lease_ttl),
             slot_tuner_enabled: slot_tuner.is_some(),
             max_concurrent_sessions: *max_concurrent_sessions,
+            codec_rotation_batch_size: *codec_rotation_batch_size,
+            scanner_election: scanner.elect,
+            scanner_lease_ttl_ms: dur_ms(scanner.lease_ttl),
+            scanner_jitter: crate::scanner_lease::clamp_jitter(scanner.jitter),
+            timeout_scan_interval_ms: scanner.timeout_interval.map(dur_ms),
+            timeout_scan_batch_size: scanner.timeout_batch_size,
+            rebalance_resume_interval_ms: dur_ms(crate::scanner_lease::scanner_interval(
+                scanner.rebalance_resume_interval,
+            )),
+            rebalance_resume_enabled: scanner.rebalance_resume_enabled,
+            rebalance_stall_after_ms: dur_ms(crate::scanner_lease::rebalance_stall_after(
+                scanner.rebalance_stall_after,
+            )),
+            retry_budget_default: retry_budget.default_policy(),
+            retry_budget_overrides: retry_budget.overrides(),
+            adaptive_limit_default: adaptive_limit.default_policy(),
+            adaptive_limit_overrides: adaptive_limit.overrides(),
             workflow_panic_max_attempts: *workflow_panic_max_attempts,
             notification_channel_configured: notification_database_url.is_some(),
             shard_notification_channels_configured: shard_notification_database_urls.len(),
@@ -489,6 +634,22 @@ pub struct ShardTopologyView {
     /// replicas before accepting pinned starts. `BTreeMap` ordering makes the
     /// projection stable, so a byte comparison of two snapshots is meaningful.
     pub residency_map: BTreeMap<String, i32>,
+    /// The declared retired-shard → successor mapping (issue #964).
+    ///
+    /// Empty unless the deployment has decommissioned a shard. Surfacing it is
+    /// the same argument as `residency_map`, applied to a strictly worse
+    /// failure mode: two replicas that disagree about where a **retired**
+    /// shard's ids resolve will answer the *same* `ExecutionId` from *different*
+    /// databases — one finding the run, the other a confident `404` — while
+    /// reporting identical `readable`/`writable`/`default` sets. Diff this field
+    /// across replicas as the last step of a shard decommission.
+    pub shard_forwards: BTreeMap<i32, i32>,
+    /// The shards reserved for pinned work, one per tenant cell (issue #1837).
+    ///
+    /// Empty unless the deployment reserves a shard. Unpinned starts never
+    /// land on these shards. Diff this field across replicas. A replica that
+    /// does not reserve a cell shard hashes shared tenants into that cell.
+    pub reserved_shards: Vec<i32>,
 }
 
 impl ShardTopologyView {
@@ -506,6 +667,8 @@ impl ShardTopologyView {
             writable_shards,
             default_shard,
             residency_map,
+            shard_forwards,
+            reserved_shards,
         } = router.parts();
         Self {
             readable_shards: readable_shards.iter().map(|s| s.as_i32()).collect(),
@@ -515,6 +678,11 @@ impl ShardTopologyView {
                 .iter()
                 .map(|(key, shard)| (key.clone(), shard.as_i32()))
                 .collect(),
+            shard_forwards: shard_forwards
+                .iter()
+                .map(|(from, to)| (from.as_i32(), to.as_i32()))
+                .collect(),
+            reserved_shards: reserved_shards.iter().map(|s| s.as_i32()).collect(),
         }
     }
 }
@@ -625,7 +793,9 @@ impl EffectiveConfigView {
     /// [`BuiltHarvest`](crate::builder::BuiltHarvest) and database pool.
     /// `resolved_sharding` is the resolved-runtime-pool override for the two
     /// [`WorkerConfigView`] sharded-pool fields (`None` = fall back to the
-    /// `WorkerConfig::sharded_pool` knob; the pure no-DB path).
+    /// `WorkerConfig::sharded_pool` knob; the pure no-DB path). `dispatch` is
+    /// the Redis dispatch section (issue #1429); `None` when the caller does
+    /// not evaluate Redis dispatch.
     #[must_use]
     pub fn capture(
         worker: &WorkerConfig,
@@ -634,6 +804,7 @@ impl EffectiveConfigView {
         pool: PoolConfigView,
         poll_interval: Duration,
         resolved_sharding: Option<ShardedInfo>,
+        dispatch: Option<DispatchConfigView>,
     ) -> Self {
         Self {
             worker: WorkerConfigView::from_worker_config_with_resolved_sharding(
@@ -645,6 +816,7 @@ impl EffectiveConfigView {
             shard_topology: ShardTopologyView::from_router(router),
             features: compiled_feature_flags(),
             pool,
+            dispatch,
         }
     }
 }
@@ -696,6 +868,28 @@ mod tests {
         assert_eq!(view.shard_notification_channels_configured, 1);
     }
 
+    /// The view reports the adaptive limit config (issue #1836).
+    #[test]
+    fn view_reports_the_adaptive_limit() {
+        let worker = WorkerConfig::default().with_adaptive_limit(
+            crate::adaptive_limit::AdaptiveLimitConfig::disabled().with_activity(
+                "charge_card",
+                Some(crate::policy::AdaptiveLimitPolicy::new(2, 32)),
+            ),
+        );
+        let view = WorkerConfigView::from_worker_config(&worker, Duration::from_millis(500));
+        let json = serde_json::to_value(&view).expect("serialize");
+        assert_eq!(json["adaptive_limit_default"], serde_json::Value::Null);
+        assert_eq!(
+            json["adaptive_limit_overrides"]["charge_card"]["min_limit"],
+            2
+        );
+        assert_eq!(
+            json["adaptive_limit_overrides"]["charge_card"]["max_limit"],
+            32
+        );
+    }
+
     #[test]
     fn sentinel_coverage_surfaces_distinctive_values() {
         let worker = WorkerConfig::default()
@@ -719,10 +913,23 @@ mod tests {
     }
 
     #[test]
+    fn default_activity_start_to_close_ms_surfaces_the_shipped_default_issue_1808() {
+        let view = WorkerConfigView::from_worker_config(
+            &WorkerConfig::default(),
+            Duration::from_millis(500),
+        );
+        assert_eq!(view.default_activity_start_to_close_ms, Some(600_000));
+
+        // The opt-out surfaces as null, so an operator can see it.
+        let off = WorkerConfig::default().without_default_activity_start_to_close();
+        let view = WorkerConfigView::from_worker_config(&off, Duration::from_millis(500));
+        assert_eq!(view.default_activity_start_to_close_ms, None);
+    }
+
+    #[test]
     fn retry_after_ceiling_ms_surfaces_the_configured_value_issue_744() {
-        // The ceiling is not opt-in (always present, unlike the sibling
-        // default_activity_* floors) -- confirm the default AND a configured
-        // override both surface through the introspection snapshot.
+        // The ceiling always applies. Confirm that the default and a
+        // configured override both surface through the snapshot.
         let default_view = WorkerConfigView::from_worker_config(
             &WorkerConfig::default(),
             Duration::from_millis(500),
@@ -754,6 +961,35 @@ mod tests {
         );
         assert_eq!(view.poll_interval_ms, expected_ms);
         assert_eq!(expected_ms, 500);
+    }
+
+    /// The view reports the jitter the scanner uses (issue #1795). A
+    /// non-finite or out-of-range setting is clamped, so the JSON holds a
+    /// number, never `null`.
+    #[test]
+    fn scanner_jitter_reports_the_clamped_value() {
+        for (set, used) in [
+            (f64::NAN, 0.0),
+            (f64::INFINITY, 0.0),
+            (-1.0, 0.0),
+            (5.0, 0.9),
+            (0.2, 0.2),
+        ] {
+            let worker = WorkerConfig {
+                scanner: crate::scanner_lease::ScannerConfig {
+                    jitter: set,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let view = WorkerConfigView::from_worker_config(&worker, Duration::from_millis(500));
+            let json = serde_json::to_value(&view).expect("serialize");
+            assert_eq!(
+                json["scanner_jitter"],
+                serde_json::json!(used),
+                "jitter {set}"
+            );
+        }
     }
 
     #[test]
@@ -801,6 +1037,20 @@ mod tests {
     }
 
     #[test]
+    fn default_view_reports_sticky_routing_on_with_a_5s_fallback() {
+        let view = WorkerConfigView::from_worker_config(
+            &WorkerConfig::default(),
+            Duration::from_millis(500),
+        );
+        assert!(view.sticky_routing_enabled);
+        assert_eq!(view.sticky_timeout_ms, 5_000);
+        assert!(
+            view.resident_workflows,
+            "resident workflows are on by default"
+        );
+    }
+
+    #[test]
     fn derived_bools_track_their_source_tunable() {
         // Off: zero sticky timeout, zero poison-pill threshold, no tuner.
         let off = WorkerConfig {
@@ -811,6 +1061,10 @@ mod tests {
         };
         let off_view = WorkerConfigView::from_worker_config(&off, Duration::from_millis(500));
         assert!(!off_view.sticky_routing_enabled);
+        assert!(
+            !off_view.resident_workflows,
+            "resident workflows need sticky routing"
+        );
         assert!(!off_view.poison_pill_quarantine_enabled);
         assert!(!off_view.slot_tuner_enabled);
 
@@ -823,7 +1077,15 @@ mod tests {
         let on_view = WorkerConfigView::from_worker_config(&on, Duration::from_millis(500));
         assert!(on_view.sticky_routing_enabled);
         assert_eq!(on_view.sticky_timeout_ms, 15_000);
+        assert!(on_view.resident_workflows);
         assert!(on_view.poison_pill_quarantine_enabled);
+
+        // The resident switch alone turns resident workflows off.
+        let resident_off = WorkerConfig::default().with_resident_workflows(false);
+        let resident_off_view =
+            WorkerConfigView::from_worker_config(&resident_off, Duration::from_millis(500));
+        assert!(resident_off_view.sticky_routing_enabled);
+        assert!(!resident_off_view.resident_workflows);
     }
 
     #[test]
@@ -848,6 +1110,44 @@ mod tests {
         assert!(
             view.residency_map.is_empty(),
             "a router with no declared map must report an empty projection"
+        );
+        assert!(
+            view.shard_forwards.is_empty(),
+            "a router with no decommissioned shard must report an empty forward map"
+        );
+    }
+
+    /// Issue #964: the same replica-drift argument as the residency map, applied
+    /// to a strictly worse failure mode. Two replicas that disagree about where a
+    /// RETIRED shard's ids resolve answer the *same* `ExecutionId` from
+    /// *different* databases -- one finding the run, the other a confident 404 --
+    /// while reporting identical readable/writable/default sets.
+    #[test]
+    fn shard_topology_surfaces_the_retired_shard_forwards() {
+        let replica_a = crate::shard::ShardRouter::new(
+            vec![crate::types::ShardId::new(1), crate::types::ShardId::new(2)],
+            vec![crate::types::ShardId::new(1), crate::types::ShardId::new(2)],
+            crate::types::ShardId::new(1),
+        )
+        .with_shard_forwards([(crate::types::ShardId::new(0), crate::types::ShardId::new(1))]);
+        // Same topology, shard 0's residents claimed by a DIFFERENT successor.
+        let replica_b = crate::shard::ShardRouter::new(
+            vec![crate::types::ShardId::new(1), crate::types::ShardId::new(2)],
+            vec![crate::types::ShardId::new(1), crate::types::ShardId::new(2)],
+            crate::types::ShardId::new(1),
+        )
+        .with_shard_forwards([(crate::types::ShardId::new(0), crate::types::ShardId::new(2))]);
+
+        let view_a = ShardTopologyView::from_router(&replica_a);
+        let view_b = ShardTopologyView::from_router(&replica_b);
+
+        assert_eq!(view_a.shard_forwards.get(&0), Some(&1));
+        assert_eq!(view_a.readable_shards, view_b.readable_shards);
+        assert_eq!(view_a.writable_shards, view_b.writable_shards);
+        assert_eq!(view_a.default_shard, view_b.default_shard);
+        assert_ne!(
+            view_a.shard_forwards, view_b.shard_forwards,
+            "conflicting retired-shard forwards MUST be visible in the snapshot"
         );
     }
 
@@ -966,6 +1266,7 @@ mod tests {
             },
             Duration::from_millis(500),
             None,
+            None,
         );
         let json = serde_json::to_value(&view).expect("serialize");
         for key in [
@@ -974,6 +1275,7 @@ mod tests {
             "shard_topology",
             "features",
             "pool",
+            "dispatch",
         ] {
             assert!(
                 json.as_object().unwrap().contains_key(key),
@@ -982,6 +1284,64 @@ mod tests {
         }
         assert_eq!(json["pool"]["worker_pool_max_connections"], 10);
         assert_eq!(json["pool"]["shard_pool_count"], 1);
+        assert!(json["dispatch"].is_null());
+    }
+
+    #[test]
+    fn dispatch_view_reports_installed_state_and_tuning() {
+        let view = DispatchConfigView {
+            installed: true,
+            endpoint: Some("redis://dbhost:6379".to_string()),
+            key_prefix: Some("harvest".to_string()),
+            key_prefixes: None,
+            consumer_group: Some("harvest_workers".to_string()),
+            visibility_timeout_ms: Some(60_000),
+            poll_interval_ms: Some(20),
+            reconcile_interval_ms: Some(1_000),
+            reconcile_batch: Some(1_000),
+        };
+        let json = serde_json::to_value(&view).expect("serialize");
+        assert_eq!(json["installed"], true);
+        assert_eq!(json["endpoint"], "redis://dbhost:6379");
+        assert_eq!(json["key_prefix"], "harvest");
+        assert_eq!(json["consumer_group"], "harvest_workers");
+        assert_eq!(json["visibility_timeout_ms"], 60_000);
+        assert_eq!(json["poll_interval_ms"], 20);
+        assert_eq!(json["reconcile_interval_ms"], 1_000);
+        assert_eq!(json["reconcile_batch"], 1_000);
+    }
+
+    #[test]
+    fn dispatch_view_never_leaks_a_connection_url() {
+        // The caller must pass the already-redacted endpoint. This test pins
+        // that the view itself has no field that could carry the raw URL.
+        let view = DispatchConfigView {
+            installed: false,
+            endpoint: None,
+            key_prefix: None,
+            key_prefixes: None,
+            consumer_group: None,
+            visibility_timeout_ms: None,
+            poll_interval_ms: None,
+            reconcile_interval_ms: None,
+            reconcile_batch: None,
+        };
+        let json = serde_json::to_string(&view).expect("serialize");
+        assert!(!json.contains("://"), "leaked a URL scheme: {json}");
+        assert_eq!(
+            view,
+            DispatchConfigView {
+                installed: false,
+                endpoint: None,
+                key_prefix: None,
+                key_prefixes: None,
+                consumer_group: None,
+                visibility_timeout_ms: None,
+                poll_interval_ms: None,
+                reconcile_interval_ms: None,
+                reconcile_batch: None,
+            }
+        );
     }
 
     #[test]

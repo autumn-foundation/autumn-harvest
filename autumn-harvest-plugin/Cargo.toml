@@ -34,11 +34,48 @@ metrics = []
 connectors = ["dep:async-trait", "dep:sha2"]
 kafka = ["connectors", "dep:rdkafka"]
 sqs = ["connectors", "dep:aws-config", "dep:aws-sdk-sqs"]
+# AWS KMS binding for the core AES-256-GCM payload codec (issue #1825).
+# `autumn_harvest_plugin::aws_kms::AwsKms` implements the core `KmsDecrypt`
+# trait, so the core crate keeps zero cloud dependencies (the issue #944 rule,
+# enforced by `tests/connector_dependency_graph.rs`). Like `sqs`, it brings in
+# `aws-lc-rs`, which needs cmake and a C compiler. The locked `aws-sdk-kms`
+# 1.99.0 needs Rust 1.88, so the effective MSRV does not rise.
+aws-kms = ["dep:aws-sdk-kms", "dep:async-trait"]
+# Zero-setup local dev runtime (issue #525) — the `harvest-dev` binary.
+#
+# Off by default and never in a release build. It provisions an **ephemeral**
+# Postgres cluster, applies the ordinary embedded migration sets, runs a worker
+# and serves the management API + Vantage UI, then reclaims every byte of that
+# state on exit. Development and evaluation only; it refuses to point at
+# anything that looks like a real database.
+#
+# This tier drives a Postgres install that is already on the machine
+# (Homebrew, apt, Postgres.app, the EnterpriseDB installer). It adds one small
+# pure-Rust dependency (`url`, already in the lockfile via `autumn-harvest`).
+dev-runtime = ["dep:tokio-postgres"]
+# `dev-runtime` plus automatic acquisition of a platform-matched PostgreSQL
+# build when the machine has none — the tier that makes "a clean machine with
+# only the Rust toolchain" literally true. `postgresql_archive` only downloads
+# and extracts the archive; the cluster is still driven by our own lifecycle
+# code, so ephemerality and teardown stay under this crate's control.
+#
+# `postgresql_archive` 0.19 (not 0.21) deliberately: it is what `autumn-web`'s
+# own `managed-pg` feature resolves to, its rustls feature unifies on the
+# reqwest already in the graph rather than pulling a second copy, and its MSRV
+# (1.87) is below this workspace's 1.88 — so unlike `wasm-activities` this
+# feature raises no effective MSRV at all.
+dev-runtime-managed = ["dev-runtime", "dep:postgresql_archive"]
+# Redis dispatch channel (issue #1312). Off by default: with the feature off
+# the runtime keeps the Postgres claim path, and `[harvest.redis] url` is
+# rejected at config validation rather than silently ignored. The channel
+# carries references to claimable `harvest_task_queue` rows; Postgres stays
+# the source of truth. See `docs/operations/redis-dispatch.md`.
+redis = ["dep:autumn-harvest-redis"]
 
 
 [dependencies]
-autumn-harvest = { version = "0.6.0", path = "../autumn-harvest", features = ["db", "testing"] }
-autumn-web = "0.7"
+autumn-harvest = { version = "0.7.0", path = "../autumn-harvest", features = ["db", "testing"] }
+autumn-web = "0.8"
 tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }
 serde = { workspace = true }
@@ -70,8 +107,29 @@ matchit = "0.8"
 # `queue_coverage.rs` can call it without pulling in the rest of `url`.
 percent-encoding = "2.3"
 maud = { version = "0.27", features = ["axum"] }
+# The dev runtime's production-database refusal gate parses candidate DSNs with
+# the SAME parser the connection will use (issue #525). This is the whole point:
+# a second, hand-rolled parser is a second opinion about what the client will
+# dial, and every disagreement between the two is a bypass — `hostaddr` vs
+# `host`, a `host=` query parameter that appends rather than replaces, and the
+# first-vs-last `@` split of userinfo were all real ones. Already in the
+# lockfile at this version (`autumn-harvest` depends on it under `db`, and
+# `diesel-async` connects through it), so this unifies rather than widening the
+# graph.
+tokio-postgres = { version = "0.7.18", optional = true }
+# Downloads and extracts a platform-matched PostgreSQL build for the
+# `dev-runtime-managed` tier (issue #525). Deliberately `postgresql_archive`
+# and NOT `postgresql_embedded`: we need archive acquisition only, and the
+# server-orchestration half of `postgresql_embedded` would pull `sqlx` into the
+# graph for a cluster we already drive ourselves. `default-features = false`
+# drops its native-tls default in favour of rustls, matching the rest of the
+# crate's pure-Rust TLS story (no OpenSSL on Windows).
+postgresql_archive = { version = "0.19", default-features = false, features = ["theseus", "rustls"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 thiserror = { workspace = true }
+# Redis Streams dispatch channel (issue #1312), behind the `redis` feature.
+# Optional so the default build keeps a Postgres-only dependency graph.
+autumn-harvest-redis = { version = "0.7.0", path = "../autumn-harvest-redis", optional = true }
 
 # ── Broker connectors (issue #944) — all optional, all off by default ──
 # Object-safe async traits for the EventSource / DeadLetterSink seams
@@ -80,19 +138,41 @@ async-trait = { version = "0.1", optional = true }
 # Collision-resistant digest for the bounded idempotency-key encoding, so a
 # pathological topic/key component can never blow the 512-byte start-key cap
 # (the issue #699 `bound_key_component` precedent).
-sha2 = { version = "0.10", optional = true }
+sha2 = { version = "0.11", optional = true }
 # Kafka client. `cmake-build` builds librdkafka from the vendored source, so
 # the adapter needs no system librdkafka. NOTE: librdkafka's build requires
 # libcurl headers (`libcurl4-openssl-dev` on Debian/Ubuntu) even with
 # `WITH_CURL=0` — see the CI step added alongside this feature.
-rdkafka = { version = "0.38", default-features = false, features = ["cmake-build", "libz", "tokio"], optional = true }
-# SQS client.
+rdkafka = { version = "0.39", default-features = false, features = ["cmake-build", "libz", "tokio"], optional = true }
+# SQS client. `aws-sdk-sqs` requests `default-https-client` rather than its
+# own `rustls` feature deliberately: `rustls` there maps to
+# `aws-smithy-runtime/tls-rustls`, which pulls the legacy hyper-0.14/h2-0.3.x/
+# rustls-0.21 connector stack *alongside* the modern one instead of selecting
+# it (RUSTSEC-2026-0098/0099/0104/0258, see deny.toml). `default-https-client`
+# is the independent feature that actually gets the modern hyper-1.x/
+# aws-lc-rs client and is sufficient on its own. `aws-config`'s own `rustls`
+# feature doesn't have this problem (it aliases to `client-hyper` ->
+# `default-https-client`, same target), so it's left as-is.
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "rustls"], optional = true }
-aws-sdk-sqs = { version = "1", default-features = false, features = ["rt-tokio", "rustls"], optional = true }
+aws-sdk-sqs = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"], optional = true }
+# KMS client for the `aws-kms` feature. Same feature choice as `aws-sdk-sqs`,
+# for the same reason.
+aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"], optional = true }
+
+[[bin]]
+# Zero-setup local dev runtime (issue #525). `cargo dev` is the workspace alias
+# for running this with the managed tier enabled.
+name = "harvest-dev"
+path = "src/bin/harvest_dev.rs"
+required-features = ["dev-runtime"]
 
 [dev-dependencies]
-autumn-web = { version = "0.7", features = ["test-support", "mcp"] }
-autumn-harvest = { version = "0.6.0", path = "../autumn-harvest", features = ["db", "testing"] }
+autumn-web = { version = "0.8", features = ["test-support", "mcp"] }
+# The dev-runtime lifecycle test drives the running dev runtime over real HTTP
+# (start a workflow, poll its status, fetch the Vantage page). The crate already
+# depends on reqwest for the callback deliverer; the test needs `json` on top.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+autumn-harvest = { version = "0.7.0", path = "../autumn-harvest", features = ["db", "testing"] }
 tower = "0.5"
 # `test-util` for `#[tokio::test(start_paused = true)]`: the shutdown-drain
 # deadline is a 30s wall-clock wait that must be asserted, not slept through.
@@ -103,6 +183,53 @@ tracing-subscriber = "0.3"
 # Issue #798: the export -> bundle -> drift-gate end-to-end test writes a real
 # bundle directory and feeds it to `WorkflowReplayer::replay_bundle`.
 tempfile = "3"
+
+# Deterministic (non-criterion) instruction/allocation-count profiling
+# harness for `dag_graph::build_run_graph` -- the pure projection behind
+# `GET /dag-run-graph` (issue #690) that reconstructs a unified DAG run's
+# node topology from the registered DagDefinition and recorded event
+# history. No feature requirement: `dag_graph`/`dag_retry` are unconditional
+# modules. See `benches/dag_graph_profile.rs` and
+# `docs/performance-dag-graph.md`.
+[[bench]]
+name = "dag_graph_profile"
+harness = false
+
+# End-to-end wall-clock latency of `GET /workflows/{id}/diagnose` against a
+# real Postgres (issue #1194, following up on issue #809's unverified
+# `p95 < 500 ms` claim). `harness = false` + its own `main()`, matching
+# `claim_bench`/`e2e_bench`/`retention_reclaim_bench` in the `autumn-harvest`
+# crate: the report format (p50/p99/max tables pasted into
+# `docs/performance.md`) is the house convention those establish, even though
+# `/diagnose` is read-only and criterion would be numerically valid here (see
+# the bench's own module doc comment). Drives the real `harvest_api_router`
+# handler over `tower::ServiceExt::oneshot`, not a reimplementation of its
+# query shapes -- the diagnose internals are private to this crate, so a
+# bench in `autumn-harvest/benches/` could only ever measure a proxy. No
+# `required-features`: this crate's `autumn-harvest` dependency already
+# unconditionally enables `db`/`testing` (see `[dependencies]` above).
+[[bench]]
+name = "diagnose_bench"
+harness = false
+
+# Deterministic (non-criterion) instruction/allocation-count profiling
+# harness for `lineage::LineageWalk` / `LineageTreeReport::finish` -- the
+# pure, in-memory half of `GET /workflows/{id}/lineage` (issue #621). No
+# feature requirement: `lineage` is an unconditional module. See
+# `benches/lineage_profile.rs`.
+[[bench]]
+name = "lineage_profile"
+harness = false
+
+# Deterministic (non-criterion) instruction/allocation-count profiling
+# harness for `queue_coverage::partition_uncovered_and_paused` -- the
+# pure, per-shard, in-memory core of `GET /admin/queue-coverage` (issue
+# #774). No feature requirement: `queue_coverage` is an unconditional
+# module. See `benches/queue_coverage_profile.rs` and
+# `docs/performance-queue-coverage.md`.
+[[bench]]
+name = "queue_coverage_profile"
+harness = false
 
 [lints]
 workspace = true

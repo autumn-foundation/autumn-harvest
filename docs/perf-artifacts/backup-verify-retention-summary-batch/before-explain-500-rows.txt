@@ -1,0 +1,18 @@
+=== PER-ROW (single call), 500-row table ===
+                                                                                    QUERY PLAN                                                                                    
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result  (cost=8.29..8.30 rows=1 width=1) (actual time=0.066..0.067 rows=1 loops=1)
+   Output: $0
+   Buffers: shared hit=3
+   InitPlan 1 (returns $0)
+     ->  Index Only Scan using harvest_execution_summaries_pkey on public.harvest_execution_summaries  (cost=0.27..8.29 rows=1 width=0) (actual time=0.062..0.062 rows=1 loops=1)
+           Index Cond: (harvest_execution_summaries.execution_id = '000100aa-c5cb-40da-8321-e45f44d321ad'::uuid)
+           Heap Fetches: 1
+           Buffers: shared hit=3
+ Query Identifier: -7154358466697771746
+ Planning:
+   Buffers: shared hit=192
+ Planning Time: 1.150 ms
+ Execution Time: 0.145 ms
+(13 rows)
+

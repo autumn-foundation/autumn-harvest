@@ -25,7 +25,6 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -41,7 +40,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 type HarvestApiApp = axum::Router;
@@ -126,7 +125,7 @@ fn build_app(pool: HarvestDbPool, router: ShardRouter) -> HarvestApiApp {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         router,
     ));
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 /// Single-shard app plus a connection to its database.
@@ -225,7 +224,7 @@ async fn insert(conn: &mut AsyncPgConnection, spec: Spec<'_>) -> ExecutionId {
         workflow_id: spec.workflow_id,
         run_id: uuid::Uuid::new_v4(),
         shard_id: spec.shard,
-        input: json!({}),
+        input: json!({}).into(),
         parent_id: spec.parent.map(|p| p.as_uuid()),
         queue_name: "default",
         execution_timeout: None,
@@ -330,7 +329,10 @@ async fn a_leaf_root_returns_an_empty_children_array_not_an_error() {
 
     let (status, body) = get_json(&app, &format!("/workflows/{root}/tree")).await;
     assert_eq!(status, StatusCode::OK, "AC: a leaf is not an error");
-    assert!(children_of(&body["root"]).is_empty());
+    assert_eq!(
+        children_of(&body["root"]).as_slice(),
+        [] as [serde_json::Value; 0]
+    );
     assert_eq!(body["node_count"], 1);
     assert_eq!(body["truncated"], false);
 }
@@ -671,11 +673,12 @@ async fn a_tree_that_ends_exactly_at_the_depth_cap_is_not_reported_truncated() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["truncated"], false);
     assert_eq!(body["truncation_reason"], Value::Null);
-    assert!(
+    assert_eq!(
         body["truncated_parent_ids"]
             .as_array()
             .expect("array")
-            .is_empty()
+            .as_slice(),
+        [] as [serde_json::Value; 0]
     );
 }
 

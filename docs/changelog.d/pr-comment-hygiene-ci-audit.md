@@ -1,0 +1,3852 @@
+## Tooling — Comment-hygiene CI harness and a corpus audit
+
+**Tooling + comment-only source changes** (implemented). Adds
+`docs/audits/comment-hygiene.py`, wired into CI's ungated `lint` job
+alongside the other Folio corpus harnesses, and fixes every Tier A defect it
+found across the 785 `*.rs` files (822k lines, 175k comment lines).
+
+**The design decision that shaped it.** A blanket "comments must be short"
+gate was rejected. Measured over the corpus, 18,064 comment sentences exceed
+ASD-STE100's 25-word ceiling, and the longest blocks are the ones carrying
+the engine's correctness arguments — the ABBA lock-ordering proof for
+`materialize_due_child_timeout_deadlines`, the `cohort` partition-key
+argument in `partition.rs`, the codec-rotation scope guarantee `CLAUDE.md`
+cites as the proof that `harvest_events` exception #3 is safe. A length cap
+over a comment *block* would reward deleting exactly those. So the harness
+measures per **sentence** and never caps block length: a thorough rationale
+passes once it is written as several sentences.
+
+**Two tiers.**
+
+- **Tier A — absolute, at zero, a new one fails the build.** `CH001`
+  commented-out code, `CH002` a TODO/FIXME/XXX/HACK with no `#<issue>` or
+  URL, `CH003` a narrative aside, `CH004` a blank `//` line at a block edge.
+- **Tier B — ratcheted against the merge base**, per file and per rule, by
+  a fingerprint of the rule and the comment's normalised text. A change may
+  not ADD one to a file it touches; the legacy population stays until
+  someone chooses to fix it. There is no checked-in baseline, deliberately:
+  a stored file goes stale the moment the base branch moves, and the
+  predictable response to a spurious failure is to regenerate it, which
+  defeats the ratchet. `CH005` review-round archaeology (1,370 — "Codex
+  round 8" is process trivia a future reader cannot look up; the issue
+  number is the durable handle), `CH006` contractions (426), `CH007`
+  sentences over 25 words (18,064).
+
+**What the audit fixed** (24 Tier A sites, all comment-only):
+
+- A 52-line commented-out "API GAP" scaffold in
+  `autumn-harvest-verify/tests/resolve_fixtures.rs` proposing an API that has
+  since landed — every item (`Resolution`, `Substitution`, `resolve_call`,
+  `resolve_terminator`, `call_substitution`, `substituted_callees`,
+  `body_paths`) is present in `src/resolve/`, and the tests below the block
+  are already active against it.
+- A self-contradicting aside in `autumn-harvest-cli/src/lib.rs` arguing to
+  represent DELETE as a POST, directly above code already using
+  `ApiMethod::Delete`.
+- A wrong event count in
+  `autumn-harvest-plugin/tests/workflow_history_pagination_integration.rs`:
+  three comment lines claimed "16 total" and "append 2 more" where the test
+  asserts 15 (`1` WorkflowStarted + `14` timer events).
+- A doc comment in `throttle_tests.rs` that stated a bypass rule and then
+  reversed itself mid-sentence ("... actually it DOES bypass").
+- 13 further first-person/deliberation asides, and 6 blank comment lines at
+  block edges.
+
+**Invariants.** No behaviour change: every edit is a comment, and no
+`WorkflowEvent` variant, migration, or SQL is touched. `cargo check` passes
+for `autumn-harvest` (`--all-features --tests`), `autumn-harvest-cli`,
+`autumn-harvest-plugin` and `autumn-harvest-verify` (`--all-targets`);
+`cargo fmt --all -- --check` is clean.
+
+**Test evidence.** The gate was verified in both directions rather than
+assumed: a seeded contraction plus an over-long sentence produces exit 1 and
+names both rules and the file; a seeded `// let stale = ...` line trips
+`CH001` for exit 1; the unmodified tree exits 0. Rule tuning was measured
+against the corpus, not guessed — fenced code blocks, markdown tables and
+headings are excluded (a naive scan mistook ~670 doc-example lines for
+commented-out code), `CH003` and `CH007` are evaluated per sentence rather
+than per wrapped line, and non-contiguous comment blocks separated by code
+are no longer merged into one prose unit.
+
+**Codex review follow-up (PR #1380).** Two P2 findings, both verified real
+against the corpus and both fixed by replacing the line-regex comment matcher
+with a real Rust lexer (`extract_comments`):
+
+- *Exclude string contents.* A `//` line inside a raw string was being read as
+  a comment. Confirmed on 10 live sites — `det_check_tests.rs` fixtures embed
+  `// harvest-suppress: DET001 ...`, and `chaos_catalogue_drift.rs:200` carries
+  a literal commented-out call as test data. None trip a rule today, but Tier A
+  gates at zero, so one new fixture of that shape would have blocked an
+  innocent PR.
+- *Inspect trailing and block comments.* The old matcher was anchored to the
+  start of a line, so `let n = 1; // TODO: fix` and `/* TODO: fix */` were
+  invisible — every gated defect class could be introduced through either form
+  with CI green. 897 comment pieces were out of scope; they are now covered.
+
+The lexer handles nested block comments, raw strings of any hash count,
+byte/C-string prefixes, escapes, and the lifetime-vs-char-literal ambiguity.
+Writing it surfaced a third defect of my own: a backslash-newline continuation
+inside a string (used throughout the long SQL and `#[error(...)]` strings) was
+consuming the newline without counting it, drifting every subsequent line
+number — `error.rs` was off by 11 by line 700. Fixed and pinned; all 175,892
+comment pieces now report a line number that really contains them.
+
+`--self-test` pins 14 lexer fixtures and CI runs it before the scan, so a
+silent regression in comment-finding fails loudly instead of quietly ceasing
+to gate. Tier A remained at zero under the widened coverage. The Tier B
+baseline was regenerated for the rule-definition change (+2 CH006, +10 CH007,
+all in newly visible trailing and block comments). The gate was re-verified
+through the new paths: CH001/CH002 via a trailing comment, CH002/CH003 via a
+block comment, each exit 1, while a raw-string fixture correctly exits 0.
+
+**Tier B is scoped to changed files (PR #1380 CI).** The harness's own first
+CI run failed — correctly, and on a design flaw rather than a bug. While the
+PR was open, `trunk-dev` merged #1377, which added 4 long sentences to
+`cross_region_dr_tests.rs`. CI evaluates the merge of the branch onto the base,
+so those sentences appeared in the scan while the locally-generated baseline
+knew nothing of them, and the gate failed on a file the PR never touched.
+
+That is inherent to a whole-corpus count: it is a shared mutable number, so
+one merge adding a long comment anywhere turns every open PR red, and the
+predictable response is to regenerate the baseline — which defeats the ratchet
+entirely. Fixed by scoping Tier B to the files a change actually touches, via
+`--base <ref>` (merge-base + `git diff --name-only`), which CI passes as the
+PR's target branch. Tier A is never scoped and gates everywhere.
+
+Failing safe matters here as much as failing correctly. When the diff cannot
+be computed — no `--base`, an unknown ref, a shallow clone with no reachable
+merge base — Tier B reports and never fails, because gating the whole corpus
+at exactly the moment the tool cannot tell what changed is the worst available
+option. The `lint` checkout takes `fetch-depth: 0` so the merge base is
+actually reachable; without it the step would silently degrade to report-only
+and quietly stop gating.
+
+Verified across all five paths: base drift on an untouched file passes; a
+CH006/CH007 regression in a file the branch does touch exits 1 naming both
+rules; a Tier A defect exits 1 regardless of scope; an unknown ref and a
+missing `--base` both degrade to report-only at exit 0.
+
+**Second Codex round (PR #1380): four more P2 findings, all verified real.**
+
+- *`/*!` evaded the gate.* The lexer recognised the marker but advanced only
+  past `/*`, leaving `!` on the body so the anchored rules missed
+  `/*! TODO */` and `/*! let stale = 1; */`. Now advances past the whole
+  marker, with a guard so `/**/` (an empty comment, not a doc marker) does not
+  eat its own terminator and swallow the rest of the file.
+- *CH001 false-positived on prose.* The `fn` alternative accepted anything
+  after the opening paren, so `// fn foo() is called by the wrapper.` was
+  reported as commented-out code — a false positive that fails CI on ordinary
+  prose, contradicting the terminator-bearing heuristic every other
+  alternative follows. It now requires a real terminator (`{`, `;`, or an
+  open paren at end of line for a wrapped signature).
+- *A count-neutral swap passed.* Removing one legacy violation and adding a
+  different one in the same file left the count unchanged and the gate green.
+  Demonstrated live: a new `// A newly introduced defect: this isn't
+  compliant.` in `event.rs` passed because CH006 stayed at 1.
+- *Renames failed.* A baselined file moved to a new path had no entry, so all
+  its legacy findings read as new — 24 spurious regressions for a pure rename
+  of `history_export.rs`, comments untouched.
+
+The last two share a root cause, so both are fixed by one change rather than
+two patches: **the stored baseline is gone.** The harness now reads the merge
+base out of git (`git show <merge-base>:<path>`) and re-scans each changed
+file as it stood there, matching findings by fingerprint (rule + normalized
+text) instead of counting them. That kills the whole class at once — it cannot
+go stale when the base moves, there is no regeneration ritual to launder a
+violation through, a renamed file is compared against its own previous path,
+and 532 KB of generated fingerprints stay out of the tree. Identities rather
+than counts also mean a swap is caught: the total never moves, but the new
+fingerprint is not in the allowed set.
+
+Verified across eight cases in an isolated worktree: count-neutral swap fails;
+pure rename passes (and reports "1 renamed"); a new Tier B finding in a
+touched file fails; Tier A fails anywhere; `/*! TODO */` fails; `// fn foo()
+is called by the wrapper.` passes; a newly added file is allowed nothing, so
+its findings fail; base drift on an untouched file passes; and both
+degradation paths (no `--base`, unknown ref) report at exit 0.
+
+**Third Codex round (PR #1380): three more P2 findings.** One
+("regenerating the baseline launders a violation") was already answered by
+dropping the stored baseline. Two were real and outstanding:
+
+- *Push runs scoped from the wrong boundary.* The push branch diffed
+  `HEAD~1`, so on a multi-commit push to `trunk-dev` a violation introduced by
+  an earlier commit slipped through in any file the final commit did not also
+  touch. Now uses `github.event.before`, the boundary the workflow's own
+  `changes` job already uses, with a fallback to report-only on a branch's
+  first push (no before-SHA exists). Proven: with the violation in commit 1
+  and an unrelated commit 2, `--base HEAD~1` exits 0 while
+  `--base $BEFORE` exits 1 and names the file.
+- *The prescribed local check gated almost nothing.* `CLAUDE.md` told
+  contributors to run `python3 docs/audits/comment-hygiene.py`, which without
+  `--base` leaves Tier B report-only — so the documented pre-push command
+  checked Tier A and little else. It now prescribes
+  `--base origin/trunk-dev` and says plainly why the flag matters.
+
+**Fourth Codex round (PR #1380): two more P2 findings, both real.** Both came
+from state that was scoped to the file when it should have been scoped to the
+comment block.
+
+- *An unclosed fence disabled the whole file.* `fence` was one boolean across
+  every comment in a file, so a `/// ```rust` block that never closed left it
+  set for everything after it. Reproduced: with an unclosed fence above them,
+  `// TODO: issue required` and `// let stale = compute();` produced **no
+  findings at all** — every Tier A rule silently off for the rest of the file.
+  That is the exact failure mode this harness is supposed to avoid: a gate
+  that stops gating without failing.
+- *Adjacent trailing comments merged into one sentence.* Prose units were
+  joined on line adjacency alone, so two short trailing notes on consecutive
+  lines became one long unit and could trip CH007 as a sentence neither author
+  wrote.
+
+Both are fixed by one concept: `comment_runs()`. A run is what a reader sees
+as one comment — consecutive lines, same kind — and a trailing comment is
+always its own run. Fence state resets per run, and prose units never span
+one. CH004 uses the same grouping instead of re-deriving it.
+
+Three rule-level fixtures now pin this alongside the 14 lexer ones, since
+neither behaviour is expressible as a lexer test: an unclosed fence does not
+leak past its block, fenced example code stays exempt, and adjacent trailing
+comments are not merged. Tier A stayed at zero; CH007 fell 17,913 → 17,903 as
+wrongly-merged trailing units split into the separate short notes they always
+were.
+
+**Fifth Codex round (PR #1380): two more P2 findings, both real.**
+
+- *The wrapped-signature branch accepted prose.* The earlier CH001 fix added
+  an alternative for `fn foo(` at end of line, but wrote it as `[^)]*` — any
+  line with no closing paren. So `// fn resolve_call(the caller name appears
+  in diagnostics` was reported as commented-out code. A narrower fix for the
+  original false positive that reintroduced a smaller one. It now accepts only
+  an open paren at end of line, or parameters ending in a trailing comma.
+- *`////` was misread as `///`.* Four or more slashes is an ordinary comment
+  in Rust, not a doc comment, but the marker match took the first three and
+  left a stray `/` on the body — so `//// let stale = compute();` extracted as
+  `/ let stale = compute();` and CH001 missed it. The marker is now the whole
+  leading slash run, so `////` and `/////` both extract cleanly.
+
+Three more fixtures pin these (20 in total): `////` is an ordinary comment,
+prose after an open paren is not a signature, and a wrapped commented-out
+signature is still caught on its opening line.
+
+**Proactive CH001 hardening.** Two review rounds had found CH001 false-
+positiving on prose that opens with a Rust keyword, so rather than wait for a
+third the boundary was swept adversarially: 210 generated prose lines (every
+keyword the rule keys on, crossed with the sentence shapes this corpus
+actually writes) against 23 genuine commented-out shapes.
+
+That found six more false positives before review did — `use the caller
+decide, since the row may be gone;` and `use T: Send is required here;` (the
+`use` alternative allowed bare spaces, so any prose sentence starting with
+"use" and ending in `;` matched), plus `let x = the value the operator
+supplied;` and the `type` equivalent (a right-hand side of bare words read as
+an initializer). It also found one missed true positive: `});` is two closers,
+and the rule allowed only one.
+
+Fixed by requiring a real use-path shape, rejecting a `let`/`type` right-hand
+side of three or more bare words, and allowing a run of closers. The sweep now
+reports 0 false positives and 0 misses, and 26 of those shapes are pinned in
+`--self-test` so the next narrowing of CH001 cannot quietly re-widen it.
+
+**Sixth Codex round (PR #1380): four more P2 findings, all real.**
+
+- *Wrapped parameters excluded valid Rust.* `// fn f(x: impl Send + Sync,` and
+  `// fn f(x: [u8; 4],` evaded CH001 because the parameter character class had
+  no `+`, `;` or `=`. Widened, and gated on a `:` or a `self` receiver so that
+  prose ending in a comma still cannot match.
+- *A change of comment marker did not end a run.* `/// ```rust` immediately
+  followed by `// TODO: issue required` stayed one run, so the doc block's
+  unclosed fence suppressed the ordinary comment below it — the same class as
+  the previous round's fence leak, one level down. The marker is now part of
+  the run boundary.
+- *Nested block comment bodies were buried.* `/* outer /* let stale =
+  compute(); */ */` handed the rules a single string starting "outer", so the
+  nested code was never anchored. A nested opener or closer now ends the
+  segment, and the inner body starts its own piece.
+- *Any fence delimiter closed any fence.* A `~~~` line inside a ` ``` ` block
+  is literal content under CommonMark, but it toggled the fence off — so the
+  example's own sample text was then read as real comments and reported. The
+  opening delimiter is now tracked and only its match closes.
+
+The marker-boundary fix unmasked **three genuine CH004 defects** that run
+merging had been hiding: a `///` doc block closing on a blank `///` before a
+`//` block (`runner.rs`, `scheduler.rs`) and one opening on a blank `///`
+(`worker.rs`). All three removed, so Tier A is back at zero.
+
+The adversarial sweep was extended to 240 prose lines and still reports 0
+false positives, and the self-test now carries 24 lexer/rule fixtures plus 30
+code-vs-prose shapes.
+
+**Seventh Codex round (PR #1380): three more P2 findings, all real, all in
+fence and nested-comment handling.**
+
+- *A nested inner-doc marker kept its `!`.* The nested-body fix advanced two
+  characters at every nested opener, so `/* outer /*! TODO */ */` extracted as
+  `! TODO`. The same whole-marker handling the top level already had now
+  applies to nested openers.
+- *Fence openers accepted any indentation.* CommonMark allows at most three
+  spaces; four is an indented code line. `///     ```rust` therefore opened a
+  fence that never closed and suppressed the rest of the run.
+- *Any closer of the same character closed a fence.* A closer must be at least
+  as long as its opener, so a ` ``` ` line inside a ` ````rust ` example is
+  content — it was ending the fence early and the example's own sample text
+  was then read as real comments.
+
+Fence state is now a (character, length) pair applied through one
+`fence_transition()` helper shared by `comment_lines()` and `prose_units()`,
+rather than a boolean duplicated across both. Five fixtures added.
+
+**Eighth Codex round (PR #1380): two more P2 findings.**
+
+- *A multiline trailing block comment was split across runs.* When
+  `/* ... */` opens after code and continues onto later lines, the
+  `run[-1].trailing` test separated its first physical line from the rest of
+  the same comment, resetting fence state mid-block. Each block comment now
+  carries a group id, and one block is one run however many lines it spans and
+  wherever it starts.
+- *CH001 missed commented-out statements* — `// cleanup();`,
+  `// client.send(value).await?;`, `// return Err(error);`. This was a
+  documented limitation, but the documentation was written for the
+  *unterminated* form (`// foo(bar)`); these end in `;` and are unambiguous.
+
+The statement rule was measured before being added rather than reasoned
+about: applied to all 176k corpus comments it produced exactly **one** hit,
+`examples/progress_query.rs:76`, and that was genuine — an illustrative
+`// ctx.execute_activity_raw("process_batch_chunk", ...).await?;` sketch
+(with `...`, so not even valid Rust). Reworded as prose with an inline code
+span, which is what it always was.
+
+The first draft of the rule then failed the project's own adversarial sweep:
+`return|break|continue` followed by anything up to a `;` matched 18 prose
+lines such as `break this module owns the sweep;`. Narrowed to a single-token
+operand (`return Err(error);` yes, `return the caller decide, since ...;` no).
+The sweep is now 399 prose lines with 0 false positives.
+
+**Ninth Codex round (PR #1380): two more P2 findings, both oversights of mine.**
+
+- *`can't` was never matched.* CH006's stem list built `can` + `n't` =
+  "cann't". The most common English contraction went unreported in **93
+  corpus comments**. Fixed to the `ca` stem; the corpus count moves 333 → 426.
+- *Distinct block comments merged into one run.* The previous round's `group`
+  id was only used to *prevent* a split, never to cause one, so
+  `/* ```rust */` followed by `/* TODO: issue required */` stayed one run and
+  the first comment's unclosed fence suppressed the second.
+
+Worth recording what the `can't` fix demonstrated about the baseline design:
+correcting a rule mid-review widened it by 93 findings across the corpus and
+produced **zero** Tier B regressions, because the merge base is re-scanned
+with the same corrected code. A stored baseline would have reported all 93 as
+newly introduced and blocked the fix that found them.
+
+**Tenth Codex round (PR #1380): two P2 findings, plus the structural fix that
+should end this class.**
+
+- *More commented-out statements missed* — `// value = compute();`,
+  `// if ready {`, `// anyhow::bail!("oops");`. Three new alternatives (any
+  macro statement, block-opening control flow, single-token assignment), each
+  measured at **0 corpus hits** before being added.
+- *A backtick in a backtick fence's info string.* CommonMark forbids it, so
+  ` ```foo`bar ` is not a fence — but it opened one that never closed and
+  suppressed the rest of the run.
+
+**The adversarial prose sweep is now part of `--self-test`, so CI runs it.**
+Hand-editing CH001 produced a false positive in three separate review rounds;
+generating the keyword × sentence-shape cross-product catches them first. It
+did so again here: the first draft of the control-flow branch matched `if the
+queue is paused, the worker parks {`, and tightening that exposed the same
+latent flaw in the pre-existing `impl` branch. Both were fixed before pushing.
+644 generated prose lines, 0 false positives, checked on every CI run.
+
+CH001's contract is now written down in KNOWN LIMITATIONS: **deliberately
+high-precision and incomplete.** A false positive fails CI on ordinary
+English, which is worse than missing one commented-out line — so recall is
+added by new narrowly-anchored alternatives measured against the corpus and
+the sweep, never by relaxing an existing anchor, which has produced a false
+positive every time it has been tried.
+
+**Eleventh Codex round (PR #1380): two more P2 findings, both real.**
+
+- *Modal perfect contractions were missed.* CH006's `'ve` alternation listed
+  only pronouns, so `should've`, `could've`, `would've`, `must've` and
+  `might've` went unreported. No corpus instances, so this one is purely
+  preventive.
+- *A nested comment's fence leaked into the enclosing one.*
+  `/* outer /* ```rust */ TODO: issue required */` produced no finding:
+  `block_group` incremented only at the outer `/*`, so every nesting depth
+  shared one group and the inner fence suppressed the outer text after the
+  inner comment had already closed. Each nesting level now gets its own group,
+  on both entry and exit.
+
+Checked against the four neighbouring cases that pull against this, since
+nesting and run-grouping fixes have repeatedly broken each other: nested
+bodies are still inspected, a nested `/*!` is still stripped, one multiline
+block is still one run, and two distinct blocks are still two runs.
+
+**Twelfth Codex round (PR #1380): two more P2 findings, both real.**
+
+- *A non-Rust → Rust rename inherited an allowance it never earned.* The
+  rename lookup did not check the OLD path's extension, so renaming a fixture
+  from `.txt` to `.rs` scanned the text file at the merge base and granted its
+  comments as legacy debt — smuggling contractions and long sentences into the
+  audited corpus with the gate green. A rename now inherits only when the old
+  path was also `.rs`; renamed *into* the corpus means no allowance, so every
+  finding belongs to the change.
+- *Interrogative contractions were missed.* `how's`, `where's`, `when's` and
+  `why's` were absent from the apostrophe-s stems (`who's` and `what's` were
+  already there, which is what made the gap easy to miss).
+
+The rename fix was verified against a real git rename in both directions,
+because the two cases are one line apart and pull opposite ways: `.txt` → `.rs`
+now exits 1 with both findings attributed to the change (`0 at the merge
+base`), while a pure `.rs` → `.rs` rename still exits 0 with its allowance
+intact.
+
+**CH006 enumerated, before a thirteenth round found more.** CH006 produced a
+finding in three consecutive review rounds — `can't`, the modal perfects, the
+interrogatives — each because the rule was spot-checked rather than
+enumerated. Applying the lesson from the CH001 sweep, its coverage is now
+generated rather than sampled: 61 English contractions it must match and 10
+possessive or abbreviation forms it must not, checked by `--self-test` on
+every CI run.
+
+That audit found one further genuine miss (`daren't`) and, more usefully,
+settled a question it would otherwise have hit later. The noun + `'s` forms
+(`one's`, `someone's`, `everything's`) are ambiguous: "someone's waiting" is a
+contraction, "someone's row" is a possessive, which STE permits. Measured over
+the corpus, **all 21 occurrences are possessives** — "the previous one's
+outcome", "the worst one's" — so matching those stems would report 21 false
+positives against correct prose. They are now excluded deliberately, with that
+measurement written down as the reason, rather than left to look like an
+oversight.
+
+**Thirteenth Codex round (PR #1380): four P2 findings.** Two are gaps, one is
+a false positive I introduced, and one is a fix from round ten I only did half
+of.
+
+- *Compound assignment missed.* `count += 1;`, `retries -= 1;`,
+  `flags |= READY;`, `bits <<= 2;` — the assignment branch accepted only a
+  bare `=`.
+- *`world's` was reported as a contraction.* `world` was in the pronoun stem
+  list, so an ordinary possessive tripped CH006 — directly contradicting the
+  rationale written two lines above it about possessives being permitted. A
+  false positive of my own making; removed.
+- *An invalid fence opener was still exempted.* Round ten taught
+  `fence_transition()` to reject ` ```foo`bar `, but `comment_lines()` still
+  yielded the line as fenced, so the TODO embedded in it was skipped anyway.
+  Rejecting an opener now means the line is ordinary text and gets scanned —
+  otherwise the rejection hides the very defect it exists to expose.
+- *Typographic apostrophes bypassed CH006 entirely.* `can’t`, `isn’t`, `we’re`
+  matched nothing, because every branch required an ASCII `'`. Editors
+  substitute these automatically, so this was a bypass anyone could trip
+  without meaning to.
+
+The last one lands one commit after the CH006 enumeration was added, and is
+the sharper lesson: enumerating the contraction *list* while leaving the
+apostrophe *character* assumed still left a whole class open. The inventory
+now carries both apostrophe forms.
+
+**Applying the pattern instead of just naming it.** Thirteen review rounds
+produced a consistent shape: a rule gets checked on the axis its author was
+thinking about and stays blind to the orthogonal one. The prose sweep closed
+CH001's *wording* axis, the inventory closed CH006's *word-list* axis, and
+neither touched *encoding* — which is exactly how `can’t` walked through a
+rule one commit after it was declared enumerated.
+
+So the other rules were audited on those same axes rather than waiting for
+review to find them. Two live bugs, both fixed here:
+
+- **CH002 was case-sensitive.** `// todo: fix this` and `// fixme: fix`
+  produced no finding at all. Lowercase markers are ordinary in real code, so
+  this was a trivial bypass of a Tier A gate. Measured at 0 new corpus hits
+  before the change.
+- **CH003 matched only the ASCII apostrophe.** `We’ll group stats by queue
+  name` slipped through while `We'll` was caught — the identical defect to
+  CH006's, in a rule nobody had connected to it.
+
+`_APOS` now lives above the Tier A patterns and is shared by both rules that
+need it, and the self-test pins the marker-case and apostrophe axes directly
+rather than only pinning content.
+
+**Fourteenth Codex round (PR #1380): two P2 findings.**
+
+- *Macros take any delimiter.* The macro-statement branch hard-coded `(...)`,
+  so `// vec![1, 2];` and `// my_macro!{ a: 1 };` were missed. Now matches
+  bracket and brace forms too, while `see vec![1, 2] for the shape;` stays
+  clean because the anchor still requires the macro to open the line.
+- *A Tier B failure did not say what to fix.* This one is a usability defect
+  rather than a correctness one, and it mattered more than its severity
+  suggests. The output named the rule, the file and the totals —
+  `worker.rs: 1 new finding(s), 30 total vs 29 at the merge base` — and never
+  the line. In a file carrying 30 legacy findings a contributor had to bisect
+  by hand to discover which comment they had added. A gate that fails without
+  telling you what to fix is one people learn to route around.
+
+Findings are now indexed by fingerprint, so a regression prints its location:
+
+```
+CH006 autumn-harvest/src/worker.rs: 1 new finding(s), 30 total vs 29 at the merge base
+    autumn-harvest/src/worker.rs:36855: This one isn't compliant.
+```
+
+**Fifteenth Codex round (PR #1380): fence indentation is container-relative.**
+
+CommonMark's "at most three spaces before a fence" is measured against the
+enclosing block container, not the line. Inside a list item the content starts
+past the marker, so an opener indented four spaces there is a perfectly valid
+fence — and the flat `^ {0,3}` from round seven rejected it, scanning the
+example's own sample text and reporting CH002. A false positive on a Tier A
+gate, blocking ordinary Rustdoc.
+
+This one is in direct tension with round seven's fix, which is why the flat
+limit looked right at the time: reject deep indentation and you get this false
+positive; accept it and a four-space line with no container opens a fence that
+never closes and suppresses the rest of the run. Neither is correct without
+tracking the container, so that is now tracked — a list marker opens a
+container at its content indent, a dedent below it closes one, and the
+three-space allowance is applied relative to whichever is open.
+
+Both directions verified together, along with the seven other fence
+behaviours accumulated over rounds six to fourteen, since each has broken a
+neighbour at least once:
+
+```
+/// - Example: + 4-space ```rust        -> exempt   (this fix)
+///     ```rust, no list                -> CH002    (round 7 preserved)
+///    ```rust  (3 spaces)              -> exempt
+```
+
+### Round sixteen — the container fix, applied to closers and to list-marker lines
+
+Review caught two false positives created by round fifteen, both verified to
+reproduce before being fixed.
+
+The container allowance was applied to openers only. A delimiter reached while
+a fence was already open was accepted at any indentation, so an over-indented
+` ``` ` inside a fence closed it early and the example's own sample text was
+read as real comments:
+
+```
+/// ```rust
+///     ```                             -> closed the fence, so
+/// TODO: fixture placeholder           -> CH002 on sample text
+/// ```
+```
+
+Separately, the fence pattern still matched against the raw line, so a fence
+opening on the same line as its list marker was never seen at all:
+
+```
+/// - ```rust
+///   TODO: fixture placeholder         -> CH002 on sample text
+///   ```
+```
+
+`fence_indent_ok` is replaced by `fence_delimiter`, which skips one leading
+list marker before matching, measures the delimiter's indent from the marker's
+end, and applies the three-space allowance to closers as well as openers. An
+over-indented delimiter is now content: fenced content while a fence is open,
+an indented code line while one is not.
+
+All ten fence behaviours re-verified together, the eight from rounds six to
+fifteen plus these two.
+
+### Round seventeen — block quotes, ordered-list markers, duplicate locations
+
+Three review findings, all verified to reproduce first.
+
+**A fence inside a block quote was not a fence.** Rustdoc writes quoted
+examples, and the fence pattern ran against a body still carrying its `>`:
+
+```
+/// > ~~~rust
+/// > TODO: fixture placeholder         -> CH002 on sample text
+/// > ~~~
+```
+
+A block quote is a container like a list item, so it is stripped before any
+container or fence judgement. Its marker must be followed by a space, another
+marker, or the end of the line — CommonMark would read `>=foo` as a quote of
+`=foo`, but in a Rust comment a line wrapping onto a leading `>=` is an
+operator, and stripping that `>` rewrites the text every rule then judges. The
+corpus contains exactly that in `scheduler.rs` and `start_idempotency.rs`.
+
+**Prose kept a second list pattern of its own**, and it had drifted: it knew
+`1.` but not `1)`, so two short items merged into one sentence long enough to
+report a CH007 neither author wrote. It now uses `LIST_MARKER_RE`, the one the
+container logic already uses, which structurally prevents the drift.
+
+Accepting `1)` has a cost the finding did not mention, and the corpus proved
+it: `202)` and `503)` also match, and both occur here as the tail of a wrapped
+parenthesis. Two guards, verified against the whole corpus:
+
+- A `N)` marker with an unmatched `(` earlier in the paragraph closes that
+  paren; it is not a marker.
+- CommonMark's own rule — only a bullet, or the number one, may interrupt a
+  paragraph. Inside a list any number continues it.
+
+That second guard exposed a third defect: a `// ─────` section rule was being
+joined into the sentence below it. A thematic break now ends the block. This
+is the round's largest effect — 63 findings lose a leading rule from their
+quoted text and point at the prose line instead of the rule line, and four
+sentences that were only over the limit because the rule counted as a word
+drop out. No rule's count rose in any file.
+
+**A Tier B failure could name the wrong line.** The fingerprint *is* the
+comment text, so identical comments share one. When the merge base already
+carried a copy, reporting the first occurrence pointed at the legacy line —
+telling a contributor to edit a comment they never wrote. Every candidate is
+named now, with a count of how many are new. The self-test grew its first
+direct check of the ratchet's reporting, not just its arithmetic.
+
+### Round eighteen — list padding, a verb read as deliberation, and per-sentence lines
+
+Three findings, all verified to reproduce first.
+
+**A list marker followed by five spaces opened a fence that suppressed the
+gate.** CommonMark counts one to four spaces after a marker as padding; five
+or more means the content starts one space past the marker and the rest is an
+indented code block. The marker pattern consumed all of it, so:
+
+```
+/// -     ```rust
+/// TODO: issue required        -> silently exempt
+```
+
+That is a Tier A bypass, the failure mode this harness exists to prevent.
+`list_content` now returns the CommonMark content column, and both the
+container logic and the fence detector measure from it.
+
+**`lets` as an ordinary verb was read as deliberation.** `// The semaphore
+lets just one claimant proceed.` failed CH003, an absolute gate, for stating
+behaviour. The alternative is there for the misspelling of `let's just`, so it
+now has to open a sentence — the same constraint `actually` already carries,
+for the same reason from the other direction.
+
+**Every sentence in a paragraph reported the paragraph's first line.** Joining
+wrapped lines into a prose unit lost which line each came from, so a long
+sentence three lines into a doc comment was reported against line one. The
+join now carries each fragment's offset and line, and sentence splitting keeps
+offsets, so a finding points at the sentence that caused it.
+
+This is the round's largest effect and the third output-quality finding in a
+row: **6514 of 19542** findings — a third of the corpus — now name a different,
+correct line. `debug.rs` is typical: the flagged sentence begins on line 7 of a
+paragraph opening on line 6, and was reported at 6.
+
+The set of findings is otherwise byte-identical to round seventeen's — same
+rules, paths and text, only lines moved — and no rule's count rose in any file.
+
+### Round nineteen — three more synthetic fences, and destructuring `let`
+
+Four findings, all verified to reproduce first. Three are the same failure
+class: a line that is not a fence opener was read as one, and everything after
+it was silently exempt from the absolute gates.
+
+**A fence did not end when its container did.** CommonMark closes a fenced
+block with the list item or block quote holding it, closing delimiter or not.
+The container was only recomputed while no fence was open, so:
+
+```
+/// - ~~~rust
+///   let x = 1;
+/// TODO: issue required        -> silently exempt
+```
+
+An open fence now records the container column and quote depth it started in,
+and any later line that dedents below either ends it.
+
+**Padding was measured in characters, not columns.** A tab is up to four
+columns wide, so `- \t\t~~~rust` is three characters of padding and seven
+columns of it — past the four-column limit round eighteen added, and through
+it. Columns are expanded from the start of the line, because a tab's width
+depends on the column it sits in.
+
+**A marker's own indentation was unbounded.** `///     - ~~~rust` is an
+indented code line, not a list item, but any amount of leading whitespace was
+accepted. It is now limited to three columns past the container, like every
+other CommonMark indent here.
+
+All three live in `list_content`, which now applies the three rules together.
+
+**Destructuring `let` bypassed CH001.** The binding had to be a single `\w+`,
+so `let (left, right) = split();`, `let [a, b] = arr;`, `let Foo { x, y } =
+value;` and the let-else forms were all missed. Two anchored alternatives
+added, and thirteen shapes added to the code-vs-prose boundary test — eight
+code, five prose, including `let (or rather, allow) the worker retry;`.
+
+Corpus effect: none at all. All four were latent, and the finding set is
+identical to round eighteen's.
+
+One round-eighteen fixture was wrong and is corrected here. It asserted that
+an unindented line after a list-item fence stays fenced; it does not, and the
+container fix above is what exposed it.
+
+### Round twenty — columns everywhere, a container stack, and tuple let-else
+
+Three findings, all verified to reproduce first. Two are follow-ons to the
+previous round's fixes, in the two places the fix did not reach.
+
+**Indentation was compared in characters again.** `list_content` learned to
+count columns last round; `leaves_container` did not, so a tab-indented fence
+body read as one column against a four-column container and the fence was
+judged to have ended. That reports an example's own sample `TODO` as CH002 —
+a false positive on an absolute gate, the opposite failure from the one the
+container fix was for. `leading_columns` is now the single place indentation
+becomes a number, and both callers use it.
+
+**A dedent out of a nested list item reset the container to zero.** After
+`- outer` and `  - inner`, a line back at the outer item's content column
+dropped the container from 4 to 0, so a fence opened there was recorded as
+top-level and outlived the list entirely. The container is a stack now, popped
+to the nearest surviving item rather than emptied:
+
+```
+- outer               -> [2]
+  - inner             -> [2, 4]
+  ~~~rust             -> [2]      (was 0)
+TODO: issue required  -> []
+```
+
+**Tuple and slice let-else still bypassed CH001.** The destructuring branch
+added last round required a terminating semicolon, so `let (Some(a), Some(b))
+= pair else {` and `let [first, ..] = slice else {` were missed while the
+capitalised-pattern branch beside it already accepted `else {`. Both branches
+take the same terminator now.
+
+Corpus effect: none. All three were latent, and the finding set is identical
+to round nineteen's.
+
+### Round twenty-one — the container stack learns quote depth and paragraphs
+
+Two findings, both in the stack added last round, both verified to reproduce
+first.
+
+**A list container outlived the block quote it opened in.** A stack entry was
+a bare column, so `/// > - quoted item` left a container at column 2 standing
+after the quote ended. A later four-space top-level line then measured as a
+fence against a list that is no longer open, and suppressed the `TODO` below
+it. Entries now carry their quote depth and are dropped when the line's depth
+falls below it.
+
+**A marker that cannot interrupt a paragraph still opened a container.**
+`interrupts_paragraph` was applied to sentence splitting and not to the
+container stack, so `2.` partway through a list item's paragraph pushed a
+synthetic nested container. A valid fence then recorded against the fake
+column, and the example's own body appeared to dedent out of it — CH002 on
+fenced sample text.
+
+The rule needs paragraph state, and the subtle part is when to clear it: any
+pop clears it, because dedenting out of an item ends the paragraph inside it.
+That is what keeps `2.` on the line after `1.` opening its own item while `2.`
+inside an item's paragraph does not:
+
+```
+1. first                     -> [(3, 0)]   pops, so "2." may interrupt
+2. second                    -> [(3, 0)]
+- outer paragraph            -> [(2, 0)]
+  2. still the same          -> [(2, 0)]   no pop, so "2." may not
+```
+
+Corpus effect: none. Both were latent, and the finding set is identical to
+round twenty's.
+
+### Round twenty-two — quote depth in the pop rule, fences end paragraphs, turbofish
+
+Three findings, all verified to reproduce first.
+
+**A block quote nested inside a list item closed the item.** `/// - outer`
+then `///   > quoted`: stripping the quote marker puts the body at column
+zero, which read as a dedent out of the item, so a fence opened afterwards was
+recorded as top-level and outlived the list.
+
+The rule is that columns only compare within one quote depth. A shallower line
+has left the quote outright; a deeper one is *inside* the container, so its
+stripped column says nothing about leaving it. Both the pop loop and
+`leaves_container` now require equal depth before comparing columns.
+
+**A fence did not end the paragraph before it.** The opener line set
+`paragraph`, and nothing cleared it, so an ordered list starting at a number
+other than one was refused a container immediately after a fenced block — and
+the fence nested under that list then measured against the wrong column, so
+its own sample text failed CH002. A fence delimiter now clears the paragraph,
+in both loops.
+
+**Turbofish calls bypassed CH001.** `Type::method::<T>(value);` and
+`iter.collect::<Vec<_>>();` stopped the call pattern at `<`. A constrained
+turbofish segment is allowed before the call parenthesis, on the receiver and
+on each method. `see collect::<Vec<_>>() for the shape;` stays clean — the
+pattern still has to open the line.
+
+Corpus effect: none. All three latent, finding set identical to round
+twenty-one's.
+
+### Round twenty-three — literal markers, empty items, quote indent
+
+Three findings, all verified to reproduce first.
+
+**A list marker inside an open fence was stripped as a container.** Sample
+text beginning `- ``` ` had its marker removed and the backticks read as a
+closing delimiter, so the example's own `TODO` was scanned. List syntax is
+literal inside a fence, so the marker is skipped only when looking for an
+*opener*; `fence_delimiter` takes the fence state now.
+
+**A marker alone on its line opened nothing.** `LIST_MARKER_RE` required
+trailing whitespace, so `/// -` was not an item and an indented fence beneath
+it was recorded as top-level. The pattern accepts end of line, and an empty
+item's content column is one past the marker, as CommonMark specifies.
+
+**A quote marker's indent was absolute.** Three columns, but three columns
+from the line rather than from the container, so a quote inside a list item
+whose content starts at column four was missed — and with it the fence inside
+that quote, reporting the example's sample text. `quote_marker` measures
+against the container in force, as every other marker here now does.
+
+Corpus effect: none. All three latent, finding set identical to round
+twenty-two's.
+
+**On the trajectory.** Rounds seventeen to twenty-three have all been
+CommonMark container modelling, all found by review rather than by the corpus,
+and none has changed a single finding in this tree. They are real defects and
+each was verified before fixing, but they are edge cases of a Markdown parser
+that this harness only needs in order to know what *not* to scan. If they keep
+coming, the better answer than a twenty-fourth round is an issue proposing a
+real CommonMark block parser for the container layer, or a decision that the
+remaining cases are out of scope for a comment linter.
+
+### Round twenty-four — quote markers inside fences, quotes as prose blocks
+
+Two findings, both verified to reproduce first.
+
+**A quoted delimiter inside a fence closed it.** Round twenty-three stopped
+stripping *list* markers inside an open fence but kept stripping every quote
+marker, so a top-level fenced example containing a literal `> ``` ` had that
+sample line read as a closer. Only the quote levels belonging to the fence's
+own container are continuation syntax; anything deeper is sample text.
+`strip_quote_levels` removes exactly the fence's depth and no more.
+
+**A block quote merged into the paragraph above it.** `prose_units` stripped
+the marker and appended the text, so an intro line plus a quoted 25-word
+sentence counted as one 26-word sentence — a CH007 the author never wrote.
+A quote is its own CommonMark block, so crossing into or out of one flushes
+the unit, in both directions.
+
+Corpus effect: none. Both latent, finding set identical to round
+twenty-three's — the sixth consecutive round with byte-identical output. The
+note at the end of round twenty-three still stands.
+
+### Round twenty-five — the fence scope needs two frames, not one
+
+One finding, verified to reproduce first, and its fix exposed a second defect
+that the fixtures caught before it shipped.
+
+A quoted fence inside a list item recorded quote depth zero, because the
+`quote_depth` call that saves the fence's scope omitted the container the
+marker is indented to. Its own closing delimiter then read as literal content
+and the fence never closed.
+
+Passing the container alone was not enough, and the round-twenty-three fixture
+failed immediately: the saved *column* came from a different frame than the
+saved depth. A quote marker is measured against the container it sits in (a
+list item, at column four), while the content behind it starts again at column
+zero. One number cannot be both.
+
+The scope carries both now — `(outer, container, depth)` — with `outer` for
+reading the marker and `container` for comparing columns once it is stripped.
+`container_at_depth` picks the column recorded at the fence's own depth, since
+a stack entry pushed while unquoted is a raw column and one pushed inside a
+quote is measured after the marker.
+
+Nine accumulated fence behaviours re-verified together. Corpus effect: none;
+the seventh consecutive round with byte-identical output.
+
+### Round twenty-six — nested container markers, and where this stops
+
+One finding: several container markers on one line. `/// - 1. ```rust` and
+`/// - > ```rust` open a list holding a list, and a list holding a quote, but
+only one marker of each kind was consumed, so the fence never opened and the
+example's own `TODO` failed CH002.
+
+`strip_containers` peels markers one at a time now, measuring each in the
+frame the last one left. Which frame that is depends on the marker: a list
+marker on this line opens an item with nothing in it, so the next frame starts
+at zero, while crossing a quote enters a depth the stack may already hold a
+container for. Getting that wrong broke the round-seventeen quoted-list
+fixture on the first attempt.
+
+**Half of this finding is fixed and half is not, deliberately.**
+`- 1. ```rust` works. `- > ```rust` opens the fence but its *body* is still
+scanned, because `update_containers` also consumes one marker per line, so the
+stack never records the quote container the list line opens and the fence's
+saved scope is a frame off. Nothing regressed — that case behaves exactly as
+it did before this commit — but it is not fixed.
+
+Fixing it means giving `update_containers` the same recursive peel, which is
+CommonMark's block-continuation algorithm: walk the line against the open
+container stack, consume each container it continues, then open what is left.
+That is a rewrite of the container layer, it re-frames every existing
+container behaviour, and it is precisely option (a) of the choice raised at
+the end of round twenty-three, which is still unanswered. Landing it
+unprompted on the eighth consecutive round with no corpus effect is a larger
+call than this PR should make on its own.
+
+Corpus effect: none, for the eighth round running.
+
+### Round twenty-seven — the fence's depth comes from the peel; headings are not paragraphs
+
+Two findings, both verified to reproduce first. One of them answers a question
+this PR asked two rounds ago.
+
+**A fence behind a list and a quote recorded depth zero.** `/// - > ~~~rust`
+opens after round twenty-six's peel, but the saved scope still read the depth
+off the *unpeeled* line, where the quote follows a list marker and so is not
+seen at all. The quoted closer then read as literal content and the fence never
+closed. `strip_containers` returns the depth it reached, and the scope takes it
+from there.
+
+That is most of the half left unfixed last round, without the rewrite. What
+remains is the artificial form where every line repeats both markers
+(`- > ...` on the body as well as the opener), which is not how a list
+continuation is written; the indented form Codex used here is, and it works.
+
+**A heading left a paragraph open.** Round twenty-two clears paragraph state at
+a fence, and I declined the broader "and other block-level structural lines"
+because I could not construct a case — and asked for one on the thread. Here
+it is: `# Heading` then `22. item` refuses the list its container, and a fence
+under that item then measures against the wrong column and reports its own
+sample text. Headings, thematic breaks and table rows no longer count as
+paragraph content. A list marker's own text still does.
+
+Worth recording that the question was the right thing to ask rather than
+guessing at the class: the answer names three block types, and two of them
+(`SEPARATOR_RE`, `TABLE_RE`) already existed in the file for the prose path and
+simply were not consulted here.
+
+Corpus effect: none, for the ninth round running.
+
+### Round twenty-eight — counting quote levels, scoping to the inner item, peeling prose
+
+Three findings, all verified to reproduce first, all in code written in the
+previous two rounds.
+
+**A multi-level quote counted as one.** `quote_marker` matches `> >` in a
+single match; the peel added one to the depth per match rather than per
+marker, so a two-deep fence stripped one level from its closer and never
+closed. The depth advances by the number of markers consumed.
+
+**A fence inside `- 1. ` was scoped to the outer item.** The peel reset the
+container to zero per list marker without recording where the content actually
+landed, so a body line that dedents out of the inner item but not the outer
+one kept the fence open. `strip_containers` returns the column it reached, and
+the fence's scope takes both column and depth from the peel — neither is
+recoverable from the raw line.
+
+**Prose kept the second marker as a word.** `- > <25 words>` stripped whichever
+marker came first and left the other in the sentence, reporting 26 words. The
+prose path peels the same way the fence path does now.
+
+That last one regressed three `context.rs` findings on the first attempt, and
+the corpus diff caught it: the peel applies CommonMark's indent limit while
+`LIST_MARKER_RE` does not, so a bullet indented six columns with no container
+open is a list item to one and indented code to the other. Its `*` stayed in
+the sentence. The peel is used only when it actually consumes something, so
+such a line reads exactly as it always has.
+
+Corpus effect: none, for the tenth round running.
+
+### Round twenty-nine — nesting is a scope, not a boundary; uninitialized bindings
+
+Two findings, both verified to reproduce first.
+
+**A nested comment inside a fenced example lost the fence.** A doc comment
+holding a Rust example that itself contains a block comment —
+
+```
+/**
+```rust
+/* TODO: fixture placeholder */
+```
+*/
+```
+
+— had the inner comment split into its own run with fresh fence state, so the
+example's own `TODO` failed CH002.
+
+Round twelve gave a nested comment a new group precisely so its fence could
+not leak outward, and that was half right: nesting is a *scope*, not a
+boundary. A piece now records how deep it sits, its run is the whole outermost
+comment, and the fence state is stacked per level — going deeper inherits the
+enclosing fence, coming back out restores what was saved. Both directions hold
+at once, which the group split could not express.
+
+**Uninitialized bindings bypassed CH001.** `let mut retries: usize;` has no
+`=` for the destructuring or assignment branches to anchor on. The new
+alternative anchors on the type annotation instead, since English does not put
+a colon between two bare words — and the 644-line adversarial prose sweep
+immediately caught the first attempt on `let T: Send is required here;`, so it
+carries the same three-bare-words rejection the other `let` branches use.
+
+Corpus effect: none, for the eleventh round running.
+
+### Round thirty — a bullet is not a fence; an empty marker is not an item
+
+Two findings, both verified to reproduce first.
+
+**A container marker exempted commented-out code.** `/// - let stale =
+compute();` produced no CH001, because the rule is anchored to the start of
+the stripped line and saw the bullet rather than the `let`. A list or a quote
+is not a code fence, and the fence is the documented exemption — so the line
+is peeled before CH001 is applied, with no container, so only markers
+CommonMark would accept at the left margin are removed. Ordinary bulleted
+prose stays clean, and the 644-line adversarial sweep and 79 boundary shapes
+pass unchanged.
+
+**An empty marker interrupted a paragraph.** Round twenty-three taught the
+harness that `-` alone opens a list item, which is right at the start of a
+block and wrong in the middle of a paragraph: CommonMark requires an
+interrupting item's first line to carry content. A lone `-` after a prose line
+was inventing a container, and the four-column fence beneath it then measured
+against an allowance the rendered document does not have.
+
+The two round-twenty-three behaviours now stand side by side — a lone marker
+opens a list where a list may start, and stays paragraph text where one may
+not.
+
+Corpus effect: none, for the twelfth round running. CH001 is still zero, so
+the first finding was a latent hole rather than a live miss.
+
+### Round thirty-one — marker limits, marker values, spaced breaks, lazy quotes
+
+Four findings, all verified to reproduce first. The first three are the same
+mistake in three places: reading a marker's *spelling* instead of what
+CommonMark says it means.
+
+- **Ten digits is not an ordered marker.** The cap is nine; `\d+` accepted any
+  run, so `1234567890.` opened a list and a fence allowance the rendered
+  document has neither of.
+- **`01.` may interrupt a paragraph.** CommonMark reads the marker's value,
+  and the rule compared its spelling against the string `"1"`.
+- **A thematic break may be spaced.** `* * *` is a horizontal rule, and it was
+  read as a bullet — twice over, since the break pattern required contiguous
+  characters *and* `list_content` did not give a break precedence over an item.
+  CommonMark does.
+
+**A quoted paragraph continues lazily.** A line with no `>` of its own carries
+on the quoted paragraph above it, provided it is ordinary paragraph text.
+Flushing there split one 30-word quoted sentence into two short units, and a
+long sentence slipped past CH007.
+
+That one exposed a fixture this PR added in round twenty-four, on its own
+initiative rather than from a finding. Round twenty-four's finding was about
+*entering* a quote; the reply claimed the rule held "in both directions" and
+added a fixture asserting that leaving one flushes too. It does not — leaving a
+quote onto paragraph text is exactly a lazy continuation. The fixture asserted
+the bug. It is replaced by two that assert what actually holds: leaving onto
+prose continues, leaving onto a block start flushes.
+
+Corpus effect: none, for the thirteenth round running.
+
+### Round thirty-two — the nesting snapshot has to hold everything
+
+One finding, verified to reproduce first, in the fix from round twenty-nine.
+
+That round made comment nesting a *scope*: going deeper inherits the enclosing
+state, coming back out restores it. The snapshot held the fence and its scope,
+and nothing else. So a list marker inside a nested comment — ordinary
+paragraph text as far as Rustdoc is concerned, since the `/* */` delimiters
+survive into the rendered documentation — pushed a container onto the
+enclosing run's stack and left it there. The next delimiter measured against
+that phantom container, opened a fence, and swallowed the `TODO` below it.
+
+The snapshot now carries every piece of block state the loop holds: fence,
+scope, container stack and paragraph flag, plus the quote depth and list flag
+in the prose path. The rule is that a nested comment cannot change *anything*
+about the block state of the comment containing it — which is what "scope"
+meant, and the previous fix only implemented for one field of it.
+
+Corpus effect: none, for the fourteenth round running.
+
+### Round thirty-three — a marker-only heading, and two meanings of "separator"
+
+Two findings, both verified to reproduce first.
+
+**`#` alone is a heading.** The pattern required trailing whitespace, so a
+marker-only ATX heading read as paragraph text and the `22.` after it was
+refused a container. Same shape as round twenty-three's marker-only list item,
+in the neighbouring pattern.
+
+**A decorative rule is not a thematic break.** `SEPARATOR_RE` was widened in
+round seventeen to cover `===` and the box-drawing rules this tree draws
+sections with, because a section rule is not a word of the sentence beneath
+it. That is right for splitting prose and wrong for container state: Rustdoc
+renders `===` as ordinary paragraph text, so letting it clear the paragraph
+flag hands the next `22.` a container, and its fence an allowance, that the
+rendered document does not have.
+
+The two meanings are separate patterns now. `SEPARATOR_RE` keeps the broad
+decorative set and still ends a prose unit; `THEMATIC_BREAK_RE` is the
+CommonMark subset — `-`, `_`, `*` only — and is what container state and the
+break-beats-list-item precedence consult. Codex proposed exactly this split;
+it is the right line, and it is one I had blurred by reusing a pattern written
+for the prose path in the container path two rounds ago.
+
+Corpus effect: none, for the fifteenth round running.
+
+### Round thirty-four — four block rules, three of them already written elsewhere
+
+Four findings, all verified to reproduce first.
+
+**A quote marker needs no space.** `>~~~rust` opens a quoted fence in
+CommonMark; round twenty-three's lookahead demanded whitespace, another
+marker, or end of line. That lookahead exists only to keep a wrapped `>=`
+operator from being read as a quote, so it is narrowed to exactly that: the
+exception is `>=` and nothing else.
+
+**A thematic break is indented like every other marker** — at most three
+columns past its container. It accepted any indentation, so an indented `* * *`
+inside a paragraph cleared the paragraph state and invented a list below it.
+
+**A pipe-prefixed line is not a block.** Tables are a GFM extension, not
+CommonMark, and `| not a table` is prose. It no longer touches container
+state; `TABLE_RE` still ends a prose unit, which is the job it was written for.
+Same split as round thirty-three's separator, one pattern along.
+
+**A Setext underline ends a paragraph.** `===` under a paragraph line makes
+that paragraph a heading. Round thirty-three established that `===` at the
+start of a block is decorative text, and both readings are correct — this is
+the position-not-shape split again, and the paragraph flag already
+distinguishes them, so no lookahead is needed.
+
+Three of the four are rules this file already applies somewhere else: the
+container-relative indent limit, the CommonMark-only test for container state,
+and the position split. The pattern named in round thirty-three — a rule fixed
+in one place and unexamined in the next — is now the most productive one in
+this review.
+
+Corpus effect: none, for the sixteenth round running.
+
+### Round thirty-five — the same three fixes, one pattern to the left
+
+Three findings, all verified to reproduce first, and each is the neighbour of
+something fixed in the previous two rounds.
+
+**A container marker exempted an unreferenced TODO.** Round thirty peeled
+containers before CH001 for exactly this reason and stopped there; CH002's
+unpunctuated form is anchored the same way, four lines down, and saw the
+bullet instead of the `TODO`. It uses the same peel now. A TODO carrying an
+issue reference is still clean, and a fenced one is still exempt — the fence
+remains the only exemption.
+
+**A single pipe is not a table row.** Round thirty-four took pipe lines out of
+*container* state and left them ending a prose unit, on the reasoning that a
+table row is not a sentence. True of a row; `| foo` mid-paragraph is just a
+word. `TABLE_RE` requires a second pipe now, so a sentence carries on across
+it and a long one is reported.
+
+**A Setext underline may be hyphens.** Round thirty-four's fix accepted only
+`=`. `---` happened to work because it is also a thematic break, but `--` is
+neither three characters nor recognised, so a hyphen-underlined heading left
+its paragraph open.
+
+All three are shape (iv) from the running list — a rule fixed in one place and
+unexamined in the adjacent one — and two of the three are neighbours of my own
+fix from the round before. The list of shapes is in the check-in notes; this
+round is the clearest evidence yet that it is worth consulting before pushing
+rather than after being told.
+
+Corpus effect: none, for the seventeenth round running.
+
+### Round thirty-six — a table is a structure, and Setext is a marker like any other
+
+Two findings, both verified to reproduce first.
+
+**Two pipes are not a table.** Round thirty-five narrowed `TABLE_RE` from one
+pipe to two, which is a better guess and still a guess: a wrapped sentence
+carrying `| ... |` was classified as a table row, dropped from its paragraph,
+and the long sentence it belonged to went unreported.
+
+Guessing is now replaced with the actual GFM rule. `table_rows` finds each
+delimiter row (`|---|:--:|`), takes the header line above it, and extends
+through the rows that follow. A pipe with no delimiter row anywhere is prose,
+however many pipes it has. This is the structural check declined in round
+thirty-four — correctly, for *container* state, where ignoring pipes entirely
+is both safe and CommonMark-accurate; the prose path needs the real answer
+because both of its wrong answers lose text.
+
+**A Setext underline is measured against its container.** Absolute three
+columns, so an underline inside a list item whose content starts past column
+three was missed.
+
+This is the fifth marker pattern in this file to need the container-relative
+limit, and the fifth added without it — including, this time, one added in the
+same commit whose review reply stated the property as a general rule. Writing
+the rule down did not make it operate. It is a helper now, next to
+`thematic_break`, which is the form the other four eventually took.
+
+Corpus effect: none, for the eighteenth round running.
+
+### Round thirty-seven — the same two lessons, applied where they had not been
+
+Two findings, both verified to reproduce first, and both instances of patterns
+this file already had names for.
+
+**A block quote did not end the paragraph for container state.** Round
+twenty-four taught the *prose* path that a quote is its own block and flushes
+the unit; the container path never learned it, so a `22.` after a quoted line
+was refused a container and the fence beneath it reported its own sample text.
+Shape (iv) — fixed in one path, unexamined in the other.
+
+**A table delimiter row is a marker.** Round thirty-six added `table_delimiter`
+and stripped the line before judging it, so an over-indented delimiter made a
+table out of the paragraph above and dropped its sentence. Sixth instance of
+the container-relative rule, in the helper added one round earlier.
+
+The delimiter check also moved out of the up-front `table_rows` pass and into
+the loop, because that is the only place the container in force is known. The
+table state is now one flag carried across lines rather than a precomputed set
+— which is also how every other block in this file is tracked, so it should
+have been written that way to begin with.
+
+Corpus effect: none, for the nineteenth round running.
+
+### Round thirty-eight — a blank segment is not a blank line
+
+Four findings, all verified to reproduce first.
+
+**The nesting snapshot omitted the quote depth** that round thirty-seven added
+one commit earlier. Adding it to the snapshot was not enough, and chasing why
+found a lexer defect underneath: a nested comment closing at the end of a line
+leaves a **zero-length segment**, which the lexer emitted as a piece. A blank
+segment is not a blank line — but every rule that ends a paragraph at a blank
+line believed it was, so `Intro /* > inner */` ended its own paragraph. The
+lexer now suppresses an empty segment when the line has already produced one,
+and still emits the genuinely blank comment line CH004 depends on.
+
+**A delimiter row needs a hyphen run in every cell.** `| | --- |` has an empty
+first cell and is not a delimiter, so the pipe line above it is not a header.
+
+**A confirmed table ends the paragraph.** Round thirty-four took pipe lines out
+of container state entirely and argued the omission was safe because erring
+open only costs an exemption. That was wrong: a real table before a list left
+the paragraph open, refused the list its container, and reported the fence's
+own sample text. The asymmetry stands — a bare pipe still changes nothing —
+but the structure now exists to tell the two apart, so the container path uses
+it.
+
+**A sentence crossing an inline nested comment is one sentence.** The prose
+path flushed at every nesting transition. Rustdoc renders the delimiters and
+the text between them literally, so `20 words /* note */ 10 words` is one
+30-word sentence. Only the *block* state is isolated by nesting; the sentence
+is not.
+
+Corpus effect: none, for the twentieth round running.
+
+### Round thirty-nine — the container rule, the second loop, and round thirty-two again
+
+Three findings, and none of them is new. Each is a rule already written down
+in this file, applied everywhere except the one place the round found.
+
+**An indented `#` is not a heading.** `HEADING_RE` matched `^\s*#`, with no
+limit on the indent. Four columns into a paragraph that is indented content,
+so reading it as a heading closed a paragraph the rendered document still
+held open, and the `22.` under it then took a container — and its fence an
+allowance — that nothing opened. `heading(text, container)` now measures the
+indent the way `thematic_break`, `setext_underline`, `table_delimiter`,
+`list_content`, `quote_marker` and `fence_delimiter` already do. That is the
+seventh marker pattern here to need the container rule and the seventh
+written without it.
+
+A sweep of the rest follows the same rule, with one deliberate exception now
+stated at the pattern: `SEPARATOR_RE` may match at any indent, because it
+opens no container and closes no paragraph. A section rule is not a word of
+the sentence wherever it sits.
+
+**The table lookahead reads in the container it is in.** `comment_lines`
+called `table_delimiter(strip_quote(next.text), 0)` — container zero, hard
+coded — while `prose_units` passed the real container. A table nested in a
+list item was therefore a table to one loop and prose to the other. Two loops
+walking the same structure need the same arguments, and a literal `0` where
+the other passes a variable is the shape of that defect.
+
+**`in_table` belongs in the nesting snapshot.** Round thirty-two's title was
+"the nesting snapshot has to hold everything", and round thirty-eight added a
+variable to both loops without adding it there. A table inside a nested
+comment left `in_table` true after the comment closed, so the enclosing run
+read ordinary pipe lines as table rows. Both snapshots now carry it, and
+`nesting_shift` says plainly that "everything" is checked by hand and leaks
+silently when it is not.
+
+Corpus effect: none, for the twenty-first round running.
+
+### Round forty — what rustdoc actually renders
+
+Two findings. One prescribed the wrong fix for a real defect, and the check
+that settled it was rendering the shape with the compiler in the tree rather
+than reasoning about the specification.
+
+**A delimiter row must match its header's width.** The report asked for three
+hyphens per cell. Rustdoc 1.94 disagrees: `| a |` over `| - |` renders as a
+table, so one hyphen is valid and requiring three would make the harness miss
+real tables. The reported *shape* is still a defect, for a different reason —
+`Intro | header |` has two cells and `| - |` has one, and a delimiter row is
+only a delimiter row for a header of the same width. `table_delimiter` now
+takes the header and compares cell counts. Cells are split on unescaped pipes
+only, and one list marker is peeled first, because rustdoc renders
+`- | a | b |` as an item holding a two-column table.
+
+**A checkbox is not two words.** Rustdoc renders `- [ ] text` with an
+`<input>`, so the brackets are not prose. Counting them added two words to
+every task item and reported a complying 24-word sentence as 26 — a CH007
+regression that would fail CI on a correct comment. A valid marker is exactly
+`[ ]`, `[x]` or `[X]` with a space after it; `[]`, `[y]` and `[ ]no-space`
+stay literal, which is again what rustdoc does. A quote following the list
+marker suppresses the strip, since `[ ]` in quoted prose is two real words.
+
+Every claim above was checked by compiling a doc comment and reading the
+generated HTML. That is the primary source for a tool whose whole job is to
+agree with the renderer, and it should have been the first check in this seam
+rather than the fortieth round's.
+
+Corpus effect: none, for the twenty-second round running.
+
+### Round forty-one — the other side of the nested comment, and compound types
+
+**A gutter before a nested opener is not a blank line.** Round thirty-eight
+suppressed the empty segment a nested comment leaves when it CLOSES at the end
+of a line. The opening side had the same defect: `* /* note */` emitted the
+` * ` in front of the opener as a piece, whose normalized text is empty, so
+both scanners read a blank line and ended the paragraph one line early. The
+`22.` under it then took a container and its fence an allowance, and a TODO
+inside the invented fence went unreported. Rustdoc renders the whole sequence
+as one paragraph, delimiters and all — checked, not assumed.
+
+`gutter_only` asks the question `Piece.text` answers, and all four segment
+emitters use it: before a nested opener, after a nested close, at the closing
+line, and — unchanged from round thirty-eight — at a newline, where a
+genuinely blank line must still count. A nested opener now also marks the line
+as started, so a line holding only `/*` is not blank either.
+
+**CH001 missed every compound type.** The uninitialized-binding rule needed a
+type annotation to tell `let mut retries: usize;` from `let the reader
+decide;`, and its character class admitted only scalar-shaped ones. An array
+length needs `;`, a trait object `+`, a function pointer `->`, a raw pointer
+`*`, so `let bytes: [u8; 32];` and its kin passed an absolute gate. The class
+now carries them, with two constraints: the inner `;` is allowed only where a
+`]` closes before the next one, so the statement's own terminator still ends
+it; and a hyphen is admitted only as `->`. The first cut allowed a bare hyphen
+and the adversarial prose sweep immediately produced `let a::b is re-exported
+for callers;` — the sweep earning its place again.
+
+Corpus effect: none, for the twenty-third round running.
+
+### Round forty-two — one place decides what a table is
+
+Both findings are the table lookahead, read once from each side.
+
+**A delimiter row must be in the same comment as its header.** The lookahead
+took the next piece without checking its nesting level, so `/* | --- | */`
+under `| h |` was read as the outer header's delimiter. Rustdoc renders a
+nested comment's delimiters literally — it even smart-quotes the `---` into an
+em dash, which is proof enough that the text is inline — so the sequence is
+one paragraph. Reading it as a table cleared that paragraph before the nesting
+snapshot round thirty-nine added could restore anything, and a TODO under the
+invented fence went unreported.
+
+**A pipe does not end a lazy quote continuation.** The lazy test rejected any
+line containing a pipe. Rustdoc renders a quoted sentence carrying on across
+an unmarked `continued | ...` line as one paragraph inside the block quote, so
+flushing there split a 28-word sentence into units of 20 and 8 and CH007 saw
+neither. A newly added long sentence could pass the Tier B ratchet that way.
+
+The fix for both is one function. `table_header` decides whether a pipe row is
+a header — same comment, delimiter row underneath, matching width — and the
+container path, the prose path and the lazy test all ask it. Three call sites
+that each re-derived the answer are why rounds thirty-four to forty-two kept
+finding the same question answered differently in different places.
+
+Corpus effect: none, for the twenty-fourth round running.
+
+### Round forty-three — a piece is not always a line
+
+One finding, and the general defect under it: a nested comment splits one
+source line into several pieces, and both scanners treated every piece as a
+line of its own. Every Markdown BLOCK marker must start a line, so a piece
+beginning after a literal `/*` or `*/` carries none of them.
+
+`/** Outer /* ```rust` renders as a paragraph — the backticks sit after text,
+so they open nothing — but the audit read the nested piece as a line, opened a
+fence, and exempted the TODO under it. `Piece.line_start` now records whether
+a piece begins its own line, and a piece that does not opens no fence, no
+list, no quote and no table; its text joins the prose around it, which is
+where Rustdoc puts it.
+
+Fixing the reported case exposed the same loss of line context in the other
+direction, and it was the worse of the two. A closing fence may be followed
+only by spaces, so Rustdoc keeps the fence open across `` ``` /* note */ ``
+— while the audit saw a piece reading `` ``` `` with nothing after it, closed
+the fence, and reported a fenced example's own TODO. That is a **false
+positive on a Tier A gate**, which fails CI on a legitimate example, and it is
+the failure this harness must never produce. `line_tail` reassembles the rest
+of the line past any nested comment, and a delimiter is now judged against the
+whole line: no trailing text for a closer, no backtick in an opener's info
+string.
+
+Corpus effect: none, for the twenty-fifth round running.
+
+### Round forty-four — an HTML block, a table, and the two abbreviations
+
+Three findings, and the first corpus movement in twenty-five rounds.
+
+**An HTML block ends the paragraph above it.** Rustdoc renders `Intro.` then
+`<pre>raw</pre>` as a paragraph and a block, so the `22.` under them opens a
+list and the fence inside it is a fence. The audit knew nothing of HTML, kept
+the paragraph open, and reported a 26-word *code sample* inside that valid
+fence as CH007. `html_block` recognizes CommonMark's type 1 and type 6 tag
+names, and deliberately not type 7 (any complete tag alone on a line): type 7
+cannot interrupt a paragraph, and `<T>` in a Rust comment is a type parameter.
+A fixture pins that side too.
+
+**The prose scanner did not pass the table flag.** `comment_lines` has decided
+the table before the containers since round thirty-eight; `prose_units` still
+decided it afterwards, so a `22.` after a real table was refused its container
+and the same false CH007 appeared on the fenced sample. Rule (B) again, in the
+one loop pair this review keeps finding it in. The two loops now read the same
+way, in the same order.
+
+**"e.g." does not end a sentence.** The header called the naive split a known
+limitation and argued the fix would over-report. That argument was against
+*requiring a following capital*, which would merge "... the row. Postgres ...".
+Excluding two named abbreviations does not: neither "e.g." nor "i.e." ever ends
+an English sentence, and this corpus writes both constantly. A 27-word sentence
+carrying `e.g.` produced no finding at all. Only those two are excluded —
+"etc." and "vs." do end sentences, so excluding them would merge two real ones.
+
+Corpus effect: **19690 to 19887**, all CH007, and the first change in
+twenty-five rounds. It is the abbreviation fix, and it is the sentences already
+in the tree being measured at their true length: 274 findings restated as 471
+longer ones. The ratchet recomputes both sides with the same code, so the gate
+stays clean — 5018 in changed files against 5020 at the merge base.
+
+### Round forty-five — a table row without a pipe, and how far an HTML block reaches
+
+Both findings are the same mistake in two features added the round before:
+recognizing where a block STARTS and never asking where it ends.
+
+**A table body row needs no pipe.** Rustdoc renders `ordinary row with no
+separator` under a table as a cell and fills the missing ones. The scanners
+cleared the table state on any pipe-less line, so the table ended a line early,
+the `22.` after it was refused its container, and a 26-word code sample inside
+the fence below reported CH007. A GFM table runs to a blank line or the next
+block, which is what `starts_block` now decides — and a fixture pins that a
+blank line still ends one.
+
+**An HTML block runs to its closer.** Round forty-four taught the audit that
+`<pre>` opens a block and stopped there, so the preformatted line under it was
+still counted as prose and reported. Both loops now carry the block: types 1
+to 5 end on the line holding their closer, which may be the opening line
+itself (`<pre>raw</pre>`), and a type-6 tag-name block ends at a blank line,
+which remains a block boundary in its own right. Inside one, nothing is
+Markdown and nothing is prose.
+
+Three of the four shapes here are CH007 or CH002 reported on content that is
+not prose. That is the false-positive direction, on a gate meant to run in CI,
+and it is worth noting that both defects were introduced by the fixes for the
+two rounds before them. Recognizing a block opener without its extent is a
+half-implemented block, and a half-implemented block reports the inside of it.
+
+Corpus effect: none. The tree writes no tables in `*.rs` comments and no raw
+HTML in them, which is also why nothing caught these until they were rendered.
+
+### Round forty-six — four false positives in one round, and the loop diff
+
+Four findings, every one of them CH002 reported on preformatted content, and
+three of the four are defects in the code round forty-five added.
+
+- **A quoted HTML block was never recognized.** `comment_lines` asked
+  `html_block` with the quote marker still on the line, while `prose_units`
+  asked with it peeled. `/// > <pre>` opened nothing, so the TODO inside was
+  read as prose.
+- **A verbatim block closed on any tag.** Rustdoc keeps a `<pre>` block open
+  across a literal `</style>` line. The kind is now the tag itself, and only
+  its own closer ends it.
+- **A block complete on one line still scanned that line.**
+  `<pre>TODO: x</pre>` renders preformatted, and the opener's own line is
+  inside the block it opens.
+- **An empty nested comment left no trace.** `/**/` produces no piece, so
+  `` ``` /**/ `` looked like a clean closing fence. Rustdoc keeps the fence
+  open, because a closer may be followed only by spaces. `Piece.line_end`
+  now records that a nested delimiter follows, whether or not it wrapped any
+  text.
+
+**The loop diff.** Round forty-four's reply said that if the
+`comment_lines`/`prose_units` divergence recurred, the loops would be
+reconciled wholesale rather than patched again. It recurred, so the two were
+listed side by side and compared operation by operation. One divergence was
+left beyond the reported one: `comment_lines` derived `quoted` from the raw
+line while `prose_units` derived it from the container peel. In `- > text`
+the marker comes first, so the raw line reports depth zero and one loop
+believed the line had left the quote. Both now read the peel. Rustdoc renders
+the shape that exposes it — `- > intro`, then `22.` and a fence in the item —
+with the TODO inside `<code>`, so the audit was reporting a fourth false
+positive that no review round had found.
+
+Corpus effect: none. Every fix here is in a shape this tree does not write,
+which is exactly why only the renderer finds them.
+
+### Round forty-seven — one fix, and a line drawn
+
+Three findings, all in the HTML block layer. One is fixed; two are recorded
+and left.
+
+**Fixed: a list marker is peeled before the HTML opener.** Round forty-six
+taught `html_block` to peel a quote marker and stopped there, so `- <pre>`
+opened nothing and the indented TODO under it reported CH002. Rustdoc renders
+that content preformatted inside the item. Both scanners now peel through
+every container, as the fence test already did. This is a false positive on a
+Tier A gate, which is why it is fixed rather than deferred.
+
+**Recorded, not fixed:** an HTML block is not scoped to the container that
+opened it, so `> <pre>` followed by an unquoted line keeps the block open;
+and an HTML closer inside an inline nested comment is not seen, because a
+mid-line piece carries no block syntax. Both UNDER-report, which is the safe
+direction for a gate, and both are recorded in KNOWN LIMITATIONS and in the
+follow-up issue.
+
+**Why stop here.** Rounds seventeen to forty-seven have all been in this
+hand-rolled block layer, and rounds forty-four to forty-seven were largely
+self-inflicted: each round's fix produced the next round's findings. The
+corpus has not moved for any of them except round forty-four's sentence
+splitter, and the reason is plain — no `*.rs` comment in this tree contains a
+table or raw HTML. The gate does its job today: Tier A is at zero, the ratchet
+is clean, and CH005 to CH007 measure the real corpus. What remains is a
+Markdown parser being reimplemented one review comment at a time, in shapes
+the repository does not contain. Either the block layer is replaced with a
+real CommonMark parser -- which costs `docs/audits/` its deliberate
+no-dependency property and is not a decision this PR should make -- or the
+remainder is out of scope. This PR takes the second.
+
+### Round forty-eight — indented code, and which comments are Markdown at all
+
+One finding, and it is a false positive on a Tier A gate, so it is fixed under
+the line drawn last round rather than deferred with the rest.
+
+Markdown's other code block is four spaces of indent after a blank line, and
+the audit did not know it. `///     let x = compute();` renders as a Rust
+example and failed CH001; an indented TODO failed CH002. No unfenced rustdoc
+example could be added to this tree. `indented_code` follows CommonMark: four
+columns past the container, only where no paragraph is open — a block cannot
+interrupt one, so a wrapped line indented under its own paragraph stays prose
+— and a blank line stays inside the block until the indent ends.
+
+**The first cut removed nineteen real findings, and that is the interesting
+part.** Applied to every comment, the rule exempted indented passages in plain
+`//` comments — `chaos.rs` and `context.rs` lay out long arguments that way —
+and eighteen CH007 sentences and one CH005 stopped being measured. Those are
+prose. Rustdoc renders no `//` comment at all, so nothing there is Markdown
+and indentation is just how the argument is laid out. The rule is therefore
+limited to the markers Rustdoc renders: `///`, `//!`, `/**`, `/*!`.
+
+A ``` fence stays exempt in every comment, and the difference is not an
+inconsistency. An author writes a fence to say "this is an example", whatever
+the marker. Nobody indents a paragraph to say it.
+
+Corpus effect: none, once the rule is limited to doc comments.
+
+### Round forty-nine — the marker line, and the third scoping gap
+
+Two findings, sorted by direction as the line drawn in round forty-seven says.
+
+**Fixed: a code block may begin on the list marker's own line.**
+`-     let x = compute();` is an item holding four columns of indented code —
+CommonMark puts the item's content one column past the marker when the padding
+exceeds four, and everything past that is code. Round forty-eight measured the
+indent on the unpeeled line, so the bullet counted as content and the example
+failed CH001 and CH002. The measurement is now taken in the frame the peel
+leaves: `strip_containers` returns both the text and the container it ends in,
+and the four columns are counted from there. That is the same peel-then-measure
+shape rounds forty-six and forty-seven applied to the HTML opener, arriving one
+round later at the feature added in between.
+
+**Deferred to the follow-up issue: a table is not scoped to its container.** A
+quoted table survives the line that leaves the quote, so a `22.` after it takes
+a container the rendered document does not give it and a TODO under the
+invented fence goes unreported. It is the exact sibling of the HTML scoping gap
+already recorded there, it under-reports, and no `*.rs` comment in this tree
+contains a table at all. KNOWN LIMITATIONS now names all three.
+
+Corpus effect: none.
+
+### Round fifty — `/***` is not a doc comment
+
+Two findings, sorted by direction as before, but the fixed one is not in the
+block layer at all.
+
+**Fixed: the lexer called `/***` a doc comment.** Rustdoc documents nothing
+for `/*** ... */` — compiled and checked, the item's page carries no docblock
+— but the lexer recorded its marker as `/**`. Round forty-eight's indented
+code exemption keys on that marker, so an indented `let x = compute();` and an
+unreferenced TODO inside an ordinary `/***` block were treated as a rendered
+example and Tier A came off the whole comment. It is a marker-classification
+defect in the lexer rather than a Markdown one, and it silently disables the
+absolute gate, so it is fixed rather than deferred. `/**/` was already
+excluded for its own reason; `/***` now joins it, in the nested marker too.
+
+That is the shape of the risk in keying anything on `marker`: round
+forty-eight limited indented code to the markers Rustdoc renders, which was
+right, and inherited a lexer bug that had been harmless until something
+depended on it.
+
+**Deferred to the follow-up issue:** an empty nested comment leaves the
+fragments around it adjacent at the same nesting level, so `| h | /**/ | - |`
+lets `next_row` take the resumed fragment on the *same physical line* as the
+header's delimiter row. A delimiter row must be line-leading and on a later
+line. It under-reports, and the shape is a table with an inline empty comment
+in it.
+
+Corpus effect: none.
+
+### Round fifty-one — three rule defects, and three exclusions the corpus chose
+
+Three findings, none of them in the Markdown block layer, and all three fixed.
+
+**A sentence may end inside emphasis.** `**strong emphasis.** This second ...`
+puts two asterisks between the full stop and the space, so the splitter merged
+two compliant sentences and reported one long one — a CH007 that could fail
+the ratchet on correct prose.
+
+The interesting part is what is *not* in the fix. Three other closing
+delimiters look equally reasonable and each produced false splits, found by
+measuring rather than by argument: a backtick cut three hundred sentences,
+because a code span carries punctuation constantly (`` `?` ``, `` `.` ``); a
+closing paren cut the tree's own `(first is `0`, second is `1`, ...) -- so
+prefix explicitly`, where the ellipsis is mid-sentence; and a quote cut
+`answer "is `charge_card` held?" during an incident`, which is one sentence.
+Only `*` and `_` survive, and the reasoning for each exclusion is recorded at
+the pattern.
+
+**A marker inside a code span is documentation.** ``Parse the `TODO:` prefix``
+failed CH002, so the syntax of the marker could not be documented without an
+issue reference. CH002 now blanks inline code spans before matching. CH005 and
+CH006 deliberately do not, and the KNOWN LIMITATIONS entry that says so now
+records why CH002 differs: it is absolute, and a false positive there fails the
+build outright.
+
+**`pub(in crate::foo)` is a visibility.** The prefix shared by five CH001
+alternatives allowed word characters and colons but not the space in
+`pub(in path)`, so an unambiguous commented-out declaration passed an absolute
+gate.
+
+Corpus effect: 19887 to 19825, all CH007 — 275 merged sentences restated as
+213 correctly split ones. The ratchet recomputes both sides, so the gate stays
+clean.
+
+### Round fifty-two — three false positives, and the doc-marker limit again
+
+Three findings, all of them the audit reporting a defect on correct code, and
+all three fixed.
+
+**Only a backtick fence forbids a backtick in its info string.** Round
+forty-three's whole-line delimiter check applied that rule to every fence, so
+`~~~rust /* note */ `info`` was discarded as an invalid opener and the TODO
+inside the example reported CH002. CommonMark restricts the info string only
+for backtick fences, because a backtick there would be ambiguous with the
+delimiter itself; a tilde fence has no such problem.
+
+**A heading on a list-marker line is a heading.** Rustdoc renders `- # text`
+as an `<h2>` inside the item. The flush test read the unpeeled line, so the
+heading fell through to the list branch and its title was added to the prose
+run — a 26-word heading reported CH007. The test now classifies the peeled
+content, like the HTML test beside it.
+
+**A Setext title is a heading, not a sentence.** A long line followed by `===`
+renders as a heading, but the underline reached the separator branch, which
+*flushes* — emitting the accumulated title as a prose unit. An ATX heading
+never reaches the run at all, so the same title reported CH007 in one form and
+not the other. The run is now discarded rather than flushed.
+
+**And the same limit as round forty-eight, for the same reason.** The first
+cut of the Setext fix removed sixty-six real findings: this tree closes plain
+`//` banner comments with a rule of hyphens, and every paragraph above one was
+discarded as a heading title. Rustdoc renders no `//` comment, so nothing
+there underlines anything. The discard is limited to `///`, `//!`, `/**` and
+`/*!`, and a fixture pins the banner case.
+
+That is twice now that a correct Markdown rule, applied to every comment, has
+quietly stopped the tool measuring real prose — and twice the corpus diff was
+the only thing that noticed.
+
+Corpus effect: none, once limited.
+
+### Round fifty-three — a tuple struct, and the second absolute rule to blank code spans
+
+Two findings, neither in the Markdown block layer, both fixed.
+
+**A tuple struct is a declaration.** The item-header alternative accepted `(`
+only where it ended the line, so `struct CountingLayer(Arc<Mutex<u64>>);` — an
+ordinary form, and one this repository writes throughout — passed the absolute
+gate. It gets its own narrowly-anchored alternative rather than a relaxation of
+the existing one, which is what this file's own guidance asks for: the name
+stays anchored against `struct`, the field list may not contain a brace or a
+semicolon, and the line must end at the terminator. `struct fields are
+described below;` and `struct (or enum) definitions live here;` still read as
+prose.
+
+**CH003 blanks inline code spans, as CH002 does.** ``Parse the `let's` token``
+failed the narrative-aside rule, so a literal containing a narrative phrase
+could not be documented. The two rules that fail the build outright now agree
+on this; CH005 and CH006 still read the raw text, because they are ratcheted,
+and the KNOWN LIMITATIONS entry already records that split. `// Actually,
+let's just skip the retry here.` still reports.
+
+Corpus effect: none.
+
+### Round fifty-four — a code span may wrap, and an array field carries a semicolon
+
+Two findings, both fixed.
+
+**A code span may wrap onto the next line.** Rustdoc renders ``` `literal ```
+and ``` TODO: marker` ``` on consecutive lines as one `<code>` span, but the
+blanking round fifty-one added ran a line at a time and never saw the opener,
+so CH002 failed the build on a marker inside a literal. The blanking now
+happens over the joined lines and splits back, so a span that opens on one
+line closes on the next. Two properties are kept and pinned: an unmatched
+backtick blanks nothing, which is what CommonMark does with it, and a blank
+line ends the paragraph and so ends any span. Fenced lines are emptied before
+joining, so a fence's backticks cannot open a span over the prose after it.
+
+**An array field carries a semicolon.** Last round's tuple-struct alternative
+excluded every `;` from the field list, so `struct Packet([u8; 32]);` passed
+the gate. The uninitialized-binding rule has had the answer since round
+forty-one — admit a `;` where a `]` closes before the next one — and the new
+alternative was written without it. One round, one sibling, again.
+
+Corpus effect: none.
+
+### Round fifty-five — both halves of last round's fix were wrong
+
+Two findings, and both are defects in the code round fifty-four added. Both
+weaken an absolute rule by blanking text that is not a code span, so both are
+fixed.
+
+**A delimiter run has to match exactly.** The backreference let a one-backtick
+opener close against a `` `` `` pair. Guarding the closer against a following
+backtick only moved the problem to the pair's second tick; a run is a
+delimiter only when no backtick abuts it on either side, so both ends are
+fenced now. Rustdoc renders `` `literal TODO: issue required`` suffix`` as
+ordinary text, backticks and all, and the audit was blanking the marker inside
+it.
+
+**A code span belongs to one comment.** The blanking joined every comment in
+the file, so an unmatched backtick in one could pair with a backtick in an
+unrelated one further down and blank everything between — including the
+comments of the intervening code. It runs per `comment_runs` group now.
+
+I flagged that second risk when writing the fix last round and shipped it
+anyway as "rare". It was not rare; it was one review round away. The rule
+that follows is not "think harder" but "if a bound is obvious enough to note
+in a comment, it is obvious enough to implement".
+
+Corpus effect: none.
+
+### Round fifty-six — the boundary and the mask, and where an escape applies
+
+Two findings, both in the code-span machinery, both fixed. Two of my own first
+cuts were wrong before the round landed, and the corpus diff caught both.
+
+**A period inside a code span is not a sentence end.** Rustdoc renders
+``` `foo. not sure why` ``` as one span, but sentences were split before spans
+were blanked, so the fragment after the period reached CH003 as deliberation
+and failed an absolute rule. `split_sentences` now takes the text to find
+boundaries IN, separately from the text it slices sentences FROM, so the
+reported text and the word count remain exactly what the author wrote.
+
+The first cut masked spans to spaces, and the separator's own `\s+` then
+swallowed a span that OPENED a sentence — every such sentence lost its first
+word and reported one short. The mask is filler characters now, not
+whitespace. Blanking to spaces is still right for *matching*, where a rule
+must not read across the span; masking to filler is right for *splitting*,
+where only the boundaries matter.
+
+**An escape applies to the opener, not the closer.** A backslash-escaped
+backtick opens no span, so ``` \`literal ``` and a later backtick are literal
+text and the marker between them must be reported. Guarding the closing run
+the same way was wrong and the corpus said so within a minute: ``` `\` ``` is
+a code span holding one backslash — rustdoc renders `<code>\</code>` — and
+refusing that closer left the span open and merged the sentences after it.
+Backslash escapes do not apply inside a code span.
+
+Corpus effect: 19825 to 19860, all CH007. Sentences that used to be cut at a
+period inside a span are now measured whole, so several fragments become one
+longer sentence. The ratchet recomputes both sides and stays clean.
+
+### Round fifty-seven — parity, and a scanner instead of a pattern
+
+One finding, and it is the caveat round fifty-six wrote down and shipped
+anyway: two backslashes escape each other, so the backtick after them still
+opens a code span. Rustdoc renders `` \\`TODO: marker` `` with the marker as
+code; the single-character lookbehind refused that opener and CH002 failed the
+build on it.
+
+Parity cannot be done with a lookbehind, and the first attempt — masking every
+`\x` escape before matching — was wrong in the other direction within a
+minute of measuring. It consumed the closing backtick of `` `\` ``, which is a
+span holding one backslash, and thirteen sentences in this tree merged with
+the ones after them.
+
+So the span finder is a scanner now, not a pattern. Three rules that a single
+regex kept getting wrong, each written out: the two delimiter runs must be
+exactly equal; an escaped backtick cannot OPEN a span, while inside an open one
+there are no escapes at all; and a blank line ends the paragraph, so no span
+crosses one. Rounds fifty-five, fifty-six and fifty-seven were all one of those
+three, and each pattern-level fix broke another.
+
+**This is the third round running where the review's finding was a limitation
+I had already written into a comment.** Round fifty-four noted the whole-file
+join was "rare"; round fifty-six noted the escaped-backslash caveat "errs
+toward reporting, and this tree never writes it". Both were Tier A defects one
+round later. A limitation worth documenting is worth implementing, and if it
+genuinely is not worth implementing it belongs in the follow-up issue, not in
+a comment beside the code that has it.
+
+Corpus effect: none.
+
+### Round fifty-eight — the third rendering rule that had to be scoped
+
+One finding: an HTML block opened in a plain `//` comment, and everything
+until its closer was exempt — so `// <pre>`, `// TODO: issue required`,
+`// let stale = compute();` produced no CH002 and no CH001. Rustdoc renders no
+`//` comment, so `<pre>` in one is text and exempts nothing.
+
+This is the same scoping mistake as round forty-eight's indented code and
+round fifty-two's Setext underline, in the third of the three rules that
+depend on rendering. It is now in KNOWN LIMITATIONS as a rule rather than as
+three separate observations: **a rule about what Rustdoc renders applies to
+the four doc markers only.** A ``` fence stays exempt in every comment, and
+the reason is the distinction the whole family turns on — a fence is an author
+saying "this is an example", which a tag in an unrendered comment is not.
+
+The two earlier instances were caught by the corpus diff removing real
+findings. This one removed nothing, because the tree contains no HTML block in
+any comment, which is exactly why it needed the review to find it: a scoping
+error that suppresses findings is invisible unless something in the corpus
+happens to hit it.
+
+Corpus effect: none.
+
+### Round fifty-nine — a span belongs to a block, not to a comment
+
+One finding: round fifty-five stopped code spans reaching across comment runs,
+but two list items in ONE comment are still two blocks. Rustdoc renders
+`- Explain the ` + backtick + `literal` and `- TODO: issue required` + backtick
+as two `<li>` elements with literal backticks, so the marker is prose; the
+audit paired the backticks and blanked it.
+
+`comment_lines` already knew where blocks begin — `starts_block` has decided
+that since round forty-five — but it did not say so. It yields that now as a
+fourth element, and the span pass cuts the run at each block start rather than
+at each comment. Round fifty-five's fix was the right idea one level too
+coarse: the bound is a block, and a comment run is merely the outermost one.
+
+Two fixtures: across two items, where the span must not pair, and across one
+item's own wrapped lines, where it must.
+
+Corpus effect: none.
+
+### Round sixty — the quote edge, and inline HTML that renders as code
+
+Two findings, both fixed.
+
+**Entering or leaving a block quote is a block boundary.** Round fifty-nine cut
+code spans at block starts, but asked `starts_block` about text whose `>` had
+already been peeled — so it could never see a quote. The depth is what knows,
+and it knows about the line that LEAVES a quote too, which no marker on the
+line could. Both edges are boundaries now, and a span still reaches across the
+lines inside one quote.
+
+**An inline `<code>` element is code.** Rustdoc renders
+`<code>not sure why</code>` exactly as it renders a backtick span, so the
+absolute rules must not read a narrative phrase or a marker inside one. CH002
+and CH003 both mask it, which keeps the two rules that fail the build agreeing
+on what counts as code.
+
+Doc comments only, by the rule this file has needed four times now: nothing
+renders a `//` comment, so `<code>` there is six literal characters and the
+phrase inside it is prose. `prose_units` carries the marker for that decision;
+one run has one marker, because `comment_runs` splits where it changes.
+
+Corpus effect: none.
+
+### Round sixty-one — the same fix, one function further along
+
+One finding, and it is round fifty-six's fix applied to round sixty's feature:
+sentence boundaries are found on a masked copy, and last round taught the
+*matching* pass about inline `<code>` without teaching the *boundary* pass.
+A full stop inside `<code>foo. not sure why</code>` split the sentence, and
+the fragment reached CH003 as deliberation.
+
+The pair now moves together, as the backtick spans beside them already do:
+mask to filler for finding boundaries, blank to spaces for matching. Two
+fixtures, and the `//` counter-case, where the phrase is genuine prose.
+
+Three rounds have now added a masking concept and forgotten one of its two
+uses — round fifty-six (spans, boundaries), round sixty (`<code>`, matching),
+round sixty-one (`<code>`, boundaries). The two operations sit next to each
+other in the file and are named for what they do; the failure is not knowing
+about them but not asking "and the other one?".
+
+### Round sixty-two — two blocks with no name, and a tag that is not one
+
+Two findings, both bypassing the absolute CH002 gate from opposite sides.
+
+**A table and a Setext heading are blocks.** `starts_block` decides a block
+boundary from one line, and neither of these is a fact about one line: a
+table needs the delimiter row under its header to confirm it, and a Setext
+underline needs the paragraph above it to underline. Both were already
+detected elsewhere in `comment_lines` -- `in_table` for the table rule,
+`setext_underline` for the container state -- and neither reached `opens`,
+so a code span paired straight across them and blanked the marker on the
+far side. Rustdoc renders paragraph/table/paragraph and heading/paragraph,
+with the backticks literal in each.
+
+Every table ROW is a boundary too, not merely the table. Rustdoc renders
+each cell as its own inline context, so `| x `open |` and `| close` y |`
+keep their backticks literal; within one cell a span still pairs, and a
+fixture pins that side.
+
+Doc comments only, by the rule round forty-eight set for Setext and round
+fifty-two for HTML.
+
+**An escaped `<code>` tag is not a tag.** `\<code>TODO: add retry\</code>`
+renders as literal characters, so the marker inside it is a real commitment,
+and the pattern matched straight through both escaped tags and erased it.
+Fixed by the parity scanner the backticks already had: `escaped_backticks`
+is now a filter over a character-blind `escaped_offsets`, because giving
+each construct its own escape scanner is how the two drift apart.
+
+Two over-reports came out of the same rewrite, in the opposite direction.
+An unclosed `<code>` runs to the END OF THE BLOCK -- this is the one place
+an element differs from a backtick span, where an unmatched delimiter opens
+nothing at all. So `<code>a\</code> TODO: x` and a `<code>` opened on the
+line above a marker both render that marker as code, and the line-by-line
+pattern failed the build on each. `blank_inline_code` now runs over the
+joined block, as the spans beside it already did.
+
+Corpus effect: none. Eleven fixtures, seven of which fail on the parent
+commit.
+
+### Round sixty-three — both absolute rules read the wrong text
+
+Two findings, one in each direction, and the same sentence fixes both:
+an absolute rule must read the text rustdoc renders, not the raw line.
+
+**CH001 read the raw line.** A code span may wrap, so `Demonstrates ` `
+over `let x = compute();` renders the statement as `<code>` -- an example
+of Rust, not Rust that was commented out. CH002 has been blanking spans
+since it was written and CH001 never did, so the gate failed the build on
+a legitimate example. It reads `spanless` now, by the same peel.
+
+**CH002 read the whole line for a reference.** One `#123` anywhere
+satisfied every marker beside it, which passed two untracked commitments:
+an unrelated reference already on the line (`See #123 for the parser.
+TODO: add retries`) and a second marker after a tracked one
+(`TODO(#123): parser; TODO: add retries`). A marker now owns the text
+from itself to the next marker, or to the end of the line. That admits
+every form this tree writes and refuses only a reference that belongs to
+something else.
+
+The reference is read from the blanked text too, which is the third
+defect and was not reported: `The `#123` syntax` documents a marker's
+shape and does not track the commitment beside it.
+
+Corpus effect: none. Seven fixtures, three of which fail on the parent
+commit, and four counter-cases pinning the forms that must stay silent.
+
+### Round sixty-four — a word boundary is not the end of a tag name
+
+One finding, in code round sixty-two added. `<code\b[^>]*>` treats
+`<code@example.com>` as an opener: `\b` sits happily before punctuation,
+and the element then has no closer, so the masking ran to the end of the
+paragraph and took CH002 off everything in it. Rustdoc renders that input
+as a mail link, and the marker beside it as prose.
+
+A tag name ends at whitespace, `/` or `>`. That also settles a sibling
+the report did not name: `<code-block>` is a different element, and a
+word boundary accepted it as this one. `<codex>` was always safe, because
+two word characters have no boundary between them -- the guard was only
+ever half present.
+
+The pattern is `<code(?=[\s/>])[^<>]*>` now, and the inner class refuses
+`<` as well, since raw HTML does not nest a tag inside a tag.
+
+The direction is the same as round sixty-two's own over-reports and the
+opposite of what a wider pattern suggests: every character this matcher
+accepts loosely is an absolute rule switched OFF for the rest of a block,
+so the matcher has to be exact in the strict direction.
+
+Corpus effect: none. Four fixtures -- the autolink, the longer tag name,
+a closed element that still ends at its closer, and `<code/>`, which HTML
+does open.
+
+### Round sixty-five — the question `starts_block` cannot answer
+
+One finding, and it exposes the limit of the signal round sixty-two
+extended. `starts_block` answers "does a block BEGIN on this line". Every
+multi-line block answers that on its own first line, so the signal was
+enough — until a block that is exactly ONE line long. Rustdoc renders
+`# Explain the `literal` as a heading and the line under it as its own
+paragraph, and nothing on that paragraph's line says a block began,
+because none did. The one above it ended.
+
+So the loop now carries `after_block`: a leaf block one line long ends
+after itself, and the next line opens whatever follows. Three qualify --
+an ATX heading, a thematic break, and a Setext underline. Only the
+heading was reachable, because it is the only one of the three that
+holds inline content: a break and an underline have no backtick to pair
+with anything, which is why round sixty-two's cut at the underline was
+sufficient by luck rather than by construction. It is by construction
+now.
+
+The carry is consumed exactly once and only by a line-starting piece, so
+a nested comment in the middle of a line cannot spend it.
+
+Corpus effect: none. Three fixtures -- the heading, a span within one
+heading, which must still pair, and the thematic break that was already
+correct and is now pinned.
+
+### Round sixty-six — spell the grammar out, or keep guessing at it
+
+Two findings. One is fixed; one is already recorded in issue #1383 and
+stays there.
+
+**The `<code>` matcher now uses CommonMark's open-tag grammar.** Rounds
+sixty-two and sixty-four each bounded the pattern by what a tag may not
+contain, and each accepted a shape Rustdoc escapes: `<code@example.com>`
+is a mail autolink, `<code-block>` is a different element, and
+`<code =bad>` has no attribute name where one is required. Every one of
+them rendered the marker beside it as prose while the audit masked it.
+
+Three attempts at the same pattern is the signal to stop approximating.
+The grammar is short -- a tag name, then attributes that each need a
+name and may carry a quoted or unquoted value, then an optional slash
+and the bracket -- and writing it down also settles a shape no guess
+would have: `<code title="a>b">` is one attribute whose value holds the
+character that would otherwise end the tag.
+
+The direction is why this class keeps returning. Every character the
+matcher takes loosely is an ABSOLUTE rule switched off to the end of a
+block. A generous pattern here does not misreport; it goes silent.
+
+**An HTML block is still not scoped to its container** -- `/// > <pre>`
+followed by an unquoted line keeps the block open past the quote that
+opened it. That is issue #1383's first item, filed in round fifty-one and
+unchanged: it under-reports, no comment in this tree contains raw HTML,
+and the fence path's `scope` is the model it needs. It stays deferred.
+
+Corpus effect: none. Four fixtures, one for the malformed opener and
+three for the attribute forms that must keep working.
+
+### Round sixty-seven — the same two flags, two different answers
+
+One finding, and the first in this PR that is not about what Rustdoc
+renders. `--tier-a-only` promises to check only the absolute gates. The
+text report has kept that promise since it was written, by returning
+before it reaches Tier B. The JSON path ran the ratchet comparison
+anyway and put a Tier B regression into its exit status, so
+`--tier-a-only --base` exited 0 and `--json --tier-a-only --base` exited
+1 on the same tree.
+
+Measured before the fix, with one contraction added to a changed file:
+`--base` exits 1, `--tier-a-only --base` exits 0, and
+`--json --tier-a-only --base` exits 1 with a populated
+`tier_b_regressions`. After: 1, 0, 0 with an empty list, and plain
+`--json --base` still exits 1, which is the half that must not move.
+
+Both paths now ask one function, `tier_b_gate`. A promise kept in two
+places is a promise kept in one of them eventually.
+
+The baseline is no longer built at all under `--tier-a-only`. Nothing
+reads it on that path, and constructing it walks the merge base for
+every file in scope.
+
+This defect is not expressible as a lexer fixture, so it is a self-test
+beside `ratchet_reporting_test`: the same current and baseline, gated
+both ways, one non-empty and one empty.
+
+Corpus effect: none.
+
+### Round sixty-eight — an ABI name is not a word
+
+One finding. CH001's signature pattern spelled the ABI string as `"\w+"`,
+so `extern "C-unwind" fn stale() {` was outside the absolute gate.
+`C-unwind` and its siblings are stable Rust, and rustc 1.94.1 in this
+container compiles them, so this is an ordinary form of commented-out
+FFI that the gate simply did not see.
+
+The sibling in the same matcher, not reported: the ABI string may be
+absent altogether. A bare `extern fn` means `extern "C" fn`, compiles
+today (with a deprecation warning), and was missed for the same reason.
+The quantifier is optional now as well as hyphen-bearing.
+
+The counter-case is the one that matters, because CH001 is absolute and
+a false positive fails the build on a legitimate comment: prose that
+merely NAMES an ABI is prose. The pattern is anchored, so
+`Use the extern "C-unwind" convention here.` cannot reach it, and a
+fixture pins that.
+
+Corpus effect: none, which is the expected answer -- no comment in this
+tree contains a commented-out FFI signature of any ABI.
+
+### Round sixty-nine — leaving a quote is not always leaving the block
+
+Two findings. One is a Tier A FALSE POSITIVE and is fixed; one
+under-reports and joins issue #1383.
+
+**A lazy continuation is not a block boundary.** CommonMark lets a
+paragraph inside a block quote carry on across a line with no `>` at
+all. Round fifty-nine cut the span at a change of quote DEPTH, which is
+right for the line that opens a quote and wrong for the line that
+continues one lazily: Rustdoc renders
+
+    /// > Explain the `literal
+    /// TODO: issue required` suffix.
+
+as one quoted paragraph with the marker inside a code span, and the
+audit split the span and failed the build on it.
+
+`prose_units` has known this since round forty-one -- it carries a
+`lazy` predicate with six exceptions worked out over several rounds --
+and `comment_lines` did not. The predicate is one shared
+`lazy_continuation` now, used by both. Extracting it changed no finding
+in the corpus, which is the evidence that the move was a move and not a
+rewrite.
+
+This is round sixty-seven's lesson in the other half of the file: a rule
+kept in two places is kept in one of them eventually. Two rounds running,
+the defect was a second implementation of something the file already
+knew.
+
+**A rejected list marker is still peeled** -- `2.` after an open
+paragraph opens no list, `update_containers` says so, and
+`strip_containers` peels it anyway and finds a fence behind it. That is
+#1383's sixth item. It under-reports; the shape occurs nowhere in this
+tree; and the fix threads paragraph state through a helper with eight
+call sites whose semantics after crossing a quote are exactly the
+question rounds forty-four to fifty kept getting wrong.
+
+Corpus effect: none. Three fixtures -- the lazy continuation, the blank
+line that really does leave the quote, and a heading that ends the
+continuation because it begins a block.
+
+### Round seventy — two identifiers CH001 could not spell
+
+Two findings, both in the signature pattern and both leaving ordinary
+Rust outside an absolute gate.
+
+**A re-export carries a visibility.** The `use` alternative required
+`use` at the start of the line, so `pub use crate::foo;` and
+`pub(crate) use crate::foo;` could not match -- and those are the forms
+this tree writes, not the bare one. Every other item alternative already
+took the visibility prefix; this was the one written without it.
+
+**An identifier may be raw.** `r#match` is a name, `\w+` stops at the
+`#`, and a commented-out `fn r#match() {` was outside the gate. The same
+applies to a raw type or module name, so `fn`, `struct`, `enum`,
+`trait`, `union`, `mod` and the `use` path all take the optional `r#`
+now. Not hypothetical here: `det_check.rs` discusses `r#gen` at length.
+
+Both premises were checked against rustc 1.94.1 rather than assumed --
+`pub fn r#match()`, `pub struct r#type;` and `pub use inner::X;` compile,
+with only a naming-convention warning on the second.
+
+The `#` is escaped in the pattern. It is a VERBOSE regex, where an
+unescaped `#` opens a comment and would have silently discarded the rest
+of the alternative.
+
+Corpus effect: none. Six fixtures, four for the defects and two for the
+counter-cases that keep prose out of an absolute rule -- a line opening
+with "Use the LATER definition", and `pub use the cached resolver ...`,
+which is a sentence and not a path.
+
+### Round seventy-one — both findings are defects in the last two rounds
+
+Two findings, and both are regressions this review introduced. That is
+worth stating rather than glossing: round sixty-three narrowed CH002 to
+per-marker references and made an absolute rule reject a tracked
+commitment, and round seventy taught six alternatives about raw
+identifiers and left four beside them.
+
+**A reference may abut the marker on its LEFT.** Round sixty-three read
+the text from each marker forward, so `#123 - TODO: remove the legacy
+fallback` reported CH002 — an absolute gate failing the build on a
+commitment that is tracked, just written the other way round. The
+reference must ABUT the marker: separators between the two and nothing
+else, opened either at the previous marker or at a clause separator. So
+`TODO(#1): a; #2 - TODO: b` has both markers tracked, while `See #123
+for the parser. TODO: x` and `Fixes #123. TODO: x` stay untracked, which
+is the property round sixty-three added and this round must not undo.
+
+**Four more identifier positions.** Round seventy covered `fn`,
+`struct`, `enum`, `trait`, `union`, `mod` and the `use` path, and left
+`let`, the uninitialized `let`, `const`/`static` and `type`. A raw name
+is legal in all of them.
+
+The lesson from round seventy was to grep for the construct before
+adding it to a pattern. The correct instruction was to grep for the
+POSITION — every place an identifier can appear — and one round later
+the same pattern family produced the same class of gap.
+
+Corpus effect: none. Six fixtures: three tracked forms that must stay
+silent, one earlier-clause reference that must still report, and the two
+raw bindings.
+
+### Round seventy-two — the third round running on the previous round's fix
+
+Two findings, both defects in round seventy-one, which was itself two
+defects in rounds sixty-three and seventy.
+
+**One reference tracks one marker.** Round seventy-one let a marker
+claim a reference abutting it on the left, and bounded that lookbehind
+at the previous marker's END -- which is inside the region the previous
+marker's own FORWARD search already covers. So in
+`TODO: #123; TODO: add retries` the second marker borrowed the first
+one's reference and passed. Each marker now records the reference it
+consumes, and a borrowed one is refused. A DIFFERENT reference in the
+same span still counts, so `TODO(#1): a; #2 - TODO: b` keeps both
+markers tracked.
+
+**A raw identifier inside a grouped use tree.** Rounds seventy and
+seventy-one gave the optional `r#` to eleven identifier positions and
+left the brace group's character class, which does not admit `#` at all.
+`pub use inner::{r#type};` compiles and was outside the gate.
+
+Three rounds running the finding has been in the previous round's fix,
+and the second one here is the fourth instance of the same enumeration
+gap. "Grep for the position" was the right instruction and was applied
+to the positions that look like identifiers; a character class holding
+identifier characters is that position too, written in a different
+notation. The reliable form of the rule is to enumerate by CONSTRUCT
+across the whole pattern -- every place a name can be spelled -- rather
+than by the shape of the syntax that spells it.
+
+Corpus effect: none. Two fixtures, one for each.
+
+### Round seventy-three — HTML nests, and the scanner did not
+
+One finding, a Tier A false positive, in code from round sixty-six.
+
+`<code>` is phrasing content and may contain another `<code>`. Rustdoc
+renders `<code>outer <code>inner</code> TODO: x</code>` with the marker
+still inside the OUTER element, and the scanner paired the outer opener
+with the inner closer, exposed the marker, and failed the build on it.
+The element now ends at the closer that returns the depth to zero.
+
+The fixture discriminates rather than merely passing: the marker inside
+the element and a second marker on the line below it. Before, both
+reported; now only the one outside does. A single-line version would
+have reported one finding either way and asserted nothing -- which is
+the fixture rule this PR adopted in round thirty-nine, and it earned its
+keep again here.
+
+Round sixty-six wrote the scanner to replace a regex that could not
+express escaping. Depth is the second thing a regex cannot express, and
+it was the next finding in the same function -- the scan should have
+been written for both at once.
+
+Corpus effect: none.
+
+### Round seventy-four — two false positives and a definition
+
+Three findings. Two fail the build on correct documentation, so both
+shipped this round; the third is an ordinary gap.
+
+**An escape takes one backtick, not the run.** Rustdoc renders
+`` \``TODO: issue required` suffix. `` with the first tick literal and
+the second opening a one-tick span, so the marker is code. The scanner
+discarded the whole run when its first character was escaped. It now
+shrinks the run by one and keeps the remainder as a delimiter.
+
+**A marker that cannot interrupt a paragraph opens no block.** `2.`
+after an open paragraph is paragraph text, so `Intro `literal` and
+`2. TODO: issue required` suffix.` are one paragraph with the marker
+inside a code span. `starts_block` cut the span there and failed the
+build. It takes an optional `paragraph` now, defaulted off so the two
+table-end callers keep asking the question they always asked.
+
+This is the OVER-REPORTING twin of #1383's sixth item, which was
+deferred last round as an under-report. The two are not the same fix:
+this one is a paragraph flag at a single call site, where the deferred
+one threads state through a helper with eight callers and into fence
+parsing behind it. Fixing the reachable half does not close the issue,
+and #1383 keeps the entry.
+
+**A macro definition ends at its brace.** `macro_rules! stale { () =>
+{}; }` needs no trailing `;`, and the macro alternative required one.
+Nine tracked files define macros in this form. The new alternative is
+anchored on the keyword, so prose that merely names `macro_rules!`
+cannot reach it -- and a fixture pins both lines together.
+
+Corpus effect: none. Four fixtures.
+
+### Round seventy-five — a test that could never fire
+
+One finding. `lazy_continuation` refuses to treat a line as a quote
+continuation when that line begins a block, and one of its six tests was
+`LIST_MARKER_RE.match(peeled)` -- against text `strip_containers` had
+already taken the marker off. The test could not fire, in either caller,
+and had not since round forty-one.
+
+It is live now, on the raw line and through `list_content`, so it is
+bounded by the container like every other marker test in this file.
+
+Two things this exposed:
+
+**The test is not paragraph-gated, and must not be.** Round seventy-four
+taught `starts_block` that `2.` cannot interrupt an open paragraph. That
+is the right rule inside one block and the wrong one here: the quote's
+paragraph is not open at the level an unquoted line lands on. Rustdoc
+closes the quote and opens `<ol start="2">`, so a marker that could not
+interrupt a paragraph still starts a block. A bullet already reported,
+because a bullet CAN interrupt one -- so round seventy-four's fix is what
+made the ordered case reachable, and the two rules had to be told apart
+rather than shared.
+
+**Dead code in a predicate is invisible to the corpus.** Every check this
+PR runs -- the self-test, the corpus diff, the ratchet -- confirms
+behaviour, and a test that never fires changes no behaviour. Nothing
+here can find one. The review did.
+
+Corpus effect: none. Two fixtures, the ordered marker and the bullet.
+
+### Round seventy-six — the deferral was wrong on its facts
+
+One finding, and it was already on issue #1383 as the fifth deferred
+item. It is fixed here instead, because checking the premise of the
+deferral showed the premise was false.
+
+#1383 says the deferred gaps are safe to leave because "no `*.rs`
+comment in this repository contains raw HTML or a GFM table". The HTML
+half is true. **The table half is not**: 410 comment lines in tracked
+sources are table rows, across at least ten files, and their cells
+routinely hold code spans -- `` `harvest debug diff` ``, `` `initdb` ``,
+`` `PostgreSQL` ``. A single unmatched backtick in one of those cells
+would take CH001 and CH002 off the rest of the row.
+
+Rustdoc parses each cell as its own inline context, so a backtick in one
+cannot pair with a backtick in the next. `row_cell_spans` gives the span
+pass those boundaries as offsets, and a table row's block is blanked one
+cell at a time. This is the one block boundary that falls INSIDE a line,
+which is why the block layer could not express it and why the entry said
+"the span pass has nowhere to put that yet". It has one now.
+
+Doc comments only, and the `//` counter-case is pinned: nothing renders
+a `//` comment, so there is no table there and the span does reach
+across.
+
+Corpus effect: none, so no comment in this tree relies on the old
+behaviour today. That is what makes the change safe; it is not what
+makes it unnecessary.
+
+The deferral rule stands, and this is what it needs to be useful: the
+reasons have to be re-checked, not repeated. #1383 is corrected --
+item 5 removed, and the false claim about tables with it.
+
+### Round seventy-seven — one question asked in three places
+
+One finding reported, a Tier A false positive, and pulling on it found
+the same defect in two more places and a second defect underneath.
+
+**The reported half.** `lazy_continuation` asked `FENCE_RE.match(peeled)`
+with no container. `FENCE_RE` captures the indent rather than bounding
+it -- deliberately, so each caller measures against its own container --
+and a caller that forgets asks an unbounded question. An over-indented
+delimiter opens no fence, so Rustdoc keeps the line inside the quoted
+paragraph and the marker inside a code span. The audit cut the span and
+failed the build.
+
+**`starts_block` asked the same question and got it half right.** It
+bounded the indent and never checked the info string, so a fix to the
+lazy test alone changed nothing: the block was still cut, one clause
+further along. Both call `opens_fence` now.
+
+**And the info-string rule was reading the wrong text.** A backtick
+fence's info string may hold no backtick. The check looked only at
+`line_tail` -- the part of the line past a NESTED COMMENT -- so it caught
+"``` /* note */ `info`" and missed the ordinary one-piece form
+"```rust `info`" completely. It reads the delimiter's own remainder now,
+plus the tail. That check exists twice, in `comment_lines` and in
+`prose_units`, and the first attempt at this edit asserted a single
+match and refused to apply -- which is the only reason both got fixed.
+
+Four fixtures: the two shapes that open no fence, a real fence that does
+and exempts its content, and an unclosed one.
+
+Corpus effect: none.
+
+The lesson is the one this PR keeps relearning, in its sharpest form
+yet. Three call sites asked "does a fence open here?" and each answered
+it differently, and none of the checks in this harness can see that --
+they compare behaviour, and two wrong answers that agree on the corpus
+look exactly like one right answer.
+
+### Round seventy-eight — the same shape twice more
+
+One finding reported, a Tier A false positive, and the same seam
+underneath it as last round: a test asking the wrong question, and a
+second test making the same mistake one clause away.
+
+**The separator branch was unbounded.** `lazy_continuation` asked
+`SEPARATOR_RE.match(peeled)`. That pattern is unbounded ON PURPOSE, and
+its own comment says so -- a decorative rule is not a word of a sentence
+at any indent, which is the question `prose_units` asks it. This asks
+whether a BLOCK begins, and the two answers differ twice over: `===` is
+ordinary text to CommonMark, and an over-indented `---` is indented
+content. The CommonMark `thematic_break`, bounded by the container,
+answers the question actually being asked.
+
+**And the Setext test had no container either.** Fixing the separator
+alone left `===` still reporting, because `setext` asked only whether a
+paragraph was open -- not whether it was open in THIS container. A line
+that leaves a quote underlines nothing: Rustdoc keeps `===` under a
+lazily continued quote inside the paragraph, as text. It is gated on
+`quoted == before_quoted` now, which also required moving the
+computation after the quote depth is known.
+
+Four fixtures, one per rendering: indented `===`, bare `===`, bare
+`---` which really does end the quote, and indented `---` which does
+not.
+
+Corpus effect: none.
+
+Rounds seventy-seven and seventy-eight are the same lesson twice: a
+predicate borrowed from a neighbour that answers a NEARBY question. The
+fence test borrowed a pattern whose indent bound belongs to the caller;
+the separator test borrowed one that is deliberately unbounded. Both
+were reasonable at a glance and both were wrong, and no check here can
+see it -- the harness compares behaviour, and a rule that is wrong only
+in shapes the corpus lacks behaves identically to a right one.
+
+### Round seventy-nine — both halves of a rule I applied to one half
+
+Two findings, both in code this review produced, and both the same
+mistake: a scope applied in one of the two places that needed it.
+
+**HTML is doc-only, in one predicate out of two.** Round fifty-two
+established that nothing renders a `//` comment, so a tag there is
+literal characters. `lazy_continuation` tested `html_block` without that
+scope, and so did `starts_block` one clause away -- so fixing the first
+alone changed nothing, exactly as in round seventy-seven. Both take the
+marker now. Every other test in those predicates holds in both comment
+kinds: a heading, a rule and a list marker are block syntax this tree
+writes in plain comments too, which is why HTML is the only one that
+needed the flag.
+
+**The Setext container gate, in one loop out of two.** Round
+seventy-eight taught `comment_lines` that an underline titles only a
+paragraph in its own container. `prose_units` has the same branch and
+did not learn it, so `> Actually, explain this behavior` followed by an
+unquoted `===` discarded the whole run as a heading title -- and the
+narrative aside inside it with the run.
+
+That second one is the sharper of the two. Round seventy-seven's lesson
+was to grep for every site asking the same question and assert the match
+count before editing. Round seventy-eight added a condition to one of
+two sites and did not run that check, and this is the finding.
+
+Corpus effect: none. Two fixtures.
+
+### Round eighty — the third caller, and the last one
+
+One finding, a Tier A false positive, and the same scope missing from a
+third place: `update_containers` called `html_block` without knowing the
+comment kind, so a `//` comment's `<pre>` cleared the paragraph, the
+following `2.` opened a list it is not entitled to, and the span was cut.
+
+Round seventy-nine fixed two callers of that question and this is the
+third. So the fix this round is not a third gate. **`html_block` takes
+`doc` itself, with no default**, and every one of its five callers must
+now answer. A future caller cannot forget, because the code will not run
+until it decides.
+
+That is the difference between a rule and a type. "Remember to gate the
+HTML test" survived rounds fifty-two, seventy-nine and eighty. "This
+function needs to know" survives whatever comes next.
+
+Corpus effect: none, which also confirms the centralisation changed
+nothing beyond the one defect -- the two callers that already gated it
+kept their answers, and the two that guarded it with a marker test now
+pass the same marker test as an argument.
+
+One fixture.
+
+### Round eighty-one — a sentence is not a line
+
+One finding, a Tier A false positive, and it is the plainest authoring
+shape yet: a marker whose reference wraps.
+
+    // TODO: implement the retry described in
+    // #123
+
+CH002 read one line, found no reference, and failed the build on a
+commitment that is tracked. Rustdoc renders the two lines as one
+paragraph, and so does any reader.
+
+The marker's text now carries onto following lines of the same block.
+Where it STOPS is the whole of the design, and each bound is one of this
+review's earlier rules seen from the other end:
+
+- a block boundary or a fenced line, because a sentence does not cross
+  one -- rounds sixty-two to sixty-five;
+- a blank line, for the same reason;
+- **another marker**, because everything past it belongs to that one --
+  round seventy-two's "one reference tracks one marker", read forwards
+  instead of backwards.
+
+Three fixtures, one per bound, and the wrapped case itself.
+
+Corpus effect: none, which is worth a note of its own: 1,370 CH005 and
+426 CH006 findings exist in this tree, and not one comment in it wraps a
+marker's reference. The shape the harness got wrong is ordinary in
+prose and simply absent here -- which is why every fixture for it had to
+be written rather than found.
+
+### Round eighty-two — the carry, and the last identifier positions
+
+Two findings.
+
+**The wrapped reference carried too far.** Round eighty-one let a
+marker's reference wrap onto the next line and bounded that carry at a
+block edge, a blank line and the next marker. It did not bound it at the
+end of the marker's own SENTENCE, so `TODO: add retries.` and
+`See #123 for parser.` below it became one tracked commitment -- exactly
+the borrowing round sixty-three exists to refuse, reintroduced one line
+lower. The carry now stops at terminal punctuation, with the same
+abbreviation guards `SENTENCE_SPLIT_RE` already carries, so `e.g.` does
+not end it.
+
+That is worth naming: a fix that widens a rule's reach has to re-check
+every bound the rule already had. Round eighty-one added a dimension and
+carried three of the four bounds into it.
+
+**Raw identifiers, the fifth and final round of them.** Rounds seventy
+and seventy-one gave the optional `r#` to eleven positions, round
+seventy-two to a grouped `use` tree, and the destructuring classes were
+still left. Rather than fix the one reported, every remaining identifier
+position in `COMMENTED_CODE_RE` was enumerated and fixed together:
+
+- a wrapped parameter list,
+- an `impl` type path,
+- tuple and slice destructuring,
+- the path of a struct pattern,
+- the type of an uninitialized binding,
+- a macro statement's name.
+
+Four fixtures for the four that are reachable, and the pattern was
+checked directly against each shape as well as through the scan.
+
+Corpus effect: none.
+
+### Round eighty-three — one keyword out of three, one bound out of two
+
+Two findings.
+
+**`continue` does not take an expression.** The control-flow alternative
+grouped `return`, `break` and `continue` and allowed any single token
+after each. That is right for two of them -- `break normally;` really is
+a value returned from a loop, and rustc compiles it -- and wrong for the
+third: `continue` takes only a lifetime label, and rustc answers
+"expected a label, found an identifier". So a sentence wrapping onto
+`continue normally;` failed an absolute gate. `continue` has its own
+alternative now, taking `'label` or nothing.
+
+Three keywords with two grammars, sharing one pattern because they share
+a position. That is the same mistake as the borrowed predicates of
+rounds seventy-seven and seventy-eight, one level down: convenience of
+form standing in for identity of meaning.
+
+**The forward search had no sentence bound.** Round eighty-two put one
+on the wrapped carry and not on the same-line search beside it, so
+`TODO: add retries. See #123 for parser.` was tracked by a reference in
+the following sentence -- the same borrowing, on one line instead of
+two. Both searches take the bound now.
+
+Round eighty-two's own lesson was that widening a rule means re-checking
+every bound it already had. This round is the reverse and equally
+avoidable: ADDING a bound means applying it to every search the rule
+already had. A bound and a reach are the same edge from two sides.
+
+Corpus effect: none. Four fixtures -- the prose that must not report,
+`continue 'outer;` and `break normally;` which must, and the
+same-line borrowed reference.
+
+### Round eighty-four — derived from a pattern, minus the part that mattered
+
+One finding, a Tier A false positive, in the bound round eighty-three
+added. `SENTENCE_END_RE` matched any `.`, so `TODO: update foo.rs per
+#123` ended its sentence inside a filename and the search stopped before
+the reference. `v1.2` does the same.
+
+A sentence end is punctuation followed by SPACE or the end of the text.
+`SENTENCE_SPLIT_RE` has always required that -- the new pattern was
+derived from it and dropped exactly the clause that distinguishes a
+sentence end from a period. The abbreviation lookbehinds came across;
+the separator did not.
+
+Four rounds running the finding has been in the previous round's fix,
+and all four are one function's notion of what a marker owns:
+
+- 81 gave it a new dimension and dropped a bound;
+- 82 added the bound to one of two searches;
+- 83 applied it to both, with a pattern missing a clause;
+- 84 restores the clause.
+
+The pattern to watch is not carelessness in any one step. It is that
+each fix was written from the FINDING rather than from the rule, so each
+one repaired the reported symptom and left the neighbouring case for the
+next round. Writing down what a marker owns -- its own sentence, from
+its own start, wherever that sentence runs -- would have produced all
+four at once.
+
+Corpus effect: none. Three fixtures: a filename, a version, and an
+abbreviation.
+
+### Round eighty-five — the fifth finding, so the rule instead of the edge
+
+`// TODO: add retries. (#123)` failed the build. The sentence bound cut
+the marker's range at the period, and the reference sits after it.
+
+That is the fifth consecutive finding in one notion, so this round
+writes the notion down instead of the edge. Two functions now hold it:
+
+- `sentence_end` answers where one sentence ends, and a bracketed
+  citation attached to that end is part of it;
+- `marker_span` answers what one marker owns, from its own start to its
+  own sentence end or the next marker, whichever comes first.
+
+`untracked_marker` reads that one span. The wrapped-line carry no longer
+decides anything: it supplies the rest of the comment, and `marker_span`
+cuts it back. `ENDS_SENTENCE_RE` is gone -- it was a second answer to
+the question `SENTENCE_END_RE` already answers, and the round eighty-two
+and eighty-three findings were both that duplication.
+
+The carry keeps its other bounds, which are not about sentences: a block
+edge, a fence, a blank line, and the next marker. That last one stops a
+marker on a later line being reported twice, once on its own line and
+once through the carry.
+
+A wrapped citation now works as well, so a period at the end of one line
+and `(#123)` on the next is one tracked commitment.
+
+Corpus effect: none. Five fixtures: a citation in round brackets, one in
+square brackets, one on the line below, a following sentence that is not
+a citation, and a citation cut off by the next marker.
+
+### Round eighty-six — two absolute-gate defects, in opposite directions
+
+A Tier A false positive and a Tier A bypass, both about a pattern that
+was derived from another and lost a clause on the way.
+
+`// TODO: preserve the "Ready?" prompt under #123` failed the build.
+`SENTENCE_END_RE` accepted a closing quote or bracket as the boundary
+after terminal punctuation, so the `?` inside the quoted word ended the
+marker's sentence before its reference. `SENTENCE_SPLIT_RE` has always
+required real whitespace and has always allowed emphasis markers first.
+The new pattern carries both clauses and nothing else, which is the
+round eighty-four lesson applied to the same pair of patterns again.
+
+`// pub(in crate::r#type) fn stale() {` produced no CH001. The
+restricted-visibility prefix matched its path with `[\w:]+`, which stops
+at the `#` of a raw segment, and `r#type` is a legal module name.
+`rustc 1.94.1` compiles the declaration.
+
+The prefix appeared seven times, identically, which is why one round
+could add raw identifiers to every item NAME and leave every item
+VISIBILITY behind. It is now one `VISIBILITY` fragment spliced into all
+seven alternatives, so the next answer to that question is one answer.
+
+Three siblings went with it, found by asking where else a path is
+matched rather than where the finding pointed: the path of a call, the
+path of a macro statement, and the left side of an assignment.
+
+Corpus effect: none. Eight fixtures.
+
+### Round eighty-seven — a rule that damaged the tree it audits
+
+Three findings. The third is the serious one, because the gate was not
+merely wrong about a hypothetical line: it made the audit delete a
+comment that was doing work.
+
+Rustdoc joins every `#[doc]` attribute an item carries, and a doc comment
+IS a `#[doc]`, so an attribute between two doc lines sits INSIDE the
+document rather than ending it. CH004 read a comment run as consecutive
+source lines, so the blank `//!` beside `#![cfg(feature = "testing")]` in
+`idempotency_tests.rs` looked like a block edge. It is a paragraph break.
+Deleting it merged `Run with:` and `Covers:` into one paragraph, which
+rustdoc 1.94.1 confirms directly. The line is restored, and a run now
+survives an intervening attribute -- for `//!` over `#![...]` and for
+`///` over `#[...]`, both checked by rendering, and over an attribute
+that wraps across lines.
+
+The fact lives on the piece rather than in the rule: `mark_bridges` sets
+`Piece.bridged`, so `comment_runs` answers "what does a reader see as one
+comment" in the one place that question was already asked.
+
+Three counter-cases hold the widening down. A blank doc line with no doc
+after it still renders nothing, so it is still an edge. A commented-out
+attribute is code, not a bridge. A plain `//` run does not join across
+code, because nothing renders it.
+
+The other two findings are the sentence boundary again, in both
+directions this time. `// TODO: print "ready." See #123 for parser.`
+found no boundary at all, so the marker borrowed a reference from the
+next sentence. A closing delimiter is genuinely ambiguous -- `"ready."`
+ends a sentence and `"Ready?"` does not, and both are punctuation, quote,
+space -- so it is now its own alternative, decided by whether a CAPITAL
+follows. The known limitations reject that test for the prose splitter,
+which must not merge two sentences; here it decides only what the plain
+rule cannot read, and guessing wrong merely lets a sentence run on.
+
+And `TODO: http://` counted as a tracking reference. `TODO_REF_RE` was
+the one reference pattern of three that did not require a destination.
+
+Corpus effect: none. Two CH007 findings move down one line, because a
+line was restored above them. Eleven fixtures.
+
+### Round eighty-eight — both fixes of round eighty-seven, one edge further
+
+Two findings, one on each of the previous round's changes.
+
+A closing quote may be TYPOGRAPHIC. `// TODO: print “ready.” See #123 for
+parser.` found no sentence boundary, so the marker borrowed the reference
+from the next sentence. An editor that curls a quote changes nothing a
+reader sees and everything an ASCII class matches, and this corpus
+already carries curly quotes and em dashes. The closer set now holds
+`’`, `”` and `»` beside the ASCII three, and the following-capital test
+is unchanged, so `“Ready?” prompt` still continues its sentence.
+
+`mark_bridges` counted an attribute's brackets character by character, so
+a `]` inside a string closed a wrapped attribute early:
+
+```rust
+/// One.
+///
+#[doc = concat!(
+    "Inserted ] text."
+)]
+/// Two.
+```
+
+Rustdoc 1.94.1 renders two paragraphs there; the audit reported CH004 on
+the blank line and would have had it deleted. The reported example was a
+single-line attribute, which already balanced and already passed -- the
+defect needs the attribute to wrap.
+
+The counter is lexical now. `extract_comments` already distinguishes a
+string from code, so it records every string and char literal span while
+it has them, and `blank_literals` hands `mark_bridges` a copy with the
+literal text spaced out and every line number intact. Raw strings and
+`']'` are covered by the same record.
+
+Cost measured, because the first version copied every file
+character-by-character and added forty per cent to the corpus run. The
+kept version splices the spans, and the run is 23.1 s against 22.9 s
+before.
+
+Corpus effect: none. Six fixtures.
+
+### Round eighty-nine — a reference that routes nowhere
+
+One finding. `// TODO: add retries #0` passed the absolute gate. Issue
+numbering starts at one, so `#0` is a placeholder rather than a
+reference, and a placeholder is the state CH002 exists to refuse.
+
+Three patterns recognise a reference, because a marker may carry one
+forward, inside a citation, or on its left, and all three read `#\d+`.
+The finding named one; all three are fixed, and each has its own
+fixture. An issue number is `#[1-9]\d*` now -- positive and unpadded,
+the way the tracker writes it, so `#000` and `#012` are refused with
+`#0` while `#10` and `#100` are untouched.
+
+Corpus effect: none. Four fixtures.
+
+### Round ninety — the carry, read from the other side
+
+One finding. `// #123` over `// TODO: remove the fallback` failed the
+build, although the same association written on one line -- `#123 -
+TODO: remove the fallback` -- has passed since round sixty-three. The
+carry only ever reached forward.
+
+It reaches both ways now, and neither direction decides anything. The
+carries supply the rest of the comment and the patterns that already
+read a line judge it: forward, `marker_span` cuts the text back to the
+marker's own sentence; backward, `ADJACENT_REF_RE` still requires the
+reference to ABUT the marker. That is why carrying a whole preceding
+line of prose is safe rather than dangerous: "See #123 for the parser."
+above a marker leaves "for the parser." between the two.
+
+The backward carry accumulates in ONE pass rather than re-walking the
+run per line, which is the difference between 25.8 s and 23.9 s on a
+23 s baseline.
+
+**The first attempt was wrong, and the harness caught it.** Prefixing
+the lead onto the line moved the marker off the start of the string, and
+`TODO_RE` reads an unpunctuated "TODO fix this" only there -- so
+`// #123` over `// TODO remove the fallback` stopped being seen at all,
+and an existing fixture for a nested inner-doc comment failed. The lead
+is passed to `untracked_marker` as its own argument now, used only for
+the first marker's adjacency search, where the text to a marker's left
+belongs. Both forms are fixtures.
+
+Corpus effect: none. Six fixtures.
+
+### Round ninety-one — a comment inside an attribute belongs to it
+
+One finding, on the round-87 bridge. A comment written between an
+attribute's brackets stopped the bridge, so:
+
+```rust
+/// One.
+///
+#[allow(
+    // keep this lint off for now
+    dead_code
+)]
+/// Two.
+```
+
+reported CH004 on the blank line, while rustdoc 1.94.1 renders "One."
+and "Two." as two paragraphs of one document. Round 87 knew about that
+`depth = 0` reset and left it, which is the third time this round a
+known-and-left edge has come back as a finding.
+
+Two things were wrong, and both are the same idea. The bracket counter
+gave up at a comment because it could not read one; and `comment_runs`
+let that comment cut the document in two. A comment inside an attribute
+is part of the ATTRIBUTE. So the lexer records comment spans beside
+literal spans -- `blank_literals` becomes `blank_non_code` -- and the
+counter reads a copy with both blanked. A comment-only line then blanks
+to nothing and cannot OPEN an attribute, which is what kept
+`// #[derive(Debug)]` prose about one; but a comment on a line that
+BEGINS inside an open attribute is recorded as part of it, and
+`comment_runs` sets it aside as its own run instead of breaking the
+document.
+
+"Begins inside" is the exact test, and the first version got it wrong.
+Marking every occupied attribute line made `#[allow(dead_code)] // why`
+into an inside-comment, and two of those in `api.rs` joined into one
+thirty-word sentence -- a CH007 finding that had never existed. The
+corpus diff caught it. A comment after a finished attribute is beside
+it, not in it.
+
+Corpus effect: none. Four fixtures, three of them counter-cases.
+
+### Round ninety-two — a scheme is not a destination
+
+One new finding, and one restatement of round ninety-one's, which the
+same commit had already fixed.
+
+Round eighty-seven made a URL reference require something after the
+scheme, and wrote that as `\S` -- any non-whitespace character. So
+`// TODO: see https://).` passed the absolute gate on a closing bracket.
+A host starts with a letter, a digit, an underscore, or the `[` of an
+IPv6 literal, and never with punctuation.
+
+One `URL_HOST` now, shared by all three reference patterns rather than
+spelled three ways -- `\S`, `\S+` and `[^)\]\s]+` were three different
+answers to one question, and only the first was reported. The patterns
+keep their own tails, which differ for a real reason: a citation's
+destination stops at the bracket that closes it.
+
+Accepted, and fixtured: a name, `localhost:8080`, an IPv4 literal and
+`https://[::1]/p`.
+
+Corpus effect: none. Three fixtures.
+
+### Round ninety-three — a where clause, and an empty line
+
+Two findings, one bypass and one false positive.
+
+`// fn foo<T>() where T: Copy {` produced no CH001. The complete-signature
+form allowed a return type between the `)` and the `{`, and nothing else.
+The sibling sweep found five more places a `where` clause may sit, all
+compiled with rustc 1.94.1 first: a function with and without a return
+type, a struct, an enum, a trait, a tuple struct after its parens, and an
+impl with more than one bound, whose comma the shared class did not hold.
+One `WHERE` fragment now, spliced in beside `VISIBILITY`, bounded by the
+`{` or `;` that ends the declaration so it can never run past its item.
+`// The queue drains where the worker parks` is the counter-case.
+
+The second is the round-91 bridge one gap further. An EMPTY source line
+between two doc runs renders nothing, exactly as an attribute does, so it
+does not end the document either -- rustdoc 1.94.1 renders "One." and
+"Two." as two paragraphs across one, and the blank `///` beside it is
+what separates them. CH004 reported that separator.
+
+The emptiness is judged on the real source rather than the blanked copy,
+because a comment-only line blanks to nothing and is not empty. That is
+what keeps `// #[derive(Debug)]` from bridging, and it is a fixture. Two
+more hold the widening down: with no doc after it a blank doc line still
+renders nothing, and a plain `//` run is joined by nothing at all.
+
+Corpus effect: none. Eight fixtures, four of them counter-cases.
+
+### Round ninety-four — a body that closes on its own line
+
+One finding, a bypass. `// fn stale() {}` produced no CH001, because
+every item form anchored on the `{` that OPENS a block and then required
+the end of the line. A body that opens and closes on one line is a body.
+
+The sibling sweep turned one into nine, all compiled with rustc 1.94.1
+first: a function empty and with a value, a function with a where
+clause, a struct, an enum, a trait, a module, an impl, and an impl whose
+one-line body nests another. One `BODY` fragment now, beside `VISIBILITY`
+and `WHERE`, spliced into each of them.
+
+Control flow does NOT take it, deliberately. Its guard is a lookahead
+over the words before the brace, so it never had a name to anchor on, and
+`// match the shard {0}` is prose that ends in a closing brace. That is a
+counter-case fixture, as is `// Returns the shard {0}`.
+
+Corpus effect: none, which for a widened absolute gate is the number that
+matters -- no comment in this tree newly reads as code.
+
+Six fixtures, two of them counter-cases.
+
+### Round ninety-five — one notation, read from both ends
+
+One finding, a Tier A false positive. `// (#123)` over
+`// TODO: remove the fallback` failed the build, and so did the same
+association on one line.
+
+`ADJACENT_REF_RE` admitted `(` or `[` before the reference and neither
+closer after it. The two ends are one notation: a `)` or `]` following a
+reference is punctuation around it, exactly as the bracket in front is.
+The closers join the trailing separator class.
+
+Round 90 saw this while carrying a wrapped reference backwards, judged it
+symmetric with the same-line behaviour, and left it. It was symmetric --
+both forms were wrong. The rule this round confirms is the one round 91
+already wrote down: a known edge on an absolute gate is a finding waiting
+to be filed.
+
+Counter-cases hold: prose above the marker still does not abut it, issue
+zero and a bare scheme are still not references, and the trailing
+citation pattern is untouched.
+
+Corpus effect: none. Three fixtures.
+
+### Round ninety-six — one definition of a reference
+
+Two findings, both on the reference patterns, which is the fifth round
+running that one of the three has been out of step with the others. The
+standing tripwire said that a fifth means merging them, so it is merged.
+
+`#123abc` and `#1_000` were read as `#123` and `#1` with something after
+them. An issue number ends where the number ends: `#[1-9]\d*(?!\w)`.
+`owner/repo#123` still counts, because the boundary is only needed after
+the digits -- a cross-repository reference is a real one.
+
+`HTTPS://github.com/...` found no reference at all, so a tracked marker
+failed the build. A scheme is case-insensitive by RFC 3986 and by every
+browser that has ever shipped.
+
+Both defects were in all three patterns, and the three had already
+disagreed about `#123abc`: the adjacent form rejected it, the other two
+accepted it. So WHAT a reference is now has one definition, `REFERENCE`,
+and the three keep only their own answer to WHERE a reference may sit --
+which genuinely differs, and is the reason there are three.
+
+The five disagreements, for the record: a URL destination (round 87), a
+zero issue (89), a punctuation host (92), a bracketed citation (95), and
+this round's pair.
+
+Corpus effect: none. Four fixtures, covering both defects in more than
+one position.
+
+### Round ninety-seven — the end of a line, and the end of a host
+
+Two findings.
+
+A comment on the line that OPENS a multiline attribute still broke the
+doc run. Round 91 asked whether the line BEGAN inside an attribute, which
+`#[cfg(all(/* note */` does not. The right question reads both ends at
+once: a comment on the line is inside the attribute when the attribute is
+still open at the END of the line. `#[allow(dead_code)] // why` closes on
+its own line, so that comment is beside the attribute; `#[cfg(all(` does
+not close, so a comment after it is within. One test, both cases.
+
+The first version of that read only the END, and re-testing caught it:
+`/* why */ ))]` on a CLOSING line was already handled correctly by the
+old test and would have broken. Either end alone gets a real case wrong,
+so both are read.
+
+Line granularity remains a stand-in for a question about POSITION, and
+one case is now decided the safe way rather than the right way. In
+`)] // done` the comment follows the attribute but reads as inside it,
+which costs a CH004 that goes unreported. The alternative costs a CH004
+reported on correct documentation, and a Tier A false positive fails the
+build. The trade is written where the code makes it. A third finding here
+means giving `Piece` its source offset and asking by position.
+
+`https://[` counted as a URL. An IPv6 literal is a host only when its
+bracket closes, and the tail could not close it because a `]` ends the
+citation form. The two host shapes are spelled apart now. The same edit
+fixes the other half of the report: `https://[::1]/p` on a marker's LEFT
+was rejected, because that pattern's tail excluded the `]` as well.
+
+Corpus effect: none. Three fixtures.
+
+### Round ninety-eight — a generic list nests to any depth
+
+One finding, a bypass. `// fn stale<T: Into<Vec<u8>>>() {}` produced no
+CH001, because every generic list was matched by a class of "anything but
+angle brackets" -- which reads `<T>` and refuses anything inside it. The
+sibling sweep found the same class at five sites: a function, a struct or
+enum or trait or union, a tuple struct, a type alias and an impl. Six
+shapes were outside an absolute gate, all compiled with rustc 1.94.1
+before being accepted.
+
+The first fix counted levels, and three levels handled the report. A
+four-level case then failed -- which is this review's own recurring shape,
+a fix that moves the gap one step out and files next round's finding. So
+the list is bounded by what CANNOT appear inside one instead: a `;` or a
+`{` ends the declaration. The greedy run backtracks to the `>` the
+surrounding anchor needs -- the `(` of a signature, the `=` of an alias,
+the `{` of a body -- which admits any depth and admits `Fn(u8) -> u8`
+with it.
+
+Prose is unaffected because these forms are anchored on a keyword and a
+name: `// Compare a < b and c > d in the queue` is a counter-case fixture,
+and the control-flow guards are untouched. Pathological inputs were timed
+rather than assumed -- sixty unbalanced `<` return in under a millisecond.
+
+Corpus effect: none. Five fixtures, one of them a counter-case.
+
+### Round ninety-nine — a semicolon that ends nothing, a period that ends nothing
+
+Two findings, each the previous round's rule one step out.
+
+`// fn stale<T: Into<[u8; 32]>>() {}` produced no CH001. Round ninety-eight
+bounded a generic list by the `;` and `{` that end a declaration, and an
+array type carries a semicolon. The tree already had the answer: the
+tuple-struct and uninitialized-binding alternatives have used
+`;(?=[^;]*\])` since round forty-one, and the generic list uses it now.
+The sibling was in the same file, one screen away.
+
+`// TODO: retain approx. 5 retries under #123` failed the build.
+`SENTENCE_END_RE` ended the marker's sentence at `approx.`, and the
+reference sat past the cut. The guarded abbreviations were a list, and a
+list is the counted bound this review keeps punishing.
+
+So the rule is the other end instead: a sentence ends where the NEXT one
+STARTS. A capital or an opening delimiter after the space begins a
+sentence; a lower-case word or a digit continues this one. That reads
+`approx. 5`, `Fig. 3` and `v1.2` without naming any of them, and the two
+alternatives round eighty-seven and round eighty-eight added collapse into
+one.
+
+The abbreviation guards stay, for the case the next token cannot read:
+"use e.g. Postgres for the shard" is one sentence and its next token is a
+capital.
+
+The failure is one-sided, which is why the test is acceptable here and
+rejected for the prose splitter. An un-ended sentence reaches further and
+may read a reference that is not the marker's; a wrongly cut one fails
+the build.
+
+Corpus effect: none. Every CH002 fixture from rounds sixty-three to
+ninety-eight was re-run: twenty-five cases, all unchanged. Four new
+fixtures.
+
+### Round one hundred — the same two shapes, one round on
+
+Two findings, and both had a sibling the report did not name.
+
+`// use foo::{bar::{Baz, Qux}, Quux};` produced no CH001: a grouped use
+tree nests, and its group was matched by a class of what may sit inside
+one. That is round ninety-eight's lesson in a second place, so it takes
+round ninety-eight's answer -- the group is bounded by the `;` that ends
+the declaration. Asking where else the file bounds a nested construct by
+its contents found one more, unreported: an attribute's class had no `!`,
+so `#[doc = include_str!("../README.md")]` was outside the gate. It is
+bounded by the `]` that closes it at the end of the line now.
+
+`// TODO: compare vs. the baseline under #123` was already fixed by round
+ninety-nine, which reads the token after the period rather than a list of
+abbreviations. But `Dr.`, which the report also named, was not: a title is
+followed by a CAPITAL, and that is the one case the next-token test cannot
+read.
+
+So a list is kept for those -- and a list is the right tool here, which is
+worth distinguishing from round ninety-eight. Nesting is structural and
+unbounded, so counting levels always leaves a next level. Abbreviations
+are a LEXICAL set: finite, and enumerable in the language rather than in
+the grammar. Entries are only needed for forms a capital may follow, so
+`approx. 5` and `etc. and` are still read without one.
+
+Corpus effect: none. Every CH001 and CH002 fixture from rounds sixty-three
+to ninety-nine was re-run unchanged. Four new fixtures.
+
+### Round one hundred and one — a scheme starts where a scheme may start
+
+One finding. `// TODO: remove fallback under nothttps://example.com/123`
+passed the absolute gate: `https://` sat inside a larger token, and
+`REFERENCE` bounded the scheme's end but not its beginning.
+
+RFC 3986 gives the character set a scheme is written in, so a scheme
+character in front of `https` means the token is a different scheme, not
+this one. That is the same shape as round ninety-six's boundary after an
+issue number, read from the other side -- and the edge rule again: a
+token has two ends and a bound on one is not a bound on the other.
+
+The issue-number half needs no guard in front, and that asymmetry is
+deliberate rather than an oversight: `owner/repo#123` is a real
+cross-repository reference and the tracker renders it as one.
+
+The adjacent form already rejected the malformed token, because its
+left-hand anchor requires a clause separator before the reference. That
+is the third time a disagreement between the three positions has surfaced
+only when a finding named one of them, and the definition they now share
+is what makes the fix reach all three.
+
+Corpus effect: none. Two fixtures, one of them a counter-case for a
+hyphen that is a separator rather than a scheme character.
+
+### Round one hundred and two — a shape after all, and a widening that went too far
+
+Two findings. The second is one I caused two rounds ago.
+
+`// TODO: deploy to the U.S. East region under #123` failed the build.
+Round one hundred kept a list for abbreviations followed by a capital, on
+the ground that abbreviations are a lexical set. That is true of `Dr.` and
+`vs.`; it is NOT true of an INITIALISM, which is a shape -- single letters
+separated by periods -- and reads itself. `U.S.`, `a.m.` and `Ph.D.` are
+all guarded now by one lookbehind, and no list grew.
+
+So the lexical-versus-structural distinction round one hundred drew was
+right about the tool and wrong about the boundary between the two sets. A
+list is still correct for `Dr.`; it was never correct for the initialisms
+inside it.
+
+`// #[This section is intentionally blank]` reported CH001, and so did
+`// #[]`. Round one hundred bounded an attribute by the `]` that closes
+it and stopped there, which admits any sentence written in brackets. An
+attribute opens with a PATH, and what may follow a path is `(`, `=`, `,`,
+`::` or the closing bracket -- never another bare word. Bounding the end
+of a construct is not the same as recognising it.
+
+The counter-cases that round ran were ordinary prose, and ordinary prose
+does not begin with `#[`. **A counter-case has to be written in the SHAPE
+of the widened form**, not merely in the neighbourhood of it.
+
+Corpus effect: none. Five fixtures, three of them counter-cases.
+
+### Round one hundred and three — ask the compiler what the grammar is
+
+One finding, on the attribute alternative for the third round running,
+and wrong in both directions at once. `#[Note, this section is
+intentionally blank]` was reported although rustc rejects it, and
+`#[foo [bar]]` and `#[foo {bar}]` were missed although rustc accepts
+them.
+
+Round one hundred and two wrote the post-path set from memory, reasoning
+from `#[cfg_attr(test, derive(Debug))]` that a comma may follow a path.
+It may not: that comma is INSIDE the parentheses. The set was invented
+where it could have been read.
+
+rustc prints it. Feed it the malformed attribute and the error is the
+grammar:
+
+```
+error: expected one of `(`, `::`, `=`, `[`, `]`, or `{`, found `,`
+```
+
+The `::` belongs to the path and the rest is the input, so the
+alternative is now that list and nothing else. `#[allow[dead_code]]` and
+`#[allow{dead_code}]` parse -- rustc's complaint about them is "wrong
+meta list delimiters", a later check, not a syntax error -- so they are
+commented-out code and are fixtures.
+
+Three rounds on one alternative, each from a set written by hand: too
+narrow in round one hundred, too wide in one hundred and one's absence of
+a shape, wrong in both directions in one hundred and two. **The standing
+rule this adds: when a compiler will enumerate a grammar, ask it, and
+paste what it says.**
+
+Corpus effect: none. Three fixtures, one of them a counter-case.
+
+### Round one hundred and four — the value is an expression, and an alias has a where clause
+
+Two findings, and both premises came from rustc rather than from
+reasoning, which is the rule round one hundred and three added.
+
+`// #[Note = this section is intentionally blank]` reported CH001. The
+`=` branch accepted anything up to the closing bracket, and the value of
+a name-value attribute is an EXPRESSION. rustc names what may follow the
+value's first atom:
+
+```
+error: expected one of `!`, `.`, `::`, `?`, `]`, `{`, or an operator,
+       found `section`
+```
+
+So a literal opens a value outright, and a path opens one only when what
+follows is from that set. Two bare words in a row are prose in brackets.
+`#[doc = "this section is intentionally blank"]` is still commented-out
+code, because the same words inside a string ARE a value -- that is the
+counter-case, written in the shape of the widened form as round one
+hundred and two requires.
+
+`// type Foo<T> where T: Copy = Vec<T>;` produced no finding. Round
+ninety-three gave `WHERE` to a function, a struct, an enum, a trait, a
+union, a tuple struct and an impl, and missed the one item form that
+takes the clause BEFORE its `=`. rustc accepts it and warns that the
+clause is not enforced, which is a lint about meaning rather than a
+syntax error.
+
+This is the fourth round on the attribute alternative. The tripwire said
+that a fourth means checking the whole alternative against rustc rather
+than editing the reported part, and that is what produced the `=` branch
+above: every malformed variant was fed to the compiler and its answer
+pasted in.
+
+Corpus effect: none. Three fixtures, one of them a counter-case.
+
+### Round one hundred and five — a brace that ends nothing, and digits that are ASCII
+
+Two bypasses.
+
+`// struct Stale<const N: usize = { 1 + 2 }>;` produced no CH001. Round
+ninety-eight bounded a generic list by the `;` and `{` that end a
+declaration. The `;` half was right and needed the array-type guard round
+ninety-nine added; the `{` half was a guess, and rustc 1.94.1 accepts a
+const-block default. A `{` may appear inside a generic list, so it is not
+a bound at all -- and it never needed to be, because the greedy run
+backtracks to the `>` the surrounding anchor asks for.
+
+`// TODO: fix #1٢` passed the gate. Python's `\d` matches every Unicode
+decimal digit, and `#1` followed by U+0662 or U+FF14 routes nowhere. The
+tracker's digits are ASCII, so the pattern's are.
+
+The sibling sweep for that one found two more `\d` and left one alone.
+The attribute name-value branch now reads `[0-9]`, since a Rust literal is
+ASCII. `LIST_MARKER_RE` does too, because CommonMark says "1-9 arabic
+digits" and a Unicode digit opens no list. `ARCHAEOLOGY_RE` keeps `\d`
+deliberately: it is a ratcheted rule where matching MORE is the safe
+direction, and narrowing it would move a counted baseline for no gain.
+
+Corpus effect: none. Three fixtures.
+
+### Round one hundred and six — the same guard, one fragment away
+
+Three bypasses, and two of them are the same question asked in places
+round ninety-nine did not look.
+
+`// fn stale<T>() where T: Into<[u8; 32]> {` produced no CH001. Round
+ninety-nine gave the array-type guard to `GENERICS` and stopped there;
+`WHERE` bounds itself by a `;` for the same reason and needed the same
+guard. That is the guard sibling rule -- introduced in round one hundred
+and still not applied widely enough when the guard itself moves.
+
+Asking where else the file bounds by `;` found the impl header, which
+did not use `WHERE` at all: it was a class of what may appear in an impl
+header, and a class cannot hold `[u8; 32]`. It is bounded by what may not
+now -- the `{` that opens the body, and a `;` outside an array type --
+with the prose lookahead unchanged.
+
+`// pub unsafe trait Stale {}` produced nothing either. `unsafe`
+qualifies a trait and an impl, and on `pub unsafe trait` it sits between
+the visibility and the keyword where no alternative could reach it. The
+function alternative has carried the qualifier since the beginning; the
+other two never did. rustc 1.94.1 takes it on exactly those three.
+
+`https://[:]` and `https://[....]` counted as URLs. A bracketed host is
+an IP literal, and an address has at least one colon AND at least one hex
+digit. That is the cheapest test that refuses both without pretending to
+parse IPv6, which this file has no business doing.
+
+Corpus effect: none. Seven fixtures, one of them a counter-case in the
+shape of the widened impl form.
+
+Round 107 -- `extern`, which had no item alternative at all.
+
+`// extern crate serde;` and `// pub extern crate alloc;` produced no
+CH001. The import alternative read only `use`, and `extern crate` is an
+import item beside it. It now carries the same visibility prefix and the
+same `as` rename that the `use` form does; rustc 1.94.1 accepts both,
+including `as _`.
+
+`// extern "C" {` and `// unsafe extern "C" {}` produced none either.
+Round 106 noticed the gap and left it, on the grounds that the file had
+no extern-block alternative to qualify. That was a reason to write one.
+
+`unsafe` is optional on an extern block before edition 2024 and required
+from it. This tree is edition 2024, so a bare `extern {` is the older
+spelling of the same construct, and a comment carries no edition, so
+both spellings are gated. The ABI string needs whitespace in front of
+it, because `extern"C"` is a reserved prefix that rustc rejects. No
+visibility: `pub extern "C" {}` is not Rust in any edition.
+
+The opener `unsafe extern "C" {` did match before this round, but through
+the control-flow alternative, which carries `unsafe` for its own reasons.
+The complete `unsafe extern "C" {}` did not, because control flow ends
+its line at the opening brace. That is the same accident the `unsafe
+trait` finding turned up one round earlier.
+
+Corpus effect: none. Seven fixtures, two of them counter-cases in the
+shape of the widened forms.
+
+Round 108 -- the ABI is a string literal, and a string literal has more
+than one spelling.
+
+`// extern r"C" {` and `// extern r"C" fn stale() {}` produced no CH001.
+Both rules read `"[\w-]+"`, and rustc 1.94.1 accepts a raw literal in
+either position, hashes and all.
+
+The ABI now lives in one place, `abi()`, which the two rules splice. Its
+raw delimiter takes any number of hashes and requires the closing run to
+match the opening one, which a backreference states exactly. The group
+name is per call site, because one pattern holds two of these.
+
+rustc names the rest of the set rather than leaving it to memory: `b"C"`,
+`c"C"` and `br"C"` each answer "non-string ABI literal", so a byte
+string, a C string and a raw byte string stay out.
+
+The ABI name stays `[\w-]+`, wider than the set rustc knows. `extern "Q"
+{}` is E0703 and this pattern reports it, which is an over-report no
+prose can reach: `extern` is not an English word.
+
+Corpus effect: none. Five fixtures, two of them refusals.
+
+Round 109 -- a path may start at the crate root, and a brace-delimited
+macro call needs no semicolon.
+
+`// stale! {}` produced no CH001. rustc 1.94.1 states the rule in its own
+error: "macros that expand to items must be delimited with braces or
+followed by a semicolon". The `;` is now mandatory after `(` and `[` and
+optional after `}`, and a space is allowed before the delimiter, which
+`// stale! {}` needs and no form had.
+
+The semicolon-free branch is separate, because it needs two guards the
+terminated one does not. Dropping the `;` opens the rule to English:
+"Important! {see the note below}" is the shape of an exclamation. The
+four-lowercase-word lookahead from the control-flow rule refuses that
+one, and a snake_case name refuses "Note! {a, b}" and "Stop! {}", which
+are too short for it to see.
+
+That second guard is about English, not Rust: rustc accepts
+`macro_rules! Stale` and `Stale! {}` without a warning. An upper-case
+macro name therefore loses the semicolon-free form, an under-report, and
+the terminated alternative still reads `Stale!(x);`.
+
+`// use ::std::fmt;` produced nothing either. Two of the four rules that
+read a path were reported; asking which rules read one at all found the
+other two. `ROOT` is now spliced into the use tree, the macro path, the
+path of a destructuring pattern and the path of an attribute, each of
+which rustc accepts with a leading `::`.
+
+Corpus effect: none. Nine fixtures, three of them refusals.
+
+Round 110 -- a Tier A false positive on valid documentation, and the
+other half of a conditional.
+
+CH004 failed the build on this, which is correct Rust and correct
+rustdoc:
+
+    /// One.
+    ///
+    #[doc = "Two."]
+
+An explicit `#[doc = ...]` carries document content, so the run has not
+reached its edge: the blank doc line is the paragraph break between the
+two halves. Rendered with rustdoc 1.94.1 both ways -- with the blank
+line, two paragraphs; without it, one. The rule's own fix instruction,
+"drop the empty line", would have silently merged them.
+
+The reverse order was not reported and is the same defect:
+`#[doc = "Zero."]` above a blank `///` above `/// One.` renders two
+paragraphs too. Both edges consult the attribute now.
+
+The kinds have to agree, which the rendering also settles. `//! One.`
+over a blank `//!` over `#[doc = "Two."]` renders the module document as
+"One." alone, because the outer attribute documents the next item. That
+blank is a real edge and stays reported. So does the blank in front of
+`#[doc(hidden)]` or `#[doc(alias = "zz")]`, which render nothing.
+
+`// } else {` and `// else {` produced no CH001. The control-flow rule
+knows six keywords and `else` was not among them, and the
+standalone-brace rule stops at the brace.
+
+`}` is admitted only in front of `else`, and that is a choice about what
+people write rather than about the grammar: `} if x > 1 {` parses as two
+statements, but nobody writes it on one line. What follows `else` IS the
+grammar -- rustc takes a block or another `if` and answers "expected
+`{`, found keyword `while`" for anything else.
+
+Corpus effect: none. Ten fixtures, five of them refusals.
+
+Round 111 -- a warning this file printed in CI on every clean checkout.
+
+`abi()`, added in round 108, held `[\w-]+` in a non-raw docstring. Python
+answers `SyntaxWarning: invalid escape sequence '\w'`, and the CI log
+printed it above the harness output on a pull request whose whole subject
+is a lint gate. The docstring is raw now.
+
+Every local run hid it. Python raises the warning once per BYTECODE
+compile, so a warm `__pycache__` is silent and only a clean checkout says
+anything. Three rounds of local verification could not have found it, and
+the CI log did the moment CI was allowed to finish.
+
+`--self-test` compiles the source under `warnings.catch_warnings` and
+fails on any escape-sequence warning. Compiling does not execute, and the
+check is proved by reverting the docstring: the self-test exits 1.
+
+Round 112 -- a label in front of a block, and a declaration with no body.
+
+`// 'outer: loop {` produced no CH001. Matching started at the label,
+which none of the alternatives read.
+
+rustc 1.94.1 enumerates what may follow a label rather than leaving it to
+guesswork: "expected `while`, `for`, `loop` or `{` after a label". So a
+label attaches to three of the six control-flow keywords and to a bare
+block, and not to `if`, `match` or `unsafe`. It is its own alternative
+for that reason -- hanging an optional label on the control-flow rule
+would have accepted `'a: if x > 1 {`, which the compiler rejects, and a
+bound that admits what the grammar refuses does no work.
+
+`// const LIMIT: usize;` and `// static FOREIGN: u8;` produced nothing
+either. The const rule requires an `=`, and rustc takes the first in a
+trait and the second in an extern block. The new alternative reads the
+type from `DECL_TYPE`, the same fragment the uninitialized binding now
+reads, rather than a second copy of it.
+
+Two residuals, both stated rather than papered over. `// 'note: {` is
+accepted; a line that opens a quote, gives one word, a colon and a brace
+and then stops is a labeled block by construction, and a guard against it
+would do no work. And `// 'outer: loop {}` is still missed, because the
+control-flow rule ends its line at the opening brace -- which is equally
+true of `// if x > 1 {}` and is one gap for all six keywords, not a new
+one.
+
+Corpus effect: none. Eight fixtures, four of them refusals.
+
+Round 113 -- an associated type declared rather than defined.
+
+`// type Item;` and `// type Iter: Iterator<Item = Self::Item>;` produced
+no CH001. The alias rule needs an `=`, and a trait's associated type has
+none.
+
+Three things the compiler settled. `pub type Item;` is E0449, "visibility
+qualifiers are not permitted here", so this alternative carries no
+visibility -- admitting one accepts what Rust refuses. A bound is a
+trait, so `type Item: [u8; 32];` is "expected a trait, found type", but a
+bound may HOLD an array as `Into<[u8; 32]>` does, so the run keeps the
+array guard. And `type Item where Self: Sized;` is a where clause with no
+bound at all.
+
+The adversarial prose sweep earned its place. The first version matched
+"type a::b is re-exported for callers;" -- the `::` puts a non-word
+character exactly where a bound's colon goes, and the three-bare-words
+lookahead could not see past it. The same sentence defeated the
+uninitialized binding in round forty-one, in the same way. A bound is
+introduced by ONE colon; a path separator is two, and the rule says so.
+`type I: ::std::fmt::Debug;` still reports, because its bound colon is
+followed by a space.
+
+Corpus effect: none. Nine fixtures, four of them refusals.
+
+Round 114 -- the array guard, written once instead of a fourth time.
+
+`// fn stale() -> [u8; 32] {` and `// const STALE: [u8; 32] = [0; 32];`
+produced no CH001. The `;` of an array length ended the run that was
+reading a type.
+
+This is the THIRD round to report that same guard missing from a
+different rule: the generic list in ninety-nine, the where clause and the
+impl header in one hundred and six, these two now. Patching the two
+reported sites would have earned a fourth round, so the question asked
+instead was which runs in the pattern bound themselves by `;` at all.
+
+Fifteen forms were outside the gate. Two were reported; the other twelve
+are the same defect in the type of an initialized binding, the type of a
+destructured one and its initializer, a control-flow condition, the tail
+of an `else if`, a turbofish, and the right-hand side of an assignment.
+
+The guard now has ONE definition -- `NO_SEMI` and its three variants,
+which differ only in what else they refuse -- and every type or
+expression position splices it. Writing it inline is what let three
+rounds find three copies of the same hole.
+
+The prose lookaheads keep their bare `[^;{]*` on purpose. A wider run
+there lets a lookahead see more text and refuse more often, which is the
+under-reporting direction, and prose holding an array type is not a thing
+anyone writes.
+
+One residual: `// return [0u8; 32];` is still missed. That rule takes a
+single whitespace-free token after the keyword, deliberately, because
+admitting spaces would swallow "return the row to the pool;". The array
+needs a space, so the two cannot both be had here.
+
+Corpus effect: none. Nine fixtures.
+
+Round 115 -- two Tier A false positives on correct comments.
+
+`// Renew the Let's Encrypt certificate` failed the build. CH003 read the
+apostrophe as deliberation and CH006 read it as a contraction, but the
+name is a certificate authority and "Let us Encrypt" is a wrong
+expansion. Both patterns now carry one shared exemption, keyed on the
+capitalised second word and read case-SENSITIVELY inside two otherwise
+case-insensitive patterns. "let's encrypt the payload" is still
+deliberation and still a contraction; only the name is exempt. Both
+apostrophe spellings are covered.
+
+`#[cfg_attr(all(), doc = "Two.")]` after a blank doc line failed CH004.
+Round 110 taught this rule to read `#[doc = ...]`; a `cfg_attr` carries
+the same payload, and rustdoc 1.94.1 renders two paragraphs for it.
+
+The attribute is now searched as a WHOLE rather than by its first line,
+which finds the payload at any nesting -- `cfg_attr(all(), cfg_attr(all(),
+doc = "Six."))` renders two paragraphs too -- and finds it when the
+attribute WRAPS and puts it three lines down, which the first-line
+version missed and nobody had reported.
+
+The predicate is not read, deliberately. `#[cfg_attr(any(), doc = ...)]`
+renders nothing, so treating it as content is an under-report; but
+`#[cfg_attr(feature = "x", doc = ...)]` cannot be decided from the source
+at all, and the two errors are not equal. A missed blank line is untidy.
+A Tier A false positive fails the build on correct documentation.
+
+The self-test caught a regression in the first version: the payload
+pattern omitted `[` from the characters that may precede `doc`, so the
+plain `#[doc = ...]` form stopped matching and every fixture from round
+110 failed. The fixtures were the only thing that noticed.
+
+Corpus effect: none. Seven fixtures, three of them refusals.
+
+Round 116 -- an assignment's right-hand side, and a guard that does not
+transfer.
+
+`// retries = retries + 1;` produced no CH001. The rule refused all
+whitespace after the `=`, which was doing the prose guarding by refusing
+most of the language. The guard now sits where every other rule puts it,
+on the words: three bare words before the terminator are a sentence.
+
+The same widening was TRIED on `return` and `break`, to retire the
+residual round one hundred and fourteen recorded. The adversarial sweep
+refused it, with eighteen generated sentences -- "return early, before
+the lock is taken;", "break cleanup() first, then retry;".
+
+The reason is worth keeping. The three-bare-words lookahead is ANCHORED:
+it fires only when the whole tail is bare words and a `;`, so any comma,
+colon or equals walks past it. An assignment survives the widening
+because `NAME =` anchors it before the prose starts. `return` is an
+English verb with no anchor at all.
+
+So `// return [0u8; 32];` stays missed, as that round said, and the file
+now records the failed attempt rather than the bare restatement.
+
+Corpus effect: none. Five fixtures, two of them refusals.
+
+Round 117 -- a false positive of my own making, a reference that routes
+nowhere, and the first corpus movement in fifty-five rounds.
+
+`// mode = legacy default;` failed the build. Round one hundred and
+sixteen widened the assignment rule and left the old three-word threshold
+beside it, so a TWO-word tail slipped through. rustc answers "expected
+one of `!`, `.`, `::`, `;`, `?`, `{`, `}`, or an operator, found
+`default`", so it is not an expression.
+
+The threshold is two words now, with one exception: `as`.
+`// retries = count as usize;` is a bare three-word run and valid Rust,
+and the old guard refused it, so the same change retires an under-report.
+`dyn`, `impl` and `move` were checked and are NOT exceptions -- they
+never appear in a bare word run, because `Box<dyn Send>`, `&dyn T` and
+`move || 1` each carry a character that ends one.
+
+The guard was written out six times. It is one fragment now, so the
+binding rules gained the `as` fix without being named in the report.
+
+`// TODO: fix token abc#123` counted as tracked. The file said the issue
+number needed no guard in front "because `owner/repo#123` is a real
+cross-repository reference" -- true of that form, and it admitted every
+other. The prefix is spelled out instead of tolerated: either the hash
+opens a token, or a complete `owner/repo` sits against it. `x/#123` has
+the slash and no repository, and is refused.
+
+CH007 counted every token inside an inline code span. `/// Use ` plus a
+twenty-six-token command plus `here.` is a two-word sentence, and the
+rule called it twenty-eight and failed the Tier B ratchet on
+documentation that says almost nothing. The count now reads the masked
+copy, where a span is one unbroken token -- the same mask that finds
+sentence boundaries.
+
+That last one MOVES THE CORPUS, for the first time since round sixty:
+CH007 falls from 18064 to 17661, exactly 403 sentences that were never
+over the limit. Tier A stays at zero, CH005 and CH006 do not move, and
+the ratchet still passes -- 4889 in changed files against 4891 at the
+merge base.
+
+Eight fixtures.
+
+Round 118 -- two more Tier A false positives, one of them the other half
+of last round's fix.
+
+`// const timeout: duration = legacy default;` failed the build. Round
+one hundred and seventeen gave the prose guard to the assignment and the
+bindings and not to the initialized const, which is the same shape with a
+keyword in front. It carries the fragment now.
+
+`// trait object;` and `// enum value;` failed it too. One terminator set
+was shared by four item kinds, and rustc 1.94.1 gives each a different
+answer:
+
+    struct Foo;    OK          enum E;   expected `{}`, found `;`
+    struct Foo();  OK          trait T;  expected `{}`, found `;`
+                               union U;  expected `where` or `{`
+
+Only a struct ends at `;` or `(`. The kinds are separate alternatives
+now, and the tuple form is a struct alone, because `union U(u8);` is not
+Rust either. Two ordinary English words were failing an absolute gate.
+
+`// *counter = counter + 1;` produced no CH001. The target class could
+not open on a star. The star must ABUT its target, so a markdown bullet
+does not reach the rule -- `strip_containers` has already removed a real
+bullet by then, and this is the cheaper second line.
+
+The self-test caught a regression on the way: making the star required
+rather than optional broke every plain assignment, six fixtures at once.
+
+Corpus effect: none, at 19311.
+
+Round 119 -- a bound that described a form the rule then refused.
+
+`// *(counter) = counter + 1;` and `// *(ptr.add(1)) = value;` produced
+no CH001. The previous round's lookahead reads `\*+(?=[\w(])` -- it
+admits an opening parenthesis -- and the class behind it could consume
+only word characters. So the bound named a shape the rule went on to
+reject, which is the failure this file has a rule against.
+
+The parenthesized target is allowed only BEHIND a star. A bare
+`(x) = 1;` is valid Rust as well, and admitting it at the start of a
+comment would open the rule to "(see below) = ..." for nothing.
+
+The target carries the prose guard too. The right-hand side had one
+already, but it reads only the right, and `*(the queue drains) = x;`
+puts the sentence on the left. Found while timing the first fix rather
+than by a reviewer, and cheap enough to close instead of record.
+
+Corpus effect: none, at 19311. Four fixtures, two of them refusals.
+
+Round 120 -- the binding mode in front of a name.
+
+`// let ref stale = String::new();` and the `ref mut` form produced no
+CH001. The rule read an optional `mut` and nothing else.
+
+Asking which OTHER rules read a binding found the third form the report
+did not name: `// let ref x: String;` is valid Rust, and the
+uninitialized rule was missing it for the same reason. Both read one
+`BIND` fragment now.
+
+The order is fixed, from rustc rather than from symmetry: `ref mut` is
+accepted and `mut ref` is E0658, "mutable by-reference binding", so the
+reverse stays out.
+
+The destructuring rules needed nothing, which was worth checking rather
+than assuming. `ref` binds an IDENTIFIER, so it sits inside the pattern
+-- `let (ref a, ref b) = t;` already reported -- and `let ref (a, b) = t;`
+is not Rust.
+
+Corpus effect: none, at 19311. Five fixtures, two of them refusals.
+
+Round 121 -- a literal value, matched instead of merely opened.
+
+`// #[Retry = 3 attempts remaining]` failed the build. The numeric branch
+opened on a digit and let `.*` take the rest, so prose after a number was
+an attribute value.
+
+Asking rustc 1.94.1 for the follow-set gives it verbatim: "expected one
+of `.`, `?`, `]`, or an operator". That set is NARROWER than the one a
+path gets -- no `!`, no `::`, no `{`, because a number is not a macro
+name, a path segment or a struct literal -- so it is its own fragment
+rather than a reuse of the path's.
+
+The same probe found the string branch has the identical hole, which was
+not reported: `// #[deprecated = "use foo" instead]` draws the same error
+from rustc and was passing the gate.
+
+Both are fixed by MATCHING the literal rather than opening it -- a
+non-raw string with its escapes, a raw string with balanced hashes, a
+number, a character -- because a follow-set is only possible once the
+literal has an end. That also retires an under-report nobody had filed:
+`// #[doc = r#"raw "inner" text"#]` is valid and the old opener could not
+read `r#` at all.
+
+`// #[doc = "text with ] bracket"]` still reports, which is the case a
+looser string match would have broken.
+
+Corpus effect: none, at 19311. Six fixtures, two of them refusals.
+
+On timing: the two new scans are linear, measured at 1000/2000/4000/8000
+words. A whole-corpus run is 32.8 seconds against 33.0 for the previous
+head, measured back to back -- the "23 seconds" quoted in earlier rounds
+was taken on a differently loaded machine and is not a baseline.
+
+Round 122 -- a block expression used as a statement.
+
+`// async move {};` and `// const { let value = 1; };` produced no CH001.
+The control-flow rule ends its line at the opening brace; these end at a
+`;`, and nothing read them.
+
+rustc 1.94.1 gives the set, and it is not the two reported. `unsafe {};`
+is the third and was not named. `move {}` is NOT one -- "expected one of
+`async`, `|`, or `||`" -- and `try` and `gen` blocks are E0658,
+experimental, so all three stay out rather than being admitted for
+symmetry.
+
+A bare `{ let x = 1; };` is valid too and is deliberately NOT admitted.
+Without a keyword there is nothing to anchor on, and a braced aside in
+prose would reach it. Stated as an under-report rather than taken.
+
+The four-lowercase-word lookahead comes along, so
+`// const {the shard map is stale};` stays prose.
+
+Corpus effect: none, at 19311. Five fixtures, two of them refusals.
+
+Round 123 -- the prose guard reads atoms now, not words.
+
+`// timeout = 30-second default;` failed the build. The guard counted
+runs of bare words, and the hyphen in `30-second` ends a run before two
+words are there to count.
+
+Counting words was wrong twice over: three was too many, which let
+`mode = legacy default;` past in round one hundred and eighteen, and a
+word run cannot see punctuation, which let this one past.
+
+What actually separates the two is that an EXPRESSION never puts two
+atoms side by side. `a - b;` has an operator between them; `legacy
+default;` and `30-second default;` do not. The test is now whether the
+tail ends with a word whose preceding character is neither an operator
+nor a delimiter.
+
+Five keywords do legally put two atoms together, and each is checked
+against rustc rather than assumed: `as` in an expression, and `mut`,
+`const`, `dyn` and `impl` in a type, where this guard also runs. The
+self-test caught the first two the moment the guard became positional --
+`let handle: &'a mut Worker;` and `let ptr: *const u8;` are shape
+fixtures, and both went missing.
+
+`// TODO: fix -/-#1` counted as tracked. Round one hundred and seventeen
+spelled the cross-repository prefix out and then let it be any run of
+punctuation. An owner and a repository begin with an alphanumeric.
+
+Corpus effect: none, at 19311. Four fixtures. The new guard is also
+faster than the old one on a prose tail, 0.02 ms against 0.3 ms.
+
+Round 124 -- a follow-set is not a validation.
+
+`// #[Retry = 3 + attempts remaining]` failed the build. Round one hundred
+and twenty-one gave the attribute's FIRST atom a follow-set from rustc and
+left `.*` to take everything after it, so the `+` satisfied the set and
+the prose rode in behind it. Checking where a value STARTS is not the same
+as checking what it is.
+
+The attribute now carries the same two-atoms test the assignment does,
+anchored on the `]` that ends it rather than the `;`. It guards the whole
+alternative, so the delimiter branch is covered as well -- `// #[Note (see
+below) and more]` reports nothing either, and that form was not reported.
+
+`// Foo::<u8>::bar();` produced no CH001. A turbofish was allowed once and
+only at the end of a path, and this one sits BETWEEN segments: the type is
+instantiated and then an associated function is named. rustc accepts it.
+
+Corpus effect: none, at 19311. Four fixtures, two of them refusals. Both
+new scans are linear, measured at 2000, 4000 and 8000.
+
+Round 125 -- a regression of my own, and the reason nothing caught it.
+
+`// ::std::mem::drop(value);` produced no CH001. It reported on 285bb93
+and stopped on 94bfcbb: round one hundred and twenty-four rebuilt this
+path to admit turbofish segments and dropped the `:` that the old leading
+class had carried.
+
+The useful part is why it survived. Round one hundred and nine checked
+this exact form BY HAND, found it already reported, put it in a table in
+a review reply as evidence, and wrote no fixture for it. A shape proved
+in prose is a shape the next rewrite may break silently -- the corpus
+diff cannot see it, because the corpus holds no commented-out root-
+qualified call. It has a fixture now.
+
+Every other call shape was checked against both heads rather than
+assumed: fifteen forms, one regressed, one gained (the turbofish that
+round intended), thirteen unchanged.
+
+That sweep also turned up a form missed by BOTH heads and never reported:
+`// <Foo as Bar>::baz();` names a trait method through a qualified path,
+and rustc accepts it. Added, with `// <b>bold</b> text here;` as the
+refusal that keeps a tag from reading as one.
+
+Corpus effect: none, at 19311. Three fixtures.
+
+Round 126 -- the prose guard reads the whole tail.
+
+`// timeout = legacy default + jitter;` failed the build. The guard read
+the atom immediately before the `;`, where `+ jitter` looks like an
+expression, and the adjacent `legacy default` in the middle went unseen.
+
+This is the fourth shape of that guard, and the first three each read too
+little: a three-word threshold missed `mode = legacy default;` in round
+one hundred and eighteen, a bare-word run could not see the hyphen in
+`30-second default;` in one hundred and twenty-three, and reading only
+the last atom missed this one. Reading the WHOLE tail is what they have
+in common.
+
+It asks two questions now, and calls the tail prose only when both
+answer yes. Does it carry no CODE SIGNAL -- no quote, `!`, `(`, `[` or
+`::`? And are two word-atoms ADJACENT with nothing but space between
+them? An expression never does the second, and the keyword pairs that
+appear to (`count as`, `as usize`, `mut Worker`, `} else`) are exempt on
+either side.
+
+The code signal is what keeps `msg = format!("the queue is paused");`
+reported. Without it, the words inside a string literal would read as
+prose and a real commented-out statement would go missing -- an
+under-report traded for the false positive, which is the wrong way round.
+
+Verified against 56 hand-built cases, 42 valid Rust and 14 prose, before
+the file was touched.
+
+`// <Vec<u8> as Bar>::baz();` produced no CH001. The qualified path added
+last round excluded every inner angle bracket, so it covered only the
+non-generic form. Bounded by the `;` that would end the statement now, so
+the brackets nest freely.
+
+Corpus effect: none, at 19311. Three fixtures.
+
+On timing: both scans are linear, measured at five sizes with the best of
+three runs each. A single sample at 40000 characters read 4.1 ms and
+looked superlinear; it was noise.
+
+Round 127 -- the ratchet stopped watching a file and said nothing.
+
+A changed path with a non-ASCII character, a tab or a newline left the
+Tier B scope silently. Git QUOTES a path it cannot write plainly, so
+`src/é.rs` arrives as `"src/\303\251.rs"` -- quotes and octal escapes
+included -- and that string does not end in `.rs`.
+
+Proved against real git output rather than argued. In a scratch
+repository holding an added `src/é.rs` and a rename to `src/ñ.rs`, the
+old parser returns two paths and NEITHER ends in `.rs`; the new one
+returns both correctly. The rename target was quoted too, so a rename to
+such a name was dropped as well, which the report did not mention.
+
+`-z` writes every field raw and NUL-terminated, so there is nothing to
+unquote: `STATUS\0path\0`, and `R100\0old\0new\0` for a rename or a copy.
+
+The parsing is its own function now, `parse_name_status`, so it can carry
+a fixture -- the round one hundred and twenty-five lesson, applied before
+a reviewer has to teach it twice. The fixture is real `-z` output
+captured from that scratch repository, holding both record shapes.
+
+A ratchet that quietly stops watching a file is worse than one that
+fails, which is what makes this worth more than the regex rounds around
+it.
+
+Corpus effect: none. Still gating the same 22 changed files.

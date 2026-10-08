@@ -374,15 +374,52 @@ pub fn spawn_session_slot_reconciler(
     registry: SessionSlotRegistry,
     cancel: tokio_util::sync::CancellationToken,
     interval: std::time::Duration,
+    // The shard this pool serves (issue #1823). A held shard gets no write.
+    shard: Option<crate::types::ShardId>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    // Keep the worker dispatch binding for hints (issue #1431).
+    crate::dispatch::spawn_bound(async move {
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
                 () = tokio::time::sleep(interval) => {}
             }
-            match pool.get().await {
-                Ok(mut conn) => match reconcile_local_sessions(&mut conn, &registry).await {
+            // Issue #1823: a held shard skips the tick before it takes a connection.
+            // It can be an unreachable standby, so a checkout could wait on it.
+            if crate::replication::shard_writes_held(shard) {
+                continue;
+            }
+            // Selected against `cancel` (issue #1426). A pool may have no
+            // deadpool `Timeouts`, so `pool.get()` alone can park this task
+            // indefinitely on an exhausted shard pool. The top-of-loop select
+            // only guards the sleep between ticks. A tick already parked
+            // here would otherwise never observe shutdown. The join in
+            // `shutdown_and_cleanup_monitors` would then wait forever.
+            let get_result = tokio::select! {
+                () = cancel.cancelled() => break,
+                result = pool.get() => result,
+            };
+            // The fence opens only after the checkout. A tick that waits for a
+            // connection holds no barrier, so pool pressure cannot block a bump. The
+            // tick runs under the barrier of this shard and each pinned shard
+            // colocated with it. A fenced shard skips the tick, and a lost barrier
+            // stops it.
+            let Some(fence) = crate::replication::begin_shard_tick(&pool, shard).await else {
+                continue;
+            };
+            match get_result {
+                Ok(mut conn) => match crate::replication::run_fenced_pass(
+                    &fence,
+                    Box::pin(async {
+                        // Issue #1823: the older connection joins the pass.
+                        // A lost guard then ends its backend.
+                        let _member = crate::replication::join_fenced_pass(&pool, &mut conn).await;
+                        reconcile_local_sessions(&mut conn, &registry).await
+                    }),
+                )
+                .await
+                .and_then(|done| done)
+                {
                     Ok(released) if released > 0 => {
                         tracing::warn!(
                             released,
@@ -734,6 +771,9 @@ async fn break_session_and_fail_members(
     conn: &mut diesel_async::AsyncPgConnection,
     session_id: crate::types::SessionId,
     reason: BrokenSessionReason,
+    // Issue #1243: `ActivityFailed` carries `details`, a payload-bearing field,
+    // so this write encodes through the configured registry like every other.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<usize> {
     use diesel::prelude::*;
     use diesel_async::{AsyncConnection, RunQueryDsl};
@@ -742,88 +782,99 @@ async fn break_session_and_fail_members(
     use crate::event::WorkflowEvent;
     use crate::models::TaskQueueItem;
 
-    Box::pin(conn.transaction::<usize, HarvestError, _>(async |conn| {
-        use crate::schema::harvest_sessions::dsl as s;
-        use crate::schema::harvest_task_queue::dsl as q;
+    // Each wake below re-pends a parked workflow task, so it raises a dispatch
+    // hint (issue #1312). The buffering scope holds every hint until this
+    // transaction commits. A hint published earlier names a row no reader
+    // outside this transaction can see.
+    crate::dispatch::buffered_settled(Box::pin(conn.transaction::<usize, HarvestError, _>(
+        async |conn| {
+            use crate::schema::harvest_sessions::dsl as s;
+            use crate::schema::harvest_task_queue::dsl as q;
 
-        let still_active: Option<String> = s::harvest_sessions
-            .find(session_id.as_uuid())
-            .for_update()
-            .select(s::state)
-            .first(conn)
-            .await
-            .optional()
-            .map_err(crate::error::database_error)?;
-        if still_active.as_deref() != Some("ACTIVE") {
-            return Ok(0);
-        }
-
-        diesel::update(s::harvest_sessions.find(session_id.as_uuid()))
-            .set(crate::models::SessionBrokenUpdate {
-                state: "BROKEN".to_string(),
-                broken_at: chrono::Utc::now(),
-                broken_reason: reason.to_string(),
-            })
-            .execute(conn)
-            .await
-            .map_err(crate::error::database_error)?;
-
-        let member_tasks: Vec<TaskQueueItem> = q::harvest_task_queue
-            .filter(q::session_id.eq(Some(session_id.as_uuid())))
-            .filter(q::state.eq_any(["PENDING", "RUNNING"]))
-            .select(TaskQueueItem::as_select())
-            .load(conn)
-            .await
-            .map_err(crate::error::database_error)?;
-
-        let mut failed = 0usize;
-        for task in member_tasks {
-            let Some(exec_uuid) = task.workflow_exec_id else {
-                continue;
-            };
-            let Some(activity_name) = task.activity_name.as_deref() else {
-                continue;
-            };
-            let exec_id: crate::types::ExecutionId = exec_uuid
-                .to_string()
-                .parse()
-                .expect("database UUIDs must round-trip into ExecutionId");
-
-            let history =
-                crate::timeout::lock_workflow_execution_and_load_history(conn, exec_id).await?;
-            let Some(activity_id) = crate::timeout::pending_activity_id_for_task(
-                &history.events,
-                &task,
-                activity_name,
-            )?
-            else {
-                continue;
-            };
-            let Some(state) = crate::timeout::task_state_for_update(conn, task.id).await? else {
-                continue;
-            };
-            if state != "PENDING" && state != "RUNNING" {
-                continue;
+            let still_active: Option<String> = s::harvest_sessions
+                .find(session_id.as_uuid())
+                .for_update()
+                .select(s::state)
+                .first(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?;
+            if still_active.as_deref() != Some("ACTIVE") {
+                return Ok(0);
             }
 
-            let attempt = u32::try_from(task.attempt.max(1)).unwrap_or(1);
-            let failed_event = WorkflowEvent::ActivityFailed {
-                activity_id,
-                error: reason.to_string(),
-                attempt,
-                error_type: crate::failure::ERROR_TYPE_SESSION_BROKEN.to_string(),
-                non_retryable: true,
-                details: None,
-            };
-            crate::store::append_events(conn, exec_id, &[failed_event], history.next_event_id)
-                .await?;
-            crate::queue::fail_task(conn, task.id, &reason.to_string()).await?;
-            crate::queue::wake_workflow_task(conn, exec_id).await?;
-            failed += 1;
-        }
+            diesel::update(s::harvest_sessions.find(session_id.as_uuid()))
+                .set(crate::models::SessionBrokenUpdate {
+                    state: "BROKEN".to_string(),
+                    broken_at: chrono::Utc::now(),
+                    broken_reason: reason.to_string(),
+                })
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
 
-        Ok(failed)
-    }))
+            let member_tasks: Vec<TaskQueueItem> = q::harvest_task_queue
+                .filter(q::session_id.eq(Some(session_id.as_uuid())))
+                .filter(q::state.eq_any(["PENDING", "RUNNING"]))
+                .select(TaskQueueItem::as_select())
+                .load(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+
+            let mut failed = 0usize;
+            for task in member_tasks {
+                let Some(exec_uuid) = task.workflow_exec_id else {
+                    continue;
+                };
+                let Some(activity_name) = task.activity_name.as_deref() else {
+                    continue;
+                };
+                let exec_id = crate::types::ExecutionId::from_uuid(exec_uuid);
+
+                let history =
+                    crate::timeout::lock_workflow_execution_and_load_history(conn, exec_id, codecs)
+                        .await?;
+                let Some(activity_id) = crate::timeout::pending_activity_id_for_task(
+                    &history.events,
+                    &task,
+                    activity_name,
+                )?
+                else {
+                    continue;
+                };
+                let Some(state) = crate::timeout::task_state_for_update(conn, task.id).await?
+                else {
+                    continue;
+                };
+                if state != "PENDING" && state != "RUNNING" {
+                    continue;
+                }
+
+                let attempt = u32::try_from(task.attempt.max(1)).unwrap_or(1);
+                let failed_event = WorkflowEvent::ActivityFailed {
+                    activity_id,
+                    error: reason.to_string(),
+                    attempt,
+                    error_type: crate::failure::ERROR_TYPE_SESSION_BROKEN.to_string(),
+                    non_retryable: true,
+                    details: None,
+                };
+                crate::store::append_events_with_codecs(
+                    conn,
+                    exec_id,
+                    &[failed_event],
+                    history.next_event_id,
+                    codecs,
+                )
+                .await?;
+                crate::queue::fail_task(conn, task.id, &reason.to_string()).await?;
+                crate::queue::wake_workflow_task(conn, exec_id).await?;
+                failed += 1;
+            }
+
+            Ok(failed)
+        },
+    )))
     .await
 }
 
@@ -844,6 +895,8 @@ async fn break_session_and_fail_members(
 pub async fn enforce_broken_sessions(
     conn: &mut diesel_async::AsyncPgConnection,
     worker_stale_secs: i64,
+    // Issue #1243: forwarded to the member-failure write below.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<usize> {
     use diesel_async::RunQueryDsl;
 
@@ -860,7 +913,7 @@ pub async fn enforce_broken_sessions(
             continue;
         };
         let session_id = crate::types::SessionId::from_uuid(candidate.id);
-        total += break_session_and_fail_members(conn, session_id, reason).await?;
+        total += break_session_and_fail_members(conn, session_id, reason, codecs).await?;
     }
     Ok(total)
 }

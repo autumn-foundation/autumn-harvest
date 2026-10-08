@@ -37,10 +37,13 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 // -------------------------------------------------------------------------
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
-async fn setup_test_db() -> (String, ContainerAsync<Postgres>) {
+async fn setup_test_db() -> (String, Option<ContainerAsync<Postgres>>) {
+    if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+        return (url, None);
+    }
     let container = Postgres::default()
         .with_init_sql(init_sql())
         .with_tag("16")
@@ -50,7 +53,7 @@ async fn setup_test_db() -> (String, ContainerAsync<Postgres>) {
     let host = container.get_host().await.expect("host");
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
-    (url, container)
+    (url, Some(container))
 }
 
 fn build_pool(database_url: &str) -> DbPool {
@@ -165,6 +168,9 @@ fn build_registry(telemetry: Arc<TelemetryConfig>) -> Arc<HandlerRegistry> {
 
 fn runtime_config(worker_id: &str, slot_tuner: Option<SlotTunerConfig>) -> WorkerRuntimeConfig {
     WorkerRuntimeConfig {
+        codec_rotation_batch_size: 0,
+        scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
+        dr: autumn_harvest::replication::DrConfig::default(),
         worker_id: worker_id.to_string(),
         queues: vec!["default".to_string()],
         notification_database_url: None,
@@ -183,6 +189,7 @@ fn runtime_config(worker_id: &str, slot_tuner: Option<SlotTunerConfig>) -> Worke
         build_id: String::new(),
         deployment_name: None,
         workflow_cache_size: 1000,
+        resident_workflows: true,
         priority_aging_secs: None,
         unknown_target_grace_window: Duration::from_secs(5),
         poison_pill_threshold: 3,
@@ -211,7 +218,7 @@ async fn start_workflow(database_url: &str, workflow_id: &str) -> ExecutionId {
             workflow_name: "slot_tuner_slow_workflow",
             workflow_id,
             exec_id,
-            input: Value::Null,
+            input: Value::Null.into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,

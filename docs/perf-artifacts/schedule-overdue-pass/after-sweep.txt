@@ -1,0 +1,5 @@
+-- after: overdue_schedule_pass, pg_stat_statements aux-lookup call/buffer sweep --
+n	aux_calls	aux_buffers	schedules_list_calls
+50	4	8	1
+200	4	11	1
+500	4	17	1

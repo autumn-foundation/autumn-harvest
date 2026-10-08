@@ -564,10 +564,18 @@ pub fn is_compensation_dispatch(input: &serde_json::Value, dispatched: &BTreeSet
 /// forward node introduced under a name an older definition used for a
 /// compensator reports `NotAttempted` rather than inheriting the compensation's
 /// outcome.
+///
+/// `dispatched` is [`dispatched_activity_names`] over the same `events` --
+/// callers that classify more than one node from the same history must
+/// compute it once and pass it in, rather than each call recomputing an
+/// identical `BTreeSet` (issue #690 follow-up; the same redundancy class as
+/// `dag_graph::latest_scheduled`'s pre-hoist shape).
 #[must_use]
-pub fn node_outcome(events: &[WorkflowEvent], node: &str) -> NodeOutcome {
-    let dispatched = dispatched_activity_names(events);
-
+pub fn node_outcome(
+    events: &[WorkflowEvent],
+    node: &str,
+    dispatched: &BTreeSet<&str>,
+) -> NodeOutcome {
     // Find the activity_id of the *latest* ActivityScheduled with this name.
     // If a node was scheduled more than once (e.g. a re-dispatched attempt with
     // a fresh activity_id), the latest attempt is the one whose terminal state
@@ -581,7 +589,7 @@ pub fn node_outcome(events: &[WorkflowEvent], node: &str) -> NodeOutcome {
             ..
         } = event
             && name == node
-            && !is_compensation_dispatch(input, &dispatched)
+            && !is_compensation_dispatch(input, dispatched)
         {
             scheduled_id = Some(*activity_id);
             break;
@@ -720,10 +728,11 @@ pub fn resolve_retry_plan(
 
     // (b) Every requested node must have been attempted, and (c) be in a
     // non-Succeeded state on the source run.
+    let dispatched = dispatched_activity_names(events);
     let mut not_attempted = Vec::new();
     let mut already_succeeded = Vec::new();
     for node in from_nodes {
-        let outcome = node_outcome(events, node);
+        let outcome = node_outcome(events, node, &dispatched);
         if !outcome.is_attempted() {
             not_attempted.push(node.clone());
         } else if outcome.is_succeeded() {
@@ -959,9 +968,16 @@ mod tests {
             scheduled("c", id_c),
             failed(id_c),
         ];
-        assert_eq!(node_outcome(&events, "a"), NodeOutcome::Succeeded);
-        assert_eq!(node_outcome(&events, "c"), NodeOutcome::Failed);
-        assert_eq!(node_outcome(&events, "d"), NodeOutcome::NotAttempted);
+        let dispatched = dispatched_activity_names(&events);
+        assert_eq!(
+            node_outcome(&events, "a", &dispatched),
+            NodeOutcome::Succeeded
+        );
+        assert_eq!(node_outcome(&events, "c", &dispatched), NodeOutcome::Failed);
+        assert_eq!(
+            node_outcome(&events, "d", &dispatched),
+            NodeOutcome::NotAttempted
+        );
     }
 
     #[test]
@@ -977,7 +993,11 @@ mod tests {
             scheduled("c", id2),
             completed(id2),
         ];
-        assert_eq!(node_outcome(&events, "c"), NodeOutcome::Succeeded);
+        let dispatched = dispatched_activity_names(&events);
+        assert_eq!(
+            node_outcome(&events, "c", &dispatched),
+            NodeOutcome::Succeeded
+        );
     }
 
     /// Issue #780 introduced a *new class* of `ActivityScheduled` event — the
@@ -1006,13 +1026,14 @@ mod tests {
             activity_started(iu),
             completed(iu),
         ];
+        let dispatched = dispatched_activity_names(&events);
         assert_eq!(
-            node_outcome(&events, "undo_a"),
+            node_outcome(&events, "undo_a", &dispatched),
             NodeOutcome::NotAttempted,
             "a compensation dispatch must never be read as a forward node's outcome"
         );
         assert_eq!(
-            node_outcome(&events, "a"),
+            node_outcome(&events, "a", &dispatched),
             NodeOutcome::Succeeded,
             "the genuinely-executed forward node is unaffected"
         );
@@ -1039,7 +1060,11 @@ mod tests {
             },
             completed(ia),
         ];
-        assert_eq!(node_outcome(&events, "a"), NodeOutcome::Succeeded);
+        let dispatched = dispatched_activity_names(&events);
+        assert_eq!(
+            node_outcome(&events, "a", &dispatched),
+            NodeOutcome::Succeeded
+        );
     }
 
     // ---- resolve: linear -------------------------------------------------

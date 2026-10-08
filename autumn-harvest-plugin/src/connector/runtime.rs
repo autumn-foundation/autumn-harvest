@@ -227,11 +227,12 @@ impl Default for ConnectorRuntimeConfig {
             // An hour covers a 30s visibility timeout against SQS's
             // `maxReceiveCount` maximum of 1000 with room to spare.
             poison_retention: std::time::Duration::from_secs(60 * 60),
-            // Same 30s the engine gives its own worker drain, for the same
-            // reason: long enough that an ordinary in-flight dispatch settles
-            // and gets acked, short enough that a rolling deployment is not
-            // held hostage by one wedged call.
-            shutdown_timeout: std::time::Duration::from_secs(30),
+            // The engine's own worker drain default, for the same reason. It
+            // is long enough that an ordinary in-flight dispatch settles and
+            // gets acked. It is short enough that one wedged call cannot hold
+            // a rolling deployment hostage. It also ends before a Kubernetes
+            // `SIGKILL` (issue #1813).
+            shutdown_timeout: autumn_harvest::builder::DEFAULT_SHUTDOWN_TIMEOUT,
         }
     }
 }
@@ -2492,7 +2493,10 @@ mod tests {
         }
 
         assert!(sink.entries().is_empty());
-        assert!(source.acked().is_empty());
+        assert_eq!(
+            source.acked(),
+            [] as [crate::connector::message::MessageHandle; 0]
+        );
         assert_eq!(source.abandoned().len(), 5, "redelivered on every lap");
         assert_eq!(
             rt.poison.lock().await.tracked(),
@@ -2520,7 +2524,10 @@ mod tests {
 
         assert_eq!(summary.dead_lettered, 1);
         assert!(sink.entries().is_empty(), "the broker owns the DLQ here");
-        assert!(source.acked().is_empty());
+        assert_eq!(
+            source.acked(),
+            [] as [crate::connector::message::MessageHandle; 0]
+        );
         // The POISON path, not the transient-retry path: the two are opposite
         // intents (drive the receive count toward the redrive threshold vs.
         // return gently with backoff) and SQS implements them differently.
@@ -2548,7 +2555,10 @@ mod tests {
         let summary = rt.run_once().await.unwrap();
 
         assert_eq!(summary.retried, 1);
-        assert!(source.acked().is_empty());
+        assert_eq!(
+            source.acked(),
+            [] as [crate::connector::message::MessageHandle; 0]
+        );
         assert_eq!(source.abandoned().len(), 1);
         assert!(
             source.nacked_for_dead_letter().is_empty(),
@@ -3594,7 +3604,7 @@ mod tests {
         let rt = runtime_with_metrics(malformed_binding(), source, sink, Arc::clone(&metrics));
 
         rt.run_once().await.unwrap();
-        assert!(metrics.lag().is_empty());
+        assert_eq!(metrics.lag(), [] as [(std::string::String, i64); 0]);
     }
 
     #[tokio::test]

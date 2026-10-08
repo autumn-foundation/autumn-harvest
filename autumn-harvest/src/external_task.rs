@@ -142,6 +142,7 @@ pub async fn record_external_task(
         "external task schedule to close",
     )?;
 
+    // host-clock-ok: the external-task timeout scan also compares with the host clock.
     let schedule_to_close_at = Utc::now().checked_add_signed(dur).ok_or_else(|| {
         crate::error::HarvestError::Database("Datetime addition overflow".to_string())
     })?;
@@ -306,6 +307,11 @@ pub async fn find_by_token_locked(
 /// parked workflow task.  Returns `true` if the state transition happened,
 /// `false` if the token was already in a terminal state (idempotent).
 ///
+/// Delegates to [`complete_externally_with_codecs`] under the identity
+/// registry (issue #1243). A payload-bearing call site should use the
+/// `_with_codecs` sibling instead. This wrapper keeps the pre-#1243 public
+/// signature for an out-of-tree caller.
+///
 /// # Errors
 ///
 /// Returns [`HarvestError::NotFound`] when `token` is unknown on this shard.
@@ -314,35 +320,57 @@ pub async fn complete_externally(
     token: ExternalActivityToken,
     output: serde_json::Value,
 ) -> HarvestResult<bool> {
-    Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
-        let task = lock_task(conn, token).await?;
+    complete_externally_with_codecs(conn, token, output, &crate::store::DEFAULT_PAYLOAD_CODECS)
+        .await
+}
 
-        if task.state != "PENDING" {
-            return Ok(false);
-        }
+/// [`complete_externally`], encoding `ActivityCompletedExternally.output`
+/// through `codecs` (issue #1243).
+///
+/// # Errors
+///
+/// Same as [`complete_externally`].
+pub async fn complete_externally_with_codecs(
+    conn: &mut AsyncPgConnection,
+    token: ExternalActivityToken,
+    output: serde_json::Value,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<bool> {
+    // The wake below re-pends a parked workflow task, so it raises a dispatch
+    // hint (issue #1312). The buffering scope holds the hint until this
+    // transaction commits. A hint published earlier names a row no reader
+    // outside this transaction can see.
+    crate::dispatch::buffered_settled(Box::pin(conn.transaction::<bool, HarvestError, _>(
+        async |conn| {
+            let task = lock_task(conn, token).await?;
 
-        let exec_id = ExecutionId::from_uuid(task.workflow_exec_id);
-        let activity_id = ActivityExecId::from_uuid(task.activity_id);
+            if task.state != "PENDING" {
+                return Ok(false);
+            }
 
-        diesel::update(harvest_external_tasks::table.find(task.id))
-            .set((
-                harvest_external_tasks::state.eq("COMPLETED"),
-                harvest_external_tasks::updated_at.eq(Utc::now()),
-            ))
-            .execute(conn)
-            .await
-            .map_err(database_error)?;
+            let exec_id = ExecutionId::from_uuid(task.workflow_exec_id);
+            let activity_id = ActivityExecId::from_uuid(task.activity_id);
 
-        let event = WorkflowEvent::ActivityCompletedExternally {
-            activity_id,
-            token,
-            output,
-        };
-        store::append_single_event(conn, exec_id, event).await?;
-        crate::queue::wake_workflow_task(conn, exec_id).await?;
+            diesel::update(harvest_external_tasks::table.find(task.id))
+                .set((
+                    harvest_external_tasks::state.eq("COMPLETED"),
+                    harvest_external_tasks::updated_at.eq(Utc::now()),
+                ))
+                .execute(conn)
+                .await
+                .map_err(database_error)?;
 
-        Ok(true)
-    }))
+            let event = WorkflowEvent::ActivityCompletedExternally {
+                activity_id,
+                token,
+                output,
+            };
+            store::append_single_event_with_codecs(conn, exec_id, event, codecs).await?;
+            crate::queue::wake_workflow_task(conn, exec_id).await?;
+
+            Ok(true)
+        },
+    )))
     .await
 }
 
@@ -361,36 +389,42 @@ pub async fn fail_externally(
     error: String,
     retryable: bool,
 ) -> HarvestResult<bool> {
-    Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
-        let task = lock_task(conn, token).await?;
+    // The wake below re-pends a parked workflow task, so it raises a dispatch
+    // hint (issue #1312). The buffering scope holds the hint until this
+    // transaction commits. A hint published earlier names a row no reader
+    // outside this transaction can see.
+    crate::dispatch::buffered_settled(Box::pin(conn.transaction::<bool, HarvestError, _>(
+        async |conn| {
+            let task = lock_task(conn, token).await?;
 
-        if task.state != "PENDING" {
-            return Ok(false);
-        }
+            if task.state != "PENDING" {
+                return Ok(false);
+            }
 
-        let exec_id = ExecutionId::from_uuid(task.workflow_exec_id);
-        let activity_id = ActivityExecId::from_uuid(task.activity_id);
+            let exec_id = ExecutionId::from_uuid(task.workflow_exec_id);
+            let activity_id = ActivityExecId::from_uuid(task.activity_id);
 
-        diesel::update(harvest_external_tasks::table.find(task.id))
-            .set((
-                harvest_external_tasks::state.eq("FAILED"),
-                harvest_external_tasks::updated_at.eq(Utc::now()),
-            ))
-            .execute(conn)
-            .await
-            .map_err(database_error)?;
+            diesel::update(harvest_external_tasks::table.find(task.id))
+                .set((
+                    harvest_external_tasks::state.eq("FAILED"),
+                    harvest_external_tasks::updated_at.eq(Utc::now()),
+                ))
+                .execute(conn)
+                .await
+                .map_err(database_error)?;
 
-        let event = WorkflowEvent::ActivityFailedExternally {
-            activity_id,
-            token,
-            error,
-            retryable,
-        };
-        store::append_single_event(conn, exec_id, event).await?;
-        crate::queue::wake_workflow_task(conn, exec_id).await?;
+            let event = WorkflowEvent::ActivityFailedExternally {
+                activity_id,
+                token,
+                error,
+                retryable,
+            };
+            store::append_single_event(conn, exec_id, event).await?;
+            crate::queue::wake_workflow_task(conn, exec_id).await?;
 
-        Ok(true)
-    }))
+            Ok(true)
+        },
+    )))
     .await
 }
 

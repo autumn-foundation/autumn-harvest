@@ -5,7 +5,10 @@
 //! record samples into it) and `autumn_web::actuator::MetricsSource` (so
 //! autumn-web's already-shared `/actuator/prometheus` endpoint can render
 //! those samples alongside the app's own `autumn_http_*` families and any
-//! other plugin's metrics).
+//! other plugin's metrics). [`HarvestMetricsRecorder::render_prometheus`]
+//! (issue #1611) renders the same aggregated state directly, for a
+//! standalone embedder with no `autumn_web::actuator` endpoint to feed —
+//! see `examples/standalone-runner`.
 //!
 //! This deliberately does **not** touch the global `metrics`-crate registry
 //! (unlike the `metrics-rs` adapter/escape hatch documented in
@@ -25,8 +28,12 @@
 //! on every tick with their results silently discarded. It also aggregates the
 //! four broker-connector families (issue #944), which are not sampler-adjacent
 //! but do back shipped dashboard panels — leaving those to the no-op default
-//! would make a dropped metric indistinguishable from an idle consumer. Every
-//! other `MetricsRecorder` method keeps the trait's no-op default — an embedder
+//! would make a dropped metric indistinguishable from an idle consumer. It
+//! also aggregates `harvest.api.rate_limited` from the plugin's own API rate
+//! limiter (issue #1827), and `harvest.build.ramp_aborted` from the build
+//! ramp guard (issue #1814).
+//!
+//! Every other `MetricsRecorder` method keeps the trait's no-op default — an embedder
 //! who needs the full metric surface (e.g. `harvest.workflow.terminal`,
 //! `harvest.activity.attempts`/`.retries`, `harvest.schedule.fire_attempts`,
 //! and the rest of the starter alert pack in `docs/alerts/`) or OTLP export
@@ -41,11 +48,14 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use autumn_harvest::telemetry::{
-    ActivityStatus, ConnectorOutcome, METRIC_LABEL_ACTIVITY, METRIC_LABEL_KIND, METRIC_LABEL_NAME,
-    METRIC_LABEL_OUTCOME, METRIC_LABEL_QUEUE, METRIC_LABEL_REASON, METRIC_LABEL_SHARD,
-    METRIC_LABEL_SLOT_TYPE, METRIC_LABEL_SOURCE, METRIC_LABEL_STATUS, METRIC_LABEL_WORKFLOW,
-    MetricsRecorder, PoisonReason, SlotType, WorkflowStatus,
+    ActivityStatus, BUILD_ID_LABEL_NONE, ConnectorOutcome, DbOp, METRIC_LABEL_ACTIVITY,
+    METRIC_LABEL_BUILD_ID, METRIC_LABEL_CLIENT_KIND, METRIC_LABEL_DIMENSION, METRIC_LABEL_KIND,
+    METRIC_LABEL_NAME, METRIC_LABEL_OP, METRIC_LABEL_OUTCOME, METRIC_LABEL_QUEUE,
+    METRIC_LABEL_REASON, METRIC_LABEL_ROUTE_CLASS, METRIC_LABEL_SHARD, METRIC_LABEL_SLOT_TYPE,
+    METRIC_LABEL_SOURCE, METRIC_LABEL_STATUS, METRIC_LABEL_WORKFLOW, MetricsRecorder, PoisonReason,
+    SlotType, WorkflowStatus,
 };
+use autumn_harvest::worker_outlier::OutlierDimension;
 use autumn_web::actuator::{MetricFamily, MetricKind, MetricSample, MetricsSource};
 
 /// Label values keyed to a stable position; label *names* are supplied by
@@ -176,6 +186,29 @@ struct Inner {
     connector_dispatched: Counter,
     connector_poisoned: Counter,
     connector_lag: Gauge,
+    // Issue #1429: the dispatch background publisher's dropped-hint counter
+    // already exists (`dispatch::dropped_hints()`); without an override here
+    // it stays invisible to the built-in scrape endpoint.
+    dispatch_dropped_hints: Gauge,
+    // Issue #1796: the post-commit notify path exposes two in-process
+    // readings. Without an override here, the built-in scrape endpoint
+    // discards both of them.
+    notify_send_failures: Gauge,
+    notify_queue_usage: Gauge,
+    // Issue #1815: the DB-pool sampler runs under the same is_enabled() gate,
+    // so its gauges render here too. The poller, outlier and duration
+    // readings back the shipped saturation panels.
+    db_pool_in_use: Gauge,
+    db_pool_idle: Gauge,
+    db_pool_wait: Histogram,
+    db_query_duration: Histogram,
+    worker_pollers: Gauge,
+    worker_outlier: Gauge,
+    // Issue #1827: the plugin's own API rate limiter records here.
+    api_rate_limited: Counter,
+    // Issue #1814: the ramp guard records each automatic abort here. The
+    // starter dashboard reads it on the built-in scrape path.
+    build_ramp_aborted: Counter,
 }
 
 /// In-process aggregator for the built-in Prometheus scrape endpoint
@@ -196,6 +229,90 @@ impl HarvestMetricsRecorder {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Render the current aggregated state as Prometheus text exposition
+    /// format (issue #1611).
+    ///
+    /// `MetricsSource::collect` below is the only place that walks `Inner`
+    /// into `MetricFamily` values. This method renders exactly that output.
+    /// A standalone embedder with no `autumn_web::actuator` endpoint to
+    /// mount sees the same series the plugin path's `/actuator/prometheus`
+    /// serves. Serving it needs one route:
+    ///
+    /// ```rust
+    /// use autumn_harvest_plugin::metrics_scrape::HarvestMetricsRecorder;
+    ///
+    /// let recorder = HarvestMetricsRecorder::new();
+    /// let text = recorder.render_prometheus();
+    /// assert!(text.is_empty()); // nothing recorded yet
+    /// ```
+    ///
+    /// mounted on a bare Axum router as
+    /// `.route("/metrics", get(move || { let r = recorder.clone(); async move { r.render_prometheus() } }))`.
+    #[must_use]
+    pub fn render_prometheus(&self) -> String {
+        use std::fmt::Write as _;
+
+        let mut out = String::new();
+        for family in MetricsSource::collect(self) {
+            let kind = match family.kind {
+                MetricKind::Counter => "counter",
+                MetricKind::Gauge => "gauge",
+            };
+            let _ = writeln!(
+                out,
+                "# HELP {} {}",
+                family.name,
+                escape_help_text(&family.help)
+            );
+            let _ = writeln!(out, "# TYPE {} {kind}", family.name);
+            for sample in &family.samples {
+                let value = format_sample_value(sample.value);
+                if sample.labels.is_empty() {
+                    let _ = writeln!(out, "{} {value}", family.name);
+                } else {
+                    let labels = sample
+                        .labels
+                        .iter()
+                        .map(|(k, v)| format!("{k}=\"{}\"", escape_label_value(v)))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let _ = writeln!(out, "{}{{{labels}}} {value}", family.name);
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Prometheus text format escaping for a `# HELP` line: backslash and
+/// newline only (a HELP string is not quoted, so `"` needs no escaping).
+fn escape_help_text(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\n', "\\n")
+}
+
+/// Prometheus text format escaping for a quoted label value: backslash,
+/// double-quote, and newline.
+fn escape_label_value(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+/// Format a sample value per Prometheus text format. `f64::to_string()`
+/// renders infinities and NaN in a shape the exposition format rejects.
+/// The plugin path's own `/actuator/prometheus` renderer special-cases
+/// them the same way, so this stays consistent with it.
+fn format_sample_value(v: f64) -> String {
+    if v == f64::INFINITY {
+        "+Inf".to_owned()
+    } else if v == f64::NEG_INFINITY {
+        "-Inf".to_owned()
+    } else if v.is_nan() {
+        "NaN".to_owned()
+    } else {
+        v.to_string()
+    }
 }
 
 impl MetricsRecorder for HarvestMetricsRecorder {
@@ -208,16 +325,40 @@ impl MetricsRecorder for HarvestMetricsRecorder {
         true
     }
 
+    /// Clones share one `Inner`, so they feed one sink (issue #1815).
+    fn sink_key(&self) -> Option<usize> {
+        Some(Arc::as_ptr(&self.0) as usize)
+    }
+
     fn record_workflow_started(&self, workflow_name: &str, queue: &str) {
         self.0
             .workflow_started
             .incr(vec![workflow_name.to_owned(), queue.to_owned()], 1);
     }
 
+    // Issue #1814: both duration families always carry `build_id`. A call
+    // with no build reports `none`, so every sample has the same label set.
     fn record_workflow_completed(
         &self,
         workflow_name: &str,
         queue: &str,
+        duration_secs: f64,
+        status: WorkflowStatus,
+    ) {
+        self.record_workflow_completed_for_build(
+            workflow_name,
+            queue,
+            BUILD_ID_LABEL_NONE,
+            duration_secs,
+            status,
+        );
+    }
+
+    fn record_workflow_completed_for_build(
+        &self,
+        workflow_name: &str,
+        queue: &str,
+        build_id: &str,
         duration_secs: f64,
         status: WorkflowStatus,
     ) {
@@ -226,6 +367,7 @@ impl MetricsRecorder for HarvestMetricsRecorder {
                 workflow_name.to_owned(),
                 queue.to_owned(),
                 status.as_str().to_owned(),
+                build_id.to_owned(),
             ],
             duration_secs,
         );
@@ -238,11 +380,31 @@ impl MetricsRecorder for HarvestMetricsRecorder {
         duration_secs: f64,
         status: ActivityStatus,
     ) {
+        self.record_activity_completed_for_build(
+            activity_name,
+            queue,
+            BUILD_ID_LABEL_NONE,
+            duration_secs,
+            status,
+            None,
+        );
+    }
+
+    fn record_activity_completed_for_build(
+        &self,
+        activity_name: &str,
+        queue: &str,
+        build_id: &str,
+        duration_secs: f64,
+        status: ActivityStatus,
+        _error_type: Option<&str>,
+    ) {
         self.0.activity_duration.observe(
             vec![
                 activity_name.to_owned(),
                 queue.to_owned(),
                 status.as_str().to_owned(),
+                build_id.to_owned(),
             ],
             duration_secs,
         );
@@ -264,6 +426,20 @@ impl MetricsRecorder for HarvestMetricsRecorder {
         self.0
             .dlq_entries
             .set(vec![shard.to_string()], depth as f64);
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn record_dispatch_dropped_hints(&self, total: u64) {
+        self.0.dispatch_dropped_hints.set(Vec::new(), total as f64);
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn record_notify_send_failures(&self, total: u64) {
+        self.0.notify_send_failures.set(Vec::new(), total as f64);
+    }
+
+    fn record_notify_queue_usage(&self, ratio: f64) {
+        self.0.notify_queue_usage.set(Vec::new(), ratio);
     }
 
     fn record_schedule_run(&self, kind: &str, name: &str) {
@@ -323,6 +499,42 @@ impl MetricsRecorder for HarvestMetricsRecorder {
     }
 
     #[allow(clippy::cast_precision_loss)]
+    fn record_db_pool(&self, shard: u16, in_use: u64, idle: u64) {
+        self.0
+            .db_pool_in_use
+            .set(vec![shard.to_string()], in_use as f64);
+        self.0
+            .db_pool_idle
+            .set(vec![shard.to_string()], idle as f64);
+    }
+
+    fn record_db_pool_wait(&self, shard: u16, seconds: f64) {
+        self.0
+            .db_pool_wait
+            .observe(vec![shard.to_string()], seconds);
+    }
+
+    fn record_db_query_duration(&self, op: DbOp, shard: u16, seconds: f64) {
+        self.0
+            .db_query_duration
+            .observe(vec![op.as_str().to_owned(), shard.to_string()], seconds);
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn record_worker_pollers(&self, queue: &str, pollers: u64) {
+        self.0
+            .worker_pollers
+            .set(vec![queue.to_owned()], pollers as f64);
+    }
+
+    fn record_worker_outlier(&self, dimension: OutlierDimension, flagged: bool) {
+        self.0.worker_outlier.set(
+            vec![dimension.as_str().to_owned()],
+            if flagged { 1.0 } else { 0.0 },
+        );
+    }
+
+    #[allow(clippy::cast_precision_loss)]
     fn record_worker_slot_target(&self, slot_type: SlotType, target: u64) {
         self.0
             .worker_slot_target
@@ -366,6 +578,18 @@ impl MetricsRecorder for HarvestMetricsRecorder {
         self.0
             .connector_poisoned
             .incr(vec![source.to_owned(), reason.as_str().to_owned()], 1);
+    }
+
+    fn record_api_rate_limited(&self, route_class: &str, client_kind: &str) {
+        self.0
+            .api_rate_limited
+            .incr(vec![route_class.to_owned(), client_kind.to_owned()], 1);
+    }
+
+    fn record_build_ramp_aborted(&self, queue: &str, reason: &str) {
+        self.0
+            .build_ramp_aborted
+            .incr(vec![queue.to_owned(), reason.to_owned()], 1);
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -490,6 +714,7 @@ fn push_catalogue_metrics(families: &mut Vec<MetricFamily>, inner: &Inner) {
             METRIC_LABEL_WORKFLOW,
             METRIC_LABEL_QUEUE,
             METRIC_LABEL_STATUS,
+            METRIC_LABEL_BUILD_ID,
         ],
         inner.workflow_duration.snapshot(),
     );
@@ -501,6 +726,7 @@ fn push_catalogue_metrics(families: &mut Vec<MetricFamily>, inner: &Inner) {
             METRIC_LABEL_ACTIVITY,
             METRIC_LABEL_QUEUE,
             METRIC_LABEL_STATUS,
+            METRIC_LABEL_BUILD_ID,
         ],
         inner.activity_duration.snapshot(),
     );
@@ -601,6 +827,73 @@ fn push_sampler_adjacent_metrics(families: &mut Vec<MetricFamily>, inner: &Inner
         &[METRIC_LABEL_KIND, METRIC_LABEL_NAME],
         inner.schedule_overdue.snapshot(),
     );
+    push_gauge(
+        families,
+        "harvest_dispatch_dropped_hints",
+        "Cumulative dispatch hints dropped because the background publisher queue was full",
+        &[],
+        inner.dispatch_dropped_hints.snapshot(),
+    );
+    push_gauge(
+        families,
+        "harvest_notify_send_failures",
+        "Cumulative post-commit notifications lost to an error since process start",
+        &[],
+        inner.notify_send_failures.snapshot(),
+    );
+    push_gauge(
+        families,
+        "harvest_notify_queue_usage",
+        "Largest Postgres notification queue usage a live notify sender read last (0 to 1)",
+        &[],
+        inner.notify_queue_usage.snapshot(),
+    );
+}
+
+/// DB-pool, DB op, poller and outlier families (issue #1815).
+fn push_saturation_metrics(families: &mut Vec<MetricFamily>, inner: &Inner) {
+    push_gauge(
+        families,
+        "harvest_db_pool_in_use",
+        "Database connections the worker pool lends out now, per shard",
+        &[METRIC_LABEL_SHARD],
+        inner.db_pool_in_use.snapshot(),
+    );
+    push_gauge(
+        families,
+        "harvest_db_pool_idle",
+        "Open database connections idle in the worker pool, per shard",
+        &[METRIC_LABEL_SHARD],
+        inner.db_pool_idle.snapshot(),
+    );
+    push_histogram(
+        families,
+        "harvest_db_pool_wait_duration",
+        "Seconds a caller waits for a pooled connection",
+        &[METRIC_LABEL_SHARD],
+        inner.db_pool_wait.snapshot(),
+    );
+    push_histogram(
+        families,
+        "harvest_db_query_duration",
+        "Seconds one database operation takes",
+        &[METRIC_LABEL_OP, METRIC_LABEL_SHARD],
+        inner.db_query_duration.snapshot(),
+    );
+    push_gauge(
+        families,
+        "harvest_worker_pollers",
+        "Poll loops on this worker that claim from the queue",
+        &[METRIC_LABEL_QUEUE],
+        inner.worker_pollers.snapshot(),
+    );
+    push_gauge(
+        families,
+        "harvest_worker_outlier",
+        "1 when this worker is an outlier against its peers on the dimension",
+        &[METRIC_LABEL_DIMENSION],
+        inner.worker_outlier.snapshot(),
+    );
 }
 
 /// Broker-connector families (issue #944).
@@ -640,12 +933,37 @@ fn push_connector_metrics(families: &mut Vec<MetricFamily>, inner: &Inner) {
     );
 }
 
+/// The API rate limiter family (issue #1827).
+fn push_api_rate_limit_metrics(families: &mut Vec<MetricFamily>, inner: &Inner) {
+    push_counter(
+        families,
+        "harvest_api_rate_limited_total",
+        "Total number of API requests the rate limiter refused with 429, per route class and client kind",
+        &[METRIC_LABEL_ROUTE_CLASS, METRIC_LABEL_CLIENT_KIND],
+        inner.api_rate_limited.snapshot(),
+    );
+}
+
+/// The ramp guard abort family (issue #1814).
+fn push_build_ramp_metrics(families: &mut Vec<MetricFamily>, inner: &Inner) {
+    push_counter(
+        families,
+        "harvest_build_ramp_aborted_total",
+        "Total number of build ramps that the ramp guard aborted, per queue and reason",
+        &[METRIC_LABEL_QUEUE, METRIC_LABEL_REASON],
+        inner.build_ramp_aborted.snapshot(),
+    );
+}
+
 impl MetricsSource for HarvestMetricsRecorder {
     fn collect(&self) -> Vec<MetricFamily> {
         let mut families = Vec::new();
         push_catalogue_metrics(&mut families, &self.0);
         push_sampler_adjacent_metrics(&mut families, &self.0);
+        push_saturation_metrics(&mut families, &self.0);
         push_connector_metrics(&mut families, &self.0);
+        push_api_rate_limit_metrics(&mut families, &self.0);
+        push_build_ramp_metrics(&mut families, &self.0);
         families
     }
 }
@@ -721,6 +1039,7 @@ mod tests {
             ("workflow", "onboarding"),
             ("queue", "default"),
             ("status", "completed"),
+            ("build_id", "none"),
         ];
         assert_eq!(sample_value(count_f, &labels), 2.0);
         assert_eq!(sample_value(sum_f, &labels), 4.0);
@@ -743,6 +1062,7 @@ mod tests {
             ("activity", "send_email"),
             ("queue", "email-workers"),
             ("status", "completed"),
+            ("build_id", "none"),
         ];
         assert_eq!(sample_value(count_f, &labels), 1.0);
         assert_eq!(sample_value(sum_f, &labels), 0.25);
@@ -846,6 +1166,42 @@ mod tests {
         assert_eq!(sample_value(f, &[("queue", "default")]), 12.5);
     }
 
+    /// Issue #1815: the DB-pool, poller and outlier readings render on the
+    /// built-in endpoint, the two durations as `_count` and `_sum` pairs.
+    #[test]
+    fn saturation_and_outlier_metrics_render_with_bounded_labels() {
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_db_pool(2, 3, 5);
+        recorder.record_db_pool_wait(2, 0.5);
+        recorder.record_db_pool_wait(2, 0.25);
+        recorder.record_db_query_duration(DbOp::Claim, 2, 0.125);
+        recorder.record_worker_pollers("email", 1);
+        recorder.record_worker_outlier(OutlierDimension::FailureRatio, true);
+        recorder.record_worker_outlier(OutlierDimension::LatencyP99, false);
+
+        let families = recorder.collect();
+        let in_use = family(&families, "harvest_db_pool_in_use");
+        assert_eq!(in_use.kind, MetricKind::Gauge);
+        assert_eq!(sample_value(in_use, &[("shard", "2")]), 3.0);
+        let idle = family(&families, "harvest_db_pool_idle");
+        assert_eq!(sample_value(idle, &[("shard", "2")]), 5.0);
+        let wait = family(&families, "harvest_db_pool_wait_duration_count");
+        assert_eq!(sample_value(wait, &[("shard", "2")]), 2.0);
+        let wait_sum = family(&families, "harvest_db_pool_wait_duration_sum");
+        assert_eq!(sample_value(wait_sum, &[("shard", "2")]), 0.75);
+        let query = family(&families, "harvest_db_query_duration_count");
+        assert_eq!(sample_value(query, &[("op", "claim"), ("shard", "2")]), 1.0);
+        let pollers = family(&families, "harvest_worker_pollers");
+        assert_eq!(pollers.kind, MetricKind::Gauge);
+        assert_eq!(sample_value(pollers, &[("queue", "email")]), 1.0);
+        let outlier = family(&families, "harvest_worker_outlier");
+        assert_eq!(
+            sample_value(outlier, &[("dimension", "failure_ratio")]),
+            1.0
+        );
+        assert_eq!(sample_value(outlier, &[("dimension", "latency_p99")]), 0.0);
+    }
+
     #[test]
     fn worker_slots_are_gauges_labeled_by_slot_type() {
         let recorder = HarvestMetricsRecorder::new();
@@ -937,6 +1293,100 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_dropped_hints_is_an_unlabeled_last_write_wins_gauge() {
+        // Issue #1429: the dispatch background publisher already counts
+        // dropped hints (`dispatch::dropped_hints()`). This pins that the
+        // built-in scrape recorder renders it. A later sample replaces the
+        // earlier one rather than summing.
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_dispatch_dropped_hints(3);
+        recorder.record_dispatch_dropped_hints(5);
+
+        let families = recorder.collect();
+        let f = family(&families, "harvest_dispatch_dropped_hints");
+        assert_eq!(f.kind, MetricKind::Gauge);
+        assert_eq!(f.samples.len(), 1);
+        assert_eq!(f.samples[0].labels.len(), 0);
+        assert_eq!(f.samples[0].value, 5.0);
+    }
+
+    #[test]
+    fn notify_metrics_are_unlabeled_last_write_wins_gauges() {
+        // Issue #1796: the notify module exposes a send-failure total and a
+        // queue-usage ratio. This test pins that the built-in scrape recorder
+        // renders both. A later sample replaces the earlier one.
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_notify_send_failures(2);
+        recorder.record_notify_send_failures(4);
+        recorder.record_notify_queue_usage(0.25);
+        recorder.record_notify_queue_usage(0.5);
+
+        let families = recorder.collect();
+        let f = family(&families, "harvest_notify_send_failures");
+        assert_eq!(f.kind, MetricKind::Gauge);
+        assert_eq!(f.samples.len(), 1);
+        assert_eq!(f.samples[0].labels.len(), 0);
+        assert_eq!(f.samples[0].value, 4.0);
+
+        let f = family(&families, "harvest_notify_queue_usage");
+        assert_eq!(f.kind, MetricKind::Gauge);
+        assert_eq!(f.samples.len(), 1);
+        assert_eq!(f.samples[0].labels.len(), 0);
+        assert_eq!(f.samples[0].value, 0.5);
+    }
+
+    #[test]
+    fn ramp_guard_aborts_reach_the_built_in_scrape_endpoint() {
+        // Issue #1814: without an override, the scrape drops every abort, and
+        // the starter dashboard panel stays flat.
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_build_ramp_aborted("default", "failure_rate");
+        recorder.record_build_ramp_aborted("default", "failure_rate");
+        recorder.record_build_ramp_aborted("billing", "nd_block_rate");
+
+        let families = recorder.collect();
+
+        let aborted = family(&families, "harvest_build_ramp_aborted_total");
+        assert_eq!(aborted.kind, MetricKind::Counter);
+        assert_eq!(
+            sample_value(aborted, &[("queue", "default"), ("reason", "failure_rate")]),
+            2.0
+        );
+        assert_eq!(
+            sample_value(
+                aborted,
+                &[("queue", "billing"), ("reason", "nd_block_rate")]
+            ),
+            1.0
+        );
+    }
+
+    #[test]
+    fn api_rate_limit_rejections_reach_the_built_in_scrape_endpoint() {
+        // Issue #1827: without an override, the scrape drops every rejection.
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_api_rate_limited("mutating", "token");
+        recorder.record_api_rate_limited("mutating", "token");
+        recorder.record_api_rate_limited("read", "ip");
+
+        let families = recorder.collect();
+
+        let limited = family(&families, "harvest_api_rate_limited_total");
+        assert_eq!(limited.kind, MetricKind::Counter);
+        assert_eq!(
+            sample_value(
+                limited,
+                &[("route_class", "mutating"), ("client_kind", "token")]
+            ),
+            2.0
+        );
+        assert_eq!(
+            sample_value(limited, &[("route_class", "read"), ("client_kind", "ip")]),
+            1.0
+        );
+    }
+
+    #[test]
     fn connector_metrics_reach_the_built_in_scrape_endpoint() {
         // Issue #944 (Codex round E): this recorder is per-metric
         // hand-maintained, so a new family that is not overridden here falls
@@ -1024,5 +1474,123 @@ mod tests {
             sample_value(f, &[("workflow", "onboarding"), ("queue", "default")]),
             1.0
         );
+    }
+
+    #[test]
+    fn render_prometheus_is_empty_before_any_recording() {
+        let recorder = HarvestMetricsRecorder::new();
+        assert_eq!(recorder.render_prometheus(), "");
+    }
+
+    #[test]
+    fn render_prometheus_emits_help_type_and_a_labeled_counter_line() {
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_workflow_started("onboarding", "default");
+        recorder.record_workflow_started("onboarding", "default");
+
+        let text = recorder.render_prometheus();
+        assert!(text.contains(
+            "# HELP harvest_workflow_started_total Total number of workflow executions started"
+        ));
+        assert!(text.contains("# TYPE harvest_workflow_started_total counter\n"));
+        assert!(text.contains(
+            "harvest_workflow_started_total{workflow=\"onboarding\",queue=\"default\"} 2\n"
+        ));
+    }
+
+    #[test]
+    fn render_prometheus_emits_an_unlabeled_counter_line() {
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_timer_started(30.0);
+
+        let text = recorder.render_prometheus();
+        assert!(text.contains("# TYPE harvest_timer_started_total counter\n"));
+        assert!(text.contains("harvest_timer_started_total 1\n"));
+    }
+
+    #[test]
+    fn render_prometheus_decomposes_a_histogram_into_count_and_sum_families() {
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_activity_completed("send_email", "default", 1.5, ActivityStatus::Completed);
+        recorder.record_activity_completed("send_email", "default", 2.5, ActivityStatus::Completed);
+
+        let text = recorder.render_prometheus();
+        assert!(text.contains("# TYPE harvest_activity_duration_count counter\n"));
+        assert!(text.contains(
+            "harvest_activity_duration_count{activity=\"send_email\",queue=\"default\",status=\"completed\",build_id=\"none\"} 2\n"
+        ));
+        assert!(text.contains("# TYPE harvest_activity_duration_sum counter\n"));
+        assert!(text.contains(
+            "harvest_activity_duration_sum{activity=\"send_email\",queue=\"default\",status=\"completed\",build_id=\"none\"} 4\n"
+        ));
+    }
+
+    #[test]
+    fn render_prometheus_escapes_a_backslash_in_a_label_value() {
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_workflow_started("a\\b", "q");
+        assert!(recorder.render_prometheus().contains("workflow=\"a\\\\b\""));
+    }
+
+    #[test]
+    fn render_prometheus_escapes_a_double_quote_in_a_label_value() {
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_workflow_started("a\"b", "q");
+        assert!(recorder.render_prometheus().contains("workflow=\"a\\\"b\""));
+    }
+
+    #[test]
+    fn render_prometheus_escapes_a_newline_in_a_label_value() {
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_workflow_started("a\nb", "q");
+        assert!(recorder.render_prometheus().contains("workflow=\"a\\nb\""));
+    }
+
+    // ── build_id label on the latency families (issue #1814) ─────────────
+
+    #[test]
+    fn duration_families_carry_the_build_id_label() {
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_workflow_completed_for_build(
+            "onboarding",
+            "default",
+            "v2",
+            1.5,
+            WorkflowStatus::Failed,
+        );
+        recorder.record_activity_completed_for_build(
+            "send_email",
+            "default",
+            "v2",
+            0.25,
+            ActivityStatus::Failed,
+            Some("Timeout"),
+        );
+        recorder.record_workflow_completed("onboarding", "default", 2.0, WorkflowStatus::Completed);
+
+        let families = recorder.collect();
+        let wf = family(&families, "harvest_workflow_duration_count");
+        let v2 = [
+            ("workflow", "onboarding"),
+            ("queue", "default"),
+            ("status", "failed"),
+            ("build_id", "v2"),
+        ];
+        assert_eq!(sample_value(wf, &v2), 1.0);
+        let none = [
+            ("workflow", "onboarding"),
+            ("queue", "default"),
+            ("status", "completed"),
+            ("build_id", "none"),
+        ];
+        assert_eq!(sample_value(wf, &none), 1.0);
+        let act = family(&families, "harvest_activity_duration_sum");
+        let act_v2 = [
+            ("activity", "send_email"),
+            ("queue", "default"),
+            ("status", "failed"),
+            ("build_id", "v2"),
+        ];
+        assert_eq!(sample_value(act, &act_v2), 0.25);
     }
 }

@@ -3,6 +3,12 @@
 A minimal runnable example for [autumn-harvest](../../README.md): one `#[workflow]`, one `#[activity]`, one durable timer.
 From `git clone` on a machine with Docker to a running durable workflow in under 5 minutes.
 
+> Only want to *see* a durable workflow run? `cargo dev` from the workspace root
+> needs neither Docker nor a database — it provisions an ephemeral Postgres,
+> serves the dashboard, and cleans up after itself. See
+> [Chapter 1](../../docs/getting-started/01-project-skeleton.md). This example
+> is the bring-your-own-Postgres path, and is unchanged.
+
 ## Prerequisites
 
 - Stable Rust toolchain (`rustup default stable`)
@@ -33,6 +39,17 @@ The workflow dashboard is at **http://localhost:3000/api/harvest/ui**.
 ```bash
 cargo run -p autumn-harvest-cli -- --base-url http://localhost:3000/api/harvest preflight
 ```
+
+Preflight reads the management API's deployment-readiness report — migrations,
+shard read/write availability, catalog and schedule resolvability, worker queue
+coverage, DLQ access. Exit code `0` is `pass`, `2` is `warn`, `1` is `fail`.
+
+No credential is needed here because `AUTUMN_PROFILE=dev` (Step 2) serves the
+management API unauthenticated to any local caller — which is also why the app
+above logs a warning saying so at startup. Every other profile is fail-closed:
+see [Deployment preflight](../../README.md#deployment-preflight) in the
+top-level README for how to authenticate the same command against a real
+deployment.
 
 ## Step 4 — Trigger a workflow execution
 

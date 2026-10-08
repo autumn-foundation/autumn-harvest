@@ -1,0 +1,17 @@
+                                                                   QUERY PLAN                                                                    
+-------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=225.28..225.29 rows=1 width=8) (actual rows=1 loops=1)
+   Output: count(*)
+   Buffers: shared hit=34
+   ->  Bitmap Heap Scan on public.harvest_task_queue recheck  (cost=26.28..225.28 rows=1 width=0) (actual rows=0 loops=1)
+         Recheck Cond: (recheck.state = 'RUNNING'::text)
+         Filter: ((recheck.worker_id IS NOT NULL) AND (recheck.concurrency_key = 'bench-ck-0'::text) AND (recheck.task_type = 'activity'::text))
+         Rows Removed by Filter: 2000
+         Heap Blocks: exact=31
+         Buffers: shared hit=34
+         ->  Bitmap Index Scan on idx_harvest_tq_running  (cost=0.00..26.28 rows=2000 width=0) (actual rows=2000 loops=1)
+               Buffers: shared hit=3
+ Planning Time: 0.116 ms
+ Execution Time: 0.310 ms
+(13 rows)
+

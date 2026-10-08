@@ -86,7 +86,7 @@ use uuid::Uuid;
 // ---------------------------------------------------------------------------
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 async fn setup_db() -> (String, Option<ContainerAsync<Postgres>>) {
@@ -151,6 +151,9 @@ fn build_registry(
 
 fn worker_config(worker_id: &str, local_cap: Duration) -> WorkerRuntimeConfig {
     WorkerRuntimeConfig {
+        codec_rotation_batch_size: 0,
+        scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
+        dr: autumn_harvest::replication::DrConfig::default(),
         worker_id: worker_id.to_string(),
         // Two queues so `info().queue_name` is falsifiable: with a single
         // "default" queue, the workflow queue, the activity queue and the
@@ -170,6 +173,7 @@ fn worker_config(worker_id: &str, local_cap: Duration) -> WorkerRuntimeConfig {
         build_id: String::new(),
         deployment_name: None,
         workflow_cache_size: 1000,
+        resident_workflows: true,
         priority_aging_secs: None,
         unknown_target_grace_window: Duration::from_secs(5),
         poison_pill_threshold: 3,
@@ -306,7 +310,7 @@ async fn seed_workflow(
         workflow_id: &workflow_id,
         run_id: Uuid::new_v4(),
         shard_id: 0,
-        input: input.clone(),
+        input: input.clone().into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -1317,9 +1321,10 @@ async fn checkpointing_activity_loses_zero_completed_work() {
 
     // --- Negative control: same work, no deadline guard. ---
     //
-    // Without the guard the attempt is killed by the `start_to_close` scanner,
-    // which is terminal (non-retryable), so the run fails with strictly fewer
-    // than TOTAL_ITEMS processed. This is what makes the guarded result above
+    // Without the guard the attempt is killed by the `start_to_close` scanner.
+    // The control allows one attempt, so the timeout is terminal (ADR 0005,
+    // issue #1809), and the run fails with strictly fewer than TOTAL_ITEMS
+    // processed. This is what makes the guarded result above
     // attributable to `ctx.is_expiring_within` rather than to luck.
     let (exec2, _) = seed_workflow(&mut conn, "unguarded_wf", serde_json::json!({})).await;
     let (registry2, observed2) = build_registry(
@@ -1328,7 +1333,7 @@ async fn checkpointing_activity_loses_zero_completed_work() {
             "unguarded_activity",
             unguarded_activity,
             ATTEMPT_BUDGET,
-            RetryPolicy::fixed(5, Duration::from_millis(50)),
+            RetryPolicy::fixed(1, Duration::from_millis(50)),
         )],
     );
     let worker2 = build_worker("w-info-f2", registry2);

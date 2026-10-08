@@ -1,0 +1,5 @@
+-- before: reclaim_expired_leases_and_wake, pg_stat_statements sweep --
+n	reclaim_loop_calls	reclaim_loop_buffers	advisory_calls	wake_calls
+200	525	2287	175	54
+1000	2631	12363	877	276
+2000	5262	21786	1754	554

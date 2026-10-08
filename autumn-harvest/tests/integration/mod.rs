@@ -2,7 +2,13 @@
 
 #[cfg(feature = "db")]
 mod active_workflow_gauge_tests;
+#[cfg(feature = "db")]
+mod activity_claim_epoch_tests;
 mod activity_default_floor_tests;
+#[cfg(feature = "db")]
+mod activity_default_timeout_tests;
+#[cfg(feature = "db")]
+mod activity_enqueue_batch_perf;
 mod activity_failure_tests;
 #[cfg(feature = "db")]
 mod activity_info_tests;
@@ -10,15 +16,36 @@ mod activity_interceptor_tests;
 mod activity_outcome_metrics_tests;
 #[cfg(feature = "db")]
 mod activity_pause_tests;
+#[cfg(feature = "db")]
+mod activity_timeout_retry_tests;
+mod adaptive_limit_tests;
 mod admission_gate_authoritative_tests;
 mod admission_gate_tests;
 mod alert_pack_docs;
+#[cfg(feature = "db")]
+mod append_only_guard_tests;
+#[cfg(feature = "db")]
+mod audit_chain_tests;
+mod audit_export_docs;
+#[cfg(feature = "db")]
+mod audit_export_tests;
+#[cfg(feature = "db")]
+mod audit_log_unexported_idx_write_cost_perf;
 mod audit_tests;
 #[cfg(feature = "db")]
 mod auto_heartbeat_tests;
 mod awaitables_tests;
 #[cfg(all(feature = "db", feature = "testing"))]
+mod backup_verify_refs_batch_perf;
+#[cfg(all(feature = "db", feature = "testing"))]
+mod backup_verify_retention_batch_perf;
+#[cfg(all(feature = "db", feature = "testing"))]
 mod backup_verify_tests;
+#[cfg(feature = "db")]
+mod batch_executor_pool_exhaustion_tests;
+mod benchmarks_docs;
+#[cfg(feature = "db")]
+mod build_reachability_fanout_perf;
 #[cfg(feature = "db")]
 mod build_routing_tests;
 #[cfg(feature = "testing")]
@@ -26,6 +53,7 @@ mod business_day_replay_tests;
 #[cfg(feature = "db")]
 mod business_day_timer_tests;
 mod cache_delta_load_tests;
+mod calendars_docs;
 #[cfg(feature = "db")]
 mod canary_tests;
 mod cancellation_tests;
@@ -37,19 +65,44 @@ mod chaos_catalogue_drift;
 mod chaos_docs;
 #[cfg(feature = "chaos")]
 mod chaos_tests;
+mod chaos_watchdog;
+#[cfg(feature = "db")]
+mod child_fanout_batch_perf;
 mod child_fanout_tests;
 mod child_policy_tests;
 #[cfg(feature = "db")]
 mod child_timeout_tests;
 mod ci_run_coverage;
 mod circuit_breaker_wiring_tests;
+#[cfg(feature = "db")]
+mod claim_batched_tests;
 mod claim_bench_support;
 #[cfg(feature = "db")]
 mod claim_budget_tests;
+#[cfg(feature = "db")]
+mod claim_continuation_priority_tests;
+#[cfg(feature = "db")]
+mod claim_run_deadline_tests;
+#[cfg(feature = "db")]
+mod claim_seek_tests;
+#[cfg(all(feature = "db", feature = "testing"))]
+mod codec_rotation_db_tests;
+#[cfg(feature = "db")]
+mod completion_callback_outcome_batch_perf;
 mod completion_callback_tests;
+#[cfg(feature = "db")]
+mod completion_trigger_outbox_queue_perf;
 mod concurrency_key_tests;
+mod concurrency_model_ci;
 mod concurrency_supersede_tests;
 mod context_headers_tests;
+mod cross_region_dr_docs;
+#[cfg(feature = "db")]
+mod cross_region_dr_tests;
+mod cross_shard_child_context_tests;
+mod cross_shard_child_placement_unit;
+#[cfg(feature = "db")]
+mod cross_shard_children_tests;
 #[cfg(feature = "db")]
 mod cross_type_continue_as_new_tests;
 mod cross_workflow_await_tests;
@@ -70,22 +123,50 @@ mod dashboard_pack_docs;
 mod debounce_tests;
 #[cfg(feature = "debugger")]
 mod debugger_tests;
+#[cfg(all(feature = "db", feature = "testing"))]
+mod decision_boundary_db_tests;
+#[cfg(feature = "testing")]
+mod decision_boundary_replay_tests;
 mod delayed_start_tests;
 mod det_check_tests;
+mod determinism_static_analysis_docs;
+mod dispatch_tests;
+mod drain_release_tests;
+#[cfg(feature = "db")]
+mod dst_differential_tests;
+mod e2e_bench_cell_timeout_tests;
+mod e2e_bench_support;
 mod event_batch_tests;
+mod event_partitioning_tests;
 mod executor_span_tests;
 #[cfg(feature = "testing")]
 mod external_completion_tests;
+mod external_outbox_scan_tests;
 mod fanout_tests;
 mod force_fail_tests;
+mod formal_models_coverage;
+mod fuzz_nightly_wiring;
 mod guardrail_catalog_tests;
 mod havoc_reentrancy;
 mod havoc_tests;
+mod history_ceiling_claim_tests;
+mod history_checker;
+#[cfg(feature = "db")]
+mod history_crash_tests;
+#[cfg(feature = "db")]
+mod history_default_caps_tests;
+mod host_clock_skew_tests;
+mod hot_code_swap_docs;
+#[cfg(all(feature = "hot-code-swap", feature = "testing"))]
+mod hot_code_swap_tests;
 #[cfg(feature = "testing")]
 mod idempotency_tests;
 mod integration_e2e;
 mod legal_hold_tests;
+#[cfg(feature = "db")]
+mod lifecycle_model_props;
 mod lineage_store_tests;
+mod lock_order_docs;
 mod macros_activity;
 mod macros_collect;
 #[cfg(feature = "testing")]
@@ -98,12 +179,27 @@ mod macros_workflow;
 mod metrics_coverage;
 mod metrics_integration;
 mod metrics_rs_adapter;
+#[cfg(feature = "db")]
+mod migrate_tests;
 mod migrating_from_temporal_docs;
 mod migration_hygiene;
+mod migration_lock_safety;
+#[cfg(feature = "db")]
+mod mixed_suspension_tests;
+#[cfg(feature = "db")]
+mod mixed_suspension_timer_batch_perf;
+#[cfg(feature = "db")]
+mod mutex_lease_reclaim_perf;
 #[cfg(feature = "db")]
 mod mutex_tests;
 mod nd_block_tests;
+#[cfg(feature = "db")]
+mod notify_post_commit_tests;
+mod otel_semconv_docs;
 mod panic_containment_tests;
+#[cfg(feature = "db")]
+mod parent_close_cascade_unfinished_handlers_perf;
+mod partitioned_events_docs;
 mod pause_tests;
 #[cfg(feature = "testing")]
 mod payload_cap_tests;
@@ -112,7 +208,13 @@ mod payload_offload_db_tests;
 #[cfg(feature = "testing")]
 mod payload_offload_replay_tests;
 mod performance_docs;
+#[cfg(feature = "db")]
+mod pg_timeouts_tests;
+#[cfg(feature = "db")]
+mod poison_pill_reclaim_perf;
 mod poison_pill_tests;
+#[cfg(feature = "db")]
+mod poll_capacity_gate_tests;
 mod priority_tests;
 #[cfg(feature = "testing")]
 mod publish_progress_tests;
@@ -123,12 +225,23 @@ mod queue_fairness_tests;
 mod queue_pause_success_metric_tests;
 mod queue_pause_tests;
 mod quota_enforcement_tests;
+mod quota_history_bytes_perf_tests;
+mod quota_lock_ordering_tests;
+mod quota_reconcile_candidate_bound_tests;
+mod quota_reconcile_candidate_scan_perf_tests;
+mod quota_reconcile_tests;
+mod quota_supersede_ordering_tests;
+#[cfg(feature = "db")]
+mod ramp_guard_tests;
+mod rate_limit_bucket_gc_tests;
 mod rate_limit_key_tests;
 mod redrive_tests;
 #[cfg(all(feature = "testing", feature = "db"))]
 mod replay_canary_tests;
 #[cfg(feature = "testing")]
 mod replay_drift_tests;
+#[cfg(feature = "fuzzing")]
+mod replay_fuzz_seeds;
 mod replay_tests;
 #[cfg(feature = "testing")]
 mod replay_verifier_tests;
@@ -137,11 +250,15 @@ mod replayer_integration_tests;
 #[cfg(feature = "testing")]
 mod replayer_tests;
 mod retention_overrides_tests;
+mod retention_reclaim_support;
 mod retention_summary_tests;
 mod retry_after_tests;
+mod retry_budget_tests;
 mod retry_chain_routing_tests;
+mod retry_clock_skew_tests;
 mod retry_now_tests;
 mod saga_tests;
+mod scanner_lease_tests;
 mod scanner_liveness_tests;
 mod scanner_tick_db_tests;
 mod schedule_decisions;
@@ -158,10 +275,19 @@ mod scheduler_catchup_tests;
 #[cfg(feature = "db")]
 mod scheduler_ha_tests;
 #[cfg(feature = "db")]
+mod scheduler_overdue_pass_perf;
+#[cfg(feature = "db")]
 mod scheduler_overdue_tests;
 #[cfg(feature = "db")]
 mod scheduler_registration_tests;
 mod security;
+#[cfg(feature = "db")]
+mod shard_database_sweep_tests;
+#[cfg(feature = "db")]
+mod shard_placement_by_id_tests;
+#[cfg(all(feature = "db", feature = "testing"))]
+mod shard_rebalance_db_tests;
+mod shard_rebalance_unit;
 #[cfg(feature = "db")]
 mod sharded_runtime_tests;
 mod sharding_unit;
@@ -169,16 +295,31 @@ mod signal_tests;
 #[cfg(feature = "db")]
 mod signal_with_start_tests;
 mod sla_breach_tests;
+mod slo_pack_docs;
 mod slot_tuner_tests;
 mod sqlite_feasibility_docs;
 #[cfg(feature = "db")]
 mod start_idempotency_tests;
 #[cfg(feature = "db")]
 mod start_source_tests;
+#[cfg(feature = "db")]
+mod sticky_default_tests;
 mod sticky_routing_tests;
+mod supply_chain_ci;
 mod telemetry_span_tests;
 #[cfg(feature = "db")]
+mod tenant_cell_isolation_tests;
+mod tenant_isolation_docs;
+#[cfg(feature = "db")]
+mod terminal_task_gc_tests;
+#[cfg(feature = "db")]
+mod terminal_write_ownership_tests;
+#[cfg(feature = "db")]
+mod throttle_bucket_prelock_batch_perf;
+#[cfg(feature = "db")]
 mod throttle_tests;
+#[cfg(feature = "db")]
+mod throwaway_db;
 #[cfg(feature = "db")]
 mod transactional_activity_tests;
 #[cfg(feature = "db")]
@@ -186,13 +327,23 @@ mod transactional_start_tests;
 #[cfg(feature = "db")]
 mod triage_tests;
 #[cfg(feature = "db")]
+mod tx_conflict_retry_tests;
+#[cfg(feature = "db")]
+mod typed_stub_deferred_admission_tests;
+#[cfg(feature = "db")]
 mod typed_stubs_tests;
 mod typed_workflow_failure_tests;
 mod updt_with_start_tests;
+mod usage_report_activity_lookback_tests;
 #[cfg(feature = "wasm-activities")]
 mod wasm_activities_tests;
 mod webhook_trigger_tests;
+#[cfg(feature = "db")]
+mod with_start_shared_tests;
+#[cfg(feature = "db")]
+mod worker_saturation_metrics_tests;
 mod worker_session_tests;
+mod workflow_backoff_requeue_tests;
 #[cfg(feature = "db")]
 mod workflow_handle_tests;
 #[cfg(feature = "db")]
@@ -200,6 +351,8 @@ mod workflow_id_targeted_tests;
 mod workflow_logger_tests;
 mod workflow_logs_tests;
 mod workflow_mutation_tests;
+#[cfg(feature = "db")]
+mod workflow_pause_claim_recheck_tests;
 #[cfg(feature = "db")]
 mod workflow_reachability_samples_tests;
 mod workflow_retry_tests;

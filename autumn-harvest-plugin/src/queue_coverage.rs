@@ -63,7 +63,7 @@
 //! live pollers is not included there (nothing interesting to report — it
 //! would not have been uncovered anyway).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::Duration;
 
 use autumn_harvest::error::HarvestResult;
@@ -79,113 +79,21 @@ use uuid::Uuid;
 
 use crate::api::HarvestApiState;
 use crate::shard_fanout::{self, FanoutStatus, ShardObservation};
-
-/// A query string component's percent-decoded bytes are not valid UTF-8.
-///
-/// Returned by [`parse_raw_query_pairs_strict`]; the caller (`GET
-/// /admin/queue-coverage`) maps this to a `400` JSON response rather than
-/// silently substituting `U+FFFD`, the fallback axum's built-in
-/// `Query<T>` extractor performs via `serde_urlencoded`/`form_urlencoded`
-/// (issue #774 review).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InvalidQueryEncoding;
-
-impl std::fmt::Display for InvalidQueryEncoding {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "query string contains an invalid percent-encoded UTF-8 byte sequence"
-        )
-    }
-}
-
-impl std::error::Error for InvalidQueryEncoding {}
-
-/// Strictly percent-decodes a raw query string into `(key, value)` pairs.
-///
-/// A malformed value like `?queue_name=%FF` would otherwise silently decode
-/// to `queue_name=<U+FFFD>` via axum's lossy `Query<T>` extractor — a
-/// legitimate-looking but wrong filter that lets a scoped deploy gate
-/// (`GET /admin/queue-coverage`) pass instead of rejecting the request with
-/// the documented `400` (issue #774 review).
-///
-/// Mirrors `form_urlencoded::parse`'s grammar exactly: split on `&`, split
-/// each segment on the first `=` (a segment with no `=` is a key with an
-/// empty value), `+` decodes to a literal space *before* percent-decoding.
-/// An empty segment (from a leading/trailing/doubled `&`, or an entirely
-/// empty query string) is skipped.
-///
-/// # Errors
-///
-/// Returns [`InvalidQueryEncoding`] on the first key or value that is
-/// malformed in either of two ways: a syntactically invalid `%` escape (not
-/// followed by exactly two hex digits, e.g. `%`, `%2`, `%GG`), or a
-/// syntactically valid escape whose decoded bytes are not valid UTF-8 (e.g.
-/// `%FF`). This is the one place in the `queue-coverage` request path that
-/// *can* reject an input outright — [`QueueCoverageQuery::from_query_pairs`]
-/// below, which consumes this function's output, stays infallible by
-/// construction.
-pub fn parse_raw_query_pairs_strict(
-    raw_query: &str,
-) -> Result<Vec<(String, String)>, InvalidQueryEncoding> {
-    let mut pairs = Vec::new();
-    for segment in raw_query.split('&') {
-        if segment.is_empty() {
-            continue;
-        }
-        let (raw_key, raw_value) = segment.split_once('=').unwrap_or((segment, ""));
-        pairs.push((
-            decode_form_component_strict(raw_key)?,
-            decode_form_component_strict(raw_value)?,
-        ));
-    }
-    Ok(pairs)
-}
-
-/// Strictly percent-decodes one `application/x-www-form-urlencoded`
-/// key/value component: `+` -> space first, then `%XX` percent-decoding
-/// with strict (non-lossy) UTF-8 validation of the resulting bytes.
-fn decode_form_component_strict(raw: &str) -> Result<String, InvalidQueryEncoding> {
-    if !has_only_well_formed_percent_escapes(raw) {
-        return Err(InvalidQueryEncoding);
-    }
-    let space_decoded = raw.replace('+', " ");
-    percent_encoding::percent_decode_str(&space_decoded)
-        .decode_utf8()
-        .map(std::borrow::Cow::into_owned)
-        .map_err(|_| InvalidQueryEncoding)
-}
-
-/// Whether every `%` in `s` is immediately followed by exactly two ASCII
-/// hex digits.
-///
-/// `percent_encoding::percent_decode_str` does **not** reject a malformed
-/// escape on its own: an incomplete (`%`, `%2`) or non-hex (`%GG`) sequence
-/// is left as a **literal, undecoded** run of bytes rather than an error --
-/// and since those bytes (`%`, `G`, digits, ...) are themselves valid ASCII,
-/// `decode_utf8()` still succeeds trivially. Without this pre-check,
-/// `?queue_name=orders%GG` would silently decode to the literal string
-/// `"orders%GG"` and query that (almost certainly nonexistent) queue name
-/// instead of being rejected -- a second, distinct malformed-encoding
-/// shape from the already-handled `%FF`-decodes-to-invalid-UTF-8 case
-/// (issue #774 review).
-fn has_only_well_formed_percent_escapes(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            let well_formed = bytes.get(i + 1).is_some_and(u8::is_ascii_hexdigit)
-                && bytes.get(i + 2).is_some_and(u8::is_ascii_hexdigit);
-            if !well_formed {
-                return false;
-            }
-            i += 3;
-        } else {
-            i += 1;
-        }
-    }
-    true
-}
+// Strict raw-query percent-decoding was extracted to `crate::strict_query`
+// (issue #1151) so every other management API route with the same
+// `Query<Vec<(String, String)>>` gap could share it rather than
+// reimplementing it. The `queue_coverage` handler itself now calls
+// `crate::strict_query::decode_or_queue_coverage_bad_request` directly, and
+// this module's own doc comments reference the strict decoder by its full
+// path, so nothing in THIS crate needs the re-export below any more.
+//
+// It stays `pub` anyway (Codex review, PR #1334): `autumn-harvest-plugin` is
+// a published library crate, and `parse_raw_query_pairs_strict`/
+// `InvalidQueryEncoding` were already public at this path when issue #774
+// shipped -- dropping them would be a source-breaking change for any
+// external crate that imported `autumn_harvest_plugin::queue_coverage::
+// parse_raw_query_pairs_strict` directly, not merely internal dead code.
+pub use crate::strict_query::{InvalidQueryEncoding, parse_raw_query_pairs_strict};
 
 /// Query string accepted by `GET /admin/queue-coverage`.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -194,7 +102,7 @@ pub struct QueueCoverageQuery {
     /// valid value — an unknown/never-scheduled queue simply yields
     /// `uncovered: false` (there is nothing pending on it), never an error.
     /// A malformed *encoding* (invalid percent-decoded UTF-8) is rejected
-    /// earlier, by [`parse_raw_query_pairs_strict`], before it ever reaches
+    /// earlier, by [`crate::strict_query::parse_raw_query_pairs_strict`], before it ever reaches
     /// this type — see that function's doc comment.
     pub queue_name: Option<String>,
 }
@@ -206,7 +114,7 @@ impl QueueCoverageQuery {
     /// Infallible by construction (issue #774 AC8, matching the
     /// `dlq::DlqAggregateParams`/`workflow_count::WorkflowCountParams`/
     /// `usage::UsageParams` convention) **once the pairs are already valid
-    /// decoded strings** — see [`parse_raw_query_pairs_strict`] for the
+    /// decoded strings** — see [`crate::strict_query::parse_raw_query_pairs_strict`] for the
     /// upstream check that actually can reject a request. `queue_name` is a
     /// free-text filter with no invalid *decoded value* — any string is a
     /// legitimate (if possibly never-scheduled) queue name — so unlike a
@@ -333,12 +241,19 @@ pub struct QueueCoverageShardInspection {
 
 /// One shard's raw observation: a queue with pending work that has zero
 /// live pollers *on this shard*, before cross-shard aggregation.
+///
+/// `pub` (and its fields `pub`) solely so `queue_coverage_profile` can build
+/// fixtures and call [`partition_uncovered_and_paused`] directly.
+/// `queue_coverage_profile` is a separate-crate bench binary; see
+/// `benches/queue_coverage_profile.rs` and
+/// `docs/performance-queue-coverage.md`.
+/// `dlq::group_dead_letter_rows`/`DlqRawGroup` are `pub` for the same reason.
 #[derive(Debug, Clone)]
-struct UncoveredQueueDemand {
-    queue_name: String,
-    pending_count: i64,
-    sample_task_ids: Vec<Uuid>,
-    sample_execution_ids: Vec<Uuid>,
+pub struct UncoveredQueueDemand {
+    pub queue_name: String,
+    pub pending_count: i64,
+    pub sample_task_ids: Vec<Uuid>,
+    pub sample_execution_ids: Vec<Uuid>,
 }
 
 /// Per-queue accumulator: aggregates uncovered demand across shards.
@@ -433,9 +348,14 @@ fn merge_excluded_paused_queues(sets: Vec<BTreeSet<String>>) -> Vec<String> {
         .collect()
 }
 
-/// Whether `worker` is a live poller of `queue_name` on `shard_id` for
-/// coverage purposes: assigned to the shard, has a fresh heartbeat, is
-/// `Active` or `Draining` (not `Stopped`), and lists the queue.
+/// Whether `worker` is live (fresh heartbeat, `Active`/`Draining`, not
+/// `Stopped`) **and** assigned to `shard_id`.
+///
+/// The two parts of coverage that depend only on the worker and the shard
+/// being inspected, never on which queue is being asked about. Factored out
+/// of [`worker_covers_queue`] so [`partition_uncovered_and_paused`] can
+/// compute it once per worker instead of once per (worker, pending-queue)
+/// pair.
 ///
 /// Shard-membership (including the empty-`shard_assignments` legacy-worker
 /// special case) is delegated to the shared
@@ -446,16 +366,23 @@ fn merge_excluded_paused_queues(sets: Vec<BTreeSet<String>>) -> Vec<String> {
 /// function's own bug while implementing #774) -- factoring the predicate
 /// into one shared function means the two consumers cannot drift apart
 /// again.
-pub(crate) fn worker_covers_queue(worker: &WorkerRow, queue_name: &str, shard_id: i32) -> bool {
+fn worker_is_live_and_assigned(worker: &WorkerRow, shard_id: i32) -> bool {
     let is_live = worker.health == WorkerHealth::Healthy
         && (worker.worker.status == WorkerStatus::Active.as_str()
             || worker.worker.status == WorkerStatus::Draining.as_str());
+    is_live && shard_fanout::worker_covers_shard(worker, shard_id)
+}
+
+/// Whether `worker` is a live poller of `queue_name` on `shard_id` for
+/// coverage purposes: assigned to the shard, has a fresh heartbeat, is
+/// `Active` or `Draining` (not `Stopped`), and lists the queue.
+pub(crate) fn worker_covers_queue(worker: &WorkerRow, queue_name: &str, shard_id: i32) -> bool {
     let has_queue = worker.worker.queues.as_array().is_some_and(|queues| {
         queues
             .iter()
             .any(|value| value.as_str() == Some(queue_name))
     });
-    is_live && shard_fanout::worker_covers_shard(worker, shard_id) && has_queue
+    worker_is_live_and_assigned(worker, shard_id) && has_queue
 }
 
 /// Load only the workers that can possibly count as coverage on this shard's
@@ -538,27 +465,9 @@ async fn observe_shard(
     filter: Option<String>,
     worker_stale_threshold: Duration,
 ) -> (ShardObservation<UncoveredQueueDemand>, BTreeSet<String>) {
-    let Some(pool) = pool else {
-        return (
-            ShardObservation {
-                shard_id,
-                rows: Vec::new(),
-                error: Some(format!("shard {shard_id} has no configured storage pool")),
-            },
-            BTreeSet::new(),
-        );
-    };
-    let Ok(mut conn) = pool.get().await else {
-        return (
-            ShardObservation {
-                shard_id,
-                rows: Vec::new(),
-                error: Some(format!(
-                    "database connection for shard {shard_id} could not be acquired"
-                )),
-            },
-            BTreeSet::new(),
-        );
+    let mut conn = match shard_fanout::acquire_shard_conn(shard_id, pool).await {
+        Ok(conn) => conn,
+        Err(observation) => return (observation, BTreeSet::new()),
     };
 
     let pending: Vec<PendingQueueDemand> =
@@ -629,10 +538,63 @@ async fn observe_shard(
     )
 }
 
-/// Partitions this shard's `pending` demand into the genuinely-uncovered
-/// rows and the set of queue names that were excluded solely because they
-/// are currently paused (see [`merge_excluded_paused_queues`]).
-fn partition_uncovered_and_paused(
+/// Partitions this shard's pending demand into uncovered rows and paused
+/// queue names.
+///
+/// The first element is the genuinely-uncovered rows; the second is the set
+/// of queue names excluded solely because they are currently paused (see
+/// [`merge_excluded_paused_queues`]).
+///
+/// `pub` solely for `queue_coverage_profile` (see [`UncoveredQueueDemand`]'s
+/// doc comment) — not part of the crate's HTTP-facing API surface.
+#[must_use]
+pub fn partition_uncovered_and_paused(
+    pending: Vec<PendingQueueDemand>,
+    workers: &[WorkerRow],
+    paused: &BTreeSet<String>,
+    shard_id: i32,
+) -> (Vec<UncoveredQueueDemand>, BTreeSet<String>) {
+    // Building the coverage index below costs O(workers x
+    // queues-per-worker), no matter how many pending queues it then serves.
+    // That cost is worth paying only when the index answers more than one
+    // question. A `?queue_name=` filtered request narrows `pending` to at
+    // most one row (issue #774 review). There, the pre-fix direct scan can
+    // short-circuit on the first covering worker. So indexing the entire
+    // fleet up front would make a cheap targeted check slower on a large
+    // fleet. Fall back to the direct per-demand scan for that case.
+    if pending.len() <= 1 {
+        return partition_uncovered_and_paused_direct(pending, workers, paused, shard_id);
+    }
+
+    // `shard_id` is fixed for the whole call. Which workers are live and
+    // assigned to it does not depend on `demand`. Precompute the union of
+    // their queue names once instead: O(workers x queues-per-worker). This
+    // replaces a re-scan of every worker, and every worker's own queues,
+    // for every pending queue. That scan was O(pending x workers x
+    // queues-per-worker). See `docs/performance-queue-coverage.md`.
+    let covered_queues: HashSet<&str> = workers
+        .iter()
+        .filter(|worker| worker_is_live_and_assigned(worker, shard_id))
+        .filter_map(|worker| worker.worker.queues.as_array())
+        .flat_map(|queues| queues.iter().filter_map(serde_json::Value::as_str))
+        .collect();
+
+    let mut paused_uncovered = BTreeSet::new();
+    let rows = pending
+        .into_iter()
+        .filter_map(|demand| {
+            let has_coverage = covered_queues.contains(demand.queue_name.as_str());
+            classify_pending_demand(demand, has_coverage, paused, &mut paused_uncovered)
+        })
+        .collect();
+    (rows, paused_uncovered)
+}
+
+/// The pre-fix per-demand scan, kept for the small-`pending` case. See
+/// [`partition_uncovered_and_paused`]'s doc comment. There is no upfront
+/// index here, so a single filtered demand costs at most one pass over
+/// `workers`, short-circuiting on the first covering one.
+fn partition_uncovered_and_paused_direct(
     pending: Vec<PendingQueueDemand>,
     workers: &[WorkerRow],
     paused: &BTreeSet<String>,
@@ -645,24 +607,39 @@ fn partition_uncovered_and_paused(
             let has_coverage = workers
                 .iter()
                 .any(|worker| worker_covers_queue(worker, &demand.queue_name, shard_id));
-            if paused.contains(&demand.queue_name) {
-                if !has_coverage {
-                    paused_uncovered.insert(demand.queue_name);
-                }
-                return None;
-            }
-            if has_coverage {
-                return None;
-            }
-            Some(UncoveredQueueDemand {
-                queue_name: demand.queue_name,
-                pending_count: demand.pending_count,
-                sample_task_ids: demand.sample_task_ids,
-                sample_execution_ids: demand.sample_execution_ids,
-            })
+            classify_pending_demand(demand, has_coverage, paused, &mut paused_uncovered)
         })
         .collect();
     (rows, paused_uncovered)
+}
+
+/// Shared classification step for one pending demand, given its already-
+/// computed coverage. Paused-and-uncovered goes into `paused_uncovered`.
+/// Paused-and-covered or unpaused-and-covered is reported nowhere.
+/// Unpaused-and-uncovered becomes a row. Factored out so the indexed and
+/// direct scans above ([`partition_uncovered_and_paused`] /
+/// [`partition_uncovered_and_paused_direct`]) cannot drift on this logic.
+fn classify_pending_demand(
+    demand: PendingQueueDemand,
+    has_coverage: bool,
+    paused: &BTreeSet<String>,
+    paused_uncovered: &mut BTreeSet<String>,
+) -> Option<UncoveredQueueDemand> {
+    if paused.contains(&demand.queue_name) {
+        if !has_coverage {
+            paused_uncovered.insert(demand.queue_name);
+        }
+        return None;
+    }
+    if has_coverage {
+        return None;
+    }
+    Some(UncoveredQueueDemand {
+        queue_name: demand.queue_name,
+        pending_count: demand.pending_count,
+        sample_task_ids: demand.sample_task_ids,
+        sample_execution_ids: demand.sample_execution_ids,
+    })
 }
 
 fn build_report_from_observations(
@@ -1262,6 +1239,34 @@ mod tests {
     }
 
     #[test]
+    fn partition_single_pending_demand_uses_the_direct_scan_and_still_reports_uncovered() {
+        // `pending.len() == 1` (a `?queue_name=` filtered request) takes
+        // the direct-scan path, not the indexed one. Exercise it with a
+        // genuinely-uncovered result, not just the covered cases above.
+        let pending = vec![pending_demand("typo_queue", 7)];
+        let worker = worker_row(
+            WorkerStatus::Active,
+            WorkerHealth::Healthy,
+            &[0],
+            &["other_queue"],
+        );
+        let (rows, paused_uncovered) =
+            partition_uncovered_and_paused(pending, &[worker], &BTreeSet::new(), 0);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].queue_name, "typo_queue");
+        assert!(paused_uncovered.is_empty());
+    }
+
+    #[test]
+    fn partition_empty_pending_is_empty_on_either_path() {
+        let (rows, paused_uncovered) =
+            partition_uncovered_and_paused(Vec::new(), &[], &BTreeSet::new(), 0);
+        assert!(rows.is_empty());
+        assert!(paused_uncovered.is_empty());
+    }
+
+    #[test]
     fn merge_excluded_paused_queues_dedups_and_sorts_across_shards() {
         let shard0: BTreeSet<String> = ["zeta_paused", "alpha_paused"]
             .into_iter()
@@ -1279,8 +1284,14 @@ mod tests {
 
     #[test]
     fn merge_excluded_paused_queues_empty_input_is_empty() {
-        assert!(merge_excluded_paused_queues(Vec::new()).is_empty());
-        assert!(merge_excluded_paused_queues(vec![BTreeSet::new()]).is_empty());
+        assert_eq!(
+            merge_excluded_paused_queues(Vec::new()),
+            [] as [std::string::String; 0]
+        );
+        assert_eq!(
+            merge_excluded_paused_queues(vec![BTreeSet::new()]),
+            [] as [std::string::String; 0]
+        );
     }
 
     // ── QueueCoverageQuery::from_query_pairs (AC8) ──────────────────────
@@ -1347,144 +1358,11 @@ mod tests {
     }
 
     // ── parse_raw_query_pairs_strict (issue #774 review) ────────────────
-
-    #[test]
-    fn parse_raw_query_pairs_strict_empty_input_is_empty_pairs() {
-        assert_eq!(parse_raw_query_pairs_strict(""), Ok(Vec::new()));
-    }
-
-    #[test]
-    fn parse_raw_query_pairs_strict_decodes_normal_pairs() {
-        assert_eq!(
-            parse_raw_query_pairs_strict("queue_name=email"),
-            Ok(vec![("queue_name".to_string(), "email".to_string())])
-        );
-    }
-
-    #[test]
-    fn parse_raw_query_pairs_strict_decodes_percent_encoded_values() {
-        // %20 must decode to a literal space, matching form_urlencoded.
-        assert_eq!(
-            parse_raw_query_pairs_strict("queue_name=hello%20world"),
-            Ok(vec![("queue_name".to_string(), "hello world".to_string())])
-        );
-    }
-
-    #[test]
-    fn parse_raw_query_pairs_strict_decodes_plus_as_space() {
-        // application/x-www-form-urlencoded: unescaped `+` means space.
-        assert_eq!(
-            parse_raw_query_pairs_strict("queue_name=a+b"),
-            Ok(vec![("queue_name".to_string(), "a b".to_string())])
-        );
-    }
-
-    #[test]
-    fn parse_raw_query_pairs_strict_a_literal_plus_is_encoded_as_percent_2b() {
-        // %2B is a percent-encoded literal '+', distinct from bare '+'
-        // (which means space) -- the two must decode differently.
-        assert_eq!(
-            parse_raw_query_pairs_strict("queue_name=a%2Bb"),
-            Ok(vec![("queue_name".to_string(), "a+b".to_string())])
-        );
-    }
-
-    #[test]
-    fn parse_raw_query_pairs_strict_rejects_invalid_utf8_in_value() {
-        // 0xFF is never a valid standalone UTF-8 byte -- this is the exact
-        // review-flagged repro (`?queue_name=%FF`).
-        assert_eq!(
-            parse_raw_query_pairs_strict("queue_name=%FF"),
-            Err(InvalidQueryEncoding)
-        );
-    }
-
-    #[test]
-    fn parse_raw_query_pairs_strict_rejects_invalid_utf8_in_key() {
-        assert_eq!(
-            parse_raw_query_pairs_strict("%FF=value"),
-            Err(InvalidQueryEncoding)
-        );
-    }
-
-    #[test]
-    fn parse_raw_query_pairs_strict_rejects_a_lone_trailing_percent() {
-        // `%` with nothing after it -- percent_decode_str leaves it as a
-        // literal `%` (still valid UTF-8 on its own), so only an explicit
-        // hex-escape well-formedness check catches this.
-        assert_eq!(
-            parse_raw_query_pairs_strict("queue_name=orders%"),
-            Err(InvalidQueryEncoding)
-        );
-    }
-
-    #[test]
-    fn parse_raw_query_pairs_strict_rejects_a_percent_with_one_hex_digit() {
-        assert_eq!(
-            parse_raw_query_pairs_strict("queue_name=orders%2"),
-            Err(InvalidQueryEncoding)
-        );
-    }
-
-    #[test]
-    fn parse_raw_query_pairs_strict_rejects_non_hex_percent_escape() {
-        // `%GG` -- the exact review-flagged repro. `G` is not a hex digit,
-        // so percent_decode_str leaves `%GG` undecoded rather than erroring;
-        // the caller must not silently query the literal "orders%GG".
-        assert_eq!(
-            parse_raw_query_pairs_strict("queue_name=orders%GG"),
-            Err(InvalidQueryEncoding)
-        );
-    }
-
-    #[test]
-    fn parse_raw_query_pairs_strict_rejects_non_hex_percent_escape_in_key() {
-        assert_eq!(
-            parse_raw_query_pairs_strict("queue%ZZname=value"),
-            Err(InvalidQueryEncoding)
-        );
-    }
-
-    #[test]
-    fn parse_raw_query_pairs_strict_accepts_well_formed_lowercase_hex_escape() {
-        // Lowercase hex digits are just as well-formed as uppercase.
-        assert_eq!(
-            parse_raw_query_pairs_strict("queue_name=hello%2fworld"),
-            Ok(vec![("queue_name".to_string(), "hello/world".to_string())])
-        );
-    }
-
-    #[test]
-    fn parse_raw_query_pairs_strict_skips_empty_segments() {
-        // A leading/trailing/doubled `&` must not produce a spurious
-        // empty-key pair.
-        assert_eq!(
-            parse_raw_query_pairs_strict("&a=1&&b=2&"),
-            Ok(vec![
-                ("a".to_string(), "1".to_string()),
-                ("b".to_string(), "2".to_string()),
-            ])
-        );
-    }
-
-    #[test]
-    fn parse_raw_query_pairs_strict_key_without_equals_has_empty_value() {
-        assert_eq!(
-            parse_raw_query_pairs_strict("queue_name"),
-            Ok(vec![("queue_name".to_string(), String::new())])
-        );
-    }
-
-    #[test]
-    fn parse_raw_query_pairs_strict_preserves_percent_encoded_whitespace_padding() {
-        // Regression tie-in to the whitespace-preservation fix above: a
-        // caller who genuinely percent-encodes surrounding whitespace must
-        // still get it back verbatim through the strict decoder.
-        assert_eq!(
-            parse_raw_query_pairs_strict("queue_name=%20email%20"),
-            Ok(vec![("queue_name".to_string(), " email ".to_string())])
-        );
-    }
+    //
+    // The generic decoding tests moved to `crate::strict_query`'s own test
+    // module (issue #1151, extraction). Only the test below stays here: it
+    // exercises the queue_coverage-specific integration between the shared
+    // strict decoder and `QueueCoverageQuery::from_query_pairs`.
 
     #[test]
     fn parse_raw_query_pairs_strict_duplicate_and_unknown_keys_survive_to_from_query_pairs() {

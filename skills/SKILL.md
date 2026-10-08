@@ -15,7 +15,7 @@ description: >
 # autumn-harvest — Durable Workflow Engine for Rust
 
 **Repository**: https://github.com/autumn-foundation/autumn-harvest
-**Version**: 0.5.0 | **Edition**: 2024 | **MSRV**: 1.88.0
+**Version**: 0.7.0 | **Edition**: 2024 | **MSRV**: 1.88.0
 **Author**: autumn-foundation
 
 autumn-harvest is a Postgres-backed durable workflow engine — Temporal-style semantics
@@ -60,13 +60,13 @@ non-web or other-framework contexts.
 
 ```toml
 [dependencies]
-autumn-harvest = { version = "0.4", features = ["db"] }
-autumn-harvest-plugin = "0.4"
-autumn-web = { version = "0.5", features = ["ws"] }
+autumn-harvest = { version = "0.7", features = ["db"] }
+autumn-harvest-plugin = "0.7"
+autumn-web = { version = "0.8", features = ["ws"] }
 # ... plus standard deps (serde_json, chrono, uuid, tokio, tracing, etc.)
 ```
 
-The `db` feature (default) pulls Diesel + diesel-async. Requirements: Postgres 12+.
+The `db` feature (default) pulls Diesel + diesel-async. Requirements: Postgres 12+. CI runs Harvest's own DB suites on Postgres 16 and does not test 12 to 15.
 
 ## Defining Workflows
 
@@ -144,11 +144,15 @@ async fn send_welcome_email(
 
 | Attribute | Purpose |
 |-----------|---------|
-| `start_to_close = "30s"` | Maximum execution time before timeout |
+| `start_to_close = "30s"` | Maximum execution time before timeout. An activity with no `start_to_close`, `schedule_to_close` or `heartbeat_timeout` gets the worker's `default_activity_start_to_close`: 10 minutes since 0.7.0 |
 | `heartbeat_timeout = "10s"` | Max time between heartbeats for long-running activities |
 | `retry = RetryPolicy::exponential(max_attempts, initial_delay)` | Retry policy on failure |
 
 Activities that exhaust their retry policy are moved to a dead letter queue.
+
+Since 0.7.0, a `start_to_close` or `heartbeat_timeout` timeout retries per the
+retry policy, like a handler failure. An open circuit breaker defers the task
+by default instead of failing it.
 
 ## Retry Policies
 
@@ -249,6 +253,13 @@ async fn weekly_digest(ctx: &WorkflowContext, user_id: i64) -> HarvestResult<()>
 ```
 
 ## Integrating with autumn-web
+
+Harvest 0.7 needs `autumn-web` 0.8. A leftover `autumn-web = "0.7"` builds a
+second copy whose `Plugin` trait `HarvestPlugin` does not implement.
+
+Outside the `dev` profile, a management API with no declared auth layer
+answers every mutating route with `401` (0.7.0). Declare an auth layer before
+you deploy. See `docs/upgrading/0.7.0.md` for every 0.7.0 default change.
 
 ### Building the HarvestPlugin
 

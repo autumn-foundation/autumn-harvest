@@ -12,6 +12,10 @@ metric-backed rule below — each alert maps to a named panel (the mapping
 table lives in `docs/dashboards/README.md`), and each mapped panel's
 description links back to its section in this runbook.
 
+The `harvest_slo_*` sections at the end serve the optional SLO burn-rate
+pack ([`docs/alerts/slo.md`](../alerts/slo.md)). Those alerts have no
+starter-pack rule and no dashboard panel.
+
 ## First 60 seconds — one-call incident triage
 
 When an alert fires or a page lands, hit **one** endpoint first:
@@ -46,7 +50,9 @@ where to look next.
       "active": 4,
       "draining": 0,
       "unhealthy": 0,
-      "total": 4
+      "total": 4,
+      "outliers": [],
+      "outliers_total": 0
     },
     {
       "name": "shards",
@@ -85,6 +91,13 @@ where to look next.
 }
 ```
 
+The `workers` block lists gray failures under `outliers` (issue #1815). Each
+entry names a live worker that fails or slows far more than its peers on the
+same queues, queue weights, build, labels and slots per task kind. It shows the worker's stats and the peer medians. The list holds
+the worst 20, and `outliers_total` gives the full count. Any outlier degrades
+the block with the `worker_outlier` reason code. See
+[harvest_worker_gray_failure](#harvest_worker_gray_failure).
+
 Each subsystem block carries its verdict, its `reason_codes`, its headline
 numbers (flattened into the block), and a `drill_down` path — which is
 populated **only when the subsystem is not `healthy`** and is `null`
@@ -95,7 +108,7 @@ otherwise. The `drill_down` paths are relative to the management-API mount
 
 | Subsystem | Headline metrics | `drill_down` when non-`healthy` |
 |---|---|---|
-| `workers` | `active` / `draining` / `unhealthy` / `total` | `/workers/health` |
+| `workers` | `active` / `draining` / `unhealthy` / `total` / `outliers` / `outliers_total` | `/workers/health` |
 | `shards` | `ready` / `degraded` / `unavailable` | `/admin/shards/health` |
 | `dead_letters` | `total` / `newest_entry_age_secs` | `/dead-letters/aggregate` |
 | `queues` | `max_backlog` / `max_backlog_queue` | `/admin/shards/health` |
@@ -193,6 +206,8 @@ count. Override them per environment with
 - The **static alert pack** (`docs/alerts/starter-pack-v0.1.0.json`, the rest of
   this runbook) owns **PUSH alerting** — it tells you *when* to look.
 - **`/api/harvest/health`** is **liveness** — is the process up — not a rollup.
+  For probes, use `/api/harvest/health/live` and `/api/harvest/health/ready`. See
+  [`../operations/kubernetes-probes.md`](../operations/kubernetes-probes.md).
 - **`/api/harvest/admin/preflight`** is **startup validation** — is this
   deployment safe to promote — run at deploy time, not during an incident.
   One exception, added by issue #797: its `scanner_liveness` check is a *live*
@@ -640,6 +655,16 @@ harvest dlq redrive \
   --max 500 --reason "stripe rate-limit cleared, incident-1234"
 ```
 
+Redrive specific rows instead of a filter when you already have their ids —
+from `harvest dlq list`, or from a bug report — with `--dead-letter-id`
+(repeatable, or comma-separated):
+
+```bash
+harvest dlq redrive \
+  --dead-letter-id 8f14e2c1-4b3a-4d9e-9a2f-6c1d0b5e7f31,a93c0752-1e6d-4a8b-8f0c-2d9b7a4e1c56 \
+  --reason "stripe rate-limit cleared, incident-1234"
+```
+
 The response distinguishes `matched` (total filtered), `redriven`,
 `skipped`, and `failed`. Read it:
 
@@ -674,6 +699,14 @@ The response distinguishes `matched` (total filtered), `redriven`,
   as `skipped` — never a duplicate side-effect.
 - **Shard-aware.** A filtered redrive fans out across all shards; each row is
   re-enqueued on the shard that owns its `workflow_exec_id`.
+- **Spread, not a burst (issue #1832).** Redrive and bulk replay spread the
+  new tasks' `scheduled_at` over a window. Each task gets a jittered slot. So
+  1000 tasks do not hit the dependency that sent them to the DLQ at one
+  instant. The default window is 60 s for 1000 rows, scaled down for fewer
+  rows (100 rows: 6 s). `--spread-secs N` sets it, up to 3600. `--spread-secs 0`
+  makes every task due at once. The base instant is the database clock.
+  On a sharded cluster, every shard uses the window of the whole call. A
+  completion-callback entry gets its next delivery attempt in the window.
 
 The endpoint backing this is `POST /api/harvest/dlq/redrive` (admin auth,
 audit op `dlq.redrive`).
@@ -825,40 +858,41 @@ if readiness cannot be proven during a rollout.
 
 ## harvest_shard_undrained
 
-A writable shard has claimable pending work but **no live worker is polling it**,
-so every workflow rendezvous-hashed onto that shard is permanently undispatched.
+A writable shard has pending work that no live worker can claim. The cause can
+be missing shard coverage or an eligibility mismatch.
 
 This is the **shard-dimension** analogue of
 [`harvest_queue_uncovered`](#harvest_queue_uncovered), which detects the same
 condition per *queue*. Both can be true at once (a queue with no poller on a
-shard with no poller), and each names a different fix: widen a worker's
-**queues** vs. widen a worker's **shards**.
+shard with stranded work). Use shard health to decide whether to change shard
+or queue coverage or fix worker eligibility.
 
 ### Triage steps
 
 1. Run `harvest shard health --output json` and note which shard ids are
    affected and whether they are writable.
-2. Ask whether the shard has **no poller at all** or a poller that is merely
-   behind:
+2. Inspect `no_live_worker` and its `blocking_reasons`. The reason code means no
+   live worker can claim at least one demand. It does not prove poller absence.
+3. Branch on `blocking_reasons`:
+   - `are stale, unhealthy, draining, or stopped` means an assigned poller exists but is not
+     live. Restore, restart, or reactivate that worker.
+   - `polls queue(s)` means no shard-assigned worker polls the pending queue.
+     Start or widen a worker's shard and queue coverage.
+   - `capability/build/sticky requirements` means a covering poller is present
+     but ineligible. Fix build compatibility, capabilities, or sticky ownership.
+4. Use this optional expression to find stranded shards with no recent dispatch
+   activity:
 
    ```promql
-   # stranded work with NO dispatch on that shard  →  genuinely no poller
+   # stranded work with no recent dispatch activity
    max by (shard) (harvest_shard_stranded_pending) > 0
      unless (sum by (shard) (rate(harvest_shard_dispatched_total[5m])) > 0)
    ```
 
-   `unless`, not `and ... == 0`: a shard that has **never** had a covering
-   poller has no `harvest_shard_dispatched_total{shard}` series at all, so an
-   `== 0` comparison produces no element for it and the vector match would
-   return empty — sending you down the "poller present but behind" branch for a
-   shard with no poller whatsoever. `unless` keeps the left-hand element when
-   the right-hand side has none.
-
-   A non-zero dispatch rate alongside stranded work means a worker *is*
-   covering the shard but cannot claim the specific pending rows — fall through
-   to `harvest queue coverage --json` (queue mismatch) or
-   `harvest workflow stack <execution_id>` (build-id/capability mismatch).
-3. Read the worker's **effective** shard coverage:
+   This expression does not prove poller absence. A covering worker can have no
+   dispatches because it cannot claim these rows. `unless`, not `and ... == 0`,
+   preserves a shard that has never had a dispatch series.
+5. Read the worker's **effective** shard coverage:
 
    ```bash
    curl -s .../api/harvest/admin/config | jq '.worker.shard_assignments'
@@ -867,16 +901,15 @@ shard with no poller), and each names a different fix: widen a worker's
    Since issue #961 an **empty** `shard_assignments` means *auto*: the worker
    covers every shard in its pool. `GET /admin/config` reports the *resolved*
    list, so the shard ids printed here are exactly the ones the worker polls.
-4. Confirm at least one live worker reports the shard:
+6. Confirm at least one live worker reports the shard:
    `harvest worker health --output json`.
 
 ### Likely causes
 
-A shard was added to `writable_shards` without starting (or widening) a worker
-that covers it; the only worker covering a shard died or was drained; a worker
-was explicitly narrowed with `WorkerConfig::with_shard_assignments([...])` and
-never widened when the shard set grew; or that shard is in the router but has no
-`ShardedDbPool` entry in the process at all — in which case startup is refused;
+A shard was added to `writable_shards` without a covering worker; its worker
+died or was drained; its worker was explicitly narrowed; or its worker cannot
+claim the rows due to queue, build-id, capability, or sticky-lease constraints.
+The shard can also lack a `ShardedDbPool` entry. In that case, startup is refused;
 check the logs for `ShardRouter references shards ... that have no pool entry`.
 (The sibling `shard_assignments are missing from the sharded_pool` rejection can
 only fire for an **explicitly narrowed** worker: auto-derived assignments come
@@ -894,11 +927,12 @@ while it finishes — cross-check `harvest shard health` for its writable flag.
 
 ### Safe actions
 
-Start or widen a worker that covers the shard — either remove the explicit
-`with_shard_assignments` narrowing so auto-coverage applies, or add the shard to
-the list. Both take effect on worker restart. Do **not** move existing
-executions across shards; Harvest does not rebalance them, and their execution
-ids encode the original shard.
+For a `polls queue(s)` block, remove explicit `with_shard_assignments`
+narrowing, add the shard, or add the queue. For a `are stale, unhealthy, draining, or stopped`
+block, restore, restart, or reactivate the assigned worker. For a
+`capability/build/sticky requirements` block, fix the named eligibility
+constraint. Configuration changes take effect on worker restart. Do **not**
+move executions across shards. Execution ids encode the original shard.
 
 ### Escalation criteria
 
@@ -920,7 +954,8 @@ shows a shard the router considers writable but no worker resolves.
 
 New build policy moved starts to a build with no active workers, old workers
 were drained before in-flight executions finished, compat was not declared, or
-legacy workers with empty build IDs are masking the real routing state.
+workers with empty build IDs cannot claim pinned runs (see
+`harvest.worker.empty_build_policy`).
 
 ### False positives
 
@@ -1066,7 +1101,8 @@ per-execution operator action**. Full playbook:
    - `build_id` (the build ID of the worker that observed the divergence)
 3. Diagnose one specific execution on demand against the **currently-deployed**
    code with `POST /api/harvest/workflows/{id}/replay-diagnosis` (issue #614) —
-   it returns the same `{kind, event_index, expected, actual}` vocabulary and,
+   it returns the same `{kind, event_index, expected, actual}` vocabulary (one
+   exception: a skipped recorded command, see the playbook) and,
    after a candidate rollback/fix is deployed, a `clean` verdict confirms the
    run will resume. See the **"Diagnose the divergence"** section of
    [`docs/runbooks/nondeterminism-block.md`](nondeterminism-block.md#diagnose-the-divergence-issue-614)
@@ -1079,10 +1115,13 @@ per-execution operator action**. Full playbook:
 - Code deployment that modifies workflow logic (adding, removing, or reordering activities, signals, timers, or child workflows) without updating the version gate.
 - Side effects that are not wrapped in `WorkflowContext::side_effect()`, such as direct system calls, time queries (`Instant::now()`), or random number generation.
 - Iteration order on non-deterministic collections (like `HashMap` or `HashSet`) in the workflow function.
+- Drift from an earlier deploy that the engine upgrade surfaces (issue #1791). The worker now blocks a cycle that skips a recorded command. The `build_id` is then the current build, and a rollback does not clear the block.
 
 ### False positives
 
-None. A non-determinism mismatch means the workflow code generated a different sequence of commands/actions than what was recorded in history, making replay safety impossible. Author `Err(...)` returns are never classified as divergence — they still fail terminally.
+None for a mismatch. A non-determinism mismatch means the workflow code generated a different sequence of commands/actions than what was recorded in history, making replay safety impossible. Author `Err(...)` returns are never classified as divergence — they still fail terminally.
+
+One misdiagnosis is possible (issue #1791). A workflow body that awaits non-durable work beside a durable await can block with `expected: <workflow suspended early>` (issue #1797). Replay-diagnosis then reports `clean`. Move that work into an activity.
 
 ### Safe actions
 
@@ -1222,8 +1261,9 @@ self-resolves within one evaluation window is expected.
 
 1. If a downstream outage is confirmed, force-open the failing activity's
    circuit breaker (`POST /api/harvest/admin/circuits/{activity}/force-open`)
-   so new sagas fail fast at the first step instead of committing work they
-   will immediately unwind.
+   so new sagas stop at the first step instead of committing work they will
+   immediately unwind. In defer mode they wait in `PENDING`. In fail-fast mode
+   they fail at once.
 2. Pause the schedules or gate the admissions that feed the affected workflow
    type until the downstream recovers.
 3. Let in-flight unwinds run — compensations are idempotent by contract and
@@ -1527,23 +1567,24 @@ stalled (their `stack` shows no forward progress across successive checks).
 
 **What to do when a still-running workflow's history is approaching the hard
 cap:** the `harvest.workflow.history_bloat` counter (issue #704) is an operator
-**early-warning**, distinct from the terminal outcome it precedes. Harvest can
-optionally enforce a hard cap on the number of recorded `harvest_events` an
-in-flight execution may accumulate (`WorkflowHistoryPolicy::event_hard_cap`,
-set once via `HarvestBuilder::history_event_hard_cap` at worker-registry
-construction time — **registry-wide, not per-workflow-type**: `HandlerRegistry`
+**early-warning**, distinct from the terminal outcome it precedes. Harvest
+enforces a hard cap on the number of recorded `harvest_events` an
+in-flight execution may accumulate. The default is 50,000 events (issue
+#1804). Set it with `HarvestBuilder::history_event_hard_cap`
+(`WorkflowHistoryPolicy::event_hard_cap`) at worker-registry
+construction time. The cap is **registry-wide, not per-workflow-type**: `HandlerRegistry`
 stores a single `WorkflowHistoryPolicy`, consulted with no workflow-name
 parameter, so every workflow type registered on that worker shares the
 identical cap and warn fraction; there is no per-type override, and raising or
 lowering either value affects every workflow type that worker serves. Distinct
 from the unrelated fleet-wide `HarvestBuilder::max_workflow_history_events`
 ceiling from issue #493, which is sampled by a separate periodic scanner and
-reported via the `harvest.workflow.history_oversized` gauge). When a hard cap
-is configured,
+reported via the `harvest.workflow.history_oversized` gauge). Unless the cap
+is unlimited,
 the same still-`RUNNING` execution that would eventually hit it is instead
 warned once — the first time its recorded history crosses a configurable
-fraction of that cap (`history_bloat_warn_fraction`, default **75%**,
-`0` disables the signal entirely). The counter increments once per crossing
+fraction of that cap (`history_bloat_warn_fraction`, default **20.48%**, so
+10,240 events under the default cap; `0` disables the signal entirely). The counter increments once per crossing
 per execution (delivery is at-least-once — see the last triage step below);
 the run itself is completely unaffected and keeps executing normally. A
 single decision cycle can also grow history from below the soft threshold
@@ -1565,12 +1606,12 @@ window to act *before* that happens.
    `history_event_count`:
    `harvest workflow list --history-bloat-min-events <threshold>` (or
    `GET /api/harvest/workflows?history_bloat_min_events=<threshold>`). Start
-   with a threshold near the configured hard cap's 75% soft mark and lower it
+   with a threshold near the configured hard cap's 20.48% soft mark and lower it
    if you need to see the full ranked population; every returned row is
    guaranteed non-terminal (`RUNNING`/`PAUSED`), sorted by history size
    descending. This is a DIFFERENT query parameter from the unrelated,
    pre-existing general-purpose `min_history_events` filter (issue #493,
-   `docs/runbooks/history-ceiling.md`), which composes with `state=`/
+   [`docs/runbooks/history-ceiling.md`](history-ceiling.md)), which composes with `state=`/
    pagination and does not restrict to live executions or sort by size.
 3. For the largest offender(s), inspect `GET /api/harvest/workflows/{execution_id}/stack`
    and `GET /api/harvest/workflows/{execution_id}/history` to understand what
@@ -1615,9 +1656,10 @@ A single crossing for a workflow type known to run long and record many
 events by design (e.g. a long-lived entity workflow deliberately operating
 close to its configured cap) is expected, not an incident — the alert fires
 once per execution and does not repeat unless the execution keeps growing
-past the point already investigated. A worker whose `HandlerRegistry` has no
-`event_hard_cap` configured will show a permanently flat, never-incrementing
-series; that is the disabled/no-op state, not a health signal to chase.
+past the point already investigated. A worker with an unlimited event cap
+(`history_event_hard_cap_unlimited()`) or a warn fraction of `0`
+(`history_bloat_warn_fraction(0.0)`) shows a flat series. That is the
+disabled state, not a health signal.
 
 ### Safe actions
 
@@ -1825,11 +1867,11 @@ redriven later).
 correctness in production depends on a fleet of control loops that run as
 bare spawned Tokio tasks *inside the embedder's process* — timeout
 enforcement, the soft-SLA scanner, poison-pill orphan reclaim, the external
-signal/cancel/await outboxes, the retention janitor, the schedule ticker, and
-the bounded-pause auto-resumer. If one panics, deadlocks on a poisoned
-connection, or stalls on a never-returning query, it fails **silently**: the
-work it owns simply stops happening, and every other part of the process keeps
-running normally.
+signal/cancel/await outboxes, the retention janitor, the schedule ticker, the
+bounded-pause auto-resumer, and the dedicated audit-export task (issue
+#1269). If one panics, deadlocks on a poisoned connection, or stalls on a
+never-returning query, it fails **silently**: the work it owns simply stops
+happening, and every other part of the process keeps running normally.
 
 `harvest.scanner.tick` (issue #797) closes that blind spot. It is incremented
 **unconditionally at the end of every iteration** — including iterations that
@@ -1840,7 +1882,7 @@ in the catalogue (`harvest.retention.deleted`,
 only emit when there *is* work, so a healthy idle loop and a dead one both read
 zero. Here, **a flat-lined series is the wedge signal.**
 
-There are seven `scanner` label values but **five** spawned loops: `sla` and
+There are eight `scanner` label values but **six** spawned loops: `sla` and
 `external_outbox` are enforcement responsibilities *inside* the `timeout` loop,
 not tasks of their own. All three are ticked together by that loop, so they
 **share one liveness fate and cannot diverge** — `timeout` healthy implies `sla`
@@ -1858,6 +1900,8 @@ own work counters and its `tracing::error!`, not this heartbeat.
 | `retention` | `RetentionRuntime::spawn` | History/audit/summary GC (#737, #752) |
 | `schedule` | `Scheduler::spawn_sharded` | Every cron/interval schedule firing |
 | `pause_auto_resume` | `spawn_pause_auto_resumer` | Bounded-pause auto-resume (#383) |
+| `audit_export` | `spawn_audit_export_checker_for_shard` | Audit-record export to the configured SIEM sink (#1269) |
+| `rebalance_resume` | `spawn_rebalance_resume_scanner` | Settles a shard migration that stalled after its cutover (#1839) |
 
 ### Triage steps
 
@@ -1874,13 +1918,17 @@ own work counters and its `tracing::error!`, not this heartbeat.
    the metric (step 2) to find which replica went quiet, then run the check
    there.
 2. With Prometheus, find the replica:
-   `rate(harvest_scanner_tick_total{scanner!="retention"}[5m])` — the wedged
-   loop reads `0` on the affected `instance` while its siblings and the other
-   replicas keep incrementing. Deliberately **not** `sum by (scanner)`: every
-   replica runs its own copy of all seven loops, so summing lets a healthy
-   replica mask a wedged one. Use a wider window for `retention`
-   (`increase(harvest_scanner_tick_total{scanner="retention"}[3h])`), which
-   polls hourly by default.
+   `rate(harvest_scanner_tick_total{scanner!="retention",scanner!="audit_export"}[5m])`
+   — the wedged loop reads `0` on the affected `instance` while its siblings
+   and the other replicas keep incrementing. Deliberately **not** `sum by
+   (scanner)`: every replica runs its own copy of all eight loops, so
+   summing lets a healthy replica mask a wedged one. Use a wider window for
+   `retention` (`increase(harvest_scanner_tick_total{scanner="retention"}[3h])`),
+   which polls hourly by default, and for `audit_export`
+   (`rate(harvest_scanner_tick_total{scanner="audit_export"}[10m])`), whose
+   per-tick duration follows the configured `audit_export_lease` rather
+   than the poll interval — a healthy delivery can legitimately flat-line
+   the 5m query without being wedged.
 3. Read the worker process logs around the time the series flat-lined. A
    panicked loop leaves a panic backtrace; a stalled one leaves nothing at all,
    which is itself diagnostic.
@@ -1910,7 +1958,8 @@ own work counters and its `tracing::error!`, not this heartbeat.
   API-only pod.
 - **A loop polling slower than the alert window.** The loops do *not* share a
   cadence: `timeout`/`sla`/`external_outbox` poll every 500 ms, `schedule`
-  every 1 s, `poison_pill`/`pause_auto_resume` every 5 s — but `retention`
+  every 1 s, `poison_pill`/`pause_auto_resume`/`rebalance_resume` every 5 s —
+  but `retention`
   polls **hourly** by default. That is why the shipped rule carries two
   expressions with different windows; a single 5-minute window would page
   continuously on a perfectly healthy retention janitor. Retune both if you
@@ -1983,19 +2032,31 @@ own work counters and its `tracing::error!`, not this heartbeat.
   normally:
 
   ```promql
-  (rate(harvest_scanner_tick_total{scanner!="retention"}[5m]) == 0)
+  (rate(harvest_scanner_tick_total{scanner!="retention",scanner!="audit_export"}[5m]) == 0)
+    and on(instance) (count by (instance) (harvest_worker_slots_available) > 0)
+  ```
+
+  `audit_export` is excluded here for the same reason it gets its own window
+  in the shipped alert: a healthy delivery can legitimately run longer than
+  this recipe's 5m under a configured `audit_export_lease`. Give it its own
+  arm with the wider window, same gate:
+
+  ```promql
+  (rate(harvest_scanner_tick_total{scanner="audit_export"}[10m]) == 0)
     and on(instance) (count by (instance) (harvest_worker_slots_available) > 0)
   ```
 
   Since the tick series is created at registration (see below), this also
   covers the narrow case of a process that registers its loops and drains
   before any of them completes a first iteration. Adapt `instance` to whatever
-  target label your scrape config uses. If your topology runs `retention` or
-  `schedule` on a process with no worker, gate those two on that process's own
-  identifying label instead — or rely on the `scanner_liveness` check, which
-  needs no gate because it knows what is registered.
+  target label your scrape config uses. If your topology runs `retention`,
+  `schedule`, or `audit_export` on a process with no worker, gate those on
+  that process's own identifying label instead — or rely on the
+  `scanner_liveness` check, which needs no gate because it knows what is
+  registered.
 - **Not a false positive: one wedged shard.** A multi-shard worker spawns a
-  `timeout`, `poison_pill`, and `pause_auto_resume` loop **per assigned shard**,
+  `timeout`, `poison_pill`, `pause_auto_resume` and `rebalance_resume` loop
+  **per assigned shard**,
   all under one `scanner` label. Both surfaces handle this, and both have to:
   the counter carries a bounded **`shard`** label (the shard id, or `none` for
   the process-wide `retention`/`schedule` loops and single-shard deployments),
@@ -2571,3 +2632,1145 @@ terminally failed. Escalate to the team owning the deploy if
 `GET /admin/workflow-types/reachability` reports `orphaned` for a type that is
 supposed to be live — a handler was removed while in-flight work still needed
 it, and those executions cannot make progress until it is redeployed.
+
+## harvest_replication_down
+
+**What to do when a shard has no connected standby:** cross-region DR is not
+protecting that shard. The RPO is unbounded and growing, a failover right now
+would lose everything since the standby stopped consuming, and the WAL the
+abandoned slot retains accumulates on the primary until it exhausts the disk.
+
+This alert keys on `harvest_replication_standbys{shard} == 0`, **not** on a lag
+threshold, and that is load-bearing. `harvest.replication.lag_seconds` is
+deliberately **absent** rather than `0` when the RPO is unknown — a dead standby
+reported as a perfect RPO is the most dangerous number the DR feature could
+publish — so an alert written as `lag_seconds > N` produces no series and stays
+silent through exactly this outage. `harvest.replication.lag_bytes` *does* stay
+real, because a slot pins WAL whether or not a walsender is attached; that is
+your severity signal here.
+
+### Triage steps
+
+1. `harvest dr status --shard <id>=<dsn> -o json`. `connected_standbys: 0` with
+   a growing `lag_bytes` confirms it.
+2. On the primary, **scoped to this shard's database**:
+   `SELECT slot_name, database, active, pg_current_wal_lsn() -
+   COALESCE(confirmed_flush_lsn, restart_lsn) AS backlog FROM
+   pg_replication_slots WHERE database = current_database() OR database IS NULL;`
+   An `active = false` slot with a growing backlog is an abandoned standby.
+   The `WHERE` clause is load-bearing: `pg_replication_slots` is **cluster-wide**
+   and one cluster can host several shard databases, so an unscoped listing
+   shows you a sibling shard's slots alongside your own.
+3. On the standby: is the subscription enabled?
+   `SELECT subname, subenabled FROM pg_subscription;` Check the standby's log
+   for apply-worker errors — a constraint violation or a missing table stops
+   apply permanently and the slot then just accumulates.
+4. Check the standby host itself: disk full, out of memory, restarted, or the
+   network path from standby to primary broken.
+
+### Likely causes
+
+- The subscription was disabled (often by a `DISABLE` during maintenance that
+  was never re-enabled).
+- The apply worker is failing permanently: a schema mismatch after a migration
+  was applied to the primary but not the standby (logical replication carries
+  no DDL).
+- The standby host is down, out of disk, or unable to reach the primary.
+- The slot was created and then never consumed — a half-finished DR setup.
+- The `pg_monitor` grant was revoked, so the views read as unavailable. This
+  looks like `0` standbys and is a configuration problem, not an outage.
+
+### False positives
+
+- A deliberate maintenance window on the standby. Expected, and still worth the
+  page: the RPO really is unbounded for its duration.
+- A single sampler interval during a standby restart. The `for: 2m` window
+  covers a normal restart.
+- A deployment that never configured DR at all. If a shard has no standby by
+  design, silence this alert for that shard explicitly rather than letting it
+  become background noise everyone ignores.
+
+### Safe actions
+
+- Re-enable the subscription: `ALTER SUBSCRIPTION <name> ENABLE;` This is the
+  fix for the most common cause (a maintenance `DISABLE` that was never undone)
+  and it costs seconds.
+- Apply any missing migrations to the standby, then re-enable.
+- Rebuild the standby from a fresh base backup or a fresh `copy_data = true`
+  subscription.
+
+### Destructive — last resort only
+
+`SELECT pg_drop_replication_slot('<name>');` is **irreversible** and is not a
+safe action. Dropping a slot ends DR for that shard until the standby is
+rebuilt from scratch, and converts a five-second `ALTER SUBSCRIPTION ... ENABLE`
+into a multi-hour re-seed if the standby was merely disabled.
+
+Preconditions, all of them:
+
+1. You have confirmed the slot's `database` matches the affected shard. An
+   unscoped listing will show sibling shards' slots, and destroying one of those
+   ends a **healthy** shard's DR with no way to repair it short of a rebuild.
+2. You have established the standby is genuinely unrecoverable, not disabled.
+3. You have accepted that this shard has no DR until it is rebuilt, and said so
+   in the incident channel.
+
+The one situation that justifies it: retained WAL is about to exhaust the
+primary's disk. A primary that runs out of WAL space is a full outage, which is
+worse than a lost safety net — but that is a trade to make deliberately, not a
+"safe action".
+
+### Escalation criteria
+
+Escalate to the platform team owning the DR topology when the backlog passes
+the primary's WAL headroom, when the standby cannot be recovered in place, or
+when this shard is under an RPO commitment and DR has been down long enough to
+breach it. If a regional failure occurs while this is firing, the failover will
+proceed with an **unmeasured** loss — say so in the incident channel rather
+than recording "RPO: 0", and follow `docs/runbooks/cross-region-failover.md`.
+
+## harvest_replication_lag_high
+
+**What to do when the measured RPO is growing:** the standby is falling behind,
+so the amount of acknowledged work a failover would lose is growing with it.
+The number is literal: at failover, up to `lag` seconds of confirmed work is
+gone, and per Harvest's at-least-once contract, side effects from that window
+may re-execute on the new primary.
+
+A large `harvest.replication.lag_seconds` next to a `NULL`
+`pg_stat_replication.replay_lag` is the signature of a **stuck apply worker**.
+That combination is not a contradiction: `replay_lag` is computed from the
+subscriber's reply messages, so a subscriber whose apply worker is blocked stops
+replying and the column goes blind, while Harvest's watermark trail — computed
+on the primary from a position the standby confirmed — keeps measuring.
+
+### Triage steps
+
+1. `harvest dr status --shard <id>=<dsn> -o json` for the per-shard RPO and
+   byte backlog.
+2. On the primary: `SELECT application_name, state, replay_lag FROM
+   pg_stat_replication;` Compare with step 1 — a `NULL` here beside a large RPO
+   means apply is stuck, not slow.
+3. On the standby, look for a long-running transaction or a lock the apply
+   worker is waiting on: `SELECT pid, state, wait_event_type, wait_event, query
+   FROM pg_stat_activity WHERE backend_type = 'client backend';` A reporting
+   query holding a lock on a replicated table blocks apply completely. The
+   `backend_type` filter matters before you terminate anything: the logical
+   apply worker and the walreceiver are in that view too, and killing them is
+   the opposite of the fix.
+4. Check standby I/O and CPU. A standby on smaller hardware than its primary
+   falls behind under write bursts and never catches up.
+
+### Likely causes
+
+- A long-running query or an idle-in-transaction session on the standby holding
+  a lock the apply worker needs.
+- The standby is under-provisioned relative to the primary's write rate.
+- A large bulk write on the primary (a backfill, a retention sweep, a batch
+  start) that the single-threaded logical apply worker cannot keep pace with.
+- Network throughput between regions, especially with a burst of large payloads.
+- The sampler interval is set very high, so the reported number is coarse. The
+  RPO's resolution floor is one sampler interval.
+
+### False positives
+
+- A brief spike during a known bulk operation. Correlate with
+  `harvest_workflow_started_total` and your own backfill schedule.
+- A value between zero and one sampler interval on a healthy system. That is
+  the resolution floor, not lag.
+- A generation-skew alert firing *during* a planned failover. Skew is expected
+  while shards are being promoted; it is only a problem if it persists after
+  the failover is complete.
+
+### Safe actions
+
+- Terminate the blocking session on the standby:
+  `SELECT pg_terminate_backend(<pid>);`
+- Reduce write pressure: pause a backfill, lower a batch-start rate, or defer a
+  retention sweep.
+- Raise the standby's resources.
+- Do **not** "fix" the alert by widening the threshold. The threshold should be
+  the RPO the business agreed to accept; if the real lag exceeds it, the
+  exposure is real.
+
+### Escalation criteria
+
+Escalate when the measured RPO exceeds the documented RPO budget for more than
+one business hour, when it is rising monotonically with no identified cause, or
+when a failover is being considered while it is elevated — the RPO reported at
+that moment is the loss being accepted, and that is a decision for the service
+owner, not for on-call.
+
+## harvest_shard_fenced
+
+**What to do when a worker was fenced:** the shard's write-authority generation
+moved past the epoch that worker pinned at startup, so another region holds
+write authority now. The worker stopped rather than appending to a history it no
+longer owns. This is the cross-region DR fence working exactly as designed —
+the question is only whether the fence was intentional.
+
+### Triage steps
+
+1. Is a failover in progress? If yes, this is expected for the **old** fleet and
+   the remaining work is `docs/runbooks/cross-region-failover.md` step 4:
+   restart workers against the region that now holds authority.
+2. If no: `SELECT shard_id, generation, fenced_at, fenced_by, fenced_reason
+   FROM harvest_shard_generation;` The row records who bumped it and why.
+3. `harvest dr status --shard <id>=<dsn> -o json` across every shard. Compare
+   generations: if they differ, some shards were fenced and some were not,
+   which is a half-failed-over cluster.
+4. `harvest worker health --output json` — expect the fenced workers to be
+   absent or stale. They stopped; they are not slow.
+
+### Likely causes
+
+- A planned failover, with the old fleet still running.
+- A `harvest dr fence` run against the wrong shard, the wrong region, or during
+  a healthy week.
+- A worker restarted against the **old** region after a failover, pinning an
+  epoch that was already superseded.
+- A fail-back where the old region was re-seeded (correctly) from the new
+  primary, bringing the newer epoch with it, while a surviving worker there was
+  never restarted.
+
+### False positives
+
+None. A fence is always a real loss of write authority. It can be *expected* —
+during a failover it is the intended outcome — but it is never spurious, and
+the count never decays on its own.
+
+### Safe actions
+
+- Restart the fenced workers against the region that currently holds authority.
+  The default `Auto` fencing mode finds the generation row, so they fence
+  again and pin the current epoch at startup.
+- If the fence was a mistake, the recovery is still to **restart the fleet**.
+  Generations only go up; there is no un-bump, and bumping again does not undo
+  anything — it fences the fleet a second time.
+- **Never** re-pin or adopt the new epoch in a running worker. That would
+  re-admit a worker the promoted region just evicted, which is precisely the
+  split-brain the epoch exists to prevent.
+- Verify no fenced worker wrote anything: a fenced claim burns no attempt and a
+  fenced append writes nothing, so its tasks should still be `PENDING` and
+  claimable by the region that holds authority.
+
+### Escalation criteria
+
+Escalate immediately when no failover was planned — an unexplained generation
+bump means someone has write authority you did not grant. Escalate when
+generations are skewed across shards outside a failover window, and when fenced
+workers keep reappearing after restart (they are being pointed at a region that
+no longer holds authority — fix the DSN or DNS, not the worker).
+
+## harvest_replication_unobservable
+
+**What to do when a shard's replication views cannot be read:** the RPO and
+standby count for that shard are **unknown** — not zero, and not evidence that
+replication is down. Replication itself may be perfectly healthy; what has been
+lost is the ability to see it. Almost always a missing `GRANT pg_monitor` on
+the role Harvest connects as.
+
+This is a ticket rather than a page for that reason, but it is not cosmetic. A
+Prometheus gauge keeps exporting its last value until something changes it, so
+while `harvest.replication.observable` is `0` the RPO, standby-count and
+backlog panels are **frozen at their last healthy reading** rather than
+reflecting reality. Harvest deliberately withholds those gauges instead of
+publishing zeros — a zero standby count would page on-call for a permissions
+problem — and this signal is what tells a dashboard that the silence means
+"cannot see", not "nothing to report".
+
+`harvest_replication_down` is gated on `observable == 1`, so the two rules are
+mutually exclusive and neither can fire on a stale reading.
+
+### Triage steps
+
+1. `harvest dr status --shard <id>=<dsn> -o json`. The affected shard reports
+   `unreadable` for standbys and carries an explicit `replication_error`.
+2. Read that error. `permission denied for view pg_stat_replication` is the
+   common case.
+3. Confirm the role's membership:
+   `SELECT pg_has_role(current_user, 'pg_monitor', 'member');`
+4. If the grant is present, check whether the DSN points where you think — a
+   shard pointed at a replica or a pooler that rewrites the session can produce
+   the same symptom.
+
+### Likely causes
+
+- `GRANT pg_monitor TO harvest` was never run, or was lost when the role was
+  recreated during a migration or a restore.
+- The deployment connects through a connection pooler in a mode that does not
+  preserve the expected role.
+- A managed-Postgres provider that restricts `pg_stat_replication` to its own
+  monitoring role.
+- The DSN was repointed at a database whose role differs from the primary's.
+
+### False positives
+
+- A single tick during a role change or a failover, where the connection is
+  re-established as a different role. The `for: 10m` window covers that.
+- A deployment that has not configured DR at all but set
+  `with_dr_fencing(true)`: the sampler runs and finds nothing to read.
+  Silence this shard explicitly rather than letting it become background
+  noise.
+
+### Safe actions
+
+- `GRANT pg_monitor TO <harvest role>;` — the fix in the overwhelming majority
+  of cases, and it takes effect on the next connection.
+- Repoint the DSN if the shard is aimed at the wrong database.
+- Nothing here touches replication itself; all of it is read-permission
+  configuration.
+
+### Escalation criteria
+
+Escalate when this shard is under an RPO commitment and the grant cannot be
+made (a managed provider that will not expose the views): the commitment cannot
+be *measured*, which is a contractual problem rather than an operational one,
+and it should be recorded as accepted risk rather than left firing. Escalate
+immediately if a failover is being considered while this is firing — the RPO
+you would be accepting is unmeasured, and that must be said out loud in the
+incident channel rather than recorded as zero.
+
+---
+
+## harvest_replication_rpo_unknown
+
+**What to do when a shard's RPO has no source.** The replication views are
+readable and a standby is connected, but no signal can produce an RPO number
+yet: no DR slot has confirmed a position, and the standby has not reported a
+`replay_lag` either. This differs from `harvest_replication_unobservable`: the
+views are not the problem here, the RPO itself has no source.
+
+`harvest.replication.lag_seconds` is withheld rather than published as a stale
+or fabricated number. A Prometheus gauge keeps exporting its last value, so
+withholding it alone does not make the panel stale — it freezes at the last
+healthy reading. `harvest.replication.rpo_known` is the signal that breaks
+that freeze: it is emitted every tick the views are readable, `0` included.
+
+### Triage steps
+
+1. `harvest dr status --shard <id>=<dsn> -o json`. Read the standby and slot
+   list for the affected shard.
+2. Confirm a DR slot exists and carries the configured prefix
+   (`replication_slot_prefix`, default `harvest_dr`). A standby attached
+   without one cannot report a watermark.
+3. Check how long ago the standby connected. A `replay_lag` of `NULL` is
+   normal until the first feedback round trip completes; give it one sampler
+   interval before treating it as stuck.
+
+### Likely causes
+
+- A physical standby attached to the primary without a `primary_slot_name`,
+  so no slot exists for the sampler to read a position from.
+- A freshly created DR slot with no watermark beat written yet (the sampler
+  writes at most one beat per shard per interval).
+- A standby that connected moments ago and has not completed a feedback round
+  trip.
+
+### False positives
+
+- The first sampler tick after a new standby connects. The `for: 10m` window
+  covers ordinary startup.
+
+### Safe actions
+
+- Create the missing replication slot and reattach the standby with
+  `primary_slot_name` set, per `docs/cross-region-dr.md`.
+- Wait one sampler interval past standby connection before escalating.
+
+### Escalation criteria
+
+Escalate if this fires for longer than the standby's expected catch-up time,
+or if a failover is being considered while this is firing — the RPO for this
+shard is unmeasured, and that must be said out loud in the incident channel
+rather than assumed to be small.
+
+---
+
+## harvest_audit_export_lag_high
+
+`harvest.audit.export_lag` is the age of the **oldest** audit record the SIEM
+sink has not acknowledged (issue #953; see `docs/audit-export.md`). A rising
+line does **not** mean records are being lost — the export cursor is held
+rather than advanced past a failure, and the retention sweep refuses to purge
+an unexported record — but the window in which a privileged action would be
+invisible to detection is growing, and the audit table is growing with it.
+
+### Triage steps
+
+1. Ask the exporter about itself:
+
+   ```bash
+   curl -s "$HARVEST/admin/audit-export" | jq '{sink_configured, status, shards}'
+   ```
+
+2. Read `delivery_state` and `last_error` on the lagging shard. Three states
+   are worth telling apart:
+
+   | What you see | What it means |
+   |---|---|
+   | `last_error` populated, `delivery_state: "BACKOFF"` | The sink is rejecting or unreachable. The cursor is parked, retrying with capped backoff. |
+   | `delivery_state: "NOT_STARTED"` that persists across reads | No exporter has ever ticked this shard. Either export is configured nowhere, or it is configured only on a fleet that is not reaching this shard. |
+   | `delivery_state: "RETIRED"` | An operator ran `POST /admin/audit-export/decommission` here. No exporter owes this shard records and retention may purge them — this is a deliberate state, not a fault. |
+   | No `harvest_audit_export_lag` series at all | No exporter is running for that shard. **Worse than a high value**, and a threshold alert cannot see it. |
+
+3. Check `pending_records` on the same response to size the backlog, and
+   whether it is still growing between two reads.
+
+   **Do not diagnose from `sink_configured`.** It reports only whether the
+   process that served your request has a sink installed. In a split
+   web/worker deployment the API process legitimately reports `false` while
+   export is healthy on the worker fleet, and `true` there would not tell you
+   the *worker* is configured. Use the database-backed signals instead —
+   `pending_records` growing across two reads, `lag_seconds` rising, or a
+   persistent `NOT_STARTED` — which describe the shard rather than whichever
+   process answered.
+
+### Likely causes
+
+- The sink endpoint is down, rejecting (non-2xx), or answering with a redirect
+  — redirects are never followed, so a 3xx is a failure by design.
+- The HMAC secret was rotated on the receiver but not in the Harvest build, so
+  every batch is rejected as unauthenticated.
+- Audit export was configured on the web application but not on the worker
+  build; the scanner that exports lives on the workers.
+- A sink slower than the configured claim lease
+  (`HarvestBuilder::audit_export_lease`), so every attempt is superseded before
+  it lands. `last_error` names the lease timeout when this is the cause.
+- A shard whose database has been unreachable to the exporter, so its cursor
+  row was never provisioned.
+
+### False positives
+
+- A brief spike right after a deploy, while a restarted worker re-claims shards
+  whose leases had not yet expired. It clears within one lease period.
+- A backfill or bulk administrative operation that writes a burst of audit rows
+  faster than one batch per scanner tick drains them. Lag rises and then falls;
+  `harvest.audit.exported` stays non-zero throughout, which distinguishes it
+  from a stall.
+- A shard with genuinely no audited traffic reports `0`, not a missing series —
+  do not read `0` as "broken".
+
+### Safe actions
+
+- Fix the sink. Recovery is automatic and needs no operator action: the cursor
+  resumes from where it stopped and nothing was skipped.
+- Configure `audit_export_*` on the worker build if `sink_configured` is
+  `false` there.
+- Raise `audit_export_lease` above the sink's own request timeout if
+  `last_error` reports the lease timeout.
+- The starter pack ships `absent(harvest_audit_export_lag)` as a companion rule
+  (`harvest_audit_export_absent`) — the threshold rule structurally cannot fire
+  when no exporter is running anywhere, because the gauge then has no series
+  and `max(...)` evaluates over an empty vector.
+
+  ⚠️ **`absent()` alone is not sufficient once a shard has reported.** The
+  gauge is only written on a successful observation: if the exporter cannot
+  read the cursor — a failing query, a connection it cannot acquire — the
+  recorder keeps serving the last value it was given, commonly `0`. Prometheus
+  then sees neither a high value nor an absent series while that shard is going
+  unexported.
+
+  `time() - timestamp(...)` does not provide a fix, either: Prometheus stamps
+  each *scraped sample* with the scrape time, and the endpoint keeps exposing
+  the stale value on every scrape, so such an expression stays near the
+  scrape interval forever. Do not rely on it. `changes(...) == 0` fails the
+  same way for the opposite reason — a healthy caught-up shard also holds a
+  constant `0`.
+
+  `harvest_audit_export_unobservable` (below) is the metric-only fix for this
+  exact case (issue #1268): `harvest.audit.export_observed` is emitted every
+  tick that reaches a shard, success or failure, so it cannot go stale the
+  way the lag gauge can.
+
+  What each alert actually covers:
+
+  | Condition | Detected by |
+  |---|---|
+  | Process down | `up == 0` |
+  | Exporter never ran for a shard | `absent(harvest_audit_export_lag{shard="N"})` |
+  | Sink failing or slow, exporter observing normally | the lag threshold — the cursor is held, so the oldest unacknowledged record ages and the gauge climbs |
+  | Export **disabled** in a live process (issue #1506) | `harvest_audit_export_unobservable` — the exporter reports `observed = 0` |
+  | Exporter alive but **cannot observe the shard** | `harvest_audit_export_unobservable` — see the runbook section below |
+  | **One shard** never scanned while others report | **nothing in the shipped rules.** `absent()` is false as soon as any shard reports. Template one absence rule per configured shard from your own inventory: `absent(harvest_audit_export_lag{shard="N"})` |
+
+  The last row remains an open gap: it names a shard missing from a worker's
+  `shard_assignments` altogether, which no exporter tick ever touches, so no
+  series — lag or observed — exists for it either. That is a per-deployment
+  inventory question the starter pack cannot answer generically. Note that
+  the common outage — a sink that is down or rejecting — falls in the
+  *third* row and is covered: the exporter still reads the cursor fine and
+  the gauge climbs as designed.
+
+**Do not reach for the redrive.** `POST /admin/audit-export/redrive` rewinds
+the cursor so already-delivered records are re-exported; it is for **sink-side
+data loss** (your SIEM lost a day and you need it back). It does nothing for a
+stalled sink except queue more work behind the stall, and a cursor can only
+ever move backwards, so it cannot be used to skip past a stuck batch. There is
+no supported way to skip an audit record — that is the point of the feature.
+
+### Escalation criteria
+
+- Lag exceeds the window your compliance posture can tolerate privileged-action
+  logs being absent from the SIEM. That number is a policy decision, not a
+  Harvest default; write it down before the incident.
+- `pending_records` grows without bound and the audit table is approaching its
+  volume budget. Retention will not purge unexported records for as long as
+  export is behind — that is the deliberate trade.
+
+  **Disabling the sink is not enough to restore purging.** The guard keys on
+  the shard's cursor row, not on whether a sink happens to be configured in the
+  process running retention — deliberately, so that a worker outage cannot let
+  a web process delete the records that outage stranded. Relieving the disk
+  pressure takes two steps: stop the exporter, then explicitly retire the
+  cursor:
+
+  ```bash
+  curl -X POST https://app.example.com/api/harvest/admin/audit-export/decommission \
+    -H 'Content-Type: application/json' \
+    -d '{"shard": <shard_id>}'
+  ```
+
+  The next retention tick then purges that shard's aged rows normally.
+
+  This permanently gives up the un-exported window: those records will never
+  reach the SIEM. Treat it as a decision with a security/compliance sign-off,
+  not a cleanup step — the route writes its own audit record
+  (`audit_export.decommission`), so the paper trail is automatic. It is
+  reversible in the sense that `POST /admin/audit-export/reactivate` later
+  continues the sequence correctly (the cursor's high-water mark survives
+  the purge) — but the records purged in between are gone.
+- Escalate to the security/compliance owner, not only the platform team: the
+  question "were privileged actions logged during this window?" is theirs to
+  answer.
+
+### Confirming recovery
+
+Lag returns to ~0 and `harvest.audit.exported` resumes. On the receiver, check
+`(shard, seq)` contiguity across the outage window: sequences are dense per
+shard, so a hole is a real gap and a duplicate is the expected at-least-once
+behaviour.
+
+---
+
+## harvest_audit_export_unobservable
+
+**What to do when a shard's audit-export cursor cannot be read:** the
+exporter is running, but this tick could not read the shard's cursor row, or
+could not compute its lag, or could not even acquire a connection to the
+shard (issue #1268). `harvest.audit.export_lag` is not a reliable signal
+here — a Prometheus gauge keeps its last value, so the lag reading for this
+shard is frozen, commonly at `0`, and looks healthy.
+
+This is a ticket rather than a page: the sink may be working fine, and
+records already sequenced are not lost — the cursor is simply not advancing
+because the exporter cannot currently reach this shard to advance it.
+
+This alert also fires when export was disabled in a live process (issue
+#1506). A runtime rebuilt with no sink sets `export_observed` to `0` for each
+shard. In that case `GET /admin/audit-export` shows `sink_configured: false`.
+Configure a sink again, or silence the alert if you disabled export on purpose.
+Check `sink_configured` first.
+
+### Triage steps
+
+1. `curl -s "$HARVEST/admin/audit-export" | jq '.shards[] | select(.shard == <id>)'`.
+2. Read `last_error` on that shard. A connection-acquisition failure logs at
+   `tracing::error!` level; search the worker logs for the shard id around
+   the alert's firing window. The dedicated export task (issue #1269, the
+   default shipped path) logs `[audit_export] failed to acquire a
+   connection for the export tick` or `timed out acquiring a connection for
+   the export tick`. An embedder driving `fire_due_audit_exports` by hand
+   instead logs `[audit_export] failed to get connection to shard ...` or
+   `timed out acquiring a connection for this shard`.
+3. Confirm the shard's own database is reachable from the worker: the audit
+   exporter (issue #1269: its own dedicated task, one per assigned shard)
+   uses the same `ShardedDbPool` as every other per-shard scanner, so a
+   shard unreachable here is usually unreachable for claim/timeout
+   processing too.
+4. Check the shard's connection pool size. The export task and the timeout
+   checker each take a connection in turn, and the export task never holds
+   its connection across the sink call (`export_once_via_pool`), so a
+   `max_size` of `1` neither deadlocks permanently nor blocks the checker
+   for the duration of a slow delivery. Either task can still exceed
+   `SHARD_ACQUIRE_BOUND` (in `audit_export.rs`) and skip a tick under
+   sustained contention.
+
+### Likely causes
+
+- The shard's database is down, unreachable over the network, or rejecting
+  new connections.
+- The shard's connection pool is undersized for the number of per-shard
+  scanner tasks sharing it.
+- The shard is assigned to this worker but was never given a pool entry — a
+  configuration mismatch between `shard_assignments` and the
+  `ShardedDbPool`.
+- A transient cursor-row read failure or lag-query failure under database
+  load; this self-heals on the next tick without operator action.
+
+### False positives
+
+- A single tick during a brief connection blip. The `for: 10m` window
+  covers that; watch for the gauge returning to `1` on its own.
+- A deploy that briefly saturates a shard's pool while workers roll. It
+  clears within one or two poll intervals.
+
+### Safe actions
+
+- Fix the underlying connectivity or pool-sizing problem; recovery is
+  automatic once the shard is reachable again, and nothing was skipped —
+  the cursor resumes from where it stopped.
+- Widen the shard's connection pool if `SHARD_ACQUIRE_BOUND` timeouts recur
+  under normal load.
+- Nothing here calls for a redrive: no record was marked delivered that was
+  not, so there is nothing to rewind.
+
+### Escalation criteria
+
+Escalate when the shard stays unobservable past the compliance window your
+posture allows for privileged-action logs to sit unconfirmed, or when the
+underlying database outage is itself a page-worthy incident. Escalate to
+the team owning that shard's database first; this signal names an
+availability problem with the shard, not with the SIEM sink.
+
+## harvest_dispatch_dropped_hints
+
+**What to do when the Redis dispatch channel drops hints:** the dispatch
+background publisher's bounded queue was full (issue #1429). The gauge
+`harvest.dispatch.dropped_hints` reports the running total for this
+process. A dropped hint costs latency only. The row stays `PENDING`, and
+the worker's reconcile sweep republishes it on its own cadence.
+
+This is a health signal, not a durability one. Nothing is lost.
+
+### Triage steps
+
+1. Check the alert labels to find the affected worker process.
+2. Read `harvest.dispatch.dropped_hints` for that process over time. A step
+   change means a burst; a steady climb means sustained saturation.
+3. Compare against `harvest.queue.depth` for the queues that process
+   serves. A rising backlog alongside dropped hints confirms the publisher
+   cannot keep up with the enqueue rate.
+4. Check the Redis endpoint's own latency and error rate. A slow or
+   degraded Redis backs up the publisher queue from the other end.
+
+### Likely causes
+
+- The enqueue rate on this process exceeds the publisher's fixed queue
+  capacity (10,000 hints) for a sustained period.
+- Redis is slow or unreachable, so the publisher cannot drain its queue as
+  fast as new hints arrive.
+- A burst enqueue (a large batch start, a backfill) that exceeds the queue
+  in one spike.
+
+### False positives
+
+A brief spike during a known batch enqueue that clears within one or two
+reconcile intervals. Alert only when the counter keeps climbing past a
+single burst window.
+
+### Safe actions
+
+- Nothing here is urgent by itself: the reconcile sweep is the durability
+  floor, so a dropped hint never loses or duplicates work.
+- If the climb is sustained, investigate Redis health first — a slow
+  channel is the common cause.
+- A sustained high enqueue rate that outpaces the fixed publisher queue
+  capacity is a capacity question for the team that owns this tunable, not
+  an operator action.
+
+### Escalation criteria
+
+Escalate when dropped hints climb alongside a growing queue backlog and
+Redis itself shows no sign of degradation — that combination points at
+undersized publisher capacity for the deployment's enqueue rate, which
+needs a code change, not an operator fix.
+
+## harvest_notify_send_failures
+
+**What to do when post-commit notifications fail:** the notify sender on
+this process is losing notifications (issue #1796). The gauge
+`harvest.notify.send_failures` reports the running total for this process.
+A failed send counts once for each merged wake. A dropped note counts once.
+
+A lost notification costs latency only. The row is already committed, and
+workers find it on their next poll. This is a health signal, not a
+durability one. Nothing is lost.
+
+### Triage steps
+
+1. Check the alert labels to find the affected process.
+2. Search that process's logs for `harvest: notifications lost`. The
+   `cause` field names the failure. The warning repeats at most once every
+   30 seconds, and its `total` field carries the running count.
+3. Read `harvest.notify.queue_usage` for the same process. A high value
+   means the Postgres notification queue is filling up. See
+   [harvest_notify_queue_usage_high](#harvest_notify_queue_usage_high).
+4. Check the database itself for connection errors, failover, or
+   connection-pool exhaustion around the time the counter climbed.
+
+### Likely causes
+
+- The database is unreachable or failing over, so each `NOTIFY` fails.
+- The Postgres notification queue is full, so Postgres rejects each
+  `NOTIFY` until a listener drains it.
+- The sender holds more notes than its bound (10,000) because it cannot
+  read commit state fast enough. The sender drops the excess.
+- A write transaction stays open longer than 60 seconds. The sender drops
+  the notes that wait on it.
+- The process stopped, or its Tokio runtime ended, before the sender sent
+  the notes it held.
+- The database failed over to another server. Notes staged on the old server
+  cannot be checked on the new one, so the sender drops them.
+
+### False positives
+
+A short climb during a planned database restart or failover. Alert only
+when the counter keeps climbing past a single burst window.
+
+### Safe actions
+
+- Nothing here is urgent by itself. Polling is the durability floor, so a
+  lost notification never loses or duplicates work.
+- Fix the database-side cause first: connectivity, a full notification
+  queue, or a long open transaction.
+- Give a short-lived process time to flush its sender before it exits.
+  `Worker::run` and `HarvestRunner::stop` already do this.
+
+### Escalation criteria
+
+Escalate when the counter climbs while the database shows no errors and
+the notification queue is nearly empty. That combination points at the
+sender itself and needs a code change, not an operator fix.
+
+## harvest_notify_queue_usage_high
+
+**What to do when the Postgres notification queue fills up:** the gauge
+`harvest.notify.queue_usage` reads from `0` to `1`. It is the largest
+`pg_notification_queue_usage()` that a live sender on this process read last
+(issue #1796). Postgres rejects every `NOTIFY` once the queue is full.
+
+The queue belongs to the database, not to one process. Every process on
+one database reports about the same value.
+
+### Triage steps
+
+1. Run `SELECT pg_notification_queue_usage();` on the database to confirm
+   the reading.
+2. Find long open transactions:
+   `SELECT pid, state, xact_start, query FROM pg_stat_activity ORDER BY xact_start NULLS LAST;`.
+   A listening session inside an old transaction pins the queue tail.
+3. Find the listening sessions. Look for `LISTEN` in the `query` column of
+   `pg_stat_activity`, and match each `pid` to a process.
+4. Read `harvest.notify.send_failures`. A climb there means Postgres
+   already rejects notifications.
+
+### Likely causes
+
+- A session that ran `LISTEN` sits idle in an open transaction, so
+  Postgres cannot discard the notifications behind it.
+- A listener process is stuck or overloaded and does not read its
+  connection.
+- A large burst of notifications arrives faster than the listeners
+  consume them.
+
+### False positives
+
+A brief rise during a large batch enqueue that falls again within a few
+minutes. The `for: 10m` clause covers most of these.
+
+### Safe actions
+
+- End the transaction that holds the queue tail. Prefer a graceful
+  restart of the owning process over `pg_terminate_backend`.
+- Restart a stuck listener process. Its tasks stay safe in the queue.
+- Workers keep polling while notifications fail, so the queue fills
+  without data loss. Only latency degrades.
+
+### Escalation criteria
+
+Escalate when the queue usage keeps rising after the long transactions
+end, or when it reaches `1` and `harvest.notify.send_failures` climbs.
+Escalate to the database owner first, because the queue is a
+database-wide resource that other applications can also fill.
+
+## harvest_worker_gray_failure
+
+**What to do when one worker is alive but sick:** the gauge
+`harvest.worker.outlier{dimension}` reads `1` on a worker that fails a far
+higher share of tasks than its peers. It also reads `1` on a worker with a
+far higher p99 task latency (issue #1815). The worker still heartbeats, so
+`/workers/health` shows it as healthy. Huang et al. (HotOS'17) call this a
+gray failure.
+
+Each worker keeps a window of its own task outcomes. The window holds the
+last 5 minutes and at most 1024 tasks. A busy worker therefore covers less
+than 5 minutes. A worker whose heartbeat interval is longer than 150 seconds
+keeps two heartbeat intervals instead, so every outcome reaches a snapshot. The liveness heartbeat writes a snapshot to
+`harvest_worker_task_stats` on every shard. Each heartbeat then compares
+the worker with its peers. It merges the peers from all the worker's
+shards, so every heartbeat sees the same peers. If one shard fails, a
+healthy shard keeps the verdict live. When two workers in one process share a metrics recorder,
+the gauge reads `1` when either worker is an outlier.
+
+The peers are the live, `Active` workers that poll the same queues with the
+same `queue_weights`, on the same build with the same labels, and with the
+same `max_concurrent_workflows` and `max_concurrent_activities`. The build id is the
+only code identity in the key. Workers without one share a cohort across code
+versions that register the same names, so set `build_id` for a rolling
+deployment. A worker with
+a slot tuner is keyed on the tuner's band, its initial target per kind and
+the tuner's `policy()` instead, because the tuner sizes its slots from there. Session capacity counts
+too, because session member activities are pinned to the session's host. So do
+`priority_aging_secs` and the activities the worker's labels make it
+ineligible for, because the claim query orders and filters tasks by them. So
+do the shards and the registered handlers, because a task without a handler is
+released and never counts. So do the circuit-breaker policies, because an
+activity with a breaker skips the claim-time rate-limit gate. The open state
+of a breaker is left out, because it is the worker's own health. So does the
+dispatch route on each shard, because a dispatch channel ignores
+`queue_weights` and the Postgres claim applies them. So do the retry-budget policies, because a
+tighter budget defers more retries. So do the adaptive-limit policies, because a
+saturated activity type is left out of the claim. So do the outcome window and the peer
+freshness limit, which both follow `worker_heartbeat_interval`. Workers with
+two intervals would compare two time ranges. So do the workflow cache
+settings (`sticky_timeout`, `workflow_cache_size`, `resident_workflows`), the
+task budgets (`workflow_task_timeout`, `max_local_activity_start_to_close`)
+and the quarantine limits (`workflow_panic_max_attempts`,
+`poison_pill_threshold`). So does `cancellation_grace_period`: a timed-out
+activity that ignores its cancellation runs that long before the timeout is
+recorded. So does `dr_fencing`: a fenced worker checks its shard generation
+in each claim query and before each history persist. So do the payload caps, the history policy, the
+payload offloader, the registered payload codecs and default codec, the
+registered and active codec keys, the activity interceptor chain
+and each activity's own caps, rate and concurrency limits and WASM binding.
+So do the defaults a local activity runs with, because it has no task row,
+the hot-code-swap module host's policy, each workflow's input cap, DAG
+classification and quota, the declarative query and update handlers, and the workflow
+log policy. Each heartbeat reads the codec keys afresh, because a reload can
+register, retire or activate one. A
+worker with the cache off replays full histories, a shorter budget times out
+tasks that its peers finish, and a smaller result cap fails results that its
+peers return. Those
+decide which tasks a worker can claim, and in
+which mix under load. So workers of two sizes are two cohorts. A worker on a
+slow queue is not compared with workers on a fast queue. A worker that favours
+a bulk queue is not compared with one that favours an interactive queue.
+During a rolling deployment, each build is its own cohort. A GPU worker that
+takes capability-routed tasks is not compared with a CPU worker. Each
+heartbeat reads only its own cohort. `GET /admin/status` runs the same
+comparison over every shard. It keeps each cohort's rows for that cohort's
+own freshness limit, as the cohort's heartbeat does. It lists the worst 20 outliers under
+`workers.outliers`, and `workers.outliers_total` gives the full count.
+
+The rule flags a failure ratio at least 20 points above the peer median. That
+ratio must also be at least twice the median. The rule flags a p99 latency
+at least 3 times the peer median. That p99 must also be at least 100 ms above
+the median. A worker needs 20 tasks in its window, and 2 such peers, before
+it is judged.
+
+### Triage steps
+
+1. Read `workers.outliers` from `GET /api/harvest/admin/status`. Each entry
+   names the worker, the dimensions, its own stats and the peer medians.
+2. Match the alert `instance` label to that worker id and host. One process
+   can run more than one worker, so check every worker on that instance.
+3. On the dashboard, open **Database pool, queries & pollers → Worker
+   outliers**. Compare the worker with its peers over the last hour.
+4. Read the worker's logs for `task execution failed` and for activity
+   errors. Check its host for CPU steal, memory pressure, disk errors and
+   network faults.
+
+### Likely causes
+
+- The host is degraded: noisy neighbor, failing disk, low memory or a bad
+  network path to a downstream service.
+- The worker runs a different build or configuration from its peers.
+- A local resource is broken, such as an expired credential, a full temp
+  directory or an exhausted file-descriptor limit.
+
+### False positives
+
+Workers that poll the same queues can still get different work. For
+example, one tenant's slow tasks can land on one worker for a while. A short
+burst on a lightly loaded worker can also flag it for a few minutes. The
+`for: 10m` clause covers most of these. A draining worker reads `0`.
+
+### Safe actions
+
+- Drain the worker with `POST /api/harvest/workers/{id}/drain`. Its peers
+  take over the queue, and in-flight tasks finish or retry.
+- Replace the host or restart the worker after the drain.
+- Do not restart the whole fleet. A healthy fleet does not need it, and a
+  fleet-wide fault does not fire this rule.
+
+### Escalation criteria
+
+Escalate when the outlier stays after a drain and a restart on a fresh host.
+Also escalate when more workers become outliers one after another. A spread
+like that points to a rollout or a shared dependency, not to one host.
+
+## harvest_db_pool_wait_high
+
+**What to do when callers wait for a database connection:** the histogram
+`harvest.db.pool.wait_duration{shard}` times each `pool.get()` on the claim
+path, the timeout scanner and the activity heartbeat flush (issue #1815). A
+high p99 means the worker pool is too small for the load. It can also mean
+that slow queries hold connections too long.
+
+### Triage steps
+
+1. On the dashboard, open **Database pool, queries & pollers**. Read **DB
+   pool connections in use / idle** for the same shard. Series C shows the
+   fewest idle connections on one replica. A value near `0` confirms that a
+   pool is exhausted.
+2. Read **DB operation latency p99 by op**. A slow op holds its connection
+   longer, so slow queries and pool waits often rise together.
+3. Count connections on the database:
+   `SELECT state, count(*) FROM pg_stat_activity GROUP BY state;`.
+4. Compare the pool size with the worker's slot counts. Each in-flight task
+   can hold a connection.
+
+### Likely causes
+
+- The worker pool size, `HarvestPoolConfig::worker_pool_size` per shard, is
+  smaller than the worker's concurrency needs.
+- Slow queries or lock waits hold connections for longer than usual.
+- A connection leak in an activity that calls `run_transactional` and does
+  not finish.
+- The database limits connections, so the pool cannot grow.
+
+### False positives
+
+A short spike during a worker start, while the pool opens its first
+connections. The `for: 10m` clause covers it.
+
+### Safe actions
+
+- Raise the worker pool size within the database `max_connections` budget.
+- Lower `max_concurrent_activities` on the worker so it asks for fewer
+  connections at once.
+- Fix the slow query first when **DB operation latency** is also high.
+
+### Escalation criteria
+
+Escalate to the database owner when the database is at `max_connections`.
+Also escalate when the wait stays high after the pool grows and the queries
+are fast.
+
+## harvest_db_query_latency_high
+
+**What to do when hot-path database operations are slow:** the histogram
+`harvest.db.query.duration{op, shard}` times four ops (issue #1815). They
+are one claim, one workflow-task persist transaction, one timeout-scanner
+pass and one activity heartbeat write. Each op is a unit of work, not one SQL
+statement. The rule watches `claim` and `persist`, because they set
+throughput. It keeps the `instance` and `shard` labels, so one slow replica,
+or one slow shard of a multi-shard worker, fires it alone.
+
+### Triage steps
+
+1. Find the slow op on **DB operation latency p99 by op**. When only one
+   instance fires, check that replica's network path and its pool first.
+2. List long-running statements:
+   `SELECT pid, wait_event_type, wait_event, now() - query_start AS age, query FROM pg_stat_activity WHERE state <> 'idle' ORDER BY age DESC LIMIT 20;`.
+3. Look for lock waits on `harvest_task_queue` and
+   `harvest_workflow_executions`.
+4. Check the database host for CPU, IO and replication load.
+
+### Likely causes
+
+- The database is saturated on CPU or IO.
+- A long transaction or a migration holds locks on a hot table.
+- Table bloat or a missing index after a large backlog.
+- A large history makes each persist transaction write more rows.
+
+### False positives
+
+A scan pass is long by design and is not part of this rule. A claim can be
+slow for a few minutes after a large backlog lands. The `for: 10m` clause
+covers it.
+
+### Safe actions
+
+- End the transaction that blocks a hot table. Prefer a graceful restart of
+  its owner over `pg_terminate_backend`.
+- Run `VACUUM (ANALYZE)` on a bloated queue table.
+- Lower worker concurrency to cut database load while the cause is fixed.
+
+### Escalation criteria
+
+Escalate to the database owner when the latency stays high with no blocking
+transaction. Also escalate when the database host is saturated.
+
+## harvest_slo_workflow_task
+
+This section covers the three workflow-task SLO alerts in the optional
+burn-rate pack (`docs/alerts/slo-pack-v0.1.0.rules.yml`, issue #1816):
+`harvest_slo_workflow_task_burn_1h`, `_burn_6h`, and `_burn_3d`. The SLI
+and its 99.9% objective are in [`docs/alerts/slo.md`](../alerts/slo.md).
+
+A workflow task is one executor cycle. A task fails when its cycle ends the
+run as `failed`, or when it runs longer than `workflow_task_timeout` and the
+worker abandons it (`harvest.workflow.task_timeout`). A `burn_1h` or
+`burn_6h` alert is a page. A `burn_3d` alert is a ticket.
+
+### Triage steps
+
+1. Read the `window` label. It tells you how fast the budget burns:
+   `1h` is 14.4x, `6h` is 6x, and `3d` is 1x.
+2. Find the source of the errors. Compare
+   `sum by (workflow) (rate(harvest_workflow_duration_count{status="failed"}[1h]))`
+   with
+   `sum by (workflow) (rate(harvest_workflow_task_timeout_total{workflow!~"__harvest_canary_probe.*"}[1h]))`.
+   The matcher removes canary probes, as the SLI does.
+3. If failed cycles lead, follow
+   [`harvest_workflow_failure_rate`](#harvest_workflow_failure_rate).
+4. If timeouts lead, run
+   `harvest dlq aggregate --group-by workflow_name,failure_signature`.
+   A task that times out `poison_pill_threshold` times in a row goes to
+   the DLQ. The aggregate names its workflow type.
+
+### Likely causes
+
+- A deploy that makes a workflow fail.
+- A downstream outage that exhausts activity retries.
+- A workflow body that blocks or does slow work, so its cycle times out.
+- A worker that gets too little CPU time to finish a cycle.
+
+### False positives
+
+The `failed` status includes failures that the workflow returns on purpose.
+If a workflow type fails by design, remove it from the SLI with a
+`workflow!~"..."` matcher. A deliberate load test can also burn budget.
+
+### Safe actions
+
+Roll back the release that caused the errors. Pause the schedules that feed
+a failing workflow type. Give workers more CPU if timeouts lead.
+
+### Escalation criteria
+
+Escalate to the workflow owner when a page stays active for 30 minutes.
+Escalate to the release owner when the onset matches a deploy.
+
+## harvest_slo_schedule_to_start
+
+This section covers the three schedule-to-start SLO alerts in the optional
+burn-rate pack: `harvest_slo_schedule_to_start_burn_1h`, `_burn_6h`, and
+`_burn_3d`. The SLI is the share of tasks that wait more than 5 s from
+eligibility to start. The objective is 99% within 5 s. See
+[`docs/alerts/slo.md`](../alerts/slo.md).
+
+A task adds a sample only when it starts. A task that never starts adds no
+sample. [`harvest_queue_uncovered`](#harvest_queue_uncovered) covers that
+case.
+
+### Triage steps
+
+1. Read the `window` label. It tells you how fast the budget burns.
+2. Find the slow queues with
+   `histogram_quantile(0.99, sum by (le, queue) (rate(harvest_queue_schedule_to_start_bucket[1h])))`.
+3. Follow
+   [`harvest_queue_schedule_to_start_high`](#harvest_queue_schedule_to_start_high)
+   for the queues that you find.
+
+### Likely causes
+
+- Not enough worker slots for the load.
+- A queue had no live worker. Its held tasks start late when a worker
+  comes back, and then they burn budget.
+- A paused queue, a concurrency limit, or a rate limit holds tasks back.
+
+### False positives
+
+A large planned backfill can burn budget. A paused queue burns budget when
+it resumes, because its held tasks start late. Mute the alert for a planned
+backfill, or move the backfill to its own queue.
+
+### Safe actions
+
+Add worker capacity. Move a hot workflow type to its own queue. Do not
+remove a concurrency limit or a rate limit until you know why it is there.
+
+### Escalation criteria
+
+Escalate to the platform owner when added capacity does not reduce the
+burn within 30 minutes.
+
+## harvest_slo_canary
+
+This section covers the three canary SLO alerts in the optional burn-rate
+pack: `harvest_slo_canary_burn_1h`, `_burn_6h`, and `_burn_3d`. The SLI is
+the share of synthetic liveness probes (issue #796) that fail. The
+objective is 99%. See [`docs/alerts/slo.md`](../alerts/slo.md).
+
+A canary probe runs the full start, dispatch, activity, durable timer, and
+complete path. A failed probe means that this path is broken for real
+workflows too.
+
+### Triage steps
+
+1. Run `GET /api/harvest/admin/canary`. Find the probes with
+   `stale: true` or a rising `failure_count`.
+2. If one queue fails, run `harvest worker list --queue <queue> --output json`.
+3. If one shard fails, run `harvest shard health --output json`.
+4. If all probes fail, run `harvest preflight --output json`.
+
+### Likely causes
+
+- No live worker polls a probe queue.
+- A shard is unready, fenced, or not writable.
+- Durable timers do not fire, so probes time out.
+
+### False positives
+
+A probe queue with no worker fails every probe. That is a configuration
+error, not a false positive. Remove the queue from the canary configuration
+or add a worker for it.
+
+### Safe actions
+
+Restart a stuck worker. If a shard is unready, use the safe actions in
+[`harvest_shard_unready`](#harvest_shard_unready).
+
+### Escalation criteria
+
+Escalate to the platform owner at once when every probe fails. That
+pattern means the execution path is down for all workflows.
+
+## harvest_slo_objective_invalid
+
+This ticket comes from the optional burn-rate pack. An SLO has no
+`harvest:slo_objective:ratio` record, or its value is not above 0 and
+below 1. The `slo` label names the SLO. See
+[`docs/alerts/slo.md`](../alerts/slo.md).
+
+A missing objective makes the burn alerts for that SLO silent. An
+objective of 1 or more makes the budget zero or negative, so those alerts
+fire and do not reset.
+
+### Triage steps
+
+1. Query `harvest:slo_objective:ratio` in Prometheus.
+2. Compare each `slo` label and value with the rules file that you loaded.
+
+### Likely causes
+
+- A tune that writes a percentage, such as `99.9`, in place of `0.999`.
+- A typo in the `slo` label after an edit.
+- A rules file that Prometheus did not load.
+
+### False positives
+
+None after the first 10 minutes. The `for: 10m` clause covers a restart.
+
+### Safe actions
+
+Fix the objective record and reload Prometheus. Run
+`promtool check rules` on the file before the reload.
+
+### Escalation criteria
+
+Escalate to the owner of the Prometheus rules if the record is correct
+in the file but does not appear in Prometheus.

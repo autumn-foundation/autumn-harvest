@@ -43,7 +43,7 @@ use tracing_subscriber::layer::SubscriberExt;
 // -------------------------------------------------------------------------
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 // -------------------------------------------------------------------------
@@ -314,7 +314,7 @@ fn all_adr_0001_span_kinds_are_emitted() {
                     workflow_name: "telemetry_master_workflow",
                     workflow_id: "telem-master-001",
                     exec_id,
-                    input: Value::Null,
+                    input: Value::Null.into(),
                     parent_id: None,
                     queue_name: "default",
                     execution_timeout: None,
@@ -366,6 +366,9 @@ fn all_adr_0001_span_kinds_are_emitted() {
             let worker = Arc::new(
                 Worker::new(
                     WorkerRuntimeConfig {
+                        codec_rotation_batch_size: 0,
+                        scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
+                        dr: autumn_harvest::replication::DrConfig::default(),
                         worker_id: "telem-test-worker".to_string(),
                         queues: vec!["default".to_string()],
                         notification_database_url: None,
@@ -381,6 +384,7 @@ fn all_adr_0001_span_kinds_are_emitted() {
                         build_id: String::new(),
                         deployment_name: None,
                         workflow_cache_size: 1000,
+                        resident_workflows: true,
                         priority_aging_secs: None,
                         unknown_target_grace_window: Duration::from_secs(5),
                         poison_pill_threshold: 3,

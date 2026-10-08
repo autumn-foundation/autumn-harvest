@@ -1,0 +1,411 @@
+// WARNING: This output format is intended for human consumers only
+// and is subject to change without notice. Knock yourself out.
+// HINT: See also -Z dump-mir for MIR at specific points during compilation.
+fn <impl at async_multi_await.rs:11:1: 11:9>::emit(_1: &Ctx, _2: u64) -> u64 {
+    debug self => _1;
+    debug v => _2;
+    let mut _0: u64;
+
+    bb0: {
+        _0 = copy _2;
+        return;
+    }
+}
+
+fn step(_1: u64) -> {async fn body of step()} {
+    debug v => _1;
+    let mut _0: {async fn body of step()};
+
+    bb0: {
+        _0 = {coroutine@async_multi_await.rs:23:34: 25:2 (#0)} { v: copy _1 };
+        return;
+    }
+}
+
+fn step::{closure#0}(_1: Pin<&mut {async fn body of step()}>, _2: &mut Context<'_>) -> Poll<u64> {
+    debug _task_context => _2;
+    debug v => ((*_7).0: u64);
+    let mut _0: std::task::Poll<u64>;
+    let _3: u64;
+    let mut _4: (u64, bool);
+    let mut _5: u64;
+    let mut _6: u32;
+    let mut _7: &mut {async fn body of step()};
+    scope 1 {
+        debug v => _3;
+    }
+
+    bb0: {
+        _7 = copy (_1.0: &mut {async fn body of step()});
+        _6 = discriminant((*_7));
+        switchInt(move _6) -> [0: bb1, 1: bb5, 2: bb4, otherwise: bb6];
+    }
+
+    bb1: {
+        _3 = copy ((*_7).0: u64);
+        _4 = AddWithOverflow(copy _3, const 1_u64);
+        assert(!move (_4.1: bool), "attempt to compute `{} + {}`, which would overflow", copy _3, const 1_u64) -> [success: bb2, unwind: bb3];
+    }
+
+    bb2: {
+        _5 = move (_4.0: u64);
+        _0 = Poll::<u64>::Ready(move _5);
+        discriminant((*_7)) = 1;
+        return;
+    }
+
+    bb3 (cleanup): {
+        discriminant((*_7)) = 2;
+        resume;
+    }
+
+    bb4: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb4, unwind continue];
+    }
+
+    bb5: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb5, unwind continue];
+    }
+
+    bb6: {
+        unreachable;
+    }
+}
+
+fn pipeline(_1: &Ctx, _2: Order) -> {async fn body of pipeline()} {
+    debug ctx => _1;
+    debug order => _2;
+    let mut _0: {async fn body of pipeline()};
+
+    bb0: {
+        _0 = {coroutine@async_multi_await.rs:29:55: 34:2 (#0)} { ctx: copy _1, order: move _2 };
+        return;
+    }
+}
+
+fn pipeline::{closure#0}(_1: Pin<&mut {async fn body of pipeline()}>, _2: &mut Context<'_>) -> Poll<u64> {
+    debug _task_context => _2;
+    debug ctx => ((*_52).0: &Ctx);
+    debug order => ((*_52).1: Order);
+    let mut _0: std::task::Poll<u64>;
+    let mut _3: {async fn body of step()};
+    let mut _4: {async fn body of step()};
+    let mut _5: u64;
+    let mut _6: std::task::Poll<u64>;
+    let mut _7: std::pin::Pin<&mut {async fn body of step()}>;
+    let mut _8: &mut {async fn body of step()};
+    let mut _9: &mut std::task::Context<'_>;
+    let mut _10: isize;
+    let mut _12: &mut std::task::Context<'_>;
+    let mut _13: {async fn body of step()};
+    let mut _14: {async fn body of step()};
+    let mut _15: u64;
+    let mut _16: std::task::Poll<u64>;
+    let mut _17: std::pin::Pin<&mut {async fn body of step()}>;
+    let mut _18: &mut {async fn body of step()};
+    let mut _19: &mut std::task::Context<'_>;
+    let mut _20: isize;
+    let mut _22: &mut std::task::Context<'_>;
+    let mut _23: {async fn body of step()};
+    let mut _24: {async fn body of step()};
+    let mut _25: u64;
+    let mut _26: std::task::Poll<u64>;
+    let mut _27: std::pin::Pin<&mut {async fn body of step()}>;
+    let mut _28: &mut {async fn body of step()};
+    let mut _29: &mut std::task::Context<'_>;
+    let mut _30: isize;
+    let mut _32: &mut std::task::Context<'_>;
+    let mut _33: u64;
+    let mut _34: u64;
+    let mut _35: u64;
+    let mut _36: u64;
+    let mut _37: u64;
+    let mut _38: u64;
+    let mut _39: u64;
+    let mut _40: (u64, bool);
+    let mut _41: (u64, bool);
+    let mut _42: u64;
+    let mut _43: (u64, bool);
+    let mut _44: u64;
+    let mut _45: (u64, bool);
+    let mut _46: u64;
+    let mut _47: usize;
+    let mut _48: &std::string::String;
+    let mut _49: (u64, bool);
+    let mut _50: u64;
+    let mut _51: u32;
+    let mut _52: &mut {async fn body of pipeline()};
+    let mut _53: &Ctx;
+    scope 1 {
+        debug ctx => (((*_52) as variant#5).0: &Ctx);
+        scope 2 {
+            debug order => (((*_52) as variant#5).1: Order);
+            scope 3 {
+                debug a => (((*_52) as variant#5).2: u64);
+                scope 6 {
+                    debug b => (((*_52) as variant#5).3: u64);
+                    scope 9 {
+                        debug c => _31;
+                    }
+                    scope 10 {
+                        debug __awaitee => (((*_52) as variant#5).4: {async fn body of step()});
+                        let _31: u64;
+                        scope 11 {
+                            debug result => _31;
+                        }
+                    }
+                }
+                scope 7 {
+                    debug __awaitee => (((*_52) as variant#4).3: {async fn body of step()});
+                    let _21: u64;
+                    scope 8 {
+                        debug result => _21;
+                    }
+                }
+            }
+            scope 4 {
+                debug __awaitee => (((*_52) as variant#3).2: {async fn body of step()});
+                let _11: u64;
+                scope 5 {
+                    debug result => _11;
+                }
+            }
+        }
+    }
+
+    bb0: {
+        _52 = copy (_1.0: &mut {async fn body of pipeline()});
+        _51 = discriminant((*_52));
+        switchInt(move _51) -> [0: bb1, 1: bb44, 2: bb43, 3: bb40, 4: bb41, 5: bb42, otherwise: bb7];
+    }
+
+    bb1: {
+        (((*_52) as variant#5).0: &Ctx) = copy ((*_52).0: &Ctx);
+        (((*_52) as variant#5).1: Order) = move ((*_52).1: Order);
+        _5 = copy ((((*_52) as variant#5).1: Order).0: u64);
+        _4 = step(move _5) -> [return: bb2, unwind: bb38];
+    }
+
+    bb2: {
+        _3 = <{async fn body of step()} as IntoFuture>::into_future(move _4) -> [return: bb3, unwind: bb38];
+    }
+
+    bb3: {
+        (((*_52) as variant#3).2: {async fn body of step()}) = move _3;
+        goto -> bb4;
+    }
+
+    bb4: {
+        _8 = &mut (((*_52) as variant#3).2: {async fn body of step()});
+        _7 = Pin::<&mut {async fn body of step()}>::new_unchecked(copy _8) -> [return: bb5, unwind: bb37];
+    }
+
+    bb5: {
+        _9 = copy _2;
+        _6 = <{async fn body of step()} as Future>::poll(move _7, copy _9) -> [return: bb6, unwind: bb37];
+    }
+
+    bb6: {
+        _10 = discriminant(_6);
+        switchInt(move _10) -> [0: bb9, 1: bb8, otherwise: bb7];
+    }
+
+    bb7: {
+        unreachable;
+    }
+
+    bb8: {
+        _0 = Poll::<u64>::Pending;
+        discriminant((*_52)) = 3;
+        return;
+    }
+
+    bb9: {
+        _11 = copy ((_6 as Ready).0: u64);
+        (((*_52) as variant#5).2: u64) = copy _11;
+        drop((((*_52) as variant#3).2: {async fn body of step()})) -> [return: bb10, unwind: bb38];
+    }
+
+    bb10: {
+        _15 = copy (((*_52) as variant#5).2: u64);
+        _14 = step(move _15) -> [return: bb11, unwind: bb38];
+    }
+
+    bb11: {
+        _13 = <{async fn body of step()} as IntoFuture>::into_future(move _14) -> [return: bb12, unwind: bb38];
+    }
+
+    bb12: {
+        (((*_52) as variant#4).3: {async fn body of step()}) = move _13;
+        goto -> bb13;
+    }
+
+    bb13: {
+        _18 = &mut (((*_52) as variant#4).3: {async fn body of step()});
+        _17 = Pin::<&mut {async fn body of step()}>::new_unchecked(copy _18) -> [return: bb14, unwind: bb36];
+    }
+
+    bb14: {
+        _19 = copy _2;
+        _16 = <{async fn body of step()} as Future>::poll(move _17, copy _19) -> [return: bb15, unwind: bb36];
+    }
+
+    bb15: {
+        _20 = discriminant(_16);
+        switchInt(move _20) -> [0: bb17, 1: bb16, otherwise: bb7];
+    }
+
+    bb16: {
+        _0 = Poll::<u64>::Pending;
+        discriminant((*_52)) = 4;
+        return;
+    }
+
+    bb17: {
+        _21 = copy ((_16 as Ready).0: u64);
+        (((*_52) as variant#5).3: u64) = copy _21;
+        drop((((*_52) as variant#4).3: {async fn body of step()})) -> [return: bb18, unwind: bb38];
+    }
+
+    bb18: {
+        _25 = copy ((((*_52) as variant#5).1: Order).1: u64);
+        _24 = step(move _25) -> [return: bb19, unwind: bb38];
+    }
+
+    bb19: {
+        _23 = <{async fn body of step()} as IntoFuture>::into_future(move _24) -> [return: bb20, unwind: bb38];
+    }
+
+    bb20: {
+        (((*_52) as variant#5).4: {async fn body of step()}) = move _23;
+        goto -> bb21;
+    }
+
+    bb21: {
+        _28 = &mut (((*_52) as variant#5).4: {async fn body of step()});
+        _27 = Pin::<&mut {async fn body of step()}>::new_unchecked(copy _28) -> [return: bb22, unwind: bb35];
+    }
+
+    bb22: {
+        _29 = copy _2;
+        _26 = <{async fn body of step()} as Future>::poll(move _27, copy _29) -> [return: bb23, unwind: bb35];
+    }
+
+    bb23: {
+        _30 = discriminant(_26);
+        switchInt(move _30) -> [0: bb25, 1: bb24, otherwise: bb7];
+    }
+
+    bb24: {
+        _0 = Poll::<u64>::Pending;
+        discriminant((*_52)) = 5;
+        return;
+    }
+
+    bb25: {
+        _31 = copy ((_26 as Ready).0: u64);
+        drop((((*_52) as variant#5).4: {async fn body of step()})) -> [return: bb26, unwind: bb38];
+    }
+
+    bb26: {
+        _53 = copy (((*_52) as variant#5).0: &Ctx);
+        _38 = copy (((*_52) as variant#5).2: u64);
+        _39 = copy (((*_52) as variant#5).3: u64);
+        _40 = AddWithOverflow(copy _38, copy _39);
+        assert(!move (_40.1: bool), "attempt to compute `{} + {}`, which would overflow", move _38, move _39) -> [success: bb27, unwind: bb38];
+    }
+
+    bb27: {
+        _37 = move (_40.0: u64);
+        _41 = AddWithOverflow(copy _37, copy _31);
+        assert(!move (_41.1: bool), "attempt to compute `{} + {}`, which would overflow", move _37, copy _31) -> [success: bb28, unwind: bb38];
+    }
+
+    bb28: {
+        _36 = move (_41.0: u64);
+        _42 = copy ((((*_52) as variant#5).1: Order).0: u64);
+        _43 = AddWithOverflow(copy _36, copy _42);
+        assert(!move (_43.1: bool), "attempt to compute `{} + {}`, which would overflow", move _36, move _42) -> [success: bb29, unwind: bb38];
+    }
+
+    bb29: {
+        _35 = move (_43.0: u64);
+        _44 = copy ((((*_52) as variant#5).1: Order).1: u64);
+        _45 = AddWithOverflow(copy _35, copy _44);
+        assert(!move (_45.1: bool), "attempt to compute `{} + {}`, which would overflow", move _35, move _44) -> [success: bb30, unwind: bb38];
+    }
+
+    bb30: {
+        _34 = move (_45.0: u64);
+        _48 = &((((*_52) as variant#5).1: Order).2: std::string::String);
+        _47 = String::len(move _48) -> [return: bb31, unwind: bb38];
+    }
+
+    bb31: {
+        _46 = move _47 as u64 (IntToInt);
+        _49 = AddWithOverflow(copy _34, copy _46);
+        assert(!move (_49.1: bool), "attempt to compute `{} + {}`, which would overflow", move _34, move _46) -> [success: bb32, unwind: bb38];
+    }
+
+    bb32: {
+        _33 = move (_49.0: u64);
+        _50 = Ctx::emit(copy _53, move _33) -> [return: bb33, unwind: bb38];
+    }
+
+    bb33: {
+        drop((((*_52) as variant#5).1: Order)) -> [return: bb34, unwind: bb39];
+    }
+
+    bb34: {
+        _0 = Poll::<u64>::Ready(move _50);
+        discriminant((*_52)) = 1;
+        return;
+    }
+
+    bb35 (cleanup): {
+        drop((((*_52) as variant#5).4: {async fn body of step()})) -> [return: bb38, unwind terminate(cleanup)];
+    }
+
+    bb36 (cleanup): {
+        drop((((*_52) as variant#4).3: {async fn body of step()})) -> [return: bb38, unwind terminate(cleanup)];
+    }
+
+    bb37 (cleanup): {
+        drop((((*_52) as variant#3).2: {async fn body of step()})) -> [return: bb38, unwind terminate(cleanup)];
+    }
+
+    bb38 (cleanup): {
+        drop((((*_52) as variant#5).1: Order)) -> [return: bb39, unwind terminate(cleanup)];
+    }
+
+    bb39 (cleanup): {
+        discriminant((*_52)) = 2;
+        resume;
+    }
+
+    bb40: {
+        _12 = move _2;
+        _2 = move _12;
+        goto -> bb4;
+    }
+
+    bb41: {
+        _22 = move _2;
+        _2 = move _22;
+        goto -> bb13;
+    }
+
+    bb42: {
+        _32 = move _2;
+        _2 = move _32;
+        goto -> bb21;
+    }
+
+    bb43: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb43, unwind continue];
+    }
+
+    bb44: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb44, unwind continue];
+    }
+}

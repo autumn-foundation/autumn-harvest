@@ -2,3 +2,42 @@
 Cargo.lock
 .env*
 .claude/
+__pycache__/
+
+# Crash dumps that rustc writes on an internal compiler error.
+rustc-ice-*.txt
+
+# Nested cargo target dirs (e.g. per-agent --target-dir runs inside member crates)
+**/target/
+
+# Generated TypeScript client (examples/typescript-client, issue #694). The
+# types are regenerated from the served OpenAPI document on every run, so they
+# are build output, not source.
+node_modules/
+examples/typescript-client/src/harvest-api.ts
+
+# Published TypeScript client (issue #1616). The build generates the types
+# from docs/openapi.json, so they are build output, not source.
+clients/typescript/src/harvest-api.ts
+clients/typescript/dist/
+clients/typescript/*.tgz
+
+# claude-agent-daemon example runtime state (issue #1493's README). The
+# documented "Try it in one minute" walkthrough runs `agentd` from the
+# repository root, and its defaults (`agentd.db`, `agentd.sock`, both
+# defined in examples/claude-agent-daemon/src) write there. Left unignored,
+# following the docs verbatim leaves the checkout dirty with a database that
+# — once run against a real key — holds every prompt, tool input, and file
+# the agent read. Guarded by
+# scripts/check-agentd-runtime-artifacts-ignored.sh.
+/agentd.db*
+/agentd.sock*
+
+# TLC trace dumps from a manual run in formal/tla (issue #1819).
+formal/tla/*_TTrace_*
+formal/tla/states/
+
+# Patch leftovers (issue #1831). CI fails on a tracked one
+# (docs/audits/tracked-artifacts.py).
+*.orig
+*.rej

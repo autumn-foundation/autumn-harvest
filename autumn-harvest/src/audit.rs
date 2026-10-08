@@ -19,6 +19,7 @@
 //! list endpoint itself. See [`crate::audit::EXCLUDED_ROUTES`] for the full list.
 
 use chrono::{DateTime, Utc};
+use diesel::BoolExpressionMethods;
 use diesel::ExpressionMethods;
 use diesel::QueryDsl;
 use diesel::SelectableHelper;
@@ -113,6 +114,30 @@ pub const OP_RATE_LIMIT_PACING_OVERRIDE_SET: &str = "rate_limit.pacing_override.
 /// Audit operation: Cleared a TTL'd runtime pacing override on a declared
 /// per-activity rate limit before its TTL elapsed (issue #945).
 pub const OP_RATE_LIMIT_PACING_OVERRIDE_CLEAR: &str = "rate_limit.pacing_override.clear";
+/// Audit operation: Rewound a shard's audit-export cursor so already-delivered
+/// audit records are re-exported to the SIEM sink (issue #953).
+///
+/// The redrive is itself a privileged action — it causes records to be
+/// re-shipped, and a cursor an operator can move is a control an auditor will
+/// ask about — so it produces an audit record like any other mutation. Note
+/// that a rewind can only ever move a cursor BACKWARDS; the route refuses a
+/// forward request rather than recording one.
+pub const OP_AUDIT_EXPORT_REDRIVE: &str = "audit_export.redrive";
+/// Audit operation: Retired a shard's audit-export cursor, permitting
+/// retention to purge its aged records (issue #953, issue #1273).
+///
+/// This discards the compliance guarantee over any record the shard had not
+/// yet shipped. An auditor must be able to name who authorised that, so the
+/// route is admin-gated and audited like every other privileged action here.
+pub const OP_AUDIT_EXPORT_DECOMMISSION: &str = "audit_export.decommission";
+/// Audit operation: Reactivated a shard's retired audit-export cursor
+/// (issue #1273).
+///
+/// The inverse of [`OP_AUDIT_EXPORT_DECOMMISSION`]. Resuming export used to
+/// be an implicit side effect of the exporter's next scanner tick. It is now
+/// its own explicit, audited operator action, for the same reason
+/// retirement is: an auditor must name who decided to resume it.
+pub const OP_AUDIT_EXPORT_REACTIVATE: &str = "audit_export.reactivate";
 /// Audit operation: Set (or updated) a TTL'd runtime pacing override on a
 /// declared workflow-start throttle (issue #945).
 ///
@@ -170,6 +195,10 @@ pub const OP_BATCH_RESET: &str = "batch.reset";
 pub const OP_BUILD_RAMP_SET: &str = "build_routing.ramp.set";
 /// Audit operation: Cleared a queue's percentage build ramp (issue #604).
 pub const OP_BUILD_RAMP_CLEAR: &str = "build_routing.ramp.clear";
+/// Audit operation: The ramp guard aborted a queue's build ramp (issue #1814).
+///
+/// The actor is `system`. The row's summary holds the reason and both rates.
+pub const OP_BUILD_RAMP_AUTO_ABORT: &str = "build_routing.ramp.auto_abort";
 /// Audit operation: Manually redrove a dead-lettered completion-callback
 /// delivery (issue #605).
 pub const OP_CALLBACK_REDRIVE: &str = "completion_callback.redrive";
@@ -205,6 +234,37 @@ pub const OP_QUEUE_RESUME: &str = "queue.resume";
 pub const OP_TOKEN_CREATE: &str = "token.create";
 /// Audit operation: revoked a scoped API token (issue #942).
 pub const OP_TOKEN_REVOKE: &str = "token.revoke";
+/// Audit operation: a queue started to shed new starts (issue #1794).
+///
+/// The load-shed sampler writes it, not a route. So no `ALL_MUTATION_ROUTES`
+/// entry exists for it.
+pub const OP_LOAD_SHED_TRIP: &str = "load_shed.trip";
+/// Audit operation: a queue stopped shedding new starts (issue #1794).
+pub const OP_LOAD_SHED_CLEAR: &str = "load_shed.clear";
+/// Audit operation: an operator's `harvest shard rebalance` or
+/// `rebalance-resume` stepped a shard migration (issue #964).
+///
+/// The CLI writes it, not a route. So no `ALL_MUTATION_ROUTES` entry exists
+/// for it.
+pub const OP_SHARD_REBALANCE_MIGRATE: &str = "shard.rebalance.migrate";
+/// Audit operation: the rebalance-resume scanner settled a shard migration
+/// that stalled after its cutover (issue #1839).
+///
+/// The scanner writes it, not a route. So no `ALL_MUTATION_ROUTES` entry
+/// exists for it.
+pub const OP_SHARD_REBALANCE_AUTO_RESUME: &str = "shard.rebalance.auto_resume";
+/// Audit operation: a token scope or the authorizer hook denied a request
+/// (issue #1803).
+///
+/// The row has status `failed`, so the SIEM export marks it `ERROR`. The deny
+/// reason goes in `error_summary` and never into the response.
+pub const OP_AUTHZ_DENY: &str = "authz.deny";
+/// Audit operation: one API rate-limit bucket reached the sustained-rejection
+/// threshold in one window (issue #1827).
+///
+/// The row has status `failed`. The limiter writes it, not a route, so no
+/// `ALL_MUTATION_ROUTES` entry exists for it.
+pub const OP_API_RATE_LIMIT_SUSTAINED: &str = "api.rate_limit_sustained";
 
 // ── Target type constants ─────────────────────────────────────────────────────
 
@@ -233,6 +293,10 @@ pub const TARGET_CALLBACK_DELIVERY: &str = "completion_callback_delivery";
 pub const TARGET_TOKEN: &str = "token";
 /// Target type: a named task queue (issue #619).
 pub const TARGET_QUEUE: &str = "queue";
+/// Audit target type: a shard's audit-export cursor (issue #953).
+pub const TARGET_AUDIT_EXPORT: &str = "audit_export";
+/// Audit target type: a management API route that a deny refused (issue #1803).
+pub const TARGET_ROUTE: &str = "route";
 
 // ── Status constants ──────────────────────────────────────────────────────────
 
@@ -263,6 +327,12 @@ pub const HEADER_SOURCE: &str = "x-harvest-source";
 /// Out-of-band exactly-once delivery key for the standalone signal route.
 pub const HEADER_IDEMPOTENCY_KEY: &str = "idempotency-key";
 
+/// Caller-declared tenant key that the authorizer hook receives (issue #1803).
+///
+/// Harvest does not check this value. The authorizer decides if the principal
+/// may act for the tenant.
+pub const HEADER_TENANT: &str = "x-harvest-tenant";
+
 // ── Retention ─────────────────────────────────────────────────────────────────
 
 /// Default audit record retention in days (90 days ≈ 3 months).
@@ -286,10 +356,12 @@ pub const DEFAULT_AUDIT_RETENTION_DAYS: i64 = 90;
 pub enum RouteClass {
     /// Always safe to expose without authentication.
     ///
-    /// Currently only `GET /health`. Kubernetes liveness/readiness probes and
-    /// load-balancer health checks commonly require this endpoint to be
-    /// reachable without credentials. Exposing it is an explicit product
-    /// decision, not an oversight.
+    /// `GET /health`, `GET /health/live`, `GET /health/ready` and
+    /// `GET /openapi.json`. Kubernetes liveness/readiness
+    /// probes and load-balancer health checks commonly require the health
+    /// endpoints to be reachable without credentials. The `OpenAPI` document
+    /// describes the route surface only and carries no execution state.
+    /// Exposing both is an explicit product decision, not an oversight.
     PublicSafe,
 
     /// Reads operator state but does not modify workflow execution.
@@ -349,7 +421,16 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     // Kubernetes liveness/readiness probes and load-balancer health checks
     // require /health to be reachable without credentials.
     ("GET /health", RouteClass::PublicSafe),
+    // The probe split of /health (issue #1812). No worker ids, queues or shard detail.
+    ("GET /health/live", RouteClass::PublicSafe),
+    ("GET /health/ready", RouteClass::PublicSafe),
+    // The published OpenAPI document. Route surface only, no execution state,
+    // and a client generator must reach it before it holds a credential.
+    ("GET /openapi.json", RouteClass::PublicSafe),
     // ── ReadOnly ── reads state, does not modify workflow execution ───────────
+    // Audit-export status (issue #953): read-only, admin-gated. Reports cursor
+    // position, lag, and last error — never audit record contents.
+    ("GET /admin/audit-export", RouteClass::ReadOnly),
     ("GET /workflows/count", RouteClass::ReadOnly),
     // Tiered/summary retention list (issue #752): read-only, admin-guarded.
     ("GET /workflows/summaries", RouteClass::ReadOnly),
@@ -435,6 +516,11 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("GET /admin/start-throttle", RouteClass::ReadOnly),
     // Per-tenant resource quota usage-vs-limit report (issue #946): read-only.
     ("GET /admin/quotas", RouteClass::ReadOnly),
+    // Payload-codec key rotation progress (issue #948): read-only. Classifying
+    // it matters — an unclassified path defaults to `Mutating`, which would
+    // deny a read-only operator the very screen they watch to decide when an
+    // outgoing key is safe to retire.
+    ("GET /admin/codec/rotation", RouteClass::ReadOnly),
     // Workflow-type handler reachability (issue #520): read-only, no state mutation.
     (
         "GET /admin/workflow-types/reachability",
@@ -624,6 +710,12 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
         "GET /workflows/by-id/{workflow_name}/{workflow_id}",
         RouteClass::ReadOnly,
     ),
+    // Empty-workflow_id guard (issue #1353): literal trailing-slash form of
+    // the base route above; always returns 400 (no read, no write).
+    (
+        "GET /workflows/by-id/{workflow_name}/",
+        RouteClass::ReadOnly,
+    ),
     (
         "GET /workflows/by-id/{workflow_name}/{workflow_id}/result",
         RouteClass::ReadOnly,
@@ -748,6 +840,15 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
         "POST /admin/circuits/{activity_name}/force-close",
         RouteClass::Mutating,
     ),
+    // Rewinds a shard's audit-export cursor (issue #953): mutating, audited.
+    ("POST /admin/audit-export/redrive", RouteClass::Mutating),
+    // Retires or reactivates a shard's audit-export cursor (issue #1273):
+    // mutating, audited.
+    (
+        "POST /admin/audit-export/decommission",
+        RouteClass::Mutating,
+    ),
+    ("POST /admin/audit-export/reactivate", RouteClass::Mutating),
     // Calendar + completion-trigger CRUD. No dedicated audit op constant yet
     // (audit wiring is out of scope for #776); disposition is EXCLUDED_ROUTES.
     ("POST /admin/completion-triggers", RouteClass::Mutating),
@@ -755,6 +856,17 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("PUT /calendars/{name}", RouteClass::Mutating),
     ("DELETE /calendars/{name}", RouteClass::Mutating),
 ];
+
+/// Routes that only an `admin`-scoped API token can reach (issue #1803).
+///
+/// A `mutate` token reaches every other mutation. Token management is here
+/// because a token that mints tokens can copy itself. Each entry must also be
+/// a `Mutating` entry in [`CLASSIFIED_ROUTES`].
+///
+/// No management route publishes a workflow module today. A future publish
+/// route runs code, so it belongs here. A guard test fails if a mutating
+/// `/modules` route is missing from this list.
+pub const ADMIN_SCOPE_ROUTES: &[&str] = &["POST /admin/tokens", "DELETE /admin/tokens/{id}"];
 
 // ── Declarative route manifest ────────────────────────────────────────────────
 
@@ -800,6 +912,11 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_RATE_LIMIT_PACING_OVERRIDE_CLEAR,
     OP_START_THROTTLE_PACING_OVERRIDE_SET,
     OP_START_THROTTLE_PACING_OVERRIDE_CLEAR,
+    // Audit-export cursor redrive (issue #953), decommission and reactivate
+    // (issue #1273)
+    OP_AUDIT_EXPORT_REDRIVE,
+    OP_AUDIT_EXPORT_DECOMMISSION,
+    OP_AUDIT_EXPORT_REACTIVATE,
     OP_BUILD_POLICY_SET,
     OP_BUILD_COMPAT_DECLARE,
     OP_BUILD_COMPAT_REVOKE,
@@ -835,6 +952,9 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     // Operator read-path payload decoding (issue #608). Read audit — no
     // ALL_MUTATION_ROUTES entry; see the doc comment on OP_PAYLOAD_DECODE_READ.
     OP_PAYLOAD_DECODE_READ,
+    // Issue #1803: a deny has no route of its own, so no
+    // ALL_MUTATION_ROUTES entry names it.
+    OP_AUTHZ_DENY,
     // Read-only operator role (issue #776): these four constants pre-existed
     // but had never been wired into a route manifest entry. Their handlers
     // already write audit rows under these ops; classifying the routes (below)
@@ -850,6 +970,19 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_QUEUE_RESUME,
     OP_TOKEN_CREATE,
     OP_TOKEN_REVOKE,
+    // Automatic load shedding (issue #1794). No route entry: the sampler
+    // writes these rows.
+    OP_LOAD_SHED_TRIP,
+    OP_LOAD_SHED_CLEAR,
+    // Build ramp guard (issue #1814). No route entry: the guard writes these
+    // rows.
+    OP_BUILD_RAMP_AUTO_ABORT,
+    // Shard rebalancing (issues #964 and #1839). No route entry: the CLI and
+    // the rebalance-resume scanner write these rows.
+    OP_SHARD_REBALANCE_MIGRATE,
+    OP_SHARD_REBALANCE_AUTO_RESUME,
+    // API rate limiting (issue #1827). No route entry: the limiter writes it.
+    OP_API_RATE_LIMIT_SUSTAINED,
 ];
 
 /// Routes explicitly excluded from audit.
@@ -858,6 +991,7 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
 /// coverage guard test to ensure no route is accidentally omitted from either
 /// [`ALL_MUTATION_ROUTES`] or this exclusion list.
 pub const EXCLUDED_ROUTES: &[&str] = &[
+    "GET /admin/audit-export",
     "GET /workflows/count",
     "GET /workflows/summaries",
     "GET /workflows",
@@ -886,6 +1020,9 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /dags/{dag_name}/runs/{run_exec_id}",
     "GET /dead-letters",
     "GET /health",
+    "GET /health/live",
+    "GET /health/ready",
+    "GET /openapi.json",
     "GET /admin/preflight",
     "GET /admin/shards/health",
     "GET /admin/queue-coverage",
@@ -901,6 +1038,11 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /admin/start-throttle",
     // Per-tenant resource quota usage-vs-limit report (issue #946): read-only.
     "GET /admin/quotas",
+    // Payload-codec key rotation progress (issue #948): read-only, and it
+    // surfaces only key IDENTIFIERS and row counts — no key material, no
+    // payload content — so there is nothing here to audit that the admin gate
+    // does not already cover.
+    "GET /admin/codec/rotation",
     // Read-only pacing-override lookup (issue #945); the SET/DELETE mutations
     // above (OP_START_THROTTLE_PACING_OVERRIDE_SET/CLEAR) are audited.
     "GET /admin/start-throttle/{workflow_name}/override",
@@ -943,6 +1085,8 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     // ALL_MUTATION_ROUTES with `None` (both mean "not audited") but is NOT in
     // EXCLUDED_ROUTES, so the by-id variant must not be either.
     "GET /workflows/by-id/{workflow_name}/{workflow_id}",
+    // Empty-workflow_id guard (issue #1353): always 400, no read, no write.
+    "GET /workflows/by-id/{workflow_name}/",
     "GET /workflows/by-id/{workflow_name}/{workflow_id}/stack",
     "GET /workflows/by-id/{workflow_name}/{workflow_id}/children",
     "GET /workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}",
@@ -1063,6 +1207,9 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("POST /dlq/redrive", Some(OP_DLQ_REDRIVE)),
     // Health / observability (read-only)
     ("GET /health", None),
+    ("GET /health/live", None),
+    ("GET /health/ready", None),
+    ("GET /openapi.json", None),
     ("GET /admin/preflight", None),
     ("GET /admin/shards/health", None),
     ("GET /admin/queue-coverage", None),
@@ -1079,6 +1226,8 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /admin/start-throttle", None),
     // Per-tenant resource quota usage-vs-limit report (issue #946): read-only.
     ("GET /admin/quotas", None),
+    // Issue #948: read-only, no audit operation.
+    ("GET /admin/codec/rotation", None),
     // Workflow-type handler reachability (issue #520): read-only.
     ("GET /admin/workflow-types/reachability", None),
     ("GET /admin/history/exports", None),
@@ -1231,6 +1380,8 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     // delegate to them; the delegated handler writes the audit row under the
     // exec-id route string with the resolved exec_id as the target).
     ("GET /workflows/by-id/{workflow_name}/{workflow_id}", None),
+    // Empty-workflow_id guard (issue #1353): always 400, never audited.
+    ("GET /workflows/by-id/{workflow_name}/", None),
     (
         "GET /workflows/by-id/{workflow_name}/{workflow_id}/result",
         None,
@@ -1321,6 +1472,21 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
         "POST /admin/circuits/{activity_name}/force-close",
         Some(OP_CIRCUIT_FORCE_CLOSE),
     ),
+    // Audit export (issue #953): read-only status, and the audited redrive.
+    // Decommission and reactivate (issue #1273) are audited the same way.
+    ("GET /admin/audit-export", None),
+    (
+        "POST /admin/audit-export/redrive",
+        Some(OP_AUDIT_EXPORT_REDRIVE),
+    ),
+    (
+        "POST /admin/audit-export/decommission",
+        Some(OP_AUDIT_EXPORT_DECOMMISSION),
+    ),
+    (
+        "POST /admin/audit-export/reactivate",
+        Some(OP_AUDIT_EXPORT_REACTIVATE),
+    ),
     ("POST /admin/completion-triggers", None),
     ("POST /calendars", None),
     ("PUT /calendars/{name}", None),
@@ -1339,6 +1505,16 @@ pub struct AuditFilters {
     pub status: Option<String>,
     pub since: Option<DateTime<Utc>>,
     pub before: Option<DateTime<Utc>>,
+    /// Row id tiebreaker for `before` (issue #1408).
+    ///
+    /// `list_audit` orders by `(occurred_at, id)` DESC. Pass the last row's
+    /// `id` from the prior page along with `before` to page past a tie
+    /// without loss. A caller that sends `before` alone keeps the legacy,
+    /// single-column cursor, which can skip rows tied on `occurred_at`.
+    ///
+    /// Has no effect without `before`: `list_audit` applies no cursor filter
+    /// at all when `before` is absent, even if this field is set.
+    pub before_id: Option<Uuid>,
     /// Maximum number of records to return. Clamped to [1, 500].
     pub limit: i64,
 }
@@ -1360,6 +1536,7 @@ impl Default for AuditFilters {
             status: None,
             since: None,
             before: None,
+            before_id: None,
             limit: Self::default_limit(),
         }
     }
@@ -1374,10 +1551,33 @@ impl Default for AuditFilters {
 /// the HTTP client — the audit record must be durable before the response is
 /// sent.
 ///
+/// A read route writes audit rows too, with no fence barrier. So when the
+/// DR fence is on, the insert checks the fence in its own transaction
+/// (issue #1823). See [`crate::replication::assert_database_fence`].
+///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] if the insert fails.
+/// Returns the fence's error when this process lost write authority.
 pub async fn insert_audit(
+    conn: &mut AsyncPgConnection,
+    record: &NewAuditRecord<'_>,
+) -> HarvestResult<Uuid> {
+    use diesel_async::AsyncConnection as _;
+    if !crate::replication::FenceRegistry::is_enabled() {
+        return insert_audit_row(conn, record).await;
+    }
+    Box::pin(
+        conn.transaction::<_, crate::error::HarvestError, _>(async move |conn| {
+            crate::replication::assert_database_fence(conn).await?;
+            insert_audit_row(conn, record).await
+        }),
+    )
+    .await
+}
+
+/// The insert of [`insert_audit`], with no fence check.
+async fn insert_audit_row(
     conn: &mut AsyncPgConnection,
     record: &NewAuditRecord<'_>,
 ) -> HarvestResult<Uuid> {
@@ -1389,10 +1589,80 @@ pub async fn insert_audit(
         .map_err(database_error)
 }
 
-/// List audit records matching the given filters, ordered by `occurred_at DESC`.
+/// `PostgreSQL`'s wire protocol caps a single statement at 65 535 bound
+/// parameters. `NewAuditRecord` has 11 columns, so a chunk of this many
+/// rows binds at most 54 989 parameters. That stays comfortably under the
+/// limit, even when every column binds a value rather than falling back to
+/// its SQL `DEFAULT`. Issue #1407 review: a batch at or beyond the raw
+/// limit used to silently drop every audit row for its shard. Callers
+/// discard this function's error, so nothing surfaced the drop.
+const MAX_AUDIT_BATCH_ROWS: usize = 4999;
+
+/// Insert several audit records in one round trip per chunk of at most
+/// [`MAX_AUDIT_BATCH_ROWS`] records. Returns the generated ids in the same
+/// order as `records`.
+///
+/// An empty slice never sends a statement. An empty `VALUES` list has no
+/// `Insertable` representation. This returns `Ok(vec![])` without touching
+/// the connection.
+///
+/// Same durability contract as [`insert_audit`]: the caller must ensure this
+/// returns `Ok` before reporting success for every mutation it covers. Same
+/// DR fence check too (issue #1823).
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] if any chunk's insert
+/// fails. A failure partway through leaves earlier chunks committed. Each
+/// chunk is its own statement, matching the per-row loop this replaces,
+/// which offered no cross-row atomicity either.
+pub async fn insert_audit_batch(
+    conn: &mut AsyncPgConnection,
+    records: &[NewAuditRecord<'_>],
+) -> HarvestResult<Vec<Uuid>> {
+    use diesel_async::AsyncConnection as _;
+    if records.is_empty() || !crate::replication::FenceRegistry::is_enabled() {
+        return insert_audit_rows(conn, records).await;
+    }
+    Box::pin(
+        conn.transaction::<_, crate::error::HarvestError, _>(async move |conn| {
+            crate::replication::assert_database_fence(conn).await?;
+            insert_audit_rows(conn, records).await
+        }),
+    )
+    .await
+}
+
+/// The inserts of [`insert_audit_batch`], with no fence check.
+async fn insert_audit_rows(
+    conn: &mut AsyncPgConnection,
+    records: &[NewAuditRecord<'_>],
+) -> HarvestResult<Vec<Uuid>> {
+    let mut ids = Vec::with_capacity(records.len());
+    for chunk in records.chunks(MAX_AUDIT_BATCH_ROWS) {
+        let chunk_ids = diesel::insert_into(harvest_audit_log::table)
+            .values(chunk)
+            .returning(harvest_audit_log::id)
+            .get_results::<Uuid>(conn)
+            .await
+            .map_err(database_error)?;
+        ids.extend(chunk_ids);
+    }
+    Ok(ids)
+}
+
+/// List audit records matching the given filters, ordered by
+/// `(occurred_at, id) DESC`.
 ///
 /// The `limit` in `filters` is clamped to [1, 500]. The caller is responsible
 /// for merging and re-sorting results when aggregating across multiple shards.
+///
+/// ## Paging past tied timestamps (issue #1408)
+///
+/// A batch insert (see [`insert_audit_batch`]) gives every row in the batch
+/// the same `occurred_at`. Set `filters.before_id` to the prior page's last
+/// row id. Pair it with `filters.before`. The cursor then breaks the tie by
+/// `id`, instead of dropping rows that share the boundary timestamp.
 ///
 /// # Errors
 ///
@@ -1405,7 +1675,10 @@ pub async fn list_audit(
 
     let mut query = harvest_audit_log::table
         .into_boxed()
-        .order(harvest_audit_log::occurred_at.desc())
+        .order((
+            harvest_audit_log::occurred_at.desc(),
+            harvest_audit_log::id.desc(),
+        ))
         .limit(limit);
 
     if let Some(actor) = &filters.actor {
@@ -1426,8 +1699,20 @@ pub async fn list_audit(
     if let Some(since) = filters.since {
         query = query.filter(harvest_audit_log::occurred_at.ge(since));
     }
-    if let Some(before) = filters.before {
-        query = query.filter(harvest_audit_log::occurred_at.lt(before));
+    match (filters.before, filters.before_id) {
+        (Some(before), Some(before_id)) => {
+            query = query.filter(
+                harvest_audit_log::occurred_at
+                    .lt(before)
+                    .or(harvest_audit_log::occurred_at
+                        .eq(before)
+                        .and(harvest_audit_log::id.lt(before_id))),
+            );
+        }
+        (Some(before), None) => {
+            query = query.filter(harvest_audit_log::occurred_at.lt(before));
+        }
+        (None, _) => {}
     }
 
     query
@@ -1442,18 +1727,352 @@ pub async fn list_audit(
 /// Called by the retention subsystem on its configured cadence. Returns the
 /// number of rows deleted.
 ///
+/// **Never deletes a record the audit exporter has not shipped** (issue #953).
+/// A retention sweep that removed an unexported row would be a silent
+/// compliance gap — the record would be gone from the database *and* absent
+/// from the SIEM, with nothing anywhere to show it was lost, which is exactly
+/// what "zero silent record loss by construction" rules out.
+///
+/// ## Deciding whether export is live
+///
+/// The guard applies when **any** signal says an exporter owes this shard
+/// records:
+///
+/// - **A live (non-retired) cursor row exists** for the shard. Durable, shared
+///   state, so it works
+///   when retention and export run in **different processes** (issue #953,
+///   Codex review P1): a split web/worker deployment where only the worker
+///   configures the sink would otherwise have the web app's retention sweep
+///   delete rows the worker still owes.
+/// - **A sink is configured in this process**
+///   ([`crate::audit_export::is_configured`]) — covers the window before the
+///   exporter's first tick on a shard has created the cursor row at all
+///   (freshly enabled, newly added to the fleet, or a shard whose pool has
+///   been failing).
+/// - **`protect_unexported_audit` is `true`** (issue #1266). The first two
+///   signals can both be absent at once. This happens in a split web/worker
+///   deployment, before the worker's first successful tick on a shard. The
+///   process running retention then has no sink and no cursor row to read.
+///   Neither signal can close that window: both need the worker to have
+///   reached the shard at least once. This third signal needs no such
+///   contact. An operator sets it the same way on every process. The guard
+///   then holds from the moment export is configured, not from the moment it
+///   first succeeds.
+///
+///   This includes a shard whose cursor is **retired**. A previously
+///   decommissioned shard being re-enabled has exactly this gap. The worker
+///   has not yet ticked it since. Its cursor is still retired. New rows
+///   would otherwise be unprotected until that tick lands.
+///
+///   An earlier draft scoped this flag to "no cursor row at all" (issue
+///   #1266). That reopened precisely this window.
+///   `is_configured` does **not** share this shape (issue #1273). It is a
+///   process-wide boolean with no notion of which shard's sink it
+///   actually reflects. So it must not override a specific shard's own
+///   retired cursor -- only this explicit, per-shard-scoped flag does.
+///   Decommissioning a shard does not resume purging there while this
+///   flag stays `true` for it.
+///
+///   This `bool` is a single shard's answer, not a fleet-wide switch. A
+///   caller with more than one shard computes it separately per shard.
+///   See [`crate::retention::RetentionConfig::protects_unexported_audit`].
+///   Decommissioning one shard then need not also drop protection from
+///   another, still mid-bootstrap on the same sweep.
+///
+/// Deliberately **not** time-based. An earlier revision expired the guard 24h
+/// after the exporter's last heartbeat, so a long worker outage lifted it; a
+/// timeout cannot distinguish "export was intentionally removed" from "the
+/// worker has been down since Friday", and it resolves that ambiguity by
+/// deleting audit records during exactly the outage where they matter most
+/// (issue #953, Codex review round 3 P1).
+///
+/// Retiring export is therefore an explicit operator action —
+/// [`crate::audit_export::decommission_cursor`] — not an inferred one. The
+/// cost is that a sink left down indefinitely lets the audit table grow past
+/// its retention window. That is the deliberate trade, and the growth is
+/// bounded by the genuine unexported backlog rather than the whole table:
+/// fully-acknowledged records are purged on the normal schedule. Dropping a
+/// privileged-action log to reclaim disk is not a choice this function gets to
+/// make on an operator's behalf; `harvest.audit.export_lag` and the
+/// `last_error` on `GET /admin/audit-export` are how the condition is
+/// surfaced. See `docs/audit-export.md`.
+///
+/// `protect_unexported_audit` has its own "both steps required" trade,
+/// independent of `is_configured`. Decommissioning alone does not resume
+/// purging on a shard while the flag stays `true` for it. The operator must
+/// also unset it there, or exempt the shard. `decommission_cursor` alone
+/// is what resumes purging when the flag was never set at all.
+///
+/// With export inactive by every signal the guard is skipped entirely and the
+/// delete is byte-identical to the pre-#953 statement.
+///
+/// The pending check treats a row as pending, and so protected, in three
+/// cases. Its `export_seq` may be unassigned. Some shard in
+/// `colocated_shard_ids` may have no cursor row at all. Or any live
+/// (non-retired) cursor row anywhere in this database may simply not
+/// have acknowledged it yet. This holds whether or not its shard is
+/// named in `colocated_shard_ids` (Codex review, PR #1504). A retired
+/// cursor's own stale ack counts too, but only for a shard in
+/// `colocated_shard_ids`, and only while `protect_unexported_audit` is
+/// itself protecting this pool group. See the note above the SQL for
+/// why.
+///
+/// The second case matters on its own (issue #1266). A stamped row can
+/// survive a cursor row's manual deletion. It can
+/// also survive a partial restore. [`crate::audit_export::ensure_cursor_row`]
+/// rebuilds such a cursor with `last_acked_seq = 0`, treating every
+/// already-stamped row as unacknowledged again. The pending check must
+/// agree, or a sweep landing first would delete rows `ensure_cursor_row`
+/// intended to redeliver.
+///
+/// `colocated_shard_ids` exists because a pool is not always one shard's
+/// own database. [`crate::shard::ShardedDbPool::pool_groups`] can name
+/// several logical shards sharing one physical pool. Each keeps its own
+/// cursor row there once it ticks.
+///
+/// An earlier draft compared the cursor row *count* against the number
+/// of colocated shards instead of matching shard identities. A
+/// decommissioned shard's cursor row is never deleted, only retired. A
+/// shard removed from the fleet entirely can leave a row behind that
+/// makes the count look complete. A currently colocated shard can still
+/// have none. Comparing identities closes that gap: every id this
+/// parameter names must have a cursor row of its own, regardless of how
+/// many other rows exist. A single-shard caller passes that one shard's
+/// id, and the check is then exactly the previous "no cursor row at all"
+/// test.
+///
+/// **A cursor row, once it exists, is authoritative over `is_configured()`**
+/// (issue #1273). The two signals above are not simply OR'd. `is_configured()`
+/// only stands in for an expected shard -- one named in
+/// `colocated_shard_ids` -- when that shard has no cursor row yet. That
+/// is the bootstrap window this function's doc already covers.
+///
+/// This is scoped per shard (Codex review, PR #1504). An unrelated
+/// colocated shard's own lingering row must never stand in for a
+/// different expected shard's still-missing one. Once an expected
+/// shard's own row exists, its `retired_at` decides, full stop.
+///
+/// Earlier this made no practical difference:
+/// [`crate::audit_export::ensure_cursor_row`] used to un-retire a cursor on
+/// its very next scanner tick, so a retirement rarely outlived one tick.
+/// Issue #1273 made retirement durable, and that is exactly what surfaced
+/// this. With the old OR'd predicate, decommissioning a shard released
+/// nothing here as long as *any* shard in the process still had a sink
+/// configured. That is the ordinary fleet steady state. It silently broke the
+/// documented "retiring is what lets retention purge them" contract this
+/// module and `crate::audit_export::decommission_cursor_locked` both state.
+///
+/// **`audit_export.decommission` and `audit_export.reactivate` records are
+/// never purged, live or retired shard, exported or not** (issue #1273,
+/// Codex review P1). These two rows describe the audit-export system's own
+/// lifecycle controls. A decommission targeting the shard it runs on can
+/// never export its own record. Retiring a cursor is exactly what stops
+/// that shard's exporter from claiming anything, including this row. In a
+/// single-shard deployment that shard is also the only one there is.
+///
+/// A cross-shard best-effort copy (see `audit_export_decommission_handler`
+/// in the plugin) can get such a record to the SIEM when another shard is
+/// still exporting. It cannot when the target IS the only exportable shard,
+/// or when the copy's own write fails.
+///
+/// So the guarantee this route actually provides is narrower, and
+/// achievable: a permanent LOCAL record of who authorised the transition.
+/// It stays discoverable via `GET /audit` on that shard, forever. Not
+/// guaranteed delivery to an external SIEM for the one event whose entire
+/// subject is "this shard's exporter just stopped or resumed". The
+/// exclusion below spends unbounded local storage on two specific, rare,
+/// admin-triggered operations, to make that narrower guarantee
+/// unconditionally true.
+///
+/// The delete also advances `harvest_audit_purge_watermark` in the same
+/// statement (issue #1508). See [`crate::audit_export::redrive_window_truncated`].
+///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] if the delete fails.
 pub async fn purge_old_audit_records(
     conn: &mut AsyncPgConnection,
     retention_days: i64,
+    protect_unexported_audit: bool,
+    colocated_shard_ids: &[i32],
+    exempted_shard_ids: &[i32],
 ) -> HarvestResult<usize> {
+    use diesel_async::RunQueryDsl as _;
+
     let cutoff = chrono::Utc::now() - chrono::Duration::days(retention_days);
-    diesel::delete(harvest_audit_log::table.filter(harvest_audit_log::occurred_at.lt(cutoff)))
-        .execute(conn)
-        .await
-        .map_err(database_error)
+
+    // Delete an aged row UNLESS export is live AND that row is still pending.
+    //
+    // The outer "export may be live" gate follows issue #1273's
+    // authoritative-cursor rule. A live (non-retired) cursor row anywhere
+    // in this database decides on its own, full stop. `$2`
+    // (`protect_unexported_audit`) is unconditionally sufficient on its
+    // own (issue #1266). An operator's explicit signal must keep closing
+    // the bootstrap window, regardless of what any other colocated
+    // shard's cursor looks like. `$7` (raw `is_configured()`) only
+    // stands in when some shard named in `$3` has no cursor row of its
+    // own yet (Codex review, PR #1504). That is #1273's own narrow
+    // signal, scoped the same way the pending check's own
+    // missing-cursor disjunct already is below.
+    //
+    // An earlier revision checked whether the whole cursor table was
+    // empty, not whether an expected shard's own row was missing. A
+    // retired, unrelated shard's lingering row then made that check
+    // false for every other colocated shard sharing this database.
+    // That reopened the exact bootstrap window this disjunct exists to
+    // close, even for a shard that had never ticked.
+    //
+    // `is_configured()` never overrides a specific shard's own retired
+    // cursor outside that zero-cursor case, on purpose. This matches
+    // #1273's finding: it is a process-wide boolean with no notion of
+    // which shard's sink it actually reflects. So it cannot distinguish
+    // two cases. One case: this shard's export was just re-enabled. The
+    // other case: some other colocated shard's sink happens to be
+    // configured while this one stays permanently retired.
+    // `protect_unexported_audit` does not share that ambiguity. Its
+    // blast radius is the caller's own explicit
+    // `colocated_shard_ids`/`exempted_shard_ids` split, not an implicit,
+    // untracked one. So it keeps overriding retirement the way it
+    // always has.
+    //
+    // The pending check's middle disjunct matches shard identities
+    // rather than comparing a cursor-row count (issue #1266). A shared
+    // physical pool can hold one cursor row per colocated shard. A
+    // decommissioned shard's row is retired, never deleted. A count
+    // can look complete even when a currently colocated shard still
+    // has no row of its own. `unnest` walks the caller's exact
+    // shard-id list; the disjunct is true the moment any of them has no
+    // matching row.
+    //
+    // The last disjunct's live-cursor arm is unconditional (Codex
+    // review, PR #1504). Any live cursor in this database blocks the
+    // delete, whether or not its shard is named in `$3`
+    // (`colocated_shard_ids`). An earlier revision scoped this arm to
+    // `$3` too. A split deployment has two processes, each with its own
+    // partial view of which shards share this physical database. It can
+    // leave a live cursor here that this call's own `colocated_shard_ids`
+    // never names. That scoped arm ignored the unlisted shard's own
+    // unacknowledged backlog entirely. It let such a row purge anyway,
+    // the moment every shard this call did know about had acknowledged
+    // it. Matching the outer gate's own unscoped
+    // `EXISTS (... WHERE retired_at IS NULL)` closes the same gap here.
+    //
+    // A retired cursor's own stale ack is ignored too, but only while
+    // `protect_unexported_audit` is not itself protecting this pool
+    // group (issue #1266). `decommission_cursor`'s own doc comment says
+    // retiring a cursor "is precisely what lets retention purge" that
+    // shard's rows. `harvest_audit_export_cursor` rows are retired,
+    // never deleted. Without this, a permanently decommissioned shard's
+    // frozen ack would block a still-active colocated shard's rows
+    // forever. Gating this on `$2` alone, not `is_configured()`, matches
+    // the outer gate's own reasoning above. An operator who explicitly
+    // keeps `protect_unexported_audit` protecting this group through a
+    // decommission-then-resume transition still needs a re-enabling
+    // shard's retired, not-yet-un-retired cursor treated as pending.
+    // `is_configured()` alone, with the flag unset, does not. An
+    // operator re-enabling export for a specific shard sets the flag,
+    // with the appropriate exemptions, for that transition.
+    // Re-enabling it via `is_configured()` alone was never a documented
+    // signal this pending check trusted to override retirement.
+    //
+    // `exempted_shard_ids` (`$4`) is no longer read by this predicate
+    // (Codex review, PR #1504). Its own exemption already takes effect
+    // only once `decommission_cursor` actually retires that shard's row,
+    // not from the moment the config change lands. While the cursor
+    // stays live, it already counts as pending regardless of `$2`. The
+    // unconditional live-cursor arm above now does exactly that for
+    // every live cursor, exempted or not. `$4` stays a parameter for
+    // interface stability, still bound below, though nothing in this
+    // query reads it.
+    //
+    // Also never one of the two audit-export lifecycle records exempted
+    // above (issue #1273).
+    //
+    // The same statement records a watermark (issue #1508). A `before`
+    // redrive reads it to detect a purged prefix. The delete and the
+    // upsert commit together, so a purge cannot leave records gone without
+    // a trace. Unsequenced rows are skipped: no redrive ever selects one.
+    diesel::sql_query(
+        "WITH deleted AS ( \
+         DELETE FROM harvest_audit_log a \
+         WHERE a.occurred_at < $1 \
+           AND a.operation NOT IN ($5, $6) \
+           AND NOT ( \
+                 ( \
+                   EXISTS ( \
+                        SELECT 1 FROM harvest_audit_export_cursor \
+                        WHERE retired_at IS NULL \
+                   ) \
+                   OR $2::BOOLEAN \
+                   OR ( \
+                     $7::BOOLEAN \
+                     AND EXISTS ( \
+                          SELECT 1 FROM unnest($3::int4[]) AS expected(shard_id) \
+                          WHERE NOT EXISTS ( \
+                               SELECT 1 FROM harvest_audit_export_cursor c \
+                               WHERE c.shard_id = expected.shard_id \
+                          ) \
+                     ) \
+                   ) \
+                 ) \
+                 AND ( \
+                   a.export_seq IS NULL \
+                   OR EXISTS ( \
+                        SELECT 1 FROM unnest($3::int4[]) AS expected(shard_id) \
+                        WHERE NOT EXISTS ( \
+                             SELECT 1 FROM harvest_audit_export_cursor c \
+                             WHERE c.shard_id = expected.shard_id \
+                        ) \
+                   ) \
+                   OR EXISTS ( \
+                        SELECT 1 FROM harvest_audit_export_cursor c \
+                        WHERE a.export_seq > c.last_acked_seq \
+                          AND ( \
+                                c.retired_at IS NULL \
+                                OR ( \
+                                  c.shard_id = ANY($3::int4[]) \
+                                  AND $2::BOOLEAN \
+                                ) \
+                              ) \
+                   ) \
+                 ) \
+           ) \
+         RETURNING a.occurred_at, a.export_seq \
+         ), \
+         stamped AS ( \
+           SELECT MAX(occurred_at) AS max_at, COUNT(*) AS n \
+           FROM deleted WHERE export_seq IS NOT NULL \
+         ), \
+         mark AS ( \
+           INSERT INTO harvest_audit_purge_watermark AS w \
+                  (singleton, max_purged_occurred_at, purged_records) \
+           SELECT TRUE, max_at, n FROM stamped WHERE n > 0 \
+           ON CONFLICT (singleton) DO UPDATE SET \
+                  max_purged_occurred_at = \
+                      GREATEST(w.max_purged_occurred_at, EXCLUDED.max_purged_occurred_at), \
+                  purged_records = w.purged_records + EXCLUDED.purged_records, \
+                  updated_at = NOW() \
+         ) \
+         SELECT COUNT(*) AS deleted FROM deleted",
+    )
+    .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
+    .bind::<diesel::sql_types::Bool, _>(protect_unexported_audit)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(colocated_shard_ids.to_vec())
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(exempted_shard_ids.to_vec())
+    .bind::<diesel::sql_types::Text, _>(OP_AUDIT_EXPORT_DECOMMISSION)
+    .bind::<diesel::sql_types::Text, _>(OP_AUDIT_EXPORT_REACTIVATE)
+    .bind::<diesel::sql_types::Bool, _>(crate::audit_export::is_configured())
+    .get_result::<PurgeCount>(conn)
+    .await
+    .map_err(database_error)
+    .map(|row| usize::try_from(row.deleted).unwrap_or(0))
+}
+
+/// Row count returned by the purge statement.
+#[derive(diesel::QueryableByName)]
+struct PurgeCount {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    deleted: i64,
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -1839,6 +2458,45 @@ mod tests {
             EXCLUDED_ROUTES.contains(&"GET /admin/tokens"),
             "GET /admin/tokens must be in EXCLUDED_ROUTES (read, no audit) (issue #942)"
         );
+    }
+
+    #[test]
+    fn admin_scope_routes_are_classified_mutations() {
+        // Issue #1803: a typo in the admin list must fail here, not open a route.
+        assert_ne!(ADMIN_SCOPE_ROUTES.len(), 0);
+        for route in ADMIN_SCOPE_ROUTES {
+            assert!(
+                CLASSIFIED_ROUTES
+                    .iter()
+                    .any(|(r, c)| r == route && *c == RouteClass::Mutating),
+                "{route} must be a classified Mutating route (issue #1803)"
+            );
+        }
+    }
+
+    #[test]
+    fn token_and_module_mutations_require_admin_scope() {
+        // Issue #1803: token management and module publishing are admin-only.
+        // A new route under either family must join ADMIN_SCOPE_ROUTES.
+        for (route, class) in CLASSIFIED_ROUTES {
+            let sensitive = route.contains("/admin/tokens") || route.contains("/modules");
+            if sensitive && *class == RouteClass::Mutating {
+                assert!(
+                    ADMIN_SCOPE_ROUTES.contains(route),
+                    "{route} must be in ADMIN_SCOPE_ROUTES (issue #1803)"
+                );
+            }
+        }
+        assert!(ADMIN_SCOPE_ROUTES.contains(&"POST /admin/tokens"));
+        assert!(ADMIN_SCOPE_ROUTES.contains(&"DELETE /admin/tokens/{id}"));
+    }
+
+    #[test]
+    fn authz_deny_is_an_audited_operation() {
+        assert_eq!(OP_AUTHZ_DENY, "authz.deny");
+        assert!(AUDITED_OPERATIONS.contains(&OP_AUTHZ_DENY));
+        assert_eq!(TARGET_ROUTE, "route");
+        assert_eq!(HEADER_TENANT, "x-harvest-tenant");
     }
 
     #[test]

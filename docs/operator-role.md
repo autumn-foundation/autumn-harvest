@@ -148,8 +148,9 @@ their **own** class gate (`enforce_read_only_mcp_mutation`), installed on every
 unchanged. Because autumn-web re-dispatches the `/mcp` JSON-RPC `tools/call`
 envelope through the same route with the caller's forwarded credential, this one
 gate closes both the direct-HTTP and the envelope invocation paths. When
-`api_with_role_auth` is not used, the gate is not installed and the MCP routes
-are byte-for-byte their pre-#776 shape.
+`api_with_role_auth` is not used, this class gate is not installed. The issue
+#1802 mutation gate still wraps every mutating tool. See
+[Fail-closed mutations](./security-posture.md#fail-closed-mutations-issue-1802).
 
 ## Known limitation: the Vantage UI (`/ui`)
 
@@ -173,6 +174,8 @@ out of scope for this role.
 - Fine-grained per-workflow-type, per-queue, or per-namespace RBAC.
 - Multi-tenant data isolation / row-level scoping.
 - Arbitrary custom per-route permission policies beyond the binary read/mutate
-  classification.
+  classification. Use the
+  [authorizer hook](./security-posture.md#authorizer-hook-issue-1803)
+  (issue #1803) for a per-route, per-tenant or per-shard policy.
 - Changing the default single-admin boundary or the `has_harvest_admin_access`
   semantics for existing callers.

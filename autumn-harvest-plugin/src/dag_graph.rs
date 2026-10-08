@@ -98,6 +98,8 @@
 //! indistinguishable from `pending` via history alone — which is acceptable per
 //! the issue's AC7 wording, which targets #482 data-dependent branches.
 
+use std::collections::BTreeSet;
+
 use autumn_harvest::dag::{DagDefinition, DagTask, GateTimeoutAction};
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::policy::TaskStatus;
@@ -246,8 +248,18 @@ fn is_live_state(exec_state: &str) -> bool {
 /// `status` (from `node_outcome`) and the timing/attempts/error this selects
 /// describing the same attempt — without it a name-reused node would report
 /// `pending` alongside the old compensation's timestamps.
-fn latest_scheduled(events: &[WorkflowEvent], node: &str) -> Option<(usize, ActivityExecId)> {
-    let dispatched = crate::dag_retry::dispatched_activity_names(events);
+///
+/// `dispatched` is [`crate::dag_retry::dispatched_activity_names`] over the
+/// same `events` — the caller's job to compute, since it depends only on
+/// `events` and is identical across every node in one `build_run_graph` call
+/// ([`build_run_graph`] computes it once and threads it down here rather than
+/// this function rebuilding it — an O(events) scan plus a fresh `BTreeSet`
+/// allocation — on every single node).
+fn latest_scheduled(
+    events: &[WorkflowEvent],
+    node: &str,
+    dispatched: &BTreeSet<&str>,
+) -> Option<(usize, ActivityExecId)> {
     events.iter().enumerate().rev().find_map(|(idx, event)| {
         if let WorkflowEvent::ActivityScheduled {
             activity_id,
@@ -256,7 +268,7 @@ fn latest_scheduled(events: &[WorkflowEvent], node: &str) -> Option<(usize, Acti
             ..
         } = event
         {
-            (name == node && !crate::dag_retry::is_compensation_dispatch(input, &dispatched))
+            (name == node && !crate::dag_retry::is_compensation_dispatch(input, dispatched))
                 .then_some((idx, *activity_id))
         } else {
             None
@@ -438,6 +450,21 @@ pub fn build_run_graph(
         .map(|(_, event)| event.clone())
         .collect();
     let tasks = def.tasks();
+    // `latest_scheduled`'s issue #780 compensator exclusion needs the set of
+    // dispatched activity names — computed once here (it depends only on
+    // `events`, identical for every node below) and threaded down through
+    // `classify`, instead of `latest_scheduled` rebuilding it (an O(events)
+    // scan plus a fresh `BTreeSet` allocation) on every node in the loop.
+    // Only activity (non-gate) nodes ever read `dispatched` (gate nodes take
+    // the early-return branch below and never reach `classify`), so a
+    // gate-only DAG -- which paid nothing for this before the hoist --
+    // skips the O(events) scan entirely rather than paying it unconditionally
+    // for a value nothing will use (issue #690 review, Codex).
+    let dispatched = if tasks.iter().any(|t| t.signal.is_none()) {
+        crate::dag_retry::dispatched_activity_names(&events)
+    } else {
+        BTreeSet::new()
+    };
 
     tasks
         .iter()
@@ -460,7 +487,7 @@ pub fn build_run_graph(
                 return DagRunNode {
                     node_name,
                     kind: DagNodeKind::Gate,
-                    status: gate_status(&events, task_index, task, tasks, exec_state),
+                    status: gate_status(&events, task_index, task, tasks, exec_state, &dispatched),
                     depends_on,
                     started_at: None,
                     finished_at: None,
@@ -470,7 +497,7 @@ pub fn build_run_graph(
                 };
             }
 
-            let base = node_outcome(&events, &node_name);
+            let base = node_outcome(&events, &node_name, &dispatched);
 
             // `classify` is the single source of truth for status, timing,
             // attempts, and error: all four describe the node's authoritative
@@ -482,6 +509,7 @@ pub fn build_run_graph(
                 &node_name,
                 &task.upstreams,
                 &events,
+                &dispatched,
                 timestamped_events,
                 exec_state,
             );
@@ -554,6 +582,7 @@ fn gate_status(
     task: &DagTask,
     tasks: &[DagTask],
     exec_state: &str,
+    dispatched: &BTreeSet<&str>,
 ) -> DagNodeStatus {
     let Some(gate) = &task.signal else {
         // Defensive: only called for gate tasks.
@@ -574,7 +603,7 @@ fn gate_status(
     // gate by its recorded resolution ONLY once its upstreams' outcomes show the
     // walker would have reached it; an unreached (or trigger-rule-skipped) gate
     // is `pending`, never `succeeded`/`timed_out` from a stray event.
-    match task_reach(events, task, tasks, tasks.len()) {
+    match task_reach(events, task, tasks, tasks.len(), dispatched) {
         TaskReach::NotReached | TaskReach::SkippedByTrigger => return DagNodeStatus::Pending,
         TaskReach::Reached => {}
     }
@@ -673,10 +702,11 @@ fn task_reach(
     task: &DagTask,
     tasks: &[DagTask],
     depth: usize,
+    dispatched: &BTreeSet<&str>,
 ) -> TaskReach {
     let mut statuses: Vec<TaskStatus> = Vec::with_capacity(task.upstreams.len());
     for &up in &task.upstreams {
-        match resolved_upstream_status(events, up, tasks, depth) {
+        match resolved_upstream_status(events, up, tasks, depth, dispatched) {
             Some(status) => statuses.push(status),
             None => return TaskReach::NotReached,
         }
@@ -705,6 +735,7 @@ fn resolved_upstream_status(
     idx: usize,
     tasks: &[DagTask],
     depth: usize,
+    dispatched: &BTreeSet<&str>,
 ) -> Option<TaskStatus> {
     // Defensive: recursion deeper than the DAG size ⇒ a malformed cyclic
     // definition. Treat as not-yet-resolved rather than looping forever.
@@ -728,7 +759,7 @@ fn resolved_upstream_status(
         // for it may exist; an unreached gate (an upstream still in flight) is not
         // "done" → None. Only a gate the walker actually reached is classified from
         // its recorded signal/timer resolution.
-        return match task_reach(events, up, tasks, depth) {
+        return match task_reach(events, up, tasks, depth, dispatched) {
             TaskReach::SkippedByTrigger => Some(TaskStatus::Skipped),
             TaskReach::NotReached => None,
             TaskReach::Reached => match gate_resolution(events, &gate.signal_name) {
@@ -743,7 +774,7 @@ fn resolved_upstream_status(
             },
         };
     }
-    match node_outcome(events, &up.activity_name) {
+    match node_outcome(events, &up.activity_name, dispatched) {
         NodeOutcome::Succeeded => Some(TaskStatus::Succeeded),
         NodeOutcome::Failed | NodeOutcome::TimedOut => Some(TaskStatus::Failed),
         // Scheduled-no-terminal: in flight (or the run died while it ran). The
@@ -758,7 +789,7 @@ fn resolved_upstream_status(
             // marker — infer it from this upstream's own upstream outcomes) or
             // genuinely not-yet-run. A trigger-rule skip is a "done" outcome
             // (Skipped); a not-yet-reached / still-runnable node is not resolved.
-            match task_reach(events, up, tasks, depth) {
+            match task_reach(events, up, tasks, depth, dispatched) {
                 TaskReach::SkippedByTrigger => Some(TaskStatus::Skipped),
                 TaskReach::Reached | TaskReach::NotReached => None,
             }
@@ -773,13 +804,14 @@ fn resolved_upstream_status(
 /// [`DagNodeStatus::Cancelled`], [`DagNodeStatus::Skipped`] vs
 /// [`DagNodeStatus::Pending`]) are the only places history-plus-run-state adds
 /// information beyond the base outcome.
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn classify(
     base: NodeOutcome,
     task_index: usize,
     node_name: &str,
     upstreams: &[usize],
     events: &[WorkflowEvent],
+    dispatched: &BTreeSet<&str>,
     timestamped_events: &[(DateTime<Utc>, WorkflowEvent)],
     exec_state: &str,
 ) -> (
@@ -820,7 +852,7 @@ fn classify(
     let mut error = None;
     let mut attempts: u32 = 0;
 
-    if let Some((sched_idx, activity_id)) = latest_scheduled(events, node_name) {
+    if let Some((sched_idx, activity_id)) = latest_scheduled(events, node_name, dispatched) {
         let (started_count, latest_started_idx) = started_attempts(events, activity_id);
         // A scheduled node has made at least one attempt: the engine appends an
         // `ActivityStarted` per claim, so `started_count` is the true attempt
@@ -1397,7 +1429,7 @@ mod tests {
     fn depends_on_linear() {
         let def = linear_dag();
         let nodes = build_run_graph(&def, &[(ts(0), started())], "RUNNING");
-        assert!(node(&nodes, "a").depends_on.is_empty());
+        assert_eq!(node(&nodes, "a").depends_on, [] as [std::string::String; 0]);
         assert_eq!(node(&nodes, "b").depends_on, vec!["a".to_string()]);
         assert_eq!(node(&nodes, "c").depends_on, vec!["b".to_string()]);
         assert_eq!(node(&nodes, "d").depends_on, vec!["c".to_string()]);
@@ -1407,7 +1439,7 @@ mod tests {
     fn depends_on_fanout_join() {
         let def = fanout_dag();
         let nodes = build_run_graph(&def, &[(ts(0), started())], "RUNNING");
-        assert!(node(&nodes, "a").depends_on.is_empty());
+        assert_eq!(node(&nodes, "a").depends_on, [] as [std::string::String; 0]);
         assert_eq!(node(&nodes, "b").depends_on, vec!["a".to_string()]);
         assert_eq!(node(&nodes, "c").depends_on, vec!["a".to_string()]);
         assert_eq!(node(&nodes, "d").depends_on, vec!["a".to_string()]);
@@ -1440,9 +1472,10 @@ mod tests {
             (ts(7), sched("d", id)),
         ];
         let events_only: Vec<WorkflowEvent> = events.iter().map(|(_, e)| e.clone()).collect();
+        let dispatched = crate::dag_retry::dispatched_activity_names(&events_only);
         let nodes = build_run_graph(&def, &events, "FAILED");
         for n in &nodes {
-            let outcome = node_outcome(&events_only, &n.node_name);
+            let outcome = node_outcome(&events_only, &n.node_name, &dispatched);
             let consistent = match outcome {
                 NodeOutcome::Succeeded => n.status == DagNodeStatus::Succeeded,
                 NodeOutcome::Failed => n.status == DagNodeStatus::Failed,
@@ -1642,7 +1675,11 @@ mod tests {
         // AC5: this exactly matches the #366 retry resolver for the same
         // history — both collapse to the latest-scheduled instance's outcome.
         let plain: Vec<WorkflowEvent> = events.into_iter().map(|(_ts, ev)| ev).collect();
-        assert_eq!(node_outcome(&plain, "a"), NodeOutcome::Succeeded);
+        let dispatched = crate::dag_retry::dispatched_activity_names(&plain);
+        assert_eq!(
+            node_outcome(&plain, "a", &dispatched),
+            NodeOutcome::Succeeded
+        );
     }
 
     #[test]
@@ -1685,7 +1722,11 @@ mod tests {
         // AC5: node_outcome returns NotAttempted for the same zero-event history,
         // so the graph and the #366 retry path agree.
         let plain: Vec<WorkflowEvent> = events.into_iter().map(|(_ts, ev)| ev).collect();
-        assert_eq!(node_outcome(&plain, "a"), NodeOutcome::NotAttempted);
+        let dispatched = crate::dag_retry::dispatched_activity_names(&plain);
+        assert_eq!(
+            node_outcome(&plain, "a", &dispatched),
+            NodeOutcome::NotAttempted
+        );
     }
 
     // ── Issue #746 — signal/timer gate nodes (Phase 1 RED) ───────────────────
@@ -1751,6 +1792,33 @@ mod tests {
             gate.status,
             DagNodeStatus::Succeeded,
             "a gate whose signal has arrived reports `succeeded`"
+        );
+    }
+
+    /// A DAG with no activity nodes at all -- just one root signal gate.
+    fn gate_only_dag() -> DagDefinition {
+        let mut builder = DagBuilder::new();
+        let _gate = builder.signal_gate("approval");
+        builder.build().expect("gate-only dag builds")
+    }
+
+    #[test]
+    fn gate_only_dag_classifies_without_an_activity_node() {
+        // issue #690 review, Codex: `build_run_graph` hoists
+        // `dispatched_activity_names` once per call for the (overwhelmingly
+        // common) case of a DAG with at least one activity node, but must
+        // not pay that scan at all for a DAG with none -- the gate-only
+        // shape exercised here.
+        let def = gate_only_dag();
+        let events = vec![(ts(0), started())];
+        let nodes = build_run_graph(&def, &events, "RUNNING");
+        assert_eq!(nodes.len(), 1);
+        let gate = node(&nodes, "approval");
+        assert_eq!(gate.kind, DagNodeKind::Gate);
+        assert_eq!(
+            gate.status,
+            DagNodeStatus::Waiting,
+            "an un-signalled gate with no upstream on a live run reports `waiting`"
         );
     }
 

@@ -23,9 +23,9 @@
 ///
 /// # Composition with within-queue priority (#249)
 ///
-/// Weights decide **which queue** to claim from. Once a queue is selected,
-/// `claim_task` uses its standard `ORDER BY priority DESC, scheduled_at ASC`
-/// SQL to pick the best row in that queue — fully unchanged.
+/// Weights decide **which queue** to claim from. `claim_task` then picks the
+/// best row in that queue by its standard claim order. That order is
+/// `priority`, then the claim-order due time (issue #1824).
 use std::collections::HashMap;
 
 /// Pair a queue name with its effective non-negative weight.
@@ -72,9 +72,18 @@ pub fn effective_queue_weights<'a, S: std::hash::BuildHasher>(
 /// * `rng` — any `rand::Rng` (typically `rand::thread_rng()` in production,
 ///   a seeded `StdRng` in tests for reproducibility).
 ///
-/// Returns a permutation of all queue names.
+/// Returns a permutation of all queue names, borrowed from `pairs` — no
+/// string allocation on this poll-time hot path. This used to `.to_owned()`
+/// every queue name on every poll (issue #515 Bolt follow-up). That
+/// happened regardless of how many the caller's claim loop actually tries
+/// before it finds work. A dhat profile at 16 queues / 20,000 polls found
+/// those clones were 300,000 of the harness's 420,035 total allocations.
+/// See `docs/performance-queue-fairness.md`.
 #[must_use]
-pub fn weighted_queue_order(pairs: &[(&str, u32)], rng: &mut impl rand::Rng) -> Vec<String> {
+pub fn weighted_queue_order<'a>(
+    pairs: &[(&'a str, u32)],
+    rng: &mut impl rand::Rng,
+) -> Vec<&'a str> {
     // Separate positive-weight and zero-weight queues.
     let mut positive: Vec<(&str, f64)> = Vec::with_capacity(pairs.len());
     let mut zeros: Vec<&str> = Vec::new();
@@ -97,8 +106,8 @@ pub fn weighted_queue_order(pairs: &[(&str, u32)], rng: &mut impl rand::Rng) -> 
     // Sort descending by key so the highest key (highest-priority draw) comes first.
     positive.sort_by(|a, b| b.1.total_cmp(&a.1));
 
-    let mut result: Vec<String> = positive.iter().map(|(n, _)| (*n).to_owned()).collect();
-    result.extend(zeros.iter().map(|n| (*n).to_owned()));
+    let mut result: Vec<&'a str> = positive.iter().map(|(n, _)| *n).collect();
+    result.extend(zeros.iter().copied());
     result
 }
 
@@ -148,7 +157,7 @@ mod tests {
     #[test]
     fn empty_queues_returns_empty() {
         let result = effective_queue_weights(&[], &HashMap::new());
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [(&str, u32); 0]);
     }
 
     // -----------------------------------------------------------------------
@@ -171,7 +180,7 @@ mod tests {
             let order = weighted_queue_order(&pairs, &mut rng);
             assert_eq!(order.len(), 3, "length must equal input length");
             let mut sorted = order.clone();
-            sorted.sort();
+            sorted.sort_unstable();
             assert_eq!(
                 sorted,
                 vec!["a", "b", "c"],
@@ -186,9 +195,9 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(7);
         for _ in 0..300 {
             let order = weighted_queue_order(&pairs, &mut rng);
-            let zero_pos = order.iter().position(|q| q == "zero").unwrap();
-            let high_pos = order.iter().position(|q| q == "high").unwrap();
-            let med_pos = order.iter().position(|q| q == "med").unwrap();
+            let zero_pos = order.iter().position(|q| *q == "zero").unwrap();
+            let high_pos = order.iter().position(|q| *q == "high").unwrap();
+            let med_pos = order.iter().position(|q| *q == "med").unwrap();
             assert!(
                 zero_pos > high_pos && zero_pos > med_pos,
                 "zero-weight queue must come after all positive-weight queues; order={order:?}"
@@ -252,7 +261,7 @@ mod tests {
         let pairs: Vec<(&str, u32)> = vec![];
         let mut rng = StdRng::seed_from_u64(0);
         let order = weighted_queue_order(&pairs, &mut rng);
-        assert!(order.is_empty());
+        assert_eq!(order, [] as [&str; 0]);
     }
 
     /// No-starvation property: the low-weight queue must appear somewhere in the
@@ -265,7 +274,7 @@ mod tests {
         for _ in 0..500 {
             let order = weighted_queue_order(&pairs, &mut rng);
             assert!(
-                order.contains(&"light".to_owned()),
+                order.contains(&"light"),
                 "'light' must always appear in the permutation"
             );
         }

@@ -20,7 +20,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use autumn_harvest::prelude::*;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 async fn setup_database_url() -> (String, ContainerAsync<Postgres>) {
@@ -128,8 +128,8 @@ async fn test_typed_workflow_client_stubs() {
         .await
         .unwrap();
 
-    // Since we don't have a worker executing, let's manually write the workflow completed event to database
-    // to simulate the worker completing it, so we can await result().
+    // No worker is running, so write the workflow-completed event directly.
+    // This simulates the worker finishing and lets result() resolve.
     use autumn_harvest::WorkflowEvent;
     use autumn_harvest::schema::harvest_workflow_executions::dsl;
 

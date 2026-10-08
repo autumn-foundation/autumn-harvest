@@ -651,7 +651,7 @@ pub async fn resolve_target_queue(
         });
 
     if let Some(dp) = default_pool
-        && let Ok(mut default_conn) = dp.get().await
+        && let Ok(mut default_conn) = crate::replication::fenced_checkout(&dp).await
     {
         use crate::schema::harvest_schedules::dsl as sched_dsl;
         use diesel::prelude::*;
@@ -685,6 +685,79 @@ fn default_workflow_queue() -> String {
         .unwrap_or_else(|| "default".to_string())
 }
 
+/// Batch form of [`resolve_target_queue`]'s `harvest_schedules` lookup. It
+/// makes one round trip for every distinct `target_workflow_name` in
+/// `names`, instead of one per row (issue #1227 follow-up, Ledger).
+///
+/// `harvest_schedules` carries `harvest_schedules_workflow_name_unique`
+/// (issue #91's migration). So `workflow_name = ANY($1)` returns **at most
+/// one row per name** — the same "at most one match" cardinality
+/// [`resolve_target_queue`] relies on via `.first()`. Batching therefore
+/// cannot reorder or drop a match. The per-name answer this returns is
+/// byte-for-byte the one [`resolve_target_queue`] would return for that
+/// name; only the round-trip count changes. A name with no schedule row,
+/// or a schedule row whose `queue_name` is `NULL`, resolves to
+/// [`default_workflow_queue`] — identical to the per-row path.
+///
+/// Schedules live only on the default shard. That is the same reason
+/// [`resolve_target_queue`] always ends up there for a non-default target
+/// shard, so this always queries `default_conn`. The caller passes a
+/// connection already checked out from the default shard's pool.
+#[cfg(feature = "db")]
+async fn resolve_target_queues_batch(
+    default_conn: &mut diesel_async::AsyncPgConnection,
+    names: &[String],
+) -> std::collections::HashMap<String, String> {
+    use crate::schema::harvest_schedules::dsl as sched_dsl;
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    if names.is_empty() {
+        return std::collections::HashMap::new();
+    }
+
+    let Ok(rows) = sched_dsl::harvest_schedules
+        .filter(sched_dsl::workflow_name.eq_any(names))
+        .select((sched_dsl::workflow_name, sched_dsl::queue_name))
+        .load::<(Option<String>, Option<String>)>(default_conn)
+        .await
+    else {
+        // Same fail-open shape as `resolve_target_queue`'s own
+        // `Ok(...).optional()` handling. A lookup failure here is not
+        // fatal to the relay. It just means every name in this batch
+        // falls through to the per-row fallback the caller keeps for
+        // exactly this case.
+        return std::collections::HashMap::new();
+    };
+
+    // `workflow_name` is `Nullable<Text>` in the schema (DAG-kind schedule
+    // rows leave it NULL). But every row this filter can match came from
+    // `names`, a list of non-empty `String`s. So a NULL name here would
+    // mean the `ANY($1)` predicate matched a NULL, which SQL's `= ANY`
+    // never does. Skip defensively rather than unwrap. This filters
+    // nothing in practice, and turns a would-be panic into a harmless
+    // miss; the caller's per-row fallback still covers it.
+    let mut resolved: std::collections::HashMap<String, String> = rows
+        .into_iter()
+        .filter_map(|(name, queue)| name.map(|n| (n, queue.unwrap_or_else(default_workflow_queue))))
+        .collect();
+
+    // A name with no `harvest_schedules` row at all is simply absent from
+    // `rows` -- SQL's `= ANY` has nothing to return a NULL match for.
+    // Without this backfill, such a name would fall through to the
+    // per-row fallback exactly like a genuine lookup failure. That would
+    // defeat the batch for every such name, instead of resolving it to
+    // the correct default here. `resolve_target_queue` reaches the
+    // identical `default_workflow_queue()` answer for this case, via its
+    // own `.optional()` returning `Ok(None)`.
+    for name in names {
+        resolved
+            .entry(name.clone())
+            .or_insert_with(default_workflow_queue);
+    }
+    resolved
+}
+
 /// Resolve the start queue for a **cross-shard** completion-trigger target.
 ///
 /// Mirrors how `enforce_completion_triggers_outbox` resolves the queue at fire
@@ -716,7 +789,7 @@ pub async fn resolve_cross_shard_target_queue(
         .and_then(|p| p.clone())
         .and_then(|sp| sp.exact_pool_for(target_shard).cloned());
     if let Some(tp) = target_pool {
-        match tp.get().await {
+        match crate::replication::fenced_checkout(&tp).await {
             Ok(mut target_conn) => {
                 return resolve_target_queue(&mut target_conn, target_workflow_name, target_shard)
                     .await;
@@ -731,6 +804,45 @@ pub async fn resolve_cross_shard_target_queue(
     }
     default_workflow_queue()
 }
+
+/// Backoff stamped on an outbox row's `next_attempt_at` when a relay attempt
+/// hits `QuotaExceeded` (issue #1227, Finding 4; a follow-up to #946 and
+/// #1221). Mirrors `throttle.rs`/`debounce.rs`'s
+/// identically-named, identically-valued constant, kept separate per file
+/// purely for log/intent clarity.
+#[cfg(feature = "db")]
+const QUOTA_REDEFER_BACKOFF: chrono::Duration = chrono::Duration::seconds(5);
+
+/// Convert a whole-second backoff constant to `make_interval`'s fractional-
+/// seconds argument (issue #1392). Mirrors `queue::delay_secs`, which does
+/// the same conversion for the task queue's own DB-clock backoff writes.
+#[cfg(feature = "db")]
+#[allow(clippy::cast_precision_loss)] // whole-second constants never approach 2^53
+const fn backoff_secs(delay: chrono::Duration) -> f64 {
+    delay.num_seconds() as f64
+}
+
+/// Cap on the number of outbox rows `enforce_completion_triggers_outbox`
+/// claims per scan.
+#[cfg(feature = "db")]
+const OUTBOX_CLAIM_BATCH_LIMIT: i64 = 50;
+
+/// Slots of `OUTBOX_CLAIM_BATCH_LIMIT` reserved for retry-eligible rows
+/// (issue #1227, Finding 4, PR #1386). With them, a sustained arrival of
+/// fresh (never-attempted) rows can never fill every batch. So it can never
+/// strand a previously-blocked row after its target's quota frees up.
+/// The reservation is 20% of the batch. It is large enough that a retry
+/// backlog visibly drains across a handful of ticks, not one row at a time.
+/// It is small enough that a genuine flood of fresh work still gets the
+/// large majority of each batch.
+#[cfg(feature = "db")]
+const OUTBOX_RETRY_RESERVED_SLOTS: i64 = 10;
+
+/// Retry-tier claim eligibility, on Postgres's own clock (issue #1392).
+/// Shared with a unit test pinning the SQL text, so it can never silently
+/// drift back to a host-sampled comparison.
+#[cfg(feature = "db")]
+const OUTBOX_RETRY_ELIGIBLE_PREDICATE: &str = "next_attempt_at <= NOW()";
 
 /// Outcome of a claimed cross-shard completion-trigger relay attempt, decided
 /// under the source-row `FOR UPDATE SKIP LOCKED` claim (issue #618, F-round19).
@@ -754,16 +866,26 @@ enum RelayOutcome {
     /// relay does NOT re-record it — `reason` is kept only for the tracing log.
     Blocked { reason: String },
     /// A declared per-tenant quota (issue #946, Task #7 hardening) is exhausted
-    /// on the target at relay time. Unlike `Blocked` (an operator-lifted
-    /// admission gate, with no natural "retry later" cadence, so the row is
-    /// dropped) this is TEMPORARY -- the tenant's usage frees up as an
-    /// existing execution completes or is deleted -- so the outbox row is
-    /// left claimable (neither deleted nor the fires row touched) rather than
-    /// dropped or propagated as an error. `enforce_completion_triggers_outbox`
-    /// naturally re-attempts an unclaimed row on its next scan; the core
-    /// start primitive already recorded `harvest.quota.rejected` inside
+    /// on the target at relay time. `Blocked` is an operator-lifted admission
+    /// gate with no natural "retry later" cadence, so its row is dropped.
+    /// This outcome is TEMPORARY instead. The tenant's usage frees up as an
+    /// existing execution completes or is deleted. So the outbox row stays
+    /// claimable: it is never deleted, and the fires row is never touched.
+    /// The row is not dropped or propagated as an error either.
+    /// `enforce_completion_triggers_outbox` naturally re-attempts the row on
+    /// a later scan. The core start primitive already recorded
+    /// `harvest.quota.rejected` inside
     /// `start_or_load_workflow_execution_collect`, so the relay does NOT
     /// re-record it here.
+    ///
+    /// The row's `next_attempt_at` is stamped to `now() + QUOTA_REDEFER_BACKOFF`
+    /// (issue #1227, Finding 4) so the claim query excludes it until the
+    /// backoff elapses. Pre-#1227 the row had no cadence tracking at all.
+    /// A target durably at quota cap could then dominate every unordered
+    /// `LIMIT 50` claim batch on every scanner tick. That row starved any
+    /// OTHER, unrelated relay sharing the batch. One example is a
+    /// `max_dead_letters` cap, which clears only through manual operator
+    /// action.
     QuotaBlocked {
         key: String,
         resource: crate::quota::QuotaResource,
@@ -771,6 +893,15 @@ enum RelayOutcome {
         current: u64,
     },
 }
+
+/// Claims a source outbox row only when its backoff has elapsed, on
+/// Postgres's own clock (issue #1392). Shared between
+/// [`relay_gate_checked_start`] and its unit tests. A test then pins the
+/// exact query a peer replica's write is checked against.
+#[cfg(feature = "db")]
+const RELAY_CLAIM_QUERY: &str = "SELECT id FROM harvest_completion_trigger_outbox \
+     WHERE id = $1 AND (next_attempt_at IS NULL OR next_attempt_at <= NOW()) \
+     FOR UPDATE SKIP LOCKED";
 
 /// Run the cross-shard completion-trigger relay's start/block decision through the
 /// existence-aware [`crate::execution::gate_checked_start_or_load`] primitive under
@@ -817,6 +948,8 @@ async fn relay_gate_checked_start(
     source_exec_id: Uuid,
     trigger_id: Uuid,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    // Issue #1243: `WorkflowStarted.input` is payload-bearing.
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<()> {
     use crate::schema::harvest_completion_trigger_fires::dsl as fires_dsl;
     use crate::schema::harvest_completion_trigger_outbox::dsl as outbox_dsl;
@@ -847,19 +980,34 @@ async fn relay_gate_checked_start(
     // Claim the source outbox row `FOR UPDATE SKIP LOCKED` and hold the claim across
     // the whole relay (F-round19). `source_tx` is the claim transaction; `target_conn`
     // is a separate connection whose own transaction commits independently.
+    //
+    // The claim's `WHERE` re-checks the SAME backoff eligibility predicate the
+    // caller's batch `SELECT` already filtered on (issue #1227, PR #1386).
+    // With multiple scanner replicas, that outer `SELECT` takes no lock. So
+    // after replica A loads a row into its batch, replica B can claim and
+    // QuotaBlocked-restamp that row before A claims it. Without this
+    // re-check, A's `id`-only claim would still succeed once B's transaction
+    // commits and releases the row. That drives an extra admission attempt
+    // on a row whose backoff a peer just (re)armed, one bypass per stale
+    // reader.
+    //
+    // Compares against Postgres's own `NOW()`, not a host-sampled
+    // `chrono::Utc::now()` (issue #1392). Every replica's clock can drift
+    // from every other's. Every replica reads and writes this one deadline
+    // against the same DB clock instead, so that drift cannot leak in.
     let outcome = Box::pin(source_conn
         .transaction::<RelayOutcome, crate::error::HarvestError, _>(async |source_tx| {
-            let claimed: Option<ClaimedId> = diesel::sql_query(
-                "SELECT id FROM harvest_completion_trigger_outbox \
-                 WHERE id = $1 FOR UPDATE SKIP LOCKED",
-            )
+            let claimed: Option<ClaimedId> = diesel::sql_query(RELAY_CLAIM_QUERY)
             .bind::<diesel::sql_types::Uuid, _>(outbox_id)
             .get_result::<ClaimedId>(source_tx)
             .await
             .optional()
             .map_err(crate::error::database_error)?;
             if claimed.is_none() {
-                // A sibling relay path / peer replica owns this row right now.
+                // Either a sibling relay path or a peer replica owns this row
+                // right now, or its backoff has not elapsed. That includes a
+                // backoff that a concurrent replica just armed after this row
+                // was loaded into the caller's batch.
                 return Ok(RelayOutcome::Skipped);
             }
 
@@ -890,11 +1038,12 @@ async fn relay_gate_checked_start(
                 return Ok(RelayOutcome::Delivered);
             }
 
-            match crate::execution::start_or_load_workflow_execution_with_metrics(
+            match crate::execution::start_or_load_workflow_execution_with_metrics_and_codecs(
                 target_conn,
                 params,
                 metrics,
                 Some(crate::admission_gate::GateMode::CheckCached),
+                codecs,
             )
             .await
             {
@@ -942,12 +1091,38 @@ async fn relay_gate_checked_start(
                     limit,
                     current,
                     ..
-                }) => Ok(RelayOutcome::QuotaBlocked {
-                    key,
-                    resource,
-                    limit,
-                    current,
-                }),
+                }) => {
+                    // Stamped on Postgres's own `clock_timestamp()`, not the
+                    // host clock (issue #1392). `source_tx` already did
+                    // prior work this transaction: the claim above, plus
+                    // the cross-shard start attempt that raised this error.
+                    // `NOW()` is frozen at the transaction's start, so it
+                    // would understate the backoff. `clock_timestamp()`
+                    // reads the real time at execution.
+                    use diesel::dsl::sql;
+                    use diesel::sql_types::{Double, Timestamptz};
+                    use diesel::NullableExpressionMethods;
+
+                    diesel::update(
+                        outbox_dsl::harvest_completion_trigger_outbox
+                            .filter(outbox_dsl::id.eq(outbox_id)),
+                    )
+                    .set(outbox_dsl::next_attempt_at.eq(sql::<Timestamptz>(
+                        "clock_timestamp() + make_interval(secs => ",
+                    )
+                    .bind::<Double, _>(backoff_secs(QUOTA_REDEFER_BACKOFF))
+                    .sql(")")
+                    .nullable()))
+                    .execute(source_tx)
+                    .await
+                    .map_err(crate::error::database_error)?;
+                    Ok(RelayOutcome::QuotaBlocked {
+                        key,
+                        resource,
+                        limit,
+                        current,
+                    })
+                }
                 Err(e) => Err(e),
                 Ok(_started) => {
                     // Fresh start OR an idempotent attach to a still-active run:
@@ -1046,6 +1221,10 @@ pub struct DeferredTriggerStart {
     pub retry_policy: Option<crate::policy::RetryPolicy>,
     /// Server-side ceiling on `max_attempts` (issue #523). Clamped at start time.
     pub max_workflow_attempts_ceiling: Option<u32>,
+    /// The configured payload-codec registry (issue #1243). `spawn` runs
+    /// detached from the evaluating call's own scope, so the registry rides
+    /// along on the struct rather than through a process-global static.
+    pub codecs: crate::payload_codec::PayloadCodecs,
 }
 
 #[cfg(feature = "db")]
@@ -1067,7 +1246,7 @@ impl DeferredTriggerStart {
             return;
         };
         tokio::spawn(async move {
-            let conn_res = pool.get().await;
+            let conn_res = crate::replication::fenced_checkout(&pool).await;
             let mut target_conn = match conn_res {
                 Ok(c) => c,
                 Err(e) => {
@@ -1109,7 +1288,7 @@ impl DeferredTriggerStart {
                 );
                 return;
             };
-            let mut source_conn = match source_pool.get().await {
+            let mut source_conn = match crate::replication::fenced_checkout(&source_pool).await {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::error!(
@@ -1128,59 +1307,76 @@ impl DeferredTriggerStart {
             // Provenance ref is the triggering (source) execution id (#740).
             let source_exec_id_str = self.source_exec_id.to_string();
             let params = crate::execution::StartWorkflowParams {
-                workflow_name: &self.target_workflow_name,
-                workflow_id: &self.target_workflow_id,
-                exec_id: crate::types::ExecutionId::new_for_shard(self.target_shard),
-                input: self.target_input,
-                parent_id: None,
-                queue_name: &queue_name,
-                execution_timeout: None,
-                memo: None,
-                search_attrs: None,
-                reuse_policy: crate::types::WorkflowIdReusePolicy::AllowDuplicate,
-                conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
-                trace_context: None,
-                max_execution_timeout_ceiling: None,
-                chain_execution_timeout: None,
-                max_workflow_chain_timeout_ceiling: None,
-                inherited_chain_deadline_at: None,
                 concurrency_key: self.concurrency_key,
                 concurrency_limit: self.concurrency_limit,
                 concurrency_on_conflict: self.concurrency_on_conflict,
                 priority: self.priority,
                 max_workflow_input_bytes: self.max_workflow_input_bytes,
-                start_at: None,
-                delay: None,
-                max_workflow_start_delay: None,
                 owner: self.owner.as_deref(),
                 runbook_url: self.runbook_url.as_deref(),
                 severity: self.severity.as_deref(),
-                context_headers: None,
                 sla: self.sla.and_then(|d| chrono::Duration::from_std(d).ok()),
-                schedule_id: None,
-                scheduled_for: None,
-                workflow_attempt: 1,
                 workflow_retry_policy: self.retry_policy.clone(),
-                retry_of_exec_id: None,
                 max_workflow_attempts_ceiling: self.max_workflow_attempts_ceiling,
-                origin: None,
-                completion_callbacks: None,
                 start_source: crate::types::StartSource::CompletionTrigger,
                 start_source_ref: Some(source_exec_id_str.as_str()),
-                started_by: None,
+                // `origin` and `completion_callbacks` keep their `None` default.
+                // A completion-trigger start is not a schedule fire (issue #534).
+                // Only builder-wide callback targets apply (issue #605).
+                ..crate::execution::StartWorkflowParams::new(
+                    &self.target_workflow_name,
+                    &self.target_workflow_id,
+                    crate::types::ExecutionId::new_for_shard(self.target_shard),
+                    self.target_input,
+                    &queue_name,
+                )
             };
 
-            if let Err(e) = relay_gate_checked_start(
-                &mut target_conn,
-                &mut source_conn,
-                params,
-                self.outbox_id,
-                self.source_exec_id,
-                self.trigger_id,
-                metrics_ref,
-            )
+            // Issue #1823: this relay runs detached, after its caller's fence
+            // ends. It writes the source and the target shard, so it holds the
+            // fence of both while it writes. A fenced or held shard leaves the
+            // outbox row for the scanner. The relay takes the slots of both
+            // guards at once, so it never waits for a slot while it holds one.
+            let fence = match crate::replication::begin_fenced_groups(&[
+                (&source_pool, self.source_shard),
+                (&pool, self.target_shard),
+            ])
             .await
             {
+                Ok(guards) => guards,
+                Err(error) => {
+                    tracing::warn!(
+                        source_shard = self.source_shard.as_i32(),
+                        target_shard = self.target_shard.as_i32(),
+                        %error,
+                        "[completion_trigger] the DR fence forbids this relay; leaving the outbox row for the scanner"
+                    );
+                    return;
+                }
+            };
+            // Both connections predate the pass. They join it, so a lost
+            // guard ends their backends too.
+            let relayed = crate::replication::run_fenced_pass(
+                &fence,
+                Box::pin(async {
+                    target_conn.join_pass().await?;
+                    source_conn.join_pass().await?;
+                    relay_gate_checked_start(
+                        &mut target_conn,
+                        &mut source_conn,
+                        params,
+                        self.outbox_id,
+                        self.source_exec_id,
+                        self.trigger_id,
+                        metrics_ref,
+                        &self.codecs,
+                    )
+                    .await
+                }),
+            )
+            .await
+            .and_then(|relayed| relayed);
+            if let Err(e) = relayed {
                 // A start error (e.g. PayloadTooLarge) leaves the outbox row for the
                 // scanner to handle (which deletes an oversized-payload row).
                 tracing::error!(
@@ -1192,7 +1388,22 @@ impl DeferredTriggerStart {
     }
 }
 
-#[allow(clippy::too_many_lines)]
+/// Evaluate completion triggers for a just-sealed terminal execution,
+/// discarding any latest-wins supersede cancellation metrics the same-shard
+/// inline start path collects.
+///
+/// This is the pre-issue-#1197 entry point, kept byte-for-byte for the 56 test
+/// call sites and any production call site with no convenient post-commit
+/// point of its own. It delegates to
+/// [`evaluate_triggers_for_execution_collecting`] with a throwaway collector,
+/// so a same-shard supersede performed here emits neither
+/// `harvest.concurrency.superseded` nor the incumbent's cancelled terminal —
+/// matching the behaviour before issue #811 gave this path a metrics-emitting
+/// start call at all (an unconditional under-count, not a regression: see
+/// issue #1197). A caller that has its own post-commit hook should call
+/// [`evaluate_triggers_for_execution_collecting`] directly instead and emit
+/// the collected metrics via [`crate::execution::emit_start_cancel_metrics`]
+/// once its enclosing transaction has actually committed.
 #[cfg(feature = "db")]
 pub fn evaluate_triggers_for_execution<'a>(
     conn: &'a mut diesel_async::AsyncPgConnection,
@@ -1202,14 +1413,113 @@ pub fn evaluate_triggers_for_execution<'a>(
 ) -> futures::future::BoxFuture<'a, crate::error::HarvestResult<Vec<DeferredTriggerStart>>> {
     use futures::FutureExt;
     async move {
+        let mut discarded_cancel_metrics = Vec::new();
+        evaluate_triggers_for_execution_collecting_with_codecs(
+            conn,
+            exec_id,
+            state,
+            metrics,
+            &mut discarded_cancel_metrics,
+            &crate::store::DEFAULT_PAYLOAD_CODECS,
+        )
+        .await
+    }
+    .boxed()
+}
+
+/// [`evaluate_triggers_for_execution`], encoding a triggered target's
+/// `WorkflowStarted.input` through `codecs` (issue #1243).
+///
+/// # Errors
+///
+/// Same as [`evaluate_triggers_for_execution`].
+#[cfg(feature = "db")]
+pub fn evaluate_triggers_for_execution_with_codecs<'a>(
+    conn: &'a mut diesel_async::AsyncPgConnection,
+    exec_id: crate::types::ExecutionId,
+    state: TerminalState,
+    metrics: Option<&'a (dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    codecs: &'a crate::payload_codec::PayloadCodecs,
+) -> futures::future::BoxFuture<'a, crate::error::HarvestResult<Vec<DeferredTriggerStart>>> {
+    use futures::FutureExt;
+    async move {
+        let mut discarded_cancel_metrics = Vec::new();
+        evaluate_triggers_for_execution_collecting_with_codecs(
+            conn,
+            exec_id,
+            state,
+            metrics,
+            &mut discarded_cancel_metrics,
+            codecs,
+        )
+        .await
+    }
+    .boxed()
+}
+
+/// Evaluate completion triggers for a just-sealed terminal execution.
+///
+/// Identical to [`evaluate_triggers_for_execution`] except for one thing: a
+/// same-shard inline trigger start that performs a latest-wins supersede
+/// (issue #811) pushes its [`crate::execution::StartCancelledRun`] samples
+/// into `pending` instead of emitting them immediately. The emission side
+/// (`start_or_load_workflow_execution_with_metrics`) fires at return, which is
+/// INSIDE this function's caller's still-open terminal transaction — if that
+/// transaction later rolls back, an eager emission would already have counted
+/// a cancellation that never became durable (issue #1197, item 1).
+///
+/// Callers MUST call [`crate::execution::emit_start_cancel_metrics`] with the
+/// accumulated `pending` list only **after** their enclosing transaction has
+/// committed — the exact same discipline already required of the
+/// `StartCancelledRun`s a fresh workflow start collects.
+#[cfg(feature = "db")]
+pub fn evaluate_triggers_for_execution_collecting<'a>(
+    conn: &'a mut diesel_async::AsyncPgConnection,
+    exec_id: crate::types::ExecutionId,
+    state: TerminalState,
+    metrics: Option<&'a (dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    pending: &'a mut Vec<crate::execution::StartCancelledRun>,
+) -> futures::future::BoxFuture<'a, crate::error::HarvestResult<Vec<DeferredTriggerStart>>> {
+    use futures::FutureExt;
+    async move {
+        evaluate_triggers_for_execution_collecting_with_codecs(
+            conn,
+            exec_id,
+            state,
+            metrics,
+            pending,
+            &crate::store::DEFAULT_PAYLOAD_CODECS,
+        )
+        .await
+    }
+    .boxed()
+}
+
+/// [`evaluate_triggers_for_execution_collecting`], encoding a triggered
+/// target's `WorkflowStarted.input` through `codecs` (issue #1243).
+///
+/// # Errors
+///
+/// Same as [`evaluate_triggers_for_execution_collecting`].
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+#[cfg(feature = "db")]
+pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
+    conn: &'a mut diesel_async::AsyncPgConnection,
+    exec_id: crate::types::ExecutionId,
+    state: TerminalState,
+    metrics: Option<&'a (dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    pending: &'a mut Vec<crate::execution::StartCancelledRun>,
+    codecs: &'a crate::payload_codec::PayloadCodecs,
+) -> futures::future::BoxFuture<'a, crate::error::HarvestResult<Vec<DeferredTriggerStart>>> {
+    use futures::FutureExt;
+    async move {
         use diesel::prelude::*;
         use diesel_async::RunQueryDsl;
         use crate::schema::harvest_completion_triggers::dsl as triggers_dsl;
         use crate::schema::harvest_completion_trigger_fires::dsl as fires_dsl;
         use crate::schema::harvest_workflow_executions::dsl as execs_dsl;
         use crate::models::{CompletionTriggerDb, NewCompletionTriggerFireDb, WorkflowExecution, NewCompletionTriggerOutboxDb};
-        use crate::execution::{StartWorkflowParams, start_or_load_workflow_execution_with_metrics};
-        use crate::types::WorkflowIdReusePolicy;
+        use crate::execution::{StartWorkflowParams, start_or_load_workflow_execution_collect_with_codecs, check_and_report_unfinished_handlers_batch};
         use crate::types::Priority;
 
         let mut deferred_starts = Vec::new();
@@ -1310,6 +1620,9 @@ pub fn evaluate_triggers_for_execution<'a>(
                             source_exec_id: exec_id.as_uuid(),
                             trigger_id: trigger_db.id,
                             outcome: Some("condition_unmet".to_string()),
+                            // A resolved-skip never picks a target (issue #1401).
+                            target_shard: None,
+                            target_workflow_name: None,
                         })
                         .on_conflict_do_nothing()
                         .execute(conn)
@@ -1405,7 +1718,12 @@ pub fn evaluate_triggers_for_execution<'a>(
                     crate::error::database_error(diesel::result::Error::RollbackTransaction)
                 })?;
             let target_shard = router.pick_for_new_workflow(&trigger_db.target_workflow_name, &target_workflow_id);
-            let source_shard = router.shard_for_execution(exec_id);
+            // The row's own residence, not the id's origin (issue #1317).
+            // `execution` was loaded from THIS connection above, so
+            // `execution.shard_id` is exactly where it lives. This is
+            // unlike `router.shard_for_execution(exec_id)`, which decodes
+            // the id's origin and does not see a completed rebalance.
+            let source_shard = crate::types::ShardId::new(execution.shard_id);
 
             // Resolve target metadata (owner, runbook_url, severity, sla, retry_policy)
             let (target_owner, target_runbook_url, target_severity, target_sla, target_retry_policy) = {
@@ -1511,6 +1829,12 @@ pub fn evaluate_triggers_for_execution<'a>(
                                 source_exec_id: exec_id.as_uuid(),
                                 trigger_id: trigger_db.id,
                                 outcome: Some("admission_blocked".to_string()),
+                                // The target was resolved before the gate
+                                // blocked it (issue #1401).
+                                target_shard: Some(target_shard.as_i32()),
+                                target_workflow_name: Some(
+                                    trigger_db.target_workflow_name.clone(),
+                                ),
                             })
                             .on_conflict_do_nothing()
                             .execute(conn)
@@ -1524,24 +1848,9 @@ pub fn evaluate_triggers_for_execution<'a>(
                     // the fallback a completion-trigger start blocked by a gate on
                     // one of those terminal paths would be dropped-and-recorded but
                     // NEVER counted — a hole in the "zero un-counted blocks" bar.
-                    let fallback_recorder = if metrics.is_none() {
-                        crate::admission_gate::global_admission_metrics()
-                    } else {
-                        None
-                    };
-                    // A tuple `match` (rather than `if let ... else`) so the
-                    // `&dyn MetricsRecorder` -> annotated `+ Send + Sync` coercion
-                    // still applies at the `Some(g.as_ref())` expression site (the
-                    // trait has both supertraits), matching how the worker passes
-                    // `registry.telemetry().metrics.as_ref()`.
-                    let effective_metrics: Option<
-                        &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
-                    > = match (metrics, fallback_recorder.as_ref()) {
-                        (Some(m), _) => Some(m),
-                        (None, Some(g)) => Some(g.as_ref()),
-                        (None, None) => None,
-                    };
-                    if let Some(m) = effective_metrics {
+                    let resolved_metrics =
+                        crate::admission_gate::resolve_metrics_with_global_fallback(metrics);
+                    if let Some(m) = resolved_metrics.as_dyn() {
                         // Only count the FIRST resolution of this (source, trigger)
                         // pair (issue #618, F4): cascade re-entry / multi-terminal-
                         // path re-eval hits ON CONFLICT DO NOTHING (inserted == 0)
@@ -1564,6 +1873,15 @@ pub fn evaluate_triggers_for_execution<'a>(
                     // NULL outcome = fired (issue #810 reserves the column
                     // for resolved-skip reasons).
                     outcome: None,
+                    // Captured at relay time so a restore-verification pass
+                    // can read the historical target directly, instead of
+                    // reconstructing it from current, mutable state.
+                    // `target_shard` from a topology that may have changed
+                    // since. `target_workflow_name` from a trigger row
+                    // `sync_completion_triggers` can update in place (issue
+                    // #1401).
+                    target_shard: Some(target_shard.as_i32()),
+                    target_workflow_name: Some(trigger_db.target_workflow_name.clone()),
                 })
                 .on_conflict_do_nothing()
                 .execute(conn)
@@ -1616,74 +1934,55 @@ pub fn evaluate_triggers_for_execution<'a>(
                 };
 
                 let target_exec_id = crate::types::ExecutionId::new_for_shard(target_shard);
-                // `_with_metrics` (not the metrics-less wrapper) so a latest-wins
-                // supersede performed by this target is counted (issue #811,
-                // Codex round 2): the wrapper discards the collected
-                // cancellations, so `harvest.concurrency.superseded` and the
-                // incumbent's cancelled terminal were both dropped even though a
-                // recorder is in scope here. Emission is inline, matching every
-                // other counter this function already records inside the source's
-                // terminal transaction (`record_completion_trigger_fired`).
-                //
-                // Residual (Codex round 3): emission happens at return, not after
-                // the enclosing terminal transaction commits, so a rollback of that
-                // transaction leaves both counters emitted for a supersede that never
-                // became durable. Bounded to rolled-back terminal transactions, and
-                // strictly better than the pre-fix state (never emitted at all, an
-                // unconditional under-count). Deferring emission needs a post-commit
-                // collector threaded out of `evaluate_triggers_for_execution`, which
-                // changes its return type across 71 call sites; tracked as a
-                // follow-up issue.
-                let start_res = match start_or_load_workflow_execution_with_metrics(
+                // `_collect` (issue #1197, item 1): a latest-wins supersede
+                // performed by this same-shard target must still be counted
+                // (issue #811, Codex round 2's fix), but NOT emitted here —
+                // this call runs INSIDE the source execution's own still-open
+                // terminal transaction, and `_with_metrics` used to emit at
+                // return, so a rollback of that enclosing transaction left
+                // both `harvest.concurrency.superseded` and the incumbent's
+                // cancelled terminal counted for a cancellation that never
+                // became durable. `_collect` performs the identical start
+                // (including the nested supersede) but returns the collected
+                // `StartCancelledRun`s instead of emitting them; they are
+                // pushed onto `pending` below and left for the caller of
+                // `evaluate_triggers_for_execution_collecting` to emit once
+                // ITS OWN enclosing transaction has actually committed.
+                let (start_res, cancel_deferred_starts, cancel_deferred_checks, cancel_metrics) =
+                    match start_or_load_workflow_execution_collect_with_codecs(
                     conn,
                     StartWorkflowParams {
-                        workflow_name: &trigger_db.target_workflow_name,
-                        workflow_id: &target_workflow_id,
-                        exec_id: target_exec_id,
-                        // Cloned (not moved) — `target_input` and `concurrency_key`
-                        // must stay available after this call for the new
-                        // `QuotaExceeded` outbox-fallback arm below (issue #946,
-                        // Codex round-3 review), which needs the original values
-                        // to construct a `DeferredTriggerStart` for retry.
-                        input: target_input.clone(),
-                        parent_id: None,
-                        queue_name: &queue_name,
-                        execution_timeout: None,
-                        memo: None,
-                        search_attrs: None,
-                        reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
-                        conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
-                        trace_context: None,
-                        max_execution_timeout_ceiling: None,
-                        chain_execution_timeout: None,
-                        max_workflow_chain_timeout_ceiling: None,
-                        inherited_chain_deadline_at: None,
                         concurrency_key: concurrency_key.clone(),
                         concurrency_limit,
                         concurrency_on_conflict,
-                        priority: Priority::default(),
                         max_workflow_input_bytes,
-                        start_at: None,
-                        delay: None,
-                        max_workflow_start_delay: None,
                         owner: target_owner.as_deref(),
                         runbook_url: target_runbook_url.as_deref(),
                         severity: target_severity.as_deref(),
-                        context_headers: None,
                         sla: target_sla.and_then(|d| chrono::Duration::from_std(d).ok()),
-                        schedule_id: None,
-                        scheduled_for: None,
-                        workflow_attempt: 1,
                         workflow_retry_policy: target_retry_policy.clone(),
-                        retry_of_exec_id: None,
                         max_workflow_attempts_ceiling,
-                        // Completion-trigger start is not a schedule fire (issue #534).
-                        origin: None,
-                        completion_callbacks: None,
                         start_source: crate::types::StartSource::CompletionTrigger,
                         start_source_ref: Some(source_exec_id_str.as_str()),
-                        started_by: None,
+                        // `target_input` is cloned, not moved. The `QuotaExceeded`
+                        // outbox-fallback arm below needs the original values to
+                        // build a `DeferredTriggerStart` for retry (issue #946).
+                        // `origin` and `completion_callbacks` keep their `None` default.
+                        // A completion-trigger start is not a schedule fire (issue #534).
+                        // Only builder-wide callback targets apply (issue #605).
+                        ..StartWorkflowParams::new(
+                            &trigger_db.target_workflow_name,
+                            &target_workflow_id,
+                            target_exec_id,
+                            target_input.clone(),
+                            &queue_name,
+                        )
                     },
+                    // Not nested inside a caller-managed outer transaction from
+                    // this call's own point of view, and no debounce-reject
+                    // check applies to a completion-trigger target start.
+                    false,
+                    false,
                     metrics,
                     // The inline same-shard completion-trigger start keeps its own
                     // unlocked pre-check gate above (it also performs the fires-row
@@ -1691,6 +1990,7 @@ pub fn evaluate_triggers_for_execution<'a>(
                     // counting that the primitive cannot), so it is not gated again
                     // here — pass `None` to avoid double-counting (issue #618).
                     None,
+                    codecs,
                 )
                 .await
                 {
@@ -1711,6 +2011,23 @@ pub fn evaluate_triggers_for_execution<'a>(
                             workflow_type = %workflow_type,
                             "Oversized trigger input payload; skipping trigger execution."
                         );
+                        // Resolve the fires row inserted above, same as the
+                        // cross-shard outbox's own PayloadTooLarge arm
+                        // (Codex follow-up x15). This inline start runs on
+                        // `conn`, inside the source's own still-open
+                        // terminal transaction. A plain update on the same
+                        // connection is enough. No separate claim or
+                        // transaction is needed the way the outbox path
+                        // requires.
+                        diesel::update(
+                            fires_dsl::harvest_completion_trigger_fires
+                                .filter(fires_dsl::source_exec_id.eq(exec_id.as_uuid()))
+                                .filter(fires_dsl::trigger_id.eq(trigger_db.id)),
+                        )
+                        .set(fires_dsl::outcome.eq(Some("payload_too_large")))
+                        .execute(conn)
+                        .await
+                        .map_err(crate::error::database_error)?;
                         if let Some(m) = metrics {
                             m.record_completion_trigger_fired(&trigger_name, "payload_too_large");
                         }
@@ -1823,12 +2140,32 @@ pub fn evaluate_triggers_for_execution<'a>(
                             sla: target_sla,
                             retry_policy: target_retry_policy,
                             max_workflow_attempts_ceiling,
+                            codecs: codecs.clone(),
                         });
 
                         continue;
                     }
                     Err(e) => return Err(e),
                 };
+
+                // Mirrors `start_or_load_workflow_execution_with_metrics`'s own
+                // post-`_collect` bookkeeping: spawn this start's own deferred
+                // follow-ups and run its unfinished-handler checks immediately
+                // (unchanged from before this fix — that timing is not the
+                // issue #1197 residual). Only the cancellation SAMPLES are new:
+                // pushed onto `pending` rather than emitted, for the caller of
+                // `evaluate_triggers_for_execution_collecting` to emit after ITS
+                // enclosing transaction commits.
+                for start in cancel_deferred_starts {
+                    start.spawn();
+                }
+                let _ = check_and_report_unfinished_handlers_batch(
+                    conn,
+                    &cancel_deferred_checks,
+                    metrics,
+                )
+                .await;
+                pending.extend(cancel_metrics);
 
                 if let Some(m) = metrics {
                     if start_res.created {
@@ -1891,6 +2228,7 @@ pub fn evaluate_triggers_for_execution<'a>(
                     sla: target_sla,
                     retry_policy: target_retry_policy,
                     max_workflow_attempts_ceiling,
+                    codecs: codecs.clone(),
                 });
             }
         }
@@ -1898,6 +2236,80 @@ pub fn evaluate_triggers_for_execution<'a>(
         Ok(deferred_starts)
     }
     .boxed()
+}
+
+/// Backoff stamped on an outbox row that could not even be ATTEMPTED this
+/// scan (issue #1227, Finding 4, PR #1386). The causes are a missing
+/// target-shard pool, a connection-acquisition failure, or any other
+/// unexpected error surfacing from `relay_gate_checked_start` outside its own
+/// `QuotaExceeded` handling. It has the same value as `QUOTA_REDEFER_BACKOFF`.
+/// It is a separate constant because the two recover for unrelated reasons.
+/// A quota clears on a tenant capacity change. A transport or pool failure
+/// clears on infra recovery. Nothing depends on them staying numerically
+/// equal.
+#[cfg(feature = "db")]
+const OUTBOX_RELAY_FAILURE_BACKOFF: chrono::Duration = chrono::Duration::seconds(5);
+
+/// [`stamp_outbox_relay_backoff`]'s write, shared with its unit tests (issue
+/// #1392) so the pinned SQL text can never drift from what actually runs.
+#[cfg(feature = "db")]
+const OUTBOX_RELAY_BACKOFF_STAMP_QUERY: &str = "UPDATE harvest_completion_trigger_outbox \
+     SET next_attempt_at = clock_timestamp() + make_interval(secs => $2) \
+     WHERE id IN ( \
+         SELECT id FROM harvest_completion_trigger_outbox \
+         WHERE id = $1 \
+         FOR UPDATE SKIP LOCKED \
+     )";
+
+/// Stamp `next_attempt_at` on an outbox row this scan could not even attempt
+/// to relay. Without this, a row whose target shard is durably unreachable
+/// would sit with `next_attempt_at IS NULL` forever. The pool was never
+/// configured, or it persistently refuses connections. The "fresh" tier's
+/// own priority in [`enforce_completion_triggers_outbox`] would then let the
+/// row dominate every claim batch. A persistently-blocked quota row did
+/// exactly that before issue #1227, Finding 4. This time the cause is a
+/// failure class that the quota-specific stamp inside
+/// `relay_gate_checked_start` never covers.
+///
+/// Best-effort: a failure writing this bookkeeping column is logged, not
+/// propagated. A diagnostics-only write must never fail the whole scanner
+/// tick. The row is then simply retried sooner than intended, not lost.
+///
+/// Claims the row `FOR UPDATE SKIP LOCKED` before writing (issue #1227,
+/// PR #1386). The caller's batch `SELECT` takes no lock. So this row can
+/// also be the one that [`relay_gate_checked_start`] holds under ITS own
+/// claim for the entire relay. A peer replica can reach the same row through
+/// a missing-pool or connection-acquisition failure. It then calls this
+/// function concurrently with that relay. A plain `UPDATE ... WHERE id = $1`
+/// has no "skip" option. It would simply block until the relay's claim
+/// transaction commits or rolls back. That stalls this replica's whole scan,
+/// and every later scanner duty behind it, on a possibly-slow cross-shard
+/// relay. It defeats the very non-blocking design that `SKIP LOCKED` exists
+/// for. Losing the race is not an error: the row is already claimed
+/// elsewhere. The relay owns the row's outcome right now. It leaves the row
+/// in a consistent state itself.
+#[cfg(feature = "db")]
+async fn stamp_outbox_relay_backoff(conn: &mut diesel_async::AsyncPgConnection, task_id: Uuid) {
+    use diesel_async::RunQueryDsl;
+
+    // Stamped on Postgres's own `clock_timestamp()`, not the host clock
+    // (issue #1392). Every scanner replica later checks this deadline
+    // against that same DB clock. Writing it there too removes
+    // cross-replica host skew by construction.
+    let result = diesel::sql_query(OUTBOX_RELAY_BACKOFF_STAMP_QUERY)
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .bind::<diesel::sql_types::Double, _>(backoff_secs(OUTBOX_RELAY_FAILURE_BACKOFF))
+        .execute(conn)
+        .await;
+
+    if let Err(e) = result {
+        tracing::warn!(
+            outbox_id = %task_id,
+            error = %e,
+            "[completion_trigger outbox] failed to stamp relay-failure backoff; \
+             row may be retried sooner than intended next scan",
+        );
+    }
 }
 
 /// Enforces pending completion triggers outbox tasks.
@@ -1913,6 +2325,31 @@ pub async fn enforce_completion_triggers_outbox(
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
     shard_assignments: &[crate::types::ShardId],
 ) -> crate::error::HarvestResult<usize> {
+    enforce_completion_triggers_outbox_with_codecs(
+        conn,
+        metrics,
+        sharded_pool,
+        shard_assignments,
+        &crate::store::DEFAULT_PAYLOAD_CODECS,
+    )
+    .await
+}
+
+/// [`enforce_completion_triggers_outbox`], encoding a relayed target's
+/// `WorkflowStarted.input` through `codecs` (issue #1243).
+///
+/// # Errors
+///
+/// Same as [`enforce_completion_triggers_outbox`].
+#[cfg(feature = "db")]
+#[allow(clippy::too_many_lines)]
+pub async fn enforce_completion_triggers_outbox_with_codecs(
+    conn: &mut diesel_async::AsyncPgConnection,
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+    sharded_pool: &Option<crate::shard::ShardedDbPool>,
+    shard_assignments: &[crate::types::ShardId],
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> crate::error::HarvestResult<usize> {
     use crate::models::CompletionTriggerOutboxDb;
     use crate::schema::harvest_completion_trigger_outbox::dsl as outbox_dsl;
     use crate::types::Priority;
@@ -1925,17 +2362,133 @@ pub async fn enforce_completion_triggers_outbox(
         shard_assignments.iter().map(|s| s.as_i32()).collect()
     };
 
-    // Load up to 50 pending outbox tasks for shards assigned to this worker.
-    let pending_tasks = outbox_dsl::harvest_completion_trigger_outbox
+    // Load up to `OUTBOX_CLAIM_BATCH_LIMIT` pending outbox tasks for shards
+    // assigned to this worker. Load them as two separately-capped tiers, not
+    // one combined query (issue #1227 Finding 4 and its follow-ups on
+    // PR #1386).
+    //
+    // Pre-#1227 there was no `next_attempt_at` filter at all. A
+    // `QuotaBlocked` outcome left a row blocked against a durably exhausted
+    // quota completely untouched. So that row could dominate every unordered
+    // `LIMIT 50` batch on every tick. It starved any OTHER, unrelated relay
+    // that happened to sort after it.
+    //
+    // The first attempt ordered by `created_at` ALONE, which was not enough.
+    // Suppose `WorkerRuntimeConfig::poll_interval` is at or above
+    // `QUOTA_REDEFER_BACKOFF` (5s). A persistently-blocked row's backoff has
+    // then always re-elapsed by the next tick. So the row goes straight back
+    // to being one of the 50 OLDEST eligible rows. The exact same batch
+    // reloads forever, and a newer, healthy row never gets a turn.
+    //
+    // The next fix switched to a single `next_attempt_at IS NULL` ("fresh")
+    // -vs- retry ordering. It traded one starvation direction for the other.
+    // A *sustained* arrival of ≥50 fresh rows between ticks fills every batch
+    // with fresh rows. A previously-blocked row can then never be reclaimed
+    // again, even after its target's quota frees up.
+    //
+    // The current design reserves `OUTBOX_RETRY_RESERVED_SLOTS` of the batch
+    // for retry-eligible rows. Each tier is an independently-limited query,
+    // and the results are combined. This gives each tier a floor that neither
+    // backlog can starve. Fresh rows always get at least
+    // `OUTBOX_CLAIM_BATCH_LIMIT - OUTBOX_RETRY_RESERVED_SLOTS` slots,
+    // regardless of how large the retry backlog is. Retries always get at
+    // least `OUTBOX_RETRY_RESERVED_SLOTS`, regardless of how fast fresh rows
+    // arrive. The fresh query can fill short of its own limit. The retry tier
+    // then already gets the difference, because its own `retry_limit` grows
+    // to match. The retry tier can also fill short of ITS limit. That is the
+    // common case, since most scans have no quota-blocked backlog at all. A
+    // third query then backfills more fresh rows. So a reservation that the
+    // retry backlog never needed does not silently cap every scan at 40 of
+    // the configured 50 (PR #1386).
+    let mut pending_tasks = outbox_dsl::harvest_completion_trigger_outbox
         .filter(outbox_dsl::target_shard.eq_any(&shards))
-        .limit(50)
+        .filter(outbox_dsl::next_attempt_at.is_null())
+        .order(outbox_dsl::created_at.asc())
+        .limit(OUTBOX_CLAIM_BATCH_LIMIT - OUTBOX_RETRY_RESERVED_SLOTS)
+        .load::<CompletionTriggerOutboxDb>(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    let fresh_ids: Vec<Uuid> = pending_tasks.iter().map(|t| t.id).collect();
+
+    let retry_limit = OUTBOX_CLAIM_BATCH_LIMIT
+        - i64::try_from(pending_tasks.len()).unwrap_or(OUTBOX_CLAIM_BATCH_LIMIT);
+    // Compares against Postgres's own `NOW()`, not a host-sampled
+    // `chrono::Utc::now()` (issue #1392). Eligibility then agrees with the
+    // clock the backoff was stamped on, regardless of this replica's own
+    // clock drift.
+    let retry_rows = outbox_dsl::harvest_completion_trigger_outbox
+        .filter(outbox_dsl::target_shard.eq_any(&shards))
+        .filter(diesel::dsl::sql::<diesel::sql_types::Bool>(
+            OUTBOX_RETRY_ELIGIBLE_PREDICATE,
+        ))
+        .order((
+            outbox_dsl::next_attempt_at.asc(),
+            outbox_dsl::created_at.asc(),
+        ))
+        .limit(retry_limit)
         .load::<CompletionTriggerOutboxDb>(conn)
         .await
         .map_err(crate::error::database_error)?;
 
+    // The reservation above is a FLOOR for retries, not a fixed carve-out
+    // (issue #1227, PR #1386). The retry backlog is often smaller than
+    // `OUTBOX_RETRY_RESERVED_SLOTS`. That is the common case: most scans have
+    // no quota-blocked backlog at all. The unused reservation must then go
+    // back to fresh work. Otherwise it silently caps every scan at 40 of the
+    // configured 50 and permanently cuts outbox throughput by up to 20%.
+    let unused_retry_capacity =
+        retry_limit - i64::try_from(retry_rows.len()).unwrap_or(retry_limit);
+    pending_tasks.extend(retry_rows);
+    if unused_retry_capacity > 0 {
+        let backfill = outbox_dsl::harvest_completion_trigger_outbox
+            .filter(outbox_dsl::target_shard.eq_any(&shards))
+            .filter(outbox_dsl::next_attempt_at.is_null())
+            .filter(outbox_dsl::id.ne_all(&fresh_ids))
+            .order(outbox_dsl::created_at.asc())
+            .limit(unused_retry_capacity)
+            .load::<CompletionTriggerOutboxDb>(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+        pending_tasks.extend(backfill);
+    }
+
     if pending_tasks.is_empty() {
         return Ok(0);
     }
+
+    // Pre-resolve every distinct `target_workflow_name` among rows that
+    // carry no explicit `queue_name`, in one round trip (issue #1227
+    // follow-up, Ledger). This replaces a per-row `resolve_target_queue`
+    // call below. Each such call opens its own connection to the default
+    // shard, on its own turn through the loop. `CompletionTrigger::new` defaults
+    // `queue_name` to `None`. So an unremarkable fan-in deployment (many
+    // source executions, one downstream trigger) fills a claim batch with
+    // rows that all take this path. Commonly, they all name the same
+    // handful of target workflows.
+    //
+    // Best-effort: an empty map here (no default-shard pool, or the batch
+    // query itself failing) is not a correctness problem. It is only a
+    // missed optimization. The per-row loop below falls back to
+    // `resolve_target_queue` for any name the map has no entry for,
+    // exactly as it always has.
+    let names_needing_lookup: Vec<String> = {
+        let mut set = std::collections::HashSet::new();
+        for task in &pending_tasks {
+            if task.queue_name.is_none() {
+                set.insert(task.target_workflow_name.clone());
+            }
+        }
+        set.into_iter().collect()
+    };
+    let resolved_queues = if !names_needing_lookup.is_empty()
+        && let Some(sp) = sharded_pool.as_ref()
+        && let Ok(mut default_conn) =
+            crate::replication::fenced_checkout(sp.pool_for(sp.default_shard())).await
+    {
+        resolve_target_queues_batch(&mut default_conn, &names_needing_lookup).await
+    } else {
+        std::collections::HashMap::new()
+    };
 
     let mut processed_count = 0;
     for task in pending_tasks {
@@ -1944,10 +2497,18 @@ pub async fn enforce_completion_triggers_outbox(
             .as_ref()
             .and_then(|sp| sp.exact_pool_for(target_shard).cloned())
         else {
+            // Issue #1227 Finding 4: a missing pool never resolves itself
+            // between scans. It reflects this node's own topology, not a
+            // transient race. Without a backoff, this row would sit fresh
+            // forever. It would dominate the fresh tier ahead of a newer row
+            // that targets a healthy shard.
+            stamp_outbox_relay_backoff(conn, task.id).await;
             continue;
         };
 
-        let mut target_conn = match target_pool.get().await {
+        // Under a fenced pass the checkout is bounded, and a timeout abandons
+        // the pass (issue #1823). See `replication::fenced_checkout`.
+        let mut target_conn = match crate::replication::fenced_checkout(&target_pool).await {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(
@@ -1955,11 +2516,14 @@ pub async fn enforce_completion_triggers_outbox(
                     target_shard,
                     e
                 );
+                stamp_outbox_relay_backoff(conn, task.id).await;
                 continue;
             }
         };
 
         let queue_name = if let Some(ref q) = task.queue_name {
+            q.clone()
+        } else if let Some(q) = resolved_queues.get(&task.target_workflow_name) {
             q.clone()
         } else {
             resolve_target_queue(&mut target_conn, &task.target_workflow_name, target_shard).await
@@ -2005,22 +2569,6 @@ pub async fn enforce_completion_triggers_outbox(
         // Provenance ref is the triggering (source) execution id (#740).
         let source_exec_id_str = task.source_exec_id.to_string();
         let params = crate::execution::StartWorkflowParams {
-            workflow_name: &task.target_workflow_name,
-            workflow_id: &task.target_workflow_id,
-            exec_id: crate::types::ExecutionId::new_for_shard(target_shard),
-            input: task.target_input,
-            parent_id: None,
-            queue_name: &queue_name,
-            execution_timeout: None,
-            memo: None,
-            search_attrs: None,
-            reuse_policy: crate::types::WorkflowIdReusePolicy::AllowDuplicate,
-            conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
-            trace_context: None,
-            max_execution_timeout_ceiling: None,
-            chain_execution_timeout: None,
-            max_workflow_chain_timeout_ceiling: None,
-            inherited_chain_deadline_at: None,
             concurrency_key: task.concurrency_key,
             concurrency_limit: task
                 .concurrency_limit
@@ -2028,29 +2576,24 @@ pub async fn enforce_completion_triggers_outbox(
             concurrency_on_conflict: relay_concurrency_on_conflict,
             priority,
             max_workflow_input_bytes: u64::try_from(task.max_workflow_input_bytes).unwrap_or(0),
-            start_at: None,
-            delay: None,
-            max_workflow_start_delay: None,
             owner: target_owner.as_deref(),
             runbook_url: target_runbook_url.as_deref(),
             severity: target_severity.as_deref(),
-            context_headers: None,
             sla: target_sla.and_then(|d| chrono::Duration::from_std(d).ok()),
-            schedule_id: None,
-            scheduled_for: None,
-            workflow_attempt: 1,
             workflow_retry_policy: target_retry_policy,
-            retry_of_exec_id: None,
             max_workflow_attempts_ceiling,
-            // Completion-trigger start is not a schedule fire (issue #534).
-            origin: None,
-            // Internal start: only builder-wide default callback targets apply
-            // (issue #605); a completion-trigger target has no per-execution
-            // callback option of its own.
-            completion_callbacks: None,
             start_source: crate::types::StartSource::CompletionTrigger,
             start_source_ref: Some(source_exec_id_str.as_str()),
-            started_by: None,
+            // `origin` and `completion_callbacks` keep their `None` default.
+            // A completion-trigger start is not a schedule fire (issue #534).
+            // Only builder-wide callback targets apply (issue #605).
+            ..crate::execution::StartWorkflowParams::new(
+                &task.target_workflow_name,
+                &task.target_workflow_id,
+                crate::types::ExecutionId::new_for_shard(target_shard),
+                task.target_input,
+                &queue_name,
+            )
         };
 
         // Existence-aware relay-time start/block via `gate_checked_start_or_load`
@@ -2071,6 +2614,7 @@ pub async fn enforce_completion_triggers_outbox(
             task.source_exec_id,
             task.trigger_id,
             Some(metrics),
+            codecs,
         )
         .await
         {
@@ -2081,8 +2625,25 @@ pub async fn enforce_completion_triggers_outbox(
                 cap_bytes,
                 ..
             }) => {
+                use crate::schema::harvest_completion_trigger_fires::dsl as fires_dsl;
+                use diesel_async::AsyncConnection as _;
+
                 // Permanent error: payload will never fit regardless of retries.
-                // Delete the outbox row so it does not retry forever.
+                // Delete the outbox row so it does not retry forever, and
+                // resolve the fires row the same way `admission_blocked`
+                // does. Without this, the fires row stays `outcome IS NULL`
+                // forever. A restore-verification pass then reads this
+                // permanent, correctly-handled rejection as a delivered
+                // relay whose target is missing (issue #1401).
+                //
+                // Both writes commit or roll back TOGETHER (issue #1401,
+                // Codex follow-up). Two separate autocommitted statements
+                // left a crash window between them. The outbox row gone
+                // but the fires row still `outcome IS NULL` is EXACTLY the
+                // shape a restore-verification pass reads as a lost
+                // delivery. A rolled-back transaction leaves the outbox row
+                // in place, so the next scanner tick retries this same
+                // rejection from scratch.
                 tracing::error!(
                     target_workflow = %task.target_workflow_name,
                     kind = %kind,
@@ -2090,10 +2651,118 @@ pub async fn enforce_completion_triggers_outbox(
                     cap_bytes,
                     "[completion_trigger outbox] permanent error: oversized input payload; deleting outbox row"
                 );
-                let _ = diesel::delete(outbox_dsl::harvest_completion_trigger_outbox)
-                    .filter(outbox_dsl::id.eq(task.id))
-                    .execute(conn)
+
+                // Claim (delete) the outbox row FIRST, and check delivery
+                // LAST (issue #1401, Codex follow-up x8). Checking first
+                // left a window. Another attempt could deliver the target
+                // and roll back only its OWN outbox delete, in between our
+                // check and our delete. Our check would never see that.
+                // Deleting first closes the window. Once our delete
+                // commits, no other attempt can touch this row again. An
+                // existence check run immediately after is therefore the
+                // last possible look, and cannot miss a delivery that beat
+                // us to the target.
+                //
+                // The claim, the check, and the fires update all run
+                // inside ONE open transaction (issue #1401, Codex follow-up
+                // x9), not as separate steps. A failure at any step rolls
+                // back the delete too. The outbox row is restored for the
+                // next scan tick to retry, instead of being permanently
+                // lost while `fires.outcome` stays NULL.
+                let resolved: Result<bool, crate::error::HarvestError> =
+                    Box::pin(conn.transaction(async |tx| {
+                        let deleted = diesel::delete(outbox_dsl::harvest_completion_trigger_outbox)
+                            .filter(outbox_dsl::id.eq(task.id))
+                            .execute(tx)
+                            .await
+                            .map_err(crate::error::database_error)?;
+                        // Zero rows deleted means another attempt already
+                        // claimed and resolved this row (issue #1401, Codex
+                        // follow-up). Nothing left for us to do.
+                        if deleted == 0 {
+                            return Ok(false);
+                        }
+
+                        let already_delivered = crate::execution::execution_exists_by_key(
+                            &mut target_conn,
+                            &task.target_workflow_name,
+                            &task.target_workflow_id,
+                        )
+                        .await?
+                            // A LIVE check alone is not proof of non-delivery
+                            // (issue #1401, Codex follow-up x10): retention
+                            // can remove the row within seconds of
+                            // completion. A summary, when the deployment
+                            // captures one, outlives that window.
+                            || crate::execution::execution_summary_exists_by_key(
+                                &mut target_conn,
+                                &task.target_workflow_name,
+                                &task.target_workflow_id,
+                            )
+                            .await?;
+                        if already_delivered {
+                            tracing::debug!(
+                                source_exec_id = %task.source_exec_id,
+                                trigger_id = %task.trigger_id,
+                                "[completion_trigger outbox] target already exists or is \
+                                 retained (any state); treating the stale outbox row as \
+                                 delivered, not rejected"
+                            );
+                            return Ok(false);
+                        }
+
+                        // Neither check proved delivery here (Codex follow-up).
+                        // Per `execution_summary_exists_by_key`'s own doc
+                        // comment, that is still not proof of NON-delivery
+                        // when summaries are disabled or expired.
+                        // `payload_too_large` is the deliberate choice
+                        // anyway. Leaving `outcome` unset instead would make
+                        // this fire a candidate lost relay for every future
+                        // `backup_verify` run. That is the exact false
+                        // positive issue #1401 exists to prevent. This
+                        // trades a rare, silent miss (a genuinely delivered
+                        // target, retained without a summary) for a loud,
+                        // common false alarm. See
+                        // `docs/runbooks/backup-restore.md` §4.2(d) for the
+                        // same residual, documented once.
+                        diesel::update(
+                            fires_dsl::harvest_completion_trigger_fires
+                                .filter(fires_dsl::source_exec_id.eq(task.source_exec_id))
+                                .filter(fires_dsl::trigger_id.eq(task.trigger_id)),
+                        )
+                        .set(fires_dsl::outcome.eq(Some("payload_too_large")))
+                        .execute(tx)
+                        .await
+                        .map_err(crate::error::database_error)?;
+                        Ok(true)
+                    }))
                     .await;
+                match resolved {
+                    Ok(false) => {
+                        tracing::warn!(
+                            source_exec_id = %task.source_exec_id,
+                            trigger_id = %task.trigger_id,
+                            "[completion_trigger outbox] outbox row already claimed or \
+                             already delivered; leaving its fire outcome untouched"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            source_exec_id = %task.source_exec_id,
+                            trigger_id = %task.trigger_id,
+                            error = ?e,
+                            "[completion_trigger outbox] failed to resolve the \
+                             permanently-rejected fire; backing off this outbox row"
+                        );
+                        // The whole transaction rolled back on any Err, so
+                        // the outbox row is untouched here (issue #1401,
+                        // Codex follow-up). Without this backoff it would
+                        // retry at full poll cadence forever, mirroring the
+                        // generic error arm below.
+                        stamp_outbox_relay_backoff(conn, task.id).await;
+                    }
+                    Ok(true) => {}
+                }
                 processed_count += 1;
             }
             Err(e) => {
@@ -2101,11 +2770,44 @@ pub async fn enforce_completion_triggers_outbox(
                     "[completion_trigger outbox] Failed to start workflow execution cross-shard: {:?}",
                     e
                 );
+                // Issue #1227 Finding 4: any OTHER error reaching here still
+                // gets a backoff, not a retry at full poll cadence. Such an
+                // error is genuinely unexpected. QuotaExceeded is handled
+                // inside relay_gate_checked_start, and PayloadTooLarge is a
+                // permanent error handled above. The rationale is the same
+                // as for the pool and connection failures above.
+                stamp_outbox_relay_backoff(conn, task.id).await;
             }
         }
     }
 
     Ok(processed_count)
+}
+
+/// Build the `next_attempt_at` `SET` clause used by the `QuotaBlocked` arm of
+/// [`relay_gate_checked_start`], so a no-DB unit test can assert the
+/// generated SQL shape (issue #1392). Mirrors the
+/// `queue::workflow_backoff_sql` shape-test precedent.
+#[cfg(all(test, feature = "db"))]
+fn quota_blocked_backoff_query() -> String {
+    use crate::schema::harvest_completion_trigger_outbox::dsl as outbox_dsl;
+    use diesel::dsl::sql;
+    use diesel::pg::Pg;
+    use diesel::sql_types::{Double, Timestamptz};
+    use diesel::{ExpressionMethods, NullableExpressionMethods, QueryDsl, debug_query};
+
+    let query = diesel::update(
+        outbox_dsl::harvest_completion_trigger_outbox.filter(outbox_dsl::id.eq(Uuid::nil())),
+    )
+    .set(
+        outbox_dsl::next_attempt_at.eq(sql::<Timestamptz>(
+            "clock_timestamp() + make_interval(secs => ",
+        )
+        .bind::<Double, _>(backoff_secs(QUOTA_REDEFER_BACKOFF))
+        .sql(")")
+        .nullable()),
+    );
+    debug_query::<Pg, _>(&query).to_string()
 }
 
 #[cfg(test)]
@@ -3038,5 +3740,67 @@ mod tests {
         // unchanged for legacy consumers).
         let val = serde_json::to_value(CompletionTrigger::new("a", "b")).unwrap();
         assert!(val.get("condition").is_none());
+    }
+
+    // ── issue #1392: outbox backoff deadlines must use the DB clock ────────
+    //
+    // Every scanner replica has its own host clock, and those clocks can
+    // drift from each other. A backoff stamped on one replica's host clock
+    // can already look due to a faster replica. A 5-second cadence then
+    // collapses into repeated immediate retries.
+    //
+    // These tests pin the generated SQL text. Every eligibility check
+    // compares against Postgres's own `NOW()`. Every backoff write is
+    // computed by Postgres's own `clock_timestamp()`, never a host-sampled
+    // `chrono::Utc::now()`.
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn relay_claim_query_checks_backoff_against_the_db_clock() {
+        assert!(
+            RELAY_CLAIM_QUERY.contains("next_attempt_at <= NOW()"),
+            "the claim re-check must compare next_attempt_at against Postgres's \
+             own NOW(), not a host-sampled parameter: {RELAY_CLAIM_QUERY}"
+        );
+        assert_eq!(
+            RELAY_CLAIM_QUERY.matches('$').count(),
+            1,
+            "the query must bind only outbox_id ($1) -- no second, \
+             host-computed timestamp parameter: {RELAY_CLAIM_QUERY}"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn outbox_retry_tier_filters_on_the_db_clock() {
+        assert_eq!(
+            OUTBOX_RETRY_ELIGIBLE_PREDICATE, "next_attempt_at <= NOW()",
+            "the retry-tier batch filter must compare against Postgres's own \
+             NOW(), not a host-sampled chrono::Utc::now()"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn stamp_outbox_relay_backoff_writes_on_the_db_clock() {
+        assert!(
+            OUTBOX_RELAY_BACKOFF_STAMP_QUERY
+                .contains("next_attempt_at = clock_timestamp() + make_interval(secs => $2)"),
+            "the relay-failure backoff must be computed by Postgres's own \
+             clock_timestamp(), not a host-computed timestamp parameter: \
+             {OUTBOX_RELAY_BACKOFF_STAMP_QUERY}"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn quota_blocked_backoff_writes_on_the_db_clock() {
+        let sql = quota_blocked_backoff_query();
+        assert!(
+            sql.contains("\"next_attempt_at\" = clock_timestamp() + make_interval(secs => $"),
+            "a QuotaExceeded outcome must stamp next_attempt_at from \
+             Postgres's own clock_timestamp(), not a host-computed \
+             chrono::Utc::now(): {sql}"
+        );
     }
 }

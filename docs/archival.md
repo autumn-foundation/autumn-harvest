@@ -207,3 +207,10 @@ Under transient failure, the retention janitor logs warnings:
 ```
 
 To debug, filter your logs by `autumn_harvest::retention` target. Check network routes and credentials associated with your cold storage bucket. The candidate will continue to re-appear inside subsequent ticks until the hook succeeds.
+
+## See also
+
+* [`docs/partitioned-events.md`](partitioned-events.md) — an opt-in, complementary
+  reclamation path: instead of this janitor's row-by-row delete, eligible
+  `harvest_events` rows can live in droppable partitions, so retention reclaims
+  space by dropping a partition instead of deleting individual rows.

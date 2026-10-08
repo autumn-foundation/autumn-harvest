@@ -484,17 +484,36 @@ fn redacted_summary(value: &Value, kind: &'static str) -> Result<Value, HistoryE
     }))
 }
 
+/// Decimal digit count of `n` as `serde_json` renders it: plain, unsigned,
+/// no leading zero. `1` for `0`, `n.ilog10() + 1` otherwise.
+const fn decimal_digit_width(n: usize) -> usize {
+    if n == 0 { 1 } else { n.ilog10() as usize + 1 }
+}
+
+/// `size_limit.actual_bytes` is itself a field inside `document`. So the
+/// document's own serialized length depends on how many decimal digits
+/// that one field renders as. That is a self-referential fixed point.
+///
+/// Every other byte of the document is invariant across guesses at that
+/// field's value. So the fixed point is solved with exactly one real
+/// serialization. That one serialization also reveals `constant`, the
+/// length of everything else. The rest of the fixed point is then solved
+/// with O(1) arithmetic on the digit width. This replaces re-serializing
+/// the whole document again for every guess.
 fn measure_export_bytes(document: &mut HistoryExportDocument) -> Result<usize, HistoryExportError> {
-    let mut last = 0;
+    let mut previous = document.size_limit.actual_bytes;
+    let mut actual = serde_json::to_vec(document)?.len();
+    let constant = actual - decimal_digit_width(previous);
+
     for _ in 0..4 {
-        let actual = serde_json::to_vec(document)?.len();
-        if actual == last {
+        if actual == previous {
             return Ok(actual);
         }
         document.size_limit.actual_bytes = actual;
-        last = actual;
+        previous = actual;
+        actual = constant + decimal_digit_width(actual);
     }
-    Ok(last)
+    Ok(previous)
 }
 
 fn history_state_is_terminal(state: &str) -> bool {
@@ -518,6 +537,11 @@ pub fn export_mermaid_sequence(events: &[WorkflowEvent]) -> Result<String, std::
     Ok(exporter.out)
 }
 
+/// Makes operator text safe inside one Mermaid note line.
+fn mermaid_text(text: &str) -> String {
+    text.replace('\n', " ").replace('"', "'")
+}
+
 struct MermaidExporter {
     out: String,
     participants: std::collections::HashSet<String>,
@@ -536,7 +560,7 @@ impl MermaidExporter {
         writeln!(self.out, "    autonumber")?;
         writeln!(self.out, "    participant WF as Workflow")?;
 
-        // We'll keep track of dynamic participants to avoid re-declaring them.
+        // Track dynamic participants to avoid re-declaring them.
         self.participants.insert("WF".to_string());
 
         for event in events {
@@ -578,7 +602,8 @@ impl MermaidExporter {
                 WorkflowEvent::SignalReceived { .. }
                 | WorkflowEvent::MarkerRecorded { .. }
                 | WorkflowEvent::SideEffectRecorded { .. }
-                | WorkflowEvent::MutexGranted { .. } => {
+                | WorkflowEvent::MutexGranted { .. }
+                | WorkflowEvent::DecisionCommitted { .. } => {
                     self.handle_misc_event(event)?;
                 }
                 WorkflowEvent::ActivityAwaitingExternal { .. }
@@ -733,16 +758,17 @@ impl MermaidExporter {
                 activity_id,
                 ..
             } => {
-                // Without mapping activity_id to name, we use a generic Worker.
-                // In a perfect world, we'd track activity_id -> name, but let's keep it simple.
+                // No activity_id -> name mapping exists here, so the diagram
+                // names a generic Worker.
                 writeln!(
                     self.out,
                     "    Note right of WF: Activity Started (ID: {activity_id}) on {worker_id}"
                 )?;
             }
             WorkflowEvent::ActivityCompleted { activity_id, .. } => {
-                // Note: since we lack the activity name here, we'll draw it back to WF generally
-                // or just use a note. To do an arrow, we would need to map activity_id -> participant.
+                // The activity name is unavailable here, so the diagram emits a
+                // note against WF. An arrow would need an activity_id ->
+                // participant mapping.
                 writeln!(
                     self.out,
                     "    Note right of WF: Activity Completed (ID: {activity_id})"
@@ -901,6 +927,22 @@ impl MermaidExporter {
             WorkflowEvent::SideEffectRecorded { kind, name, .. } => {
                 let label = name.as_deref().unwrap_or(kind.as_str());
                 writeln!(self.out, "    Note over WF: Side Effect: {label}")?;
+            }
+            WorkflowEvent::DecisionCommitted {
+                build_id,
+                worker_id,
+            } => {
+                writeln!(
+                    self.out,
+                    "    Note over WF: Decision committed (build {}, worker {})",
+                    // Plain text: Mermaid can read `<none>` as an HTML tag.
+                    if build_id.is_legacy() {
+                        "none".to_string()
+                    } else {
+                        mermaid_text(build_id.as_str())
+                    },
+                    mermaid_text(worker_id.as_str()),
+                )?;
             }
             WorkflowEvent::MutexGranted { key, .. } => {
                 writeln!(self.out, "    Note over WF: Mutex Acquired: {key}")?;
@@ -1973,5 +2015,43 @@ mod tests {
             "Redacted export must contain neither plaintext nor the envelope: {json}"
         );
         assert_eq!(document.events[0]["data"]["output"]["redacted"], true);
+    }
+
+    // ── DecisionCommitted (issue #1833) ──────────────────────────────────────
+
+    fn decision_committed() -> WorkflowEvent {
+        WorkflowEvent::DecisionCommitted {
+            build_id: crate::types::BuildId::new("build-9"),
+            worker_id: crate::types::WorkerId::new("node-a"),
+        }
+    }
+
+    #[test]
+    fn mermaid_shows_build_and_worker_per_decision() {
+        let diagram = export_mermaid_sequence(&[decision_committed()]).expect("export");
+        assert!(
+            diagram.contains("Note over WF: Decision committed (build build-9, worker node-a)"),
+            "{diagram}"
+        );
+    }
+
+    #[test]
+    fn mermaid_names_a_missing_build_and_escapes_operator_text() {
+        let event = WorkflowEvent::DecisionCommitted {
+            build_id: crate::types::BuildId::legacy(),
+            worker_id: crate::types::WorkerId::new("node \"a\"\nx"),
+        };
+        let diagram = export_mermaid_sequence(&[event]).expect("export");
+        assert!(
+            diagram.contains("Note over WF: Decision committed (build none, worker node 'a' x)"),
+            "{diagram}"
+        );
+    }
+
+    #[test]
+    fn redacted_export_keeps_build_and_worker() {
+        let value = redacted_event_value(&decision_committed()).expect("redact");
+        assert_eq!(value["data"]["build_id"], "build-9");
+        assert_eq!(value["data"]["worker_id"], "node-a");
     }
 }

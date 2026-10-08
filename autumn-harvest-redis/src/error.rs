@@ -28,6 +28,14 @@ pub enum RedisAdapterError {
     /// The queue name contained characters that are not allowed.
     #[error("invalid queue name '{0}'")]
     InvalidQueueName(String),
+
+    /// A configuration value is not usable.
+    #[error("invalid redis dispatch configuration: {0}")]
+    InvalidConfig(String),
+
+    /// The connection was not established inside the connect timeout.
+    #[error("redis connect timed out after {0:?}")]
+    ConnectTimeout(std::time::Duration),
 }
 
 /// Convenience result alias used throughout the adapter.

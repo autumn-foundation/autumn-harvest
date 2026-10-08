@@ -1,0 +1,23 @@
+# NON-PRODUCTION THROWAWAY APPARATUS — see ../../0001-redis-adapter-throughput-ceiling.md
+#
+# This is archived for reproducibility only. It is deliberately NOT a member
+# of the workspace root Cargo.toml and must never become one: it exists to
+# answer one already-closed assay question, not to be built, tested, or
+# depended on by anything else.
+[package]
+name = "redis_bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Deliberately detached from the repo's root workspace (see the file-level
+# comment above) rather than added to its `members`/`exclude` list.
+[workspace]
+
+[dependencies]
+autumn-harvest-redis = { path = "../../../../autumn-harvest-redis" }
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3

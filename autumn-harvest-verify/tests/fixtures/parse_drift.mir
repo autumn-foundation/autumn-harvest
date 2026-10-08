@@ -1,0 +1,151 @@
+// WARNING: This output format is intended for human consumers only
+// and is subject to change without notice. Knock yourself out.
+// HINT: See also -Z dump-mir for MIR at specific points during compilation.
+fn <impl at parse_drift.rs:17:1: 17:21>::execute_activity_raw(_1: &WorkflowContext, _2: String, _3: u64) -> Result<u64, String> {
+    debug self => _1;
+    debug name => _2;
+    debug arg => _3;
+    let mut _0: std::result::Result<u64, std::string::String>;
+
+    bb0: {
+        _0 = Result::<u64, String>::Ok(copy _3);
+        drop(_2) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+fn wall_clock_secs() -> u64 {
+    let mut _0: u64;
+    let mut _1: &std::time::Duration;
+    let _2: std::time::Duration;
+    let mut _3: std::result::Result<std::time::Duration, std::time::SystemTimeError>;
+    let mut _4: &std::time::SystemTime;
+    let _5: std::time::SystemTime;
+
+    bb0: {
+        _5 = SystemTime::now() -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        _4 = &_5;
+        _3 = SystemTime::duration_since(move _4, const std::time::UNIX_EPOCH) -> [return: bb2, unwind continue];
+    }
+
+    bb2: {
+        _2 = Result::<Duration, SystemTimeError>::unwrap_or_default(move _3) -> [return: bb3, unwind continue];
+    }
+
+    bb3: {
+        _1 = &_2;
+        _0 = Duration::as_secs(move _1) -> [return: bb4, unwind continue];
+    }
+
+    bb4: {
+        return;
+    }
+}
+
+fn wf_helper_parse_target(_1: &WorkflowContext) -> {async fn body of wf_helper_parse_target()} {
+    debug ctx => _1;
+    let mut _0: {async fn body of wf_helper_parse_target()};
+
+    bb0: {
+        _0 = {coroutine@parse_drift.rs:30:67: 33:2 (#0)} { ctx: copy _1 };
+        return;
+    }
+}
+
+fn wf_helper_parse_target::{closure#0}(_1: Pin<&mut {async fn body of wf_helper_parse_target()}>, _2: &mut Context<'_>) -> Poll<u64> {
+    coroutine layout {
+        variant_fields = {
+            Unresumed(0): [],
+            Returned (1): [],
+            Panicked (2): [],
+        }
+        storage_conflicts = BitMatrix(0x0) {}
+    }
+    debug _task_context => _11;
+    debug ctx => ((*_10).0: &WorkflowContext);
+    let mut _0: std::task::Poll<u64>;
+    let _3: &WorkflowContext;
+    let mut _5: std::result::Result<u64, std::string::String>;
+    let mut _6: std::string::String;
+    let mut _7: &str;
+    let mut _8: u64;
+    let mut _9: u32;
+    let mut _10: &mut {async fn body of wf_helper_parse_target()};
+    let mut _11: std::future::ResumeTy;
+    let mut _12: std::ptr::NonNull<std::task::Context<'_>>;
+    scope 1 {
+        debug ctx => _3;
+        let _4: u64;
+        scope 2 {
+            debug stamp => _4;
+        }
+    }
+
+    bb0: {
+        _12 = move _2 as std::ptr::NonNull<std::task::Context<'_>> (Transmute);
+        _11 = std::future::ResumeTy(move _12);
+        _10 = copy (_1.0: &mut {async fn body of wf_helper_parse_target()});
+        _9 = discriminant((*_10));
+        switchInt(move _9) -> [0: bb9, 1: bb7, 2: bb6, otherwise: bb8];
+    }
+
+    bb1: {
+        _7 = const "x";
+        _6 = <str as ToString>::to_string(move _7) -> [return: bb2, unwind: bb5];
+    }
+
+    bb2: {
+        _5 = WorkflowContext::execute_activity_raw(copy _3, move _6, copy _4) -> [return: bb3, unwind: bb5];
+    }
+
+    bb3: {
+        _8 = Result::<u64, String>::unwrap_or(move _5, const 0_u64) -> [return: bb4, unwind: bb5];
+    }
+
+    bb4: {
+        _0 = Poll::<u64>::Ready(move _8);
+        discriminant((*_10)) = 1;
+        return;
+    }
+
+    bb5 (cleanup): {
+        discriminant((*_10)) = 2;
+        resume;
+    }
+
+    bb6: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb6, unwind continue];
+    }
+
+    bb7: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb7, unwind continue];
+    }
+
+    bb8: {
+        unreachable;
+    }
+
+    bb9: {
+        _3 = copy ((*_10).0: &WorkflowContext);
+        _4 = wall_clock_secs() -> [return: bb1, unwind: bb5];
+    }
+}
+
+alloc1 (size: 1, align: 1) {
+    78                                              │ x
+}
+
+fn __autumn_workflow_info_wf_helper_parse_target() -> u8 {
+    let mut _0: u8;
+
+    bb0: {
+        _0 = const 1_u8;
+        return;
+    }
+}

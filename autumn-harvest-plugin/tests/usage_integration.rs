@@ -16,7 +16,6 @@ use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::DbPool;
 use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -34,7 +33,7 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 type HarvestApiApp = axum::Router;
@@ -81,7 +80,7 @@ async fn setup_two_shards() -> ((String, String), ContainerAsync<Postgres>) {
             .expect("shard connect");
         diesel_async::SimpleAsyncConnection::batch_execute(
             &mut conn,
-            autumn_harvest::full_migrations_sql(),
+            &autumn_harvest::test_init_sql(),
         )
         .await
         .expect("migrate shard");
@@ -104,7 +103,7 @@ fn build_app(storage: HarvestDbPool) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(storage);
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 fn build_app_with_max_groups(storage: HarvestDbPool, max_groups: usize) -> HarvestApiApp {
@@ -112,7 +111,7 @@ fn build_app_with_max_groups(storage: HarvestDbPool, max_groups: usize) -> Harve
     api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(storage);
     api_state.set_usage_max_groups(max_groups);
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 fn single_app(url: &str) -> HarvestApiApp {
@@ -174,7 +173,7 @@ async fn seed_execution(
         workflow_id: &wf_id,
         run_id: Uuid::new_v4(),
         shard_id: shard,
-        input: serde_json::json!({}),
+        input: serde_json::json!({}).into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -251,13 +250,16 @@ async fn seed_activity_event(
         .execute(&mut conn)
         .await
         .expect("insert event");
-    diesel::update(
-        dsl::harvest_events
-            .filter(dsl::workflow_exec_id.eq(exec_id))
-            .filter(dsl::event_id.eq(event_id)),
-    )
-    .set(dsl::timestamp.eq(timestamp))
-    .execute(&mut conn)
+    autumn_harvest::append_only::with_guard_off(&mut conn, async |c| {
+        diesel::update(
+            dsl::harvest_events
+                .filter(dsl::workflow_exec_id.eq(exec_id))
+                .filter(dsl::event_id.eq(event_id)),
+        )
+        .set(dsl::timestamp.eq(timestamp))
+        .execute(c)
+        .await
+    })
     .await
     .expect("force event timestamp");
 }
@@ -279,7 +281,10 @@ async fn empty_fleet_returns_complete_zero_groups() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "complete");
     assert_eq!(body["groups"].as_array().unwrap().len(), 0);
-    assert!(body["unavailable_shards"].as_array().unwrap().is_empty());
+    assert_eq!(
+        body["unavailable_shards"].as_array().unwrap().as_slice(),
+        [] as [serde_json::Value; 0]
+    );
 }
 
 #[tokio::test]
@@ -336,13 +341,16 @@ async fn seed_terminal_event(
         .execute(&mut conn)
         .await
         .expect("insert event");
-    diesel::update(
-        dsl::harvest_events
-            .filter(dsl::workflow_exec_id.eq(exec_id))
-            .filter(dsl::event_id.eq(event_id)),
-    )
-    .set(dsl::timestamp.eq(timestamp))
-    .execute(&mut conn)
+    autumn_harvest::append_only::with_guard_off(&mut conn, async |c| {
+        diesel::update(
+            dsl::harvest_events
+                .filter(dsl::workflow_exec_id.eq(exec_id))
+                .filter(dsl::event_id.eq(event_id)),
+        )
+        .set(dsl::timestamp.eq(timestamp))
+        .execute(c)
+        .await
+    })
     .await
     .expect("force event timestamp");
 }
@@ -827,7 +835,7 @@ async fn one_shard_down_is_partial_not_500() {
     let unavailable = body["unavailable_shards"].as_array().unwrap();
     assert_eq!(unavailable.len(), 1);
     assert_eq!(unavailable[0]["shard_id"], 1);
-    assert!(!unavailable[0]["reason"].as_str().unwrap().is_empty());
+    assert_ne!(unavailable[0]["reason"].as_str().unwrap(), "");
 }
 
 #[tokio::test]

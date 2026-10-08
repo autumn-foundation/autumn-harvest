@@ -1,0 +1,284 @@
+# Dependency ledger harness (Ballast). Run locally with `cargo deny check`;
+# CI runs the same command in .github/workflows/ci.yml's `dependency-audit`
+# job on every push/PR that touches Cargo.toml/Cargo.lock/this file.
+# .github/workflows/advisory-scan.yml also runs the advisory check every day,
+# because a new advisory needs no code change (issue #1826).
+#
+# Every `ignore`/`exceptions` entry below is a documented pin: it carries the
+# reason it's deferred and the trigger that should bring it back for review.
+# An entry with neither is a bug in this file, not a policy.
+
+[graph]
+# Resolve metadata the same way CI builds it (`--all-features`), so a crate
+# that's only pulled in behind a feature flag (e.g. `kafka`, `mcp`) is still
+# audited.
+all-features = true
+
+[output]
+feature-depth = 1
+
+# ---------------------------------------------------------------------------
+# Advisories — RUSTSEC scan, reachability-joined by hand below.
+# ---------------------------------------------------------------------------
+[advisories]
+yanked = "deny"
+# `unsound` scopes which crates can surface an `unsound` advisory at all.
+# History, so the next person doesn't relitigate this: cargo-deny 0.18
+# removed the field outright and unconditionally denied `unsound` findings
+# for every reachable instance, workspace or transitive -- this file used to
+# document that as the permanent fix for the gap `unsound` used to have
+# (silently dropping any unsound finding reached only transitively, e.g.
+# two-or-more hops below a workspace member). That was accurate for 0.18.x
+# but did not hold: cargo-deny 0.19.0 (PR#826) reintroduced
+# `[advisories.unsound]`, this time defaulting to `Scope::Workspace` --
+# the exact gap 0.18 had supposedly closed, back, silently, with no
+# deprecation warning and no config-validation failure to flag it. This
+# repo's Cargo.lock-pinned `cargo-deny` tracked that upgrade (0.18.9 ->
+# 0.20.2) without anyone touching this file, so the gap reopened
+# unannounced: a run with the field absent still printed "advisories ok"
+# with only a low-signal `advisory-not-detected` warning on the
+# RUSTSEC-2026-0253 ignore entry below, not a failure -- indistinguishable
+# at a glance from the entry simply having become stale. Caught by Ballast's
+# 2026-09-28 run: `cargo deny check advisories -s` went from "0 errors, 1
+# warnings, 6 notes" (field absent) to "0 errors, 0 warnings, 8 notes"
+# (`unsound = "all"` set) -- the two new notes are RUSTSEC-2026-0253 against
+# `lru` 0.16.4 (ratatui-core's transitive pin) actually being evaluated
+# again, matching the ignore entry's documented "unreachable" verdict rather
+# than silently skipping it. Set explicitly again; treat any future
+# cargo-deny upgrade that touches `[advisories]` defaults as a reason to
+# re-diff `cargo deny check advisories -s` output, not just the version
+# number.
+unsound = "all"
+ignore = [
+    # RUSTSEC-2026-0253 — lru, use-after-free in LruCache::pop() when a
+    # stored key's Drop panics mid-pop (pop() drops the key via
+    # ptr::drop_in_place before calling self.detach(), so a panicking Drop
+    # skips detach and leaves dangling list pointers). FIXED for our own
+    # instance in the scheduled-batch bump flagged by the prior Ballast PR:
+    # autumn-harvest/Cargo.toml's `lru = "0.16"` -> `"0.18"`, lockfile at
+    # 0.18.4 (patched >= 0.18.2). CHANGELOG.md read start to finish
+    # (0.16.4 -> 0.18.4): every entry is additive (new methods, MSRV bumps,
+    # this exact panic-safety fix); nothing touches new/put/get/pop/len/
+    # is_empty/cap, the only methods autumn-harvest/src/cache.rs calls.
+    # Rehearsal: `cargo check -p autumn-harvest --all-features` and
+    # `cargo test -p autumn-harvest --lib cache::` (8 tests) both green;
+    # `cargo check --workspace` green; the bump also unified with autumn-web's
+    # own transitive `lru` requirement (previously resolved separately at
+    # 0.18.0, itself still < 0.18.2 and therefore still affected) onto the
+    # same patched 0.18.4 instance, so autumn-web's exposure closes too as a
+    # side effect, not just ours.
+    #
+    # One instance remains in the graph and keeps this ignore entry alive:
+    # ratatui-core 0.1.0 pins `lru = "0.16"` in its own manifest (external,
+    # not ours to bump), resolving to 0.16.4 — still an affected version.
+    # Verdict: unreachable. Traced in ratatui-core's source
+    # (src/layout/layout.rs): its LAYOUT_CACHE never calls `pop()`; the only
+    # cache-shrinking call is `resize()`, which calls `pop_lru()`
+    # (lru-0.16.4/src/lib.rs:1358) via `remove_last()`. Read `pop()` (line
+    # 1278) against `pop_lru()` (line 1358) side by side in the 0.16.4
+    # source: only `pop()` drops the key in place before detaching; `pop_lru`
+    # never does that drop-then-detach sequence, so it cannot hit this bug
+    # regardless of the stored key/value types' Drop behavior. Key type is
+    # `(Rect, Layout)` regardless, and neither has a custom Drop impl (no
+    # `impl Drop` for either in ratatui-core's source) — so this instance is
+    # unreachable on two independent grounds, either of which is sufficient.
+    # Revisit: ratatui-core raises its own `lru` requirement past 0.18.2, or
+    # starts calling `pop()` on this cache.
+    #
+    # This entry has gone stale twice for the same underlying reason, worth
+    # recording both times: once our own instance moved off `lru = "0.16"`,
+    # the only remaining affected instance (ratatui-core's) was no longer a
+    # *direct* dependency of any workspace member, so any `unsound` scope
+    # narrower than "all" stops evaluating it -- `cargo deny check` reports
+    # "advisory was not encountered" for this ignore entry, not because the
+    # ratatui-core instance disappeared or its own revisit trigger fired, but
+    # because the scope stopped looking at it. First seen under PR #1417
+    # (cargo-deny's then-current `Scope::Workspace` default), fixed there
+    # with `unsound = "all"`. Recurred under this repo's cargo-deny 0.18.9 ->
+    # 0.20.2 upgrade, caught by Ballast's 2026-09-28 run: see the
+    # `[advisories]` comment above for the full history. The reasoning and
+    # revisit trigger below are unchanged from PR #1417.
+    { id = "RUSTSEC-2026-0253", reason = "unreachable: only remaining affected instance is ratatui-core 0.1.0's own `lru = \"0.16\"` pin (external, resolves 0.16.4); our own instance is fixed (0.18.4). ratatui-core's cache only calls pop_lru() via resize(), never the vulnerable pop(), and its key type (Rect, Layout) has no custom Drop either. Revisit: ratatui-core bumps past 0.18.2 or starts calling pop()." },
+
+    # RUSTSEC-2026-0190 — anyhow, unsoundness in `Error::downcast_mut()`.
+    # Not one of ours: `anyhow` isn't a direct dependency of any workspace
+    # manifest; the reachable instance was `wasmtime-internal-core`'s own
+    # interop shim (`error/error.rs`, `#[cfg(feature = "anyhow")]`), which
+    # wasmtime pulls in via its own `default = [..., "anyhow", ...]` feature
+    # set -- active whenever `wasm-activities` is built, since nothing in
+    # this workspace disables wasmtime's default features. That shim's
+    # `Error::downcast_mut::<E>()` tries its own chain first and, only on a
+    # miss, downcasts its inner value to `anyhow::Error` and calls *its*
+    # `downcast_mut` -- the exact unsound call the advisory describes.
+    # FIXED, not deferred: `cargo update -p anyhow` (1.0.102 -> 1.0.104,
+    # patched >= 1.0.103) satisfies every `anyhow` requirement in this
+    # workspace's tree without a manifest change anywhere -- it was never a
+    # direct dependency of ours to bump. No ignore entry needed once patched.
+    #
+    # This is also the second instance (after RUSTSEC-2026-0253, above) of
+    # an unsound advisory that the old `unsound = "all"` override was needed
+    # to even see: `anyhow` is never a direct workspace dependency either, so
+    # under cargo-deny's then-default this would have stayed invisible
+    # indefinitely, not just until some pin aged out.
+
+    # RUSTSEC-2026-0258 — h2, unbounded empty DATA frames. The hyper-1.x/
+    # axum/autumn-web instance (h2 0.4.13) was fixed in the harness PR
+    # (`cargo update -p h2@0.4.13` -> 0.4.19). The second instance, h2
+    # 0.3.27 via the old hyper-0.14 line, is now GONE from the graph: see
+    # the `sqs`-feature fix below (RUSTSEC-2026-0098 comment) — it removed
+    # the entire legacy hyper-0.14/h2-0.3.x cluster, not just the
+    # rustls-webpki finding. No ignore entry needed for this advisory
+    # anymore; `cargo tree --workspace --all-features` has zero h2 0.3.x
+    # or 0.4.x-below-0.4.16 instances.
+
+    # RUSTSEC-2026-0173 — proc-macro-error2 2.0.1 is unmaintained (not a
+    # vulnerability). Pulled by validator_derive -> validator -> autumn-web;
+    # no direct use in this repo. "No safe upgrade is available" per the
+    # advisory. Nothing to bump; the maintenance signal belongs to
+    # autumn-web's dependency on `validator`.
+    # Revisit: if autumn-web drops or replaces `validator`, or
+    # proc-macro-error2 gains a maintained release.
+    { id = "RUSTSEC-2026-0173", reason = "unmaintained, no safe upgrade exists; entirely inside autumn-web's `validator` dependency, not used directly here. Revisit: autumn-web drops/replaces validator, or proc-macro-error2 is revived." },
+
+    # RUSTSEC-2023-0071 — rsa 0.9.10 Marvin Attack (timing side-channel on
+    # private-key ops). Pulled by jsonwebtoken -> autumn-web; whether this is
+    # reachable depends on whether autumn-web ever performs RSA *signing*
+    # (private-key ops) rather than RS256 *verification* only, which is a
+    # question about autumn-web's own source, outside this repository.
+    # No patch exists upstream ("no patch is yet available") as of this
+    # writing regardless. Verdict: undetermined from this repo alone.
+    # Revisit: an upstream `rsa` fix ships, or autumn-web's JWT usage is
+    # confirmed verify-only (would lower urgency further).
+    { id = "RUSTSEC-2023-0071", reason = "undetermined from this repo: reachability depends on whether autumn-web does RSA signing vs. verify-only, which is outside this codebase. No upstream patch exists yet either way. Revisit: rsa fix ships upstream, or autumn-web's usage is confirmed verify-only." },
+
+    # RUSTSEC-2024-0384 — `instant` 0.1.13 is unmaintained (no vulnerability,
+    # "no safe upgrade available"). Pulled by parking_lot 0.11 / wasm-timer ->
+    # reqwest-retry -> postgresql_archive, which is itself gated behind
+    # autumn-harvest-plugin's `dev-runtime-managed` feature: local-only
+    # ephemeral-Postgres tooling for `cargo dev`, off by default and never in
+    # a release build (see the feature's own doc comment in
+    # autumn-harvest-plugin/Cargo.toml). Revisit: postgresql_archive drops
+    # its parking_lot 0.11 dependency, or instant gains a maintained fork.
+    { id = "RUSTSEC-2024-0384", reason = "unmaintained, no safe upgrade exists; reached only through dev-runtime-managed (local `cargo dev` tooling), off by default and never shipped. Revisit: postgresql_archive moves off parking_lot 0.11, or instant is forked/revived." },
+
+    # RUSTSEC-2026-0098 / -0099 / -0104 (rustls-webpki 0.101.7) and the
+    # h2@0.3.27 half of RUSTSEC-2026-0258 — FIXED, not deferred. All four
+    # traced to the same root cause, previously mis-scoped in this file as
+    # "needs an aws-config/aws-sdk-sqs manifest bump": it isn't a version
+    # problem at all. `aws-sdk-sqs`'s own `rustls` feature (which
+    # autumn-harvest-plugin's `sqs` feature requested) is defined upstream
+    # as `rustls = ["aws-smithy-runtime/tls-rustls"]`, and
+    # `aws-smithy-runtime`'s `tls-rustls` unconditionally pulls
+    # `connector-hyper-0-14-x` — the legacy hyper 0.14 / h2 0.3.x / rustls
+    # 0.21 / rustls-webpki 0.101.7 connector — *in addition to*, not instead
+    # of, the modern stack. `aws-sdk-sqs` ships both HTTP-client stacks
+    # side by side; `default-https-client` (`aws-smithy-runtime/
+    # default-https-client` -> `aws-smithy-http-client/rustls-aws-lc`,
+    # hyper 1.x + aws-lc-rs) is the independent, sufficient-on-its-own
+    # feature that actually selects the client used, and was already a
+    # no-op alongside `rustls` here (both were on). Traced with `cargo
+    # tree --workspace --all-features -e features -i
+    # aws-smithy-runtime@1.10.0`, confirmed at the manifest-source level
+    # (docs.rs source view of aws-config/aws-sdk-sqs/aws-smithy-runtime
+    # Cargo.toml `[features]`), and re-checked against aws-sdk-sqs's
+    # newest release (1.109.0) — the mapping is unchanged there too, so
+    # this was never going to be closed by a version bump at any MSRV.
+    # (Separately: aws-sdk-sqs 1.93.0, already in this lockfile, is in
+    # fact the newest release compatible with this workspace's `rust-
+    # version = "1.88.0"` — 1.94.0+ requires rustc 1.91 — so a manifest
+    # bump wasn't even available as an option before this fix.)
+    #
+    # Fix: autumn-harvest-plugin/Cargo.toml's `aws-sdk-sqs` dependency now
+    # requests `default-https-client` instead of `rustls`. This is a
+    # feature-flag change only — no version bump, no MSRV change.
+    # `aws-config`'s own `rustls` feature was left as-is; it already
+    # aliases to `client-hyper` -> `aws-smithy-runtime/default-https-
+    # client`, the same modern target, so it was never part of the legacy
+    # path.
+    #
+    # Rehearsal: `cargo tree --workspace --all-features` now has zero
+    # instances of hyper 0.14, h2 0.3.x, rustls 0.21.x, rustls-webpki
+    # 0.101.7, hyper-rustls 0.24.x or tokio-rustls 0.24.x (all four
+    # advisories' entire vulnerable cluster gone, not just the specific
+    # flagged versions) — 759 -> 747 unique (name, version) entries under
+    # `-e normal`. `cargo check -p autumn-harvest-plugin --no-default-
+    # features --features sqs` and `cargo test -p autumn-harvest-plugin
+    # --no-default-features --features sqs --lib` both green; the sqs
+    # connector only uses the high-level `aws_config::load_defaults` /
+    # `Client::new`/`Client::from_conf` API, never a connector type
+    # directly, so the swap is behavior-invisible to it. No new packages
+    # added to Cargo.lock, only the legacy cluster removed.
+]
+
+# ---------------------------------------------------------------------------
+# Licenses — inventory taken 2026-09-02 via `cargo deny list`.
+# ---------------------------------------------------------------------------
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "0BSD",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+    "PostgreSQL",
+]
+confidence-threshold = 0.8
+exceptions = [
+    # r-efi is LGPL-2.1-or-later, otherwise not in the `allow` list above
+    # (copyleft, deliberately not blanket-allowed). It's an optional
+    # dependency of `getrandom` active only under `target_os = "uefi"`; this
+    # workspace never builds for that target, so it's present in Cargo.lock
+    # but never actually compiled into anything we ship. Scoped to this one
+    # crate rather than added to `allow` so a *reachable* LGPL dependency
+    # would still fail the gate.
+    { allow = ["LGPL-2.1-or-later"], crate = "r-efi" },
+]
+
+[licenses.private]
+# The four examples/* crates are `publish = false` and carry no `license`
+# field — they're internal samples, never published. Don't fail the gate on
+# them; a real crate we intend to publish should still set `license`.
+ignore = true
+
+# ---------------------------------------------------------------------------
+# Bans — duplicate-version and wildcard/feature policy.
+# ---------------------------------------------------------------------------
+[bans]
+# `warn`, not `deny`: as of this baseline there are 33 duplicated crate names
+# in the graph (see the harness PR's ledger report for the full list and
+# which party's version constraint causes each). The large majority are
+# driven by external hires (autumn-web, testcontainers, redis, diesel_migrations)
+# whose own transitive versions we don't control from this manifest; treating
+# every one as a hard failure would block CI on constraints this repo can't
+# resolve unilaterally. `croner` is the one duplicate where BOTH sides are in
+# reach (our own direct `croner = "2.2"` vs. autumn-web's `^3.0`) — a
+# candidate for a dedicated dedup PR, not bundled into this harness.
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+deny = []
+skip = []
+skip-tree = []
+
+# Issue #1834: the Redis TLS client must always verify the server. These
+# `redis` features add a way to turn certificate checks off (the
+# `#insecure` URL fragment, `danger_accept_invalid_hostnames`). Keep them out.
+[[bans.features]]
+crate = "redis"
+deny = ["tls-rustls-insecure", "tls-native-tls"]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

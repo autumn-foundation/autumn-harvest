@@ -14,7 +14,6 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -258,6 +257,7 @@ async fn register_active_worker(pool: &DbPool, worker_id: &str, queues: &[&str],
         None,
         &std::collections::HashMap::new(),
         0,
+        &[],
     )
     .await
     .expect("worker registration should succeed");
@@ -382,7 +382,7 @@ async fn three_shard_rollout_gate_tracks_missing_added_and_stale_worker_coverage
             SchedulerMonitor::offline(),
         ),
     );
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     let (status, body) = get_json(&app, "/admin/shards/health").await;
 
@@ -440,7 +440,7 @@ async fn single_shard_ready_state_uses_shard_zero_response_shape() {
             SchedulerMonitor::offline(),
         ),
     );
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     let (status, body) = get_json(&app, "/admin/shards/health").await;
 
@@ -478,7 +478,7 @@ async fn writable_shard_reports_degraded_codes_and_worker_counts() {
             SchedulerMonitor::offline(),
         ),
     );
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     let (status, body) = get_json(&app, "/admin/shards/health").await;
 
@@ -522,7 +522,7 @@ async fn unreachable_writable_shard_reports_unavailable_reason_code() {
             SchedulerMonitor::offline(),
         ),
     );
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     let (status, body) = get_json(&app, "/admin/shards/health").await;
 
@@ -552,7 +552,7 @@ async fn health_endpoint_can_enforce_writable_shard_readiness() {
         ),
     );
     state.set_health_requires_shard_readiness(true);
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("prod"));
+    let app = harvest_api_router(state);
 
     let (status, body) = get_json(&app, "/health").await;
 
@@ -589,12 +589,89 @@ async fn health_endpoint_enforces_unavailable_writable_shard_readiness() {
         ),
     );
     state.set_health_requires_shard_readiness(true);
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("prod"));
+    let app = harvest_api_router(state);
 
     let (status, body) = get_json(&app, "/health").await;
 
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body["shard_readiness"]["overall_readiness"], "unavailable");
+}
+
+fn default_queue_runtime(router: ShardRouter) -> HarvestApiRuntime {
+    runtime_for(
+        &["default"],
+        None,
+        Vec::new(),
+        router,
+        SchedulerMonitor::offline(),
+    )
+}
+
+/// Issue #1812 AC2: a ready replica drops readiness on drain. Liveness stays 200.
+#[tokio::test]
+async fn ready_probe_passes_then_fails_on_drain() {
+    let (database_url, _container) = setup_database_url_with_migrations().await;
+    let state = api_state(
+        HarvestDbPool::from(build_test_pool(&database_url)),
+        default_queue_runtime(ShardRouter::single()),
+    );
+    let app = harvest_api_router(state.clone());
+
+    let (status, body) = get_json(&app, "/health/ready").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ready"], true);
+    assert_eq!(body["database_reachable"], true);
+    assert_eq!(body["reasons"], serde_json::json!([]));
+
+    state.begin_draining();
+
+    let (status, body) = get_json(&app, "/health/ready").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["draining"], true);
+    assert_eq!(body["reasons"], serde_json::json!(["draining"]));
+
+    let (status, body) = get_json(&app, "/health/live").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["draining"], true);
+}
+
+/// Readiness honors `require_shard_readiness`, like `/health`.
+#[tokio::test]
+async fn ready_probe_applies_enforced_shard_readiness() {
+    let (database_url, _container) = setup_database_url_with_migrations().await;
+    let state = api_state(
+        HarvestDbPool::from(build_test_pool(&database_url)),
+        default_queue_runtime(ShardRouter::single()),
+    );
+    state.set_health_requires_shard_readiness(true);
+    let app = harvest_api_router(state);
+
+    let (status, body) = get_json(&app, "/health/ready").await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["database_reachable"], true);
+    // The public body has the verdict only, not the admin report.
+    assert_eq!(body["shard_readiness"], "degraded");
+    assert_eq!(body["reasons"], serde_json::json!(["shard_not_ready"]));
+}
+
+/// Without enforcement, readiness probes only the default shard.
+/// One bad shard must not pull every replica out of the load balancer.
+#[tokio::test]
+async fn ready_probe_ignores_a_bad_non_default_shard_when_not_enforced() {
+    let (shard0_url, _container) = setup_database_url_with_migrations().await;
+    let pool = build_two_shard_pool(&shard0_url, "postgres://postgres:postgres@127.0.0.1:1/nope");
+    let router = ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![ShardId::new(0), ShardId::new(1)],
+        ShardId::new(0),
+    );
+    let app = harvest_api_router(api_state(pool, default_queue_runtime(router)));
+
+    let (status, body) = get_json(&app, "/health/ready").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["shard_readiness"], Value::Null);
 }
 
 #[tokio::test]
@@ -623,7 +700,7 @@ async fn readable_only_candidate_without_workers_lists_promotion_blockers() {
             SchedulerMonitor::offline(),
         ),
     );
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     let (status, body) = get_json(&app, "/admin/shards/health?candidate_shard=1").await;
 
@@ -656,7 +733,7 @@ async fn writable_shard_with_missing_queue_coverage_is_degraded() {
             SchedulerMonitor::offline(),
         ),
     );
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     let (status, body) = get_json(&app, "/admin/shards/health").await;
 
@@ -687,7 +764,7 @@ async fn stale_worker_coverage_makes_writable_shard_degraded() {
             SchedulerMonitor::offline(),
         ),
     );
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     let (status, body) = get_json(&app, "/admin/shards/health").await;
 
@@ -720,7 +797,7 @@ async fn stale_scheduler_coverage_makes_scheduled_writable_shard_degraded() {
             SchedulerMonitor::new(1),
         ),
     );
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     let (status, body) = get_json(&app, "/admin/shards/health").await;
 
@@ -761,7 +838,7 @@ async fn unreachable_shard_returns_partial_health_for_reachable_shards() {
             SchedulerMonitor::offline(),
         ),
     );
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     let (status, body) = get_json(&app, "/admin/shards/health").await;
 
@@ -823,7 +900,7 @@ async fn migration_mismatch_marks_only_affected_shard_degraded() {
             SchedulerMonitor::offline(),
         ),
     );
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     let (status, body) = get_json(&app, "/admin/shards/health").await;
 
@@ -863,7 +940,7 @@ async fn router_only_writable_shard_is_reported_unavailable() {
             SchedulerMonitor::offline(),
         ),
     );
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     let (status, body) = get_json(&app, "/admin/shards/health").await;
 

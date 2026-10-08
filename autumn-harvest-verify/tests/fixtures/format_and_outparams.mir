@@ -1,0 +1,3348 @@
+// WARNING: This output format is intended for human consumers only
+// and is subject to change without notice. Knock yourself out.
+// HINT: See also -Z dump-mir for MIR at specific points during compilation.
+fn <impl at format_and_outparams.rs:28:1: 28:21>::execute_activity_raw(_1: &WorkflowContext, _2: String, _3: u64) -> Result<u64, String> {
+    debug self => _1;
+    debug name => _2;
+    debug arg => _3;
+    let mut _0: std::result::Result<u64, std::string::String>;
+
+    bb0: {
+        _0 = Result::<u64, String>::Ok(copy _3);
+        drop(_2) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+fn <impl at format_and_outparams.rs:28:1: 28:21>::system_now(_1: &WorkflowContext) -> u64 {
+    debug self => _1;
+    let mut _0: u64;
+
+    bb0: {
+        _0 = const 0_u64;
+        return;
+    }
+}
+
+fn <impl at format_and_outparams.rs:28:1: 28:21>::side_effect(_1: &WorkflowContext, _2: &str, _3: F) -> T {
+    debug self => _1;
+    debug key => _2;
+    debug f => _3;
+    let mut _0: T;
+
+    bb0: {
+        _0 = <F as FnOnce<()>>::call_once(copy _3, const ()) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+fn <impl at format_and_outparams.rs:28:1: 28:21>::timer(_1: &WorkflowContext, _2: u64) -> () {
+    debug self => _1;
+    debug secs => _2;
+    let mut _0: ();
+
+    bb0: {
+        return;
+    }
+}
+
+fn <impl at format_and_outparams.rs:28:1: 28:21>::metrics(_1: &WorkflowContext) -> u64 {
+    debug self => _1;
+    let mut _0: u64;
+
+    bb0: {
+        _0 = const 0_u64;
+        return;
+    }
+}
+
+fn <impl at format_and_outparams.rs:28:1: 28:21>::version(_1: &WorkflowContext) -> u32 {
+    debug self => _1;
+    let mut _0: u32;
+
+    bb0: {
+        _0 = copy ((*_1).0: u32);
+        return;
+    }
+}
+
+static PLAIN_LIMIT: u64 = {
+    let mut _0: u64;
+
+    bb0: {
+        _0 = const 7_u64;
+        return;
+    }
+}
+
+static COUNTER: AtomicU64 = {
+    let mut _0: std::sync::atomic::AtomicU64;
+
+    bb0: {
+        ConstEvalCounter;
+        _0 = AtomicU64::new(const 0_u64) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+static LAZY_START: LazyLock<u64> = {
+    let mut _0: std::sync::LazyLock<u64>;
+    let mut _1: fn() -> u64;
+
+    bb0: {
+        StorageLive(_1);
+        _1 = wall_clock_secs as fn() -> u64 (PointerCoercion(ReifyFnPointer(Safe), Implicit));
+        ConstEvalCounter;
+        _0 = LazyLock::<u64>::new(move _1) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        StorageDead(_1);
+        return;
+    }
+}
+
+static ONCE_START: OnceLock<u64> = {
+    let mut _0: std::sync::OnceLock<u64>;
+
+    bb0: {
+        ConstEvalCounter;
+        _0 = OnceLock::<u64>::new() -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+static mut RAW_COUNTER: u64 = {
+    let mut _0: u64;
+
+    bb0: {
+        _0 = const 0_u64;
+        return;
+    }
+}
+
+const TL_SEQ: LocalKey<RefCell<u64>> = {
+    let mut _0: std::thread::LocalKey<std::cell::RefCell<u64>>;
+
+    bb0: {
+        ConstEvalCounter;
+        _0 = LocalKey::<RefCell<u64>>::new(const TL_SEQ::{constant#0}) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+fn __rust_std_internal_init_fn() -> RefCell<u64> {
+    let mut _0: std::cell::RefCell<u64>;
+
+    bb0: {
+        _0 = RefCell::<u64>::new(const 0_u64) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+TL_SEQ::{constant#0}: for<'a> fn(Option<&'a mut Option<RefCell<u64>>>) -> *const RefCell<u64> = {
+    let mut _0: for<'a> fn(std::option::Option<&'a mut std::option::Option<std::cell::RefCell<u64>>>) -> *const std::cell::RefCell<u64>;
+    let mut _1: bool;
+    let mut _2: {closure@/rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/sys/thread_local/native/mod.rs:92:21: 92:47};
+    let mut _3: {closure@/rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/sys/thread_local/native/mod.rs:100:21: 100:47};
+
+    bb0: {
+        StorageLive(_1);
+        ConstEvalCounter;
+        _1 = std::mem::needs_drop::<RefCell<u64>>() -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        switchInt(move _1) -> [0: bb3, otherwise: bb2];
+    }
+
+    bb2: {
+        StorageLive(_2);
+        _2 = {closure@/rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/sys/thread_local/native/mod.rs:92:21: 92:47};
+        _0 = move _2 as for<'a> fn(std::option::Option<&'a mut std::option::Option<std::cell::RefCell<u64>>>) -> *const std::cell::RefCell<u64> (PointerCoercion(ClosureFnPointer(Safe), Implicit));
+        StorageDead(_2);
+        goto -> bb4;
+    }
+
+    bb3: {
+        StorageLive(_3);
+        _3 = {closure@/rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/sys/thread_local/native/mod.rs:100:21: 100:47};
+        _0 = move _3 as for<'a> fn(std::option::Option<&'a mut std::option::Option<std::cell::RefCell<u64>>>) -> *const std::cell::RefCell<u64> (PointerCoercion(ClosureFnPointer(Safe), Implicit));
+        StorageDead(_3);
+        goto -> bb4;
+    }
+
+    bb4: {
+        StorageDead(_1);
+        return;
+    }
+}
+
+fn TL_SEQ::{constant#0}::{closure#0}(_1: &{closure@/rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/sys/thread_local/native/mod.rs:92:21: 92:47}, _2: Option<&mut Option<RefCell<u64>>>) -> *const RefCell<u64> {
+    debug __rust_std_internal_init => _2;
+    let mut _0: *const std::cell::RefCell<u64>;
+    let _3: &std::thread::local_impl::LazyStorage<std::cell::RefCell<u64>, ()>;
+
+    bb0: {
+        _3 = &/*tls*/ TL_SEQ::{constant#0}::{closure#0}::__RUST_STD_INTERNAL_VAL;
+        _0 = LazyStorage::<RefCell<u64>, ()>::get_or_init::<fn() -> RefCell<u64> {__rust_std_internal_init_fn}>(copy _3, copy _2, __rust_std_internal_init_fn) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+static TL_SEQ::{constant#0}::{closure#0}::__RUST_STD_INTERNAL_VAL: LazyStorage<RefCell<u64>, ()> = {
+    let mut _0: std::thread::local_impl::LazyStorage<std::cell::RefCell<u64>, ()>;
+
+    bb0: {
+        ConstEvalCounter;
+        _0 = LazyStorage::<RefCell<u64>, ()>::new() -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+fn TL_SEQ::{constant#0}::{closure#1}(_1: &{closure@/rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/sys/thread_local/native/mod.rs:100:21: 100:47}, _2: Option<&mut Option<RefCell<u64>>>) -> *const RefCell<u64> {
+    debug __rust_std_internal_init => _2;
+    let mut _0: *const std::cell::RefCell<u64>;
+    let _3: &std::thread::local_impl::LazyStorage<std::cell::RefCell<u64>, !>;
+
+    bb0: {
+        _3 = &/*tls*/ TL_SEQ::{constant#0}::{closure#1}::__RUST_STD_INTERNAL_VAL;
+        _0 = LazyStorage::<RefCell<u64>, !>::get_or_init::<fn() -> RefCell<u64> {__rust_std_internal_init_fn}>(copy _3, copy _2, __rust_std_internal_init_fn) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+static TL_SEQ::{constant#0}::{closure#1}::__RUST_STD_INTERNAL_VAL: LazyStorage<RefCell<u64>, !> = {
+    let mut _0: std::thread::local_impl::LazyStorage<std::cell::RefCell<u64>, !>;
+
+    bb0: {
+        ConstEvalCounter;
+        _0 = LazyStorage::<RefCell<u64>, !>::new() -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+fn wall_clock_secs() -> u64 {
+    let mut _0: u64;
+    let mut _1: &std::time::Duration;
+    let _2: std::time::Duration;
+    let mut _3: std::result::Result<std::time::Duration, std::time::SystemTimeError>;
+    let mut _4: &std::time::SystemTime;
+    let _5: std::time::SystemTime;
+
+    bb0: {
+        _5 = SystemTime::now() -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        _4 = &_5;
+        _3 = SystemTime::duration_since(move _4, const std::time::UNIX_EPOCH) -> [return: bb2, unwind continue];
+    }
+
+    bb2: {
+        _2 = Result::<Duration, SystemTimeError>::unwrap_or_default(move _3) -> [return: bb3, unwind continue];
+    }
+
+    bb3: {
+        _1 = &_2;
+        _0 = Duration::as_secs(move _1) -> [return: bb4, unwind continue];
+    }
+
+    bb4: {
+        return;
+    }
+}
+
+fn stamped_name(_1: &str) -> String {
+    debug prefix => _1;
+    let mut _0: std::string::String;
+    let _2: u64;
+    let mut _3: std::string::String;
+    let mut _4: std::fmt::Arguments<'_>;
+    let mut _6: &&str;
+    let mut _7: &u64;
+    let mut _9: core::fmt::rt::Argument<'_>;
+    let mut _10: core::fmt::rt::Argument<'_>;
+    let mut _11: &[u8; 5];
+    let _12: &[core::fmt::rt::Argument<'_>; 2];
+    let mut _13: &&str;
+    let mut _14: &u64;
+    scope 1 {
+        debug secs => _2;
+        let _5: (&&str, &u64);
+        scope 2 {
+            debug args => _5;
+            let _8: [core::fmt::rt::Argument<'_>; 2];
+            scope 3 {
+                debug args => _8;
+            }
+        }
+    }
+
+    bb0: {
+        _2 = wall_clock_secs() -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        _6 = &_1;
+        _7 = &_2;
+        _5 = (move _6, move _7);
+        _13 = copy (_5.0: &&str);
+        _9 = core::fmt::rt::Argument::<'_>::new_display::<&str>(copy _13) -> [return: bb2, unwind continue];
+    }
+
+    bb2: {
+        _14 = copy (_5.1: &u64);
+        _10 = core::fmt::rt::Argument::<'_>::new_display::<u64>(copy _14) -> [return: bb3, unwind continue];
+    }
+
+    bb3: {
+        _8 = [move _9, move _10];
+        _11 = const b"\xc0\x01-\xc0\x00";
+        _12 = &_8;
+        _4 = Arguments::<'_>::new::<5, 2>(move _11, copy _12) -> [return: bb4, unwind continue];
+    }
+
+    bb4: {
+        _3 = format(move _4) -> [return: bb5, unwind continue];
+    }
+
+    bb5: {
+        _0 = must_use::<String>(move _3) -> [return: bb6, unwind continue];
+    }
+
+    bb6: {
+        return;
+    }
+}
+
+alloc80 (size: 5, align: 1) {
+    c0 01 2d c0 00                                  │ ..-..
+}
+
+fn fill_seq(_1: &mut u64) -> () {
+    debug dst => _1;
+    let mut _0: ();
+    let mut _2: u64;
+    let mut _3: &std::sync::atomic::AtomicU64;
+    let mut _4: std::sync::atomic::Ordering;
+
+    bb0: {
+        _3 = const {alloc9: &AtomicU64};
+        _4 = std::sync::atomic::Ordering::SeqCst;
+        _2 = AtomicU64::load(move _3, move _4) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        (*_1) = move _2;
+        return;
+    }
+}
+
+alloc9 (static: COUNTER, size: 8, align: 8) {
+    00 00 00 00 00 00 00 00                         │ ........
+}
+
+fn parse_amount(_1: &str) -> Result<u64, String> {
+    debug raw => _1;
+    let mut _0: std::result::Result<u64, std::string::String>;
+    let mut _2: std::result::Result<u64, std::num::ParseIntError>;
+
+    bb0: {
+        _2 = core::str::<impl str>::parse::<u64>(copy _1) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        _0 = Result::<u64, ParseIntError>::map_err::<String, {closure@format_and_outparams.rs:104:32: 104:35}>(move _2, const ZeroSized: {closure@format_and_outparams.rs:104:32: 104:35}) -> [return: bb2, unwind continue];
+    }
+
+    bb2: {
+        return;
+    }
+}
+
+fn parse_amount::{closure#0}(_1: {closure@format_and_outparams.rs:104:32: 104:35}, _2: ParseIntError) -> String {
+    let mut _0: std::string::String;
+    let mut _3: &str;
+
+    bb0: {
+        _3 = const "bad amount";
+        _0 = <str as ToString>::to_string(move _3) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+alloc81 (size: 10, align: 1) {
+    62 61 64 20 61 6d 6f 75 6e 74                   │ bad amount
+}
+
+fn one() -> u64 {
+    let mut _0: u64;
+
+    bb0: {
+        _0 = const 1_u64;
+        return;
+    }
+}
+
+fn pick_source(_1: bool) -> fn() -> u64 {
+    debug sel => _1;
+    let mut _0: fn() -> u64;
+
+    bb0: {
+        switchInt(copy _1) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _0 = wall_clock_secs as fn() -> u64 (PointerCoercion(ReifyFnPointer(Safe), Implicit));
+        goto -> bb3;
+    }
+
+    bb2: {
+        _0 = one as fn() -> u64 (PointerCoercion(ReifyFnPointer(Safe), Implicit));
+        goto -> bb3;
+    }
+
+    bb3: {
+        return;
+    }
+}
+
+fn <impl at format_and_outparams.rs:123:1: 123:27>::now_secs(_1: &SystemClock) -> u64 {
+    debug self => _1;
+    let mut _0: u64;
+
+    bb0: {
+        _0 = wall_clock_secs() -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+fn <impl at format_and_outparams.rs:137:1: 137:27>::name(_1: &StaticNamer) -> String {
+    debug self => _1;
+    let mut _0: std::string::String;
+    let mut _2: &str;
+
+    bb0: {
+        _2 = const "static";
+        _0 = <str as ToString>::to_string(move _2) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+alloc82 (size: 6, align: 1) {
+    73 74 61 74 69 63                               │ static
+}
+
+fn <impl at format_and_outparams.rs:145:1: 145:29>::name(_1: &CountingNamer) -> String {
+    debug self => _1;
+    let mut _0: std::string::String;
+    let mut _2: std::string::String;
+    let mut _3: std::fmt::Arguments<'_>;
+    let _4: (&u64,);
+    let mut _5: &u64;
+    let _6: u64;
+    let mut _7: &std::sync::atomic::AtomicU64;
+    let mut _8: std::sync::atomic::Ordering;
+    let mut _10: core::fmt::rt::Argument<'_>;
+    let mut _11: &[u8; 4];
+    let _12: &[core::fmt::rt::Argument<'_>; 1];
+    let mut _13: &u64;
+    scope 1 {
+        debug args => _4;
+        let _9: [core::fmt::rt::Argument<'_>; 1];
+        scope 2 {
+            debug args => _9;
+        }
+    }
+
+    bb0: {
+        _7 = const {alloc9: &AtomicU64};
+        _8 = std::sync::atomic::Ordering::SeqCst;
+        _6 = AtomicU64::load(move _7, move _8) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        _5 = &_6;
+        _4 = (move _5,);
+        _13 = copy (_4.0: &u64);
+        _10 = core::fmt::rt::Argument::<'_>::new_display::<u64>(copy _13) -> [return: bb2, unwind continue];
+    }
+
+    bb2: {
+        _9 = [move _10];
+        _11 = const b"\x01n\xc0\x00";
+        _12 = &_9;
+        _3 = Arguments::<'_>::new::<4, 1>(move _11, copy _12) -> [return: bb3, unwind continue];
+    }
+
+    bb3: {
+        _2 = format(move _3) -> [return: bb4, unwind continue];
+    }
+
+    bb4: {
+        _0 = must_use::<String>(move _2) -> [return: bb5, unwind continue];
+    }
+
+    bb5: {
+        return;
+    }
+}
+
+alloc83 (size: 4, align: 1) {
+    01 6e c0 00                                     │ .n..
+}
+
+alloc9 (static: COUNTER, size: 8, align: 8) {
+    00 00 00 00 00 00 00 00                         │ ........
+}
+
+fn __autumn_workflow_info_wf_format_into_activity_name() -> u8 {
+    let mut _0: u8;
+
+    bb0: {
+        _0 = const 0_u8;
+        return;
+    }
+}
+
+fn wf_format_into_activity_name(_1: &WorkflowContext) -> {async fn body of wf_format_into_activity_name()} {
+    debug ctx => _1;
+    let mut _0: {async fn body of wf_format_into_activity_name()};
+
+    bb0: {
+        _0 = {coroutine@format_and_outparams.rs:158:89: 161:2 (#0)} { ctx: copy _1 };
+        return;
+    }
+}
+
+fn wf_format_into_activity_name::{closure#0}(_1: Pin<&mut {async fn body of wf_format_into_activity_name()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    debug _task_context => _2;
+    debug ctx => ((*_8).0: &WorkflowContext);
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let _3: &WorkflowContext;
+    let mut _5: &str;
+    let mut _6: std::result::Result<u64, std::string::String>;
+    let mut _7: u32;
+    let mut _8: &mut {async fn body of wf_format_into_activity_name()};
+    scope 1 {
+        debug ctx => _3;
+        let _4: std::string::String;
+        scope 2 {
+            debug name => _4;
+        }
+    }
+
+    bb0: {
+        _8 = copy (_1.0: &mut {async fn body of wf_format_into_activity_name()});
+        _7 = discriminant((*_8));
+        switchInt(move _7) -> [0: bb1, 1: bb6, 2: bb5, otherwise: bb7];
+    }
+
+    bb1: {
+        _3 = copy ((*_8).0: &WorkflowContext);
+        _5 = const "charge";
+        _4 = stamped_name(move _5) -> [return: bb2, unwind: bb4];
+    }
+
+    bb2: {
+        _6 = WorkflowContext::execute_activity_raw(copy _3, copy _4, const 1_u64) -> [return: bb3, unwind: bb4];
+    }
+
+    bb3: {
+        _0 = Poll::<Result<u64, String>>::Ready(move _6);
+        discriminant((*_8)) = 1;
+        return;
+    }
+
+    bb4 (cleanup): {
+        discriminant((*_8)) = 2;
+        resume;
+    }
+
+    bb5: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb5, unwind continue];
+    }
+
+    bb6: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb6, unwind continue];
+    }
+
+    bb7: {
+        unreachable;
+    }
+}
+
+alloc1 (size: 6, align: 1) {
+    63 68 61 72 67 65                               │ charge
+}
+
+fn __autumn_workflow_info_wf_out_param_launder() -> u8 {
+    let mut _0: u8;
+
+    bb0: {
+        _0 = const 0_u8;
+        return;
+    }
+}
+
+fn wf_out_param_launder(_1: &WorkflowContext) -> {async fn body of wf_out_param_launder()} {
+    debug ctx => _1;
+    let mut _0: {async fn body of wf_out_param_launder()};
+
+    bb0: {
+        _0 = {coroutine@format_and_outparams.rs:168:81: 172:2 (#0)} { ctx: copy _1 };
+        return;
+    }
+}
+
+fn wf_out_param_launder::{closure#0}(_1: Pin<&mut {async fn body of wf_out_param_launder()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    debug _task_context => _2;
+    debug ctx => ((*_12).0: &WorkflowContext);
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let _3: &WorkflowContext;
+    let _5: ();
+    let mut _6: &mut u64;
+    let mut _7: std::string::String;
+    let mut _8: &str;
+    let mut _9: u64;
+    let mut _10: std::result::Result<u64, std::string::String>;
+    let mut _11: u32;
+    let mut _12: &mut {async fn body of wf_out_param_launder()};
+    scope 1 {
+        debug ctx => _3;
+        let mut _4: u64;
+        scope 2 {
+            debug seq => _4;
+        }
+    }
+
+    bb0: {
+        _12 = copy (_1.0: &mut {async fn body of wf_out_param_launder()});
+        _11 = discriminant((*_12));
+        switchInt(move _11) -> [0: bb1, 1: bb7, 2: bb6, otherwise: bb8];
+    }
+
+    bb1: {
+        _3 = copy ((*_12).0: &WorkflowContext);
+        _4 = const 0_u64;
+        _6 = &mut _4;
+        _5 = fill_seq(copy _6) -> [return: bb2, unwind: bb5];
+    }
+
+    bb2: {
+        _8 = const "charge";
+        _7 = <str as ToString>::to_string(move _8) -> [return: bb3, unwind: bb5];
+    }
+
+    bb3: {
+        _9 = copy _4;
+        _10 = WorkflowContext::execute_activity_raw(copy _3, move _7, move _9) -> [return: bb4, unwind: bb5];
+    }
+
+    bb4: {
+        _0 = Poll::<Result<u64, String>>::Ready(move _10);
+        discriminant((*_12)) = 1;
+        return;
+    }
+
+    bb5 (cleanup): {
+        discriminant((*_12)) = 2;
+        resume;
+    }
+
+    bb6: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb6, unwind continue];
+    }
+
+    bb7: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb7, unwind continue];
+    }
+
+    bb8: {
+        unreachable;
+    }
+}
+
+alloc1 (size: 6, align: 1) {
+    63 68 61 72 67 65                               │ charge
+}
+
+fn __autumn_workflow_info_wf_side_effect_is_clean() -> u8 {
+    let mut _0: u8;
+
+    bb0: {
+        _0 = const 0_u8;
+        return;
+    }
+}
+
+fn wf_side_effect_is_clean(_1: &WorkflowContext) -> {async fn body of wf_side_effect_is_clean()} {
+    debug ctx => _1;
+    let mut _0: {async fn body of wf_side_effect_is_clean()};
+
+    bb0: {
+        _0 = {coroutine@format_and_outparams.rs:179:84: 182:2 (#0)} { ctx: copy _1 };
+        return;
+    }
+}
+
+fn wf_side_effect_is_clean::{closure#0}(_1: Pin<&mut {async fn body of wf_side_effect_is_clean()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    debug _task_context => _2;
+    debug ctx => ((*_11).0: &WorkflowContext);
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let _3: &WorkflowContext;
+    let mut _5: &str;
+    let mut _6: {closure@format_and_outparams.rs:180:41: 180:43};
+    let mut _7: std::string::String;
+    let mut _8: &str;
+    let mut _9: std::result::Result<u64, std::string::String>;
+    let mut _10: u32;
+    let mut _11: &mut {async fn body of wf_side_effect_is_clean()};
+    scope 1 {
+        debug ctx => _3;
+        let _4: u64;
+        scope 2 {
+            debug secs => _4;
+        }
+    }
+
+    bb0: {
+        _11 = copy (_1.0: &mut {async fn body of wf_side_effect_is_clean()});
+        _10 = discriminant((*_11));
+        switchInt(move _10) -> [0: bb1, 1: bb7, 2: bb6, otherwise: bb8];
+    }
+
+    bb1: {
+        _3 = copy ((*_11).0: &WorkflowContext);
+        _5 = const "start";
+        _6 = {closure@format_and_outparams.rs:180:41: 180:43};
+        _4 = WorkflowContext::side_effect::<u64, {closure@format_and_outparams.rs:180:41: 180:43}>(copy _3, move _5, move _6) -> [return: bb2, unwind: bb5];
+    }
+
+    bb2: {
+        _8 = const "charge";
+        _7 = <str as ToString>::to_string(move _8) -> [return: bb3, unwind: bb5];
+    }
+
+    bb3: {
+        _9 = WorkflowContext::execute_activity_raw(copy _3, move _7, copy _4) -> [return: bb4, unwind: bb5];
+    }
+
+    bb4: {
+        _0 = Poll::<Result<u64, String>>::Ready(move _9);
+        discriminant((*_11)) = 1;
+        return;
+    }
+
+    bb5 (cleanup): {
+        discriminant((*_11)) = 2;
+        resume;
+    }
+
+    bb6: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb6, unwind continue];
+    }
+
+    bb7: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb7, unwind continue];
+    }
+
+    bb8: {
+        unreachable;
+    }
+}
+
+alloc2 (size: 5, align: 1) {
+    73 74 61 72 74                                  │ start
+}
+
+alloc1 (size: 6, align: 1) {
+    63 68 61 72 67 65                               │ charge
+}
+
+fn wf_side_effect_is_clean::{closure#0}::{closure#0}(_1: {closure@format_and_outparams.rs:180:41: 180:43}) -> u64 {
+    let mut _0: u64;
+
+    bb0: {
+        _0 = wall_clock_secs() -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+fn __autumn_workflow_info_wf_hashmap_iteration() -> u8 {
+    let mut _0: u8;
+
+    bb0: {
+        _0 = const 0_u8;
+        return;
+    }
+}
+
+fn wf_hashmap_iteration(_1: &WorkflowContext, _2: HashMap<String, u64>) -> {async fn body of wf_hashmap_iteration()} {
+    debug ctx => _1;
+    debug m => _2;
+    let mut _0: {async fn body of wf_hashmap_iteration()};
+
+    bb0: {
+        _0 = {coroutine@format_and_outparams.rs:192:26: 198:2 (#0)} { ctx: copy _1, m: move _2 };
+        return;
+    }
+}
+
+fn wf_hashmap_iteration::{closure#0}(_1: Pin<&mut {async fn body of wf_hashmap_iteration()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    debug _task_context => _2;
+    debug ctx => ((*_25).0: &WorkflowContext);
+    debug m => ((*_25).1: std::collections::HashMap<std::string::String, u64>);
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let _3: &WorkflowContext;
+    let mut _6: std::collections::hash_map::Iter<'_, std::string::String, u64>;
+    let mut _7: &std::collections::HashMap<std::string::String, u64>;
+    let mut _9: std::option::Option<(&std::string::String, &u64)>;
+    let mut _10: &mut std::collections::hash_map::Iter<'_, std::string::String, u64>;
+    let mut _11: isize;
+    let mut _14: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, std::string::String>, u64>;
+    let mut _15: std::result::Result<u64, std::string::String>;
+    let mut _16: std::string::String;
+    let mut _17: u64;
+    let mut _18: isize;
+    let mut _21: (u64, bool);
+    let mut _22: u64;
+    let mut _23: std::result::Result<u64, std::string::String>;
+    let mut _24: u32;
+    let mut _25: &mut {async fn body of wf_hashmap_iteration()};
+    scope 1 {
+        debug ctx => _3;
+        let _4: std::collections::HashMap<std::string::String, u64>;
+        scope 2 {
+            debug m => _4;
+            let mut _5: u64;
+            scope 3 {
+                debug total => _5;
+                let mut _8: std::collections::hash_map::Iter<'_, std::string::String, u64>;
+                scope 4 {
+                    debug iter => _8;
+                    let _12: &std::string::String;
+                    let _13: &u64;
+                    scope 5 {
+                        debug k => _12;
+                        debug v => _13;
+                        let _19: std::result::Result<std::convert::Infallible, std::string::String>;
+                        let _20: u64;
+                        scope 6 {
+                            debug residual => _19;
+                            scope 7 {
+                            }
+                        }
+                        scope 8 {
+                            debug val => _20;
+                            scope 9 {
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    bb0: {
+        _25 = copy (_1.0: &mut {async fn body of wf_hashmap_iteration()});
+        _24 = discriminant((*_25));
+        switchInt(move _24) -> [0: bb1, 1: bb19, 2: bb18, otherwise: bb5];
+    }
+
+    bb1: {
+        _3 = copy ((*_25).0: &WorkflowContext);
+        _4 = move ((*_25).1: std::collections::HashMap<std::string::String, u64>);
+        _5 = const 0_u64;
+        _7 = &_4;
+        _6 = <&HashMap<String, u64> as IntoIterator>::into_iter(move _7) -> [return: bb2, unwind: bb16];
+    }
+
+    bb2: {
+        _8 = move _6;
+        goto -> bb3;
+    }
+
+    bb3: {
+        _10 = &mut _8;
+        _9 = <std::collections::hash_map::Iter<'_, String, u64> as Iterator>::next(copy _10) -> [return: bb4, unwind: bb16];
+    }
+
+    bb4: {
+        _11 = discriminant(_9);
+        switchInt(move _11) -> [0: bb7, 1: bb6, otherwise: bb5];
+    }
+
+    bb5: {
+        unreachable;
+    }
+
+    bb6: {
+        _12 = copy (((_9 as Some).0: (&std::string::String, &u64)).0: &std::string::String);
+        _13 = copy (((_9 as Some).0: (&std::string::String, &u64)).1: &u64);
+        _16 = <String as Clone>::clone(copy _12) -> [return: bb8, unwind: bb16];
+    }
+
+    bb7: {
+        _22 = copy _5;
+        _23 = Result::<u64, String>::Ok(move _22);
+        drop(_4) -> [return: bb15, unwind: bb17];
+    }
+
+    bb8: {
+        _17 = copy (*_13);
+        _15 = WorkflowContext::execute_activity_raw(copy _3, move _16, move _17) -> [return: bb9, unwind: bb16];
+    }
+
+    bb9: {
+        _14 = <Result<u64, String> as Try>::branch(move _15) -> [return: bb10, unwind: bb16];
+    }
+
+    bb10: {
+        _18 = discriminant(_14);
+        switchInt(move _18) -> [0: bb11, 1: bb12, otherwise: bb5];
+    }
+
+    bb11: {
+        _20 = copy ((_14 as Continue).0: u64);
+        _21 = AddWithOverflow(copy _5, copy _20);
+        assert(!move (_21.1: bool), "attempt to compute `{} + {}`, which would overflow", copy _5, copy _20) -> [success: bb14, unwind: bb16];
+    }
+
+    bb12: {
+        _19 = move ((_14 as Break).0: std::result::Result<std::convert::Infallible, std::string::String>);
+        _23 = <Result<u64, String> as FromResidual<Result<Infallible, String>>>::from_residual(copy _19) -> [return: bb13, unwind: bb16];
+    }
+
+    bb13: {
+        drop(_4) -> [return: bb15, unwind: bb17];
+    }
+
+    bb14: {
+        _5 = move (_21.0: u64);
+        goto -> bb3;
+    }
+
+    bb15: {
+        _0 = Poll::<Result<u64, String>>::Ready(move _23);
+        discriminant((*_25)) = 1;
+        return;
+    }
+
+    bb16 (cleanup): {
+        drop(_4) -> [return: bb17, unwind terminate(cleanup)];
+    }
+
+    bb17 (cleanup): {
+        discriminant((*_25)) = 2;
+        resume;
+    }
+
+    bb18: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb18, unwind continue];
+    }
+
+    bb19: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb19, unwind continue];
+    }
+}
+
+fn __autumn_workflow_info_wf_sorted_keys() -> u8 {
+    let mut _0: u8;
+
+    bb0: {
+        _0 = const 0_u8;
+        return;
+    }
+}
+
+fn wf_sorted_keys(_1: &WorkflowContext, _2: HashMap<String, u64>) -> {async fn body of wf_sorted_keys()} {
+    debug ctx => _1;
+    debug m => _2;
+    let mut _0: {async fn body of wf_sorted_keys()};
+
+    bb0: {
+        _0 = {coroutine@format_and_outparams.rs:205:100: 213:2 (#0)} { ctx: copy _1, m: move _2 };
+        return;
+    }
+}
+
+fn wf_sorted_keys::{closure#0}(_1: Pin<&mut {async fn body of wf_sorted_keys()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    debug _task_context => _2;
+    debug ctx => ((*_30).0: &WorkflowContext);
+    debug m => ((*_30).1: std::collections::HashMap<std::string::String, u64>);
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let _3: &WorkflowContext;
+    let mut _6: std::iter::Cloned<std::collections::hash_map::Keys<'_, std::string::String, u64>>;
+    let mut _7: std::collections::hash_map::Keys<'_, std::string::String, u64>;
+    let mut _8: &std::collections::HashMap<std::string::String, u64>;
+    let _9: ();
+    let mut _10: &mut [std::string::String];
+    let mut _11: &mut std::vec::Vec<std::string::String>;
+    let mut _13: std::vec::IntoIter<std::string::String>;
+    let mut _14: std::vec::Vec<std::string::String>;
+    let mut _16: std::option::Option<std::string::String>;
+    let mut _17: &mut std::vec::IntoIter<std::string::String>;
+    let mut _18: isize;
+    let mut _20: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, std::string::String>, u64>;
+    let mut _21: std::result::Result<u64, std::string::String>;
+    let mut _22: isize;
+    let mut _25: (u64, bool);
+    let mut _26: u64;
+    let mut _27: bool;
+    let mut _28: std::result::Result<u64, std::string::String>;
+    let mut _29: u32;
+    let mut _30: &mut {async fn body of wf_sorted_keys()};
+    scope 1 {
+        debug ctx => _3;
+        let _4: std::collections::HashMap<std::string::String, u64>;
+        scope 2 {
+            debug m => _4;
+            let mut _5: std::vec::Vec<std::string::String>;
+            scope 3 {
+                debug keys => _5;
+                let mut _12: u64;
+                scope 4 {
+                    debug total => _12;
+                    let mut _15: std::vec::IntoIter<std::string::String>;
+                    scope 5 {
+                        debug iter => _15;
+                        let _19: std::string::String;
+                        scope 6 {
+                            debug k => _19;
+                            let _23: std::result::Result<std::convert::Infallible, std::string::String>;
+                            let _24: u64;
+                            scope 7 {
+                                debug residual => _23;
+                                scope 8 {
+                                }
+                            }
+                            scope 9 {
+                                debug val => _24;
+                                scope 10 {
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    bb0: {
+        _30 = copy (_1.0: &mut {async fn body of wf_sorted_keys()});
+        _29 = discriminant((*_30));
+        switchInt(move _29) -> [0: bb1, 1: bb28, 2: bb27, otherwise: bb10];
+    }
+
+    bb1: {
+        _27 = const false;
+        _3 = copy ((*_30).0: &WorkflowContext);
+        _4 = move ((*_30).1: std::collections::HashMap<std::string::String, u64>);
+        _8 = &_4;
+        _7 = HashMap::<String, u64>::keys(move _8) -> [return: bb2, unwind: bb23];
+    }
+
+    bb2: {
+        _6 = <std::collections::hash_map::Keys<'_, String, u64> as Iterator>::cloned::<'_, String>(move _7) -> [return: bb3, unwind: bb23];
+    }
+
+    bb3: {
+        _5 = <Cloned<std::collections::hash_map::Keys<'_, String, u64>> as Iterator>::collect::<Vec<String>>(move _6) -> [return: bb4, unwind: bb23];
+    }
+
+    bb4: {
+        _27 = const true;
+        _11 = &mut _5;
+        _10 = <Vec<String> as DerefMut>::deref_mut(move _11) -> [return: bb5, unwind: bb26];
+    }
+
+    bb5: {
+        _9 = slice::<impl [String]>::sort(copy _10) -> [return: bb6, unwind: bb26];
+    }
+
+    bb6: {
+        _12 = const 0_u64;
+        _27 = const false;
+        _14 = move _5;
+        _13 = <Vec<String> as IntoIterator>::into_iter(move _14) -> [return: bb7, unwind: bb26];
+    }
+
+    bb7: {
+        _15 = move _13;
+        goto -> bb8;
+    }
+
+    bb8: {
+        _17 = &mut _15;
+        _16 = <std::vec::IntoIter<String> as Iterator>::next(copy _17) -> [return: bb9, unwind: bb22];
+    }
+
+    bb9: {
+        _18 = discriminant(_16);
+        switchInt(move _18) -> [0: bb12, 1: bb11, otherwise: bb10];
+    }
+
+    bb10: {
+        unreachable;
+    }
+
+    bb11: {
+        _19 = move ((_16 as Some).0: std::string::String);
+        _21 = WorkflowContext::execute_activity_raw(copy _3, copy _19, const 1_u64) -> [return: bb13, unwind: bb22];
+    }
+
+    bb12: {
+        drop(_15) -> [return: bb19, unwind: bb26];
+    }
+
+    bb13: {
+        _20 = <Result<u64, String> as Try>::branch(move _21) -> [return: bb14, unwind: bb22];
+    }
+
+    bb14: {
+        _22 = discriminant(_20);
+        switchInt(move _22) -> [0: bb15, 1: bb16, otherwise: bb10];
+    }
+
+    bb15: {
+        _24 = copy ((_20 as Continue).0: u64);
+        _25 = AddWithOverflow(copy _12, copy _24);
+        assert(!move (_25.1: bool), "attempt to compute `{} + {}`, which would overflow", copy _12, copy _24) -> [success: bb18, unwind: bb22];
+    }
+
+    bb16: {
+        _23 = move ((_20 as Break).0: std::result::Result<std::convert::Infallible, std::string::String>);
+        _28 = <Result<u64, String> as FromResidual<Result<Infallible, String>>>::from_residual(copy _23) -> [return: bb17, unwind: bb22];
+    }
+
+    bb17: {
+        drop(_15) -> [return: bb20, unwind: bb26];
+    }
+
+    bb18: {
+        _12 = move (_25.0: u64);
+        goto -> bb8;
+    }
+
+    bb19: {
+        _26 = copy _12;
+        _28 = Result::<u64, String>::Ok(move _26);
+        _27 = const false;
+        drop(_4) -> [return: bb21, unwind: bb24];
+    }
+
+    bb20: {
+        _27 = const false;
+        drop(_4) -> [return: bb21, unwind: bb24];
+    }
+
+    bb21: {
+        _0 = Poll::<Result<u64, String>>::Ready(move _28);
+        discriminant((*_30)) = 1;
+        return;
+    }
+
+    bb22 (cleanup): {
+        drop(_15) -> [return: bb26, unwind terminate(cleanup)];
+    }
+
+    bb23 (cleanup): {
+        _27 = const false;
+        drop(_4) -> [return: bb24, unwind terminate(cleanup)];
+    }
+
+    bb24 (cleanup): {
+        discriminant((*_30)) = 2;
+        resume;
+    }
+
+    bb25 (cleanup): {
+        drop(_5) -> [return: bb23, unwind terminate(cleanup)];
+    }
+
+    bb26 (cleanup): {
+        switchInt(copy _27) -> [0: bb23, otherwise: bb25];
+    }
+
+    bb27: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb27, unwind continue];
+    }
+
+    bb28: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb28, unwind continue];
+    }
+}
+
+fn __autumn_workflow_info_wf_branch_on_wallclock() -> u8 {
+    let mut _0: u8;
+
+    bb0: {
+        _0 = const 0_u8;
+        return;
+    }
+}
+
+fn wf_branch_on_wallclock(_1: &WorkflowContext) -> {async fn body of wf_branch_on_wallclock()} {
+    debug ctx => _1;
+    let mut _0: {async fn body of wf_branch_on_wallclock()};
+
+    bb0: {
+        _0 = {coroutine@format_and_outparams.rs:220:83: 226:2 (#0)} { ctx: copy _1 };
+        return;
+    }
+}
+
+fn wf_branch_on_wallclock::{closure#0}(_1: Pin<&mut {async fn body of wf_branch_on_wallclock()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    debug _task_context => _2;
+    debug ctx => ((*_12).0: &WorkflowContext);
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let _3: &WorkflowContext;
+    let mut _4: bool;
+    let mut _5: u64;
+    let mut _6: u64;
+    let mut _7: bool;
+    let mut _8: std::string::String;
+    let mut _9: &str;
+    let mut _10: std::result::Result<u64, std::string::String>;
+    let mut _11: u32;
+    let mut _12: &mut {async fn body of wf_branch_on_wallclock()};
+    scope 1 {
+        debug ctx => _3;
+    }
+
+    bb0: {
+        _12 = copy (_1.0: &mut {async fn body of wf_branch_on_wallclock()});
+        _11 = discriminant((*_12));
+        switchInt(move _11) -> [0: bb1, 1: bb10, 2: bb9, otherwise: bb11];
+    }
+
+    bb1: {
+        _3 = copy ((*_12).0: &WorkflowContext);
+        _6 = wall_clock_secs() -> [return: bb2, unwind: bb8];
+    }
+
+    bb2: {
+        _7 = Eq(const 2_u64, const 0_u64);
+        assert(!move _7, "attempt to calculate the remainder of `{}` with a divisor of zero", copy _6) -> [success: bb3, unwind: bb8];
+    }
+
+    bb3: {
+        _5 = Rem(move _6, const 2_u64);
+        _4 = Eq(move _5, const 0_u64);
+        switchInt(move _4) -> [0: bb6, otherwise: bb4];
+    }
+
+    bb4: {
+        _9 = const "even";
+        _8 = <str as ToString>::to_string(move _9) -> [return: bb5, unwind: bb8];
+    }
+
+    bb5: {
+        _10 = WorkflowContext::execute_activity_raw(copy _3, move _8, const 0_u64) -> [return: bb12, unwind: bb8];
+    }
+
+    bb6: {
+        _10 = Result::<u64, String>::Ok(const 0_u64);
+        goto -> bb7;
+    }
+
+    bb7: {
+        _0 = Poll::<Result<u64, String>>::Ready(move _10);
+        discriminant((*_12)) = 1;
+        return;
+    }
+
+    bb8 (cleanup): {
+        discriminant((*_12)) = 2;
+        resume;
+    }
+
+    bb9: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb9, unwind continue];
+    }
+
+    bb10: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb10, unwind continue];
+    }
+
+    bb11: {
+        unreachable;
+    }
+
+    bb12: {
+        goto -> bb7;
+    }
+}
+
+alloc3 (size: 4, align: 1) {
+    65 76 65 6e                                     │ even
+}
+
+fn __autumn_workflow_info_wf_branch_on_version() -> u8 {
+    let mut _0: u8;
+
+    bb0: {
+        _0 = const 0_u8;
+        return;
+    }
+}
+
+fn wf_branch_on_version(_1: &WorkflowContext) -> {async fn body of wf_branch_on_version()} {
+    debug ctx => _1;
+    let mut _0: {async fn body of wf_branch_on_version()};
+
+    bb0: {
+        _0 = {coroutine@format_and_outparams.rs:233:81: 239:2 (#0)} { ctx: copy _1 };
+        return;
+    }
+}
+
+fn wf_branch_on_version::{closure#0}(_1: Pin<&mut {async fn body of wf_branch_on_version()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    debug _task_context => _2;
+    debug ctx => ((*_10).0: &WorkflowContext);
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let _3: &WorkflowContext;
+    let mut _4: bool;
+    let mut _5: u32;
+    let mut _6: std::string::String;
+    let mut _7: &str;
+    let mut _8: std::result::Result<u64, std::string::String>;
+    let mut _9: u32;
+    let mut _10: &mut {async fn body of wf_branch_on_version()};
+    scope 1 {
+        debug ctx => _3;
+    }
+
+    bb0: {
+        _10 = copy (_1.0: &mut {async fn body of wf_branch_on_version()});
+        _9 = discriminant((*_10));
+        switchInt(move _9) -> [0: bb1, 1: bb9, 2: bb8, otherwise: bb10];
+    }
+
+    bb1: {
+        _3 = copy ((*_10).0: &WorkflowContext);
+        _5 = WorkflowContext::version(copy _3) -> [return: bb2, unwind: bb7];
+    }
+
+    bb2: {
+        _4 = Ge(move _5, const 2_u32);
+        switchInt(move _4) -> [0: bb5, otherwise: bb3];
+    }
+
+    bb3: {
+        _7 = const "v2";
+        _6 = <str as ToString>::to_string(move _7) -> [return: bb4, unwind: bb7];
+    }
+
+    bb4: {
+        _8 = WorkflowContext::execute_activity_raw(copy _3, move _6, const 0_u64) -> [return: bb11, unwind: bb7];
+    }
+
+    bb5: {
+        _8 = Result::<u64, String>::Ok(const 0_u64);
+        goto -> bb6;
+    }
+
+    bb6: {
+        _0 = Poll::<Result<u64, String>>::Ready(move _8);
+        discriminant((*_10)) = 1;
+        return;
+    }
+
+    bb7 (cleanup): {
+        discriminant((*_10)) = 2;
+        resume;
+    }
+
+    bb8: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb8, unwind continue];
+    }
+
+    bb9: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb9, unwind continue];
+    }
+
+    bb10: {
+        unreachable;
+    }
+
+    bb11: {
+        goto -> bb6;
+    }
+}
+
+alloc4 (size: 2, align: 1) {
+    76 32                                           │ v2
+}
+
+fn __autumn_workflow_info_wf_try_on_clean_result() -> u8 {
+    let mut _0: u8;
+
+    bb0: {
+        _0 = const 0_u8;
+        return;
+    }
+}
+
+fn wf_try_on_clean_result(_1: &WorkflowContext, _2: String) -> {async fn body of wf_try_on_clean_result()} {
+    debug ctx => _1;
+    debug raw => _2;
+    let mut _0: {async fn body of wf_try_on_clean_result()};
+
+    bb0: {
+        _0 = {coroutine@format_and_outparams.rs:246:96: 249:2 (#0)} { ctx: copy _1, raw: move _2 };
+        return;
+    }
+}
+
+fn wf_try_on_clean_result::{closure#0}(_1: Pin<&mut {async fn body of wf_try_on_clean_result()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    debug _task_context => _2;
+    debug ctx => ((*_16).0: &WorkflowContext);
+    debug raw => ((*_16).1: std::string::String);
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let _3: &WorkflowContext;
+    let mut _5: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, std::string::String>, u64>;
+    let mut _6: std::result::Result<u64, std::string::String>;
+    let _7: &str;
+    let _8: &std::string::String;
+    let mut _9: isize;
+    let mut _12: std::string::String;
+    let mut _13: &str;
+    let mut _14: std::result::Result<u64, std::string::String>;
+    let mut _15: u32;
+    let mut _16: &mut {async fn body of wf_try_on_clean_result()};
+    scope 1 {
+        debug ctx => _3;
+        let _4: std::string::String;
+        scope 2 {
+            debug raw => _4;
+            let _10: std::result::Result<std::convert::Infallible, std::string::String>;
+            let _11: u64;
+            scope 3 {
+                debug amount => _11;
+            }
+            scope 4 {
+                debug residual => _10;
+                scope 5 {
+                }
+            }
+            scope 6 {
+                debug val => _11;
+                scope 7 {
+                }
+            }
+        }
+    }
+
+    bb0: {
+        _16 = copy (_1.0: &mut {async fn body of wf_try_on_clean_result()});
+        _15 = discriminant((*_16));
+        switchInt(move _15) -> [0: bb1, 1: bb15, 2: bb14, otherwise: bb5];
+    }
+
+    bb1: {
+        _3 = copy ((*_16).0: &WorkflowContext);
+        _4 = move ((*_16).1: std::string::String);
+        _8 = &_4;
+        _7 = <String as Deref>::deref(copy _8) -> [return: bb2, unwind: bb12];
+    }
+
+    bb2: {
+        _6 = parse_amount(copy _7) -> [return: bb3, unwind: bb12];
+    }
+
+    bb3: {
+        _5 = <Result<u64, String> as Try>::branch(move _6) -> [return: bb4, unwind: bb12];
+    }
+
+    bb4: {
+        _9 = discriminant(_5);
+        switchInt(move _9) -> [0: bb6, 1: bb7, otherwise: bb5];
+    }
+
+    bb5: {
+        unreachable;
+    }
+
+    bb6: {
+        _11 = copy ((_5 as Continue).0: u64);
+        _13 = const "charge";
+        _12 = <str as ToString>::to_string(move _13) -> [return: bb9, unwind: bb12];
+    }
+
+    bb7: {
+        _10 = move ((_5 as Break).0: std::result::Result<std::convert::Infallible, std::string::String>);
+        _14 = <Result<u64, String> as FromResidual<Result<Infallible, String>>>::from_residual(copy _10) -> [return: bb8, unwind: bb12];
+    }
+
+    bb8: {
+        drop(_4) -> [return: bb11, unwind: bb13];
+    }
+
+    bb9: {
+        _14 = WorkflowContext::execute_activity_raw(copy _3, move _12, copy _11) -> [return: bb10, unwind: bb12];
+    }
+
+    bb10: {
+        drop(_4) -> [return: bb11, unwind: bb13];
+    }
+
+    bb11: {
+        _0 = Poll::<Result<u64, String>>::Ready(move _14);
+        discriminant((*_16)) = 1;
+        return;
+    }
+
+    bb12 (cleanup): {
+        drop(_4) -> [return: bb13, unwind terminate(cleanup)];
+    }
+
+    bb13 (cleanup): {
+        discriminant((*_16)) = 2;
+        resume;
+    }
+
+    bb14: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb14, unwind continue];
+    }
+
+    bb15: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb15, unwind continue];
+    }
+}
+
+alloc1 (size: 6, align: 1) {
+    63 68 61 72 67 65                               │ charge
+}
+
+fn __autumn_workflow_info_wf_await_is_clean() -> u8 {
+    let mut _0: u8;
+
+    bb0: {
+        _0 = const 0_u8;
+        return;
+    }
+}
+
+fn tick(_1: u64) -> {async fn body of tick()} {
+    debug v => _1;
+    let mut _0: {async fn body of tick()};
+
+    bb0: {
+        _0 = {coroutine@format_and_outparams.rs:255:34: 257:2 (#0)} { v: copy _1 };
+        return;
+    }
+}
+
+fn tick::{closure#0}(_1: Pin<&mut {async fn body of tick()}>, _2: &mut Context<'_>) -> Poll<u64> {
+    debug _task_context => _2;
+    debug v => ((*_7).0: u64);
+    let mut _0: std::task::Poll<u64>;
+    let _3: u64;
+    let mut _4: (u64, bool);
+    let mut _5: u64;
+    let mut _6: u32;
+    let mut _7: &mut {async fn body of tick()};
+    scope 1 {
+        debug v => _3;
+    }
+
+    bb0: {
+        _7 = copy (_1.0: &mut {async fn body of tick()});
+        _6 = discriminant((*_7));
+        switchInt(move _6) -> [0: bb1, 1: bb5, 2: bb4, otherwise: bb6];
+    }
+
+    bb1: {
+        _3 = copy ((*_7).0: u64);
+        _4 = AddWithOverflow(copy _3, const 1_u64);
+        assert(!move (_4.1: bool), "attempt to compute `{} + {}`, which would overflow", copy _3, const 1_u64) -> [success: bb2, unwind: bb3];
+    }
+
+    bb2: {
+        _5 = move (_4.0: u64);
+        _0 = Poll::<u64>::Ready(move _5);
+        discriminant((*_7)) = 1;
+        return;
+    }
+
+    bb3 (cleanup): {
+        discriminant((*_7)) = 2;
+        resume;
+    }
+
+    bb4: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb4, unwind continue];
+    }
+
+    bb5: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb5, unwind continue];
+    }
+
+    bb6: {
+        unreachable;
+    }
+}
+
+fn wf_await_is_clean(_1: &WorkflowContext) -> {async fn body of wf_await_is_clean()} {
+    debug ctx => _1;
+    let mut _0: {async fn body of wf_await_is_clean()};
+
+    bb0: {
+        _0 = {coroutine@format_and_outparams.rs:260:78: 264:2 (#0)} { ctx: copy _1 };
+        return;
+    }
+}
+
+fn wf_await_is_clean::{closure#0}(_1: Pin<&mut {async fn body of wf_await_is_clean()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    debug _task_context => _2;
+    debug ctx => ((*_30).0: &WorkflowContext);
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let mut _3: {async fn body of tick()};
+    let mut _4: {async fn body of tick()};
+    let mut _5: std::task::Poll<u64>;
+    let mut _6: std::pin::Pin<&mut {async fn body of tick()}>;
+    let mut _7: &mut {async fn body of tick()};
+    let mut _8: &mut std::task::Context<'_>;
+    let mut _9: isize;
+    let mut _11: &mut std::task::Context<'_>;
+    let mut _12: {async fn body of tick()};
+    let mut _13: {async fn body of tick()};
+    let mut _14: u64;
+    let mut _15: std::task::Poll<u64>;
+    let mut _16: std::pin::Pin<&mut {async fn body of tick()}>;
+    let mut _17: &mut {async fn body of tick()};
+    let mut _18: &mut std::task::Context<'_>;
+    let mut _19: isize;
+    let mut _21: &mut std::task::Context<'_>;
+    let mut _22: std::string::String;
+    let mut _23: &str;
+    let mut _24: u64;
+    let mut _25: u64;
+    let mut _26: (u64, bool);
+    let mut _27: bool;
+    let mut _28: std::result::Result<u64, std::string::String>;
+    let mut _29: u32;
+    let mut _30: &mut {async fn body of wf_await_is_clean()};
+    let mut _31: &WorkflowContext;
+    scope 1 {
+        debug ctx => (((*_30) as variant#4).0: &WorkflowContext);
+        scope 2 {
+            debug a => (((*_30) as variant#4).1: u64);
+            scope 5 {
+                debug b => _20;
+            }
+            scope 6 {
+                debug __awaitee => (((*_30) as variant#4).2: {async fn body of tick()});
+                let _20: u64;
+                scope 7 {
+                    debug result => _20;
+                }
+            }
+        }
+        scope 3 {
+            debug __awaitee => (((*_30) as variant#3).1: {async fn body of tick()});
+            let _10: u64;
+            scope 4 {
+                debug result => _10;
+            }
+        }
+    }
+
+    bb0: {
+        _30 = copy (_1.0: &mut {async fn body of wf_await_is_clean()});
+        _29 = discriminant((*_30));
+        switchInt(move _29) -> [0: bb1, 1: bb31, 2: bb30, 3: bb28, 4: bb29, otherwise: bb7];
+    }
+
+    bb1: {
+        _27 = const false;
+        (((*_30) as variant#4).0: &WorkflowContext) = copy ((*_30).0: &WorkflowContext);
+        _4 = tick(const 1_u64) -> [return: bb2, unwind: bb27];
+    }
+
+    bb2: {
+        _3 = <{async fn body of tick()} as IntoFuture>::into_future(move _4) -> [return: bb3, unwind: bb27];
+    }
+
+    bb3: {
+        (((*_30) as variant#3).1: {async fn body of tick()}) = move _3;
+        goto -> bb4;
+    }
+
+    bb4: {
+        _7 = &mut (((*_30) as variant#3).1: {async fn body of tick()});
+        _6 = Pin::<&mut {async fn body of tick()}>::new_unchecked(copy _7) -> [return: bb5, unwind: bb25];
+    }
+
+    bb5: {
+        _8 = copy _2;
+        _5 = <{async fn body of tick()} as Future>::poll(move _6, copy _8) -> [return: bb6, unwind: bb25];
+    }
+
+    bb6: {
+        _9 = discriminant(_5);
+        switchInt(move _9) -> [0: bb9, 1: bb8, otherwise: bb7];
+    }
+
+    bb7: {
+        unreachable;
+    }
+
+    bb8: {
+        _0 = Poll::<Result<u64, String>>::Pending;
+        discriminant((*_30)) = 3;
+        return;
+    }
+
+    bb9: {
+        _10 = copy ((_5 as Ready).0: u64);
+        (((*_30) as variant#4).1: u64) = copy _10;
+        drop((((*_30) as variant#3).1: {async fn body of tick()})) -> [return: bb10, unwind: bb27];
+    }
+
+    bb10: {
+        _14 = copy (((*_30) as variant#4).1: u64);
+        _13 = tick(move _14) -> [return: bb11, unwind: bb27];
+    }
+
+    bb11: {
+        _12 = <{async fn body of tick()} as IntoFuture>::into_future(move _13) -> [return: bb12, unwind: bb27];
+    }
+
+    bb12: {
+        (((*_30) as variant#4).2: {async fn body of tick()}) = move _12;
+        goto -> bb13;
+    }
+
+    bb13: {
+        _17 = &mut (((*_30) as variant#4).2: {async fn body of tick()});
+        _16 = Pin::<&mut {async fn body of tick()}>::new_unchecked(copy _17) -> [return: bb14, unwind: bb24];
+    }
+
+    bb14: {
+        _18 = copy _2;
+        _15 = <{async fn body of tick()} as Future>::poll(move _16, copy _18) -> [return: bb15, unwind: bb24];
+    }
+
+    bb15: {
+        _19 = discriminant(_15);
+        switchInt(move _19) -> [0: bb17, 1: bb16, otherwise: bb7];
+    }
+
+    bb16: {
+        _0 = Poll::<Result<u64, String>>::Pending;
+        discriminant((*_30)) = 4;
+        return;
+    }
+
+    bb17: {
+        _20 = copy ((_15 as Ready).0: u64);
+        drop((((*_30) as variant#4).2: {async fn body of tick()})) -> [return: bb18, unwind: bb27];
+    }
+
+    bb18: {
+        _31 = copy (((*_30) as variant#4).0: &WorkflowContext);
+        _23 = const "charge";
+        _22 = <str as ToString>::to_string(move _23) -> [return: bb19, unwind: bb23];
+    }
+
+    bb19: {
+        _27 = const true;
+        _25 = copy (((*_30) as variant#4).1: u64);
+        _26 = AddWithOverflow(copy _25, copy _20);
+        assert(!move (_26.1: bool), "attempt to compute `{} + {}`, which would overflow", move _25, copy _20) -> [success: bb20, unwind: bb22];
+    }
+
+    bb20: {
+        _24 = move (_26.0: u64);
+        _27 = const false;
+        _28 = WorkflowContext::execute_activity_raw(copy _31, move _22, move _24) -> [return: bb21, unwind: bb22];
+    }
+
+    bb21: {
+        _27 = const false;
+        _0 = Poll::<Result<u64, String>>::Ready(move _28);
+        discriminant((*_30)) = 1;
+        return;
+    }
+
+    bb22 (cleanup): {
+        switchInt(copy _27) -> [0: bb23, otherwise: bb26];
+    }
+
+    bb23 (cleanup): {
+        _27 = const false;
+        goto -> bb27;
+    }
+
+    bb24 (cleanup): {
+        drop((((*_30) as variant#4).2: {async fn body of tick()})) -> [return: bb27, unwind terminate(cleanup)];
+    }
+
+    bb25 (cleanup): {
+        drop((((*_30) as variant#3).1: {async fn body of tick()})) -> [return: bb27, unwind terminate(cleanup)];
+    }
+
+    bb26 (cleanup): {
+        drop(_22) -> [return: bb23, unwind terminate(cleanup)];
+    }
+
+    bb27 (cleanup): {
+        discriminant((*_30)) = 2;
+        resume;
+    }
+
+    bb28: {
+        _11 = move _2;
+        _2 = move _11;
+        goto -> bb4;
+    }
+
+    bb29: {
+        _21 = move _2;
+        _2 = move _21;
+        goto -> bb13;
+    }
+
+    bb30: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb30, unwind continue];
+    }
+
+    bb31: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb31, unwind continue];
+    }
+}
+
+alloc1 (size: 6, align: 1) {
+    63 68 61 72 67 65                               │ charge
+}
+
+fn __autumn_workflow_info_wf_lazylock_deref() -> u8 {
+    let mut _0: u8;
+
+    bb0: {
+        _0 = const 0_u8;
+        return;
+    }
+}
+
+fn wf_lazylock_deref(_1: &WorkflowContext) -> {async fn body of wf_lazylock_deref()} {
+    debug ctx => _1;
+    let mut _0: {async fn body of wf_lazylock_deref()};
+
+    bb0: {
+        _0 = {coroutine@format_and_outparams.rs:271:78: 274:2 (#0)} { ctx: copy _1 };
+        return;
+    }
+}
+
+fn wf_lazylock_deref::{closure#0}(_1: Pin<&mut {async fn body of wf_lazylock_deref()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    debug _task_context => _2;
+    debug ctx => ((*_11).0: &WorkflowContext);
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let _3: &WorkflowContext;
+    let mut _5: &u64;
+    let mut _6: &std::sync::LazyLock<u64>;
+    let mut _7: std::string::String;
+    let mut _8: &str;
+    let mut _9: std::result::Result<u64, std::string::String>;
+    let mut _10: u32;
+    let mut _11: &mut {async fn body of wf_lazylock_deref()};
+    scope 1 {
+        debug ctx => _3;
+        let _4: u64;
+        scope 2 {
+            debug start => _4;
+        }
+    }
+
+    bb0: {
+        _11 = copy (_1.0: &mut {async fn body of wf_lazylock_deref()});
+        _10 = discriminant((*_11));
+        switchInt(move _10) -> [0: bb1, 1: bb7, 2: bb6, otherwise: bb8];
+    }
+
+    bb1: {
+        _3 = copy ((*_11).0: &WorkflowContext);
+        _6 = const {alloc5: &LazyLock<u64>};
+        _5 = <LazyLock<u64> as Deref>::deref(move _6) -> [return: bb2, unwind: bb5];
+    }
+
+    bb2: {
+        _4 = copy (*_5);
+        _8 = const "charge";
+        _7 = <str as ToString>::to_string(move _8) -> [return: bb3, unwind: bb5];
+    }
+
+    bb3: {
+        _9 = WorkflowContext::execute_activity_raw(copy _3, move _7, copy _4) -> [return: bb4, unwind: bb5];
+    }
+
+    bb4: {
+        _0 = Poll::<Result<u64, String>>::Ready(move _9);
+        discriminant((*_11)) = 1;
+        return;
+    }
+
+    bb5 (cleanup): {
+        discriminant((*_11)) = 2;
+        resume;
+    }
+
+    bb6: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb6, unwind continue];
+    }
+
+    bb7: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb7, unwind continue];
+    }
+
+    bb8: {
+        unreachable;
+    }
+}
+
+alloc5 (static: LAZY_START, size: 16, align: 8) {
+    ╾───────alloc13───────╼ 03 00 00 00 __ __ __ __ │ ╾──────╼....░░░░
+}
+
+alloc13 (fn: wall_clock_secs)
+
+alloc1 (size: 6, align: 1) {
+    63 68 61 72 67 65                               │ charge
+}
+
+fn __autumn_workflow_info_wf_oncelock_get_or_init() -> u8 {
+    let mut _0: u8;
+
+    bb0: {
+        _0 = const 0_u8;
+        return;
+    }
+}
+
+fn wf_oncelock_get_or_init(_1: &WorkflowContext) -> {async fn body of wf_oncelock_get_or_init()} {
+    debug ctx => _1;
+    let mut _0: {async fn body of wf_oncelock_get_or_init()};
+
+    bb0: {
+        _0 = {coroutine@format_and_outparams.rs:281:84: 284:2 (#0)} { ctx: copy _1 };
+        return;
+    }
+}
+
+fn wf_oncelock_get_or_init::{closure#0}(_1: Pin<&mut {async fn body of wf_oncelock_get_or_init()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    debug _task_context => _2;
+    debug ctx => ((*_12).0: &WorkflowContext);
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let _3: &WorkflowContext;
+    let mut _5: &u64;
+    let mut _6: &std::sync::OnceLock<u64>;
+    let mut _7: {closure@format_and_outparams.rs:282:41: 282:43};
+    let mut _8: std::string::String;
+    let mut _9: &str;
+    let mut _10: std::result::Result<u64, std::string::String>;
+    let mut _11: u32;
+    let mut _12: &mut {async fn body of wf_oncelock_get_or_init()};
+    scope 1 {
+        debug ctx => _3;
+        let _4: u64;
+        scope 2 {
+            debug start => _4;
+        }
+    }
+
+    bb0: {
+        _12 = copy (_1.0: &mut {async fn body of wf_oncelock_get_or_init()});
+        _11 = discriminant((*_12));
+        switchInt(move _11) -> [0: bb1, 1: bb7, 2: bb6, otherwise: bb8];
+    }
+
+    bb1: {
+        _3 = copy ((*_12).0: &WorkflowContext);
+        _6 = const {alloc6: &OnceLock<u64>};
+        _7 = {closure@format_and_outparams.rs:282:41: 282:43};
+        _5 = OnceLock::<u64>::get_or_init::<{closure@format_and_outparams.rs:282:41: 282:43}>(move _6, move _7) -> [return: bb2, unwind: bb5];
+    }
+
+    bb2: {
+        _4 = copy (*_5);
+        _9 = const "charge";
+        _8 = <str as ToString>::to_string(move _9) -> [return: bb3, unwind: bb5];
+    }
+
+    bb3: {
+        _10 = WorkflowContext::execute_activity_raw(copy _3, move _8, copy _4) -> [return: bb4, unwind: bb5];
+    }
+
+    bb4: {
+        _0 = Poll::<Result<u64, String>>::Ready(move _10);
+        discriminant((*_12)) = 1;
+        return;
+    }
+
+    bb5 (cleanup): {
+        discriminant((*_12)) = 2;
+        resume;
+    }
+
+    bb6: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb6, unwind continue];
+    }
+
+    bb7: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb7, unwind continue];
+    }
+
+    bb8: {
+        unreachable;
+    }
+}
+
+alloc6 (static: ONCE_START, size: 16, align: 8) {
+    __ __ __ __ __ __ __ __ 03 00 00 00 __ __ __ __ │ ░░░░░░░░....░░░░
+}
+
+alloc1 (size: 6, align: 1) {
+    63 68 61 72 67 65                               │ charge
+}
+
+fn wf_oncelock_get_or_init::{closure#0}::{closure#0}(_1: {closure@format_and_outparams.rs:282:41: 282:43}) -> u64 {
+    let mut _0: u64;
+
+    bb0: {
+        _0 = wall_clock_secs() -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+fn __autumn_workflow_info_wf_plain_static_is_clean() -> u8 {
+    let mut _0: u8;
+
+    bb0: {
+        _0 = const 0_u8;
+        return;
+    }
+}
+
+fn wf_plain_static_is_clean(_1: &WorkflowContext) -> {async fn body of wf_plain_static_is_clean()} {
+    debug ctx => _1;
+    let mut _0: {async fn body of wf_plain_static_is_clean()};
+
+    bb0: {
+        _0 = {coroutine@format_and_outparams.rs:291:85: 293:2 (#0)} { ctx: copy _1 };
+        return;
+    }
+}
+
+fn wf_plain_static_is_clean::{closure#0}(_1: Pin<&mut {async fn body of wf_plain_static_is_clean()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    debug _task_context => _2;
+    debug ctx => ((*_10).0: &WorkflowContext);
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let _3: &WorkflowContext;
+    let mut _4: std::string::String;
+    let mut _5: &str;
+    let mut _6: u64;
+    let mut _7: &u64;
+    let mut _8: std::result::Result<u64, std::string::String>;
+    let mut _9: u32;
+    let mut _10: &mut {async fn body of wf_plain_static_is_clean()};
+    scope 1 {
+        debug ctx => _3;
+    }
+
+    bb0: {
+        _10 = copy (_1.0: &mut {async fn body of wf_plain_static_is_clean()});
+        _9 = discriminant((*_10));
+        switchInt(move _9) -> [0: bb1, 1: bb6, 2: bb5, otherwise: bb7];
+    }
+
+    bb1: {
+        _3 = copy ((*_10).0: &WorkflowContext);
+        _5 = const "charge";
+        _4 = <str as ToString>::to_string(move _5) -> [return: bb2, unwind: bb4];
+    }
+
+    bb2: {
+        _7 = const {alloc7: &u64};
+        _6 = copy (*_7);
+        _8 = WorkflowContext::execute_activity_raw(copy _3, move _4, move _6) -> [return: bb3, unwind: bb4];
+    }
+
+    bb3: {
+        _0 = Poll::<Result<u64, String>>::Ready(move _8);
+        discriminant((*_10)) = 1;
+        return;
+    }
+
+    bb4 (cleanup): {
+        discriminant((*_10)) = 2;
+        resume;
+    }
+
+    bb5: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb5, unwind continue];
+    }
+
+    bb6: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb6, unwind continue];
+    }
+
+    bb7: {
+        unreachable;
+    }
+}
+
+alloc7 (static: PLAIN_LIMIT, size: 8, align: 8) {
+    07 00 00 00 00 00 00 00                         │ ........
+}
+
+alloc1 (size: 6, align: 1) {
+    63 68 61 72 67 65                               │ charge
+}
+
+fn __autumn_workflow_info_wf_static_mut_raw_read() -> u8 {
+    let mut _0: u8;
+
+    bb0: {
+        _0 = const 0_u8;
+        return;
+    }
+}
+
+fn wf_static_mut_raw_read(_1: &WorkflowContext) -> {async fn body of wf_static_mut_raw_read()} {
+    debug ctx => _1;
+    let mut _0: {async fn body of wf_static_mut_raw_read()};
+
+    bb0: {
+        _0 = {coroutine@format_and_outparams.rs:299:83: 302:2 (#0)} { ctx: copy _1 };
+        return;
+    }
+}
+
+fn wf_static_mut_raw_read::{closure#0}(_1: Pin<&mut {async fn body of wf_static_mut_raw_read()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    debug _task_context => _2;
+    debug ctx => ((*_11).0: &WorkflowContext);
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let _3: &WorkflowContext;
+    let mut _5: *const u64;
+    let _6: *mut u64;
+    let mut _7: std::string::String;
+    let mut _8: &str;
+    let mut _9: std::result::Result<u64, std::string::String>;
+    let mut _10: u32;
+    let mut _11: &mut {async fn body of wf_static_mut_raw_read()};
+    scope 1 {
+        debug ctx => _3;
+        let _4: u64;
+        let mut _12: *const ();
+        let mut _13: usize;
+        let mut _14: usize;
+        let mut _15: usize;
+        let mut _16: bool;
+        let mut _17: *const ();
+        let mut _18: usize;
+        let mut _19: bool;
+        let mut _20: bool;
+        let mut _21: bool;
+        let mut _22: bool;
+        scope 2 {
+            debug n => _4;
+        }
+    }
+
+    bb0: {
+        _11 = copy (_1.0: &mut {async fn body of wf_static_mut_raw_read()});
+        _10 = discriminant((*_11));
+        switchInt(move _10) -> [0: bb1, 1: bb6, 2: bb5, otherwise: bb7];
+    }
+
+    bb1: {
+        _3 = copy ((*_11).0: &WorkflowContext);
+        _6 = const {alloc8: *mut u64};
+        _5 = &raw const (*_6);
+        _12 = copy _5 as *const () (PtrToPtr);
+        _13 = copy _12 as usize (Transmute);
+        _14 = Sub(const <u64 as std::mem::SizedTypeProperties>::ALIGN, const 1_usize);
+        _15 = BitAnd(copy _13, copy _14);
+        _16 = Eq(copy _15, const 0_usize);
+        assert(copy _16, "misaligned pointer dereference: address must be a multiple of {} but is {}", const <u64 as std::mem::SizedTypeProperties>::ALIGN, copy _13) -> [success: bb8, unwind unreachable];
+    }
+
+    bb2: {
+        _9 = WorkflowContext::execute_activity_raw(copy _3, move _7, copy _4) -> [return: bb3, unwind: bb4];
+    }
+
+    bb3: {
+        _0 = Poll::<Result<u64, String>>::Ready(move _9);
+        discriminant((*_11)) = 1;
+        return;
+    }
+
+    bb4 (cleanup): {
+        discriminant((*_11)) = 2;
+        resume;
+    }
+
+    bb5: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb5, unwind continue];
+    }
+
+    bb6: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb6, unwind continue];
+    }
+
+    bb7: {
+        unreachable;
+    }
+
+    bb8: {
+        _17 = copy _5 as *const () (PtrToPtr);
+        _18 = copy _17 as usize (Transmute);
+        _19 = Ne(const <u64 as std::mem::SizedTypeProperties>::SIZE, const 0_usize);
+        _20 = Eq(copy _18, const 0_usize);
+        _21 = BitAnd(copy _20, copy _19);
+        _22 = Not(copy _21);
+        assert(copy _22, "null pointer dereference occurred") -> [success: bb9, unwind unreachable];
+    }
+
+    bb9: {
+        _4 = copy (*_5);
+        _8 = const "charge";
+        _7 = <str as ToString>::to_string(move _8) -> [return: bb2, unwind: bb4];
+    }
+}
+
+alloc8 (static: RAW_COUNTER, size: 8, align: 8) {
+    00 00 00 00 00 00 00 00                         │ ........
+}
+
+alloc1 (size: 6, align: 1) {
+    63 68 61 72 67 65                               │ charge
+}
+
+fn __autumn_workflow_info_wf_ffi_clock() -> u8 {
+    let mut _0: u8;
+
+    bb0: {
+        _0 = const 0_u8;
+        return;
+    }
+}
+
+fn wf_ffi_clock(_1: &WorkflowContext) -> {async fn body of wf_ffi_clock()} {
+    debug ctx => _1;
+    let mut _0: {async fn body of wf_ffi_clock()};
+
+    bb0: {
+        _0 = {coroutine@format_and_outparams.rs:308:73: 316:2 (#0)} { ctx: copy _1 };
+        return;
+    }
+}
+
+fn wf_ffi_clock::{closure#0}(_1: Pin<&mut {async fn body of wf_ffi_clock()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    debug _task_context => _2;
+    debug ctx => ((*_13).0: &WorkflowContext);
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let _3: &WorkflowContext;
+    let mut _6: *mut Timespec;
+    let mut _7: std::string::String;
+    let mut _8: &str;
+    let mut _9: u64;
+    let mut _10: i64;
+    let mut _11: std::result::Result<u64, std::string::String>;
+    let mut _12: u32;
+    let mut _13: &mut {async fn body of wf_ffi_clock()};
+    scope 1 {
+        debug ctx => _3;
+        let mut _4: Timespec;
+        scope 2 {
+            debug ts => _4;
+            let _5: i32;
+            scope 3 {
+                debug rc => _5;
+                scope 4 {
+                }
+            }
+        }
+    }
+
+    bb0: {
+        _13 = copy (_1.0: &mut {async fn body of wf_ffi_clock()});
+        _12 = discriminant((*_13));
+        switchInt(move _12) -> [0: bb1, 1: bb7, 2: bb6, otherwise: bb8];
+    }
+
+    bb1: {
+        _3 = copy ((*_13).0: &WorkflowContext);
+        _4 = Timespec { tv_sec: const 0_i64, tv_nsec: const 0_i64 };
+        _6 = &raw mut _4;
+        _5 = clock_gettime(const 0_i32, move _6) -> [return: bb2, unwind unreachable];
+    }
+
+    bb2: {
+        _8 = const "charge";
+        _7 = <str as ToString>::to_string(move _8) -> [return: bb3, unwind: bb5];
+    }
+
+    bb3: {
+        _10 = copy (_4.0: i64);
+        _9 = move _10 as u64 (IntToInt);
+        _11 = WorkflowContext::execute_activity_raw(copy _3, move _7, move _9) -> [return: bb4, unwind: bb5];
+    }
+
+    bb4: {
+        _0 = Poll::<Result<u64, String>>::Ready(move _11);
+        discriminant((*_13)) = 1;
+        return;
+    }
+
+    bb5 (cleanup): {
+        discriminant((*_13)) = 2;
+        resume;
+    }
+
+    bb6: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb6, unwind continue];
+    }
+
+    bb7: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb7, unwind continue];
+    }
+
+    bb8: {
+        unreachable;
+    }
+}
+
+alloc1 (size: 6, align: 1) {
+    63 68 61 72 67 65                               │ charge
+}
+
+fn __autumn_workflow_info_wf_fn_pointer() -> u8 {
+    let mut _0: u8;
+
+    bb0: {
+        _0 = const 0_u8;
+        return;
+    }
+}
+
+fn wf_fn_pointer(_1: &WorkflowContext, _2: bool) -> {async fn body of wf_fn_pointer()} {
+    debug ctx => _1;
+    debug sel => _2;
+    let mut _0: {async fn body of wf_fn_pointer()};
+
+    bb0: {
+        _0 = {coroutine@format_and_outparams.rs:322:85: 325:2 (#0)} { ctx: copy _1, sel: copy _2 };
+        return;
+    }
+}
+
+fn wf_fn_pointer::{closure#0}(_1: Pin<&mut {async fn body of wf_fn_pointer()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    debug _task_context => _2;
+    debug ctx => ((*_12).0: &WorkflowContext);
+    debug sel => ((*_12).1: bool);
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let _3: &WorkflowContext;
+    let mut _6: std::string::String;
+    let mut _7: &str;
+    let mut _8: u64;
+    let mut _9: bool;
+    let mut _10: std::result::Result<u64, std::string::String>;
+    let mut _11: u32;
+    let mut _12: &mut {async fn body of wf_fn_pointer()};
+    scope 1 {
+        debug ctx => _3;
+        let _4: bool;
+        scope 2 {
+            debug sel => _4;
+            let _5: fn() -> u64;
+            scope 3 {
+                debug f => _5;
+            }
+        }
+    }
+
+    bb0: {
+        _12 = copy (_1.0: &mut {async fn body of wf_fn_pointer()});
+        _11 = discriminant((*_12));
+        switchInt(move _11) -> [0: bb1, 1: bb11, 2: bb10, otherwise: bb12];
+    }
+
+    bb1: {
+        _9 = const false;
+        _3 = copy ((*_12).0: &WorkflowContext);
+        _4 = copy ((*_12).1: bool);
+        _5 = pick_source(copy _4) -> [return: bb2, unwind: bb8];
+    }
+
+    bb2: {
+        _7 = const "charge";
+        _6 = <str as ToString>::to_string(move _7) -> [return: bb3, unwind: bb7];
+    }
+
+    bb3: {
+        _9 = const true;
+        _8 = copy _5() -> [return: bb4, unwind: bb6];
+    }
+
+    bb4: {
+        _9 = const false;
+        _10 = WorkflowContext::execute_activity_raw(copy _3, move _6, move _8) -> [return: bb5, unwind: bb6];
+    }
+
+    bb5: {
+        _9 = const false;
+        _0 = Poll::<Result<u64, String>>::Ready(move _10);
+        discriminant((*_12)) = 1;
+        return;
+    }
+
+    bb6 (cleanup): {
+        switchInt(copy _9) -> [0: bb7, otherwise: bb9];
+    }
+
+    bb7 (cleanup): {
+        _9 = const false;
+        goto -> bb8;
+    }
+
+    bb8 (cleanup): {
+        discriminant((*_12)) = 2;
+        resume;
+    }
+
+    bb9 (cleanup): {
+        drop(_6) -> [return: bb7, unwind terminate(cleanup)];
+    }
+
+    bb10: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb10, unwind continue];
+    }
+
+    bb11: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb11, unwind continue];
+    }
+
+    bb12: {
+        unreachable;
+    }
+}
+
+alloc1 (size: 6, align: 1) {
+    63 68 61 72 67 65                               │ charge
+}
+
+fn __autumn_workflow_info_wf_dyn_two_impls() -> u8 {
+    let mut _0: u8;
+
+    bb0: {
+        _0 = const 0_u8;
+        return;
+    }
+}
+
+fn wf_dyn_two_impls(_1: &WorkflowContext, _2: bool) -> {async fn body of wf_dyn_two_impls()} {
+    debug ctx => _1;
+    debug sel => _2;
+    let mut _0: {async fn body of wf_dyn_two_impls()};
+
+    bb0: {
+        _0 = {coroutine@format_and_outparams.rs:331:88: 338:2 (#0)} { ctx: copy _1, sel: copy _2 };
+        return;
+    }
+}
+
+fn wf_dyn_two_impls::{closure#0}(_1: Pin<&mut {async fn body of wf_dyn_two_impls()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    debug _task_context => _2;
+    debug ctx => ((*_17).0: &WorkflowContext);
+    debug sel => ((*_17).1: bool);
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let _3: &WorkflowContext;
+    let mut _6: std::boxed::Box<dyn Namer>;
+    let mut _7: std::boxed::Box<dyn Namer>;
+    let mut _8: std::boxed::Box<StaticNamer>;
+    let mut _9: StaticNamer;
+    let mut _10: std::boxed::Box<CountingNamer>;
+    let mut _11: CountingNamer;
+    let mut _12: std::string::String;
+    let mut _13: &dyn Namer;
+    let mut _14: *const dyn Namer;
+    let mut _15: std::result::Result<u64, std::string::String>;
+    let mut _16: u32;
+    let mut _17: &mut {async fn body of wf_dyn_two_impls()};
+    scope 1 {
+        debug ctx => _3;
+        let _4: bool;
+        scope 2 {
+            debug sel => _4;
+            let _5: std::boxed::Box<dyn Namer>;
+            scope 3 {
+                debug n => _5;
+            }
+        }
+    }
+
+    bb0: {
+        _17 = copy (_1.0: &mut {async fn body of wf_dyn_two_impls()});
+        _16 = discriminant((*_17));
+        switchInt(move _16) -> [0: bb1, 1: bb13, 2: bb12, otherwise: bb14];
+    }
+
+    bb1: {
+        _3 = copy ((*_17).0: &WorkflowContext);
+        _4 = copy ((*_17).1: bool);
+        switchInt(copy _4) -> [0: bb4, otherwise: bb2];
+    }
+
+    bb2: {
+        _9 = StaticNamer;
+        _8 = Box::<StaticNamer>::new(move _9) -> [return: bb3, unwind: bb11];
+    }
+
+    bb3: {
+        _7 = move _8 as std::boxed::Box<dyn Namer> (PointerCoercion(Unsize, Implicit));
+        _6 = move _7;
+        goto -> bb6;
+    }
+
+    bb4: {
+        _11 = CountingNamer;
+        _10 = Box::<CountingNamer>::new(move _11) -> [return: bb5, unwind: bb11];
+    }
+
+    bb5: {
+        _6 = move _10 as std::boxed::Box<dyn Namer> (PointerCoercion(Unsize, Implicit));
+        goto -> bb6;
+    }
+
+    bb6: {
+        _5 = move _6;
+        _14 = copy ((_5.0: std::ptr::Unique<dyn Namer>).0: std::ptr::NonNull<dyn Namer>) as *const dyn Namer (Transmute);
+        _13 = &(*_14);
+        _12 = <dyn Namer as Namer>::name(move _13) -> [return: bb7, unwind: bb10];
+    }
+
+    bb7: {
+        _15 = WorkflowContext::execute_activity_raw(copy _3, move _12, const 0_u64) -> [return: bb8, unwind: bb10];
+    }
+
+    bb8: {
+        drop(_5) -> [return: bb9, unwind: bb11];
+    }
+
+    bb9: {
+        _0 = Poll::<Result<u64, String>>::Ready(move _15);
+        discriminant((*_17)) = 1;
+        return;
+    }
+
+    bb10 (cleanup): {
+        drop(_5) -> [return: bb11, unwind terminate(cleanup)];
+    }
+
+    bb11 (cleanup): {
+        discriminant((*_17)) = 2;
+        resume;
+    }
+
+    bb12: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb12, unwind continue];
+    }
+
+    bb13: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb13, unwind continue];
+    }
+
+    bb14: {
+        unreachable;
+    }
+}
+
+fn __autumn_workflow_info_wf_dyn_single_impl() -> u8 {
+    let mut _0: u8;
+
+    bb0: {
+        _0 = const 0_u8;
+        return;
+    }
+}
+
+fn wf_dyn_single_impl(_1: &WorkflowContext) -> {async fn body of wf_dyn_single_impl()} {
+    debug ctx => _1;
+    let mut _0: {async fn body of wf_dyn_single_impl()};
+
+    bb0: {
+        _0 = {coroutine@format_and_outparams.rs:345:79: 348:2 (#0)} { ctx: copy _1 };
+        return;
+    }
+}
+
+fn wf_dyn_single_impl::{closure#0}(_1: Pin<&mut {async fn body of wf_dyn_single_impl()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    debug _task_context => _2;
+    debug ctx => ((*_15).0: &WorkflowContext);
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let _3: &WorkflowContext;
+    let mut _5: std::boxed::Box<SystemClock>;
+    let mut _6: SystemClock;
+    let mut _7: std::string::String;
+    let mut _8: &str;
+    let mut _9: u64;
+    let mut _10: &dyn Clock;
+    let mut _11: bool;
+    let mut _12: *const dyn Clock;
+    let mut _13: std::result::Result<u64, std::string::String>;
+    let mut _14: u32;
+    let mut _15: &mut {async fn body of wf_dyn_single_impl()};
+    scope 1 {
+        debug ctx => _3;
+        let _4: std::boxed::Box<dyn Clock>;
+        scope 2 {
+            debug c => _4;
+        }
+    }
+
+    bb0: {
+        _15 = copy (_1.0: &mut {async fn body of wf_dyn_single_impl()});
+        _14 = discriminant((*_15));
+        switchInt(move _14) -> [0: bb1, 1: bb12, 2: bb11, otherwise: bb13];
+    }
+
+    bb1: {
+        _11 = const false;
+        _3 = copy ((*_15).0: &WorkflowContext);
+        _6 = SystemClock;
+        _5 = Box::<SystemClock>::new(move _6) -> [return: bb2, unwind: bb9];
+    }
+
+    bb2: {
+        _4 = move _5 as std::boxed::Box<dyn Clock> (PointerCoercion(Unsize, Implicit));
+        _8 = const "charge";
+        _7 = <str as ToString>::to_string(move _8) -> [return: bb3, unwind: bb8];
+    }
+
+    bb3: {
+        _11 = const true;
+        _12 = copy ((_4.0: std::ptr::Unique<dyn Clock>).0: std::ptr::NonNull<dyn Clock>) as *const dyn Clock (Transmute);
+        _10 = &(*_12);
+        _9 = <dyn Clock as Clock>::now_secs(move _10) -> [return: bb4, unwind: bb7];
+    }
+
+    bb4: {
+        _11 = const false;
+        _13 = WorkflowContext::execute_activity_raw(copy _3, move _7, move _9) -> [return: bb5, unwind: bb7];
+    }
+
+    bb5: {
+        _11 = const false;
+        drop(_4) -> [return: bb6, unwind: bb9];
+    }
+
+    bb6: {
+        _0 = Poll::<Result<u64, String>>::Ready(move _13);
+        discriminant((*_15)) = 1;
+        return;
+    }
+
+    bb7 (cleanup): {
+        switchInt(copy _11) -> [0: bb8, otherwise: bb10];
+    }
+
+    bb8 (cleanup): {
+        _11 = const false;
+        drop(_4) -> [return: bb9, unwind terminate(cleanup)];
+    }
+
+    bb9 (cleanup): {
+        discriminant((*_15)) = 2;
+        resume;
+    }
+
+    bb10 (cleanup): {
+        drop(_7) -> [return: bb8, unwind terminate(cleanup)];
+    }
+
+    bb11: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb11, unwind continue];
+    }
+
+    bb12: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb12, unwind continue];
+    }
+
+    bb13: {
+        unreachable;
+    }
+}
+
+alloc1 (size: 6, align: 1) {
+    63 68 61 72 67 65                               │ charge
+}
+
+fn __autumn_workflow_info_wf_option_map_closure() -> u8 {
+    let mut _0: u8;
+
+    bb0: {
+        _0 = const 0_u8;
+        return;
+    }
+}
+
+fn wf_option_map_closure(_1: &WorkflowContext, _2: Option<u64>) -> {async fn body of wf_option_map_closure()} {
+    debug ctx => _1;
+    debug o => _2;
+    let mut _0: {async fn body of wf_option_map_closure()};
+
+    bb0: {
+        _0 = {coroutine@format_and_outparams.rs:358:26: 363:2 (#0)} { ctx: copy _1, o: copy _2 };
+        return;
+    }
+}
+
+fn wf_option_map_closure::{closure#0}(_1: Pin<&mut {async fn body of wf_option_map_closure()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    debug _task_context => _2;
+    debug ctx => ((*_12).0: &WorkflowContext);
+    debug o => ((*_12).1: std::option::Option<u64>);
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let _3: &WorkflowContext;
+    let mut _6: std::option::Option<u64>;
+    let mut _7: {closure@format_and_outparams.rs:360:14: 360:17};
+    let mut _8: std::string::String;
+    let mut _9: &str;
+    let mut _10: std::result::Result<u64, std::string::String>;
+    let mut _11: u32;
+    let mut _12: &mut {async fn body of wf_option_map_closure()};
+    scope 1 {
+        debug ctx => _3;
+        let _4: std::option::Option<u64>;
+        scope 2 {
+            debug o => _4;
+            let _5: u64;
+            scope 3 {
+                debug v => _5;
+            }
+        }
+    }
+
+    bb0: {
+        _12 = copy (_1.0: &mut {async fn body of wf_option_map_closure()});
+        _11 = discriminant((*_12));
+        switchInt(move _11) -> [0: bb1, 1: bb8, 2: bb7, otherwise: bb9];
+    }
+
+    bb1: {
+        _3 = copy ((*_12).0: &WorkflowContext);
+        _4 = copy ((*_12).1: std::option::Option<u64>);
+        _7 = {closure@format_and_outparams.rs:360:14: 360:17};
+        _6 = Option::<u64>::map::<u64, {closure@format_and_outparams.rs:360:14: 360:17}>(copy _4, move _7) -> [return: bb2, unwind: bb6];
+    }
+
+    bb2: {
+        _5 = Option::<u64>::unwrap_or_default(move _6) -> [return: bb3, unwind: bb6];
+    }
+
+    bb3: {
+        _9 = const "charge";
+        _8 = <str as ToString>::to_string(move _9) -> [return: bb4, unwind: bb6];
+    }
+
+    bb4: {
+        _10 = WorkflowContext::execute_activity_raw(copy _3, move _8, copy _5) -> [return: bb5, unwind: bb6];
+    }
+
+    bb5: {
+        _0 = Poll::<Result<u64, String>>::Ready(move _10);
+        discriminant((*_12)) = 1;
+        return;
+    }
+
+    bb6 (cleanup): {
+        discriminant((*_12)) = 2;
+        resume;
+    }
+
+    bb7: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb7, unwind continue];
+    }
+
+    bb8: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb8, unwind continue];
+    }
+
+    bb9: {
+        unreachable;
+    }
+}
+
+alloc1 (size: 6, align: 1) {
+    63 68 61 72 67 65                               │ charge
+}
+
+fn wf_option_map_closure::{closure#0}::{closure#0}(_1: {closure@format_and_outparams.rs:360:14: 360:17}, _2: u64) -> u64 {
+    debug x => _2;
+    let mut _0: u64;
+    let mut _3: u64;
+    let mut _4: &std::sync::atomic::AtomicU64;
+    let mut _5: std::sync::atomic::Ordering;
+    let mut _6: (u64, bool);
+
+    bb0: {
+        _4 = const {alloc9: &AtomicU64};
+        _5 = std::sync::atomic::Ordering::SeqCst;
+        _3 = AtomicU64::load(move _4, move _5) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        _6 = AddWithOverflow(copy _2, copy _3);
+        assert(!move (_6.1: bool), "attempt to compute `{} + {}`, which would overflow", copy _2, move _3) -> [success: bb2, unwind continue];
+    }
+
+    bb2: {
+        _0 = move (_6.0: u64);
+        return;
+    }
+}
+
+alloc9 (static: COUNTER, size: 8, align: 8) {
+    00 00 00 00 00 00 00 00                         │ ........
+}
+
+fn __autumn_workflow_info_wf_sort_by_ambient_comparator() -> u8 {
+    let mut _0: u8;
+
+    bb0: {
+        _0 = const 0_u8;
+        return;
+    }
+}
+
+fn wf_sort_by_ambient_comparator(_1: &WorkflowContext, _2: Vec<u64>) -> {async fn body of wf_sort_by_ambient_comparator()} {
+    debug ctx => _1;
+    debug xs => _2;
+    let mut _0: {async fn body of wf_sort_by_ambient_comparator()};
+
+    bb0: {
+        _0 = {coroutine@format_and_outparams.rs:373:26: 383:2 (#0)} { ctx: copy _1, xs: move _2 };
+        return;
+    }
+}
+
+fn wf_sort_by_ambient_comparator::{closure#0}(_1: Pin<&mut {async fn body of wf_sort_by_ambient_comparator()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    debug _task_context => _2;
+    debug ctx => ((*_29).0: &WorkflowContext);
+    debug xs => ((*_29).1: std::vec::Vec<u64>);
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let _3: &WorkflowContext;
+    let _5: ();
+    let mut _6: &mut [u64];
+    let mut _7: &mut std::vec::Vec<u64>;
+    let mut _8: {closure@format_and_outparams.rs:374:16: 374:22};
+    let mut _10: std::vec::IntoIter<u64>;
+    let mut _11: std::vec::Vec<u64>;
+    let mut _13: std::option::Option<u64>;
+    let mut _14: &mut std::vec::IntoIter<u64>;
+    let mut _15: isize;
+    let mut _17: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, std::string::String>, u64>;
+    let mut _18: std::result::Result<u64, std::string::String>;
+    let mut _19: std::string::String;
+    let mut _20: &str;
+    let mut _21: isize;
+    let mut _24: (u64, bool);
+    let mut _25: u64;
+    let mut _26: bool;
+    let mut _27: std::result::Result<u64, std::string::String>;
+    let mut _28: u32;
+    let mut _29: &mut {async fn body of wf_sort_by_ambient_comparator()};
+    scope 1 {
+        debug ctx => _3;
+        let mut _4: std::vec::Vec<u64>;
+        scope 2 {
+            debug xs => _4;
+            let mut _9: u64;
+            scope 3 {
+                debug total => _9;
+                let mut _12: std::vec::IntoIter<u64>;
+                scope 4 {
+                    debug iter => _12;
+                    let _16: u64;
+                    scope 5 {
+                        debug x => _16;
+                        let _22: std::result::Result<std::convert::Infallible, std::string::String>;
+                        let _23: u64;
+                        scope 6 {
+                            debug residual => _22;
+                            scope 7 {
+                            }
+                        }
+                        scope 8 {
+                            debug val => _23;
+                            scope 9 {
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    bb0: {
+        _29 = copy (_1.0: &mut {async fn body of wf_sort_by_ambient_comparator()});
+        _28 = discriminant((*_29));
+        switchInt(move _28) -> [0: bb1, 1: bb25, 2: bb24, otherwise: bb7];
+    }
+
+    bb1: {
+        _26 = const false;
+        _3 = copy ((*_29).0: &WorkflowContext);
+        _26 = const true;
+        _4 = move ((*_29).1: std::vec::Vec<u64>);
+        _7 = &mut _4;
+        _6 = <Vec<u64> as DerefMut>::deref_mut(move _7) -> [return: bb2, unwind: bb23];
+    }
+
+    bb2: {
+        _8 = {closure@format_and_outparams.rs:374:16: 374:22};
+        _5 = slice::<impl [u64]>::sort_by::<{closure@format_and_outparams.rs:374:16: 374:22}>(copy _6, move _8) -> [return: bb3, unwind: bb23];
+    }
+
+    bb3: {
+        _9 = const 0_u64;
+        _26 = const false;
+        _11 = move _4;
+        _10 = <Vec<u64> as IntoIterator>::into_iter(move _11) -> [return: bb4, unwind: bb23];
+    }
+
+    bb4: {
+        _12 = move _10;
+        goto -> bb5;
+    }
+
+    bb5: {
+        _14 = &mut _12;
+        _13 = <std::vec::IntoIter<u64> as Iterator>::next(copy _14) -> [return: bb6, unwind: bb20];
+    }
+
+    bb6: {
+        _15 = discriminant(_13);
+        switchInt(move _15) -> [0: bb9, 1: bb8, otherwise: bb7];
+    }
+
+    bb7: {
+        unreachable;
+    }
+
+    bb8: {
+        _16 = copy ((_13 as Some).0: u64);
+        _20 = const "charge";
+        _19 = <str as ToString>::to_string(move _20) -> [return: bb10, unwind: bb20];
+    }
+
+    bb9: {
+        drop(_12) -> [return: bb17, unwind: bb23];
+    }
+
+    bb10: {
+        _18 = WorkflowContext::execute_activity_raw(copy _3, move _19, copy _16) -> [return: bb11, unwind: bb20];
+    }
+
+    bb11: {
+        _17 = <Result<u64, String> as Try>::branch(move _18) -> [return: bb12, unwind: bb20];
+    }
+
+    bb12: {
+        _21 = discriminant(_17);
+        switchInt(move _21) -> [0: bb13, 1: bb14, otherwise: bb7];
+    }
+
+    bb13: {
+        _23 = copy ((_17 as Continue).0: u64);
+        _24 = AddWithOverflow(copy _9, copy _23);
+        assert(!move (_24.1: bool), "attempt to compute `{} + {}`, which would overflow", copy _9, copy _23) -> [success: bb16, unwind: bb20];
+    }
+
+    bb14: {
+        _22 = move ((_17 as Break).0: std::result::Result<std::convert::Infallible, std::string::String>);
+        _27 = <Result<u64, String> as FromResidual<Result<Infallible, String>>>::from_residual(copy _22) -> [return: bb15, unwind: bb20];
+    }
+
+    bb15: {
+        drop(_12) -> [return: bb18, unwind: bb23];
+    }
+
+    bb16: {
+        _9 = move (_24.0: u64);
+        goto -> bb5;
+    }
+
+    bb17: {
+        _25 = copy _9;
+        _27 = Result::<u64, String>::Ok(move _25);
+        _26 = const false;
+        goto -> bb19;
+    }
+
+    bb18: {
+        _26 = const false;
+        goto -> bb19;
+    }
+
+    bb19: {
+        _0 = Poll::<Result<u64, String>>::Ready(move _27);
+        discriminant((*_29)) = 1;
+        return;
+    }
+
+    bb20 (cleanup): {
+        drop(_12) -> [return: bb23, unwind terminate(cleanup)];
+    }
+
+    bb21 (cleanup): {
+        _26 = const false;
+        discriminant((*_29)) = 2;
+        resume;
+    }
+
+    bb22 (cleanup): {
+        drop(_4) -> [return: bb21, unwind terminate(cleanup)];
+    }
+
+    bb23 (cleanup): {
+        switchInt(copy _26) -> [0: bb21, otherwise: bb22];
+    }
+
+    bb24: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb24, unwind continue];
+    }
+
+    bb25: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb25, unwind continue];
+    }
+}
+
+alloc1 (size: 6, align: 1) {
+    63 68 61 72 67 65                               │ charge
+}
+
+fn wf_sort_by_ambient_comparator::{closure#0}::{closure#0}(_1: &mut {closure@format_and_outparams.rs:374:16: 374:22}, _2: &u64, _3: &u64) -> std::cmp::Ordering {
+    debug a => _2;
+    debug b => _3;
+    let mut _0: std::cmp::Ordering;
+    let _4: u64;
+    let mut _5: &std::sync::atomic::AtomicU64;
+    let mut _6: std::sync::atomic::Ordering;
+    let mut _7: &u64;
+    let _8: u64;
+    let _9: &u64;
+    let _10: u64;
+    scope 1 {
+        debug skew => _4;
+    }
+
+    bb0: {
+        _5 = const {alloc9: &AtomicU64};
+        _6 = std::sync::atomic::Ordering::SeqCst;
+        _4 = AtomicU64::load(move _5, move _6) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        _8 = <&u64 as BitXor<u64>>::bitxor(copy _2, copy _4) -> [return: bb2, unwind continue];
+    }
+
+    bb2: {
+        _7 = &_8;
+        _10 = <&u64 as BitXor<u64>>::bitxor(copy _3, copy _4) -> [return: bb3, unwind continue];
+    }
+
+    bb3: {
+        _9 = &_10;
+        _0 = <u64 as Ord>::cmp(move _7, copy _9) -> [return: bb4, unwind continue];
+    }
+
+    bb4: {
+        return;
+    }
+}
+
+alloc9 (static: COUNTER, size: 8, align: 8) {
+    00 00 00 00 00 00 00 00                         │ ........
+}
+
+fn __autumn_workflow_info_wf_thread_local_counter() -> u8 {
+    let mut _0: u8;
+
+    bb0: {
+        _0 = const 0_u8;
+        return;
+    }
+}
+
+fn wf_thread_local_counter(_1: &WorkflowContext) -> {async fn body of wf_thread_local_counter()} {
+    debug ctx => _1;
+    let mut _0: {async fn body of wf_thread_local_counter()};
+
+    bb0: {
+        _0 = {coroutine@format_and_outparams.rs:390:84: 393:2 (#0)} { ctx: copy _1 };
+        return;
+    }
+}
+
+fn wf_thread_local_counter::{closure#0}(_1: Pin<&mut {async fn body of wf_thread_local_counter()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    debug _task_context => _2;
+    debug ctx => ((*_11).0: &WorkflowContext);
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let _3: &WorkflowContext;
+    let mut _5: &std::thread::LocalKey<std::cell::RefCell<u64>>;
+    let mut _6: {closure@format_and_outparams.rs:391:27: 391:30};
+    let mut _7: std::string::String;
+    let mut _8: &str;
+    let mut _9: std::result::Result<u64, std::string::String>;
+    let mut _10: u32;
+    let mut _11: &mut {async fn body of wf_thread_local_counter()};
+    scope 1 {
+        debug ctx => _3;
+        let _4: u64;
+        scope 2 {
+            debug seq => _4;
+        }
+    }
+
+    bb0: {
+        _11 = copy (_1.0: &mut {async fn body of wf_thread_local_counter()});
+        _10 = discriminant((*_11));
+        switchInt(move _10) -> [0: bb1, 1: bb7, 2: bb6, otherwise: bb8];
+    }
+
+    bb1: {
+        _3 = copy ((*_11).0: &WorkflowContext);
+        _5 = const wf_thread_local_counter::{closure#0}::promoted[0];
+        _6 = {closure@format_and_outparams.rs:391:27: 391:30};
+        _4 = LocalKey::<RefCell<u64>>::with::<{closure@format_and_outparams.rs:391:27: 391:30}, u64>(move _5, move _6) -> [return: bb2, unwind: bb5];
+    }
+
+    bb2: {
+        _8 = const "charge";
+        _7 = <str as ToString>::to_string(move _8) -> [return: bb3, unwind: bb5];
+    }
+
+    bb3: {
+        _9 = WorkflowContext::execute_activity_raw(copy _3, move _7, copy _4) -> [return: bb4, unwind: bb5];
+    }
+
+    bb4: {
+        _0 = Poll::<Result<u64, String>>::Ready(move _9);
+        discriminant((*_11)) = 1;
+        return;
+    }
+
+    bb5 (cleanup): {
+        discriminant((*_11)) = 2;
+        resume;
+    }
+
+    bb6: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb6, unwind continue];
+    }
+
+    bb7: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb7, unwind continue];
+    }
+
+    bb8: {
+        unreachable;
+    }
+}
+
+alloc1 (size: 6, align: 1) {
+    63 68 61 72 67 65                               │ charge
+}
+
+const wf_thread_local_counter::{closure#0}::promoted[0]: &LocalKey<RefCell<u64>> = {
+    let mut _0: &std::thread::LocalKey<std::cell::RefCell<u64>>;
+    let mut _1: std::thread::LocalKey<std::cell::RefCell<u64>>;
+
+    bb0: {
+        _1 = const TL_SEQ;
+        _0 = &_1;
+        return;
+    }
+}
+
+fn wf_thread_local_counter::{closure#0}::{closure#0}(_1: {closure@format_and_outparams.rs:391:27: 391:30}, _2: &RefCell<u64>) -> u64 {
+    debug c => _2;
+    let mut _0: u64;
+    let mut _3: &u64;
+    let mut _4: &std::cell::Ref<'_, u64>;
+    let _5: std::cell::Ref<'_, u64>;
+
+    bb0: {
+        _5 = RefCell::<u64>::borrow(copy _2) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        _4 = &_5;
+        _3 = <Ref<'_, u64> as Deref>::deref(move _4) -> [return: bb2, unwind: bb4];
+    }
+
+    bb2: {
+        _0 = copy (*_3);
+        drop(_5) -> [return: bb3, unwind continue];
+    }
+
+    bb3: {
+        return;
+    }
+
+    bb4 (cleanup): {
+        drop(_5) -> [return: bb5, unwind terminate(cleanup)];
+    }
+
+    bb5 (cleanup): {
+        resume;
+    }
+}
+
+fn __autumn_workflow_info_wf_observability_is_clean() -> u8 {
+    let mut _0: u8;
+
+    bb0: {
+        _0 = const 0_u8;
+        return;
+    }
+}
+
+fn wf_observability_is_clean(_1: &WorkflowContext) -> {async fn body of wf_observability_is_clean()} {
+    debug ctx => _1;
+    let mut _0: {async fn body of wf_observability_is_clean()};
+
+    bb0: {
+        _0 = {coroutine@format_and_outparams.rs:401:86: 406:2 (#0)} { ctx: copy _1 };
+        return;
+    }
+}
+
+fn wf_observability_is_clean::{closure#0}(_1: Pin<&mut {async fn body of wf_observability_is_clean()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    debug _task_context => _2;
+    debug ctx => ((*_11).0: &WorkflowContext);
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let _3: &WorkflowContext;
+    let mut _4: u64;
+    let _6: ();
+    let mut _7: std::string::String;
+    let mut _8: &str;
+    let mut _9: std::result::Result<u64, std::string::String>;
+    let mut _10: u32;
+    let mut _11: &mut {async fn body of wf_observability_is_clean()};
+    scope 1 {
+        debug ctx => _3;
+        scope 2 {
+            let _5: u64;
+            scope 3 {
+                debug now => _5;
+            }
+        }
+    }
+
+    bb0: {
+        _11 = copy (_1.0: &mut {async fn body of wf_observability_is_clean()});
+        _10 = discriminant((*_11));
+        switchInt(move _10) -> [0: bb1, 1: bb9, 2: bb8, otherwise: bb10];
+    }
+
+    bb1: {
+        _3 = copy ((*_11).0: &WorkflowContext);
+        _4 = WorkflowContext::metrics(copy _3) -> [return: bb2, unwind: bb7];
+    }
+
+    bb2: {
+        _5 = WorkflowContext::system_now(copy _3) -> [return: bb3, unwind: bb7];
+    }
+
+    bb3: {
+        _6 = WorkflowContext::timer(copy _3, const 30_u64) -> [return: bb4, unwind: bb7];
+    }
+
+    bb4: {
+        _8 = const "charge";
+        _7 = <str as ToString>::to_string(move _8) -> [return: bb5, unwind: bb7];
+    }
+
+    bb5: {
+        _9 = WorkflowContext::execute_activity_raw(copy _3, move _7, copy _5) -> [return: bb6, unwind: bb7];
+    }
+
+    bb6: {
+        _0 = Poll::<Result<u64, String>>::Ready(move _9);
+        discriminant((*_11)) = 1;
+        return;
+    }
+
+    bb7 (cleanup): {
+        discriminant((*_11)) = 2;
+        resume;
+    }
+
+    bb8: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb8, unwind continue];
+    }
+
+    bb9: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb9, unwind continue];
+    }
+
+    bb10: {
+        unreachable;
+    }
+}
+
+alloc1 (size: 6, align: 1) {
+    63 68 61 72 67 65                               │ charge
+}

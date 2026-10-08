@@ -3,10 +3,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use autumn_web::AppState;
 use autumn_web::error::AutumnError;
 use autumn_web::reexports::axum;
 use autumn_web::session::Session;
@@ -35,7 +34,8 @@ use autumn_harvest::admission_gate::{AdmissionGateView, GateScope};
 use autumn_harvest::audit::{
     self, AuditFilters, CLASSIFIED_ROUTES, HEADER_ACTOR, HEADER_IDEMPOTENCY_KEY, HEADER_REQUEST_ID,
     HEADER_SOURCE, OP_ACTIVITY_FAIL_NOW, OP_ACTIVITY_PAUSE, OP_ACTIVITY_RESUME,
-    OP_ACTIVITY_RETRY_NOW, OP_BATCH_SUBMIT, OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE,
+    OP_ACTIVITY_RETRY_NOW, OP_AUDIT_EXPORT_DECOMMISSION, OP_AUDIT_EXPORT_REACTIVATE,
+    OP_AUDIT_EXPORT_REDRIVE, OP_BATCH_SUBMIT, OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE,
     OP_BUILD_POLICY_SET, OP_BUILD_RAMP_CLEAR, OP_BUILD_RAMP_SET, OP_CALLBACK_REDRIVE,
     OP_CIRCUIT_FORCE_CLOSE, OP_CIRCUIT_FORCE_OPEN, OP_DAG_PATCH, OP_DAG_RETRY, OP_DAG_TRIGGER,
     OP_DLQ_DISCARD_BULK, OP_DLQ_REDRIVE, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK,
@@ -49,11 +49,11 @@ use autumn_harvest::audit::{
     OP_WORKFLOW_CANCEL, OP_WORKFLOW_ERASE_PAYLOADS, OP_WORKFLOW_PAUSE, OP_WORKFLOW_RERUN,
     OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START,
     OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE, OP_WORKFLOW_UPDATE_WITH_START, RouteClass,
-    SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_ACTIVITY, TARGET_BATCH,
-    TARGET_BUILD_ROUTING, TARGET_CALLBACK_DELIVERY, TARGET_CIRCUIT, TARGET_DAG, TARGET_DEAD_LETTER,
-    TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_QUEUE, TARGET_RATE_LIMIT, TARGET_RETENTION,
-    TARGET_SCHEDULE, TARGET_TASK, TARGET_THROTTLE, TARGET_TOKEN, TARGET_WORKER, TARGET_WORKFLOW,
-    deny_readonly_mutation,
+    SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_ACTIVITY, TARGET_AUDIT_EXPORT,
+    TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_CALLBACK_DELIVERY, TARGET_CIRCUIT, TARGET_DAG,
+    TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_QUEUE, TARGET_RATE_LIMIT,
+    TARGET_RETENTION, TARGET_SCHEDULE, TARGET_TASK, TARGET_THROTTLE, TARGET_TOKEN, TARGET_WORKER,
+    TARGET_WORKFLOW, deny_readonly_mutation,
 };
 use autumn_harvest::audit::{OP_BATCH_RESET, OP_BATCH_START};
 use autumn_harvest::batch::{
@@ -90,7 +90,8 @@ use autumn_harvest::models::{
 };
 use autumn_harvest::payload_codec::{LossyDecodeOutcome, PayloadCodecs};
 use autumn_harvest::policy::{
-    Schedule, SkipPolicy, WorkflowSchedule, compute_jitter_offset, validate_jitter,
+    Schedule, SkipPolicy, WorkflowSchedule, compute_jitter_offset, default_schedule_jitter,
+    validate_jitter,
 };
 use autumn_harvest::queue::{self, ConcurrencyKeyStats};
 use autumn_harvest::reset::{
@@ -117,7 +118,7 @@ use autumn_harvest::types::{
     ExecutionId, ExternalActivityToken, Priority, ShardId, UpdateId, WorkflowIdConflictPolicy,
     WorkflowIdReusePolicy,
 };
-use autumn_harvest::worker::{DbPool, HandlerRegistry};
+use autumn_harvest::worker::{DbPool, DispatchDeadline, HandlerRegistry};
 use autumn_harvest::workers::{
     DrainPreviewItem, DrainResponse, FleetHealth, PinnedExecutionRow, WorkerFilters, WorkerRow,
     get_worker, list_pinned_executions, list_workers, parse_worker_filters, preview_item_from_row,
@@ -128,9 +129,9 @@ use autumn_harvest::{
     SignalWithStartOutcome, SignalWithStartParams, StartWorkflowParams, TriageFieldChange,
     TriageOutcome, TriagePatch, UpdateWithStartOutcome, UpdateWithStartParams,
     WorkflowHandleClient, WorkflowResult, annotate_workflow_execution,
-    signal_with_start_workflow_execution_with_metrics,
-    start_or_load_workflow_execution_with_metrics,
-    update_with_start_workflow_execution_with_metrics,
+    signal_with_start_workflow_execution_with_metrics_and_codecs,
+    start_or_load_workflow_execution_with_metrics_and_codecs,
+    update_with_start_workflow_execution_with_metrics_and_codecs,
 };
 
 use crate::lineage::{
@@ -358,12 +359,22 @@ pub struct HarvestApiState {
     deployment_profile: Arc<Mutex<String>>,
     /// Whether the management API was mounted behind an embedder-provided auth boundary.
     admin_auth_boundary: Arc<Mutex<bool>>,
+    /// Explicit opt-out that opens mutating routes with no auth (issue #1802).
+    allow_unauthenticated_mutations: Arc<Mutex<bool>>,
     /// Autumn session key used by built-in guards when no outer auth boundary is configured.
     admin_auth_session_key: Arc<Mutex<String>>,
     /// When enabled, `/health` returns 503 until writable shards are ready.
     health_requires_shard_readiness: Arc<Mutex<bool>>,
+    /// Set at shutdown. `/health/ready` then returns 503 (issue #1812).
+    draining: Arc<std::sync::atomic::AtomicBool>,
+    /// The autumn-web probe state, linked on the plugin path (issue #1812).
+    /// autumn-web marks it at SIGTERM, before its shutdown hooks run.
+    host_probes: Arc<Mutex<Option<autumn_web::probe::ProbeState>>>,
+    /// The last readiness database result and its time (issue #1812).
+    ready_cache: Arc<tokio::sync::Mutex<Option<(tokio::time::Instant, ReadyDatabaseVerdict)>>>,
     /// Default drain deadline offset used when `POST /workers/{id}/drain` omits `deadline_at`.
-    /// Set from `WorkerConfig::shutdown_timeout` at startup; defaults to 30 s.
+    /// Set from `WorkerConfig::shutdown_timeout` at startup. It defaults to
+    /// `DEFAULT_SHUTDOWN_TIMEOUT` (25 s).
     worker_shutdown_timeout: Arc<Mutex<std::time::Duration>>,
     /// Per-shard Postgres URLs used by workflow result LISTEN/NOTIFY waits.
     workflow_result_notification_urls: Arc<Mutex<BTreeMap<ShardId, String>>>,
@@ -412,6 +423,9 @@ pub struct HarvestApiState {
     /// Cap on distinct groups `GET /admin/usage` will return before failing
     /// loudly with `413` (issue #596). Defaults to 10,000.
     usage_max_groups: Arc<Mutex<usize>>,
+    /// Build ramp guard settings (issue #1814), mirrored from
+    /// `BuiltHarvest::ramp_guard` at startup. The default is disabled.
+    ramp_guard_config: Arc<Mutex<autumn_harvest::ramp_guard::RampGuardConfig>>,
     /// SSRF policy for completion-callback targets (issue #605), mirrored
     /// from `BuiltHarvest::completion_callback_config()` at startup so the
     /// HTTP start route can validate a per-execution target the same way
@@ -438,6 +452,17 @@ pub struct HarvestApiState {
     /// read model can resolve the probe interval / staleness window. `None`
     /// when the canary is disabled.
     canary_config: Arc<Mutex<Option<crate::canary::CanaryConfig>>>,
+    /// Refuse `start_harvest_runtime` unless ambient Harvest configuration
+    /// resolves to `embedded` mode (issue #1291).
+    ///
+    /// Set only by the dev runtime (`crate::dev`), which owns one ephemeral
+    /// cluster and has no second database for `split`/`external` storage.
+    /// Every ordinary embedder leaves this `false` and keeps full support
+    /// for both modes. This is a backstop, not the primary gate. The dev
+    /// runtime already refuses before provisioning, and again before the
+    /// server starts. This only matters if ambient configuration changed in
+    /// the narrow window after that.
+    require_embedded_harvest_mode: Arc<Mutex<bool>>,
 }
 
 impl Default for HarvestApiState {
@@ -450,9 +475,15 @@ impl Default for HarvestApiState {
             audit_retention_days: Arc::new(Mutex::new(None)),
             deployment_profile: Arc::new(Mutex::new("unknown".to_string())),
             admin_auth_boundary: Arc::new(Mutex::new(false)),
+            allow_unauthenticated_mutations: Arc::new(Mutex::new(false)),
             admin_auth_session_key: Arc::new(Mutex::new("user_id".to_string())),
             health_requires_shard_readiness: Arc::new(Mutex::new(false)),
-            worker_shutdown_timeout: Arc::new(Mutex::new(std::time::Duration::from_secs(30))),
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            host_probes: Arc::new(Mutex::new(None)),
+            ready_cache: Arc::new(tokio::sync::Mutex::new(None)),
+            worker_shutdown_timeout: Arc::new(Mutex::new(
+                autumn_harvest::builder::DEFAULT_SHUTDOWN_TIMEOUT,
+            )),
             workflow_result_notification_urls: Arc::default(),
             workflow_result_max_wait: Arc::new(Mutex::new(std::time::Duration::from_secs(30))),
             query_timeout: Arc::new(Mutex::new(std::time::Duration::from_secs(5))),
@@ -475,6 +506,9 @@ impl Default for HarvestApiState {
             usage_max_groups: Arc::new(Mutex::new(
                 autumn_harvest::usage::default_usage_max_groups(),
             )),
+            ramp_guard_config: Arc::new(Mutex::new(
+                autumn_harvest::ramp_guard::RampGuardConfig::default(),
+            )),
             completion_callback_ssrf_policy: Arc::new(Mutex::new(
                 autumn_harvest::completion_callback::SsrfPolicy::default(),
             )),
@@ -489,6 +523,7 @@ impl Default for HarvestApiState {
                 crate::status_summary::StatusThresholds::default(),
             )),
             canary_config: Arc::new(Mutex::new(None)),
+            require_embedded_harvest_mode: Arc::new(Mutex::new(false)),
         }
     }
 }
@@ -503,43 +538,31 @@ impl HarvestApiState {
     ///
     /// Call this during startup with `2 × WorkerConfig::worker_heartbeat_interval`
     /// so the API correctly reflects the configured heartbeat cadence.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_worker_stale_threshold(&self, threshold: std::time::Duration) {
         *self
             .worker_stale_threshold
             .lock()
-            .expect("harvest api state lock poisoned") = threshold;
+            .unwrap_or_else(PoisonError::into_inner) = threshold;
     }
 
     /// Override the per-query execution timeout (default 5 s, issue #234).
     ///
     /// Call this at startup with `WorkerConfig::query_timeout` so the management
     /// API honours the same timeout as the worker's in-process query dispatch.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_query_timeout(&self, timeout: std::time::Duration) {
         *self
             .query_timeout
             .lock()
-            .expect("harvest api state lock poisoned") = timeout;
+            .unwrap_or_else(PoisonError::into_inner) = timeout;
     }
 
     /// Current per-query execution timeout.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn query_timeout(&self) -> std::time::Duration {
         *self
             .query_timeout
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Set the server-side ceiling for workflow execution timeouts (issue #243).
@@ -547,26 +570,20 @@ impl HarvestApiState {
     /// Call this during startup from the plugin to propagate
     /// `BuiltHarvest::max_workflow_execution_timeout` into the API state so the
     /// `POST /workflows` handler can apply the cap to every start request.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_max_workflow_execution_timeout(&self, ceiling: Option<std::time::Duration>) {
         *self
             .max_workflow_execution_timeout
             .lock()
-            .expect("harvest api state lock poisoned") = ceiling;
+            .unwrap_or_else(PoisonError::into_inner) = ceiling;
     }
 
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
+    /// Current server-side ceiling for workflow execution timeouts.
     #[must_use]
     pub fn max_workflow_execution_timeout(&self) -> Option<std::time::Duration> {
         *self
             .max_workflow_execution_timeout
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Set the server-side ceiling for the chain-scoped lifetime cap (issue #617).
@@ -575,26 +592,20 @@ impl HarvestApiState {
     /// ceiling both caps a workflow-declared chain cap AND acts as a fleet-wide
     /// default so `POST /workflows` starts inherit it even when a workflow
     /// under-specifies.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_max_workflow_chain_timeout(&self, ceiling: Option<std::time::Duration>) {
         *self
             .max_workflow_chain_timeout
             .lock()
-            .expect("harvest api state lock poisoned") = ceiling;
+            .unwrap_or_else(PoisonError::into_inner) = ceiling;
     }
 
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
+    /// Current server-side ceiling for workflow chain timeouts.
     #[must_use]
     pub fn max_workflow_chain_timeout(&self) -> Option<std::time::Duration> {
         *self
             .max_workflow_chain_timeout
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Set the server-side ceiling for workflow-level retry attempts (issue #523).
@@ -602,35 +613,25 @@ impl HarvestApiState {
     /// Call this during startup from the plugin to propagate
     /// `BuiltHarvest::max_workflow_attempts` into the API state so every start
     /// request can have the cap applied.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_max_workflow_attempts(&self, ceiling: Option<u32>) {
         *self
             .max_workflow_attempts
             .lock()
-            .expect("harvest api state lock poisoned") = ceiling;
+            .unwrap_or_else(PoisonError::into_inner) = ceiling;
     }
 
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
+    /// Current server-side ceiling for workflow attempts.
     #[must_use]
     pub fn max_workflow_attempts(&self) -> Option<u32> {
         *self
             .max_workflow_attempts
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Set the SSRF policy used to validate completion-callback targets at
     /// registration time (issue #605). Call this during startup from the
     /// plugin to mirror `BuiltHarvest::completion_callback_config()`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_completion_callback_ssrf_policy(
         &self,
         policy: autumn_harvest::completion_callback::SsrfPolicy,
@@ -638,19 +639,17 @@ impl HarvestApiState {
         *self
             .completion_callback_ssrf_policy
             .lock()
-            .expect("harvest api state lock poisoned") = policy;
+            .unwrap_or_else(PoisonError::into_inner) = policy;
     }
 
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
+    /// Current SSRF policy for completion-callback targets.
     #[must_use]
     pub fn completion_callback_ssrf_policy(
         &self,
     ) -> autumn_harvest::completion_callback::SsrfPolicy {
         self.completion_callback_ssrf_policy
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 
@@ -660,27 +659,19 @@ impl HarvestApiState {
     /// stored envelopes. Mirroring the registry alone changes nothing —
     /// decoding also requires the [`Self::set_decode_payloads_on_read`]
     /// opt-in and harvest-admin access on the request.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_payload_codecs(&self, codecs: autumn_harvest::payload_codec::PayloadCodecs) {
         *self
             .payload_codecs
             .lock()
-            .expect("harvest api state lock poisoned") = codecs;
+            .unwrap_or_else(PoisonError::into_inner) = codecs;
     }
 
     /// Snapshot of the mirrored codec registry (issue #608).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub(crate) fn payload_codecs(&self) -> autumn_harvest::payload_codec::PayloadCodecs {
         self.payload_codecs
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 
@@ -689,81 +680,77 @@ impl HarvestApiState {
     /// Default **off**: with the flag off, no handler consults the codec
     /// registry and responses are byte-for-byte identical to a deployment
     /// that never heard of this feature.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_decode_payloads_on_read(&self, enabled: bool) {
         *self
             .decode_payloads_on_read
             .lock()
-            .expect("harvest api state lock poisoned") = enabled;
+            .unwrap_or_else(PoisonError::into_inner) = enabled;
     }
 
     /// Override the thresholds for the rolled-up `GET /admin/status` verdict
     /// (issue #679). Mirrored from the plugin builder at startup.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_status_thresholds(&self, thresholds: crate::status_summary::StatusThresholds) {
         *self
             .status_thresholds
             .lock()
-            .expect("harvest api state lock poisoned") = thresholds;
+            .unwrap_or_else(PoisonError::into_inner) = thresholds;
     }
 
     /// Current thresholds for the rolled-up `GET /admin/status` verdict.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn status_thresholds(&self) -> crate::status_summary::StatusThresholds {
         self.status_thresholds
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 
     /// Mirror the built-in synthetic liveness canary configuration (issue #796)
     /// from the plugin builder at startup. `None` disables the canary.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_canary_config(&self, config: Option<crate::canary::CanaryConfig>) {
         *self
             .canary_config
             .lock()
-            .expect("harvest api state lock poisoned") = config;
+            .unwrap_or_else(PoisonError::into_inner) = config;
     }
 
     /// The mirrored synthetic liveness canary configuration, if enabled
     /// (issue #796).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn canary_config(&self) -> Option<crate::canary::CanaryConfig> {
         self.canary_config
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 
+    /// Mirror [`crate::plugin::HarvestPlugin`]'s dev-runtime-only flag (issue
+    /// #1291), so `start_harvest_runtime` can also refuse a non-embedded
+    /// ambient mode. See the field doc on `require_embedded_harvest_mode`.
+    pub(crate) fn set_require_embedded_harvest_mode(&self, value: bool) {
+        *self
+            .require_embedded_harvest_mode
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = value;
+    }
+
+    /// Whether `start_harvest_runtime` must refuse a non-embedded ambient
+    /// Harvest mode (issue #1291). See the field doc on
+    /// `require_embedded_harvest_mode`.
+    pub(crate) fn require_embedded_harvest_mode(&self) -> bool {
+        *self
+            .require_embedded_harvest_mode
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Whether read-path payload decoding is enabled (issue #608).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn decode_payloads_on_read(&self) -> bool {
         *self
             .decode_payloads_on_read
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Set the hard ceiling on per-execution event count (issue #493).
@@ -771,35 +758,27 @@ impl HarvestApiState {
     /// Call this during startup from the plugin to propagate
     /// `BuiltHarvest::max_workflow_history_events` into the API state so the
     /// preflight check can surface it.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_max_workflow_history_events(&self, ceiling: Option<u64>) {
         *self
             .max_workflow_history_events
             .lock()
-            .expect("harvest api state lock poisoned") = ceiling;
+            .unwrap_or_else(PoisonError::into_inner) = ceiling;
     }
 
     /// Current hard ceiling on per-execution event count (issue #493).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn max_workflow_history_events(&self) -> Option<u64> {
         *self
             .max_workflow_history_events
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Override the SSE keepalive comment interval (default 15 s, issue #324).
     ///
     /// # Panics
     ///
-    /// Panics if `interval` is zero or if the internal mutex is poisoned.
+    /// Panics if `interval` is zero.
     pub fn set_sse_keepalive_interval(&self, interval: std::time::Duration) {
         assert!(
             !interval.is_zero(),
@@ -808,221 +787,177 @@ impl HarvestApiState {
         *self
             .sse_keepalive_interval
             .lock()
-            .expect("harvest api state lock poisoned") = interval;
+            .unwrap_or_else(PoisonError::into_inner) = interval;
     }
 
     /// Current SSE keepalive comment interval.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn sse_keepalive_interval(&self) -> std::time::Duration {
         *self
             .sse_keepalive_interval
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Override the SSE per-stream event buffer depth (default 1024, issue #324).
     ///
     /// When the producer falls behind by more than this many events the stream
     /// closes with a slow-consumer response.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_sse_buffer_depth(&self, depth: usize) {
         *self
             .sse_buffer_depth
             .lock()
-            .expect("harvest api state lock poisoned") = depth;
+            .unwrap_or_else(PoisonError::into_inner) = depth;
     }
 
     /// Current SSE per-stream event buffer depth.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn sse_buffer_depth(&self) -> usize {
         *self
             .sse_buffer_depth
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Set the maximum start delay allowed (issue #322).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_max_workflow_start_delay(&self, delay: std::time::Duration) {
         *self
             .max_workflow_start_delay
             .lock()
-            .expect("harvest api state lock poisoned") = delay;
+            .unwrap_or_else(PoisonError::into_inner) = delay;
     }
 
     /// Maximum allowed workflow start delay.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn max_workflow_start_delay(&self) -> std::time::Duration {
         *self
             .max_workflow_start_delay
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Returns the default max-wait cap applied to debounced workflow starts (issue #499).
-    ///
-    /// # Panics
-    ///
-    /// Panics if an internal mutex is poisoned.
     #[must_use]
     pub fn default_debounce_max_wait(&self) -> std::time::Duration {
         *self
             .default_debounce_max_wait
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Override the default debounce max-wait cap (issue #499).
-    ///
-    /// # Panics
-    ///
-    /// Panics if an internal mutex is poisoned.
     pub fn set_default_debounce_max_wait(&self, max_wait: std::time::Duration) {
         *self
             .default_debounce_max_wait
             .lock()
-            .expect("harvest api state lock poisoned") = max_wait;
+            .unwrap_or_else(PoisonError::into_inner) = max_wait;
     }
 
     /// Returns the retention window for request-scoped start idempotency keys
     /// (issue #808). Defaults to 24h.
-    ///
-    /// # Panics
-    ///
-    /// Panics if an internal mutex is poisoned.
     #[must_use]
     pub fn start_idempotency_window(&self) -> std::time::Duration {
         *self
             .start_idempotency_window
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Override the start-idempotency retention window (issue #808).
-    ///
-    /// # Panics
-    ///
-    /// Panics if an internal mutex is poisoned.
     pub fn set_start_idempotency_window(&self, window: std::time::Duration) {
         *self
             .start_idempotency_window
             .lock()
-            .expect("harvest api state lock poisoned") = window;
+            .unwrap_or_else(PoisonError::into_inner) = window;
     }
 
     /// Returns the ceiling on the `[from, to]` window accepted by
     /// `GET /admin/usage` (issue #596). Defaults to 90 days.
-    ///
-    /// # Panics
-    ///
-    /// Panics if an internal mutex is poisoned.
     #[must_use]
     pub fn usage_window_ceiling(&self) -> std::time::Duration {
         *self
             .usage_window_ceiling
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Override the `GET /admin/usage` window ceiling (issue #596).
-    ///
-    /// # Panics
-    ///
-    /// Panics if an internal mutex is poisoned.
     pub fn set_usage_window_ceiling(&self, ceiling: std::time::Duration) {
         *self
             .usage_window_ceiling
             .lock()
-            .expect("harvest api state lock poisoned") = ceiling;
+            .unwrap_or_else(PoisonError::into_inner) = ceiling;
     }
 
     /// Returns the cap on distinct groups `GET /admin/usage` will return
     /// before failing loudly with `413` (issue #596). Defaults to 10,000.
-    ///
-    /// # Panics
-    ///
-    /// Panics if an internal mutex is poisoned.
     #[must_use]
     pub fn usage_max_groups(&self) -> usize {
         *self
             .usage_max_groups
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Override the `GET /admin/usage` group-count cap (issue #596).
-    ///
-    /// # Panics
-    ///
-    /// Panics if an internal mutex is poisoned.
     pub fn set_usage_max_groups(&self, cap: usize) {
         *self
             .usage_max_groups
             .lock()
-            .expect("harvest api state lock poisoned") = cap;
+            .unwrap_or_else(PoisonError::into_inner) = cap;
+    }
+
+    /// The build ramp guard settings (issue #1814).
+    #[must_use]
+    pub fn ramp_guard_config(&self) -> autumn_harvest::ramp_guard::RampGuardConfig {
+        *self
+            .ramp_guard_config
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Set the build ramp guard settings (issue #1814).
+    ///
+    /// The boot path reads them when it spawns the guard loop, so set them
+    /// first.
+    pub fn set_ramp_guard_config(&self, config: autumn_harvest::ramp_guard::RampGuardConfig) {
+        *self
+            .ramp_guard_config
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = config;
     }
 
     /// Set the hard caps for `POST /workflows/batch_start` (issue #357).
     ///
     /// Call this during startup with values from [`BatchStartConfig`] so the
     /// management API honours operator-configured limits.
-    ///
-    /// # Panics
-    ///
-    /// Panics if an internal mutex is poisoned.
     pub fn set_batch_start_config(&self, config: &BatchStartConfig) {
         *self
             .batch_start_max_items
             .lock()
-            .expect("harvest api state lock poisoned") = config.max_items_per_batch;
+            .unwrap_or_else(PoisonError::into_inner) = config.max_items_per_batch;
         *self
             .batch_start_max_bytes
             .lock()
-            .expect("harvest api state lock poisoned") = config.max_total_bytes;
+            .unwrap_or_else(PoisonError::into_inner) = config.max_total_bytes;
     }
 
     /// Maximum items per `POST /workflows/batch_start` request.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn batch_start_max_items(&self) -> usize {
         *self
             .batch_start_max_items
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Maximum total bytes for a `POST /workflows/batch_start` request body.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn batch_start_max_bytes(&self) -> u64 {
         *self
             .batch_start_max_bytes
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Return a clone of the shared admission gate cache (issue #377).
@@ -1063,10 +998,6 @@ impl HarvestApiState {
     ///
     /// When no extractor is installed the default behaviour reads the
     /// `X-Harvest-Actor` header and falls back to `"anonymous"`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_actor_extractor<F>(&self, f: F)
     where
         F: Fn(&axum::http::HeaderMap) -> String + Send + Sync + 'static,
@@ -1074,22 +1005,18 @@ impl HarvestApiState {
         *self
             .actor_extractor
             .lock()
-            .expect("harvest api state lock poisoned") = Some(Arc::new(f));
+            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(f));
     }
 
     /// Set the audit log retention period in days.
     ///
     /// Audit records older than this threshold will be deleted on each
     /// retention sweep. Default: 90 days.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_audit_retention_days(&self, days: i64) {
         *self
             .audit_retention_days
             .lock()
-            .expect("harvest api state lock poisoned") = Some(days);
+            .unwrap_or_else(PoisonError::into_inner) = Some(days);
     }
 
     /// Record the host application's deployment profile for preflight checks.
@@ -1097,29 +1024,39 @@ impl HarvestApiState {
     /// `dev` allows an unauthenticated local management API; every other
     /// profile is treated as non-dev and must have an auth boundary.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
+    /// A standalone embedder declares the profile with
+    /// [`StandaloneAdminAuth::with_deployment_profile`]. See `docs/embedding.md`.
     pub fn set_deployment_profile(&self, profile: impl Into<String>) {
         *self
             .deployment_profile
             .lock()
-            .expect("harvest api state lock poisoned") = profile.into();
+            .unwrap_or_else(PoisonError::into_inner) = profile.into();
     }
 
     /// Mark whether the Harvest management API is mounted behind auth.
     ///
     /// This reports the boundary provided via [`crate::plugin::HarvestPlugin::api_with_auth`]
-    /// or an equivalent standalone integration. It does not implement RBAC.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
+    /// or [`StandaloneAdminAuth::with_admin_auth_boundary`]. It does not implement RBAC.
+    /// See `docs/embedding.md` for the standalone path.
     pub fn set_admin_auth_boundary(&self, present: bool) {
         *self
             .admin_auth_boundary
             .lock()
-            .expect("harvest api state lock poisoned") = present;
+            .unwrap_or_else(PoisonError::into_inner) = present;
+    }
+
+    /// Open the mutating routes to a caller with no credential (issue #1802).
+    ///
+    /// Outside the `dev` profile, a mount with no auth boundary refuses every
+    /// mutating route with 401. This opt-out restores the pre-#1802 posture
+    /// for routes with no admin gate. Admin-gated routes keep their gate.
+    /// `HarvestPlugin` and `HarvestEmbedding` log a startup warning while the
+    /// opt-out opens the routes. A raw router mount logs nothing.
+    pub fn set_allow_unauthenticated_mutations(&self, allow: bool) {
+        *self
+            .allow_unauthenticated_mutations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = allow;
     }
 
     /// Set the Autumn session key used by built-in management guards.
@@ -1127,15 +1064,12 @@ impl HarvestApiState {
     /// This mirrors `AppState::auth_session_key()` during plugin startup. Standalone
     /// integrations that mount `harvest_api_router` directly can call this to keep
     /// Harvest's built-in high-impact route guard aligned with their app auth config.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
+    /// [`StandaloneAdminAuth::with_admin_auth_session_key`] declares it for them.
     pub fn set_admin_auth_session_key(&self, session_key: impl Into<String>) {
         *self
             .admin_auth_session_key
             .lock()
-            .expect("harvest api state lock poisoned") = session_key.into();
+            .unwrap_or_else(PoisonError::into_inner) = session_key.into();
     }
 
     /// Configure `/health` to fail when writable shard rollout readiness is not `ready`.
@@ -1144,15 +1078,53 @@ impl HarvestApiState {
     /// liveness-style health check. Production deployments can enable this to
     /// make readiness probes and rollout pipelines gate on worker and scheduler
     /// coverage before accepting starts.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_health_requires_shard_readiness(&self, required: bool) {
         *self
             .health_requires_shard_readiness
             .lock()
-            .expect("harvest api state lock poisoned") = required;
+            .unwrap_or_else(PoisonError::into_inner) = required;
+    }
+
+    /// Mark this replica as draining (issue #1812).
+    ///
+    /// `GET /health/ready` then returns 503. `GET /health/live` stays 200.
+    /// Both stop paths call this first. An embedder can call it earlier, when
+    /// SIGTERM arrives. The next runtime start ends the drain.
+    pub fn begin_draining(&self) {
+        self.draining
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Report whether this replica is draining (issue #1812).
+    ///
+    /// A linked autumn-web probe state that is shutting down also counts.
+    #[must_use]
+    pub fn is_draining(&self) -> bool {
+        // The full path is necessary. Diesel `RunQueryDsl::load` shadows the method.
+        std::sync::atomic::AtomicBool::load(&self.draining, std::sync::atomic::Ordering::SeqCst)
+            || self
+                .host_probes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref()
+                .is_some_and(autumn_web::probe::ProbeState::is_shutting_down)
+    }
+
+    /// End a drain. Each runtime start calls this before its first await.
+    pub(crate) fn end_draining(&self) {
+        self.draining
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Link the autumn-web probe state (issue #1812).
+    ///
+    /// autumn-web marks it at SIGTERM. It closes the listener before it runs
+    /// the `HarvestPlugin` shutdown hook, so the hook alone is too late.
+    pub(crate) fn link_host_probes(&self, probes: autumn_web::probe::ProbeState) {
+        *self
+            .host_probes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(probes);
     }
 
     /// Returns `Some(days)` only when explicitly set via [`HarvestApiState::set_audit_retention_days`];
@@ -1161,13 +1133,13 @@ impl HarvestApiState {
         *self
             .audit_retention_days
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     pub(crate) fn deployment_profile(&self) -> String {
         self.deployment_profile
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 
@@ -1175,13 +1147,20 @@ impl HarvestApiState {
         *self
             .admin_auth_boundary
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn allow_unauthenticated_mutations(&self) -> bool {
+        *self
+            .allow_unauthenticated_mutations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     pub(crate) fn admin_auth_session_key(&self) -> String {
         self.admin_auth_session_key
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 
@@ -1189,44 +1168,33 @@ impl HarvestApiState {
         *self
             .health_requires_shard_readiness
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Override the default deadline applied when `POST /workers/{id}/drain` does not
-    /// supply a `deadline_at`. Defaults to 30 s (the `WorkerConfig::shutdown_timeout`
-    /// default). Set this at startup from the actual `WorkerConfig`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
+    /// supply a `deadline_at`. Defaults to the `WorkerConfig::shutdown_timeout`
+    /// default, `DEFAULT_SHUTDOWN_TIMEOUT` (25 s). Set this at startup from the
+    /// actual `WorkerConfig`.
     pub fn set_worker_shutdown_timeout(&self, timeout: std::time::Duration) {
         *self
             .worker_shutdown_timeout
             .lock()
-            .expect("harvest api state lock poisoned") = timeout;
+            .unwrap_or_else(PoisonError::into_inner) = timeout;
     }
 
     pub(crate) fn worker_shutdown_timeout(&self) -> std::time::Duration {
         *self
             .worker_shutdown_timeout
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Configure the default-shard database URL used by workflow result waits.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_workflow_result_notification_database_url(&self, url: impl Into<String>) {
         self.set_workflow_result_notification_database_urls([(ShardId::new(0), url)]);
     }
 
     /// Configure per-shard database URLs used by workflow result waits.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_workflow_result_notification_database_urls<I, S>(&self, urls: I)
     where
         I: IntoIterator<Item = (ShardId, S)>,
@@ -1235,29 +1203,25 @@ impl HarvestApiState {
         *self
             .workflow_result_notification_urls
             .lock()
-            .expect("harvest api state lock poisoned") = urls
+            .unwrap_or_else(PoisonError::into_inner) = urls
             .into_iter()
             .map(|(shard, url)| (shard, url.into()))
             .collect();
     }
 
     /// Override the maximum long-poll wait for workflow result requests.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn set_workflow_result_max_wait(&self, max_wait: std::time::Duration) {
         *self
             .workflow_result_max_wait
             .lock()
-            .expect("harvest api state lock poisoned") = max_wait;
+            .unwrap_or_else(PoisonError::into_inner) = max_wait;
     }
 
     pub(crate) fn workflow_result_max_wait(&self) -> std::time::Duration {
         *self
             .workflow_result_max_wait
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     fn workflow_result_notification_database_urls(
@@ -1266,7 +1230,7 @@ impl HarvestApiState {
         let urls = self
             .workflow_result_notification_urls
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .clone();
         if urls.is_empty() {
             return Err(HarvestError::Config(
@@ -1304,7 +1268,7 @@ impl HarvestApiState {
         let extractor = self
             .actor_extractor
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .clone();
         if let Some(f) = extractor {
             return f(headers);
@@ -1322,53 +1286,35 @@ impl HarvestApiState {
         *self
             .worker_stale_threshold
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Install the currently running Harvest runtime snapshot.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal API-state mutex is poisoned.
     pub fn install(&self, runtime: HarvestApiRuntime) {
-        *self
-            .runtime
-            .lock()
-            .expect("harvest api state lock poisoned") = Some(runtime);
+        *self.runtime.lock().unwrap_or_else(PoisonError::into_inner) = Some(runtime);
     }
 
     /// Install the Harvest storage pool used by management routes.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal API-state mutex is poisoned.
     pub fn install_storage_pool(&self, pool: HarvestDbPool) {
         *self
             .storage_pool
             .lock()
-            .expect("harvest api state lock poisoned") = Some(pool);
+            .unwrap_or_else(PoisonError::into_inner) = Some(pool);
     }
 
     /// Clear the currently running Harvest runtime snapshot.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal API-state mutex is poisoned.
     pub fn clear(&self) {
-        *self
-            .runtime
-            .lock()
-            .expect("harvest api state lock poisoned") = None;
+        *self.runtime.lock().unwrap_or_else(PoisonError::into_inner) = None;
         *self
             .storage_pool
             .lock()
-            .expect("harvest api state lock poisoned") = None;
+            .unwrap_or_else(PoisonError::into_inner) = None;
     }
 
     pub(crate) fn runtime(&self) -> HarvestResult<HarvestApiRuntime> {
         self.runtime
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .clone()
             .ok_or_else(|| HarvestError::Config("harvest runtime is not started".to_string()))
     }
@@ -1376,7 +1322,7 @@ impl HarvestApiState {
     pub(crate) fn storage_pool(&self) -> HarvestResult<HarvestDbPool> {
         self.storage_pool
             .lock()
-            .expect("harvest api state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .clone()
             .ok_or_else(|| {
                 HarvestError::Config("harvest storage pool is not configured".to_string())
@@ -2843,9 +2789,9 @@ struct DagPauseRequest {
 }
 
 /// Kind tag on a schedule entry returned by `GET /admin/schedules`.
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-enum ScheduleKind {
+pub(crate) enum ScheduleKind {
     Dag,
     Workflow,
 }
@@ -2997,6 +2943,14 @@ struct PauseResumeRequest {
     reason: Option<String>,
 }
 
+/// Resolve a request `jitter_secs`. An omitted value gets `default_schedule_jitter`.
+fn requested_jitter(jitter_secs: Option<u64>, schedule: &Schedule) -> std::time::Duration {
+    jitter_secs.map_or_else(
+        || default_schedule_jitter(schedule),
+        std::time::Duration::from_secs,
+    )
+}
+
 /// Request body for `POST /admin/schedules/workflow`.
 #[derive(Debug, Deserialize)]
 struct CreateWorkflowScheduleRequest {
@@ -3019,9 +2973,10 @@ struct CreateWorkflowScheduleRequest {
     paused: bool,
     #[serde(default = "default_queue_name")]
     queue_name: String,
-    /// Jitter window in seconds. `0` disables jitter (default).
+    /// Jitter window in seconds. `0` disables jitter. If the request omits this
+    /// field, the schedule gets `default_schedule_jitter` (issue #1792).
     #[serde(default)]
-    jitter_secs: u64,
+    jitter_secs: Option<u64>,
     /// Overlap policy string (e.g. `"skip"`, `"buffer_one"`, `"buffer_all"`,
     /// `"cancel_other"`, `"terminate_other"`). Defaults to `"skip"`.
     #[serde(default = "default_overlap_policy")]
@@ -3179,6 +3134,11 @@ pub(crate) const KNOWN_WORKFLOW_STATES: &[&str] = &[
     "TIMED_OUT",
     "CONTINUED_AS_NEW",
     "TERMINATED",
+    // Issue #964. Both are returned by `GET /workflows`, so both must be
+    // filterable: a state the API emits but rejects as a filter value is a
+    // listing an operator can see and cannot narrow.
+    "MIGRATING",
+    "MIGRATED",
 ];
 
 const DEFAULT_WORKFLOW_LIMIT: i64 = 50;
@@ -3627,6 +3587,23 @@ struct WorkflowChildrenCursor {
 struct WorkflowChildrenResponse {
     items: Vec<WorkflowChildResponse>,
     next_cursor: Option<String>,
+    /// Cross-shard completeness of this page (issue #756 contract, extended to
+    /// this endpoint by issue #956).
+    ///
+    /// `GET /workflows/{id}/children` has always fanned out across every shard —
+    /// a child could live anywhere even before cross-shard *placement* existed,
+    /// because the traversal follows `parent_id` across the whole fleet — but it
+    /// propagated a pool error with `?`, so one unreachable shard turned the
+    /// whole call into a `500`. Cross-shard children make that failure mode
+    /// routine rather than exotic, so the endpoint now degrades: it returns the
+    /// children it could see and names the shards it could not, exactly like
+    /// `GET /workflows/{id}/tree` and the other #756 endpoints.
+    ///
+    /// Additive: always present, `complete` on the happy path.
+    status: FanoutStatus,
+    /// Shards that could not be queried, named with a reason. Empty when
+    /// `status` is `complete`.
+    unavailable_shards: Vec<UnavailableShard>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3963,8 +3940,8 @@ async fn lift_gate_handler(
 #[derive(serde::Deserialize)]
 struct CreateTokenRequest {
     name: String,
-    /// `"read"` or `"mutate"` — the verb-level scope drawn from the route
-    /// classification. Defaults to `read` (least privilege) when omitted.
+    /// `"read"`, `"mutate"` or `"admin"`: the verb-level scope drawn from the
+    /// route classification. Defaults to `read` (least privilege) when omitted.
     #[serde(default = "default_token_scope")]
     scope: String,
     /// Optional expiry; an expired token is rejected 401 on the next request.
@@ -3989,7 +3966,10 @@ async fn create_token_handler(
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": format!("unknown scope '{}' (expected 'read' or 'mutate')", body.scope)
+                "error": format!(
+                    "unknown scope '{}' (expected 'read', 'mutate' or 'admin')",
+                    body.scope
+                )
             })),
         )
             .into_response();
@@ -4201,6 +4181,20 @@ pub(crate) async fn resolve_workflow_by_business_id(
     workflow_name: &str,
     workflow_id: &str,
 ) -> Result<ExecutionId, AutumnError> {
+    // issue #1353: reject an empty workflow_id uniformly across the whole
+    // by-id route family, before any shard fan-out. `matchit` cannot bind an
+    // empty FINAL path segment. The base route (`GET .../{name}/{id}`)
+    // therefore 404'd at the router for such a value. Every sibling route
+    // resolved it instead, because its empty id lands on a non-final segment
+    // (e.g. `.../{id}/stack`). That made the family inconsistent for one
+    // identifier. Rejecting it here, ahead of resolution, makes all ten
+    // routes answer 400 alike, regardless of which router-matching quirk let
+    // the request through.
+    if workflow_id.is_empty() {
+        return Err(AutumnError::bad_request_msg(
+            "workflow_id must not be empty",
+        ));
+    }
     let pools = crate::shard_fanout::pools_by_shard(api_state);
     let expected = crate::shard_fanout::expected_shards(api_state, &pools);
     let mut candidates = Vec::new();
@@ -4303,6 +4297,29 @@ async fn get_workflow_by_id(
     finalize_by_id(out, exec_id)
 }
 
+/// `GET /workflows/by-id/{workflow_name}/` — literal-trailing-slash form of
+/// the base by-id route (issue #1353). `matchit` cannot bind an empty FINAL
+/// path segment as `{workflow_id}`. This shape therefore needs its own
+/// registration to reach a handler at all. Without it, axum answers a
+/// structural 404 ("no route matches") before any application code runs.
+/// Delegates to [`get_workflow_by_id`] with `workflow_id = ""`, which
+/// [`resolve_workflow_by_business_id`] now rejects 400 -- the same answer
+/// every other by-id route gives for an empty id.
+async fn get_workflow_by_id_trailing_slash(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(workflow_name): Path<String>,
+    headers: axum::http::HeaderMap,
+    maybe_session: Option<Extension<Session>>,
+) -> axum::response::Response {
+    get_workflow_by_id(
+        Extension(api_state),
+        Path((workflow_name, String::new())),
+        headers,
+        maybe_session,
+    )
+    .await
+}
+
 /// `GET /workflows/by-id/{workflow_name}/{workflow_id}/result` — terminal-output
 /// projection by business id (issue #805). Header carries `execution_id` on all
 /// responses; the 200/204/long-poll semantics of the delegate are preserved
@@ -4310,10 +4327,23 @@ async fn get_workflow_by_id(
 async fn get_workflow_result_by_id(
     Extension(api_state): Extension<HarvestApiState>,
     Path((workflow_name, workflow_id)): Path<(String, String)>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     headers: axum::http::HeaderMap,
     maybe_session: Option<Extension<Session>>,
 ) -> axum::response::Response {
+    // Issue #1151 review: reject a malformed query string up front, before
+    // the business-id resolution DB lookup below -- otherwise an unknown
+    // workflow_id or an unreachable shard would mask the malformed query
+    // behind a 404/503 instead of the documented 400, and the lookup would
+    // run for a request that was always going to be rejected. The delegate
+    // (`get_workflow_result`) decodes `raw_query` again once resolution
+    // succeeds; this is a cheap, side-effect-free re-parse, not a
+    // functional duplication.
+    if let Err(response) =
+        crate::strict_query::decode_or_autumn_error_response(raw_query.as_deref())
+    {
+        return response;
+    }
     let exec_id =
         match resolve_workflow_by_business_id(&api_state, &workflow_name, &workflow_id).await {
             Ok(id) => id,
@@ -4322,7 +4352,7 @@ async fn get_workflow_result_by_id(
     let mut resp = get_workflow_result(
         Extension(api_state),
         Path(exec_id.to_string()),
-        Query(pairs),
+        axum::extract::RawQuery(raw_query),
         headers,
         maybe_session,
     )
@@ -4357,8 +4387,15 @@ async fn get_workflow_stack_by_id(
 async fn list_workflow_children_by_id(
     Extension(api_state): Extension<HarvestApiState>,
     Path((workflow_name, workflow_id)): Path<(String, String)>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> axum::response::Response {
+    // Issue #1151 review: same early-reject rationale as
+    // `get_workflow_result_by_id` above.
+    if let Err(response) =
+        crate::strict_query::decode_or_autumn_error_response(raw_query.as_deref())
+    {
+        return response;
+    }
     let exec_id =
         match resolve_workflow_by_business_id(&api_state, &workflow_name, &workflow_id).await {
             Ok(id) => id,
@@ -4367,7 +4404,7 @@ async fn list_workflow_children_by_id(
     let out = list_workflow_children(
         Extension(api_state),
         Path(exec_id.to_string()),
-        Query(pairs),
+        axum::extract::RawQuery(raw_query),
     )
     .await;
     finalize_by_id(out, exec_id)
@@ -4646,8 +4683,26 @@ async fn by_id_missing_workflow_id(Path(_workflow_name): Path<String>) -> axum::
 }
 
 #[allow(clippy::too_many_lines)]
-pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
+pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
     let require_admin = middleware::from_fn_with_state(api_state.clone(), require_harvest_admin);
+    // Issue #1802: outside `dev`, this gate refuses a mutating call with no
+    // credential. A declared boundary, a scoped token, an admin session or the
+    // opt-out admits it.
+    let require_mutation_auth =
+        middleware::from_fn_with_state(api_state.clone(), require_classified_mutation_auth);
+    // issue #1278: the Vantage dead-letter page's bulk-action forms submit
+    // here directly (a relative `../dead-letters/replay` /
+    // `../dead-letters/discard` action from `/ui/dead-letters`), carrying
+    // the operator's session cookie. Every row's per-entry "Replay" and
+    // "Discard" button posts to these same two bulk routes with a single
+    // `dead_letter_id` field, so they cover the whole page. `POST
+    // /dead-letters/{id}/replay` and `POST /dlq/redrive` are separate,
+    // bodyless API-only operations no Vantage form ever targets, so they
+    // stay ungated here. The rest of this router is out of scope too. It is
+    // the documented, headerless `curl`-and-CLI management API (see
+    // `docs/runbooks/`), not a surface Vantage renders an HTML `<form>`
+    // against.
+    let same_origin = middleware::from_fn(crate::same_origin::require_same_origin);
 
     Router::new()
         .route("/workflows", get(list_workflows))
@@ -4719,6 +4774,18 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route(
             "/workflows/by-id/{workflow_name}/{workflow_id}",
             get(get_workflow_by_id),
+        )
+        // Empty-workflow_id guard (issue #1353): the literal trailing-slash
+        // shape of the base route above. `matchit` will not bind an empty
+        // FINAL segment to `{workflow_id}`. Without this registration the
+        // request never reaches a handler at all. It would 404 at the router
+        // instead -- a structural failure, not the 400 every sibling by-id
+        // route now gives for an empty id. Distinct literal template from
+        // both the 3-segment name-only guard and the 4-segment param route,
+        // so no collision.
+        .route(
+            "/workflows/by-id/{workflow_name}/",
+            get(get_workflow_by_id_trailing_slash),
         )
         .route(
             "/workflows/by-id/{workflow_name}/{workflow_id}/result",
@@ -4914,11 +4981,15 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         )
         .route(
             "/dead-letters/replay",
-            post(bulk_replay_dead_letters_handler).route_layer(require_admin.clone()),
+            post(bulk_replay_dead_letters_handler)
+                .route_layer(require_admin.clone())
+                .route_layer(same_origin.clone()),
         )
         .route(
             "/dead-letters/discard",
-            post(bulk_discard_dead_letters_handler).route_layer(require_admin.clone()),
+            post(bulk_discard_dead_letters_handler)
+                .route_layer(require_admin.clone())
+                .route_layer(same_origin),
         )
         .route(
             "/dead-letters/{id}/replay",
@@ -4929,6 +5000,12 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             post(redrive_dead_letters_handler).route_layer(require_admin.clone()),
         )
         .route("/health", get(health))
+        // Kubernetes probes (issue #1812). PublicSafe, like `/health`.
+        .route("/health/live", get(health_live))
+        .route("/health/ready", get(health_ready))
+        // No admin gate: a client generator fetches this before it holds any
+        // credential. An embedder's own auth middleware still gates it.
+        .route("/openapi.json", get(crate::openapi::get_openapi_document))
         .route(
             "/admin/preflight",
             get(preflight).route_layer(require_admin.clone()),
@@ -4952,6 +5029,14 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route(
             "/admin/canary",
             get(admin_canary).route_layer(require_admin.clone()),
+        )
+        .route(
+            // Payload-codec key rotation progress (issue #948). Admin-gated,
+            // read-only. The response carries operator-chosen KEY IDS and
+            // per-key row counts — never key material, never payload content.
+            // See docs/api-contract.json.
+            "/admin/codec/rotation",
+            get(codec_rotation_status).route_layer(require_admin.clone()),
         )
         .route(
             "/admin/version-gates/usage",
@@ -5004,6 +5089,29 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             // resolve from user/tenant-derived fields (issue #607). Parity with
             // /admin/debounce and /admin/concurrency.
             get(start_throttle_status).route_layer(require_admin.clone()),
+        )
+        // Audit-record export to an external SIEM sink (issue #953).
+        // Read-only status; admin-gated like every other compliance-adjacent
+        // read.
+        .route(
+            "/admin/audit-export",
+            get(audit_export_status_handler).route_layer(require_admin.clone()),
+        )
+        // Rewind a shard's export cursor after sink-side data loss. Mutating
+        // and audited (`audit_export.redrive`).
+        .route(
+            "/admin/audit-export/redrive",
+            post(audit_export_redrive_handler).route_layer(require_admin.clone()),
+        )
+        // Retire / reactivate a shard's export cursor (issue #1273). Both
+        // mutating and audited.
+        .route(
+            "/admin/audit-export/decommission",
+            post(audit_export_decommission_handler).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/admin/audit-export/reactivate",
+            post(audit_export_reactivate_handler).route_layer(require_admin.clone()),
         )
         .route(
             "/admin/quotas",
@@ -5293,7 +5401,290 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             "/admin/tasks/{id}/eligibility",
             get(get_task_eligibility).route_layer(require_admin),
         )
+        // A route layer runs on a matched route only, so an unknown path
+        // still answers 404. It wraps every per-route layer above.
+        .route_layer(require_mutation_auth)
         .layer(Extension(api_state))
+}
+
+/// Admin-auth wiring a standalone mount declares for the management API
+/// (issue #1608).
+///
+/// [`HarvestPlugin`] installs the scoped-API-token layer (issue #942), the
+/// read-only-role layer (issue #776) and the [`HarvestApiState`] settings that
+/// `require_harvest_admin` reads. An embedder that mounts
+/// [`harvest_api_router`] on a raw Axum server reached none of them. The one
+/// credential Harvest has that needs no autumn-web `Session` was therefore
+/// unusable standalone. In a token-only mount, every route except those
+/// classified [`RouteClass::PublicSafe`] requires a verified Harvest token.
+///
+/// The layer ordering is load-bearing, so this type applies it rather than
+/// documenting it. See [`Self::mount`].
+///
+/// ```rust,no_run
+/// use autumn_harvest_plugin::api::{HarvestApiState, StandaloneAdminAuth, harvest_api_router};
+///
+/// let api_state = HarvestApiState::new();
+/// let auth = StandaloneAdminAuth::new()
+///     .with_api_tokens()
+///     .with_deployment_profile("prod");
+/// let router = auth.mount(harvest_api_router(api_state.clone()), &api_state);
+/// ```
+///
+/// [`HarvestPlugin`]: crate::HarvestPlugin
+// Each bool is an independent opt-in. A state machine would not fit them.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Debug, Default)]
+pub struct StandaloneAdminAuth {
+    api_tokens: bool,
+    read_only_role: bool,
+    authorizer: Option<crate::authz::SharedAuthorizer>,
+    admin_auth_boundary: bool,
+    allow_unauthenticated_mutations: bool,
+    deployment_profile: Option<String>,
+    admin_auth_session_key: Option<String>,
+    rate_limit: Option<crate::api_rate_limit::ApiRateLimit>,
+}
+
+impl StandaloneAdminAuth {
+    /// A mount that declares nothing. [`Self::mount`] then returns the router
+    /// unchanged, which is the pre-issue-#1608 standalone posture.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Install the scoped-API-token layer (issue #942).
+    ///
+    /// A request carrying a verified `hvst_` bearer reaches the routes its
+    /// scope allows. Without a declared embedder auth boundary, requests to
+    /// non-public routes must carry such a token; missing and non-Harvest
+    /// credentials are rejected with 401. A `read` token is denied every
+    /// mutating route with 403, before any handler runs. The layer needs a
+    /// token store, so install the storage pool on the state as well.
+    #[must_use]
+    pub const fn with_api_tokens(mut self) -> Self {
+        self.api_tokens = true;
+        self
+    }
+
+    /// Install the class-aware read-only-role layer (issue #776).
+    ///
+    /// The layer reads an autumn-web `Session` that the embedder's own auth
+    /// middleware sets, so apply that middleware outside the mounted router.
+    #[must_use]
+    pub const fn with_read_only_role(mut self) -> Self {
+        self.read_only_role = true;
+        self
+    }
+
+    /// Install an authorizer hook (issue #1803).
+    ///
+    /// The hook sees each request after the token and read-only layers. It can
+    /// deny by principal, route class, tenant key or shard. See
+    /// [`crate::authz`] for the contract.
+    #[must_use]
+    pub fn with_authorizer(mut self, authorizer: impl crate::authz::HarvestAuthorizer) -> Self {
+        self.authorizer = Some(crate::authz::SharedAuthorizer::new(authorizer));
+        self
+    }
+
+    /// Install the per-client rate limiter (issue #1827).
+    ///
+    /// Each verified token, or each client IP without one, gets one bucket
+    /// for mutating routes and one for read routes. See
+    /// [`crate::api_rate_limit`].
+    #[must_use]
+    pub const fn with_rate_limit(
+        mut self,
+        rate_limit: crate::api_rate_limit::ApiRateLimit,
+    ) -> Self {
+        self.rate_limit = Some(rate_limit);
+        self
+    }
+
+    /// Declare that the embedder authenticates admin requests itself.
+    ///
+    /// This is the standalone equivalent of [`HarvestPlugin::api_with_auth`].
+    /// It reports a boundary to `preflight` and admits admin routes. Declare it
+    /// only when an auth layer really does wrap the mounted router.
+    ///
+    /// [`HarvestPlugin::api_with_auth`]: crate::HarvestPlugin::api_with_auth
+    #[must_use]
+    pub const fn with_admin_auth_boundary(mut self) -> Self {
+        self.admin_auth_boundary = true;
+        self
+    }
+
+    /// Open the mutating routes to a caller with no credential (issue #1802).
+    ///
+    /// Outside the `dev` profile, a mount with no declared auth boundary
+    /// refuses every mutating route with 401. This opt-out restores the
+    /// pre-#1802 posture for routes with no admin gate. [`Self::mount`] sets
+    /// the state from this declaration, the same as the boundary. See
+    /// [`HarvestApiState::set_allow_unauthenticated_mutations`].
+    #[must_use]
+    pub const fn allow_unauthenticated_mutations(mut self) -> Self {
+        self.allow_unauthenticated_mutations = true;
+        self
+    }
+
+    /// Declare the deployment profile `preflight` reports.
+    ///
+    /// The profile is `unknown` when undeclared, which `preflight` reports as a
+    /// warning. The `dev` profile allows an unauthenticated local management
+    /// API. See [`HarvestApiState::set_deployment_profile`].
+    #[must_use]
+    pub fn with_deployment_profile(mut self, profile: impl Into<String>) -> Self {
+        self.deployment_profile = Some(profile.into());
+        self
+    }
+
+    /// Declare the session key the built-in guards read.
+    ///
+    /// Relevant only when the embedder sets an autumn-web `Session`. See
+    /// [`HarvestApiState::set_admin_auth_session_key`].
+    #[must_use]
+    pub fn with_admin_auth_session_key(mut self, session_key: impl Into<String>) -> Self {
+        self.admin_auth_session_key = Some(session_key.into());
+        self
+    }
+
+    /// The declared deployment profile, if any.
+    pub(crate) fn declared_deployment_profile(&self) -> Option<&str> {
+        self.deployment_profile.as_deref()
+    }
+
+    /// Apply the declaration to `api_state` and wrap `router` in the declared
+    /// layers.
+    ///
+    /// `router` is the composed Harvest router: [`harvest_api_router`], with
+    /// [`harvest_ui_router`] already nested inside it when Vantage is mounted.
+    /// Nesting first is what puts Vantage under the read-only-role layer, which
+    /// is how [`HarvestPlugin`] composes it.
+    ///
+    /// When an embedder auth boundary is declared, apply it outside. The
+    /// request order is then: embedder auth -> token layer -> read-only-role
+    /// layer -> authorizer -> per-route `require_admin` -> handler. Without
+    /// that declaration, enabling API tokens additionally installs a
+    /// fail-closed token requirement on every non-public route.
+    ///
+    /// [`harvest_ui_router`]: crate::harvest_ui_router
+    /// [`HarvestPlugin`]: crate::HarvestPlugin
+    pub fn mount(&self, router: Router<()>, api_state: &HarvestApiState) -> Router<()> {
+        api_state.set_admin_auth_boundary(self.admin_auth_boundary);
+        api_state.set_allow_unauthenticated_mutations(self.allow_unauthenticated_mutations);
+        if let Some(profile) = &self.deployment_profile {
+            api_state.set_deployment_profile(profile.clone());
+        }
+        if let Some(session_key) = &self.admin_auth_session_key {
+            api_state.set_admin_auth_session_key(session_key.clone());
+        }
+        let router = apply_admin_auth_layers(
+            router,
+            api_state,
+            &AdminAuthLayers {
+                api_tokens: self.api_tokens,
+                read_only_role: self.read_only_role,
+                authorizer: self.authorizer.clone(),
+                rate_limit: self.rate_limit.clone(),
+            },
+        );
+        if self.api_tokens && !self.admin_auth_boundary {
+            router.layer(middleware::from_fn(
+                crate::api_token::require_token_for_non_public,
+            ))
+        } else {
+            router
+        }
+    }
+}
+
+/// The opt-in layers [`apply_admin_auth_layers`] installs.
+pub(crate) struct AdminAuthLayers {
+    /// The scoped-API-token layer (issue #942).
+    pub api_tokens: bool,
+    /// The read-only-role layer (issue #776).
+    pub read_only_role: bool,
+    /// The authorizer hook (issue #1803).
+    pub authorizer: Option<crate::authz::SharedAuthorizer>,
+    /// The per-client rate limiter (issue #1827).
+    pub rate_limit: Option<crate::api_rate_limit::ApiRateLimit>,
+}
+
+/// Wrap a composed Harvest router in the admin-auth layer stack.
+///
+/// The one place the ordering is written down. `HarvestPlugin` and
+/// [`StandaloneAdminAuth::mount`] both call this, so the two mount paths cannot
+/// drift.
+///
+/// Issue #776: the class-aware read-only layer is installed BEFORE the
+/// embedder's auth middleware wraps the router. The request order is:
+/// embedder auth mw (sets Session), token layer, this layer, per-route
+/// `require_admin`, handler. This layer reads the Session, the method and the
+/// nest-stripped path. It is applied to the combined router, so it also covers
+/// a nested `/ui` sub-router. Vantage carries no route class, so it fails
+/// closed and answers 403 for a read-only principal.
+///
+/// Issue #942: the scoped-API-token verification and scope layer is installed
+/// OUTSIDE the read-only-class layer, so it runs first. It verifies the token,
+/// sets `TokenPrincipal` and the authoritative actor, then denies a read-scope
+/// mutation. It sits INSIDE the embedder's auth middleware.
+///
+/// Issue #1803: the authorizer layer is installed INSIDE the read-only-class
+/// layer. It runs after both built-in gates, so it can only deny. It sees the
+/// `TokenPrincipal` the token layer sets.
+///
+/// Issue #1827: the rate-limit layer sits directly INSIDE the token layer. It
+/// keys a bucket on the verified `TokenPrincipal`, so an unverified bearer
+/// cannot open a new bucket. It runs before the read-only and authorizer
+/// layers, so a refused request reaches no handler.
+///
+/// With tokens on, a pre-auth layer of the same limiter sits OUTSIDE the token
+/// layer. It charges each claimed token to its address before the lookup. A
+/// flood of made-up tokens thus gets `429` and never reaches the pool. The
+/// inner layer refunds that charge when the token verifies.
+///
+/// No layer is installed unless asked for, so a deployment that declares none
+/// does an identical amount of work as before.
+pub(crate) fn apply_admin_auth_layers(
+    router: Router<()>,
+    api_state: &HarvestApiState,
+    layers: &AdminAuthLayers,
+) -> Router<()> {
+    let mut router = router;
+    if let Some(authorizer) = &layers.authorizer {
+        router = router.layer(middleware::from_fn_with_state(
+            (api_state.clone(), authorizer.clone()),
+            crate::authz::enforce_authorizer,
+        ));
+    }
+    if layers.read_only_role {
+        router = router.layer(middleware::from_fn(enforce_read_only_class));
+    }
+    let limiter = layers
+        .rate_limit
+        .clone()
+        .map(crate::api_rate_limit::ApiRateLimiter::new);
+    if let Some(limiter) = &limiter {
+        router = router.layer(middleware::from_fn_with_state(
+            (api_state.clone(), limiter.clone()),
+            crate::api_rate_limit::enforce_api_rate_limit,
+        ));
+    }
+    if layers.api_tokens {
+        router = router.layer(middleware::from_fn_with_state(
+            api_state.clone(),
+            crate::api_token::enforce_token_scope,
+        ));
+        if let Some(limiter) = limiter {
+            router = router.layer(middleware::from_fn_with_state(
+                (api_state.clone(), limiter),
+                crate::api_rate_limit::enforce_pre_auth_rate_limit,
+            ));
+        }
+    }
+    router
 }
 
 pub(crate) async fn require_harvest_admin(
@@ -5307,6 +5698,11 @@ pub(crate) async fn require_harvest_admin(
     // outer `enforce_token_scope` layer, so a `read` token attempting a mutating
     // admin route was denied 403 before reaching here; any principal that
     // reaches this point is authorized for the route it is on.
+    //
+    // A standalone mount installs that outer layer with
+    // `StandaloneAdminAuth::with_api_tokens` (issue #1608). The layer used to
+    // have exactly one call site, inside `HarvestPlugin`, which made this mode
+    // unreachable off the plugin path.
     if request
         .extensions()
         .get::<crate::api_token::TokenPrincipal>()
@@ -5322,6 +5718,186 @@ pub(crate) async fn require_harvest_admin(
     }
 }
 
+/// Refuse an unauthenticated call to a `Mutating` route (issue #1802).
+///
+/// The class comes from `CLASSIFIED_ROUTES`, and an unclassified route counts
+/// as `Mutating`. An `OPTIONS` preflight is not a mutation, so it passes. A
+/// route with an admin gate runs this check first, then its
+/// own. This check admits every caller the admin gate admits, so the admin
+/// gate still decides. The per-route same-origin guard on the bulk
+/// dead-letter routes runs after this check, so an anonymous cross-site post
+/// there gets 401, not 403.
+pub(crate) async fn require_classified_mutation_auth(
+    State(api_state): State<HarvestApiState>,
+    request: axum::extract::Request,
+    next: Next,
+) -> axum::response::Response {
+    if request.method() == axum::http::Method::OPTIONS
+        || classify_route(request.method(), request.uri().path()) != RouteClass::Mutating
+    {
+        return next.run(request).await;
+    }
+    admit_mutation(&api_state, request, next).await
+}
+
+/// Refuse an unauthenticated mutation on a route outside `CLASSIFIED_ROUTES`
+/// (issue #1802).
+///
+/// Vantage and the MCP tool routes use it. Every method except `GET`, `HEAD`
+/// and `OPTIONS` counts as a mutation.
+pub(crate) async fn require_mutation_auth_by_method(
+    State(api_state): State<HarvestApiState>,
+    request: axum::extract::Request,
+    next: Next,
+) -> axum::response::Response {
+    if matches!(
+        *request.method(),
+        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+    ) {
+        return next.run(request).await;
+    }
+    admit_mutation(&api_state, request, next).await
+}
+
+async fn admit_mutation(
+    api_state: &HarvestApiState,
+    request: axum::extract::Request,
+    next: Next,
+) -> axum::response::Response {
+    let has_token = request
+        .extensions()
+        .get::<crate::api_token::TokenPrincipal>()
+        .is_some();
+    let session = request.extensions().get::<Session>().cloned();
+    if !mutation_admitted(api_state, has_token, session).await {
+        return AutumnError::unauthorized_msg("authentication required").into_response();
+    }
+    // Issue #1823: a handler reads its body after the guards below are
+    // taken. A slow upload would then hold them while nothing writes. So the
+    // body is read first, up to the largest limit any route allows. The
+    // route's own limit still applies when its handler extracts the body.
+    let request = if autumn_harvest::replication::FenceRegistry::is_enabled() {
+        let (parts, body) = request.into_parts();
+        let limit = usize::try_from(BATCH_START_BODY_HARD_LIMIT).unwrap_or(usize::MAX);
+        match axum::body::to_bytes(body, limit).await {
+            Ok(bytes) => axum::extract::Request::from_parts(parts, axum::body::Body::from(bytes)),
+            Err(error) => {
+                return AutumnError::bad_request_msg(error.to_string())
+                    .with_status(StatusCode::PAYLOAD_TOO_LARGE)
+                    .into_response();
+            }
+        }
+    } else {
+        request
+    };
+    // Held until the handler returns, so a bump cannot commit while the
+    // handler writes. See `FencePassGuard`.
+    let fence = match enforce_dr_fence(api_state).await {
+        Ok(guards) => guards,
+        Err(refusal) => return refusal.into_response(),
+    };
+    run_dr_fenced(&fence, next.run(request)).await
+}
+
+/// Run a handler under its DR fence guards (issue #1823).
+///
+/// A lost guard session frees the pass lock, so a bump can commit. The
+/// handler then stops and the caller gets a `503`. The pool discards a
+/// connection that the handler left in a transaction, so the server rolls
+/// the transaction back.
+pub(crate) async fn run_dr_fenced(
+    fence: &[autumn_harvest::replication::FencePassGuard],
+    handler: impl std::future::Future<Output = axum::response::Response>,
+) -> axum::response::Response {
+    autumn_harvest::replication::run_fenced_pass(fence, handler)
+        .await
+        .unwrap_or_else(|lost| {
+            AutumnError::service_unavailable_msg(lost.to_string()).into_response()
+        })
+}
+
+/// Refuse an admin write when this process lost write authority (issue #1823).
+///
+/// Every route that [`admit_mutation`] gates runs this after authentication:
+/// the classified management API, Vantage and the MCP tools. It opens a fence
+/// barrier on each shard of the storage pool, and on every pinned shard
+/// colocated with it, through
+/// [`autumn_harvest::replication::begin_fenced_tick`]. Each barrier is opened
+/// on the database where its row lives. A failover bumps the generation, so a
+/// stale node refuses each admin write before its handler runs. A process
+/// that pinned nothing pays one atomic load.
+///
+/// A shard that cannot be checked fails closed with `503`.
+///
+/// The caller holds the returned guards until its handler returns. Each is
+/// a commit-order barrier: a bump cannot commit while the handler writes.
+/// See [`autumn_harvest::replication::FencePassGuard`].
+pub(crate) async fn enforce_dr_fence(
+    api_state: &HarvestApiState,
+) -> Result<Vec<autumn_harvest::replication::FencePassGuard>, AutumnError> {
+    use autumn_harvest::replication::{FenceRegistry, begin_fenced_tick};
+
+    if !FenceRegistry::is_enabled() {
+        return Ok(Vec::new());
+    }
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    // Every refusal here is a 503, whatever its error kind. A retry must
+    // reach an authoritative node, and a webhook releases its delivery id
+    // only on a 5xx.
+    begin_fenced_tick(pool.sharded_pool())
+        .await
+        .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))
+}
+
+/// Whether the mutation gate admits a caller (issue #1802).
+///
+/// The gate is open in the `dev` profile, under a declared auth boundary, and
+/// under the explicit opt-out. Otherwise the caller must present a verified
+/// scoped token or pass the admin check.
+async fn mutation_admitted(
+    api_state: &HarvestApiState,
+    has_token: bool,
+    session: Option<Session>,
+) -> bool {
+    let auth_boundary_present = api_state.admin_auth_boundary();
+    if auth_boundary_present
+        || crate::boot::unauthenticated_mutations_open(
+            &api_state.deployment_profile(),
+            auth_boundary_present,
+            api_state.allow_unauthenticated_mutations(),
+        )
+        || has_token
+    {
+        return true;
+    }
+    has_harvest_admin_access(api_state, session).await
+}
+
+/// Whether the request established a session principal at all (issue #1284).
+///
+/// Two shapes mean "this caller presented no credential", and they are NOT the
+/// same shape — a fix that handles only the first leaves the reported bug in
+/// place:
+///
+///   1. **No `Session` extension.** No session layer ran, so nothing could ever
+///      have authenticated this caller. This is what a standalone integration
+///      that mounts [`harvest_api_router`] directly produces.
+///   2. **A `Session` that is not cookie-backed.** autumn-web installs its
+///      session layer *unconditionally* and that layer inserts a `Session` on
+///      every request — minting a fresh, empty one when the request carries no
+///      valid session cookie. `HarvestPlugin` mounts through `app.nest(..)`,
+///      i.e. *inside* that layer, so a cookieless CLI call against a real
+///      autumn-web app arrives as `Some(session)`, never `None`.
+///      [`Session::is_cookie_backed`] is autumn-web's own accessor for exactly
+///      this question: did the session id come from a valid request cookie, or
+///      was it generated for this request?
+///
+/// A forged or stale cookie also lands here, correctly: it establishes no
+/// principal either.
+async fn session_principal_established(session: &Session) -> bool {
+    session.is_cookie_backed().await
+}
+
 pub(crate) async fn has_harvest_admin_access(
     api_state: &HarvestApiState,
     session: Option<Session>,
@@ -5330,11 +5906,46 @@ pub(crate) async fn has_harvest_admin_access(
         return true;
     }
 
+    // ── Unauthenticated local management API in the `dev` profile (#1284) ────
+    //
+    // `set_deployment_profile`'s contract has always read "`dev` allows an
+    // unauthenticated local management API", and `check_admin_auth_boundary`
+    // reports the boundary as "optional for the dev profile" — but the code
+    // required a `Session` carrying `admin_auth_session_key` regardless of
+    // profile, so the quickstart's own documented Step 3
+    // (`harvest --base-url … preflight`, a bare cookieless request) answered
+    // 401 for everyone, always. This makes the code match its contract.
+    //
+    // The widening is bounded on three sides, and each bound is a test in
+    // `tests/security.rs`:
+    //   - `dev` only. Every other profile — including the default `unknown`
+    //     that a standalone integration gets for free — falls through to the
+    //     unchanged fail-closed branch below.
+    //   - Callers with no established session only. A cookie-backed session is
+    //     still judged by `admin_auth_session_key`, so an embedder running its
+    //     own auth middleware in `dev` keeps exactly the gate it has today.
+    //     Read this as a compatibility bound, not a security barrier: a caller
+    //     is always free to simply omit its cookie. What keeps the posture safe
+    //     is the `dev`-only bound plus the network boundary, which is why the
+    //     startup warning says "do not expose this process beyond localhost".
+    //   - An embedder-declared boundary still short-circuits above, and the
+    //     scoped-token path (#942) short-circuits earlier still, in
+    //     `require_harvest_admin`.
+    //
+    // A `dev` deployment reaching this arm is announced at startup by
+    // `warn_if_dev_admin_api_is_open` and reported by `harvest preflight`'s
+    // `admin_auth_boundary` check (`unauthenticated_access: true`), so an open
+    // management API is never silent.
+    let is_dev = api_state.deployment_profile() == "dev";
+
     let Some(session) = session else {
-        return false;
+        return is_dev;
     };
 
-    if api_state.deployment_profile() == "dev" {
+    if is_dev {
+        if !session_principal_established(&session).await {
+            return true;
+        }
         let session_key = api_state.admin_auth_session_key();
         session.contains_key(&session_key).await
     } else {
@@ -5494,49 +6105,82 @@ fn normalize_route_template(path: &str) -> String {
     }
     if out.is_empty() {
         out.push('/');
+    } else if path.len() > 1 && path.ends_with('/') {
+        // issue #1353: preserve a literal trailing slash. `matchit` binds it
+        // as a distinct route from the no-slash form. Dropping it here would
+        // collide two separately registered routes onto one template (e.g.
+        // the by-id empty-`workflow_id` guard and its name-only sibling).
+        out.push('/');
     }
     out
 }
 
-/// Per-method radix-tree matchers over `CLASSIFIED_ROUTES`, built once.
+/// Per-method radix-tree matchers over one route table.
 ///
-/// Keyed per HTTP method because the same path can carry a different class per
+/// Keyed per HTTP method because the same path can carry a different value per
 /// method (e.g. `GET /admin/schedules/{id}` is `ReadOnly`, `DELETE` is
 /// `Mutating`).
-fn route_class_matchers() -> &'static HashMap<axum::http::Method, matchit::Router<RouteClass>> {
-    static MATCHERS: std::sync::OnceLock<HashMap<axum::http::Method, matchit::Router<RouteClass>>> =
-        std::sync::OnceLock::new();
-    MATCHERS.get_or_init(|| {
-        let mut by_method: HashMap<axum::http::Method, matchit::Router<RouteClass>> =
-            HashMap::new();
-        for (template, class) in CLASSIFIED_ROUTES {
-            let Some((method, path)) = template.split_once(' ') else {
-                debug_assert!(false, "malformed CLASSIFIED_ROUTES template: {template}");
-                continue;
-            };
-            let Ok(method) = method.parse::<axum::http::Method>() else {
-                debug_assert!(false, "unknown method in CLASSIFIED_ROUTES: {template}");
-                continue;
-            };
-            let normalized = normalize_route_template(path);
-            let router = by_method.entry(method).or_default();
-            if let Err(e) = router.insert(normalized, *class) {
-                // Fail closed, never panic (F4): a future post-normalization
-                // collision must not crash the first read-only request and
-                // poison the `OnceLock`. A skipped route stays unclassified →
-                // `classify_route` → `Mutating` → denied to read-only
-                // principals (over-restriction, never exposure). The
-                // build-time `route_class_matchers_build_without_conflict`
-                // test (debug_assert active) still fails CI on any conflict.
-                tracing::error!(
-                    template = %template,
-                    error = %e,
-                    "harvest: CLASSIFIED_ROUTES matcher insert failed; route will fail closed (deny read-only)"
-                );
-                debug_assert!(false, "matcher insert conflict for '{template}': {e}");
-            }
+pub(crate) type RouteMatchers<T> = HashMap<axum::http::Method, matchit::Router<T>>;
+
+/// Build [`RouteMatchers`] from `(template, value)` pairs. `table` names the
+/// source table in a conflict log.
+pub(crate) fn build_route_matchers<T>(
+    table: &str,
+    entries: impl IntoIterator<Item = (&'static str, T)>,
+) -> RouteMatchers<T> {
+    let mut by_method: RouteMatchers<T> = HashMap::new();
+    for (template, value) in entries {
+        let Some((method, path)) = template.split_once(' ') else {
+            debug_assert!(false, "malformed {table} template: {template}");
+            continue;
+        };
+        let Ok(method) = method.parse::<axum::http::Method>() else {
+            debug_assert!(false, "unknown method in {table}: {template}");
+            continue;
+        };
+        let normalized = normalize_route_template(path);
+        let router = by_method.entry(method).or_default();
+        if let Err(e) = router.insert(normalized, value) {
+            // Fail closed, never panic (F4): a future post-normalization
+            // collision must not crash the first request and poison the
+            // `OnceLock`. A skipped route stays unmatched, and every caller
+            // treats unmatched as the restrictive answer. The build-time
+            // `route_class_matchers_build_without_conflict` test (debug_assert
+            // active) still fails CI on any conflict.
+            tracing::error!(
+                table = %table,
+                template = %template,
+                error = %e,
+                "harvest: route matcher insert failed; route will fail closed"
+            );
+            debug_assert!(false, "matcher insert conflict for '{template}': {e}");
         }
-        by_method
+    }
+    by_method
+}
+
+/// Look up `path` for `method` in `matchers`.
+///
+/// `HEAD` is looked up under `GET` (F3): axum serves `HEAD` via the `GET`
+/// handler, so a `HEAD` probe inherits that route's value.
+pub(crate) fn match_route<'m, T>(
+    matchers: &'m RouteMatchers<T>,
+    method: &axum::http::Method,
+    path: &'m str,
+) -> Option<matchit::Match<'m, 'm, &'m T>> {
+    let lookup_method = if *method == axum::http::Method::HEAD {
+        &axum::http::Method::GET
+    } else {
+        method
+    };
+    matchers.get(lookup_method)?.at(path).ok()
+}
+
+/// Per-method matchers over `CLASSIFIED_ROUTES`, built once.
+fn route_class_matchers() -> &'static RouteMatchers<RouteClass> {
+    static MATCHERS: std::sync::OnceLock<RouteMatchers<RouteClass>> = std::sync::OnceLock::new();
+    MATCHERS.get_or_init(|| {
+        build_route_matchers("CLASSIFIED_ROUTES", CLASSIFIED_ROUTES.iter().copied())
     })
 }
 
@@ -5550,19 +6194,129 @@ fn route_class_matchers() -> &'static HashMap<axum::http::Method, matchit::Route
 /// read class rather than fail closed to `Mutating` and 403 a read-only
 /// dashboard's existence/size probe.
 pub(crate) fn classify_route(method: &axum::http::Method, path: &str) -> RouteClass {
-    let get = axum::http::Method::GET;
-    let lookup_method = if *method == axum::http::Method::HEAD {
-        &get
-    } else {
-        method
-    };
-    let Some(router) = route_class_matchers().get(lookup_method) else {
-        return RouteClass::Mutating;
-    };
-    match router.at(path) {
-        Ok(m) => *m.value,
-        Err(_) => RouteClass::Mutating,
+    classified_route(method, path).unwrap_or(RouteClass::Mutating)
+}
+
+/// The `CLASSIFIED_ROUTES` class of a request, or `None` for an unclassified
+/// route.
+///
+/// The API rate limiter (issue #1827) classes a `None` route by its method.
+/// Use [`classify_route`] for an access decision. It fails closed.
+pub(crate) fn classified_route(method: &axum::http::Method, path: &str) -> Option<RouteClass> {
+    match_route(route_class_matchers(), method, path).map(|m| *m.value)
+}
+
+/// Path prefixes under which every mutation is admin-only (issue #1803).
+///
+/// This catches a future token or module route that someone forgets to add to
+/// [`autumn_harvest::audit::ADMIN_SCOPE_ROUTES`].
+const ADMIN_SCOPE_PREFIXES: &[&str] = &["/admin/tokens", "/admin/modules", "/modules"];
+
+/// Whether only an `admin`-scoped token may call this route (issue #1803).
+///
+/// Backed by [`autumn_harvest::audit::ADMIN_SCOPE_ROUTES`], plus any mutation
+/// under [`ADMIN_SCOPE_PREFIXES`]. A path that matches neither is not
+/// admin-only, but [`classify_route`] still treats it as `Mutating`.
+pub(crate) fn requires_admin_scope(method: &axum::http::Method, path: &str) -> bool {
+    static MATCHERS: std::sync::OnceLock<RouteMatchers<()>> = std::sync::OnceLock::new();
+    let safe = matches!(
+        *method,
+        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+    );
+    let under_prefix = ADMIN_SCOPE_PREFIXES.iter().any(|prefix| {
+        path.strip_prefix(prefix)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    });
+    if !safe && under_prefix {
+        return true;
     }
+    let matchers = MATCHERS.get_or_init(|| {
+        build_route_matchers(
+            "ADMIN_SCOPE_ROUTES",
+            autumn_harvest::audit::ADMIN_SCOPE_ROUTES
+                .iter()
+                .map(|route| (*route, ())),
+        )
+    });
+    match_route(matchers, method, path).is_some()
+}
+
+/// The positional name of the execution-id parameter in a route template.
+///
+/// `{exec_id}` and `{run_exec_id}` are execution ids wherever they occur.
+/// `{id}` is one only directly under `/workflows/`. Elsewhere `{id}` names a
+/// token, gate or schedule, whose UUID bits do not encode a shard.
+fn execution_param(template: &str) -> Option<String> {
+    let (_, path) = template.split_once(' ')?;
+    let params = path
+        .split('/')
+        .filter(|seg| seg.starts_with('{') && seg.ends_with('}'));
+    for (idx, param) in params.enumerate() {
+        let is_exec = matches!(param, "{exec_id}" | "{run_exec_id}")
+            || (param == "{id}" && path.starts_with("/workflows/{id}"));
+        if is_exec {
+            return Some(format!("p{idx}"));
+        }
+    }
+    None
+}
+
+/// Parse one raw path segment as an execution id.
+///
+/// The segment is percent-decoded first, as axum's `Path` extractor does.
+fn parse_execution_segment(raw: &str) -> Option<autumn_harvest::types::ExecutionId> {
+    let decoded = percent_encoding::percent_decode_str(raw)
+        .decode_utf8()
+        .ok()?;
+    let uuid = uuid::Uuid::parse_str(&decoded).ok()?;
+    Some(autumn_harvest::types::ExecutionId::from_uuid(uuid))
+}
+
+/// The execution id a Vantage route under `/ui` names, if any.
+///
+/// Vantage names an execution as `/ui/workflows/{id}/...` or
+/// `/ui/dags/{dag_name}/runs/{run_exec_id}/...`.
+fn ui_execution_id(path: &str) -> Option<autumn_harvest::types::ExecutionId> {
+    let mut segments = path.strip_prefix("/ui/")?.split('/');
+    match (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) {
+        (Some("workflows"), Some(id), _, _) | (Some("dags"), Some(_), Some("runs"), Some(id)) => {
+            parse_execution_segment(id)
+        }
+        _ => None,
+    }
+}
+
+/// The execution id a route names in its path, if any (issue #1803).
+///
+/// A management route is matched against `CLASSIFIED_ROUTES`. Only the
+/// parameter [`execution_param`] picks is decoded, so a token or gate UUID
+/// never yields a shard. A Vantage route under `/ui` uses
+/// [`ui_execution_id`].
+pub(crate) fn execution_id_in_path(
+    method: &axum::http::Method,
+    path: &str,
+) -> Option<autumn_harvest::types::ExecutionId> {
+    static MATCHERS: std::sync::OnceLock<RouteMatchers<Option<String>>> =
+        std::sync::OnceLock::new();
+    if path.starts_with("/ui/") {
+        return ui_execution_id(path);
+    }
+    let matchers = MATCHERS.get_or_init(|| {
+        build_route_matchers(
+            "CLASSIFIED_ROUTES",
+            CLASSIFIED_ROUTES
+                .iter()
+                .map(|(template, _)| (*template, execution_param(template))),
+        )
+    });
+    let matched = match_route(matchers, method, path)?;
+    let param = matched.value.as_deref()?;
+    parse_execution_segment(matched.params.get(param)?)
 }
 
 /// A `403 Forbidden` for a read-only principal that attempted a mutation
@@ -6078,6 +6832,9 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/workflows/by-id/{workflow_name}"),
         ("POST", "/workflows/by-id/{workflow_name}"),
         ("GET", "/workflows/by-id/{workflow_name}/{workflow_id}"),
+        // Empty-workflow_id guard (issue #1353): literal trailing-slash form
+        // of the base route above; always 400.
+        ("GET", "/workflows/by-id/{workflow_name}/"),
         (
             "GET",
             "/workflows/by-id/{workflow_name}/{workflow_id}/result",
@@ -6148,14 +6905,23 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/batch-operations"),
         ("POST", "/batch-operations"),
         ("GET", "/batch-operations/{id}"),
+        // ── task priority (issue #249) ────────────────────────────────────────
+        ("PATCH", "/tasks/{id}"),
         // ── health & admin ────────────────────────────────────────────────────
         ("GET", "/health"),
+        ("GET", "/health/live"),
+        ("GET", "/health/ready"),
+        // The published OpenAPI 3.1 document for this router.
+        ("GET", "/openapi.json"),
         ("GET", "/admin/preflight"),
         ("GET", "/admin/shards/health"),
         ("GET", "/admin/queue-coverage"),
         ("GET", "/admin/status"),
         ("GET", "/admin/config"),
         ("GET", "/admin/canary"),
+        // Payload-codec key rotation progress (issue #948): admin-gated,
+        // read-only. See docs/api-contract.json.
+        ("GET", "/admin/codec/rotation"),
         ("GET", "/admin/version-gates/usage"),
         ("GET", "/admin/version-gates/retirement-check"),
         ("GET", "/admin/workflow-types/reachability"),
@@ -6167,6 +6933,11 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/debounce"),
         ("GET", "/admin/start-throttle"),
         ("GET", "/admin/quotas"),
+        // ── Audit export to a SIEM sink (issue #953) ──────────────────────
+        ("GET", "/admin/audit-export"),
+        ("POST", "/admin/audit-export/redrive"),
+        ("POST", "/admin/audit-export/decommission"),
+        ("POST", "/admin/audit-export/reactivate"),
         ("GET", "/admin/rate-limits"),
         ("POST", "/admin/rate-limits/{key}"),
         // ── TTL'd runtime pacing overrides (issue #945) ───────────────────
@@ -6283,6 +7054,8 @@ pub const fn management_api_request_fields()
                 "idempotency_key",
                 "shard_id",
                 "residency_key",
+                "context_headers",
+                "priority",
             ]),
         ),
         (
@@ -6436,32 +7209,39 @@ pub const fn management_api_request_fields()
             "POST",
             "/dead-letters/replay",
             Some(&[
+                "dead_letter_id",
                 "activity_name",
                 "workflow_name",
                 "queue_name",
                 "min_attempts",
+                "task_type",
                 "failed_after",
                 "failed_before",
                 "error_class",
                 "dlq_reason",
                 "failure_signature",
+                "shard_id",
                 "limit",
                 "dry_run",
+                "spread_secs",
             ]),
         ),
         (
             "POST",
             "/dead-letters/discard",
             Some(&[
+                "dead_letter_id",
                 "activity_name",
                 "workflow_name",
                 "queue_name",
                 "min_attempts",
+                "task_type",
                 "failed_after",
                 "failed_before",
                 "error_class",
                 "dlq_reason",
                 "failure_signature",
+                "shard_id",
                 "limit",
                 "dry_run",
             ]),
@@ -6472,6 +7252,7 @@ pub const fn management_api_request_fields()
             "/dlq/redrive",
             Some(&[
                 "queue",
+                "shard_id",
                 "workflow_name",
                 "dead_lettered_after",
                 "dead_lettered_before",
@@ -6480,6 +7261,7 @@ pub const fn management_api_request_fields()
                 "max",
                 "dry_run",
                 "reason",
+                "spread_secs",
             ]),
         ),
         // ── external activity handoff ─────────────────────────────────────────
@@ -6501,6 +7283,7 @@ pub const fn management_api_request_fields()
         // ── workers ───────────────────────────────────────────────────────────
         ("POST", "/workers/{worker_id}/drain", Some(&["deadline_at"])),
         // ── batch operations ──────────────────────────────────────────────────
+        ("PATCH", "/tasks/{id}", Some(&["priority"])),
         (
             "POST",
             "/batch-operations",
@@ -6555,6 +7338,14 @@ pub const fn management_api_request_fields()
             "/admin/start-throttle/{workflow_name}/override",
             Some(&[]),
         ),
+        // ── audit export (issue #953) ────────────────────────────────────
+        (
+            "POST",
+            "/admin/audit-export/redrive",
+            Some(&["shard", "to_seq", "before"]),
+        ),
+        ("POST", "/admin/audit-export/decommission", Some(&["shard"])),
+        ("POST", "/admin/audit-export/reactivate", Some(&["shard"])),
         (
             "POST",
             "/admin/schedules/workflow",
@@ -6570,6 +7361,14 @@ pub const fn management_api_request_fields()
                 "skip_policy",
                 "catchup_policy",
                 "catchup_window_secs",
+                "timezone",
+                "jitter_secs",
+                "overlap_policy",
+                "buffer_all_max",
+                "consecutive_failure_limit",
+                "end_at",
+                "max_runs",
+                "retry_policy",
             ]),
         ),
         (
@@ -6593,12 +7392,13 @@ pub const fn management_api_request_fields()
                 "catchup_policy",
                 "catchup_window_secs",
                 "retry_policy",
+                "workflow_name",
             ]),
         ),
         ("POST", "/admin/schedules/{id}/pause", Some(&["reason"])),
-        // Resume accepts an optional body for forward-compatibility but reason is not persisted
-        // (pause_reason is cleared on resume and AuditRecord has no free-text notes field).
-        ("POST", "/admin/schedules/{id}/resume", Some(&[])),
+        // Resume accepts `reason` for symmetry with pause, then ignores it. Resume clears
+        // pause_reason, and AuditRecord has no free-text notes field.
+        ("POST", "/admin/schedules/{id}/resume", Some(&["reason"])),
         (
             "POST",
             "/admin/schedules/{id}/backfill",
@@ -6750,6 +7550,7 @@ pub const fn management_api_response_fields()
                 "scheduled_time",
                 "history_truncated",
                 "history_endpoint",
+                "legal_hold",
             ]),
         ),
         (
@@ -6766,7 +7567,12 @@ pub const fn management_api_response_fields()
         (
             "GET",
             "/workflows/{id}/children",
-            Some(&["items", "next_cursor"]),
+            // `status` + `unavailable_shards` added additively (issue #756's
+            // contract, extended here by #956): the traversal already spans
+            // every shard, and cross-shard child placement makes an unreachable
+            // shard routine — so it degrades to `200 partial` naming the shard
+            // rather than a `500`.
+            Some(&["items", "next_cursor", "status", "unavailable_shards"]),
         ),
         (
             "GET",
@@ -6916,24 +7722,18 @@ pub const fn management_api_response_fields()
         (
             "POST",
             "/workflows/{workflow_name}/start",
-            // Normal start returns 200/201 with execution_id/workflow_name/workflow_id/state.
-            // A debounced workflow (issue #499) instead returns 202 Accepted with the
-            // debounce fields below (no execution_id exists until the scanner fires).
-            // With an idempotency_key (issue #808) the response also carries the
-            // started_fresh/deduplicated flags (200 on a dedup replay).
+            // The 201 body: a normal start, or a batch that flushed at once. With
+            // an idempotency_key (issue #808) it also carries started_fresh and
+            // deduplicated. A deferred start (debounce, batch or throttle) is a
+            // 202 with its own fields. The contract lists those under
+            // `additional_responses` (issue #1616).
             Some(&[
                 "execution_id",
                 "workflow_name",
                 "workflow_id",
                 "state",
-                "debounced",
-                "debounce_key",
-                "fire_at",
-                "pending_count",
                 "batched",
                 "flushed",
-                "batch_key",
-                "max_size",
                 "started_fresh",
                 "deduplicated",
                 "shard_id",
@@ -7053,6 +7853,8 @@ pub const fn management_api_response_fields()
                 "children",
                 "skipped_children",
                 "failures",
+                "prior_residences",
+                "retired_residences",
             ]),
         ),
         (
@@ -7428,6 +8230,11 @@ pub const fn management_api_response_fields()
             ]),
         ),
         ("GET", "/batch-operations/{id}", None), // BatchJobView (external model)
+        (
+            "PATCH",
+            "/tasks/{id}",
+            Some(&["task_id", "priority", "updated"]),
+        ),
         // ── health & admin ────────────────────────────────────────────────────
         (
             "GET",
@@ -7442,6 +8249,22 @@ pub const fn management_api_response_fields()
                 "shard_readiness",
             ]),
         ),
+        ("GET", "/health/live", Some(&["alive", "draining"])),
+        (
+            "GET",
+            "/health/ready",
+            Some(&[
+                "ready",
+                "runtime_ready",
+                "draining",
+                "database_reachable",
+                "shard_readiness_enforced",
+                "shard_readiness",
+                "reasons",
+            ]),
+        ),
+        // The OpenAPI document itself, a free-form JSON object.
+        ("GET", "/openapi.json", None),
         (
             "GET",
             "/admin/preflight",
@@ -7577,6 +8400,47 @@ pub const fn management_api_response_fields()
             "/admin/quotas",
             Some(&["quotas", "status", "unavailable_shards"]),
         ),
+        (
+            "GET",
+            "/admin/codec/rotation",
+            Some(&[
+                "active_key_id",
+                "registered_key_ids",
+                "shards",
+                "rows_remaining_total",
+                "status",
+                "unavailable_shards",
+            ]),
+        ),
+        // ── audit export (issue #953) ────────────────────────────────────
+        (
+            "GET",
+            "/admin/audit-export",
+            Some(&["sink_configured", "shards", "status", "unavailable_shards"]),
+        ),
+        (
+            "POST",
+            "/admin/audit-export/redrive",
+            Some(&[
+                "shard",
+                "outcome",
+                "from",
+                "to",
+                "recoverable_records",
+                "already_purged_records",
+                "window_truncated",
+            ]),
+        ),
+        (
+            "POST",
+            "/admin/audit-export/decommission",
+            Some(&["shard", "outcome"]),
+        ),
+        (
+            "POST",
+            "/admin/audit-export/reactivate",
+            Some(&["shard", "outcome"]),
+        ),
         ("GET", "/admin/rate-limits", None), // Vec<RateLimitBucketView> (declared baseline + effective/override state, issue #945)
         ("POST", "/admin/rate-limits/{key}", Some(&["ok"])),
         // ── TTL'd runtime pacing overrides (issue #945) ───────────────────────
@@ -7677,6 +8541,7 @@ pub const fn management_api_response_fields()
                 "failure_threshold",
                 "window_secs",
                 "cooldown_secs",
+                "open_mode",
             ]),
         ),
         (
@@ -7692,6 +8557,7 @@ pub const fn management_api_response_fields()
                 "failure_threshold",
                 "window_secs",
                 "cooldown_secs",
+                "open_mode",
             ]),
         ),
         (
@@ -7707,6 +8573,7 @@ pub const fn management_api_response_fields()
                 "failure_threshold",
                 "window_secs",
                 "cooldown_secs",
+                "open_mode",
             ]),
         ),
         ("GET", "/admin/queues/scaling", None),
@@ -8186,11 +9053,33 @@ pub const fn management_api_response_fields()
     ]
 }
 
-async fn preflight(
-    Extension(api_state): Extension<HarvestApiState>,
-    axum::extract::State(autumn_state): axum::extract::State<AppState>,
-) -> Json<PreflightReport> {
-    api_state.set_deployment_profile(autumn_state.profile().to_string());
+// Issue #1609: this handler used to reset the deployment profile from
+// `AppState::profile()` on every call.
+//
+// The reset was redundant on the `HarvestPlugin` path. `plugin.rs`'s
+// `start_harvest_runtime` sets the profile once at startup, before this
+// handler can run.
+//
+// The reset was harmful on a standalone mount. The admin gate
+// (`require_admin`, a `route_layer`) reads the profile before this handler
+// runs. The reset here can never open the gate for its own request.
+//
+// The reset could also close a gate an embedder had opened. Some mounts use
+// a placeholder `AppState`, for example `AppState::for_test()`. Its
+// `profile()` method returns `"default"`. A first request could pass
+// through a profile the embedder set with
+// `HarvestApiState::set_deployment_profile`. The handler would then
+// overwrite that profile with `"default"` as a side effect of the response.
+// Every later request would then fail the gate.
+//
+// A preflight check reports the current profile. It must not also change
+// the profile.
+//
+// Issue #1606: that reset was also the only reader of the router's
+// `autumn_web::AppState`. Removing it is what lets both routers be
+// `Router<()>`, so an embedder no longer constructs an `AppState` it has no
+// other use for.
+async fn preflight(Extension(api_state): Extension<HarvestApiState>) -> Json<PreflightReport> {
     Json(build_preflight_report(&api_state).await)
 }
 
@@ -8213,32 +9102,21 @@ async fn shards_health(
 ///
 /// The one thing this endpoint *does* reject outright is a malformed query
 /// string: the raw query is parsed via
-/// [`crate::queue_coverage::parse_raw_query_pairs_strict`] rather than
-/// axum's built-in `Query<Vec<(String, String)>>` extractor, so an invalid
+/// [`crate::strict_query::parse_raw_query_pairs_strict`] rather than axum's
+/// built-in `Query<Vec<(String, String)>>` extractor, so an invalid
 /// percent-encoded byte sequence (e.g. `?queue_name=%FF`) returns the
 /// documented `400` JSON error instead of silently substituting `U+FFFD`
 /// and reporting a false-clean result for a scoped deploy gate (issue #774
-/// review).
+/// review; swept to every other raw-pairs route by issue #1151).
 async fn queue_coverage(
     Extension(api_state): Extension<HarvestApiState>,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> axum::response::Response {
-    let pairs = match raw_query
-        .as_deref()
-        .map(crate::queue_coverage::parse_raw_query_pairs_strict)
-    {
-        None => Vec::new(),
-        Some(Ok(pairs)) => pairs,
-        Some(Err(crate::queue_coverage::InvalidQueryEncoding)) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "malformed query string: invalid percent-encoded UTF-8"
-                })),
-            )
-                .into_response();
-        }
-    };
+    let pairs =
+        match crate::strict_query::decode_or_queue_coverage_bad_request(raw_query.as_deref()) {
+            Ok(pairs) => pairs,
+            Err(response) => return response,
+        };
     let query = crate::queue_coverage::QueueCoverageQuery::from_query_pairs(&pairs);
     Json(crate::queue_coverage::build_queue_coverage_report(&api_state, query).await)
         .into_response()
@@ -8305,6 +9183,75 @@ async fn admin_canary(
     Extension(api_state): Extension<HarvestApiState>,
 ) -> Json<crate::canary::CanaryReport> {
     Json(crate::canary::build_canary_report_from_shards(&api_state).await)
+}
+
+/// `GET /admin/codec/rotation` — report payload-codec key rotation progress
+/// per shard (issue #948, AC7).
+///
+/// Read-only and side-effect-free: it runs the per-key census and reads the
+/// sweep's resume cursor; it never rewrites a row and never advances the sweep.
+///
+/// Fails **closed** on partial availability, exactly like the retirement gate
+/// the operator uses this screen to decide about: a shard that cannot be read
+/// is reported in `unavailable_shards` with `status: "partial"`, never omitted
+/// and never counted as zero rows remaining.
+///
+/// The body carries operator-chosen key *identifiers* and row counts only —
+/// no key material and no payload content.
+async fn codec_rotation_status(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Result<Json<Value>, AutumnError> {
+    let codecs = api_state.payload_codecs();
+    // Pin the active key ONCE, before the fan-out. Each shard is read on its
+    // own connection, so reading the key per shard lets a concurrent
+    // `set_active_key` straddle the report: shards seen before the flip count
+    // their old-key rows as converted, shards seen after count the same key's
+    // rows as remaining, and the body advertises whichever key won the race.
+    // The dangerous reading is `rows_remaining_total: 0` beside the *new*
+    // `active_key_id` -- which the runbook tells the operator means the
+    // outgoing key is safe to retire.
+    let active_key_id = codecs.active_key_id();
+    let observations = observe_shards(&api_state, |shard_id, mut conn| {
+        let codecs = codecs.clone();
+        let active_key_id = active_key_id.clone();
+        async move {
+            ::autumn_harvest::codec_rotation::load_shard_rotation_progress_against(
+                &mut conn,
+                shard_id,
+                &codecs,
+                &active_key_id,
+            )
+            .await
+            .map(|progress| vec![(shard_id, progress)])
+            .map_err(|e| e.to_string())
+        }
+    })
+    .await?;
+
+    let collected = shard_fanout::collect_fanout_rows(observations);
+    let mut rows_remaining_total: i64 = 0;
+    let mut shards: Vec<Value> = Vec::with_capacity(collected.rows.len());
+    for (shard_id, progress) in collected.rows {
+        let remaining = progress.rows_remaining();
+        rows_remaining_total = rows_remaining_total.saturating_add(remaining);
+        shards.push(serde_json::json!({
+            "shard_id": shard_id,
+            "rows_by_key_id": progress.rows_by_key_id,
+            "rows_remaining": remaining,
+            "cursor": progress.cursor,
+        }));
+    }
+
+    Ok(Json(serde_json::json!({
+        "active_key_id": active_key_id,
+        "registered_key_ids": codecs.registered_key_ids(),
+        "shards": shards,
+        // Only meaningful when `status == "complete"`: an unread shard's rows
+        // are unknown, not zero, so a `partial` total is a floor, not a count.
+        "rows_remaining_total": rows_remaining_total,
+        "status": collected.status,
+        "unavailable_shards": collected.unavailable_shards,
+    })))
 }
 
 async fn version_usage(
@@ -8831,6 +9778,9 @@ struct AuditListQuery {
     since: Option<String>,
     /// ISO 8601 timestamp upper bound (exclusive).
     before: Option<String>,
+    /// Row id tiebreaker for `before` (issue #1408). Pass the prior page's
+    /// last row id to page past rows tied on `before`.
+    before_id: Option<uuid::Uuid>,
     limit: Option<i64>,
 }
 
@@ -8862,6 +9812,7 @@ async fn list_audit_records(
         status: query.status,
         since,
         before,
+        before_id: query.before_id,
         limit,
     };
 
@@ -9042,9 +9993,10 @@ mod stack_state_tests {
 
 async fn list_workflows(
     Extension(api_state): Extension<HarvestApiState>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<axum::response::Response, AutumnError> {
     use axum::response::IntoResponse as _;
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let filters = parse_workflow_filters(&pairs)?;
     // PR #1139 review: `no_progress_minutes` (stalled-workflow discovery,
     // issue #486) and `history_bloat_min_events` (history-bloat discovery,
@@ -9308,8 +10260,9 @@ pub struct SummaryListPage {
 /// false` so a summary is never mistaken for a live execution.
 async fn list_workflow_summaries(
     Extension(api_state): Extension<HarvestApiState>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<Json<SummaryListPage>, AutumnError> {
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let filters = parse_summary_filters(&pairs)?;
     let (summaries, next_cursor) = load_summaries_from_shards(&api_state, &filters).await?;
     let items: Vec<SummaryListItem> = summaries
@@ -9406,8 +10359,9 @@ async fn load_summaries_from_shards(
 /// is named in `unavailable_shards` rather than failing the call wholesale.
 async fn count_workflows(
     Extension(api_state): Extension<HarvestApiState>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<Json<WorkflowCountResponse>, AutumnError> {
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let params = WorkflowCountParams::from_query_pairs(&pairs, KNOWN_WORKFLOW_STATES)
         .map_err(AutumnError::bad_request_msg)?;
     Ok(Json(
@@ -9425,8 +10379,9 @@ async fn count_workflows(
 /// `unavailable_shards` rather than failing the call wholesale.
 async fn usage_report(
     Extension(api_state): Extension<HarvestApiState>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<Json<UsageResponse>, AutumnError> {
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let ceiling = api_state.usage_window_ceiling();
     let params = UsageParams::from_query_pairs(&pairs, chrono::Utc::now(), ceiling)
         .map_err(AutumnError::bad_request_msg)?;
@@ -10191,10 +11146,14 @@ fn terminal_workflow_states() -> Vec<String> {
 async fn export_workflow_history(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     headers: axum::http::HeaderMap,
     maybe_session: Option<Extension<Session>>,
 ) -> axum::response::Response {
+    let pairs = match crate::strict_query::decode_or_autumn_error_response(raw_query.as_deref()) {
+        Ok(pairs) => pairs,
+        Err(response) => return response,
+    };
     let exec_id = match parse_execution_id(&id) {
         Ok(id) => id,
         Err(error) => return error.into_response(),
@@ -10255,7 +11214,10 @@ async fn export_workflow_history(
             TARGET_WORKFLOW,
             Some(&target),
             "GET /workflows/{id}/history/export",
-            Some(exec_id.shard()),
+            // The row's own residence, not the id's origin (issue #1317).
+            // `conn` above is already resolved there, so a rebalanced
+            // execution's audit row must say so too.
+            Some(ShardId::new(execution.shard_id)),
             outcome,
             None,
         )
@@ -10269,10 +11231,14 @@ async fn export_workflow_history(
 
 async fn export_workflow_histories(
     Extension(api_state): Extension<HarvestApiState>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     headers: axum::http::HeaderMap,
     maybe_session: Option<Extension<Session>>,
 ) -> axum::response::Response {
+    let pairs = match crate::strict_query::decode_or_autumn_error_response(raw_query.as_deref()) {
+        Ok(pairs) => pairs,
+        Err(response) => return response,
+    };
     let query = match parse_history_batch_export_query(&pairs) {
         Ok(query) => query,
         Err(error) => return error.into_response(),
@@ -10323,10 +11289,14 @@ async fn export_workflow_histories(
 /// no state transition, no event appended, no task claimed.
 async fn export_workflow_history_sample(
     Extension(api_state): Extension<HarvestApiState>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     headers: axum::http::HeaderMap,
     maybe_session: Option<Extension<Session>>,
 ) -> axum::response::Response {
+    let pairs = match crate::strict_query::decode_or_autumn_error_response(raw_query.as_deref()) {
+        Ok(pairs) => pairs,
+        Err(response) => return response,
+    };
     let query = match parse_history_sample_export_query(&pairs) {
         Ok(query) => query,
         Err(error) => return error.into_response(),
@@ -10461,7 +11431,8 @@ async fn get_workflow(
             TARGET_WORKFLOW,
             Some(&target),
             "GET /workflows/{id}",
-            Some(exec_id.shard()),
+            // The row's own residence, not the id's origin (issue #1317).
+            Some(ShardId::new(execution.shard_id)),
             outcome,
             None,
         )
@@ -10572,16 +11543,17 @@ fn parse_workflow_history_query(
 async fn get_workflow_history(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     headers: axum::http::HeaderMap,
     maybe_session: Option<Extension<Session>>,
 ) -> Result<Json<WorkflowHistoryPage>, AutumnError> {
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let exec_id = parse_execution_id(&id)?;
     let (limit, after_id, event_types) = parse_workflow_history_query(&pairs)?;
     // Read-path payload decoding (issue #608): decode-only-when-admin.
     let decoder = read_path_decoder(&api_state, extension_session(maybe_session)).await;
 
-    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+    let (mut conn, exec_shard) = db_conn_for_execution_with_shard(&api_state, exec_id).await?;
 
     // 404 when the execution doesn't exist — cheaper than a full-row load.
     if !autumn_harvest::store::check_execution_exists(&mut conn, exec_id)
@@ -10652,7 +11624,12 @@ async fn get_workflow_history(
             TARGET_WORKFLOW,
             Some(&target),
             "GET /workflows/{id}/history",
-            Some(exec_id.shard()),
+            // The row's own residence, not the id's origin (issue #1317
+            // review). `exec_shard` above already resolved it, so `conn`
+            // stays the only checkout this handler ever makes. A second
+            // resolution here would deadlock a pool-size-one shard against
+            // the connection this call still holds.
+            Some(exec_shard),
             outcome,
             None,
         )
@@ -10670,10 +11647,14 @@ async fn get_workflow_history(
 async fn get_workflow_result(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     headers: axum::http::HeaderMap,
     maybe_session: Option<Extension<Session>>,
 ) -> axum::response::Response {
+    let pairs = match crate::strict_query::decode_or_autumn_error_response(raw_query.as_deref()) {
+        Ok(pairs) => pairs,
+        Err(response) => return response,
+    };
     let exec_id = match parse_execution_id(&id) {
         Ok(id) => id,
         Err(error) => return error.into_response(),
@@ -10724,18 +11705,22 @@ async fn get_workflow_result(
         let handle = client.handle(current_id);
         match handle.result_snapshot_with_wait(remaining).await {
             Ok(None) => return workflow_result_pending_response(),
-            // Successor row gone mid-chain — return the last CAN sentinel.
-            Err(HarvestError::NotFound(_)) if last_can_snapshot.is_some() => {
-                return respond_with_workflow_result(
-                    &api_state,
-                    &headers,
-                    exec_id,
-                    last_can_snapshot.unwrap(),
-                    decoder.as_ref(),
-                )
-                .await;
+            Err(error) => {
+                return match (error, last_can_snapshot) {
+                    // Successor row gone mid-chain — return the last CAN sentinel.
+                    (HarvestError::NotFound(_), Some(snapshot)) => {
+                        respond_with_workflow_result(
+                            &api_state,
+                            &headers,
+                            exec_id,
+                            snapshot,
+                            decoder.as_ref(),
+                        )
+                        .await
+                    }
+                    (error, _) => map_error(error).into_response(),
+                };
             }
-            Err(error) => return map_error(error).into_response(),
             Ok(Some(snapshot)) => {
                 use autumn_harvest::WorkflowResultState;
                 if snapshot.state != WorkflowResultState::ContinuedAsNew {
@@ -10803,10 +11788,7 @@ pub(crate) async fn resolve_terminal_workflow_execution(
         let execution = match load_execution_following_retries(api_state, current_id).await {
             Ok(e) => e,
             // Only swallow NotFound mid-chain (missing successor row).
-            Err(HarvestError::NotFound(_)) if last_continued_as_new.is_some() => {
-                return Ok(last_continued_as_new.unwrap());
-            }
-            Err(e) => return Err(map_error(e)),
+            Err(e) => return last_known_on_not_found(e, last_continued_as_new),
         };
         if execution.state != "CONTINUED_AS_NEW" {
             return Ok(execution);
@@ -10824,12 +11806,19 @@ pub(crate) async fn resolve_terminal_workflow_execution(
         }
     }
     // Exceeded chain depth — return whatever state the current execution has.
-    match load_execution_following_retries(api_state, current_id).await {
-        Ok(e) => Ok(e),
-        Err(HarvestError::NotFound(_)) if last_continued_as_new.is_some() => {
-            Ok(last_continued_as_new.unwrap())
-        }
-        Err(e) => Err(map_error(e)),
+    load_execution_following_retries(api_state, current_id)
+        .await
+        .or_else(|e| last_known_on_not_found(e, last_continued_as_new))
+}
+
+/// Returns `last` for a `NotFound` error when `last` is `Some`. Maps every other error.
+fn last_known_on_not_found(
+    error: HarvestError,
+    last: Option<WorkflowExecution>,
+) -> Result<WorkflowExecution, AutumnError> {
+    match (error, last) {
+        (HarvestError::NotFound(_), Some(last)) => Ok(last),
+        (error, _) => Err(map_error(error)),
     }
 }
 
@@ -10853,14 +11842,28 @@ async fn workflow_result_snapshot_following_can(
 /// [`autumn_harvest::execution::resolve_live_attempt`] so the management API and
 /// the core `WorkflowHandle` cannot drift on what "the live attempt" means
 /// (issue #843).
+///
+/// Resolves `exec_id`'s residence WITH its shard (issue #1596 review), not
+/// just a connection. A retry successor found mid-walk can itself have been
+/// rebalanced away from that shard. The walker must follow it there, rather
+/// than trust the origin-side `MIGRATED` stub it would otherwise read.
 async fn load_execution_following_retries(
     api_state: &HarvestApiState,
     exec_id: ExecutionId,
 ) -> HarvestResult<WorkflowExecution> {
-    let mut conn = db_conn_for_execution(api_state, exec_id)
+    let pool = api_state.storage_pool()?;
+    let (mut conn, shard) = db_conn_for_execution_with_shard(api_state, exec_id)
         .await
         .map_err(|e| HarvestError::Database(e.to_string()))?;
-    autumn_harvest::execution::resolve_live_attempt(&mut conn, exec_id).await
+    // Only the row is needed here (issue #1596 follow-up review, comment
+    // 4052389744). Every caller reads fields off it directly. A caller that
+    // must follow up against the resolved execution's own id resolves its
+    // own fresh connection for that id, instead of reusing this one. That
+    // fresh resolve already follows the id's own forwarding pointer
+    // correctly.
+    autumn_harvest::execution::resolve_live_attempt(&mut conn, pool.sharded_pool(), shard, exec_id)
+        .await
+        .map(|(execution, _shard)| execution)
 }
 
 /// Load the successor execution ID from a `WorkflowContinuedAsNew` event in
@@ -10923,7 +11926,11 @@ async fn respond_with_workflow_result(
             TARGET_WORKFLOW,
             Some(&target),
             "GET /workflows/{id}/result",
-            Some(exec_id.shard()),
+            // The row's own residence, not the id's origin (issue #1317).
+            // With `conn: None` just above, a stale origin would make the
+            // pool-acquiring branch below write the audit row to the WRONG
+            // database entirely. Not merely mislabel it.
+            resolve_shard_best_effort(api_state, exec_id).await,
             outcome,
             None,
         )
@@ -10940,6 +11947,48 @@ fn workflow_result_response(result: WorkflowResult) -> axum::response::Response 
     }
 }
 
+/// The `429` response for a start that load shedding refused (issue #1794).
+///
+/// `Retry-After` carries the policy delay in whole seconds. The body names the
+/// shed queue. The `429` status tells a caller that overload refused the
+/// start, not a manual gate.
+fn load_shed_response(
+    queue: &str,
+    oldest_pending_age_secs: u64,
+    retry_after_secs: u64,
+) -> axum::response::Response {
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(serde_json::json!({
+            "error": "load shed",
+            "queue": queue,
+            "oldest_pending_age_secs": oldest_pending_age_secs,
+            "retry_after_secs": retry_after_secs,
+        })),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from(retry_after_secs),
+    );
+    response
+}
+
+/// Map a failed start to a response.
+///
+/// A shed start gets [`load_shed_response`]. `map_error` cannot set a header,
+/// so it would drop `Retry-After`. Every other error goes to `map_error`.
+fn start_error_response(error: HarvestError) -> axum::response::Response {
+    match error {
+        HarvestError::LoadShed {
+            queue,
+            oldest_pending_age_secs,
+            retry_after_secs,
+        } => load_shed_response(&queue, oldest_pending_age_secs, retry_after_secs),
+        other => map_error(other).into_response(),
+    }
+}
+
 fn workflow_result_pending_response() -> axum::response::Response {
     let mut response = StatusCode::NO_CONTENT.into_response();
     response.headers_mut().insert(
@@ -10952,8 +12001,9 @@ fn workflow_result_pending_response() -> axum::response::Response {
 async fn list_workflow_children(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<Json<WorkflowChildrenResponse>, AutumnError> {
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let exec_id = parse_execution_id(&id)?;
     let filters = parse_workflow_children_filters(&pairs)?;
 
@@ -10964,7 +12014,8 @@ async fn list_workflow_children(
             .map_err(map_error)?;
     }
 
-    let mut rows = load_workflow_children_page_from_shards(&api_state, exec_id, &filters).await?;
+    let fanout = load_workflow_children_page_from_shards(&api_state, exec_id, &filters).await?;
+    let mut rows = fanout.rows;
     sort_workflow_child_rows(&mut rows);
 
     let next_cursor = if rows.len() > filters.limit {
@@ -10978,42 +12029,135 @@ async fn list_workflow_children(
     Ok(Json(WorkflowChildrenResponse {
         items: rows.into_iter().map(WorkflowChildResponse::from).collect(),
         next_cursor,
+        status: fanout.status,
+        unavailable_shards: fanout.unavailable_shards,
     }))
+}
+
+/// Query one shard for `parent_id`'s direct children, folding any failure into
+/// the observation rather than propagating it (issue #956).
+///
+/// An unreachable shard contributes zero rows and a named reason, which
+/// `collect_fanout_rows` turns into a `partial` status — never a `500`.
+async fn workflow_children_on_shard(
+    shard_id: i32,
+    shard_pool: Option<autumn_harvest::worker::DbPool>,
+    parent_id: ExecutionId,
+    query_filters: store::WorkflowChildFilters,
+) -> crate::shard_fanout::ShardObservation<store::WorkflowChildRow> {
+    let Some(shard_pool) = shard_pool else {
+        return crate::shard_fanout::ShardObservation {
+            shard_id,
+            rows: Vec::new(),
+            error: Some("no connection pool configured for this shard".to_string()),
+        };
+    };
+    let mut conn = match autumn_harvest::replication::fenced_checkout(&shard_pool).await {
+        Ok(c) => c,
+        Err(e) => {
+            return crate::shard_fanout::ShardObservation {
+                shard_id,
+                rows: Vec::new(),
+                error: Some(e.to_string()),
+            };
+        }
+    };
+    match store::load_workflow_children(&mut conn, parent_id, &query_filters, 0).await {
+        Ok(rows) => crate::shard_fanout::ShardObservation {
+            shard_id,
+            rows,
+            error: None,
+        },
+        Err(e) => crate::shard_fanout::ShardObservation {
+            shard_id,
+            rows: Vec::new(),
+            error: Some(e.to_string()),
+        },
+    }
+}
+
+/// Query one shard for the children of a whole traversal frontier.
+async fn workflow_children_multi_on_shard(
+    shard_id: i32,
+    shard_pool: Option<autumn_harvest::worker::DbPool>,
+    parent_uuids: Vec<uuid::Uuid>,
+    query_filters: store::WorkflowChildFilters,
+    depth: u8,
+) -> crate::shard_fanout::ShardObservation<store::WorkflowChildRow> {
+    let Some(shard_pool) = shard_pool else {
+        return crate::shard_fanout::ShardObservation {
+            shard_id,
+            rows: Vec::new(),
+            error: Some("no connection pool configured for this shard".to_string()),
+        };
+    };
+    let mut conn = match autumn_harvest::replication::fenced_checkout(&shard_pool).await {
+        Ok(c) => c,
+        Err(e) => {
+            return crate::shard_fanout::ShardObservation {
+                shard_id,
+                rows: Vec::new(),
+                error: Some(e.to_string()),
+            };
+        }
+    };
+    match store::load_workflow_children_multi(&mut conn, &parent_uuids, &query_filters, depth).await
+    {
+        Ok(rows) => crate::shard_fanout::ShardObservation {
+            shard_id,
+            rows,
+            error: None,
+        },
+        Err(e) => crate::shard_fanout::ShardObservation {
+            shard_id,
+            rows: Vec::new(),
+            error: Some(e.to_string()),
+        },
+    }
 }
 
 async fn load_workflow_children_page_from_shards(
     api_state: &HarvestApiState,
     parent_id: ExecutionId,
     filters: &WorkflowChildrenFilters,
-) -> Result<Vec<store::WorkflowChildRow>, AutumnError> {
+) -> Result<crate::shard_fanout::FanoutRows<store::WorkflowChildRow>, AutumnError> {
     if filters.max_depth > 0 {
         return load_workflow_children_tree_from_shards(api_state, parent_id, filters).await;
     }
 
-    let pool = api_state.storage_pool().map_err(map_error)?;
-    let mut rows = Vec::new();
+    let pools = crate::shard_fanout::pools_by_shard(api_state);
+    let expected = crate::shard_fanout::expected_shards(api_state, &pools);
     let query_filters = workflow_children_store_filters(filters);
 
-    for (_shard, shard_pool) in pool.iter_shards() {
-        let mut conn = acquire_conn(shard_pool).await?;
-        let mut shard_rows = store::load_workflow_children(&mut conn, parent_id, &query_filters, 0)
-            .await
-            .map_err(map_error)?;
-        rows.append(&mut shard_rows);
-    }
+    let observations = futures::future::join_all(expected.iter().map(|shard_id| {
+        workflow_children_on_shard(
+            *shard_id,
+            pools.get(shard_id).cloned(),
+            parent_id,
+            query_filters.clone(),
+        )
+    }))
+    .await;
 
-    Ok(rows)
+    Ok(crate::shard_fanout::collect_fanout_rows(observations))
 }
 
 async fn load_workflow_children_tree_from_shards(
     api_state: &HarvestApiState,
     parent_id: ExecutionId,
     filters: &WorkflowChildrenFilters,
-) -> Result<Vec<store::WorkflowChildRow>, AutumnError> {
-    let pool = api_state.storage_pool().map_err(map_error)?;
+) -> Result<crate::shard_fanout::FanoutRows<store::WorkflowChildRow>, AutumnError> {
+    let pools = crate::shard_fanout::pools_by_shard(api_state);
+    let expected = crate::shard_fanout::expected_shards(api_state, &pools);
     let mut rows = Vec::new();
     let mut frontier = vec![parent_id];
     let mut seen = HashSet::new();
+    // A shard is degraded for the WHOLE traversal the moment any depth level
+    // fails against it: a missed level's children are missed descendants, so
+    // reporting `complete` afterwards would understate the gap.
+    let mut shard_errors: std::collections::BTreeMap<i32, String> =
+        std::collections::BTreeMap::new();
+    let mut observed: std::collections::BTreeSet<i32> = std::collections::BTreeSet::new();
     // Result filters cannot constrain traversal: a nonmatching child can have
     // matching descendants, and either row may live on any shard.
     let traversal_filters = store::WorkflowChildFilters::default();
@@ -11034,17 +12178,24 @@ async fn load_workflow_children_tree_from_shards(
         // `seen`, and result filters only ever inspect the row itself.
         let parent_uuids: Vec<uuid::Uuid> = frontier.iter().map(ExecutionId::as_uuid).collect();
         let mut next_frontier = Vec::new();
-        for (_shard, shard_pool) in pool.iter_shards() {
-            let mut conn = acquire_conn(shard_pool).await?;
-            let shard_rows = store::load_workflow_children_multi(
-                &mut conn,
-                &parent_uuids,
-                &traversal_filters,
+        let observations = futures::future::join_all(expected.iter().map(|shard_id| {
+            workflow_children_multi_on_shard(
+                *shard_id,
+                pools.get(shard_id).cloned(),
+                parent_uuids.clone(),
+                traversal_filters.clone(),
                 depth,
             )
-            .await
-            .map_err(map_error)?;
-            for row in shard_rows {
+        }))
+        .await;
+
+        for observation in observations {
+            if let Some(reason) = observation.error {
+                shard_errors.insert(observation.shard_id, reason);
+                continue;
+            }
+            observed.insert(observation.shard_id);
+            for row in observation.rows {
                 if !seen.insert(row.exec_id.as_uuid()) {
                     continue;
                 }
@@ -11061,7 +12212,26 @@ async fn load_workflow_children_tree_from_shards(
         frontier = next_frontier;
     }
 
-    Ok(rows)
+    let mut unavailable_shards: Vec<crate::shard_fanout::UnavailableShard> = shard_errors
+        .into_iter()
+        .map(|(shard_id, reason)| crate::shard_fanout::UnavailableShard { shard_id, reason })
+        .collect();
+    unavailable_shards.sort_by_key(|s| s.shard_id);
+    // A shard that answered at one depth and failed at another counts as
+    // degraded, so subtract the failures from the observed set before deciding
+    // completeness.
+    let inspected = observed
+        .iter()
+        .filter(|shard| !unavailable_shards.iter().any(|u| u.shard_id == **shard))
+        .count();
+    let status =
+        crate::shard_fanout::FanoutStatus::from_counts(inspected, unavailable_shards.len());
+
+    Ok(crate::shard_fanout::FanoutRows {
+        rows,
+        status,
+        unavailable_shards,
+    })
 }
 
 // ── Recursive cross-shard lineage tree (issue #621) ───────────────────────────
@@ -11083,8 +12253,9 @@ async fn load_workflow_children_tree_from_shards(
 async fn get_workflow_tree(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<axum::response::Response, AutumnError> {
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let exec_id = parse_execution_id(&id)?;
     let params = parse_lineage_query(&pairs)?;
 
@@ -11323,7 +12494,7 @@ async fn lineage_children_on_shard(
             format!("shard {shard_id} has no configured storage pool"),
         );
     };
-    let Ok(mut conn) = pool.get().await else {
+    let Ok(mut conn) = autumn_harvest::replication::fenced_checkout(&pool).await else {
         return lineage_shard_unavailable(
             shard_id,
             format!("database connection for shard {shard_id} could not be acquired"),
@@ -11352,7 +12523,7 @@ async fn lineage_probe_on_shard(
             format!("shard {shard_id} has no configured storage pool"),
         );
     };
-    let Ok(mut conn) = pool.get().await else {
+    let Ok(mut conn) = autumn_harvest::replication::fenced_checkout(&pool).await else {
         return lineage_shard_unavailable(
             shard_id,
             format!("database connection for shard {shard_id} could not be acquired"),
@@ -11386,7 +12557,7 @@ async fn lineage_summary_probe_on_shard(
             format!("shard {shard_id} has no configured storage pool"),
         );
     };
-    let Ok(mut conn) = pool.get().await else {
+    let Ok(mut conn) = autumn_harvest::replication::fenced_checkout(&pool).await else {
         return lineage_shard_unavailable(
             shard_id,
             format!("database connection for shard {shard_id} could not be acquired"),
@@ -11678,8 +12849,9 @@ impl From<external_task::ExternalHandoffRow> for ExternalHandoffResponse {
 
 async fn list_external_handoffs(
     Extension(api_state): Extension<HarvestApiState>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<Json<ExternalHandoffListResponse>, AutumnError> {
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let filters = parse_external_handoff_filters(&pairs)?;
     let limit = filters.limit;
     let (mut rows, coverage) = load_external_handoffs_from_shards(&api_state, &filters).await?;
@@ -12125,8 +13297,9 @@ fn parse_workflow_logs_query(
 async fn get_workflow_logs(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<Json<WorkflowLogsResponse>, AutumnError> {
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let exec_id = parse_execution_id(&id)?;
     let (limit, cursor, levels, since) = parse_workflow_logs_query(&pairs)?;
 
@@ -12796,6 +13969,16 @@ type WorkflowTaskRow = (
     Option<serde_json::Value>,     // required_capabilities
     Option<uuid::Uuid>,            // session_id
     Option<String>,                // sticky_worker_id
+    // `harvest_task_queue.created_at` is `Nullable<Timestamptz>` (issue
+    // #501: pre-upgrade rows have none). This stays `Option` for that
+    // reason, even though every row this endpoint's own writes produce
+    // sets it.
+    Option<chrono::DateTime<chrono::Utc>>, // created_at
+    // Issue #1402: the timer-provenance marker `is_the_missed_timer_wake`
+    // checks. `scheduled_at` alone can stop proving ownership: a
+    // queue-pause resume credit, an orphan reclaim, or a capability-miss
+    // release can each drift it.
+    Option<chrono::DateTime<chrono::Utc>>, // timer_fires_at
 );
 
 /// The narrow task-queue projection [`build_diagnosis_report`] reads.
@@ -13013,13 +14196,15 @@ fn local_build_id_from_workers(workers: &[WorkerRow], local_worker_id: Option<&s
 /// Can ANY single live worker actually claim this task?
 ///
 /// Queue coverage alone is not the claim predicate. `queue::claim_task` also
-/// enforces the task's `required_build_id` (exact, `harvest_build_compat`
-/// declared, or legacy empty-build worker), its `required_capabilities` (the
-/// same Exact/In label match), and its **session pin** -- so a task sitting on
-/// a well-covered queue can still be permanently unclaimable because no poller
-/// runs the right build, advertises the right labels, or *is* the session's
-/// pinned host. This endpoint must report that as a stall, not healthy
-/// progress.
+/// enforces three more rules. The first is the task's `required_build_id`: an
+/// exact or `harvest_build_compat` match, never an empty `build_id`. The second
+/// is its `required_capabilities`, the same Exact/In label match. The third is
+/// its **session pin**.
+///
+/// So a task on a well-covered queue can still be permanently unclaimable.
+/// No poller may run the right build, advertise the right labels, or *be* the
+/// session's pinned host. This endpoint must report that as a stall, not
+/// healthy progress.
 ///
 /// Every dimension is checked against the **same** worker, exactly as the
 /// stranded-work sampler does (`worker.rs`): a task needing both a build and a
@@ -13094,8 +14279,7 @@ fn eligible_worker_ids<'a>(
                 return true;
             }
             requirements.as_ref().is_none_or(|parsed| {
-                let labels: std::collections::HashMap<String, String> =
-                    serde_json::from_value(w.worker.labels.clone()).unwrap_or_default();
+                let labels = autumn_harvest::payload_codec::string_valued_labels(&w.worker.labels);
                 autumn_harvest::eligibility::matches_requirements(parsed, &labels)
             })
         })
@@ -13134,6 +14318,87 @@ fn local_circuit_snapshot_is_authoritative(
         ([only], Some(local)) => *only == local,
         _ => false,
     }
+}
+
+/// Is `local_build_id` shared by every worker in `eligible_ids`?
+///
+/// The circuit-tracked-activity set, like the capability-registry fallback it
+/// reuses [`registry_fallback_binds`] from, is a compile-time
+/// `#[activity(circuit_breaker = ...)]` declaration -- identical across every
+/// worker on the SAME build, but possibly different on another. So a fact
+/// this process's registry holds about an activity (tracked or not) describes
+/// every eligible worker only when none of them could be running a different
+/// build.
+///
+/// `worker_build_ids` maps worker id -> advertised build id, built ONCE by
+/// the caller from the same `workers` slice [`eligible_worker_ids`] already
+/// scanned to produce `eligible_ids` (issue #1190 review round 1). Looking a
+/// worker's build up here is therefore an O(1) map hit rather than a second
+/// O(workers) linear scan per eligible id, which would otherwise make a wide
+/// fan-out with many eligible workers quadratic in fleet size.
+///
+/// Vacuously `true` for an empty `eligible_ids` (issue #1190 review round 2):
+/// with no candidate worker there is no OTHER build the local fact could
+/// disagree with, so the "every worker agrees" claim holds trivially, same as
+/// the standard reading of a universally-quantified statement over an empty
+/// set. This matters for a reason distinct from the headline verdict --
+/// `activity_no_worker` outranks the rate-limit verdicts there regardless
+/// (issue #809) -- but `contributing_reason_codes` is a union of every
+/// impediment, not just the winner, and a `rate_limit_exhausted` fact stays
+/// true (the bucket is still what would refuse a worker the moment one
+/// appears) even while no worker exists yet to be refused. Returning `false`
+/// here would silently drop that fact from the union purely because a
+/// worker-liveness check unrelated to build agreement also failed.
+fn every_eligible_worker_is_on_the_local_build(
+    eligible_ids: &[&str],
+    worker_build_ids: &std::collections::HashMap<&str, &str>,
+    local_build_id: &str,
+) -> bool {
+    eligible_ids.iter().all(|id| {
+        worker_build_ids
+            .get(id)
+            .is_some_and(|build_id| registry_fallback_binds(build_id, local_build_id))
+    })
+}
+
+/// May `claim_task`'s rate-limit bucket be consulted as THE answer for this
+/// task (issue #1190)?
+///
+/// A circuit-breaker-tracked activity enforces its rate limit at DISPATCH
+/// rather than at claim (issue #369), so `locally_tracked` -- read from THIS
+/// process's own registry -- decides whether the bucket is even a claim-time
+/// impediment. But that registry is in-process, exactly like the breaker
+/// phase itself ([`local_circuit_snapshot_is_authoritative`]): during a
+/// rolling deploy an eligible peer on a DIFFERENT build may declare the
+/// breaker differently, and there is no cross-process registry to settle
+/// which of them is right (`CircuitBreakerRegistry` has no table backing it).
+///
+/// So the local tracked/untracked fact is trustworthy only when every
+/// eligible worker shares this replica's build
+/// ([`every_eligible_worker_is_on_the_local_build`]). When it does not, the
+/// direction-of-safety rule this endpoint already applies elsewhere -- an
+/// unknown worker is assumed capable, never assumed blocked -- makes the
+/// answer `false`: NEITHER `activity_rate_limited` NOR
+/// `activity_rate_limit_bucket_missing` is reported for it, the same
+/// conservative bias that keeps a genuinely fleet-wide breaker outage from
+/// reporting `activity_circuit_open` off one replica's snapshot.
+///
+/// `locally_tracked` short-circuits the build check entirely: when it is
+/// `true` the answer is always `false` regardless of build agreement, so the
+/// bucket for a locally-tracked activity's key is never queried in the first
+/// place -- see the `rate_limit_keys` filter at this function's call site.
+fn rate_limit_gate_applies(
+    locally_tracked: bool,
+    eligible_ids: &[&str],
+    worker_build_ids: &std::collections::HashMap<&str, &str>,
+    local_build_id: &str,
+) -> bool {
+    !locally_tracked
+        && every_eligible_worker_is_on_the_local_build(
+            eligible_ids,
+            worker_build_ids,
+            local_build_id,
+        )
 }
 
 /// Decode the one activity error this response actually surfaces (issue #608).
@@ -13193,9 +14458,13 @@ pub(crate) async fn build_diagnosis_report(
         Err(err) => return Err(map_error(err)),
     };
 
-    // Snapshot `now` once so every deadline, age and backoff comparison in this
-    // response is judged against one consistent instant.
-    let now = chrono::Utc::now();
+    // This instant is reported, never compared. It backs only
+    // `last_event_age_seconds` below, and the same field on the terminal
+    // early return -- a display metric, not a deadline check. It may
+    // therefore run slightly ahead of `now`, captured further down. `now`
+    // (issue #1368) is the single instant every deadline, age and backoff
+    // COMPARISON in this response is judged against.
+    let report_started_at = chrono::Utc::now();
 
     let last_event_at: Option<chrono::DateTime<chrono::Utc>> = harvest_events::table
         .filter(harvest_events::workflow_exec_id.eq(exec_uuid))
@@ -13203,8 +14472,11 @@ pub(crate) async fn build_diagnosis_report(
         .first::<Option<chrono::DateTime<chrono::Utc>>>(&mut conn)
         .await
         .map_err(database_error)?;
-    let last_event_age_seconds =
-        last_event_at.map(|ts| (now - ts).to_std().map_or(0.0, |d| d.as_secs_f64()));
+    let last_event_age_seconds = last_event_at.map(|ts| {
+        (report_started_at - ts)
+            .to_std()
+            .map_or(0.0, |d| d.as_secs_f64())
+    });
 
     let is_terminal = is_terminal_state(&execution.state);
     if is_terminal {
@@ -13363,6 +14635,14 @@ pub(crate) async fn build_diagnosis_report(
             harvest_task_queue::required_capabilities,
             harvest_task_queue::session_id,
             harvest_task_queue::sticky_worker_id,
+            // Issue #1191: the provenance fingerprint
+            // `wake_source_repended_this_row` reads to settle what a
+            // coincidental timer-`fires_at` match cannot.
+            harvest_task_queue::created_at,
+            // Issue #1402: survives a `scheduled_at` drift that
+            // `created_at` alone cannot explain (a queue-pause resume
+            // credit, an orphan reclaim, a capability-miss release).
+            harvest_task_queue::timer_fires_at,
         ))
         .first::<WorkflowTaskRow>(&mut conn)
         .await
@@ -13377,6 +14657,24 @@ pub(crate) async fn build_diagnosis_report(
     // by dispatch), so consulting it here cannot perturb enforcement. A
     // cooled-down breaker therefore still reads "open" until a real probe is
     // admitted — a deliberate, documented read-only conservatism.
+    //
+    // `now` is captured here, back-to-back with the `list()` call below, not
+    // at the top of the function. `time_until_probe_secs` on the snapshot is
+    // a duration measured from THIS instant, so `cooldown_until` (derived
+    // from it below) and `now` are always mutually consistent.
+    //
+    // Issue #1368: every comparison this response makes against
+    // `cooldown_until` -- both `classify_execution` calls below included --
+    // MUST use this same `now`, never an earlier one. PR #1365 fixed
+    // `cooldown_until`'s own derivation this way, but left `classify_execution`
+    // reading a `now` captured before the DB queries above ran. For an
+    // ALREADY-CLEARED breaker
+    // (`time_until_probe_secs == 0.0`), `cooldown_until` then pinned to
+    // exactly this instant. That instant is always later than the stale
+    // `now`, so the "already cleared" comparison could never succeed. One
+    // `now`, used everywhere a comparison needs it, keeps that from
+    // recurring.
+    let now = chrono::Utc::now();
     let (cb_phase, cb_tracked): (
         std::collections::HashMap<String, autumn_harvest::circuit_breaker::CircuitSnapshot>,
         Vec<String>,
@@ -13418,9 +14716,18 @@ pub(crate) async fn build_diagnosis_report(
         .unwrap_or_default();
 
     // Rate-limit saturation. A circuit-breaker-tracked activity enforces its
-    // rate limit at DISPATCH rather than at claim (issue #369), so its bucket is
-    // never a claim-time impediment and is deliberately not consulted — the
-    // breaker verdict is the accurate one. Matches the eligibility explainer.
+    // rate limit at DISPATCH rather than at claim (issue #369), so its bucket
+    // is never a claim-time impediment for it -- `rate_limit_gate_applies`
+    // (issue #1190) short-circuits to `false` on `locally_tracked` alone,
+    // with no build check at all, so a locally-tracked activity's key can
+    // never surface regardless of what its eligible workers' builds are.
+    // Filtering it out here (issue #1190 review round 1) therefore loses no
+    // coverage and avoids sending a large, unfiltered fan-out of dynamic
+    // bucket keys to Postgres for lookups the per-task gate would discard
+    // unconditionally anyway. Only the OTHER direction -- untracked here but
+    // possibly tracked on an eligible peer's different build -- depends on
+    // that peer's build, which is a per-task question resolved once
+    // eligibility is known below; that activity's key IS still included here.
     let rate_limit_keys: Vec<String> = pending_tasks
         .iter()
         .filter(|t| {
@@ -13512,6 +14819,14 @@ pub(crate) async fn build_diagnosis_report(
     // and `claim_task` asks each worker's own registry instead (see
     // [`registry_fallback_binds`]). `None` for an API-only replica.
     let local_build_id = local_build_id_from_workers(&live_workers, local_worker_id.as_deref());
+    // Worker id -> advertised build id, built ONCE for every task's
+    // `rate_limit_gate_applies` call (issue #1190 review round 1) rather than
+    // re-scanning `live_workers` per eligible id per task -- see
+    // `every_eligible_worker_is_on_the_local_build`.
+    let worker_build_ids: std::collections::HashMap<&str, &str> = live_workers
+        .iter()
+        .map(|w| (w.worker.worker_id.as_str(), w.worker.build_id.as_str()))
+        .collect();
     // The row's OWN recorded shard, not `exec_id.shard()`. A pre-sharding (or
     // `ExecutionId::new()`) id carries the `ShardId::UNENCODED` sentinel
     // (0xFFFF), which the router resolves to the default shard — but a worker
@@ -13577,11 +14892,28 @@ pub(crate) async fn build_diagnosis_report(
                     Some(BlockingCircuitPhase::Open),
                     snapshot
                         .and_then(|s| s.time_until_probe_secs)
+                        // See the comment where `now` is captured above
+                        // (issue #1193; issue #1368).
                         .and_then(|secs| circuit_cooldown_until(now, secs)),
                 ),
                 Some("half_open") => (Some(BlockingCircuitPhase::HalfOpen), None),
                 _ => (None, None),
             };
+            // Authoritative, straight from the registry's own flag -- NEVER
+            // inferred from whether `circuit_cooldown_until` could be
+            // computed (issue #1193 Codex round-1 P2): a policy cooldown
+            // outside `chrono`'s representable range ALSO makes
+            // `circuit_cooldown_until` return `None` for a breaker that was
+            // tripped organically, which would otherwise be indistinguishable
+            // from a genuinely operator-forced one.
+            let circuit_forced_open = snapshot.is_some_and(|s| s.forced_open);
+            // Whether the local tracked/untracked fact about this activity's
+            // breaker is trustworthy for THIS row's own eligible workers (see
+            // `rate_limit_gate_applies`, issue #1190) -- computed per task
+            // because eligibility (and therefore build agreement) is itself
+            // per task.
+            let gate_applies =
+                rate_limit_gate_applies(has_cb, &eligible_ids, &worker_build_ids, &local_build_id);
             let concurrency_saturated = match (t.concurrency_key.as_ref(), t.concurrency_cap) {
                 (Some(key), Some(cap)) => {
                     running_by_key
@@ -13621,13 +14953,14 @@ pub(crate) async fn build_diagnosis_report(
                 ),
                 circuit_phase,
                 circuit_cooldown_until,
-                rate_limit_saturated: !has_cb
+                circuit_forced_open,
+                rate_limit_saturated: gate_applies
                     && t.rate_limit_key
                         .as_ref()
                         .is_some_and(|k| rate_limit_gate.saturated.contains(k)),
                 // A key with NO bucket row is refused by the gate's `EXISTS`
                 // forever, so it is a stall rather than a refilling deferral.
-                rate_limit_bucket_missing: !has_cb
+                rate_limit_bucket_missing: gate_applies
                     && t.rate_limit_key
                         .as_ref()
                         .is_some_and(|k| rate_limit_gate.missing.contains(k)),
@@ -13710,6 +15043,8 @@ pub(crate) async fn build_diagnosis_report(
             required_capabilities,
             session_id,
             sticky_worker_id,
+            created_at,
+            timer_fires_at,
         )| {
             WorkflowTaskFacts {
                 has_worker: worker_id.is_some(),
@@ -13742,6 +15077,8 @@ pub(crate) async fn build_diagnosis_report(
                 state,
                 queue_name,
                 scheduled_at,
+                created_at,
+                timer_fires_at,
             }
         },
     );
@@ -13874,7 +15211,7 @@ pub(crate) async fn build_diagnosis_report(
         decode_outcome.merged(decode_surfaced_activity_error(&mut blocked_on, decoder));
     let health = blocked_on.health();
     let summary = summarize(&blocked_on);
-    let contributing_reason_codes = contributing_reasons_for(&inputs.activities);
+    let contributing_reason_codes = contributing_reasons_for(&inputs.activities, now);
 
     Ok(WorkflowDiagnoseResponse {
         execution_id: exec_id.to_string(),
@@ -13907,8 +15244,16 @@ pub(crate) async fn build_diagnosis_report(
 /// Delegates to the eligibility explainer's own pure
 /// [`task_intrinsic_impediment_reasons`] (issue #611) so this list and
 /// `blocked_on` can never drift apart in how an impediment is named.
+///
+/// A row enters the `phases` map only when
+/// [`autumn_harvest::stall_diagnosis::activity_circuit_currently_blocks`]
+/// says its breaker still blocks dispatch (issue #1371). An
+/// organically-tripped breaker whose cooldown clears by the row's own
+/// effective dispatch instant no longer blocks. Its `circuit_open` reason
+/// must not appear once the headline verdict stops reporting it.
 fn contributing_reasons_for(
     activities: &[autumn_harvest::stall_diagnosis::PendingActivityFacts],
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Vec<String> {
     // Derived from the FACTS, never from the raw in-process snapshot: a phase
     // reaches a fact only when the local breaker is authoritative for that row
@@ -13925,6 +15270,9 @@ fn contributing_reasons_for(
                 autumn_harvest::stall_diagnosis::BlockingCircuitPhase::HalfOpen => "half_open",
                 _ => return None,
             };
+            if !autumn_harvest::stall_diagnosis::activity_circuit_currently_blocks(f, now) {
+                return None;
+            }
             Some((name, phase))
         })
         .collect();
@@ -14177,7 +15525,8 @@ async fn get_workflow_diagnose(
             TARGET_WORKFLOW,
             Some(&exec_id.to_string()),
             "GET /workflows/{id}/diagnose",
-            Some(exec_id.shard()),
+            // The row's own residence, not the id's origin (issue #1317).
+            resolve_shard_best_effort(&api_state, exec_id).await,
             outcome,
             None,
         )
@@ -15044,7 +16393,8 @@ async fn get_workflow_stack(
             TARGET_WORKFLOW,
             Some(&target),
             "GET /workflows/{id}/stack",
-            Some(exec_id.shard()),
+            // The row's own residence, not the id's origin (issue #1317).
+            Some(ShardId::new(execution.shard_id)),
             decode_outcome,
             None,
         )
@@ -15176,6 +16526,32 @@ fn workflow_resolving_throttle(
 /// `workflow_name` + key stays well under that limit and a too-long key is a
 /// clean `400` at the API boundary instead.
 const MAX_START_IDEMPOTENCY_KEY_LEN: usize = 512;
+
+/// Reject an explicitly-empty `workflow_id` (issue #1353), shared by
+/// `start_workflow`, `signal_with_start_workflow`, `update_with_start_workflow`,
+/// and `rerun_workflow`'s override field. Omitting the field is untouched:
+/// `None` still auto-generates a UUID, or reuses the source's key on a
+/// rerun. An explicit empty string is different -- a degenerate business id
+/// the by-id route family cannot address consistently. Reject it at the
+/// boundary instead of accepting it as a live, addressable identifier.
+///
+/// A whitespace-only id is out of scope. It is a normal, non-empty final
+/// path segment, so it does not trigger the router gap this issue addresses.
+#[allow(clippy::result_large_err)]
+fn reject_empty_workflow_id(raw: Option<&str>) -> Result<(), axum::response::Response> {
+    use axum::response::IntoResponse as _;
+    if raw == Some("") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "workflow_id must not be empty",
+                "detail": "omit workflow_id to auto-generate one, or supply a non-empty value"
+            })),
+        )
+            .into_response());
+    }
+    Ok(())
+}
 
 /// Shared trim + empty-`400` + length-cap validation for a request-scoped
 /// `idempotency_key` (issue #808), used by both the `Idempotency-Key` header
@@ -15687,6 +17063,12 @@ pub(crate) async fn start_workflow(
         }
     };
 
+    // `audit_context` and `route` are cheap: no DB call, no runtime cost.
+    // Compute them once here. The registry check, the issue #1353
+    // empty-workflow_id check, and the probe below all need them.
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /workflows/{workflow_name}/start";
+
     // Workflow-start provenance (issue #740): default `api` for the plain HTTP
     // start route; a webhook-delegated start (`from_webhook`) overrides it to
     // `webhook`. Applied uniformly to the direct start and every deferred
@@ -15776,9 +17158,6 @@ pub(crate) async fn start_workflow(
         Ok(r) => r,
         Err(e) => return map_error(e).into_response(),
     };
-
-    let (actor, source, request_id) = audit_context(&headers, &api_state);
-    let route = "POST /workflows/{workflow_name}/start";
 
     if !runtime.registry.workflows.contains_key(&workflow_name) {
         if let Ok(pool) = api_state.storage_pool()
@@ -16029,9 +17408,14 @@ pub(crate) async fn start_workflow(
     // `MINT_CAP` and warn, only for the start to be rejected moments later on
     // the fresh-start path anyway. A dedup hit never uses the minted id (it
     // returns the original execution), so skipping the mint costs nothing.
+    //
+    // A reserved (cell) shard is writable, but unpinned placement never picks
+    // it (issue #1837). No minted id can hash there, so the loop skips it.
+    // A cell tenant must pin every start, as ADR 0004 states.
     if (idempotency_key.is_some() || !placement.is_auto())
         && !explicit_workflow_id
         && pin_is_writable
+        && runtime.router.accepts_unpinned(shard)
     {
         const MINT_CAP: u32 = 10_000;
         let mut attempts = 0u32;
@@ -16108,6 +17492,29 @@ pub(crate) async fn start_workflow(
         )
         .await
     {
+        return resp;
+    }
+
+    // This check is fresh-start-only, like every check below (issue #1353).
+    // It runs AFTER the committed-replay probe above. A keyed start that
+    // (pre-#1353) committed under an empty workflow_id can still be
+    // retried. Such a retry must return the `200` no-op, not a `400`. A
+    // `400` here would contradict the retry's own prior success. It would
+    // also audit a working retry as a failure.
+    if let Err(resp) = reject_empty_workflow_id(Some(workflow_id.as_str())) {
+        audit_start_failure(
+            &api_state,
+            &StartFailureAudit {
+                actor: &actor,
+                workflow_name: &workflow_name,
+                route,
+                request_id: request_id.as_deref(),
+                source: &source,
+                requested_shard_id: request.shard_id,
+            },
+            "empty workflow_id",
+        )
+        .await;
         return resp;
     }
 
@@ -17335,10 +18742,11 @@ pub(crate) async fn start_workflow(
             },
         };
 
-        match autumn_harvest::event_batch::admit_batched_start(
+        match autumn_harvest::event_batch::admit_batched_start_with_codecs(
             &mut batch_conn,
             admit_params,
             Some(runtime.registry.telemetry().metrics.as_ref()),
+            runtime.registry.payload_codecs(),
         )
         .await
         {
@@ -17598,7 +19006,9 @@ pub(crate) async fn start_workflow(
         // workflow resolves a throttle policy (the enclosing `if let`), so the
         // batch route's extra `workflow_resolving_throttle(...).is_some()` guard
         // is redundant here.
-        if let Some((gate_id, gate_reason, scope_kind)) = {
+        // Load shedding (issue #1794) follows the same rule. A deferred start
+        // never reaches the primitive's shed check, and its later fire is exempt.
+        let gate_hit = {
             let wf_owner = runtime
                 .registry
                 .workflows
@@ -17607,7 +19017,12 @@ pub(crate) async fn start_workflow(
             api_state
                 .gate_cache()
                 .check(&workflow_name, &queue_name, shard.as_i32(), wf_owner)
-        } {
+        };
+        let shed_hit = api_state
+            .gate_cache()
+            .load_shedder()
+            .check(&queue_name, std::time::Instant::now());
+        if gate_hit.is_some() || shed_hit.is_some() {
             // Idempotent-retry bypass (mirrors the batch route's bypasses). Only
             // meaningful for an explicit `workflow_id`: an auto-generated id varies
             // per retry and can never resolve to a prior run/row. The checks reuse
@@ -17627,6 +19042,7 @@ pub(crate) async fn start_workflow(
                         harvest_workflow_executions::state
                             .ne_all(["CONTINUED_AS_NEW", "TERMINATED"]),
                     )
+                    .filter(harvest_workflow_executions::migrated_run_terminal_at.is_null())
                     .select(harvest_workflow_executions::state)
                     .first::<String>(&mut conn)
                     .await
@@ -17659,7 +19075,7 @@ pub(crate) async fn start_workflow(
                     .await
                     .unwrap_or(false)
             };
-            if !is_idempotent_retry {
+            if !is_idempotent_retry && let Some((gate_id, gate_reason, scope_kind)) = gate_hit {
                 let reason_label = match gate_reason.char_indices().nth(64) {
                     Some((idx, _)) => &gate_reason[..idx],
                     None => &gate_reason,
@@ -17694,6 +19110,39 @@ pub(crate) async fn start_workflow(
                     })),
                 )
                     .into_response();
+            }
+            // The lookups above can outlast a sample, so re-check the shedder
+            // here rather than trust the decision taken before them.
+            if !is_idempotent_retry
+                && let Some(decision) = api_state
+                    .gate_cache()
+                    .load_shedder()
+                    .check(&queue_name, std::time::Instant::now())
+            {
+                runtime
+                    .registry
+                    .telemetry()
+                    .metrics
+                    .record_load_shed_rejected(&decision.queue);
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(workflow_name.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("load shed"),
+                    shard_id: Some(shard.as_i32()),
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+                return load_shed_response(
+                    &decision.queue,
+                    decision.oldest_pending_age_secs,
+                    decision.retry_after_secs,
+                );
             }
             // Idempotent retry: fall through to `reserve_or_defer`, which resolves
             // it to the existing execution / same pending row (no fresh admission).
@@ -17743,7 +19192,7 @@ pub(crate) async fn start_workflow(
             started_by: None,
         };
 
-        match autumn_harvest::throttle::reserve_or_defer(
+        match autumn_harvest::throttle::reserve_or_defer_or_shed(
             &mut conn,
             autumn_harvest::throttle::AdmitThrottleParams {
                 workflow_name: &workflow_name,
@@ -17818,6 +19267,32 @@ pub(crate) async fn start_workflow(
                 // no-op/immediate reject; no token reserved, fall through to
                 // the normal start below.
             }
+            // The deferral point shed the start (issue #1794): answer 429 with
+            // `Retry-After`, like every other shed start.
+            Err(e @ HarvestError::LoadShed { .. }) => {
+                if let HarvestError::LoadShed { queue, .. } = &e {
+                    runtime
+                        .registry
+                        .telemetry()
+                        .metrics
+                        .record_load_shed_rejected(queue);
+                }
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(workflow_name.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("load shed"),
+                    shard_id: Some(shard.as_i32()),
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+                return start_error_response(e);
+            }
             Err(e) => return map_error(e).into_response(),
         }
     }
@@ -17859,15 +19334,9 @@ pub(crate) async fn start_workflow(
                 .into_response();
         }
         let window_secs = api_state.start_idempotency_window().as_secs_f64();
-        let idem = autumn_harvest::start_or_load_workflow_execution_idempotent(
+        let idem = autumn_harvest::start_or_load_workflow_execution_idempotent_with_codecs(
             &mut conn,
             StartWorkflowParams {
-                workflow_name: &workflow_name,
-                workflow_id: &workflow_id,
-                exec_id,
-                input,
-                parent_id: None,
-                queue_name: &queue_name,
                 execution_timeout: request
                     .execution_timeout_secs
                     .map(chrono::Duration::seconds)
@@ -17886,7 +19355,6 @@ pub(crate) async fn start_workflow(
                 // fleet-wide ceiling-as-default, at parity with the per-run timeout.
                 chain_execution_timeout: info_chain_timeout_chrono,
                 max_workflow_chain_timeout_ceiling: max_chain_timeout_ceiling,
-                inherited_chain_deadline_at: None,
                 concurrency_key,
                 concurrency_limit,
                 concurrency_on_conflict,
@@ -17900,17 +19368,18 @@ pub(crate) async fn start_workflow(
                 severity,
                 context_headers: request.context_headers.clone(),
                 sla: effective_sla,
-                schedule_id: None,
-                scheduled_for: None,
-                workflow_attempt: 1,
                 workflow_retry_policy,
-                retry_of_exec_id: None,
                 max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
-                origin: None,
                 completion_callbacks,
                 start_source: effective_start_source,
                 start_source_ref: effective_start_source_ref.as_deref(),
-                started_by: None,
+                ..StartWorkflowParams::new(
+                    &workflow_name,
+                    &workflow_id,
+                    exec_id,
+                    input,
+                    &queue_name,
+                )
             },
             key,
             window_secs,
@@ -17920,6 +19389,7 @@ pub(crate) async fn start_workflow(
             // back the idempotency reservation (retryable); a committed-replay
             // short-circuited to `200` above never reaches here.
             Some(autumn_harvest::admission_gate::GateMode::Check),
+            runtime.registry.payload_codecs(),
         )
         .await;
 
@@ -18089,18 +19559,12 @@ pub(crate) async fn start_workflow(
                     source: &source,
                 };
                 let _ = audit::insert_audit(&mut conn, &ar).await;
-                map_error(e).into_response()
+                start_error_response(e)
             }
         };
     }
 
     let start_params = StartWorkflowParams {
-        workflow_name: &workflow_name,
-        workflow_id: &workflow_id,
-        exec_id,
-        input,
-        parent_id: None,
-        queue_name: &queue_name,
         execution_timeout: request
             .execution_timeout_secs
             .map(chrono::Duration::seconds)
@@ -18117,7 +19581,6 @@ pub(crate) async fn start_workflow(
         // fleet-wide ceiling-as-default, at parity with the per-run timeout.
         chain_execution_timeout: info_chain_timeout_chrono,
         max_workflow_chain_timeout_ceiling: max_chain_timeout_ceiling,
-        inherited_chain_deadline_at: None,
         concurrency_key,
         concurrency_limit,
         concurrency_on_conflict,
@@ -18131,17 +19594,12 @@ pub(crate) async fn start_workflow(
         severity,
         context_headers: request.context_headers.clone(),
         sla: effective_sla,
-        schedule_id: None,
-        scheduled_for: None,
-        workflow_attempt: 1,
         workflow_retry_policy,
-        retry_of_exec_id: None,
         max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
-        origin: None,
         completion_callbacks,
         start_source: effective_start_source,
         start_source_ref: effective_start_source_ref.as_deref(),
-        started_by: None,
+        ..StartWorkflowParams::new(&workflow_name, &workflow_id, exec_id, input, &queue_name)
     };
     let metrics_ref: Option<&(dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync)> =
         Some(runtime.registry.telemetry().metrics.as_ref());
@@ -18156,11 +19614,12 @@ pub(crate) async fn start_workflow(
     // attach admits nothing and is never gated (returns the existing run). This path
     // is reached by every non-debounce / non-batch start (plain, auto-id, and a
     // throttle-`Reserved` fall-through — its token is refunded on a block below).
-    let result = start_or_load_workflow_execution_with_metrics(
+    let result = start_or_load_workflow_execution_with_metrics_and_codecs(
         &mut conn,
         start_params,
         metrics_ref,
         Some(autumn_harvest::admission_gate::GateMode::Check),
+        runtime.registry.payload_codecs(),
     )
     .await;
 
@@ -18302,7 +19761,7 @@ pub(crate) async fn start_workflow(
                 source: &source,
             };
             let _ = audit::insert_audit(&mut conn, &ar).await;
-            map_error(e).into_response()
+            start_error_response(e)
         }
         Ok(start) => {
             // AC-a: a start that attached to an existing run (rather than
@@ -18470,6 +19929,11 @@ async fn batch_start_workflows(
                 "workflow '{}' is a registered DAG; use POST /dags/{{name}}/trigger",
                 item.workflow_name
             ))
+        } else if item.workflow_id.as_deref() == Some("") {
+            // issue #1353: an explicit empty workflow_id is a degenerate
+            // business id the by-id route family cannot address consistently.
+            // Reject it per-item, same as the standalone start route.
+            Some("workflow_id must not be empty".to_string())
         } else if item.workflow_id.is_none()
             && workflow_has_resolving_debounce(
                 &runtime.registry,
@@ -18622,6 +20086,11 @@ async fn batch_start_workflows(
     let mut shard_groups: std::collections::BTreeMap<ShardId, Vec<(usize, String)>> =
         std::collections::BTreeMap::new();
     let mut gate_rejected: Vec<BatchStartItemResult> = Vec::new();
+    // Load shedding (issue #1794). A throttle defer in Phase 2 skips the
+    // primitive's check, so each item is checked here. The first check per
+    // item is a hint. A fresh check after the idempotency lookups decides.
+    let mut shed_rejected = 0_usize;
+    let mut last_shed: Option<autumn_harvest::load_shed::ShedDecision> = None;
     for (idx, item) in request.items.iter().enumerate() {
         if pre_rejected_idxs.contains(&idx) {
             continue;
@@ -18640,12 +20109,17 @@ async fn batch_start_workflows(
             .workflows
             .get(&item.workflow_name)
             .and_then(|i| i.owner);
-        if let Some((gate_id, gate_reason, scope_kind)) = api_state.gate_cache().check(
+        let gate_hit = api_state.gate_cache().check(
             &item.workflow_name,
             item_queue,
             shard.as_i32(),
             item_owner,
-        ) {
+        );
+        let shed_hit = api_state
+            .gate_cache()
+            .load_shedder()
+            .check(item_queue, std::time::Instant::now());
+        if gate_hit.is_some() || shed_hit.is_some() {
             // Idempotent retry bypass: if the caller supplied an explicit
             // workflow_id, check whether an active (RUNNING/SUSPENDED) execution
             // already exists on this shard.  AllowDuplicate would return the
@@ -18693,6 +20167,9 @@ async fn batch_start_workflows(
                                     harvest_workflow_executions::state
                                         .ne_all(["CONTINUED_AS_NEW", "TERMINATED"]),
                                 )
+                                .filter(
+                                    harvest_workflow_executions::migrated_run_terminal_at.is_null(),
+                                )
                                 .select(harvest_workflow_executions::state)
                                 .first::<String>(&mut pre_conn)
                                 .await
@@ -18734,25 +20211,58 @@ async fn batch_start_workflows(
                     .push((idx, workflow_id));
                 continue;
             }
-            let reason_label = match gate_reason.char_indices().nth(64) {
-                Some((idx2, _)) => &gate_reason[..idx2],
-                None => &gate_reason,
-            };
-            runtime
-                .registry
-                .telemetry()
-                .metrics
-                .record_admission_blocked(scope_kind, reason_label);
-            gate_rejected.push(BatchStartItemResult {
-                index: idx,
-                workflow_id: Some(workflow_id.clone()),
-                status: BatchStartItemStatus::Rejected,
-                execution_id: None,
-                error: Some(format!(
-                    "admission blocked by gate {gate_id}: {gate_reason}"
-                )),
-            });
-            continue;
+            if let Some((gate_id, gate_reason, scope_kind)) = gate_hit {
+                let reason_label = match gate_reason.char_indices().nth(64) {
+                    Some((idx2, _)) => &gate_reason[..idx2],
+                    None => &gate_reason,
+                };
+                runtime
+                    .registry
+                    .telemetry()
+                    .metrics
+                    .record_admission_blocked(scope_kind, reason_label);
+                gate_rejected.push(BatchStartItemResult {
+                    index: idx,
+                    workflow_id: Some(workflow_id.clone()),
+                    status: BatchStartItemStatus::Rejected,
+                    execution_id: None,
+                    error: Some(format!(
+                        "admission blocked by gate {gate_id}: {gate_reason}"
+                    )),
+                });
+                continue;
+            }
+            // `shed_hit` is only a hint. The lookups above can outlast a
+            // sample, so the decision comes from a fresh check, as on the
+            // single-start route. A cleared or stale state then fails open.
+            if let Some(decision) = api_state
+                .gate_cache()
+                .load_shedder()
+                .check(item_queue, std::time::Instant::now())
+            {
+                runtime
+                    .registry
+                    .telemetry()
+                    .metrics
+                    .record_load_shed_rejected(&decision.queue);
+                shed_rejected += 1;
+                gate_rejected.push(BatchStartItemResult {
+                    index: idx,
+                    workflow_id: Some(workflow_id.clone()),
+                    status: BatchStartItemStatus::Rejected,
+                    execution_id: None,
+                    error: Some(
+                        HarvestError::LoadShed {
+                            queue: decision.queue.clone(),
+                            oldest_pending_age_secs: decision.oldest_pending_age_secs,
+                            retry_after_secs: decision.retry_after_secs,
+                        }
+                        .to_string(),
+                    ),
+                });
+                last_shed = Some(decision);
+                continue;
+            }
         }
 
         shard_groups
@@ -18763,6 +20273,7 @@ async fn batch_start_workflows(
 
     // Atomic mode: if any item was gate-rejected, fail the whole batch.
     if request.atomic && !gate_rejected.is_empty() {
+        let only_shed = shed_rejected == gate_rejected.len();
         if let Ok(pool) = api_state.storage_pool()
             && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
         {
@@ -18775,11 +20286,37 @@ async fn batch_start_workflows(
                 request_id: request_id.as_deref(),
                 idempotency_key: None,
                 status: STATUS_FAILED,
-                error_summary: Some("atomic batch rejected: one or more items blocked by gate"),
+                error_summary: Some(if only_shed {
+                    "atomic batch rejected: one or more items shed"
+                } else {
+                    "atomic batch rejected: one or more items blocked by gate"
+                }),
                 shard_id: None,
                 source: &source,
             };
             let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
+        // Only sheds: answer 429 with `Retry-After`, so the caller retries.
+        // A manual-gate block keeps the 409.
+        if let Some(decision) = last_shed.as_ref().filter(|_| only_shed) {
+            let mut response = (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(BatchStartRejectedResponse {
+                    message: format!(
+                        "{} of {} items shed on queue '{}'; no executions inserted (atomic=true)",
+                        gate_rejected.len(),
+                        request.items.len(),
+                        decision.queue
+                    ),
+                    rejected: gate_rejected,
+                }),
+            )
+                .into_response();
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from(decision.retry_after_secs),
+            );
+            return response;
         }
         return (
             StatusCode::CONFLICT,
@@ -19083,6 +20620,38 @@ async fn batch_start_workflows(
                         continue;
                     }
                 };
+                // The queue can trip after Phase 1 (issue #1794). A fresh row
+                // would defer past the primitive's check, so check here too.
+                // `skip_cap_check` marks an attach or a bypass, which is no
+                // fresh admission.
+                if !skip_cap_check
+                    && let Some(decision) = api_state
+                        .gate_cache()
+                        .load_shedder()
+                        .check(&queue_name, std::time::Instant::now())
+                {
+                    runtime
+                        .registry
+                        .telemetry()
+                        .metrics
+                        .record_load_shed_rejected(&decision.queue);
+                    rejected_count += 1;
+                    results.push(BatchStartItemResult {
+                        index: *idx,
+                        workflow_id: Some(workflow_id.clone()),
+                        status: BatchStartItemStatus::Rejected,
+                        execution_id: None,
+                        error: Some(
+                            HarvestError::LoadShed {
+                                queue: decision.queue,
+                                oldest_pending_age_secs: decision.oldest_pending_age_secs,
+                                retry_after_secs: decision.retry_after_secs,
+                            }
+                            .to_string(),
+                        ),
+                    });
+                    continue;
+                }
                 if !skip_cap_check && effective_wf_cap > 0 {
                     let observed = serde_json::to_string(&input).map_or(0u64, |s| s.len() as u64);
                     if observed > effective_wf_cap {
@@ -19138,7 +20707,7 @@ async fn batch_start_workflows(
                     start_source_ref: None,
                     started_by: Some(actor.clone()),
                 };
-                match autumn_harvest::throttle::reserve_or_defer(
+                match autumn_harvest::throttle::reserve_or_defer_or_shed(
                     &mut conn,
                     autumn_harvest::throttle::AdmitThrottleParams {
                         workflow_name: &item.workflow_name,
@@ -19179,6 +20748,15 @@ async fn batch_start_workflows(
                         // the normal start below.
                     }
                     Err(e) => {
+                        // A deferral-point shed (issue #1794) counts like any
+                        // other shed item.
+                        if let HarvestError::LoadShed { queue, .. } = &e {
+                            runtime
+                                .registry
+                                .telemetry()
+                                .metrics
+                                .record_load_shed_rejected(queue);
+                        }
                         rejected_count += 1;
                         results.push(BatchStartItemResult {
                             index: *idx,
@@ -19199,70 +20777,58 @@ async fn batch_start_workflows(
             // rejection below (issue #499).
             let item_reject_fresh =
                 workflow_has_resolving_debounce(&runtime.registry, &item.workflow_name, &input);
-            let start_result = autumn_harvest::execution::start_or_load_workflow_execution_collect(
-                &mut conn,
-                StartWorkflowParams {
-                    workflow_name: &item.workflow_name,
-                    workflow_id,
-                    exec_id,
-                    input,
-                    parent_id: None,
-                    queue_name: &queue_name,
-                    execution_timeout: None,
-                    memo: None,
-                    search_attrs: item.search_attributes.clone(),
-                    reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
-                    conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
-                    trace_context: trace_ctx,
-                    max_execution_timeout_ceiling: max_exec_timeout_ceiling,
-                    // Chain-scoped lifetime cap (issue #617): workflow-type default
-                    // + fleet-wide ceiling-as-default, at parity with the per-run
-                    // ceiling threaded above.
-                    chain_execution_timeout: info_chain_execution_timeout
-                        .and_then(|d| chrono::Duration::from_std(d).ok()),
-                    max_workflow_chain_timeout_ceiling: max_chain_timeout_ceiling,
-                    inherited_chain_deadline_at: None,
-                    concurrency_key,
-                    concurrency_limit,
-                    concurrency_on_conflict,
-                    priority: item.priority.unwrap_or_default(),
-                    max_workflow_input_bytes: effective_wf_cap,
-                    start_at: None,
-                    delay: None,
-                    max_workflow_start_delay: None,
-                    owner,
-                    runbook_url,
-                    severity,
-                    context_headers: item.context_headers.clone(),
-                    sla,
-                    schedule_id: None,
-                    scheduled_for: None,
-                    workflow_attempt: 1,
-                    workflow_retry_policy: item_workflow_retry_policy,
-                    retry_of_exec_id: None,
-                    max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
-                    origin: None,
-                    completion_callbacks: None,
-                    // Batch-start API immediate path (issue #740): provenance is
-                    // `batch`, attributed to the operator that issued the batch.
-                    // Mirrors the throttle-carrier branch above.
-                    start_source: autumn_harvest::StartSource::Batch,
-                    start_source_ref: None,
-                    started_by: Some(actor.as_str()),
-                },
-                false,
-                item_reject_fresh,
-                Some(runtime.registry.telemetry().metrics.as_ref()),
-                // issue #618 (PR #1014): gate each batch item authoritatively under
-                // the primitive's `FOR UPDATE` lock. This closes the batch TOCTOU
-                // (Phase 1's policy-blind pre-check can skip the gate for an item
-                // whose prior seals before Phase 2 starts it). A blocked item's
-                // `Err(AdmissionBlocked)` is mapped to a per-item rejection by the
-                // `Err(e)` arm below (never a hard batch failure) — the block is
-                // counted once by the primitive.
-                Some(autumn_harvest::admission_gate::GateMode::Check),
-            )
-            .await;
+            let start_result =
+                autumn_harvest::execution::start_or_load_workflow_execution_collect_with_codecs(
+                    &mut conn,
+                    StartWorkflowParams {
+                        search_attrs: item.search_attributes.clone(),
+                        trace_context: trace_ctx,
+                        max_execution_timeout_ceiling: max_exec_timeout_ceiling,
+                        // Chain-scoped lifetime cap (issue #617): workflow-type default
+                        // + fleet-wide ceiling-as-default, at parity with the per-run
+                        // ceiling threaded above.
+                        chain_execution_timeout: info_chain_execution_timeout
+                            .and_then(|d| chrono::Duration::from_std(d).ok()),
+                        max_workflow_chain_timeout_ceiling: max_chain_timeout_ceiling,
+                        concurrency_key,
+                        concurrency_limit,
+                        concurrency_on_conflict,
+                        priority: item.priority.unwrap_or_default(),
+                        max_workflow_input_bytes: effective_wf_cap,
+                        owner,
+                        runbook_url,
+                        severity,
+                        context_headers: item.context_headers.clone(),
+                        sla,
+                        workflow_retry_policy: item_workflow_retry_policy,
+                        max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
+                        // Batch-start API immediate path (issue #740): provenance is
+                        // `batch`, attributed to the operator that issued the batch.
+                        // Mirrors the throttle-carrier branch above.
+                        start_source: autumn_harvest::StartSource::Batch,
+                        started_by: Some(actor.as_str()),
+                        ..StartWorkflowParams::new(
+                            &item.workflow_name,
+                            workflow_id,
+                            exec_id,
+                            input,
+                            &queue_name,
+                        )
+                    },
+                    false,
+                    item_reject_fresh,
+                    Some(runtime.registry.telemetry().metrics.as_ref()),
+                    // issue #618 (PR #1014): gate each batch item authoritatively under
+                    // the primitive's `FOR UPDATE` lock. This closes the batch TOCTOU
+                    // (Phase 1's policy-blind pre-check can skip the gate for an item
+                    // whose prior seals before Phase 2 starts it). A blocked item's
+                    // `Err(AdmissionBlocked)` is mapped to a per-item rejection by the
+                    // `Err(e)` arm below (never a hard batch failure) — the block is
+                    // counted once by the primitive.
+                    Some(autumn_harvest::admission_gate::GateMode::Check),
+                    runtime.registry.payload_codecs(),
+                )
+                .await;
 
             let start_result = match start_result {
                 Ok((started, deferred, checks, cancel_metrics)) => {
@@ -19358,6 +20924,14 @@ async fn batch_start_workflows(
                     }
                     rejected_count += 1;
                     let err_str = e.to_string();
+                    // The queue can trip between Phase 1 and this start (issue
+                    // #1794). A shed keeps its 429 and `Retry-After` here too.
+                    let shed_retry_after = match &e {
+                        HarvestError::LoadShed {
+                            retry_after_secs, ..
+                        } => Some(*retry_after_secs),
+                        _ => None,
+                    };
                     results.push(BatchStartItemResult {
                         index: *idx,
                         workflow_id: Some(workflow_id.clone()),
@@ -19374,12 +20948,21 @@ async fn batch_start_workflows(
                             &source,
                             request_id.as_deref(),
                             route,
-                            "atomic batch rejected: start failure",
+                            if shed_retry_after.is_some() {
+                                "atomic batch rejected: item shed"
+                            } else {
+                                "atomic batch rejected: start failure"
+                            },
                         )
                         .await;
                         results.sort_by_key(|r| r.index);
-                        return (
-                            StatusCode::CONFLICT,
+                        let status = if shed_retry_after.is_some() {
+                            StatusCode::TOO_MANY_REQUESTS
+                        } else {
+                            StatusCode::CONFLICT
+                        };
+                        let mut response = (
+                            status,
                             Json(BatchStartRejectedResponse {
                                 message: format!(
                                     "atomic batch aborted: item {idx} failed: {err_str}"
@@ -19388,6 +20971,13 @@ async fn batch_start_workflows(
                             }),
                         )
                             .into_response();
+                        if let Some(secs) = shed_retry_after {
+                            response.headers_mut().insert(
+                                axum::http::header::RETRY_AFTER,
+                                axum::http::HeaderValue::from(secs),
+                            );
+                        }
+                        return response;
                     }
                 }
             }
@@ -20040,6 +21630,35 @@ pub(crate) async fn signal_with_start_workflow(
         return resp;
     }
 
+    // This check is fresh-start-only, like every check below (issue #1353).
+    // It runs AFTER the committed-replay probe above. `start_workflow`
+    // orders its own check the same way, for the same reason. A keyed
+    // signal-with-start that (pre-#1353) committed under an empty
+    // workflow_id can still be retried. Such a retry must replay its `200`
+    // no-op, not a `400`. A `400` here would contradict the retry's own
+    // prior success.
+    if let Err(resp) = reject_empty_workflow_id(Some(workflow_id.as_str())) {
+        if let Ok(pool) = api_state.storage_pool()
+            && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+        {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_SIGNAL_WITH_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: request.idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some("empty workflow_id"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
+        return resp;
+    }
+
     // issue #610: structural schema validation of the signal payload against
     // the signal handler's published `arg_schema` (if any). Runs before any
     // durable start/attach so a malformed signal is rejected at the edge with a
@@ -20104,7 +21723,18 @@ pub(crate) async fn signal_with_start_workflow(
     // The 4th element records whether this is a pure attach (existing RUNNING/SUSPENDED +
     // AllowDuplicate*). Used below to skip start_input schema validation on attach requests
     // where start_input is never written (mirrors the payload-cap deferral from issue #252).
+    // The shard a fresh start would land on (issue #1317 review). A terminal,
+    // non-live prior found on any OTHER shard must not anchor `replace_execution`
+    // there. That call seals and inserts on `candidate_shard`'s own connection.
+    // A reconciled predecessor left on its former migration target would then
+    // place the new run there. A subsequent plain `start_workflow` for the same
+    // key routes straight to this shard. It finds nothing to stop it there, and
+    // admits a second live run for the same key on two shards.
+    let canonical_shard = runtime
+        .router
+        .pick_for_new_workflow(&workflow_name, &workflow_id);
     let mut found_shard: Option<(ShardId, PoolConn, ExecutionId, bool)> = None;
+    let mut seal_only: Option<ShardId> = None;
     for (candidate_shard, shard_pool) in pool.iter_shards() {
         let mut shard_conn = match acquire_conn(shard_pool).await {
             Ok(c) => c,
@@ -20114,6 +21744,15 @@ pub(crate) async fn signal_with_start_workflow(
             .filter(harvest_workflow_executions::workflow_name.eq(&workflow_name))
             .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
             .filter(harvest_workflow_executions::state.ne_all(["CONTINUED_AS_NEW", "TERMINATED"]))
+            // An observed-terminal `MIGRATED` seal no longer occupies this
+            // key (issue #1317). The widened active-uniqueness index
+            // already excludes it. Exclude it here too. Otherwise a sole
+            // reconciled seal on the origin shard reads as a live copy
+            // still elsewhere. This handler then refuses a request that
+            // would actually succeed as a fresh start. A live replacement
+            // row never carries this marker, so it still matches
+            // unaffected.
+            .filter(harvest_workflow_executions::migrated_run_terminal_at.is_null())
             .select((
                 harvest_workflow_executions::id,
                 harvest_workflow_executions::state,
@@ -20132,40 +21771,103 @@ pub(crate) async fn signal_with_start_workflow(
             }
         };
         if let Some((existing_uuid, existing_state)) = hit {
-            // Attach (reuse UUID) only when the prior is live AND the policy
-            // expects to attach. Every other path goes through replace_execution
-            // and needs a fresh exec_id keyed for the same shard.
-            // Only a RUNNING execution under a non-rejecting policy is a true
-            // attach (signal delivered, start_input ignored). SUSPENDED is
-            // upgraded to TerminateIfRunning by resolve_effective_signal_with_start_policy,
-            // which writes a fresh execution using start_input — so validation must run.
-            let will_attach = existing_state == "RUNNING"
-                && matches!(
-                    reuse_policy,
-                    WorkflowIdReusePolicy::AllowDuplicate
-                        | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
-                );
-            let exec_id = if will_attach {
-                ExecutionId::from_uuid(existing_uuid)
-            } else {
-                ExecutionId::new_for_shard(candidate_shard)
-            };
-            found_shard = Some((candidate_shard, shard_conn, exec_id, will_attach));
-            break;
+            // A rebalanced SEAL is not the run (issue #964). It matches this
+            // query — `MIGRATED` is neither CONTINUED_AS_NEW nor TERMINATED —
+            // and shards iterate in id order, so the seal on the origin shard is
+            // found before the live copy on the target. Selecting it sends the
+            // whole operation to a row that will never run again: the resolver
+            // sees a non-RUNNING prior, upgrades to `TerminateIfRunning`, and
+            // the start path refuses a rebalanced prior, so the request 503s
+            // forever while the live run sits available on the next shard.
+            //
+            // Keep scanning instead, remembering the seal only so a live copy
+            // this node cannot see is refused rather than silently duplicated.
+            if matches!(existing_state.as_str(), "MIGRATED" | "MIGRATING") {
+                seal_only = Some(candidate_shard);
+                continue;
+            }
+            // `PAUSED` is the persisted name for a suspended run
+            // (`is_active_conflict_state`); `SUSPENDED` is kept alongside it
+            // for parity with the other live-state checks in this file. Both
+            // are live wherever they are found. Attach (RUNNING only), or
+            // route through `replace_execution` on THEIR OWN shard. Never
+            // skipped: a business key has at most one live row, so nothing
+            // later in the scan can outrank it.
+            if matches!(existing_state.as_str(), "RUNNING" | "SUSPENDED" | "PAUSED") {
+                let will_attach = existing_state == "RUNNING"
+                    && matches!(
+                        reuse_policy,
+                        WorkflowIdReusePolicy::AllowDuplicate
+                            | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
+                    );
+                let exec_id = if will_attach {
+                    ExecutionId::from_uuid(existing_uuid)
+                } else {
+                    ExecutionId::new_for_shard(candidate_shard)
+                };
+                found_shard = Some((candidate_shard, shard_conn, exec_id, will_attach));
+                break;
+            }
+            // A dead, non-live prior (COMPLETED/FAILED/CANCELLED/TIMED_OUT).
+            // `replace_execution` seals and inserts on the same connection.
+            // So this can never anchor a fresh run on a shard other than the
+            // one it sits on (see the comment above the loop). Drop this
+            // connection and keep scanning (issue #1317 review). Holding it
+            // via a `canonical_dead`-style fallback would starve a later
+            // shard aliased to the same size-one pool. A live row found
+            // later still wins. The fallback below reacquires
+            // `canonical_shard` fresh.
+            //
+            // `canonical_shard`, not this row's own shard. This applies
+            // even to a FAILED/CANCELLED/TIMED_OUT row that stays
+            // resettable through `reset.rs`'s `allow_terminal_source`
+            // (issue #1317 review, P1 follow-up and its own follow-up).
+            // Landing the fresh start on
+            // the dead row's shard instead was tried and reverted. A later
+            // plain `start_workflow` for the same key still routes to
+            // `canonical_shard` regardless, finds nothing there, and admits
+            // a second live run immediately. No reset is required, and
+            // this is the exact race the COMPLETED case below, and its
+            // own regression test, already close.
+            //
+            // A resettable row left off `canonical_shard` this way can
+            // still be revived by a later reset on its own shard. That
+            // produces a second live execution the far slower way. Closing
+            // it needs cross-shard coordination this codebase deliberately
+            // does not have (see `docs/sharding.md`'s residency caveats and
+            // issue #1313). Accepted as a known residual, not fixed here.
         }
+    }
+
+    // A seal but no live copy anywhere this node can reach: the run is alive on
+    // a shard with no pool here. Falling through would start a FRESH run for a
+    // business key that is already held, which is the duplicate the seal exists
+    // to prevent — so refuse retryably instead.
+    if found_shard.is_none()
+        && let Some(seal_shard) = seal_only
+    {
+        return AutumnError::service_unavailable_msg(format!(
+            "workflow_id '{workflow_id}' is held by an execution that was rebalanced \
+             off shard {}; its live copy is not reachable from this node, so the \
+             signal-with-start is refused rather than starting a duplicate run",
+            seal_shard.as_i32()
+        ))
+        .into_response();
     }
 
     let (shard, mut conn, exec_id, _will_attach) = if let Some(tuple) = found_shard {
         tuple
     } else {
-        let shard = runtime
-            .router
-            .pick_for_new_workflow(&workflow_name, &workflow_id);
-        let conn = match db_conn_for_shard(&api_state, shard).await {
+        let conn = match db_conn_for_shard(&api_state, canonical_shard).await {
             Ok(c) => c,
             Err(e) => return e.into_response(),
         };
-        (shard, conn, ExecutionId::new_for_shard(shard), false)
+        (
+            canonical_shard,
+            conn,
+            ExecutionId::new_for_shard(canonical_shard),
+            false,
+        )
     };
 
     // issue #377: check admission gates unconditionally.
@@ -20291,7 +21993,7 @@ pub(crate) async fn signal_with_start_workflow(
     let sws_workflow_retry_policy =
         info_retry_policy_sws.and_then(|p| serde_json::to_value(&p).ok());
 
-    let result = signal_with_start_workflow_execution_with_metrics(
+    let result = signal_with_start_workflow_execution_with_metrics_and_codecs(
         &mut conn,
         SignalWithStartParams {
             workflow_name: &workflow_name,
@@ -20351,6 +22053,7 @@ pub(crate) async fn signal_with_start_workflow(
         // pre-check block short-circuits before this call, so a fresh create is
         // never double-counted.
         Some(autumn_harvest::admission_gate::GateMode::Check),
+        runtime.registry.payload_codecs(),
     )
     .await;
 
@@ -20491,7 +22194,7 @@ pub(crate) async fn signal_with_start_workflow(
                 source: &source,
             };
             let _ = audit::insert_audit(&mut conn, &ar).await;
-            map_error(e).into_response()
+            start_error_response(e)
         }
         Ok(outcome) => {
             let exec_id_str = outcome.exec_id.to_string();
@@ -20533,6 +22236,11 @@ pub(crate) async fn signal_with_start_workflow(
 }
 
 // ── update-with-start (issue #479) ───────────────────────────────────────────
+
+/// Version 5 UUID namespace for update ids derived from an idempotency key.
+///
+/// It is the RFC 4122 DNS namespace. Do not change it: stored ids depend on it.
+const UPDATE_ID_NAMESPACE: uuid::Uuid = uuid::Uuid::NAMESPACE_DNS;
 
 /// `POST /workflows/{workflow_name}/update-with-start`
 ///
@@ -20679,9 +22387,7 @@ async fn update_with_start_workflow(
         .idempotency_key
         .as_ref()
         .map_or_else(UpdateId::new, |key| {
-            let namespace = uuid::Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
-                .expect("static namespace UUID is valid");
-            UpdateId::from_uuid(uuid::Uuid::new_v5(&namespace, key.as_bytes()))
+            UpdateId::from_uuid(uuid::Uuid::new_v5(&UPDATE_ID_NAMESPACE, key.as_bytes()))
         });
 
     // INVARIANT (this PR + #377): keyed committed-replay short-circuit. A retry of
@@ -20713,6 +22419,36 @@ async fn update_with_start_workflow(
     } else {
         None
     };
+
+    // This check is fresh-start-only (issue #1353). It is gated the same
+    // way the admission-gate and #373 schema checks below are: skipped on
+    // a committed-replay hit. A keyed update-with-start that (pre-#1353)
+    // committed under an empty workflow_id can still be retried. Such a
+    // retry must replay its cached admission, not a `400` that contradicts
+    // its own prior success.
+    if probe_outcome.is_none()
+        && let Err(resp) = reject_empty_workflow_id(Some(workflow_id.as_str()))
+    {
+        if let Ok(pool) = api_state.storage_pool()
+            && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+        {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_UPDATE_WITH_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: request.idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some("empty workflow_id"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
+        return resp;
+    }
 
     // Debounce admission is owned by POST /workflows/{name}/start. Ask the core
     // primitive to reject only a *fresh start* under its lock so an attach /
@@ -20762,7 +22498,13 @@ async fn update_with_start_workflow(
         };
         (hit_exec_id.shard(), conn, hit_exec_id)
     } else {
+        // The shard a fresh start would land on (issue #1317 review) — see the
+        // matching comment in the signal-with-start handler.
+        let canonical_shard = runtime
+            .router
+            .pick_for_new_workflow(&workflow_name, &workflow_id);
         let mut found_shard: Option<(ShardId, PoolConn, ExecutionId)> = None;
+        let mut seal_only: Option<ShardId> = None;
         for (candidate_shard, shard_pool) in pool.iter_shards() {
             let mut shard_conn = match acquire_conn(shard_pool).await {
                 Ok(c) => c,
@@ -20774,6 +22516,12 @@ async fn update_with_start_workflow(
                 .filter(
                     harvest_workflow_executions::state.ne_all(["CONTINUED_AS_NEW", "TERMINATED"]),
                 )
+                // An observed-terminal `MIGRATED` seal no longer occupies
+                // this key (issue #1317) — see the matching scan in the
+                // signal-with-start handler. Exclude it here too, or a sole
+                // reconciled seal refuses a request that would actually
+                // succeed as a fresh start.
+                .filter(harvest_workflow_executions::migrated_run_terminal_at.is_null())
                 .select((
                     harvest_workflow_executions::id,
                     harvest_workflow_executions::state,
@@ -20792,38 +22540,76 @@ async fn update_with_start_workflow(
                 }
             };
             if let Some((existing_uuid, existing_state)) = hit {
-                // Reuse the execution UUID only when attaching to a live RUNNING or
-                // SUSPENDED run under a non-rejecting policy. All other paths
-                // (terminal prior, PAUSED, TerminateIfRunning) go through
-                // replace_execution and need a fresh exec_id to avoid a
-                // primary-key conflict.
-                let will_attach = matches!(existing_state.as_str(), "RUNNING" | "SUSPENDED")
-                    && matches!(
-                        reuse_policy,
-                        WorkflowIdReusePolicy::AllowDuplicate
-                            | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
-                    );
-                let exec_id = if will_attach {
-                    ExecutionId::from_uuid(existing_uuid)
-                } else {
-                    ExecutionId::new_for_shard(candidate_shard)
-                };
-                found_shard = Some((candidate_shard, shard_conn, exec_id));
-                break;
+                // A rebalanced seal is not the run (issue #964) — see the
+                // matching scan in the signal-with-start handler. Skip it and
+                // keep looking for the live copy.
+                if matches!(existing_state.as_str(), "MIGRATED" | "MIGRATING") {
+                    seal_only = Some(candidate_shard);
+                    continue;
+                }
+                // `PAUSED` and `SUSPENDED` are live wherever found, exactly
+                // like `RUNNING` — see the matching check in the
+                // signal-with-start handler. Never skipped: `replace_execution`
+                // must run on THEIR OWN shard. A business key has at most
+                // one live row, so nothing later in the scan can outrank it.
+                if matches!(existing_state.as_str(), "RUNNING" | "SUSPENDED" | "PAUSED") {
+                    // Reuse the execution UUID only when attaching to a live RUNNING
+                    // run under a non-rejecting policy. All other paths (terminal
+                    // prior, PAUSED, TerminateIfRunning) go through replace_execution
+                    // and need a fresh exec_id to avoid a primary-key conflict.
+                    let will_attach = existing_state == "RUNNING"
+                        && matches!(
+                            reuse_policy,
+                            WorkflowIdReusePolicy::AllowDuplicate
+                                | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
+                        );
+                    let exec_id = if will_attach {
+                        ExecutionId::from_uuid(existing_uuid)
+                    } else {
+                        ExecutionId::new_for_shard(candidate_shard)
+                    };
+                    found_shard = Some((candidate_shard, shard_conn, exec_id));
+                    break;
+                }
+                // A dead, non-live prior (COMPLETED/FAILED/CANCELLED/TIMED_OUT) —
+                // see the matching check in the signal-with-start handler.
+                // Drop this connection and keep scanning, rather than
+                // holding it as a fallback (issue #1317 review). A
+                // `canonical_dead`-style hold would starve a later shard
+                // aliased to the same size-one pool. A live row found later
+                // still wins. The fallback below reacquires
+                // `canonical_shard` fresh, including for a
+                // FAILED/CANCELLED/TIMED_OUT row that stays resettable.
+                // See the matching comment in the signal-with-start handler
+                // (issue #1317 review, P1 follow-up and its own follow-up)
+                // for why that tradeoff is deliberate.
             }
         }
 
         if let Some(tuple) = found_shard {
             tuple
+        } else if let Some(seal_shard) = seal_only {
+            // Held by a run rebalanced onto a shard this node cannot reach.
+            // Starting fresh would duplicate the business key. Even if a dead
+            // canonical row was also seen, an unreachable seal means an
+            // active run elsewhere cannot be ruled out.
+            return AutumnError::service_unavailable_msg(format!(
+                "workflow_id '{workflow_id}' is held by an execution that was rebalanced \
+                 off shard {}; its live copy is not reachable from this node, so the \
+                 update-with-start is refused rather than starting a duplicate run",
+                seal_shard.as_i32()
+            ))
+            .into_response();
         } else {
-            let shard = runtime
-                .router
-                .pick_for_new_workflow(&workflow_name, &workflow_id);
-            let conn = match db_conn_for_shard(&api_state, shard).await {
+            let conn = match db_conn_for_shard(&api_state, canonical_shard).await {
                 Ok(c) => c,
                 Err(e) => return e.into_response(),
             };
-            (shard, conn, ExecutionId::new_for_shard(shard))
+            (
+                canonical_shard,
+                conn,
+                ExecutionId::new_for_shard(canonical_shard),
+            )
         }
     };
 
@@ -21092,7 +22878,7 @@ async fn update_with_start_workflow(
     let result = match probe_outcome {
         Some(outcome) => Ok(outcome),
         None => {
-            update_with_start_workflow_execution_with_metrics(
+            update_with_start_workflow_execution_with_metrics_and_codecs(
                 &mut conn,
                 params,
                 Some(runtime.registry.telemetry().metrics.as_ref()),
@@ -21102,6 +22888,7 @@ async fn update_with_start_workflow(
                 // create TOCTOU; a pre-check block short-circuits before this call,
                 // so no double-count.
                 Some(autumn_harvest::admission_gate::GateMode::Check),
+                runtime.registry.payload_codecs(),
             )
             .await
         }
@@ -21242,7 +23029,7 @@ async fn update_with_start_workflow(
                 source: &source,
             };
             let _ = audit::insert_audit(&mut conn, &ar).await;
-            map_error(e).into_response()
+            start_error_response(e)
         }
         Ok(outcome) => {
             let exec_id_str = outcome.exec_id.to_string();
@@ -21317,8 +23104,14 @@ async fn update_with_start_workflow(
             }
 
             // Poll for the update result, then embed it in the response.
-            let poll_response =
-                poll_update_result(&pool, outcome.exec_id, outcome.update_id, timeout_secs).await;
+            let poll_response = poll_update_result(
+                &pool,
+                outcome.exec_id,
+                outcome.update_id,
+                timeout_secs,
+                &api_state.payload_codecs(),
+            )
+            .await;
 
             // Re-build response combining outcome + poll result.
             let mut base = UpdateWithStartResponse::from_outcome(&outcome);
@@ -21419,6 +23212,10 @@ async fn cancel_workflow(
     // running — the sharpest correctness gap this routing closes. The response's
     // `execution_id` reports the attempt actually cancelled. For a workflow with
     // no retry policy this is exactly `cancel_workflow_execution`.
+    //
+    // `cancel_live_attempt` binds each resolved hop to its own real shard
+    // internally (issue #1596 follow-up review, comment 4052389744), rather
+    // than trusting `conn` to already be there.
     let cancel_result = autumn_harvest::execution::cancel_live_attempt(
         &mut conn,
         exec_id,
@@ -21443,7 +23240,7 @@ async fn cancel_workflow(
                 source: &source,
             };
             let _ = audit::insert_audit(&mut conn, &ar).await;
-            Err(map_error(e))
+            Err(conflict_from(e))
         }
         Ok(cancelled) => {
             // Issue #843: the audit record's subject is the execution actually
@@ -21560,6 +23357,9 @@ async fn terminate_workflow(
     let exec_id_str = exec_id.to_string();
 
     let metrics_ref = metrics_recorder_or_noop(&api_state);
+    // `terminate_live_attempt` binds each resolved hop to its own real shard
+    // internally (issue #1596 follow-up review, comment 4052389744), rather
+    // than trusting `conn` to already be there.
     let terminate_result = autumn_harvest::execution::terminate_live_attempt(
         &mut conn,
         exec_id,
@@ -21768,6 +23568,23 @@ async fn rerun_workflow(
             }
         }
     };
+
+    // issue #1353: reject an explicit empty workflow_id override before the
+    // main connection is acquired below. Mirrors the malformed-JSON-body
+    // audit just above: the id is well-formed, so audit through the
+    // execution's own shard.
+    if let Err(resp) = reject_empty_workflow_id(request.workflow_id.as_deref()) {
+        if let Ok(mut c) = db_conn_for_execution(&api_state, exec_id).await {
+            audit_rerun_failure_on(
+                &mut c,
+                &audit_ctx,
+                Some(&exec_id_str),
+                "empty workflow_id override",
+            )
+            .await;
+        }
+        return resp;
+    }
 
     // From here on every failure audit rides the CALLER'S connection: acquiring
     // a second pool connection while this one is held deadlocks a size-1 pool
@@ -22041,11 +23858,12 @@ async fn rerun_workflow(
         trace_context: runtime.registry.telemetry().capture_trace_context(),
     };
 
-    let result = autumn_harvest::execution::rerun_workflow_execution(
+    let result = autumn_harvest::execution::rerun_workflow_execution_with_codecs(
         &mut conn,
         exec_id,
         rerun_request,
         metrics_ref,
+        runtime.registry.payload_codecs(),
     )
     .await;
 
@@ -22144,18 +23962,40 @@ async fn rerun_workflow(
         Err(e) => {
             let msg = e.to_string();
             audit_rerun_failure_on(&mut conn, &audit_ctx, Some(&exec_id_str), &msg).await;
-            map_error(e).into_response()
+            start_error_response(e)
         }
     }
 }
 
 /// Build a `409 Conflict` response from a state-conflict error (issue #383).
+///
+/// Many callers besides cancel/pause/rerun route their own distinct
+/// state-conflict messages through this same helper as `Config`. Examples:
+/// `POST /admin/build-routing/ramp` without a base policy, and `retry-now`
+/// on a non-`PENDING` task. So the match below defaults every `Config` to
+/// 409.
+///
+/// Two known exceptions are surfaced on the same cancel/terminate call path.
+/// Both are operational or data-integrity failures, not resource-state
+/// conflicts. One is `resolve_live_attempt_id`'s retry-chain max-depth guard
+/// (issue #843). The other is `apply_parent_close_cascade`'s parse of a
+/// corrupted stored `parent_close_policy` column (issue #1445).
+///
+/// [`HarvestError::RetryChainMaxDepthExceeded`] and
+/// [`HarvestError::InvalidParentClosePolicy`] each exclude their case by its
+/// own distinct variant, not by inspecting message text (issue #1445). A
+/// substring match is spoofable: caller-controlled text can land inside an
+/// unrelated `Config` message, for example a queue name. That risks two
+/// failure directions -- wrongly admitting an unrelated conflict into 409,
+/// or wrongly excluding a genuine one.
 fn conflict_from(error: HarvestError) -> AutumnError {
     match error {
-        // Only a genuine state conflict (e.g. "already terminal"),
-        // surfaced by the core as `Config`, maps to 409. Everything else —
-        // NotFound (404), Database (500), etc. — flows through the normal mapper
-        // so a real persistence failure is not masked as a state conflict.
+        error @ (HarvestError::RetryChainMaxDepthExceeded { .. }
+        | HarvestError::InvalidParentClosePolicy { .. }) => map_error(error),
+        // Every `Config` is a genuine state conflict, surfaced by the core in
+        // that shape, and maps to 409. Everything else -- NotFound (404),
+        // Database (500), etc. -- flows through the normal mapper so a real
+        // persistence failure is not masked as a conflict.
         HarvestError::Config(msg) => {
             AutumnError::bad_request_msg(msg).with_status(axum::http::StatusCode::CONFLICT)
         }
@@ -22200,6 +24040,10 @@ async fn pause_workflow(
     // only accepts a `RUNNING`/`PAUSED` row, so an unrouted pause of a retried
     // run 409s against its sealed `FAILED` predecessor — denying the operator
     // the one reversible containment lever.
+    //
+    // `pause_live_attempt` binds each resolved hop to its own real shard
+    // internally (issue #1596 follow-up review, comment 4052389744), rather
+    // than trusting `conn` to already be there.
     let result = autumn_harvest::execution::pause_live_attempt(
         &mut conn,
         exec_id,
@@ -22272,6 +24116,10 @@ async fn resume_workflow(
     // an idempotent success no-op against a non-paused row, so an unrouted
     // resume of a retried run would report success while the paused live
     // attempt stayed parked.
+    //
+    // `resume_live_attempt` binds each resolved hop to its own real shard
+    // internally (issue #1596 follow-up review, comment 4052389744), rather
+    // than trusting `conn` to already be there.
     let result = autumn_harvest::execution::resume_live_attempt(
         &mut conn,
         exec_id,
@@ -22636,10 +24484,34 @@ async fn erase_workflow_payloads_handler(
         .unwrap_or_default();
 
     let exec_id = parse_execution_id(&id)?;
-    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
     let exec_id_str = exec_id.to_string();
 
-    let result = autumn_harvest::erase::erase_workflow_payloads(&mut conn, exec_id, &reason).await;
+    // Cross-residence (issue #964): a rebalanced execution's payloads exist on
+    // the sealed source shard as well as the live target, and an erasure that
+    // scrubbed only the shard the id routes to would leave a complete readable
+    // copy of the subject's data behind on another database.
+    //
+    // NOTE the deliberate absence of a held connection around this call. The
+    // helper checks out its own connection PER RESIDENCE, starting with the
+    // live one — so holding the audit connection across it would have this
+    // request waiting on a pool slot it is itself holding whenever the live
+    // shard's pool is the supported minimum size of one. That would wedge every
+    // erasure, migrated or not, until checkout timed out. The audit connection
+    // is therefore acquired AFTER the erase returns, which is the same
+    // one-connection-at-a-time discipline the cross-shard cancel path keeps for
+    // issue #688's precedent.
+    let result = match api_state.storage_pool() {
+        Ok(pool) => {
+            autumn_harvest::erase::erase_workflow_payloads_all_residences(
+                pool.sharded_pool(),
+                exec_id,
+                &reason,
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    };
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
 
     let (status, error_summary) = match &result {
         Ok(_) => (STATUS_SUCCEEDED, None),
@@ -22733,11 +24605,22 @@ async fn set_legal_hold_handler(
     }
 
     let exec_id = parse_execution_id(&id)?;
-    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
     let exec_id_str = exec_id.to_string();
+    let pool = api_state.storage_pool().map_err(map_error)?;
 
-    let result =
-        autumn_harvest::set_legal_hold(&mut conn, exec_id, &reason, hold_until, &actor, now).await;
+    // Issue #1405: `set_legal_hold` refuses a row a concurrent cutover sealed
+    // out from under it, rather than writing the hold onto the sealed
+    // tombstone. The `_forwarded` sibling follows the pointer and retries,
+    // and reports the shard it landed on.
+    let result = ::autumn_harvest::shard_rebalance::set_legal_hold_forwarded(
+        pool.sharded_pool(),
+        exec_id,
+        &reason,
+        hold_until,
+        &actor,
+        now,
+    )
+    .await;
 
     let (status, error_summary) = match &result {
         Ok(_) => (STATUS_SUCCEEDED, None),
@@ -22756,10 +24639,31 @@ async fn set_legal_hold_handler(
         shard_id: None,
         source: &source,
     };
-    let _ = audit::insert_audit(&mut conn, &ar).await;
+    // Best-effort, on its own connection: an audit-log failure here must not
+    // mask the write's outcome from the caller (issue #1405 review). On
+    // success the write already reports the shard it landed on, so this
+    // reuses that instead of re-walking the forwarding pointer from
+    // scratch. `ShardUnavailable` means the write itself could not resolve
+    // a working shard (Codex review). Retrying that same resolution here
+    // would cost the caller a second pool-checkout wait on an
+    // already-unavailable shard. This skips the audit write in that one
+    // case. Every other error is cheap to retry a checkout for and still
+    // worth auditing (e.g. `NotFound`).
+    let audit_conn = match &result {
+        Ok((_, shard)) => {
+            ::autumn_harvest::shard_rebalance::conn_for_shard(pool.sharded_pool(), *shard)
+                .await
+                .ok()
+        }
+        Err(HarvestError::ShardUnavailable { .. }) => None,
+        Err(_) => db_conn_for_execution(&api_state, exec_id).await.ok(),
+    };
+    if let Some(mut conn) = audit_conn {
+        let _ = audit::insert_audit(&mut conn, &ar).await;
+    }
 
     match result {
-        Ok(outcome) => Ok((axum::http::StatusCode::OK, Json(outcome))),
+        Ok((outcome, _)) => Ok((axum::http::StatusCode::OK, Json(outcome))),
         Err(e) => Err(conflict_from(e)),
     }
 }
@@ -22785,10 +24689,16 @@ async fn release_legal_hold_handler(
     let route = "POST /workflows/{id}/legal-hold/release";
 
     let exec_id = parse_execution_id(&id)?;
-    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
     let exec_id_str = exec_id.to_string();
+    let pool = api_state.storage_pool().map_err(map_error)?;
 
-    let result = autumn_harvest::release_legal_hold(&mut conn, exec_id, chrono::Utc::now()).await;
+    // Issue #1405: see the same-shaped comment in set_legal_hold_handler.
+    let result = ::autumn_harvest::shard_rebalance::release_legal_hold_forwarded(
+        pool.sharded_pool(),
+        exec_id,
+        chrono::Utc::now(),
+    )
+    .await;
 
     let (status, error_summary) = match &result {
         Ok(_) => (STATUS_SUCCEEDED, None),
@@ -22807,10 +24717,23 @@ async fn release_legal_hold_handler(
         shard_id: None,
         source: &source,
     };
-    let _ = audit::insert_audit(&mut conn, &ar).await;
+    // Best-effort, on its own connection. See the same-shaped comment in
+    // set_legal_hold_handler.
+    let audit_conn = match &result {
+        Ok((_, shard)) => {
+            ::autumn_harvest::shard_rebalance::conn_for_shard(pool.sharded_pool(), *shard)
+                .await
+                .ok()
+        }
+        Err(HarvestError::ShardUnavailable { .. }) => None,
+        Err(_) => db_conn_for_execution(&api_state, exec_id).await.ok(),
+    };
+    if let Some(mut conn) = audit_conn {
+        let _ = audit::insert_audit(&mut conn, &ar).await;
+    }
 
     match result {
-        Ok(outcome) => Ok((axum::http::StatusCode::OK, Json(outcome))),
+        Ok((outcome, _)) => Ok((axum::http::StatusCode::OK, Json(outcome))),
         Err(e) => Err(conflict_from(e)),
     }
 }
@@ -23044,6 +24967,7 @@ async fn fail_activity_now(
         exec_id.as_uuid(),
         task_id,
         reason.as_deref(),
+        &api_state.payload_codecs(),
     )
     .await;
 
@@ -23988,7 +25912,7 @@ pub(crate) async fn signal_workflow(
             return e.into_response();
         }
     };
-    let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
+    let (mut conn, shard) = match db_conn_for_execution_with_shard(&api_state, exec_id).await {
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
@@ -23999,9 +25923,23 @@ pub(crate) async fn signal_workflow(
     // sent after attempt 1 sealed `FAILED` was inserted against — and dropped
     // with — the sealed predecessor while the retry ran on. For a workflow with
     // no retry policy this resolves to `exec_id` and is a strict no-op.
-    let execution = match autumn_harvest::execution::resolve_live_attempt(&mut conn, exec_id).await
+    //
+    // Issue #1596 review: a retry successor can itself have been rebalanced
+    // off `shard` after being minted. Residence is re-resolved at this hop
+    // too, rather than trusting `conn` to already own the whole chain.
+    let pool = match api_state.storage_pool() {
+        Ok(pool) => pool,
+        Err(e) => return map_error(e).into_response(),
+    };
+    let (execution, target_shard) = match autumn_harvest::execution::resolve_live_attempt(
+        &mut conn,
+        pool.sharded_pool(),
+        shard,
+        exec_id,
+    )
+    .await
     {
-        Ok(ex) => ex,
+        Ok(resolved) => resolved,
         Err(e) => {
             let err_str = e.to_string();
             let ar = NewAuditRecord {
@@ -24041,7 +25979,26 @@ pub(crate) async fn signal_workflow(
     // to validation + the `ON CONFLICT` insert. Skipped when no key is present,
     // so fresh + unkeyed deliveries are still fully validated before enqueue.
     if let Some(key) = idempotency_key.as_deref() {
-        match signal::signal_idempotency_key_exists(&mut conn, target, key).await {
+        // Issue #1596 follow-up review, comment 4052389744: `target` can
+        // live on a different shard than `conn`. `conn` is still resolved
+        // for the ORIGINAL `exec_id`, and the retry chain can hop shards
+        // mid-walk. Bind to `target`'s own shard before probing it, rather
+        // than reading whatever row happens to be on `conn`'s database.
+        let exists = {
+            let mut bound = match autumn_harvest::shard_rebalance::bind_to_shard(
+                &mut conn,
+                pool.sharded_pool(),
+                shard,
+                target_shard,
+            )
+            .await
+            {
+                Ok(b) => b,
+                Err(e) => return map_error(e).into_response(),
+            };
+            signal::signal_idempotency_key_exists(bound.as_mut(), target, key).await
+        };
+        match exists {
             Ok(true) => {
                 // Same success audit + response the normal on-conflict path
                 // writes when `send_signal_idempotent` returns `Ok(false)`.
@@ -24134,15 +26091,32 @@ pub(crate) async fn signal_workflow(
     // against, so hand it straight to the delivery rather than walking the chain
     // a second time (one full row load per hop, on the highest-volume mutating
     // route). A re-drive inside still re-resolves from `exec_id`.
-    let signal_result = signal::send_signal_from_resolved(
-        &mut conn,
-        exec_id,
-        target,
-        &signal_name,
-        payload,
-        idempotency_key.as_deref(),
-    )
-    .await;
+    //
+    // Bound to `target_shard`, not `conn` directly (issue #1596 follow-up
+    // review, comment 4052389744). Same reason as the idempotency-key probe
+    // above: `target` can have moved off `conn`'s own shard.
+    let signal_result = {
+        let mut bound = match autumn_harvest::shard_rebalance::bind_to_shard(
+            &mut conn,
+            pool.sharded_pool(),
+            shard,
+            target_shard,
+        )
+        .await
+        {
+            Ok(b) => b,
+            Err(e) => return map_error(e).into_response(),
+        };
+        signal::send_signal_from_resolved(
+            bound.as_mut(),
+            exec_id,
+            target,
+            &signal_name,
+            payload,
+            idempotency_key.as_deref(),
+        )
+        .await
+    };
 
     let (signal_delivered, delivered_to) = match signal_result {
         Ok(delivery) => (delivery.delivered, delivery.target),
@@ -24202,15 +26176,35 @@ async fn hydrate_ctx_for_query(
     query_label: &str,
 ) -> Result<WorkflowContext, AutumnError> {
     let runtime = api_state.runtime().map_err(map_error)?;
-    let mut conn = db_conn_for_execution(api_state, exec_id).await?;
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let (mut conn, shard) = db_conn_for_execution_with_shard(api_state, exec_id).await?;
     // Issue #843: a query addresses the LOGICAL run, so follow the
-    // workflow-level retry chain (#523/#842) to the live attempt. A retry
-    // successor is minted on the predecessor's shard, so the connection
-    // resolved from `exec_id` above already owns the whole chain.
-    let execution = autumn_harvest::execution::resolve_live_attempt(&mut conn, exec_id)
-        .await
-        .map_err(map_error)?;
+    // workflow-level retry chain (#523/#842) to the live attempt.
+    //
+    // A retry successor is minted on the predecessor's shard. Nothing stops
+    // it from being rebalanced away afterwards (issue #1596 review).
+    // `resolve_live_attempt` re-resolves residence at each hop, rather than
+    // trusting `conn` to already own the whole chain.
+    let (execution, target_shard) = autumn_harvest::execution::resolve_live_attempt(
+        &mut conn,
+        pool.sharded_pool(),
+        shard,
+        exec_id,
+    )
+    .await
+    .map_err(map_error)?;
     let target = ExecutionId::from_uuid(execution.id);
+    // Bind to `target`'s own shard (issue #1596 follow-up review, comment
+    // 4052389744). A retry successor found mid-walk can itself have moved
+    // off `shard`. `conn` does not move there on its own.
+    let mut bound = autumn_harvest::shard_rebalance::bind_to_shard(
+        &mut conn,
+        pool.sharded_pool(),
+        shard,
+        target_shard,
+    )
+    .await
+    .map_err(map_error)?;
 
     // Terminal executions are now queryable for post-mortem state inspection
     // (issue #612): the workflow function is driven through replay and the query
@@ -24247,13 +26241,26 @@ async fn hydrate_ctx_for_query(
                 execution.workflow_name
             ))
         })?;
-    let history = store::load_history(&mut conn, target)
-        .await
-        .map_err(map_error)?;
+    let history =
+        store::load_history_with_codecs(bound.as_mut(), target, &api_state.payload_codecs())
+            .await
+            .map_err(map_error)?;
 
-    // Drop the DB connection before driving user code — prevents holding a
-    // pool slot during replay, which would starve other management and worker
-    // DB operations for the entire duration of the workflow replay.
+    // Drop the DB connection before driving user code (issue #1596
+    // review, comment_id 4056047329). This prevents holding a pool slot
+    // during replay, which would starve other management and worker DB
+    // operations for the entire replay duration.
+    //
+    // `drop(bound)` alone is not enough. `ResidentConn::Held` is the
+    // overwhelmingly common case, per `bind_to_shard`'s own doc comment.
+    // It holds only a `&mut` borrow of `conn`, so dropping it ends the
+    // borrow without releasing `conn`'s own pool checkout. Even the
+    // `Fresh` sibling variant leaves `conn` itself untouched: it owns a
+    // SEPARATE checkout on the target shard. So `conn`'s original
+    // checkout stays held regardless of which variant this resolved to.
+    // Ending `bound`'s borrow first, then dropping `conn` explicitly,
+    // releases both pool slots before the replay below runs.
+    drop(bound);
     drop(conn);
 
     // Whether the recorded history reached a terminal seal (issue #612). A run
@@ -24984,7 +26991,7 @@ async fn patch_dag(
     }
 }
 
-fn effective_fire_time(
+pub(crate) fn effective_fire_time(
     schedule_id: uuid::Uuid,
     next_run_at: Option<chrono::DateTime<chrono::Utc>>,
     jitter_secs: i64,
@@ -25004,8 +27011,25 @@ fn effective_fire_time(
 /// (`scheduler.rs`, `tick_one_workflow_schedule`) in sync with this formula
 /// when either changes. Callers map this over an `Option<i32> max_runs`
 /// (`None` = unlimited, so there is no budget to derive).
-fn remaining_runs_budget(max_runs: i32, runs_started: i32) -> i32 {
+pub(crate) fn remaining_runs_budget(max_runs: i32, runs_started: i32) -> i32 {
     (max_runs - runs_started).max(0)
+}
+
+/// The remaining run budget for a schedule row, encoding the engine's
+/// **`max_runs > 0`** convention: a non-positive cap means *unlimited*, not a
+/// spent budget.
+///
+/// That convention is applied at every bound check in the engine
+/// (`schedule_backfill_inner`, `trigger_schedule_now`, the scheduler's
+/// reservation predicate and `schedule_overdue`) and is pinned by
+/// `backfill_max_runs_zero_is_treated_as_unlimited`. Mapping
+/// [`remaining_runs_budget`] over the raw `Option<i32>` instead yields `Some(0)`
+/// for a legacy `max_runs = 0` row, which reads as "exhausted" everywhere it is
+/// consumed — including the preview's zero-entry short-circuit.
+pub(crate) fn schedule_remaining_runs(max_runs: Option<i32>, runs_started: i32) -> Option<i32> {
+    max_runs
+        .filter(|max| *max > 0)
+        .map(|max| remaining_runs_budget(max, runs_started))
 }
 
 async fn list_schedules(
@@ -25118,10 +27142,12 @@ async fn get_schedule(
                 .as_deref()
                 .or(sched.workflow_name.as_deref())
                 .unwrap_or("");
-            // Tick-exact shard-local basis (RUNNING/PAUSED + #607 pending throttle).
-            at_capacity = autumn_harvest::scheduler::schedule_running_basis(&mut conn, name)
-                .await
-                .is_ok_and(|basis| basis >= i64::from(sched.max_active_runs));
+            // Tick-exact shard-local basis (RUNNING/PAUSED, cross-type #1160
+            // successors of this schedule_id included, + #607 pending throttle).
+            at_capacity =
+                autumn_harvest::scheduler::schedule_running_basis(&mut conn, name, sched.id)
+                    .await
+                    .is_ok_and(|basis| basis >= i64::from(sched.max_active_runs));
             effective_fire_at = autumn_harvest::scheduler::resolve_effective_fire_at(
                 &mut conn,
                 sched.calendar_name.as_deref(),
@@ -25247,6 +27273,27 @@ async fn resolve_schedule_for_runs(
     api_state: &HarvestApiState,
     schedule_id: uuid::Uuid,
 ) -> Result<HarvestSchedule, AutumnError> {
+    resolve_schedule_with_shard(api_state, schedule_id)
+        .await
+        .map(|(row, _shard)| row)
+}
+
+/// [`resolve_schedule_for_runs`], also reporting which shard the row was found
+/// on.
+///
+/// Shared with the Vantage schedule drill-downs (issue #951) so a page opened
+/// during a shard outage reports `503 indeterminate` exactly as the API does,
+/// rather than telling an operator mid-incident that a schedule they can see in
+/// the list does not exist.
+///
+/// # Errors
+///
+/// `404` when every expected shard was checked and none had the row; `503` when
+/// any expected shard could not be checked. Never `500`.
+pub(crate) async fn resolve_schedule_with_shard(
+    api_state: &HarvestApiState,
+    schedule_id: uuid::Uuid,
+) -> Result<(HarvestSchedule, autumn_harvest::types::ShardId), AutumnError> {
     use autumn_harvest::schema::harvest_schedules::dsl;
 
     // Consult every shard the router knows about, not just those with a live
@@ -25278,7 +27325,7 @@ async fn resolve_schedule_for_runs(
             .await
             .optional();
         match row {
-            Ok(Some(row)) => return Ok(row),
+            Ok(Some(row)) => return Ok((row, autumn_harvest::types::ShardId::new(*shard_id))),
             Ok(None) => {}
             // A per-shard lookup error (DB restarted after checkout, shard
             // mid-migration) is treated like an unreachable shard: mark it and
@@ -25415,12 +27462,37 @@ async fn observe_schedule_runs_shard(
 async fn list_schedule_runs_handler(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id_str): Path<String>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<Json<schedule_runs::ScheduleRunsResponse>, AutumnError> {
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let schedule_id = parse_uuid(&id_str, "schedule id")?;
     let params = schedule_runs::ScheduleRunsParams::from_query_pairs(&pairs, chrono::Utc::now())
         .map_err(AutumnError::bad_request_msg)?;
 
+    Ok(Json(
+        load_schedule_runs(&api_state, schedule_id, params).await?,
+    ))
+}
+
+/// The body of `GET /admin/schedules/{id}/runs`, factored out so the Vantage
+/// run-history drill-down (issue #951) consumes exactly the response the API
+/// serves — the same keyset merge, the same scheduled-origin-only cadence
+/// summary, and above all the same `complete`/`partial`/`unavailable` status,
+/// so the page can never render a cross-shard-truncated list as if it were
+/// whole.
+///
+/// Read-only.
+///
+/// # Errors
+///
+/// Returns `400` for an invalid state/origin filter, `404` when every expected
+/// shard was reachable and none had the schedule, and `503` when the row's
+/// existence is indeterminate because a shard could not be checked.
+pub(crate) async fn load_schedule_runs(
+    api_state: &HarvestApiState,
+    schedule_id: uuid::Uuid,
+    params: schedule_runs::ScheduleRunsParams,
+) -> Result<schedule_runs::ScheduleRunsResponse, AutumnError> {
     validate_run_filters(&params)?;
 
     // Existence + next_run_at resolution consults the full expected shard set
@@ -25428,7 +27500,7 @@ async fn list_schedule_runs_handler(
     // checked; the runs fan-out below uses the *same* expected shard set so its
     // partial/complete status can never read `complete` while a router-known
     // shard was never queried (issue #762 review).
-    let schedule = resolve_schedule_for_runs(&api_state, schedule_id).await?;
+    let schedule = resolve_schedule_for_runs(api_state, schedule_id).await?;
     let next_run_at = schedule.next_run_at;
 
     // Fetch limit + 1 per shard so the merge can detect whether a further page
@@ -25447,8 +27519,8 @@ async fn list_schedule_runs_handler(
     // becomes an unavailable observation rather than being silently omitted, so
     // `build_runs_response` reports `partial`/`unavailable` and never a false
     // `complete`. Mirrors `workflow_count`/`workflow_reachability`.
-    let pools = crate::shard_fanout::pools_by_shard(&api_state);
-    let expected = crate::shard_fanout::expected_shards(&api_state, &pools);
+    let pools = crate::shard_fanout::pools_by_shard(api_state);
+    let expected = crate::shard_fanout::expected_shards(api_state, &pools);
 
     let mut observations = Vec::new();
     for shard_id in &expected {
@@ -25466,12 +27538,12 @@ async fn list_schedule_runs_handler(
         );
     }
 
-    Ok(Json(schedule_runs::build_runs_response(
+    Ok(schedule_runs::build_runs_response(
         schedule_id,
         next_run_at,
         params.limit,
         observations,
-    )))
+    ))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -25690,14 +27762,15 @@ async fn upsert_workflow_schedule_and_read_back(
     // the `harvest.schedule.overdue` gauge correctly suppress it to `false` —
     // breaking the read == gauge == tick invariant (issue #696, Codex round 2).
     // Reuse the single-source `scheduler::schedule_running_basis` (shard-local
-    // `RUNNING`/`PAUSED` count + #607 pending-throttle backlog) that list/get use;
-    // a count failure falls back to `false` (don't suppress the wedge signal).
+    // `RUNNING`/`PAUSED` count, cross-type #1160 successors of this schedule_id
+    // included, + #607 pending-throttle backlog) that list/get use; a count
+    // failure falls back to `false` (don't suppress the wedge signal).
     let name = row
         .dag_name
         .as_deref()
         .or(row.workflow_name.as_deref())
         .unwrap_or("");
-    let at_capacity = autumn_harvest::scheduler::schedule_running_basis(conn, name)
+    let at_capacity = autumn_harvest::scheduler::schedule_running_basis(conn, name, row.id)
         .await
         .is_ok_and(|basis| basis >= i64::from(row.max_active_runs));
     // Calendar-adjusted fire time (Codex round 3), resolved on the same shard
@@ -25864,6 +27937,7 @@ async fn create_workflow_schedule(
         }
     }
 
+    let jitter = requested_jitter(request.jitter_secs, &schedule);
     let ws = WorkflowSchedule {
         workflow_name: request.workflow_name.clone(),
         dag_name: None,
@@ -25873,7 +27947,7 @@ async fn create_workflow_schedule(
         max_active_runs: request.max_active_runs,
         paused: request.paused,
         queue_name: request.queue_name.clone(),
-        jitter: std::time::Duration::from_secs(request.jitter_secs),
+        jitter,
         overlap_policy,
         buffer_all_max: request.buffer_all_max,
         execution_timeout: None,
@@ -26096,9 +28170,7 @@ fn schedule_entry_from_row(
         (ScheduleKind::Dag, String::new())
     };
     let buffered_count = autumn_harvest::scheduler::parse_buffered_runs_pub(&s.buffered_runs).len();
-    let remaining_runs = s
-        .max_runs
-        .map(|max| remaining_runs_budget(max, s.runs_started));
+    let remaining_runs = schedule_remaining_runs(s.max_runs, s.runs_started);
     let (execution_timeout_secs, sla_secs) = resolve_schedule_deadline_secs(registry, &name);
     let effective_policy = autumn_harvest::policy::CatchupPolicy::from_db(
         s.catchup_policy.as_deref(),
@@ -26204,28 +28276,88 @@ async fn load_schedule_overdue_aux_by_shard(
         let Ok(schedules) = schedules else {
             continue;
         };
+
+        // Batched, once per shard: replaces what used to be up to three DB
+        // round trips *per schedule row* (`schedule_running_basis`'s two
+        // queries plus `resolve_effective_fire_at`'s calendar-exclusions
+        // load) with exactly two grouped queries covering every schedule on
+        // the shard at once (issue #786-class N+1; Ledger perf pass). A
+        // failed running-basis batch degrades to "0 running" for every
+        // schedule via `unwrap_or_default()`, the same as the old per-row
+        // `Err(_) => false` arm: it never *suppresses* an overdue wedge
+        // signal, only fails to hide one. The exclusions batch below is
+        // handled differently -- see the comment at its call site.
+        //
+        // Keyed by (schedule_id, name) rather than name alone (issue #1160):
+        // `schedule_running_basis_batch`'s cross-type disjunct means the
+        // result is looked up per schedule, not per name. No BTreeSet dedup
+        // needed here (unlike the pre-#1160 name-only batch): a dag_name and
+        // a different row's workflow_name can collide on the same string,
+        // but keying by `s.id` (unique) rather than by name means a
+        // collision no longer risks two schedules sharing one basis lookup.
+        let schedule_names: Vec<(uuid::Uuid, &str)> = schedules
+            .iter()
+            .map(|s| {
+                (
+                    s.id,
+                    s.dag_name
+                        .as_deref()
+                        .or(s.workflow_name.as_deref())
+                        .unwrap_or(""),
+                )
+            })
+            .collect();
+        let basis =
+            autumn_harvest::scheduler::schedule_running_basis_batch(&mut conn, &schedule_names)
+                .await
+                .unwrap_or_default();
+
+        let calendar_names: Vec<&str> = schedules
+            .iter()
+            .filter_map(|s| s.calendar_name.as_deref())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        // `Err` here (as opposed to a successful load that simply has no rows
+        // for a given calendar) must NOT fall through to "treat every
+        // calendar as exclusion-free": `calendar_excludes_weekends` is a pure
+        // name check independent of whatever the query returned, so an empty
+        // map on a genuine query failure could still let a "weekends-off"
+        // calendar rebase a weekend slot away from its raw anchor -- exactly
+        // the wedge-hiding the old per-schedule `.unwrap_or(None)` fallback
+        // was written to prevent (Codex review, PR #1314). So a failed batch
+        // is tracked explicitly and every calendar-bearing schedule on this
+        // shard falls back to the raw anchor (`effective_fire_at = None`),
+        // matching what `resolve_effective_fire_at`'s own failure arm did.
+        let exclusions =
+            autumn_harvest::calendar::load_exclusions_for_calendars(&mut conn, &calendar_names)
+                .await
+                .ok();
+
         for s in schedules {
-            let name = s
-                .dag_name
-                .as_deref()
-                .or(s.workflow_name.as_deref())
-                .unwrap_or("");
-            // Tick-exact shard-local basis (RUNNING/PAUSED + #607 pending throttle).
+            // Tick-exact shard-local basis (RUNNING/PAUSED, cross-type #1160
+            // successors of this schedule_id included, + #607 pending throttle).
             let at_capacity =
-                match autumn_harvest::scheduler::schedule_running_basis(&mut conn, name).await {
-                    Ok(basis) => basis >= i64::from(s.max_active_runs),
-                    Err(_) => false, // count failed → don't suppress the wedge signal
-                };
-            // Calendar-adjusted fire time (Codex round 3), resolved on this shard.
-            let effective_fire_at = autumn_harvest::scheduler::resolve_effective_fire_at(
-                &mut conn,
-                s.calendar_name.as_deref(),
-                &s.skip_policy,
-                s.schedule_expr.as_deref(),
-                s.next_run_at,
-            )
-            .await
-            .unwrap_or(None); // resolve failed → raw anchor (don't hide a wedge)
+                basis.get(&s.id).copied().unwrap_or(0) >= i64::from(s.max_active_runs);
+            // Calendar-adjusted fire time (Codex round 3), computed in-memory
+            // against this shard's preloaded exclusions map -- or the raw
+            // anchor (`None`) if that load failed, never a silent "no
+            // exclusions" guess.
+            let effective_fire_at = exclusions.as_ref().and_then(|exclusions| {
+                s.calendar_name.as_deref().and_then(|cal_name| {
+                    let empty: Vec<chrono::NaiveDate> = Vec::new();
+                    let excluded = exclusions.get(cal_name).unwrap_or(&empty);
+                    let exclude_weekends =
+                        autumn_harvest::calendar::calendar_excludes_weekends(cal_name);
+                    autumn_harvest::scheduler::resolve_effective_fire_at_pure(
+                        excluded,
+                        exclude_weekends,
+                        &s.skip_policy,
+                        s.schedule_expr.as_deref(),
+                        s.next_run_at,
+                    )
+                })
+            });
             aux.insert(
                 s.id,
                 ScheduleOverdueAux {
@@ -27584,7 +29716,9 @@ async fn trigger_schedule_now(
     // treat it as saturated rather than silently firing through.
     if effective_overlap_policy == autumn_harvest::OverlapPolicy::Skip {
         let is_saturated =
-            match query_running_count(&pool, &ScheduleKind::Workflow, &workflow_name).await {
+            match query_running_count(&pool, &ScheduleKind::Workflow, &workflow_name, schedule.id)
+                .await
+            {
                 Ok(running) => running >= i64::from(schedule.max_active_runs),
                 Err(_) => true,
             };
@@ -27983,21 +30117,10 @@ async fn trigger_schedule_now(
     // schedule id and attributed to the operator (mirrors the throttle-carrier
     // branch above). Bound in the enclosing scope so the ref outlives the params.
     let manual_schedule_id_str = schedule_id.to_string();
-    let result = start_or_load_workflow_execution_with_metrics(
+    let result = start_or_load_workflow_execution_with_metrics_and_codecs(
         &mut exec_conn,
         StartWorkflowParams {
-            workflow_name: &workflow_name,
-            workflow_id: &workflow_id,
-            exec_id,
-            input: input.clone(),
-            parent_id: None,
-            queue_name: &queue_name,
             execution_timeout: info_execution_timeout,
-            memo: None,
-            search_attrs: None,
-            reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
-            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
-            trace_context: None,
             max_execution_timeout_ceiling: api_state
                 .max_workflow_execution_timeout()
                 .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
@@ -28007,11 +30130,9 @@ async fn trigger_schedule_now(
             max_workflow_chain_timeout_ceiling: api_state
                 .max_workflow_chain_timeout()
                 .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
-            inherited_chain_deadline_at: None,
             concurrency_key,
             concurrency_limit,
             concurrency_on_conflict,
-            priority: Priority::default(),
             max_workflow_input_bytes: runtime
                 .registry
                 .workflows
@@ -28020,13 +30141,9 @@ async fn trigger_schedule_now(
                 .map_or(runtime.registry.max_workflow_input_bytes, |per| {
                     per.max(runtime.registry.max_workflow_input_bytes)
                 }),
-            start_at: None,
-            delay: None,
-            max_workflow_start_delay: None,
             owner,
             runbook_url,
             severity,
-            context_headers: None,
             sla,
             // Manual trigger-now is *attributed* to its schedule (issue #534) so it shows
             // up in GET /admin/schedules/{id}/runs, but is marked origin=manual_trigger so
@@ -28037,19 +30154,23 @@ async fn trigger_schedule_now(
             // trigger path also lacks the budget/exhaustion checks the automated lineage
             // relies on — only scheduled fires and backfills advance the carryover cursor.
             schedule_id: Some(schedule_id),
-            scheduled_for: None,
-            workflow_attempt: 1,
             workflow_retry_policy: manual_trigger_retry_policy,
-            retry_of_exec_id: None,
             max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
             origin: Some(autumn_harvest::execution::ORIGIN_MANUAL_TRIGGER),
-            completion_callbacks: None,
             start_source: autumn_harvest::StartSource::Schedule,
             start_source_ref: Some(manual_schedule_id_str.as_str()),
             started_by: Some(actor.as_str()),
+            ..StartWorkflowParams::new(
+                &workflow_name,
+                &workflow_id,
+                exec_id,
+                input.clone(),
+                &queue_name,
+            )
         },
         Some(runtime.registry.telemetry().metrics.as_ref()),
         None,
+        runtime.registry.payload_codecs(),
     )
     .await;
 
@@ -28469,21 +30590,21 @@ async fn transition_backfill_exhausted_if_reached(
 
 /// Request body for `POST /admin/schedules/{id}/backfill`.
 #[derive(Debug, Deserialize)]
-struct ScheduleBackfillRequest {
-    from: chrono::DateTime<chrono::Utc>,
-    to: chrono::DateTime<chrono::Utc>,
+pub(crate) struct ScheduleBackfillRequest {
+    pub from: chrono::DateTime<chrono::Utc>,
+    pub to: chrono::DateTime<chrono::Utc>,
     #[serde(default)]
-    dry_run: bool,
+    pub dry_run: bool,
     #[serde(default)]
-    include_paused: bool,
-    max_count: Option<usize>,
+    pub include_paused: bool,
+    pub max_count: Option<usize>,
 }
 
 /// A shard that could not be reached or dispatched during a backfill.
 #[derive(Debug, Serialize)]
-struct BackfillShardFailure {
-    shard_id: i32,
-    reason: String,
+pub(crate) struct BackfillShardFailure {
+    pub shard_id: i32,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28516,42 +30637,71 @@ fn classify_backfill_running_count(result: diesel::QueryResult<i64>) -> Backfill
 
 /// Response for `POST /admin/schedules/{id}/backfill`.
 #[derive(Debug, Serialize)]
-struct ScheduleBackfillResponse {
+pub(crate) struct ScheduleBackfillResponse {
     /// `"dry_run"`, `"complete"`, or `"partial"`.
-    status: String,
-    schedule_id: uuid::Uuid,
-    kind: ScheduleKind,
-    name: String,
-    from: chrono::DateTime<chrono::Utc>,
-    to: chrono::DateTime<chrono::Utc>,
-    planned_timestamps: Vec<chrono::DateTime<chrono::Utc>>,
-    total: usize,
-    dispatched: usize,
-    skipped: usize,
-    failed: usize,
+    pub status: String,
+    pub schedule_id: uuid::Uuid,
+    pub kind: ScheduleKind,
+    pub name: String,
+    pub from: chrono::DateTime<chrono::Utc>,
+    pub to: chrono::DateTime<chrono::Utc>,
+    pub planned_timestamps: Vec<chrono::DateTime<chrono::Utc>>,
+    pub total: usize,
+    pub dispatched: usize,
+    pub skipped: usize,
+    pub failed: usize,
     /// Machine-readable breakdown of why timestamps were skipped.
     /// Keys: `"already_exists"`, `"max_active_runs"`.
-    skipped_reasons: std::collections::HashMap<String, usize>,
-    partial_shard_failures: Vec<BackfillShardFailure>,
+    pub skipped_reasons: std::collections::HashMap<String, usize>,
+    pub partial_shard_failures: Vec<BackfillShardFailure>,
     /// Set when a DAG schedule is paused and `include_paused=true`: inserted
     /// QUEUED runs will not execute until the schedule is resumed because
     /// `activate_queued_runs` skips paused schedules.
     #[serde(skip_serializing_if = "Option::is_none")]
-    paused_schedule_warning: Option<String>,
+    pub paused_schedule_warning: Option<String>,
 }
 
-#[allow(clippy::too_many_lines)]
 async fn schedule_backfill(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
     Json(request): Json<ScheduleBackfillRequest>,
 ) -> Result<Json<ScheduleBackfillResponse>, AutumnError> {
-    let (actor, source, req_id) = audit_context(&headers, &api_state);
-    let route = "POST /admin/schedules/{id}/backfill";
+    schedule_backfill_inner(
+        &api_state,
+        &id,
+        &headers,
+        request,
+        "POST /admin/schedules/{id}/backfill",
+    )
+    .await
+    .map(Json)
+}
+
+/// The backfill implementation, with the audited `route_or_command` supplied by
+/// the caller.
+///
+/// The Vantage backfill launcher (issue #951) shares this body so it inherits
+/// every guard, the `harvest_backfill_log` row and the audit record — but it
+/// passes its **own** route string, so a dashboard-initiated backfill is
+/// recorded as `POST /ui/schedules/{id}/backfill` rather than masquerading as an
+/// API call. Mirrors how `retry_dag_run_inner` is shared with `dag_retry_commit_ui`.
+///
+/// # Errors
+///
+/// Propagates the same errors as `POST /admin/schedules/{id}/backfill`.
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn schedule_backfill_inner(
+    api_state: &HarvestApiState,
+    id: &str,
+    headers: &axum::http::HeaderMap,
+    request: ScheduleBackfillRequest,
+    route: &str,
+) -> Result<ScheduleBackfillResponse, AutumnError> {
+    let (actor, source, req_id) = audit_context(headers, api_state);
     let started_at = chrono::Utc::now();
 
-    let schedule_id = parse_uuid(&id, "schedule id")?;
+    let schedule_id = parse_uuid(id, "schedule id")?;
     let pool = api_state.storage_pool().map_err(map_error)?;
     let runtime = api_state.runtime().map_err(map_error)?;
 
@@ -28562,8 +30712,7 @@ async fn schedule_backfill(
     }
 
     // Load the schedule row (fan out across shards; schedule rows are not shard-assigned).
-    let (schedule, schedule_shard) =
-        load_schedule_by_id_with_shard(&api_state, schedule_id).await?;
+    let (schedule, schedule_shard) = load_schedule_by_id_with_shard(api_state, schedule_id).await?;
 
     // Respect paused state unless the caller explicitly opts in.
     if schedule.is_paused && !request.include_paused {
@@ -28681,7 +30830,7 @@ async fn schedule_backfill(
 
     // Dry-run: query current running count and project what would happen.
     if request.dry_run {
-        let running = query_running_count_best_effort(&pool, &kind, &name).await;
+        let running = query_running_count_best_effort(&pool, &kind, &name, schedule_id).await;
         // Workflow IDs are derived from original_slot (not fire_time), so duplicate
         // detection must use the same set of timestamps that dispatch will use.
         let original_slots: Vec<_> = timestamp_pairs.iter().map(|(orig, _)| *orig).collect();
@@ -28747,12 +30896,12 @@ async fn schedule_backfill(
             &source,
             req_id.as_deref(),
             route,
-            &id,
+            id,
             STATUS_SUCCEEDED,
             None,
         )
         .await;
-        return Ok(Json(ScheduleBackfillResponse {
+        return Ok(ScheduleBackfillResponse {
             status: "dry_run".to_string(),
             schedule_id,
             kind,
@@ -28767,7 +30916,7 @@ async fn schedule_backfill(
             skipped_reasons,
             partial_shard_failures: vec![],
             paused_schedule_warning,
-        }));
+        });
     }
 
     // Non-dry-run: dispatch each timestamp idempotently, respecting max_active_runs.
@@ -28804,7 +30953,7 @@ async fn schedule_backfill(
     // Count running executions once before the loop; track dispatched_this_call separately
     // so we don't re-query on every timestamp. This value gates max_active_runs,
     // so non-dry-run dispatch must not treat count failures as zero.
-    let running_at_start = match query_running_count(&pool, &kind, &name).await {
+    let running_at_start = match query_running_count(&pool, &kind, &name, schedule_id).await {
         Ok(count) => count,
         Err(count_failures) => {
             let status = "partial";
@@ -28839,7 +30988,7 @@ async fn schedule_backfill(
             )
             .await;
 
-            return Ok(Json(ScheduleBackfillResponse {
+            return Ok(ScheduleBackfillResponse {
                 status: status.to_string(),
                 schedule_id,
                 kind,
@@ -28854,7 +31003,7 @@ async fn schedule_backfill(
                 skipped_reasons,
                 partial_shard_failures: count_failures,
                 paused_schedule_warning,
-            }));
+            });
         }
     };
     // A throttled scheduled/backfill fire (issue #607) durably defers before any
@@ -28906,7 +31055,7 @@ async fn schedule_backfill(
                 )
                 .await;
 
-                return Ok(Json(ScheduleBackfillResponse {
+                return Ok(ScheduleBackfillResponse {
                     status: status.to_string(),
                     schedule_id,
                     kind,
@@ -28921,7 +31070,7 @@ async fn schedule_backfill(
                     skipped_reasons,
                     partial_shard_failures: count_failures,
                     paused_schedule_warning,
-                }));
+                });
             }
         }
     } else {
@@ -29117,20 +31266,17 @@ async fn schedule_backfill(
                     },
                 );
                 let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
-                // Issue #743 review (PR #1141, Finding #5): a workflow backfill
-                // must ALSO thread the declared `execution_timeout` and the
-                // fleet-wide `max_workflow_execution_timeout` ceiling into the
-                // start below -- `info_execution_timeout` was already resolved
-                // above (it feeds the `sla` clamp) but was never applied to the
-                // execution row itself, leaving a backfilled run with no hard
-                // deadline even when the workflow type declares one. Mirrors the
-                // DAG branch's identical fix immediately below.
-                let workflow_execution_timeout =
-                    info_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
-                let workflow_max_execution_timeout_ceiling = runtime
-                    .registry
-                    .max_workflow_execution_timeout
-                    .and_then(|d| chrono::Duration::from_std(d).ok());
+                // Issue #1412: thread the declared execution_timeout and the
+                // fleet-wide ceiling into the start below, via the same shared
+                // lookup the DAG branch uses right below. `info_execution_timeout`
+                // above still separately feeds the `sla` clamp on the raw
+                // `std::time::Duration` form -- `resolve_dispatch_deadline` returns
+                // an unclamped `sla` too, so it is discarded here.
+                let DispatchDeadline {
+                    execution_timeout: workflow_execution_timeout,
+                    max_execution_timeout_ceiling: workflow_max_execution_timeout_ceiling,
+                    ..
+                } = runtime.registry.resolve_dispatch_deadline(&wf_name);
 
                 // issue #377: check admission gates before firing a backfill run.
                 // Workflow backfill writes to pool.default_pool() and creates
@@ -29414,22 +31560,11 @@ async fn schedule_backfill(
                 // `backfill`, referencing the schedule id and the operator actor —
                 // matching the throttled branch above.
                 let schedule_id_str = schedule_id.to_string();
-                let result = start_or_load_workflow_execution_with_metrics(
+                let result = start_or_load_workflow_execution_with_metrics_and_codecs(
                     &mut conn,
                     StartWorkflowParams {
-                        workflow_name: &wf_name,
-                        workflow_id: &workflow_id,
-                        exec_id,
-                        input: input.clone(),
-                        parent_id: None,
-                        queue_name: dispatch_queue,
                         execution_timeout: workflow_execution_timeout,
-                        memo: None,
-                        search_attrs: None,
                         reuse_policy: WorkflowIdReusePolicy::RejectDuplicate,
-                        conflict_policy:
-                            autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
-                        trace_context: None,
                         max_execution_timeout_ceiling: workflow_max_execution_timeout_ceiling,
                         // Chain-scoped lifetime cap (issue #617): backfilled runs
                         // inherit the workflow-type default + fleet-wide
@@ -29442,12 +31577,8 @@ async fn schedule_backfill(
                             .map(|d| {
                                 chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)
                             }),
-                        inherited_chain_deadline_at: None,
-                        concurrency_key: None,
-                        concurrency_limit: None,
                         concurrency_on_conflict:
                             autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
-                        priority: Priority::default(),
                         max_workflow_input_bytes: runtime
                             .registry
                             .workflows
@@ -29456,18 +31587,13 @@ async fn schedule_backfill(
                             .map_or(runtime.registry.max_workflow_input_bytes, |per| {
                                 per.max(runtime.registry.max_workflow_input_bytes)
                             }),
-                        start_at: None,
-                        delay: None,
-                        max_workflow_start_delay: None,
                         owner,
                         runbook_url,
                         severity,
-                        context_headers: None,
                         sla,
                         // Backfilled runs share the schedule's carryover lineage (issue #488).
                         schedule_id: Some(schedule_id),
                         scheduled_for: Some(*original_slot),
-                        workflow_attempt: 1,
                         workflow_retry_policy: schedule
                             .retry_policy
                             .as_ref()
@@ -29479,19 +31605,25 @@ async fn schedule_backfill(
                                     .get(&wf_name)
                                     .and_then(|info| info.retry_policy.clone())
                             }),
-                        retry_of_exec_id: None,
                         max_workflow_attempts_ceiling: runtime
                             .registry
                             .max_workflow_attempts_ceiling,
                         // Distinguish a backfill storm from normal cadence (issue #534).
                         origin: Some(autumn_harvest::execution::ORIGIN_BACKFILL),
-                        completion_callbacks: None,
                         start_source: autumn_harvest::StartSource::Backfill,
                         start_source_ref: Some(&schedule_id_str),
                         started_by: Some(actor.as_str()),
+                        ..StartWorkflowParams::new(
+                            &wf_name,
+                            &workflow_id,
+                            exec_id,
+                            input.clone(),
+                            dispatch_queue,
+                        )
                     },
                     Some(runtime.registry.telemetry().metrics.as_ref()),
                     None,
+                    runtime.registry.payload_codecs(),
                 )
                 .await;
                 match result {
@@ -29675,32 +31807,26 @@ async fn schedule_backfill(
                             )
                         });
 
-                // Issue #743 review (PR #1141, Finding #5): a DAG backfill must
-                // thread the DAG's declared execution_timeout/sla, and the
-                // fleet-wide max_workflow_execution_timeout ceiling, the SAME
-                // way the scheduler tick's dispatch path and a manual/MCP
-                // trigger (`trigger_unified_dag`) already do -- resolved from the
-                // DAG's own shadow `WorkflowInfo`, registered under `dag_name` in
-                // `registry.workflows` by `DagInfo::as_workflow_info()`. Kept as a
-                // separate lookup from the `(owner, runbook_url, severity)` tuple
-                // above (sourced from `runtime.dags()`) so this fix stays scoped
-                // to the deadline fields and never touches classic-DAG behavior
-                // for those three unrelated fields. `chain_execution_timeout` is
-                // deliberately left `None` for a DAG start (issue #617: DAGs
-                // carry no chain-scoped lifetime cap), matching
-                // `DagInfo::as_workflow_info()`'s own `chain_execution_timeout:
-                // None`.
-                let dag_wf_info = runtime.registry.workflows.get(&dag_name);
-                let dag_execution_timeout = dag_wf_info
-                    .and_then(|info| info.execution_timeout)
-                    .and_then(|d| chrono::Duration::from_std(d).ok());
-                let dag_sla = dag_wf_info
-                    .and_then(|info| info.sla)
-                    .and_then(|d| chrono::Duration::from_std(d).ok());
-                let dag_max_execution_timeout_ceiling = runtime
-                    .registry
-                    .max_workflow_execution_timeout
-                    .and_then(|d| chrono::Duration::from_std(d).ok());
+                // Issue #1412: a DAG backfill must thread the DAG's declared
+                // execution_timeout/sla/ceiling. The scheduler tick's dispatch path
+                // and the manual/MCP trigger (`trigger_unified_dag`) already do this.
+                // One shared lookup resolves these fields from the DAG's own shadow
+                // `WorkflowInfo`. `DagInfo::as_workflow_info()` registers this shadow
+                // entry under `dag_name` in `registry.workflows`.
+                //
+                // This lookup stays separate from the `(owner, runbook_url, severity)`
+                // tuple above. That tuple comes from `runtime.dags()`. Keeping the
+                // lookups separate scopes this fix to the deadline fields only; it
+                // never touches classic-DAG behavior for those three unrelated fields.
+                //
+                // `chain_execution_timeout` stays `None` for a DAG start (issue #617).
+                // DAGs carry no chain-scoped lifetime cap. This matches
+                // `DagInfo::as_workflow_info()`'s own `chain_execution_timeout: None`.
+                let DispatchDeadline {
+                    execution_timeout: dag_execution_timeout,
+                    sla: dag_sla,
+                    max_execution_timeout_ceiling: dag_max_execution_timeout_ceiling,
+                } = runtime.registry.resolve_dispatch_deadline(&dag_name);
 
                 // issue #377: enforce admission gates for DAG backfills, mirroring
                 // the workflow backfill branch gate check.
@@ -29770,62 +31896,44 @@ async fn schedule_backfill(
                 // Provenance for a non-throttled DAG backfill (issue #740):
                 // `backfill`, referencing the schedule id and the operator actor.
                 let schedule_id_str = schedule_id.to_string();
-                let start_result = start_or_load_workflow_execution_with_metrics(
+                let start_result = start_or_load_workflow_execution_with_metrics_and_codecs(
                     &mut conn,
                     StartWorkflowParams {
-                        workflow_name: &dag_name,
-                        workflow_id: &workflow_id,
-                        exec_id,
-                        input: serde_json::json!({"_harvest_run_source": "backfill"}),
-                        parent_id: None,
-                        queue_name: dag_queue,
                         execution_timeout: dag_execution_timeout,
-                        memo: None,
-                        search_attrs: None,
                         reuse_policy: autumn_harvest::types::WorkflowIdReusePolicy::RejectDuplicate,
-                        conflict_policy:
-                            autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
-                        trace_context: None,
                         max_execution_timeout_ceiling: dag_max_execution_timeout_ceiling,
-                        chain_execution_timeout: None,
-                        max_workflow_chain_timeout_ceiling: None,
-                        inherited_chain_deadline_at: None,
-                        concurrency_key: None,
-                        concurrency_limit: None,
                         concurrency_on_conflict:
                             autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
-                        priority: Priority::default(),
-                        max_workflow_input_bytes: 0,
-                        start_at: None,
-                        delay: None,
-                        max_workflow_start_delay: None,
                         owner,
                         runbook_url,
                         severity,
-                        context_headers: None,
-
                         sla: dag_sla,
                         // Backfilled runs share the schedule's carryover lineage (issue #488).
                         schedule_id: Some(schedule_id),
                         scheduled_for: Some(*original_slot),
-                        workflow_attempt: 1,
                         workflow_retry_policy: schedule
                             .retry_policy
                             .as_ref()
                             .and_then(|v| serde_json::from_value(v.clone()).ok()),
-                        retry_of_exec_id: None,
                         max_workflow_attempts_ceiling: runtime
                             .registry
                             .max_workflow_attempts_ceiling,
                         // Distinguish a backfill storm from normal cadence (issue #534).
                         origin: Some(autumn_harvest::execution::ORIGIN_BACKFILL),
-                        completion_callbacks: None,
                         start_source: autumn_harvest::StartSource::Backfill,
                         start_source_ref: Some(&schedule_id_str),
                         started_by: Some(actor.as_str()),
+                        ..StartWorkflowParams::new(
+                            &dag_name,
+                            &workflow_id,
+                            exec_id,
+                            serde_json::json!({"_harvest_run_source": "backfill"}),
+                            dag_queue,
+                        )
                     },
                     Some(runtime.registry.telemetry().metrics.as_ref()),
                     None,
+                    runtime.registry.payload_codecs(),
                 )
                 .await;
                 match start_result {
@@ -29920,7 +32028,7 @@ async fn schedule_backfill(
     )
     .await;
 
-    Ok(Json(ScheduleBackfillResponse {
+    Ok(ScheduleBackfillResponse {
         status: status.to_string(),
         schedule_id,
         kind,
@@ -29935,18 +32043,22 @@ async fn schedule_backfill(
         skipped_reasons,
         partial_shard_failures: shard_failures,
         paused_schedule_warning,
-    }))
+    })
 }
 
 /// Count active (RUNNING or PAUSED) workflow executions or DAG runs for the
 /// named entity. A PAUSED run still occupies an active slot for
 /// `max_active_runs`/overlap enforcement (issue #383), matching the scheduler.
+/// The `schedule_id` disjunct (issue #1160) also counts a cross-type
+/// continue-as-new successor of this schedule, matching
+/// `scheduler::schedule_running_basis`.
 /// Returns the total count across all shards, or all shard failures that made
 /// the count unsafe to use for `max_active_runs` enforcement.
 async fn query_running_count(
     pool: &HarvestDbPool,
     kind: &ScheduleKind,
     name: &str,
+    schedule_id: uuid::Uuid,
 ) -> Result<i64, Vec<BackfillShardFailure>> {
     let mut total = 0i64;
     let mut failures = Vec::new();
@@ -29962,7 +32074,11 @@ async fn query_running_count(
         // Both DAG and Workflow kinds query harvest_workflow_executions since
         // DAGs are now unified as workflows (issue #256 step 5).
         let count_result = harvest_workflow_executions::table
-            .filter(harvest_workflow_executions::workflow_name.eq(name))
+            .filter(
+                harvest_workflow_executions::workflow_name
+                    .eq(name)
+                    .or(harvest_workflow_executions::schedule_id.eq(Some(schedule_id))),
+            )
             .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
             .count()
             .get_result::<i64>(&mut conn)
@@ -29991,8 +32107,11 @@ async fn query_running_count_best_effort(
     pool: &HarvestDbPool,
     kind: &ScheduleKind,
     name: &str,
+    schedule_id: uuid::Uuid,
 ) -> i64 {
-    query_running_count(pool, kind, name).await.unwrap_or(0)
+    query_running_count(pool, kind, name, schedule_id)
+        .await
+        .unwrap_or(0)
 }
 
 /// Fan out across shards summing pending (not-yet-fired) start-throttle rows
@@ -30200,30 +32319,21 @@ async fn load_schedule_by_id(
 
 /// Like [`load_schedule_by_id`] but also returns the [`ShardId`] of the shard
 /// the schedule was found on, so callers can route subsequent writes correctly.
+///
+/// Delegates to [`resolve_schedule_with_shard`] so every schedule lookup in the
+/// plugin obeys one rule. The previous implementation `?`-propagated the first
+/// shard's `acquire_conn` failure, so a schedule living on a *later* healthy
+/// shard could not be found at all while an earlier shard was down — which took
+/// down `GET /admin/schedules/{id}/preview` and `POST /admin/schedules/{id}/backfill`
+/// (and, through them, the Vantage drill-downs) for rows that were perfectly
+/// readable. The shared resolver keeps scanning, returns the row when any shard
+/// has it, and distinguishes an authoritative `404` from a `503` when a shard
+/// could not be checked — never an unqualified "not found" during an outage.
 async fn load_schedule_by_id_with_shard(
     api_state: &HarvestApiState,
     schedule_id: uuid::Uuid,
 ) -> Result<(HarvestSchedule, ShardId), AutumnError> {
-    use autumn_harvest::schema::harvest_schedules::dsl;
-
-    let pool = api_state.storage_pool().map_err(map_error)?;
-    for (shard, shard_pool) in pool.iter_shards() {
-        let mut conn = acquire_conn(shard_pool).await?;
-        let row = dsl::harvest_schedules
-            .find(schedule_id)
-            .select(HarvestSchedule::as_select())
-            .first(&mut conn)
-            .await
-            .optional()
-            .map_err(database_error)
-            .map_err(map_error)?;
-        if let Some(r) = row {
-            return Ok((r, shard));
-        }
-    }
-    Err(AutumnError::not_found_msg(format!(
-        "schedule {schedule_id}"
-    )))
+    resolve_schedule_with_shard(api_state, schedule_id).await
 }
 
 fn parse_schedule_expr_with_tz(
@@ -30406,8 +32516,9 @@ async fn list_dead_letters(
 /// on the happy path).
 async fn aggregate_dead_letters(
     Extension(api_state): Extension<HarvestApiState>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<Json<Value>, AutumnError> {
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let params = dlq::DlqAggregateParams::from_query_pairs(&pairs, chrono::Utc::now())
         .map_err(AutumnError::bad_request_msg)?;
 
@@ -30593,6 +32704,37 @@ struct BulkDlqApiBody {
     dry_run: bool,
 }
 
+/// The replay-only fields of a `POST /dead-letters/replay` JSON body.
+///
+/// Discard shares [`BulkDlqApiBody`] and has no use for `spread_secs`
+/// (issue #1832). So the replay route reads this second view of its body.
+#[derive(Debug, Deserialize)]
+struct ReplayOnlyApiBody {
+    #[serde(default)]
+    spread_secs: Option<u64>,
+}
+
+/// Read `spread_secs` from a bulk-replay JSON body (issue #1832).
+fn replay_spread_secs(body: &[u8]) -> Result<Option<u64>, AutumnError> {
+    serde_json::from_slice::<ReplayOnlyApiBody>(body)
+        .map(|replay| replay.spread_secs)
+        .map_err(|e| AutumnError::bad_request_msg(format!("invalid JSON body: {e}")))
+}
+
+/// [`parse_bulk_dlq_request`] plus the replay-only `spread_secs` field.
+///
+/// A form body sets `spread_secs` in `parse_bulk_dlq_form` already.
+fn parse_bulk_replay_request(
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+) -> Result<ParsedBulkDlqRequest, AutumnError> {
+    let mut request = parse_bulk_dlq_request(headers, body)?;
+    if !is_form_urlencoded(headers) {
+        request.selector.filter.spread_secs = replay_spread_secs(body)?;
+    }
+    Ok(request)
+}
+
 impl BulkDlqApiBody {
     fn into_selector(self) -> Result<DlqBulkSelector, AutumnError> {
         let task_type = self
@@ -30621,6 +32763,7 @@ impl BulkDlqApiBody {
                 failure_signature: normalize_cause_filter(self.failure_signature)?,
                 limit: self.limit,
                 dry_run: self.dry_run,
+                spread_secs: None,
             },
             dead_letter_id: self.dead_letter_id,
             task_type,
@@ -30700,6 +32843,8 @@ struct RedriveApiBody {
     shard_id: Option<i32>,
     #[serde(default)]
     reason: Option<String>,
+    #[serde(default)]
+    spread_secs: Option<u64>,
 }
 
 impl RedriveApiBody {
@@ -30714,10 +32859,55 @@ impl RedriveApiBody {
                 dead_letter_ids: self.dead_letter_ids,
                 max: self.max,
                 dry_run: self.dry_run,
+                spread_secs: self.spread_secs,
             },
             shard_id: self.shard_id,
             reason: self.reason,
         }
+    }
+}
+
+#[cfg(test)]
+mod dlq_spread_body_tests {
+    use super::*;
+
+    #[test]
+    fn redrive_body_carries_spread_secs() {
+        let body: RedriveApiBody =
+            serde_json::from_str(r#"{"queue":"q","spread_secs":90}"#).expect("valid body");
+        assert_eq!(body.into_request().filter.spread_secs, Some(90));
+    }
+
+    #[test]
+    fn bulk_replay_body_carries_spread_secs() {
+        let body = br#"{"queue_name":"q","spread_secs":90}"#;
+        assert_eq!(replay_spread_secs(body).expect("valid body"), Some(90));
+        assert_eq!(
+            replay_spread_secs(br#"{"queue_name":"q"}"#).expect("valid"),
+            None
+        );
+        assert!(replay_spread_secs(br#"{"spread_secs":"soon"}"#).is_err());
+    }
+
+    #[test]
+    fn the_shared_bulk_body_leaves_spread_secs_to_replay() {
+        // Discard shares this body, so it never sets `spread_secs`.
+        let body: BulkDlqApiBody =
+            serde_json::from_str(r#"{"queue_name":"q","spread_secs":90}"#).expect("valid body");
+        let selector = body.into_selector().expect("valid selector");
+        assert_eq!(selector.filter.spread_secs, None);
+    }
+
+    #[test]
+    fn bulk_replay_form_carries_spread_secs() {
+        let parsed = parse_bulk_dlq_form(b"queue_name=q&spread_secs=90").expect("valid form");
+        assert_eq!(parsed.selector.filter.spread_secs, Some(90));
+    }
+
+    #[test]
+    fn spread_secs_is_absent_by_default() {
+        let body: RedriveApiBody = serde_json::from_str(r#"{"queue":"q"}"#).expect("valid body");
+        assert_eq!(body.into_request().filter.spread_secs, None);
     }
 }
 
@@ -30738,7 +32928,7 @@ fn parse_bulk_dlq_request(
     }
 }
 
-fn is_form_urlencoded(headers: &axum::http::HeaderMap) -> bool {
+pub(crate) fn is_form_urlencoded(headers: &axum::http::HeaderMap) -> bool {
     headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
@@ -30797,6 +32987,10 @@ fn parse_bulk_dlq_form(body: &[u8]) -> Result<ParsedBulkDlqRequest, AutumnError>
                 selector.filter.failed_before = Some(parse_utc_datetime(value, "failed_before")?);
             }
             "limit" => selector.filter.limit = Some(parse_u32_field(value, "limit")?),
+            "spread_secs" => {
+                selector.filter.spread_secs =
+                    Some(u64::from(parse_u32_field(value, "spread_secs")?));
+            }
             "dry_run" => selector.filter.dry_run = parse_bool_field(value, "dry_run")?,
             "shard_id" => selector.shard_id = Some(parse_i32_field(value, "shard_id")?),
             "return_to" => return_to = Some(value.to_string()),
@@ -31034,7 +33228,7 @@ async fn bulk_replay_dead_letters_handler(
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
-    let request = match parse_bulk_dlq_request(&headers, &body) {
+    let request = match parse_bulk_replay_request(&headers, &body) {
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
@@ -31243,6 +33437,61 @@ async fn bulk_discard_dead_letters_handler(
     }
 }
 
+/// The `spread_secs` each shard gets in a DLQ fan-out (issue #1832).
+///
+/// The default window scales with the rows in one call. Each shard sees only
+/// its own rows. So with N shards, each shard gets a shorter window, and the
+/// shards together start tasks N times faster than one shard. A call that
+/// spans more than one shard therefore gives every shard the window of all
+/// `rows` the call selects, rounded up to whole seconds. An explicit value is
+/// kept.
+fn fan_out_spread_secs(spread_secs: Option<u64>, rows: usize, shards: usize) -> Option<u64> {
+    if spread_secs.is_some() || shards <= 1 {
+        return spread_secs;
+    }
+    let window = dlq::redrive_spread_window(None, rows);
+    Some(window.as_secs() + u64::from(window.subsec_nanos() > 0))
+}
+
+/// The rows a fan-out selects: the matches on every shard, capped at `budget`.
+fn fan_out_rows(matched: usize, budget: u32) -> usize {
+    matched.min(usize::try_from(budget).unwrap_or(usize::MAX))
+}
+
+#[cfg(test)]
+mod fan_out_spread_secs_tests {
+    use super::fan_out_spread_secs;
+
+    #[test]
+    fn one_shard_keeps_the_per_call_default() {
+        assert_eq!(fan_out_spread_secs(None, 1000, 1), None);
+    }
+
+    #[test]
+    fn many_shards_share_the_window_of_all_selected_rows() {
+        // Two shards of 500 rows must not each get a 30 s window.
+        assert_eq!(fan_out_spread_secs(None, 1000, 2), Some(60));
+        // 100 rows: 6 s. 1 row: 60 ms, rounded up to 1 s.
+        assert_eq!(fan_out_spread_secs(None, 100, 4), Some(6));
+        assert_eq!(fan_out_spread_secs(None, 1, 4), Some(1));
+    }
+
+    #[test]
+    fn the_window_follows_the_matches_not_the_budget() {
+        use super::fan_out_rows;
+        // One match under the default budget of 100 waits at most 1 s, not 6 s.
+        assert_eq!(fan_out_spread_secs(None, fan_out_rows(1, 100), 2), Some(1));
+        // More matches than the budget scale to the budget.
+        assert_eq!(fan_out_rows(5000, 1000), 1000);
+    }
+
+    #[test]
+    fn an_explicit_value_is_kept() {
+        assert_eq!(fan_out_spread_secs(Some(0), 1000, 4), Some(0));
+        assert_eq!(fan_out_spread_secs(Some(90), 1000, 4), Some(90));
+    }
+}
+
 async fn bulk_replay_from_shards(
     api_state: &HarvestApiState,
     selector: &DlqBulkSelector,
@@ -31264,6 +33513,28 @@ async fn bulk_replay_from_shards(
     // conversions below are infallible in practice.
     let mut remaining: u32 =
         u32::try_from(selector.filter.effective_limit()).unwrap_or(dlq::DEFAULT_BULK_LIMIT);
+    let shards = pool
+        .iter_shards()
+        .filter(|(shard_id, _)| selector.shard_id.is_none_or(|w| w == shard_id.as_i32()))
+        .count();
+    let mut spread_secs = selector.filter.spread_secs;
+    // A dry run schedules nothing, so it skips the extra count.
+    if spread_secs.is_none() && shards > 1 && !selector.dry_run() {
+        // Size the shared window from the rows the call selects.
+        let mut matched = 0_usize;
+        for (shard_id, shard_pool) in pool.iter_shards() {
+            if selector
+                .shard_id
+                .is_some_and(|wanted| wanted != shard_id.as_i32())
+            {
+                continue;
+            }
+            let mut conn = autumn_harvest::replication::fenced_checkout(shard_pool).await?;
+            let n = count_api_bulk_filter_matches(&mut conn, selector).await?;
+            matched = matched.saturating_add(usize::try_from(n).unwrap_or(0));
+        }
+        spread_secs = fan_out_spread_secs(None, fan_out_rows(matched, remaining), shards);
+    }
 
     for (shard_id, shard_pool) in pool.iter_shards() {
         if selector
@@ -31272,10 +33543,7 @@ async fn bulk_replay_from_shards(
         {
             continue;
         }
-        let mut conn = shard_pool
-            .get()
-            .await
-            .map_err(|e| HarvestError::Database(e.to_string()))?;
+        let mut conn = autumn_harvest::replication::fenced_checkout(shard_pool).await?;
 
         if remaining == 0 {
             // Budget exhausted: count-only so matched reflects all shards.
@@ -31288,6 +33556,7 @@ async fn bulk_replay_from_shards(
 
         let mut shard_selector = selector.clone();
         shard_selector.filter.limit = Some(remaining);
+        shard_selector.filter.spread_secs = spread_secs;
         let shard_result =
             bulk_replay_dead_letters_for_selector(&mut conn, &shard_selector, registry).await?;
         // Rows consumed = acted + skipped + failed (or preview ids in dry-run).
@@ -31421,6 +33690,28 @@ async fn redrive_from_shards(
     // Enforce `max` as a global cap across all shards, not per-shard.
     let mut remaining: u32 =
         u32::try_from(request.filter.effective_max()).unwrap_or(dlq::DEFAULT_BULK_LIMIT);
+    let shards = pool
+        .iter_shards()
+        .filter(|(shard_id, _)| request.shard_id.is_none_or(|w| w == shard_id.as_i32()))
+        .count();
+    let mut spread_secs = request.filter.spread_secs;
+    // A dry run schedules nothing, so it skips the extra count.
+    if spread_secs.is_none() && shards > 1 && !request.filter.dry_run {
+        // Size the shared window from the rows the call selects.
+        let mut matched = 0_usize;
+        for (shard_id, shard_pool) in pool.iter_shards() {
+            if request
+                .shard_id
+                .is_some_and(|wanted| wanted != shard_id.as_i32())
+            {
+                continue;
+            }
+            let mut conn = autumn_harvest::replication::fenced_checkout(shard_pool).await?;
+            let n = dlq::count_redrive_filter_matches(&mut conn, &request.filter).await?;
+            matched = matched.saturating_add(usize::try_from(n).unwrap_or(0));
+        }
+        spread_secs = fan_out_spread_secs(None, fan_out_rows(matched, remaining), shards);
+    }
 
     for (shard_id, shard_pool) in pool.iter_shards() {
         if request
@@ -31429,10 +33720,7 @@ async fn redrive_from_shards(
         {
             continue;
         }
-        let mut conn = shard_pool
-            .get()
-            .await
-            .map_err(|e| HarvestError::Database(e.to_string()))?;
+        let mut conn = autumn_harvest::replication::fenced_checkout(shard_pool).await?;
 
         if remaining == 0 {
             // Budget exhausted: count-only so `matched` reflects all shards.
@@ -31445,6 +33733,7 @@ async fn redrive_from_shards(
 
         let mut shard_filter = request.filter.clone();
         shard_filter.max = Some(remaining);
+        shard_filter.spread_secs = spread_secs;
         let shard_result =
             dlq::redrive_dead_letters(&mut conn, &shard_filter, registry, reason, metrics.as_ref())
                 .await?;
@@ -31486,10 +33775,7 @@ async fn bulk_discard_from_shards(
         {
             continue;
         }
-        let mut conn = shard_pool
-            .get()
-            .await
-            .map_err(|e| HarvestError::Database(e.to_string()))?;
+        let mut conn = autumn_harvest::replication::fenced_checkout(shard_pool).await?;
 
         if remaining == 0 {
             // Budget exhausted: count-only so matched reflects all shards.
@@ -31622,35 +33908,23 @@ async fn bulk_replay_dead_letters_for_selector(
         .await
         .map(|n| usize::try_from(n).unwrap_or(0))?;
     let rows = query_dead_letters_for_api_bulk(conn, selector).await?;
-    let mut result = dlq::BulkDlqResult {
-        matched,
-        acted_on: 0,
-        skipped: 0,
-        ids: Vec::new(),
-        dry_run: selector.dry_run(),
-        failures: Vec::new(),
-    };
 
     if selector.dry_run() {
-        result.ids = rows.into_iter().map(|row| row.id.to_string()).collect();
-        return Ok(result);
+        return Ok(dlq::BulkDlqResult {
+            matched,
+            acted_on: 0,
+            skipped: 0,
+            ids: rows.into_iter().map(|row| row.id.to_string()).collect(),
+            dry_run: true,
+            failures: Vec::new(),
+        });
     }
 
-    for row in rows {
-        let id = row.id;
-        match dlq::replay_dead_letter(conn, id, registry).await {
-            Ok(_) => {
-                result.acted_on += 1;
-                result.ids.push(id.to_string());
-            }
-            Err(HarvestError::NotFound(_)) => result.skipped += 1,
-            Err(error) => result.failures.push(dlq::BulkDlqFailure {
-                id: id.to_string(),
-                reason: error.to_string(),
-            }),
-        }
-    }
-
+    // The core batch spreads the replayed tasks over a window (issue #1832).
+    let ids: Vec<uuid::Uuid> = rows.iter().map(|row| row.id).collect();
+    let mut result =
+        dlq::replay_dead_letter_batch(conn, &ids, selector.filter.spread_secs, registry).await?;
+    result.matched = matched;
     Ok(result)
 }
 
@@ -31676,17 +33950,44 @@ async fn bulk_discard_dead_letters_for_selector(
         return Ok(result);
     }
 
-    for row in rows {
-        let id = row.id;
-        let deleted = diesel::delete(harvest_dead_letters::table.find(id))
-            .execute(conn)
-            .await
-            .map_err(database_error)?;
-        if deleted > 0 {
-            result.acted_on += 1;
-            result.ids.push(id.to_string());
-        } else {
-            result.skipped += 1;
+    // One statement replaces one DELETE per row (issue #1421).
+    // `dlq::discard_dead_letters_batch` binds `id = ANY($1)` as a single
+    // array parameter. A 1,000-row bulk discard -- the endpoint's own
+    // `MAX_BULK_LIMIT` -- costs one round trip, not 1,000. See
+    // `docs/performance-dlq-bulk-discard.md`.
+    //
+    // A batch failure (statement timeout, lock contention) is captured into
+    // `result.failures` instead of propagated with `?` (Codex review, PR
+    // #1422). `bulk_discard_from_shards` calls this once per shard and stops
+    // at the first `Err`. Raising here would abort every later shard. It
+    // would also discard already-accumulated totals from earlier shards, for
+    // a single Postgres-side hiccup on one shard's one statement, not a
+    // per-row business failure. Returning `Ok` with `failures` populated
+    // lets that loop move on to the next shard. It also lets the handler's
+    // existing failures-aware status logic apply to discard exactly as it
+    // already does for replay. That logic returns 500 only when nothing in
+    // the whole request succeeded, and 200-with-failures otherwise.
+    let ids: Vec<uuid::Uuid> = rows.iter().map(|row| row.id).collect();
+    match dlq::discard_dead_letters_batch(conn, &ids).await {
+        Ok(deleted_ids) => {
+            let deleted: std::collections::HashSet<uuid::Uuid> = deleted_ids.into_iter().collect();
+            result.ids = ids
+                .iter()
+                .filter(|id| deleted.contains(id))
+                .map(ToString::to_string)
+                .collect();
+            result.acted_on = result.ids.len();
+            result.skipped = ids.len() - result.acted_on;
+        }
+        Err(e) => {
+            let reason = e.to_string();
+            result.failures = ids
+                .iter()
+                .map(|id| dlq::BulkDlqFailure {
+                    id: id.to_string(),
+                    reason: reason.clone(),
+                })
+                .collect();
         }
     }
 
@@ -31940,13 +34241,11 @@ async fn run_replay_canary_handler(
 ///     The `query_timeout` bound applies to async-yielding replays; a workflow
 ///     function that busy-loops synchronously without ever `.await`-ing is out of
 ///     scope, exactly as for the live executor. A large but healthy history is
-///     not at risk: `SUSPENSION_TIMEOUT` (the executor's per-cycle 100 ms
-///     suspension heuristic) only fires when the handler future is genuinely
-///     *pending* on an unresolved oneshot at the replay frontier — it never cuts
-///     off a CPU-bound replay consuming recorded events, so a completed history
-///     replays to its verdict regardless of wall-clock duration, bounded only by
-///     this outer `query_timeout` (ample headroom for the ~<200 ms/10k-event
-///     replay budget, issue #135).
+///     not at risk. The executor suspends only when the handler is pending on
+///     a parked Harvest future (issue #1797). It never cuts off a CPU-bound
+///     replay that consumes recorded events. A completed history therefore
+///     replays to its verdict, bounded only by this outer `query_timeout`. That
+///     gives ample headroom for the ~<200 ms/10k-event replay budget (issue #135).
 ///   * `410` — history unavailable: a terminal execution whose recorded history
 ///     is incomplete (truncated before its terminal seal — pruned by retention
 ///     or released on reset), or a terminal execution whose payloads were
@@ -32018,6 +34317,10 @@ async fn replay_diagnosis(
     }
 
     // The registered handler to replay against.
+    #[expect(
+        clippy::expect_used,
+        reason = "the check above returns early for an unregistered workflow"
+    )]
     let handler = runtime
         .registry
         .workflows
@@ -32088,7 +34391,8 @@ async fn replay_diagnosis(
             TARGET_WORKFLOW,
             Some(&target),
             "POST /workflows/{id}/replay-diagnosis",
-            Some(exec_id.shard()),
+            // The row's own residence, not the id's origin (issue #1317).
+            Some(ShardId::new(execution.shard_id)),
             outcome,
             None,
         )
@@ -32693,7 +34997,81 @@ async fn get_start_throttle_pacing_override(
     }
 }
 
+/// Record a `STATUS_FAILED` audit row for a pacing-override SET/CLEAR request
+/// rejected before any shard write (issue #1229, finding 3).
+///
+/// The four pacing-override mutation handlers early-return on a bad
+/// refill/burst, an unrecognized JSON field, an unregistered activity or
+/// workflow, or a dynamic-key policy. Every one of those branches ran before
+/// `audit_context` was ever called, so a rejected administrative attempt left
+/// no audit trace. Centralizing the insert here turns each branch into a
+/// one-line call. Mirrors `schedule_create_audit_failed`'s best-effort shape:
+/// an insert failure is swallowed, never surfaced, so a rejection response is
+/// never replaced by an unrelated error.
+#[allow(clippy::too_many_arguments)]
+async fn audit_rejected_pacing_override(
+    pool: &HarvestDbPool,
+    actor: &str,
+    source: &str,
+    request_id: Option<&str>,
+    operation: &str,
+    target_type: &str,
+    target_id: &str,
+    route: &str,
+    error_summary: &str,
+) {
+    let Ok(mut conn) = acquire_conn(pool.default_pool()).await else {
+        return;
+    };
+    let ar = NewAuditRecord {
+        actor,
+        operation,
+        target_type,
+        target_id: Some(target_id),
+        route_or_command: route,
+        request_id,
+        idempotency_key: None,
+        status: STATUS_FAILED,
+        error_summary: Some(error_summary),
+        shard_id: None,
+        source,
+    };
+    let _ = audit::insert_audit(&mut conn, &ar).await;
+}
+
+/// Audit a rejected pacing-override request, then return its response.
+///
+/// Every early return in the four pacing-override mutation handlers goes
+/// through this macro so it is audited before responding (issue #1229,
+/// finding 3). One module-level macro, instead of one copy per handler.
+/// Every argument is passed explicitly. It is not read from an enclosing
+/// local by bare name. A `macro_rules!` defined outside a function cannot
+/// see that function's locals. It only sees tokens its caller hands it.
+macro_rules! reject_pacing_override {
+    (
+        $pool:expr, $actor:expr, $source:expr, $request_id:expr,
+        $op:expr, $target_type:expr, $target_id:expr, $route:expr, $err:expr
+    ) => {{
+        let err = $err;
+        let error_summary = err.to_string();
+        audit_rejected_pacing_override(
+            $pool,
+            $actor,
+            $source,
+            $request_id,
+            $op,
+            $target_type,
+            $target_id,
+            $route,
+            &error_summary,
+        )
+        .await;
+        return err.into_response();
+    }};
+}
+
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StartThrottlePacingOverrideRequest {
     refill_per_sec: Option<f64>,
     burst: Option<f64>,
@@ -32704,83 +35082,34 @@ struct StartThrottlePacingOverrideRequest {
 /// TTL'd runtime pacing override on top of a *declared* workflow-start
 /// throttle (issue #945).
 ///
-/// Mirrors `set_rate_limit_pacing_override` exactly (same replace-not-merge
-/// semantics, same TTL validation via [`pacing_override_expiry`], same
-/// shared upsert SQL against `harvest_rate_limit_buckets`), but resolves the
-/// declared baseline from `WorkflowInfo.throttle`
-/// (`#[workflow(throttle(...))]`, issue #607) and the shared bucket key via
-/// [`autumn_harvest::throttle::bucket_key`] rather than the activity-side
-/// `rate_limit_key` convention. An unkeyed/global throttle resolves its
-/// bucket key with an empty resolved-key component
-/// (`throttle::bucket_key(workflow_name, "")`), matching the resolution the
-/// throttle admission path itself uses for a policy with no `key_expr`.
+/// Mirrors `set_rate_limit_pacing_override` exactly. Both share
+/// replace-not-merge semantics, TTL validation via [`pacing_override_expiry`],
+/// and the same upsert SQL against `harvest_rate_limit_buckets`.
+///
+/// This handler resolves the declared baseline from `WorkflowInfo.throttle`
+/// (`#[workflow(throttle(...))]`, issue #607). It resolves the shared bucket
+/// key via [`autumn_harvest::throttle::bucket_key`], not the activity-side
+/// `rate_limit_key` convention.
+///
+/// An unkeyed/global throttle resolves its bucket key with an empty
+/// resolved-key component (`throttle::bucket_key(workflow_name, "")`). This
+/// matches the resolution the throttle admission path itself uses for a
+/// policy with no `key_expr`.
 ///
 /// `404` when `workflow_name` is not registered, or is registered but
 /// declares no throttle. `409` when the throttle is dynamically per-key
-/// (`throttle(key = ...)`, issue #607) — a pacing override targets one
-/// static bucket and cannot disambiguate which resolved tenant key's bucket
-/// to override. `400` on a non-finite/non-positive `refill_per_sec`/`burst`,
-/// an omitted `refill_per_sec`/`burst` pair, or a `ttl_secs` of zero or
-/// above the server cap.
+/// (`throttle(key = ...)`, issue #607). A pacing override targets one static
+/// bucket. It cannot disambiguate which resolved tenant key's bucket to
+/// override. `400` on a non-finite/non-positive `refill_per_sec`/`burst`, an
+/// omitted `refill_per_sec`/`burst` pair, or a `ttl_secs` of zero or above
+/// the server cap.
 #[allow(clippy::too_many_lines)]
 async fn set_start_throttle_pacing_override(
     headers: axum::http::HeaderMap,
     Extension(api_state): Extension<HarvestApiState>,
     Path(workflow_name): Path<String>,
-    Json(request): Json<StartThrottlePacingOverrideRequest>,
+    body: Result<Json<StartThrottlePacingOverrideRequest>, JsonRejection>,
 ) -> impl axum::response::IntoResponse {
-    if let Some(rate) = request.refill_per_sec
-        && (!rate.is_finite() || rate <= 0.0)
-    {
-        return AutumnError::bad_request_msg(
-            "refill_per_sec must be a finite number greater than zero",
-        )
-        .into_response();
-    }
-    if let Some(burst) = request.burst
-        && (!burst.is_finite() || burst < 1.0)
-    {
-        return AutumnError::bad_request_msg("burst must be a finite number, at least 1.0")
-            .into_response();
-    }
-    if request.refill_per_sec.is_none() && request.burst.is_none() {
-        return AutumnError::bad_request_msg(
-            "must override at least one of refill_per_sec or burst",
-        )
-        .into_response();
-    }
-    let expires_at = match pacing_override_expiry(request.ttl_secs) {
-        Ok(v) => v,
-        Err(e) => return e.into_response(),
-    };
-
-    let runtime = match api_state.runtime().map_err(map_error) {
-        Ok(r) => r,
-        Err(e) => return e.into_response(),
-    };
-    let Some(workflow) = runtime.registry().workflows.get(&workflow_name) else {
-        return AutumnError::not_found_msg(format!("workflow '{workflow_name}' is not registered"))
-            .into_response();
-    };
-    let Some(policy) = workflow.throttle else {
-        return AutumnError::not_found_msg(format!(
-            "workflow '{workflow_name}' has no declared start throttle; nothing to override"
-        ))
-        .into_response();
-    };
-    if let Some(expr) = policy.key_expr {
-        return AutumnError::bad_request_msg(format!(
-            "workflow '{workflow_name}' uses a dynamic per-key start throttle \
-             (key expression '{expr}'); a pacing override targets a single \
-             static bucket and cannot be applied to a dynamically-keyed policy"
-        ))
-        .with_status(axum::http::StatusCode::CONFLICT)
-        .into_response();
-    }
-    let declared_refill_rate = policy.refill_per_sec;
-    let declared_burst = policy.burst;
-    let key = autumn_harvest::throttle::bucket_key(&workflow_name, "");
-
     let pool = match api_state.storage_pool().map_err(map_error) {
         Ok(p) => p,
         Err(e) => return e.into_response(),
@@ -32788,14 +35117,183 @@ async fn set_start_throttle_pacing_override(
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "POST /admin/start-throttle/{workflow_name}/override";
 
+    // The body is unwrapped in-handler, not by a bare `Json` extractor. A
+    // rejected body -- most importantly an unknown field, rejected via
+    // `deny_unknown_fields` -- surfaces as this route's documented `400`.
+    // It carries a failed audit row, never axum's default plain-text `422`
+    // (mirrors `update_schedule_handler`).
+    let request = match body {
+        Ok(Json(req)) => req,
+        Err(rejection) => {
+            let err_summary = format!("invalid request body: {}", rejection.body_text());
+            reject_pacing_override!(
+                &pool,
+                &actor,
+                &source,
+                request_id.as_deref(),
+                OP_START_THROTTLE_PACING_OVERRIDE_SET,
+                TARGET_THROTTLE,
+                &workflow_name,
+                route,
+                AutumnError::bad_request_msg(err_summary)
+            );
+        }
+    };
+
+    if let Some(rate) = request.refill_per_sec
+        && (!rate.is_finite() || rate <= 0.0)
+    {
+        reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_START_THROTTLE_PACING_OVERRIDE_SET,
+            TARGET_THROTTLE,
+            &workflow_name,
+            route,
+            AutumnError::bad_request_msg(
+                "refill_per_sec must be a finite number greater than zero"
+            )
+        );
+    }
+    if let Some(burst) = request.burst
+        && (!burst.is_finite() || burst < 1.0)
+    {
+        reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_START_THROTTLE_PACING_OVERRIDE_SET,
+            TARGET_THROTTLE,
+            &workflow_name,
+            route,
+            AutumnError::bad_request_msg("burst must be a finite number, at least 1.0")
+        );
+    }
+    if request.refill_per_sec.is_none() && request.burst.is_none() {
+        reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_START_THROTTLE_PACING_OVERRIDE_SET,
+            TARGET_THROTTLE,
+            &workflow_name,
+            route,
+            AutumnError::bad_request_msg("must override at least one of refill_per_sec or burst")
+        );
+    }
+    let expires_at = match pacing_override_expiry(request.ttl_secs) {
+        Ok(v) => v,
+        Err(e) => reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_START_THROTTLE_PACING_OVERRIDE_SET,
+            TARGET_THROTTLE,
+            &workflow_name,
+            route,
+            e
+        ),
+    };
+
+    let runtime = match api_state.runtime() {
+        Ok(r) => r,
+        Err(e) => reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_START_THROTTLE_PACING_OVERRIDE_SET,
+            TARGET_THROTTLE,
+            &workflow_name,
+            route,
+            map_error(e)
+        ),
+    };
+    let Some(workflow) = runtime.registry().workflows.get(&workflow_name) else {
+        reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_START_THROTTLE_PACING_OVERRIDE_SET,
+            TARGET_THROTTLE,
+            &workflow_name,
+            route,
+            AutumnError::not_found_msg(format!("workflow '{workflow_name}' is not registered"))
+        );
+    };
+    let Some(policy) = workflow.throttle else {
+        reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_START_THROTTLE_PACING_OVERRIDE_SET,
+            TARGET_THROTTLE,
+            &workflow_name,
+            route,
+            AutumnError::not_found_msg(format!(
+                "workflow '{workflow_name}' has no declared start throttle; nothing to override"
+            ))
+        );
+    };
+    if let Some(expr) = policy.key_expr {
+        reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_START_THROTTLE_PACING_OVERRIDE_SET,
+            TARGET_THROTTLE,
+            &workflow_name,
+            route,
+            AutumnError::bad_request_msg(format!(
+                "workflow '{workflow_name}' uses a dynamic per-key start throttle \
+                 (key expression '{expr}'); a pacing override targets a single \
+                 static bucket and cannot be applied to a dynamically-keyed policy"
+            ))
+            .with_status(axum::http::StatusCode::CONFLICT)
+        );
+    }
+    let declared_refill_rate = policy.refill_per_sec;
+    let declared_burst = policy.burst;
+    let key = autumn_harvest::throttle::bucket_key(&workflow_name, "");
+
+    // Fan out over every shard the ROUTER knows about. Do not merely use
+    // every shard this process holds a live pool for. `pool.iter_shards()`
+    // silently dropped a shard the router already advertises mid a
+    // shard-add rollout. A mutation could then return a bare `200` while a
+    // real, router-known shard never received the write (issue #1229,
+    // finding 1). A missing pool for an expected shard is now a fan-out
+    // failure. It is folded into `shard_errors` like any other unreachable
+    // shard.
+    //
+    // Pass the `runtime` already validated above, not `api_state`.
+    // `expected_shards` re-reads `api_state.runtime()` on its own. Plugin
+    // shutdown clears `runtime` and `storage_pool` as two separate locks.
+    // A second, independent re-read here could race that clear. It would
+    // then quietly fall back to pool-only shards for this one request --
+    // reopening finding 1 in that window (issue #1229 review).
+    let pools = crate::shard_fanout::pools_by_shard(&api_state);
+    let expected = crate::shard_fanout::expected_shards_for(Some(&runtime), &pools);
+
     let mut any_success = false;
     let mut shard_errors: Vec<String> = Vec::new();
     let mut persisted_baseline: Option<(f64, f64)> = None;
-    for (shard_id, shard_pool) in pool.iter_shards() {
+    for shard_id in expected {
+        let Some(shard_pool) = pools.get(&shard_id) else {
+            shard_errors.push(format!("shard {shard_id}: has no configured storage pool"));
+            continue;
+        };
         let mut conn = match acquire_conn(shard_pool).await {
             Ok(c) => c,
             Err(e) => {
-                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+                shard_errors.push(format!("shard {shard_id}: {e}"));
                 continue;
             }
         };
@@ -32819,7 +35317,7 @@ async fn set_start_throttle_pacing_override(
                     persisted_baseline = Some((row.refill_rate, row.burst));
                 }
             }
-            Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
+            Err(e) => shard_errors.push(format!("shard {shard_id}: {e}")),
         }
     }
 
@@ -32924,33 +35422,6 @@ async fn clear_start_throttle_pacing_override(
     Extension(api_state): Extension<HarvestApiState>,
     Path(workflow_name): Path<String>,
 ) -> impl axum::response::IntoResponse {
-    let runtime = match api_state.runtime().map_err(map_error) {
-        Ok(r) => r,
-        Err(e) => return e.into_response(),
-    };
-    let Some(workflow) = runtime.registry().workflows.get(&workflow_name) else {
-        return AutumnError::not_found_msg(format!("workflow '{workflow_name}' is not registered"))
-            .into_response();
-    };
-    let Some(policy) = workflow.throttle else {
-        return AutumnError::not_found_msg(format!(
-            "workflow '{workflow_name}' has no declared start throttle; nothing to override"
-        ))
-        .into_response();
-    };
-    if let Some(expr) = policy.key_expr {
-        return AutumnError::bad_request_msg(format!(
-            "workflow '{workflow_name}' uses a dynamic per-key start throttle \
-             (key expression '{expr}'); a pacing override targets a single \
-             static bucket and cannot be applied to a dynamically-keyed policy"
-        ))
-        .with_status(axum::http::StatusCode::CONFLICT)
-        .into_response();
-    }
-    let declared_refill_rate = policy.refill_per_sec;
-    let declared_burst = policy.burst;
-    let key = autumn_harvest::throttle::bucket_key(&workflow_name, "");
-
     let pool = match api_state.storage_pool().map_err(map_error) {
         Ok(p) => p,
         Err(e) => return e.into_response(),
@@ -32958,14 +35429,89 @@ async fn clear_start_throttle_pacing_override(
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "DELETE /admin/start-throttle/{workflow_name}/override";
 
+    let runtime = match api_state.runtime() {
+        Ok(r) => r,
+        Err(e) => reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_START_THROTTLE_PACING_OVERRIDE_CLEAR,
+            TARGET_THROTTLE,
+            &workflow_name,
+            route,
+            map_error(e)
+        ),
+    };
+    let Some(workflow) = runtime.registry().workflows.get(&workflow_name) else {
+        reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_START_THROTTLE_PACING_OVERRIDE_CLEAR,
+            TARGET_THROTTLE,
+            &workflow_name,
+            route,
+            AutumnError::not_found_msg(format!("workflow '{workflow_name}' is not registered"))
+        );
+    };
+    let Some(policy) = workflow.throttle else {
+        reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_START_THROTTLE_PACING_OVERRIDE_CLEAR,
+            TARGET_THROTTLE,
+            &workflow_name,
+            route,
+            AutumnError::not_found_msg(format!(
+                "workflow '{workflow_name}' has no declared start throttle; nothing to override"
+            ))
+        );
+    };
+    if let Some(expr) = policy.key_expr {
+        reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_START_THROTTLE_PACING_OVERRIDE_CLEAR,
+            TARGET_THROTTLE,
+            &workflow_name,
+            route,
+            AutumnError::bad_request_msg(format!(
+                "workflow '{workflow_name}' uses a dynamic per-key start throttle \
+                 (key expression '{expr}'); a pacing override targets a single \
+                 static bucket and cannot be applied to a dynamically-keyed policy"
+            ))
+            .with_status(axum::http::StatusCode::CONFLICT)
+        );
+    }
+    let declared_refill_rate = policy.refill_per_sec;
+    let declared_burst = policy.burst;
+    let key = autumn_harvest::throttle::bucket_key(&workflow_name, "");
+
+    // Fan out over every shard the ROUTER knows about. Do not merely use
+    // every shard this process holds a live pool for (issue #1229,
+    // finding 1). See the identical comment in
+    // `set_start_throttle_pacing_override`.
+    let pools = crate::shard_fanout::pools_by_shard(&api_state);
+    let expected = crate::shard_fanout::expected_shards_for(Some(&runtime), &pools);
+
     let mut any_success = false;
     let mut shard_errors: Vec<String> = Vec::new();
     let mut persisted_baseline: Option<(f64, f64)> = None;
-    for (shard_id, shard_pool) in pool.iter_shards() {
+    for shard_id in expected {
+        let Some(shard_pool) = pools.get(&shard_id) else {
+            shard_errors.push(format!("shard {shard_id}: has no configured storage pool"));
+            continue;
+        };
         let mut conn = match acquire_conn(shard_pool).await {
             Ok(c) => c,
             Err(e) => {
-                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+                shard_errors.push(format!("shard {shard_id}: {e}"));
                 continue;
             }
         };
@@ -32982,7 +35528,7 @@ async fn clear_start_throttle_pacing_override(
                     persisted_baseline = Some((row.refill_rate, row.burst));
                 }
             }
-            Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
+            Err(e) => shard_errors.push(format!("shard {shard_id}: {e}")),
         }
     }
 
@@ -33103,6 +35649,11 @@ async fn list_rate_limits(
     use autumn_harvest::schema::harvest_rate_limit_buckets::dsl::harvest_rate_limit_buckets;
 
     let pool = api_state.storage_pool().map_err(map_error)?;
+    // Every shard below is reached before this count is used: a connection
+    // or query error bails out via `?` first. So this is exactly the
+    // reachable-shard count `build_rate_limit_bucket_view` needs to spot a
+    // key that is missing a row on some shard (issue #1222).
+    let shard_count = pool.iter_shards().count();
 
     // Aggregate across all shards so operators see every configured key.
     // Rate-limit config is written to all shards by `set_rate_limit`; a TTL'd
@@ -33131,7 +35682,7 @@ async fn list_rate_limits(
     Ok(Json(
         per_key
             .into_values()
-            .map(|rows| build_rate_limit_bucket_view(&rows, now))
+            .map(|rows| build_rate_limit_bucket_view(&rows, shard_count, now))
             .collect(),
     ))
 }
@@ -33141,6 +35692,16 @@ async fn list_rate_limits(
 /// (issue #945 review, round 5) alongside the pre-existing worst-case
 /// (lowest-tokens) representative-row selection.
 ///
+/// `shard_count` is the number of reachable shards queried by
+/// [`list_rate_limits`]. It can exceed `rows.len()`. A shard with no row for
+/// this key has not lazily created its bucket yet.
+///
+/// That shard is not "no policy". It carries an un-overridden baseline
+/// policy, not yet materialized. It will diverge from an active override on
+/// a sibling shard the moment it materializes (issue #1222). Each such
+/// shard counts as one inactive entry toward disagreement, the same as an
+/// explicit inactive row would.
+///
 /// # Panics
 ///
 /// Never in practice: `rows` is always non-empty here, built from the
@@ -33148,9 +35709,10 @@ async fn list_rate_limits(
 /// which only ever inserts a key alongside at least one row.
 fn build_rate_limit_bucket_view(
     rows: &[RateLimitBucket],
+    shard_count: usize,
     now: chrono::DateTime<chrono::Utc>,
 ) -> RateLimitBucketView {
-    let effective_per_shard: Vec<queue::EffectiveRateLimit> = rows
+    let mut effective_per_shard: Vec<queue::EffectiveRateLimit> = rows
         .iter()
         .map(|b| {
             queue::resolve_effective_rate_limit(
@@ -33163,6 +35725,16 @@ fn build_rate_limit_bucket_view(
             )
         })
         .collect();
+    let missing_shards = shard_count.saturating_sub(rows.len());
+    // `refill_rate`/`burst` here are placeholders, never real values. They
+    // are safe: `pacing_shards_disagree` compares values only across
+    // `override_active` entries, and this entry is always inactive.
+    let no_row_yet = queue::EffectiveRateLimit {
+        refill_rate: 0.0,
+        burst: 0.0,
+        override_active: false,
+    };
+    effective_per_shard.extend(std::iter::repeat_n(no_row_yet, missing_shards));
     let disagreement = queue::pacing_shards_disagree(&effective_per_shard);
 
     // Representative row: prefer an ACTIVE override row whenever any shard
@@ -33176,6 +35748,7 @@ fn build_rate_limit_bucket_view(
     // depleted shard rather than an optimistically full one.
     let is_active =
         |b: &RateLimitBucket| b.override_expires_at.is_some_and(|expires| expires > now);
+    #[expect(clippy::expect_used, reason = "callers pass a non-empty `rows`")]
     let representative = rows
         .iter()
         .filter(|b| is_active(b))
@@ -33186,6 +35759,100 @@ fn build_rate_limit_bucket_view(
     RateLimitBucketView {
         shard_disagreement: disagreement,
         ..RateLimitBucketView::from(representative.clone())
+    }
+}
+
+#[cfg(test)]
+mod build_rate_limit_bucket_view_tests {
+    use super::{RateLimitBucket, build_rate_limit_bucket_view};
+    use chrono::{TimeZone as _, Utc};
+
+    fn bucket(
+        override_refill_rate: Option<f64>,
+        override_burst: Option<f64>,
+        override_expires_at: Option<chrono::DateTime<Utc>>,
+    ) -> RateLimitBucket {
+        let ts = Utc.with_ymd_and_hms(2026, 7, 24, 12, 0, 0).unwrap();
+        RateLimitBucket {
+            key: "send_email".to_string(),
+            refill_rate: 5.0,
+            burst: 10.0,
+            tokens: 3.0,
+            last_refilled_at: ts,
+            created_at: ts,
+            updated_at: ts,
+            override_refill_rate,
+            override_burst,
+            override_expires_at,
+            last_registered_at: Some(ts),
+            baseline_set_at: None,
+        }
+    }
+
+    #[test]
+    fn agrees_when_every_shard_has_a_row() {
+        let now = Utc::now();
+        let rows = [bucket(None, None, None)];
+        let view = build_rate_limit_bucket_view(&rows, rows.len(), now);
+        assert!(!view.shard_disagreement);
+    }
+
+    /// Issue #1222: a shard with no row for this key has not lazily
+    /// created its bucket yet. It will enforce the un-overridden baseline
+    /// on its next dispatch -- a different effective rate than an active
+    /// override on a sibling shard. `shard_count` above `rows.len()` must
+    /// count as disagreement, the same as an explicit inactive row would.
+    #[test]
+    fn disagrees_when_a_shard_has_no_row_at_all() {
+        let now = Utc::now();
+        let expires = now + chrono::Duration::seconds(300);
+        let rows = [bucket(Some(50.0), Some(100.0), Some(expires))];
+        let shard_count = rows.len() + 1;
+        let view = build_rate_limit_bucket_view(&rows, shard_count, now);
+        assert!(
+            view.shard_disagreement,
+            "one shard has an active override, another has no row yet -- \
+             those enforce different rates and must disagree"
+        );
+    }
+
+    /// A missing shard must not manufacture a false positive. No override is
+    /// active anywhere here, so the missing shard's future baseline agrees
+    /// with the one row that already exists.
+    #[test]
+    fn agrees_when_a_shard_has_no_row_and_no_override_is_active() {
+        let now = Utc::now();
+        let rows = [bucket(None, None, None)];
+        let shard_count = rows.len() + 1;
+        let view = build_rate_limit_bucket_view(&rows, shard_count, now);
+        assert!(
+            !view.shard_disagreement,
+            "no shard has an active override, so a not-yet-materialized \
+             baseline on the missing shard agrees with the existing row"
+        );
+    }
+
+    /// `missing_shards` must count every absent shard, not just one.
+    #[test]
+    fn disagrees_when_multiple_shards_have_no_row() {
+        let now = Utc::now();
+        let expires = now + chrono::Duration::seconds(300);
+        let rows = [bucket(Some(50.0), Some(100.0), Some(expires))];
+        let shard_count = rows.len() + 2;
+        let view = build_rate_limit_bucket_view(&rows, shard_count, now);
+        assert!(view.shard_disagreement);
+    }
+
+    /// A row-less shard must never change the reported representative
+    /// values -- only `shard_disagreement` reflects it.
+    #[test]
+    fn missing_shard_does_not_change_representative_fields() {
+        let now = Utc::now();
+        let expires = now + chrono::Duration::seconds(300);
+        let rows = [bucket(Some(50.0), Some(100.0), Some(expires))];
+        let view = build_rate_limit_bucket_view(&rows, rows.len() + 1, now);
+        assert!((view.effective_refill_rate - 50.0).abs() < 1e-9);
+        assert!((view.effective_burst - 100.0).abs() < 1e-9);
     }
 }
 
@@ -33215,15 +35882,25 @@ async fn set_rate_limit(
 
     let pool = api_state.storage_pool().map_err(map_error)?;
 
+    // `baseline_set_at` marks this bucket as carrying a PERMANENT operator
+    // baseline, which exempts it from the idle-bucket GC (issue #1127). This
+    // route validates nothing against the registry, so an operator can (and, to
+    // clamp a noisy tenant, would) target a per-tenant `dyn-rate:`/
+    // `start-throttle:` key — and collecting such a row would silently revert
+    // the clamp to the code-declared rate the next time that tenant appeared.
+    // Same principle as the sweep's refusal to collect a bucket under a live
+    // TTL'd pacing override (issue #945): deliberate operator intent is never
+    // destroyed by a background pass.
     let upsert_sql = "INSERT INTO harvest_rate_limit_buckets \
-         (key, refill_rate, burst, tokens, last_refilled_at, created_at, updated_at) \
-         VALUES ($1, $2, $3, $3, NOW(), NOW(), NOW()) \
+         (key, refill_rate, burst, tokens, last_refilled_at, created_at, updated_at, baseline_set_at) \
+         VALUES ($1, $2, $3, $3, NOW(), NOW(), NOW(), NOW()) \
          ON CONFLICT (key) DO UPDATE \
          SET refill_rate = EXCLUDED.refill_rate, \
              burst = EXCLUDED.burst, \
              tokens = LEAST(EXCLUDED.burst, harvest_rate_limit_buckets.tokens), \
              last_refilled_at = NOW(), \
-             updated_at = NOW()";
+             updated_at = NOW(), \
+             baseline_set_at = NOW()";
 
     // Fail fast on any shard error: an emergency throttle must be applied to the
     // entire fleet.  A partial write would leave some shards with the old bucket
@@ -33431,6 +36108,15 @@ struct RateLimitBucketView {
     /// shard (preferring an active override), but an operator should not
     /// treat them as authoritative for every shard.
     shard_disagreement: bool,
+    /// When an operator last wrote this bucket's permanent baseline through
+    /// `POST /admin/rate-limits/{key}`. Non-`null` also means the row is
+    /// **exempt** from the idle rate-limit-bucket GC (issue #1127) — the
+    /// answer to "why has this bucket never been collected?".
+    baseline_set_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the engine last (re-)registered this bucket (issue #1127). With
+    /// `last_refilled_at` and `updated_at` this is the GC's idleness clock, so
+    /// it is also the answer to "why has this bucket not been collected yet?".
+    last_registered_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl From<RateLimitBucket> for RateLimitBucketView {
@@ -33458,6 +36144,8 @@ impl From<RateLimitBucket> for RateLimitBucketView {
             effective_refill_rate: effective.refill_rate,
             effective_burst: effective.burst,
             shard_disagreement: false,
+            baseline_set_at: b.baseline_set_at,
+            last_registered_at: b.last_registered_at,
         }
     }
 }
@@ -33484,6 +36172,8 @@ mod rate_limit_bucket_view_tests {
             override_refill_rate,
             override_burst,
             override_expires_at,
+            last_registered_at: Some(ts),
+            baseline_set_at: None,
         }
     }
 
@@ -33620,6 +36310,7 @@ fn pacing_override_clear_sql() -> String {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RateLimitPacingOverrideRequest {
     refill_rate: Option<f64>,
     burst: Option<f64>,
@@ -33630,14 +36321,14 @@ struct RateLimitPacingOverrideRequest {
 /// TTL'd runtime pacing override on top of a *declared* per-activity rate
 /// limit (issue #945).
 ///
-/// Each call **replaces** the whole override — a field omitted from this
-/// call reverts to the declared baseline even if a *previous* call had
-/// overridden it, rather than being merged forward with that earlier call.
+/// Each call **replaces** the whole override. A field omitted from this call
+/// reverts to the declared baseline, even if a *previous* call had
+/// overridden it. It is not merged forward with that earlier call.
 ///
 /// `404` when `activity_name` is not a registered activity, or is registered
 /// but declares no rate limit. `409` when the activity's rate limit is
-/// dynamically per-key (`rate_limit(key = ...)`, issue #699) — a pacing
-/// override targets one static bucket and cannot disambiguate which
+/// dynamically per-key (`rate_limit(key = ...)`, issue #699). A pacing
+/// override targets one static bucket. It cannot disambiguate which
 /// resolved tenant key's bucket to override. `400` on a non-finite/
 /// non-positive `refill_rate`/`burst`, an omitted `refill_rate`/`burst`
 /// pair, or a `ttl_secs` of zero or above the server cap.
@@ -33646,59 +36337,8 @@ async fn set_rate_limit_pacing_override(
     headers: axum::http::HeaderMap,
     Extension(api_state): Extension<HarvestApiState>,
     Path(activity_name): Path<String>,
-    Json(request): Json<RateLimitPacingOverrideRequest>,
+    body: Result<Json<RateLimitPacingOverrideRequest>, JsonRejection>,
 ) -> impl axum::response::IntoResponse {
-    if let Some(rate) = request.refill_rate
-        && (!rate.is_finite() || rate <= 0.0)
-    {
-        return AutumnError::bad_request_msg(
-            "refill_rate must be a finite number greater than zero",
-        )
-        .into_response();
-    }
-    if let Some(burst) = request.burst
-        && (!burst.is_finite() || burst < 1.0)
-    {
-        return AutumnError::bad_request_msg("burst must be a finite number, at least 1.0")
-            .into_response();
-    }
-    if request.refill_rate.is_none() && request.burst.is_none() {
-        return AutumnError::bad_request_msg("must override at least one of refill_rate or burst")
-            .into_response();
-    }
-    let expires_at = match pacing_override_expiry(request.ttl_secs) {
-        Ok(v) => v,
-        Err(e) => return e.into_response(),
-    };
-
-    let runtime = match api_state.runtime().map_err(map_error) {
-        Ok(r) => r,
-        Err(e) => return e.into_response(),
-    };
-    let Some(activity) = runtime.registry().activities.get(&activity_name) else {
-        return AutumnError::not_found_msg(format!("activity '{activity_name}' is not registered"))
-            .into_response();
-    };
-    let Some(declared_refill_rate) = activity.rate_limit_rps else {
-        return AutumnError::not_found_msg(format!(
-            "activity '{activity_name}' has no declared rate limit; nothing to override"
-        ))
-        .into_response();
-    };
-    if let Some(expr) = activity.rate_limit_key_expr {
-        return AutumnError::bad_request_msg(format!(
-            "activity '{activity_name}' uses a dynamic per-key rate limit \
-             (key expression '{expr}'); a pacing override targets a single \
-             static bucket and cannot be applied to a dynamically-keyed policy"
-        ))
-        .with_status(axum::http::StatusCode::CONFLICT)
-        .into_response();
-    }
-    let declared_burst = activity.rate_limit_burst.unwrap_or(declared_refill_rate);
-    let key: String = activity
-        .rate_limit_key
-        .map_or_else(|| activity_name.clone(), std::string::ToString::to_string);
-
     let pool = match api_state.storage_pool().map_err(map_error) {
         Ok(p) => p,
         Err(e) => return e.into_response(),
@@ -33706,14 +36346,171 @@ async fn set_rate_limit_pacing_override(
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "POST /admin/rate-limits/{activity_name}/override";
 
+    // The body is unwrapped in-handler, not by a bare `Json` extractor. A
+    // rejected body -- most importantly an unknown field, rejected via
+    // `deny_unknown_fields` -- surfaces as this route's documented `400`.
+    // It carries a failed audit row, never axum's default plain-text `422`
+    // (mirrors `update_schedule_handler`).
+    let request = match body {
+        Ok(Json(req)) => req,
+        Err(rejection) => {
+            let err_summary = format!("invalid request body: {}", rejection.body_text());
+            reject_pacing_override!(
+                &pool,
+                &actor,
+                &source,
+                request_id.as_deref(),
+                OP_RATE_LIMIT_PACING_OVERRIDE_SET,
+                TARGET_RATE_LIMIT,
+                &activity_name,
+                route,
+                AutumnError::bad_request_msg(err_summary)
+            );
+        }
+    };
+
+    if let Some(rate) = request.refill_rate
+        && (!rate.is_finite() || rate <= 0.0)
+    {
+        reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_RATE_LIMIT_PACING_OVERRIDE_SET,
+            TARGET_RATE_LIMIT,
+            &activity_name,
+            route,
+            AutumnError::bad_request_msg("refill_rate must be a finite number greater than zero")
+        );
+    }
+    if let Some(burst) = request.burst
+        && (!burst.is_finite() || burst < 1.0)
+    {
+        reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_RATE_LIMIT_PACING_OVERRIDE_SET,
+            TARGET_RATE_LIMIT,
+            &activity_name,
+            route,
+            AutumnError::bad_request_msg("burst must be a finite number, at least 1.0")
+        );
+    }
+    if request.refill_rate.is_none() && request.burst.is_none() {
+        reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_RATE_LIMIT_PACING_OVERRIDE_SET,
+            TARGET_RATE_LIMIT,
+            &activity_name,
+            route,
+            AutumnError::bad_request_msg("must override at least one of refill_rate or burst")
+        );
+    }
+    let expires_at = match pacing_override_expiry(request.ttl_secs) {
+        Ok(v) => v,
+        Err(e) => reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_RATE_LIMIT_PACING_OVERRIDE_SET,
+            TARGET_RATE_LIMIT,
+            &activity_name,
+            route,
+            e
+        ),
+    };
+
+    let runtime = match api_state.runtime() {
+        Ok(r) => r,
+        Err(e) => reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_RATE_LIMIT_PACING_OVERRIDE_SET,
+            TARGET_RATE_LIMIT,
+            &activity_name,
+            route,
+            map_error(e)
+        ),
+    };
+    let Some(activity) = runtime.registry().activities.get(&activity_name) else {
+        reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_RATE_LIMIT_PACING_OVERRIDE_SET,
+            TARGET_RATE_LIMIT,
+            &activity_name,
+            route,
+            AutumnError::not_found_msg(format!("activity '{activity_name}' is not registered"))
+        );
+    };
+    let Some(declared_refill_rate) = activity.rate_limit_rps else {
+        reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_RATE_LIMIT_PACING_OVERRIDE_SET,
+            TARGET_RATE_LIMIT,
+            &activity_name,
+            route,
+            AutumnError::not_found_msg(format!(
+                "activity '{activity_name}' has no declared rate limit; nothing to override"
+            ))
+        );
+    };
+    if let Some(expr) = activity.rate_limit_key_expr {
+        reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_RATE_LIMIT_PACING_OVERRIDE_SET,
+            TARGET_RATE_LIMIT,
+            &activity_name,
+            route,
+            AutumnError::bad_request_msg(format!(
+                "activity '{activity_name}' uses a dynamic per-key rate limit \
+                 (key expression '{expr}'); a pacing override targets a single \
+                 static bucket and cannot be applied to a dynamically-keyed policy"
+            ))
+            .with_status(axum::http::StatusCode::CONFLICT)
+        );
+    }
+    let declared_burst = activity.rate_limit_burst.unwrap_or(declared_refill_rate);
+    let key: String = activity
+        .rate_limit_key
+        .map_or_else(|| activity_name.clone(), std::string::ToString::to_string);
+
+    // Fan out over every shard the ROUTER knows about. Do not merely use
+    // every shard this process holds a live pool for (issue #1229,
+    // finding 1). See the identical comment in
+    // `set_start_throttle_pacing_override`.
+    let pools = crate::shard_fanout::pools_by_shard(&api_state);
+    let expected = crate::shard_fanout::expected_shards_for(Some(&runtime), &pools);
+
     let mut any_success = false;
     let mut shard_errors: Vec<String> = Vec::new();
     let mut persisted_baseline: Option<(f64, f64)> = None;
-    for (shard_id, shard_pool) in pool.iter_shards() {
+    for shard_id in expected {
+        let Some(shard_pool) = pools.get(&shard_id) else {
+            shard_errors.push(format!("shard {shard_id}: has no configured storage pool"));
+            continue;
+        };
         let mut conn = match acquire_conn(shard_pool).await {
             Ok(c) => c,
             Err(e) => {
-                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+                shard_errors.push(format!("shard {shard_id}: {e}"));
                 continue;
             }
         };
@@ -33735,7 +36532,7 @@ async fn set_rate_limit_pacing_override(
                     persisted_baseline = Some((row.refill_rate, row.burst));
                 }
             }
-            Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
+            Err(e) => shard_errors.push(format!("shard {shard_id}: {e}")),
         }
     }
 
@@ -33840,34 +36637,6 @@ async fn clear_rate_limit_pacing_override(
     Extension(api_state): Extension<HarvestApiState>,
     Path(activity_name): Path<String>,
 ) -> impl axum::response::IntoResponse {
-    let runtime = match api_state.runtime().map_err(map_error) {
-        Ok(r) => r,
-        Err(e) => return e.into_response(),
-    };
-    let Some(activity) = runtime.registry().activities.get(&activity_name) else {
-        return AutumnError::not_found_msg(format!("activity '{activity_name}' is not registered"))
-            .into_response();
-    };
-    let Some(declared_refill_rate) = activity.rate_limit_rps else {
-        return AutumnError::not_found_msg(format!(
-            "activity '{activity_name}' has no declared rate limit; nothing to override"
-        ))
-        .into_response();
-    };
-    if let Some(expr) = activity.rate_limit_key_expr {
-        return AutumnError::bad_request_msg(format!(
-            "activity '{activity_name}' uses a dynamic per-key rate limit \
-             (key expression '{expr}'); a pacing override targets a single \
-             static bucket and cannot be applied to a dynamically-keyed policy"
-        ))
-        .with_status(axum::http::StatusCode::CONFLICT)
-        .into_response();
-    }
-    let declared_burst = activity.rate_limit_burst.unwrap_or(declared_refill_rate);
-    let key: String = activity
-        .rate_limit_key
-        .map_or_else(|| activity_name.clone(), std::string::ToString::to_string);
-
     let pool = match api_state.storage_pool().map_err(map_error) {
         Ok(p) => p,
         Err(e) => return e.into_response(),
@@ -33875,14 +36644,90 @@ async fn clear_rate_limit_pacing_override(
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "DELETE /admin/rate-limits/{activity_name}/override";
 
+    let runtime = match api_state.runtime() {
+        Ok(r) => r,
+        Err(e) => reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_RATE_LIMIT_PACING_OVERRIDE_CLEAR,
+            TARGET_RATE_LIMIT,
+            &activity_name,
+            route,
+            map_error(e)
+        ),
+    };
+    let Some(activity) = runtime.registry().activities.get(&activity_name) else {
+        reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_RATE_LIMIT_PACING_OVERRIDE_CLEAR,
+            TARGET_RATE_LIMIT,
+            &activity_name,
+            route,
+            AutumnError::not_found_msg(format!("activity '{activity_name}' is not registered"))
+        );
+    };
+    let Some(declared_refill_rate) = activity.rate_limit_rps else {
+        reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_RATE_LIMIT_PACING_OVERRIDE_CLEAR,
+            TARGET_RATE_LIMIT,
+            &activity_name,
+            route,
+            AutumnError::not_found_msg(format!(
+                "activity '{activity_name}' has no declared rate limit; nothing to override"
+            ))
+        );
+    };
+    if let Some(expr) = activity.rate_limit_key_expr {
+        reject_pacing_override!(
+            &pool,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_RATE_LIMIT_PACING_OVERRIDE_CLEAR,
+            TARGET_RATE_LIMIT,
+            &activity_name,
+            route,
+            AutumnError::bad_request_msg(format!(
+                "activity '{activity_name}' uses a dynamic per-key rate limit \
+                 (key expression '{expr}'); a pacing override targets a single \
+                 static bucket and cannot be applied to a dynamically-keyed policy"
+            ))
+            .with_status(axum::http::StatusCode::CONFLICT)
+        );
+    }
+    let declared_burst = activity.rate_limit_burst.unwrap_or(declared_refill_rate);
+    let key: String = activity
+        .rate_limit_key
+        .map_or_else(|| activity_name.clone(), std::string::ToString::to_string);
+
+    // Fan out over every shard the ROUTER knows about. Do not merely use
+    // every shard this process holds a live pool for (issue #1229,
+    // finding 1). See the identical comment in
+    // `set_start_throttle_pacing_override`.
+    let pools = crate::shard_fanout::pools_by_shard(&api_state);
+    let expected = crate::shard_fanout::expected_shards_for(Some(&runtime), &pools);
+
     let mut any_success = false;
     let mut shard_errors: Vec<String> = Vec::new();
     let mut persisted_baseline: Option<(f64, f64)> = None;
-    for (shard_id, shard_pool) in pool.iter_shards() {
+    for shard_id in expected {
+        let Some(shard_pool) = pools.get(&shard_id) else {
+            shard_errors.push(format!("shard {shard_id}: has no configured storage pool"));
+            continue;
+        };
         let mut conn = match acquire_conn(shard_pool).await {
             Ok(c) => c,
             Err(e) => {
-                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+                shard_errors.push(format!("shard {shard_id}: {e}"));
                 continue;
             }
         };
@@ -33899,7 +36744,7 @@ async fn clear_rate_limit_pacing_override(
                     persisted_baseline = Some((row.refill_rate, row.burst));
                 }
             }
-            Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
+            Err(e) => shard_errors.push(format!("shard {shard_id}: {e}")),
         }
     }
 
@@ -34080,7 +36925,8 @@ async fn force_circuit(
         )
     };
     if let Ok(pool) = api_state.storage_pool()
-        && let Ok(mut conn) = pool.default_pool().get().await
+        && let Ok(mut conn) =
+            autumn_harvest::replication::fenced_checkout(pool.default_pool()).await
     {
         let ar = NewAuditRecord {
             actor: &actor,
@@ -35483,6 +38329,7 @@ fn merge_paused_queue_rows(
 
             // Deterministic top-level summary: the hold that started first.
             // Tie-broken by shard id so the choice never depends on fan-out order.
+            #[expect(clippy::expect_used, reason = "each group has at least one row")]
             let earliest = shard_rows
                 .iter()
                 .min_by_key(|(shard_id, row)| (row.paused_at, *shard_id))
@@ -35642,6 +38489,775 @@ fn merge_quota_rows(
             })
         })
         .collect()
+}
+
+// ── Audit export to an external sink (issue #953) ────────────────────────────
+//
+// Two routes: a read-only status view and an admin-gated, audited redrive.
+// Both are shard-aware because the export cursor is per-shard, living in that
+// shard's own database alongside the audit rows it tracks.
+
+/// `GET /admin/audit-export` — per-shard audit-export cursor position, lag,
+/// delivery state, and last error (issue #953 AC7).
+///
+/// Cross-shard and `shard_fanout`-based like every other admin read: an
+/// unreachable shard degrades the response to `partial` (naming it in
+/// `unavailable_shards`) rather than failing the whole read, so one bad shard
+/// never hides the other shards' compliance posture.
+///
+/// A shard with no cursor row yet reports `delivery_state: "NOT_STARTED"` —
+/// deliberately *with* its live `pending_records`/`lag_seconds`, because "the
+/// exporter has never run here and 40k records are waiting" is precisely the
+/// state an operator needs to see, and omitting the shard would hide it.
+///
+/// Admin-gated and read-only: the response carries `actor`-adjacent
+/// compliance posture but no audit record contents.
+async fn audit_export_status_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Result<Json<Value>, AutumnError> {
+    let observations = observe_shards(&api_state, |shard_id, mut conn| async move {
+        let now = chrono::Utc::now();
+        match ::autumn_harvest::audit_export::export_status(&mut conn, shard_id, now).await {
+            Ok(Some(status)) => Ok(vec![serde_json::json!(status)]),
+            Ok(None) => {
+                // No cursor row: the exporter has never claimed this shard.
+                // Still report the backlog it would face.
+                let (pending, lag) =
+                    ::autumn_harvest::audit_export::pending_and_lag(&mut conn, 0, now)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                Ok(vec![serde_json::json!({
+                    "shard": shard_id,
+                    "cursor_seq": 0,
+                    "last_assigned_seq": 0,
+                    "pending_records": pending,
+                    "lag_seconds": lag,
+                    "delivery_state": "NOT_STARTED",
+                    "consecutive_failures": 0,
+                    "last_status": Value::Null,
+                    "last_error": Value::Null,
+                    "last_delivered_at": Value::Null,
+                    "next_attempt_at": Value::Null,
+                })])
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    })
+    .await?;
+
+    let mut collected = shard_fanout::collect_fanout_rows(observations);
+    collected
+        .rows
+        .sort_by_key(|row| row["shard"].as_i64().unwrap_or(0));
+
+    Ok(Json(serde_json::json!({
+        // Whether THIS process has an audit sink installed. A `false` here
+        // with a growing `pending_records` is the signature of "export was
+        // configured on the web app but not on the worker fleet", which is
+        // otherwise invisible.
+        "sink_configured": ::autumn_harvest::audit_export::is_configured(),
+        "shards": collected.rows,
+        "status": collected.status,
+        "unavailable_shards": collected.unavailable_shards,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct AuditExportRedriveRequest {
+    /// Shard whose cursor to rewind.
+    shard: i32,
+    /// Rewind to this exact sequence: records with `seq > to_seq` re-export.
+    to_seq: Option<i64>,
+    /// Rewind so every record at or after this instant re-exports.
+    before: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Appended to the redrive audit detail and refusal when retention cut the window.
+const TRUNCATED_NOTE: &str = "; retention already purged records at or after the requested \
+                              instant, so the window is incomplete";
+
+/// What `rewind_cursor_locked` decided, plus how much of it the database can
+/// actually deliver (issue #1267).
+///
+/// `recoverable_records` and `already_purged_records` are `0` unless
+/// `outcome` is [`RewindOutcome::Rewound`][rw]; a refused rewind moved
+/// nothing, so there is no window to measure.
+///
+/// [rw]: ::autumn_harvest::audit_export::RewindOutcome::Rewound
+struct RedriveApplied {
+    outcome: ::autumn_harvest::audit_export::RewindOutcome,
+    recoverable_records: i64,
+    already_purged_records: i64,
+    /// Retention purged records a `before` request named (issue #1508).
+    window_truncated: bool,
+}
+
+/// `POST /admin/audit-export/redrive` — rewind one shard's export cursor so
+/// already-delivered audit records are re-exported after sink-side data loss
+/// (issue #953 AC6).
+///
+/// Exactly one of `to_seq` or `before` must be supplied. Re-exported records
+/// are **byte-identical** — the export sequence is never re-stamped, so a
+/// record carries the same `(shard, seq)` and the same JSON on every delivery
+/// and the receiver dedupes.
+///
+/// A cursor may only ever move **backwards**: a request that would move it
+/// forward, or leave it where it is, is refused with `400` rather than
+/// applied, because advancing it would mark records delivered that never were
+/// — the exact gap this feature exists to make impossible.
+///
+/// **The rewind and its audit record are one transaction on one connection**
+/// (issue #953, Codex review P1/P2). The audit row is written through the very
+/// connection holding the cursor lock, into the *target shard's*
+/// `harvest_audit_log` — deliberately not the default shard's, which is the
+/// house pattern for every other audited route here. Two reasons:
+///
+/// 1. **Atomicity is real, not approximate.** A second connection's insert
+///    commits independently, so the two could disagree in either direction: a
+///    committed `SUCCEEDED` row claiming a rewind that then failed to commit,
+///    or a rewind with no trail. Same connection, same transaction, one
+///    outcome.
+/// 2. **It cannot self-deadlock.** `acquire_conn` is an unbounded `pool.get()`.
+///    Asking the default pool for a second connection while already holding one
+///    from it — which is what a redrive of the *default* shard does — parks
+///    forever on a small pool, while holding the cursor lock.
+///
+/// The audit row is shard-local anyway: it describes a shard-scoped mutation,
+/// carries that shard's id, and is picked up by that shard's own exporter, so
+/// it reaches the SIEM like every other audit record.
+///
+/// **The response reports what it can actually deliver, not the full window
+/// asked for** (issue #1267). Retention does not take the cursor row's lock.
+/// A sweep can read the pre-rewind cursor and purge part of the window this
+/// redrive is about to promise back. `recoverable_records` counts, inside
+/// this same transaction, the `(to, from]` rows that still exist.
+/// `already_purged_records` is the rest of the window. Those records are
+/// gone before this redrive could reach them.
+#[allow(clippy::too_many_lines)] // one mutation + its bound audit write
+async fn audit_export_redrive_handler(
+    headers: axum::http::HeaderMap,
+    Extension(api_state): Extension<HarvestApiState>,
+    Json(request): Json<AuditExportRedriveRequest>,
+) -> impl axum::response::IntoResponse {
+    let (target, requested) = match (request.to_seq, request.before) {
+        (Some(seq), None) => (
+            ::autumn_harvest::audit_export::RewindRequest::Seq(seq),
+            format!("to_seq={seq}"),
+        ),
+        (None, Some(before)) => (
+            ::autumn_harvest::audit_export::RewindRequest::Before(before),
+            format!("before={}", before.to_rfc3339()),
+        ),
+        (Some(_), Some(_)) => {
+            return AutumnError::bad_request_msg(
+                "supply exactly one of to_seq or before, not both",
+            )
+            .into_response();
+        }
+        (None, None) => {
+            return AutumnError::bad_request_msg("supply exactly one of to_seq or before")
+                .into_response();
+        }
+    };
+
+    // Mirrors `observe_shards`: a missing storage pool is a 503, not a 400 —
+    // the two audit-export routes must agree about what "storage is not
+    // configured" looks like.
+    let Ok(pool) = api_state.storage_pool() else {
+        return AutumnError::service_unavailable_msg("harvest storage pool is not configured")
+            .into_response();
+    };
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /admin/audit-export/redrive";
+
+    // The audit row's target names BOTH the shard and the position asked for.
+    // A redrive is the one operation here that can trigger a mass re-export,
+    // so "alice redrove shard 5" without the position is not an answer an
+    // auditor can use.
+    let target_label = format!("shard={};{requested}", request.shard);
+
+    let shard_pool = pool.exact_pool_for(::autumn_harvest::types::ShardId::new(request.shard));
+
+    let applied: Result<RedriveApplied, String> = match shard_pool {
+        Some(shard_pool) => match acquire_conn(shard_pool).await {
+            Ok(mut conn) => {
+                let actor = actor.clone();
+                let source = source.clone();
+                let request_id = request_id.clone();
+                let target_label = target_label.clone();
+                // Pinned to READ COMMITTED, not inherited (issue #1267,
+                // matching `queue::claim_task`, `activity_pause`,
+                // `queue_pause`, the timeout enforcer, and the scheduler).
+                // The recoverable-records count below depends on seeing a
+                // retention purge that commits after this transaction's
+                // first statement. Under READ COMMITTED each statement gets
+                // a fresh snapshot, so that holds. Under REPEATABLE READ (or
+                // SERIALIZABLE), every statement shares one snapshot instead,
+                // taken at the cursor's `FOR UPDATE`. A purge committed after
+                // that point would stay invisible to the count. It would
+                // silently report full recovery of records already gone.
+                // Pinning the level on `BEGIN` keeps the guarantee
+                // independent of an operator's
+                // `default_transaction_isolation` setting.
+                let mut tx = conn.build_transaction().read_committed();
+                Box::pin(tx.run::<
+                    RedriveApplied,
+                    ::autumn_harvest::error::HarvestError,
+                    _,
+                >(async |conn| {
+                    let outcome = ::autumn_harvest::audit_export::rewind_cursor_locked(
+                        conn,
+                        request.shard,
+                        target,
+                        chrono::Utc::now(),
+                    )
+                    .await?;
+
+                    // A rewind that moved the cursor promises to redeliver
+                    // `(to, from]`. Retention does not take the cursor row's
+                    // lock. Part of that window can already be gone (issue
+                    // #1267). Count what survives, in this same transaction,
+                    // before the response claims anything.
+                    let (recoverable_records, already_purged_records) =
+                        ::autumn_harvest::audit_export::redrive_recovery_counts(conn, outcome)
+                            .await?;
+
+                    // A `before` window comes from surviving rows, so the
+                    // counts above cannot see a purged prefix (issue #1508).
+                    let window_truncated = ::autumn_harvest::audit_export::redrive_window_truncated(
+                        conn, target, outcome,
+                    )
+                    .await?;
+
+                    // Only a rewind that actually moved the cursor is a
+                    // SUCCEEDED privileged action; a refused request changed
+                    // nothing and must not read as one in the trail.
+                    let (status, detail) = match &outcome {
+                        ::autumn_harvest::audit_export::RewindOutcome::Rewound { from, to } => {
+                            let mut detail = if already_purged_records > 0 {
+                                format!(
+                                    "cursor rewound from {from} to {to}; {already_purged_records} \
+                                     of {} records in that window were already purged by \
+                                     retention and cannot be re-exported",
+                                    from - to
+                                )
+                            } else {
+                                format!("cursor rewound from {from} to {to}")
+                            };
+                            if window_truncated {
+                                detail.push_str(TRUNCATED_NOTE);
+                            }
+                            (STATUS_SUCCEEDED, Some(detail))
+                        }
+                        ::autumn_harvest::audit_export::RewindOutcome::NoOp {
+                            cursor,
+                            requested,
+                        } => (
+                            STATUS_FAILED,
+                            Some(format!(
+                                "refused: cursor is at {cursor}, requested {requested}; a \
+                                 cursor may only be rewound{}",
+                                if window_truncated { TRUNCATED_NOTE } else { "" }
+                            )),
+                        ),
+                        ::autumn_harvest::audit_export::RewindOutcome::NotConfigured => (
+                            STATUS_FAILED,
+                            Some("refused: shard has no audit-export cursor".to_string()),
+                        ),
+                    };
+                    let ar = NewAuditRecord {
+                        actor: &actor,
+                        operation: OP_AUDIT_EXPORT_REDRIVE,
+                        target_type: TARGET_AUDIT_EXPORT,
+                        target_id: Some(target_label.as_str()),
+                        route_or_command: route,
+                        request_id: request_id.as_deref(),
+                        idempotency_key: None,
+                        status,
+                        error_summary: detail.as_deref(),
+                        shard_id: Some(request.shard),
+                        source: &source,
+                    };
+                    // Same `conn`, same transaction as the rewind above.
+                    audit::insert_audit(conn, &ar).await?;
+                    Ok(RedriveApplied {
+                        outcome,
+                        recoverable_records,
+                        already_purged_records,
+                        window_truncated,
+                    })
+                }))
+                .await
+                .map_err(|e: ::autumn_harvest::error::HarvestError| e.to_string())
+            }
+            Err(e) => Err(format!("shard {}: {e}", request.shard)),
+        },
+        None => Err(format!("shard {} is not configured", request.shard)),
+    };
+
+    let applied = match applied {
+        Ok(applied) => applied,
+        Err(error) => {
+            // The transaction rolled back (or never opened), so nothing was
+            // applied and there is no mutation to leave unrecorded. Record the
+            // *attempt* on the default shard, best effort — this is the one
+            // path where the target shard may be exactly what is unreachable.
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_AUDIT_EXPORT_REDRIVE,
+                target_type: TARGET_AUDIT_EXPORT,
+                target_id: Some(target_label.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some(error.as_str()),
+                shard_id: Some(request.shard),
+                source: &source,
+            };
+            if let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+                && let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await
+            {
+                tracing::error!(
+                    error = %audit_err,
+                    "audit insert failed for a failed audit_export.redrive"
+                );
+            }
+            tracing::error!(error = %error, "audit_export.redrive failed");
+            return AutumnError::service_unavailable_msg(error).into_response();
+        }
+    };
+
+    match applied.outcome {
+        ::autumn_harvest::audit_export::RewindOutcome::Rewound { from, to } => (
+            axum::http::StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "shard": request.shard,
+                "outcome": "rewound",
+                "from": from,
+                "to": to,
+                "recoverable_records": applied.recoverable_records,
+                "already_purged_records": applied.already_purged_records,
+                "window_truncated": applied.window_truncated,
+            })),
+        )
+            .into_response(),
+        ::autumn_harvest::audit_export::RewindOutcome::NoOp { cursor, requested } => {
+            AutumnError::bad_request_msg(format!(
+                "refusing to move shard {}'s audit-export cursor to {requested} (it is at \
+                 {cursor}); a cursor may only be rewound, since advancing it would mark \
+                 records delivered that never were{}",
+                request.shard,
+                if applied.window_truncated {
+                    TRUNCATED_NOTE
+                } else {
+                    ""
+                }
+            ))
+            .into_response()
+        }
+        ::autumn_harvest::audit_export::RewindOutcome::NotConfigured => {
+            AutumnError::not_found_msg(format!(
+                "shard {} has no live audit-export cursor: audit export has either never \
+                 run there or has been retired. A retired shard cannot be redriven — its \
+                 records are no longer protected from retention and no exporter is \
+                 running to ship them; re-enable export first",
+                request.shard
+            ))
+            .into_response()
+        }
+    }
+}
+
+/// Body of `POST /admin/audit-export/decommission` and
+/// `POST /admin/audit-export/reactivate` (issue #1273).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuditExportShardRequest {
+    /// Shard whose export cursor to retire or reactivate.
+    shard: i32,
+}
+
+/// `POST /admin/audit-export/decommission` — retire one shard's audit-export
+/// cursor, permitting retention to purge its aged records (issue #953, issue
+/// #1273).
+///
+/// This is the audited front door for what `audit_export::decommission_cursor`
+/// used to be a bare library call for. Retirement discards the compliance
+/// guarantee over any record the shard has not yet shipped. An auditor must
+/// be able to name who authorised that. This route makes the action
+/// admin-gated and audited, exactly like [`audit_export_redrive_handler`].
+///
+/// **The retirement and its audit record are one transaction on one
+/// connection**, on the *target shard's* connection. Same reasons as the
+/// redrive route: a second connection's insert would commit independently
+/// (breaking atomicity). Also, a second connection from the default pool,
+/// while holding one from the target's, can self-deadlock when the target
+/// IS the default shard.
+///
+/// A shard already retired, or never configured, changes nothing but is
+/// still audited. An auditor needs the record of the request, not only of
+/// requests that had an effect.
+///
+/// **The atomic record above lands on the shard whose own exporter this
+/// call just stopped** (Codex review, issue #1273 P1). So it can never
+/// reach the SIEM. In a single-shard deployment that shard is also the only
+/// one there is, so there is no other exportable destination to fall back
+/// to.
+///
+/// What makes this route's guarantee true anyway is
+/// [`crate::audit::purge_old_audit_records`]: it never purges an
+/// `audit_export.decommission` or `.reactivate` row, on any shard, live or
+/// retired. So the atomic record survives forever and stays readable via
+/// `GET /audit` on the target shard, even though it may never leave that
+/// shard's own database.
+///
+/// **A genuine retirement also writes a second, best-effort audit record on
+/// the default shard**, when that differs from the target. The default
+/// shard keeps exporting, so its copy has a real chance of reaching the
+/// SIEM. This is an opportunistic improvement, not the correctness
+/// guarantee: a failure here is logged and does not fail the request. The
+/// atomic record's permanence, above, already makes this action's
+/// compliance trail durable on its own. Skipped when the target already IS
+/// the default shard, where a second copy would be redundant with the
+/// first.
+#[allow(clippy::too_many_lines)] // one mutation + its bound audit write
+async fn audit_export_decommission_handler(
+    headers: axum::http::HeaderMap,
+    Extension(api_state): Extension<HarvestApiState>,
+    Json(request): Json<AuditExportShardRequest>,
+) -> impl axum::response::IntoResponse {
+    let Ok(pool) = api_state.storage_pool() else {
+        return AutumnError::service_unavailable_msg("harvest storage pool is not configured")
+            .into_response();
+    };
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /admin/audit-export/decommission";
+    let target_label = format!("shard={}", request.shard);
+
+    let shard_pool = pool.exact_pool_for(::autumn_harvest::types::ShardId::new(request.shard));
+
+    let outcome: Result<::autumn_harvest::audit_export::DecommissionOutcome, String> =
+        match shard_pool {
+            Some(shard_pool) => match acquire_conn(shard_pool).await {
+                Ok(mut conn) => {
+                    use diesel_async::AsyncConnection as _;
+                    let actor = actor.clone();
+                    let source = source.clone();
+                    let request_id = request_id.clone();
+                    let target_label = target_label.clone();
+                    Box::pin(conn.transaction::<
+                        ::autumn_harvest::audit_export::DecommissionOutcome,
+                        ::autumn_harvest::error::HarvestError,
+                        _,
+                    >(async |conn| {
+                        let outcome = ::autumn_harvest::audit_export::decommission_cursor_locked(
+                            conn,
+                            request.shard,
+                            chrono::Utc::now(),
+                        )
+                        .await?;
+
+                        // Only a genuine retirement is a novel privileged action; an
+                        // already-retired or never-configured shard changed nothing.
+                        // Both are still recorded, exactly as a refused redrive is.
+                        let (status, detail) = match &outcome {
+                            ::autumn_harvest::audit_export::DecommissionOutcome::Retired => {
+                                (STATUS_SUCCEEDED, None)
+                            }
+                            ::autumn_harvest::audit_export::DecommissionOutcome::AlreadyRetired => {
+                                (
+                                    STATUS_SUCCEEDED,
+                                    Some("no-op: shard was already retired".to_string()),
+                                )
+                            }
+                            ::autumn_harvest::audit_export::DecommissionOutcome::NotConfigured => {
+                                (
+                                    STATUS_FAILED,
+                                    Some("refused: shard has no audit-export cursor".to_string()),
+                                )
+                            }
+                        };
+                        let ar = NewAuditRecord {
+                            actor: &actor,
+                            operation: OP_AUDIT_EXPORT_DECOMMISSION,
+                            target_type: TARGET_AUDIT_EXPORT,
+                            target_id: Some(target_label.as_str()),
+                            route_or_command: route,
+                            request_id: request_id.as_deref(),
+                            idempotency_key: None,
+                            status,
+                            error_summary: detail.as_deref(),
+                            shard_id: Some(request.shard),
+                            source: &source,
+                        };
+                        // Same `conn`, same transaction as the retirement above.
+                        audit::insert_audit(conn, &ar).await?;
+                        Ok(outcome)
+                    }))
+                    .await
+                    .map_err(|e: ::autumn_harvest::error::HarvestError| e.to_string())
+                }
+                Err(e) => Err(format!("shard {}: {e}", request.shard)),
+            },
+            None => Err(format!("shard {} is not configured", request.shard)),
+        };
+
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            // The transaction rolled back (or never opened), so nothing was
+            // applied. Record the *attempt* on the default shard, best effort.
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_AUDIT_EXPORT_DECOMMISSION,
+                target_type: TARGET_AUDIT_EXPORT,
+                target_id: Some(target_label.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some(error.as_str()),
+                shard_id: Some(request.shard),
+                source: &source,
+            };
+            if let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+                && let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await
+            {
+                tracing::error!(
+                    error = %audit_err,
+                    "audit insert failed for a failed audit_export.decommission"
+                );
+            }
+            tracing::error!(error = %error, "audit_export.decommission failed");
+            return AutumnError::service_unavailable_msg(error).into_response();
+        }
+    };
+
+    // A genuine retirement stops the TARGET shard's own exporter. So the
+    // atomic record above can never reach the SIEM from there (Codex
+    // review, issue #1273 P1). `purge_old_audit_records` never purges this
+    // operation, on any shard, so that record is permanent regardless. This
+    // is a durability guarantee, not an export one. In a single-shard
+    // deployment the target IS the only shard, so permanence is all this
+    // route can ever promise there.
+    //
+    // Where a DIFFERENT shard still exports, attempt a second, best-effort
+    // copy there for an actual shot at reaching the SIEM. A failure here is
+    // logged, not fatal: the atomic record's permanence already satisfies
+    // this route's compliance contract on its own. Skipped when the target
+    // IS the default shard, where a second copy would be redundant.
+    if outcome == ::autumn_harvest::audit_export::DecommissionOutcome::Retired
+        && ::autumn_harvest::types::ShardId::new(request.shard) != pool.default_shard()
+    {
+        let ar = NewAuditRecord {
+            actor: &actor,
+            operation: OP_AUDIT_EXPORT_DECOMMISSION,
+            target_type: TARGET_AUDIT_EXPORT,
+            target_id: Some(target_label.as_str()),
+            route_or_command: route,
+            request_id: request_id.as_deref(),
+            idempotency_key: None,
+            status: STATUS_SUCCEEDED,
+            error_summary: Some(
+                "opportunistic copy: the target shard's own exporter is now retired",
+            ),
+            shard_id: Some(request.shard),
+            source: &source,
+        };
+        match acquire_conn(pool.default_pool()).await {
+            Ok(mut conn) => {
+                if let Err(e) = audit::insert_audit(&mut conn, &ar).await {
+                    tracing::error!(
+                        error = %e,
+                        "failed to write the opportunistic copy of audit_export.decommission \
+                         on the default shard; the retirement is still permanently recorded \
+                         on the target shard, just not exported"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "could not reach the default shard to write the opportunistic copy of \
+                     audit_export.decommission; the retirement is still permanently \
+                     recorded on the target shard, just not exported"
+                );
+            }
+        }
+    }
+
+    match outcome {
+        ::autumn_harvest::audit_export::DecommissionOutcome::Retired => (
+            axum::http::StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "shard": request.shard,
+                "outcome": "retired",
+            })),
+        )
+            .into_response(),
+        ::autumn_harvest::audit_export::DecommissionOutcome::AlreadyRetired => (
+            axum::http::StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "shard": request.shard,
+                "outcome": "already_retired",
+            })),
+        )
+            .into_response(),
+        ::autumn_harvest::audit_export::DecommissionOutcome::NotConfigured => {
+            AutumnError::not_found_msg(format!(
+                "shard {} has no audit-export cursor: audit export has never run there",
+                request.shard
+            ))
+            .into_response()
+        }
+    }
+}
+
+/// `POST /admin/audit-export/reactivate` — reactivate one shard's retired
+/// audit-export cursor, resuming from the preserved sequence high-water mark
+/// (issue #1273).
+///
+/// The inverse of [`audit_export_decommission_handler`], audited the same
+/// way. Resuming export used to be an implicit side effect of the
+/// exporter's next scanner tick. That raced a concurrent decommission
+/// (issue #1273 finding 1) and left no record of who decided to resume it
+/// (finding 2). This route replaces both: `ensure_cursor_row` no longer
+/// reactivates a retired cursor under any circumstance. So this is now the
+/// only path back from `RETIRED` to live.
+#[allow(clippy::too_many_lines)] // one mutation + its bound audit write
+async fn audit_export_reactivate_handler(
+    headers: axum::http::HeaderMap,
+    Extension(api_state): Extension<HarvestApiState>,
+    Json(request): Json<AuditExportShardRequest>,
+) -> impl axum::response::IntoResponse {
+    let Ok(pool) = api_state.storage_pool() else {
+        return AutumnError::service_unavailable_msg("harvest storage pool is not configured")
+            .into_response();
+    };
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /admin/audit-export/reactivate";
+    let target_label = format!("shard={}", request.shard);
+
+    let shard_pool = pool.exact_pool_for(::autumn_harvest::types::ShardId::new(request.shard));
+
+    let outcome: Result<::autumn_harvest::audit_export::ReactivateOutcome, String> =
+        match shard_pool {
+            Some(shard_pool) => match acquire_conn(shard_pool).await {
+                Ok(mut conn) => {
+                    use diesel_async::AsyncConnection as _;
+                    let actor = actor.clone();
+                    let source = source.clone();
+                    let request_id = request_id.clone();
+                    let target_label = target_label.clone();
+                    Box::pin(conn.transaction::<
+                        ::autumn_harvest::audit_export::ReactivateOutcome,
+                        ::autumn_harvest::error::HarvestError,
+                        _,
+                    >(async |conn| {
+                        let outcome = ::autumn_harvest::audit_export::reactivate_cursor_locked(
+                            conn,
+                            request.shard,
+                            chrono::Utc::now(),
+                        )
+                        .await?;
+
+                        let (status, detail) = match &outcome {
+                            ::autumn_harvest::audit_export::ReactivateOutcome::Reactivated => {
+                                (STATUS_SUCCEEDED, None)
+                            }
+                            ::autumn_harvest::audit_export::ReactivateOutcome::AlreadyActive => {
+                                (
+                                    STATUS_SUCCEEDED,
+                                    Some("no-op: shard was already active".to_string()),
+                                )
+                            }
+                            ::autumn_harvest::audit_export::ReactivateOutcome::NotConfigured => {
+                                (
+                                    STATUS_FAILED,
+                                    Some("refused: shard has no audit-export cursor".to_string()),
+                                )
+                            }
+                        };
+                        let ar = NewAuditRecord {
+                            actor: &actor,
+                            operation: OP_AUDIT_EXPORT_REACTIVATE,
+                            target_type: TARGET_AUDIT_EXPORT,
+                            target_id: Some(target_label.as_str()),
+                            route_or_command: route,
+                            request_id: request_id.as_deref(),
+                            idempotency_key: None,
+                            status,
+                            error_summary: detail.as_deref(),
+                            shard_id: Some(request.shard),
+                            source: &source,
+                        };
+                        // Same `conn`, same transaction as the reactivation above.
+                        audit::insert_audit(conn, &ar).await?;
+                        Ok(outcome)
+                    }))
+                    .await
+                    .map_err(|e: ::autumn_harvest::error::HarvestError| e.to_string())
+                }
+                Err(e) => Err(format!("shard {}: {e}", request.shard)),
+            },
+            None => Err(format!("shard {} is not configured", request.shard)),
+        };
+
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_AUDIT_EXPORT_REACTIVATE,
+                target_type: TARGET_AUDIT_EXPORT,
+                target_id: Some(target_label.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some(error.as_str()),
+                shard_id: Some(request.shard),
+                source: &source,
+            };
+            if let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+                && let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await
+            {
+                tracing::error!(
+                    error = %audit_err,
+                    "audit insert failed for a failed audit_export.reactivate"
+                );
+            }
+            tracing::error!(error = %error, "audit_export.reactivate failed");
+            return AutumnError::service_unavailable_msg(error).into_response();
+        }
+    };
+
+    match outcome {
+        ::autumn_harvest::audit_export::ReactivateOutcome::Reactivated => (
+            axum::http::StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "shard": request.shard,
+                "outcome": "reactivated",
+            })),
+        )
+            .into_response(),
+        ::autumn_harvest::audit_export::ReactivateOutcome::AlreadyActive => (
+            axum::http::StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "shard": request.shard,
+                "outcome": "already_active",
+            })),
+        )
+            .into_response(),
+        ::autumn_harvest::audit_export::ReactivateOutcome::NotConfigured => {
+            AutumnError::not_found_msg(format!(
+                "shard {} has no audit-export cursor: audit export has never run there",
+                request.shard
+            ))
+            .into_response()
+        }
+    }
 }
 
 // ── Per-activity-type pause / resume (issue #807) ────────────────────────────
@@ -36969,6 +40585,7 @@ fn merge_activity_catalog_rows(
             let mut shard_rows = paused_by_activity.remove(name).unwrap_or_default();
             shard_rows.sort_by_key(|(shard_id, _)| *shard_id);
 
+            #[expect(clippy::expect_used, reason = "a `json!` object literal is an object")]
             let map = entry
                 .as_object_mut()
                 .expect("json! object literal is an object");
@@ -37090,6 +40707,7 @@ async fn prometheus_metrics(
         .into_response())
 }
 
+#[expect(clippy::unwrap_used, reason = "`fmt::Write` for `String` never fails")]
 fn format_prometheus_metrics(signals: &[::autumn_harvest::queue::QueueScalingSignal]) -> String {
     let mut out = String::new();
 
@@ -37167,7 +40785,7 @@ async fn get_aggregated_scaling_signals(
     let pool = api_state.storage_pool().map_err(map_error)?;
     let stale_threshold = api_state.worker_stale_threshold();
 
-    // We'll group stats by queue name in-memory
+    // Group the stats by queue name in memory.
     let mut task_stats: std::collections::HashMap<
         String,
         ::autumn_harvest::queue::QueueTaskCounts,
@@ -37378,6 +40996,180 @@ async fn health(Extension(api_state): Extension<HarvestApiState>) -> axum::respo
         .into_response()
 }
 
+/// Total budget for the readiness database checks (issue #1812).
+///
+/// One deadline covers `SELECT 1` and the shard report together. It is below
+/// the probe `timeoutSeconds` in `docs/operations/kubernetes-probes.md`, so the
+/// replica answers 503 before the kubelet stops waiting.
+const READY_DATABASE_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Lifetime of a cached readiness database result (issue #1812).
+///
+/// The probe is public. The cache limits its database work to one check per
+/// interval, whatever the request rate.
+const READY_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(1);
+
+const READY_REASON_RUNTIME_NOT_STARTED: &str = "runtime_not_started";
+const READY_REASON_DRAINING: &str = "draining";
+const READY_REASON_DATABASE_UNREACHABLE: &str = "database_unreachable";
+const READY_REASON_SHARD_NOT_READY: &str = "shard_not_ready";
+const READY_REASON_SHARD_REPORT_TIMEOUT: &str = "shard_report_timeout";
+
+#[derive(Debug, Serialize)]
+struct HarvestLiveness {
+    alive: bool,
+    draining: bool,
+}
+
+// Each bool is a wire field of the documented contract. An enum would change it.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Serialize)]
+struct HarvestReadiness {
+    ready: bool,
+    runtime_ready: bool,
+    draining: bool,
+    /// `None` when an earlier check failed and this check did not run.
+    database_reachable: Option<bool>,
+    shard_readiness_enforced: bool,
+    /// The overall verdict only. `GET /admin/shards/health` has the detail.
+    shard_readiness: Option<ShardReadiness>,
+    reasons: Vec<&'static str>,
+}
+
+/// The database part of a readiness answer. It is cached for [`READY_CACHE_TTL`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReadyDatabaseVerdict {
+    shard_readiness_enforced: bool,
+    database_reachable: bool,
+    shard_readiness: Option<ShardReadiness>,
+    reason: Option<&'static str>,
+}
+
+/// `GET /health/live` (issue #1812). It does no I/O and always returns 200.
+async fn health_live(Extension(api_state): Extension<HarvestApiState>) -> Json<HarvestLiveness> {
+    Json(HarvestLiveness {
+        alive: true,
+        draining: api_state.is_draining(),
+    })
+}
+
+/// `GET /health/ready` (issue #1812).
+///
+/// The checks run in order. A failed runtime or drain check skips the
+/// database checks, so a stopping replica does no extra I/O.
+async fn health_ready(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> axum::response::Response {
+    let shard_readiness_enforced = api_state.health_requires_shard_readiness();
+    let verdict = if api_state.runtime().is_ok() && !api_state.is_draining() {
+        Some(ready_database_verdict(&api_state, shard_readiness_enforced).await)
+    } else {
+        None
+    };
+
+    // Read the state again. A drain or a stop can start during the database await.
+    let runtime_ready = api_state.runtime().is_ok();
+    let draining = api_state.is_draining();
+    let mut reasons = Vec::new();
+    if !runtime_ready {
+        reasons.push(READY_REASON_RUNTIME_NOT_STARTED);
+    }
+    if draining {
+        reasons.push(READY_REASON_DRAINING);
+    }
+    reasons.extend(verdict.and_then(|verdict| verdict.reason));
+
+    let ready = reasons.is_empty();
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(HarvestReadiness {
+            ready,
+            runtime_ready,
+            draining,
+            database_reachable: verdict.map(|verdict| verdict.database_reachable),
+            shard_readiness_enforced,
+            shard_readiness: verdict.and_then(|verdict| verdict.shard_readiness),
+            reasons,
+        }),
+    )
+        .into_response()
+}
+
+/// Return a fresh cached verdict, or compute one.
+///
+/// The lock is held across the check. Concurrent callers wait, then read the
+/// new result, so at most one check runs at a time.
+async fn ready_database_verdict(
+    api_state: &HarvestApiState,
+    shard_readiness_enforced: bool,
+) -> ReadyDatabaseVerdict {
+    let mut cache = api_state.ready_cache.lock().await;
+    if let Some((at, verdict)) = *cache
+        && at.elapsed() < READY_CACHE_TTL
+        && verdict.shard_readiness_enforced == shard_readiness_enforced
+    {
+        return verdict;
+    }
+    let verdict = check_ready_database(api_state, shard_readiness_enforced).await;
+    *cache = Some((tokio::time::Instant::now(), verdict));
+    verdict
+}
+
+/// Run the database checks within one [`READY_DATABASE_BUDGET`].
+///
+/// The deadline covers the pool checkout too. An exhausted pool otherwise
+/// blocks the probe with no limit. Without `require_shard_readiness`, only the
+/// default shard is read. One bad non-default shard therefore does not
+/// remove every replica from the load balancer.
+async fn check_ready_database(
+    api_state: &HarvestApiState,
+    shard_readiness_enforced: bool,
+) -> ReadyDatabaseVerdict {
+    let deadline = tokio::time::Instant::now() + READY_DATABASE_BUDGET;
+    let mut verdict = ReadyDatabaseVerdict {
+        shard_readiness_enforced,
+        database_reachable: false,
+        shard_readiness: None,
+        reason: Some(READY_REASON_DATABASE_UNREACHABLE),
+    };
+    let Ok(pool) = api_state.storage_pool() else {
+        return verdict;
+    };
+    let select_one = async {
+        let mut conn = autumn_harvest::replication::fenced_checkout(pool.default_pool())
+            .await
+            .ok()?;
+        diesel::sql_query("SELECT 1").execute(&mut conn).await.ok()
+    };
+    if !matches!(
+        tokio::time::timeout_at(deadline, select_one).await,
+        Ok(Some(_))
+    ) {
+        return verdict;
+    }
+    verdict.database_reachable = true;
+    verdict.reason = None;
+    if shard_readiness_enforced {
+        let report =
+            tokio::time::timeout_at(deadline, build_shard_health_report(api_state, None)).await;
+        match report {
+            Ok(report) => {
+                verdict.shard_readiness = Some(report.overall_readiness);
+                if report.overall_readiness != ShardReadiness::Ready {
+                    verdict.reason = Some(READY_REASON_SHARD_NOT_READY);
+                }
+            }
+            Err(_) => verdict.reason = Some(READY_REASON_SHARD_REPORT_TIMEOUT),
+        }
+    }
+    verdict
+}
+
 pub(crate) async fn load_execution(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -37392,24 +41184,165 @@ pub(crate) async fn load_execution(
         .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))
 }
 
-pub(crate) type PoolConn = deadpool::managed::Object<
-    diesel_async::pooled_connection::AsyncDieselConnectionManager<diesel_async::AsyncPgConnection>,
->;
+/// A handler's connection (issue #1823). Under [`run_dr_fenced`], a lost
+/// guard ends its backend, so a statement it sent cannot commit after a bump.
+pub(crate) type PoolConn = autumn_harvest::replication::FencedConn;
 
 fn map_pool_error(error: &impl ToString) -> AutumnError {
     AutumnError::service_unavailable_msg(error.to_string())
 }
 
+/// Check out a connection for a handler (issue #1823). Under
+/// [`run_dr_fenced`], the wait stays below a bump's lock timeout, and a
+/// failed checkout drops the request's fence guards. See
+/// [`autumn_harvest::replication::fenced_checkout`].
 pub(crate) async fn acquire_conn(pool: &DbPool) -> Result<PoolConn, AutumnError> {
-    pool.get().await.map_err(|error| map_pool_error(&error))
+    autumn_harvest::replication::fenced_checkout(pool)
+        .await
+        .map_err(|error| map_pool_error(&error))
 }
 
+/// Resolve a connection to the shard that currently hosts `exec_id`.
+///
+/// Routes through `shard_rebalance::conn_for_execution_forwarded` (issue #964)
+/// so an execution an operator has rebalanced onto another shard is still found
+/// by the `ExecutionId` a caller captured before the move — the identity
+/// contract that makes shard rebalancing safe is *"any id captured before the
+/// migration continues to resolve after it"*, and this is the chokepoint the
+/// ~40 single-execution management routes reach it through.
+///
+/// A single-shard deployment pays nothing: with one pool there is nowhere to
+/// migrate to, so the forwarding probe is skipped and this is byte-for-byte the
+/// pre-#964 `pool_for_execution` checkout. A multi-shard deployment pays one
+/// primary-key lookup against a partial index that is empty until an operator
+/// rebalances.
 pub(crate) async fn db_conn_for_execution(
     api_state: &HarvestApiState,
     exec_id: ExecutionId,
 ) -> Result<PoolConn, AutumnError> {
     let pool = api_state.storage_pool().map_err(map_error)?;
-    acquire_conn(pool.pool_for_execution(exec_id)).await
+    ::autumn_harvest::shard_rebalance::conn_for_execution_forwarded(pool.sharded_pool(), exec_id)
+        .await
+        .map_err(|error| map_pool_error(&error))
+}
+
+/// [`db_conn_for_execution`], also returning the shard the connection was
+/// checked out from (issue #1317 review).
+///
+/// A caller that needs both a connection AND the shard to attribute it to
+/// must use this. This is for audit logging on a path with no row already
+/// loaded, say. It must not follow up with a separate
+/// [`resolve_shard_best_effort`] call. A second resolution checks out its
+/// own connection, which can deadlock a pool-size-one shard against the
+/// one already held here.
+pub(crate) async fn db_conn_for_execution_with_shard(
+    api_state: &HarvestApiState,
+    exec_id: ExecutionId,
+) -> Result<(PoolConn, ShardId), AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    ::autumn_harvest::shard_rebalance::conn_for_execution_forwarded_with_shard(
+        pool.sharded_pool(),
+        exec_id,
+    )
+    .await
+    .map_err(|error| map_pool_error(&error))
+}
+
+/// The shard `exec_id` currently lives on (issue #1317) — `None` on any
+/// resolution failure. This is for a caller with no row or live connection
+/// in hand to read `shard_id` off of directly. It is the only way to get
+/// the execution's actual residence, instead of its `ExecutionId`'s origin
+/// shard bits. Used for best-effort audit attribution (mirroring
+/// [`audit_decoded_read`]'s own fail-open shape). Also used, where
+/// establishing a LISTEN connection cannot wait for an existence check,
+/// for resolving which database to listen against.
+pub(crate) async fn resolve_shard_best_effort(
+    api_state: &HarvestApiState,
+    exec_id: ExecutionId,
+) -> Option<ShardId> {
+    let pool = api_state.storage_pool().ok()?;
+    ::autumn_harvest::shard_rebalance::resolve_execution_shard(pool.sharded_pool(), exec_id)
+        .await
+        .ok()
+}
+
+/// Whether `error` is the request's shard fence refusing a checkout
+/// (issue #1803). The match is on the variant, never on the message text.
+const fn left_shard_fence(error: &HarvestError) -> bool {
+    matches!(error, HarvestError::OutsideShardFence { .. })
+}
+
+/// The outcome of a checkout an SSE producer makes on a run's live shard
+/// (issue #1803).
+///
+/// The producers run under the request's shard fence. A cutover after the
+/// stream opened moves the run to a shard the policy never saw. The fence
+/// then refuses every checkout there. The producer must not keep waiting on
+/// the old shard. The keepalive pings would hold the connection open, and
+/// the client would never reconnect. So a fenced miss ends the stream with
+/// an `error` frame. The reconnect is authorized against the live shard.
+enum FencedCheckout<T> {
+    /// The checkout succeeded.
+    Ready(T),
+    /// A transient failure. The producer keeps its listener and retries on
+    /// the next tick, as it did before the fence existed.
+    Retry,
+    /// The run left the request's shard fence. The producer ends the stream.
+    LeftFence,
+}
+
+impl<T> FencedCheckout<T> {
+    /// Sort an engine result into the three outcomes.
+    fn from_result(result: HarvestResult<T>) -> Self {
+        match result {
+            Ok(value) => Self::Ready(value),
+            Err(error) if left_shard_fence(&error) => Self::LeftFence,
+            Err(_) => Self::Retry,
+        }
+    }
+}
+
+/// [`db_conn_for_execution`] for an SSE producer. It keeps the engine error,
+/// so a fenced miss is told apart from a transient failure by its variant.
+async fn stream_conn_for_execution(
+    api_state: &HarvestApiState,
+    exec_id: ExecutionId,
+) -> FencedCheckout<PoolConn> {
+    let Ok(pool) = api_state.storage_pool() else {
+        return FencedCheckout::Retry;
+    };
+    FencedCheckout::from_result(
+        ::autumn_harvest::shard_rebalance::conn_for_execution_forwarded(
+            pool.sharded_pool(),
+            exec_id,
+        )
+        .await,
+    )
+}
+
+/// The shard `exec_id` lives on now, for an SSE producer's listener rebind.
+/// The walk follows the forwarding pointer with a checkout on each hop, so
+/// a run that moved outside the fence is caught here first.
+async fn stream_live_shard(
+    api_state: &HarvestApiState,
+    exec_id: ExecutionId,
+) -> FencedCheckout<ShardId> {
+    let Ok(pool) = api_state.storage_pool() else {
+        return FencedCheckout::Retry;
+    };
+    FencedCheckout::from_result(
+        ::autumn_harvest::shard_rebalance::resolve_execution_shard(pool.sharded_pool(), exec_id)
+            .await,
+    )
+}
+
+/// The final frame of a stream whose run left the request's shard fence
+/// (issue #1803). `retry` tells the client to reconnect. The reconnect is
+/// authorized against the live shard.
+fn shard_fence_error_event() -> axum::response::sse::Event {
+    axum::response::sse::Event::default()
+        .event("error")
+        .data(serde_json::json!({ "error": "outside_shard_fence", "retry": true }).to_string())
 }
 
 /// Resolve a connection to the shard that *owns* `exec_id`, with **no default
@@ -37442,7 +41375,19 @@ pub(crate) async fn db_conn_for_execution_exact(
 ) -> Result<Option<PoolConn>, AutumnError> {
     let pool = api_state.storage_pool().map_err(map_error)?;
     if let Some(shard_pool) = pool.sharded_pool().exact_pool_for_execution(exec_id) {
-        return acquire_conn(shard_pool).await.map(Some);
+        // Issue #964: the origin shard is reachable, but the run may have been
+        // rebalanced off it. Follow the durable forwarding pointer, preserving
+        // this helper's exact/no-default contract — without it `/tree`, `/logs`
+        // and `PATCH /triage` read (and, for triage, WRITE) the sealed source
+        // instead of the live copy, and report success for doing so.
+        let _ = shard_pool;
+        return ::autumn_harvest::shard_rebalance::conn_for_execution_forwarded(
+            pool.sharded_pool(),
+            exec_id,
+        )
+        .await
+        .map(Some)
+        .map_err(|error| map_pool_error(&error));
     }
     let shard = exec_id.shard().as_i32();
     let pools = crate::shard_fanout::pools_by_shard(api_state);
@@ -37773,7 +41718,38 @@ pub(crate) async fn load_workflows(
         };
     }
 
-    if !filters.states.is_empty() {
+    if filters.states.is_empty() {
+        // Issue #964: a completed migration leaves TWO rows carrying the same
+        // `id` and the same copied `created_at` — `MIGRATED` on the source and
+        // the live `RUNNING` copy on the target — and this listing fans out
+        // across every shard. Returning both would show one logical execution
+        // twice, and worse: the keyset cursor is derived from `(created_at, id)`,
+        // which is byte-identical for the two copies, so a page boundary landing
+        // between them makes the strict next-page predicate skip the other one
+        // permanently — possibly leaving only the stale `MIGRATED` state visible.
+        //
+        // The sealed source is a forwarding tombstone, not a workflow, so the
+        // DEFAULT listing collapses residences to the live row by excluding it.
+        // An explicit `state=MIGRATED` filter still returns it: the diagnostic
+        // view an operator needs mid-decommission is deliberately preserved,
+        // and that branch cannot double-count because it excludes the live copy
+        // by the same predicate.
+        //
+        // `MIGRATING` has the identical hazard during the staging window
+        // (issue #1317). The source still holds the live `RUNNING`/`PAUSED`
+        // row, while the target holds a staged `MIGRATING` copy with the
+        // same `id` and `created_at`. It is NOT excluded here, unlike
+        // `MIGRATED` (review). If the process crashes between
+        // `commit_cutover` and `activate_target`, the source is already
+        // `MIGRATED` and excluded, leaving the `MIGRATING` target as the
+        // SOLE copy. Excluding it too would make the execution invisible
+        // for as long as that repairable window lasts. The staging-window
+        // duplicate this would otherwise double-count is instead collapsed
+        // post-merge, in `build_workflow_fanout_page`. It can tell a real
+        // duplicate (a live counterpart is also in the page) from an
+        // orphaned sole copy (it is not).
+        query = query.filter(harvest_workflow_executions::state.ne("MIGRATED"));
+    } else {
         query = query.filter(harvest_workflow_executions::state.eq_any(filters.states.clone()));
     }
     if let Some(name) = &filters.workflow_name {
@@ -38050,6 +42026,7 @@ pub(crate) async fn load_workflows_from_shards(
         observations,
         filters.order,
         filters.limit,
+        filters.states.is_empty(),
     ))
 }
 
@@ -38066,6 +42043,28 @@ pub(crate) struct WorkflowFanoutPage {
     pub(crate) unavailable_shards: Vec<UnavailableShard>,
 }
 
+/// Collapse a staging-window migration's source/target pair to the live row
+/// (issue #1317 review).
+///
+/// `load_workflows`'s default-listing predicate excludes `MIGRATED` but not
+/// `MIGRATING`. A mid-migration execution can therefore appear twice in
+/// this merged page. It shows once as the source's live `RUNNING`/`PAUSED`
+/// row, once as the target's staged `MIGRATING` copy, both sharing the
+/// same `id`. Drop the `MIGRATING` one, but ONLY when its live counterpart
+/// is also present in this page. A `MIGRATING` row with no such
+/// counterpart is the SOLE surviving copy. The source has already sealed
+/// to `MIGRATED` and was excluded upstream. It must stay visible.
+fn dedupe_staging_migration_pairs(rows: Vec<WorkflowExecution>) -> Vec<WorkflowExecution> {
+    let live_ids: std::collections::HashSet<uuid::Uuid> = rows
+        .iter()
+        .filter(|row| row.state != "MIGRATING")
+        .map(|row| row.id)
+        .collect();
+    rows.into_iter()
+        .filter(|row| row.state != "MIGRATING" || !live_ids.contains(&row.id))
+        .collect()
+}
+
 /// Merge, sort, and paginate per-shard workflow observations (pure, no DB).
 ///
 /// Ordering, keyset cursor, and truncation are applied over the union of
@@ -38077,12 +42076,17 @@ pub(crate) fn build_workflow_fanout_page(
     observations: Vec<ShardObservation<WorkflowExecution>>,
     order: WorkflowSortOrder,
     limit_raw: i64,
+    dedupe_staging_pairs: bool,
 ) -> WorkflowFanoutPage {
     let FanoutRows {
         mut rows,
         status,
         unavailable_shards,
     } = collect_fanout_rows(observations);
+
+    if dedupe_staging_pairs {
+        rows = dedupe_staging_migration_pairs(rows);
+    }
 
     // Sort by the requested direction; tie-break on id for total ordering.
     match order {
@@ -39532,7 +43536,7 @@ impl<'a, I: Iterator<Item = &'a str>> DedupCountSorted<'a> for I {
 ///
 /// The distinction is load-bearing for the gate. `pool.iter_shards()` yields
 /// only shards wired up in *this* process, but during a shard-add rollout the
-/// router's `readable_shards` is widened first (see the workspace CLAUDE.md
+/// router's `readable_shards` is widened first (see `docs/architecture.md`
 /// "add a shard" procedure), so a shard can be routable — and already holding
 /// in-flight executions — while this node has no pool for it. Enumerating only
 /// the pools would omit that shard *silently*: it would appear in neither
@@ -40233,6 +44237,56 @@ async fn resolve_stream_end_reason(
     stream_end_reason(state.as_deref(), event_derived)
 }
 
+/// Map a `stream-end` `reason` back to its raw execution-state form.
+///
+/// Reverses `stream_end_reason`'s lowercase-hyphen mapping, e.g.
+/// `"timed-out"` becomes `"TIMED_OUT"`. The result matches
+/// `harvest_workflow_executions.state` exactly (issue #1458).
+fn stream_end_state(reason: &str) -> String {
+    reason.to_uppercase().replace('-', "_")
+}
+
+/// Build the `stream-end` terminal-marker JSON payload.
+///
+/// Adds `execution_id` and `state` alongside `reason`, per
+/// `docs/management-api.md`'s "Terminal marker" section (issue #1458).
+fn stream_end_payload(exec_id: ExecutionId, reason: &str) -> String {
+    serde_json::json!({
+        "reason": reason,
+        "execution_id": exec_id.to_string(),
+        "state": stream_end_state(reason),
+    })
+    .to_string()
+}
+
+/// Send the terminal `stream-end` frame: one call site for all four places
+/// that detect a terminal execution (issue #1458). A single call site keeps
+/// the `id:`/`execution_id`/`state` fields from drifting out of sync again.
+async fn send_stream_end(
+    api: &HarvestApiState,
+    exec_id: ExecutionId,
+    tx: &mut futures::channel::mpsc::Sender<
+        Result<axum::response::sse::Event, std::convert::Infallible>,
+    >,
+    // `event_id`, not `harvest_events.id` (issue #1405): the cursor a
+    // reconnecting client's `Last-Event-ID` must carry, stable across a
+    // shard migration. `None` when no event was ever observed for this
+    // stream (mirrors the pre-#1405 `-1` sentinel's "nothing to report").
+    last_event_id: Option<i32>,
+    event_derived_state: &str,
+) {
+    use futures::SinkExt as _;
+
+    let reason = resolve_stream_end_reason(api, exec_id, event_derived_state).await;
+    let end_data = stream_end_payload(exec_id, &reason);
+    let _ = tx
+        .send(Ok(axum::response::sse::Event::default()
+            .id(last_event_id.map_or_else(String::new, |id| id.to_string()))
+            .event("stream-end")
+            .data(end_data)))
+        .await;
+}
+
 #[cfg(test)]
 mod stream_end_reason_tests {
     use super::stream_end_reason;
@@ -40281,6 +44335,31 @@ mod stream_end_reason_tests {
     }
 }
 
+#[cfg(test)]
+mod stream_end_payload_tests {
+    use super::{ExecutionId, stream_end_payload, stream_end_state};
+
+    #[test]
+    fn state_reverses_the_reason_mapping() {
+        assert_eq!(stream_end_state("completed"), "COMPLETED");
+        assert_eq!(stream_end_state("failed"), "FAILED");
+        assert_eq!(stream_end_state("cancelled"), "CANCELLED");
+        assert_eq!(stream_end_state("timed-out"), "TIMED_OUT");
+        assert_eq!(stream_end_state("terminated"), "TERMINATED");
+        assert_eq!(stream_end_state("continued-as-new"), "CONTINUED_AS_NEW");
+    }
+
+    #[test]
+    fn payload_carries_reason_execution_id_and_state() {
+        let exec_id = ExecutionId::new();
+        let payload = stream_end_payload(exec_id, "timed-out");
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(value["reason"], "timed-out");
+        assert_eq!(value["execution_id"], exec_id.to_string());
+        assert_eq!(value["state"], "TIMED_OUT");
+    }
+}
+
 /// `GET /executions/{exec_id}/events/stream`
 ///
 /// Returns a `text/event-stream` response that tails every `WorkflowEvent`
@@ -40290,14 +44369,17 @@ mod stream_end_reason_tests {
 ///
 /// SSE wire format:
 /// ```text
-/// id: <harvest_events.id BIGSERIAL>
+/// id: <harvest_events.event_id, per-execution monotonic>
 /// event: <WorkflowEvent::type_name()>
 /// data: <JSON event value>
 ///
 /// ```
 ///
-/// Resume: send `Last-Event-ID: <id>` to replay events with `id > n` before
-/// switching to live-tail mode.
+/// Resume: send `Last-Event-ID: <event_id>` to replay events after it before
+/// switching to live-tail mode. The cursor is `event_id` (issue #1405), not
+/// the shard-local `harvest_events.id`. A shard-rebalance migration copies
+/// `event_id` byte-for-byte but never `id`. A cursor keyed on `id` means
+/// nothing once the execution has moved shards.
 ///
 /// Keepalive: `: ping\n\n` comments every `sse_keepalive_interval` (default 15 s).
 ///
@@ -40335,28 +44417,76 @@ async fn stream_execution_events(
     // both the backfill and live loops build frames through sse_frame_data.
     let decoder = read_path_decoder(&api_state, session).await;
 
-    // Extract Last-Event-ID for resume (harvest_events.id BIGSERIAL cursor).
-    // An absent header means "start from the beginning" (cursor = -1).
-    // A present but non-parseable value is a client error → 400.
-    let last_row_id: i64 = match headers.get("last-event-id").and_then(|v| v.to_str().ok()) {
-        None => -1,
-        Some(s) => match s.parse::<i64>() {
-            Ok(n) => n,
-            Err(_) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": "invalid_last_event_id",
-                        "message": "Last-Event-ID must be a valid i64"
-                    })),
-                )
-                    .into_response();
-            }
+    // Extract Last-Event-ID for resume. The wire cursor is `event_id`
+    // (issue #1405). This is the per-execution monotonic value. A shard
+    // migration carries it byte-for-byte. The cursor is NOT
+    // `harvest_events.id`, a shard-local BIGSERIAL. A migration deliberately
+    // does not copy that column. An absent header means "start from the
+    // beginning". A present but non-parseable value is a client error → 400.
+    //
+    // Known rolling-deployment edge case: a client holding an OLD, row-id
+    // cursor from before this change parses fine here. Both are plain
+    // integers, so it is silently read as an event_id. Usually no event_id
+    // matches, so the client gets one full replay and self-heals from
+    // there. On a low-traffic shard the stale number can coincidentally
+    // match a real event_id, giving a wrong-but-bounded backfill instead.
+    // One reconnect during a rollout; every later one is correct.
+    let last_event_id: Option<i32> =
+        match headers.get("last-event-id").and_then(|v| v.to_str().ok()) {
+            None => None,
+            Some(s) => match s.parse::<i32>() {
+                Ok(n) => Some(n),
+                Err(_) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": "invalid_last_event_id",
+                            "message": "Last-Event-ID must be a valid i32"
+                        })),
+                    )
+                        .into_response();
+                }
+            },
+        };
+
+    // Get a pooled connection and verify the execution exists BEFORE
+    // resolving the LISTEN/NOTIFY URL. `execution.shard_id` is this row's
+    // actual residence, not its id's origin shard (issue #1317). Reusing
+    // `exec_id.shard()` here would open the LISTEN connection against a
+    // rebalanced execution's origin instead of the live shard `conn` below
+    // resolves to. Every subsequent notification would be missed.
+    let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    let execution = match load_execution(&mut conn, exec_id).await {
+        Ok(e) => e,
+        Err(e) => return map_error(e).into_response(),
+    };
+    let shard = ShardId::new(execution.shard_id);
+
+    // Translate the wire cursor to a `harvest_events.id` on `conn`'s shard
+    // (issue #1405). A cursor from BEFORE a migration names an `event_id`.
+    // That event may now live on a different shard than it did when the
+    // client last saw it. Only this connection's own `id` sequence is
+    // meaningful to the backfill query below. Falls open to -1 (from the
+    // start, bounded by the buffer-depth cap below) when no cursor was
+    // sent. It also falls open on `Ok(None)`, when the cursor names no
+    // event on this shard.
+    //
+    // A real `Err` is a different case (Codex review, P2): the connection
+    // is still usable but the lookup itself failed. The response has not
+    // started yet at this point, so return the database error instead of
+    // masking it as "no cursor". Silently falling open here would resend
+    // the client its full history, not merely miss a resume optimization.
+    let last_row_id: i64 = match last_event_id {
+        Some(event_id) => match store::row_id_for_event_id(&mut conn, exec_id, event_id).await {
+            Ok(row_id) => row_id.unwrap_or(-1),
+            Err(e) => return map_error(e).into_response(),
         },
+        None => -1,
     };
 
-    // Resolve the LISTEN/NOTIFY database URL for this execution's shard
-    let shard = exec_id.shard();
     // NOTE: a not-configured URL here is `HarvestError::Config` → 400 via
     // `map_error`. That latent misclassification (server misconfig should be
     // 503) is a pre-existing #324 behavior and out of scope for #791 — the
@@ -40370,18 +44500,6 @@ async fn stream_execution_events(
     // race where new events are committed between the query and LISTEN setup
     let listener = match WorkflowEventListener::connect(&notification_url).await {
         Ok(l) => l,
-        Err(e) => return map_error(e).into_response(),
-    };
-
-    // Get a pooled connection for the initial verification and backfill
-    let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
-        Ok(c) => c,
-        Err(e) => return e.into_response(),
-    };
-
-    // Verify the execution exists
-    let execution = match load_execution(&mut conn, exec_id).await {
-        Ok(e) => e,
         Err(e) => return map_error(e).into_response(),
     };
 
@@ -40403,7 +44521,7 @@ async fn stream_execution_events(
 
     // Slow-consumer check: if reconnecting client is too far behind, return 409
     if backfill.len() > buffer_depth {
-        let drop_id = backfill.last().map_or(last_row_id, |r| r.id);
+        let drop_id = backfill.last().map_or(last_event_id, |r| Some(r.event_id));
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
@@ -40472,8 +44590,15 @@ async fn stream_execution_events(
     let keepalive_interval = api_state.sse_keepalive_interval();
     let api_clone = api_state.clone();
 
+    // The producer re-resolves the run on every poll. It runs under the
+    // request's shard fence, so a cutover mid-stream cannot lead it onto a
+    // shard the authorizer never saw (issue #1803). A fenced miss ends the
+    // stream with an `error` frame, so the client reconnects and the
+    // reconnect is authorized against the live shard. See `FencedCheckout`.
+    let fence = ::autumn_harvest::shard_fence::current();
+
     // Producer task: runs independently of the HTTP handler after we return
-    tokio::spawn(async move {
+    tokio::spawn(::autumn_harvest::shard_fence::scoped(fence, async move {
         use autumn_harvest::audit::OP_EXECUTION_STREAM_CLOSE;
 
         // Frames are built by sse_frame_data: the inner payload of the
@@ -40482,32 +44607,43 @@ async fn stream_execution_events(
         // read-path payload decoding is active (issue #608).
 
         // Helper: flush a slice of DB rows into the SSE channel.
-        // Returns the last `row.id` seen and the first terminal state name found,
-        // or breaks early if the channel is full / dropped.
+        // Returns the last `row.id`/`row.event_id` actually SENT and the
+        // first terminal state name found, or breaks early if the channel
+        // is full / dropped. `cur_last_seen_event_id` tracks in step with
+        // `cur_last_seen`. Both update only after a row is sent. A
+        // caller-side `rows.last()` read (Codex review) would report a row
+        // this call never sent, when `try_send` fails partway through.
+        // That would hand a reconnecting client a cursor past events it
+        // never received.
         // Using a macro-style closure here because closures can't easily `break 'notify`.
-        // We use a boolean return: (last_id, terminal_state, should_break).
+        // We use a boolean return: (last_id, last_event_id, terminal_state, should_break).
         let send_rows =
             |rows: &[autumn_harvest::models::HarvestEvent],
              mut cur_last_seen: i64,
+             mut cur_last_seen_event_id: Option<i32>,
              tx: &mut futures::channel::mpsc::Sender<Result<Event, std::convert::Infallible>>|
-             -> (i64, Option<&'static str>, bool) {
+             -> (i64, Option<i32>, Option<&'static str>, bool) {
                 let mut found_terminal: Option<&'static str> = None;
                 for row in rows {
                     let sse_event = Event::default()
-                        .id(row.id.to_string())
+                        // `event_id`, not the shard-local `id` (issue #1405):
+                        // this is what a client reconnecting with
+                        // `Last-Event-ID` after a migration must send back.
+                        .id(row.event_id.to_string())
                         .event(row.event_type.as_str())
                         .data(sse_frame_data(&row.event_data, decoder.as_ref()));
                     if tx.try_send(Ok(sse_event)).is_err() {
-                        return (cur_last_seen, None, true);
+                        return (cur_last_seen, cur_last_seen_event_id, None, true);
                     }
                     cur_last_seen = row.id;
+                    cur_last_seen_event_id = Some(row.event_id);
                     if is_terminal_event_type(&row.event_type) {
                         found_terminal = Some(terminal_event_type_to_state(&row.event_type));
                     } else if row.event_type == "WorkflowRedriven" {
                         found_terminal = None;
                     }
                 }
-                (cur_last_seen, found_terminal, false)
+                (cur_last_seen, cur_last_seen_event_id, found_terminal, false)
             };
 
         // ── 1. Send backfill events (events already committed before this request) ──
@@ -40516,7 +44652,9 @@ async fn stream_execution_events(
         let mut backfill_terminal: Option<&'static str> = None;
         for row in &backfill {
             let sse_event = Event::default()
-                .id(row.id.to_string())
+                // `event_id`, not the shard-local `id` (issue #1405): see
+                // `send_rows` above.
+                .id(row.event_id.to_string())
                 .event(row.event_type.as_str())
                 .data(sse_frame_data(&row.event_data, decoder.as_ref()));
             if tx.send(Ok(sse_event)).await.is_err() {
@@ -40557,19 +44695,112 @@ async fn stream_execution_events(
             } else {
                 None
             });
+        // Tracks the shard the close-audit below should attribute to
+        // (issue #1596 review, P2). Starts at the connect-time shard, and
+        // the live-tail loop below updates it on each rebind. Declared
+        // here so it still reads the right shard after that loop exits.
+        let mut listener_shard = shard;
         if let Some(state) = effective_terminal {
-            let reason = resolve_stream_end_reason(&api_clone, exec_id, state).await;
-            let end_data = serde_json::json!({"reason": reason}).to_string();
-            let _ = tx
-                .send(Ok(Event::default().event("stream-end").data(end_data)))
-                .await;
+            // Falls back to the client's own translated cursor, not `None`,
+            // when backfill was empty (issue #1405). An empty backfill means
+            // nothing NEW was found. It does not mean no event_id is known.
+            // This mirrors the same fallback below.
+            let last_event_id_seen = backfill.last().map(|r| r.event_id).or(last_event_id);
+            send_stream_end(&api_clone, exec_id, &mut tx, last_event_id_seen, state).await;
         } else {
             // ── 3. Live-tail: LISTEN/NOTIFY loop ─────────────────────────────
             let mut last_seen_id = backfill.last().map_or(last_row_id, |r| r.id);
+            // The stable per-execution twin of `last_seen_id` (fresh
+            // review, P1 follow-up): kept in step with it below, purely so
+            // the shard-rebind block can translate the cursor. See
+            // `store::row_id_for_event_id`.
+            //
+            // Falls back to the client's own translated cursor, not `None`,
+            // when backfill was empty (issue #1405). An empty backfill means
+            // the cursor was already caught up. It does not mean no
+            // event_id is known. `None` here would reset a migration that
+            // lands mid-stream with zero new events to -1 (from the start)
+            // on its next rebind. That would replay the whole history.
+            let mut last_seen_event_id: Option<i32> =
+                backfill.last().map(|r| r.event_id).or(last_event_id);
             let mut listener = listener;
             let buf_limit = i64::try_from(api_clone.sse_buffer_depth()).ok();
 
             'notify: loop {
+                // Shard-residence rebind (issue #1317 review, P2 follow-up).
+                // The listener stays bound to whichever shard it resolved
+                // at connect time. If the execution migrates mid-stream,
+                // that connection stays healthy -- no `ChannelClosed` -- so
+                // nothing wakes it again on its own. The periodic
+                // `TimedOut` poll below still finds new rows, because its
+                // own DB read follows the forwarding pointer fresh every
+                // time. Only the listener itself stays pinned to the stale
+                // shard. Without this rebind the stream would silently
+                // degrade from event-driven to poll-only delivery for the
+                // rest of its life once a migration happens.
+                //
+                // A fenced miss ends the stream (issue #1803). The run moved
+                // to a shard the policy never saw.
+                let current_shard = match stream_live_shard(&api_clone, exec_id).await {
+                    FencedCheckout::Ready(shard) => Some(shard),
+                    FencedCheckout::Retry => None,
+                    FencedCheckout::LeftFence => {
+                        let _ = tx.send(Ok(shard_fence_error_event())).await;
+                        break 'notify;
+                    }
+                };
+                if let Some(current_shard) = current_shard
+                    && current_shard != listener_shard
+                    && let Ok(url) = api_clone.sse_notification_url(current_shard)
+                    && let Ok(l) = WorkflowEventListener::connect(&url).await
+                {
+                    // Translate the resume cursor to the shard being
+                    // rebound to (fresh review, P1 follow-up).
+                    // `last_seen_id` is `harvest_events.id`, local to
+                    // whichever database currently holds it. The NEW
+                    // shard has its own, unrelated `id` sequence.
+                    // Comparing directly via `id > last_seen_id` could
+                    // silently drop every later event (target ids lower)
+                    // or replay copied history as duplicates (target ids
+                    // higher).
+                    //
+                    // Reset to the documented `-1` fallback (resume from
+                    // the start, bounded by `buf_limit`) whenever
+                    // translation cannot complete for any reason (fresh
+                    // review, P1 follow-up). A resumed stream with an
+                    // empty backfill has no `last_seen_event_id` yet. A
+                    // transient checkout or query failure leaves the
+                    // lookup unresolved too. Either way, leaving the OLD
+                    // shard's cursor in place would compare it against
+                    // the new shard's own `id` sequence. That is the
+                    // exact bug this translation exists to prevent.
+                    last_seen_id = match last_seen_event_id {
+                        Some(event_id) => {
+                            match stream_conn_for_execution(&api_clone, exec_id).await {
+                                FencedCheckout::Ready(mut target_conn) => {
+                                    ::autumn_harvest::store::row_id_for_event_id(
+                                        &mut target_conn,
+                                        exec_id,
+                                        event_id,
+                                    )
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or(-1)
+                                }
+                                FencedCheckout::LeftFence => {
+                                    let _ = tx.send(Ok(shard_fence_error_event())).await;
+                                    break 'notify;
+                                }
+                                FencedCheckout::Retry => -1,
+                            }
+                        }
+                        None => -1,
+                    };
+                    listener = l;
+                    listener_shard = current_shard;
+                }
+
                 // Use 2× keepalive as notification timeout so the KeepAlive wrapper
                 // has time to send its ping before this loop wakes and re-checks
                 let wait_timeout = keepalive_interval.saturating_mul(2);
@@ -40583,8 +44814,8 @@ async fn stream_execution_events(
 
                         // Load new events from the pool — capped to buffer_depth so
                         // rapid bursts between notifications stay bounded in memory.
-                        let new_rows = match db_conn_for_execution(&api_clone, exec_id).await {
-                            Ok(mut conn) => {
+                        let new_rows = match stream_conn_for_execution(&api_clone, exec_id).await {
+                            FencedCheckout::Ready(mut conn) => {
                                 match store::load_events_after_row_id(
                                     &mut conn,
                                     exec_id,
@@ -40600,17 +44831,23 @@ async fn stream_execution_events(
                                     Err(_) => continue,
                                 }
                             }
-                            Err(_) => continue,
+                            // The run left the fence (issue #1803): end the stream.
+                            FencedCheckout::LeftFence => {
+                                let _ = tx.send(Ok(shard_fence_error_event())).await;
+                                break 'notify;
+                            }
+                            FencedCheckout::Retry => continue,
                         };
 
-                        let (new_id, terminal_state, should_break) =
-                            send_rows(&new_rows, last_seen_id, &mut tx);
+                        let (new_id, new_event_id, terminal_state, should_break) =
+                            send_rows(&new_rows, last_seen_id, last_seen_event_id, &mut tx);
                         last_seen_id = new_id;
+                        last_seen_event_id = new_event_id;
 
                         if should_break {
                             let err_data = serde_json::json!({
                                 "error": "slow_consumer",
-                                "drop_after_event_id": last_seen_id,
+                                "drop_after_event_id": last_seen_event_id,
                             })
                             .to_string();
                             let _ = tx.try_send(Ok(Event::default()
@@ -40620,12 +44857,14 @@ async fn stream_execution_events(
                         }
 
                         if let Some(state) = terminal_state {
-                            let reason =
-                                resolve_stream_end_reason(&api_clone, exec_id, state).await;
-                            let end_data = serde_json::json!({"reason": reason}).to_string();
-                            let _ = tx
-                                .send(Ok(Event::default().event("stream-end").data(end_data)))
-                                .await;
+                            send_stream_end(
+                                &api_clone,
+                                exec_id,
+                                &mut tx,
+                                last_seen_event_id,
+                                state,
+                            )
+                            .await;
                             break 'notify;
                         }
                     }
@@ -40637,8 +44876,14 @@ async fn stream_execution_events(
                         }
                         // Periodic safety-net poll: catch any events missed due to a
                         // prior DB failure on a notification (e.g. terminal event).
-                        let Ok(mut conn) = db_conn_for_execution(&api_clone, exec_id).await else {
-                            continue 'notify;
+                        // A run that left the fence ends the stream (issue #1803).
+                        let mut conn = match stream_conn_for_execution(&api_clone, exec_id).await {
+                            FencedCheckout::Ready(conn) => conn,
+                            FencedCheckout::LeftFence => {
+                                let _ = tx.send(Ok(shard_fence_error_event())).await;
+                                break 'notify;
+                            }
+                            FencedCheckout::Retry => continue 'notify,
                         };
                         let Ok(missed) = store::load_events_after_row_id(
                             &mut conn,
@@ -40650,13 +44895,14 @@ async fn stream_execution_events(
                         else {
                             continue 'notify;
                         };
-                        let (new_id, terminal_state, should_break) =
-                            send_rows(&missed, last_seen_id, &mut tx);
+                        let (new_id, new_event_id, terminal_state, should_break) =
+                            send_rows(&missed, last_seen_id, last_seen_event_id, &mut tx);
                         last_seen_id = new_id;
+                        last_seen_event_id = new_event_id;
                         if should_break {
                             let err_data = serde_json::json!({
                                 "error": "slow_consumer",
-                                "drop_after_event_id": last_seen_id,
+                                "drop_after_event_id": last_seen_event_id,
                             })
                             .to_string();
                             let _ = tx.try_send(Ok(Event::default()
@@ -40665,25 +44911,42 @@ async fn stream_execution_events(
                             break 'notify;
                         }
                         if let Some(state) = terminal_state {
-                            let reason =
-                                resolve_stream_end_reason(&api_clone, exec_id, state).await;
-                            let end_data = serde_json::json!({"reason": reason}).to_string();
-                            let _ = tx
-                                .send(Ok(Event::default().event("stream-end").data(end_data)))
-                                .await;
+                            send_stream_end(
+                                &api_clone,
+                                exec_id,
+                                &mut tx,
+                                last_seen_event_id,
+                                state,
+                            )
+                            .await;
                             break 'notify;
                         }
                     }
                     Ok(WorkflowEventWaitOutcome::ChannelClosed) => {
                         // LISTEN connection dropped; reconnect and backfill any events
                         // that may have been committed while the connection was down.
-                        let Ok(l) = WorkflowEventListener::connect(&notification_url).await else {
+                        // Reconnect to `listener_shard`, not the original
+                        // `notification_url` (issue #1317 review, P2
+                        // follow-up). The shard-rebind check above this
+                        // match may have already moved the listener this
+                        // very tick. Reconnecting to the stale URL would
+                        // silently undo that.
+                        let Ok(url) = api_clone.sse_notification_url(listener_shard) else {
+                            break 'notify;
+                        };
+                        let Ok(l) = WorkflowEventListener::connect(&url).await else {
                             break 'notify;
                         };
                         listener = l;
-                        // Backfill events missed during reconnection window
-                        let Ok(mut conn) = db_conn_for_execution(&api_clone, exec_id).await else {
-                            continue 'notify;
+                        // Backfill events missed during reconnection window.
+                        // A run that left the fence ends the stream (issue #1803).
+                        let mut conn = match stream_conn_for_execution(&api_clone, exec_id).await {
+                            FencedCheckout::Ready(conn) => conn,
+                            FencedCheckout::LeftFence => {
+                                let _ = tx.send(Ok(shard_fence_error_event())).await;
+                                break 'notify;
+                            }
+                            FencedCheckout::Retry => continue 'notify,
                         };
                         let Ok(missed) = store::load_events_after_row_id(
                             &mut conn,
@@ -40695,13 +44958,14 @@ async fn stream_execution_events(
                         else {
                             continue 'notify;
                         };
-                        let (new_id, terminal_state, should_break) =
-                            send_rows(&missed, last_seen_id, &mut tx);
+                        let (new_id, new_event_id, terminal_state, should_break) =
+                            send_rows(&missed, last_seen_id, last_seen_event_id, &mut tx);
                         last_seen_id = new_id;
+                        last_seen_event_id = new_event_id;
                         if should_break {
                             let err_data = serde_json::json!({
                                 "error": "slow_consumer",
-                                "drop_after_event_id": last_seen_id,
+                                "drop_after_event_id": last_seen_event_id,
                             })
                             .to_string();
                             let _ = tx.try_send(Ok(Event::default()
@@ -40710,12 +44974,14 @@ async fn stream_execution_events(
                             break 'notify;
                         }
                         if let Some(state) = terminal_state {
-                            let reason =
-                                resolve_stream_end_reason(&api_clone, exec_id, state).await;
-                            let end_data = serde_json::json!({"reason": reason}).to_string();
-                            let _ = tx
-                                .send(Ok(Event::default().event("stream-end").data(end_data)))
-                                .await;
+                            send_stream_end(
+                                &api_clone,
+                                exec_id,
+                                &mut tx,
+                                last_seen_event_id,
+                                state,
+                            )
+                            .await;
                             break 'notify;
                         }
                     }
@@ -40724,7 +44990,16 @@ async fn stream_execution_events(
             }
         }
 
-        // Audit stream close (issue #158) — fires on every producer exit path
+        // Audit stream close (issue #158) — fires on every producer exit path.
+        //
+        // Stamped with `listener_shard`, not `shard` (issue #1596 review,
+        // P2). `shard` is the shard this stream started on. A rebind
+        // earlier in the loop may have since moved `listener_shard` on,
+        // and `db_conn_for_execution` above already checks out that
+        // CURRENT shard. Using `shard` here would write the close record
+        // to the target database while attributing it to the source
+        // shard. That corrupts per-shard audit attribution for every
+        // migrated long-lived stream.
         if let Ok(mut conn) = db_conn_for_execution(&api_clone, exec_id).await {
             let target = exec_id.to_string();
             let ar = NewAuditRecord {
@@ -40737,12 +45012,12 @@ async fn stream_execution_events(
                 idempotency_key: None,
                 status: STATUS_SUCCEEDED,
                 error_summary: None,
-                shard_id: Some(shard.as_i32()),
+                shard_id: Some(listener_shard.as_i32()),
                 source: &audit_source,
             };
             let _ = audit::insert_audit(&mut conn, &ar).await;
         }
-    });
+    }));
 
     // Return the SSE response. axum's KeepAlive wrapper sends `: ping\n\n`
     // comments every keepalive_interval so proxies don't idle the connection.
@@ -40779,30 +45054,51 @@ const PROGRESS_STREAM_CHANNEL_CAPACITY: usize = 256;
 /// chunk is not lost on close.
 const PROGRESS_STREAM_FINAL_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(75);
 
+/// What the progress stream's terminal-state poll found.
+enum ProgressPoll {
+    /// The run reached a terminal state, or its row is gone. The stream ends
+    /// with `event: end` and this reason.
+    End(String),
+    /// The run is still live, or the poll hit a transient failure. The next
+    /// idle tick polls again.
+    Wait,
+    /// The run left the request's shard fence (issue #1803). The stream ends
+    /// with `event: error`, and the client reconnects.
+    LeftFence,
+}
+
 /// Poll the execution's terminal state for the progress stream's close check.
 ///
-/// Returns `Some(reason)` when the stream should end — the execution reached a
-/// terminal state, or its row was retention-deleted (which only happens once an
-/// execution is already terminal) — and `None` to keep waiting (still running,
-/// or a transient DB/pool error the next idle tick retries).
+/// [`ProgressPoll::End`] means the stream should end. The execution reached
+/// a terminal state, or retention deleted its row. Retention only deletes a
+/// terminal execution. [`ProgressPoll::Wait`] keeps the stream waiting. The
+/// run is still live, or a transient DB or pool error hit, and the next idle
+/// tick retries. A checkout the shard fence refuses is
+/// [`ProgressPoll::LeftFence`], never a wait.
 async fn progress_stream_end_reason(
     api_state: &HarvestApiState,
     exec_id: ExecutionId,
-) -> Option<String> {
-    let mut conn = db_conn_for_execution(api_state, exec_id).await.ok()?;
-    let state: Option<String> = harvest_workflow_executions::table
+) -> ProgressPoll {
+    let mut conn = match stream_conn_for_execution(api_state, exec_id).await {
+        FencedCheckout::Ready(conn) => conn,
+        FencedCheckout::Retry => return ProgressPoll::Wait,
+        FencedCheckout::LeftFence => return ProgressPoll::LeftFence,
+    };
+    let Ok(state) = harvest_workflow_executions::table
         .find(exec_id.as_uuid())
         .select(harvest_workflow_executions::state)
-        .first(&mut conn)
+        .first::<String>(&mut conn)
         .await
         .optional()
-        .ok()?;
+    else {
+        return ProgressPoll::Wait;
+    };
     match state {
         // Row gone: retention only deletes terminal executions, so end the stream.
-        None => Some("deleted".to_string()),
-        Some(s) if is_terminal_state(&s) => Some(s.to_lowercase().replace('_', "-")),
+        None => ProgressPoll::End("deleted".to_string()),
+        Some(s) if is_terminal_state(&s) => ProgressPoll::End(s.to_lowercase().replace('_', "-")),
         // Still running — keep the live loop open.
-        Some(_) => None,
+        Some(_) => ProgressPoll::Wait,
     }
 }
 
@@ -40829,9 +45125,12 @@ async fn progress_stream_end_reason(
 ///
 /// ```
 /// A final `event: end` frame is emitted when the execution reaches a terminal
-/// state and the stream then closes; `event: error` is sent if the LISTEN
-/// connection drops. Keepalive `: ping` comments (axum `KeepAlive`) keep proxies
-/// from idling the connection.
+/// state, and the stream then closes. `event: error` is sent if the LISTEN
+/// connection drops. It is also sent if the run leaves the request's shard
+/// fence after a rebalance cutover (issue #1803). That frame carries
+/// `{"error":"outside_shard_fence","retry":true}`. The client then reconnects,
+/// and the reconnect is authorized against the live shard. Keepalive `: ping`
+/// comments (axum `KeepAlive`) keep proxies from idling the connection.
 ///
 /// **Progress chunks are EPHEMERAL**: never recorded in `harvest_events`, never
 /// replayed, and there is **no backfill** on (re)connect. A subscriber that
@@ -40866,14 +45165,29 @@ async fn stream_workflow_progress(
         Err(e) => return e.into_response(),
     };
 
-    // Resolve the LISTEN/NOTIFY database URL for this execution's shard.
+    // Resolve the LISTEN/NOTIFY database URL for this execution's current
+    // residence, not its id's origin shard (issue #1317). The existence
+    // check below reads `execution.shard_id`. This LISTEN connection must
+    // open against that same database, or a rebalanced execution's chunks
+    // are silently missed. Resolved without a row in hand (the ordering
+    // just below deliberately listens before that check runs). So this
+    // walks the forwarding pointer itself rather than reading a column.
     //
     // No LISTEN/NOTIFY URL configured is a *server* misconfiguration, not a
     // client error: return 503 (retriable once configured), matching the handler
     // contract and docs/api-contract.json. A DB-unreachable failure on `connect`
     // below is likewise 503 (via `map_error`'s `HarvestError::Database` arm), so
     // both "not configured" and "unreachable" surface as 503, never a 400.
-    let shard = exec_id.shard();
+    // A resolution failure here means an infrastructure problem (e.g. a pool
+    // checkout failure), not a missing execution. `resolve_execution_shard`
+    // does not require the row to exist, only that its shard is reachable.
+    // A missing execution is still caught by the existence check below.
+    let Some(shard) = resolve_shard_best_effort(&api_state, exec_id).await else {
+        return AutumnError::service_unavailable_msg(
+            "progress streaming is not configured (no LISTEN/NOTIFY database URL)",
+        )
+        .into_response();
+    };
     let Ok(notification_url) = api_state.sse_notification_url(shard) else {
         return AutumnError::service_unavailable_msg(
             "progress streaming is not configured (no LISTEN/NOTIFY database URL)",
@@ -40926,8 +45240,13 @@ async fn stream_workflow_progress(
         let _ = tx.try_send(Ok(Event::default().event("end").data(end_data)));
     } else {
         let api_clone = api_state.clone();
+        // The producer runs under the request's shard fence (issue #1803).
+        // A fenced miss ends the stream with an `error` frame, so the
+        // client reconnects and the reconnect is authorized against the
+        // live shard. See `FencedCheckout`.
+        let fence = ::autumn_harvest::shard_fence::current();
         // Producer task: runs independently of the HTTP handler after we return.
-        tokio::spawn(async move {
+        tokio::spawn(::autumn_harvest::shard_fence::scoped(fence, async move {
             // Emit a progress chunk NON-BLOCKING. Returns `false` when the
             // receiver has been dropped (client disconnected) so the caller
             // ends the stream; a full channel (slow consumer) DROPS the chunk
@@ -40957,7 +45276,37 @@ async fn stream_workflow_progress(
             };
 
             let mut listener = listener;
+            let mut listener_shard = shard;
             loop {
+                // Shard-residence rebind (issue #1317 review, P2 follow-up).
+                // Unlike the events stream above, this loop had no rebind
+                // and no fallback. `ChannelClosed` just ends the stream.
+                // The terminal-state poll below only detects the workflow
+                // finishing, not new chunks published elsewhere. A
+                // migration mid-stream would silently and permanently
+                // stop chunk delivery until the workflow finished on its
+                // new shard. Re-resolving here before every wait catches
+                // that promptly instead.
+                //
+                // A fenced miss ends the stream (issue #1803). The run moved
+                // to a shard the policy never saw.
+                let current_shard = match stream_live_shard(&api_clone, exec_id).await {
+                    FencedCheckout::Ready(shard) => Some(shard),
+                    FencedCheckout::Retry => None,
+                    FencedCheckout::LeftFence => {
+                        let _ = tx.send(Ok(shard_fence_error_event())).await;
+                        break;
+                    }
+                };
+                if let Some(current_shard) = current_shard
+                    && current_shard != listener_shard
+                    && let Ok(url) = api_clone.sse_notification_url(current_shard)
+                    && let Ok(l) = WorkflowProgressListener::connect(&url, exec_id.as_uuid()).await
+                {
+                    listener = l;
+                    listener_shard = current_shard;
+                }
+
                 match listener.wait_for_progress_timeout(keepalive).await {
                     Ok(ProgressWaitOutcome::Chunk(payload)) => {
                         if !emit_chunk(&mut tx, payload) {
@@ -40973,31 +45322,37 @@ async fn stream_workflow_progress(
                         }
                         // Periodic terminal-state poll: there is no terminal
                         // chunk, so this bounds close latency to one keepalive.
-                        if let Some(reason) = progress_stream_end_reason(&api_clone, exec_id).await
-                        {
-                            // Bounded final-chunk drain: the workflow's LAST
-                            // published chunk may have arrived on the listener
-                            // socket but not yet been forwarded by the driver
-                            // task when this idle tick fired. Drain (non-blocking)
-                            // with a short grace so the primary "here's your
-                            // answer" frame is not dropped on close. A non-Chunk
-                            // outcome (no more chunks in flight, timeout, or the
-                            // listener dropped) exits the drain and proceeds to
-                            // close.
-                            while let Ok(ProgressWaitOutcome::Chunk(payload)) = listener
-                                .wait_for_progress_timeout(PROGRESS_STREAM_FINAL_DRAIN_GRACE)
-                                .await
-                            {
-                                if !emit_chunk(&mut tx, payload) {
-                                    return; // client disconnected mid-drain
-                                }
+                        // A run that left the fence ends the stream (issue #1803).
+                        let reason = match progress_stream_end_reason(&api_clone, exec_id).await {
+                            ProgressPoll::End(reason) => reason,
+                            ProgressPoll::Wait => continue,
+                            ProgressPoll::LeftFence => {
+                                let _ = tx.send(Ok(shard_fence_error_event())).await;
+                                break;
                             }
-                            let end_data = serde_json::json!({ "reason": reason }).to_string();
-                            let _ = tx
-                                .send(Ok(Event::default().event("end").data(end_data)))
-                                .await;
-                            break;
+                        };
+                        // Bounded final-chunk drain: the workflow's LAST
+                        // published chunk may have arrived on the listener
+                        // socket but not yet been forwarded by the driver
+                        // task when this idle tick fired. Drain (non-blocking)
+                        // with a short grace so the primary "here's your
+                        // answer" frame is not dropped on close. A non-Chunk
+                        // outcome (no more chunks in flight, timeout, or the
+                        // listener dropped) exits the drain and proceeds to
+                        // close.
+                        while let Ok(ProgressWaitOutcome::Chunk(payload)) = listener
+                            .wait_for_progress_timeout(PROGRESS_STREAM_FINAL_DRAIN_GRACE)
+                            .await
+                        {
+                            if !emit_chunk(&mut tx, payload) {
+                                return; // client disconnected mid-drain
+                            }
                         }
+                        let end_data = serde_json::json!({ "reason": reason }).to_string();
+                        let _ = tx
+                            .send(Ok(Event::default().event("end").data(end_data)))
+                            .await;
+                        break;
                     }
                     Ok(ProgressWaitOutcome::ChannelClosed) => {
                         // LISTEN connection dropped; end with an error frame
@@ -41012,7 +45367,7 @@ async fn stream_workflow_progress(
                     Err(_) => break,
                 }
             }
-        });
+        }));
     }
 
     Sse::new(rx)
@@ -41083,6 +45438,12 @@ pub(crate) fn map_error(error: HarvestError) -> AutumnError {
         | HarvestError::WorkflowFailed {
             reason: message, ..
         } => AutumnError::bad_request_msg(message),
+        // Preserves each variant's pre-#1445 status: both used to be a plain
+        // `Config`, which this same arm maps to 400.
+        error @ (HarvestError::RetryChainMaxDepthExceeded { .. }
+        | HarvestError::InvalidParentClosePolicy { .. }) => {
+            AutumnError::bad_request_msg(error.to_string())
+        }
         HarvestError::UpdateRejected { reason } => {
             AutumnError::bad_request_msg(reason).with_status(axum::http::StatusCode::CONFLICT)
         }
@@ -41142,7 +45503,23 @@ pub(crate) fn map_error(error: HarvestError) -> AutumnError {
             details.insert("current".to_string(), vec![current.to_string()]);
             AutumnError::validation(details).with_status(axum::http::StatusCode::TOO_MANY_REQUESTS)
         }
+        // A route with no `start_error_response` arm still answers 429 for a
+        // shed start (issue #1794). It has no `Retry-After` header.
+        error @ HarvestError::LoadShed { .. } => AutumnError::bad_request_msg(error.to_string())
+            .with_status(axum::http::StatusCode::TOO_MANY_REQUESTS),
         HarvestError::Database(message) => AutumnError::service_unavailable_msg(message),
+        // `OutsideShardFence`: the run moved after the authorizer hook
+        // checked it (issue #1803). Nothing was read or written on the new
+        // shard. The body is the retry hint only. The policy's reason never
+        // reaches the caller, and a `403` here would leak that a shard is
+        // denied.
+        //
+        // `ShardFenced`: this node lost write authority to another region
+        // (issue #1823). Nothing was written. A retry on this node fails the
+        // same way until the node restarts against the authoritative region.
+        error @ (HarvestError::OutsideShardFence { .. } | HarvestError::ShardFenced { .. }) => {
+            AutumnError::service_unavailable_msg(error.to_string())
+        }
         other => AutumnError::service_unavailable_msg(other.to_string()),
     }
 }
@@ -41422,37 +45799,37 @@ const fn default_preview_count() -> usize {
 }
 
 /// A single enriched entry in the schedule next-fires preview (issue #348).
-#[derive(Debug, Serialize)]
-struct ScheduleFirePreviewEntry {
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ScheduleFirePreviewEntry {
     /// UTC wall-clock instant the cron/interval computed.
-    scheduled_at: chrono::DateTime<chrono::Utc>,
+    pub scheduled_at: chrono::DateTime<chrono::Utc>,
     /// `scheduled_at` rendered in the schedule's configured timezone (RFC 3339).
-    local_at: String,
+    pub local_at: String,
     /// Effective fire time after calendar adjustment and jitter application.
     /// `None` means the firing is suppressed (calendar exclusion with `skip` policy).
     #[serde(skip_serializing_if = "Option::is_none")]
-    effective_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub effective_at: Option<chrono::DateTime<chrono::Utc>>,
     /// `effective_at` rendered in the schedule's timezone. Omitted when `effective_at` is `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    effective_local_at: Option<String>,
+    pub effective_local_at: Option<String>,
     /// Human-readable reason for this instant:
     /// - `"cron"` — fires as scheduled.
     /// - `"cron+jitter"` — fires at `effective_at` after deterministic jitter.
     /// - `"skipped:calendar-excluded"` — suppressed by calendar exclusion.
     /// - `"deferred:calendar"` — moved to a different day by calendar skip-policy.
-    reason: String,
+    pub reason: String,
     /// Earliest possible fire time when jitter is enabled (`= scheduled_at`).
     /// Omitted when `jitter_secs = 0`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    jitter_earliest_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub jitter_earliest_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Latest possible fire time when jitter is enabled (`= scheduled_at + jitter_secs`).
     /// Omitted when `jitter_secs = 0`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    jitter_latest_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub jitter_latest_at: Option<chrono::DateTime<chrono::Utc>>,
     /// `true` when the overlap policy (`"skip"` or `"buffer_one"`) could silently drop this
     /// firing if `max_active_runs` is already running at dispatch time. Preview is stateless
     /// and cannot know the future run count; treat this as an advisory warning.
-    would_skip_if_active: bool,
+    pub would_skip_if_active: bool,
 }
 
 /// Request body for `POST /admin/schedules/preview` — validate a candidate schedule
@@ -41472,8 +45849,10 @@ struct CandidateSchedulePreviewRequest {
     max_active_runs: u32,
     #[serde(default)]
     paused: bool,
+    /// If the request omits this field, the preview uses `default_schedule_jitter`,
+    /// as create does.
     #[serde(default)]
-    jitter_secs: u64,
+    jitter_secs: Option<u64>,
     #[serde(default = "default_overlap_policy")]
     overlap_policy: String,
     #[serde(default = "default_buffer_all_max")]
@@ -41648,23 +46027,68 @@ fn parse_from_param(from: Option<&str>) -> Result<chrono::DateTime<chrono::Utc>,
 /// paths (e.g. `PATCH /dags/{dag_name}`) clear `is_paused` without also
 /// clearing `pause_reason`, so reading the raw column unconditionally could
 /// leak a stale reason for a schedule that is not actually paused.
+/// The `GET /admin/schedules/{id}/preview` payload (issue #348).
+///
+/// Typed rather than an ad-hoc `serde_json::json!` object so the Vantage
+/// schedules page (issue #951) can render exactly what the API returns instead
+/// of re-deriving bounded-run truncation and pause/exhaustion handling — the
+/// one thing that would let the UI and the API disagree about *why a schedule
+/// will not fire*. The field set (and its JSON key names) are unchanged from
+/// the original hand-built object, so the public response shape is identical.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SchedulePreview {
+    /// The projected fire times, already truncated by `end_at` / the remaining
+    /// run budget (issues #478 / #543). Empty for a paused, exhausted, or
+    /// unparseable schedule.
+    pub entries: Vec<ScheduleFirePreviewEntry>,
+    /// Whether the schedule is paused (a paused schedule previews zero entries).
+    pub is_paused: bool,
+    /// The recorded pause reason — surfaced **only** while `is_paused`, so a
+    /// stale reason left on an active row is never leaked.
+    pub pause_reason: Option<String>,
+    /// The instant the preview was projected from.
+    pub from: chrono::DateTime<chrono::Utc>,
+    /// The requested entry count, after clamping.
+    pub count_requested: usize,
+    /// Absolute cutoff for this schedule (issue #478), echoed so a caller can see
+    /// why a preview is short.
+    pub end_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Remaining run budget (issue #478), `None` when the schedule is unlimited.
+    pub remaining_runs: Option<i32>,
+    /// Machine-readable exhaustion reason (issue #478), `None` when not exhausted.
+    pub exhausted_reason: Option<String>,
+}
+
 fn empty_preview_response(
     schedule: &HarvestSchedule,
     remaining_runs: Option<i32>,
     from: chrono::DateTime<chrono::Utc>,
     count: usize,
-) -> serde_json::Value {
-    let pause_reason = schedule.is_paused.then(|| schedule.pause_reason.clone());
-    serde_json::json!({
-        "entries": [],
-        "is_paused": schedule.is_paused,
-        "pause_reason": pause_reason.flatten(),
-        "from": from,
-        "count_requested": count,
-        "end_at": schedule.end_at,
-        "remaining_runs": remaining_runs,
-        "exhausted_reason": schedule.exhausted_reason,
-    })
+) -> SchedulePreview {
+    // `is_paused` keeps mirroring the column. An auto-paused row has it `false`
+    // yet still previews empty, so the reason carries the explanation rather
+    // than leaving a caller to guess why a healthy-looking schedule projects
+    // nothing (#360).
+    let pause_reason = if schedule.is_paused {
+        schedule.pause_reason.clone()
+    } else if schedule.auto_paused_at.is_some() {
+        Some(format!(
+            "auto-paused after {} consecutive failures; resume to restore firing",
+            schedule.consecutive_failure_count
+        ))
+    } else {
+        None
+    };
+    SchedulePreview {
+        entries: vec![],
+        is_paused: schedule.is_paused,
+        pause_reason,
+        from,
+        count_requested: count,
+        end_at: schedule.end_at,
+        remaining_runs,
+        exhausted_reason: schedule.exhausted_reason.clone(),
+    }
 }
 
 /// `GET /admin/schedules/{id}/preview?count=N&from=<ISO8601>` — preview the next N
@@ -41674,20 +46098,61 @@ async fn preview_schedule_firings_handler(
     Path(id): Path<uuid::Uuid>,
     Query(params): Query<SchedulePreviewQuery>,
 ) -> Result<impl IntoResponse, AutumnError> {
+    let count = params.count.clamp(1, 100);
+    let from = parse_from_param(params.from.as_deref()).map_err(AutumnError::bad_request_msg)?;
+    let preview = compute_schedule_preview(&api_state, id, count, from).await?;
+    Ok((StatusCode::OK, Json(preview)))
+}
+
+/// The body of `GET /admin/schedules/{id}/preview`, factored out so the Vantage
+/// preview drill-down (issue #951) renders the *same* projection the API
+/// returns — including the #478/#543 bounded-run truncation and the
+/// paused/exhausted zero-entry branches — rather than a second implementation
+/// of them.
+///
+/// Read-only: it loads the schedule row and (when a calendar is attached) that
+/// calendar's exclusions, and writes nothing.
+///
+/// # Errors
+///
+/// Propagates the schedule lookup's `404`/`503` and any storage error.
+pub(crate) async fn compute_schedule_preview(
+    api_state: &HarvestApiState,
+    id: uuid::Uuid,
+    count: usize,
+    from: chrono::DateTime<chrono::Utc>,
+) -> Result<SchedulePreview, AutumnError> {
+    // load_schedule_by_id fans out across all shards so schedules on any shard are found.
+    let schedule = load_schedule_by_id(api_state, id).await?;
+    compute_schedule_preview_for(api_state, schedule, count, from).await
+}
+
+/// [`compute_schedule_preview`] for a caller that has already resolved the row.
+///
+/// `load_schedule_by_id` stops at the first shard whose connection fails, so a
+/// caller that resolved the schedule through the resilient
+/// [`resolve_schedule_with_shard`] — the Vantage drill-downs (issue #951) — must
+/// not hand the id back for a second, fragile lookup: in a multi-shard
+/// deployment where an earlier shard is down and the schedule lives on a later
+/// healthy one, that second lookup fails on a row we already hold.
+///
+/// # Errors
+///
+/// Propagates storage errors from the calendar-exclusion read.
+pub(crate) async fn compute_schedule_preview_for(
+    api_state: &HarvestApiState,
+    schedule: HarvestSchedule,
+    count: usize,
+    from: chrono::DateTime<chrono::Utc>,
+) -> Result<SchedulePreview, AutumnError> {
     use autumn_harvest::policy::SkipPolicy;
     use autumn_harvest::scheduler::parse_schedule_from_expr_pub;
 
-    let count = params.count.clamp(1, 100);
-    let from = parse_from_param(params.from.as_deref()).map_err(AutumnError::bad_request_msg)?;
-
-    // load_schedule_by_id fans out across all shards so schedules on any shard are found.
-    let schedule = load_schedule_by_id(&api_state, id).await?;
-
     // Surfaced on every branch below so a caller can see why a schedule is
-    // bounded even when it returns zero entries.
-    let remaining_runs = schedule
-        .max_runs
-        .map(|max| remaining_runs_budget(max, schedule.runs_started));
+    // bounded even when it returns zero entries. Uses the `max > 0` convention,
+    // so a legacy `max_runs = 0` row is unlimited rather than reporting a spent
+    // budget and truncating the preview to nothing.
+    let remaining_runs = schedule_remaining_runs(schedule.max_runs, schedule.runs_started);
 
     // Paused schedules return zero entries with a paused reason summary.
     //
@@ -41700,15 +46165,21 @@ async fn preview_schedule_firings_handler(
     // harmless belt-and-suspenders match — `truncate_preview_entries_by_bounds`
     // would produce an empty list for `Some(0)` regardless, so this only skips
     // the unnecessary schedule-parsing and calendar-exclusion work).
-    if schedule.is_paused || schedule.exhausted_at.is_some() || remaining_runs == Some(0) {
-        return Ok((
-            StatusCode::OK,
-            Json(empty_preview_response(
-                &schedule,
-                remaining_runs,
-                from,
-                count,
-            )),
+    // `auto_paused_at` is as terminal as `is_paused` for firing: the scheduler's
+    // due-list filters on `auto_paused_at IS NULL` (#360), so an auto-paused
+    // schedule will not fire even though its `is_paused` column is false.
+    // Projecting fire times for it would tell an operator a stopped schedule has
+    // upcoming firings.
+    if schedule.is_paused
+        || schedule.auto_paused_at.is_some()
+        || schedule.exhausted_at.is_some()
+        || remaining_runs == Some(0)
+    {
+        return Ok(empty_preview_response(
+            &schedule,
+            remaining_runs,
+            from,
+            count,
         ));
     }
 
@@ -41717,14 +46188,11 @@ async fn preview_schedule_firings_handler(
         .as_deref()
         .and_then(parse_schedule_from_expr_pub);
     let Some(ref sched) = parsed_schedule else {
-        return Ok((
-            StatusCode::OK,
-            Json(empty_preview_response(
-                &schedule,
-                remaining_runs,
-                from,
-                count,
-            )),
+        return Ok(empty_preview_response(
+            &schedule,
+            remaining_runs,
+            from,
+            count,
         ));
     };
 
@@ -41785,19 +46253,16 @@ async fn preview_schedule_firings_handler(
     // dispatch.
     let entries = truncate_preview_entries_by_bounds(entries, schedule.end_at, remaining_runs);
 
-    Ok((
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "entries": entries,
-            "is_paused": false,
-            "pause_reason": serde_json::Value::Null,
-            "from": from,
-            "count_requested": count,
-            "end_at": schedule.end_at,
-            "remaining_runs": remaining_runs,
-            "exhausted_reason": schedule.exhausted_reason,
-        })),
-    ))
+    Ok(SchedulePreview {
+        entries,
+        is_paused: false,
+        pause_reason: None,
+        from,
+        count_requested: count,
+        end_at: schedule.end_at,
+        remaining_runs,
+        exhausted_reason: schedule.exhausted_reason,
+    })
 }
 
 /// `POST /admin/schedules/preview` — validate a candidate schedule config and return
@@ -41859,9 +46324,9 @@ async fn preview_candidate_schedule_handler(
         ));
     }
 
-    // Validate jitter before i64 conversion; body.jitter_secs is u64 so an
-    // overly large value would overflow chrono::Duration::seconds and panic.
-    let jitter_duration = std::time::Duration::from_secs(body.jitter_secs);
+    // Validate jitter before the i64 conversion. A u64 second count can
+    // overflow chrono::Duration::seconds and panic.
+    let jitter_duration = requested_jitter(body.jitter_secs, &schedule);
     if let Err(e) = validate_jitter(&schedule, jitter_duration) {
         return Ok((
             StatusCode::BAD_REQUEST,
@@ -41870,7 +46335,7 @@ async fn preview_candidate_schedule_handler(
     }
     // Safe after validate_jitter: valid jitter is at most 3600 s for cron,
     // or less than the interval period, both well within i64 range.
-    let jitter_secs = i64::try_from(body.jitter_secs).unwrap_or(i64::MAX);
+    let jitter_secs = i64::try_from(jitter_duration.as_secs()).unwrap_or(i64::MAX);
 
     // Verify the calendar exists before returning any result so that a typo
     // here gets a 400 even when the schedule is paused.  Exclusion dates are
@@ -41947,10 +46412,9 @@ async fn preview_candidate_schedule_handler(
         raw_entries.iter().map(|e| e.effective_at).collect();
 
     if jitter_secs > 0 {
-        let jitter_window = std::time::Duration::from_secs(body.jitter_secs);
         for entry in &mut raw_entries {
             if let Some(t) = entry.effective_at {
-                let offset = compute_jitter_offset(schedule_id, t, jitter_window);
+                let offset = compute_jitter_offset(schedule_id, t, jitter_duration);
                 if let Ok(d) = chrono::Duration::from_std(offset) {
                     entry.effective_at = Some(t + d);
                 }
@@ -42047,10 +46511,14 @@ async fn complete_external_activity(
         }
     };
     let output = request.output.unwrap_or(Value::Null);
+    let codecs = api_state.payload_codecs();
 
     let complete_result = resolve_external_on_shards(&api_state, token, |conn, tok| {
         let out = output.clone();
-        Box::pin(async move { external_task::complete_externally(conn, tok, out).await })
+        let codecs = codecs.clone();
+        Box::pin(async move {
+            external_task::complete_externally_with_codecs(conn, tok, out, &codecs).await
+        })
     })
     .await;
 
@@ -42306,24 +46774,70 @@ where
 /// for `?shard_id=` queries (issue #522 review). The freshest snapshot reflects
 /// the worker's true liveness regardless of which shard it was read from.
 pub(crate) fn dedup_workers_by_freshest(rows: Vec<WorkerRow>) -> Vec<WorkerRow> {
-    let mut by_id: std::collections::HashMap<String, WorkerRow> = std::collections::HashMap::new();
-    for row in rows {
+    dedup_worker_sources_by_freshest(rows.into_iter().map(|row| (0, row)).collect())
+        .into_iter()
+        .map(|(_, row)| row)
+        .collect()
+}
+
+/// Deduplicate worker rows fanned out across shards, keeping the freshest
+/// snapshot per `worker_id` **and** the shard id that snapshot was read from.
+///
+/// [`dedup_workers_by_freshest`] discards the source shard. Its callers do
+/// not need it. Fleet health's `by_shard` tally does. An empty-array
+/// (auto/legacy) `shard_assignments` row covers whatever shard it was read
+/// from (issue #1150). Dedup collapses a multi-shard fan-out to one row per
+/// worker, so that row must still say which shard it came from (issue
+/// #1208).
+pub(crate) fn dedup_worker_sources_by_freshest(
+    rows: Vec<(i32, WorkerRow)>,
+) -> Vec<(i32, WorkerRow)> {
+    let mut by_id: std::collections::HashMap<String, (i32, WorkerRow)> =
+        std::collections::HashMap::new();
+    for (source_shard_id, row) in rows {
         match by_id.get(&row.worker.worker_id) {
-            // Keep the existing row only if it is at least as fresh.
-            Some(existing) if existing.worker.last_heartbeat_at >= row.worker.last_heartbeat_at => {
-            }
+            // Keep the existing entry only if it is at least as fresh.
+            Some((_, existing))
+                if existing.worker.last_heartbeat_at >= row.worker.last_heartbeat_at => {}
             _ => {
-                by_id.insert(row.worker.worker_id.clone(), row);
+                by_id.insert(row.worker.worker_id.clone(), (source_shard_id, row));
             }
         }
     }
     by_id.into_values().collect()
 }
 
+/// Tally worker counts per shard from a deduped, source-tagged worker list.
+///
+/// An empty `shard_assignments` array covers whatever shard the row was read
+/// from, so it is attributed to `source_shard_id`. A non-empty array is the
+/// worker's own explicit claim. It is attributed to every shard it names,
+/// regardless of source — unchanged since before issue #1208. A malformed
+/// (non-array) value is corrupt, not legacy, and is attributed to nothing.
+fn tally_by_shard(rows: &[(i32, WorkerRow)]) -> std::collections::HashMap<i32, usize> {
+    let mut by_shard: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
+    for (source_shard_id, row) in rows {
+        let Some(shards) = row.worker.shard_assignments.as_array() else {
+            continue;
+        };
+        if shards.is_empty() {
+            *by_shard.entry(*source_shard_id).or_default() += 1;
+        } else {
+            for s in shards {
+                if let Some(id) = s.as_i64().and_then(|v| i32::try_from(v).ok()) {
+                    *by_shard.entry(id).or_default() += 1;
+                }
+            }
+        }
+    }
+    by_shard
+}
+
 async fn list_workers_handler(
     Extension(api_state): Extension<HarvestApiState>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<Json<Value>, AutumnError> {
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let filters = parse_worker_filters_api(&pairs)?;
     let stale_threshold = api_state.worker_stale_threshold();
 
@@ -42332,26 +46846,47 @@ async fn list_workers_handler(
     // (issue #522 review). A multi-shard worker's shard rows can disagree on
     // status/health, so filtering per-shard could let a stale Active copy on one
     // shard survive while the freshest Draining row on another is dropped before
-    // dedup — returning the obsolete snapshot. The shard-invariant queue/shard
-    // filters (read from the worker's advertised JSON, identical across rows) are
-    // kept here. Use i64::MAX as the per-shard limit so list_workers performs no
-    // truncation before the global sort+truncate below.
+    // dedup — returning the obsolete snapshot. The queue filter (read from the
+    // worker's advertised JSON, identical across rows) is kept here. `shard_id`
+    // is deliberately dropped from the per-shard query below. It is reapplied
+    // after, source-aware (issue #1213). It is NOT shard-invariant. An
+    // empty-array (auto/legacy) row means "covers whatever shard it was read
+    // from". The fan-out also reads such rows from every OTHER shard. An
+    // evaluation of those rows against the caller's requested shard would
+    // falsely match. Use i64::MAX as the per-shard limit so list_workers
+    // performs no truncation before the global sort+truncate below.
+    let requested_shard_id = filters.shard_id;
     let per_shard_filters = WorkerFilters {
         limit: i64::MAX,
         status: None,
         health: None,
         build_id: None,
         deployment_name: None,
+        shard_id: None,
         ..filters.clone()
     };
     // Issue #756: collect-and-continue so an unreachable shard degrades to a
     // `200 partial` naming `unavailable_shards` rather than a `500`.
-    let observations = observe_shards(&api_state, |_shard_id, mut conn| {
+    let observations = observe_shards(&api_state, |source_shard_id, mut conn| {
         let per_shard_filters = per_shard_filters.clone();
         async move {
-            list_workers(&mut conn, &per_shard_filters, stale_threshold)
+            let mut rows = list_workers(&mut conn, &per_shard_filters, stale_threshold)
                 .await
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+            // Issue #1213: evaluate shard coverage against the shard this row
+            // was actually read from. Do not evaluate it blindly against the
+            // caller's requested shard. See the source-aware predicate doc
+            // above.
+            if let Some(requested) = requested_shard_id {
+                rows.retain(|r| {
+                    autumn_harvest::workers::shard_assignments_cover_from_source(
+                        &r.worker.shard_assignments,
+                        source_shard_id,
+                        requested,
+                    )
+                });
+            }
+            Ok(rows)
         }
     })
     .await?;
@@ -42410,8 +46945,8 @@ async fn list_workers_handler(
                     }
 
                     parsed_reqs.as_ref().is_none_or(|reqs| {
-                        let worker_labels: std::collections::HashMap<String, String> =
-                            serde_json::from_value(w.worker.labels.clone()).unwrap_or_default();
+                        let worker_labels =
+                            autumn_harvest::payload_codec::string_valued_labels(&w.worker.labels);
                         autumn_harvest::eligibility::matches_requirements(reqs, &worker_labels)
                     })
                 });
@@ -42517,19 +47052,23 @@ async fn workers_health(
         ..WorkerFilters::default()
     };
 
-    // Collect all worker rows from every shard, then dedup by worker_id so a
-    // multi-shard worker (which registers a row in each of its shard DBs) is
-    // counted exactly once in the healthy/stale/draining totals.
+    // Collect all worker rows from every shard, tagged with the shard each row
+    // was read from. Dedup by worker_id so a multi-shard worker (which
+    // registers a row in each of its shard DBs) is counted exactly once in
+    // the healthy/stale/draining/by_shard totals. The source tag survives
+    // dedup (issue #1208): `by_shard` needs it below, to attribute an
+    // empty-array (auto/legacy) row to the shard it actually came from.
     //
     // Issue #756: collect-and-continue — an unreachable shard is named in
     // `unavailable_shards` and the totals reflect the reachable shards rather
     // than failing the whole health check with a `500`.
-    let observations = observe_shards(&api_state, |_shard_id, mut conn| {
+    let observations = observe_shards(&api_state, |source_shard_id, mut conn| {
         let per_shard_filters = per_shard_filters.clone();
         async move {
-            list_workers(&mut conn, &per_shard_filters, stale_threshold)
+            let rows = list_workers(&mut conn, &per_shard_filters, stale_threshold)
                 .await
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+            Ok(rows.into_iter().map(|row| (source_shard_id, row)).collect())
         }
     })
     .await?;
@@ -42542,17 +47081,17 @@ async fn workers_health(
     // Dedup by worker_id, keeping the freshest per-shard snapshot so a stale
     // copy on one shard never masks a healthy heartbeat on another in the
     // healthy/stale/draining totals (issue #522 review).
-    let all_workers = dedup_workers_by_freshest(all_workers);
+    let all_workers = dedup_worker_sources_by_freshest(all_workers);
 
     let mut combined = FleetHealth {
         healthy: 0,
         stale: 0,
         draining: 0,
         by_queue: std::collections::HashMap::new(),
-        by_shard: std::collections::HashMap::new(),
+        by_shard: tally_by_shard(&all_workers),
     };
 
-    for row in &all_workers {
+    for (_source_shard_id, row) in &all_workers {
         match row.health {
             autumn_harvest::workers::WorkerHealth::Healthy => combined.healthy += 1,
             autumn_harvest::workers::WorkerHealth::Stale => combined.stale += 1,
@@ -42564,16 +47103,6 @@ async fn workers_health(
             for q in queues {
                 if let Some(name) = q.as_str() {
                     *combined.by_queue.entry(name.to_string()).or_default() += 1;
-                }
-            }
-        }
-        // by_shard stays additive across shard assignments on the deduped
-        // worker, correctly reflecting how many distinct workers cover each
-        // shard.
-        if let Some(shards) = row.worker.shard_assignments.as_array() {
-            for s in shards {
-                if let Some(id) = s.as_i64().and_then(|v| i32::try_from(v).ok()) {
-                    *combined.by_shard.entry(id).or_default() += 1;
                 }
             }
         }
@@ -42827,8 +47356,9 @@ async fn request_drain_handler(
 
 async fn drain_preview_handler(
     Extension(api_state): Extension<HarvestApiState>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<Json<Vec<DrainPreviewItem>>, AutumnError> {
+    let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let filters = parse_worker_filters_api(&pairs)?;
     let stale_threshold = api_state.worker_stale_threshold();
     let pool = api_state.storage_pool().map_err(map_error)?;
@@ -42839,20 +47369,33 @@ async fn drain_preview_handler(
     // shard is filtered out before dedup (issue #522 review). The preview's own
     // filters (default-Active status plus any requested status/health/build/
     // deployment) and the limit are applied globally against the freshest row.
+    // `shard_id` is dropped here and reapplied source-aware below, exactly as
+    // `/workers` does (issue #1213) — see the comment in `list_workers_handler`.
+    let requested_shard_id = filters.shard_id;
     let per_shard_filters = WorkerFilters {
         limit: i64::MAX,
         status: None,
         health: None,
         build_id: None,
         deployment_name: None,
+        shard_id: None,
         ..filters.clone()
     };
     let mut rows: Vec<WorkerRow> = Vec::new();
-    for (_shard, shard_pool) in pool.iter_shards() {
+    for (source_shard_id, shard_pool) in pool.iter_shards() {
         let mut conn = acquire_conn(shard_pool).await?;
         let mut shard_rows = list_workers(&mut conn, &per_shard_filters, stale_threshold)
             .await
             .map_err(map_error)?;
+        if let Some(requested) = requested_shard_id {
+            shard_rows.retain(|r| {
+                autumn_harvest::workers::shard_assignments_cover_from_source(
+                    &r.worker.shard_assignments,
+                    source_shard_id.as_i32(),
+                    requested,
+                )
+            });
+        }
         rows.append(&mut shard_rows);
     }
     let mut rows = dedup_workers_by_freshest(rows);
@@ -42945,6 +47488,10 @@ struct UpdateOrphanedResponse {
 /// workflow worker, then either returns immediately (`?wait=admitted`) or polls
 /// for the terminal `UpdateCompleted`/`UpdateFailed` event (`?wait=completed`,
 /// the default) until the configurable timeout fires.
+// Grew past the 100-line cap when `poll_update_result` gained the codec
+// registry argument, which turned a one-line tail call into a seven-line one.
+// The body is a flat sequence of validation steps, not nested logic.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn admit_update(
     Extension(api_state): Extension<HarvestApiState>,
     Path((id, update_name)): Path<(String, String)>,
@@ -42957,7 +47504,7 @@ pub(crate) async fn admit_update(
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
-    let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
+    let (mut conn, shard) = match db_conn_for_execution_with_shard(&api_state, exec_id).await {
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
@@ -42985,12 +47532,27 @@ pub(crate) async fn admit_update(
     //
     // Issue #843: an update addresses the LOGICAL run, so follow the
     // workflow-level retry chain (#523/#842) to the live attempt before both
-    // validating and admitting. A retry successor is minted on the
-    // predecessor's shard, so `conn` above already owns the whole chain.
-    // `resolve_live_attempt` returns the resolved row, so the validation below
-    // reuses it rather than re-loading the identical row by id.
-    let resolved = match autumn_harvest::execution::resolve_live_attempt(&mut conn, exec_id).await {
-        Ok(ex) => ex,
+    // validating and admitting.
+    //
+    // A retry successor is minted on the predecessor's shard. Nothing stops
+    // it from being rebalanced away afterwards (issue #1596 review).
+    // `resolve_live_attempt` re-resolves residence at each hop, rather than
+    // trusting `conn` to already own the whole chain. `resolve_live_attempt`
+    // returns the resolved row, so the validation below reuses it rather than
+    // re-loading the identical row by id.
+    let pool = match api_state.storage_pool() {
+        Ok(pool) => pool,
+        Err(e) => return map_error(e).into_response(),
+    };
+    let (resolved, mut target_shard) = match autumn_harvest::execution::resolve_live_attempt(
+        &mut conn,
+        pool.sharded_pool(),
+        shard,
+        exec_id,
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
         Err(e) => return map_error(e).into_response(),
     };
     let mut target = ExecutionId::from_uuid(resolved.id);
@@ -43051,31 +47613,67 @@ pub(crate) async fn admit_update(
     // attempt. `admit_update_event` verifies RUNNING under the same FOR UPDATE
     // lock and rolls back on rejection, so a re-driven admit can never
     // double-admit.
-    let mut admit = store::admit_update_event(
+    //
+    // Bound to `target_shard`, not `conn` directly (issue #1596 follow-up
+    // review, comment 4052389744). The resolved attempt, and each
+    // re-drive's fresh one, can live on a different shard than `conn`.
+    // `conn` stays on `exec_id`'s own shard throughout.
+    let mut bound = match autumn_harvest::shard_rebalance::bind_to_shard(
         &mut conn,
+        pool.sharded_pool(),
+        shard,
+        target_shard,
+    )
+    .await
+    {
+        Ok(b) => b,
+        Err(e) => return map_error(e).into_response(),
+    };
+    let mut admit = store::admit_update_event_with_codecs(
+        bound.as_mut(),
         target,
         update_id,
         update_name.clone(),
         request.input.clone(),
         Some(runtime.registry.telemetry().metrics.as_ref()),
+        runtime.registry.payload_codecs(),
     )
     .await;
     for _ in 0..autumn_harvest::execution::RETRY_CHAIN_MAX_REDRIVES {
         let Err(error) = admit else { break };
-        let fresh = autumn_harvest::execution::resolve_live_attempt_id(&mut conn, exec_id)
-            .await
-            .unwrap_or(target);
+        drop(bound);
+        let (fresh, fresh_shard) = autumn_harvest::execution::resolve_live_attempt_id(
+            &mut conn,
+            pool.sharded_pool(),
+            shard,
+            exec_id,
+        )
+        .await
+        .unwrap_or((target, target_shard));
         if !autumn_harvest::execution::redrive_target(target, fresh) {
             return map_error(error).into_response();
         }
         target = fresh;
-        admit = store::admit_update_event(
+        target_shard = fresh_shard;
+        bound = match autumn_harvest::shard_rebalance::bind_to_shard(
             &mut conn,
+            pool.sharded_pool(),
+            shard,
+            target_shard,
+        )
+        .await
+        {
+            Ok(b) => b,
+            Err(e) => return map_error(e).into_response(),
+        };
+        admit = store::admit_update_event_with_codecs(
+            bound.as_mut(),
             target,
             update_id,
             update_name.clone(),
             request.input.clone(),
             Some(runtime.registry.telemetry().metrics.as_ref()),
+            runtime.registry.payload_codecs(),
         )
         .await;
     }
@@ -43084,7 +47682,7 @@ pub(crate) async fn admit_update(
     }
 
     // Wake the workflow worker so it picks up the new admitted update.
-    if let Err(e) = queue::wake_workflow_task(&mut conn, target).await {
+    if let Err(e) = queue::wake_workflow_task(bound.as_mut(), target).await {
         return map_error(e).into_response();
     }
 
@@ -43105,7 +47703,14 @@ pub(crate) async fn admit_update(
         Ok(p) => p,
         Err(e) => return map_error(e).into_response(),
     };
-    poll_update_result(&pool, target, update_id, timeout_secs).await
+    poll_update_result(
+        &pool,
+        target,
+        update_id,
+        timeout_secs,
+        &api_state.payload_codecs(),
+    )
+    .await
 }
 
 /// Poll history until `update_id` resolves to `UpdateCompleted`/`UpdateFailed`
@@ -43139,6 +47744,11 @@ pub async fn poll_update_result(
     exec_id: ExecutionId,
     update_id: UpdateId,
     timeout_secs: u64,
+    // The update's `output` is a payload field returned verbatim to the HTTP
+    // caller, so this must be the configured registry: the identity one would
+    // either raise `UnknownCodecKey` or serve a ciphertext envelope as the
+    // update result.
+    codecs: &autumn_harvest::payload_codec::PayloadCodecs,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
@@ -43148,12 +47758,19 @@ pub async fn poll_update_result(
         loop {
             let result = {
                 // Scope the connection so it is returned to the pool before sleeping.
-                let mut c = pool
-                    .pool_for_execution(exec_id)
-                    .get()
-                    .await
-                    .map_err(|e| HarvestError::Database(e.to_string()))?;
-                let h = store::load_history(&mut c, exec_id).await?;
+                // Forwarding-aware (issue #964): the admit-and-wake half of an
+                // update routes through `db_conn_for_execution`, which follows
+                // the durable pointer to the live copy. If the poll did not, a
+                // rebalanced workflow would have its update run on the target
+                // while this loop read the sealed source's frozen history —
+                // never observing `UpdateCompleted`/`UpdateFailed`, and
+                // answering 504 for an update that in fact completed.
+                let mut c = autumn_harvest::shard_rebalance::conn_for_execution_forwarded(
+                    pool.sharded_pool(),
+                    exec_id,
+                )
+                .await?;
+                let h = store::load_history_with_codecs(&mut c, exec_id, codecs).await?;
                 // c is dropped here, releasing the connection back to the pool.
                 let mut terminal_state = get_terminal_workflow_state(&h.events);
                 if (terminal_state == Some("CANCELLED") || terminal_state == Some("FAILED"))
@@ -43230,6 +47847,11 @@ pub async fn poll_update_result(
 /// - `409 Conflict` with `error` if the handler failed or the update was rejected.
 /// - `202 Accepted` if the update is still in-flight.
 /// - `404 Not Found` if no `UpdateAdmitted` event exists for the given ID.
+// Issue #1596 review: threading the sharded pool and shard through the
+// residence-aware `retry_chain_ids` call pushed this past the clippy line
+// limit. An allow is cheaper than refactoring an unrelated large function
+// for a four-line fix (mirrors `execute_query_in_process`'s own allow).
+#[allow(clippy::too_many_lines)]
 async fn get_update_result(
     Extension(api_state): Extension<HarvestApiState>,
     Path((id, update_id_str)): Path<(String, String)>,
@@ -43248,9 +47870,13 @@ async fn get_update_result(
         }
     };
 
-    let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
+    let (mut conn, shard) = match db_conn_for_execution_with_shard(&api_state, exec_id).await {
         Ok(c) => c,
         Err(e) => return e.into_response(),
+    };
+    let pool = match api_state.storage_pool() {
+        Ok(pool) => pool,
+        Err(e) => return map_error(e).into_response(),
     };
 
     // Issue #843: `admit_update` routes admission to the live attempt of the
@@ -43267,33 +47893,79 @@ async fn get_update_result(
     // this admission — deepest first, because the live attempt is the common
     // case (an update admitted moments ago) and a workflow that never retried
     // has a one-element chain, i.e. exactly today's single history load.
-    let chain = match autumn_harvest::execution::retry_chain_ids(&mut conn, exec_id).await {
+    //
+    // Issue #1596 review: `retry_chain_ids` re-resolves residence at each
+    // hop. A chain member rebalanced onto another shard is still discovered
+    // here, instead of the walk stopping at its stale origin-side seal.
+    let chain = match autumn_harvest::execution::retry_chain_ids(
+        &mut conn,
+        pool.sharded_pool(),
+        shard,
+        exec_id,
+    )
+    .await
+    {
         Ok(c) => c,
         Err(e) => return map_error(e).into_response(),
     };
     let mut found = None;
-    for candidate in chain.into_iter().rev() {
-        let history = match store::load_history(&mut conn, candidate).await {
+    for (candidate, candidate_shard) in chain.into_iter().rev() {
+        // Bound to THIS candidate's own shard (issue #1596 follow-up
+        // review, comment 4052389744). Different links of the chain can
+        // live on different shards. `conn` is fixed on `shard`, `exec_id`'s
+        // own, and does not follow any of them on its own.
+        let mut bound = match autumn_harvest::shard_rebalance::bind_to_shard(
+            &mut conn,
+            pool.sharded_pool(),
+            shard,
+            candidate_shard,
+        )
+        .await
+        {
+            Ok(b) => b,
+            Err(e) => return map_error(e).into_response(),
+        };
+        let history = match store::load_history_with_codecs(
+            bound.as_mut(),
+            candidate,
+            &api_state.payload_codecs(),
+        )
+        .await
+        {
             Ok(h) => h,
             Err(e) => return map_error(e).into_response(),
         };
         if history.events.iter().any(
             |ev| matches!(ev, WorkflowEvent::UpdateAdmitted { update_id: id, .. } if *id == update_id),
         ) {
-            found = Some((candidate, history));
+            found = Some((candidate, candidate_shard, history));
             break;
         }
     }
-    let Some((target, history)) = found else {
+    let Some((target, target_shard, history)) = found else {
         return AutumnError::not_found_msg(format!("update {update_id_str}")).into_response();
     };
 
     let mut terminal_state = get_terminal_workflow_state(&history.events);
+    // Bound to `target`'s own shard, not `conn` directly (issue #1596
+    // follow-up review, comment 4052389744). `target` is the chain member
+    // found above. It may not be `exec_id` itself.
+    let mut bound = match autumn_harvest::shard_rebalance::bind_to_shard(
+        &mut conn,
+        pool.sharded_pool(),
+        shard,
+        target_shard,
+    )
+    .await
+    {
+        Ok(b) => b,
+        Err(e) => return map_error(e).into_response(),
+    };
     if (terminal_state == Some("CANCELLED") || terminal_state == Some("FAILED"))
         && let Ok(Some(db_state)) = harvest_workflow_executions::table
             .find(target.as_uuid())
             .select(harvest_workflow_executions::state)
-            .first::<String>(&mut conn)
+            .first::<String>(bound.as_mut())
             .await
             .optional()
     {
@@ -43546,7 +48218,7 @@ async fn set_build_policy_handler(
     Extension(api_state): Extension<HarvestApiState>,
     axum::Json(body): axum::Json<SetBuildPolicyBody>,
 ) -> impl axum::response::IntoResponse {
-    use autumn_harvest::build_routing::set_build_policy;
+    use autumn_harvest::build_routing::set_build_policy_with_ramp_id;
 
     let queue_name = body.queue_name.trim();
     let build_id = body.build_id.trim();
@@ -43562,7 +48234,20 @@ async fn set_build_policy_handler(
     let deployment = body.deployment_name.as_deref().filter(|s| !s.is_empty());
     let (actor, source, request_id) = audit_context(&headers, &api_state);
 
+    // One ramp id for every shard, so a retained ramp keeps one identity
+    // (issue #1814). A retry with the same `Idempotency-Key` reuses it.
+    let ramp_id = match fan_out_ramp_id(
+        &headers,
+        "policy",
+        queue_name,
+        &[Some(build_id), deployment],
+    ) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
     let mut last_policy = None;
+    let mut last_conflict = None;
+    let mut shard_conflicts: Vec<String> = Vec::new();
     let mut shard_errors: Vec<String> = Vec::new();
     for (shard_id, shard_pool) in pool.iter_shards() {
         let mut conn = match acquire_conn(shard_pool).await {
@@ -43572,16 +48257,29 @@ async fn set_build_policy_handler(
                 continue;
             }
         };
-        match set_build_policy(&mut conn, queue_name, build_id, deployment)
+        match set_build_policy_with_ramp_id(&mut conn, queue_name, build_id, deployment, ramp_id)
             .await
-            .map_err(map_error)
         {
             Ok(p) => last_policy = Some(p),
+            Err(e @ autumn_harvest::HarvestError::Config(_)) => {
+                shard_conflicts.push(format!("shard {}: {e}", shard_id.as_i32()));
+                last_conflict = Some(e);
+            }
             Err(e) => {
-                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+                shard_errors.push(format!("shard {}: {}", shard_id.as_i32(), map_error(e)));
             }
         }
     }
+
+    // A later write superseded this keyed request on every shard that holds
+    // it (issue #1814). That is a conflict, not an outage.
+    if last_policy.is_none()
+        && shard_errors.is_empty()
+        && let Some(conflict) = last_conflict
+    {
+        return conflict_from(conflict).into_response();
+    }
+    shard_errors.extend(shard_conflicts);
 
     // If every shard write failed, return 503 before attempting audit.
     if !shard_errors.is_empty() && last_policy.is_none() {
@@ -43669,6 +48367,113 @@ async fn set_build_policy_handler(
     }
 }
 
+/// A caller `ramp_id` derived from the parts of one request (issue #1814).
+///
+/// Each part has a length prefix, and a missing part has its own marker. So
+/// no two different part lists give one id.
+pub(crate) fn derived_ramp_id(parts: &[Option<&str>]) -> uuid::Uuid {
+    use std::fmt::Write as _;
+
+    let mut name = String::from("build-routing");
+    for part in parts {
+        match part {
+            Some(text) => {
+                let _ = write!(name, "/{}:{text}", text.len());
+            }
+            None => name.push_str("/-"),
+        }
+    }
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, name.as_bytes())
+}
+
+/// The `ramp_id` of one build-routing fan-out (issue #1814).
+///
+/// A request with an `Idempotency-Key` header gets an id derived from the
+/// route, the queue, the key and the payload. A retry after a partial
+/// fan-out therefore writes the same id on every shard. A reused key with a
+/// changed payload gets a new id, so every shard rewrites the ramp under
+/// that new id. A request with no key gets a new id.
+#[allow(clippy::result_large_err)]
+fn fan_out_ramp_id(
+    headers: &axum::http::HeaderMap,
+    route: &str,
+    queue_name: &str,
+    payload: &[Option<&str>],
+) -> Result<uuid::Uuid, axum::response::Response> {
+    let Some(key) = extract_start_idempotency_header_key(headers)? else {
+        return Ok(uuid::Uuid::new_v4());
+    };
+    let mut parts = vec![Some(route), Some(queue_name), Some(key.as_str())];
+    parts.extend_from_slice(payload);
+    Ok(derived_ramp_id(&parts))
+}
+
+/// Refuse a keyed ramp whose generation the ramp guard aborted (issue
+/// #1814).
+///
+/// A keyed retry derives the same `ramp_id`. A retry after an abort, for
+/// example after a lost response, would otherwise restore the aborted ramp.
+/// The check runs before any write, so no shard gets the ramp back. Each
+/// shard checks its abort markers for the generation id of its own base.
+/// The audit pool then checks its report ledger, which outlives the
+/// markers. The check fails closed with `503`. A shard that cannot be read
+/// could hold an aborted generation whose markers are pruned, and only the
+/// audit pool can then refuse it.
+#[allow(clippy::result_large_err)]
+async fn refuse_aborted_ramp(
+    pool: &HarvestDbPool,
+    queue_name: &str,
+    target_build_id: &str,
+    ramp_id: uuid::Uuid,
+) -> Result<(), axum::response::Response> {
+    use autumn_harvest::build_routing::{
+        aborted_generation_error, get_build_policy, ramp_caller_target_id, ramp_generation_aborted,
+        ramp_generation_id,
+    };
+
+    let caller_target = ramp_caller_target_id(ramp_id, queue_name, target_build_id);
+    let refused = || conflict_from(aborted_generation_error(queue_name, target_build_id));
+    let unchecked = |shard: ShardId, error: &dyn std::fmt::Display| {
+        AutumnError::service_unavailable_msg(format!(
+            "shard {}: cannot check the ramp for an earlier abort: {error}; no shard was \
+             written, retry the request",
+            shard.as_i32()
+        ))
+        .into_response()
+    };
+    let mut generations = Vec::new();
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool)
+            .await
+            .map_err(|e| unchecked(shard_id, &e))?;
+        // A shard with no base policy holds no ramp. Its write fails on the
+        // missing base.
+        let Some(policy) = get_build_policy(&mut conn, queue_name)
+            .await
+            .map_err(|e| unchecked(shard_id, &e))?
+        else {
+            continue;
+        };
+        let generation = ramp_generation_id(ramp_id, queue_name, &policy.build_id, target_build_id);
+        if ramp_generation_aborted(&mut conn, queue_name, &[generation, ramp_id, caller_target])
+            .await
+            .map_err(|e| unchecked(shard_id, &e))?
+        {
+            return Err(refused().into_response());
+        }
+        generations.push(generation);
+    }
+    generations.extend([ramp_id, caller_target]);
+    let mut conn = acquire_conn(pool.default_pool())
+        .await
+        .map_err(axum::response::IntoResponse::into_response)?;
+    match ramp_generation_aborted(&mut conn, queue_name, &generations).await {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(refused().into_response()),
+        Err(e) => Err(map_error(e).into_response()),
+    }
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct SetBuildRampBody {
     queue_name: String,
@@ -43691,7 +48496,7 @@ async fn set_build_ramp_handler(
     Extension(api_state): Extension<HarvestApiState>,
     axum::Json(body): axum::Json<SetBuildRampBody>,
 ) -> impl axum::response::IntoResponse {
-    use autumn_harvest::build_routing::{set_build_ramp, validate_ramp_percent};
+    use autumn_harvest::build_routing::{set_build_ramp_with_id, validate_ramp_percent};
 
     let queue_name = body.queue_name.trim();
     let target_build_id = body.target_build_id.trim();
@@ -43708,9 +48513,29 @@ async fn set_build_ramp_handler(
         Err(e) => return e.into_response(),
     };
     let (actor, source, request_id) = audit_context(&headers, &api_state);
+    // One id for this ramp on every shard. The ramp guard matches its abort
+    // markers to a ramp by this id, not by clocks (issue #1814). A retry with
+    // the same `Idempotency-Key` reuses it.
+    let percent = body.ramp_percent.to_string();
+    let ramp_id = match fan_out_ramp_id(
+        &headers,
+        "ramp",
+        queue_name,
+        &[Some(target_build_id), Some(percent.as_str())],
+    ) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    if headers.contains_key(HEADER_IDEMPOTENCY_KEY)
+        && let Err(response) =
+            refuse_aborted_ramp(&pool, queue_name, target_build_id, ramp_id).await
+    {
+        return response;
+    }
 
     let mut last_policy = None;
     let mut last_conflict = None;
+    let mut shard_conflicts: Vec<String> = Vec::new();
     let mut shard_errors: Vec<String> = Vec::new();
     for (shard_id, shard_pool) in pool.iter_shards() {
         let mut conn = match acquire_conn(shard_pool).await {
@@ -43720,9 +48545,18 @@ async fn set_build_ramp_handler(
                 continue;
             }
         };
-        match set_build_ramp(&mut conn, queue_name, target_build_id, body.ramp_percent).await {
+        match set_build_ramp_with_id(
+            &mut conn,
+            queue_name,
+            target_build_id,
+            body.ramp_percent,
+            ramp_id,
+        )
+        .await
+        {
             Ok(p) => last_policy = Some(p),
             Err(e @ autumn_harvest::HarvestError::Config(_)) => {
+                shard_conflicts.push(format!("shard {}: {e}", shard_id.as_i32()));
                 last_conflict = Some(e);
             }
             Err(e) => {
@@ -43738,6 +48572,9 @@ async fn set_build_ramp_handler(
     {
         return conflict_from(conflict).into_response();
     }
+    // A conflict on one shard while another shard takes the ramp leaves the
+    // fan-out divergent. Report it as a partial failure (issue #1814).
+    shard_errors.extend(shard_conflicts);
 
     // If every shard write failed, return 503 before attempting audit.
     if !shard_errors.is_empty() && last_policy.is_none() {
@@ -44726,8 +49563,8 @@ async fn evaluate_eligibility_for_shard(
         i64::from(tasks.iter().any(|t| {
             t.state == "PENDING"
                 && t.scheduled_at <= chrono::Utc::now()
-                && (t.schedule_to_close_at.is_none()
-                    || t.schedule_to_close_at.unwrap() > chrono::Utc::now())
+                && t.schedule_to_close_at
+                    .is_none_or(|at| at > chrono::Utc::now())
         }))
     } else {
         let count: i64 = harvest_task_queue::table
@@ -44753,8 +49590,8 @@ async fn evaluate_eligibility_for_shard(
             .filter(|&t| {
                 t.state == "PENDING"
                     && t.scheduled_at <= chrono::Utc::now()
-                    && (t.schedule_to_close_at.is_none()
-                        || t.schedule_to_close_at.unwrap() > chrono::Utc::now())
+                    && t.schedule_to_close_at
+                        .is_none_or(|at| at > chrono::Utc::now())
             })
             .map(|t| {
                 let age = chrono::Utc::now().signed_duration_since(t.scheduled_at);
@@ -44985,8 +49822,8 @@ async fn evaluate_eligibility_for_shard(
         .filter(|t| {
             t.state == "PENDING"
                 && t.scheduled_at <= chrono::Utc::now()
-                && (t.schedule_to_close_at.is_none()
-                    || t.schedule_to_close_at.unwrap() > chrono::Utc::now())
+                && t.schedule_to_close_at
+                    .is_none_or(|at| at > chrono::Utc::now())
         })
         .collect();
 
@@ -45177,8 +50014,8 @@ async fn evaluate_eligibility_for_shard(
                 };
 
                 if let Some(reqs) = parsed_reqs {
-                    let worker_labels: std::collections::HashMap<String, String> =
-                        serde_json::from_value(w.worker.labels.clone()).unwrap_or_default();
+                    let worker_labels =
+                        autumn_harvest::payload_codec::string_valued_labels(&w.worker.labels);
                     for req in &reqs {
                         let satisfied = match req {
                             autumn_harvest::eligibility::Requirement::Exact { key, value } => {
@@ -45990,6 +50827,80 @@ mod reserved_idempotency_key_tests {
 #[cfg(test)]
 mod tests {
 
+    // ── issue #1814: one ramp id per keyed build-routing fan-out ────────────
+
+    const PAYLOAD: &[Option<&str>] = &[Some("canary-v2"), Some("25")];
+
+    /// A reused key with a changed payload gets a new id. An exact retry
+    /// keeps its id.
+    #[test]
+    fn a_keyed_ramp_id_depends_on_the_payload() {
+        let headers = idempotency_headers("deploy-42");
+        let id = |payload: &[Option<&str>]| {
+            fan_out_ramp_id(&headers, "ramp", "default", payload).expect("id")
+        };
+        assert_eq!(id(PAYLOAD), id(PAYLOAD));
+        assert_ne!(id(PAYLOAD), id(&[Some("canary-v2"), Some("50")]));
+        assert_ne!(id(&[Some("b"), None]), id(&[Some("b"), Some("")]));
+    }
+
+    fn idempotency_headers(key: &str) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            HEADER_IDEMPOTENCY_KEY,
+            axum::http::HeaderValue::from_str(key).expect("header value"),
+        );
+        headers
+    }
+
+    /// A retry with the same key gets the same ramp id, so a partial
+    /// fan-out and its retry write one id on every shard.
+    #[test]
+    fn a_keyed_fan_out_gets_the_same_ramp_id_on_retry() {
+        let headers = idempotency_headers("deploy-42");
+        let first = fan_out_ramp_id(&headers, "ramp", "default", PAYLOAD).expect("id");
+        let retry = fan_out_ramp_id(&headers, "ramp", "default", PAYLOAD).expect("id");
+        assert_eq!(first, retry);
+    }
+
+    /// The id depends on the key, the queue and the route.
+    #[test]
+    fn a_keyed_ramp_id_depends_on_key_queue_and_route() {
+        let headers = idempotency_headers("deploy-42");
+        let base = fan_out_ramp_id(&headers, "ramp", "default", PAYLOAD).expect("id");
+        let other_key = fan_out_ramp_id(
+            &idempotency_headers("deploy-43"),
+            "ramp",
+            "default",
+            PAYLOAD,
+        )
+        .expect("id");
+        let other_queue = fan_out_ramp_id(&headers, "ramp", "billing", PAYLOAD).expect("id");
+        let other_route = fan_out_ramp_id(&headers, "policy", "default", PAYLOAD).expect("id");
+        assert_ne!(base, other_key);
+        assert_ne!(base, other_queue);
+        assert_ne!(base, other_route);
+    }
+
+    /// A request with no key gets a new id each time.
+    #[test]
+    fn an_unkeyed_fan_out_gets_a_new_ramp_id() {
+        let headers = axum::http::HeaderMap::new();
+        let first = fan_out_ramp_id(&headers, "ramp", "default", PAYLOAD).expect("id");
+        let second = fan_out_ramp_id(&headers, "ramp", "default", PAYLOAD).expect("id");
+        assert_ne!(first, second);
+    }
+
+    /// An empty key is a client error, as on the start route.
+    #[test]
+    fn an_empty_idempotency_key_is_rejected() {
+        let result = fan_out_ramp_id(&idempotency_headers("  "), "ramp", "default", PAYLOAD);
+        assert_eq!(
+            result.expect_err("an empty key is a 400").status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+    }
+
     // ── issue #811 (Codex round 1, P2): activity concurrency groups always defer
     // ───────────────────────────────────────────────────────────────────────
 
@@ -46349,7 +51260,10 @@ mod tests {
 
     #[test]
     fn merge_paused_queues_is_empty_when_nothing_is_held() {
-        assert!(merge_paused_queue_rows(Vec::new(), &[0]).is_empty());
+        assert_eq!(
+            merge_paused_queue_rows(Vec::new(), &[0]),
+            [] as [serde_json::Value; 0]
+        );
     }
 
     /// Issue #619 review: `effective_scope` must be derived from the shards that
@@ -46946,7 +51860,7 @@ mod tests {
 
         let mut empty: Vec<String> = Vec::new();
         sort_reason_codes(&mut empty);
-        assert!(empty.is_empty());
+        assert_eq!(empty, [] as [std::string::String; 0]);
 
         // Issue #807: the activity-level hold leads too, and a task held by
         // BOTH reports them in a deterministic order rather than whichever the
@@ -47327,8 +52241,11 @@ mod tests {
             obs.error.is_some(),
             "a poolless expected shard must be an unavailable observation, not skipped"
         );
-        assert!(obs.runs.is_empty());
-        assert!(obs.summary.is_empty());
+        assert_eq!(obs.runs, [] as [autumn_harvest::ScheduleRunRow; 0]);
+        assert_eq!(
+            obs.summary,
+            [] as [autumn_harvest::ScheduleRunStateCount; 0]
+        );
 
         // The unavailable observation, combined with a healthy inspected shard,
         // must drive the report status to `partial` — never `complete`.
@@ -47498,6 +52415,148 @@ mod tests {
         let deduped_rev = dedup_workers_by_freshest(vec![fresh2, stale2]);
         assert_eq!(deduped_rev.len(), 1);
         assert_eq!(deduped_rev[0].health, WorkerHealth::Healthy);
+    }
+
+    // ── issue #1208: `by_shard` must count an empty-assignment worker under
+    // the shard its row was read from ─────────────────────────────────────
+
+    /// Build a minimal `WorkerRow` for `by_shard` merge-layer tests.
+    fn worker_row_for_shard_test(
+        worker_id: &str,
+        hb: chrono::DateTime<chrono::Utc>,
+        shard_assignments: serde_json::Value,
+    ) -> WorkerRow {
+        use autumn_harvest::models::HarvestWorker;
+        use autumn_harvest::workers::WorkerHealth;
+
+        WorkerRow {
+            worker: HarvestWorker {
+                worker_id: worker_id.to_string(),
+                started_at: hb,
+                last_heartbeat_at: hb,
+                queues: serde_json::json!(["default"]),
+                shard_assignments,
+                max_concurrency: 10,
+                in_flight_count: 0,
+                host: "localhost".to_string(),
+                version: None,
+                status: "Active".to_string(),
+                drain_deadline_at: None,
+                build_id: String::new(),
+                deployment_name: None,
+                labels: serde_json::json!({}),
+                max_concurrent_sessions: 0,
+                in_use_sessions: 0,
+            },
+            health: WorkerHealth::Healthy,
+            active_task_ids: vec![],
+        }
+    }
+
+    #[test]
+    fn dedup_worker_sources_by_freshest_keeps_the_freshest_rows_source_shard() {
+        let now = chrono::Utc::now();
+        let stale_on_shard_0 = (
+            0,
+            worker_row_for_shard_test(
+                "w1",
+                now - chrono::Duration::hours(1),
+                serde_json::json!([]),
+            ),
+        );
+        let fresh_on_shard_1 = (
+            1,
+            worker_row_for_shard_test("w1", now, serde_json::json!([])),
+        );
+
+        let deduped =
+            dedup_worker_sources_by_freshest(vec![stale_on_shard_0, fresh_on_shard_1.clone()]);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].0, 1, "must keep the freshest row's source shard");
+
+        // Order-independent.
+        let stale_on_shard_0 = (
+            0,
+            worker_row_for_shard_test(
+                "w1",
+                now - chrono::Duration::hours(1),
+                serde_json::json!([]),
+            ),
+        );
+        let deduped_rev =
+            dedup_worker_sources_by_freshest(vec![fresh_on_shard_1, stale_on_shard_0]);
+        assert_eq!(deduped_rev.len(), 1);
+        assert_eq!(deduped_rev[0].0, 1);
+    }
+
+    #[test]
+    fn tally_by_shard_attributes_an_empty_assignment_worker_to_its_source_shard() {
+        let now = chrono::Utc::now();
+        let rows = vec![(
+            7,
+            worker_row_for_shard_test("auto", now, serde_json::json!([])),
+        )];
+        let by_shard = tally_by_shard(&rows);
+        assert_eq!(by_shard.get(&7), Some(&1));
+        assert_eq!(by_shard.len(), 1, "must not fabricate any other bucket");
+    }
+
+    #[test]
+    fn tally_by_shard_attributes_a_non_empty_assignment_worker_literally() {
+        let now = chrono::Utc::now();
+        // Source shard (3) is irrelevant once the list is non-empty: the
+        // worker's explicit claim wins, exactly as before this fix.
+        let rows = vec![(
+            3,
+            worker_row_for_shard_test("narrow", now, serde_json::json!([1, 5])),
+        )];
+        let by_shard = tally_by_shard(&rows);
+        assert_eq!(by_shard.get(&1), Some(&1));
+        assert_eq!(by_shard.get(&5), Some(&1));
+        assert_eq!(
+            by_shard.get(&3),
+            None,
+            "the source shard itself must not gain a phantom count"
+        );
+        assert_eq!(by_shard.len(), 2);
+    }
+
+    #[test]
+    fn tally_by_shard_attributes_a_malformed_assignment_to_nothing() {
+        let now = chrono::Utc::now();
+        let rows = vec![(
+            2,
+            worker_row_for_shard_test("corrupt", now, serde_json::json!("not-an-array")),
+        )];
+        let by_shard = tally_by_shard(&rows);
+        assert!(
+            by_shard.is_empty(),
+            "a malformed shard_assignments value must not be attributed anywhere: {by_shard:?}"
+        );
+    }
+
+    #[test]
+    fn tally_by_shard_does_not_double_count_a_multi_shard_worker_across_the_fanout() {
+        let now = chrono::Utc::now();
+        // The same worker_id shows up once per assigned shard (replicated row),
+        // as it would after the fan-out but before dedup collapses it to one.
+        // Dedup must run first so the literal `[1, 3]` claim is counted once
+        // per shard, not once per replica.
+        let replicas = vec![
+            (
+                1,
+                worker_row_for_shard_test("multi", now, serde_json::json!([1, 3])),
+            ),
+            (
+                3,
+                worker_row_for_shard_test("multi", now, serde_json::json!([1, 3])),
+            ),
+        ];
+        let deduped = dedup_worker_sources_by_freshest(replicas);
+        let by_shard = tally_by_shard(&deduped);
+        assert_eq!(by_shard.get(&1), Some(&1));
+        assert_eq!(by_shard.get(&3), Some(&1));
+        assert_eq!(by_shard.len(), 2);
     }
 
     #[test]
@@ -47834,9 +52893,9 @@ mod tests {
     fn parse_workflow_filters_defaults_to_empty_filters_with_default_limit() {
         let filters = parse_workflow_filters(&[]).expect("no params should parse");
         assert_eq!(filters.limit, DEFAULT_WORKFLOW_LIMIT);
-        assert!(filters.states.is_empty());
+        assert_eq!(filters.states, [] as [std::string::String; 0]);
         assert!(filters.workflow_name.is_none());
-        assert!(filters.search_attrs.is_empty());
+        assert_eq!(filters.search_attrs, [] as [serde_json::Value; 0]);
     }
 
     #[test]
@@ -48179,7 +53238,7 @@ mod tests {
     fn parse_workflow_filters_ignores_unknown_query_keys() {
         let filters = parse_workflow_filters(&pairs(&[("ignored", "value")]))
             .expect("unknown keys should be skipped");
-        assert!(filters.states.is_empty());
+        assert_eq!(filters.states, [] as [std::string::String; 0]);
         assert!(filters.workflow_name.is_none());
     }
 
@@ -48493,6 +53552,95 @@ mod tests {
         );
     }
 
+    // -- conflict_from precision (issue #1445 review) --
+
+    #[test]
+    fn conflict_from_maps_already_terminal_config_to_409() {
+        let err = HarvestError::Config(
+            "workflow execution 00000000-0000-4000-8000-000000000001 is already terminal \
+             (COMPLETED)"
+                .to_string(),
+        );
+        assert_eq!(
+            conflict_from(err).status(),
+            axum::http::StatusCode::CONFLICT
+        );
+    }
+
+    #[test]
+    fn conflict_from_excludes_the_retry_chain_max_depth_guard() {
+        // `resolve_live_attempt_id`'s retry-chain max-depth guard (issue #843)
+        // is surfaced on the cancel/pause live-attempt-routing call path via
+        // its own typed variant (issue #1445), not `Config`. It must NOT be
+        // reported as a 409 resource-state conflict. It is an
+        // operational/corrupted-chain failure, not "the workflow already
+        // finished."
+        let err = HarvestError::RetryChainMaxDepthExceeded {
+            exec_id: ExecutionId::new_for_shard(ShardId::new(0)),
+            max_depth: 256,
+        };
+        assert_ne!(
+            conflict_from(err).status(),
+            axum::http::StatusCode::CONFLICT
+        );
+    }
+
+    #[test]
+    fn conflict_from_excludes_an_invalid_parent_close_policy() {
+        // `apply_parent_close_cascade`'s parse of a corrupted stored
+        // `parent_close_policy` column (issue #1445) is reached from the same
+        // cancel/terminate transaction as a genuine "already terminal"
+        // conflict. It can fire even on a still-`RUNNING` parent. It must
+        // NOT be reported as a 409 resource-state conflict. It is a
+        // data-integrity fault, not proof the workflow already finished.
+        let err = HarvestError::InvalidParentClosePolicy {
+            child_exec_id: ExecutionId::new_for_shard(ShardId::new(0)),
+            raw: "not-a-real-policy".to_string(),
+        };
+        assert_ne!(
+            conflict_from(err).status(),
+            axum::http::StatusCode::CONFLICT
+        );
+    }
+
+    #[test]
+    fn conflict_from_still_maps_other_state_conflicts_to_409() {
+        // Callers besides cancel/pause/rerun route their own distinct
+        // state-conflict messages through this same helper as `Config`
+        // (issue #1445). One example: `POST /admin/build-routing/ramp`
+        // without a base policy. `conflict_from` must default every `Config`
+        // to 409, excluding only `RetryChainMaxDepthExceeded` above.
+        let err = HarvestError::Config(
+            "cannot set a build ramp for queue 'no-base-policy': no base build policy is \
+             configured"
+                .to_string(),
+        );
+        assert_eq!(
+            conflict_from(err).status(),
+            axum::http::StatusCode::CONFLICT
+        );
+    }
+
+    #[test]
+    fn conflict_from_config_is_not_spoofable_by_interpolated_text() {
+        // Issue #1445 finding: a message-content match on `Config` is
+        // spoofable. Caller-controlled text can land inside an unrelated
+        // conflict, e.g. a queue name containing "exceeds the maximum walk
+        // depth". The retry-chain guard is now excluded by its own typed
+        // variant, not by inspecting message text. A `Config` conflict
+        // carrying that exact phrase still maps to 409. The classification
+        // no longer reads the message at all.
+        let err = HarvestError::Config(
+            "cannot set a build ramp for queue 'exceeds the maximum walk depth of 256': no base \
+             build policy is configured"
+                .to_string(),
+        );
+        assert_eq!(
+            conflict_from(err).status(),
+            axum::http::StatusCode::CONFLICT
+        );
+    }
+
     #[test]
     fn parse_conflict_policy_unknown_value_is_not_silent_fallback() {
         // Wrong-case must be rejected, not silently coerced to Unspecified.
@@ -48589,14 +53737,55 @@ mod tests {
         );
     }
 
+    // Issue #1821: only `NotFound` with a known row returns that row.
+    #[test]
+    fn last_known_on_not_found_swallows_only_not_found_1821() {
+        let last = stub_workflow_execution();
+        let id = last.id;
+        let kept =
+            last_known_on_not_found(HarvestError::NotFound("gone".into()), Some(last.clone()));
+        assert_eq!(kept.ok().map(|e| e.id), Some(id));
+        assert!(last_known_on_not_found(HarvestError::NotFound("gone".into()), None).is_err());
+        assert!(last_known_on_not_found(HarvestError::Config("x".into()), Some(last)).is_err());
+    }
+
+    // Issue #1821: stored update ids depend on these exact namespace bytes.
+    #[test]
+    fn update_id_namespace_keeps_its_bytes_1821() {
+        assert_eq!(
+            UPDATE_ID_NAMESPACE.to_string(),
+            "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+        );
+    }
+
+    // Issue #1821: one poisoned state cell must not fail every later request.
+    #[test]
+    fn harvest_api_state_survives_a_poisoned_cell_1821() {
+        let state = HarvestApiState::new();
+        let cell = Arc::clone(&state.worker_stale_threshold);
+        let joined = std::thread::spawn(move || {
+            let _held = cell.lock();
+            panic!("poison the api state cell");
+        })
+        .join();
+        assert!(joined.is_err(), "the poisoner thread must panic");
+        assert!(state.worker_stale_threshold.is_poisoned());
+
+        state.set_worker_stale_threshold(std::time::Duration::from_secs(20));
+        assert_eq!(
+            state.worker_stale_threshold(),
+            std::time::Duration::from_secs(20)
+        );
+    }
+
     // -- Drain: AC #2 -- default deadline from shutdown timeout
 
     #[test]
-    fn harvest_api_state_shutdown_timeout_defaults_to_30s() {
+    fn harvest_api_state_shutdown_timeout_defaults_to_the_worker_default() {
         let state = HarvestApiState::new();
         assert_eq!(
             state.worker_shutdown_timeout(),
-            std::time::Duration::from_secs(30)
+            autumn_harvest::builder::DEFAULT_SHUTDOWN_TIMEOUT
         );
     }
 
@@ -48684,7 +53873,7 @@ mod tests {
                 workflow_name: "snapshot_listenerless",
                 workflow_id: "snapshot-listenerless-1",
                 exec_id,
-                input: serde_json::json!({ "ok": true }),
+                input: serde_json::json!({ "ok": true }).into(),
                 parent_id: None,
                 queue_name: "default",
                 execution_timeout: None,
@@ -48737,7 +53926,7 @@ mod tests {
         let response = get_workflow_result(
             Extension(state),
             Path(exec_id.to_string()),
-            Query(Vec::new()),
+            axum::extract::RawQuery(None),
             axum::http::HeaderMap::new(),
             None,
         )
@@ -48773,7 +53962,7 @@ mod tests {
                 workflow_name: "admit_update_no_runtime",
                 workflow_id: "admit-update-no-runtime-1",
                 exec_id,
-                input: serde_json::json!({ "ok": true }),
+                input: serde_json::json!({ "ok": true }).into(),
                 parent_id: None,
                 queue_name: "default",
                 execution_timeout: None,
@@ -48856,7 +54045,7 @@ mod tests {
 
         // And the update must NOT have been durably admitted -- no
         // UpdateAdmitted event should exist for this execution.
-        let history = autumn_harvest::store::load_history(&mut conn, exec_id)
+        let history = autumn_harvest::store::load_history_undecoded(&mut conn, exec_id)
             .await
             .expect("history should load");
         assert!(
@@ -48900,7 +54089,7 @@ mod tests {
                 workflow_name: "signal_no_runtime",
                 workflow_id: "signal-no-runtime-1",
                 exec_id,
-                input: serde_json::json!({ "ok": true }),
+                input: serde_json::json!({ "ok": true }).into(),
                 parent_id: None,
                 queue_name: "default",
                 execution_timeout: None,
@@ -49033,7 +54222,7 @@ mod tests {
                 workflow_name: "rerun_no_runtime",
                 workflow_id: "rerun-no-runtime-1",
                 exec_id,
-                input: serde_json::json!({ "ok": true }),
+                input: serde_json::json!({ "ok": true }).into(),
                 parent_id: None,
                 queue_name: "default",
                 execution_timeout: None,
@@ -49649,7 +54838,10 @@ mod tests {
 
     #[test]
     fn shard_population_of_no_rows_is_empty() {
-        assert!(shard_population(&[]).is_empty());
+        assert_eq!(
+            shard_population(&[]),
+            [] as [autumn_harvest::replay_sample::SampleWorkflowCoverage; 0]
+        );
     }
 
     /// Two logical shards may share one physical database — a supported
@@ -50454,10 +55646,28 @@ mod tests {
             serde_json::from_str(json).expect("should deserialize minimal body");
         assert_eq!(req.schedule_expr, "0 9 * * 1-5");
         assert_eq!(req.timezone, "UTC");
-        assert_eq!(req.jitter_secs, 0);
+        assert_eq!(req.jitter_secs, None);
         assert_eq!(req.overlap_policy, "skip");
         assert_eq!(req.count, 10);
         assert!(req.from.is_none());
+    }
+
+    /// An omitted `jitter_secs` gets the cron default; an explicit 0 opts out
+    /// (issue #1792).
+    #[test]
+    fn requested_jitter_defaults_only_when_omitted() {
+        let cron = Schedule::Cron("0 9 * * *".to_string());
+        assert_eq!(
+            requested_jitter(None, &cron),
+            autumn_harvest::policy::DEFAULT_CRON_JITTER
+        );
+        assert_eq!(requested_jitter(Some(0), &cron), std::time::Duration::ZERO);
+        assert_eq!(
+            requested_jitter(Some(300), &cron),
+            std::time::Duration::from_secs(300)
+        );
+        let seconds = Schedule::Cron("*/5 * * * * *".to_string());
+        assert_eq!(requested_jitter(None, &seconds), std::time::Duration::ZERO);
     }
 
     #[test]
@@ -50474,7 +55684,7 @@ mod tests {
         let req: CandidateSchedulePreviewRequest =
             serde_json::from_str(json).expect("should deserialize full body");
         assert_eq!(req.timezone, "America/Los_Angeles");
-        assert_eq!(req.jitter_secs, 300);
+        assert_eq!(req.jitter_secs, Some(300));
         assert_eq!(req.overlap_policy, "cancel_other");
         assert_eq!(req.count, 20);
         assert_eq!(req.from.as_deref(), Some("2026-06-01T09:00:00Z"));
@@ -50903,8 +56113,12 @@ mod tests {
         };
         let from = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
         let response = empty_preview_response(&schedule, None, from, 10);
-        assert_eq!(response["is_paused"], serde_json::json!(true));
-        assert_eq!(response["pause_reason"], serde_json::json!("operator hold"));
+        assert!(response.is_paused);
+        assert_eq!(response.pause_reason.as_deref(), Some("operator hold"));
+        // The serialized shape is the API contract, so assert on it too.
+        let json = serde_json::to_value(&response).expect("preview serializes");
+        assert_eq!(json["is_paused"], serde_json::json!(true));
+        assert_eq!(json["pause_reason"], serde_json::json!("operator hold"));
     }
 
     #[test]
@@ -50920,6 +56134,7 @@ mod tests {
         };
         let from = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
         let response = empty_preview_response(&schedule, None, from, 10);
+        let response = serde_json::to_value(&response).expect("preview serializes");
         assert_eq!(response["is_paused"], serde_json::json!(false));
         assert_eq!(
             response["pause_reason"],
@@ -51110,7 +56325,7 @@ mod tests {
         );
         let req: CandidateSchedulePreviewRequest =
             serde_json::from_str(&json).expect("u64::MAX must parse into the struct");
-        assert_eq!(req.jitter_secs, u64::MAX);
+        assert_eq!(req.jitter_secs, Some(u64::MAX));
     }
 
     #[test]
@@ -51838,6 +57053,88 @@ mod tests {
     }
 
     #[test]
+    fn requires_admin_scope_matches_only_token_management() {
+        // Issue #1803.
+        let id = "0b7e6a52-4a3c-4f62-9d55-1f6a1c0a7e11";
+        assert!(requires_admin_scope(
+            &axum::http::Method::POST,
+            "/admin/tokens"
+        ));
+        assert!(requires_admin_scope(
+            &axum::http::Method::DELETE,
+            &format!("/admin/tokens/{id}")
+        ));
+        assert!(!requires_admin_scope(
+            &axum::http::Method::GET,
+            "/admin/tokens"
+        ));
+        // Any mutation under a token prefix is admin-only, listed or not.
+        assert!(requires_admin_scope(
+            &axum::http::Method::POST,
+            "/admin/tokens/"
+        ));
+        assert!(requires_admin_scope(
+            &axum::http::Method::POST,
+            &format!("/admin/tokens/{id}/rotate")
+        ));
+        assert!(requires_admin_scope(&axum::http::Method::PUT, "/modules/x"));
+        assert!(!requires_admin_scope(
+            &axum::http::Method::GET,
+            "/modules/x"
+        ));
+        assert!(!requires_admin_scope(
+            &axum::http::Method::POST,
+            "/admin/tokensx"
+        ));
+        assert!(!requires_admin_scope(
+            &axum::http::Method::POST,
+            "/workflows/x/cancel"
+        ));
+    }
+
+    #[test]
+    fn execution_id_in_path_decodes_only_execution_params() {
+        use autumn_harvest::types::{ExecutionId, ShardId};
+        // Issue #1803: only execution-id positions yield a shard.
+        let exec = ExecutionId::new_for_shard(ShardId::new(7));
+        for path in [
+            format!("/workflows/{exec}"),
+            format!("/workflows/{exec}/cancel"),
+            format!("/executions/{exec}/events/stream"),
+            format!("/dags/nightly/runs/{exec}"),
+            // Percent-encoded, as a client may send it.
+            format!(
+                "/workflows/%{:02X}{}/cancel",
+                exec.to_string().as_bytes()[0],
+                &exec.to_string()[1..]
+            ),
+            format!("/ui/workflows/{exec}/cancel"),
+            format!("/ui/dags/nightly/runs/{exec}/retry"),
+        ] {
+            let method = if path.ends_with("/cancel") || path.ends_with("/retry") {
+                axum::http::Method::POST
+            } else {
+                axum::http::Method::GET
+            };
+            assert_eq!(execution_id_in_path(&method, &path), Some(exec), "{path}");
+        }
+        for (method, path) in [
+            (axum::http::Method::DELETE, format!("/admin/tokens/{exec}")),
+            (axum::http::Method::DELETE, format!("/admin/gates/{exec}")),
+            (axum::http::Method::POST, format!("/workflows/{exec}/start")),
+            (axum::http::Method::GET, "/workflows/not-a-uuid".to_string()),
+            (axum::http::Method::GET, "/workflows".to_string()),
+            (
+                axum::http::Method::POST,
+                format!("/ui/schedules/{exec}/pause"),
+            ),
+            (axum::http::Method::GET, "/ui/workflows".to_string()),
+        ] {
+            assert_eq!(execution_id_in_path(&method, &path), None, "{path}");
+        }
+    }
+
+    #[test]
     fn normalize_route_template_rewrites_params_positionally() {
         assert_eq!(normalize_route_template("/health"), "/health");
         assert_eq!(
@@ -51854,6 +57151,21 @@ mod tests {
                 "/workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}"
             ),
             "/workflows/by-id/{p0}/{p1}/query/{p2}"
+        );
+    }
+
+    /// issue #1353: a literal trailing slash must survive normalization as a
+    /// distinct template, or its `matchit` insert collides with the no-slash
+    /// sibling (`route_class_matchers_build_without_conflict` catches this).
+    #[test]
+    fn normalize_route_template_preserves_a_trailing_slash() {
+        assert_eq!(
+            normalize_route_template("/workflows/by-id/{workflow_name}/"),
+            "/workflows/by-id/{p0}/"
+        );
+        assert_ne!(
+            normalize_route_template("/workflows/by-id/{workflow_name}/"),
+            normalize_route_template("/workflows/by-id/{workflow_name}")
         );
     }
 
@@ -52284,14 +57596,14 @@ mod tests {
             &compat,
             ""
         ));
-        // A legacy worker (empty build_id) may claim anything.
+        // An empty-build worker cannot claim a pinned task (issue #1805).
         let legacy = vec![eligibility_worker(
             "w-legacy",
             &["default"],
             "",
             serde_json::json!({}),
         )];
-        assert!(task_has_eligible_worker(
+        assert!(!task_has_eligible_worker(
             &legacy,
             0,
             TaskClaimRequirements {
@@ -52703,6 +58015,9 @@ mod tests {
 
     fn stub_workflow_execution() -> WorkflowExecution {
         WorkflowExecution {
+            migrated_to_shard: None,
+            migrated_at: None,
+            migrated_from_shards: None,
             quota_key: None,
             id: uuid::Uuid::new_v4(),
             workflow_name: "decode-wf".to_string(),
@@ -52760,6 +58075,10 @@ mod tests {
             started_by: None,
             history_bloat_warned_at: None,
             triage_note: None,
+            migrated_run_terminal_at: None,
+            migrated_run_terminal_state: None,
+            staging_vacated_state: None,
+            staging_vacated_by: None,
         }
     }
 
@@ -53484,7 +58803,7 @@ mod tests {
                 error: Some("connection refused".to_string()),
             },
         ];
-        let page = build_workflow_fanout_page(obs, WorkflowSortOrder::Desc, 2);
+        let page = build_workflow_fanout_page(obs, WorkflowSortOrder::Desc, 2, true);
         // (a) desc order by created_at (newest first), (b) truncated to limit.
         assert_eq!(page.executions.len(), 2, "truncated to limit=2");
         assert_eq!(page.executions[0].created_at, t, "newest first");
@@ -53495,6 +58814,72 @@ mod tests {
         assert_eq!(page.status, FanoutStatus::Partial);
         assert_eq!(page.unavailable_shards.len(), 1);
         assert_eq!(page.unavailable_shards[0].shard_id, 1);
+    }
+
+    #[test]
+    fn a_staging_pair_collapses_to_the_live_row_by_default() {
+        // Issue #1317 review: the default per-shard predicate excludes
+        // `MIGRATED` but not `MIGRATING`. A mid-migration execution can
+        // therefore reach this merge step twice under the SAME id -- the
+        // source's live row and the target's staged copy. The default
+        // listing must show it once, as the live row.
+        let t = chrono::Utc::now();
+        let mut live = exec_at(1, t);
+        live.state = "RUNNING".to_string();
+        let mut staged = exec_at(1, t);
+        staged.state = "MIGRATING".to_string();
+        let obs = vec![ShardObservation {
+            shard_id: 0,
+            rows: vec![live, staged],
+            error: None,
+        }];
+        let page = build_workflow_fanout_page(obs, WorkflowSortOrder::Desc, 10, true);
+        assert_eq!(page.executions.len(), 1, "the pair collapses to one row");
+        assert_eq!(page.executions[0].state, "RUNNING", "the live row wins");
+    }
+
+    #[test]
+    fn an_orphaned_migrating_copy_stays_visible_with_no_live_counterpart() {
+        // Issue #1317 review: if the process crashes between `commit_cutover`
+        // and `activate_target`, the source has already sealed to `MIGRATED`
+        // (excluded upstream). The target is the SOLE surviving copy, still
+        // `MIGRATING`. It must not also be dropped here, or the execution
+        // becomes invisible for as long as that window lasts.
+        let t = chrono::Utc::now();
+        let mut staged = exec_at(1, t);
+        staged.state = "MIGRATING".to_string();
+        let obs = vec![ShardObservation {
+            shard_id: 0,
+            rows: vec![staged],
+            error: None,
+        }];
+        let page = build_workflow_fanout_page(obs, WorkflowSortOrder::Desc, 10, true);
+        assert_eq!(page.executions.len(), 1, "the sole copy must stay visible");
+        assert_eq!(page.executions[0].state, "MIGRATING");
+    }
+
+    #[test]
+    fn an_explicit_state_filter_skips_the_staging_dedupe() {
+        // The dedupe is scoped to the default listing (issue #1317 review).
+        // An operator who explicitly asked for both states wants to see
+        // both rows. This mirrors the diagnostic `state=MIGRATED` escape
+        // hatch already preserved for the sealed-source case.
+        let t = chrono::Utc::now();
+        let mut live = exec_at(1, t);
+        live.state = "RUNNING".to_string();
+        let mut staged = exec_at(1, t);
+        staged.state = "MIGRATING".to_string();
+        let obs = vec![ShardObservation {
+            shard_id: 0,
+            rows: vec![live, staged],
+            error: None,
+        }];
+        let page = build_workflow_fanout_page(obs, WorkflowSortOrder::Desc, 10, false);
+        assert_eq!(
+            page.executions.len(),
+            2,
+            "an explicit filter must see both rows"
+        );
     }
 
     #[test]
@@ -53959,6 +59344,7 @@ mod tests {
             has_live_worker: true,
             circuit_phase: None,
             circuit_cooldown_until: None,
+            circuit_forced_open: false,
             rate_limit_saturated: false,
             rate_limit_bucket_missing: false,
             concurrency_saturated: false,
@@ -53968,7 +59354,7 @@ mod tests {
         let mut b = base("dead-q");
         b.has_live_worker = false;
 
-        let reasons = contributing_reasons_for(&[a, b]);
+        let reasons = contributing_reasons_for(&[a, b], chrono::Utc::now());
         assert!(
             reasons.iter().any(|r| r == "queue_paused"),
             "expected queue_paused in {reasons:?}"
@@ -53999,11 +59385,15 @@ mod tests {
             has_live_worker: true,
             circuit_phase: None,
             circuit_cooldown_until: None,
+            circuit_forced_open: false,
             rate_limit_saturated: false,
             rate_limit_bucket_missing: false,
             concurrency_saturated: false,
         };
-        assert!(contributing_reasons_for(&[facts]).is_empty());
+        assert_eq!(
+            contributing_reasons_for(&[facts], chrono::Utc::now()),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
@@ -54027,12 +59417,13 @@ mod tests {
             has_live_worker: false,
             circuit_phase: None,
             circuit_cooldown_until: None,
+            circuit_forced_open: false,
             rate_limit_saturated: false,
             rate_limit_bucket_missing: false,
             concurrency_saturated: false,
         };
         assert_eq!(
-            contributing_reasons_for(&[facts]),
+            contributing_reasons_for(&[facts], chrono::Utc::now()),
             vec!["no_live_worker".to_string()]
         );
     }
@@ -54063,12 +59454,13 @@ mod tests {
             has_live_worker: false,
             circuit_phase: None,
             circuit_cooldown_until: None,
+            circuit_forced_open: false,
             rate_limit_saturated: false,
             rate_limit_bucket_missing: false,
             concurrency_saturated: false,
         };
         assert!(
-            contributing_reasons_for(&[facts]).is_empty(),
+            contributing_reasons_for(&[facts], chrono::Utc::now()).is_empty(),
             "a held row whose own claimant is alive is progressing; \
              reporting no_live_worker would contradict `healthy_in_progress`"
         );
@@ -54097,15 +59489,119 @@ mod tests {
             has_live_worker: true,
             circuit_phase: None,
             circuit_cooldown_until: None,
+            circuit_forced_open: false,
             rate_limit_saturated: false,
             rate_limit_bucket_missing: false,
             concurrency_saturated: false,
         };
         assert_eq!(
-            contributing_reasons_for(&[facts]),
+            contributing_reasons_for(&[facts], chrono::Utc::now()),
             vec!["no_live_worker".to_string()],
             "an orphan held by a dead claimant must surface no_live_worker even \
              when a live Active peer covers the queue"
+        );
+    }
+
+    #[test]
+    fn contributing_reasons_omit_circuit_open_once_the_organic_cooldown_clears_by_dispatch() {
+        use autumn_harvest::stall_diagnosis::{BlockingCircuitPhase, PendingActivityFacts};
+        // Issue #1371: the headline verdict already skips `circuit_open` for
+        // an organic trip whose cooldown clears by the row's own effective
+        // dispatch instant. The reason codes must agree, or the response
+        // contradicts its documented "currently holds" contract.
+        let now = chrono::Utc::now();
+        let facts = PendingActivityFacts {
+            activity_name: Some("charge_card".to_string()),
+            queue: "billing".to_string(),
+            task_state: "PENDING".to_string(),
+            claimant_is_live: None,
+            attempt: 1,
+            last_error: Some("boom".to_string()),
+            scheduled_at: now - chrono::Duration::seconds(10),
+            rate_limit_key: None,
+            concurrency_key: None,
+            queue_paused: false,
+            activity_paused: false,
+            has_live_worker: true,
+            circuit_phase: Some(BlockingCircuitPhase::Open),
+            circuit_cooldown_until: Some(now - chrono::Duration::seconds(1)),
+            circuit_forced_open: false,
+            rate_limit_saturated: false,
+            rate_limit_bucket_missing: false,
+            concurrency_saturated: false,
+        };
+        let reasons = contributing_reasons_for(&[facts], now);
+        assert!(
+            !reasons.iter().any(|r| r == "circuit_open"),
+            "an already-cleared organic cooldown must not contribute circuit_open: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn contributing_reasons_still_report_circuit_open_before_the_organic_cooldown_clears() {
+        use autumn_harvest::stall_diagnosis::{BlockingCircuitPhase, PendingActivityFacts};
+        // The converse case: a cooldown that has not yet reached the
+        // effective dispatch instant still fast-fails dispatch, so
+        // `circuit_open` must still be reported.
+        let now = chrono::Utc::now();
+        let facts = PendingActivityFacts {
+            activity_name: Some("charge_card".to_string()),
+            queue: "billing".to_string(),
+            task_state: "PENDING".to_string(),
+            claimant_is_live: None,
+            attempt: 1,
+            last_error: Some("boom".to_string()),
+            scheduled_at: now - chrono::Duration::seconds(10),
+            rate_limit_key: None,
+            concurrency_key: None,
+            queue_paused: false,
+            activity_paused: false,
+            has_live_worker: true,
+            circuit_phase: Some(BlockingCircuitPhase::Open),
+            circuit_cooldown_until: Some(now + chrono::Duration::seconds(60)),
+            circuit_forced_open: false,
+            rate_limit_saturated: false,
+            rate_limit_bucket_missing: false,
+            concurrency_saturated: false,
+        };
+        let reasons = contributing_reasons_for(&[facts], now);
+        assert!(
+            reasons.iter().any(|r| r == "circuit_open"),
+            "a still-cooling-down organic trip must contribute circuit_open: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn contributing_reasons_report_circuit_open_for_a_forced_open_breaker_regardless_of_cooldown() {
+        use autumn_harvest::stall_diagnosis::{BlockingCircuitPhase, PendingActivityFacts};
+        // A forced-open breaker never admits a probe on a timer; only
+        // `force-close` clears it. A stray `cooldown_until` must not exempt
+        // it the way an organic trip's does.
+        let now = chrono::Utc::now();
+        let facts = PendingActivityFacts {
+            activity_name: Some("charge_card".to_string()),
+            queue: "billing".to_string(),
+            task_state: "PENDING".to_string(),
+            claimant_is_live: None,
+            attempt: 1,
+            last_error: Some("boom".to_string()),
+            scheduled_at: now - chrono::Duration::seconds(10),
+            rate_limit_key: None,
+            concurrency_key: None,
+            queue_paused: false,
+            activity_paused: false,
+            has_live_worker: true,
+            circuit_phase: Some(BlockingCircuitPhase::Open),
+            circuit_cooldown_until: Some(now - chrono::Duration::seconds(1)),
+            circuit_forced_open: true,
+            rate_limit_saturated: false,
+            rate_limit_bucket_missing: false,
+            concurrency_saturated: false,
+        };
+        let reasons = contributing_reasons_for(&[facts], now);
+        assert!(
+            reasons.iter().any(|r| r == "circuit_open"),
+            "a forced-open breaker must still contribute circuit_open: {reasons:?}"
         );
     }
 
@@ -54325,8 +59821,8 @@ mod tests {
         // A co-located worker that has not registered a row yet, and an
         // API-only replica, both leave the local build unidentified -- which
         // `registry_fallback_binds` reads as "no build identity configured".
-        assert!(local_build_id_from_workers(&workers, Some("w-missing")).is_empty());
-        assert!(local_build_id_from_workers(&workers, None).is_empty());
+        assert_eq!(local_build_id_from_workers(&workers, Some("w-missing")), "");
+        assert_eq!(local_build_id_from_workers(&workers, None), "");
     }
 
     #[test]
@@ -54421,5 +59917,502 @@ mod tests {
             .is_empty(),
             "a snapshotted requirement is row-side and gates every build"
         );
+    }
+
+    // ── issue #1190: build-scope the rate-limit bypass ──────────────────────
+
+    /// Build the `worker_build_ids` map `rate_limit_gate_applies` and
+    /// `every_eligible_worker_is_on_the_local_build` expect, exactly as
+    /// `build_diagnosis_report` builds it once from `live_workers`.
+    fn build_ids(workers: &[WorkerRow]) -> std::collections::HashMap<&str, &str> {
+        workers
+            .iter()
+            .map(|w| (w.worker.worker_id.as_str(), w.worker.build_id.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn every_eligible_worker_is_on_the_local_build_requires_unanimous_agreement() {
+        let workers = vec![
+            eligibility_worker("w-local", &["payments"], "build-new", serde_json::json!({})),
+            eligibility_worker("w-peer", &["payments"], "build-new", serde_json::json!({})),
+            eligibility_worker("w-old", &["payments"], "build-old", serde_json::json!({})),
+        ];
+        let ids = build_ids(&workers);
+
+        // Every eligible worker shares the local build.
+        assert!(every_eligible_worker_is_on_the_local_build(
+            &["w-local", "w-peer"],
+            &ids,
+            "build-new",
+        ));
+
+        // One eligible worker is on a different build -- unanimity breaks, so
+        // the local fact cannot be trusted for the whole set.
+        assert!(!every_eligible_worker_is_on_the_local_build(
+            &["w-local", "w-old"],
+            &ids,
+            "build-new",
+        ));
+
+        // The default, no-build-routing deployment: every worker (and this
+        // process) advertises no build identity, so it behaves exactly like a
+        // single-build fleet -- the AC3 regression pin.
+        let no_build_routing = vec![
+            eligibility_worker("w-a", &["payments"], "", serde_json::json!({})),
+            eligibility_worker("w-b", &["payments"], "", serde_json::json!({})),
+        ];
+        assert!(every_eligible_worker_is_on_the_local_build(
+            &["w-a", "w-b"],
+            &build_ids(&no_build_routing),
+            "",
+        ));
+
+        // Vacuously TRUE for no eligible workers (issue #1190 review round
+        // 2): with no candidate worker there is no OTHER build to disagree
+        // with, and `contributing_reason_codes` still needs a genuine
+        // rate-limit fact to survive even when `activity_no_worker` wins the
+        // headline verdict.
+        assert!(every_eligible_worker_is_on_the_local_build(
+            &[],
+            &ids,
+            "build-new",
+        ));
+
+        // An eligible id absent from the map (structurally shouldn't happen,
+        // since eligible_ids is always derived from the same worker slice the
+        // map is built from, but the lookup must default safely) is treated
+        // as build-unknown, not build-matching.
+        assert!(!every_eligible_worker_is_on_the_local_build(
+            &["w-ghost"],
+            &ids,
+            "build-new",
+        ));
+    }
+
+    /// AC1: a task whose activity is breaker-tracked locally but whose only
+    /// eligible worker is on a different build must not have that local fact
+    /// applied to it -- the local tracked/untracked fact is unreliable
+    /// off-build, so the gate does not apply (and, per the endpoint's
+    /// direction-of-safety rule, is not reported as a rate-limit block
+    /// either).
+    ///
+    /// Note the short-circuit: `rate_limit_gate_applies` returns `false` here
+    /// on `!locally_tracked` alone, without even evaluating build agreement --
+    /// there is no cross-process breaker registry to consult (issue #1190's
+    /// own "why it was not fixed on #1188" section), so a build mismatch on
+    /// this side of the disagreement cannot be turned into a positive
+    /// detection, only prevented from being masked by a build check that
+    /// would otherwise wrongly vouch for it. The bucket is therefore
+    /// consulted here no more (and no less) than it was before this fix; the
+    /// residual false-negative risk this scenario describes is accepted
+    /// exactly like the analogous fleet-wide breaker outage
+    /// `local_circuit_snapshot_is_authoritative` already declines to detect.
+    #[test]
+    fn rate_limit_gate_does_not_apply_when_tracked_locally_but_eligible_peer_differs_build() {
+        let workers = vec![eligibility_worker(
+            "w-peer",
+            &["payments"],
+            "build-old",
+            serde_json::json!({}),
+        )];
+        assert!(!rate_limit_gate_applies(
+            /* locally_tracked */ true,
+            &["w-peer"],
+            &build_ids(&workers),
+            "build-new",
+        ));
+    }
+
+    /// AC2: a task whose activity is NOT breaker-tracked locally but whose
+    /// only eligible worker is on a different build must not have the bucket
+    /// consulted as the verdict either -- that peer's build may track the
+    /// breaker, in which case its real gate is dispatch-time, not this
+    /// bucket, and reporting `activity_rate_limited` /
+    /// `activity_rate_limit_bucket_missing` for it would be a false positive
+    /// on a `stalled` verdict, the worse direction.
+    #[test]
+    fn rate_limit_gate_does_not_apply_when_untracked_locally_but_eligible_peer_differs_build() {
+        let workers = vec![eligibility_worker(
+            "w-peer",
+            &["payments"],
+            "build-old",
+            serde_json::json!({}),
+        )];
+        assert!(!rate_limit_gate_applies(
+            /* locally_tracked */ false,
+            &["w-peer"],
+            &build_ids(&workers),
+            "build-new",
+        ));
+    }
+
+    /// AC3: a single-build fleet (and any deployment with no build ids, where
+    /// every worker including this process advertises `""`) behaves exactly
+    /// as it did before this fix -- the gate applies iff the activity is not
+    /// locally tracked.
+    #[test]
+    fn rate_limit_gate_applies_exactly_as_before_on_a_single_build_fleet() {
+        let workers = vec![
+            eligibility_worker("w-local", &["payments"], "build-x", serde_json::json!({})),
+            eligibility_worker("w-peer", &["payments"], "build-x", serde_json::json!({})),
+        ];
+        let ids = build_ids(&workers);
+
+        assert!(
+            rate_limit_gate_applies(false, &["w-local", "w-peer"], &ids, "build-x"),
+            "untracked locally, same build everywhere: the bucket is the accurate impediment"
+        );
+        assert!(
+            !rate_limit_gate_applies(true, &["w-local", "w-peer"], &ids, "build-x"),
+            "tracked locally, same build everywhere: the breaker gates it at dispatch"
+        );
+
+        // No build routing configured at all (every advertised build is "").
+        let no_build_routing = vec![eligibility_worker(
+            "w-peer",
+            &["payments"],
+            "",
+            serde_json::json!({}),
+        )];
+        let no_build_ids = build_ids(&no_build_routing);
+        assert!(rate_limit_gate_applies(
+            false,
+            &["w-peer"],
+            &no_build_ids,
+            ""
+        ));
+        assert!(!rate_limit_gate_applies(
+            true,
+            &["w-peer"],
+            &no_build_ids,
+            ""
+        ));
+    }
+}
+
+#[cfg(test)]
+mod mutation_gate_tests {
+    use super::*;
+    use tower::ServiceExt as _;
+
+    async fn start_status(with_token: bool) -> StatusCode {
+        let api_state = HarvestApiState::new();
+        api_state.set_deployment_profile("prod");
+        let mut request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/workflows/w/start")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from("{}"))
+            .unwrap();
+        if with_token {
+            request
+                .extensions_mut()
+                .insert(crate::api_token::TokenPrincipal {
+                    id: uuid::Uuid::nil(),
+                    scope: crate::api_token::TokenScope::Mutate,
+                });
+        }
+        harvest_api_router(api_state)
+            .oneshot(request)
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// Issue #1802: a verified scoped token passes the gate on a route with
+    /// no admin gate. The token layer sets `TokenPrincipal` in production.
+    #[tokio::test]
+    async fn a_verified_token_passes_the_mutation_gate() {
+        assert_eq!(start_status(false).await, StatusCode::UNAUTHORIZED);
+        let status = start_status(true).await;
+        assert_ne!(status, StatusCode::UNAUTHORIZED);
+        assert_ne!(status, StatusCode::FORBIDDEN);
+    }
+}
+
+#[cfg(test)]
+mod health_probe_tests {
+    use super::*;
+    use tower::ServiceExt as _;
+
+    /// A runtime with no handlers. It needs no database.
+    fn empty_runtime() -> HarvestApiRuntime {
+        HarvestApiRuntime::new(
+            Arc::new(HandlerRegistry::new(vec![], vec![])),
+            Arc::new(DagCatalog::default()),
+            Arc::new(Vec::new()),
+            None,
+            vec!["default".to_string()],
+            SchedulerMonitor::offline(),
+            HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+            ShardRouter::single(),
+        )
+    }
+
+    /// A pool that cannot connect. Port 1 refuses at once.
+    fn unreachable_pool() -> HarvestDbPool {
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            AsyncPgConnection,
+        >::new("postgres://postgres:postgres@127.0.0.1:1/nope");
+        let pool = deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("build pool");
+        HarvestDbPool::single(pool)
+    }
+
+    async fn probe(api_state: &HarvestApiState, uri: &str) -> (StatusCode, serde_json::Value) {
+        let request = axum::http::Request::builder()
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = harvest_api_router(api_state.clone())
+            .oneshot(request)
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, body)
+    }
+
+    fn reasons(body: &serde_json::Value) -> Vec<String> {
+        body["reasons"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Issue #1812 AC1: readiness fails before the runtime starts.
+    #[tokio::test]
+    async fn ready_is_503_before_the_runtime_starts() {
+        let api_state = HarvestApiState::new();
+        let (status, body) = probe(&api_state, "/health/ready").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ready"], false);
+        assert_eq!(body["runtime_ready"], false);
+        assert_eq!(body["database_reachable"], serde_json::Value::Null);
+        assert_eq!(reasons(&body), vec!["runtime_not_started"]);
+    }
+
+    /// Issue #1812: `/health` keeps its old status for compatibility.
+    #[tokio::test]
+    async fn legacy_health_is_unchanged_before_the_runtime_starts() {
+        let api_state = HarvestApiState::new();
+        let (status, body) = probe(&api_state, "/health").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["runtime_ready"], false);
+    }
+
+    #[tokio::test]
+    async fn live_is_200_before_the_runtime_starts() {
+        let api_state = HarvestApiState::new();
+        let (status, body) = probe(&api_state, "/health/live").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["alive"], true);
+        assert_eq!(body["draining"], false);
+    }
+
+    /// Issue #1812 AC2: drain fails readiness and keeps liveness.
+    #[tokio::test]
+    async fn draining_drops_ready_but_not_live() {
+        let api_state = HarvestApiState::new();
+        api_state.install(empty_runtime());
+        api_state.begin_draining();
+
+        let (status, body) = probe(&api_state, "/health/ready").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["runtime_ready"], true);
+        assert_eq!(body["draining"], true);
+        assert_eq!(body["database_reachable"], serde_json::Value::Null);
+        assert_eq!(reasons(&body), vec!["draining"]);
+
+        let (status, body) = probe(&api_state, "/health/live").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["draining"], true);
+    }
+
+    /// A drain that starts during startup survives `install()`.
+    #[test]
+    fn install_keeps_an_early_drain() {
+        let api_state = HarvestApiState::new();
+        api_state.begin_draining();
+        api_state.install(empty_runtime());
+        assert!(api_state.is_draining());
+    }
+
+    /// A restart must not inherit the drain of the stopped runtime.
+    #[test]
+    fn end_draining_ends_the_drain() {
+        let api_state = HarvestApiState::new();
+        api_state.begin_draining();
+        api_state.end_draining();
+        assert!(!api_state.is_draining());
+    }
+
+    /// autumn-web marks its probe state at SIGTERM. It closes the listener
+    /// before the plugin shutdown hook runs, so readiness must read that state.
+    #[tokio::test]
+    async fn host_probe_shutdown_drops_ready_but_not_live() {
+        let api_state = HarvestApiState::new();
+        let probes = autumn_web::probe::ProbeState::default();
+        api_state.link_host_probes(probes.clone());
+        api_state.install(empty_runtime());
+        assert!(!api_state.is_draining());
+
+        probes.begin_shutdown();
+
+        let (status, body) = probe(&api_state, "/health/ready").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(reasons(&body), vec!["draining"]);
+        let (status, body) = probe(&api_state, "/health/live").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["draining"], true);
+    }
+
+    /// `/health` keeps its old answer during a drain.
+    #[tokio::test]
+    async fn legacy_health_is_unchanged_during_a_drain() {
+        let api_state = HarvestApiState::new();
+        api_state.install(empty_runtime());
+        api_state.begin_draining();
+        let (status, body) = probe(&api_state, "/health").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["runtime_ready"], true);
+        assert!(body.get("draining").is_none());
+    }
+
+    /// A pool whose server accepts TCP and never answers.
+    fn black_hole_pool(listener: &std::net::TcpListener) -> HarvestDbPool {
+        let port = listener.local_addr().unwrap().port();
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            AsyncPgConnection,
+        >::new(format!(
+            "postgres://postgres:postgres@127.0.0.1:{port}/nope"
+        ));
+        let pool = deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("build pool");
+        HarvestDbPool::single(pool)
+    }
+
+    /// The database check is bounded, and its result is cached.
+    #[tokio::test]
+    async fn ready_is_bounded_and_cached_when_the_database_hangs() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api_state = HarvestApiState::new();
+        api_state.install_storage_pool(black_hole_pool(&listener));
+        api_state.install(empty_runtime());
+
+        let started = std::time::Instant::now();
+        let (status, body) = probe(&api_state, "/health/ready").await;
+        let first = started.elapsed();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["database_reachable"], false);
+        assert_eq!(reasons(&body), vec!["database_unreachable"]);
+        assert!(first >= READY_DATABASE_BUDGET, "{first:?}");
+        assert!(first < std::time::Duration::from_millis(2500), "{first:?}");
+
+        let started = std::time::Instant::now();
+        let (status, body) = probe(&api_state, "/health/ready").await;
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(reasons(&body), vec!["database_unreachable"]);
+    }
+
+    /// A drain that starts during the database check still fails the answer.
+    #[tokio::test]
+    async fn a_drain_during_the_database_check_fails_ready() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api_state = HarvestApiState::new();
+        api_state.install_storage_pool(black_hole_pool(&listener));
+        api_state.install(empty_runtime());
+
+        let request = tokio::spawn({
+            let api_state = api_state.clone();
+            async move { probe(&api_state, "/health/ready").await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        api_state.begin_draining();
+
+        let (status, body) = request.await.unwrap();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["draining"], true, "{body}");
+        assert!(reasons(&body).contains(&"draining".to_string()), "{body}");
+    }
+
+    /// Liveness does no database I/O, so a hung database cannot slow it.
+    #[tokio::test]
+    async fn live_does_no_database_io() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api_state = HarvestApiState::new();
+        api_state.install_storage_pool(black_hole_pool(&listener));
+        api_state.install(empty_runtime());
+
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            probe(&api_state, "/health/live"),
+        )
+        .await
+        .expect("live must not wait on the database");
+        assert_eq!(answer.0, StatusCode::OK);
+    }
+
+    /// The stopped state keeps reporting the drain.
+    #[test]
+    fn clear_keeps_the_drain() {
+        let api_state = HarvestApiState::new();
+        api_state.install(empty_runtime());
+        api_state.begin_draining();
+        api_state.clear();
+        assert!(api_state.is_draining());
+    }
+
+    #[tokio::test]
+    async fn ready_is_503_when_the_database_is_unreachable() {
+        let api_state = HarvestApiState::new();
+        api_state.install_storage_pool(unreachable_pool());
+        api_state.install(empty_runtime());
+
+        let (status, body) = probe(&api_state, "/health/ready").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["runtime_ready"], true);
+        assert_eq!(body["draining"], false);
+        assert_eq!(body["database_reachable"], false);
+        assert_eq!(reasons(&body), vec!["database_unreachable"]);
+    }
+
+    #[tokio::test]
+    async fn ready_is_503_when_no_storage_pool_is_installed() {
+        let api_state = HarvestApiState::new();
+        api_state.install(empty_runtime());
+
+        let (status, body) = probe(&api_state, "/health/ready").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["database_reachable"], false);
+        assert_eq!(reasons(&body), vec!["database_unreachable"]);
+    }
+
+    /// The probes are public, like `/health`.
+    #[test]
+    fn probes_are_public_safe() {
+        for method in [axum::http::Method::GET, axum::http::Method::HEAD] {
+            for path in ["/health/live", "/health/ready"] {
+                assert_eq!(
+                    classify_route(&method, path),
+                    RouteClass::PublicSafe,
+                    "{method} {path}"
+                );
+            }
+        }
     }
 }

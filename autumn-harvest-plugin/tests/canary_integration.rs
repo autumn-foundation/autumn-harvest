@@ -28,7 +28,6 @@ use autumn_harvest::worker::DbPool;
 use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
 use autumn_harvest_plugin::canary::CanaryConfig;
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -47,7 +46,7 @@ use uuid::Uuid;
 const CANARY_WORKFLOW: &str = "__harvest_canary_probe__default";
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 type HarvestApiApp = axum::Router;
@@ -91,7 +90,7 @@ async fn provision_ephemeral_db(base_url: &str) -> String {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&new_url)
         .await
         .expect("connect to ephemeral database");
-    conn.batch_execute(autumn_harvest::full_migrations_sql())
+    conn.batch_execute(&autumn_harvest::test_init_sql())
         .await
         .expect("apply migration bundle to ephemeral database");
     new_url
@@ -116,7 +115,7 @@ fn build_app_with_canary(url: &str) -> HarvestApiApp {
     api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(HarvestDbPool::from(build_pool(url)));
     api_state.set_canary_config(Some(CanaryConfig::new(Duration::from_secs(30))));
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 /// Admin-gated router with the canary **disabled** (no config mirrored).
@@ -124,7 +123,7 @@ fn build_app_canary_disabled(url: &str) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(HarvestDbPool::from(build_pool(url)));
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 /// Router with NO auth boundary — used to prove the admin guard rejects.
@@ -132,7 +131,7 @@ fn build_unauthenticated_app(url: &str) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(build_pool(url)));
     api_state.set_canary_config(Some(CanaryConfig::new(Duration::from_secs(30))));
-    harvest_api_router(api_state).with_state(AppState::for_test())
+    harvest_api_router(api_state)
 }
 
 async fn get_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
@@ -179,7 +178,7 @@ async fn seed_canary_execution(
         workflow_id: &wf_id,
         run_id: Uuid::new_v4(),
         shard_id: 0,
-        input: serde_json::json!({ "queue": queue }),
+        input: serde_json::json!({ "queue": queue }).into(),
         parent_id: None,
         queue_name: queue,
         execution_timeout: None,
@@ -290,7 +289,10 @@ async fn admin_canary_reports_fresh_probe() {
         probe["last_roundtrip_ms"].as_i64().unwrap() >= 0,
         "roundtrip present: {probe}"
     );
-    assert!(body["unavailable_shards"].as_array().unwrap().is_empty());
+    assert_eq!(
+        body["unavailable_shards"].as_array().unwrap().as_slice(),
+        [] as [serde_json::Value; 0]
+    );
 }
 
 // ── (c) stale probe ─────────────────────────────────────────────────────────

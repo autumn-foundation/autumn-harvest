@@ -2,7 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
-use autumn_web::config::{ConfigError, DatabaseConfig, Env, OsEnv};
+use autumn_harvest::dispatch::DEFAULT_DISPATCH_RECONCILE_BATCH;
+use autumn_web::config::{ConfigError, DatabaseConfig, Env, OsEnv, normalize_profile_name};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -44,8 +45,45 @@ pub struct HarvestBatchConfig {
 /// Readiness and health endpoint behavior.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HarvestReadinessConfig {
-    /// When true, `/health` returns 503 unless writable/candidate shards are ready.
+    /// When true, `/health` and `/health/ready` return 503 unless
+    /// writable/candidate shards are ready.
     pub require_shard_readiness: bool,
+}
+
+/// Highest accepted `harvest.redis.poll_interval_ms`.
+///
+/// The value is the wait of one blocking read. The worker checks shutdown and
+/// the reconcile clock between reads, so a longer wait delays both.
+const REDIS_POLL_INTERVAL_CEILING_MS: u64 = 5_000;
+
+/// Lowest accepted `harvest.redis.visibility_timeout_ms`.
+///
+/// The timeout must outlast one Postgres claim. A shorter value lets a peer
+/// recover a reference the owning worker is still claiming, which costs a
+/// duplicate claim attempt on every reference.
+const REDIS_VISIBILITY_TIMEOUT_FLOOR_MS: u64 = 1_000;
+
+/// Redis dispatch channel settings (issue #1312).
+///
+/// The channel carries references to claimable `harvest_task_queue` rows.
+/// Postgres stays the source of truth. `url` is the switch: `None` leaves
+/// every worker on the Postgres claim path, which is the default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarvestRedisConfig {
+    /// Redis connection URL. `None` disables Redis dispatch.
+    pub url: Option<String>,
+    /// Prefix for every key the channel owns.
+    pub key_prefix: String,
+    /// Redis Streams consumer group the workers join.
+    pub consumer_group: String,
+    /// Time a delivered reference may stay unacked before recovery.
+    pub visibility_timeout_ms: u64,
+    /// Wait for one blocking read when the channel is idle.
+    pub poll_interval_ms: u64,
+    /// Interval for the reconcile sweep over due `PENDING` rows.
+    pub reconcile_interval_ms: u64,
+    /// Row cap for one reconcile sweep per queue (issue #1429).
+    pub reconcile_batch: usize,
 }
 
 /// What to do when workflow-type reachability finds an orphaned type at
@@ -76,6 +114,51 @@ pub struct HarvestStartupConfig {
     pub orphaned_workflows: OrphanStartupAction,
 }
 
+impl HarvestStartupConfig {
+    /// Apply the operator settings over this code value (issue #1613).
+    ///
+    /// The sources are `autumn.toml`, then `autumn-{profile}.toml`, then
+    /// `AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS`. This is the precedence of
+    /// [`HarvestRuntimeConfig::load`]. A setting that no source names keeps
+    /// the code value. A plain `load()` would reset a code `fail` to `warn`.
+    ///
+    /// Only `[harvest.startup]` and its variable are read. An invalid value in
+    /// another setting does not block this overlay. A file that is not valid
+    /// TOML does block it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] when a config file cannot be read or parsed,
+    /// or when a startup value is invalid. A typo must not become `warn`.
+    /// A parse error names the file only. It does not quote the file, which
+    /// can hold a database password.
+    pub fn with_operator_overrides(mut self, env: &dyn Env) -> Result<Self, ConfigError> {
+        for path in operator_config_paths(env) {
+            if let Some(startup) = load_startup_section(&path)? {
+                self.apply_partial(startup);
+            }
+        }
+        self.apply_env_overrides(env)?;
+        Ok(self)
+    }
+
+    const fn apply_partial(&mut self, partial: PartialHarvestStartupConfig) {
+        if let Some(orphaned_workflows) = partial.orphaned_workflows {
+            self.orphaned_workflows = orphaned_workflows;
+        }
+    }
+
+    fn apply_env_overrides(&mut self, env: &dyn Env) -> Result<(), ConfigError> {
+        if let Ok(orphaned_workflows) = env.var("AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS") {
+            self.orphaned_workflows = parse_orphan_startup_action(
+                "AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS",
+                &orphaned_workflows,
+            )?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarvestRuntimeConfig {
     pub mode: HarvestMode,
@@ -86,6 +169,7 @@ pub struct HarvestRuntimeConfig {
     pub batch: HarvestBatchConfig,
     pub readiness: HarvestReadinessConfig,
     pub startup: HarvestStartupConfig,
+    pub redis: HarvestRedisConfig,
 }
 
 impl HarvestRuntimeConfig {
@@ -106,20 +190,10 @@ impl HarvestRuntimeConfig {
     /// Returns [`ConfigError`] when config files cannot be read or parsed, environment overrides
     /// are invalid, or the resulting topology configuration is not valid.
     pub fn load_with_env(env: &dyn Env) -> Result<Self, ConfigError> {
-        let profile = resolve_profile(env);
         let mut config = Self::default();
-
-        if let Some(root) = load_partial_root(&find_config_file_named("autumn.toml", env))? {
+        for root in load_operator_roots(env)? {
             config.apply_partial(root.harvest);
         }
-
-        if let Some(profile) = profile {
-            let path = find_config_file_named(&format!("autumn-{profile}.toml"), env);
-            if let Some(root) = load_partial_root(&path)? {
-                config.apply_partial(root.harvest);
-            }
-        }
-
         config.apply_env_overrides(env)?;
         config.validate()?;
         Ok(config)
@@ -168,8 +242,27 @@ impl HarvestRuntimeConfig {
         if let Some(require_shard_readiness) = partial.readiness.require_shard_readiness {
             self.readiness.require_shard_readiness = require_shard_readiness;
         }
-        if let Some(orphaned_workflows) = partial.startup.orphaned_workflows {
-            self.startup.orphaned_workflows = orphaned_workflows;
+        self.startup.apply_partial(partial.startup);
+        if let Some(url) = partial.redis.url {
+            self.redis.url = Some(url);
+        }
+        if let Some(key_prefix) = partial.redis.key_prefix {
+            self.redis.key_prefix = key_prefix;
+        }
+        if let Some(consumer_group) = partial.redis.consumer_group {
+            self.redis.consumer_group = consumer_group;
+        }
+        if let Some(visibility_timeout_ms) = partial.redis.visibility_timeout_ms {
+            self.redis.visibility_timeout_ms = visibility_timeout_ms;
+        }
+        if let Some(poll_interval_ms) = partial.redis.poll_interval_ms {
+            self.redis.poll_interval_ms = poll_interval_ms;
+        }
+        if let Some(reconcile_interval_ms) = partial.redis.reconcile_interval_ms {
+            self.redis.reconcile_interval_ms = reconcile_interval_ms;
+        }
+        if let Some(reconcile_batch) = partial.redis.reconcile_batch {
+            self.redis.reconcile_batch = reconcile_batch;
         }
     }
 
@@ -240,11 +333,38 @@ impl HarvestRuntimeConfig {
                 &require_shard_readiness,
             )?;
         }
-        if let Ok(orphaned_workflows) = env.var("AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS") {
-            self.startup.orphaned_workflows = parse_orphan_startup_action(
-                "AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS",
-                &orphaned_workflows,
+        self.startup.apply_env_overrides(env)?;
+
+        // Issue #1312. An empty `AUTUMN_HARVEST_REDIS__URL` means "off", the
+        // same convention `AUTUMN_HARVEST_DATABASE__URL` uses above.
+        if let Ok(url) = env.var("AUTUMN_HARVEST_REDIS__URL") {
+            self.redis.url = (!url.is_empty()).then_some(url);
+        }
+        if let Ok(key_prefix) = env.var("AUTUMN_HARVEST_REDIS__KEY_PREFIX") {
+            self.redis.key_prefix = key_prefix;
+        }
+        if let Ok(consumer_group) = env.var("AUTUMN_HARVEST_REDIS__CONSUMER_GROUP") {
+            self.redis.consumer_group = consumer_group;
+        }
+        if let Ok(visibility_timeout_ms) = env.var("AUTUMN_HARVEST_REDIS__VISIBILITY_TIMEOUT_MS") {
+            self.redis.visibility_timeout_ms = parse_u64(
+                "AUTUMN_HARVEST_REDIS__VISIBILITY_TIMEOUT_MS",
+                &visibility_timeout_ms,
             )?;
+        }
+        if let Ok(poll_interval_ms) = env.var("AUTUMN_HARVEST_REDIS__POLL_INTERVAL_MS") {
+            self.redis.poll_interval_ms =
+                parse_u64("AUTUMN_HARVEST_REDIS__POLL_INTERVAL_MS", &poll_interval_ms)?;
+        }
+        if let Ok(reconcile_interval_ms) = env.var("AUTUMN_HARVEST_REDIS__RECONCILE_INTERVAL_MS") {
+            self.redis.reconcile_interval_ms = parse_u64(
+                "AUTUMN_HARVEST_REDIS__RECONCILE_INTERVAL_MS",
+                &reconcile_interval_ms,
+            )?;
+        }
+        if let Ok(reconcile_batch) = env.var("AUTUMN_HARVEST_REDIS__RECONCILE_BATCH") {
+            self.redis.reconcile_batch =
+                parse_usize("AUTUMN_HARVEST_REDIS__RECONCILE_BATCH", &reconcile_batch)?;
         }
 
         Ok(())
@@ -303,8 +423,145 @@ impl HarvestRuntimeConfig {
             ));
         }
 
+        self.validate_redis()?;
+
         Ok(())
     }
+
+    /// Validate the `[harvest.redis]` section (issue #1312).
+    ///
+    /// A build without the `redis` cargo feature carries no channel
+    /// implementation. A configured URL there is rejected, so an operator
+    /// never runs a binary that silently ignores the setting.
+    ///
+    /// The bounds below are the ones a wrong value breaks silently. Every key
+    /// the channel owns carries `key_prefix`, so an empty prefix collides with
+    /// unrelated keys in a shared Redis. Redis rejects an empty consumer group
+    /// name at the first read, which is late. A poll interval above
+    /// [`REDIS_POLL_INTERVAL_CEILING_MS`] holds one blocking read open for
+    /// longer than the shutdown check tolerates. A visibility timeout below
+    /// [`REDIS_VISIBILITY_TIMEOUT_FLOOR_MS`] lets a peer recover a reference
+    /// the owning worker is still claiming.
+    fn validate_redis(&self) -> Result<(), ConfigError> {
+        if self.redis.key_prefix.is_empty() {
+            return Err(ConfigError::Validation(
+                "harvest.redis.key_prefix must not be empty".to_owned(),
+            ));
+        }
+        if self.redis.consumer_group.is_empty() {
+            return Err(ConfigError::Validation(
+                "harvest.redis.consumer_group must not be empty".to_owned(),
+            ));
+        }
+        if self.redis.visibility_timeout_ms < REDIS_VISIBILITY_TIMEOUT_FLOOR_MS {
+            return Err(ConfigError::Validation(format!(
+                "harvest.redis.visibility_timeout_ms must be at least \
+                 {REDIS_VISIBILITY_TIMEOUT_FLOOR_MS}"
+            )));
+        }
+        if self.redis.poll_interval_ms < 1 {
+            return Err(ConfigError::Validation(
+                "harvest.redis.poll_interval_ms must be at least 1".to_owned(),
+            ));
+        }
+        if self.redis.poll_interval_ms > REDIS_POLL_INTERVAL_CEILING_MS {
+            return Err(ConfigError::Validation(format!(
+                "harvest.redis.poll_interval_ms must be at most {REDIS_POLL_INTERVAL_CEILING_MS}"
+            )));
+        }
+        if self.redis.reconcile_interval_ms < 1 {
+            return Err(ConfigError::Validation(
+                "harvest.redis.reconcile_interval_ms must be at least 1".to_owned(),
+            ));
+        }
+        if self.redis.reconcile_batch < 1 {
+            return Err(ConfigError::Validation(
+                "harvest.redis.reconcile_batch must be at least 1".to_owned(),
+            ));
+        }
+
+        if self.redis.url.is_some() && !cfg!(feature = "redis") {
+            return Err(ConfigError::Validation(
+                "harvest.redis.url is set but this binary is built without the `redis` cargo \
+                 feature of autumn-harvest-plugin; rebuild with `--features redis` or unset \
+                 harvest.redis.url"
+                    .to_owned(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+/// Where a resolved `harvest.mode` value came from (issue #1291).
+///
+/// A refusal that only names the resolved mode leaves a developer guessing
+/// where it came from. This says exactly that, so a refusal message can name
+/// the variable or file to change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HarvestModeSource {
+    /// No override anywhere. The value is the built-in default, `embedded`.
+    Default,
+    /// The `AUTUMN_HARVEST__MODE` environment variable set it.
+    Env,
+    /// This config file set it, in its `[harvest]` table.
+    ConfigFile(PathBuf),
+}
+
+impl std::fmt::Display for HarvestModeSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Default => write!(f, "the built-in default"),
+            Self::Env => write!(f, "the AUTUMN_HARVEST__MODE environment variable"),
+            Self::ConfigFile(path) => write!(f, "{}", path.display()),
+        }
+    }
+}
+
+/// Resolve `harvest.mode` and say where the value came from.
+///
+/// A narrow twin of [`HarvestRuntimeConfig::load_with_env`]. It reads the
+/// same config files under the same precedence — root file, then
+/// profile-specific file, then environment — but tracks one field only.
+/// A caller that must name the responsible variable or file reads the
+/// source here. The dev runtime's startup gate does this (issue #1291). A
+/// fully loaded [`HarvestRuntimeConfig`] drops that provenance.
+///
+/// # Errors
+///
+/// Returns [`ConfigError`] when a config file cannot be read or parsed, or
+/// when `AUTUMN_HARVEST__MODE` names an unrecognised mode.
+pub fn resolve_harvest_mode_source(
+    env: &dyn Env,
+) -> Result<(HarvestMode, HarvestModeSource), ConfigError> {
+    let profile = resolve_profile(env);
+    let mut mode = HarvestMode::default();
+    let mut source = HarvestModeSource::Default;
+
+    let root_path = find_config_file_named("autumn.toml", env);
+    if let Some(root) = load_partial_root(&root_path)?
+        && let Some(configured) = root.harvest.mode
+    {
+        mode = configured;
+        source = HarvestModeSource::ConfigFile(root_path);
+    }
+
+    if let Some(profile) = &profile {
+        let profile_path = find_config_file_named(&format!("autumn-{profile}.toml"), env);
+        if let Some(root) = load_partial_root(&profile_path)?
+            && let Some(configured) = root.harvest.mode
+        {
+            mode = configured;
+            source = HarvestModeSource::ConfigFile(profile_path);
+        }
+    }
+
+    if let Ok(raw) = env.var("AUTUMN_HARVEST__MODE") {
+        mode = parse_mode(&raw)?;
+        source = HarvestModeSource::Env;
+    }
+
+    Ok((mode, source))
 }
 
 impl Default for HarvestRuntimeConfig {
@@ -318,6 +575,33 @@ impl Default for HarvestRuntimeConfig {
             batch: HarvestBatchConfig::default(),
             readiness: HarvestReadinessConfig::default(),
             startup: HarvestStartupConfig::default(),
+            redis: HarvestRedisConfig::default(),
+        }
+    }
+}
+
+impl HarvestRedisConfig {
+    /// The configured URL with any userinfo removed.
+    ///
+    /// A Redis URL can carry a user name and a password. Startup logs and
+    /// error messages name the endpoint, so they use this form. Returns
+    /// `None` when Redis dispatch is off.
+    #[must_use]
+    pub fn redacted_url(&self) -> Option<String> {
+        self.url.as_deref().map(redact_userinfo)
+    }
+}
+
+impl Default for HarvestRedisConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            key_prefix: "harvest".to_owned(),
+            consumer_group: "harvest_workers".to_owned(),
+            visibility_timeout_ms: 60_000,
+            poll_interval_ms: 20,
+            reconcile_interval_ms: 1_000,
+            reconcile_batch: DEFAULT_DISPATCH_RECONCILE_BATCH,
         }
     }
 }
@@ -366,6 +650,8 @@ struct PartialHarvestRuntimeConfig {
     readiness: PartialHarvestReadinessConfig,
     #[serde(default)]
     startup: PartialHarvestStartupConfig,
+    #[serde(default)]
+    redis: PartialHarvestRedisConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -398,9 +684,20 @@ struct PartialHarvestReadinessConfig {
     require_shard_readiness: Option<bool>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
 struct PartialHarvestStartupConfig {
     orphaned_workflows: Option<OrphanStartupAction>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialHarvestRedisConfig {
+    url: Option<String>,
+    key_prefix: Option<String>,
+    consumer_group: Option<String>,
+    visibility_timeout_ms: Option<u64>,
+    poll_interval_ms: Option<u64>,
+    reconcile_interval_ms: Option<u64>,
+    reconcile_batch: Option<usize>,
 }
 
 fn find_config_file_named(filename: &str, env: &dyn Env) -> PathBuf {
@@ -421,11 +718,84 @@ fn load_partial_root(path: &Path) -> Result<Option<PartialRoot>, ConfigError> {
     }
 }
 
+/// The operator config files, in precedence order: `autumn.toml`, then
+/// `autumn-{profile}.toml`. A file that does not exist is skipped.
+fn load_operator_roots(env: &dyn Env) -> Result<Vec<PartialRoot>, ConfigError> {
+    let mut roots = Vec::new();
+    for path in operator_config_paths(env) {
+        if let Some(root) = load_partial_root(&path)? {
+            roots.push(root);
+        }
+    }
+    Ok(roots)
+}
+
+/// The operator config file paths, in precedence order.
+fn operator_config_paths(env: &dyn Env) -> Vec<PathBuf> {
+    let mut paths = vec![find_config_file_named("autumn.toml", env)];
+    if let Some(profile) = resolve_profile(env) {
+        paths.push(find_config_file_named(
+            &format!("autumn-{profile}.toml"),
+            env,
+        ));
+    }
+    paths
+}
+
+/// Only the `[harvest.startup]` table of a config file.
+#[derive(Debug, Default, Deserialize)]
+struct StartupOnlyRoot {
+    #[serde(default)]
+    harvest: StartupOnlyHarvest,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StartupOnlyHarvest {
+    #[serde(default)]
+    startup: PartialHarvestStartupConfig,
+}
+
+/// Read `[harvest.startup]` from `path`. A missing file gives `None`.
+///
+/// The parse error names the file and the byte offset only. The TOML error
+/// text quotes the failing line, which can hold a password.
+fn load_startup_section(path: &Path) -> Result<Option<PartialHarvestStartupConfig>, ConfigError> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(ConfigError::Io(error)),
+    };
+    toml::from_str::<StartupOnlyRoot>(&contents)
+        .map(|root| Some(root.harvest.startup))
+        .map_err(|error| {
+            let offset = error
+                .span()
+                .map_or_else(String::new, |span| format!(" at byte {}", span.start));
+            ConfigError::Validation(format!(
+                "could not parse {}{offset}: the file is not valid TOML, or \
+                 [harvest.startup] holds an invalid value",
+                path.display()
+            ))
+        })
+}
+
 fn resolve_profile(env: &dyn Env) -> Option<String> {
-    if let Ok(profile) = env.var("AUTUMN_PROFILE")
-        && !profile.is_empty()
-    {
-        return Some(profile);
+    resolve_profile_input(env).and_then(|profile| normalize_profile_name(&profile))
+}
+
+/// The raw profile selector, in the autumn-web order (issue #1614).
+///
+/// The order is `AUTUMN_ENV`, `AUTUMN_PROFILE`, `--profile`, then
+/// `AUTUMN_IS_DEBUG`. `HarvestEmbedding::with_ambient_profile` also reads
+/// `AUTUMN_ENV` first. A different order here would read the wrong
+/// `autumn-{profile}.toml`, and a `fail` orphan setting in it would be lost.
+fn resolve_profile_input(env: &dyn Env) -> Option<String> {
+    for key in ["AUTUMN_ENV", "AUTUMN_PROFILE"] {
+        if let Ok(profile) = env.var(key)
+            && !profile.trim().is_empty()
+        {
+            return Some(profile);
+        }
     }
 
     let args: Vec<String> = std::env::args().collect();
@@ -475,6 +845,58 @@ fn parse_orphan_startup_action(key: &str, value: &str) -> Result<OrphanStartupAc
     }
 }
 
+/// What redaction returns when the authority cannot be isolated.
+///
+/// A caller prints this instead of a URL that may still hold a password.
+const REDACTED_URL: &str = "<redacted>";
+
+/// Remove the `user:password@` part of a URL authority.
+///
+/// The scan is bounded to the authority: the first `/`, `?` or `#` after the
+/// scheme ends it. An `@` later in the path or the query is left alone.
+///
+/// The function fails closed and returns [`REDACTED_URL`] when it cannot
+/// isolate the authority (issue #1312). Two inputs reach that path. A string
+/// with no `://` has no authority. The second input is an unencoded `/`
+/// inside the password, as in `redis://user:pa/ss@host:6379`. That `/` moves
+/// the `@` out of the authority. The scan then sees `user:pa`, which is not a
+/// valid host and port. Returning the input unchanged in either case would
+/// print the password.
+fn redact_userinfo(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return REDACTED_URL.to_owned();
+    };
+    let authority_start = scheme_end + 3;
+    let rest = &url[authority_start..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    if let Some(at) = rest[..authority_end].rfind('@') {
+        return format!("{}{}", &url[..authority_start], &rest[at + 1..]);
+    }
+    if is_bare_host_and_port(&rest[..authority_end]) {
+        return url.to_owned();
+    }
+    REDACTED_URL.to_owned()
+}
+
+/// True when `authority` reads as a host with an optional numeric port.
+///
+/// The check is what separates a credential-free URL from one whose password
+/// hides the `@` behind an unencoded `/`. A bracketed IPv6 literal keeps its
+/// brackets, so the port scan starts after the closing bracket.
+fn is_bare_host_and_port(authority: &str) -> bool {
+    let host_end = authority
+        .rfind(']')
+        .map_or(0, |bracket| bracket.saturating_add(1));
+    let (host, port) = match authority[host_end..].split_once(':') {
+        Some((head, port)) => (&authority[..host_end + head.len()], Some(port)),
+        None => (authority, None),
+    };
+    if host.is_empty() {
+        return false;
+    }
+    port.is_none_or(|port| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 fn parse_bool(key: &str, value: &str) -> Result<bool, ConfigError> {
     match value {
         "true" | "1" => Ok(true),
@@ -500,6 +922,12 @@ fn parse_u64(key: &str, value: &str) -> Result<u64, ConfigError> {
 fn parse_u32(key: &str, value: &str) -> Result<u32, ConfigError> {
     value
         .parse::<u32>()
+        .map_err(|_| ConfigError::Validation(format!("invalid integer for {key}: {value:?}")))
+}
+
+fn parse_usize(key: &str, value: &str) -> Result<usize, ConfigError> {
+    value
+        .parse::<usize>()
         .map_err(|_| ConfigError::Validation(format!("invalid integer for {key}: {value:?}")))
 }
 
@@ -796,6 +1224,589 @@ orphaned_workflows = "explode"
             "expected the TOML deserialization error to reference the bad value \
              or the field, got {error}"
         );
+    }
+
+    #[test]
+    fn harvest_config_redis_defaults_leave_dispatch_off() {
+        let env = MockEnv::new();
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("harvest config should load");
+
+        assert_eq!(config.redis.url, None);
+        assert_eq!(config.redis.key_prefix, "harvest");
+        assert_eq!(config.redis.consumer_group, "harvest_workers");
+        assert_eq!(config.redis.visibility_timeout_ms, 60_000);
+        assert_eq!(config.redis.poll_interval_ms, 20);
+        assert_eq!(config.redis.reconcile_interval_ms, 1_000);
+        assert_eq!(
+            config.redis.reconcile_batch,
+            DEFAULT_DISPATCH_RECONCILE_BATCH
+        );
+    }
+
+    #[test]
+    fn harvest_config_redis_section_parses_from_toml() {
+        let dir = unique_temp_dir("harvest-config-redis-toml");
+        write_file(
+            &dir.join("autumn.toml"),
+            r#"
+[harvest.redis]
+key_prefix = "acme"
+consumer_group = "acme_workers"
+visibility_timeout_ms = 30000
+poll_interval_ms = 5
+reconcile_interval_ms = 250
+reconcile_batch = 500
+"#,
+        );
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
+
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("harvest config should load");
+
+        assert_eq!(config.redis.url, None);
+        assert_eq!(config.redis.key_prefix, "acme");
+        assert_eq!(config.redis.consumer_group, "acme_workers");
+        assert_eq!(config.redis.visibility_timeout_ms, 30_000);
+        assert_eq!(config.redis.poll_interval_ms, 5);
+        assert_eq!(config.redis.reconcile_interval_ms, 250);
+        assert_eq!(config.redis.reconcile_batch, 500);
+    }
+
+    #[test]
+    fn harvest_config_redis_env_overrides_toml() {
+        let dir = unique_temp_dir("harvest-config-redis-env");
+        write_file(
+            &dir.join("autumn.toml"),
+            r#"
+[harvest.redis]
+key_prefix = "from_toml"
+"#,
+        );
+        let env = MockEnv::new()
+            .with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref())
+            .with("AUTUMN_HARVEST_REDIS__KEY_PREFIX", "from_env")
+            .with("AUTUMN_HARVEST_REDIS__CONSUMER_GROUP", "env_workers")
+            .with("AUTUMN_HARVEST_REDIS__VISIBILITY_TIMEOUT_MS", "15000")
+            .with("AUTUMN_HARVEST_REDIS__POLL_INTERVAL_MS", "40")
+            .with("AUTUMN_HARVEST_REDIS__RECONCILE_INTERVAL_MS", "2000")
+            .with("AUTUMN_HARVEST_REDIS__RECONCILE_BATCH", "750");
+
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("harvest config should load");
+
+        assert_eq!(config.redis.key_prefix, "from_env");
+        assert_eq!(config.redis.consumer_group, "env_workers");
+        assert_eq!(config.redis.visibility_timeout_ms, 15_000);
+        assert_eq!(config.redis.poll_interval_ms, 40);
+        assert_eq!(config.redis.reconcile_interval_ms, 2_000);
+        assert_eq!(config.redis.reconcile_batch, 750);
+    }
+
+    #[test]
+    fn harvest_config_redis_empty_url_env_leaves_dispatch_off() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__URL", "");
+
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("harvest config should load");
+
+        assert_eq!(config.redis.url, None);
+    }
+
+    #[test]
+    fn harvest_config_redis_rejects_a_zero_poll_interval() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__POLL_INTERVAL_MS", "0");
+
+        let error = HarvestRuntimeConfig::load_with_env(&env)
+            .expect_err("a zero poll interval must fail validation");
+
+        assert!(
+            error.to_string().contains("harvest.redis.poll_interval_ms"),
+            "expected a redis poll_interval_ms validation error, got {error}"
+        );
+    }
+
+    #[test]
+    fn harvest_config_redis_rejects_a_zero_reconcile_interval() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__RECONCILE_INTERVAL_MS", "0");
+
+        let error = HarvestRuntimeConfig::load_with_env(&env)
+            .expect_err("a zero reconcile interval must fail validation");
+
+        assert!(
+            error
+                .to_string()
+                .contains("harvest.redis.reconcile_interval_ms"),
+            "expected a redis reconcile_interval_ms validation error, got {error}"
+        );
+    }
+
+    #[test]
+    fn harvest_config_redis_rejects_a_zero_reconcile_batch() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__RECONCILE_BATCH", "0");
+
+        let error = HarvestRuntimeConfig::load_with_env(&env)
+            .expect_err("a zero reconcile batch must fail validation");
+
+        assert!(
+            error.to_string().contains("harvest.redis.reconcile_batch"),
+            "expected a redis reconcile_batch validation error, got {error}"
+        );
+    }
+
+    #[test]
+    fn harvest_config_redis_rejects_a_zero_visibility_timeout() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__VISIBILITY_TIMEOUT_MS", "0");
+
+        let error = HarvestRuntimeConfig::load_with_env(&env)
+            .expect_err("a zero visibility timeout must fail validation");
+
+        assert!(
+            error
+                .to_string()
+                .contains("harvest.redis.visibility_timeout_ms"),
+            "expected a redis visibility_timeout_ms validation error, got {error}"
+        );
+    }
+
+    /// A build without the `redis` feature carries no channel implementation.
+    /// A configured URL must therefore fail at load, not start a runtime that
+    /// silently ignores it.
+    #[cfg(not(feature = "redis"))]
+    #[test]
+    fn harvest_config_redis_url_without_the_feature_is_rejected() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__URL", "redis://127.0.0.1:6379");
+
+        let error = HarvestRuntimeConfig::load_with_env(&env)
+            .expect_err("a redis url must fail validation without the redis feature");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("redis") && message.contains("feature"),
+            "expected the error to name the `redis` cargo feature, got {error}"
+        );
+    }
+
+    /// A build with the `redis` feature accepts a configured URL.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn harvest_config_redis_url_with_the_feature_is_accepted() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__URL", "redis://127.0.0.1:6379");
+
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("harvest config should load");
+
+        assert_eq!(config.redis.url.as_deref(), Some("redis://127.0.0.1:6379"));
+    }
+
+    #[test]
+    fn redacted_url_is_none_when_dispatch_is_off() {
+        assert_eq!(HarvestRedisConfig::default().redacted_url(), None);
+    }
+
+    #[test]
+    fn redacted_url_keeps_the_host_and_drops_the_credentials() {
+        let config = HarvestRedisConfig {
+            url: Some("redis://operator:hunter2@cache.internal:6379/2".to_owned()),
+            ..HarvestRedisConfig::default()
+        };
+
+        let redacted = config.redacted_url().expect("a url is set");
+
+        assert_eq!(redacted, "redis://cache.internal:6379/2");
+        assert!(!redacted.contains("hunter2"));
+        assert!(!redacted.contains("operator"));
+    }
+
+    #[test]
+    fn redacted_url_leaves_a_credential_free_url_intact() {
+        let config = HarvestRedisConfig {
+            url: Some("rediss://cache.internal:6380".to_owned()),
+            ..HarvestRedisConfig::default()
+        };
+
+        assert_eq!(
+            config.redacted_url().as_deref(),
+            Some("rediss://cache.internal:6380")
+        );
+    }
+
+    #[test]
+    fn redacted_url_ignores_an_at_sign_after_the_authority() {
+        // A password in the path or query must not make the host disappear.
+        let config = HarvestRedisConfig {
+            url: Some("redis://cache.internal:6379/0?token=a@b".to_owned()),
+            ..HarvestRedisConfig::default()
+        };
+
+        assert_eq!(
+            config.redacted_url().as_deref(),
+            Some("redis://cache.internal:6379/0?token=a@b")
+        );
+    }
+
+    /// An unencoded `/` inside the password hides the `@` from the authority
+    /// scan, so the authority cannot be isolated. Redaction fails closed
+    /// (issue #1312).
+    #[test]
+    fn redacted_url_fails_closed_when_the_password_holds_a_slash() {
+        let config = HarvestRedisConfig {
+            url: Some("redis://user:pa/ss@host:6379".to_owned()),
+            ..HarvestRedisConfig::default()
+        };
+
+        let redacted = config.redacted_url().expect("a url is set");
+
+        assert!(
+            !redacted.contains("pa/ss"),
+            "the password must not survive redaction, got {redacted}"
+        );
+        assert_eq!(redacted, "<redacted>");
+    }
+
+    /// A password with no user name still leaves the host readable.
+    #[test]
+    fn redacted_url_drops_a_password_without_a_user_name() {
+        let config = HarvestRedisConfig {
+            url: Some("rediss://:pw@host/0?x=1".to_owned()),
+            ..HarvestRedisConfig::default()
+        };
+
+        let redacted = config.redacted_url().expect("a url is set");
+
+        assert_eq!(redacted, "rediss://host/0?x=1");
+        assert!(!redacted.contains("pw"));
+    }
+
+    /// A string with no `://` has no authority to isolate. Redaction fails
+    /// closed rather than echo the whole value.
+    #[test]
+    fn redacted_url_fails_closed_without_a_scheme_separator() {
+        let config = HarvestRedisConfig {
+            url: Some("operator:hunter2@cache.internal:6379".to_owned()),
+            ..HarvestRedisConfig::default()
+        };
+
+        let redacted = config.redacted_url().expect("a url is set");
+
+        assert_eq!(redacted, "<redacted>");
+        assert!(!redacted.contains("hunter2"));
+    }
+
+    /// Every key the channel owns carries the prefix. An empty prefix collides
+    /// with unrelated keys in the same Redis instance.
+    #[test]
+    fn harvest_config_redis_rejects_an_empty_key_prefix() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__KEY_PREFIX", "");
+
+        let error = HarvestRuntimeConfig::load_with_env(&env)
+            .expect_err("an empty key prefix must fail validation");
+
+        assert!(
+            error.to_string().contains("harvest.redis.key_prefix"),
+            "expected a redis key_prefix validation error, got {error}"
+        );
+    }
+
+    /// Redis rejects an empty consumer group name, so the channel must reject
+    /// it at load rather than at the first read.
+    #[test]
+    fn harvest_config_redis_rejects_an_empty_consumer_group() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__CONSUMER_GROUP", "");
+
+        let error = HarvestRuntimeConfig::load_with_env(&env)
+            .expect_err("an empty consumer group must fail validation");
+
+        assert!(
+            error.to_string().contains("harvest.redis.consumer_group"),
+            "expected a redis consumer_group validation error, got {error}"
+        );
+    }
+
+    /// The poll interval is the blocking-read wait of an idle worker. A value
+    /// above the ceiling delays the shutdown check and the reconcile sweep.
+    #[test]
+    fn harvest_config_redis_rejects_a_poll_interval_above_the_ceiling() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__POLL_INTERVAL_MS", "5001");
+
+        let error = HarvestRuntimeConfig::load_with_env(&env)
+            .expect_err("a poll interval above the ceiling must fail validation");
+
+        assert!(
+            error.to_string().contains("harvest.redis.poll_interval_ms"),
+            "expected a redis poll_interval_ms validation error, got {error}"
+        );
+    }
+
+    /// A visibility timeout below the floor lets a peer recover a reference
+    /// that the owning worker still holds.
+    #[test]
+    fn harvest_config_redis_rejects_a_visibility_timeout_below_the_floor() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__VISIBILITY_TIMEOUT_MS", "999");
+
+        let error = HarvestRuntimeConfig::load_with_env(&env)
+            .expect_err("a visibility timeout below the floor must fail validation");
+
+        assert!(
+            error
+                .to_string()
+                .contains("harvest.redis.visibility_timeout_ms"),
+            "expected a redis visibility_timeout_ms validation error, got {error}"
+        );
+    }
+
+    /// The documented defaults sit inside every bound the validator applies.
+    #[test]
+    fn harvest_config_redis_defaults_pass_validation() {
+        let env = MockEnv::new();
+
+        HarvestRuntimeConfig::load_with_env(&env).expect("the redis defaults must validate");
+    }
+
+    // -----------------------------------------------------------------
+    // `resolve_harvest_mode_source` (issue #1291)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn mode_source_defaults_to_embedded_with_no_override() {
+        let env = MockEnv::new();
+        let (mode, source) = resolve_harvest_mode_source(&env).expect("resolution should succeed");
+        assert_eq!(mode, HarvestMode::Embedded);
+        assert_eq!(source, HarvestModeSource::Default);
+    }
+
+    #[test]
+    fn mode_source_names_the_environment_variable() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST__MODE", "split");
+        let (mode, source) = resolve_harvest_mode_source(&env).expect("resolution should succeed");
+        assert_eq!(mode, HarvestMode::Split);
+        assert_eq!(source, HarvestModeSource::Env);
+    }
+
+    #[test]
+    fn mode_source_names_the_root_config_file() {
+        let dir = unique_temp_dir("harvest-mode-source-root");
+        let root_path = dir.join("autumn.toml");
+        write_file(
+            &root_path,
+            r#"
+[harvest]
+mode = "external"
+
+[harvest.database]
+url = "postgres://harvest:harvest@localhost:5432/harvest"
+"#,
+        );
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
+
+        let (mode, source) = resolve_harvest_mode_source(&env).expect("resolution should succeed");
+
+        assert_eq!(mode, HarvestMode::External);
+        assert_eq!(source, HarvestModeSource::ConfigFile(root_path));
+    }
+
+    #[test]
+    fn mode_source_prefers_the_profile_file_over_the_root_file() {
+        let dir = unique_temp_dir("harvest-mode-source-profile");
+        write_file(
+            &dir.join("autumn.toml"),
+            r#"
+[harvest]
+mode = "embedded"
+"#,
+        );
+        let profile_path = dir.join("autumn-dev.toml");
+        write_file(
+            &profile_path,
+            r#"
+[harvest]
+mode = "split"
+
+[harvest.database]
+url = "postgres://harvest:harvest@localhost:5432/harvest"
+"#,
+        );
+        let env = MockEnv::new()
+            .with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref())
+            .with("AUTUMN_PROFILE", "dev");
+
+        let (mode, source) = resolve_harvest_mode_source(&env).expect("resolution should succeed");
+
+        assert_eq!(mode, HarvestMode::Split);
+        assert_eq!(source, HarvestModeSource::ConfigFile(profile_path));
+    }
+
+    #[test]
+    fn mode_source_env_overrides_a_config_file() {
+        let dir = unique_temp_dir("harvest-mode-source-env-over-file");
+        write_file(
+            &dir.join("autumn.toml"),
+            r#"
+[harvest]
+mode = "split"
+
+[harvest.database]
+url = "postgres://harvest:harvest@localhost:5432/harvest"
+"#,
+        );
+        let env = MockEnv::new()
+            .with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref())
+            .with("AUTUMN_HARVEST__MODE", "embedded");
+
+        let (mode, source) = resolve_harvest_mode_source(&env).expect("resolution should succeed");
+
+        assert_eq!(mode, HarvestMode::Embedded);
+        assert_eq!(source, HarvestModeSource::Env);
+    }
+
+    #[test]
+    fn mode_source_rejects_an_unrecognised_environment_value() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST__MODE", "sideways");
+        let error = resolve_harvest_mode_source(&env)
+            .expect_err("an unrecognised mode must fail resolution");
+        assert!(error.to_string().contains("sideways"), "{error}");
+    }
+
+    // Issue #1613: the operator overlay for a code-built startup config.
+
+    #[test]
+    fn startup_overlay_keeps_the_code_value_when_the_operator_sets_nothing() {
+        let code = HarvestStartupConfig {
+            orphaned_workflows: OrphanStartupAction::Fail,
+        };
+        let resolved = code
+            .with_operator_overrides(&MockEnv::new())
+            .expect("an empty environment should resolve");
+        assert_eq!(resolved.orphaned_workflows, OrphanStartupAction::Fail);
+    }
+
+    #[test]
+    fn startup_overlay_applies_the_environment_override() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS", "fail");
+        let resolved = HarvestStartupConfig::default()
+            .with_operator_overrides(&env)
+            .expect("a valid override should resolve");
+        assert_eq!(resolved.orphaned_workflows, OrphanStartupAction::Fail);
+    }
+
+    #[test]
+    fn startup_overlay_applies_the_config_file_then_the_environment() {
+        let dir = unique_temp_dir("harvest-startup-overlay");
+        write_file(
+            &dir.join("autumn.toml"),
+            r#"
+[harvest.startup]
+orphaned_workflows = "off"
+"#,
+        );
+        let file_only = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
+        let resolved = HarvestStartupConfig::default()
+            .with_operator_overrides(&file_only)
+            .expect("the file should resolve");
+        assert_eq!(resolved.orphaned_workflows, OrphanStartupAction::Off);
+
+        let file_and_env = MockEnv::new()
+            .with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref())
+            .with("AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS", "fail");
+        let resolved = HarvestStartupConfig::default()
+            .with_operator_overrides(&file_and_env)
+            .expect("the file and the override should resolve");
+        assert_eq!(resolved.orphaned_workflows, OrphanStartupAction::Fail);
+    }
+
+    // Issue #1614: the profile file follows the autumn-web profile order.
+
+    #[test]
+    fn startup_overlay_reads_the_profile_file_that_autumn_env_selects() {
+        let dir = unique_temp_dir("harvest-startup-autumn-env");
+        write_file(
+            &dir.join("autumn-prod.toml"),
+            r#"
+[harvest.startup]
+orphaned_workflows = "fail"
+"#,
+        );
+        let env = MockEnv::new()
+            .with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref())
+            .with("AUTUMN_ENV", "production")
+            .with("AUTUMN_PROFILE", "dev");
+        let resolved = HarvestStartupConfig::default()
+            .with_operator_overrides(&env)
+            .expect("the profile file should resolve");
+        assert_eq!(resolved.orphaned_workflows, OrphanStartupAction::Fail);
+    }
+
+    #[test]
+    fn profile_resolution_matches_autumn_web() {
+        let resolve = |pairs: &[(&str, &str)]| {
+            let env = pairs
+                .iter()
+                .fold(MockEnv::new(), |env, (key, value)| env.with(key, value));
+            resolve_profile(&env)
+        };
+        assert_eq!(resolve(&[("AUTUMN_ENV", "prod")]).as_deref(), Some("prod"));
+        assert_eq!(
+            resolve(&[("AUTUMN_ENV", "staging"), ("AUTUMN_PROFILE", "dev")]).as_deref(),
+            Some("staging")
+        );
+        assert_eq!(
+            resolve(&[("AUTUMN_ENV", " "), ("AUTUMN_PROFILE", "Development")]).as_deref(),
+            Some("dev")
+        );
+        assert_eq!(
+            resolve(&[("AUTUMN_IS_DEBUG", "0")]).as_deref(),
+            Some("prod")
+        );
+        assert_eq!(resolve(&[]), None);
+    }
+
+    #[test]
+    fn startup_overlay_ignores_unrelated_invalid_settings() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST__WORKER_ENABLED", "maybe");
+        let resolved = HarvestStartupConfig::default()
+            .with_operator_overrides(&env)
+            .expect("an unrelated setting must not block the startup overlay");
+        assert_eq!(resolved.orphaned_workflows, OrphanStartupAction::Warn);
+    }
+
+    #[test]
+    fn startup_overlay_ignores_an_invalid_setting_outside_the_startup_table() {
+        let dir = unique_temp_dir("harvest-startup-narrow");
+        write_file(
+            &dir.join("autumn.toml"),
+            r#"
+[harvest]
+worker_enabled = "maybe"
+
+[harvest.startup]
+orphaned_workflows = "fail"
+"#,
+        );
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
+        let resolved = HarvestStartupConfig::default()
+            .with_operator_overrides(&env)
+            .expect("an invalid setting outside [harvest.startup] must not block the overlay");
+        assert_eq!(resolved.orphaned_workflows, OrphanStartupAction::Fail);
+    }
+
+    #[test]
+    fn startup_overlay_parse_error_does_not_quote_the_file() {
+        let dir = unique_temp_dir("harvest-startup-secret");
+        write_file(
+            &dir.join("autumn.toml"),
+            "[database]\nurl = postgres://user:hunter2@db/app\n",
+        );
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
+        let error = HarvestStartupConfig::default()
+            .with_operator_overrides(&env)
+            .expect_err("a file that is not valid TOML must refuse");
+        let message = error.to_string();
+        assert!(message.contains("autumn.toml"), "{message}");
+        assert!(!message.contains("hunter2"), "{message}");
+    }
+
+    #[test]
+    fn startup_overlay_rejects_an_invalid_startup_action() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS", "fial");
+        let error = HarvestStartupConfig::default()
+            .with_operator_overrides(&env)
+            .expect_err("a typo in the action must not silently become `warn`");
+        assert!(error.to_string().contains("fial"), "{error}");
     }
 
     fn unique_temp_dir(label: &str) -> PathBuf {

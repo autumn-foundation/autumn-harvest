@@ -34,7 +34,7 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 async fn setup() -> (String, ContainerAsync<Postgres>) {
@@ -100,6 +100,9 @@ fn wf_info(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn)
 fn make_worker(registry: Arc<HandlerRegistry>) -> Worker {
     Worker::new(
         WorkerRuntimeConfig {
+            codec_rotation_batch_size: 0,
+            scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
+            dr: autumn_harvest::replication::DrConfig::default(),
             worker_id: uuid::Uuid::new_v4().to_string(),
             queues: vec!["default".to_string()],
             notification_database_url: None,
@@ -115,6 +118,7 @@ fn make_worker(registry: Arc<HandlerRegistry>) -> Worker {
             build_id: String::new(),
             deployment_name: None,
             workflow_cache_size: 100,
+            resident_workflows: true,
             priority_aging_secs: None,
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
@@ -143,7 +147,7 @@ async fn start(conn: &mut AsyncPgConnection, name: &str, id: &str) -> ExecutionI
             workflow_name: name,
             workflow_id: id,
             exec_id: ExecutionId::new_for_shard(ShardId::new(0)),
-            input: Value::Null,
+            input: Value::Null.into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -1034,6 +1038,8 @@ async fn activity_schedule_to_close_enforcement_yields_to_a_pause_committed_afte
             None,
             None,
             60,
+            &autumn_harvest::payload_codec::PayloadCodecs::default(),
+            0,
         )
         .await
     });
@@ -1230,10 +1236,10 @@ async fn retry_path_requeues_when_a_concurrent_resume_shifted_the_deadline() {
     // lock is the guarantee; this test constructs the stale-snapshot state
     // deterministically by letting the activity itself perform the shift
     // mid-attempt.
-    use autumn_harvest::RetryPolicy;
     use autumn_harvest::info::ActivityInfo;
     use autumn_harvest::queue::{EnqueueParams, TaskType};
     use autumn_harvest::types::ActivityExecId;
+    use autumn_harvest::{JitterPolicy, RetryPolicy};
 
     let (url, _c) = setup().await;
     let mut conn = connect(&url).await;
@@ -1290,8 +1296,10 @@ async fn retry_path_requeues_when_a_concurrent_resume_shifted_the_deadline() {
     params.max_attempts = 5;
     params.schedule_to_close_at = Some(chrono::Utc::now() + chrono::Duration::seconds(30));
     params.retry_policy = Some(
-        serde_json::to_value(RetryPolicy::fixed(5, Duration::from_secs(300)))
-            .expect("retry policy serializes"),
+        serde_json::to_value(
+            RetryPolicy::fixed(5, Duration::from_secs(300)).with_jitter(JitterPolicy::None),
+        )
+        .expect("retry policy serializes"),
     );
     let task_id = queue::enqueue(&mut conn, &params)
         .await
@@ -1489,10 +1497,10 @@ async fn retry_path_requeues_when_a_concurrent_pause_committed_after_the_gate() 
     // Both the claim-time snapshot deadline AND the row-current deadline are
     // exceeded, so neither the snapshot gate nor the resume-shift staleness
     // re-check can save the task — only the new PAUSED re-check.
-    use autumn_harvest::RetryPolicy;
     use autumn_harvest::info::ActivityInfo;
     use autumn_harvest::queue::{EnqueueParams, TaskType};
     use autumn_harvest::types::ActivityExecId;
+    use autumn_harvest::{JitterPolicy, RetryPolicy};
 
     let (url, _c) = setup().await;
     let mut conn = connect(&url).await;
@@ -1546,8 +1554,10 @@ async fn retry_path_requeues_when_a_concurrent_pause_committed_after_the_gate() 
     params.max_attempts = 5;
     params.schedule_to_close_at = Some(chrono::Utc::now() + chrono::Duration::seconds(30));
     params.retry_policy = Some(
-        serde_json::to_value(RetryPolicy::fixed(5, Duration::from_secs(300)))
-            .expect("retry policy serializes"),
+        serde_json::to_value(
+            RetryPolicy::fixed(5, Duration::from_secs(300)).with_jitter(JitterPolicy::None),
+        )
+        .expect("retry policy serializes"),
     );
     let task_id = queue::enqueue(&mut conn, &params)
         .await
@@ -2053,4 +2063,233 @@ async fn pause_during_inflight_decision_task_discards_pending_commands() {
 
     worker.shutdown();
     let _ = worker_handle.await;
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1347: the early, non-locking pause fast path in
+// `process_workflow_task` had no ownership guard. It called
+// `queue::park_workflow_task` directly. That function parks a row by task id
+// alone. It has no worker_id check. A stale dispatcher whose claim already
+// moved to a new owner could still clear that owner's claim on this path.
+// This was the one #1184 site this class of guard had not yet reached.
+//
+// This test steals the task's claim while the decision task is mid-flight,
+// then pauses. The theft simulates a poison-pill reclaim, an operator
+// requeue, or a concurrent claim race. The stale dispatcher must find its
+// claim gone and leave the new owner's row untouched, exactly like the
+// sibling guards in `terminal_write_ownership_tests.rs`.
+// ---------------------------------------------------------------------------
+
+async fn steal_task_claim(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
+    use autumn_harvest::schema::harvest_task_queue as t;
+    diesel::update(
+        t::table
+            .filter(t::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+            .filter(t::task_type.eq("workflow")),
+    )
+    .set(t::worker_id.eq(Some("thief")))
+    .execute(conn)
+    .await
+    .expect("transfer the claim");
+}
+
+async fn task_owner_and_state(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> (Option<String>, String) {
+    use autumn_harvest::schema::harvest_task_queue as t;
+    t::table
+        .filter(t::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+        .filter(t::task_type.eq("workflow"))
+        .select((t::worker_id, t::state))
+        .first(conn)
+        .await
+        .expect("the task row survives an undecided dispatch")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pause_fast_path_makes_no_terminal_decision_when_the_claim_moved() {
+    let (url, _c) = setup().await;
+    let pool = build_pool(&url);
+    let mut conn = connect(&url).await;
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![wf_info("slow_timer_wf_1347", slow_timer_wf)],
+        vec![],
+    ));
+    let exec_id = start(&mut conn, "slow_timer_wf_1347", "inflight-pause-1347").await;
+
+    let worker = Arc::new(make_worker(registry));
+    let worker_pool = pool.clone();
+    let worker_ref = worker.clone();
+    let worker_handle = tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(25), worker_ref.run(&worker_pool)).await;
+    });
+
+    // Land the claim theft and the pause while the decision task is
+    // mid-flight. The worker has claimed it, but the handler is still in its
+    // 300ms sleep. So the fast path has not run yet.
+    wait_for_task_claimed(&mut conn, exec_id).await;
+    steal_task_claim(&mut conn, exec_id).await;
+    pause_workflow_execution(
+        &mut conn,
+        exec_id,
+        Some("mid-flight-claim-theft"),
+        "oncall",
+        &NoOpMetrics,
+    )
+    .await
+    .expect("pause should succeed on a running execution");
+    assert_eq!(get_state(&mut conn, exec_id).await, "PAUSED");
+
+    // Give the in-flight handler ample time to finish its sleep, reach the
+    // fast-path pause check, and find its claim gone.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    assert_eq!(
+        get_state(&mut conn, exec_id).await,
+        "PAUSED",
+        "execution must remain paused"
+    );
+    assert!(
+        !history(&mut conn, exec_id)
+            .await
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerStarted { .. })),
+        "a dispatcher that lost the claim must not persist new commands"
+    );
+
+    let (worker_id, state) = task_owner_and_state(&mut conn, exec_id).await;
+    assert_eq!(
+        state, "RUNNING",
+        "the stolen row's state must be untouched by the stale dispatcher"
+    );
+    assert_eq!(
+        worker_id.as_deref(),
+        Some("thief"),
+        "the claim transfer must be untouched by the stale dispatcher's park attempt"
+    );
+
+    worker.shutdown();
+    let _ = worker_handle.await;
+}
+
+// ── Workflow task timeout against the locked execution state ────────────────
+
+/// Make the execution's workflow task look claimed and past its
+/// start-to-close deadline, so the next scanner pass times it out.
+async fn make_workflow_task_overdue(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
+    diesel::sql_query(
+        "UPDATE harvest_task_queue \
+            SET state = 'RUNNING', worker_id = 'gone-worker', \
+                started_at = NOW() - INTERVAL '10 minutes', \
+                start_to_close = INTERVAL '1 second' \
+          WHERE workflow_exec_id = $1 AND task_type = 'workflow'",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(conn)
+    .await
+    .expect("make the workflow task overdue");
+}
+
+async fn scan_timeouts_once(conn: &mut AsyncPgConnection) {
+    autumn_harvest::timeout::enforce_timeouts_once(
+        conn,
+        &NoOpMetrics,
+        Duration::from_secs(5),
+        &None,
+        &[],
+        None,
+        None,
+        60,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        0,
+    )
+    .await
+    .expect("timeout enforcement should succeed");
+}
+
+#[tokio::test]
+async fn a_workflow_task_timeout_on_a_paused_run_clears_the_pause_record() {
+    // A dispatched workflow task keeps running under pause (issue #383), so its
+    // start-to-close deadline still applies. The timeout seals the run, as the
+    // quarantine path does. The sealed row must not also read as paused.
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+    let exec_id = start(&mut conn, "wf", "wft-timeout-paused").await;
+    make_workflow_task_overdue(&mut conn, exec_id).await;
+    pause_workflow_execution(&mut conn, exec_id, Some("hold"), "oncall", &NoOpMetrics)
+        .await
+        .expect("pause should succeed");
+
+    scan_timeouts_once(&mut conn).await;
+
+    assert_eq!(get_state(&mut conn, exec_id).await, "TIMED_OUT");
+    assert_eq!(
+        pause_columns(&mut conn, exec_id).await,
+        (None, None, None),
+        "a TIMED_OUT run must not keep its pause record"
+    );
+}
+
+#[tokio::test]
+async fn a_workflow_task_timeout_stays_a_timeout_once_replaced() {
+    // A start-replace seals the row `CONTINUED_AS_NEW` and writes no event.
+    // Readers then infer the outcome from history, so the timeout's own event
+    // must still say `TIMED_OUT`.
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+    let exec_id = start(&mut conn, "wf", "wft-timeout-replaced").await;
+    make_workflow_task_overdue(&mut conn, exec_id).await;
+
+    scan_timeouts_once(&mut conn).await;
+
+    assert_eq!(get_state(&mut conn, exec_id).await, "TIMED_OUT");
+    assert_eq!(
+        autumn_harvest::execution::replaced_run_outcome_state(&mut conn, exec_id)
+            .await
+            .expect("history"),
+        Some("TIMED_OUT"),
+        "the history must keep the timeout, not read back as a plain failure"
+    );
+}
+
+#[tokio::test]
+async fn a_workflow_task_timeout_never_rewrites_a_sealed_run() {
+    // The timeout scan filters on task state only. A run that another path
+    // already sealed can still own an open workflow task. The timeout must
+    // close that task and keep the run's recorded outcome.
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+    let exec_id = start(&mut conn, "wf", "wft-timeout-sealed").await;
+    make_workflow_task_overdue(&mut conn, exec_id).await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions \
+            SET state = 'COMPLETED', completed_at = NOW(), output = '1'::jsonb \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("seal the run COMPLETED");
+
+    scan_timeouts_once(&mut conn).await;
+
+    assert_eq!(get_state(&mut conn, exec_id).await, "COMPLETED");
+    use autumn_harvest::schema::harvest_task_queue as t;
+    let task_state: String = t::table
+        .filter(t::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+        .filter(t::task_type.eq("workflow"))
+        .select(t::state)
+        .first(&mut conn)
+        .await
+        .expect("the workflow task must exist");
+    assert_eq!(task_state, "FAILED", "the orphan task is closed");
+    assert!(
+        !history(&mut conn, exec_id)
+            .await
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowFailed { .. })),
+        "no WorkflowFailed may be appended to a sealed run"
+    );
 }

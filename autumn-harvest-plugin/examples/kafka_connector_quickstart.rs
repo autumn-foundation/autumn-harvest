@@ -89,14 +89,18 @@ async fn main() {
         .max_in_flight(32);
     // ─────────────────────────── end connector ───────────────────────────
 
-    autumn_web::app()
-        .plugin(
-            HarvestPlugin::new()
-                .workflows(workflows![fulfil_order])
-                .connector(binding, source)
-                .worker(WorkerConfig::default())
-                .api("/api/harvest"),
-        )
-        .run()
-        .await;
+    // The `run` future is large in autumn-web 0.8, so it is boxed.
+    // That keeps it off the stack and satisfies `clippy::large_futures`.
+    Box::pin(
+        autumn_web::app()
+            .plugin(
+                HarvestPlugin::new()
+                    .workflows(workflows![fulfil_order])
+                    .connector(binding, source)
+                    .worker(WorkerConfig::default())
+                    .api("/api/harvest"),
+            )
+            .run(),
+    )
+    .await;
 }

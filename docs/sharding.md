@@ -4,7 +4,7 @@
 
 Harvest can spread workflow state across N independent Postgres databases (shards). A single workflow's event log, task queue rows, timers, signals, and DLQ entries all live on the same shard, so per-workflow ACID guarantees are preserved without cross-shard transactions.
 
-For the full sharding architecture, see `CLAUDE.md` §Sharding and `autumn-harvest/src/shard.rs`.
+For the full sharding architecture, see [`docs/architecture.md`](architecture.md#sharding) §Sharding and `autumn-harvest/src/shard.rs`.
 
 **When should you shard?** [`performance.md`](performance.md) publishes measured
 task-claim latency against pending-backlog depth. Claim cost grows superlinearly
@@ -72,6 +72,8 @@ Two further scoping notes:
 Postgres's one-argument advisory locks share a single 64-bit space, and the durable mutex (`ctx.mutex`, issue #691) takes a *blocking* lock in that same space. A latest-wins admission holds its concurrency lock while cancelling an incumbent, and that cancellation runs the incumbent's terminal chokepoint — which can take a mutex lock. The reverse order also exists (a mutex holder reaching a terminal state whose completion trigger starts a `cancel_running` workflow), so the two orders are inverted.
 
 If both happen concurrently Postgres detects the cycle and aborts one side with SQLSTATE `40P01`, surfacing as a database error on the *start*. The aborted transaction rolls back atomically — no partial supersede, no orphaned cancellation — and the start is safe to retry. It is a **liveness** hazard, not a correctness one, and it needs a workflow that both declares `on_conflict = "cancel_running"` and participates in `ctx.mutex` on the same terminal path. If you see `40P01` on such a start, retry it; if it recurs, split the mutex usage out of the latest-wins workflow.
+
+When the abort hits a workflow-task persist, the engine resets the task and replay runs it again (issue #1822). `harvest.db.transaction_retry{site="workflow_task", reason="deadlock"}` counts it. A start through the API or a client still returns the error, and the caller retries it.
 
 ---
 
@@ -161,10 +163,19 @@ curl -s .../admin/config | jq -S '.shard_topology'
 {
   "default_shard": 0,
   "readable_shards": [0, 1],
+  "reserved_shards": [],
   "residency_map": { "eu": 0, "us": 1 },
+  "shard_forwards": {},
   "writable_shards": [0, 1]
 }
 ```
+
+`shard_forwards` (issue #964) is the same argument applied to a strictly worse
+failure mode. It is empty until a shard has been decommissioned; after one, two
+replicas that disagree about where a **retired** shard's ids resolve will answer
+the *same* `ExecutionId` from *different* databases — one finding the run, the
+other a confident `404` — while reporting identical `readable`/`writable`/
+`default` sets. Diff it as the last step of a decommission.
 
 The projection is `BTreeMap`-ordered, so it is byte-stable and a plain diff across replicas is meaningful:
 
@@ -193,9 +204,12 @@ Everything spawned under a pinned parent stays on the parent's shard — this is
 
 So pinning the **root** of a workflow tree confines the whole tree.
 
+> **One deliberate exception (issue #956).** A spawn can opt *out* of that inheritance per call, with `ChildPlacement`. The default is unchanged and permanent — every entry in the table above still reads ✅ unless the calling code explicitly passes a non-default placement. A residency-bound tree must therefore keep the default; use `ChildPlacement::ResidencyKey` when a child genuinely has its own declared jurisdiction, and never `ChildPlacement::Distributed`. See *Cross-shard child placement* below.
+
+
 ### Worked example — a two-region EU/US deployment
 
-1. **Provision two databases**, one per region, and run `diesel migration run` against each.
+1. **Provision two databases**, one per region, and run `harvest migrate run` against each (DSN via `HARVEST_DATABASE_URL`).
 
 2. **Declare the shards and the residency map** when building the router:
 
@@ -235,11 +249,154 @@ So pinning the **root** of a workflow tree confines the whole tree.
 
 - **`(workflow_name, workflow_id)` uniqueness is per-shard.** A pin moves a run off its hash-derived shard, so a *later, unpinned* start of the same `workflow_id` would route elsewhere and could create a duplicate. When the caller omits `workflow_id`, Harvest mints one that hashes to the pinned shard, closing the hole automatically. When the caller supplies an **explicit** `workflow_id`, be consistent: either always pin it or never pin it. (This is the same consistency requirement idempotency-key routing already documents.)
 - **Placement is resolved before idempotency-key replay.** A retry of a keyed start must carry the same placement as the original delivery. A *committed* keyed replay still returns its original `200` even if the pinned shard has since been drained — the replay creates no new work, so it is validated against `readable_shards` only.
-- **Only the HTTP start route and the CLI carry placement.** `POST /workflows/{name}/signal-with-start` and `/update-with-start` have no `shard_id` / `residency_key` field, and the in-process SDK start APIs (`StartWorkflowParams`, the typed client stubs) carry none either — all of them route by hash. An entity workflow created through the documented signal-with-start pattern therefore **cannot** be pinned today. If a residency-bound workflow must be reachable that way, start it explicitly first (pinned) and let signal-with-start attach to the existing run. `WorkflowHandleClient::resolve_shard_placement` resolves and validates a placement for pre-flight tooling, but does not itself place anything.
+- **Only the HTTP start route and the CLI carry placement.** `POST /workflows/{name}/signal-with-start` and `/update-with-start` have no `shard_id` / `residency_key` field, and the in-process SDK start APIs (`StartWorkflowParams`, the typed client stubs) carry none either — all of them route by hash. The one exception: a caller that builds `StartWorkflowParams` itself can pin by minting its `exec_id` with `ExecutionId::new_for_shard` (see [Tenant cells](#tenant-cells-issue-1837)). An entity workflow created through the documented signal-with-start pattern therefore **cannot** be pinned today. If a residency-bound workflow must be reachable that way, start it explicitly first (pinned) and let signal-with-start attach to the existing run. `WorkflowHandleClient::resolve_shard_placement` resolves and validates a placement for pre-flight tooling, but does not itself place anything.
 - **Deferred starts cannot be pinned.** Debounce (#499) and batch (#518) admit a start without creating an execution, so there is nothing to place at request time; combining either with `shard_id` / `residency_key` is a `400` rather than a silently discarded pin. A throttled start (#607) *is* pinned — it defers the same concrete placement to its scanner.
 - **Rollout ordering.** Placement is enforced by the node handling the start. During a rolling deploy, a pinned request that lands on a pre-#697 node is accepted and hashed, silently ignoring the pin. Upgrade the whole fleet before you begin sending pinned starts, and treat the first pinned start as the cutover point.
 - **Residency keys are an operator-declared, low-cardinality set.** The map is held in memory on every node and validated at boot; it is sized for regions/jurisdictions (single digits to dozens), not per-tenant keys. For per-tenant placement, map the tenant to a region in your own application layer and pass the region as the key.
-- **Out of scope**: migrating a *running* workflow between shards, per-shard worker assignment, geo-replication / cross-region failover, and inferring residency from payload contents. Harvest never reads your payload to decide placement — the caller states it explicitly.
+- **Out of scope**: migrating a *running* workflow between shards, and inferring residency from payload contents. A quiescent workflow can move; see [Shard rebalancing](#shard-rebalancing--migrating-quiescent-workflows-issue-964). [`cross-region-dr.md`](cross-region-dr.md) covers cross-region replication and failover (issue #954). Per-shard worker assignment is supported; see [Tenant cells](#tenant-cells-issue-1837). Harvest never reads your payload to decide placement — the caller states it explicitly.
+
+### Business-key addressing finds a pinned run wherever it is (issue #1146)
+
+`ctx.signal_external_workflow_by_id` / `ctx.request_cancel_external_workflow_by_id`
+(issue #751) address a target by `(workflow_name, workflow_id)`. Originally they
+resolved the owning shard by re-deriving `ShardRouter::pick_for_new_workflow` —
+the rendezvous hash a *fresh start* of that key would use. That answers "where
+would new work be placed?", which is not the same question as "where does this
+run live?", and for a pinned workflow it is a different answer: a signal or
+cancel addressed by business key resolved to the hash-derived shard, found
+nothing there, and failed the request `target_unknown` once the grace window
+elapsed, while the target was running the whole time.
+
+The same divergence appears without any pin at all. `pick_writable` re-hashes
+over the *current* `writable_shards` when the readable-set hash falls outside
+it, so **draining a shard moves where a key resolves after a workflow was
+already placed there** — the run stays put and the hash does not.
+
+Delivery now resolves by **observation**: it queries every expected shard for
+the addressed key and merges the answers with the same active-run-first ranking
+the management API's by-id endpoints use (`execution::select_resolved_run`). Two
+rules make that safe rather than merely broader:
+
+- **No first-hit short circuit.** `(workflow_name, workflow_id)` uniqueness is
+  shard-local, so a stale terminal run of the key can sit on one shard while the
+  live run sits on another. Every expected shard is asked before a terminal
+  answer is accepted; otherwise a signal would fail `not_running` against a dead
+  run while its live sibling waited.
+- **"Could not inspect" is never "not there."** A shard this process has no pool
+  for — mid a shard-add rollout — or one it cannot reach leaves the resolution
+  *indeterminate*, and the delivery is retried on the next outbox sweep. Only a
+  fan-out that inspected every expected shard and found nothing may become a
+  permanent `target_unknown`. A shard outage therefore stalls by-id deliveries
+  instead of durably failing them.
+
+Operationally: expect **one to two row reads per shard per by-id delivery
+attempt** (the per-shard resolver probes active-first, then most-recent-terminal
+only when a shard holds no active run), on the outbox scanners rather than the
+hot dispatch path. A **single-shard deployment expects one shard, skips the
+fan-out entirely, and is unchanged**, including keeping its inline
+(same-transaction) fast path. Multi-shard deployments route every by-id delivery
+through the outbox — which is where the hash already sent `(N-1)/N` of them —
+so delivery completes up to one scanner poll interval later than it used to.
+`ExecutionId`-addressed signal/cancel is untouched: the shard is decoded from
+the id and is always authoritative.
+
+Connections, not queries, are the budget here. The sweep calls the fan-out from
+inside a transaction on a connection checked out of its own shard's pool, and
+Harvest configures no deadpool timeouts, so a naive second `pool.get()` on that
+pool would park forever and wedge every scanner resident behind it. The caller's
+own shard is therefore probed on the connection already in hand, and a sweep
+memoizes the shards it has already failed to reach so a backlog of pending rows
+pays an acquisition bound once per shard rather than once per row.
+
+**A by-id resolution is authoritative over what it observed, not over an
+instant.** The shards are read sequentially, on separate connections to separate
+databases, with no shared snapshot — Postgres has no cross-shard transaction and
+Harvest deliberately adds no coordinator. A run of the key that starts on an
+already-read shard while a later shard is being read is therefore invisible to
+that fan-out. This needs two live runs of one business key to be possible at
+all, which needs a deployment to mix pinned and unpinned starts of the same
+`workflow_id` — exactly the discipline the *Caveats* section above asks you to
+keep, and for exactly this reason.
+
+**So a by-id cancel reports from a later fan-out than the one that cancelled**
+(issue #1313). The stale view only becomes a wrong answer once the cancel makes
+the run it found terminal, because that promotes the run which started during
+the fan-out to current run for the key. A cancel that ends a live run therefore
+cancels it, withholds `ExternalCancelDelivered`, and leaves the claim to the
+next sweep, whose fan-out observes the whole window the first one ran in. That
+run is then an ordinary second live copy, cancelled one per sweep until none is
+left, exactly as an ambiguous fan-out already converges. The cost is one extra
+scanner poll interval on every by-id cancel that finds a live run; a cancel
+whose target is already terminal changes nothing and still reports at once, as
+does every `ExecutionId`-addressed cancel and every single-shard deployment.
+
+This narrows the window rather than making the assertion atomic: the later
+fan-out is itself not a snapshot. Closing it outright means cross-shard key
+uniqueness, which is an architectural addition rather than a fix — see issue
+#1313 for the options.
+
+**Size each shard pool at one connection per local scanner sharing it, plus
+one.** `Worker` spawns one timeout checker per assigned shard, and each holds
+its own shard pool's connection for the whole scanner pass. So a process with
+`shard_assignments = [0, 1]` and one connection per pool has checker 0 wanting
+pool 1 exactly while checker 1 is holding it, and vice versa.
+
+For the usual topology — one database per logical shard — that rule is just
+"2 or more". It is stated per *physical pool* because of the colocated case:
+`ShardedDbPool::pool_for` returns the same pool for several logical shards
+aliased onto one database, while checkers are spawned per logical *assignment*.
+Shards 0 and 1 aliased onto a pool at `max_size = 2` therefore run two scanners
+against two connections and leave nothing for shard 2's cross-shard read —
+under-provisioned, though every individual shard looks like it meets a flat
+threshold of two. Such a pool needs 3. Peer acquisitions
+in the fan-out and in cross-shard delivery are bounded tightly
+(`external_target_location::FANOUT_ACQUIRE_BOUND`) precisely so neither scanner
+ever *waits* on the other and the circular wait cannot form — a peer whose only
+connection is busy is simply uninspected and the row is retried on the next tick.
+
+What that buys is **bounded return, not progress**. A one-connection pool has
+nothing to spare while its own scanner is mid-pass, so a peer read succeeds only
+if it lands during that scanner's sleep window; likely, since passes are short
+relative to the poll interval and two independent tasks do not stay in phase, but
+a probability rather than a guarantee. The guarantee is capacity: one connection
+per local scanner running against that pool, one for a peer's cross-shard read.
+A multi-shard worker configured below that now logs a warning at startup naming
+the pool's shards, its `max_size` and what it needs, so the degradation is
+visible rather than silent. The warning groups by physical pool, so an aliased
+pool is reported once, for all the shards sharing it, against the total they
+require between them. A deployment that runs one process
+per shard is unaffected either way, since each process holds only its own shard's
+connection.
+
+**A shard you cannot reach stalls by-id delivery rather than failing it, without
+a bound.** That is the deliberate trade: `target_unknown` is written into an
+append-only history and cannot be taken back, so it is only ever recorded from a
+*complete* fan-out. The consequence is that a shard which is permanently
+uninspectable *in this process* — a router whose `readable_shards` names a shard
+no pool was ever configured for, say — leaves every affected by-id request
+pending indefinitely, and a workflow awaiting the outcome waits with it. The
+per-row `by-id target resolution inconclusive` warning still names the shard
+and the reason (issue #1146), and three metrics now cover what the warning
+alone could not (issue #1307): the counter
+`harvest.external_signal.by_id_indeterminate_shard`, labelled `shard` and
+`kind`, for which shard and why; the gauges
+`harvest.external_signal.by_id_oldest_pending_indeterminate_age` and its
+`external_cancel` twin, for how long a row has been stuck — the number an
+operator actually wants to alert on, since it tells "retrying, will resolve"
+apart from "stuck since Tuesday" without reasoning about shard topology; and
+the counter `harvest.external_signal.by_id_found_over_incomplete_fanout` for
+the sibling case where a live run *was* found and delivered to, but the
+answer came from an incomplete fan-out. The plugin's startup
+`missing_router_shards` check prevents the steady-state form of this
+misconfiguration; a hand-rolled embedder whose `sharded_pool` is narrower than
+its router can still reach it.
+
+`shard::external_target_owning_shard` still exists and is still correct for the
+question it answers — *where would this key be placed?* — which is what the
+cross-type continue-as-new guard and the re-run `workflow_id`-override guard
+need. `ShardedDbPool::exact_pool_for_target` is deprecated: resolving a pool for
+a target is always a "where does it live" question, and the hash cannot answer
+it.
 
 ### Cross-shard global limits — explicit out of scope
 
@@ -252,6 +409,580 @@ If you need approximate cross-shard fair-share rather than a hard global cap, th
 When a worker crashes and its heartbeat times out, the `timeout.rs` scanner transitions the claimed task back to `PENDING` state. The concurrency cap check counts only `RUNNING` rows, so the slot is immediately available for another worker to claim. No operator intervention is required.
 
 This is handled entirely within the shard where the task lives — no cross-shard coordination is needed for crash recovery.
+
+---
+
+## Tenant cells (issue #1837)
+
+A cell is one shard and one worker pool for one tenant. A flood in a cell
+does not reach tenants outside it. The cell has its own database
+connections, scanners, NOTIFY channel and worker slots. Key-based quotas
+cannot isolate those resources. [ADR 0004](adr/0004-tenant-isolation-cells.md)
+records the decision and its limits.
+
+### Build a cell
+
+1. Reserve the cell shard on the router of **every** replica.
+   `with_reserved_shards` keeps unpinned starts off the shard.
+2. Map a cell residency key to the shard. Name the cell, not the tenant.
+3. Give each pool explicit shard assignments.
+
+```rust
+use autumn_harvest::shard::ShardRouter;
+use autumn_harvest::types::ShardId;
+use autumn_harvest::WorkerConfig;
+
+let shared = ShardId::new(0);
+let cell_a = ShardId::new(1);
+let router = ShardRouter::new(vec![shared, cell_a], vec![shared, cell_a], shared)
+    .with_residency_map([("cell-a".to_string(), cell_a)])
+    .with_reserved_shards([cell_a]);
+
+// Shared processes serve every unreserved shard.
+let shared_pool = WorkerConfig::default().with_shard_assignments([shared]);
+// Cell processes serve the cell shard only.
+let cell_pool = WorkerConfig::default().with_shard_assignments([cell_a]);
+```
+
+Pass the router to `HarvestRunnerResources::with_shard_router`. The
+`HarvestPlugin` boot path is single shard, so it cannot host a cell.
+
+4. Start the tenant's work with the cell key. The application keeps the
+   tenant-to-cell map.
+
+```bash
+curl -X POST .../workflows/import_orders/start \
+  -d '{"workflow_id": "acme-42", "input": {}, "residency_key": "cell-a"}'
+```
+
+An in-process start resolves the shard first:
+
+```rust
+use autumn_harvest::shard::ShardPlacement;
+use autumn_harvest::types::ExecutionId;
+
+let placement = ShardPlacement::residency_key("cell-a");
+let shard = router.resolve_placement(&placement, "import_orders", "acme-42")?;
+let exec_id = ExecutionId::new_for_shard(shard);
+// Pass exec_id in StartWorkflowParams on that shard's connection.
+```
+
+### Rules
+
+- **Unpinned placement never picks a reserved shard.** That covers
+  `ShardPlacement::Auto`, idempotency-key routing, DAG pinning and
+  `ChildPlacement::Distributed`. A pin by `shard_id` or `residency_key`
+  still reaches it.
+- **Only keys that hashed to the reserved shard move.** They re-hash among
+  the other writable shards. Other keys keep their shard.
+- **Reserve a fresh shard.** A business key already on the shard hashes
+  elsewhere after the reservation. This is the same effect as a drain.
+- **The runner refuses an auto pool.** It does not start a worker without
+  explicit shard assignments when the router reserves shards. An auto pool
+  covers every pool shard, cells included. An API-only process passes.
+- **Children stay in the cell** by default. `Distributed` children leave
+  it. A child pinned by `Shard` or `ResidencyKey` can enter any cell.
+- **Some start paths cannot reach a cell.** These carry no pin:
+  signal-with-start, update-with-start, debounce, batch, webhooks, broker
+  connectors, the MCP start tool, the outbox, completion triggers, workflow
+  schedules and the typed stubs.
+- **The default shard stays shared.** Schedules and unencoded ids land on
+  it. The router panics at boot if you reserve it.
+- **At least one writable shard stays unreserved.** The router panics at
+  boot otherwise.
+- **Some loops still visit every shard.** The schedule ticker and the
+  retention janitor run over every pool shard in each process. The
+  liveness canary probes each writable shard, cells included.
+- **Upgrade the fleet first.** A pre-#1837 replica cannot reserve a shard.
+  It hashes shared tenants into the cell. Add the cell shard to the
+  writable set in the same deploy that reserves it.
+
+### Verify a cell
+
+- `GET /api/harvest/admin/config` reports `shard_topology.reserved_shards`.
+  Diff it across replicas. A replica that does not reserve the cell hashes
+  shared tenants into it.
+- `GET /api/harvest/admin/shards/health` shows a live worker on each cell
+  shard.
+- `harvest.queue.schedule_to_start{queue}` measures each tenant when each
+  tenant has its own queue.
+
+### Proof
+
+`tenant_cell_isolation_tests.rs` floods tenant A in a cell. Tenant B's worst
+schedule-to-start stays under 3 s. A control run on one shared shard pushes
+it above 3 s.
+
+---
+
+## Cross-shard child placement (issue #956)
+
+Children are pinned to the parent's shard by default, and that default is permanent. That is the right default — it keeps a whole workflow tree's ACID, residency and observability story shard-local — but it means a single orchestrator concentrates its entire fan-out's write load on one database. Adding shards helps top-level starts and does nothing for the child-heavy workloads that need sharding most.
+
+`ChildPlacement` is the opt-in, **per-spawn** escape hatch.
+
+```rust
+use autumn_harvest::shard::ChildPlacement;
+
+// Today's behaviour. The router is never even consulted.
+let a: Receipt = ctx.spawn_child_workflow(&process_one_info(), item).await?;
+
+// The same call, spread across `writable_shards`.
+let b: Vec<Receipt> = ctx
+    .spawn_child_workflow_fan_out_placed(
+        &process_one_info(),
+        items,
+        &ChildPlacement::Distributed,
+    )
+    .await?;
+```
+
+Every `spawn_child_workflow*` entry point has a `_placed` sibling taking a `&ChildPlacement`; the original methods delegate with `ChildPlacement::ParentShard`.
+
+| Variant | Resolution |
+|---|---|
+| `ParentShard` (default) | The parent's shard. Short-circuits **before** the router is consulted, so a deployment with no router installed is unaffected. |
+| `Distributed` | `ShardRouter::pick_for_new_workflow` over `writable_shards` — the same rendezvous function a top-level start uses. |
+| `Shard(id)` | An explicit pin, validated exactly like `ShardPlacement::Shard` (unknown or drained ⇒ rejected). |
+| `ResidencyKey(key)` | An explicit residency pin, resolved through the declared map (undeclared ⇒ rejected, never hashed). |
+
+### `Distributed` during a full drain
+
+A fully-drained fleet (`writable_shards` empty — every shard mid-maintenance
+at once) is the one case a `Distributed` placement does not reject outright.
+Rejecting it would either fail the spawn terminally (the handler ABI erases
+the error type) or deadlock the drain itself: a drained shard must let its
+in-flight work finish, and a parent cannot finish while the children it
+awaits are refused.
+
+The child stays on the **parent's own shard** for the duration of the drain,
+not the deployment's configured default shard. The two differ whenever the
+parent is not itself on the default shard, and only the parent's own shard
+guarantees the child is classified local — never cross-shard — so it can
+never reach (and be rejected by) the persist-time drain check that governs
+genuine cross-shard targets. A `warn!` names the workflow and the shard on
+every occurrence, so an operator draining the fleet can see exactly which
+placed spawns degenerated while the window was open.
+
+### Restart stability
+
+A top-level start's rendezvous key is the caller-supplied `workflow_id`, which is stable by construction. A child's `ExecutionId` is minted fresh on every dispatch, so hashing *it* would re-roll the shard whenever a decision cycle is retried after a crash. `Distributed` instead hashes a deterministic per-parent key, `"{parent_exec_id}#{n}"`, so a retried cycle re-derives the identical shard for every slot — the same restart-stability contract top-level starts have.
+
+Placement is decided exactly once in a child's lifetime, on the **fresh dispatch**. Replay reuses the `child_id` recorded in `ChildWorkflowStarted` verbatim and never re-derives anything, so widening `writable_shards` cannot move an already-started child.
+
+### What crosses the shard boundary, and how
+
+The parent's decision transaction stays shard-local. Always. It never opens a second database.
+
+Instead, a cross-shard spawn writes **one row** into `harvest_cross_shard_children` on the parent's shard, in the same transaction as the parent's `ChildWorkflowStarted` / `ChildWorkflowSpawnedDetached` event. That row is not a message — it is the cross-shard child's lifecycle record on the parent's side, and all four cross-shard edges are transitions of it. `enforce_cross_shard_children` (part of the ordinary scanner tick, alongside #492's outbox scanners) drives them:
+
+| Edge | What the relay does | Dedupe key |
+|---|---|---|
+| Child start | Creates the child on the target shard, then marks the row `STARTED` | the child's `ExecutionId` is the primary key over there |
+| Cancel | Delivers an idempotent `cancel_workflow_execution` | a terminal target absorbs the cancel |
+| Terminal notify | Reads the child's terminal state, appends `ChildWorkflowCompleted`/`Failed` to the parent, wakes it, deletes the row — one transaction on the **parent's** shard | the append and the delete commit together |
+| Close cascade | Applies `RequestCancel`/`Terminate` on the target shard, records `ChildWorkflowCascadeApplied`, deletes the row | the cascade only acts on a `RUNNING`/`PAUSED` child |
+
+Note that the terminal notify is a **pull**, not a push. A push from the child's shard would leave a crash window between the child's terminal commit and the parent's notify; here there is nothing in flight to lose, so a crash at any instant simply leaves the durable row for the next sweep.
+
+### Consistency contract
+
+- **Per-execution ACID stays shard-local.** The parent's decision transaction touches one database; so does the child's. There is no two-phase commit and no cross-shard join.
+- **Cross-shard effects are at-least-once with dedupe** (the table above) — the same contract `enforce_external_signals_outbox` / `enforce_external_cancels_outbox` (#492) established.
+- **Latency, not correctness, is the price.** A cross-shard child's start and its terminal wake are each one scanner tick away rather than one transaction away.
+- **Placement never falls back silently.** A target shard this node has no pool for fails the spawn with the typed, retryable `HarvestError::ShardUnavailable`; the parent's decision cycle rolls back with nothing recorded and is re-driven once the shard is reachable. It is never quietly re-placed on the parent's shard.
+- **Zero event-schema impact.** No new `WorkflowEvent` variant and no change to the adjacently-tagged JSON contract. The child's shard is recoverable from the `child_id` recorded in `ChildWorkflowStarted`, so a parent replays byte-identically regardless of where its children live.
+- **Replay never re-resolves placement.** The router is consulted once, on the fresh dispatch; every later wake reuses the `child_id` already in history. This is what makes the byte-identical replay above true, and it also means a topology edit after dispatch — a shard removed, a residency mapping changed, a worker that has not installed its router yet — cannot fail a parent that is merely replaying.
+- **Restore every shard to the same instant.** A point-in-time restore that rolls shards back to *different* instants can leave a child alive on a target shard whose parent-side `ChildWorkflowStarted` and lifecycle row were rolled away — an orphan the relay cannot see, because it is driven entirely off that row. `harvest backup verify` derives its child checks from parent-side events, so it does not currently catch the reverse direction either (tracked in issue #1263). The same hazard exists for same-shard children; more databases simply make skew easier to produce. Restoring all shards to one common instant avoids it entirely.
+
+### Operating it
+
+`harvest_cross_shard_children` is the in-flight gauge:
+
+```sql
+-- In-flight cross-shard children on this shard, by target and lifecycle state.
+SELECT target_shard, status, cancel_requested, count(*)
+FROM harvest_cross_shard_children
+GROUP BY 1, 2, 3
+ORDER BY 1, 2;
+
+-- Rows that are not making progress name their own last failure.
+SELECT child_exec_id, target_shard, attempts, last_attempt_at, last_error
+FROM harvest_cross_shard_children
+WHERE attempts > 0
+ORDER BY attempts DESC
+LIMIT 20;
+
+-- Oldest still-unsettled child, per target shard: the backlog-age signal.
+SELECT target_shard, min(created_at) AS oldest, count(*) AS in_flight
+FROM harvest_cross_shard_children
+GROUP BY 1
+ORDER BY 2;
+```
+
+Every settled child deletes its row, so a steadily growing count means the relay is not draining — check `last_error` for an unreachable target shard first. `attempts` is written on **every** non-progress path (a failed step, an unreadable target shard, an unrecognised stored value), and it also drives the retry backoff: a row is re-tried after `min(attempts, 6) x 5s`, so one permanently-broken row backs off instead of consuming a slot in every sweep.
+
+There is **no dedicated metric** for the relay yet; the queries above and the `Timeout` scanner's existing `harvest.scanner.tick` liveness are the current signals. A `harvest.cross_shard_child.*` counter family is tracked in issue #1263, along with the payload-offloader gap on the relayed child's start event and the retention-window question for undelivered terminals. Per-execution metrics are unaffected: the relay threads the scanner's real recorder into its cancel, terminate and quota-admission calls, so `harvest.workflow.terminal` counts do not depend on where a child was placed.
+
+### Reading a cross-shard tree
+
+`GET /workflows/{id}/children` and `GET /workflows/{id}/tree` already traverse every shard, so a cross-shard child is visible without any new endpoint. Both now degrade rather than `500` when a shard is unreachable: they return the children they could see and name the rest in `unavailable_shards`, with `status` dropping to `partial` — the #756 contract, which cross-shard placement makes routine rather than exotic.
+
+> **Behaviour change for existing `/children` callers.** Before this, an unreachable shard produced a `500`. Now it produces a `200` whose `items` array is *incomplete*. A client that treated `200` as "this is the whole child list" must read `status` (or check `unavailable_shards` is empty) before drawing that conclusion. The fields are additive; the status code is the part that changed.
+
+The parent **detail** view (`GET /workflows/{id}`) resolves no children — it returns the execution row's own `parent_id` and nothing else — so there is nothing there to degrade.
+
+## Shard rebalancing — migrating quiescent workflows (issue #964)
+
+Before this, the sharding contract ended at *"cross-shard rebalancing of existing
+workflows is out of scope"*. That had two consequences that compound over time:
+adding a shard only helps **new** starts, so a hot shard stays hot for as long as
+its residents live — forever, for a continue-as-new entity workflow — and a shard
+can never be decommissioned, because there is no way to move its residents off.
+
+`harvest shard rebalance` is the operator-initiated primitive that fixes both.
+It is deliberately narrow: it moves **quiescent** executions only.
+
+```
+copy ──▶ replay-verify ──▶ ONE atomic cutover commit ──▶ sealed source
+```
+
+Restricting to quiescent runs is the move that makes the rest provable. It
+converts a live distributed-migration problem into a copy-verify-cutover of an
+*inert, append-only event log* — exactly the artifact Harvest's replay engine
+exists to verify — which is what removes the catch-up phase every online shard
+move in the literature needs, and with it the dual-write and the 2PC.
+
+The full design note, including the alternatives that were rejected and why, is
+`docs/plans/2026-09-02-shard-rebalancing.md`.
+
+### The identity contract: an `ExecutionId` never changes
+
+**A migrated execution keeps its `ExecutionId`.** This is the load-bearing
+decision and it is worth stating plainly, because it inverts what the first two
+bytes mean:
+
+> An `ExecutionId`'s encoded shard is the shard the run **originated** on — its
+> routing entry point — not necessarily where it lives today.
+
+Nothing that holds an id has to learn anything, because no id changed. A
+parent's recorded `ChildWorkflowStarted.child_id`, a stored `WorkflowHandle`, an
+external signal or cancel target, a webhook's stored reference, a schedule's
+carryover lineage — all keep resolving, structurally rather than by enumeration.
+There is no rewrite pass and no alias table.
+
+Resolution is two-level:
+
+| Level | Mechanism | Used when |
+|---|---|---|
+| 1 | **Origin-shard forwarding.** The sealed source row (`MIGRATED`) carries `migrated_to_shard`; an id-routed lookup lands on the origin shard as it always did and follows the pointer. | The origin shard is still readable — i.e. always, until it is decommissioned. |
+| 2 | **Router-declared shard forwards.** `ShardRouter::with_shard_forwards([(retired, successor)])` maps a *removed* shard's ids straight to its successor. | After a decommission, when there is no origin database left to ask. |
+
+Chains (A→B, then B→C) are followed up to `MAX_FORWARD_HOPS` (4) and then fail
+closed with a typed, retryable error rather than looping. A completed migration
+also best-effort repoints the **origin** shard straight at the new home, so
+chains collapse rather than accumulate; correctness comes from following the
+chain, performance from collapsing it.
+
+### The two new execution states
+
+| State | Where | Meaning |
+|---|---|---|
+| `MIGRATING` | target shard | A staged, inert copy. It holds the target's `(workflow_name, workflow_id)` active-uniqueness slot so nothing else can claim the identity mid-migration, and it has **no workflow task row at all**, so nothing can dispatch it. |
+| `MIGRATED` | source shard | The sealed source after cutover: terminal-shaped, non-claimable, carrying the forwarding pointer. |
+
+> **A deliberate deviation from the reset precedent.** Issue #964 suggests
+> modelling the seal on the reset path's `TERMINATED`, "which already releases
+> the uniqueness index". A migration must **not** do that. A reset forks a
+> successor on the *same* shard, so its source has to release
+> `(workflow_name, workflow_id)` or the successor could not be inserted. A
+> migration puts the copy on a *different database*, whose index is its own — so
+> nothing needs releasing, and releasing would be a correctness bug: a later
+> start of the same business key still hashes back to the source shard, would
+> find no active row, and would create a **second live run** alongside the
+> migrated one. `MIGRATED` therefore stays inside the active-uniqueness index,
+> and such a start fails closed instead.
+
+`MIGRATED` is a **seal, never a delete**. The source keeps its full history, so
+an audit of where a run used to live survives the move — and so does the
+forwarding pointer an id resolves through. Do not purge a `MIGRATED` row while
+any pre-migration id might still be held.
+
+### What "quiescent" means, precisely
+
+An execution is migratable only when every one of these holds. Each has a named
+blocker, so a dry run explains itself completely rather than one reason at a
+time.
+
+| Requirement | Why |
+|---|---|
+| `state = 'RUNNING'` | Terminal runs have nothing to move. |
+| No parent (`parent_id IS NULL`) | A child's terminal appends to its parent's history in a shard-local transaction; moving the child would break that edge. **Root executions only.** |
+| No claimed workflow task | A worker is mid-cycle. |
+| No workflow task dispatchable *now* | A wake is pending delivery. |
+| At most one *parked* workflow task, with `wake_requested = false` | This is the migratable shape — see below. |
+| No non-terminal activity or external tasks | In-flight work is out of scope by design. |
+| No unconsumed signals | An undelivered wake. |
+| No `INFLIGHT` completion deliveries | An outbound delivery must settle first. |
+| No `ACTIVE` worker sessions | Session state lives on exactly one worker. |
+| No live children, same-shard or cross-shard | Same reason as the parent rule. |
+| Not non-determinism-blocked | A re-dispatch backoff is pending. |
+| Holds no durable mutex (`ctx.mutex`, #691) | The lock row is shard-local and keyed by the holder; moving the holder away leaves the key held by an execution that no longer lives here, and every waiter on it blocked forever. |
+| Queued for no durable mutex | The grant is delivered by waking the waiter **on this shard**, so a migrated waiter's grant would be delivered to a sealed row — a lost wake. |
+| No dead-letter rows | Redriving a DLQ entry enqueues a task on this shard, which after a migration would target a sealed row. Redrive or discard it first. |
+| Not schedule-attributed (`schedule_id IS NULL`) | A schedule row does not move with its runs, and its overlap enforcement is **shard-local**: the tick counts `RUNNING`/`PAUSED` executions on its own shard for `max_active_runs`, and `CancelOther`/`TerminateOther` cancel priors with the same shard-local query. After a migration the local row reads `MIGRATED`, so the schedule stops counting the still-running copy and stops cancelling it — silently exceeding its own cap, or starting a run without terminating the prior it was told to replace. Making this safe means teaching schedule overlap enforcement to see forwarded residences, which is a change to the scheduler rather than to this feature. |
+| No live children, **including paused ones** | A paused child still completes eventually, and its terminal appends to the parent's history on the shard the parent used to be on. |
+
+**A run waiting on a timer or a signal IS migratable — that is the point.** Both
+shapes keep a workflow task row: a timer park is `PENDING` with a future
+`scheduled_at`, and a signal park is `RUNNING` with no worker
+(`queue::park_workflow_task`). A predicate of "no task rows" would have refused
+exactly the long-lived population this feature exists to move, so the parked row
+is **copied**, not treated as a blocker.
+
+A **paused** execution is *not* migratable. `PAUSED` is a state, not a column,
+and the predicate admits `RUNNING` only — so a paused root reports `NotRunning`
+and is skipped. Resume it, migrate it, and pause it again; the decommission
+runbook's straggler table says so. (Widening the predicate would mean the copy
+and the cutover carrying the original state through activation, which is real
+work for a case an operator can resolve in one command.)
+
+### The wake contract: never lost, never doubled
+
+| When the wake arrives | What happens |
+|---|---|
+| Before or during the copy | The cutover re-evaluates the **full** quiescence predicate inside its own `UPDATE ... WHERE`, so it matches zero rows. The migration aborts, the source is untouched, and the wake is processed there normally. |
+| After the cutover | The source is sealed, so the write resolves through the forwarding pointer to the target. Activation notices the pending signal and schedules the restored task at `NOW()` rather than leaving it waiting on a timer days out. |
+| A keyed redelivery, after the move | Signals are copied **with** their `idempotency_key`, and the target enforces the same partial unique index, so a retried delivery collides exactly as it would have on the source. |
+
+### Crash safety
+
+The durable record is `harvest_shard_migrations`, on the **source** shard — the
+database that stays authoritative right up to the cutover. Its phase says what is
+outstanding:
+
+| Phase at crash | Resume action | Source authoritative? |
+|---|---|---|
+| `PENDING` | re-stage (the inert target copy is discarded and re-made) | yes |
+| `COPIED` | verify | yes |
+| `VERIFIED` | re-check quiescence **and that the history has not advanced**, then cut over | yes |
+| `COMMITTED` | activate the target (idempotent) | **no** — the target is |
+| `DONE` / `ABORTED` | retire the row | — |
+
+Only `VERIFIED → COMMITTED` changes who is authoritative, and it is a single
+statement on one database. Run `harvest shard rebalance-resume` after any crash.
+A worker also settles a `COMMITTED` row on its own. See
+[automatic resume](#automatic-resume-after-a-stalled-cutover-issue-1839).
+
+**Why the cutover re-checks the history and not only quiescence.** Verification
+proves the copy matches the source *as of the copy*. On the end-to-end path the
+cutover follows within milliseconds, but a resume after a crash at `VERIFIED`
+can arrive hours later — and in between the run may legitimately wake, execute a
+whole decision cycle, append events and park again on a fresh timer. It is
+quiescent once more, so every quiescence predicate passes. Sealing then would
+hand authority to a copy that predates that cycle: not a lost *wake* but lost
+*progress*, and invisible afterwards. Verification therefore records the source
+history's high-water mark (`verified_event_count` / `verified_max_event_id`), and
+the cutover seals only while the source still matches it. A stale record declines
+and the resume sweep aborts it, so the run is simply migrated later from its
+current history rather than wedged.
+
+> **The one honest gap.** Between the cutover commit and the target's activation
+> the run is claimable on *neither* shard. That is a **liveness** gap, not a
+> correctness one: the run is authoritative on exactly one shard at every
+> instant, and claimability follows within one resume step. Closing it entirely
+> would need a two-phase commit across two databases, which the sharding design
+> rules out.
+
+### Automatic resume after a stalled cutover (issue #1839)
+
+The worker closes the gap above without an operator. Each worker runs one
+rebalance-resume scanner per assigned shard, when a `ShardedDbPool` is
+configured.
+
+- A pass finds each `COMMITTED` record whose `updated_at` is older than
+  `ScannerConfig::rebalance_stall_after`. The default is 30 s, and the floor
+  is 5 s. The pass activates the target, as `rebalance-resume` does, and moves
+  the record to `DONE`.
+- Passes run every `ScannerConfig::rebalance_resume_interval` (default 5 s),
+  with the scanner jitter. The run is claimable again at most one grace
+  period plus one interval after the crash.
+- Each settled record writes one `shard.rebalance.auto_resume` audit row on the
+  source shard: actor `system`, source `cli`, route
+  `background.rebalance_resume_scanner <from> -> <to>`. The audit table accepts
+  only the sources `api`, `cli` and `ui`. So `cli` is the nearest value, not
+  the real origin. The actor and the route mark the row as automatic.
+- The scanner never touches a record before the cutover. There the source is
+  still claimable, so no liveness gap exists. A cutover is the operator's
+  decision, so use `harvest shard rebalance-resume` for those records.
+- Each statement claims one record and sets its `updated_at`. So many replicas
+  can run the scanner, and one settlement writes one audit row. Only an
+  activation that outlasts the grace period can be claimed twice. Activation
+  is idempotent, so the cost is a second audit row. A record that
+  another driver settles first gets no audit row from the scanner. After a
+  claim, `updated_at` no longer shows the time of the cutover.
+- A replica claims only records whose target shard is in its pool.
+- When the target is down, the step fails. The record stays `COMMITTED`, its
+  `attempts` and `last_error` record the failure, and the worker logs an
+  error. The next try comes one grace period later.
+- When the DR fence is enabled (`replication::FenceRegistry`), the claim and
+  the activation check it first.
+- Set `ScannerConfig::rebalance_resume_enabled` to `false` to turn the scanner
+  off. Then only `harvest shard rebalance-resume` settles a stalled record.
+
+The loop reports as scanner `rebalance_resume` in `scanner_liveness` and in
+`harvest.scanner.tick`. `GET /admin/config` shows `rebalance_resume_enabled`,
+`rebalance_resume_interval_ms` and `rebalance_stall_after_ms`.
+
+### What migrates, and what does not (the dedupe scopes)
+
+| Mechanism | Migrates? | Accepted window |
+|---|---|---|
+| Full event history | ✅ verbatim | none — byte-identical and replay-verified before cutover |
+| Execution row (every column) | ✅ verbatim | none |
+| Durable timers | ✅ verbatim, including `fires_at` | none |
+| Signals, including `idempotency_key` | ✅ verbatim | none |
+| Payload refs (`harvest_payload_refs`) | ✅ | none — the blob store is shard-external |
+| The parked workflow task row | ✅ | none |
+| Terminal task rows (activity history) | ❌ stays on the sealed source | none — the durable record is in `harvest_events` |
+| Workflow logs | ✅ | none — copied for a privacy reason as much as an operational one: they are free text, so a PII sink, and `erase.rs` scrubs them via the execution's own shard. Logs left behind would be out of reach of an erasure issued against the run. |
+| Start idempotency keys | ❌ | none for an existing run: a keyed start still hashes to the same shard |
+| Debounce rows | ❌ | at most one extra debounced start per key immediately after the move |
+| Start-throttle tokens, rate-limit buckets | ❌ | already per-shard; unaffected for an existing run |
+| Concurrency-key accounting | moves implicitly with the parked task row | the run's slot moves from A's cap to B's; the documented `limit × N` scope is unchanged |
+| Completion-trigger fire ledger | ❌ | a trigger whose source run migrated may fire once more; triggers are already at-least-once |
+| Audit log | ❌ | the **source** shard records every attempt in its own `harvest_audit_log`. Note the consequence for a decommission: retiring the shard retires its audit trail, so ship audit off-box (issue #953's export) before step 5 of the runbook. |
+
+### Two copies until retention collects the source
+
+The source is **sealed, not deleted**, so between the cutover and the source
+shard's own retention pass an execution's bytes exist in two databases. That is
+deliberate — the sealed row is the forwarding pointer every pre-migration id
+resolves through — but it makes "which copy did you mean?" a real question for
+anything that acts on an execution by id. The contract:
+
+- **Every id-routed write follows the pointer, not the id.** The external
+  signal, cancel and await outboxes, the management API's per-execution
+  connection resolver, and the batch executor's per-target dispatch all resolve
+  the current residence before choosing a pool. Batch is the sharpest case: its
+  all-shard scan finds the live copy on the target, but the id it hands back
+  still encodes the origin, so an origin-only lookup would send a cancel or a
+  terminate into the sealed source — sealing the wrong copy while the live one
+  kept running.
+- **Erasure goes to *every* residence, not just the live one.**
+  `POST /workflows/{id}/erase-payloads` walks the whole residence chain and
+  scrubs each shard that still holds a copy, listing the extra ones in the
+  response's `prior_residences`. That chain is read from the live row's durable
+  `migrated_from_shards` array, **not** walked backwards along the forwarding
+  pointers — the pointers are deliberately collapsed so hops do not accumulate,
+  which after A → B → C leaves A pointing straight at C and no trace of B, whose
+  sealed copy still holds every payload it had. The terminal-state and legal-hold gates are
+  evaluated against the **live** residence only: a sealed source always reads as
+  terminal, so gating on one would let a still-running execution be erased
+  through its own stale shadow. A source copy retention has already collected
+  contributes nothing and is not an error; a residence this node cannot reach
+  fails the call, because an erasure that cannot be shown to be complete must
+  not be reported as complete.
+- **Business-key targets resolve through the seal, not by hash alone.** The
+  migration deliberately keeps `MIGRATED` inside the active-uniqueness index, so
+  `(workflow_name, workflow_id)` never moves off the shard it hashes to — the
+  seal is what still holds it. An external signal or cancel aimed at a business
+  key therefore resolves the key to its execution id on the hashed shard first,
+  then follows that id's pointer. Stopping at the hash would deliver to the
+  seal, where a cancel reads as already-terminal and reports success for a
+  workflow that keeps running.
+- **A start that would replace a rebalanced prior is refused, not honoured.**
+  `conflict_policy=terminate_existing` (and `reuse_policy=terminate_if_running`)
+  against a `MIGRATED`/`MIGRATING` prior returns a retryable `503` naming the
+  live residence. The terminate cannot reach the live copy from the prior's
+  shard, and replacing would seal the prior `CONTINUED_AS_NEW` — which is
+  excluded from the uniqueness index — releasing the business key while the real
+  run keeps executing. Cancel or terminate the execution *by id*, which routes
+  to its residence, then start again.
+- **A reverse migration keeps the origin's seal alive throughout.** `A → B → A`
+  stages onto a shard the run has lived on before, so the row it replaces is A's
+  own forwarding seal. The staged copy therefore *carries* that pointer until
+  activation clears it: ids routing to A keep resolving to live B for the whole
+  staging window, and an abort restores the seal in place rather than deleting
+  it. Without that, a failed reverse migration would leave the execution with no
+  row on its origin shard at all — an id that resolves nowhere.
+- **Reads may legitimately answer from the live copy alone.** The sealed source
+  is a frozen snapshot as of the cutover, and the live copy is a superset of it
+  by construction, so a history or status read that follows the pointer is
+  complete.
+
+### Zero new event variants; the append-only invariant is untouched
+
+A migration appends **nothing** to `harvest_events` and rewrites **nothing**. The
+copy `INSERT`s new rows on a *different* database; the source's rows are read-only
+throughout. Shard rebalancing is therefore **not** a fourth exception to the
+append-only invariant in `CLAUDE.md` — it is an instance of it. All bookkeeping
+lives in columns and in `harvest_shard_migrations`.
+
+### Using it
+
+Always dry-run first. The dry run walks the same code path up to the first write
+and reports exactly the population a real run would move — it is not a separate
+estimator that could drift.
+
+```bash
+# What would move?
+harvest shard rebalance \
+  --shard 0=postgres://.../harvest_shard0 \
+  --shard 1=postgres://.../harvest_shard1 \
+  --from 0 --to 1 --limit 100 --dry-run
+
+# Do it, with an operator identity for the audit trail.
+harvest shard rebalance \
+  --shard 0=postgres://.../harvest_shard0 \
+  --shard 1=postgres://.../harvest_shard1 \
+  --from 0 --to 1 --limit 100 --actor alice@example.com
+
+# After any crash or interruption. A worker settles a record past the
+# cutover on its own; this command also handles the earlier phases.
+harvest shard rebalance-resume \
+  --shard 0=... --shard 1=... --from 0
+```
+
+The command connects to the shard databases **directly** rather than through the
+management API: a rebalance is inherently a two-database operation and the node
+serving the API has no reason to hold a pool for both. Possession of both DSNs is
+the admin gate, and every non-dry-run attempt writes a
+`shard.rebalance.migrate` row to the source shard's `harvest_audit_log` naming
+the actor, the execution, and the outcome.
+
+A worker with a `ShardedDbPool` also writes to two shards: its
+rebalance-resume scanner finishes a cutover that an operator already committed
+(see [automatic resume](#automatic-resume-after-a-stalled-cutover-issue-1839)).
+It never starts a migration and never commits a cutover.
+
+**Run the migration before deploying the binary.** `db_conn_for_execution` now
+performs a forwarding lookup on multi-shard deployments, so a node running the
+new binary against a database that has not yet gained `migrated_to_shard`
+answers `503` on every single-execution management route. This is the ordinary
+migrate-then-deploy order; it is called out because the pre-#964 code path
+issued no query at all and so had no such requirement.
+
+**A note on payload codecs.** `harvest shard rebalance` verifies with the
+default (identity) codec registry, because the CLI has no key material and
+putting decryption keys on an operator's workstation is not a default worth
+having. That does not weaken the guarantee: the load-bearing half of
+verification is the **raw byte-identity** check over the stored event tuples,
+which is codec-independent. On a deployment using keyed codecs (issue #948) the
+decode-and-replay half will refuse with an unknown-key error, so the migration
+fails closed rather than proceeding unverified. Drive rebalancing from a process
+that has the registry installed if you need both halves.
+
+Both shards must be at the **same migration level**. The copy is deliberately
+column-list-free (`to_jsonb` on the source, `jsonb_populate_record` on the
+target) so a newly-added column is carried automatically rather than silently
+dropped by a hand-maintained list — and the converse hazard, a target that lacks
+a column and would silently discard it, is refused up front with a schema-parity
+check.
+
+### Decommissioning a shard — runbook
+
+See [`docs/runbooks/shard-decommission.md`](runbooks/shard-decommission.md) for the full drill.
 
 ---
 
@@ -364,7 +1095,7 @@ Renders a table by default; pass `--json` for piping.
 
 ### Adding a shard to a deployment that uses per-key concurrency
 
-Follow the standard add-a-shard procedure in `CLAUDE.md`. The new shard starts with no task queue rows, so the cap is independent from day one. If you need to migrate in-flight workflows to the new shard, that is out of scope (cross-shard rebalancing is not supported).
+Follow the standard add-a-shard procedure in [`docs/architecture.md`](architecture.md#sharding). The new shard starts with no task queue rows, so the cap is independent from day one. A running workflow cannot move to the new shard. A quiescent one can; see [Shard rebalancing](#shard-rebalancing--migrating-quiescent-workflows-issue-964).
 
 ---
 
@@ -460,7 +1191,7 @@ CREATE INDEX IF NOT EXISTS idx_harvest_we_created_id
     ON harvest_workflow_executions (created_at DESC, id DESC);
 ```
 
-This index must be present on every shard for deep-page performance to remain flat. The migration is idempotent (`IF NOT EXISTS`) and runs automatically with `diesel migration run`.
+This index must be present on every shard for deep-page performance to remain flat. The migration is idempotent (`IF NOT EXISTS`) and is applied by the normal migration step (`autumn migrate`, or `harvest migrate run` against a dedicated Harvest database).
 
 ## Cross-shard typed search-attribute predicates (`search_attr_filter`, issue #506)
 
@@ -513,8 +1244,18 @@ Follow this procedure to add a new shard to a live deployment. Each step is safe
 Provision a new Postgres database and run migrations against it:
 
 ```bash
-DATABASE_URL=postgres://user:pass@new-shard-host/harvest diesel migration run
+export HARVEST_DATABASE_URL=postgres://user:pass@new-shard-host/harvest
+harvest migrate run
 ```
+
+Pass the DSN through the environment, not `--database-url`: a command line is
+visible to every process on the host (`ps`, `/proc`) for as long as the
+migration runs, and a shard DSN carries a password.
+
+Harvest's migrations are embedded in the `harvest` binary, so this needs no
+source tree. Add `--include-dir` for any set that is not (the plugin's
+connector dead-letter table, an application's own); see
+[Migrations](getting-started/10-operations.md#migrations).
 
 ### Step 2 — Add to readable_shards
 
@@ -536,7 +1277,7 @@ Wait for `readiness: "ready"`. A `degraded` row includes machine-readable `reaso
 |---|---|---|
 | `no_live_worker` | The shard is `Writable` and has claimable tasks, but **no live worker** covers this shard. | Widen a worker's coverage and redeploy — either add the shard to its `shard_assignments`, or remove the explicit `shard_assignments` narrowing entirely so "auto" coverage applies (issue #961). Verify with `GET /admin/config` → `worker.shard_assignments`. |
 | `worker_queue_uncovered` | No healthy worker covers a required queue on this shard. | Same as above — check queue bindings. |
-| `schema_migration_missing` | The shard is missing required migrations. | Re-run `diesel migration run` against the shard. |
+| `schema_migration_missing` | The shard is missing required migrations. | Re-run `harvest migrate run` against the shard (DSN via `HARVEST_DATABASE_URL`). |
 
 The `no_live_worker` gate is the primary pre-flip readiness gate for issue #522: until at least one `Healthy + Active` worker lists the new shard in its `shard_assignments`, the shard will not report `ready`. This prevents silently stranding work on the new shard.
 
@@ -547,7 +1288,10 @@ Add the new shard to `writable_shards` and deploy. The fleet **automatically dra
 Shard coverage is configured in **Rust**, not in `autumn.toml` — there is no
 `[harvest.worker] shard_assignments` key. Multi-shard also runs through
 `HarvestRunner` only: `HarvestPlugin` rejects a multi-shard pool by design, so a
-plugin-hosted app is always single-shard.
+plugin-hosted app is always single-shard. `HarvestEmbedding` (issue #1613) is the
+standalone entry point for a multi-shard process. It needs one result-notification
+database URL per shard, and it refuses to start when a shard has none.
+[`embedding.md`](embedding.md) is the reference for the standalone path.
 
 ```rust
 use autumn_harvest::types::ShardId;
@@ -565,6 +1309,18 @@ The pool itself is supplied to the runner:
 
 ```rust
 HarvestRunnerResources::new(harvest_pool).with_sharded_pool(sharded_pool)
+```
+
+With `HarvestEmbedding`, name each shard's notification URL as well:
+
+```rust
+HarvestEmbedding::new(built, config, resources)
+    .with_notification_database_urls([
+        (ShardId::new(0), shard0_url),
+        (ShardId::new(1), shard1_url),
+    ])
+    .start()
+    .await?
 ```
 
 Once flipped:

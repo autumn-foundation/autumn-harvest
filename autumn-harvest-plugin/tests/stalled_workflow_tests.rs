@@ -10,7 +10,6 @@ use autumn_harvest::worker::DbPool;
 use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution};
 use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -29,14 +28,10 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 type HarvestApiApp = axum::Router;
-
-fn test_app_state() -> AppState {
-    AppState::for_test().with_profile("test")
-}
 
 async fn setup_database() -> (String, ContainerAsync<Postgres>) {
     let container = Postgres::default()
@@ -63,7 +58,7 @@ fn build_app(database_url: &str) -> HarvestApiApp {
     let pool = build_pool(database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool));
-    harvest_api_router(api_state).with_state(test_app_state())
+    harvest_api_router(api_state)
 }
 
 async fn get_json(app: &HarvestApiApp, uri: impl Into<String>) -> (StatusCode, Value) {
@@ -102,7 +97,7 @@ async fn seed_stalled_workflow(
             workflow_name: "stall_test",
             workflow_id,
             exec_id,
-            input: json!({}),
+            input: json!({}).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -147,12 +142,15 @@ async fn seed_stalled_workflow(
 
     // Backdate the WorkflowStarted event that was just appended.
     let backdated_ts = Utc::now() - Duration::hours(hours_ago);
-    diesel::update(harvest_events::table)
-        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
-        .set(harvest_events::timestamp.eq(backdated_ts))
-        .execute(&mut conn)
-        .await
-        .expect("backdate event");
+    autumn_harvest::append_only::with_guard_off(&mut conn, async |c| {
+        diesel::update(harvest_events::table)
+            .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+            .set(harvest_events::timestamp.eq(backdated_ts))
+            .execute(c)
+            .await
+    })
+    .await
+    .expect("backdate event");
 
     exec_id
 }
@@ -214,12 +212,15 @@ async fn touch_workflow(database_url: &str, exec_id: ExecutionId) {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
         .await
         .expect("failed to connect");
-    diesel::sql_query(
-        "UPDATE harvest_events SET timestamp = NOW() \
-         WHERE workflow_exec_id = $1",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-    .execute(&mut conn)
+    autumn_harvest::append_only::with_guard_off(&mut conn, async |c| {
+        diesel::sql_query(
+            "UPDATE harvest_events SET timestamp = NOW() \
+             WHERE workflow_exec_id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(c)
+        .await
+    })
     .await
     .expect("touch event timestamp");
 }
@@ -428,7 +429,7 @@ async fn test_no_pending_work_always_returned_regardless_of_include_sleeping() {
     let exec_id = seed_stalled_workflow(&database_url, "wf-always-no-pending", 2).await;
     complete_workflow_tasks(&database_url, exec_id).await;
 
-    // include_sleeping=false is the DEFAULT, but let's be explicit.
+    // include_sleeping=false is the DEFAULT. Set it explicitly for clarity.
     let (status, body) = get_json(
         &app,
         "/workflows?no_progress_minutes=30&include_sleeping=false",

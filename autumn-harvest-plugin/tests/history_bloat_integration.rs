@@ -54,7 +54,6 @@ use autumn_harvest::worker::DbPool;
 use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution};
 use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -71,14 +70,10 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+    autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
 
 type HarvestApiApp = axum::Router;
-
-fn test_app_state() -> AppState {
-    AppState::for_test().with_profile("test")
-}
 
 async fn setup_database() -> (String, ContainerAsync<Postgres>) {
     let container = Postgres::default()
@@ -131,7 +126,7 @@ async fn setup_sharded_databases() -> ((String, String), ContainerAsync<Postgres
         let mut conn = <AsyncPgConnection as AsyncConnection>::establish(shard_url)
             .await
             .expect("failed to connect to shard database");
-        conn.batch_execute(autumn_harvest::full_migrations_sql())
+        conn.batch_execute(&autumn_harvest::test_init_sql())
             .await
             .expect("failed to apply harvest migrations to shard database");
     }
@@ -162,7 +157,7 @@ fn build_app(database_url: &str) -> HarvestApiApp {
 fn build_app_with_pool(pool: HarvestDbPool) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(pool);
-    harvest_api_router(api_state).with_state(test_app_state())
+    harvest_api_router(api_state)
 }
 
 async fn get_json(app: &HarvestApiApp, uri: impl Into<String>) -> (StatusCode, Value) {
@@ -206,7 +201,7 @@ async fn seed_workflow_with_history_size(
             workflow_name: "history_bloat_filter_test",
             workflow_id,
             exec_id,
-            input: json!({}),
+            input: json!({}).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -278,13 +273,16 @@ async fn backdate_all_events(database_url: &str, exec_id: ExecutionId, hours_ago
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
         .await
         .expect("failed to connect");
-    diesel::sql_query(
-        "UPDATE harvest_events SET timestamp = NOW() - ($1 * INTERVAL '1 hour') \
-         WHERE workflow_exec_id = $2",
-    )
-    .bind::<diesel::sql_types::BigInt, _>(hours_ago)
-    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-    .execute(&mut conn)
+    autumn_harvest::append_only::with_guard_off(&mut conn, async |c| {
+        diesel::sql_query(
+            "UPDATE harvest_events SET timestamp = NOW() - ($1 * INTERVAL '1 hour') \
+             WHERE workflow_exec_id = $2",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(hours_ago)
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(c)
+        .await
+    })
     .await
     .expect("backdate events");
 }

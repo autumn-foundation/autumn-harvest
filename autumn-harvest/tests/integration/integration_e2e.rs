@@ -52,202 +52,6 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use uuid::Uuid;
 
-/// The migration SQL embedded at compile time.
-///
-/// Combines the initial schema with every forward-compatible schema-addition
-/// migration that ships in `migrations/`. The
-/// `20260410010000_harvest_workflow_start_uniqueness` migration is
-/// deliberately excluded because one test (see
-/// `legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts`)
-/// applies it on a legacy schema to verify the upgrade path.
-const INIT_SQL: &str = concat!(
-    include_str!("../../migrations/20260409000000_harvest_initial/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260619000000_harvest_task_queue_created_at/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260424000001_harvest_trace_context/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260505000000_harvest_heartbeat_details/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260427000000_harvest_continue_as_new/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260429000000_harvest_concurrency_key/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260430000000_harvest_workflow_schedules/up.sql"),
-    "\n",
-    // Unified DAG schedule rows carry both dag_name and workflow_name, so the
-    // strict XOR kind_check from the migration above must be relaxed to an OR.
-    include_str!("../../migrations/20260514010000_unified_dag_schedule_kind/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260430000001_harvest_external_tasks/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260508000000_harvest_external_task_updated_at/up.sql"),
-    "\n",
-    // Reset (#148/#538) refines the active-uniqueness index to exclude
-    // TERMINATED rows; placed after continue_as_new (creates the index) and
-    // after external_tasks (whose state_check it recreates), and before the
-    // pause migration so the later PAUSED-inclusive state_check wins.
-    include_str!("../../migrations/20260503000000_harvest_workflow_reset/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260506000000_harvest_audit_log/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260501000000_harvest_workers/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260508010000_harvest_workers_drain_deadline/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260509000000_harvest_build_routing/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260513000000_harvest_schedule_pause_metadata/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260514020000_harvest_task_activity_id/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260518000000_harvest_signal_idempotency/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260517000000_harvest_schedule_jitter/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260517000001_harvest_schedule_overlap_policy/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260613000000_harvest_workflow_sla/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260519000000_harvest_calendar_awareness/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260522000000_harvest_schedule_decisions/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260522000001_harvest_rate_limiting/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260526000001_harvest_parent_close_policy/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260530000000_harvest_schedule_ha_claim/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260601000000_harvest_schedule_auto_pause/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260601000001_harvest_poison_pill_strikes/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260601000002_harvest_ownership_metadata/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260603000000_harvest_completion_triggers/up.sql"),
-    include_str!("../../migrations/20260708000001_harvest_completion_trigger_condition/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260605000000_harvest_admission_gates/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"),
-    include_str!("../../migrations/20260607000000_harvest_worker_capability_labels/up.sql"),
-    include_str!("../../migrations/20260607000001_harvest_task_required_capabilities/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260607000002_harvest_workflow_pause/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260609000001_harvest_workflow_current_details/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260610000001_harvest_schedule_bounded_runs/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260613000001_harvest_schedule_catchup_window/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260616000001_harvest_workflow_schedule_id/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260615000001_harvest_context_headers/up.sql"),
-    "\n",
-    // issue #499: enforce_timeouts_once now scans harvest_debounce.
-    include_str!("../../migrations/20260618000001_harvest_debounce/up.sql"),
-    "\n",
-    // issue #523: workflow-level retry policy columns.
-    include_str!("../../migrations/20260626000001_harvest_workflow_retry/up.sql"),
-    "\n",
-    // issue #534: origin column + per-schedule run-history index.
-    include_str!("../../migrations/20260628000001_harvest_execution_origin/up.sql"),
-    include_str!("../../migrations/20260703000000_harvest_task_queue_wake_requested/up.sql"),
-    "\n",
-    // issue #604: target_build_id/ramp_percent columns on harvest_build_policies.
-    include_str!("../../migrations/20260704000001_harvest_build_policy_ramp/up.sql"),
-    include_str!("../../migrations/20260704000000_harvest_workflow_nd_block/up.sql"),
-    "\n",
-    // issue #605: harvest_completion_deliveries table + completion_callbacks
-    // column on harvest_workflow_executions.
-    include_str!("../../migrations/20260705000000_harvest_completion_deliveries/up.sql"),
-    "\n",
-    // issue #606: harvest_sessions table + session_id column on
-    // harvest_task_queue + max_concurrent_sessions/in_use_sessions on
-    // harvest_workers.
-    include_str!("../../migrations/20260706000000_harvest_worker_sessions/up.sql"),
-    include_str!("../../migrations/20260710000002_harvest_workflow_continue_chain/up.sql"),
-    "\n",
-    // issue #747: per-execution legal hold columns on harvest_workflow_executions.
-    include_str!("../../migrations/20260709000001_harvest_legal_hold/up.sql"),
-    "\n",
-    // issue #740: start_source/start_source_ref/started_by provenance columns on
-    // harvest_workflow_executions.
-    include_str!("../../migrations/20260712000000_harvest_execution_start_source/up.sql"),
-    "\n",
-    // issue #617: chain_execution_timeout/chain_deadline_at columns on
-    // harvest_workflow_executions.
-    include_str!("../../migrations/20260714000000_harvest_workflow_chain_timeout/up.sql"),
-    "\n",
-    // issue #619: harvest_queue_pauses. REQUIRED, not optional — `claim_task`'s
-    // pause anti-join references this table on every claim, so without it every
-    // claim in this suite (and in every suite that borrows
-    // `setup_test_database_url_or_env` from here) fails with
-    // `relation "harvest_queue_pauses" does not exist`.
-    include_str!("../../migrations/20260715000000_harvest_queue_pause/up.sql"),
-    "\n",
-    // issue #704: history_bloat_warned_at column on harvest_workflow_executions.
-    // REQUIRED, not optional — `WorkflowExecution::as_select()`/`as_returning()`
-    // reference this column on every full-row read/insert-returning, so without
-    // it every such call in this suite (and in every suite that borrows
-    // `setup_test_database_url_or_env` from here) fails with
-    // `column harvest_workflow_executions.history_bloat_warned_at does not exist`.
-    include_str!("../../migrations/20260716000000_harvest_workflow_history_bloat_warn/up.sql"),
-    "\n",
-    // issue #759: triage_note column on harvest_workflow_executions. REQUIRED,
-    // not optional — `WorkflowExecution::as_select()`/`as_returning()` reference
-    // this column on every full-row read/insert-returning, so without it every
-    // such call in this suite (and in every suite that borrows
-    // `setup_test_database_url_or_env` from here) fails with
-    // `column harvest_workflow_executions.triage_note does not exist`.
-    include_str!("../../migrations/20260717000000_harvest_workflow_triage_note/up.sql"),
-    "\n",
-    // issue #804: capability_misses column on harvest_task_queue. REQUIRED, not
-    // optional -- `TaskQueueItem` (which `claim_task`'s `RETURNING
-    // harvest_task_queue.*` deserializes into) references this column on every
-    // claim, so without it every claim in this suite (and in every suite that
-    // borrows `setup_test_database_url_or_env` from here) fails with
-    // `column "capability_misses" does not exist`.
-    include_str!("../../migrations/20260720000000_harvest_task_capability_misses/up.sql"),
-    "\n",
-    // issue #807: harvest_activity_pauses. REQUIRED, not optional -- the
-    // `paused_activities` MATERIALIZED CTE in `claim_task_query()` selects from
-    // this table on every claim, so without it every claim in this suite (and in
-    // every suite that borrows `setup_test_database_url_or_env` from here) fails
-    // with `relation "harvest_activity_pauses" does not exist`. The same
-    // migration also adds the partial `idx_harvest_tq_activity_pause` index on
-    // `harvest_task_queue`; that index is a performance aid rather than a
-    // correctness requirement, but it ships in the same file.
-    include_str!("../../migrations/20260722000000_harvest_activity_pause/up.sql"),
-    "\n",
-    // issue #843: idx_harvest_wfx_retry_of. Performance-only (CREATE INDEX,
-    // no column added, no correctness dependency), included for schema
-    // fidelity with the latest migration set.
-    include_str!("../../migrations/20260723000000_harvest_retry_chain_index/up.sql"),
-    "\n",
-    // issue #945: override_refill_rate/override_burst/override_expires_at
-    // columns on harvest_rate_limit_buckets. REQUIRED, not optional --
-    // `claim_task_query()`'s rate-limit token-availability expression
-    // references `b.override_expires_at`/`b.override_refill_rate`/
-    // `b.override_burst` unconditionally (Postgres resolves every column
-    // reference in a query at parse time, regardless of whether that branch
-    // is reached for a given row), so without these columns EVERY claim in
-    // this suite (and in every suite that borrows
-    // `setup_test_database_url_or_env` from here) fails with
-    // `column b.override_expires_at does not exist` -- even for tasks with
-    // no rate limit configured at all.
-    include_str!("../../migrations/20260724000000_harvest_pacing_overrides/up.sql"),
-    "\n",
-    // issue #946: quota_key column on harvest_workflow_executions, referenced
-    // by every WorkflowExecution::as_select() read-back in this suite (and in
-    // every suite that borrows `setup_test_database_url_or_env` from here).
-    include_str!("../../migrations/20260725000000_harvest_workflow_quotas/up.sql")
-);
-
 /// The minimal "legacy" migration set used by the upgrade-path regression
 /// test. Excludes both the workflow-start uniqueness upgrade *and* the
 /// continue-as-new migration so the test can drive the database through the
@@ -361,10 +165,33 @@ const LEGACY_INIT_SQL: &str = concat!(
     // set on the same claim, so omitting it fails the legacy path's claim exactly
     // as omitting `capability_misses` would.
     "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS capability_miss_workers TEXT[] NOT NULL DEFAULT '{}';\n",
+    // issue #1824: the new-start marker on harvest_task_queue. Every claim
+    // orders by it and `TaskQueueItem` selects it, so each claim in this suite
+    // needs it. Added inline for the same reason as the columns above.
+    "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS new_start BOOLEAN NOT NULL DEFAULT FALSE;\n",
     // issue #946: WorkflowExecution::as_select() (the modern start path's
     // read-back) references the quota_key column even for a fresh (no quota
     // policy configured) execution.
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS quota_key TEXT NULL;\n"
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS quota_key TEXT NULL;\n",
+    // issue #964: WorkflowExecution::as_select() (the modern start path's
+    // read-back) references the three rebalancing columns even for an
+    // execution that has never been migrated -- which is every execution in
+    // every deployment that never runs a rebalance.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_to_shard INTEGER NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_at TIMESTAMPTZ NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_from_shards JSONB NULL;\n",
+    // issue #1317: WorkflowExecution::as_select() also references this
+    // column, for the same reason as the three rebalancing columns above.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_run_terminal_at TIMESTAMPTZ NULL;\n",
+    // fresh review, P1 follow-up: WorkflowExecution::as_select() also
+    // references this column, for the same reason as the column above.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_run_terminal_state TEXT NULL;\n",
+    // issue #1317 review (P1 follow-up): WorkflowExecution::as_select() also
+    // references this column, for the same reason as the column above.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS staging_vacated_state TEXT NULL;\n",
+    // issue #1596 review: WorkflowExecution::as_select() also references
+    // this column, for the same reason as the column above.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS staging_vacated_by UUID NULL;\n"
 );
 
 /// Start a Postgres container with the harvest schema applied and return
@@ -388,7 +215,7 @@ async fn setup_test_db() -> (AsyncPgConnection, Option<ContainerAsync<Postgres>>
     }
 
     let container = Postgres::default()
-        .with_init_sql(INIT_SQL.to_string().into_bytes())
+        .with_init_sql(autumn_harvest::test_init_sql().into_bytes())
         .with_tag("16")
         .start()
         .await
@@ -415,7 +242,7 @@ async fn setup_test_db() -> (AsyncPgConnection, Option<ContainerAsync<Postgres>>
 /// the database URL plus the live container handle.
 pub(crate) async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
     let container = Postgres::default()
-        .with_init_sql(INIT_SQL.to_string().into_bytes())
+        .with_init_sql(autumn_harvest::test_init_sql().into_bytes())
         .with_tag("16")
         .start()
         .await
@@ -467,9 +294,32 @@ async fn setup_blank_test_database_url() -> (String, ContainerAsync<Postgres>) {
     (database_url, container)
 }
 
+/// The shared database plus the `harvest_dag_runs` table.
+///
+/// The full migration bundle drops that table. The drop-migration tests seed
+/// legacy rows first, so they need the table back. Its definition comes from
+/// the initial migration, so it cannot drift.
+async fn setup_test_db_with_legacy_dag_runs()
+-> (AsyncPgConnection, Option<ContainerAsync<Postgres>>) {
+    let (mut conn, container) = setup_test_db().await;
+    let initial = include_str!("../../migrations/20260409000000_harvest_initial/up.sql");
+    let start = initial
+        .find("CREATE TABLE harvest_dag_runs (")
+        .expect("initial migration creates harvest_dag_runs");
+    let end = start
+        + initial[start..]
+            .find(");")
+            .expect("harvest_dag_runs definition ends with `);`")
+        + ");".len();
+    conn.batch_execute(&initial[start..end])
+        .await
+        .expect("recreate the legacy harvest_dag_runs table");
+    (conn, container)
+}
+
 #[tokio::test]
 async fn drop_dag_runs_migration_copies_legacy_rows_to_workflow_executions() {
-    let (mut conn, _container) = setup_test_db().await;
+    let (mut conn, _container) = setup_test_db_with_legacy_dag_runs().await;
     let legacy_run_id = Uuid::new_v4();
     let dag_name = "legacy_migrated_dag";
     let logical_date = chrono::DateTime::parse_from_rfc3339("2026-05-14T02:00:00Z")
@@ -523,7 +373,7 @@ async fn drop_dag_runs_migration_copies_legacy_rows_to_workflow_executions() {
 
 #[tokio::test]
 async fn drop_dag_runs_migration_does_not_turn_queued_runs_into_running_workflows() {
-    let (mut conn, _container) = setup_test_db().await;
+    let (mut conn, _container) = setup_test_db_with_legacy_dag_runs().await;
     let legacy_run_id = Uuid::new_v4();
     let dag_name = "legacy_queued_dag";
     let logical_date = chrono::DateTime::parse_from_rfc3339("2026-05-14T02:00:00Z")
@@ -579,7 +429,7 @@ async fn drop_dag_runs_migration_does_not_turn_queued_runs_into_running_workflow
 
 #[tokio::test]
 async fn drop_dag_runs_migration_preserves_subsecond_legacy_run_identities() {
-    let (mut conn, _container) = setup_test_db().await;
+    let (mut conn, _container) = setup_test_db_with_legacy_dag_runs().await;
     let dag_name = "legacy_subsecond_dag";
     let first_run_id = Uuid::new_v4();
     let second_run_id = Uuid::new_v4();
@@ -726,6 +576,28 @@ pub(crate) async fn load_timers_for_execution_from_url(
         .expect("failed to reload timer rows")
 }
 
+/// Seed a pending `harvest_timers` row directly (issue #1247 regression
+/// coverage), standing in for the row a real `ArmTimer { for_await: true }`
+/// cycle would have inserted. Lets a test drive the DB-delete half of a
+/// `CancelTimer` co-batched with a `RunLocalActivity` without first fighting
+/// the scheduler for a genuine live race window.
+pub(crate) async fn seed_pending_timer_row(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    timer_id: &str,
+    fires_at: chrono::DateTime<Utc>,
+) {
+    diesel::insert_into(harvest_timers::table)
+        .values(autumn_harvest::models::NewHarvestTimer {
+            workflow_exec_id: exec_id.as_uuid(),
+            timer_id,
+            fires_at,
+        })
+        .execute(conn)
+        .await
+        .expect("failed to seed a pending harvest_timers row");
+}
+
 pub(crate) async fn load_child_executions_from_url(
     database_url: &str,
     parent_exec_id: ExecutionId,
@@ -742,19 +614,42 @@ pub(crate) async fn load_child_executions_from_url(
         .expect("failed to reload child workflow executions")
 }
 
+/// Issue #1298: `insert_workflow_execution()` must be safe to call more than
+/// once against the same database. A fixed `workflow_id` collided with the
+/// partial `UNIQUE(workflow_name, workflow_id)` active index on the second
+/// call. That index also covers a fresh `RUNNING` row, not only a sealed
+/// one. The documented `HARVEST_TEST_DATABASE_URL` fallback runs more than
+/// one test in a process, so it hits this exact path.
+#[tokio::test]
+async fn insert_workflow_execution_helper_is_safe_to_call_more_than_once() {
+    let (mut conn, _container) = setup_test_db().await;
+
+    let first = insert_workflow_execution(&mut conn).await;
+    let second = insert_workflow_execution(&mut conn).await;
+
+    assert_ne!(
+        first, second,
+        "each call should mint a distinct execution, never reusing a row"
+    );
+}
+
 /// Insert a minimal `harvest_workflow_executions` row and return its UUID.
 pub(crate) async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> ExecutionId {
     let exec_id = ExecutionId::new();
+    // Unique per call so repeated runs against the same (non-throwaway)
+    // database never collide on the partial `UNIQUE(workflow_name, workflow_id)`
+    // active index (issue #1298).
+    let workflow_id = format!("e2e-wf-{}", Uuid::new_v4().simple());
     let row = NewWorkflowExecution {
         quota_key: None,
         continued_from_exec_id: None,
         first_exec_id: None,
         id: exec_id.as_uuid(),
         workflow_name: "e2e_test_workflow",
-        workflow_id: "e2e-wf-001",
+        workflow_id: &workflow_id,
         run_id: Uuid::new_v4(),
         shard_id: 0,
-        input: serde_json::json!({"test": true}),
+        input: serde_json::json!({"test": true}).into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -817,7 +712,7 @@ pub(crate) async fn insert_workflow_execution_on_shard(
         workflow_id: &workflow_id,
         run_id: Uuid::new_v4(),
         shard_id: shard.as_i32(),
-        input: serde_json::json!({"test": true}),
+        input: serde_json::json!({"test": true}).into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -856,10 +751,8 @@ pub(crate) async fn insert_workflow_execution_on_shard(
 }
 
 /// Insert a RUNNING execution with a caller-supplied `workflow_id` (all other
-/// fields mirror [`insert_workflow_execution`]). Needed when a single test/setup
-/// inserts more than one live execution: they would otherwise collide on the
-/// partial `UNIQUE(workflow_name, workflow_id)` active index that
-/// [`insert_workflow_execution`]'s hardcoded id trips on a second call.
+/// fields mirror [`insert_workflow_execution`]). Use this when a test needs a
+/// specific, known `workflow_id`; [`insert_workflow_execution`] mints its own.
 pub(crate) async fn insert_workflow_execution_with_id(
     conn: &mut AsyncPgConnection,
     workflow_id: &str,
@@ -874,7 +767,7 @@ pub(crate) async fn insert_workflow_execution_with_id(
         workflow_id,
         run_id: Uuid::new_v4(),
         shard_id: 0,
-        input: serde_json::json!({"test": true}),
+        input: serde_json::json!({"test": true}).into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -940,7 +833,7 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         workflow_name: "upgrade_test",
         workflow_id: "workflow-42",
         exec_id: autumn_harvest::ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0)),
-        input: serde_json::json!({ "workflow_id": 42 }),
+        input: serde_json::json!({ "workflow_id": 42 }).into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -1165,6 +1058,9 @@ pub(crate) fn runtime_config(
     workflow_task_timeout: Duration,
 ) -> WorkerRuntimeConfig {
     WorkerRuntimeConfig {
+        codec_rotation_batch_size: 0,
+        scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
+        dr: autumn_harvest::replication::DrConfig::default(),
         worker_id: worker_id.to_string(),
         queues: vec!["default".to_string()],
         notification_database_url: None,
@@ -1180,6 +1076,7 @@ pub(crate) fn runtime_config(
         build_id: String::new(),
         deployment_name: None,
         workflow_cache_size: 1000,
+        resident_workflows: true,
         priority_aging_secs: None,
         unknown_target_grace_window: Duration::from_secs(5),
         poison_pill_threshold: 3,
@@ -1222,13 +1119,13 @@ pub(crate) async fn wait_for_execution_state(
 /// for tests whose expected wall-clock (e.g. many genuinely-concurrent
 /// children each sleeping for real time) can exceed the 10s default under
 /// resource-constrained CI runners.
-async fn wait_for_execution_state_with_timeout(
+pub(crate) async fn wait_for_execution_state_with_timeout(
     database_url: &str,
     exec_id: ExecutionId,
     expected_state: &str,
     timeout: Duration,
 ) -> WorkflowExecution {
-    tokio::time::timeout(timeout, async {
+    let waited = tokio::time::timeout(timeout, async {
         loop {
             let execution = load_execution_from_url(database_url, exec_id).await;
             if execution.state == expected_state {
@@ -1238,8 +1135,99 @@ async fn wait_for_execution_state_with_timeout(
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
+    .await;
+    if let Ok(execution) = waited {
+        return execution;
+    }
+    panic!(
+        "workflow should reach expected state within timeout: wanted {expected_state} \
+         within {timeout:?}\n{}",
+        describe_stuck_execution(database_url, exec_id).await
+    );
+}
+
+/// Describe an execution and its queued tasks for a timeout message.
+///
+/// A decision cycle that fails on every retry leaves a queued task with a
+/// recorded error. The state alone hides that error (issue #1693). A failed
+/// lookup returns its own error text, so it never hides the timeout.
+async fn describe_stuck_execution(database_url: &str, exec_id: ExecutionId) -> String {
+    #[derive(diesel::QueryableByName)]
+    struct TaskRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        state: String,
+        #[diesel(sql_type = diesel::sql_types::Int4)]
+        attempt: i32,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        scheduled_at: String,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        error: Option<String>,
+    }
+
+    let described = async {
+        let mut conn =
+            <AsyncPgConnection as diesel_async::AsyncConnection>::establish(database_url)
+                .await
+                .map_err(|e| e.to_string())?;
+        let execution_state = harvest_workflow_executions::table
+            .find(exec_id.as_uuid())
+            .select(harvest_workflow_executions::state)
+            .first::<String>(&mut conn)
+            .await
+            .map_err(|e| e.to_string())?;
+        let tasks = diesel::sql_query(
+            "SELECT state, attempt, scheduled_at::text AS scheduled_at, error \
+             FROM harvest_task_queue WHERE workflow_exec_id = $1 ORDER BY created_at",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .load::<TaskRow>(&mut conn)
+        .await
+        .map_err(|e| e.to_string())?;
+        let mut lines = vec![format!("execution state: {execution_state}")];
+        lines.extend(tasks.iter().map(|t| {
+            format!(
+                "harvest_task_queue: state {}, attempt {}, scheduled_at {}, task error: {}",
+                t.state,
+                t.attempt,
+                t.scheduled_at,
+                t.error.as_deref().unwrap_or("none")
+            )
+        }));
+        Ok::<String, String>(lines.join("\n"))
+    }
+    .await;
+    described.unwrap_or_else(|e| format!("could not describe the stuck execution: {e}"))
+}
+
+/// A timed-out wait names the stuck task and its last error (issue #1693).
+///
+/// A decision cycle that fails on every retry leaves the execution `RUNNING`
+/// with one queued task. The bare timeout hid the recorded error.
+#[tokio::test]
+#[should_panic(expected = "task error: simulated persist failure")]
+async fn wait_timeout_reports_the_stuck_task_error() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect to the test database");
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    enqueue_started_workflow_task(&mut conn, exec_id, serde_json::json!({})).await;
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET error = 'simulated persist failure' \
+         WHERE workflow_exec_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut conn)
     .await
-    .expect("workflow should reach expected state within timeout")
+    .expect("record a task error");
+
+    wait_for_execution_state_with_timeout(
+        &database_url,
+        exec_id,
+        "COMPLETED",
+        Duration::from_millis(300),
+    )
+    .await;
 }
 
 fn child_round_trip_registry() -> Arc<HandlerRegistry> {
@@ -1530,8 +1518,20 @@ fn slow_activity<'a>(
     _ctx: &'a ActivityContext,
     input: serde_json::Value,
 ) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    // A fixed sleep raced the 100ms StartToClose timeout below. Under a
+    // loaded CI runner, a delayed scanner tick let the activity finish
+    // first. That changed the event history this test asserts on. It
+    // failed twice in a row on this PR (issue #1272).
+    //
+    // Sleep past the test's own 10-second bound instead. The activity
+    // then cannot complete before the wait loop gives up. The only way
+    // to reach FAILED is the StartToClose timeout.
+    //
+    // `worker.shutdown()`'s 1-second budget does not abort this task. It
+    // only stops waiting for it. The test's own runtime drops it at
+    // teardown.
     Box::pin(async move {
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_secs(30)).await;
         Ok(input)
     })
 }
@@ -2027,7 +2027,7 @@ async fn worker_threads_execution_timeout_into_ctx_deadline() {
         workflow_name: "deadline_echo",
         workflow_id: "deadline-echo-1",
         exec_id,
-        input: serde_json::json!({}),
+        input: serde_json::json!({}).into(),
         parent_id: None,
         queue_name: "default",
         // The production start param that stamps the row's execution_timeout +
@@ -2105,6 +2105,9 @@ async fn worker_threads_execution_timeout_into_ctx_deadline() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
+                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
+                dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "worker-deadline-echo".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -2120,6 +2123,7 @@ async fn worker_threads_execution_timeout_into_ctx_deadline() {
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
+                resident_workflows: true,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
@@ -2239,7 +2243,7 @@ async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
         workflow_name: "deadline_echo",
         workflow_id: "deadline-echo-shifted-1",
         exec_id,
-        input: serde_json::json!({}),
+        input: serde_json::json!({}).into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: Some(timeout),
@@ -2337,6 +2341,9 @@ async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
+                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
+                dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "worker-deadline-echo-shifted".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -2352,6 +2359,7 @@ async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
+                resident_workflows: true,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
@@ -2503,6 +2511,9 @@ async fn worker_completes_workflow_task_and_persists_result() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
+                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
+                dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "worker-e2e-complete".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -2518,6 +2529,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
+                resident_workflows: true,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
@@ -2641,6 +2653,9 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
+                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
+                dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "worker-e2e-fail".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -2656,6 +2671,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
+                resident_workflows: true,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
@@ -2813,6 +2829,9 @@ async fn worker_completes_workflow_with_activity_round_trip() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
+                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
+                dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "worker-e2e-activity-round-trip".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -2828,6 +2847,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
+                resident_workflows: true,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
@@ -3050,6 +3070,9 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
+                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
+                dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "worker-e2e-activity-orphaned".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -3065,6 +3088,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
+                resident_workflows: true,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
@@ -3243,6 +3267,8 @@ async fn timeout_enforcement_fails_pending_activity_and_wakes_workflow() {
         None,
         None,
         60,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        0,
     )
     .await
     .expect("timeout enforcement should succeed");
@@ -3310,6 +3336,9 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
+                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
+                dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "worker-e2e-activity-timeout".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -3325,6 +3354,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
+                resident_workflows: true,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
@@ -3372,8 +3402,13 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                 vec![ActivityInfo {
                     name: "slow_activity",
                     module: "integration_e2e",
-                    default_retry_policy: None,
-                    default_start_to_close: Some(Duration::from_millis(50)),
+                    // One attempt keeps the timeout terminal (ADR 0005,
+                    // issue #1809). The default policy would retry it.
+                    default_retry_policy: Some(autumn_harvest::RetryPolicy::fixed(
+                        1,
+                        Duration::from_millis(10),
+                    )),
+                    default_start_to_close: Some(Duration::from_millis(100)),
                     default_heartbeat_timeout: None,
                     default_schedule_to_start: None,
                     default_schedule_to_close: None,
@@ -3426,9 +3461,13 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
         error.contains("StartToClose") && error.contains("slow_activity")
     }));
 
+    // Issue #1558: `started_at` (the StartToClose deadline anchor) is stamped
+    // at task claim, before the dispatch pipeline appends `ActivityStarted`.
+    // A short `default_start_to_close` can let enforcement win that race and
+    // fail the task first, so `ActivityStarted` never appends. Both shapes
+    // are correct engine behavior; accept either.
     let history = load_history_from_url(&database_url, exec_id).await;
-    assert!(matches!(
-        history.events.as_slice(),
+    match history.events.as_slice() {
         [
             WorkflowEvent::WorkflowStarted { .. },
             WorkflowEvent::ActivityScheduled { .. },
@@ -3439,7 +3478,17 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
             },
             WorkflowEvent::WorkflowFailed { .. },
         ]
-    ));
+        | [
+            WorkflowEvent::WorkflowStarted { .. },
+            WorkflowEvent::ActivityScheduled { .. },
+            WorkflowEvent::ActivityTimedOut {
+                timeout_type: TimeoutType::StartToClose,
+                ..
+            },
+            WorkflowEvent::WorkflowFailed { .. },
+        ] => {}
+        other => panic!("history did not match the expected event shape, got {other:#?}"),
+    }
 
     let tasks = load_tasks_for_execution_from_url(&database_url, exec_id).await;
     assert_eq!(tasks.len(), 2);
@@ -3483,6 +3532,9 @@ async fn worker_completes_workflow_with_timer_round_trip() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
+                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
+                dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "worker-e2e-timer-round-trip".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -3498,6 +3550,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
+                resident_workflows: true,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
@@ -4329,6 +4382,176 @@ fn child_fan_out_registry() -> Arc<HandlerRegistry> {
     ))
 }
 
+/// Dispatches three awaited children concurrently and then fails from a sibling
+/// branch in the SAME decision cycle, so the cycle never suspends (issue #952).
+fn parent_workflow_dispatches_three_children_then_fails<'a>(
+    ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let dispatch = async {
+            futures::future::try_join_all((0..3).map(|slot| {
+                ctx.spawn_child_workflow_raw("fan_child", serde_json::json!({ "item": slot }))
+            }))
+            .await
+            .map_err(|e| e.to_string())
+        };
+        let sibling =
+            async { Err::<Vec<serde_json::Value>, String>("budget exceeded".to_string()) };
+        futures::try_join!(dispatch, sibling)?;
+        Ok(serde_json::Value::Null)
+    })
+}
+
+fn abandoned_child_dispatch_registry() -> Arc<HandlerRegistry> {
+    Arc::new(HandlerRegistry::new(
+        vec![
+            WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
+                mcp: false,
+                name: "e2e_test_workflow",
+                module: "integration_e2e",
+                handler: parent_workflow_dispatches_three_children_then_fails,
+                execution_timeout: None,
+                chain_execution_timeout: None,
+                sla: None,
+                concurrency: None,
+
+                debounce: None,
+                batch: None,
+                throttle: None,
+                max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                retry_policy: None,
+            },
+            WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
+                mcp: false,
+                name: "fan_child",
+                module: "integration_e2e",
+                handler: fan_child_workflow,
+                execution_timeout: None,
+                chain_execution_timeout: None,
+                sla: None,
+                concurrency: None,
+
+                debounce: None,
+                batch: None,
+                throttle: None,
+                max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                retry_policy: None,
+            },
+        ],
+        vec![],
+    ))
+}
+
+/// Issue #952's success metric against a real database: in a failing decision
+/// cycle the persisted history's dispatched-children count matches the commands
+/// the code issued.
+///
+/// Before #952, `persist_terminal_outcome_commands` replayed only
+/// `RecordMarker`/`RecordSideEffect`/`SpawnDetachedChildWorkflow` from the
+/// pending-command list, so all three `StartChildWorkflow` commands vanished:
+/// no `ChildWorkflowStarted`, no child rows, an audit trail that lied about what
+/// the code did. Now each dispatch is recorded at its emission position with a
+/// synthetic terminal marking it never-started — and still no child execution
+/// rows, because nothing was ever started.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_records_every_dispatched_child_when_the_cycle_fails() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let parent_exec_id = insert_workflow_execution(&mut conn).await;
+    enqueue_started_workflow_task(&mut conn, parent_exec_id, serde_json::json!({})).await;
+
+    let worker = build_runtime_worker(
+        "worker-e2e-abandoned-child-dispatch",
+        6,
+        2,
+        abandoned_child_dispatch_registry(),
+    );
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    let parent_execution = wait_for_execution_state(&database_url, parent_exec_id, "FAILED").await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    assert!(
+        parent_execution
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("budget exceeded")),
+        "the sibling branch's error must seal the run: {:?}",
+        parent_execution.error
+    );
+
+    let parent_history = load_history_from_url(&database_url, parent_exec_id).await;
+    assert_eq!(
+        parent_history
+            .events
+            .iter()
+            .filter(|e| matches!(e, WorkflowEvent::ChildWorkflowStarted { .. }))
+            .count(),
+        3,
+        "every dispatched child must appear in the persisted history: {:?}",
+        parent_history.events
+    );
+    let abandoned = parent_history
+        .events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                WorkflowEvent::ChildWorkflowFailed { error, .. }
+                    if error == autumn_harvest::event::ABANDONED_DISPATCH_REASON
+            )
+        })
+        .count();
+    assert_eq!(
+        abandoned, 3,
+        "each dispatch must carry its synthetic terminal so replay resolves it: {:?}",
+        parent_history.events
+    );
+    assert!(
+        matches!(
+            parent_history.events.last(),
+            Some(WorkflowEvent::WorkflowFailed { .. })
+        ),
+        "the terminal failure must still be the last event: {:?}",
+        parent_history.events
+    );
+
+    let child_execs = load_child_executions_from_url(&database_url, parent_exec_id).await;
+    assert!(
+        child_execs.is_empty(),
+        "an abandoned dispatch starts no child execution: {child_execs:?}"
+    );
+}
+
 /// End-to-end proof that the worker persists a `spawn_child_workflow_fan_out_raw`
 /// suspension batch (the `fan_out:{n}` marker + N `StartChildWorkflow` commands)
 /// exactly like the pre-existing hand-rolled `tokio::join!` parallel-children
@@ -4413,23 +4636,13 @@ async fn worker_completes_parent_workflow_with_child_fan_out() {
 /// scheduling.
 ///
 /// **Must use `ctx.timer(...)`, never a raw `tokio::time::sleep` inside the
-/// workflow body.** `drive_workflow`'s live-execution poll wraps the entire
-/// handler call in `tokio::time::timeout(SUSPENSION_TIMEOUT, ...)` with
-/// `SUSPENSION_TIMEOUT = 100ms` (executor.rs) -- a hard, non-configurable
-/// budget for the workflow function to either complete or reach a genuine
-/// command-emitting suspension point (e.g. `rx.await` after pushing
-/// `WorkflowCommand::StartTimer`/`ScheduleActivity`/etc.). A raw
-/// `tokio::time::sleep` participates in neither: it blocks the same poll for
-/// its full duration with zero commands emitted, so any sleep longer than
-/// 100ms deterministically hits `drive_workflow`'s "workflow suspended
-/// without emitted commands; resumption is not implemented yet" fatal error
-/// on every single attempt -- not a CI-speed flake, a 100% reproducible bug
-/// in the test's own workflow code, confirmed via the diagnostic dump added
-/// to this test in an earlier PR #901 review round (every child showed
-/// exactly this error). `ctx.timer` pushes `StartTimer` and suspends via a
-/// real oneshot immediately, so the actual 1s wait happens on a later,
-/// separate decision cycle -- never inside the 100ms window -- exactly like
-/// every other durable-wait primitive in this engine.
+/// workflow body.** A raw sleep is not a Harvest future. Before issue #1797,
+/// a sleep over 100 ms ended the cycle with zero commands. The worker then
+/// failed the run (PR #901 found this in this test). Now the executor waits
+/// on the sleep for at most `executor::DEADLOCK_TIMEOUT` (2 s). It then fails
+/// the workflow task. A 1 s sleep would also hold a slot for the whole wait.
+/// `ctx.timer` pushes `StartTimer` and suspends at once. The 1 s wait then
+/// happens on a later decision cycle, like every other durable wait.
 fn slow_fan_child_workflow<'a>(
     ctx: &'a WorkflowContext,
     input: serde_json::Value,
@@ -4663,12 +4876,12 @@ async fn wait_for_completion_with_diagnostics(
 /// diagnostic dump in [`wait_for_completion_with_diagnostics`] (PR #901
 /// review rounds 2-8):** the original version of `slow_fan_child_workflow`
 /// used a raw `tokio::time::sleep` inside the workflow body instead of
-/// `ctx.timer(...)`. That is invalid workflow code for this engine --
-/// `drive_workflow`'s live-execution poll wraps the handler call in a hard,
-/// non-configurable 100ms `SUSPENSION_TIMEOUT`, and a raw sleep longer than
-/// that blocks the poll with zero commands emitted, deterministically
-/// hitting "workflow suspended without emitted commands; resumption is not
-/// implemented yet" on every attempt. This was mistaken for a series of
+/// `ctx.timer(...)`. That was invalid workflow code for this engine. The
+/// live-execution poll in `drive_workflow` then used a hard 100ms
+/// suspension timer (removed by issue #1797). A raw sleep longer than
+/// that ended the cycle with zero commands emitted. Every attempt hit
+/// "workflow suspended without emitted commands; resumption is not
+/// implemented yet". This was mistaken for a series of
 /// dropped-wake races across several review rounds (each of which found and
 /// fixed a real, independently-confirmed bug in `worker.rs`/`queue.rs` --
 /// none of them were the actual cause of *this test's* failures).
@@ -4701,6 +4914,21 @@ async fn wait_for_completion_with_diagnostics(
 /// at any given moment) and the outer wait bound from 90s to 180s to give
 /// a legitimately-contended cycle room to finish rather than fail the test
 /// outright; see the wait-bound call site below for the full reasoning.
+///
+/// **2026-09-09 CI-health investigation (issue #1459):** this test failed on
+/// `trunk-dev`, run 34282622366, job `Test DB (linux, shard 6)`. The parent
+/// decision cycle stayed `RUNNING`. `wake_requested` was true and `attempt`
+/// was frozen at 2. All five children had already completed. A controlled
+/// experiment pinned four concurrent copies to two CPUs. It reproduced this
+/// exact signature in five of twelve runs. Zero of fifteen unconstrained
+/// runs failed. The mechanism is a gap in `reset_timed_out_workflow_task`'s
+/// own documented pool-retry budget. That budget can exhaust under
+/// contention. A stuck row then has no backstop. The poison-pill orphan
+/// reclaimer only reclaims tasks owned by a dead worker. It does not
+/// reclaim a wedged task on a live worker. See issue #1459 for the full
+/// diagnosis and reproduction steps. This is a product-level gap, not a
+/// test-tolerance problem. The bound below is not widened again for this
+/// cause.
 #[tokio::test(flavor = "multi_thread", worker_threads = 12)]
 async fn worker_completes_ten_child_fan_out_within_wall_clock_bound() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -5090,9 +5318,11 @@ async fn reschedule_task_clears_stale_heartbeat_timestamp() {
     assert_eq!(claimed.id, task_id);
 
     let checkpoint = serde_json::json!({"next_offset": 7});
-    queue::record_heartbeat(&mut conn, task_id, checkpoint.clone())
+    let claim = queue::TaskClaim::of(&claimed).expect("claimed task has a worker");
+    let write = queue::record_heartbeat(&mut conn, &claim, checkpoint.clone())
         .await
         .expect("record heartbeat should succeed");
+    assert_eq!(write, queue::ClaimWrite::Applied);
     let heartbeating = load_task_from_url(&database_url, task_id).await;
     assert!(
         heartbeating.last_heartbeat_at.is_some(),
@@ -5616,7 +5846,7 @@ async fn insert_named_workflow_execution(
         workflow_id,
         run_id: Uuid::new_v4(),
         shard_id: 0,
-        input: serde_json::json!({}),
+        input: serde_json::json!({}).into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -6150,19 +6380,6 @@ async fn worker_continue_as_new_records_own_start_source_referencing_predecessor
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
         .await
         .expect("failed to connect to Postgres container");
-    // Isolate from a shared HARVEST_TEST_DATABASE_URL: other e2e tests reuse the
-    // fixed `e2e_test_workflow` / `e2e-wf-001` identity, so clear those rows
-    // (and the child workflow's) up front. A no-op against a fresh CI container.
-    for stmt in [
-        "DELETE FROM harvest_events WHERE workflow_exec_id IN (SELECT id FROM harvest_workflow_executions WHERE workflow_name IN ('e2e_test_workflow','child_echo_workflow'))",
-        "DELETE FROM harvest_task_queue WHERE workflow_exec_id IN (SELECT id FROM harvest_workflow_executions WHERE workflow_name IN ('e2e_test_workflow','child_echo_workflow'))",
-        "DELETE FROM harvest_workflow_executions WHERE workflow_name IN ('e2e_test_workflow','child_echo_workflow')",
-    ] {
-        diesel::sql_query(stmt)
-            .execute(&mut conn)
-            .await
-            .expect("pre-test scrub");
-    }
 
     let original_exec_id = insert_workflow_execution(&mut conn).await;
     // Give the predecessor a DISTINCT source so "successor never inherits" is
@@ -6251,19 +6468,6 @@ async fn worker_child_workflow_records_child_start_source_referencing_parent() {
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
         .await
         .expect("failed to connect to Postgres container");
-    // Isolate from a shared HARVEST_TEST_DATABASE_URL: other e2e tests reuse the
-    // fixed `e2e_test_workflow` / `e2e-wf-001` identity, so clear those rows
-    // (and the child workflow's) up front. A no-op against a fresh CI container.
-    for stmt in [
-        "DELETE FROM harvest_events WHERE workflow_exec_id IN (SELECT id FROM harvest_workflow_executions WHERE workflow_name IN ('e2e_test_workflow','child_echo_workflow'))",
-        "DELETE FROM harvest_task_queue WHERE workflow_exec_id IN (SELECT id FROM harvest_workflow_executions WHERE workflow_name IN ('e2e_test_workflow','child_echo_workflow'))",
-        "DELETE FROM harvest_workflow_executions WHERE workflow_name IN ('e2e_test_workflow','child_echo_workflow')",
-    ] {
-        diesel::sql_query(stmt)
-            .execute(&mut conn)
-            .await
-            .expect("pre-test scrub");
-    }
 
     let parent_exec_id = insert_workflow_execution(&mut conn).await;
     let workflow_input = serde_json::json!({"value": "from-parent"});
@@ -6301,6 +6505,15 @@ async fn continue_as_new_down_migration_rewrites_historical_runs_for_rollback() 
         .expect("failed to connect to Postgres container");
 
     let original_exec_id = insert_workflow_execution(&mut conn).await;
+    // `insert_workflow_execution()` mints a fresh `workflow_id` per call
+    // (issue #1298), so read back the one this run actually got instead of
+    // assuming a fixed literal.
+    let original_workflow_id: String = harvest_workflow_executions::table
+        .find(original_exec_id.as_uuid())
+        .select(harvest_workflow_executions::workflow_id)
+        .first(&mut conn)
+        .await
+        .expect("failed to read the freshly inserted workflow_id");
     let initial_input = serde_json::json!({"phase": "init"});
     enqueue_started_workflow_task(&mut conn, original_exec_id, initial_input.clone()).await;
 
@@ -6396,7 +6609,7 @@ async fn continue_as_new_down_migration_rewrites_historical_runs_for_rollback() 
     assert!(
         original_row
             .workflow_id
-            .starts_with("e2e-wf-001::continued-as-new:"),
+            .starts_with(&format!("{original_workflow_id}::continued-as-new:")),
         "sealed historical runs should get a synthetic workflow_id during rollback",
     );
 
@@ -6405,13 +6618,13 @@ async fn continue_as_new_down_migration_rewrites_historical_runs_for_rollback() 
         .find(|execution| execution.id == successor_exec_id.as_uuid())
         .expect("successor execution should still exist after rollback rewrite");
     assert_eq!(
-        successor_row.workflow_id, "e2e-wf-001",
+        successor_row.workflow_id, original_workflow_id,
         "the latest run should retain the original logical workflow_id",
     );
 
     let rows_on_original_key = executions
         .iter()
-        .filter(|execution| execution.workflow_id == "e2e-wf-001")
+        .filter(|execution| execution.workflow_id == original_workflow_id)
         .count();
     assert_eq!(
         rows_on_original_key, 1,
@@ -6437,7 +6650,7 @@ mod reuse_policy_helpers {
             workflow_name: "reuse_policy_wf",
             workflow_id,
             exec_id,
-            input: serde_json::json!({}),
+            input: serde_json::json!({}).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -7855,6 +8068,9 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
+                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
+                dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "worker-sched-baseline".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -7870,6 +8086,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
+                resident_workflows: true,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
@@ -7933,6 +8150,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
 /// (b) `max_active_runs = 1` with a slow handler: the second cron firing must
 /// be skipped — the in-flight run count must never exceed 1.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // #1798: the `resident_workflows` field tips this literal-heavy test to 101 lines
 async fn workflow_schedule_max_active_runs_enforced() {
     let (database_url, _container) = setup_test_database_url().await;
 
@@ -7988,36 +8206,9 @@ async fn workflow_schedule_max_active_runs_enforced() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
-                worker_id: "worker-sched-maxruns".to_string(),
-                queues: vec!["default".to_string()],
-                notification_database_url: None,
-                max_concurrent_workflows: 4,
-                max_concurrent_activities: 4,
                 poll_interval: Duration::from_millis(100),
                 shutdown_timeout: Duration::from_secs(2),
-                cancellation_grace_period: Duration::from_secs(1),
-                sticky_timeout: Duration::from_secs(5),
-                max_local_activity_start_to_close: Duration::from_secs(60),
-                shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
-                worker_heartbeat_interval: Duration::from_secs(5),
-                build_id: String::new(),
-                deployment_name: None,
-                workflow_cache_size: 1000,
-                priority_aging_secs: None,
-                unknown_target_grace_window: Duration::from_secs(5),
-                poison_pill_threshold: 3,
-                capability_miss_max_redeliveries: 5,
-
-                workflow_task_timeout: std::time::Duration::from_secs(10),
-                workflow_panic_max_attempts: 3,
-                labels: std::collections::HashMap::new(),
-                queue_weights: std::collections::HashMap::new(),
-                max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
-                max_workflow_history_events: None,
-                shard_notification_database_urls: Vec::new(),
-                sharded_pool: None,
-                slot_tuner: None,
-                max_concurrent_sessions: 0,
+                ..runtime_config("worker-sched-maxruns", 4, 4, Duration::from_secs(10))
             },
             Arc::clone(&registry),
         )
@@ -8110,6 +8301,9 @@ async fn workflow_schedule_pause_and_resume() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
+                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
+                dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "worker-sched-pause".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -8125,6 +8319,7 @@ async fn workflow_schedule_pause_and_resume() {
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
+                resident_workflows: true,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
@@ -8327,7 +8522,7 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             workflow_name: "approval_search_attrs_workflow",
             workflow_id: "acme-approval-001",
             exec_id,
-            input: serde_json::json!({}),
+            input: serde_json::json!({}).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -8511,7 +8706,7 @@ async fn search_attrs_survive_worker_crash_and_resume() {
             workflow_name: "approval_search_attrs_workflow",
             workflow_id: "acme-crash-resume-001",
             exec_id,
-            input: serde_json::json!({}),
+            input: serde_json::json!({}).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -8732,6 +8927,7 @@ async fn drain_accepted_sets_status_to_draining() {
         None,
         &std::collections::HashMap::new(),
         0,
+        &[],
     )
     .await
     .unwrap();
@@ -8760,7 +8956,7 @@ async fn drain_accepted_sets_status_to_draining() {
         "drain_deadline_at must be set when a deadline is supplied"
     );
     assert_eq!(resp.worker_id, "w-drain-1");
-    assert!(resp.unavailable_shards.is_empty());
+    assert_eq!(resp.unavailable_shards, [] as [i32; 0]);
 }
 
 #[tokio::test]
@@ -8782,6 +8978,7 @@ async fn drain_already_draining_on_second_call() {
         None,
         &std::collections::HashMap::new(),
         0,
+        &[],
     )
     .await
     .unwrap();
@@ -8842,6 +9039,7 @@ async fn drain_already_stopped_after_transition() {
         None,
         &std::collections::HashMap::new(),
         0,
+        &[],
     )
     .await
     .unwrap();
@@ -8897,6 +9095,7 @@ async fn drain_with_explicit_deadline_is_stored() {
         None,
         &std::collections::HashMap::new(),
         0,
+        &[],
     )
     .await
     .unwrap();
@@ -8938,6 +9137,7 @@ async fn drain_preview_returns_active_workers() {
             None,
             &std::collections::HashMap::new(),
             0,
+            &[],
         )
         .await
         .unwrap();
@@ -9248,11 +9448,15 @@ async fn circuit_breaker_short_circuits_after_tripping() {
             rate_limit_key: None,
             rate_limit_key_expr: None,
             // Trip after a single failure; long cooldown so it stays open.
-            circuit_breaker: Some(autumn_harvest::policy::CircuitBreakerPolicy::new(
-                1,
-                Duration::from_secs(60),
-                Duration::from_secs(300),
-            )),
+            // Fail-fast, so the open breaker ends the activity (issue #1809).
+            circuit_breaker: Some(
+                autumn_harvest::policy::CircuitBreakerPolicy::new(
+                    1,
+                    Duration::from_secs(60),
+                    Duration::from_secs(300),
+                )
+                .with_open_mode(autumn_harvest::policy::CircuitOpenMode::FailFast),
+            ),
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
@@ -9937,6 +10141,565 @@ async fn overlap_policy_terminate_other_terminates_inflight_run() {
     let _ = scheduler.join().await;
 }
 
+/// Seed a RUNNING execution that simulates a cross-type continue-as-new
+/// successor (issue #1160): it carries `schedule_id` from a real schedule but
+/// a `workflow_name` that is NOT that schedule's registered type -- exactly
+/// what `ctx.continue_as_new_as(...)` (#803) leaves behind mid-chain --
+/// `origin = ORIGIN_SCHEDULED` (a manual-trigger row is deliberately excluded
+/// from overlap cleanup, so this must not look like one).
+async fn insert_cross_type_scheduled_execution(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &'static str,
+    schedule_id: Uuid,
+) -> ExecutionId {
+    let exec_id = ExecutionId::new();
+    let workflow_id = format!("sched:{schedule_id}:{}", Uuid::new_v4());
+    let row = NewWorkflowExecution {
+        quota_key: None,
+        continued_from_exec_id: None,
+        first_exec_id: None,
+        id: exec_id.as_uuid(),
+        workflow_name,
+        workflow_id: &workflow_id,
+        run_id: Uuid::new_v4(),
+        shard_id: 0,
+        input: serde_json::Value::Null.into(),
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: None,
+        deadline_at: None,
+        chain_execution_timeout: None,
+        chain_deadline_at: None,
+        memo: None,
+        search_attrs: None,
+        assigned_build_id: None,
+        parent_close_policy: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+        sla: None,
+        sla_deadline_at: None,
+        schedule_id: Some(schedule_id),
+        scheduled_for: Some(Utc::now()),
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        origin: Some(autumn_harvest::ORIGIN_SCHEDULED),
+        completion_callbacks: None,
+        start_source: None,
+        start_source_ref: None,
+        started_by: None,
+    };
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(&row)
+        .execute(conn)
+        .await
+        .expect("failed to insert cross-type scheduled execution");
+    exec_id
+}
+
+/// Seed a RUNNING execution that simulates an operator-triggered manual run of
+/// a schedule's OWN type (issue #1160 AC3 regression guard): `schedule_id`
+/// NULL, `origin = ORIGIN_MANUAL_TRIGGER`. Used to prove the #1160 fix is
+/// additive -- it must not stop a manual run of an existing single-type
+/// schedule from counting toward `max_active_runs`, which is the behaviour
+/// the issue explicitly calls out as out of scope to change.
+async fn insert_manual_trigger_execution(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &'static str,
+) -> ExecutionId {
+    let exec_id = ExecutionId::new();
+    let workflow_id = format!("manual-{}", Uuid::new_v4());
+    let row = NewWorkflowExecution {
+        quota_key: None,
+        continued_from_exec_id: None,
+        first_exec_id: None,
+        id: exec_id.as_uuid(),
+        workflow_name,
+        workflow_id: &workflow_id,
+        run_id: Uuid::new_v4(),
+        shard_id: 0,
+        input: serde_json::Value::Null.into(),
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: None,
+        deadline_at: None,
+        chain_execution_timeout: None,
+        chain_deadline_at: None,
+        memo: None,
+        search_attrs: None,
+        assigned_build_id: None,
+        parent_close_policy: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+        sla: None,
+        sla_deadline_at: None,
+        schedule_id: None,
+        scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        origin: Some(autumn_harvest::ORIGIN_MANUAL_TRIGGER),
+        completion_callbacks: None,
+        start_source: None,
+        start_source_ref: None,
+        started_by: None,
+    };
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(&row)
+        .execute(conn)
+        .await
+        .expect("failed to insert manual-trigger execution");
+    exec_id
+}
+
+/// Count `harvest_schedule_decisions` rows recording a `max_active_runs_reached`
+/// skip for `schedule_id` (`decision = "skipped"`, `reason_code =
+/// "max_active_runs_reached"` -- see `schedule_decision::record_decision_graceful`
+/// and the `OverlapAction::Drop` branch in `tick_one_workflow_schedule`). A
+/// positive control: proves the tick actually ran and took the capacity-gated
+/// branch, rather than a test merely observing "nothing happened" for an
+/// unrelated reason (e.g. the schedule never ticked at all).
+async fn count_max_active_runs_skip_decisions(database_url: &str, schedule_id: Uuid) -> i64 {
+    use autumn_harvest::schema::harvest_schedule_decisions::dsl;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect for decision count query");
+    dsl::harvest_schedule_decisions
+        .filter(dsl::schedule_id.eq(Some(schedule_id)))
+        .filter(dsl::reason_code.eq("max_active_runs_reached"))
+        .count()
+        .get_result::<i64>(&mut conn)
+        .await
+        .expect("decision count query failed")
+}
+
+/// (issue #1160, AC1) `Skip` + `max_active_runs`: a cross-type continue-as-new
+/// successor of the SAME schedule (same `schedule_id`, different
+/// `workflow_name`) must still count toward the schedule's `max_active_runs`.
+///
+/// Before the fix, `schedule_running_basis` (and the tick's own inline copy of
+/// it) counted only same-named executions, so this cross-type row was
+/// invisible to `max_active_runs` and a `Skip`-policy schedule would fire
+/// straight past its configured cap of 1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlap_policy_skip_counts_a_cross_type_successor_toward_max_active_runs() {
+    let (database_url, _container) = setup_test_database_url_or_env().await;
+    let wf_name = "overlap_1160_skip_wf";
+    let successor_type = "overlap_1160_skip_wf_successor";
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
+            mcp: false,
+            name: wf_name,
+            module: "integration_e2e",
+            handler: slow_workflow,
+            execution_timeout: None,
+            chain_execution_timeout: None,
+            sla: None,
+            concurrency: None,
+
+            debounce: None,
+            batch: None,
+            throttle: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        }],
+        vec![],
+    ));
+    let pool = build_test_pool(&database_url);
+
+    let ws = WorkflowSchedule::new(wf_name, Schedule::Cron("*/2 * * * * *".to_string()))
+        .with_max_active_runs(1)
+        .with_overlap_policy(OverlapPolicy::Skip);
+    let schedule_id: Uuid;
+    {
+        use autumn_harvest::schema::harvest_schedules::dsl as sched_dsl;
+        let mut conn = pool.get().await.expect("pool get failed");
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&ws))
+            .await
+            .expect("register_workflow_schedules failed");
+        schedule_id = sched_dsl::harvest_schedules
+            .filter(sched_dsl::workflow_name.eq(wf_name))
+            .select(sched_dsl::id)
+            .first(&mut conn)
+            .await
+            .expect("schedule row must exist after registration");
+
+        // Seed the cross-type successor occupying the schedule's only slot.
+        insert_cross_type_scheduled_execution(&mut conn, successor_type, schedule_id).await;
+    }
+
+    let workflow_schedules = Arc::new(vec![ws]);
+    let scheduler = SchedulerRuntime::spawn(
+        pool.clone(),
+        Arc::clone(&registry),
+        Arc::new(DagCatalog::default()),
+        Arc::clone(&workflow_schedules),
+    );
+
+    // Actively poll for 12 s (several cron cycles at 2 s, generous for Docker
+    // startup latency): fail the instant a new own-type run appears, rather
+    // than a single blind sleep.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+    loop {
+        let running_own_type = count_running_executions(&database_url, wf_name).await;
+        assert_eq!(
+            running_own_type, 0,
+            "issue #1160: the cross-type successor must count toward max_active_runs=1, \
+             so no NEW {wf_name} run should ever be dispatched while it is RUNNING"
+        );
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+    let successor_still_running = count_running_executions(&database_url, successor_type).await;
+    assert_eq!(
+        successor_still_running, 1,
+        "the pre-seeded cross-type successor must remain RUNNING under Skip (untouched)"
+    );
+    // Positive control: prove the tick actually ran and took the
+    // capacity-gated Skip branch, not merely that nothing happened for some
+    // unrelated reason (e.g. the schedule never ticked at all).
+    let skip_decisions = count_max_active_runs_skip_decisions(&database_url, schedule_id).await;
+    assert!(
+        skip_decisions >= 1,
+        "expected at least one max_active_runs_reached skip decision recorded for the \
+         schedule, got {skip_decisions} -- did the tick actually run?"
+    );
+
+    scheduler.shutdown();
+    let _ = scheduler.join().await;
+}
+
+/// (issue #1160, AC3 regression guard) A manual-trigger run of the schedule's
+/// OWN type must still count toward `max_active_runs` after the #1160 fix --
+/// the `schedule_id`-scoped addition to the running-count is additive, not a
+/// replacement of the existing name-based count that also covers manual
+/// (non-scheduled) runs. Without this, a wrong fix that re-scoped counting to
+/// `schedule_id` alone would silently stop enforcing the cap on manual runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlap_policy_skip_still_counts_a_manual_trigger_run_of_the_same_type() {
+    let (database_url, _container) = setup_test_database_url_or_env().await;
+    let wf_name = "overlap_1160_manual_wf";
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
+            mcp: false,
+            name: wf_name,
+            module: "integration_e2e",
+            handler: slow_workflow,
+            execution_timeout: None,
+            chain_execution_timeout: None,
+            sla: None,
+            concurrency: None,
+
+            debounce: None,
+            batch: None,
+            throttle: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        }],
+        vec![],
+    ));
+    let pool = build_test_pool(&database_url);
+
+    let ws = WorkflowSchedule::new(wf_name, Schedule::Cron("*/2 * * * * *".to_string()))
+        .with_max_active_runs(1)
+        .with_overlap_policy(OverlapPolicy::Skip);
+    let schedule_id: Uuid;
+    {
+        use autumn_harvest::schema::harvest_schedules::dsl as sched_dsl;
+        let mut conn = pool.get().await.expect("pool get failed");
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&ws))
+            .await
+            .expect("register_workflow_schedules failed");
+        schedule_id = sched_dsl::harvest_schedules
+            .filter(sched_dsl::workflow_name.eq(wf_name))
+            .select(sched_dsl::id)
+            .first(&mut conn)
+            .await
+            .expect("schedule row must exist after registration");
+        insert_manual_trigger_execution(&mut conn, wf_name).await;
+    }
+
+    let workflow_schedules = Arc::new(vec![ws]);
+    let scheduler = SchedulerRuntime::spawn(
+        pool.clone(),
+        Arc::clone(&registry),
+        Arc::new(DagCatalog::default()),
+        Arc::clone(&workflow_schedules),
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+    loop {
+        let running = count_running_executions(&database_url, wf_name).await;
+        assert_eq!(
+            running, 1,
+            "the pre-existing manual-trigger run must still count toward max_active_runs=1; \
+             a regression here means the #1160 fix silently stopped counting manual runs"
+        );
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+    // Positive control: same reasoning as the sibling cross-type test above.
+    let skip_decisions = count_max_active_runs_skip_decisions(&database_url, schedule_id).await;
+    assert!(
+        skip_decisions >= 1,
+        "expected at least one max_active_runs_reached skip decision recorded for the \
+         schedule, got {skip_decisions} -- did the tick actually run?"
+    );
+
+    scheduler.shutdown();
+    let _ = scheduler.join().await;
+}
+
+/// (issue #1160, AC2) `CancelOther` must be able to cancel a cross-type
+/// continue-as-new successor of the same schedule: it carries the right
+/// `schedule_id` but the wrong `workflow_name` (the target type), so a
+/// selection that ALSO filters on `workflow_name` can never reach it.
+///
+/// Before the fix, this scenario compounded with AC1's bug: since the
+/// cross-type row was invisible to the running-count too, the tick never even
+/// entered the overlap branch, so the predecessor was neither counted NOR
+/// cancelled -- it just sat RUNNING forever while a fresh run dispatched
+/// alongside it, silently exceeding `max_active_runs`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlap_policy_cancel_other_reaches_a_cross_type_successor() {
+    let (database_url, _container) = setup_test_database_url_or_env().await;
+    let wf_name = "overlap_1160_cancel_wf";
+    let predecessor_type = "overlap_1160_cancel_wf_predecessor";
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
+            mcp: false,
+            name: wf_name,
+            module: "integration_e2e",
+            handler: slow_workflow,
+            execution_timeout: None,
+            chain_execution_timeout: None,
+            sla: None,
+            concurrency: None,
+
+            debounce: None,
+            batch: None,
+            throttle: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        }],
+        vec![],
+    ));
+    let pool = build_test_pool(&database_url);
+
+    let ws = WorkflowSchedule::new(wf_name, Schedule::Cron("*/2 * * * * *".to_string()))
+        .with_max_active_runs(1)
+        .with_overlap_policy(OverlapPolicy::CancelOther);
+    {
+        use autumn_harvest::schema::harvest_schedules::dsl as sched_dsl;
+        let mut conn = pool.get().await.expect("pool get failed");
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&ws))
+            .await
+            .expect("register_workflow_schedules failed");
+        let schedule_id: Uuid = sched_dsl::harvest_schedules
+            .filter(sched_dsl::workflow_name.eq(wf_name))
+            .select(sched_dsl::id)
+            .first(&mut conn)
+            .await
+            .expect("schedule row must exist after registration");
+        insert_cross_type_scheduled_execution(&mut conn, predecessor_type, schedule_id).await;
+    }
+
+    let workflow_schedules = Arc::new(vec![ws]);
+    let scheduler = SchedulerRuntime::spawn(
+        pool.clone(),
+        Arc::clone(&registry),
+        Arc::new(DagCatalog::default()),
+        Arc::clone(&workflow_schedules),
+    );
+
+    let (predecessor_cancelled, running) = tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let c = count_executions_in_state(&database_url, predecessor_type, "CANCELLED").await;
+            let r = count_running_executions(&database_url, wf_name).await;
+            if c >= 1 && r == 1 {
+                return (c, r);
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+    .await
+    .expect(
+        "issue #1160: CancelOther timed out waiting to reach the cross-type successor within 12 s",
+    );
+
+    // Shut the scheduler down before taking any further counts: with
+    // OverlapPolicy::CancelOther and this cron cadence, every subsequent tick
+    // cancels the current run and dispatches a new one, so wf_name's total
+    // execution count grows monotonically for as long as the scheduler keeps
+    // ticking -- an equality assertion taken while it's still running would
+    // be flaky by construction.
+    scheduler.shutdown();
+    let _ = scheduler.join().await;
+
+    assert!(
+        predecessor_cancelled >= 1,
+        "issue #1160: CancelOther must cancel the cross-type predecessor, got {predecessor_cancelled}"
+    );
+    assert_eq!(
+        running, 1,
+        "CancelOther: exactly 1 {wf_name} execution must be RUNNING after cleanup, got {running}"
+    );
+    // The predecessor was cancelled, not duplicated: exactly one execution
+    // ever carried predecessor_type.
+    let predecessor_total = count_executions_for_workflow(&database_url, predecessor_type).await;
+    assert_eq!(
+        predecessor_total, 1,
+        "CancelOther: exactly 1 execution total named {predecessor_type}, got {predecessor_total}"
+    );
+}
+
+/// (issue #1160, AC2) `TerminateOther` must be able to terminate a cross-type
+/// continue-as-new successor of the same schedule -- the symmetric case of
+/// `overlap_policy_cancel_other_reaches_a_cross_type_successor` above.
+/// `terminate_in_flight_runs` got the identical fix (drop the redundant
+/// `workflow_name` filter, select on `schedule_id` alone) via the shared
+/// `load_overlap_cleanup_targets` helper, but exercised independently since
+/// `TerminateOther` takes a different `OverlapAction` branch in
+/// `tick_one_workflow_schedule`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlap_policy_terminate_other_reaches_a_cross_type_successor() {
+    let (database_url, _container) = setup_test_database_url_or_env().await;
+    let wf_name = "overlap_1160_terminate_wf";
+    let predecessor_type = "overlap_1160_terminate_wf_predecessor";
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
+            mcp: false,
+            name: wf_name,
+            module: "integration_e2e",
+            handler: slow_workflow,
+            execution_timeout: None,
+            chain_execution_timeout: None,
+            sla: None,
+            concurrency: None,
+
+            debounce: None,
+            batch: None,
+            throttle: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        }],
+        vec![],
+    ));
+    let pool = build_test_pool(&database_url);
+
+    let ws = WorkflowSchedule::new(wf_name, Schedule::Cron("*/2 * * * * *".to_string()))
+        .with_max_active_runs(1)
+        .with_overlap_policy(OverlapPolicy::TerminateOther);
+    {
+        use autumn_harvest::schema::harvest_schedules::dsl as sched_dsl;
+        let mut conn = pool.get().await.expect("pool get failed");
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&ws))
+            .await
+            .expect("register_workflow_schedules failed");
+        let schedule_id: Uuid = sched_dsl::harvest_schedules
+            .filter(sched_dsl::workflow_name.eq(wf_name))
+            .select(sched_dsl::id)
+            .first(&mut conn)
+            .await
+            .expect("schedule row must exist after registration");
+        insert_cross_type_scheduled_execution(&mut conn, predecessor_type, schedule_id).await;
+    }
+
+    let workflow_schedules = Arc::new(vec![ws]);
+    let scheduler = SchedulerRuntime::spawn(
+        pool.clone(),
+        Arc::clone(&registry),
+        Arc::new(DagCatalog::default()),
+        Arc::clone(&workflow_schedules),
+    );
+
+    let (predecessor_terminated, running) = tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let c = count_executions_in_state(&database_url, predecessor_type, "TERMINATED").await;
+            let r = count_running_executions(&database_url, wf_name).await;
+            if c >= 1 && r == 1 {
+                return (c, r);
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+    .await
+    .expect(
+        "issue #1160: TerminateOther timed out waiting to reach the cross-type successor within 12 s",
+    );
+
+    // Same rationale as the CancelOther test: shut down before taking any
+    // further counts, since wf_name's total grows on every subsequent tick.
+    scheduler.shutdown();
+    let _ = scheduler.join().await;
+
+    assert!(
+        predecessor_terminated >= 1,
+        "issue #1160: TerminateOther must terminate the cross-type predecessor, got {predecessor_terminated}"
+    );
+    assert_eq!(
+        running, 1,
+        "TerminateOther: exactly 1 {wf_name} execution must be RUNNING after cleanup, got {running}"
+    );
+    let predecessor_total = count_executions_for_workflow(&database_url, predecessor_type).await;
+    assert_eq!(
+        predecessor_total, 1,
+        "TerminateOther: exactly 1 execution total named {predecessor_type}, got {predecessor_total}"
+    );
+}
+
 /// (overlap-d) `BufferOne` durability: buffered slots survive a scheduler restart.
 ///
 /// Phase 1 — Scheduler A dispatches exec#1 (`slow_workflow`) and buffers one slot.
@@ -10107,7 +10870,7 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
         workflow_id: "signal-blocked-timeout-001",
         run_id: uuid::Uuid::new_v4(),
         shard_id: 0,
-        input: serde_json::json!({}),
+        input: serde_json::json!({}).into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: Some(execution_timeout),
@@ -10268,8 +11031,8 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
 /// `concurrency_cap = 2`.  Verifies the claim query allows at most 2 to be
 /// RUNNING simultaneously and that all 6 are eventually processed.  Uses
 /// direct `claim_task` / `complete_task` calls (same pattern as
-/// `concurrency_cap_limits_concurrent_claims_cluster_wide`) to avoid
-/// interaction with the executor's 100 ms suspension timeout.
+/// `concurrency_cap_limits_concurrent_claims_cluster_wide`) to keep the
+/// executor out of the measurement.
 #[tokio::test]
 async fn per_key_concurrency_cap_enforced_across_fleet() {
     const LIMIT: u32 = 2;
@@ -10383,8 +11146,8 @@ async fn per_key_concurrency_cap_enforced_across_fleet() {
 ///
 /// Enqueues 4 "loud" workflow tasks (cap=1) and 2 "quiet" workflow tasks
 /// (cap=10).  Verifies the quiet tasks can be claimed even while the loud cap
-/// is saturated.  Uses direct `claim_task` calls to avoid the executor's
-/// 100 ms suspension timeout.
+/// is saturated.  Uses direct `claim_task` calls to keep the executor out of
+/// the measurement.
 #[tokio::test]
 async fn per_key_concurrency_does_not_block_other_keys() {
     const LOUD_CAP: u32 = 1;
@@ -10707,6 +11470,7 @@ async fn test_rolling_deploy_capability_routing_with_database_enforcement() {
         None,
         &std::collections::HashMap::new(),
         0,
+        &[],
     )
     .await
     .unwrap();
@@ -10744,6 +11508,7 @@ async fn test_rolling_deploy_capability_routing_with_database_enforcement() {
         None,
         &new_labels,
         0,
+        &[],
     )
     .await
     .unwrap();
@@ -11100,7 +11865,7 @@ fn unbounded_fanout_e2e_workflow<'a>(
 /// Modestly-slow activity: doubles its numeric input after a short real sleep,
 /// so multiple in-flight activities are observable by a concurrent DB poller.
 /// (A `tokio::time::sleep` is fine here — this runs on the activity dispatch
-/// path, not inside the workflow poll's 100ms suspension window.)
+/// path, not inside a workflow decision cycle.)
 fn slow_double_activity<'a>(
     _ctx: &'a ActivityContext,
     input: serde_json::Value,
@@ -11186,7 +11951,7 @@ async fn insert_named_execution(
         workflow_id,
         run_id: Uuid::new_v4(),
         shard_id: 0,
-        input,
+        input: input.into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -11363,69 +12128,104 @@ async fn windowed_fan_out_peak_task_rows_bounded_by_window() {
     assert_eq!(markers, 1, "exactly one fan_out marker recorded");
 }
 
-/// Guard: `INIT_SQL` must create every `harvest_*` table the claim path
-/// references.
+/// Guard (issue #1693): the shared test database must match the migrations.
 ///
-/// [`INIT_SQL`] is a deliberately-partial, hand-maintained bundle (it omits the
-/// workflow-start-uniqueness migration on purpose), so it is one of the few
-/// fixtures allowed to skip [`autumn_harvest::full_migrations_sql`]. That makes
-/// it a standing drift hazard: `queue::claim_task` runs on essentially every
-/// test in this suite — and in every suite that borrows
-/// `setup_test_database_url_or_env` from here (`chain_timeout_tests`,
-/// `child_timeout_tests`, `cross_type_continue_as_new_tests`, `ctx_info_tests`,
-/// `dag_execution_timeout_tests`, `rate_limit_key_tests`,
-/// `workflow_retry_tests`) — so a migration that adds a table to the claim query
-/// and forgets this bundle takes out eight suites at once with
-/// `relation "..." does not exist`.
+/// A hand-kept migration list in the shared fixture lacked a migration. The
+/// completion transaction of the source then failed on every retry.
+/// `quota_enforcement_tests` timed out with no error.
 ///
-/// That is exactly what issue #619's `harvest_queue_pauses` anti-join did. It
-/// cost a full Docker-backed CI cycle (~13 min) to surface, yet it is decidable
-/// as a pure string comparison, so this pins it as a fast no-DB check instead.
-///
-/// The rule is mechanical: every `harvest_*` identifier named in the real
-/// `claim_task_query()` SQL must appear in `INIT_SQL`. Deriving the table set
-/// from the live query rather than a hardcoded list means a future claim-path
-/// table is caught automatically, with no second list to maintain.
-#[test]
-fn init_sql_creates_every_table_the_claim_path_references() {
-    let claim_sql = autumn_harvest::queue::claim_task_query();
-
-    let mut tables: Vec<String> = Vec::new();
-    let bytes = claim_sql.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' {
-            let start = i;
-            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                i += 1;
-            }
-            let word = &claim_sql[start..i];
-            if word.starts_with("harvest_") && !tables.contains(&word.to_string()) {
-                tables.push(word.to_string());
-            }
-        } else {
-            i += 1;
-        }
+/// This test builds a reference database by applying each `migrations/*/up.sql`
+/// file in order. That path does not use the generated bundle. The test
+/// compares the columns, types and nullability of both databases.
+#[tokio::test]
+async fn shared_test_database_schema_matches_full_migrations() {
+    #[derive(diesel::QueryableByName, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    struct ColumnRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        table_name: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        column_name: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        data_type: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        is_nullable: String,
     }
 
-    assert!(
-        !tables.is_empty(),
-        "expected to find harvest_* identifiers in claim_task_query(); the token scan is broken"
-    );
+    const COLUMNS_SQL: &str = "SELECT table_name::text AS table_name, \
+         column_name::text AS column_name, data_type::text AS data_type, \
+         is_nullable::text AS is_nullable \
+         FROM information_schema.columns WHERE table_schema = 'public'";
 
-    let missing: Vec<&String> = tables
-        .iter()
-        .filter(|table| !INIT_SQL.contains(table.as_str()))
+    let (shared_url, _container) = setup_test_database_url().await;
+    let mut shared = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&shared_url)
+        .await
+        .expect("connect to the shared test database");
+    diesel::sql_query("CREATE DATABASE harvest_full_reference")
+        .execute(&mut shared)
+        .await
+        .expect("create the reference database");
+    let (server_url, _) = shared_url
+        .rsplit_once('/')
+        .expect("database url has a database name");
+    let mut reference = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&format!(
+        "{server_url}/harvest_full_reference"
+    ))
+    .await
+    .expect("connect to the reference database");
+    let migrations_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let mut migration_names: Vec<String> = std::fs::read_dir(&migrations_dir)
+        .expect("read the migrations directory")
+        .map(|entry| entry.expect("read a migration entry"))
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    migration_names.sort();
+    for name in &migration_names {
+        let up_sql = std::fs::read_to_string(migrations_dir.join(name).join("up.sql"))
+            .unwrap_or_else(|e| panic!("read {name}/up.sql: {e}"));
+        reference
+            .batch_execute(&up_sql)
+            .await
+            .unwrap_or_else(|e| panic!("apply {name}: {e}"));
+    }
+    // The partitioned layout adds a suffix on top of the migrations.
+    let init_sql = autumn_harvest::test_init_sql();
+    reference
+        .batch_execute(&init_sql[autumn_harvest::full_migrations_sql().len()..])
+        .await
+        .expect("apply the layout suffix");
+
+    let shared_columns: std::collections::BTreeSet<ColumnRow> = diesel::sql_query(COLUMNS_SQL)
+        .load(&mut shared)
+        .await
+        .expect("read shared columns")
+        .into_iter()
+        .collect();
+    let full_columns: std::collections::BTreeSet<ColumnRow> = diesel::sql_query(COLUMNS_SQL)
+        .load(&mut reference)
+        .await
+        .expect("read reference columns")
+        .into_iter()
         .collect();
 
+    let describe = |rows: Vec<&ColumnRow>| -> Vec<String> {
+        rows.into_iter()
+            .take(20)
+            .map(|r| {
+                format!(
+                    "{}.{} ({}, nullable {})",
+                    r.table_name, r.column_name, r.data_type, r.is_nullable
+                )
+            })
+            .collect()
+    };
+    let missing = describe(full_columns.difference(&shared_columns).collect());
+    let extra = describe(shared_columns.difference(&full_columns).collect());
     assert!(
-        missing.is_empty(),
-        "INIT_SQL is missing table(s) the claim path references: {missing:?}\n\
-         Add the migration that creates them to the INIT_SQL concat! in this file. \
-         Without it every claim in this suite -- and in chain_timeout_tests, \
-         child_timeout_tests, cross_type_continue_as_new_tests, ctx_info_tests, \
-         dag_execution_timeout_tests, rate_limit_key_tests and \
-         workflow_retry_tests, which reuse setup_test_database_url_or_env from \
-         here -- fails with `relation \"...\" does not exist` (issues #619, #807)."
+        missing.is_empty() && extra.is_empty(),
+        "the shared test database differs from the full migration bundle.\n\
+         missing from the shared database (first 20): {missing:#?}\n\
+         only in the shared database (first 20): {extra:#?}\n\
+         Build the shared database from `autumn_harvest::test_init_sql()` (issue #1693)."
     );
 }

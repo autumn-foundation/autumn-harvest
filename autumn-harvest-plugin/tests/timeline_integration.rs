@@ -28,7 +28,6 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -43,7 +42,7 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
-// DELIBERATE PARTIAL-SCHEMA FIXTURE — do NOT convert to `full_migrations_sql()`.
+// DELIBERATE PARTIAL-SCHEMA FIXTURE — do NOT convert to `test_init_sql()`.
 // `timeline_classic_dag_run_returns_404` inserts a classic DAG run row directly
 // into `harvest_dag_runs`, but migration 20260514000000_drop_harvest_dag_runs
 // (included in the full bundle) drops that table. This hand-rolled subset
@@ -66,6 +65,31 @@ const INIT_SQL: &str = concat!(
     // issue #704: history-bloat early-warning guard column (read back by
     // WorkflowExecution::as_select()).
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS history_bloat_warned_at TIMESTAMPTZ NULL;\n",
+    // issue #964: shard-rebalancing forwarding columns (read back by
+    // WorkflowExecution::as_select()). Added inline rather than by including
+    // the migration, which also alters `harvest_execution_summaries` -- a table
+    // this bundle never creates. Without them every seed in this suite fails
+    // with `column harvest_workflow_executions.migrated_to_shard does not
+    // exist`, and the not-found routes answer 503 instead of 404 because the
+    // lookup errors before it can miss.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_to_shard INTEGER NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_at TIMESTAMPTZ NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_from_shards JSONB NULL;\n",
+    // issue #1317: observed-terminal marker for a rebalanced seal (read back
+    // by WorkflowExecution::as_select()), for the same reason as the three
+    // rebalancing columns above.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_run_terminal_at TIMESTAMPTZ NULL;\n",
+    // fresh review, P1 follow-up: the observed live-copy outcome recorded
+    // alongside the marker above (read back by WorkflowExecution::as_select()),
+    // for the same reason as the column above.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_run_terminal_state TEXT NULL;\n",
+    // issue #1317 review (P1 follow-up): staging-vacate reversibility marker
+    // (read back by WorkflowExecution::as_select()), for the same reason as
+    // the column above.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS staging_vacated_state TEXT NULL;\n",
+    // issue #1596 review: WorkflowExecution::as_select() also references
+    // this column, for the same reason as the column above.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS staging_vacated_by UUID NULL;\n",
     "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260619000000_harvest_task_queue_created_at/up.sql"
@@ -217,6 +241,11 @@ const INIT_SQL: &str = concat!(
     // issue #946: quota_key column on harvest_workflow_executions, referenced
     // by every WorkflowExecution::as_select() read-back in this suite.
     include_str!("../../autumn-harvest/migrations/20260725000000_harvest_workflow_quotas/up.sql"),
+    "\n",
+    // issue #1824: the new-start marker on harvest_task_queue. Every claim
+    // orders by it and `TaskQueueItem` selects it, so each claim in this suite
+    // needs it. Added inline for the same reason as the columns above.
+    "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS new_start BOOLEAN NOT NULL DEFAULT FALSE;\n",
 );
 
 type HarvestApiApp = axum::Router;
@@ -256,7 +285,7 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::default(),
     ));
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 async fn get_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
@@ -293,7 +322,7 @@ async fn seed_running(conn: &mut AsyncPgConnection, workflow_id: &str) -> Execut
             workflow_name: "timeline-wf",
             workflow_id,
             exec_id,
-            input: json!({"n": 1}),
+            input: json!({"n": 1}).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,

@@ -233,6 +233,8 @@ pub fn resolve_reset_point(
                         // * ChildWorkflowCascadeApplied — post-terminal operational
                         //   tail emitted when the parent close cascade fires; including
                         //   it would re-trigger the cascade on replay.
+                        // * DecisionCommitted — the boundary after the terminal of
+                        //   the last decision (issue #1833). It is never a reset point.
                         if matches!(
                             event,
                             WorkflowEvent::WorkflowCompleted { .. }
@@ -241,6 +243,7 @@ pub fn resolve_reset_point(
                                 | WorkflowEvent::WorkflowExecutionTimedOut { .. }
                                 | WorkflowEvent::WorkflowRetryScheduled { .. }
                                 | WorkflowEvent::ChildWorkflowCascadeApplied { .. }
+                                | WorkflowEvent::DecisionCommitted { .. }
                         ) {
                             return None;
                         }
@@ -796,7 +799,11 @@ pub async fn reset_workflow_execution(
     registry: Option<&HandlerRegistry>,
 ) -> Result<ResetResult, WorkflowResetError> {
     let mut request = request.normalized();
-    let (res, deferred_starts, workflow_name, closed_children) =
+    // `enqueue_fork_workflow_task` writes the fork's `PENDING` task row, so it
+    // raises a dispatch hint (issue #1312). The buffering scope holds the hint
+    // until this transaction commits. A hint published earlier names a row no
+    // reader outside this transaction can see.
+    let (res, deferred_starts, workflow_name, closed_children) = crate::dispatch::buffered_settled(
         Box::pin(conn.transaction::<(
             ResetResult,
             Vec<DeferredTriggerStart>,
@@ -845,12 +852,20 @@ pub async fn reset_workflow_execution(
             let new_exec_id = ExecutionId::new_for_shard(ShardId::new(source.shard_id));
             let source_next_event_id = rows.last().map_or(0, |row| row.event_id.saturating_add(1));
 
+            // Issue #1243 review (P1): a completion trigger fired by this
+            // cascade can start a new workflow. It needs the caller's real
+            // registry, not the identity default. `reset_workflow_execution`
+            // already receives one.
             let (deferred, closed_children) = terminate_source_execution(
                 conn,
                 exec_id,
                 new_exec_id,
                 &request,
                 source_next_event_id,
+                registry.map_or(
+                    &crate::store::DEFAULT_PAYLOAD_CODECS,
+                    HandlerRegistry::payload_codecs,
+                ),
             )
             .await?;
             let fork = insert_fork_execution(conn, &source, new_exec_id).await?;
@@ -891,8 +906,9 @@ pub async fn reset_workflow_execution(
                 source.workflow_name,
                 closed_children,
             ))
-        }))
-        .await?;
+        })),
+    )
+    .await?;
 
     for start in deferred_starts {
         start.spawn();
@@ -1265,6 +1281,7 @@ async fn terminate_source_execution(
     new_exec_id: ExecutionId,
     request: &WorkflowResetRequest,
     source_next_event_id: i32,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> Result<(Vec<DeferredTriggerStart>, Vec<(ExecutionId, String)>), WorkflowResetError> {
     crate::store::append_events(
         conn,
@@ -1320,7 +1337,8 @@ async fn terminate_source_execution(
     // tables are absent (guarded).
     crate::mutex::sweep_terminal_holder_and_wake(conn, source_exec_id).await?;
 
-    let (deferred, closed_children) = apply_parent_close_cascade(conn, source_exec_id).await?;
+    let (deferred, closed_children) =
+        apply_parent_close_cascade(conn, source_exec_id, codecs).await?;
 
     Ok((deferred, closed_children))
 }
@@ -1375,7 +1393,7 @@ async fn insert_fork_execution(
         workflow_id: &source.workflow_id,
         run_id: Uuid::new_v4(),
         shard_id: source.shard_id,
-        input: source.input.clone(),
+        input: source.input.clone().into(),
         parent_id: None,
         queue_name: &source.queue_name,
         execution_timeout: source.execution_timeout,
@@ -1640,6 +1658,9 @@ mod tests {
 
     fn execution_in_state(state: &str) -> crate::models::WorkflowExecution {
         crate::models::WorkflowExecution {
+            migrated_to_shard: None,
+            migrated_at: None,
+            migrated_from_shards: None,
             id: ExecutionId::new().as_uuid(),
             workflow_name: "wf".into(),
             workflow_id: "id".into(),
@@ -1697,6 +1718,10 @@ mod tests {
             history_bloat_warned_at: None,
             triage_note: None,
             quota_key: None,
+            migrated_run_terminal_at: None,
+            migrated_run_terminal_state: None,
+            staging_vacated_state: None,
+            staging_vacated_by: None,
         }
     }
 
@@ -1754,7 +1779,10 @@ mod tests {
         let plan = validate_reset_point(&events, 0).expect("workflow start is always valid");
         assert_eq!(plan.reset_to_event_id, 0);
         assert_eq!(plan.events_carried_over, 1);
-        assert!(plan.unresolved_side_effects.is_empty());
+        assert_eq!(
+            plan.unresolved_side_effects,
+            [] as [crate::reset::ResetUnresolvedSideEffect; 0]
+        );
     }
 
     #[test]
@@ -1851,7 +1879,10 @@ mod tests {
         ];
 
         let plan = validate_reset_point(&events, 2).expect("resolved cancel is a valid boundary");
-        assert!(plan.unresolved_side_effects.is_empty());
+        assert_eq!(
+            plan.unresolved_side_effects,
+            [] as [crate::reset::ResetUnresolvedSideEffect; 0]
+        );
     }
 
     #[test]
@@ -1955,7 +1986,10 @@ mod tests {
         // the pending arm, so the fork validates.
         let plan = validate_reset_point(&events, 2)
             .expect("a cancelled timer resolves the pending arm, like a fire");
-        assert!(plan.unresolved_side_effects.is_empty());
+        assert_eq!(
+            plan.unresolved_side_effects,
+            [] as [crate::reset::ResetUnresolvedSideEffect; 0]
+        );
         assert_eq!(plan.reset_to_event_id, 2);
     }
 
@@ -2045,7 +2079,10 @@ mod tests {
         let plan =
             validate_reset_point(&events, 3).expect("exhausted local activity is fully resolved");
         assert_eq!(plan.reset_to_event_id, 3);
-        assert!(plan.unresolved_side_effects.is_empty());
+        assert_eq!(
+            plan.unresolved_side_effects,
+            [] as [crate::reset::ResetUnresolvedSideEffect; 0]
+        );
     }
 
     #[test]
@@ -2386,6 +2423,37 @@ mod tests {
             resolve_reset_point(&events, &ResetPoint::LastWorkflowTask),
             Ok(0),
             "LastWorkflowTask must skip ChildWorkflowCascadeApplied and return WorkflowStarted"
+        );
+    }
+
+    #[test]
+    fn last_workflow_task_skips_a_decision_boundary_after_the_terminal() {
+        // started(0), scheduled(1), completed(2), boundary(3),
+        // workflow completed(4), boundary(5). A boundary is never a reset
+        // point, so the result is index 2 (issue #1833).
+        let act_id = crate::types::ActivityExecId::new();
+        let boundary = || WorkflowEvent::DecisionCommitted {
+            build_id: crate::types::BuildId::new("b"),
+            worker_id: crate::types::WorkerId::new("w"),
+        };
+        let events = vec![
+            started(),
+            WorkflowEvent::ActivityScheduled {
+                activity_id: act_id,
+                name: "a".to_string(),
+                input: Value::Null,
+                queue: "default".to_string(),
+            },
+            activity_completed(act_id),
+            boundary(),
+            WorkflowEvent::WorkflowCompleted {
+                output: Value::Null,
+            },
+            boundary(),
+        ];
+        assert_eq!(
+            resolve_reset_point(&events, &ResetPoint::LastWorkflowTask),
+            Ok(2),
         );
     }
 
