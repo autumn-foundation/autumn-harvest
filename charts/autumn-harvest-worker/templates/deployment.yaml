@@ -51,7 +51,7 @@ spec:
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       {{- /* In `dev`, the runner applies the migrations itself after this check. */}}
-      {{- if and .Values.migrations.checkOnStart (ne .Values.profile "dev") }}
+      {{- if and .Values.migrations.checkOnStart (ne (include "harvest-worker.isDev" .) "true") }}
       initContainers:
         - name: check-migrations
           image: {{ include "harvest-worker.image" . }}

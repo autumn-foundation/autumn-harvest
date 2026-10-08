@@ -52,6 +52,14 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end }}
 {{- end }}
 
+{{/*
+"true" when `profile` is dev. It matches the runner: the name is trimmed and
+compared without case, and `development` is an alias of `dev`.
+*/}}
+{{- define "harvest-worker.isDev" -}}
+{{- has (lower (trim .Values.profile)) (list "dev" "development") }}
+{{- end }}
+
 {{/* The database Secret. The chart refuses to render without it. */}}
 {{- define "harvest-worker.databaseSecret" -}}
 {{- required "database.existingSecret is required: create a Secret that holds the database URL" .Values.database.existingSecret }}
