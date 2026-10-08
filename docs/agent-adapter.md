@@ -354,8 +354,13 @@ scheduler: the app calls `sqlite::start_heartbeat` on each tick.
 A task with `AgentTask::followups` gives the model the `schedule_followup`
 tool. The tool takes a `prompt` and a `delay_minutes`. When the segment
 completes, the workflow waits on a durable timer. Then a new segment runs
-in the same conversation. The model wrote the prompt, so the segment shows
-it as the agent's own note, not as words from the user.
+in the same conversation.
+
+The model wrote the prompt, maybe under the influence of a tool result. So
+the prompt never goes into a user message. It stays in the model's own
+`schedule_followup` call, an assistant message. The new segment starts with
+a fixed user message that the app controls, which tells the model to act on
+that call.
 
 - The workflow refuses a second follow-up in one segment.
 - The delay is at most the `max_delay` of `Followups::new`. The shortest

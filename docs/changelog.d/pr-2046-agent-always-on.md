@@ -11,8 +11,9 @@ modelled on `autumn-plugin-agent` with no dependency on it.
   builds the Postgres engine schedule. `sqlite::start_heartbeat` starts a
   tick on SQLite. The engine keeps one schedule per workflow name.
 - **Follow-up.** The `schedule_followup` tool books a durable timer in the
-  same workflow. A new segment then runs the prompt in the same
-  conversation, framed as the agent's own note. One follow-up per segment, a
+  same workflow. A new segment then continues the same conversation. The
+  model-written prompt stays in its own tool call and never enters a user
+  message. One follow-up per segment, a
   maximum delay and a chain cap bound it.
 - **Unattended runs are read-only.** A heartbeat tick and a follow-up
   segment deny `Write`, `External` and unknown tools, and cannot write

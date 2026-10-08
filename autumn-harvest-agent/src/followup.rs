@@ -3,15 +3,19 @@
 //! A run with [`Followups`] set offers the model the `schedule_followup`
 //! tool. The workflow handles the call itself: no activity runs. When the
 //! run ends, the workflow waits on a durable timer, then starts a new segment
-//! in the same conversation with the follow-up prompt.
+//! in the same conversation.
 //!
 //! The timer is durable, so a restart keeps the wake-up. A chain cap and a
 //! maximum delay stop an agent from waking itself forever.
 //!
 //! No person is present when a follow-up wakes. A follow-up segment is
-//! therefore read-only unless [`Followups::allow_actions`] is set. The model
-//! wrote the prompt, so the segment shows it as the agent's own note, not as
-//! words from the user.
+//! therefore read-only unless [`Followups::allow_actions`] is set.
+//!
+//! The model wrote the prompt, maybe under the influence of a tool result.
+//! It therefore never goes into a user message. It stays where the model put
+//! it: in the arguments of its own `schedule_followup` call, an assistant
+//! message. The segment starts with a fixed user message that the app
+//! controls.
 
 use std::time::Duration;
 
@@ -81,9 +85,9 @@ pub fn definition() -> ToolDefinition {
     ToolDefinition {
         name: FOLLOWUP_TOOL.to_owned(),
         description: "Wake yourself up later. After delay_minutes, a new turn starts \
-                      in this conversation with `prompt` as your own note. No person \
-                      is present then. Use it to check back on something that is not \
-                      ready yet."
+                      in this conversation. Then act on `prompt`, your own note from \
+                      this call. No person is present then. Use it to check back on \
+                      something that is not ready yet."
             .to_owned(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -99,18 +103,14 @@ pub fn definition() -> ToolDefinition {
 /// One planned follow-up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Planned {
-    pub(crate) prompt: String,
     pub(crate) delay_secs: u64,
 }
 
 /// The user message that starts a follow-up segment.
 ///
-/// The model wrote the prompt, maybe under the influence of a tool result.
-/// The frame marks it as the agent's own note, so it does not read as an
-/// instruction from the user.
-pub(crate) fn wake_message(prompt: &str) -> String {
-    format!("[A follow-up you scheduled earlier. No person is present. Your note:] {prompt}")
-}
+/// It is fixed text that the app controls. It holds no text from the model.
+pub(crate) const WAKE_MESSAGE: &str = "[Scheduled follow-up] The follow-up you booked with \
+`schedule_followup` is due. No person is present. Act on the prompt you gave in that call.";
 
 /// Check one follow-up call.
 ///
@@ -154,10 +154,7 @@ pub(crate) fn plan(
             settings.max_delay_secs / 60
         ));
     }
-    Ok(Planned {
-        prompt: prompt.to_owned(),
-        delay_secs,
-    })
+    Ok(Planned { delay_secs })
 }
 
 #[cfg(test)]
@@ -178,7 +175,6 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(planned.prompt, "check");
         assert_eq!(planned.delay_secs, 300);
     }
 

@@ -148,7 +148,7 @@ pub(crate) async fn drive(
         followup: None,
         chain: 0,
     };
-    let mut input = task.input.clone();
+    let mut input = task.input.as_str();
     let mut delivered = 0_u32;
     loop {
         // No person is present when a follow-up wakes. It stays read-only
@@ -212,7 +212,7 @@ pub(crate) async fn drive(
         progress.messages = report.messages;
         progress.last_text.clear();
         progress.answered = false;
-        input = followup::wake_message(&next.prompt);
+        input = followup::WAKE_MESSAGE;
     }
 }
 
@@ -243,7 +243,7 @@ async fn run_segment(
     ctx: &WorkflowContext,
     task: &AgentTask,
     progress: &mut Progress,
-    input: String,
+    input: &str,
 ) -> Result<AgentStop, String> {
     let system = system_prompt(ctx, task).await?;
     let mut messages = Vec::with_capacity(progress.messages.len() + 2);
