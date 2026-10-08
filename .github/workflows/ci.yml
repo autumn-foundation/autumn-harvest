@@ -580,6 +580,14 @@ jobs:
       - name: Run audit-export opt-in-cost guards (also on docs-only PRs)
         run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration audit_export_docs::"
 
+      # Issue #1993: the replay positioning page lives under `docs/`, so a
+      # docs-only change skips the `test` matrix. These guards run here,
+      # ungated. `replay_positioning_docs::guards_run_on_docs_only_changes`
+      # fails if this step leaves `lint` or gains an `if:`. Quoted for the
+      # trailing-`::` YAML reason above.
+      - name: Run docs/why-deterministic-replay.md guards (also on docs-only PRs)
+        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration replay_positioning_docs::"
+
       # Issue #1810: online-migration lock safety. A migration after the
       # cutoff must have a non-zero `lock_timeout` in force when it locks a
       # hot table. It must build or drop a hot-table index with CONCURRENTLY.
