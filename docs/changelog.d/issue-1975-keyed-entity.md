@@ -19,8 +19,8 @@ a new entity.
   `(workflow_name, workflow_id)`, and the loop awaits each handler.
 - State survives a worker crash. Replay rebuilds it.
 - State changes are atomic. A handler gets a copy of the state (`S::clone`,
-  so use plain data), and only `Ok` replaces it. An `Err` or an undecodable message counts as failed, and
-  the entity goes on.
+  so use plain data), and only `Ok` replaces it. An `Err` or an
+  undecodable message counts as failed, and the entity goes on.
 - No operation is lost at a checkpoint. The loop carries waiting op signals
   in the continue-as-new input while it fits the workflow input cap. An op
   that does not fit runs first.

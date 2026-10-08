@@ -5,11 +5,11 @@
 //!
 //! | Entity concept | Harvest part |
 //! |---|---|
-//! | Entity type | A root `#[workflow]` function that calls [`Entity::run`] |
+//! | Entity type | A root `#[workflow]` function that calls [`Entity::run`](crate::entity::Entity::run) |
 //! | Entity key | The `workflow_id` |
-//! | Operation | A signal named [`ENTITY_OP_SIGNAL`] |
+//! | Operation | A signal named [`ENTITY_OP_SIGNAL`](crate::entity::ENTITY_OP_SIGNAL) |
 //! | Send an operation | `signal_with_start` |
-//! | Read state | The query [`ENTITY_STATE_QUERY`] |
+//! | Read state | The query [`ENTITY_STATE_QUERY`](crate::entity::ENTITY_STATE_QUERY) |
 //!
 //! # Guarantees
 //!
@@ -34,8 +34,8 @@
 //!   offload lifts this limit only when its threshold is at or below the cap.
 //! - Continue-as-new works only in a root workflow. An entity cannot be a
 //!   child workflow.
-//! - [`Entity::max_ops_per_run`], an `execution_timeout` and the
-//!   [`EntityCheckpoint`] wire form are part of replay. Change them as a
+//! - [`Entity::max_ops_per_run`](crate::entity::Entity::max_ops_per_run), an `execution_timeout` and the
+//!   [`EntityCheckpoint`](crate::entity::EntityCheckpoint) wire form are part of replay. Change them as a
 //!   versioned workflow change.
 //! - A handler must await all the work it starts, and its error text must be
 //!   deterministic. The error text rides in the checkpoint input.
