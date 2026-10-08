@@ -369,12 +369,12 @@ mod same_module_vs_nested_module_parity_tests {
 // ── Characterization tests: signature-validation error paths ────────────────
 //
 // Pins `query_macro`'s current rejection messages for the two structural
-// checks (`first_param_is_ctx`, `returns_result`) before those checks are
-// switched to call the already-shared `attr_util::first_param_is_ctx_type`/
-// `attr_util::returns_result` (see the sibling copies in `update.rs` and
-// `signal.rs`, and the generalized versions in `attr_util.rs` already used by
-// `webhook.rs`). Committed first so the refactor cannot silently change a
-// caller-visible compile error.
+// checks (`first_param_is_ctx`, `returns_result`). A later change switches
+// those checks to call the already-shared `attr_util::first_param_is_ctx_type`/
+// `attr_util::returns_result`. See the sibling copies in `update.rs` and
+// `signal.rs`. See also the generalized versions in `attr_util.rs` that
+// `webhook.rs` already uses. Committed first so the refactor cannot silently
+// change a caller-visible compile error.
 #[cfg(test)]
 mod signature_validation_characterization_tests {
     use super::query_macro;

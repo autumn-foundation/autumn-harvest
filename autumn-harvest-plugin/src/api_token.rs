@@ -332,6 +332,24 @@ pub(crate) async fn lookup_by_secret(
 
 /// Best-effort `last_used_at` bump. Called off the request critical path.
 pub(crate) async fn touch_last_used(conn: &mut AsyncPgConnection, id: Uuid) -> HarvestResult<()> {
+    use diesel_async::AsyncConnection as _;
+    // The update runs detached from the request, past its fence. With fencing
+    // on, it asserts the fence in its own transaction (issue #1823), as an
+    // audit write does. A process that lost write authority writes nothing.
+    if !autumn_harvest::replication::FenceRegistry::is_enabled() {
+        return write_last_used(conn, id).await;
+    }
+    Box::pin(
+        conn.transaction::<_, autumn_harvest::error::HarvestError, _>(async move |conn| {
+            autumn_harvest::replication::assert_database_fence(conn).await?;
+            write_last_used(conn, id).await
+        }),
+    )
+    .await
+}
+
+/// The update of [`touch_last_used`], with no DR fence check.
+async fn write_last_used(conn: &mut AsyncPgConnection, id: Uuid) -> HarvestResult<()> {
     use harvest_api_tokens::dsl;
     diesel::update(dsl::harvest_api_tokens.filter(dsl::id.eq(id)))
         .set(dsl::last_used_at.eq(Utc::now()))

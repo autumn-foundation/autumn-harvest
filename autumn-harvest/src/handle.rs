@@ -1609,7 +1609,7 @@ impl TransactionalStartOutcome {
             // `ShardedDbPool::single`/`from_map` guarantee a default-shard entry,
             // so `pool_for` never needs its own fallible path here.
             let pool = self.client.inner.pools.pool_for(self.shard);
-            match pool.get().await {
+            match crate::replication::fenced_checkout(pool).await {
                 Ok(mut fresh_conn) => {
                     for (exec_id, workflow_name) in self.deferred.checks {
                         let _ = check_and_report_unfinished_handlers(

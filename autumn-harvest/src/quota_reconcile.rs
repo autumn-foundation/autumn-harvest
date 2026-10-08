@@ -148,8 +148,8 @@
 //! release without writing a quota key derived from its own
 //! possibly-stale registry view, onto a database another region now
 //! owns. The assert is a cheap in-process check when this worker has no
-//! pinned generation for the shard. A deployment that never enables
-//! `dr_fencing` pays nothing extra.
+//! pinned generation for the shard. A process that pins no generation
+//! pays nothing extra.
 //!
 //! # Out of scope: `harvest_dead_letters.quota_key`
 //!
@@ -623,6 +623,11 @@ pub fn spawn_quota_key_reconciler_for_shard(
                 () = cancel.cancelled() => break,
                 () = tokio::time::sleep(interval) => {}
             }
+            // Issue #1823: a held shard skips the tick before it takes a connection.
+            // It can be an unreachable standby, so a checkout could wait on it.
+            if crate::replication::shard_writes_held(shard) {
+                continue;
+            }
             // Selected against `cancel` (issue #1426). A pool may have no
             // deadpool `Timeouts`, so `pool.get()` alone can park this task
             // indefinitely on an exhausted shard pool. The top-of-loop select
@@ -633,12 +638,31 @@ pub fn spawn_quota_key_reconciler_for_shard(
                 () = cancel.cancelled() => break,
                 result = pool.get() => result,
             };
+            // The fence opens only after the checkout. A tick that waits for a
+            // connection holds no barrier, so pool pressure cannot block a bump. The
+            // tick runs under the barrier of this shard and each pinned shard
+            // colocated with it. A fenced shard skips the tick, and a lost barrier
+            // stops it.
+            let Some(fence) = crate::replication::begin_shard_tick(&pool, shard).await else {
+                continue;
+            };
             match get_result {
                 Ok(mut conn) => {
-                    match reconcile_quota_keys_from_with_codecs(
-                        &mut conn, batch_size, cursor, shard, &codecs,
+                    match crate::replication::run_fenced_pass(
+                        &fence,
+                        Box::pin(async {
+                            // Issue #1823: the older connection joins the pass.
+                            // A lost guard then ends its backend.
+                            let _member =
+                                crate::replication::join_fenced_pass(&pool, &mut conn).await;
+                            reconcile_quota_keys_from_with_codecs(
+                                &mut conn, batch_size, cursor, shard, &codecs,
+                            )
+                            .await
+                        }),
                     )
                     .await
+                    .and_then(|done| done)
                     {
                         Ok((summary, next_cursor)) => {
                             cursor = next_cursor;

@@ -1436,8 +1436,7 @@ pub async fn all_build_reachability_sharded(
         .map(|(_, shard_pool)| {
             let shard_pool = shard_pool.clone();
             async move {
-                let mut conn = shard_pool
-                    .get()
+                let mut conn = crate::replication::fenced_checkout(&shard_pool)
                     .await
                     .map_err(|e| crate::error::HarvestError::Database(e.to_string()))?;
                 all_build_reachability(&mut conn, stale_threshold).await

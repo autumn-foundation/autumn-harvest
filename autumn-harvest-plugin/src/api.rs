@@ -5761,11 +5761,84 @@ async fn admit_mutation(
         .get::<crate::api_token::TokenPrincipal>()
         .is_some();
     let session = request.extensions().get::<Session>().cloned();
-    if mutation_admitted(api_state, has_token, session).await {
-        next.run(request).await
-    } else {
-        AutumnError::unauthorized_msg("authentication required").into_response()
+    if !mutation_admitted(api_state, has_token, session).await {
+        return AutumnError::unauthorized_msg("authentication required").into_response();
     }
+    // Issue #1823: a handler reads its body after the guards below are
+    // taken. A slow upload would then hold them while nothing writes. So the
+    // body is read first, up to the largest limit any route allows. The
+    // route's own limit still applies when its handler extracts the body.
+    let request = if autumn_harvest::replication::FenceRegistry::is_enabled() {
+        let (parts, body) = request.into_parts();
+        let limit = usize::try_from(BATCH_START_BODY_HARD_LIMIT).unwrap_or(usize::MAX);
+        match axum::body::to_bytes(body, limit).await {
+            Ok(bytes) => axum::extract::Request::from_parts(parts, axum::body::Body::from(bytes)),
+            Err(error) => {
+                return AutumnError::bad_request_msg(error.to_string())
+                    .with_status(StatusCode::PAYLOAD_TOO_LARGE)
+                    .into_response();
+            }
+        }
+    } else {
+        request
+    };
+    // Held until the handler returns, so a bump cannot commit while the
+    // handler writes. See `FencePassGuard`.
+    let fence = match enforce_dr_fence(api_state).await {
+        Ok(guards) => guards,
+        Err(refusal) => return refusal.into_response(),
+    };
+    run_dr_fenced(&fence, next.run(request)).await
+}
+
+/// Run a handler under its DR fence guards (issue #1823).
+///
+/// A lost guard session frees the pass lock, so a bump can commit. The
+/// handler then stops and the caller gets a `503`. The pool discards a
+/// connection that the handler left in a transaction, so the server rolls
+/// the transaction back.
+pub(crate) async fn run_dr_fenced(
+    fence: &[autumn_harvest::replication::FencePassGuard],
+    handler: impl std::future::Future<Output = axum::response::Response>,
+) -> axum::response::Response {
+    autumn_harvest::replication::run_fenced_pass(fence, handler)
+        .await
+        .unwrap_or_else(|lost| {
+            AutumnError::service_unavailable_msg(lost.to_string()).into_response()
+        })
+}
+
+/// Refuse an admin write when this process lost write authority (issue #1823).
+///
+/// Every route that [`admit_mutation`] gates runs this after authentication:
+/// the classified management API, Vantage and the MCP tools. It opens a fence
+/// barrier on each shard of the storage pool, and on every pinned shard
+/// colocated with it, through
+/// [`autumn_harvest::replication::begin_fenced_tick`]. Each barrier is opened
+/// on the database where its row lives. A failover bumps the generation, so a
+/// stale node refuses each admin write before its handler runs. A process
+/// that pinned nothing pays one atomic load.
+///
+/// A shard that cannot be checked fails closed with `503`.
+///
+/// The caller holds the returned guards until its handler returns. Each is
+/// a commit-order barrier: a bump cannot commit while the handler writes.
+/// See [`autumn_harvest::replication::FencePassGuard`].
+pub(crate) async fn enforce_dr_fence(
+    api_state: &HarvestApiState,
+) -> Result<Vec<autumn_harvest::replication::FencePassGuard>, AutumnError> {
+    use autumn_harvest::replication::{FenceRegistry, begin_fenced_tick};
+
+    if !FenceRegistry::is_enabled() {
+        return Ok(Vec::new());
+    }
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    // Every refusal here is a 503, whatever its error kind. A retry must
+    // reach an authoritative node, and a webhook releases its delivery id
+    // only on a 5xx.
+    begin_fenced_tick(pool.sharded_pool())
+        .await
+        .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))
 }
 
 /// Whether the mutation gate admits a caller (issue #1802).
@@ -11978,7 +12051,7 @@ async fn workflow_children_on_shard(
             error: Some("no connection pool configured for this shard".to_string()),
         };
     };
-    let mut conn = match shard_pool.get().await {
+    let mut conn = match autumn_harvest::replication::fenced_checkout(&shard_pool).await {
         Ok(c) => c,
         Err(e) => {
             return crate::shard_fanout::ShardObservation {
@@ -12017,7 +12090,7 @@ async fn workflow_children_multi_on_shard(
             error: Some("no connection pool configured for this shard".to_string()),
         };
     };
-    let mut conn = match shard_pool.get().await {
+    let mut conn = match autumn_harvest::replication::fenced_checkout(&shard_pool).await {
         Ok(c) => c,
         Err(e) => {
             return crate::shard_fanout::ShardObservation {
@@ -12420,7 +12493,7 @@ async fn lineage_children_on_shard(
             format!("shard {shard_id} has no configured storage pool"),
         );
     };
-    let Ok(mut conn) = pool.get().await else {
+    let Ok(mut conn) = autumn_harvest::replication::fenced_checkout(&pool).await else {
         return lineage_shard_unavailable(
             shard_id,
             format!("database connection for shard {shard_id} could not be acquired"),
@@ -12449,7 +12522,7 @@ async fn lineage_probe_on_shard(
             format!("shard {shard_id} has no configured storage pool"),
         );
     };
-    let Ok(mut conn) = pool.get().await else {
+    let Ok(mut conn) = autumn_harvest::replication::fenced_checkout(&pool).await else {
         return lineage_shard_unavailable(
             shard_id,
             format!("database connection for shard {shard_id} could not be acquired"),
@@ -12483,7 +12556,7 @@ async fn lineage_summary_probe_on_shard(
             format!("shard {shard_id} has no configured storage pool"),
         );
     };
-    let Ok(mut conn) = pool.get().await else {
+    let Ok(mut conn) = autumn_harvest::replication::fenced_checkout(&pool).await else {
         return lineage_shard_unavailable(
             shard_id,
             format!("database connection for shard {shard_id} could not be acquired"),
@@ -33474,10 +33547,7 @@ async fn bulk_replay_from_shards(
             {
                 continue;
             }
-            let mut conn = shard_pool
-                .get()
-                .await
-                .map_err(|e| HarvestError::Database(e.to_string()))?;
+            let mut conn = autumn_harvest::replication::fenced_checkout(shard_pool).await?;
             let n = count_api_bulk_filter_matches(&mut conn, selector).await?;
             matched = matched.saturating_add(usize::try_from(n).unwrap_or(0));
         }
@@ -33491,10 +33561,7 @@ async fn bulk_replay_from_shards(
         {
             continue;
         }
-        let mut conn = shard_pool
-            .get()
-            .await
-            .map_err(|e| HarvestError::Database(e.to_string()))?;
+        let mut conn = autumn_harvest::replication::fenced_checkout(shard_pool).await?;
 
         if remaining == 0 {
             // Budget exhausted: count-only so matched reflects all shards.
@@ -33657,10 +33724,7 @@ async fn redrive_from_shards(
             {
                 continue;
             }
-            let mut conn = shard_pool
-                .get()
-                .await
-                .map_err(|e| HarvestError::Database(e.to_string()))?;
+            let mut conn = autumn_harvest::replication::fenced_checkout(shard_pool).await?;
             let n = dlq::count_redrive_filter_matches(&mut conn, &request.filter).await?;
             matched = matched.saturating_add(usize::try_from(n).unwrap_or(0));
         }
@@ -33674,10 +33738,7 @@ async fn redrive_from_shards(
         {
             continue;
         }
-        let mut conn = shard_pool
-            .get()
-            .await
-            .map_err(|e| HarvestError::Database(e.to_string()))?;
+        let mut conn = autumn_harvest::replication::fenced_checkout(shard_pool).await?;
 
         if remaining == 0 {
             // Budget exhausted: count-only so `matched` reflects all shards.
@@ -33732,10 +33793,7 @@ async fn bulk_discard_from_shards(
         {
             continue;
         }
-        let mut conn = shard_pool
-            .get()
-            .await
-            .map_err(|e| HarvestError::Database(e.to_string()))?;
+        let mut conn = autumn_harvest::replication::fenced_checkout(shard_pool).await?;
 
         if remaining == 0 {
             // Budget exhausted: count-only so matched reflects all shards.
@@ -36885,7 +36943,8 @@ async fn force_circuit(
         )
     };
     if let Ok(pool) = api_state.storage_pool()
-        && let Ok(mut conn) = pool.default_pool().get().await
+        && let Ok(mut conn) =
+            autumn_harvest::replication::fenced_checkout(pool.default_pool()).await
     {
         let ar = NewAuditRecord {
             actor: &actor,
@@ -41100,7 +41159,9 @@ async fn check_ready_database(
         return verdict;
     };
     let select_one = async {
-        let mut conn = pool.default_pool().get().await.ok()?;
+        let mut conn = autumn_harvest::replication::fenced_checkout(pool.default_pool())
+            .await
+            .ok()?;
         diesel::sql_query("SELECT 1").execute(&mut conn).await.ok()
     };
     if !matches!(
@@ -41141,16 +41202,22 @@ pub(crate) async fn load_execution(
         .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))
 }
 
-pub(crate) type PoolConn = deadpool::managed::Object<
-    diesel_async::pooled_connection::AsyncDieselConnectionManager<diesel_async::AsyncPgConnection>,
->;
+/// A handler's connection (issue #1823). Under [`run_dr_fenced`], a lost
+/// guard ends its backend, so a statement it sent cannot commit after a bump.
+pub(crate) type PoolConn = autumn_harvest::replication::FencedConn;
 
 fn map_pool_error(error: &impl ToString) -> AutumnError {
     AutumnError::service_unavailable_msg(error.to_string())
 }
 
+/// Check out a connection for a handler (issue #1823). Under
+/// [`run_dr_fenced`], the wait stays below a bump's lock timeout, and a
+/// failed checkout drops the request's fence guards. See
+/// [`autumn_harvest::replication::fenced_checkout`].
 pub(crate) async fn acquire_conn(pool: &DbPool) -> Result<PoolConn, AutumnError> {
-    pool.get().await.map_err(|error| map_pool_error(&error))
+    autumn_harvest::replication::fenced_checkout(pool)
+        .await
+        .map_err(|error| map_pool_error(&error))
 }
 
 /// Resolve a connection to the shard that currently hosts `exec_id`.
@@ -45459,11 +45526,16 @@ pub(crate) fn map_error(error: HarvestError) -> AutumnError {
         error @ HarvestError::LoadShed { .. } => AutumnError::bad_request_msg(error.to_string())
             .with_status(axum::http::StatusCode::TOO_MANY_REQUESTS),
         HarvestError::Database(message) => AutumnError::service_unavailable_msg(message),
-        // The run moved after the authorizer hook checked it (issue #1803).
-        // Nothing was read or written on the new shard. The body is the
-        // retry hint only. The policy's reason never reaches the caller,
-        // and a `403` here would leak that a shard is denied.
-        error @ HarvestError::OutsideShardFence { .. } => {
+        // `OutsideShardFence`: the run moved after the authorizer hook
+        // checked it (issue #1803). Nothing was read or written on the new
+        // shard. The body is the retry hint only. The policy's reason never
+        // reaches the caller, and a `403` here would leak that a shard is
+        // denied.
+        //
+        // `ShardFenced`: this node lost write authority to another region
+        // (issue #1823). Nothing was written. A retry on this node fails the
+        // same way until the node restarts against the authoritative region.
+        error @ (HarvestError::OutsideShardFence { .. } | HarvestError::ShardFenced { .. }) => {
             AutumnError::service_unavailable_msg(error.to_string())
         }
         other => AutumnError::service_unavailable_msg(other.to_string()),
@@ -46794,13 +46866,13 @@ async fn list_workers_handler(
     // shard survive while the freshest Draining row on another is dropped before
     // dedup — returning the obsolete snapshot. The queue filter (read from the
     // worker's advertised JSON, identical across rows) is kept here. `shard_id`
-    // is deliberately dropped from the per-shard query below and reapplied
-    // after, source-aware (issue #1213) — it is NOT shard-invariant: an
+    // is deliberately dropped from the per-shard query below. It is reapplied
+    // after, source-aware (issue #1213). It is NOT shard-invariant. An
     // empty-array (auto/legacy) row means "covers whatever shard it was read
-    // from", so evaluating it against the caller's requested shard while
-    // reading from every OTHER shard in the fan-out would falsely match. Use
-    // i64::MAX as the per-shard limit so list_workers performs no truncation
-    // before the global sort+truncate below.
+    // from". The fan-out also reads such rows from every OTHER shard. An
+    // evaluation of those rows against the caller's requested shard would
+    // falsely match. Use i64::MAX as the per-shard limit so list_workers
+    // performs no truncation before the global sort+truncate below.
     let requested_shard_id = filters.shard_id;
     let per_shard_filters = WorkerFilters {
         limit: i64::MAX,
@@ -46820,8 +46892,9 @@ async fn list_workers_handler(
                 .await
                 .map_err(|e| e.to_string())?;
             // Issue #1213: evaluate shard coverage against the shard this row
-            // was actually read from, not blindly against the caller's
-            // requested shard — see the source-aware predicate doc above.
+            // was actually read from. Do not evaluate it blindly against the
+            // caller's requested shard. See the source-aware predicate doc
+            // above.
             if let Some(requested) = requested_shard_id {
                 rows.retain(|r| {
                     autumn_harvest::workers::shard_assignments_cover_from_source(
