@@ -14,6 +14,7 @@ use serde_json::Value;
 
 use crate::context::{LoserCancelReason, WorkflowCommand, WorkflowContext};
 use crate::error::{HarvestError, HarvestResult};
+use crate::event::WorkflowEvent;
 use crate::types::{ActivityExecId, ExecutionId, TimerId};
 
 /// The reason that a cancelled scope reports.
@@ -79,6 +80,27 @@ impl ScopeMembers {
         }
     }
 
+    /// Drop the members that `event` resolves.
+    fn drop_resolved_by(&mut self, event: &WorkflowEvent) {
+        match event {
+            WorkflowEvent::ActivityCompleted { activity_id, .. }
+            | WorkflowEvent::ActivityFailed { activity_id, .. }
+            | WorkflowEvent::ActivityTimedOut { activity_id, .. }
+            | WorkflowEvent::ActivityCompletedExternally { activity_id, .. }
+            | WorkflowEvent::ActivityFailedExternally { activity_id, .. } => {
+                self.activities.retain(|id| id != activity_id);
+            }
+            WorkflowEvent::ChildWorkflowCompleted { child_id, .. }
+            | WorkflowEvent::ChildWorkflowFailed { child_id, .. } => {
+                self.children.retain(|id| id != child_id);
+            }
+            WorkflowEvent::TimerFired { timer_id } | WorkflowEvent::TimerCancelled { timer_id } => {
+                self.timers.retain(|id| id != timer_id);
+            }
+            _ => {}
+        }
+    }
+
     pub(crate) const fn is_empty(&self) -> bool {
         self.activities.is_empty() && self.children.is_empty() && self.timers.is_empty()
     }
@@ -138,6 +160,27 @@ impl ScopeShared {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+/// Drop the members that the events of a resident cycle resolved.
+///
+/// A resident future keeps its scopes across cycles. A resolved member must
+/// leave the set. Otherwise a later operation that reuses its timer id would
+/// look like a member, and a cancel would tear it down.
+pub(crate) fn drop_resolved_members(
+    live: &mut Vec<std::sync::Weak<ScopeShared>>,
+    delta: &[WorkflowEvent],
+) {
+    live.retain(|weak| {
+        let Some(shared) = weak.upgrade() else {
+            return false;
+        };
+        let mut inner = shared.lock();
+        for event in delta {
+            inner.members.drop_resolved_by(event);
+        }
+        true
+    });
 }
 
 /// Route `cmd` through the scope stack, innermost scope first.
@@ -211,7 +254,7 @@ pub struct CancellationScope<'a> {
 
 impl<'a> CancellationScope<'a> {
     fn new(ctx: &'a WorkflowContext) -> Self {
-        Self {
+        let scope = Self {
             ctx,
             shared: Arc::new(ScopeShared {
                 seq: ctx.next_scope_seq(),
@@ -224,7 +267,9 @@ impl<'a> CancellationScope<'a> {
                     members: ScopeMembers::default(),
                 }),
             }),
-        }
+        };
+        ctx.register_scope(&scope.shared);
+        scope
     }
 
     /// Run `body` inside this scope.
@@ -1412,5 +1457,93 @@ mod tests {
         assert!(ctx.take_nd_details().is_none());
         assert!(ctx.drain_commands().is_empty());
         assert!(!ctx.history_has_unconsumed_events());
+    }
+
+    /// The external workflow of the late-result tests.
+    async fn approve_then_after(ctx: &WorkflowContext) -> HarvestResult<Value> {
+        let scope = ctx.cancellation_scope();
+        let (approved, ()) = tokio::join!(
+            scope.run(ctx.execute_activity_external("approve", Value::Null, "default", 3600)),
+            async {
+                let _ = ctx.wait_for_signal("abort").await;
+                scope.cancel();
+            }
+        );
+        assert!(matches!(approved, Err(HarvestError::Cancelled(_))));
+        ctx.execute_activity_raw("after", Value::Null, "default")
+            .await
+    }
+
+    /// Other writers append between the horizon and the cancel marker: an
+    /// external result and a signal. Replay still finds the marker.
+    #[tokio::test]
+    async fn replay_steps_over_events_between_the_horizon_and_the_marker() {
+        let exec_id = ExecutionId::new();
+        let a = ActivityExecId::new();
+        let token = crate::types::ExternalActivityToken::new();
+        let mut history = vec![
+            started(),
+            WorkflowEvent::ActivityAwaitingExternal {
+                activity_id: a,
+                token,
+                name: "approve".into(),
+                input: Value::Null,
+                queue: "default".into(),
+                schedule_to_close_secs: 3600,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "abort".into(),
+                payload: Value::Null,
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(exec_id, history.clone());
+        let live = tokio::time::timeout(Duration::from_millis(50), approve_then_after(&ctx)).await;
+        assert!(live.is_err(), "the workflow parks on `after`");
+        let commands = ctx.drain_commands();
+        let details = marker(&commands, "cancel_scope:1").expect("the cancel is recorded");
+        let after = scheduled_id(&commands, "after");
+
+        history.push(WorkflowEvent::ActivityCompletedExternally {
+            activity_id: a,
+            token,
+            output: json!("approved late"),
+        });
+        history.push(WorkflowEvent::SignalReceived {
+            signal_name: "unrelated".into(),
+            payload: Value::Null,
+        });
+        history.push(WorkflowEvent::MarkerRecorded {
+            name: "cancel_scope:1".into(),
+            details,
+        });
+        history.push(scheduled(after, "after"));
+        history.push(WorkflowEvent::ActivityCompleted {
+            activity_id: after,
+            output: json!("done"),
+        });
+
+        let ctx = WorkflowContext::for_replay(exec_id, history);
+        let replayed = bounded(approve_then_after(&ctx)).await;
+        assert_eq!(replayed.ok(), Some(json!("done")));
+        assert!(ctx.take_nd_details().is_none());
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    /// A resident cycle drops a member that resolved, so a later timer that
+    /// reuses its id is not torn down by a cancel.
+    #[tokio::test]
+    async fn a_resident_cycle_drops_a_resolved_member() {
+        let ctx = WorkflowContext::new_test();
+        let scope = ctx.cancellation_scope();
+        let parked =
+            tokio::time::timeout(Duration::from_millis(50), scope.run(ctx.timer("t", 60))).await;
+        assert!(parked.is_err(), "the body parks on its timer");
+        assert_eq!(scope.shared.lock().members.timers, vec![TimerId::new("t")]);
+
+        ctx.begin_resident_cycle(&[WorkflowEvent::TimerFired {
+            timer_id: TimerId::new("t"),
+        }]);
+
+        assert!(scope.shared.lock().members.is_empty());
     }
 }

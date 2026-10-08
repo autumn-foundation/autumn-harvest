@@ -2918,6 +2918,9 @@ pub struct WorkflowContext {
     shield_seq: Mutex<u32>,
     /// The scopes and shields whose body is polled now, innermost last.
     scope_stack: Mutex<Vec<crate::cancellation_scope::ScopeFrame>>,
+    /// Every scope of this run, so a resident cycle can drop the members
+    /// that resolved (issue #1984).
+    live_scopes: Mutex<Vec<std::sync::Weak<crate::cancellation_scope::ScopeShared>>>,
     /// Monotonically increasing counter for naming worker-session identity
     /// markers (issue #606). Each `create_session()` call increments this once
     /// so each session has a stable, unique `session:{seq}` marker name across
@@ -3624,6 +3627,7 @@ impl WorkflowContext {
             scope_seq: Mutex::new(0),
             shield_seq: Mutex::new(0),
             scope_stack: Mutex::new(Vec::new()),
+            live_scopes: Mutex::new(Vec::new()),
             session_seq: Mutex::new(0),
             business_day_seq: Mutex::new(0),
             progress_local_index: std::sync::atomic::AtomicU64::new(0),
@@ -3800,6 +3804,7 @@ impl WorkflowContext {
             scope_seq: Mutex::new(0),
             shield_seq: Mutex::new(0),
             scope_stack: Mutex::new(Vec::new()),
+            live_scopes: Mutex::new(Vec::new()),
             session_seq: Mutex::new(0),
             business_day_seq: Mutex::new(0),
             progress_local_index: std::sync::atomic::AtomicU64::new(0),
@@ -3874,6 +3879,7 @@ impl WorkflowContext {
             scope_seq: Mutex::new(0),
             shield_seq: Mutex::new(0),
             scope_stack: Mutex::new(Vec::new()),
+            live_scopes: Mutex::new(Vec::new()),
             session_seq: Mutex::new(0),
             business_day_seq: Mutex::new(0),
             progress_local_index: std::sync::atomic::AtomicU64::new(0),
@@ -7363,6 +7369,10 @@ impl WorkflowContext {
             .lock()
             .expect("matcher lock poisoned")
             .append_consumed(delta);
+        crate::cancellation_scope::drop_resolved_members(
+            &mut self.live_scopes.lock().expect("live scopes lock poisoned"),
+            delta,
+        );
     }
 
     /// Whether a non-blocking signal claim probed `signal_name` with a scan
@@ -13939,6 +13949,17 @@ impl WorkflowContext {
         let mut seq = self.scope_seq.lock().expect("scope_seq lock poisoned");
         *seq += 1;
         *seq
+    }
+
+    /// Remember `scope` so a resident cycle can update its members.
+    pub(crate) fn register_scope(
+        &self,
+        scope: &std::sync::Arc<crate::cancellation_scope::ScopeShared>,
+    ) {
+        self.live_scopes
+            .lock()
+            .expect("live scopes lock poisoned")
+            .push(std::sync::Arc::downgrade(scope));
     }
 
     /// Next non-cancellable block sequence number.

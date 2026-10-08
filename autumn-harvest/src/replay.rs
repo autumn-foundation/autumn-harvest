@@ -6493,21 +6493,12 @@ impl HistoryMatcher {
                     self.advance_to_next_unconsumed_event();
                     return Some((scan_cursor, details));
                 }
-                WorkflowEvent::MarkerRecorded { .. }
-                | WorkflowEvent::SideEffectRecorded { .. }
-                | WorkflowEvent::ActivityScheduled { .. }
-                | WorkflowEvent::ActivityStarted { .. }
-                | WorkflowEvent::ActivityHeartbeat { .. }
-                | WorkflowEvent::ActivityCompleted { .. }
-                | WorkflowEvent::ActivityFailed { .. }
-                | WorkflowEvent::ActivityTimedOut { .. }
-                | WorkflowEvent::ChildWorkflowStarted { .. }
-                | WorkflowEvent::ChildWorkflowSpawnedDetached { .. }
-                | WorkflowEvent::ChildWorkflowCompleted { .. }
-                | WorkflowEvent::ChildWorkflowFailed { .. }
-                | WorkflowEvent::TimerStarted { .. }
-                | WorkflowEvent::TimerFired { .. }
-                | WorkflowEvent::TimerCancelled { .. } => {
+                // Other writers append between the horizon and the marker: a
+                // completion, a late external result, a signal. The marker
+                // name is unique, so the scan steps over any event that is not
+                // a terminal lifecycle event. The cursor returns to the first
+                // stepped-over event, so nothing is lost.
+                event if !event.is_terminal_lifecycle() => {
                     first_interleaved_command.get_or_insert(scan_cursor);
                     scan_cursor += 1;
                 }
