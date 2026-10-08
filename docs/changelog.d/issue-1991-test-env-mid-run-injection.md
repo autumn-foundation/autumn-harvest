@@ -46,6 +46,9 @@ Design decisions:
 - An update handler has a 5 second limit, as the default in-process query
   timeout. A timeout leaves the admitted update with no result. A panic
   records `UpdateFailed`.
+- `TestRunOutcome::replay_check` registers the same declarative handlers as
+  the live run. A workflow that branches on `list_query_names` then replays
+  cleanly.
 - A drive with no new event and no pending signal returns `Blocked` at once.
   It does not run the frontier code again.
 - A classic timer still fires when the workflow waits on it. A held-timer
@@ -65,5 +68,6 @@ an update validator rejection. They also cover a failed handler, an unknown
 name and declarative handlers, with the workflow-name filter. Further tests
 check the virtual time, a query before the first drive and a finished run.
 Other tests cover the update `arg_schema`, a handler that never finishes, a
-handler that panics, and a wait after a child-timeout win.
+handler that panics, a wait after a child-timeout win, and the handlers that
+`replay_check` registers.
 `replay_check` succeeds after a mid-run signal and a mid-run update.

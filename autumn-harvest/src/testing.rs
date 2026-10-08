@@ -5081,6 +5081,11 @@ pub struct TestRunOutcome {
     /// `UNIQUE (workflow_exec_id, seq)` + `ON CONFLICT DO NOTHING` produces.
     /// Empty unless the env opted in via [`WorkflowTestEnv::with_log_policy`].
     recorded_logs: Vec<RecordedLogLine>,
+    /// The declarative handlers the live cycles registered (issue #1991).
+    /// `replay_check` registers the same ones.
+    declarative_queries: Vec<crate::info::QueryHandlerInfo>,
+    /// See `declarative_queries`.
+    declarative_updates: Vec<crate::info::UpdateHandlerInfo>,
 }
 
 /// The virtual clock after `events`: `start_time` plus the fired timer time.
@@ -5298,7 +5303,35 @@ impl TestRunOutcome {
         if let Some(build_id) = self.build_id.clone() {
             replayer = replayer.with_build_id(build_id);
         }
+        // Issue #1991: the live cycles registered these declarative handlers.
+        replayer = replayer
+            .queries(self.declarative_queries.clone())
+            .updates(self.declarative_updates.clone());
         replayer.replay_from_snapshot(snapshot).await
+    }
+}
+
+/// A declarative handler record that names its workflow type.
+trait WorkflowKeyed {
+    fn workflow(&self) -> &'static str;
+    fn set_workflow(&mut self, workflow: &'static str);
+}
+
+impl WorkflowKeyed for crate::info::QueryHandlerInfo {
+    fn workflow(&self) -> &'static str {
+        self.workflow
+    }
+    fn set_workflow(&mut self, workflow: &'static str) {
+        self.workflow = workflow;
+    }
+}
+
+impl WorkflowKeyed for crate::info::UpdateHandlerInfo {
+    fn workflow(&self) -> &'static str {
+        self.workflow
+    }
+    fn set_workflow(&mut self, workflow: &'static str) {
+        self.workflow = workflow;
     }
 }
 
@@ -6505,7 +6538,28 @@ impl WorkflowTestEnv {
             // workflow's self-check replays under the same build the live run saw.
             build_id: self.build_id.clone(),
             recorded_logs,
+            declarative_queries: self.replay_handlers(&self.declarative_queries),
+            declarative_updates: self.replay_handlers(&self.declarative_updates),
         }
+    }
+
+    /// The handlers this env registers, keyed for the replayer.
+    ///
+    /// The replayer keeps a handler only if its `workflow` equals the
+    /// snapshot workflow name. With no name set, the env registers every
+    /// handler, so each one gets the empty name that the snapshot carries.
+    fn replay_handlers<H: Clone + WorkflowKeyed>(&self, handlers: &[H]) -> Vec<H> {
+        handlers
+            .iter()
+            .filter(|h| self.owns(h.workflow()))
+            .map(|h| {
+                let mut h = h.clone();
+                if self.workflow_name.is_empty() {
+                    h.set_workflow("");
+                }
+                h
+            })
+            .collect()
     }
 
     fn finish_terminal_outcome(

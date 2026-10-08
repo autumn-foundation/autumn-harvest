@@ -155,6 +155,24 @@ fn child_then_signal_workflow<'a>(
     })
 }
 
+/// Picks an activity by whether the `phase` query is registered. Replay
+/// must see the same handlers as the live run, or it takes the other branch.
+fn branch_on_handlers_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let activity = if ctx.list_query_names().iter().any(|n| n == "phase") {
+            "with_phase"
+        } else {
+            "without_phase"
+        };
+        ctx.execute_activity_raw(activity, json!(null), "default")
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
 fn string_schema() -> Value {
     json!({ "type": "string" })
 }
@@ -499,6 +517,28 @@ async fn child_timeout_win_then_wait_reports_blocked() {
         run.finish().await.result,
         Ok(json!({ "child": "done", "go": 2 }))
     );
+}
+
+/// `replay_check` registers the same declarative handlers as the live run,
+/// with and without a workflow name.
+#[tokio::test]
+async fn replay_check_sees_the_declarative_handlers() {
+    for env in [
+        WorkflowTestEnv::new(),
+        WorkflowTestEnv::new().with_workflow_name("declarative_workflow"),
+    ] {
+        let env = env
+            .queries(queries![phase, foreign_phase])
+            .mock_activity("with_phase", |_| Ok(json!("with")))
+            .mock_activity("without_phase", |_| Ok(json!("without")));
+        let outcome = env.run(branch_on_handlers_workflow, json!(null)).await;
+        assert_eq!(outcome.result, Ok(json!("with")));
+        let report = outcome.replay_check(branch_on_handlers_workflow).await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "{report}"
+        );
+    }
 }
 
 // ─────────────────────────────── queries ─────────────────────────────────────
