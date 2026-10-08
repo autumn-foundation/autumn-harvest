@@ -26,6 +26,11 @@ BINS="${ASSAY14_BINS:?set ASSAY14_BINS to tree=binary pairs}"
   echo "build assay #11's Temporal arm first: (cd $TEMPORAL_DIR && go build -o assay11 .)" >&2
   exit 1
 }
+# Start from an empty directory, so the grader never mixes two sweeps.
+if [ -d "$OUT" ] && [ -n "$(ls -A "$OUT")" ]; then
+  echo "$OUT is not empty. Move it away before a new sweep." >&2
+  exit 1
+fi
 mkdir -p "$OUT"
 
 for round in $(seq 0 $((ROUNDS - 1))); do

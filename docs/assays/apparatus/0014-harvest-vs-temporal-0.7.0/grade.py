@@ -21,9 +21,12 @@ TEMPORAL_TREE = "1.25.2"
 TEMPORAL_ARM = "temporal_go"
 DEPTHS = [250, 500, 1000, 2000]
 BASE, FIX, TRUNK = TREES
-# Recorded runs per cell, valid or not. A cell with any other count comes
-# from an interrupted sweep or stale files, so it has no mean.
-EXPECTED_RUNS = 3
+# The registered rounds. A cell needs exactly one recorded run, valid or
+# not, from each. Any other set comes from an interrupted sweep or stale
+# files, so the cell has no mean.
+EXPECTED_ROUNDS = ["0", "1", "2"]
+EXPECTED_RUNS = len(EXPECTED_ROUNDS)
+ROUND_FILE_RE = re.compile(r"^r(\d+)-")
 SIGNALS = [
     "claim_mean_ms",
     "persist_mean_ms",
@@ -62,7 +65,13 @@ def load(directory):
             depth = int(backlog.group(1))
             for match in TEMPORAL_REP_RE.finditer(text):
                 valid = match.group(2) == "PASS" and not match.group(3)
-                run = {"wfps": float(match.group(1)), "valid": valid, "file": path.name}
+                name_round = ROUND_FILE_RE.match(path.name)
+                run = {
+                    "wfps": float(match.group(1)),
+                    "valid": valid,
+                    "file": path.name,
+                    "rep": name_round.group(1) if name_round else "?",
+                }
                 runs.setdefault((TEMPORAL_TREE, TEMPORAL_ARM, depth), []).append(run)
     return runs
 
@@ -76,7 +85,8 @@ def mean(values):
 
 
 def complete(runs, key):
-    return len(runs.get(key, [])) == EXPECTED_RUNS
+    rounds = sorted(r.get("rep", "?") for r in runs.get(key, []))
+    return rounds == EXPECTED_ROUNDS
 
 
 def cell_mean(runs, tree, arm, depth):
