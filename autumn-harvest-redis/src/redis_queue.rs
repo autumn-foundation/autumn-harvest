@@ -674,7 +674,7 @@ mod tests {
 
     #[test]
     fn propagate_redis_result_surfaces_redis_errors() {
-        let err = redis::RedisError::from((redis::ErrorKind::IoError, "xread exploded"));
+        let err = redis::RedisError::from((redis::ErrorKind::Io, "xread exploded"));
         let mapped = propagate_redis_result::<i64>(Err(err));
         assert!(
             matches!(mapped, Err(RedisAdapterError::Redis(_))),
