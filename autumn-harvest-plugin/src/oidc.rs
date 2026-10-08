@@ -49,9 +49,7 @@ use axum::http::{HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 
-use crate::roles::{
-    ClaimRoleMap, HarvestRoles, RoleConfigError, SESSION_ROLES_KEY, join_role_list,
-};
+use crate::roles::{ClaimRoleMap, HarvestRoles, RoleConfigError, join_role_list};
 
 /// The login route, relative to the management API mount.
 pub const LOGIN_PATH: &str = "/auth/oidc/login";
@@ -86,6 +84,19 @@ const MAX_DISCOVERY_BYTES: usize = 1024 * 1024;
 
 /// The time limit of a discovery request.
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The session key that holds the role names of an OIDC session principal.
+///
+/// It is not the shared [`crate::roles::SESSION_ROLES_KEY`]. A plain role
+/// mount reads that key with no login check, so a login never writes it.
+/// The boundary reads this key only after it checks the login binding.
+pub const SESSION_OIDC_ROLES_KEY: &str = "harvest_oidc_roles";
+
+/// The largest clock skew a login time may show, in seconds.
+///
+/// A login time further in the future is refused. Otherwise a fast clock at
+/// login would make a session last longer than its age limit.
+const MAX_CLOCK_SKEW_SECS: u64 = 60;
 
 /// The session key that binds the principal to the login that made it.
 ///
@@ -528,7 +539,7 @@ async fn clear_principal(session: &Session) {
     // autumn-web writes `auth_provider` at a verified login.
     session.remove("auth_provider").await;
     session.remove(SESSION_SUBJECT_KEY).await;
-    session.remove(SESSION_ROLES_KEY).await;
+    session.remove(SESSION_OIDC_ROLES_KEY).await;
     session.remove(SESSION_AUTH_AT_KEY).await;
     session.remove(SESSION_LOGIN_KEY).await;
 }
@@ -600,7 +611,7 @@ async fn callback_handler(
         .insert(SESSION_SUBJECT_KEY, identity.subject.clone())
         .await;
     session
-        .insert(SESSION_ROLES_KEY, join_role_list(&roles))
+        .insert(SESSION_OIDC_ROLES_KEY, join_role_list(&roles))
         .await;
     session
         .insert(SESSION_AUTH_AT_KEY, now_unix().to_string())
@@ -692,7 +703,10 @@ async fn session_subject(session: &Session, login: &OidcLogin) -> Option<String>
         .get(SESSION_AUTH_AT_KEY)
         .await
         .and_then(|v| v.parse::<u64>().ok());
-    let fresh = auth_at.is_some_and(|at| now_unix().saturating_sub(at) < max_age.as_secs());
+    let now = now_unix();
+    let fresh = auth_at.is_some_and(|at| {
+        at <= now.saturating_add(MAX_CLOCK_SKEW_SECS) && now.saturating_sub(at) < max_age.as_secs()
+    });
     if fresh && valid_subject(&subject) {
         Some(subject)
     } else {
@@ -748,6 +762,22 @@ pub(crate) async fn require_oidc_session(
         && let Some(subject) = session_subject(&session, &login).await
     {
         set_actor(&mut request, &subject, login.issuer());
+        // The login roles reach the role layer as a grant, never through the
+        // shared session key. A host grant, such as from mTLS, still wins.
+        if request
+            .extensions()
+            .get::<crate::roles::RoleGrant>()
+            .is_none()
+        {
+            let roles = session
+                .get(SESSION_OIDC_ROLES_KEY)
+                .await
+                .map(|v| crate::roles::parse_role_list(&v))
+                .unwrap_or_default();
+            request
+                .extensions_mut()
+                .insert(crate::roles::RoleGrant::new(roles));
+        }
         return next.run(request).await;
     }
     // Host middleware can give roles, for example from an mTLS certificate.
@@ -811,7 +841,7 @@ pub(crate) async fn gate_mcp_tool(
             return error(StatusCode::UNAUTHORIZED, "authentication required");
         };
         let roles = session
-            .get(SESSION_ROLES_KEY)
+            .get(SESSION_OIDC_ROLES_KEY)
             .await
             .map(|v| crate::roles::parse_role_list(&v))
             .unwrap_or_default();
@@ -932,9 +962,11 @@ mod tests {
         assert_eq!(session_subject(&fresh, &l).await.as_deref(), Some("u"));
         let old = session(Some("u"), ROLE_VIEWER, now_unix() - 120);
         assert_eq!(session_subject(&old, &l).await, None);
-        // A login time in the future counts as age zero.
+        // A login time a little ahead is clock skew. Far ahead is refused.
+        let skewed = session(Some("u"), ROLE_VIEWER, now_unix() + 30);
+        assert_eq!(session_subject(&skewed, &l).await.as_deref(), Some("u"));
         let future = session(Some("u"), ROLE_VIEWER, now_unix() + 3600);
-        assert_eq!(session_subject(&future, &l).await.as_deref(), Some("u"));
+        assert_eq!(session_subject(&future, &l).await, None);
         // A missing or bad login time is never fresh.
         let mut data = HashMap::new();
         data.insert(SESSION_SUBJECT_KEY.to_string(), "u".to_string());
@@ -997,7 +1029,7 @@ mod tests {
         let mut data = HashMap::new();
         data.insert("user_id".to_string(), "host-user".to_string());
         data.insert(SESSION_SUBJECT_KEY.to_string(), "u".to_string());
-        data.insert(SESSION_ROLES_KEY.to_string(), ROLE_VIEWER.to_string());
+        data.insert(SESSION_OIDC_ROLES_KEY.to_string(), ROLE_VIEWER.to_string());
         data.insert(SESSION_AUTH_AT_KEY.to_string(), now_unix().to_string());
         data.insert("auth_provider".to_string(), login().provider_name());
         data.insert(SESSION_LOGIN_KEY.to_string(), login().fingerprint());
@@ -1014,7 +1046,7 @@ mod tests {
         assert_eq!(session.get("user_id").await.as_deref(), Some("host-user"));
         for key in [
             SESSION_SUBJECT_KEY,
-            SESSION_ROLES_KEY,
+            SESSION_OIDC_ROLES_KEY,
             SESSION_AUTH_AT_KEY,
             SESSION_LOGIN_KEY,
             "auth_provider",
@@ -1132,7 +1164,7 @@ mod tests {
         if let Some(subject) = subject {
             data.insert(SESSION_SUBJECT_KEY.to_string(), subject.to_string());
         }
-        data.insert(SESSION_ROLES_KEY.to_string(), roles.to_string());
+        data.insert(SESSION_OIDC_ROLES_KEY.to_string(), roles.to_string());
         data.insert(SESSION_AUTH_AT_KEY.to_string(), auth_at.to_string());
         data.insert(SESSION_LOGIN_KEY.to_string(), login().fingerprint());
         Session::new_for_test("s".to_string(), data)
@@ -1191,7 +1223,7 @@ mod tests {
         assert_eq!(out.0, StatusCode::UNAUTHORIZED);
         // A stale session loses its principal keys.
         assert!(stale.get(SESSION_SUBJECT_KEY).await.is_none());
-        assert!(stale.get(SESSION_ROLES_KEY).await.is_none());
+        assert!(stale.get(SESSION_OIDC_ROLES_KEY).await.is_none());
     }
 
     #[tokio::test]

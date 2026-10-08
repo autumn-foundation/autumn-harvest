@@ -555,9 +555,11 @@ Turn the role layer on with `HarvestPlugin::with_roles(roles)` or
 
 **Where roles come from.** The layer reads role names from one of two places:
 
-1. A `RoleGrant` request extension. Host middleware sets it.
-2. Else, the session key `harvest_roles`, a comma-separated list. The OIDC
-   login sets it. Host middleware can set it too.
+1. A `RoleGrant` request extension. Host middleware sets it. The OIDC
+   boundary sets it from the session of a verified login.
+2. Else, the session key `harvest_roles`, a comma-separated list. Host
+   middleware sets it. The OIDC login never writes it: it keeps its roles
+   under `harvest_oidc_roles`, bound to the login.
 
 A client cannot set either one. No header grants a role.
 
@@ -684,7 +686,8 @@ loopback. The scope must include `openid`.
   `StandaloneAdminAuth::with_oidc` turns off `with_read_only_role` too.
 - Two mounts can share one session. The session binds its principal to the
   login that made it: the client, the issuer, and a digest of the redirect
-  URI, the roles and the claim map. A principal of one login is not a
+  URI, the roles and the claim map. A login time more than 60 seconds in the
+  future is refused, so clock skew cannot extend a session. A principal of one login is not a
   principal on a mount with another login or another policy. The roles of a login
   replace any set by `with_roles`.
 

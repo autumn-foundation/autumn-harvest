@@ -890,3 +890,44 @@ async fn standalone_oidc_replaces_the_legacy_read_only_role() {
     let start = browser.post(&format!("{MOUNT}/workflows/wf/start")).await;
     assert!(admitted(&start), "{} {}", start.status, start.body);
 }
+
+/// A login never writes the shared `harvest_roles` key. A plain role mount
+/// that shares the session reads that key with no login check.
+#[tokio::test]
+async fn a_login_keeps_its_roles_out_of_the_shared_role_key() {
+    let idp = start_idp().await;
+    set_claims(&idp, json!({ "groups": ["harvest-admins"] }));
+    let api_state = HarvestApiState::new();
+    let router =
+        harvest_api_router(api_state.clone()).nest("/ui", harvest_ui_router(api_state.clone()));
+    let mounted = StandaloneAdminAuth::new()
+        .with_deployment_profile("prod")
+        .with_oidc(login(&idp))
+        .mount(router, &api_state);
+    let host = axum::Router::new().route(
+        "/host/roles",
+        axum::routing::get(|session: autumn_web::session::Session| async move {
+            session
+                .get(autumn_harvest_plugin::roles::SESSION_ROLES_KEY)
+                .await
+                .unwrap_or_else(|| "-".to_string())
+        }),
+    );
+    let app = axum::Router::new()
+        .nest(MOUNT, mounted)
+        .merge(host)
+        .layer(SessionLayer::new(
+            MemoryStore::new(),
+            SessionConfig {
+                secure: false,
+                ..SessionConfig::default()
+            },
+        ));
+    let mut browser = Browser::new(app);
+    assert_eq!(browser.login().await.status, StatusCode::SEE_OTHER);
+    // The login still works: the admin reaches a mutation.
+    let start = browser.post(&format!("{MOUNT}/workflows/wf/start")).await;
+    assert!(admitted(&start), "{} {}", start.status, start.body);
+    let shared = browser.get("/host/roles").await;
+    assert_eq!(shared.body, "-");
+}

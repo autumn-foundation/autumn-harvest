@@ -11,10 +11,11 @@
 //! The role layer reads the role names of a request from one of two places:
 //!
 //! 1. A [`RoleGrant`] request extension. Host middleware sets it, for example
-//!    from a verified mTLS client certificate.
-//! 2. Else, the autumn-web session key [`SESSION_ROLES_KEY`]. The OIDC login
-//!    sets it. Host middleware can set it too. The value is a comma-separated
-//!    list of role names.
+//!    from a verified mTLS client certificate. The OIDC boundary sets it from
+//!    the session of a verified login.
+//! 2. Else, the autumn-web session key [`SESSION_ROLES_KEY`]. Host middleware
+//!    sets it. The value is a comma-separated list of role names. The OIDC
+//!    login never writes it, because this key carries no login binding.
 //!
 //! A client cannot set either source. A header never grants a role.
 //!
