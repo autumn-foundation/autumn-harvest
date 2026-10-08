@@ -127,14 +127,15 @@ A worker with a payload cap other than the default must say so. Set
 - `max_result_bytes(bytes)` — the activity-result cap of the workers. A
   larger tool result is cut to fit it. The default is the engine default.
 - `model_timeout(d)` — the time budget of one model call. The default is
-  14 minutes, below the 15-minute `start_to_close`. A call over it is a
+  13 minutes. With the policy budget, it stays below the 15-minute
+  `start_to_close`. A call over it is a
   retryable failure.
 - `tool_timeout(d)` — the time budget of one tool call. The default is
   9 minutes, below the 10-minute `start_to_close`. A call over it is an
   error result that the model reads.
-- `policy_timeout(d)` — the time budget of the policy for one call. The
-  default is one minute. A policy that does not decide in time denies the
-  call, and the decision is recorded.
+- `policy_timeout(d)` — the time budget of the policy for all calls of one
+  turn. The default is one minute. A call with no decision when the budget
+  ends is denied, and the decision is recorded.
 
 A tool error is cut to fit the result cap too, so a huge error message
 cannot fail the run.

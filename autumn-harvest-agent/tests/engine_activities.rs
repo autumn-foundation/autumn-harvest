@@ -267,3 +267,47 @@ async fn a_stalled_policy_denies_the_call_instead_of_hanging_the_turn() {
         turn.decisions
     );
 }
+
+#[tokio::test]
+async fn one_deadline_bounds_every_policy_decision_of_a_turn() {
+    #[derive(Debug)]
+    struct Stalled;
+    impl autumn_plugin_agent::ToolPolicy for Stalled {
+        fn decide<'a>(
+            &'a self,
+            _call: &'a ToolCall,
+            _tool: Option<&'a dyn autumn_plugin_agent::Tool>,
+            _info: &'a autumn_plugin_agent::hooks::RunInfo,
+        ) -> futures::future::BoxFuture<'a, ToolDecision> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    let many: Vec<(String, String)> = (0..20)
+        .map(|i| (format!("c{i}"), "read".to_owned()))
+        .collect();
+    let list: Vec<(&str, &str, serde_json::Value)> = many
+        .iter()
+        .map(|(id, name)| (id.as_str(), name.as_str(), json!({})))
+        .collect();
+    let model = ScriptedModel::new(vec![calls(&list, 1)]);
+    let budget = std::time::Duration::from_millis(100);
+    let harness = AgentHarness::new(model)
+        .policy(Arc::new(Stalled))
+        .policy_timeout(budget);
+
+    let started = std::time::Instant::now();
+    let turn = harness.model_turn(turn_request()).await.unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(turn.decisions.len(), 20);
+    assert!(
+        turn.decisions
+            .iter()
+            .all(|d| matches!(d, ToolDecision::Deny { .. })),
+        "{:?}",
+        turn.decisions
+    );
+    // Twenty calls share one budget. They do not each wait for it.
+    assert!(elapsed < budget * 5, "{elapsed:?}");
+}

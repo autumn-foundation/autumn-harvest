@@ -23,13 +23,13 @@ use crate::types::{ModelTurn, ModelTurnRequest, ToolCallRequest, ToolOutcome};
 /// plugin-agent loop.
 pub const DEFAULT_TOOL_OUTPUT_LIMIT: usize = 8_000;
 
-/// The default time budget of one model call: 14 minutes.
+/// The default time budget of one model call: 13 minutes.
 ///
-/// It is below the 15-minute `start_to_close` of `agent_model_turn`. A slow
-/// call therefore ends as a retryable failure that the harness reports. It
-/// does not end as an engine timeout, which SQLite reports only after the
-/// body returns.
-pub const DEFAULT_MODEL_TIMEOUT: Duration = Duration::from_secs(14 * 60);
+/// With [`DEFAULT_POLICY_TIMEOUT`], it stays below the 15-minute
+/// `start_to_close` of `agent_model_turn`. A slow call therefore ends as a
+/// retryable failure that the harness reports. It does not end as an engine
+/// timeout, which SQLite reports only after the body returns.
+pub const DEFAULT_MODEL_TIMEOUT: Duration = Duration::from_secs(13 * 60);
 
 /// The default time budget of one tool call: 9 minutes.
 ///
@@ -37,7 +37,8 @@ pub const DEFAULT_MODEL_TIMEOUT: Duration = Duration::from_secs(14 * 60);
 /// tool therefore gives the model an error result, and the run goes on.
 pub const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(9 * 60);
 
-/// The default time budget of the policy for one tool call: one minute.
+/// The default time budget of the policy for all tool calls of one turn: one
+/// minute.
 ///
 /// A policy can wait on I/O. Without a budget, a stalled policy would hang
 /// the model turn, and SQLite cannot end the turn from outside.
@@ -140,8 +141,8 @@ impl AgentHarness {
         self
     }
 
-    /// Set the time budget of the policy for one tool call. A policy that
-    /// does not decide in time denies the call.
+    /// Set the time budget of the policy for all tool calls of one turn. A
+    /// call that has no decision when the budget ends is denied.
     #[must_use]
     pub const fn policy_timeout(mut self, timeout: Duration) -> Self {
         self.policy_timeout = timeout;
@@ -189,11 +190,14 @@ impl AgentHarness {
             max_steps: request.max_steps,
             usage: request.usage.saturating_add(response.usage),
         };
+        // One deadline bounds the whole decision phase. A per-call budget
+        // would let many stalled calls add up past `start_to_close`.
+        let deadline = tokio::time::Instant::now() + self.policy_timeout;
         for call in turn.calls() {
             let decide = self.policy.decide(&call, self.find(&call.name), &info);
             // A stalled policy denies the call. That fails closed, and the
             // model reads why.
-            let decision = tokio::time::timeout(self.policy_timeout, decide)
+            let decision = tokio::time::timeout_at(deadline, decide)
                 .await
                 .unwrap_or_else(|_| ToolDecision::Deny {
                     reason: format!("the policy did not decide within {:?}", self.policy_timeout),
