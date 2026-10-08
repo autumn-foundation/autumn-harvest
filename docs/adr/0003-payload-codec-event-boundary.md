@@ -197,11 +197,18 @@ census counts each envelope cell. The retirement gate therefore stays closed
 while any column still holds the key. The sweep converts columns with a
 compare-and-swap on the old value, so it loses to an erasure. The column pass
 runs only when the event pass reaches its end, so a converged shard scans
-nothing extra between revalidations. These tables are not append-only, so the
+nothing extra between revalidations. A column pass keeps to the batch
+budget and resumes from an in-process cursor, so it never rescans a drained
+column within a pass. These tables are not append-only, so the
 column pass is not a sanctioned exception. Only the ciphertext changes. The
 replay-fidelity test now also proves the columns decode byte-identical after a
 sweep.
 
-**Residual.** A clear value shaped exactly like an envelope is decoded on an
-engine read. This is the issue #1253 residual, now on the engine path. The
-remaining short-lived copies are follow-up work in issue #2043.
+**Escape guard.** A new write escapes a value shaped like an envelope, with
+the switch on or off, as the event codec does (issue #1253). Without it, a
+caller could store an envelope-shaped value that an engine read unwraps.
+
+**Residual.** A row written before this release had no escape. If it holds
+an envelope-shaped value, an engine read now decodes it. This is the issue
+#1253 residual, now on the engine path. The remaining short-lived copies are
+follow-up work in issue #2043.

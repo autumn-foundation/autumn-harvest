@@ -1915,8 +1915,9 @@ impl HarvestBuilder {
     /// Encode the codec columns as well as the event payloads (issue #1979).
     ///
     /// The codec columns are `harvest_workflow_executions.input`, `.output`
-    /// and `.memo`, `harvest_signals.payload` and
-    /// `harvest_dead_letters.input`. The default is off.
+    /// and `.memo`, `harvest_signals.payload`, `harvest_dead_letters.input`,
+    /// and the workflow task's `harvest_task_queue.input` and `.output`. The
+    /// default is off.
     ///
     /// This release always decodes those columns. Turn the switch on only
     /// after every worker and every API process runs this release or later.

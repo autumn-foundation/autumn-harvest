@@ -568,6 +568,25 @@ fn payload_or_a_descendant_is_a_codec_envelope(payload: &Value) -> bool {
     }
 }
 
+/// Wrap `value` in an identity envelope when it, or anything nested in it,
+/// is shaped like a codec envelope (issue #1979). Returns `None` otherwise.
+///
+/// This is the [`PayloadCodecs::encode_payload`] escape case, for a write
+/// that does not encode. The identity codec is always registered, so the
+/// wrapper always decodes back to `value`.
+fn escape_envelope_shape(value: &Value) -> HarvestResult<Option<Value>> {
+    if !payload_or_a_descendant_is_a_codec_envelope(value) {
+        return Ok(None);
+    }
+    let raw = serde_json::to_vec(value)?;
+    Ok(Some(PayloadCodecs::envelope(
+        "identity",
+        CODEC_LEGACY_KEY_ID,
+        &raw,
+        true,
+    )))
+}
+
 /// A trait for intercepting and transforming raw payload bytes.
 ///
 /// Implementations of this trait are used by the [`PayloadCodecs`] registry
@@ -1653,8 +1672,9 @@ impl PayloadCodecs {
     /// Turn encoding of the codec columns on or off (issue #1979).
     ///
     /// The codec columns are `harvest_workflow_executions.input`, `.output`
-    /// and `.memo`, `harvest_signals.payload` and
-    /// `harvest_dead_letters.input`. The default is off.
+    /// and `.memo`, `harvest_signals.payload`, `harvest_dead_letters.input`,
+    /// and the workflow task's `harvest_task_queue.input` and `.output`. The
+    /// default is off.
     ///
     /// Readers always decode these columns, whatever this switch says. So
     /// turn it on only after every process in the fleet runs a release that
@@ -1674,24 +1694,28 @@ impl PayloadCodecs {
 
     /// Encode one codec-column value for a write (issue #1979).
     ///
-    /// Returns `value` unchanged while column encoding is off. Otherwise it
-    /// encodes like [`PayloadCodecs::encode_payload`], under the active key.
+    /// With column encoding on, it encodes like
+    /// [`PayloadCodecs::encode_payload`], under the active key. With it off,
+    /// it returns `value` unchanged, except in one case. A value shaped like
+    /// a codec envelope, at any depth, is wrapped in an identity envelope, as
+    /// `encode_payload` does (issue #1253). Engine reads always decode, so
+    /// without this a caller could store an envelope-shaped value that a
+    /// later read unwraps.
     ///
     /// # Errors
     ///
     /// [`HarvestError`] when serialization or the codec's `encode` fails.
     pub fn encode_column(&self, value: &Value) -> HarvestResult<Value> {
         if self.column_encoding() {
-            self.encode_payload(value)
-        } else {
-            Ok(value.clone())
+            return self.encode_payload(value);
         }
+        Ok(escape_envelope_shape(value)?.unwrap_or_else(|| value.clone()))
     }
 
     /// [`PayloadCodecs::encode_column`] for a shared value.
     ///
-    /// While column encoding is off this returns a second handle to the same
-    /// allocation, so a large input is not copied.
+    /// While column encoding is off and no escape is needed, this returns a
+    /// second handle to the same allocation, so a large input is not copied.
     ///
     /// # Errors
     ///
@@ -1701,10 +1725,9 @@ impl PayloadCodecs {
         value: &crate::shared_json::SharedJson,
     ) -> HarvestResult<crate::shared_json::SharedJson> {
         if self.column_encoding() {
-            Ok(self.encode_payload(value)?.into())
-        } else {
-            Ok(value.clone())
+            return Ok(self.encode_payload(value)?.into());
         }
+        Ok(escape_envelope_shape(value)?.map_or_else(|| value.clone(), Into::into))
     }
 
     /// [`PayloadCodecs::encode_column`] for an optional column.
@@ -1726,9 +1749,7 @@ impl PayloadCodecs {
     ///
     /// # Errors
     ///
-    /// [`HarvestError::UnknownPayloadCodec`] or
-    /// [`HarvestError::UnknownCodecKey`] when no registered codec can read the
-    /// envelope, and any error the codec's `decode` raises.
+    /// As [`PayloadCodecs::decode_payload`].
     pub fn decode_column(&self, value: &Value) -> HarvestResult<Value> {
         self.decode_payload(value)
     }

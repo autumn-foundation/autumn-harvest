@@ -6347,6 +6347,29 @@ async fn workflow_execution_transition_error(
         )
 }
 
+/// The input and memo a workflow retry starts with, decoded (issue #1979).
+///
+/// The start path encodes them again. A value this registry cannot decode
+/// returns `None`, so the run fails without a retry. A missing key must not
+/// roll back the failure write. The codec error text is not logged.
+fn decode_retry_payload(
+    codecs: &crate::payload_codec::PayloadCodecs,
+    execution: &WorkflowExecution,
+) -> Option<(serde_json::Value, Option<serde_json::Value>)> {
+    let decoded = codecs.decode_column(&execution.input).and_then(|input| {
+        codecs
+            .decode_column_opt(execution.memo.as_ref())
+            .map(|memo| (input, memo))
+    });
+    if decoded.is_err() {
+        tracing::warn!(
+            exec_id = %execution.id,
+            "workflow retry skipped: the stored input or memo could not be decoded"
+        );
+    }
+    decoded.ok()
+}
+
 /// Seal the execution row `COMPLETED` with `output`, which is the stored
 /// form. The caller encodes it with [`PayloadCodecs::encode_column`]
 /// (issue #1979).
@@ -9640,12 +9663,9 @@ pub async fn persist_workflow_failure(
             if let (Some(exec_ref), Some((rid, policy, attempt, fire_at, start_delay))) =
                 (exec_ref, retry_fire_info)
                 && attempt < policy.max_attempts
+                && let Some((retry_input, retry_memo)) = decode_retry_payload(codecs, exec_ref)
             {
                 let retry_workflow_id = rid.to_string();
-                // The start path encodes input and memo itself, so it gets the
-                // plaintext (issue #1979).
-                let retry_input = codecs.decode_column(&exec_ref.input)?;
-                let retry_memo = codecs.decode_column_opt(exec_ref.memo.as_ref())?;
                 let retry_params = crate::execution::StartWorkflowParams {
                     execution_timeout: exec_ref.execution_timeout,
                     memo: retry_memo,
@@ -25277,9 +25297,16 @@ async fn process_workflow_task(
             )
         });
         // The task row may hold the input as an envelope (issue #1979). The
-        // handler gets the plaintext. A missing key fails the task, exactly
+        // handler gets the plaintext. A missing key fails the run, exactly
         // like a history that cannot be decoded.
-        let handler_input = registry.payload_codecs().decode_column(&task.input)?;
+        let handler_input = fail_execution_on_error(
+            conn,
+            task,
+            worker_id,
+            registry.payload_codecs().decode_column(&task.input),
+            registry.payload_codecs(),
+        )
+        .await?;
         let workflow_drive = async {
             if let Some(resident) = warm_resident.take() {
                 match resident

@@ -236,6 +236,24 @@ async fn signal_payloads(conn: &mut AsyncPgConnection, exec_id: Uuid) -> Vec<Val
         .expect("load signals")
 }
 
+/// Every task row of one execution: `(task_type, input, output)`.
+async fn task_rows(
+    conn: &mut AsyncPgConnection,
+    exec_id: Uuid,
+) -> Vec<(String, Value, Option<Value>)> {
+    use autumn_harvest::schema::harvest_task_queue;
+    harvest_task_queue::table
+        .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id)))
+        .select((
+            harvest_task_queue::task_type,
+            harvest_task_queue::input,
+            harvest_task_queue::output,
+        ))
+        .load(conn)
+        .await
+        .expect("load task rows")
+}
+
 /// Assert that `stored` is an envelope that does not hold `secret`.
 fn assert_ciphertext(stored: &Value, secret: &str, what: &str) {
     assert!(
@@ -264,6 +282,25 @@ fn wf_signal_echo(ctx: &WorkflowContext, input: Value) -> BoxFut<'_> {
             .await
             .map_err(|e| e.to_string())?;
         Ok(json!({"input": input, "signal": signal, "echoed": echoed}))
+    })
+}
+
+/// Runs one child workflow and returns its result.
+fn wf_parent(ctx: &WorkflowContext, input: Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        ctx.spawn_child_workflow_raw("cc_child", input)
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// Returns its input only when the input is the real plaintext.
+fn wf_child(_ctx: &WorkflowContext, input: Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        if input != json!({"ssn": INPUT_SECRET}) {
+            return Err(format!("the child saw a wrong input: {input}"));
+        }
+        Ok(json!({"child": input}))
     })
 }
 
@@ -311,9 +348,9 @@ async fn covered_columns_hold_ciphertext_and_the_engine_reads_plaintext() {
     )
     .await
     .expect("signal");
-    for payload in signal_payloads(&mut conn, exec_id.as_uuid()).await {
-        assert_ciphertext(&payload, SIGNAL_SECRET, "signals.payload");
-    }
+    let payloads = signal_payloads(&mut conn, exec_id.as_uuid()).await;
+    assert_eq!(payloads.len(), 1, "exactly one signal row");
+    assert_ciphertext(&payloads[0], SIGNAL_SECRET, "signals.payload");
 
     let pool = build_pool(&url);
     let worker = worker(
@@ -356,6 +393,26 @@ async fn covered_columns_hold_ciphertext_and_the_engine_reads_plaintext() {
         "executions.output",
     );
     execution.decode_columns(&codecs).expect("decode columns");
+
+    // The workflow task row holds envelopes. The short-lived activity task
+    // row stays in clear (see the coverage table).
+    let rows = task_rows(&mut conn, exec_id.as_uuid()).await;
+    assert!(
+        rows.iter().any(|(task_type, _, _)| task_type == "workflow"),
+        "the run has a workflow task row"
+    );
+    for (task_type, input, output) in rows {
+        if task_type == "workflow" {
+            assert_ciphertext(&input, INPUT_SECRET, "workflow task input");
+            assert_ciphertext(
+                output.as_ref().expect("workflow task output"),
+                INPUT_SECRET,
+                "workflow task output",
+            );
+        } else {
+            assert_eq!(input, json!({"ssn": INPUT_SECRET}), "activity task input");
+        }
+    }
     assert_eq!(execution.input, json!({"ssn": INPUT_SECRET}));
     assert_eq!(execution.memo, Some(json!({"account": MEMO_SECRET})));
     assert_eq!(execution.output, Some(result));
@@ -496,4 +553,81 @@ async fn a_workflow_retry_runs_on_the_plaintext_input() {
             .expect("load the retry row")
     };
     assert_ciphertext(&retry_input, INPUT_SECRET, "the retry row input");
+    let retry_memo: Option<Value> = {
+        use autumn_harvest::schema::harvest_workflow_executions;
+        harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::retry_of_exec_id.eq(Some(exec_id.as_uuid())))
+            .select(harvest_workflow_executions::memo)
+            .first(&mut conn)
+            .await
+            .expect("load the retry memo")
+    };
+    let retry_memo = retry_memo.expect("the retry keeps the memo");
+    assert_ciphertext(&retry_memo, MEMO_SECRET, "the retry row memo");
+    assert_eq!(
+        codecs.decode_column(&retry_memo).expect("decode memo"),
+        json!({"account": MEMO_SECRET}),
+        "the retry memo decodes once to plaintext, not to another envelope"
+    );
+}
+
+#[tokio::test]
+async fn a_child_workflow_runs_on_plaintext_and_its_rows_hold_ciphertext() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let queue = format!("cc-{}", Uuid::new_v4().simple());
+    let codecs = aead_codecs(true);
+    let mut conn = connect(&url).await;
+    let exec_id = start(&mut conn, &codecs, "cc_parent", &queue, None).await;
+
+    let pool = build_pool(&url);
+    let worker = worker(
+        &queue,
+        registry(
+            vec![
+                wf_info("cc_parent", wf_parent, None),
+                wf_info("cc_child", wf_child, None),
+            ],
+            Vec::new(),
+            &codecs,
+        ),
+    );
+    let run = worker.clone();
+    let run_pool = pool.clone();
+    let handle = tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(30), run.run(&run_pool)).await;
+    });
+
+    let client = WorkflowHandleClient::single(pool, url.clone()).with_codecs(codecs.clone());
+    let result = client
+        .handle(exec_id)
+        .result_raw_with_timeout(Duration::from_secs(25))
+        .await
+        .expect("the parent completes");
+    worker.shutdown();
+    let _ = handle.await;
+    assert_eq!(
+        result,
+        json!({"child": {"ssn": INPUT_SECRET}}),
+        "the child saw plaintext and the parent got the plaintext child result"
+    );
+
+    let child: WorkflowExecution = {
+        use autumn_harvest::schema::harvest_workflow_executions;
+        harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::parent_id.eq(Some(exec_id.as_uuid())))
+            .select(WorkflowExecution::as_select())
+            .first(&mut conn)
+            .await
+            .expect("load the child row")
+    };
+    assert_ciphertext(&child.input, INPUT_SECRET, "child executions.input");
+    assert_ciphertext(
+        child.output.as_ref().expect("child output"),
+        INPUT_SECRET,
+        "child executions.output",
+    );
+    for (task_type, input, _) in task_rows(&mut conn, child.id).await {
+        assert_eq!(task_type, "workflow");
+        assert_ciphertext(&input, INPUT_SECRET, "child workflow task input");
+    }
 }

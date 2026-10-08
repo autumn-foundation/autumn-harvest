@@ -1150,31 +1150,11 @@ async fn status_tool(
         Ok(execution) => execution,
         Err(response) => return response,
     };
-    let mut execution = match resolve_if_chained(&api_state, execution).await {
+    let execution = match resolve_if_chained(&api_state, execution).await {
         Ok(execution) => execution,
         Err(response) => return response,
     };
-    execution.output = mcp_output(&api_state, execution.output.take());
     Json(McpStatusResponse::from_execution(execution)).into_response()
-}
-
-/// The output an MCP tool reports (issue #1979).
-///
-/// The output column can hold a codec envelope. The tool decodes it only when
-/// the deployment opts into read-path decoding (issue #608). The tool is
-/// already owner-gated. A field that cannot be decoded becomes a bounded
-/// `_harvest_undecodable` marker, never an error.
-fn mcp_output(
-    api_state: &crate::api::HarvestApiState,
-    output: Option<serde_json::Value>,
-) -> Option<serde_json::Value> {
-    let mut output = output;
-    if api_state.decode_payloads_on_read()
-        && let Some(value) = output.as_mut()
-    {
-        let _outcome = api_state.payload_codecs().decode_value_lossy(value);
-    }
-    output
 }
 
 /// Follow the retry/continue-as-new chain when `execution` is a dead-end
@@ -1346,7 +1326,7 @@ async fn watch_tool(
             Event::default().event("result").data(
                 serde_json::json!({
                     "state": execution.state,
-                    "output": mcp_output(&api_clone, execution.output.clone()),
+                    "output": execution.output,
                     "error": execution.error,
                 })
                 .to_string(),

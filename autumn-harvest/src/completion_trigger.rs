@@ -1531,8 +1531,12 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
         // triggering (source) execution id (#740).
         let source_exec_id_str = exec_id.to_string();
         // The output column can hold an envelope (issue #1979). Guards and
-        // input mapping read the plaintext.
-        let decoded_output = codecs.decode_column_opt(execution.output.as_ref())?;
+        // input mapping read the plaintext. Decode only when a trigger exists.
+        let decoded_output = if triggers.is_empty() {
+            None
+        } else {
+            codecs.decode_column_opt(execution.output.as_ref())?
+        };
 
         for trigger_db in triggers {
             let terminal_states: Vec<TerminalState> = serde_json::from_value(trigger_db.terminal_states)

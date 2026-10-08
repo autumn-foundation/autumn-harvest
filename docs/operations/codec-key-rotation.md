@@ -362,11 +362,11 @@ deployment stores. It is the **activation** that must come last.
 ### ⚠️ What "zero" does and does not authorise
 
 The gate proves one specific thing: **no `harvest_events` row and no codec
-column cell on any expected shard still references the key.** That is what
-the sweep converts, so that is what the census counts. The codec columns are
-listed in `codec_rotation::CODEC_COLUMNS` (issue #1979). It is *not* a licence to destroy the key material yet,
-because a codec envelope can also be sitting in places this feature does not
-sweep:
+column cell on any expected shard still references the key.** That is what the
+sweep converts, so that is what the census counts. The codec columns are listed
+in `codec_rotation::CODEC_COLUMNS` (issue #1979). It is *not* a licence to
+destroy the key material yet, because a codec envelope can also be sitting in
+places this feature does not sweep:
 
 - **Offloaded blobs** (issue #524). Offload composes *after* codec encode, so
   the ciphertext — and its key id — lives in your `PayloadStore`, while the DB

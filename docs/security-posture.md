@@ -877,7 +877,8 @@ JSON. A workflow that carries PII or secrets must encrypt them. Use
 
 ### What the codec does not cover
 
-The codec always encrypts the payload fields of `harvest_events.event_data`:
+A registered codec always encrypts the payload fields of
+`harvest_events.event_data`:
 `input`, `output`, `payload`, `details`, `value` and
 `last_completion_result`. With column encoding on, it also encrypts the codec
 columns (issue #1979). The [column coverage](#column-coverage-issue-1979)
@@ -940,17 +941,29 @@ they were written in. The rotation sweep converts envelopes from key to key.
 It never encrypts a value written in clear.
 
 **Read surfaces.** The engine decodes a codec column before it uses the
-value: the workflow handler, the client handle, signal ingest, queries,
-retries, reruns, DLQ replay, completion triggers and callbacks. The management
-API and the Vantage UI follow the read-path decode rules (issue #608). An
-admin sees plaintext when `decode_payloads_on_read` is on. Any other caller
-sees the stored envelope. The MCP status and watch tools decode the output
-only when `decode_payloads_on_read` is on. If your API clients read results,
-turn on `decode_payloads_on_read` with column encoding.
+value. This covers the workflow handler, the client handle, signal ingest and
+queries. It also covers retries, reruns, forks and DLQ replay. So do
+completion triggers and callbacks, cross-shard children, external awaits and
+the quota reconciler.
 
-**Residual risk.** A clear value that is shaped exactly like a codec envelope
-is now decoded on an engine read. Issue #1253 accepts the same risk for the
-event log. A missing key fails the read. It never guesses.
+The management API and the Vantage UI follow the read-path decode rules
+(issue #608). An admin sees plaintext when `decode_payloads_on_read` is on.
+Any other caller sees the stored envelope. The list surfaces and the MCP
+status and watch tools always show the stored envelope. See
+[`docs/operations/read-path-decode.md`](operations/read-path-decode.md).
+
+**Behavior change for API clients.** Before column encoding, the output
+column was always plaintext, so every caller of `GET /workflows/{id}/result`
+got plaintext. With column encoding on, only an admin with
+`decode_payloads_on_read` on gets plaintext. Turn on `decode_payloads_on_read`,
+and give result readers admin access, before you turn on column encoding. The
+Rust `WorkflowHandle` decodes with its own registry, so it is not affected.
+
+**Residual risk.** With the switch on or off, a new write escapes a value
+shaped like a codec envelope, as the event codec does (issue #1253). A row
+written before this release had no escape. If such a row holds an
+envelope-shaped value, an engine read now decodes it. A missing key fails a
+strict read. It never guesses.
 
 The sweep and the census cover each column marked Covered. The list is
 `codec_rotation::CODEC_COLUMNS`. A unit test parses `schema.rs` and fails when

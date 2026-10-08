@@ -6,11 +6,12 @@
 //! (single + batch), describe, `/history`, `/stack`, `/dead-letters`, and the
 //! SSE event stream.
 //!
-//! **Seeding note:** every engine write path persists via identity codecs
-//! (real codecs are consumed only by the client handle path), so these tests
-//! synthesize envelope-bearing rows directly — an envelope is just a JSON
-//! object, and identity-codec persistence stores it verbatim. That simulates
-//! the future/foreign write path the read-path decoder must serve.
+//! **Seeding note:** most tests synthesize envelope-bearing rows directly. An
+//! envelope is just a JSON object. That simulates a foreign write path the
+//! read-path decoder must serve.
+//! `engine_written_column_envelopes_decode_on_operator_reads` instead lets
+//! the engine write AES-256-GCM envelopes into the codec columns (issue
+//! #1979).
 //!
 //! **Sandbox note:** no Docker is available in the authoring sandbox, so this
 //! file is compile-checked only (`cargo test --no-run`), matching the
@@ -271,8 +272,8 @@ async fn get_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
 // ── Seeding helpers ──────────────────────────────────────────────────────────
 
 /// Undo the identity codec's collision-escape nesting (issue #1253) on the
-/// `WorkflowStarted` event's `input`, restoring it to `encoded_input`
-/// exactly as given.
+/// `WorkflowStarted` event's `input` and on the execution row's `input`
+/// (issue #1979), restoring both to `encoded_input` exactly as given.
 ///
 /// `seed_running` starts the workflow through `start_or_load_workflow_execution`,
 /// the real engine path. It always encodes the `WorkflowStarted` event
@@ -296,7 +297,14 @@ async fn reset_workflow_started_input(
         .first(conn)
         .await
         .expect("load WorkflowStarted row");
-    event_data["data"]["input"] = encoded_input;
+    event_data["data"]["input"] = encoded_input.clone();
+    // The start path escapes an envelope-shaped input in the execution row
+    // too (issue #1979), so restore the row's raw form as well.
+    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+        .set(harvest_workflow_executions::input.eq(encoded_input))
+        .execute(conn)
+        .await
+        .expect("restore the execution input");
     autumn_harvest::append_only::with_guard_off(conn, async |c| {
         diesel::update(
             harvest_events::table
@@ -1952,5 +1960,140 @@ async fn decode_audit_reuses_callers_connection_under_single_connection_pool() {
         audit.len(),
         3,
         "one decode-audit row per decoding read must land: {audit:?}"
+    );
+}
+
+// ── issue #1979: envelopes the engine itself writes into the codec columns ──
+
+const COLUMN_SECRET: &str = "pii-column-gamma";
+
+/// An AES-256-GCM registry with column encoding on (issue #1979).
+fn column_codecs() -> PayloadCodecs {
+    let codecs = PayloadCodecs::default();
+    let key = autumn_harvest::aead_codec::DataKey::from_bytes(&[0x6b; 32]).expect("data key");
+    autumn_harvest::aead_codec::AeadCodec::new("col-k1", &key)
+        .expect("aead codec")
+        .register_with(&codecs)
+        .expect("register");
+    codecs.set_column_encoding(true);
+    codecs
+}
+
+fn build_column_app(pool: &DbPool, codecs: &PayloadCodecs, admin: bool) -> HarvestApiApp {
+    let api_state = HarvestApiState::new();
+    if admin {
+        api_state.set_admin_auth_boundary(true);
+    }
+    api_state.set_payload_codecs(codecs.clone());
+    api_state.set_decode_payloads_on_read(true);
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        Arc::new(HandlerRegistry::new(vec![], vec![]).with_payload_codecs(codecs.clone())),
+        Arc::new(DagCatalog::default()),
+        Arc::new(Vec::new()),
+        Some("column-decode-test".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::default(),
+    ));
+    harvest_api_router(api_state)
+}
+
+#[tokio::test]
+async fn engine_written_column_envelopes_decode_on_operator_reads() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let codecs = column_codecs();
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+
+    // The engine start path writes input and memo.
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let params = StartWorkflowParams {
+        memo: Some(json!({"note": COLUMN_SECRET})),
+        ..StartWorkflowParams::new(
+            "decode-wf",
+            "column-decoded",
+            exec_id,
+            json!({"user": COLUMN_SECRET}),
+            "default",
+        )
+    };
+    autumn_harvest::execution::start_or_load_workflow_execution_with_codecs(
+        &mut conn, params, None, &codecs,
+    )
+    .await
+    .expect("start");
+    // The completion write stores the output in the same encoded form.
+    mark_completed(
+        &mut conn,
+        exec_id,
+        codecs
+            .encode_column(&json!({"answer": COLUMN_SECRET}))
+            .expect("encode output"),
+    )
+    .await;
+    autumn_harvest::dlq::dead_letter_with_codecs(
+        &mut conn,
+        &autumn_harvest::dlq::NewDeadLetterEntry {
+            original_task_id: uuid::Uuid::new_v4(),
+            queue_name: "default".to_string(),
+            task_type: "ACTIVITY".to_string(),
+            workflow_exec_id: Some(exec_id.as_uuid()),
+            activity_name: Some("charge_card".to_string()),
+            input: json!({"card": COLUMN_SECRET}),
+            error: "card declined".to_string(),
+            attempts: 1,
+            owner: None,
+            severity: None,
+        },
+        &codecs,
+    )
+    .await
+    .expect("dead letter");
+
+    // At rest: every codec column holds AES-256-GCM ciphertext.
+    let (input, output, memo): (Value, Option<Value>, Option<Value>) =
+        harvest_workflow_executions::table
+            .find(exec_id.as_uuid())
+            .select((
+                harvest_workflow_executions::input,
+                harvest_workflow_executions::output,
+                harvest_workflow_executions::memo,
+            ))
+            .first(&mut conn)
+            .await
+            .unwrap();
+    for stored in [input, output.unwrap(), memo.unwrap()] {
+        assert_eq!(stored["codec_id"], "aes-256-gcm", "stored: {stored}");
+        assert!(!stored.to_string().contains(COLUMN_SECRET));
+    }
+
+    // An admin with decode on sees plaintext on every operator surface.
+    let admin = build_column_app(&pool, &codecs, true);
+    for uri in [
+        format!("/workflows/{exec_id}"),
+        format!("/workflows/{exec_id}/result"),
+        "/dead-letters".to_string(),
+    ] {
+        let (status, body) = get_json(&admin, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        let text = serde_json::to_string(&body).unwrap();
+        assert!(text.contains(COLUMN_SECRET), "{uri} decodes: {text}");
+        assert!(
+            !text.contains("_harvest_codec_envelope"),
+            "{uri} leaks no envelope: {text}"
+        );
+    }
+
+    // Any other caller sees the stored envelope, never the plaintext.
+    let other = build_column_app(&pool, &codecs, false);
+    let (status, body) = get_json(&other, &format!("/workflows/{exec_id}/result")).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let text = serde_json::to_string(&body).unwrap();
+    assert!(!text.contains(COLUMN_SECRET), "a non-admin read: {text}");
+    assert!(
+        text.contains("_harvest_codec_envelope"),
+        "a non-admin read: {text}"
     );
 }

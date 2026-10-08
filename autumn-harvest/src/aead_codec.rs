@@ -1356,4 +1356,31 @@ mod tests {
             "{err}"
         );
     }
+
+    #[test]
+    fn an_envelope_shaped_value_is_escaped_while_column_encoding_is_off() {
+        use base64::Engine as _;
+        let codecs = PayloadCodecs::default();
+        codec("k1", KEY_A).register_with(&codecs).unwrap();
+        let inner = json!({"role": "admin"});
+        let data = base64::engine::general_purpose::STANDARD.encode(inner.to_string());
+        let shaped = json!({"nested": {
+            crate::payload_codec::CODEC_ENVELOPE_KEY: 1,
+            "codec_id": "identity",
+            "data": data,
+        }});
+        let stored = codecs.encode_column(&shaped).unwrap();
+        assert_ne!(stored, shaped, "a collision is never stored verbatim");
+        assert_eq!(codecs.decode_column(&stored).unwrap(), shaped);
+        let plain = json!({"ssn": PAYLOAD_SECRET});
+        assert_eq!(codecs.encode_column(&plain).unwrap(), plain);
+    }
+
+    #[test]
+    fn the_builder_switch_turns_column_encoding_on() {
+        let builder = crate::HarvestBuilder::new();
+        assert!(!builder.payload_codecs().column_encoding());
+        let builder = builder.encode_payload_columns();
+        assert!(builder.payload_codecs().column_encoding());
+    }
 }

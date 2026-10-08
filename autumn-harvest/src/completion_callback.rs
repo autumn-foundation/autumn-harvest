@@ -2570,9 +2570,12 @@ mod direct_worker_install_tests {
 /// caller for the same execution) enqueues each target's delivery at most
 /// once.
 ///
+/// `codecs` decodes the output column for the webhook body (issue #1979).
+///
 /// # Errors
 /// Returns `HarvestError` on a database failure, or if serializing the
-/// envelope/event-filter/retry-policy JSON for a matching target fails.
+/// envelope/event-filter/retry-policy JSON for a matching target fails, or a
+/// codec error when the output column cannot be decoded.
 #[cfg(feature = "db")]
 pub async fn enqueue_completion_deliveries(
     conn: &mut diesel_async::AsyncPgConnection,

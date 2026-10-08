@@ -555,15 +555,20 @@ fn to_host_clock(
 /// `not_before` sets `scheduled_at`. `None` keeps the immediate default.
 ///
 /// The params carry the decoded input (issue #1979), so a concurrency key
-/// resolves against the plaintext. Call [`seal_requeued_input`] before the
-/// enqueue.
+/// resolves against the plaintext. The returned flag says whether the decode
+/// worked. When it did not, for example in a process with no codec registry,
+/// the params keep the stored bytes, as a replay did before. Call
+/// [`seal_requeued_input`] before the enqueue.
 fn requeue_params(
     entry: DeadLetter,
     task_type: TaskType,
     not_before: Option<DateTime<Utc>>,
     codecs: &PayloadCodecs,
-) -> HarvestResult<EnqueueParams> {
-    let input = codecs.decode_column(&entry.input)?;
+) -> (EnqueueParams, bool) {
+    let (input, decoded) = match codecs.decode_column(&entry.input) {
+        Ok(input) => (input, true),
+        Err(_) => (entry.input, false),
+    };
     let mut params = EnqueueParams::new(entry.queue_name, task_type, input);
     params.workflow_exec_id = entry.workflow_exec_id;
     params.activity_name = entry.activity_name;
@@ -571,28 +576,30 @@ fn requeue_params(
     if let Some(at) = not_before {
         params.scheduled_at = at;
     }
-    Ok(params)
+    (params, decoded)
 }
 
 /// Encode a requeued workflow task's input as the start path does (issue
 /// #1979).
 ///
 /// A workflow task row lives as long as its run, so it follows the column
-/// switch. An activity task row is short-lived and stays in clear.
+/// switch. An activity task row is short-lived and stays in clear. Input that
+/// was not decoded is already the stored form, so it stays as it is.
 fn seal_requeued_input(
     params: &mut EnqueueParams,
     task_type: TaskType,
+    decoded: bool,
     codecs: &PayloadCodecs,
 ) -> HarvestResult<()> {
-    if task_type == TaskType::Workflow {
+    if decoded && task_type == TaskType::Workflow {
         params.input = codecs.encode_shared_column(&params.input)?;
     }
     Ok(())
 }
 
 /// The codec registry a replay decodes with: the handler registry's, else
-/// the identity default. With the default, an encrypted entry fails to
-/// decode, so the replay fails closed.
+/// the identity default. With the default, an encrypted entry does not
+/// decode, so the replay requeues its stored bytes.
 fn replay_codecs(registry: Option<&HandlerRegistry>) -> &PayloadCodecs {
     registry.map_or(&*crate::store::DEFAULT_PAYLOAD_CODECS, |reg| {
         reg.payload_codecs()
@@ -677,8 +684,9 @@ pub struct NewDeadLetterEntry {
 /// free. When `workflow_exec_id` is `None` (a non-workflow-scoped task), both
 /// columns are left `NULL`.
 ///
-/// This form takes no codec registry, so it stores the input in clear. Use
-/// [`dead_letter_with_codecs`] to honour column encoding (issue #1979).
+/// This form does not encode the input. It stores the input as it arrives,
+/// so a stored envelope stays an envelope. Use [`dead_letter_with_codecs`] to
+/// honour column encoding (issue #1979).
 ///
 /// # Errors
 ///
@@ -867,7 +875,7 @@ pub async fn replay_dead_letter_at(
             let task_type = dead_letter_task_type(dead_letter_id, &entry.task_type)?;
 
             let codecs = replay_codecs(registry);
-            let mut params = requeue_params(entry, task_type, not_before, codecs)?;
+            let (mut params, decoded) = requeue_params(entry, task_type, not_before, codecs);
 
             // Restore required_build_id and concurrency policy from the owning
             // execution so the replayed task is subject to the same constraints.
@@ -909,6 +917,7 @@ pub async fn replay_dead_letter_at(
                     // per task_type, so mixing them would throttle activities
                     // against the wrong budget).
                     if task_type == TaskType::Workflow
+                        && decoded
                         && let Some(reg) = registry
                         && let Some(info) = reg.workflows.get(&workflow_name)
                         && let Some(policy) = &info.concurrency
@@ -922,7 +931,7 @@ pub async fn replay_dead_letter_at(
                 }
             }
 
-            seal_requeued_input(&mut params, task_type, codecs)?;
+            seal_requeued_input(&mut params, task_type, decoded, codecs)?;
             let task_id = crate::queue::enqueue(conn, &params).await?;
             let deleted = diesel::delete(dsl::harvest_dead_letters.find(dead_letter_id))
                 .execute(conn)
@@ -1420,6 +1429,9 @@ pub async fn redrive_dead_letter(
 /// # Errors
 ///
 /// The same as [`redrive_dead_letter`].
+// The issue #1979 decode flag puts this one line over the limit. The redrive
+// is one transaction's worth of steps, and splitting it would hide their order.
+#[allow(clippy::too_many_lines)]
 pub async fn redrive_dead_letter_at(
     conn: &mut AsyncPgConnection,
     dead_letter_id: Uuid,
@@ -1469,7 +1481,7 @@ pub async fn redrive_dead_letter_at(
             let task_type = dead_letter_task_type(dead_letter_id, &entry.task_type)?;
 
             let codecs = replay_codecs(registry);
-            let mut params = requeue_params(entry, task_type, not_before, codecs)?;
+            let (mut params, decoded) = requeue_params(entry, task_type, not_before, codecs);
 
             if let Some(exec_uuid) = params.workflow_exec_id {
                 use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
@@ -1528,6 +1540,7 @@ pub async fn redrive_dead_letter_at(
 
                 params.required_build_id = build_id;
                 if task_type == TaskType::Workflow
+                    && decoded
                     && let Some(reg) = registry
                     && let Some(info) = reg.workflows.get(&workflow_name)
                     && let Some(policy) = &info.concurrency
@@ -1538,7 +1551,7 @@ pub async fn redrive_dead_letter_at(
                 }
             }
 
-            seal_requeued_input(&mut params, task_type, codecs)?;
+            seal_requeued_input(&mut params, task_type, decoded, codecs)?;
             let task_id = crate::queue::enqueue(conn, &params).await?;
             diesel::delete(dsl::harvest_dead_letters.find(dead_letter_id))
                 .execute(conn)

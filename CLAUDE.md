@@ -133,12 +133,6 @@ both are sanctioned, narrow, and named here. Anything else is a bug.
    as unresolved, so the pass re-runs rather than reporting itself complete over
    a row it never converted.
 
-   The same sweep also converts the codec columns outside `harvest_events`,
-   listed in `codec_rotation::CODEC_COLUMNS` (issue #1979). Those tables are
-   not append-only, so that pass is not an exception. It keeps the same scope
-   guarantee: only ciphertext changes, and a compare-and-swap makes it lose
-   to an erasure.
-
 **On the numbering.** Issue #948 and `erase.rs` both described heartbeat
 checkpoints in `queue::record_heartbeat` as the *first* exception to this
 invariant. That is not accurate: `record_heartbeat` updates
@@ -146,6 +140,10 @@ invariant. That is not accurate: `record_heartbeat` updates
 mutation of the **task queue** row, not of the event log. The `#2` / `#3`
 numbering above is kept because the issues and their PRs use it, but there are
 two `event_data` writers, not three.
+
+The rotation sweep also rewrites `codec_rotation::CODEC_COLUMNS` (issue
+#1979). Those tables are not append-only, so that pass is not an exception.
+`the_column_sweep_loses_to_an_erasure` proves that it loses to an erasure.
 
 If you add another exception, it belongs in this list, with its own scope
 guarantee and its own proof.

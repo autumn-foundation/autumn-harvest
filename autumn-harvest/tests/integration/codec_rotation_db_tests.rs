@@ -3740,6 +3740,8 @@ const COLUMN_MEMO: &str = "column-memo-note";
 const COLUMN_SIGNAL: &str = "column-signal-pin";
 const COLUMN_DLQ: &str = "column-dlq-email";
 const COLUMN_SUMMARY: &str = "column-summary-result";
+const COLUMN_TASK_INPUT: &str = "column-task-input";
+const COLUMN_TASK_OUTPUT: &str = "column-task-output";
 
 /// Write one envelope under `key_id` into every swept codec column.
 async fn seed_codec_columns(
@@ -3796,10 +3798,24 @@ async fn seed_codec_columns(
     .await
     .expect("insert summary");
 
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+         (id, queue_name, task_type, workflow_exec_id, input, output, state) \
+         VALUES ($1, 'default', 'workflow', $2, $3, $4, 'COMPLETED')",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Jsonb, _>(encode_under(codecs, key_id, &json!(COLUMN_TASK_INPUT)))
+    .bind::<diesel::sql_types::Jsonb, _>(encode_under(codecs, key_id, &json!(COLUMN_TASK_OUTPUT)))
+    .execute(conn)
+    .await
+    .expect("insert workflow task");
+
     SeededColumns { exec_id, signal_id }
 }
 
-/// Every swept codec cell on the shard, as `(column, stored value)`.
+/// Every swept codec cell on the shard, as `(column, stored value)`, in
+/// `CODEC_COLUMNS` order, then by primary key.
 async fn codec_cells(conn: &mut AsyncPgConnection) -> Vec<(String, Value)> {
     #[derive(diesel::QueryableByName)]
     struct Cell {
@@ -3809,12 +3825,21 @@ async fn codec_cells(conn: &mut AsyncPgConnection) -> Vec<(String, Value)> {
         value: Value,
     }
     let cells: Vec<Cell> = diesel::sql_query(
-        "SELECT 'input' AS column_name, input AS value FROM harvest_workflow_executions \
-         UNION ALL SELECT 'output', output FROM harvest_workflow_executions WHERE output IS NOT NULL \
-         UNION ALL SELECT 'memo', memo FROM harvest_workflow_executions WHERE memo IS NOT NULL \
-         UNION ALL SELECT 'payload', payload FROM harvest_signals \
-         UNION ALL SELECT 'dlq_input', input FROM harvest_dead_letters \
-         UNION ALL SELECT 'result', result FROM harvest_execution_summaries WHERE result IS NOT NULL",
+        "SELECT column_name, value FROM ( \
+           SELECT 1 AS ord, id::TEXT AS row_id, 'input' AS column_name, input AS value \
+             FROM harvest_workflow_executions \
+           UNION ALL SELECT 2, id::TEXT, 'output', output FROM harvest_workflow_executions \
+             WHERE output IS NOT NULL \
+           UNION ALL SELECT 3, id::TEXT, 'memo', memo FROM harvest_workflow_executions \
+             WHERE memo IS NOT NULL \
+           UNION ALL SELECT 4, id::TEXT, 'payload', payload FROM harvest_signals \
+           UNION ALL SELECT 5, id::TEXT, 'dlq_input', input FROM harvest_dead_letters \
+           UNION ALL SELECT 6, execution_id::TEXT, 'result', result FROM harvest_execution_summaries \
+             WHERE result IS NOT NULL \
+           UNION ALL SELECT 7, id::TEXT, 'task_input', input FROM harvest_task_queue \
+           UNION ALL SELECT 8, id::TEXT, 'task_output', output FROM harvest_task_queue \
+             WHERE output IS NOT NULL \
+         ) c ORDER BY ord, row_id",
     )
     .load(conn)
     .await
@@ -3838,8 +3863,8 @@ async fn the_census_counts_every_codec_column() {
         .expect("census");
     assert_eq!(
         by_key.get("k1").copied(),
-        Some(6),
-        "one cell each: input, output, memo, signal, dead letter, summary"
+        Some(8),
+        "one cell each: input, output, memo, signal, dead letter, summary, task input and output"
     );
 }
 
@@ -3854,13 +3879,13 @@ async fn the_sweep_re_encrypts_every_codec_column_without_changing_plaintext() {
         .into_iter()
         .map(|(column, value)| (column, codecs.decode_column(&value).expect("decode before")))
         .collect();
-    assert_eq!(before.len(), 6);
+    assert_eq!(before.len(), 8);
 
     codecs.set_active_key("k2").expect("flip");
     let rewritten = sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
         .await
         .expect("sweep");
-    assert_eq!(rewritten, 6, "the sweep rewrote one cell per column");
+    assert_eq!(rewritten, 8, "the sweep rewrote one cell per column");
 
     let after = codec_cells(&mut conn).await;
     for (column, value) in &after {
@@ -3966,7 +3991,7 @@ async fn the_column_sweep_loses_to_an_erasure() {
 
     let column = autumn_harvest::codec_rotation::CODEC_COLUMNS
         .iter()
-        .find(|c| c.table == "harvest_signals")
+        .find(|c| c.table() == "harvest_signals")
         .expect("signals are swept");
     let candidate = encode_under(&codecs, "k2", &json!(COLUMN_SIGNAL));
     let swapped = autumn_harvest::codec_rotation::compare_and_swap_column(
@@ -4011,7 +4036,7 @@ async fn an_undecodable_column_cell_blocks_completion_but_not_its_neighbours() {
     let rewritten = sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
         .await
         .expect("a per-cell failure is not an error");
-    assert_eq!(rewritten, 5, "every other column still converts");
+    assert_eq!(rewritten, 7, "every other column still converts");
     let progress = load_shard_rotation_progress(&mut conn, 0, &codecs)
         .await
         .expect("progress");
@@ -4019,5 +4044,44 @@ async fn an_undecodable_column_cell_blocks_completion_but_not_its_neighbours() {
     assert!(
         progress.cursor.and_then(|c| c.completed_at).is_none(),
         "the pass must not complete over an unconverted cell"
+    );
+}
+
+#[tokio::test]
+async fn the_column_sweep_keeps_to_its_budget_and_finishes_over_several_ticks() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_key_registry();
+    // Two rows per table, so one column page can hold more cells than the
+    // budget has left.
+    seed_codec_columns(&mut conn, &codecs, "k1").await;
+    seed_codec_columns(&mut conn, &codecs, "k1").await;
+    codecs.set_active_key("k2").expect("flip");
+
+    let mut total = 0;
+    for _ in 0..12 {
+        let rewritten = sweep_codec_reencryption_once(&mut conn, 0, &codecs, 3, &NoOpMetrics)
+            .await
+            .expect("sweep");
+        assert!(
+            rewritten <= 3,
+            "a tick rewrote {rewritten} cells, over its budget of 3"
+        );
+        total += rewritten;
+        if rewritten == 0 {
+            break;
+        }
+    }
+    assert_eq!(total, 16, "every cell converts across ticks");
+    let by_key = autumn_harvest::codec_rotation::count_rows_by_key_id(&mut conn)
+        .await
+        .expect("census");
+    assert_eq!(by_key.get("k1").copied().unwrap_or(0), 0);
+    let progress = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("progress");
+    assert!(
+        progress.cursor.and_then(|c| c.completed_at).is_some(),
+        "the pass completes once the columns are clean"
     );
 }

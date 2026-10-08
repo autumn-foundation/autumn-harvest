@@ -9735,9 +9735,10 @@ pub enum ExternalAwaitReadResult {
 ///
 /// **Never mutates the target or creates any linkage** — a pure read.
 ///
-/// This form decodes the target's output with the identity registry. Use
-/// [`read_external_await_outcome_with_codecs`] when the output column can
-/// hold an envelope (issue #1979).
+/// This form decodes the target's output with the identity registry. An
+/// envelope under another codec reads as still pending. Use
+/// [`read_external_await_outcome_with_codecs`] on a deployment that encodes
+/// columns (issue #1979).
 ///
 /// # Errors
 ///
@@ -9749,13 +9750,40 @@ pub async fn read_external_await_outcome(
     read_external_await_outcome_with_codecs(conn, target, &store::DEFAULT_PAYLOAD_CODECS).await
 }
 
+/// The target's decoded output for an external await (issue #1979), or
+/// `None` when this registry cannot decode it.
+///
+/// A missing key must not fail the whole outbox tick, so the caller keeps the
+/// await pending. The codec error text is not logged.
+fn decoded_await_output(
+    codecs: &crate::payload_codec::PayloadCodecs,
+    target: ExecutionId,
+    execution: &WorkflowExecution,
+) -> Option<serde_json::Value> {
+    codecs
+        .decode_column_opt(execution.output.as_ref())
+        .map_or_else(
+            |_| {
+                tracing::warn!(
+                    target_exec_id = %target,
+                    "external await: the target output could not be decoded; staying pending"
+                );
+                None
+            },
+            |output| Some(output.unwrap_or(serde_json::Value::Null)),
+        )
+}
+
 /// [`read_external_await_outcome`], decoding the target's output column with
 /// `codecs` (issue #1979).
 ///
+/// An output this registry cannot decode reads as
+/// [`ExternalAwaitReadResult::NotYetTerminal`], so the await stays pending
+/// and the outbox retries it.
+///
 /// # Errors
 ///
-/// Propagates database failures, and a codec error when the output cannot
-/// be decoded.
+/// Propagates database failures.
 pub async fn read_external_await_outcome_with_codecs(
     conn: &mut AsyncPgConnection,
     target: ExecutionId,
@@ -9788,8 +9816,10 @@ pub async fn read_external_await_outcome_with_codecs(
                 // awaiter freezes the plaintext into its history, where the
                 // event codec encodes it again. A large output is copied
                 // inline, not offloaded (issue #757).
-                let output = codecs.decode_column_opt(execution.output.as_ref())?;
-                ExternalAwaitOutcome::Completed(output.unwrap_or(serde_json::Value::Null))
+                let Some(output) = decoded_await_output(codecs, current, &execution) else {
+                    return Ok(ExternalAwaitReadResult::NotYetTerminal);
+                };
+                ExternalAwaitOutcome::Completed(output)
             }
             "FAILED" => {
                 // The typed failure cause (issue #767) lives in the terminal

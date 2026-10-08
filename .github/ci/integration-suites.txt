@@ -104,6 +104,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          claim_budget_tests
 linux        autumn-harvest         integration                      -                          claim_continuation_priority_tests
 linux        autumn-harvest         integration                      -                          claim_run_deadline_tests
+linux        autumn-harvest         integration                      -                          codec_column_coverage_tests
 linux        autumn-harvest         integration                      -                          completion_callback_outcome_batch_perf
 linux        autumn-harvest         integration                      -                          completion_callback_tests
 linux        autumn-harvest         integration                      -                          completion_trigger_outbox_queue_perf

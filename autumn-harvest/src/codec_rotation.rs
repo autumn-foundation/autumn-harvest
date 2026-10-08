@@ -45,7 +45,7 @@
 //!
 //! The sweep and the census also cover the codec columns outside the event
 //! log. [`CODEC_COLUMNS`] lists them. These tables are not append-only, so
-//! this is not a sanctioned exception. The same rules apply all the same:
+//! this is not a sanctioned exception. The same rules apply:
 //! only ciphertext changes, and a compare-and-swap loses to any concurrent
 //! write, an erasure included.
 
@@ -103,14 +103,34 @@ impl ReencryptOutcome {
 /// One codec column outside `harvest_events` (issue #1979).
 ///
 /// The column holds a whole payload, so its envelope sits at the column root.
+///
+/// The fields are private. A caller can only use the entries of
+/// [`CODEC_COLUMNS`], because the names go into SQL as identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CodecColumn {
+    table: &'static str,
+    id_column: &'static str,
+    column: &'static str,
+}
+
+impl CodecColumn {
     /// The table name.
-    pub table: &'static str,
+    #[must_use]
+    pub const fn table(&self) -> &'static str {
+        self.table
+    }
+
     /// The primary-key column. It is a `UUID` in every listed table.
-    pub id_column: &'static str,
+    #[must_use]
+    pub const fn id_column(&self) -> &'static str {
+        self.id_column
+    }
+
     /// The `JSONB` column that can hold a codec envelope.
-    pub column: &'static str,
+    #[must_use]
+    pub const fn column(&self) -> &'static str {
+        self.column
+    }
 }
 
 /// Every codec column the sweep converts and the census counts (issue #1979).
@@ -123,7 +143,8 @@ pub struct CodecColumn {
 /// half swept, so the whole column is listed. The sweep skips plaintext.
 ///
 /// A column belongs here exactly when `docs/security-posture.md` marks it
-/// Covered. A unit test checks both directions.
+/// Covered, except `harvest_events.event_data`, which the event pass covers.
+/// A unit test checks both directions.
 pub const CODEC_COLUMNS: &[CodecColumn] = &[
     CodecColumn {
         table: "harvest_workflow_executions",
@@ -1034,7 +1055,8 @@ mod db {
         let carried = resumed.map_or((0, 0), |cursor| {
             (cursor.rows_reencrypted, cursor.unresolved_rows)
         });
-        let mut unresolved_total = carried.1.saturating_add(unresolved);
+        let events_unresolved_total = carried.1.saturating_add(unresolved);
+        let mut unresolved_total = events_unresolved_total;
 
         // A pass that ran off the end of the shard having left something
         // unconverted must NOT be marked complete and must NOT leave those rows
@@ -1086,20 +1108,30 @@ mod db {
         } else {
             false
         };
-        // The codec columns (issue #1979) have no cursor. Finding their work
-        // is a full scan, like the census. So the column sweep runs only at
-        // the end of an event pass that is not yet complete, or on a won
-        // revalidation claim. A converged shard pays nothing between claims.
-        // A column cell the sweep cannot convert counts as unresolved, so the
-        // pass starts again rather than completing over it.
-        if reached_end && (!already_complete || revalidate) {
-            let (column_rewritten, column_unresolved) =
+        // The codec columns (issue #1979) have no durable cursor. So the
+        // column sweep runs only when the event pass reaches its end and the
+        // pass is not yet complete. A converged shard scans no column between
+        // revalidation claims. A won claim runs the census, which sees any
+        // column cell still on an old key and restarts the pass. A cell the
+        // sweep cannot convert counts as unresolved, so the pass starts again
+        // rather than completing over it.
+        //
+        // A column pass that spends its budget may leave work behind. The
+        // cursor then stays at the end of the event log, incomplete, so the
+        // next tick resumes the column pass without rescanning events.
+        let columns_pending = if reached_end && !already_complete {
+            let columns =
                 sweep_codec_columns(conn, shard, codecs, &active_key_id, batch_limit).await?;
-            rewritten = rewritten.saturating_add(column_rewritten);
-            unresolved_total = unresolved_total.saturating_add(column_unresolved);
-        }
-        let census_needed =
-            reached_end && unresolved_total == 0 && (!already_complete || revalidate);
+            rewritten = rewritten.saturating_add(columns.rewritten);
+            unresolved_total = unresolved_total.saturating_add(columns.unresolved);
+            columns.pending
+        } else {
+            false
+        };
+        let census_needed = reached_end
+            && !columns_pending
+            && unresolved_total == 0
+            && (!already_complete || revalidate);
         let rows_reencrypted_total = carried
             .0
             .saturating_add(i64::try_from(rewritten).unwrap_or(i64::MAX));
@@ -1113,43 +1145,44 @@ mod db {
             false
         };
 
-        let (next_last_event_id, next_unresolved, next_completed_at) = if !reached_end {
-            (highest_id, unresolved_total, None)
-        } else if unresolved_total > 0 {
-            // This pass failed rows outright. Start over rather than declare
-            // victory over rows it could not convert.
-            (0, 0, None)
-        } else if !census_needed {
-            // Converged, and the revalidation clock has not come round. Keep
-            // the completion stamp -- this branch must not be mistaken for
-            // "the census said no", which would reset a perfectly good
-            // completion on every tick.
-            //
-            // But DO advance over what this tick examined. `highest_id` is
-            // correct in both cases by construction: the max id read, falling
-            // back to the resume point when the batch was empty. Carrying the
-            // stored `last_event_id` instead would stand still over an
-            // underfilled batch, so a converged shard receiving traffic would
-            // re-read and re-deserialize the same rows every tick until the
-            // batch filled or the five-minute clock moved it -- read
-            // amplification bounded only by `batch_limit`.
-            (
-                highest_id,
-                0,
-                resumed.and_then(|cursor| cursor.completed_at),
-            )
-        } else if census_clean {
-            (
-                highest_id,
-                0,
-                resumed
-                    .and_then(|cursor| cursor.completed_at)
-                    .or_else(|| Some(Utc::now())),
-            )
-        } else {
-            // Something the scan could not see is still on an outgoing key.
-            (0, 0, None)
-        };
+        let (next_last_event_id, next_unresolved, next_completed_at) =
+            if !reached_end || columns_pending {
+                (highest_id, events_unresolved_total, None)
+            } else if unresolved_total > 0 {
+                // This pass failed rows outright. Start over rather than declare
+                // victory over rows it could not convert.
+                (0, 0, None)
+            } else if !census_needed {
+                // Converged, and the revalidation clock has not come round. Keep
+                // the completion stamp -- this branch must not be mistaken for
+                // "the census said no", which would reset a perfectly good
+                // completion on every tick.
+                //
+                // But DO advance over what this tick examined. `highest_id` is
+                // correct in both cases by construction: the max id read, falling
+                // back to the resume point when the batch was empty. Carrying the
+                // stored `last_event_id` instead would stand still over an
+                // underfilled batch, so a converged shard receiving traffic would
+                // re-read and re-deserialize the same rows every tick until the
+                // batch filled or the five-minute clock moved it -- read
+                // amplification bounded only by `batch_limit`.
+                (
+                    highest_id,
+                    0,
+                    resumed.and_then(|cursor| cursor.completed_at),
+                )
+            } else if census_clean {
+                (
+                    highest_id,
+                    0,
+                    resumed
+                        .and_then(|cursor| cursor.completed_at)
+                        .or_else(|| Some(Utc::now())),
+                )
+            } else {
+                // Something the scan could not see is still on an outgoing key.
+                (0, 0, None)
+            };
 
         // Steady state on a converted shard: the pass is already complete and
         // this tick fetched nothing new. Re-upserting the identical row would
@@ -1192,25 +1225,84 @@ mod db {
         Ok(rewritten)
     }
 
+    /// What one column pass did (issue #1979). Counts only.
+    struct ColumnPass {
+        /// Cells rewritten onto the active key.
+        rewritten: usize,
+        /// Cells this cycle could not convert. Reported only when the cycle
+        /// reaches the end of the last column, so a pending cycle reports 0.
+        unresolved: i64,
+        /// The cycle stopped at its budget, so work may remain.
+        pending: bool,
+    }
+
+    /// Where one shard's column cycle stopped (issue #1979).
+    ///
+    /// It lives in this process only. A restart or a second worker starts a
+    /// cycle from the first column, which is safe: the census, not this
+    /// cursor, decides completion.
+    #[derive(Debug, Clone, Default)]
+    struct ColumnCursor {
+        /// The key id this cycle converts onto.
+        active_key_id: String,
+        /// Index into [`CODEC_COLUMNS`].
+        column: usize,
+        /// The last primary key examined in that column.
+        after: Option<uuid::Uuid>,
+        /// Cells this cycle could not convert so far.
+        unresolved: i64,
+    }
+
+    /// Column cursors by shard id.
+    static COLUMN_CURSORS: std::sync::LazyLock<std::sync::Mutex<BTreeMap<i32, ColumnCursor>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
+
+    fn load_column_cursor(shard_id: i32, active_key_id: &str) -> ColumnCursor {
+        let cursors = COLUMN_CURSORS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cursors
+            .get(&shard_id)
+            .filter(|cursor| cursor.active_key_id == active_key_id)
+            .cloned()
+            .unwrap_or_else(|| ColumnCursor {
+                active_key_id: active_key_id.to_string(),
+                ..ColumnCursor::default()
+            })
+    }
+
+    fn store_column_cursor(shard_id: i32, cursor: ColumnCursor) {
+        COLUMN_CURSORS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(shard_id, cursor);
+    }
+
     /// Re-encrypt the codec columns onto `active_key_id` (issue #1979).
     ///
-    /// Returns the cells rewritten and the cells left unconverted. It stops
-    /// once it has rewritten `batch_limit` cells. Each page selects only cells
-    /// that hold an envelope under another key, in primary-key order. A cell
-    /// that fails stays behind the page cursor, so it cannot starve the cells
-    /// after it.
+    /// Each call examines at most `batch_limit` cells and resumes where the
+    /// last call stopped, so a drained column is not scanned again. Each page
+    /// selects only cells that hold an envelope under another key, in
+    /// primary-key order. A cell that fails stays behind the cursor, so it
+    /// cannot starve the cells after it. A cycle reports its failures once it
+    /// passes the last column, and the next call starts a new cycle.
     async fn sweep_codec_columns(
         conn: &mut AsyncPgConnection,
         shard: crate::types::ShardId,
         codecs: &PayloadCodecs,
         active_key_id: &str,
         batch_limit: i64,
-    ) -> HarvestResult<(usize, i64)> {
+    ) -> HarvestResult<ColumnPass> {
+        let mut cursor = load_column_cursor(shard.as_i32(), active_key_id);
         let budget = usize::try_from(batch_limit).unwrap_or(usize::MAX);
         let key_id = key_id_expr("$1");
+        let mut examined = 0usize;
         let mut rewritten = 0usize;
-        let mut unresolved = 0i64;
-        for column in CODEC_COLUMNS {
+        while let Some(column) = CODEC_COLUMNS.get(cursor.column) {
+            if examined >= budget {
+                break;
+            }
+            let remaining = i64::try_from(budget - examined).unwrap_or(batch_limit);
             // The identifiers come from the compile-time `CODEC_COLUMNS` list.
             let sql = format!(
                 "SELECT t.{id} AS id, t.{col} AS value \
@@ -1224,41 +1316,38 @@ mod db {
                 col = column.column,
                 table = column.table,
             );
-            let mut after: Option<uuid::Uuid> = None;
-            while rewritten < budget {
-                let cells: Vec<ColumnCell> = diesel::sql_query(&sql)
-                    .bind::<Text, _>(crate::payload_codec::CODEC_LEGACY_KEY_ID)
-                    .bind::<Text, _>(active_key_id)
-                    .bind::<Nullable<diesel::sql_types::Uuid>, _>(after)
-                    .bind::<BigInt, _>(batch_limit)
-                    .load(conn)
-                    .await
-                    .map_err(database_error)?;
-                let page_len = cells.len();
-                after = cells.last().map(|cell| cell.id);
-                for cell in cells {
+            let cells: Vec<ColumnCell> = diesel::sql_query(&sql)
+                .bind::<Text, _>(crate::payload_codec::CODEC_LEGACY_KEY_ID)
+                .bind::<Text, _>(active_key_id)
+                .bind::<Nullable<diesel::sql_types::Uuid>, _>(cursor.after)
+                .bind::<BigInt, _>(remaining)
+                .load(conn)
+                .await
+                .map_err(database_error)?;
+            let page_len = cells.len();
+            for cell in cells {
+                examined += 1;
+                cursor.after = Some(cell.id);
+                let converted =
                     match reencrypt_column_value_under(codecs, active_key_id, &cell.value) {
                         Ok(Some(candidate)) => {
-                            if compare_and_swap_column(
-                                conn,
-                                shard,
-                                column,
-                                cell.id,
-                                &cell.value,
-                                &candidate,
-                            )
-                            .await?
-                            {
-                                rewritten += 1;
-                            } else {
-                                // The cell changed under us, for example by an
-                                // erasure. We lose, by design.
-                                unresolved += 1;
-                            }
+                            compare_and_swap_column(
+                            conn,
+                            shard,
+                            column,
+                            cell.id,
+                            &cell.value,
+                            &candidate,
+                        )
+                        .await?
+                            // An erasure, a row delete or another sweeper won
+                            // the race. Only a cell still on an old key is
+                            // left to convert.
+                            || !column_cell_pending(conn, column, cell.id, active_key_id)
+                                .await?
                         }
-                        Ok(None) => {}
+                        Ok(None) => true,
                         Err(error) => {
-                            unresolved += 1;
                             // Bounded and content-free, as for an event row.
                             tracing::warn!(
                                 table = column.table,
@@ -1269,15 +1358,78 @@ mod db {
                                 error_kind = super::sweep_error_kind(&error),
                                 "codec re-encryption skipped: the column cell could not be decoded"
                             );
+                            false
                         }
-                    }
-                }
-                if i64::try_from(page_len).unwrap_or(i64::MAX) < batch_limit {
-                    break;
+                    };
+                if converted {
+                    rewritten += 1;
+                } else {
+                    cursor.unresolved = cursor.unresolved.saturating_add(1);
                 }
             }
+            if i64::try_from(page_len).unwrap_or(i64::MAX) < remaining {
+                // The column is drained. Move to the next one.
+                cursor.column += 1;
+                cursor.after = None;
+            }
         }
-        Ok((rewritten, unresolved))
+        let pass = if cursor.column >= CODEC_COLUMNS.len() {
+            let unresolved = cursor.unresolved;
+            store_column_cursor(
+                shard.as_i32(),
+                ColumnCursor {
+                    active_key_id: active_key_id.to_string(),
+                    ..ColumnCursor::default()
+                },
+            );
+            ColumnPass {
+                rewritten,
+                unresolved,
+                pending: false,
+            }
+        } else {
+            store_column_cursor(shard.as_i32(), cursor);
+            ColumnPass {
+                rewritten,
+                unresolved: 0,
+                pending: true,
+            }
+        };
+        Ok(pass)
+    }
+
+    /// Whether one codec-column cell still holds an envelope under a key
+    /// other than `active_key_id` (issue #1979).
+    ///
+    /// A lost compare-and-swap asks this. A deleted row, an erasure
+    /// tombstone or a cell another sweeper converted is not pending.
+    async fn column_cell_pending(
+        conn: &mut AsyncPgConnection,
+        column: &CodecColumn,
+        row_id: uuid::Uuid,
+        active_key_id: &str,
+    ) -> HarvestResult<bool> {
+        let key_id = key_id_expr("$1");
+        // The identifiers come from the compile-time `CODEC_COLUMNS` list.
+        let sql = format!(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM {table} t \
+                 CROSS JOIN LATERAL (SELECT t.{col}) AS f(value) \
+                 WHERE t.{id} = $3 AND f.value IS NOT NULL AND {ENVELOPE_PREDICATE} \
+                   AND {key_id} <> $2 \
+             ) AS present",
+            table = column.table,
+            col = column.column,
+            id = column.id_column,
+        );
+        let probe: Present = diesel::sql_query(&sql)
+            .bind::<Text, _>(crate::payload_codec::CODEC_LEGACY_KEY_ID)
+            .bind::<Text, _>(active_key_id)
+            .bind::<diesel::sql_types::Uuid, _>(row_id)
+            .get_result(conn)
+            .await
+            .map_err(database_error)?;
+        Ok(probe.present)
     }
 
     /// Write `candidate` over one codec-column cell only if it still holds
@@ -3253,7 +3405,7 @@ mod tests {
     /// An engine signal or dead-letter write without the registry stores the
     /// payload in clear (issue #1979). The sweep never encrypts plaintext, so
     /// that leak is permanent. An external-await read without the registry
-    /// cannot decode the target output, so the await never resolves. This
+    /// cannot decode the target output, so the await stays pending. This
     /// guard keeps every engine call on the codec-aware variant.
     #[test]
     fn engine_signal_and_dead_letter_writes_pass_the_registry() {

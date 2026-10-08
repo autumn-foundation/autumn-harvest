@@ -1258,7 +1258,11 @@ impl HarvestApiState {
             WorkflowHandleClient::new(pool.sharded_pool().clone(), runtime.router().clone(), urls)
                 // Issue #684: wire the engine recorder so the in-process typed-update
                 // path emits harvest.update.admitted.
-                .with_metrics(runtime.registry.telemetry().metrics.clone()),
+                .with_metrics(runtime.registry.telemetry().metrics.clone())
+                // Issue #1979: the route decodes the output itself, through the
+                // gated read-path decoder (issue #608).
+                .with_codecs(self.payload_codecs())
+                .with_stored_result_output(),
         )
     }
 
@@ -6337,6 +6341,13 @@ pub async fn enforce_read_only_mcp_mutation(
 /// unit test without a session harness.
 pub(crate) const fn decode_gate(flag: bool, is_admin: bool) -> bool {
     flag && is_admin
+}
+
+/// The error a route returns when a stored codec column does not decode
+/// (issue #1979). It never carries the codec's own error text, which is
+/// embedder-controlled.
+fn undecodable_stored_payload() -> HarvestError {
+    HarvestError::Config("a stored payload could not be decoded".to_string())
 }
 
 /// Resolve the codec registry for read-path decoding, or `None` when this
@@ -13602,7 +13613,7 @@ pub(crate) async fn build_awaitables_report(
             let input = api_state
                 .payload_codecs()
                 .decode_column(&std::mem::take(&mut execution.input))
-                .map_err(map_error)?;
+                .map_err(|_| map_error(undecodable_stored_payload()))?;
             let outcome =
                 drive_query_replay_async(&ctx, workflow.handler, input, api_state.query_timeout())
                     .await;
@@ -23612,7 +23623,7 @@ async fn rerun_workflow(
         Some(input) => input,
         None => match api_state.payload_codecs().decode_column(&source.input) {
             Ok(input) => input,
-            Err(e) => return map_error(e).into_response(),
+            Err(_) => return map_error(undecodable_stored_payload()).into_response(),
         },
     };
 
@@ -26252,7 +26263,7 @@ async fn hydrate_ctx_for_query(
     let input = api_state
         .payload_codecs()
         .decode_column(&execution.input)
-        .map_err(map_error)?;
+        .map_err(|_| map_error(undecodable_stored_payload()))?;
     let outcome =
         drive_query_replay_async(&ctx, workflow.handler, input, api_state.query_timeout()).await;
 

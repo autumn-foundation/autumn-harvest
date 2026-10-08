@@ -861,18 +861,6 @@ async fn load_child_states(
                 let mut typed =
                     load_child_typed_failures(&mut target_conn, &failed_ids, codecs, shard).await;
                 for (id, state, output, error) in pairs {
-                    // The output column can hold an envelope (issue #1979).
-                    // The parent's history gets the plaintext. A child this
-                    // registry cannot decode stays pending, so the next sweep
-                    // tries again. The codec error text is not logged.
-                    let Ok(output) = codecs.decode_column_opt(output.as_ref()) else {
-                        tracing::warn!(
-                            child_exec_id = %id,
-                            target_shard = shard,
-                            "cross-shard child relay: the child output could not be decoded"
-                        );
-                        continue;
-                    };
                     states.insert(
                         id,
                         TargetChildState {
@@ -1772,7 +1760,12 @@ async fn deliver_terminal(
     let child_exec_id = ExecutionId::from_uuid(row.child_exec_id);
     let parent_exec_id = ExecutionId::from_uuid(row.parent_exec_id);
     let state = child.state.clone();
-    let output = child.output.clone();
+    // The output column can hold an envelope (issue #1979). The parent's
+    // history gets the plaintext. A failure here takes the caller's retry
+    // path, so the child stays pending. The codec error text is not kept.
+    let output = codecs
+        .decode_column_opt(child.output.as_ref())
+        .map_err(|_| HarvestError::Config("the child output could not be decoded".to_string()))?;
     let error = child.error.clone();
     let typed_failure = child.typed_failure.clone();
 

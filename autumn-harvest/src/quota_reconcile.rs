@@ -489,10 +489,14 @@ pub async fn reconcile_quota_keys_from_with_codecs(
 
     for row in rows {
         let policy = registered_quota_policy(&row.workflow_name);
-        let input = codecs
+        // An input this registry cannot decode resolves no key. Resolving it
+        // against the envelope could match an envelope field by accident.
+        let outcome = codecs
             .decode_column(&row.input)
-            .unwrap_or_else(|_| row.input.clone());
-        match resolve_backfill(policy, &input) {
+            .map_or(ReconcileOutcome::Unresolvable, |input| {
+                resolve_backfill(policy, &input)
+            });
+        match outcome {
             ReconcileOutcome::Backfilled(key) => {
                 let workflow_name = row.workflow_name.clone();
                 // Same lock `enforce_quota_admission` takes around its own
@@ -590,7 +594,7 @@ pub async fn reconcile_quota_keys(
 /// `batch_size <= 0` disables the sweep: the task returns immediately
 /// without polling, mirroring `codec_rotation_batch_size = 0`.
 ///
-/// `shard` is passed to every tick's [`reconcile_quota_keys_from`] call
+/// `shard` is passed to every tick's [`reconcile_quota_keys_from_with_codecs`] call
 /// for its cross-region DR fence assertion (issue #954) -- see that
 /// function's doc comment. `codecs` decodes each candidate's input (issue
 /// #1979).
