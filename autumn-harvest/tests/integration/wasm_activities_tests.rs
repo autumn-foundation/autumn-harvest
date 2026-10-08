@@ -928,6 +928,7 @@ fn build_worker_with_shards(
                 scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: worker_id.to_string(),
+                fairness_keys: false,
                 queues: vec![queue.to_string()],
                 notification_database_url: None,
                 max_concurrent_workflows: 1,

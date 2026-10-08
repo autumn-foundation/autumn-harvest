@@ -776,6 +776,17 @@ pub enum CliError {
         value: String,
     },
 
+    /// A fairness key would be normalized away as a URL dot-segment.
+    #[error(
+        "invalid fairness key '{value}': '.' and '..' are removed as \
+         dot-segments when the request URL is parsed, which would silently \
+         retarget the request at a different route"
+    )]
+    FairnessKeyDotSegment {
+        /// Original CLI argument value.
+        value: String,
+    },
+
     /// An activity name would be normalized away as a URL dot-segment.
     #[error(
         "invalid activity name '{value}': '.' and '..' are removed as \
@@ -2968,6 +2979,40 @@ enum QueueCommand {
         /// Output raw JSON instead of the summary table.
         #[arg(long)]
         json: bool,
+    },
+    /// Show, set, or clear fairness key weights in a queue (issue #1976).
+    #[command(subcommand)]
+    Fairness(FairnessCommand),
+}
+
+/// Fairness key weights within one queue (issue #1976).
+///
+/// A key with weight `w` gets `w` claims for each claim of a key with weight
+/// `1`, while both have work. A key with no override has weight `1`. A change
+/// applies at the next claim of the key. No worker restart is needed.
+#[derive(Debug, Subcommand)]
+enum FairnessCommand {
+    /// Show the weight overrides and the claim state of each key.
+    Show {
+        /// Task queue name.
+        queue_name: String,
+    },
+    /// Set the weight of one fairness key.
+    Set {
+        /// Task queue name.
+        queue_name: String,
+        /// Fairness key, matched exactly.
+        fairness_key: String,
+        /// The weight, from 0.001 to 1000.
+        #[arg(long)]
+        weight: f64,
+    },
+    /// Clear the weight of one fairness key. The key goes back to weight 1.
+    Clear {
+        /// Task queue name.
+        queue_name: String,
+        /// Fairness key, matched exactly.
+        fairness_key: String,
     },
 }
 
@@ -11644,11 +11689,17 @@ fn legal_hold_request(command: &LegalHoldCommand) -> ApiRequest {
 /// partial-application contract worth gating the exit code on.
 ///
 /// `list-paused` is a read with no such contract, so it is deliberately excluded.
+/// A fairness weight set or clear has the same contract (issue #1976). The
+/// fairness `show` read does not.
 const fn queue_mutation_should_gate(cli: &Cli) -> bool {
     matches!(
         &cli.command,
         Commands::Queue {
-            command: QueueCommand::Pause { .. } | QueueCommand::Resume { .. }
+            command: QueueCommand::Pause { .. }
+                | QueueCommand::Resume { .. }
+                | QueueCommand::Fairness(
+                    FairnessCommand::Set { .. } | FairnessCommand::Clear { .. }
+                )
         }
     )
 }
@@ -11703,6 +11754,52 @@ fn checked_queue_segment(queue_name: &str) -> Result<String, CliError> {
     Ok(path_segment(queue_name))
 }
 
+/// Reject a fairness key that cannot survive URL path parsing intact.
+fn checked_fairness_key_segment(fairness_key: &str) -> Result<String, CliError> {
+    if is_url_dot_segment(fairness_key) {
+        return Err(CliError::FairnessKeyDotSegment {
+            value: fairness_key.to_string(),
+        });
+    }
+    Ok(path_segment(fairness_key))
+}
+
+/// Map `harvest queue fairness …` onto the three fairness routes (issue #1976).
+fn fairness_request(command: &FairnessCommand) -> Result<ApiRequest, CliError> {
+    match command {
+        FairnessCommand::Show { queue_name } => {
+            let queue = checked_queue_segment(queue_name)?;
+            Ok(ApiRequest::get(format!("/admin/queues/{queue}/fairness")))
+        }
+        FairnessCommand::Set {
+            queue_name,
+            fairness_key,
+            weight,
+        } => {
+            let queue = checked_queue_segment(queue_name)?;
+            let key = checked_fairness_key_segment(fairness_key)?;
+            let mut body = Map::new();
+            body.insert("weight".to_string(), Value::from(*weight));
+            Ok(ApiRequest::post(
+                format!("/admin/queues/{queue}/fairness/{key}"),
+                Some(Value::Object(body)),
+            ))
+        }
+        FairnessCommand::Clear {
+            queue_name,
+            fairness_key,
+        } => {
+            let queue = checked_queue_segment(queue_name)?;
+            let key = checked_fairness_key_segment(fairness_key)?;
+            Ok(ApiRequest {
+                method: ApiMethod::Delete,
+                path: format!("/admin/queues/{queue}/fairness/{key}"),
+                body: None,
+            })
+        }
+    }
+}
+
 /// Map `harvest queue …` onto the three management routes (issue #619).
 ///
 /// `--shard-id` is omitted from the body entirely when unset, so the default is
@@ -11740,6 +11837,7 @@ fn queue_request(command: &QueueCommand) -> Result<ApiRequest, CliError> {
             ))
         }
         QueueCommand::ListPaused => Ok(ApiRequest::get("/admin/queues/paused")),
+        QueueCommand::Fairness(command) => fairness_request(command),
         QueueCommand::Coverage { queue_name, .. } => Ok(queue_name.as_ref().map_or_else(
             || ApiRequest::get("/admin/queue-coverage"),
             |value| {
@@ -14092,6 +14190,33 @@ mod reuse_policy_tests {
             "the read route has no partial-application contract to gate on"
         );
         assert!(!queue_mutation_should_gate(&parse(&["health"])));
+    }
+
+    #[test]
+    fn queue_mutation_gate_covers_the_fairness_writes_only() {
+        // Issue #1976: a weight set or clear reports a partial fan-out with
+        // the same `ok`/`status` contract as a queue pause.
+        assert!(queue_mutation_should_gate(&parse(&[
+            "queue", "fairness", "set", "q", "tenant-a", "--weight", "2"
+        ])));
+        assert!(queue_mutation_should_gate(&parse(&[
+            "queue", "fairness", "clear", "q", "tenant-a"
+        ])));
+        assert!(
+            !queue_mutation_should_gate(&parse(&["queue", "fairness", "show", "q"])),
+            "the read route has no partial-application contract to gate on"
+        );
+    }
+
+    #[test]
+    fn fairness_key_dot_segment_error_uses_exit_code_one() {
+        assert_eq!(
+            CliError::FairnessKeyDotSegment {
+                value: ".".to_string()
+            }
+            .exit_code(),
+            1
+        );
     }
 
     #[test]

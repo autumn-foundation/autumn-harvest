@@ -266,6 +266,11 @@ pub async fn prune_fairness_state(
     batch_size: usize,
     preview: bool,
 ) -> HarvestResult<u64> {
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
     let batch = i64::try_from(batch_size).unwrap_or(i64::MAX).max(1);
     let sql = if preview {
         format!("WITH {PRUNE_VICTIMS_SQL} SELECT COUNT(*) AS n FROM victims")
@@ -278,11 +283,6 @@ pub async fn prune_fairness_state(
              ) SELECT COUNT(*) AS n FROM gone"
         )
     };
-    #[derive(diesel::QueryableByName)]
-    struct Count {
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        n: i64,
-    }
     let count: Count = diesel::sql_query(sql)
         .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
         .bind::<diesel::sql_types::BigInt, _>(batch)

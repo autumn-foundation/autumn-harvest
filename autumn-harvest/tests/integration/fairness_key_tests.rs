@@ -1,3 +1,5 @@
+#![cfg(feature = "db")]
+
 //! Weighted fairness keys within a queue (issue #1976).
 //!
 //! # Stated bound
@@ -237,7 +239,7 @@ async fn weight_override_changes_share_at_runtime() {
         enqueue_keyed(&mut conn, &queue_name, Some("b"), age).await;
     }
 
-    let mut count =
+    let count =
         |keys: &[Option<String>], k: &str| keys.iter().filter(|x| x.as_deref() == Some(k)).count();
     let mut first = Vec::new();
     for _ in 0..100 {
@@ -277,11 +279,12 @@ async fn weight_override_changes_share_at_runtime() {
             .await
             .unwrap()
     );
-    assert!(
+    assert_eq!(
         list_fairness_weights(&mut conn, &queue_name)
             .await
             .unwrap()
-            .is_empty()
+            .len(),
+        0
     );
 }
 
@@ -392,11 +395,12 @@ async fn fairness_off_writes_no_state() {
     claim(&mut conn, &queue_name, ClaimFairness::Off)
         .await
         .unwrap();
-    assert!(
+    assert_eq!(
         list_fairness_state(&mut conn, &queue_name)
             .await
             .unwrap()
-            .is_empty()
+            .len(),
+        0
     );
 }
 
@@ -411,7 +415,7 @@ async fn by_id_claim_and_unkeyed_rows_charge_their_keys() {
     let task = queue::claim_task_by_id_with_fairness(
         &mut conn,
         keyed,
-        &[queue_name.clone()],
+        std::slice::from_ref(&queue_name),
         "fair-test-worker",
         "",
         None,

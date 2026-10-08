@@ -1962,43 +1962,65 @@ fn fair_variant(kind: Option<TaskType>, fenced: bool) -> &'static str {
     &FAIR[slot]
 }
 
-/// The fairness CTEs of the fair claim (issue #1976).
+/// The fairness CTE of the fair claim (issue #1976).
 ///
-/// `fair_state` holds the state rows of the polled queues. `fair_clock` holds
-/// the queue clock `V` of each queue: its largest `last_start`. Both are
-/// `MATERIALIZED`, so each runs once per claim. The column names carry a
-/// prefix, so no unqualified column of `candidate` becomes ambiguous.
-pub const FAIR_CTES_SQL: &str = "fair_state AS MATERIALIZED ( \
-         SELECT queue_name AS fs_queue, fairness_key AS fs_key, \
-                pass AS fs_pass, last_start AS fs_last \
-         FROM harvest_fairness_state \
-         WHERE queue_name = ANY($2) \
-     ), \
-     fair_clock AS MATERIALIZED ( \
-         SELECT fs_queue AS fc_queue, MAX(fs_last) AS fc_v \
-         FROM fair_state GROUP BY fs_queue \
+/// `fair_map` is one row with two `jsonb` maps over the polled queues:
+///
+/// - `fm_lag`: `queue || chr(31) || key` to the key's lag `pass - V`. Only
+///   keys with a positive lag are in it. A missing key has lag 0.
+/// - `fm_clock`: queue to its clock `V`, the largest `last_start`.
+///
+/// The row is cross-joined like `paused_queues`, so each candidate row does
+/// one flat map lookup. A join on the state rows made the planner scan every
+/// state row once per candidate row. The values go through `float8::text`,
+/// which round-trips a `float8` exactly. A fairness key holds no control
+/// character, so the `chr(31)` separator cannot make two keys collide.
+pub const FAIR_CTES_SQL: &str = "fair_map AS MATERIALIZED ( \
+         SELECT \
+             COALESCE(( \
+                 SELECT jsonb_object_agg(s.queue_name || chr(31) || s.fairness_key, \
+                                         (s.pass - c.v)::text) \
+                 FROM harvest_fairness_state s \
+                 JOIN ( \
+                     SELECT queue_name, MAX(last_start) AS v \
+                     FROM harvest_fairness_state \
+                     WHERE queue_name = ANY($2) \
+                     GROUP BY queue_name \
+                 ) c ON c.queue_name = s.queue_name \
+                 WHERE s.pass > c.v \
+             ), '{}'::jsonb) AS fm_lag, \
+             COALESCE(( \
+                 SELECT jsonb_object_agg(queue_name, v::text) FROM ( \
+                     SELECT queue_name, MAX(last_start) AS v \
+                     FROM harvest_fairness_state \
+                     WHERE queue_name = ANY($2) \
+                     GROUP BY queue_name \
+                 ) per_queue \
+             ), '{}'::jsonb) AS fm_clock \
      ), ";
 
-/// The joins that give each candidate row the state of its key.
-pub const FAIR_JOINS_SQL: &str = "LEFT JOIN fair_state \
-         ON fair_state.fs_queue = harvest_task_queue.queue_name \
-        AND fair_state.fs_key = COALESCE(harvest_task_queue.fairness_key, '') \
-     LEFT JOIN fair_clock ON fair_clock.fc_queue = harvest_task_queue.queue_name ";
+/// The cross join that gives each candidate row the fairness maps.
+pub const FAIR_JOINS_SQL: &str = "CROSS JOIN fair_map ";
 
-/// The start tag of a candidate row's key: `max(pass, V)`.
-///
-/// A key with no state starts at `V`. A queue with no state has `V = 0`. See
-/// [`crate::queue_fairness::fair_start`].
-pub const FAIR_START_SQL: &str = "GREATEST(COALESCE(fair_state.fs_pass, fair_clock.fc_v, 0), \
-     COALESCE(fair_clock.fc_v, 0))";
-
-/// The lag of a candidate row's key: its start tag minus `V`.
+/// The lag of a candidate row's key: `max(pass - V, 0)`.
 ///
 /// The fair claim sorts on the lag, not on the start tag. Each queue's front
-/// key then has a small lag, so one queue's large clock does not push its rows
-/// behind another queue in a multi-queue claim. See
-/// [`crate::queue_fairness::fair_lag`].
-pub const FAIR_LAG_SQL: &str = "GREATEST(COALESCE(fair_state.fs_pass - fair_clock.fc_v, 0), 0)";
+/// key then has a small lag. One queue's large clock thus does not push its
+/// rows behind another queue in a multi-queue claim. A key with no state, or
+/// with `pass <= V`, has lag 0. See [`crate::queue_fairness::fair_lag`].
+pub const FAIR_LAG_SQL: &str = "COALESCE((fair_map.fm_lag ->> (harvest_task_queue.queue_name \
+     || chr(31) || COALESCE(harvest_task_queue.fairness_key, '')))::float8, 0)";
+
+/// The clock `V` of the claimed row's queue in this claim's snapshot.
+///
+/// A queue with no state has `V = 0`. The charge starts a key at
+/// `max(pass, V)`. See [`crate::queue_fairness::fair_start`].
+macro_rules! fair_v_sql {
+    () => {
+        "(SELECT COALESCE((fair_map.fm_clock ->> candidate.fair_queue)::float8, 0) \
+          FROM fair_map)"
+    };
+}
 
 /// The weight of the key `(q, k)`: its override, else the default `1`.
 macro_rules! fair_weight_sql {
@@ -2017,9 +2039,11 @@ macro_rules! fair_weight_sql {
 /// The charge of the claimed row's key (issue #1976).
 ///
 /// It runs only when `claimed` returns a row, so a lost claim charges
-/// nothing. The upsert waits for a concurrent charge of the same key. It then
-/// starts from the current `pass`, as [`crate::queue_fairness::FairClock`]
-/// does, so two charges never share one slot.
+/// nothing. A key with no row starts at the snapshot's `V`. The upsert waits
+/// for a concurrent charge of the same key. It then starts at
+/// `max(pass, V)` from the current `pass`, as
+/// [`crate::queue_fairness::FairClock`] does. Two charges thus never share one
+/// slot.
 ///
 /// The claim locks the task row first, then the state row. No other writer
 /// locks a state row first, so the order cannot deadlock.
@@ -2027,10 +2051,13 @@ pub const FAIR_CHARGE_SQL: &str = concat!(
     "fair_charge AS ( \
          INSERT INTO harvest_fairness_state AS fs \
              (queue_name, fairness_key, pass, last_start, updated_at) \
-         SELECT candidate.fair_queue, candidate.fair_key, \
-                candidate.fair_start + 1.0 / ",
+         SELECT candidate.fair_queue, candidate.fair_key, ",
+    fair_v_sql!(),
+    " + 1.0 / ",
     fair_weight_sql!("candidate.fair_queue", "candidate.fair_key"),
-    ", candidate.fair_start, NOW() \
+    ", ",
+    fair_v_sql!(),
+    ", NOW() \
          FROM candidate JOIN claimed ON claimed.id = candidate.id \
          ON CONFLICT (queue_name, fairness_key) DO UPDATE \
          SET last_start = GREATEST(fs.pass, EXCLUDED.last_start), \
@@ -2052,9 +2079,9 @@ const FAIR_TAIL_ANCHOR: &str = "SELECT * FROM claimed";
 ///
 /// Five edits, each at an anchor that appears exactly once:
 ///
-/// 1. `fair_state` and `fair_clock` go before `candidate`.
-/// 2. `candidate` selects the queue, the key and the start tag of each row.
-/// 3. `candidate` joins the state of each row's key.
+/// 1. `fair_map` goes before `candidate`.
+/// 2. `candidate` selects the queue and the key of each row.
+/// 3. `candidate` cross-joins `fair_map`.
 /// 4. The sort takes the lag after the effective priority and before the due
 ///    time. Sticky rank and priority keep their meaning. Within one key the
 ///    order is the old order.
@@ -2089,13 +2116,10 @@ pub fn splice_fairness(base: &str) -> String {
     )
     .replace(
         FAIR_SELECT_ANCHOR,
-        &format!(
-            "activity_name, workflow_exec_id, \
-                 harvest_task_queue.queue_name AS fair_queue, \
-                 COALESCE(harvest_task_queue.fairness_key, '') AS fair_key, \
-                 {FAIR_START_SQL} AS fair_start \
-                 FROM harvest_task_queue "
-        ),
+        "activity_name, workflow_exec_id, \
+             harvest_task_queue.queue_name AS fair_queue, \
+             COALESCE(harvest_task_queue.fairness_key, '') AS fair_key \
+             FROM harvest_task_queue ",
     )
     .replace(
         FAIR_JOIN_ANCHOR,
@@ -13544,7 +13568,7 @@ mod tests {
             assert_eq!(fair.matches(order.as_str()).count(), 1, "{fair}");
             assert_eq!(fair.matches(FAIR_CTES_SQL).count(), 1);
             assert_eq!(fair.matches(FAIR_JOINS_SQL).count(), 1);
-            assert!(fair.contains("AS fair_start"));
+            assert!(fair.contains("AS fair_key FROM harvest_task_queue"));
         }
     }
 
@@ -13561,15 +13585,22 @@ mod tests {
 
     #[test]
     fn fair_sql_mirrors_the_model_rules() {
-        // start = max(pass, V); a key with no state starts at V.
-        assert!(FAIR_START_SQL.contains("COALESCE(fair_state.fs_pass, fair_clock.fc_v, 0)"));
-        assert!(FAIR_START_SQL.contains("COALESCE(fair_clock.fc_v, 0)"));
-        // lag = max(pass - V, 0); a key with no state has lag 0.
-        assert!(FAIR_LAG_SQL.contains("COALESCE(fair_state.fs_pass - fair_clock.fc_v, 0), 0"));
-        // V is the largest last_start of the queue.
-        assert!(FAIR_CTES_SQL.contains("MAX(fs_last) AS fc_v"));
+        // lag = max(pass - V, 0): only keys with pass > V are in the map, and
+        // a missing key has lag 0.
+        assert!(FAIR_CTES_SQL.contains("(s.pass - c.v)::text"));
+        assert!(FAIR_CTES_SQL.contains("WHERE s.pass > c.v"));
+        assert!(FAIR_LAG_SQL.ends_with("::float8, 0)"));
+        // V is the largest last_start of the queue; no state gives V = 0.
+        assert!(FAIR_CTES_SQL.contains("MAX(last_start) AS v"));
+        // A new key starts at V; an existing key at max(pass, V).
+        assert!(FAIR_CHARGE_SQL.contains("fair_map.fm_clock ->> candidate.fair_queue"));
+        assert!(
+            FAIR_CHARGE_SQL.contains("SET last_start = GREATEST(fs.pass, EXCLUDED.last_start)")
+        );
         // A key with no override has weight 1.
         assert!(FAIR_CHARGE_SQL.contains("), 1.0)"));
+        // The maps hold exact float8 text.
+        assert!(FAIR_CTES_SQL.contains("v::text"));
     }
 
     #[test]

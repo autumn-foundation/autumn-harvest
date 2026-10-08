@@ -693,6 +693,9 @@ for the mechanism. Security-relevant properties:
 - **A workflow can pin a child into a cell.** `ChildPlacement::Shard` and
   `ChildPlacement::ResidencyKey` place a child on any shard. The hook does
   not see that decision. Do not build a child pin from caller input.
+- **A fairness key bounds load, not access.** Any caller that may start a
+  workflow may set any fairness key (issue #1976). See
+  [Fairness keys](./fairness-keys.md).
 - **The tenant header is not an identity.** The caller declares
   `x-harvest-tenant`. Harvest does not bind it to stored executions.
 - **Name cells, not tenants.** A cell residency key appears in requests,

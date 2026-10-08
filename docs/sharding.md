@@ -402,6 +402,9 @@ it.
 
 Distributed counting across shards requires either a coordination service (Redis, a dedicated Postgres coordinator) or accepting bounded inaccuracy (approximate counts via gossip). Both add operational complexity that conflicts with Harvest's goal of being a Postgres-native engine. Cross-shard global limits are therefore **out of scope** for this feature; the per-shard guarantee is the contract.
 
+[Fairness keys](fairness-keys.md) (issue #1976) are shard-local too. Each
+shard keeps its own key state.
+
 If you need approximate cross-shard fair-share rather than a hard global cap, the metrics observable via `GET /admin/concurrency` can feed an external rate limiter in the layer above Harvest.
 
 ### Worker crash and slot release

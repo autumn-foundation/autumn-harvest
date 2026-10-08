@@ -100,10 +100,76 @@ async fn run() {
     );
     println!();
 
+    // `HARVEST_CLAIM_BENCH_SECTION=fairness` runs only the fairness-key
+    // section (issue #1976). A full run takes far longer.
+    if std::env::var(SECTION_ENV_VAR).as_deref() == Ok("fairness") {
+        fairness_section(&db).await;
+        return;
+    }
     scaling_sweep(&db).await;
     gate_breakdown(&db).await;
+    fairness_section(&db).await;
     enqueue_section(&db).await;
     explain_section(&db).await;
+}
+
+/// Run one section only. `fairness` is the one value it reads.
+const SECTION_ENV_VAR: &str = "HARVEST_CLAIM_BENCH_SECTION";
+
+/// The cost of fairness keys across backlog depth (issue #1976).
+///
+/// Each depth runs `baseline`, then `fairness_keys`, at the headline claimers
+/// and queues. The rows spread over 256 keys. `p50 vs` is the fair claim's
+/// cost against the unfair claim at the same depth.
+async fn fairness_section(db: &BenchDb) {
+    println!("## Fairness keys: claim cost vs backlog depth (issue #1976)");
+    println!();
+    println!(
+        "| backlog | mode | claimers | queues | p50 ms | p99 ms | max ms | p50 vs | claims/s |"
+    );
+    println!("|--:|:--|--:|--:|--:|--:|--:|--:|--:|");
+    let headline = headline_scenario();
+    for backlog in BACKLOG_SWEEP {
+        let mut base_p50 = None;
+        for gate in [ClaimGate::Baseline, ClaimGate::FairnessKeys] {
+            let scenario = Scenario {
+                backlog,
+                claimers: headline.claimers,
+                queues: headline.queues,
+                gate,
+            };
+            let report = db::run_claim_scenario(db, scenario).await;
+            let delta = match (gate, base_p50) {
+                (ClaimGate::FairnessKeys, Some(b)) if b > 0.0 && report.stats.count > 0 => {
+                    format!("{:+.0}%", (report.stats.p50_ms / b - 1.0) * 100.0)
+                }
+                (ClaimGate::FairnessKeys, _) => "n/a".to_string(),
+                _ => "—".to_string(),
+            };
+            if gate == ClaimGate::Baseline && report.stats.count > 0 {
+                base_p50 = Some(report.stats.p50_ms);
+            }
+            println!(
+                "| {backlog}{}{} | `{}` | {} | {} | {} | {delta} | {:.0} |",
+                truncation_note(report.truncated),
+                thin_sample_note(report.stats),
+                gate.as_str(),
+                report.scenario.claimers,
+                report.scenario.queues,
+                stats_cells(report.stats),
+                report.claims_per_sec(),
+            );
+        }
+    }
+    println!();
+    println!(
+        "> The fair claim adds one `MATERIALIZED` CTE (a `jsonb` map of key \
+         lags), one map lookup per candidate row, one sort term and one state \
+         upsert per claim. The backlog \
+         spreads over 256 keys."
+    );
+    println!("{}", marker_legend());
+    println!();
 }
 
 /// Read the server version for the report header.

@@ -775,7 +775,7 @@ so the task runs again. Each retry increments `harvest.db.transaction_retry`. A
 steady `reason="deadlock"` rate in production points to a missing row.
 
 **Ordered paths.** Each row gives one order that every path on those locks
-follows. Rows 13 to 17 list the known exceptions.
+follows. Rows 14 to 18 list the known exceptions.
 
 | # | Lock order | Where | Why | Pinned by |
 |---|---|---|---|---|
@@ -791,17 +791,18 @@ follows. Rows 13 to 17 list the known exceptions.
 | 10 | Execution row, then quota advisory lock | Each scanner fire and each direct start (`quota_lock_order.rs`) | A scanner that took every quota key first would wait on the uncommitted row of a direct start. | — |
 | 11 | Rate-limit bucket rows in byte order (`COLLATE "C"`) | Throttle scanner batch (`pre_lock_rate_limit_buckets_for_claimed_batch`, issue #1230). Dynamic-rate bucket registration sorts by key (issue #1127). | One statement locks the batch in sorted order. A locale collation would change the order. | `dedupes_and_sorts_the_same_regardless_of_claim_order` |
 | 12 | Two `ctx.mutex` keys in sorted key order | Workflow code (author rule, see "Cross-key deadlock" in the Durable Mutex section) | A durable mutex is held across transactions. Postgres does not detect this cycle, so no retry resolves it. Only the lease expiry ends it. | — |
+| 13 | Task row (`SKIP LOCKED`), then the `harvest_fairness_state` row of its key | The fair claim's `fair_charge` upsert (`queue::splice_fairness`, issue #1976) | Each fair claim locks its task row first. Prune takes state rows with `SKIP LOCKED`, and the weight API never locks a state row. | `concurrent_fair_claims_keep_every_charge` |
 
 **Known cycles.** In each row, Postgres aborts one side as a whole. That side
-is safe to run again. Only rows 13 and 14 run again automatically.
+is safe to run again. Only rows 14 and 15 run again automatically.
 
 | # | Lock order | Where | Why | Pinned by |
 |---|---|---|---|---|
-| 13 | Own execution row, then the target execution row | Inline external signal and cancel (`persist_external_signal_inline`) | Two runs that target each other in one cycle invert. `tx_retry` runs the victim again (issue #1822). | `two_persist_transactions_deadlock_and_both_commit` |
-| 14 | Execution row, then a lock that another path holds | Any workflow-task persist | A conflict now resets the task, and replay runs the cycle again (issue #1822). | `a_deadlocked_terminal_persist_runs_the_cycle_again` |
-| 15 | Concurrency-key advisory lock and mutex advisory lock | `cancel_running` admission with `ctx.mutex` (issue #691). See `docs/sharding.md`. | The two features take the keys in opposite orders. The start aborts atomically. An API start returns the error. | — |
-| 16 | Source execution row, then the target `workflow_id` occupant | Re-run with a `workflow_id` override (`execution.rs`) | Two re-runs that name each other's `workflow_id` invert. No total order exists without another lock. | — |
-| 17 | Task row, then execution row (the reverse of row 2) | Poison-pill reclaim (issue #1182) | It reclaims only the task of a dead worker, so a live persist rarely meets it. The suspended-claim release probe uses `SKIP LOCKED` and never waits. | `a_task_row_first_peer_touching_the_execution_row_never_deadlocks_the_release` |
+| 14 | Own execution row, then the target execution row | Inline external signal and cancel (`persist_external_signal_inline`) | Two runs that target each other in one cycle invert. `tx_retry` runs the victim again (issue #1822). | `two_persist_transactions_deadlock_and_both_commit` |
+| 15 | Execution row, then a lock that another path holds | Any workflow-task persist | A conflict now resets the task, and replay runs the cycle again (issue #1822). | `a_deadlocked_terminal_persist_runs_the_cycle_again` |
+| 16 | Concurrency-key advisory lock and mutex advisory lock | `cancel_running` admission with `ctx.mutex` (issue #691). See `docs/sharding.md`. | The two features take the keys in opposite orders. The start aborts atomically. An API start returns the error. | — |
+| 17 | Source execution row, then the target `workflow_id` occupant | Re-run with a `workflow_id` override (`execution.rs`) | Two re-runs that name each other's `workflow_id` invert. No total order exists without another lock. | — |
+| 18 | Task row, then execution row (the reverse of row 2) | Poison-pill reclaim (issue #1182) | It reclaims only the task of a dead worker, so a live persist rarely meets it. The suspended-claim release probe uses `SKIP LOCKED` and never waits. | `a_task_row_first_peer_touching_the_execution_row_never_deadlocks_the_release` |
 
 #### Child-timeout race mechanics and caveats
 

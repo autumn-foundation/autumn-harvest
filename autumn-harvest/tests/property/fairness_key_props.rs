@@ -230,8 +230,9 @@ proptest! {
                 .is_some_and(|n| active[n])
         });
         let after: Vec<f64> = (0..8).map(|k| clock.start_tag(&key(k))).collect();
-        prop_assert_eq!(clock.vclock(), v_before);
-        prop_assert_eq!(before, after);
+        prop_assert_eq!(clock.vclock().to_bits(), v_before.to_bits());
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        prop_assert_eq!(bits(&before), bits(&after));
         prop_assert!(pruned <= 8);
     }
 }

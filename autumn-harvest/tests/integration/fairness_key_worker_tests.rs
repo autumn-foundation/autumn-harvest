@@ -1,3 +1,5 @@
+#![cfg(feature = "db")]
+
 //! Fairness keys through a real worker (issue #1976).
 //!
 //! - A start's fairness key reaches the run's workflow task, its activities
@@ -47,8 +49,9 @@ async fn fair_parent_wf(
 #[workflow]
 async fn fair_leaf_wf(
     ctx: &WorkflowContext,
-    _input: serde_json::Value,
+    input: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
+    let _ = input;
     let queue = ctx.queue_name().to_string();
     ctx.execute_activity_raw("fair_step", serde_json::json!({}), &queue)
         .await
@@ -58,11 +61,28 @@ async fn fair_leaf_wf(
 /// A short unit of work, so the worker's one slot is the bottleneck.
 #[activity(start_to_close = "60s")]
 async fn fair_step(
-    _ctx: &ActivityContext,
-    _input: serde_json::Value,
+    ctx: &ActivityContext,
+    input: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
+    let _ = (ctx, input);
     tokio::time::sleep(Duration::from_millis(15)).await;
     Ok(serde_json::json!({}))
+}
+
+/// One task row of the propagation check.
+#[derive(diesel::QueryableByName)]
+struct Row {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    task_type: String,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    fairness_key: Option<String>,
+}
+
+/// A count.
+#[derive(diesel::QueryableByName)]
+struct Count {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    n: i64,
 }
 
 fn registry() -> Arc<HandlerRegistry> {
@@ -133,13 +153,6 @@ async fn start_key_reaches_activities_and_children() {
     worker.shutdown();
     let _ = handle.await;
 
-    #[derive(diesel::QueryableByName)]
-    struct Row {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        task_type: String,
-        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
-        fairness_key: Option<String>,
-    }
     let rows: Vec<Row> = diesel::sql_query(
         "SELECT task_type, fairness_key FROM harvest_task_queue WHERE queue_name = $1",
     )
@@ -196,12 +209,7 @@ async fn a_runs_done_before_b(fairness: bool) -> usize {
     let (worker, handle) = start_worker(&queue_name, fairness, &pool);
     wait_for_execution_state_with_timeout(&url, b, "COMPLETED", Duration::from_secs(120)).await;
 
-    #[derive(diesel::QueryableByName)]
-    struct Count {
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        n: i64,
-    }
-    let ids: Vec<Uuid> = a_runs.iter().map(|e| e.as_uuid()).collect();
+    let ids: Vec<Uuid> = a_runs.iter().map(ExecutionId::as_uuid).collect();
     let done: Count = diesel::sql_query(
         "SELECT COUNT(*) AS n FROM harvest_workflow_executions \
          WHERE id = ANY($1) AND state = 'COMPLETED'",

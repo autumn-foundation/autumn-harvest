@@ -10275,6 +10275,214 @@
     },
     {
       "method": "GET",
+      "path": "/admin/queues/{queue_name}/fairness",
+      "category": "admin",
+      "read_only": true,
+      "description": "Show the fairness key weights and the claim state of one task queue (issue #1976). Each shard keeps its own weights and state. An unreachable shard makes the response partial. Admin only.",
+      "idempotency": "Read-only; always idempotent.",
+      "params": [
+        {
+          "name": "queue_name",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "The task queue, matched exactly. A name with leading or trailing whitespace is a 400."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "queue_name",
+          "weights",
+          "weights_uniform",
+          "state",
+          "status",
+          "unavailable_shards"
+        ],
+        "notes": "Each weights entry has queue_name, fairness_key, weight, updated_by and updated_at. The list holds one entry for each key, from the lowest shard that has it. weights_uniform is false when the shards do not hold the same weights. Each state entry has shard_id, queue_name, fairness_key, pass, last_start, lag and updated_at. The claim serves keys with a smaller lag first. A key with no override has weight 1."
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Blank or oversized queue name."
+        },
+        {
+          "status": 401,
+          "description": "Admin access required."
+        },
+        {
+          "status": 503,
+          "description": "Harvest storage pool is not configured."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/admin/queues/{queue_name}/fairness/{fairness_key}",
+      "category": "admin",
+      "read_only": false,
+      "description": "Set the weight of one fairness key in a task queue (issue #1976). A key with weight w gets w claims for each claim of a key with weight 1, while both have work. The weight applies at the next claim of the key. No worker restart is necessary. The write goes to every shard. Admin only. Audited as `fairness.weight.set`, rejected attempts included.",
+      "idempotency": "Setting the same weight again returns 200 and writes the same row. updated_by and updated_at change to the latest caller.",
+      "params": [
+        {
+          "name": "queue_name",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "The task queue, matched exactly. A name with leading or trailing whitespace is a 400."
+        },
+        {
+          "name": "fairness_key",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "The fairness key, matched exactly. An empty key, a key with outer whitespace or a control character, or a key longer than 255 bytes is a 400."
+        }
+      ],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "weight",
+            "required": true,
+            "description": "The weight, a finite number from 0.001 to 1000. An unknown field is a 400."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "queue_name",
+          "fairness_key",
+          "weight",
+          "updated_by",
+          "updated_at",
+          "ok",
+          "status",
+          "partial_failures"
+        ],
+        "notes": "The body is the stored override, from the first shard that applied it. updated_by is the authenticated actor. A full write returns ok: true and status: \"complete\", and omits partial_failures. A write that reaches only some shards returns 207 with ok: false and status: \"partial\". Send the request again; it is idempotent."
+      },
+      "additional_responses": [
+        {
+          "status": 207,
+          "description": "The write reached only some shards. The body is the 200 body plus partial_failures, which names the shards that did not apply it.",
+          "fields": [
+            "queue_name",
+            "fairness_key",
+            "weight",
+            "updated_by",
+            "updated_at",
+            "ok",
+            "status",
+            {
+              "name": "partial_failures",
+              "type": "string",
+              "description": "The shards that the write did not reach. Present only on this status."
+            }
+          ]
+        }
+      ],
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Blank or oversized queue name, invalid fairness key, weight out of range, malformed body, or a queue that already holds 1000 overrides."
+        },
+        {
+          "status": 401,
+          "description": "Admin access required."
+        },
+        {
+          "status": 500,
+          "description": "Every shard failed. No weight is in effect."
+        },
+        {
+          "status": 503,
+          "description": "Harvest storage pool is not configured."
+        }
+      ]
+    },
+    {
+      "method": "DELETE",
+      "path": "/admin/queues/{queue_name}/fairness/{fairness_key}",
+      "category": "admin",
+      "read_only": false,
+      "description": "Clear the weight of one fairness key in a task queue (issue #1976). The key goes back to weight 1 at its next claim. The clear goes to every shard. Admin only. Audited as `fairness.weight.clear`, rejected attempts included.",
+      "idempotency": "Clearing a key with no override returns 200 with cleared: false.",
+      "params": [
+        {
+          "name": "queue_name",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "The task queue, matched exactly. A name with leading or trailing whitespace is a 400."
+        },
+        {
+          "name": "fairness_key",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "The fairness key, matched exactly. An empty key, a key with outer whitespace or a control character, or a key longer than 255 bytes is a 400."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "ok",
+          "status",
+          "queue_name",
+          "fairness_key",
+          "cleared",
+          "partial_failures"
+        ],
+        "notes": "cleared is true when at least one shard held an override. A full clear returns ok: true and status: \"complete\", and omits partial_failures. A clear that reaches only some shards returns 207 with ok: false and status: \"partial\". The override stays on the shards that partial_failures names. Send the request again; it is idempotent."
+      },
+      "additional_responses": [
+        {
+          "status": 207,
+          "description": "The clear reached only some shards. The body is the 200 body plus partial_failures, which names the shards that did not apply it.",
+          "fields": [
+            "ok",
+            "status",
+            "queue_name",
+            "fairness_key",
+            "cleared",
+            {
+              "name": "partial_failures",
+              "type": "string",
+              "description": "The shards that the clear did not reach. Present only on this status."
+            }
+          ]
+        }
+      ],
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Blank or oversized queue name, or an invalid fairness key."
+        },
+        {
+          "status": 401,
+          "description": "Admin access required."
+        },
+        {
+          "status": 500,
+          "description": "Every shard failed. The override was not cleared."
+        },
+        {
+          "status": 503,
+          "description": "Harvest storage pool is not configured."
+        }
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/activities",
       "category": "admin",
       "read_only": true,

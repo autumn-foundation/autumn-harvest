@@ -39,21 +39,22 @@ use autumn_harvest::audit::{
     OP_BUILD_POLICY_SET, OP_BUILD_RAMP_CLEAR, OP_BUILD_RAMP_SET, OP_CALLBACK_REDRIVE,
     OP_CIRCUIT_FORCE_CLOSE, OP_CIRCUIT_FORCE_OPEN, OP_DAG_PATCH, OP_DAG_RETRY, OP_DAG_TRIGGER,
     OP_DLQ_DISCARD_BULK, OP_DLQ_REDRIVE, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK,
-    OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_GATE_CREATE, OP_GATE_LIFT,
-    OP_LEGAL_HOLD_RELEASE, OP_LEGAL_HOLD_SET, OP_PAYLOAD_DECODE_READ, OP_QUEUE_PAUSE,
-    OP_QUEUE_RESUME, OP_RATE_LIMIT_PACING_OVERRIDE_CLEAR, OP_RATE_LIMIT_PACING_OVERRIDE_SET,
-    OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE,
-    OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_SCHEDULE_UPDATE,
-    OP_START_THROTTLE_PACING_OVERRIDE_CLEAR, OP_START_THROTTLE_PACING_OVERRIDE_SET,
-    OP_TASK_REPRIORITIZE, OP_TOKEN_CREATE, OP_TOKEN_REVOKE, OP_WORKER_DRAIN, OP_WORKFLOW_ANNOTATE,
-    OP_WORKFLOW_CANCEL, OP_WORKFLOW_ERASE_PAYLOADS, OP_WORKFLOW_PAUSE, OP_WORKFLOW_RERUN,
-    OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START,
-    OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE, OP_WORKFLOW_UPDATE_WITH_START, RouteClass,
-    SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_ACTIVITY, TARGET_AUDIT_EXPORT,
-    TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_CALLBACK_DELIVERY, TARGET_CIRCUIT, TARGET_DAG,
-    TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_QUEUE, TARGET_RATE_LIMIT,
-    TARGET_RETENTION, TARGET_SCHEDULE, TARGET_TASK, TARGET_THROTTLE, TARGET_TOKEN, TARGET_WORKER,
-    TARGET_WORKFLOW, deny_readonly_mutation,
+    OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_FAIRNESS_WEIGHT_CLEAR,
+    OP_FAIRNESS_WEIGHT_SET, OP_GATE_CREATE, OP_GATE_LIFT, OP_LEGAL_HOLD_RELEASE, OP_LEGAL_HOLD_SET,
+    OP_PAYLOAD_DECODE_READ, OP_QUEUE_PAUSE, OP_QUEUE_RESUME, OP_RATE_LIMIT_PACING_OVERRIDE_CLEAR,
+    OP_RATE_LIMIT_PACING_OVERRIDE_SET, OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL,
+    OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME,
+    OP_SCHEDULE_TRIGGER, OP_SCHEDULE_UPDATE, OP_START_THROTTLE_PACING_OVERRIDE_CLEAR,
+    OP_START_THROTTLE_PACING_OVERRIDE_SET, OP_TASK_REPRIORITIZE, OP_TOKEN_CREATE, OP_TOKEN_REVOKE,
+    OP_WORKER_DRAIN, OP_WORKFLOW_ANNOTATE, OP_WORKFLOW_CANCEL, OP_WORKFLOW_ERASE_PAYLOADS,
+    OP_WORKFLOW_PAUSE, OP_WORKFLOW_RERUN, OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME,
+    OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE,
+    OP_WORKFLOW_UPDATE_WITH_START, RouteClass, SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED,
+    TARGET_ACTIVITY, TARGET_AUDIT_EXPORT, TARGET_BATCH, TARGET_BUILD_ROUTING,
+    TARGET_CALLBACK_DELIVERY, TARGET_CIRCUIT, TARGET_DAG, TARGET_DEAD_LETTER,
+    TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_QUEUE, TARGET_RATE_LIMIT, TARGET_RETENTION,
+    TARGET_SCHEDULE, TARGET_TASK, TARGET_THROTTLE, TARGET_TOKEN, TARGET_WORKER, TARGET_WORKFLOW,
+    deny_readonly_mutation,
 };
 use autumn_harvest::audit::{OP_BATCH_RESET, OP_BATCH_START};
 use autumn_harvest::batch::{
@@ -5191,6 +5192,18 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
             "/admin/queues/{queue_name}/resume",
             post(resume_queue_handler).route_layer(require_admin.clone()),
         )
+        // Fairness key weights (issue #1976). All three are admin-gated. The
+        // read shows tenant keys, and the writes change what the fleet claims.
+        .route(
+            "/admin/queues/{queue_name}/fairness",
+            get(get_queue_fairness_handler).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/admin/queues/{queue_name}/fairness/{fairness_key}",
+            post(set_fairness_weight_handler)
+                .delete(clear_fairness_weight_handler)
+                .route_layer(require_admin.clone()),
+        )
         // Per-activity-type pause/resume (issue #807): the surgical sibling of
         // the queue hold above — stop dispatching ONE broken activity without
         // touching the healthy work sharing its queue. All four are admin-gated:
@@ -6875,6 +6888,13 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/queues/paused"),
         ("POST", "/admin/queues/{queue_name}/pause"),
         ("POST", "/admin/queues/{queue_name}/resume"),
+        // ── fairness key weights (issue #1976) ────────────────────────────
+        ("GET", "/admin/queues/{queue_name}/fairness"),
+        ("POST", "/admin/queues/{queue_name}/fairness/{fairness_key}"),
+        (
+            "DELETE",
+            "/admin/queues/{queue_name}/fairness/{fairness_key}",
+        ),
         // ── per-activity-type pause/resume (issue #807) ───────────────────
         ("GET", "/activities"),
         ("GET", "/activities/{activity_name}"),
@@ -7405,6 +7425,17 @@ pub const fn management_api_request_fields()
             "POST",
             "/admin/queues/{queue_name}/resume",
             Some(&["shard_id"]),
+        ),
+        // ── fairness key weights (issue #1976) ────────────────────────────
+        (
+            "POST",
+            "/admin/queues/{queue_name}/fairness/{fairness_key}",
+            Some(&["weight"]),
+        ),
+        (
+            "DELETE",
+            "/admin/queues/{queue_name}/fairness/{fairness_key}",
+            Some(&[]),
         ),
         // ── per-activity-type pause/resume (issue #807) ───────────────────
         // Both bodies are optional; resume carries no fields at all (it deletes
@@ -8536,6 +8567,45 @@ pub const fn management_api_response_fields()
                 "released_paused_by",
                 "provenance_uniform",
                 "shards",
+                "partial_failures",
+            ]),
+        ),
+        // ── fairness key weights (issue #1976) ────────────────────────────
+        (
+            "GET",
+            "/admin/queues/{queue_name}/fairness",
+            Some(&[
+                "queue_name",
+                "weights",
+                "weights_uniform",
+                "state",
+                "status",
+                "unavailable_shards",
+            ]),
+        ),
+        (
+            "POST",
+            "/admin/queues/{queue_name}/fairness/{fairness_key}",
+            Some(&[
+                "queue_name",
+                "fairness_key",
+                "weight",
+                "updated_by",
+                "updated_at",
+                "ok",
+                "status",
+                "partial_failures",
+            ]),
+        ),
+        (
+            "DELETE",
+            "/admin/queues/{queue_name}/fairness/{fairness_key}",
+            Some(&[
+                "ok",
+                "status",
+                "queue_name",
+                "fairness_key",
+                "cleared",
                 "partial_failures",
             ]),
         ),
@@ -38214,6 +38284,392 @@ async fn list_paused_queues_handler(
         "status": collected.status,
         "unavailable_shards": collected.unavailable_shards,
     })))
+}
+
+// ── Fairness key weights (issue #1976) ────────────────────────────────────────
+
+/// Body of `POST /admin/queues/{queue_name}/fairness/{fairness_key}`.
+///
+/// An unknown field is a 400. A typo must not set a weight the caller did not
+/// mean.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetFairnessWeightRequest {
+    weight: f64,
+}
+
+/// The claim state of one fairness key on one shard.
+#[derive(Debug, Serialize)]
+struct ShardFairnessKeyState {
+    shard_id: i32,
+    #[serde(flatten)]
+    state: ::autumn_harvest::fairness_keys::FairnessKeyState,
+}
+
+/// What one shard reports for `GET /admin/queues/{queue_name}/fairness`.
+type ShardFairnessRows = (
+    i32,
+    Vec<::autumn_harvest::fairness_keys::FairnessWeight>,
+    Vec<::autumn_harvest::fairness_keys::FairnessKeyState>,
+);
+
+/// Validate the path of a fairness weight write and resolve every shard.
+///
+/// The claim reads weights from the database of its own shard. So each write
+/// goes to every shard, the same as a fleet-wide queue pause. On rejection the
+/// audit row is written and a response is returned in `Err`.
+#[allow(clippy::result_large_err)]
+async fn prepare_fairness_weight_targets(
+    api_state: &HarvestApiState,
+    audit: &QueuePauseAuditCtx,
+    queue_name: &str,
+    fairness_key: &str,
+    operation: &'static str,
+    route: &'static str,
+) -> Result<(String, Vec<(i32, DbPool)>, Vec<String>), axum::response::Response> {
+    let prepared =
+        prepare_queue_pause_targets(api_state, audit, queue_name, None, operation, route).await?;
+    if let Err(error) = ::autumn_harvest::queue_fairness::validate_fairness_key(fairness_key) {
+        let summary = format!("fairness key {fairness_key:?}: {error}");
+        return Err(reject_queue_pause(
+            api_state,
+            audit,
+            operation,
+            route,
+            queue_name,
+            map_error(error),
+            &summary,
+        )
+        .await);
+    }
+    Ok(prepared)
+}
+
+/// The audit context of a fairness weight write: the key, the weight, and
+/// the shards that the write did not reach.
+fn fairness_weight_audit_context(
+    fairness_key: &str,
+    weight: Option<f64>,
+    failures: &[String],
+) -> String {
+    let mut context = format!("fairness_key: {fairness_key:?}");
+    if let Some(weight) = weight {
+        let _ = write!(context, " | weight: {weight}");
+    }
+    if !failures.is_empty() {
+        let _ = write!(context, " | failures: {}", failures.join("; "));
+    }
+    context
+}
+
+/// `GET /admin/queues/{queue_name}/fairness` — weights and claim state.
+///
+/// Each shard keeps its own weights and state. `weights` holds one entry per
+/// key, from the lowest shard that has it. `weights_uniform` is false when the
+/// shards disagree. `state` holds the rows of every shard, each with its
+/// `shard_id`.
+async fn get_queue_fairness_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(queue_name): Path<String>,
+) -> Result<Json<Value>, AutumnError> {
+    let queue =
+        ::autumn_harvest::queue_pause::validate_queue_name(&queue_name).map_err(map_error)?;
+    let observations = observe_shards(&api_state, |shard_id, mut conn| {
+        let queue = queue.clone();
+        async move {
+            let weights = ::autumn_harvest::fairness_keys::list_fairness_weights(&mut conn, &queue)
+                .await
+                .map_err(|e| e.to_string())?;
+            let state = ::autumn_harvest::fairness_keys::list_fairness_state(&mut conn, &queue)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok::<_, String>(vec![(shard_id, weights, state)])
+        }
+    })
+    .await?;
+    let collected = shard_fanout::collect_fanout_rows::<ShardFairnessRows>(observations);
+
+    let mut weights = BTreeMap::new();
+    let mut shard_views: Vec<Vec<(String, u64)>> = Vec::new();
+    let mut state = Vec::new();
+    for (shard_id, shard_weights, shard_state) in collected.rows {
+        shard_views.push(
+            shard_weights
+                .iter()
+                .map(|w| (w.fairness_key.clone(), w.weight.to_bits()))
+                .collect(),
+        );
+        for weight in shard_weights {
+            weights.entry(weight.fairness_key.clone()).or_insert(weight);
+        }
+        state.extend(shard_state.into_iter().map(|row| ShardFairnessKeyState {
+            shard_id,
+            state: row,
+        }));
+    }
+    let weights_uniform = shard_views.windows(2).all(|pair| pair[0] == pair[1]);
+
+    Ok(Json(serde_json::json!({
+        "queue_name": queue,
+        "weights": weights.into_values().collect::<Vec<_>>(),
+        "weights_uniform": weights_uniform,
+        "state": state,
+        "status": collected.status,
+        "unavailable_shards": collected.unavailable_shards,
+    })))
+}
+
+/// Set one fairness weight on every target shard.
+///
+/// Returns the row from the first shard that applied it, and the first cap
+/// rejection. Each shard that fails adds an entry to `failures`.
+async fn apply_fairness_weight_across_shards(
+    targets: &[(i32, DbPool)],
+    queue: &str,
+    fairness_key: &str,
+    weight: f64,
+    actor: &str,
+    failures: &mut Vec<String>,
+) -> (
+    Option<::autumn_harvest::fairness_keys::FairnessWeight>,
+    Option<String>,
+) {
+    let mut applied = None;
+    let mut cap_error = None;
+    for (shard_id, pool) in targets {
+        let mut conn = match acquire_conn(pool).await {
+            Ok(conn) => conn,
+            Err(e) => {
+                failures.push(format!("shard {shard_id}: {e}"));
+                continue;
+            }
+        };
+        match ::autumn_harvest::fairness_keys::set_fairness_weight(
+            &mut conn,
+            queue,
+            fairness_key,
+            weight,
+            actor,
+        )
+        .await
+        {
+            Ok(row) => {
+                applied.get_or_insert(row);
+            }
+            Err(HarvestError::Config(message)) => {
+                failures.push(format!("shard {shard_id}: {message}"));
+                cap_error.get_or_insert(message);
+            }
+            Err(e) => failures.push(format!("shard {shard_id}: {e}")),
+        }
+    }
+    (applied, cap_error)
+}
+
+/// `POST /admin/queues/{queue_name}/fairness/{fairness_key}` — set a weight.
+///
+/// The weight applies at the next fair claim of the key. No worker restart is
+/// needed. A write that reaches only some shards is a 207, the same as a
+/// partial queue pause. Audited as `fairness.weight.set`, rejections included.
+async fn set_fairness_weight_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path((queue_name, fairness_key)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+    body: Result<Json<SetFairnessWeightRequest>, JsonRejection>,
+) -> axum::response::Response {
+    const ROUTE: &str = "POST /admin/queues/{queue_name}/fairness/{fairness_key}";
+    const OP: &str = OP_FAIRNESS_WEIGHT_SET;
+    let audit = audit_context(&headers, &api_state);
+
+    let weight = match body {
+        Ok(Json(request)) => request.weight,
+        Err(rejection) => {
+            let summary = format!("invalid request body: {}", rejection.body_text());
+            return reject_queue_pause(
+                &api_state,
+                &audit,
+                OP,
+                ROUTE,
+                &queue_name,
+                AutumnError::bad_request_msg(summary.clone()),
+                &summary,
+            )
+            .await;
+        }
+    };
+    if let Err(error) = ::autumn_harvest::queue_fairness::validate_fairness_weight(weight) {
+        let summary = format!("fairness key {fairness_key:?}: {error}");
+        return reject_queue_pause(
+            &api_state,
+            &audit,
+            OP,
+            ROUTE,
+            &queue_name,
+            map_error(error),
+            &summary,
+        )
+        .await;
+    }
+    let (queue, targets, mut failures) = match prepare_fairness_weight_targets(
+        &api_state,
+        &audit,
+        &queue_name,
+        &fairness_key,
+        OP,
+        ROUTE,
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(response) => return response,
+    };
+    let (actor, source, request_id) = audit;
+
+    let (applied, cap_error) = apply_fairness_weight_across_shards(
+        &targets,
+        &queue,
+        &fairness_key,
+        weight,
+        &actor,
+        &mut failures,
+    )
+    .await;
+
+    let status = if applied.is_some() && failures.is_empty() {
+        STATUS_SUCCEEDED
+    } else {
+        STATUS_FAILED
+    };
+    let context = fairness_weight_audit_context(&fairness_key, Some(weight), &failures);
+    write_queue_pause_audit(
+        &targets,
+        &actor,
+        &source,
+        request_id.as_deref(),
+        OP,
+        ROUTE,
+        &queue,
+        None,
+        status,
+        Some(&context),
+    )
+    .await;
+
+    let Some(row) = applied else {
+        // A cap rejection is the caller's to fix, so it is a 400.
+        if let Some(message) = cap_error {
+            return map_error(HarvestError::Config(message)).into_response();
+        }
+        return AutumnError::internal_server_error_msg(format!(
+            "fairness weight set failed: {}",
+            failures.join("; ")
+        ))
+        .into_response();
+    };
+    let partial = (!failures.is_empty()).then(|| failures.join("; "));
+    let (status_code, ok, status) = queue_pause_partial_status(partial.as_deref());
+    let mut payload = serde_json::to_value(&row).unwrap_or(Value::Null);
+    if let Some(map) = payload.as_object_mut() {
+        map.insert("ok".to_string(), Value::Bool(ok));
+        map.insert("status".to_string(), Value::String(status.to_string()));
+    }
+    queue_pause_attach_partial(&mut payload, partial);
+    (status_code, Json(payload)).into_response()
+}
+
+/// `DELETE /admin/queues/{queue_name}/fairness/{fairness_key}` — clear a
+/// weight.
+///
+/// The key goes back to the default weight at its next claim. Idempotent: a
+/// key with no override returns 200 with `cleared: false`. Audited as
+/// `fairness.weight.clear`, rejections included.
+async fn clear_fairness_weight_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path((queue_name, fairness_key)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    const ROUTE: &str = "DELETE /admin/queues/{queue_name}/fairness/{fairness_key}";
+    const OP: &str = OP_FAIRNESS_WEIGHT_CLEAR;
+    let audit = audit_context(&headers, &api_state);
+
+    let (queue, targets, mut failures) = match prepare_fairness_weight_targets(
+        &api_state,
+        &audit,
+        &queue_name,
+        &fairness_key,
+        OP,
+        ROUTE,
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(response) => return response,
+    };
+    let (actor, source, request_id) = audit;
+
+    let mut any_ok = false;
+    let mut cleared = false;
+    for (shard_id, pool) in &targets {
+        let mut conn = match acquire_conn(pool).await {
+            Ok(conn) => conn,
+            Err(e) => {
+                failures.push(format!("shard {shard_id}: {e}"));
+                continue;
+            }
+        };
+        match ::autumn_harvest::fairness_keys::clear_fairness_weight(
+            &mut conn,
+            &queue,
+            &fairness_key,
+        )
+        .await
+        {
+            Ok(removed) => {
+                any_ok = true;
+                cleared |= removed;
+            }
+            Err(e) => failures.push(format!("shard {shard_id}: {e}")),
+        }
+    }
+
+    let status = if any_ok && failures.is_empty() {
+        STATUS_SUCCEEDED
+    } else {
+        STATUS_FAILED
+    };
+    let context = fairness_weight_audit_context(&fairness_key, None, &failures);
+    write_queue_pause_audit(
+        &targets,
+        &actor,
+        &source,
+        request_id.as_deref(),
+        OP,
+        ROUTE,
+        &queue,
+        None,
+        status,
+        Some(&context),
+    )
+    .await;
+
+    if !any_ok {
+        return AutumnError::internal_server_error_msg(format!(
+            "fairness weight clear failed: {}",
+            failures.join("; ")
+        ))
+        .into_response();
+    }
+    let partial = (!failures.is_empty()).then(|| failures.join("; "));
+    let (status_code, ok, status) = queue_pause_partial_status(partial.as_deref());
+    let mut payload = serde_json::json!({
+        "ok": ok,
+        "status": status,
+        "queue_name": queue,
+        "fairness_key": fairness_key,
+        "cleared": cleared,
+    });
+    queue_pause_attach_partial(&mut payload, partial);
+    (status_code, Json(payload)).into_response()
 }
 
 /// Merge per-shard pause rows into one entry per queue, preserving each shard's

@@ -73,9 +73,13 @@ Properties, proven by `queue_fairness_props`:
 
 `fairness_key` is a nullable column on `harvest_task_queue`. A start sets it
 from `StartWorkflowParams::fairness_key`. If that is `None`, the run's quota
-key is the key. Activities take the key of their workflow task. A child or a
-continue-as-new run takes the parent's key, else its own quota key. A row
-with no key uses the default key `''`.
+key is the key. Activities take the key of their workflow task. A child, a
+continue-as-new run or a workflow retry takes the parent's key, else its own
+quota key. A reset fork or a DLQ redrive takes the source run's quota key. A
+row with no key uses the default key `''`.
+
+The key lives on task rows only. `harvest_workflow_executions` is at Diesel's
+64-column limit, and a workflow task row lives as long as its run.
 
 ### 1.3 Storage
 
@@ -87,8 +91,13 @@ with no key uses the default key `''`.
 ### 1.4 Claim
 
 `splice_fairness` derives the fair form from any claim variant (base, fenced,
-kind, by-id). It adds two `MATERIALIZED` CTEs, one sort term before the due
-time, and one `fair_charge` upsert after `claimed`. No bind is added.
+kind, by-id). It adds one `MATERIALIZED` CTE, `fair_map`, one sort term before
+the due time, and one `fair_charge` upsert after `claimed`. No bind is added.
+
+`fair_map` folds the key state into a flat `jsonb` map of lags. A join on the
+state rows was the first form. The planner ran it as a nested loop: every state
+row once per candidate row. That cost 2x claim throughput at 8 claimers. The
+map costs one lookup per candidate row.
 
 ### 1.5 Runtime API
 
@@ -100,11 +109,15 @@ list_fairness_weights, prune_fairness_state}`, the admin HTTP routes and the
 
 | Test | Phase |
 |------|-------|
-| `queue_fairness_props` (property): newcomer bound, pair lag bound, monotone `V`, one-key order | Spec |
-| `tenant_flood_holds_tenant_b_past_the_bound_without_fairness` (DB) | Red, then green with fairness on |
+| `fairness_key_props` (property, 7 tests): newcomer bound, returning key, pair lag bound, monotone `V`, one-key order, invisible prune | Spec |
+| `tenant_flood_holds_tenant_b_within_the_bound_with_fairness_keys` (DB) | Red (199 claims), then green (at most 1) |
+| `without_fairness_keys_a_flood_holds_tenant_b_past_the_bound` (DB) | Control |
 | `fair_claim_matches_the_model_sequence` (DB) | Green |
 | `weight_override_changes_share_at_runtime` (DB) | Green |
 | `override_cap_is_1000_per_queue` (DB) | Green |
-| `fair_claim_query_preserves_every_gate` (unit) | Green |
-| `fairness_off_claim_is_byte_identical` (unit) | Green |
-| `claim_bench` scenario `fairness_keys` | Bench |
+| `prune_deletes_only_rows_the_claim_cannot_tell_apart` (DB) | Green |
+| `concurrent_fair_claims_keep_every_charge` (DB, 8 claimers) | Green |
+| `by_id_claim_and_unkeyed_rows_charge_their_keys`, `multi_queue_claim_keeps_a_clock_per_queue`, `fairness_off_writes_no_state` (DB) | Green |
+| `start_key_reaches_activities_and_children`, `worker_with_fairness_keys_serves_tenant_b_through_a_flood` (worker end-to-end) | Green |
+| `fairness_off_claim_is_byte_identical`, `fair_claim_query_preserves_every_gate_and_bind` (unit) | Green |
+| `claim_bench` section `fairness` | Bench |

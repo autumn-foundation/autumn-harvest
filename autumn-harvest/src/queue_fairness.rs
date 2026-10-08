@@ -150,8 +150,8 @@ pub const MAX_FAIRNESS_KEY_LEN: usize = 255;
 /// # Errors
 ///
 /// Returns [`HarvestError::Config`] for an empty key, a key with outer
-/// whitespace, or a key longer than [`MAX_FAIRNESS_KEY_LEN`] bytes. The empty
-/// key is [`DEFAULT_FAIRNESS_KEY`].
+/// whitespace or a control character, or a key longer than
+/// [`MAX_FAIRNESS_KEY_LEN`] bytes. The empty key is [`DEFAULT_FAIRNESS_KEY`].
 pub fn validate_fairness_key(key: &str) -> HarvestResult<()> {
     if key.is_empty() {
         return Err(HarvestError::Config(
@@ -161,6 +161,13 @@ pub fn validate_fairness_key(key: &str) -> HarvestResult<()> {
     if key.trim() != key {
         return Err(HarvestError::Config(
             "fairness key must not start or end with whitespace".to_owned(),
+        ));
+    }
+    // The fair claim joins queue and key with `chr(31)`. A key with no
+    // control character cannot collide with another key in that map.
+    if key.chars().any(char::is_control) {
+        return Err(HarvestError::Config(
+            "fairness key must not contain a control character".to_owned(),
         ));
     }
     if key.len() > MAX_FAIRNESS_KEY_LEN {
@@ -185,8 +192,8 @@ pub fn fairness_key_for(explicit: Option<&str>, quota_key: Option<&str>) -> Opti
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError::Config`] when `weight` is not finite or is outside
-/// [`MIN_FAIRNESS_WEIGHT`]`..=`[`MAX_FAIRNESS_WEIGHT`].
+/// Returns [`HarvestError::Config`] when `weight` is not finite, is below
+/// [`MIN_FAIRNESS_WEIGHT`], or is above [`MAX_FAIRNESS_WEIGHT`].
 pub fn validate_fairness_weight(weight: f64) -> HarvestResult<f64> {
     if weight.is_finite() && (MIN_FAIRNESS_WEIGHT..=MAX_FAIRNESS_WEIGHT).contains(&weight) {
         Ok(weight)
@@ -299,9 +306,9 @@ impl FairClock {
     /// Delete the state of idle keys that the claim cannot tell apart from
     /// no state. Returns the number of keys deleted.
     ///
-    /// A key goes when `is_active` is false, its `pass` is at most `V` (no
-    /// debt), and its `last_start` is below `V` (it does not set `V`). Such a
-    /// key starts at `V` with or without its row.
+    /// A key goes when three things hold. `is_active` is false. Its `pass` is
+    /// at most `V`, so it has no debt. Its `last_start` is below `V`, so it
+    /// does not set `V`. Such a key starts at `V` with or without its row.
     pub fn prune(&mut self, is_active: impl Fn(&str) -> bool) -> usize {
         let v = self.vclock();
         let before = self.keys.len();
@@ -519,6 +526,7 @@ mod tests {
         assert!(validate_fairness_key(DEFAULT_FAIRNESS_KEY).is_err());
         assert!(validate_fairness_key(" a").is_err());
         assert!(validate_fairness_key("a\n").is_err());
+        assert!(validate_fairness_key("a\u{1f}b").is_err());
         assert!(validate_fairness_key(&"x".repeat(MAX_FAIRNESS_KEY_LEN + 1)).is_err());
     }
 

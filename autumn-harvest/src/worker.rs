@@ -12948,7 +12948,7 @@ fn resolve_child_workflow_defaults(
 // Long by construction (and longer since #956 added the cross-shard early
 // return): the body is dominated by a wide, fully-explicit `NewWorkflowExecution`
 // literal, matching its `persist_all_started_child_workflows` twin.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn insert_awaited_child_execution(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,

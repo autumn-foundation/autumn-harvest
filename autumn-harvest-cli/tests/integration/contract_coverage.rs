@@ -1263,6 +1263,33 @@ fn queue_list_paused_is_covered() {
     assert_covered(&["queue", "list-paused"]);
 }
 
+// ── Fairness key weights (issue #1976) ────────────────────────────────────────
+
+#[test]
+fn queue_fairness_show_is_covered() {
+    assert_covered(&["queue", "fairness", "show", "email-workers"]);
+}
+
+#[test]
+fn queue_fairness_set_is_covered() {
+    let args = [
+        "queue",
+        "fairness",
+        "set",
+        "email-workers",
+        "tenant-a",
+        "--weight",
+        "2",
+    ];
+    assert_covered(&args);
+    assert_body_fields_documented(&args);
+}
+
+#[test]
+fn queue_fairness_clear_is_covered() {
+    assert_covered(&["queue", "fairness", "clear", "email-workers", "tenant-a"]);
+}
+
 // ── Per-activity-type pause/resume (issue #807) ───────────────────────────────
 
 #[test]

@@ -181,6 +181,13 @@ forward progress, even while heavier queues are saturated.
 Zero-weight queues appear at the end of the permutation, so they are reachable as
 soon as all positive-weight queues are drained.
 
+### Tenants that share one queue (#1976)
+
+Weights share a worker between queues. To share **one** queue between
+tenants, give each run a fairness key and turn on
+`WorkerConfig::with_fairness_keys(true)`. The claim then serves the keys of
+the queue in weighted round robin. See [Fairness keys](../fairness-keys.md).
+
 ### Composition with within-queue priority (#249)
 
 Weights decide **which queue** to claim from. Once a queue is selected, the
