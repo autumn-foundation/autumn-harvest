@@ -372,6 +372,7 @@ Current implementation scope: `ExecutionId`/`ShardId` encoding, `ShardRouter`, `
 | `policy.rs` | 1 | `RetryPolicy`, `TriggerRule`, `Schedule`, `TaskStatus`, `compute_retry_delay` |
 | `event.rs` | 1 | `WorkflowEvent` enum (adjacently-tagged serde), `type_name()`. Variants added in issue #140: `UpdateAdmitted`, `UpdateCompleted`, `UpdateFailed`. `SideEffectRecorded` + bounded `SideEffectKind` enum added in issue #384 (deterministic primitives). `ExternalCancelRequested`, `ExternalCancelDelivered`, `ExternalCancelFailed` added in issue #492. `WorkflowStarted` gained two additive optional fields in issue #488: `last_completion_result: Option<serde_json::Value>` and `last_error: Option<String>` (both `#[serde(default, skip_serializing_if = "Option::is_none")]`, frozen at schedule-fire time). `ExternalSignalRequested` gained an **additive** optional `idempotency_key: Option<String>` field in issue #521 (no new variant). |
 | `context.rs` | 1+2 | `WorkflowContext` (replay, suspension, version gate, timers), `ActivityContext` (heartbeat channel, cancellation) |
+| `cancellation_scope.rs` | 3 | `CancellationScope` (group cancel of the activities, timers and children a body starts) and `ctx.non_cancellable` (a block that defers a workflow cancel). Issue #1984; design in `DESIGN-1984.md` |
 | `info.rs` | 1 | `WorkflowInfo`, `ActivityInfo`, `WorkflowHandlerFn`, `ActivityHandlerFn` type aliases |
 | `builder.rs` | 1 | `HarvestBuilder` (fluent), `WorkerConfig` (queues, concurrency, timeouts) |
 | `prelude.rs` | 1 | Core glob re-export surface including macros |
@@ -1281,6 +1282,32 @@ let out: Quote = winner.decode()?;       // winner.index tells you which branch 
 **Determinism contract**: the winning branch is recorded via the *existing* `MarkerRecorded` event (mirrors `execute_activity_fan_out`'s count marker — no new `WorkflowEvent` variant). Every later replay of the same history *verifies* the previously recorded winner rather than re-deriving it, so a code change that would flip the outcome is rejected as `HarvestError::NonDeterministic`. If multiple branches are already resolved by the time the race is (re-)evaluated (e.g. two activities both finished before the workflow noticed), the **lowest-indexed** resolved branch wins — a documented, deterministic tie-break.
 
 **Cancellation**: losing branches are durably torn down in the *same* transaction that persists the winner marker — a still-open losing activity's task row is cancelled and a synthetic `ActivityFailed { error: "lost race to a sibling branch" }` is recorded (reusing the existing event variant, so no future replay observes it stuck in-progress); a losing child workflow is cancelled via the same primitive `ctx.request_cancel_external_workflow` uses (issue #492); a losing timer's row is deleted. A cancelled loser never triggers the workflow-level cancellation path or Saga compensation — only the loser itself is cancelled. See `autumn-harvest/examples/race_hedged_call.rs`.
+
+### Cancellation Scopes (issue #1984)
+
+`ctx.cancellation_scope()` groups the operations that a body starts, so that one call cancels them together. `ctx.non_cancellable(body)` shields a block from a workflow cancel.
+
+```rust
+let scope = ctx.cancellation_scope();
+let (charged, ()) = tokio::join!(
+    scope.run(ctx.execute_activity_raw("charge", input.clone(), "payments")),
+    async {
+        let _ = ctx.wait_for_signal("abort").await;
+        scope.cancel();               // activity, timer and child members are cancelled
+    },
+);
+if let Err(HarvestError::Cancelled(_)) = charged {
+    ctx.non_cancellable(ctx.execute_activity_raw("release_hold", input, "payments")).await??;
+}
+```
+
+**Scope.** `run` tags each command that the body pushes. Activities, durable timers and awaited children become members. `cancel` takes effect at the next poll of the run future: the run future drops the body and returns `HarvestError::Cancelled`. A cancel after the body completes does nothing.
+
+**Determinism contract.** The decision is the marker `cancel_scope:{seq}`. Its details name the members and the `horizon`, the history length that the cancelling cycle saw. The same transaction runs `CancelRaceLosers { reason: ScopeCancelled, .. }`, the race teardown. The body's commands from the cancelling cycle are withdrawn, so nothing that the body started in that cycle reaches the worker. On replay the scope finds its marker before the first poll. It polls the body with the matcher cut at the horizon, holds the body's commands, and consumes the members' events when it reaches the marker. A completion that arrived during the cancelling cycle therefore cannot change the replayed outcome.
+
+**Non-cancellable block.** The block records `non_cancellable_open:{seq}` and `non_cancellable_close:{seq}`. A cancel that finds an open block on a `RUNNING` run appends `WorkflowCancelRequested` once and keeps the run running (`CancelledWorkflowExecution::deferred`, and `deferred` in the REST response). Replay skips that event, and workflow code does not see it. The first suspended cycle with no open block runs the terminal cancel in the same transaction. A cycle that would fail or continue as new is cancelled instead, so no retry or successor drops the cancel. A cycle that completes keeps its result. A paused run is not deferred, because it cannot close its block. A block is open from the commit of the cycle that enters it: a cancel that commits first is terminal, and that cycle's work, the block's included, is discarded. A terminate, `TerminateIfRunning`, signal-with-start replace and latest-wins supersede are never deferred.
+
+**Limits.** A block cannot nest inside a cancellable scope (`HarvestError::Config`); a scope can nest inside a block. A scope cannot acquire a durable mutex, because a dropped acquire would block the key's FIFO queue. A scope cannot signal, cancel or await an external workflow either, because their late results would stay unconsumed on replay. A scope cannot create a session, because a dropped session is never released. Each returns `HarvestError::Config`. A cancel that finds no open block is terminal at once, so durable cleanup after such a cancel is still not possible. Local activities, external activities and detached children are not cancelled by a scope; replay consumes a late external result. A block dropped before it completes still records its close marker, except when the cycle suspends.
 
 ### Local Activities
 

@@ -2259,6 +2259,11 @@ async fn cancel_workflow_ui(
     let cancel_result =
         cancel_workflow_execution(&mut conn, exec_id, &reason, metrics_ref.as_ref()).await;
     let (status, error_summary, flash) = match &cancel_result {
+        Ok(cancelled) if cancelled.deferred => (
+            STATUS_SUCCEEDED,
+            None,
+            url_encode("Cancel deferred until the open non-cancellable block closes"),
+        ),
         Ok(_) => (STATUS_SUCCEEDED, None, url_encode("Workflow cancelled")),
         Err(e) => {
             let msg = e.to_string();
@@ -5724,6 +5729,7 @@ fn event_human_label(event_type: &str, event_data: &Value, execution_state: &str
             }
         }
         "WorkflowTerminated" => "Workflow terminated".to_string(),
+        "WorkflowCancelRequested" => "Cancel requested (deferred)".to_string(),
         "ActivityScheduled" => {
             let name = event_data_field(event_data, "name").unwrap_or("?");
             format!("Activity scheduled: {name}")

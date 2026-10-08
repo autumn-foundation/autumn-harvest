@@ -624,6 +624,14 @@ pub(crate) struct LocalActivityResolution {
     pub(crate) start_to_close_nanos: Option<u64>,
 }
 
+/// The events and stashed signals that [`HistoryMatcher::cut_view`] hides
+/// (issue #1984).
+pub(crate) struct ViewCut {
+    tail: Vec<WorkflowEvent>,
+    hidden_signals: VecDeque<(String, Value, usize)>,
+    cursor: usize,
+}
+
 /// Walks through recorded workflow events during replay, matching
 /// commands against what was previously recorded.
 ///
@@ -956,12 +964,15 @@ impl HistoryMatcher {
     }
 
     /// Events that carry no workflow command and that replay never consumes:
-    /// pause and resume (#383), post-terminal bookkeeping, and decision
-    /// boundaries (#1833).
+    /// pause and resume (#383), post-terminal bookkeeping, decision
+    /// boundaries (#1833) and deferred cancels (#1984).
     const fn is_command_free_bookkeeping(event: &WorkflowEvent) -> bool {
         Self::is_pause_lifecycle_event(event)
             || Self::is_post_terminal_bookkeeping(event)
             || event.is_decision_boundary()
+            // A deferred cancel (issue #1984) lands at any position and no
+            // workflow command matches it.
+            || matches!(event, WorkflowEvent::WorkflowCancelRequested { .. })
     }
 
     /// Events appended **after** a run's terminal event as durable bookkeeping.
@@ -6335,6 +6346,214 @@ impl HistoryMatcher {
                         WorkflowEvent::SignalReceived { signal_name: n, .. } if n == signal_name
                     )
             })
+    }
+
+    /// Hide every event at or after `horizon` (issue #1984).
+    ///
+    /// A replayed cancelled scope polls its body behind this cut. Stashed
+    /// signals past the cut are hidden too. Returns `None` when nothing is
+    /// hidden.
+    pub(crate) fn cut_view(&mut self, horizon: usize) -> Option<ViewCut> {
+        if horizon >= self.events.len() {
+            return None;
+        }
+        let tail = self.events.split_off(horizon);
+        let (kept, hidden_signals): (VecDeque<_>, VecDeque<_>) =
+            std::mem::take(&mut self.pending_signals)
+                .into_iter()
+                .partition(|(_, _, idx)| *idx < horizon);
+        self.pending_signals = kept;
+        Some(ViewCut {
+            tail,
+            hidden_signals,
+            cursor: self.cursor,
+        })
+    }
+
+    /// Undo a [`Self::cut_view`].
+    pub(crate) fn restore_view(&mut self, cut: ViewCut) {
+        let horizon = self.events.len();
+        self.events.extend(cut.tail);
+        self.pending_signals.extend(cut.hidden_signals);
+        self.pending_signals
+            .make_contiguous()
+            .sort_by_key(|(_, _, idx)| *idx);
+        if cut.cursor > horizon {
+            self.cursor = cut.cursor;
+        }
+    }
+
+    /// Keep only the scope members that are still open (issue #1984).
+    ///
+    /// A member is open when its start event is in history and its terminal
+    /// is not. A warm (resident) cycle and a cold replay then name the same
+    /// members.
+    pub(crate) fn open_members(
+        &self,
+        members: &crate::cancellation_scope::ScopeMembers,
+    ) -> crate::cancellation_scope::ScopeMembers {
+        let mut activities = HashSet::new();
+        let mut children = HashSet::new();
+        let mut timers = HashSet::new();
+        for event in &self.events {
+            match event {
+                WorkflowEvent::ActivityScheduled { activity_id, .. }
+                | WorkflowEvent::ActivityAwaitingExternal { activity_id, .. } => {
+                    activities.insert(*activity_id);
+                }
+                WorkflowEvent::ActivityCompleted { activity_id, .. }
+                | WorkflowEvent::ActivityFailed { activity_id, .. }
+                | WorkflowEvent::ActivityTimedOut { activity_id, .. }
+                | WorkflowEvent::ActivityCompletedExternally { activity_id, .. }
+                | WorkflowEvent::ActivityFailedExternally { activity_id, .. } => {
+                    activities.remove(activity_id);
+                }
+                WorkflowEvent::ChildWorkflowStarted { child_id, .. } => {
+                    children.insert(*child_id);
+                }
+                WorkflowEvent::ChildWorkflowCompleted { child_id, .. }
+                | WorkflowEvent::ChildWorkflowFailed { child_id, .. } => {
+                    children.remove(child_id);
+                }
+                WorkflowEvent::TimerStarted { timer_id, .. } => {
+                    timers.insert(timer_id.as_str());
+                }
+                WorkflowEvent::TimerFired { timer_id }
+                | WorkflowEvent::TimerCancelled { timer_id } => {
+                    timers.remove(timer_id.as_str());
+                }
+                _ => {}
+            }
+        }
+        crate::cancellation_scope::ScopeMembers {
+            activities: members
+                .activities
+                .iter()
+                .copied()
+                .filter(|id| activities.contains(id))
+                .collect(),
+            children: members
+                .children
+                .iter()
+                .copied()
+                .filter(|id| children.contains(id))
+                .collect(),
+            timers: members
+                .timers
+                .iter()
+                .filter(|id| timers.contains(id.as_str()))
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// The details of an unconsumed marker at or after the cursor.
+    ///
+    /// A pure read: the cursor does not move.
+    pub(crate) fn unconsumed_marker_details(&self, marker_name: &str) -> Option<Value> {
+        self.events
+            .iter()
+            .enumerate()
+            .skip(self.cursor)
+            .find_map(|(i, e)| match e {
+                WorkflowEvent::MarkerRecorded { name, details }
+                    if name == marker_name && !self.is_consumed(i) =>
+                {
+                    Some(details.clone())
+                }
+                _ => None,
+            })
+    }
+
+    /// Consume the marker `marker_name` and return its index and details.
+    ///
+    /// The scan tolerates the same interleaved sibling events as
+    /// [`Self::peek_u64_marker`]. Returns `None` at the live frontier or when
+    /// another event blocks the scan.
+    pub(crate) fn take_marker(&mut self, marker_name: &str) -> Option<(usize, Value)> {
+        if !self.prepare_match() {
+            return None;
+        }
+        let mut scan_cursor = self.cursor;
+        let mut first_interleaved_command = None;
+        while scan_cursor < self.events.len() {
+            if self.is_consumed(scan_cursor) {
+                scan_cursor += 1;
+                continue;
+            }
+            match &self.events[scan_cursor] {
+                WorkflowEvent::MarkerRecorded { name, details } if name == marker_name => {
+                    let details = details.clone();
+                    if let Some(command_cursor) = first_interleaved_command {
+                        self.consumed_out_of_order_events.insert(scan_cursor);
+                        self.cursor = command_cursor;
+                    } else {
+                        self.cursor = scan_cursor + 1;
+                    }
+                    self.advance_to_next_unconsumed_event();
+                    return Some((scan_cursor, details));
+                }
+                // Other writers append between the horizon and the marker: a
+                // completion, a late external result, a signal. The marker
+                // name is unique, so the scan steps over any event that is not
+                // a terminal lifecycle event. The cursor returns to the first
+                // stepped-over event, so nothing is lost.
+                event if !event.is_terminal_lifecycle() => {
+                    first_interleaved_command.get_or_insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                _ => break,
+            }
+        }
+        if let Some(command_cursor) = first_interleaved_command {
+            self.cursor = command_cursor;
+            self.advance_to_next_unconsumed_event();
+        }
+        None
+    }
+
+    /// Consume the events of a cancelled scope's members (issue #1984).
+    ///
+    /// Activity and child ids are unique, so each of their events is
+    /// consumed wherever it is. A timer id can be used again later, so a
+    /// `TimerFired` is consumed only inside `timer_window`.
+    pub(crate) fn consume_scope_members(
+        &mut self,
+        members: &crate::cancellation_scope::ScopeMembers,
+        timer_window: std::ops::Range<usize>,
+    ) {
+        for index in 0..self.events.len() {
+            if self.is_consumed(index) {
+                continue;
+            }
+            let member = match &self.events[index] {
+                WorkflowEvent::ActivityScheduled { activity_id, .. }
+                | WorkflowEvent::ActivityStarted { activity_id, .. }
+                | WorkflowEvent::ActivityHeartbeat { activity_id, .. }
+                | WorkflowEvent::ActivityCompleted { activity_id, .. }
+                | WorkflowEvent::ActivityFailed { activity_id, .. }
+                | WorkflowEvent::ActivityTimedOut { activity_id, .. }
+                | WorkflowEvent::ActivityAwaitingExternal { activity_id, .. }
+                | WorkflowEvent::ActivityCompletedExternally { activity_id, .. }
+                | WorkflowEvent::ActivityFailedExternally { activity_id, .. }
+                | WorkflowEvent::ActivityExternalDeadlineExtended { activity_id, .. } => {
+                    members.activities.contains(activity_id)
+                }
+                WorkflowEvent::ChildWorkflowStarted { child_id, .. }
+                | WorkflowEvent::ChildWorkflowCompleted { child_id, .. }
+                | WorkflowEvent::ChildWorkflowFailed { child_id, .. } => {
+                    members.children.contains(child_id)
+                }
+                WorkflowEvent::TimerFired { timer_id } => {
+                    timer_window.contains(&index) && members.timers.contains(timer_id)
+                }
+                _ => false,
+            };
+            if member {
+                self.consumed_out_of_order_events.insert(index);
+            }
+        }
+        self.advance_to_next_unconsumed_event();
     }
 
     /// Whether an unconsumed `MarkerRecorded { name }` exists anywhere at or

@@ -4435,6 +4435,26 @@ pub async fn cancel_activity_task(
     conn: &mut AsyncPgConnection,
     activity_id: crate::types::ActivityExecId,
 ) -> HarvestResult<Option<(String, String)>> {
+    cancel_activity_task_with_reason(
+        conn,
+        activity_id,
+        crate::context::LoserCancelReason::RaceLoser.message(),
+    )
+    .await
+}
+
+/// [`cancel_activity_task`] that stores `reason` as the row's error
+/// (issue #1984). A cancellation scope names itself here.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`](crate::error::HarvestError::Database) on
+/// update failure.
+pub async fn cancel_activity_task_with_reason(
+    conn: &mut AsyncPgConnection,
+    activity_id: crate::types::ActivityExecId,
+    reason: &str,
+) -> HarvestResult<Option<(String, String)>> {
     use crate::schema::harvest_task_queue::dsl;
 
     let cancelled = diesel::update(
@@ -4445,7 +4465,7 @@ pub async fn cancel_activity_task(
     .set((
         dsl::state.eq("CANCELLED"),
         dsl::worker_id.eq(None::<String>),
-        dsl::error.eq(Some("lost race to a sibling branch".to_string())),
+        dsl::error.eq(Some(reason.to_string())),
         dsl::heartbeat_details.eq(None::<serde_json::Value>),
         dsl::completed_at.eq(Some(Utc::now())),
     ))

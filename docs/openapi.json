@@ -8257,6 +8257,7 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "deferred": {},
                     "execution_id": {},
                     "failed_task_count": {},
                     "newly_cancelled": {},
@@ -10495,6 +10496,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "deferred": {
+                      "description": "An open non-cancellable block deferred the cancel (issue #1984). The run keeps running, and state is its live state.",
+                      "type": "boolean"
+                    },
                     "execution_id": {
                       "description": "The attempt that was stopped. A UUID.",
                       "type": "string"
@@ -10521,7 +10526,8 @@
                     "state",
                     "reason",
                     "newly_cancelled",
-                    "failed_task_count"
+                    "failed_task_count",
+                    "deferred"
                   ],
                   "type": "object"
                 }
@@ -10534,6 +10540,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "deferred": {
+                      "description": "An open non-cancellable block deferred the cancel (issue #1984). The run keeps running, and state is its live state.",
+                      "type": "boolean"
+                    },
                     "execution_id": {
                       "description": "The attempt that was stopped. A UUID.",
                       "type": "string"
@@ -10560,7 +10570,8 @@
                     "state",
                     "reason",
                     "newly_cancelled",
-                    "failed_task_count"
+                    "failed_task_count",
+                    "deferred"
                   ],
                   "type": "object"
                 }

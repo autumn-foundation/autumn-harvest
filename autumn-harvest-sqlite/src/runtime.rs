@@ -8,7 +8,9 @@ use autumn_harvest::builder::{
     DEFAULT_MAX_ACTIVITY_INPUT_BYTES, DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
     DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
 };
-use autumn_harvest::context::{DEFAULT_CURRENT_DETAILS_CAP_BYTES, empty_shared_state};
+use autumn_harvest::context::{
+    DEFAULT_CURRENT_DETAILS_CAP_BYTES, LoserCancelReason, empty_shared_state,
+};
 use autumn_harvest::executor::{
     WorkflowExecuteSpanMeta, run_workflow_with_state_history_policy_and_caps,
 };
@@ -1648,11 +1650,12 @@ impl SqliteRuntime {
                 // later replay cycle reports no progress once torn down and the loop
                 // converges instead of spinning.
                 WorkflowCommand::CancelRaceLosers {
+                    reason,
                     activities,
                     children,
                     timers,
                 } => {
-                    if apply_cancel_race_losers(&tx, exec, activities, children, timers)? {
+                    if apply_cancel_race_losers(&tx, exec, *reason, activities, children, timers)? {
                         produced = true;
                     }
                 }
@@ -2149,11 +2152,12 @@ fn persist_terminal_pending_commands(
             // arm the drain rejected it as `Unsupported`, wedging every
             // pull-signal-plus-timeout workflow (Codex #1069 P2).
             WorkflowCommand::CancelRaceLosers {
+                reason,
                 activities,
                 children,
                 timers,
             } => {
-                apply_cancel_race_losers(conn, exec, activities, children, timers)?;
+                apply_cancel_race_losers(conn, exec, *reason, activities, children, timers)?;
             }
             // Benign bookkeeping — appends no event, gates no control flow.
             // `PublishProgress` (issue #791) is an ephemeral Postgres-only
@@ -2212,6 +2216,7 @@ fn persist_terminal_pending_commands(
 fn apply_cancel_race_losers(
     conn: &Connection,
     exec: ExecutionId,
+    reason: LoserCancelReason,
     activities: &[ActivityExecId],
     children: &[ExecutionId],
     timers: &[TimerId],
@@ -2235,7 +2240,7 @@ fn apply_cancel_race_losers(
                 exec,
                 &WorkflowEvent::ActivityFailed {
                     activity_id: *activity_id,
-                    error: "lost race to a sibling branch".to_string(),
+                    error: reason.message().to_string(),
                     attempt: 1,
                     error_type: "Error".to_string(),
                     non_retryable: true,

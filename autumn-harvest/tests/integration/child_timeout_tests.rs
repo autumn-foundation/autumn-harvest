@@ -1113,6 +1113,7 @@ async fn race_loser_child_cancel_materializing_deadline_advances_event_id_past_a
     // materializing the overdue `__child_timeout` deadline (TimerFired) BEFORE
     // the ChildWorkflowFailed — TWO events onto the parent's own history.
     let commands = vec![WorkflowCommand::CancelRaceLosers {
+        reason: autumn_harvest::context::LoserCancelReason::RaceLoser,
         activities: vec![],
         children: vec![loser_child_exec_id],
         timers: vec![],

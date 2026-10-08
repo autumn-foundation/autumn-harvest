@@ -56,6 +56,7 @@ mod cache_delta_load_tests;
 mod calendars_docs;
 #[cfg(feature = "db")]
 mod canary_tests;
+mod cancellation_scope_tests;
 mod cancellation_tests;
 #[cfg(feature = "db")]
 mod capability_miss_tests;

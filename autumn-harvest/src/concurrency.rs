@@ -902,8 +902,10 @@ async fn supersede_inner(
             continue;
         }
 
+        // Issue #1984: a supersede must free the slot now, so an open
+        // non-cancellable block does not defer it.
         let (cancelled, mut deferred, mut checks, _terminal_metric) =
-            match crate::execution::cancel_workflow_execution_collect(
+            match crate::execution::cancel_workflow_execution_collect_now(
                 conn,
                 candidate.exec_id,
                 SUPERSEDE_CANCEL_REASON,

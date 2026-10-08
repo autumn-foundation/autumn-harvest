@@ -515,6 +515,7 @@ impl WorkflowSimulator {
                     advanced = true;
                 }
                 WorkflowCommand::CancelRaceLosers {
+                    reason,
                     activities,
                     children,
                     timers: _,
@@ -526,7 +527,7 @@ impl WorkflowSimulator {
                     for activity_id in activities {
                         history.push(WorkflowEvent::ActivityFailed {
                             activity_id,
-                            error: "lost race to a sibling branch".to_string(),
+                            error: reason.message().to_string(),
                             attempt: 1,
                             error_type: "Error".to_string(),
                             non_retryable: true,
@@ -536,7 +537,7 @@ impl WorkflowSimulator {
                     for child_id in children {
                         history.push(WorkflowEvent::child_workflow_failed(
                             child_id,
-                            "lost race to a sibling branch".to_string(),
+                            reason.message().to_string(),
                         ));
                     }
                     advanced = true;

@@ -2025,6 +2025,8 @@ struct CancelWorkflowResponse {
     reason: String,
     newly_cancelled: bool,
     failed_task_count: usize,
+    /// An open non-cancellable block deferred the cancel (issue #1984).
+    deferred: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -7774,6 +7776,7 @@ pub const fn management_api_response_fields()
                 "reason",
                 "newly_cancelled",
                 "failed_task_count",
+                "deferred",
             ]),
         ),
         (
@@ -8025,6 +8028,7 @@ pub const fn management_api_response_fields()
                 "reason",
                 "newly_cancelled",
                 "failed_task_count",
+                "deferred",
             ]),
         ),
         (
@@ -23276,6 +23280,7 @@ async fn cancel_workflow(
                     reason: cancelled.reason,
                     newly_cancelled: cancelled.newly_cancelled,
                     failed_task_count: cancelled.failed_task_count,
+                    deferred: cancelled.deferred,
                 }),
             ))
         }

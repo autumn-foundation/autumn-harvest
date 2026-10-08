@@ -2456,6 +2456,12 @@
             "name": "failed_task_count",
             "type": "integer",
             "required": true
+          },
+          {
+            "name": "deferred",
+            "type": "boolean",
+            "required": true,
+            "description": "An open non-cancellable block deferred the cancel (issue #1984). The run keeps running, and state is its live state."
           }
         ]
       },
@@ -2494,6 +2500,12 @@
               "name": "failed_task_count",
               "type": "integer",
               "required": true
+            },
+            {
+              "name": "deferred",
+              "type": "boolean",
+              "required": true,
+              "description": "An open non-cancellable block deferred the cancel (issue #1984). The run keeps running, and state is its live state."
             }
           ]
         }
@@ -11282,7 +11294,8 @@
           "state",
           "reason",
           "newly_cancelled",
-          "failed_task_count"
+          "failed_task_count",
+          "deferred"
         ]
       },
       "error_responses": [
