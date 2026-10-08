@@ -42,7 +42,9 @@ adds no `WorkflowEvent` variant, no migration and no worker path.
 - The state lives in memory in the body. Replay rebuilds it from the
   checkpoint input, the recorded op signals and the recorded results of the
   handler activities.
-- A handler gets a copy of the state. Only an `Ok` result replaces it. An
+- A handler gets a copy of the state (`S::clone`). Only an `Ok` result
+  replaces it. The state type must be plain data. A clone that shares
+  interior mutability lets a failed handler change the committed state. An
   `Err` or an op that does not decode counts as failed, and the entity goes
   on.
 - Queries read the last committed state, never a state inside a handler.

@@ -18,8 +18,8 @@ a new entity.
 - One handler at a time for each key. One active run exists for each
   `(workflow_name, workflow_id)`, and the loop awaits each handler.
 - State survives a worker crash. Replay rebuilds it.
-- State changes are atomic. A handler gets a copy of the state, and only
-  `Ok` replaces it. An `Err` or an undecodable message counts as failed, and
+- State changes are atomic. A handler gets a copy of the state (`S::clone`,
+  so use plain data), and only `Ok` replaces it. An `Err` or an undecodable message counts as failed, and
   the entity goes on.
 - No operation is lost at a checkpoint. The loop carries waiting op signals
   in the continue-as-new input while it fits the workflow input cap. An op
@@ -45,9 +45,8 @@ checkpoint decision.
 
 - `entity::tests` (23): serialization, rollback, decode errors, delete,
   checkpoint carry, the input-cap budget and its offload rule, the byte
-  trigger,
-  recorded-decision replay, replay stability against a naive loop, the
-  deadline probe, cancellation, bad input and queries.
+  trigger, recorded-decision replay, replay stability against a naive
+  loop, the deadline probe, cancellation, bad input and queries.
 - `tests/integration/entity_tests.rs` (Postgres): a worker crash in the
   middle of an op, with a later op held back; two clients racing on a new
   key; thirty ops across live history checkpoints, with a duplicate key.

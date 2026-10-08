@@ -23,7 +23,9 @@
 //!   workflow input cap. It runs the operations that do not fit first.
 //! - **Atomic state changes.** A handler gets a copy of the state. Only an
 //!   `Ok` result replaces the state. Activities that ran before an `Err` stay
-//!   done.
+//!   done. The copy is `S::clone`, so `clone` must copy the whole value. A
+//!   state that shares interior mutability, such as an `Arc<Mutex<_>>`,
+//!   loses this guarantee.
 //!
 //! # Limits
 //!
@@ -259,6 +261,10 @@ where
     /// `handler` gets a copy of the state and one operation. Its `Ok` value
     /// becomes the new state. An `Err` keeps the old state and counts as a
     /// failed operation. Capture `ctx` in the handler to call activities.
+    ///
+    /// The copy is `S::clone`. Use plain data for `S`. A clone that shares
+    /// state, such as an `Arc<Mutex<_>>`, lets a failed handler change the
+    /// committed state.
     ///
     /// Returns the final state after a delete. A checkpoint does not return.
     ///
