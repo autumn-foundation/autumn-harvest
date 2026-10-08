@@ -8,8 +8,11 @@
 //!
 //! The snapshot is an activity result, so replay reads the recorded snapshot
 //! and never the store.
+//!
+//! A tool call that was in flight at a crash runs again. Each edit therefore
+//! carries an [`EditKey`], and a store applies a key once.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -107,8 +110,7 @@ pub enum MemoryOp {
         /// The entry text.
         text: String,
     },
-    /// Replace the one entry that contains `old`. When no entry contains
-    /// `old` but one equals `text`, the edit is already done.
+    /// Replace the one entry that contains `old`.
     Replace {
         /// The block label.
         block: String,
@@ -117,8 +119,7 @@ pub enum MemoryOp {
         /// The new entry text.
         text: String,
     },
-    /// Remove the one entry that contains `old`. When no entry contains
-    /// `old`, nothing changes and the edit succeeds.
+    /// Remove the one entry that contains `old`.
     Remove {
         /// The block label.
         block: String,
@@ -150,7 +151,7 @@ pub fn apply_op(block: &mut MemoryBlock, op: &MemoryOp) -> Result<(), AgentError
     match op {
         MemoryOp::Add { text, .. } => {
             let text = non_empty(text)?;
-            // A tool call that ran again after a crash adds nothing twice.
+            // An entry that is there already is not added twice.
             if block.entries.iter().any(|entry| entry == text) {
                 return Ok(());
             }
@@ -159,10 +160,6 @@ pub fn apply_op(block: &mut MemoryBlock, op: &MemoryOp) -> Result<(), AgentError
         }
         MemoryOp::Replace { old, text, .. } => {
             let text = non_empty(text)?;
-            // A call that ran again after a crash finds its own result.
-            if !has_match(block, old) && block.entries.iter().any(|entry| entry == text) {
-                return Ok(());
-            }
             let index = find_unique(block, old)?;
             check_fits(block, Some(index), text)?;
             if let Some(entry) = block.entries.get_mut(index) {
@@ -170,22 +167,11 @@ pub fn apply_op(block: &mut MemoryBlock, op: &MemoryOp) -> Result<(), AgentError
             }
         }
         MemoryOp::Remove { old, .. } => {
-            // An entry that is gone already is the result the call wants.
-            // A call that ran again after a crash therefore succeeds.
-            if !old.trim().is_empty() && !has_match(block, old) {
-                return Ok(());
-            }
             let index = find_unique(block, old)?;
             block.entries.remove(index);
         }
     }
     Ok(())
-}
-
-/// Does any entry contain `old`?
-fn has_match(block: &MemoryBlock, old: &str) -> bool {
-    let old = old.trim();
-    block.entries.iter().any(|entry| entry.contains(old))
 }
 
 fn non_empty(text: &str) -> Result<&str, AgentError> {
@@ -305,6 +291,39 @@ fn escape(text: &str) -> String {
     out
 }
 
+/// The key of one memory edit: the run, the step and the tool call.
+///
+/// A store applies each key once. A retried call then changes nothing, even
+/// when another run edited the scope in between.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EditKey(String);
+
+impl EditKey {
+    /// A key with this text.
+    #[must_use]
+    pub fn new(key: impl Into<String>) -> Self {
+        Self(key.into())
+    }
+
+    /// The key of the tool call that `ctx` describes.
+    #[must_use]
+    pub fn for_call(ctx: &ToolContext) -> Self {
+        Self(format!(
+            "{}:{}:{}",
+            ctx.run_id.as_str(),
+            ctx.step,
+            ctx.call_id
+        ))
+    }
+
+    /// The key as text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Storage for memory blocks.
 pub trait MemoryStore: Send + Sync + std::fmt::Debug {
     /// Load every block of a scope. A new scope gets the default blocks.
@@ -317,8 +336,11 @@ pub trait MemoryStore: Send + Sync + std::fmt::Debug {
         scope: &'a MemoryScope,
     ) -> BoxFuture<'a, Result<Vec<MemoryBlock>, AgentError>>;
 
-    /// Apply one edit and store it. Call [`apply_op`] so the rules are the
-    /// same in every store.
+    /// Apply one edit and store it. Returns the block after the edit.
+    ///
+    /// Call [`apply_op`] so the rules are the same in every store. Store
+    /// `key` with the edit, in the same transaction. When `key` is stored
+    /// already, change nothing and return the block as it is.
     ///
     /// # Errors
     ///
@@ -328,21 +350,29 @@ pub trait MemoryStore: Send + Sync + std::fmt::Debug {
         &'a self,
         scope: &'a MemoryScope,
         op: MemoryOp,
+        key: &'a EditKey,
     ) -> BoxFuture<'a, Result<MemoryBlock, AgentError>>;
 }
 
 /// A [`MemoryStore`] in process memory. Its contents go when the process
 /// stops, so use it for tests and demos only.
 ///
-/// Its `Debug` output shows only the number of scopes, never an entry.
+/// Its `Debug` output shows only the number of scopes, never an entry. It
+/// keeps every applied key for the life of the process.
 pub struct InMemoryMemoryStore {
     template: Vec<MemoryBlock>,
-    scopes: Mutex<HashMap<MemoryScope, Vec<MemoryBlock>>>,
+    state: Mutex<State>,
+}
+
+#[derive(Default)]
+struct State {
+    scopes: HashMap<MemoryScope, Vec<MemoryBlock>>,
+    applied: HashSet<(MemoryScope, EditKey)>,
 }
 
 impl std::fmt::Debug for InMemoryMemoryStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let scopes = self.scopes.lock().map_or(0, |scopes| scopes.len());
+        let scopes = self.state.lock().map_or(0, |state| state.scopes.len());
         f.debug_struct("InMemoryMemoryStore")
             .field("scopes", &scopes)
             .finish_non_exhaustive()
@@ -367,7 +397,7 @@ impl InMemoryMemoryStore {
     pub fn with_template(template: Vec<MemoryBlock>) -> Self {
         Self {
             template,
-            scopes: Mutex::new(HashMap::new()),
+            state: Mutex::new(State::default()),
         }
     }
 }
@@ -378,9 +408,10 @@ impl MemoryStore for InMemoryMemoryStore {
         scope: &'a MemoryScope,
     ) -> BoxFuture<'a, Result<Vec<MemoryBlock>, AgentError>> {
         let blocks = self
-            .scopes
+            .state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .scopes
             .get(scope)
             .cloned()
             .unwrap_or_else(|| self.template.clone());
@@ -391,15 +422,35 @@ impl MemoryStore for InMemoryMemoryStore {
         &'a self,
         scope: &'a MemoryScope,
         op: MemoryOp,
+        key: &'a EditKey,
     ) -> BoxFuture<'a, Result<MemoryBlock, AgentError>> {
-        let mut scopes = self.scopes.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let State { scopes, applied } = &mut *state;
         let blocks = scopes
             .entry(scope.clone())
             .or_insert_with(|| self.template.clone());
-        let result = apply_to(blocks, &op);
-        drop(scopes);
+        let done = (scope.clone(), key.clone());
+        let result = if applied.contains(&done) {
+            current(blocks, &op)
+        } else {
+            let result = apply_to(blocks, &op);
+            if result.is_ok() {
+                applied.insert(done);
+            }
+            result
+        };
+        drop(state);
         Box::pin(std::future::ready(result))
     }
+}
+
+/// The block that `op` names, unchanged.
+fn current(blocks: &[MemoryBlock], op: &MemoryOp) -> Result<MemoryBlock, AgentError> {
+    blocks
+        .iter()
+        .find(|block| block.label == op.block())
+        .cloned()
+        .ok_or_else(|| unknown_block(op.block(), blocks))
 }
 
 /// Apply `op` to the block it names. Returns the block after the edit.
@@ -468,13 +519,14 @@ impl Tool for MemoryTool {
     fn execute<'a>(
         &'a self,
         input: serde_json::Value,
-        _ctx: &'a ToolContext,
+        ctx: &'a ToolContext,
     ) -> BoxFuture<'a, Result<serde_json::Value, AgentError>> {
         Box::pin(async move {
             let op: MemoryOp = serde_json::from_value(input).map_err(|err| {
                 AgentError::new(ErrorKind::Tool, format!("not a valid memory edit: {err}"))
             })?;
-            let block = self.store.apply(&self.scope, op).await?;
+            let key = EditKey::for_call(ctx);
+            let block = self.store.apply(&self.scope, op, &key).await?;
             Ok(serde_json::json!({
                 "ok": true,
                 "block": block.label,
@@ -544,19 +596,11 @@ mod tests {
                 .contains("2 entries")
         );
         assert!(
-            apply_op(
-                &mut b,
-                &MemoryOp::Replace {
-                    block: "memory".into(),
-                    old: "milk".into(),
-                    text: "oat milk".into(),
-                }
-            )
-            .unwrap_err()
-            .message()
-            .contains("no entry")
+            apply_op(&mut b, &remove("milk"))
+                .unwrap_err()
+                .message()
+                .contains("no entry")
         );
-        apply_op(&mut b, &remove("milk")).unwrap();
         assert!(apply_op(&mut b, &add("  ")).is_err());
     }
 
@@ -572,6 +616,7 @@ mod tests {
                     block: "user".into(),
                     text: "likes tea".into(),
                 },
+                &EditKey::new("k1"),
             )
             .await
             .unwrap();
@@ -588,6 +633,7 @@ mod tests {
                     block: "nope".into(),
                     text: "x".into(),
                 },
+                &EditKey::new("k2"),
             )
             .await
             .unwrap_err();
@@ -642,7 +688,11 @@ mod tests {
     async fn debug_output_shows_no_entry() {
         let store = InMemoryMemoryStore::new();
         store
-            .apply(&MemoryScope::new("u"), add("secret plan"))
+            .apply(
+                &MemoryScope::new("u"),
+                add("secret plan"),
+                &EditKey::new("k"),
+            )
             .await
             .unwrap();
         let debug = format!("{store:?}");
@@ -650,24 +700,39 @@ mod tests {
         assert!(debug.contains("scopes: 1"), "{debug}");
     }
 
-    #[test]
-    fn a_replace_or_remove_that_runs_again_succeeds() {
-        let mut b = block();
-        apply_op(&mut b, &add("tea")).unwrap();
-        let replace = MemoryOp::Replace {
-            block: "memory".into(),
-            old: "tea".into(),
-            text: "green".into(),
-        };
-        apply_op(&mut b, &replace).unwrap();
-        apply_op(&mut b, &replace).unwrap();
-        assert_eq!(b.entries, vec!["green".to_owned()]);
+    #[tokio::test]
+    async fn a_retried_edit_is_skipped_by_its_key() {
+        let store = InMemoryMemoryStore::new();
+        let scope = MemoryScope::new("u");
         let remove = MemoryOp::Remove {
             block: "memory".into(),
-            old: "green".into(),
+            old: "tea".into(),
         };
-        apply_op(&mut b, &remove).unwrap();
-        apply_op(&mut b, &remove).unwrap();
-        assert_eq!(b.entries, Vec::<String>::new());
+        let first = EditKey::new("run:0:a");
+        store
+            .apply(&scope, add("tea"), &EditKey::new("run:0:z"))
+            .await
+            .unwrap();
+        store.apply(&scope, remove.clone(), &first).await.unwrap();
+        // Another run adds the same text before the retry arrives.
+        store
+            .apply(&scope, add("tea"), &EditKey::new("other:0:b"))
+            .await
+            .unwrap();
+        // The retry of the first remove must not delete the newer entry.
+        store.apply(&scope, remove, &first).await.unwrap();
+        let blocks = store.load(&scope).await.unwrap();
+        assert_eq!(blocks[0].entries, vec!["tea".to_owned()]);
+    }
+
+    #[test]
+    fn the_key_names_the_run_the_step_and_the_call() {
+        let ctx = ToolContext {
+            run_id: crate::message::RunId::new("r"),
+            call_id: "c".into(),
+            session_id: None,
+            step: 3,
+        };
+        assert_eq!(EditKey::for_call(&ctx).as_str(), "r:3:c");
     }
 }

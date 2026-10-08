@@ -24,7 +24,11 @@ modelled on `autumn-plugin-agent` with no dependency on it.
   a retried send.
 - **Memory.** The activity `agent_memory_snapshot` reads a frozen snapshot
   once per segment. The snapshot escapes each entry, and the `memory` tool
-  writes through.
+  writes through. Each edit carries an `EditKey`, and a store applies a key
+  once.
+- **Run id.** The run id is now the execution id, not the reusable
+  workflow id. `ToolContext::run_id` and `Report::key()` therefore name one
+  run.
 - **Loop guard.** An FNV-1a fingerprint of name, arguments and result. It
   warns, then ends the run as `loop_detected`. It is on by default and covers
   the whole run.

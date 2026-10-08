@@ -252,7 +252,7 @@ impl AgentTask {
 /// The input of one model-turn activity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelTurnRequest {
-    /// The workflow id. Tools and the policy see it as the run id.
+    /// The execution id. Tools and the policy see it as the run id.
     pub run_id: String,
     /// The session the run belongs to.
     #[serde(default)]
@@ -334,7 +334,7 @@ impl ModelTurn {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCallRequest {
-    /// The workflow id.
+    /// The execution id: the run id.
     pub run_id: String,
     /// The session the run belongs to.
     #[serde(default)]

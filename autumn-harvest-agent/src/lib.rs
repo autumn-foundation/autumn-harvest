@@ -83,7 +83,7 @@ pub use heartbeat::{
     agent_heartbeat_info,
 };
 pub use loop_guard::LoopGuard;
-pub use memory::{InMemoryMemoryStore, MemoryBlock, MemoryScope, MemoryStore};
+pub use memory::{EditKey, InMemoryMemoryStore, MemoryBlock, MemoryScope, MemoryStore};
 pub use message::{
     ChatMessage, ChatRole, ContentPart, RunId, SessionId, StopReason, TokenUsage, ToolCall,
     ToolDefinition,

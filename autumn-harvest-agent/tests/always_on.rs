@@ -83,6 +83,10 @@ async fn a_delivered_run_reaches_the_delivery_once() {
     assert_eq!(reports[0].source, ReportSource::Run);
     assert_eq!(reports[0].text, "all done");
     assert_eq!(reports[0].stop, AgentStop::Completed);
+    // The run id is the execution id. A workflow id can be reused, so it
+    // would not keep `Report::key` unique.
+    assert_eq!(reports[0].run_id.as_str(), exec.to_string());
+    assert_eq!(reports[0].key(), format!("{exec}:0"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -865,4 +869,31 @@ async fn a_followup_segment_with_actions_gets_no_memory_tool() {
     };
     assert!(has_memory(0), "the attended segment keeps the tool");
     assert!(!has_memory(2), "the woken segment is unattended");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_runs_under_one_workflow_id_get_distinct_report_keys() {
+    let (_dir, db) = fresh_db();
+    let inbox = Arc::new(Inbox::default());
+    let model = ScriptedModel::new(vec![answer("one", 1), answer("two", 1)]);
+    let mut rt = runtime(&db, AgentHarness::new(model).delivery(inbox.clone()));
+
+    let task = serde_json::to_value(AgentTask::new("go").deliver()).unwrap();
+    for _ in 0..2 {
+        let start = rt
+            .start_workflow_with_reuse_policy(
+                autumn_harvest_agent::WORKFLOW_NAME,
+                "nightly",
+                task.clone(),
+                autumn_harvest::types::WorkflowIdReusePolicy::TerminateIfRunning,
+            )
+            .unwrap();
+        assert!(start.created);
+        let exec = start.exec_id;
+        let _ = report(rt.run_until_blocked(exec).await.unwrap());
+    }
+
+    let reports = inbox.reports();
+    assert_eq!(reports.len(), 2);
+    assert_ne!(reports[0].key(), reports[1].key(), "a reused workflow id");
 }

@@ -388,7 +388,8 @@ text, never the text itself.
 The workflow sends each report once, and replay does not send it again. The
 activity itself can retry, for example after a send that timed out. So a
 `Delivery` that must not repeat a message dedupes on `Report::key()`: the
-run id and the segment.
+run id and the segment. The run id is the execution id, so a later run
+under the same workflow id gets new keys.
 
 ### Memory
 
@@ -407,9 +408,11 @@ The snapshot escapes each entry onto one line, so an entry cannot close its
 block or add a prompt section. The snapshot tells the model that the
 entries are its own notes, not instructions from the user.
 
-Each edit is safe to run again after a crash. An `add` of an entry that
-already exists changes nothing. A `replace` whose `text` is already there
-succeeds. A `remove` of an entry that is gone succeeds.
+Each edit carries an `EditKey`: the run, the step and the call. A store
+applies each key once, so a call that runs again after a crash changes
+nothing, even when another run edited the scope in between. A durable store
+must save the key with the edit, in one transaction. An `add` of an entry
+that already exists changes nothing either.
 
 ### Loop guard
 
