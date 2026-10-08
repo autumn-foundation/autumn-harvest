@@ -6,9 +6,10 @@
 //! fingerprints it adds a note to the result. At `stop_after` the run ends as
 //! `loop_detected`.
 //!
-//! The guard runs inside the workflow, on recorded data only. The fingerprint
-//! is FNV-1a, which is stable across builds and Rust versions, so replay always
-//! reaches the same verdict.
+//! The guard runs inside the workflow, on recorded data only. One tracker
+//! covers the whole run, follow-up segments included. Replay recomputes every
+//! fingerprint, so a verdict needs only equal fingerprints for equal calls.
+//! FNV-1a gives that with no per-process seed.
 
 use std::collections::VecDeque;
 
@@ -16,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 /// Loop-detection thresholds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LoopGuard {
     /// Identical calls in the window before the result gets a warning note.
     pub warn_after: u32,
@@ -49,7 +51,7 @@ impl LoopGuard {
 
 /// What the guard says about one call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LoopVerdict {
+pub(crate) enum LoopVerdict {
     /// Nothing unusual.
     Ok,
     /// The call repeated this many times. Warn the model.
@@ -58,7 +60,7 @@ pub enum LoopVerdict {
     Stop(u32),
 }
 
-/// The rolling fingerprint history of one run.
+/// The rolling fingerprint history of one run, across its segments.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LoopTracker {
     recent: VecDeque<u64>,
@@ -94,8 +96,7 @@ impl LoopTracker {
 }
 
 /// The note added to the result of a repeated call.
-#[must_use]
-pub fn warning_note(name: &str, repeats: u32) -> String {
+pub(crate) fn warning_note(name: &str, repeats: u32) -> String {
     format!(
         "\n[loop guard] You repeated the same `{name}` call {repeats} times with the same \
          result. Change your approach or give your answer."
@@ -131,8 +132,7 @@ mod tests {
 
     #[test]
     fn the_fingerprint_is_stable_across_builds() {
-        // A fixed FNV-1a value, checked with an independent script. A change here
-        // changes the verdicts that replay recomputes.
+        // A fixed FNV-1a value, checked with an independent script.
         assert_eq!(fingerprint("", &json!(null), ""), 0xc3de_faea_e2ce_b336);
         assert_ne!(
             fingerprint("a", &json!({}), "b"),

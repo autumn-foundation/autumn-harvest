@@ -40,18 +40,25 @@ use crate::types::{
 /// The registered workflow name.
 pub const WORKFLOW_NAME: &str = "agent_loop";
 
-/// The mutable state of one segment. Every field is rebuilt from history on
-/// replay.
+/// The state of one run, carried across its segments. Every field is
+/// rebuilt from history on replay.
 struct Progress {
     run_id: String,
     messages: Vec<ChatMessage>,
+    /// Tokens of the whole run, earlier segments included.
     usage: TokenUsage,
+    /// Tool rounds of this segment. `max_steps` bounds it.
     steps: u32,
-    /// Tool rounds of the earlier segments. Approval names use the global
-    /// step, so a name never repeats across follow-up segments.
+    /// Tool rounds of the earlier segments. Approval names and tool steps
+    /// add it, so they never repeat across segments.
     step_base: u32,
+    /// Tool calls of the whole run.
     tool_calls: u32,
     last_text: String,
+    /// The segment ended on a turn with no tool calls, so `last_text` is its
+    /// answer.
+    answered: bool,
+    /// The loop guard history of the whole run.
     tracker: LoopTracker,
     /// The follow-up that this segment booked.
     followup: Option<Planned>,
@@ -76,11 +83,12 @@ impl Progress {
         AgentReport {
             stop,
             text: self.last_text.clone(),
-            steps_used: self.steps,
+            steps_used: self.step_base.saturating_add(self.steps),
             tool_calls: self.tool_calls,
             usage: self.usage,
             messages: without_system(&self.messages),
             followups: self.chain,
+            followup_dropped: false,
         }
     }
 }
@@ -94,7 +102,8 @@ impl Progress {
 ///
 /// A segment that completed with a booked follow-up waits on a durable timer.
 /// Then a new segment starts in the same conversation with the follow-up
-/// prompt. The report of the last segment is the workflow output.
+/// prompt. The report covers the whole run. Its text is the answer of the
+/// last segment.
 ///
 /// The run ends under a named [`AgentStop`] when a bound is reached. A bound
 /// is a normal end, not an error.
@@ -120,105 +129,129 @@ pub(crate) async fn drive(
     task: &AgentTask,
     source: ReportSource,
 ) -> Result<(AgentReport, u32), String> {
-    let run_id = ctx.workflow_id().to_owned();
-    // A system message inside the history is dropped. Only `task.system`
-    // reaches the model as the system prompt.
-    let mut history: Vec<ChatMessage> = task
-        .history
-        .iter()
-        .filter(|message| message.role != ChatRole::System)
-        .cloned()
-        .collect();
+    let mut progress = Progress {
+        run_id: ctx.workflow_id().to_owned(),
+        // A system message inside the history is dropped. Only `task.system`
+        // reaches the model as the system prompt.
+        messages: without_system(&task.history),
+        usage: TokenUsage::default(),
+        steps: 0,
+        step_base: 0,
+        tool_calls: 0,
+        last_text: String::new(),
+        answered: false,
+        tracker: LoopTracker::default(),
+        followup: None,
+        chain: 0,
+    };
     let mut input = task.input.clone();
-    let mut chain = 0_u32;
-    let mut step_base = 0_u32;
     let mut delivered = 0_u32;
     loop {
-        let (report, followup) =
-            run_segment(ctx, task, &run_id, history, input, chain, step_base).await?;
+        // No person is present when a follow-up wakes. It stays read-only
+        // unless the app opts in.
+        let woken = progress.chain > 0;
+        let read_only = task.read_only
+            || (woken
+                && !task
+                    .followups
+                    .is_some_and(|settings| settings.allow_actions));
+        let segment = AgentTask {
+            read_only,
+            history: Vec::new(),
+            ..task.clone()
+        };
+        let stop = run_segment(ctx, &segment, &mut progress, input).await?;
+        let mut report = progress.report(stop);
         if task.deliver {
-            let source = if chain == 0 {
-                source
-            } else {
+            let source = if woken {
                 ReportSource::Followup
+            } else {
+                source
             };
-            if deliver(ctx, task, &run_id, source, &report).await {
-                delivered += 1;
+            let answer = if progress.answered {
+                report.text.as_str()
+            } else {
+                ""
+            };
+            if let Some(text) = report_text(source, stop, answer) {
+                let sent = Report {
+                    source,
+                    run_id: RunId::new(progress.run_id.clone()),
+                    segment: progress.chain,
+                    session_id: task.session_id.clone(),
+                    text,
+                    stop,
+                };
+                if deliver(ctx, sent).await? {
+                    delivered = delivered.saturating_add(1);
+                }
             }
         }
         // A follow-up runs only after a segment that completed.
-        let Some(next) = followup.filter(|_| report.stop == AgentStop::Completed) else {
-            return Ok((report, delivered));
+        let next = match progress.followup.take() {
+            Some(next) if stop == AgentStop::Completed => next,
+            dropped => {
+                report.followup_dropped = dropped.is_some();
+                return Ok((report, delivered));
+            }
         };
-        ctx.timer(&format!("agent_followup:{chain}"), next.delay_secs)
-            .await
-            .map_err(|e| e.to_string())?;
-        chain += 1;
-        step_base += report.steps_used;
-        history = report.messages;
-        input = next.prompt;
+        ctx.timer(
+            &format!("agent_followup:{}", progress.chain),
+            next.delay_secs,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        progress.chain = progress.chain.saturating_add(1);
+        progress.step_base = progress.step_base.saturating_add(progress.steps);
+        progress.steps = 0;
+        progress.messages = report.messages;
+        progress.last_text.clear();
+        progress.answered = false;
+        input = followup::wake_message(&next.prompt);
     }
 }
 
-/// Send one report, when the run has something to say.
+/// Send one report.
 ///
-/// A failed delivery never fails the run. Its outcome is recorded, so replay
+/// A failed send never fails the run: the failure is recorded, so replay
 /// gives the same answer. Returns `true` when the delivery took the report.
-async fn deliver(
-    ctx: &WorkflowContext,
-    task: &AgentTask,
-    run_id: &str,
-    source: ReportSource,
-    report: &AgentReport,
-) -> bool {
-    let Some(text) = report_text(report.stop, &report.text) else {
-        return false;
-    };
-    let report = Report {
-        source,
-        run_id: RunId::new(run_id),
-        session_id: task.session_id.clone(),
-        text,
-        stop: report.stop,
-    };
+///
+/// # Errors
+///
+/// Returns an engine error that is not a failed send, such as a cancel.
+async fn deliver(ctx: &WorkflowContext, report: Report) -> Result<bool, String> {
     let sent: HarvestResult<()> = ctx.execute_activity(&agent_deliver_info(), report).await;
-    sent.is_ok()
+    match sent {
+        Ok(()) => Ok(true),
+        Err(
+            HarvestError::ActivityFailed { .. }
+            | HarvestError::Timeout { .. }
+            | HarvestError::PayloadTooLarge { .. },
+        ) => Ok(false),
+        Err(other) => Err(other.to_string()),
+    }
 }
 
 /// Run one segment: model turns and tool rounds until the model answers or a
-/// bound ends it. Returns its report and the follow-up it booked.
+/// bound ends it. Returns why the segment ended.
 async fn run_segment(
     ctx: &WorkflowContext,
     task: &AgentTask,
-    run_id: &str,
-    history: Vec<ChatMessage>,
+    progress: &mut Progress,
     input: String,
-    chain: u32,
-    step_base: u32,
-) -> Result<(AgentReport, Option<Planned>), String> {
+) -> Result<AgentStop, String> {
     let system = system_prompt(ctx, task).await?;
-    let mut messages = Vec::with_capacity(history.len() + 2);
+    let mut messages = Vec::with_capacity(progress.messages.len() + 2);
     if let Some(system) = system {
         messages.push(ChatMessage::text(ChatRole::System, system));
     }
-    messages.extend(history);
+    messages.append(&mut progress.messages);
     messages.push(ChatMessage::text(ChatRole::User, input));
+    progress.messages = messages;
     let extra_tools = task
         .followups
         .map(|_| vec![followup::definition()])
         .unwrap_or_default();
-    let mut progress = Progress {
-        run_id: run_id.to_owned(),
-        messages,
-        usage: TokenUsage::default(),
-        steps: 0,
-        step_base,
-        tool_calls: 0,
-        last_text: String::new(),
-        tracker: LoopTracker::default(),
-        followup: None,
-        chain,
-    };
 
     loop {
         let request = ModelTurnRequest {
@@ -230,13 +263,13 @@ async fn run_segment(
             messages: progress.messages.clone(),
             max_output_tokens: task.max_output_tokens,
             read_only: task.read_only,
-            memory_scope: task.memory_scope.clone(),
+            memory_scope: task.memory_tool_scope(),
             extra_tools: extra_tools.clone(),
         };
         // A request the engine would refuse is not sent. The refusal is not
         // retryable, so it would fail the run after earlier work was paid for.
         if exceeds_bytes(&request, task.request_cap()) {
-            return Ok((progress.report(AgentStop::TranscriptFull), None));
+            return Ok(AgentStop::TranscriptFull);
         }
         let turn: ModelTurn = ctx
             .execute_activity(&agent_model_turn_info(), request)
@@ -250,16 +283,15 @@ async fn run_segment(
         let calls = turn.calls();
 
         if calls.is_empty() {
-            let stop = if over_budget {
+            progress.push_assistant(&turn);
+            progress.answered = true;
+            return Ok(if over_budget {
                 AgentStop::TokensExhausted
             } else if turn.stop == StopReason::MaxTokens {
                 AgentStop::OutputCapped
             } else {
                 AgentStop::Completed
-            };
-            progress.push_assistant(&turn);
-            let followup = progress.followup.take();
-            return Ok((progress.report(stop), followup));
+            });
         }
         // A turn with calls that ends here is NOT added to the transcript. A
         // tool call with no result would make the transcript invalid for the
@@ -267,23 +299,23 @@ async fn run_segment(
         //
         // A turn cut at the output cap can hold a partial call. It never runs.
         if turn.stop == StopReason::MaxTokens {
-            return Ok((progress.report(AgentStop::OutputCapped), None));
+            return Ok(AgentStop::OutputCapped);
         }
         if over_budget {
-            return Ok((progress.report(AgentStop::TokensExhausted), None));
+            return Ok(AgentStop::TokensExhausted);
         }
         if progress.steps >= task.max_steps {
-            return Ok((progress.report(AgentStop::StepsExhausted), None));
+            return Ok(AgentStop::StepsExhausted);
         }
 
         let step = progress.steps;
-        progress.steps += 1;
+        progress.steps = progress.steps.saturating_add(1);
         progress.push_assistant(&turn);
 
-        match run_round(ctx, &mut progress, task, step, &turn, calls).await? {
+        match run_round(ctx, progress, task, step, &turn, calls).await? {
             RoundEnd::Continue => {}
-            RoundEnd::Full => return Ok((progress.report(AgentStop::TranscriptFull), None)),
-            RoundEnd::Loop => return Ok((progress.report(AgentStop::LoopDetected), None)),
+            RoundEnd::Full => return Ok(AgentStop::TranscriptFull),
+            RoundEnd::Loop => return Ok(AgentStop::LoopDetected),
         }
     }
 }
@@ -337,7 +369,7 @@ async fn run_round(
     let mut full = false;
     let mut looped = false;
     for (position, call) in calls.into_iter().enumerate() {
-        progress.tool_calls += 1;
+        progress.tool_calls = progress.tool_calls.saturating_add(1);
         let call_id = call.id.clone();
         let content = if full {
             ToolOutcome::error(NOT_RUN_FULL).content
@@ -441,7 +473,7 @@ async fn gated_call(
 ) -> Result<ToolOutcome, String> {
     let decision = await_decision::<Approval>(
         ctx,
-        &approval_signal(progress.step_base + step, position, &call.id),
+        &approval_signal(progress.step_base.saturating_add(step), position, &call.id),
         Duration::from_secs(task.approval_timeout_secs),
     )
     .await?;
@@ -502,9 +534,10 @@ async fn run_tool(
         ToolCallRequest {
             run_id: progress.run_id.clone(),
             session_id: task.session_id.clone(),
-            step: progress.step_base + step,
+            step: progress.step_base.saturating_add(step),
             call,
-            memory_scope: task.memory_scope.clone(),
+            memory_scope: task.memory_tool_scope(),
+            read_only: task.read_only,
         },
     )
     .await

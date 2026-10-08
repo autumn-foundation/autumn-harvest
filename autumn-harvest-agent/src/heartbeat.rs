@@ -12,8 +12,13 @@
 //! On Postgres, an engine schedule starts one tick per firing. See
 //! [`schedule`]. On SQLite, the app starts each tick. A tick is a whole
 //! workflow, so a crash mid-tick resumes like any other run.
+//!
+//! A tick never books a follow-up. A memory scope gives it a read-only
+//! snapshot. It can write memory only with
+//! [`HeartbeatTask::allow_memory_writes`].
 
 use std::fmt::Debug;
+use std::time::Duration;
 
 use autumn_harvest::policy::{Schedule, WorkflowSchedule};
 use autumn_harvest::prelude::*;
@@ -34,10 +39,20 @@ pub const DEFAULT_HEARTBEAT_PROMPT: &str = "This is a scheduled check. \
 Review what you can see and report only what needs attention. \
 If nothing needs attention, reply with exactly HEARTBEAT_OK.";
 
+/// The default time a heartbeat tick waits for an approval: 15 minutes.
+///
+/// No person watches a tick. A long wait would also hold the schedule, which
+/// starts no new tick while one runs.
+pub const DEFAULT_HEARTBEAT_APPROVAL_TIMEOUT_SECS: u64 = 15 * 60;
+
 /// A cheap check that can skip a heartbeat tick before any model call.
 ///
 /// Use it to look for new work, for example an unread inbox. Keep it fast
 /// and free of side effects. It runs once per tick and is not retried.
+///
+/// The task it gets has no `history`, so a long history cannot make the
+/// check too large to record. A check over the harness hook budget skips the
+/// tick.
 pub trait Precheck: Send + Sync + Debug {
     /// Return `true` to run the tick.
     fn should_run<'a>(&'a self, task: &'a HeartbeatTask) -> BoxFuture<'a, bool>;
@@ -67,6 +82,19 @@ pub struct HeartbeatTask {
     /// The most tool rounds in one tick.
     #[serde(default = "default_max_steps")]
     pub max_steps: u32,
+    /// The bound on provider-reported tokens for one tick.
+    #[serde(default)]
+    pub max_total_tokens: Option<u32>,
+    /// The output cap of one model call.
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+    /// How long a gated call waits for a decision before it is denied.
+    #[serde(default = "default_approval_timeout")]
+    pub approval_timeout_secs: u64,
+    /// Let the tick write its memory. Off by default: a tick often reads
+    /// untrusted data, and a note shows in every later run of the scope.
+    #[serde(default)]
+    pub allow_memory_writes: bool,
 }
 
 fn default_prompt() -> String {
@@ -75,6 +103,10 @@ fn default_prompt() -> String {
 
 const fn default_max_steps() -> u32 {
     DEFAULT_MAX_STEPS
+}
+
+const fn default_approval_timeout() -> u64 {
+    DEFAULT_HEARTBEAT_APPROVAL_TIMEOUT_SECS
 }
 
 impl Default for HeartbeatTask {
@@ -95,6 +127,10 @@ impl HeartbeatTask {
             memory_scope: None,
             allow_actions: false,
             max_steps: DEFAULT_MAX_STEPS,
+            max_total_tokens: None,
+            max_output_tokens: None,
+            approval_timeout_secs: DEFAULT_HEARTBEAT_APPROVAL_TIMEOUT_SECS,
+            allow_memory_writes: false,
         }
     }
 
@@ -149,6 +185,35 @@ impl HeartbeatTask {
         self
     }
 
+    /// Set the bound on provider-reported tokens for one tick.
+    #[must_use]
+    pub const fn max_total_tokens(mut self, max: u32) -> Self {
+        self.max_total_tokens = Some(max);
+        self
+    }
+
+    /// Set the output cap of one model call.
+    #[must_use]
+    pub const fn max_output_tokens(mut self, max: u32) -> Self {
+        self.max_output_tokens = Some(max);
+        self
+    }
+
+    /// Set how long a gated call waits for a decision. A part second rounds
+    /// up to a whole second.
+    #[must_use]
+    pub const fn approval_timeout(mut self, timeout: Duration) -> Self {
+        self.approval_timeout_secs = AgentTask::new_timeout_secs(timeout);
+        self
+    }
+
+    /// Let the tick write its memory.
+    #[must_use]
+    pub const fn allow_memory_writes(mut self) -> Self {
+        self.allow_memory_writes = true;
+        self
+    }
+
     /// The agent task of one tick.
     fn agent_task(&self) -> AgentTask {
         let mut task = AgentTask::new(self.prompt.clone())
@@ -158,7 +223,11 @@ impl HeartbeatTask {
         task.system.clone_from(&self.system);
         task.session_id.clone_from(&self.session_id);
         task.memory_scope.clone_from(&self.memory_scope);
+        task.max_total_tokens = self.max_total_tokens;
+        task.max_output_tokens = self.max_output_tokens;
+        task.approval_timeout_secs = self.approval_timeout_secs;
         task.read_only = !self.allow_actions;
+        task.read_only_memory_writes = self.allow_memory_writes;
         task
     }
 }
@@ -184,8 +253,12 @@ pub async fn agent_heartbeat(
     ctx: &WorkflowContext,
     task: HeartbeatTask,
 ) -> Result<HeartbeatReport, String> {
+    let probe = HeartbeatTask {
+        history: Vec::new(),
+        ..task.clone()
+    };
     let run: bool = ctx
-        .execute_activity(&agent_precheck_info(), task.clone())
+        .execute_activity(&agent_precheck_info(), probe)
         .await
         .map_err(|e| e.to_string())?;
     if !run {
@@ -205,9 +278,13 @@ pub async fn agent_heartbeat(
 
 /// A Postgres engine schedule that starts one heartbeat tick per firing.
 ///
-/// Register it with the scheduler of the engine, for example
+/// Register it with `HarvestBuilder::workflow_schedule`, for example with
 /// `Schedule::Interval(Duration::from_secs(1_800))` for a tick every 30
 /// minutes.
+///
+/// The engine keeps one schedule per workflow name, so a deployment has one
+/// heartbeat schedule. For one heartbeat per user, start each tick from the
+/// app, or let one scheduled workflow start the ticks.
 ///
 /// # Errors
 ///

@@ -2,7 +2,12 @@
 //!
 //! A run with `deliver` set, a heartbeat, and a follow-up all end by sending a
 //! [`Report`] to the harness [`Delivery`]. The send is its own activity,
-//! `agent_deliver`, so a restart never sends one report twice.
+//! `agent_deliver`. Its result is recorded, so a restart of the workflow does
+//! not send a report again.
+//!
+//! The activity itself can retry, for example after a send that timed out.
+//! Delivery is therefore at least once. A [`Delivery`] that must not repeat a
+//! message dedupes on [`Report::key`].
 //!
 //! The crate speaks no chat or mail protocol. The app implements
 //! [`Delivery`]. [`LogDelivery`] is the default.
@@ -17,25 +22,24 @@ use crate::types::AgentStop;
 /// The answer that means "nothing needs attention".
 pub const HEARTBEAT_OK: &str = "HEARTBEAT_OK";
 
-/// The most characters a silent answer may add around [`HEARTBEAT_OK`].
-pub const SILENT_ACK_MAX_CHARS: usize = 300;
-
-/// Is this answer a silent acknowledgement?
+/// Is this heartbeat answer a silent acknowledgement?
 ///
-/// It is when it is [`HEARTBEAT_OK`], or starts or ends with it and adds at
-/// most [`SILENT_ACK_MAX_CHARS`] characters.
+/// It is when it holds [`HEARTBEAT_OK`] and no other letter or digit. So
+/// `HEARTBEAT_OK.` is silent, and `HEARTBEAT_OK, but the disk is full` is
+/// not.
 #[must_use]
 pub fn is_silent(text: &str) -> bool {
-    let text = text.trim();
-    let rest = text
-        .strip_prefix(HEARTBEAT_OK)
-        .or_else(|| text.strip_suffix(HEARTBEAT_OK));
-    rest.is_some_and(|rest| rest.trim().chars().count() <= SILENT_ACK_MAX_CHARS)
+    text.contains(HEARTBEAT_OK)
+        && !text
+            .replace(HEARTBEAT_OK, "")
+            .chars()
+            .any(char::is_alphanumeric)
 }
 
 /// What started the run that reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ReportSource {
     /// An `agent_loop` run with `deliver` set.
     Run,
@@ -52,6 +56,9 @@ pub struct Report {
     pub source: ReportSource,
     /// The run id.
     pub run_id: RunId,
+    /// The segment of the run: 0 for the first, then one more per follow-up.
+    #[serde(default)]
+    pub segment: u32,
     /// The session of the run, if any.
     #[serde(default)]
     pub session_id: Option<SessionId>,
@@ -61,15 +68,51 @@ pub struct Report {
     pub stop: AgentStop,
 }
 
-/// The text to deliver for a run, or `None` when it has nothing to say.
+impl Report {
+    /// A key that is unique to this report: the run id and the segment.
+    #[must_use]
+    pub fn key(&self) -> String {
+        format!("{}:{}", self.run_id.as_str(), self.segment)
+    }
+}
+
+/// The text to deliver for one segment, or `None` when it has nothing to say.
 ///
-/// Only a final answer is delivered: a run that `completed`, or whose last
-/// turn hit the output cap. An empty answer and a silent acknowledgement are
-/// not delivered.
+/// - A final answer is delivered: a segment that `completed`, or whose last
+///   answer hit the output cap. An empty answer is not.
+/// - A silent heartbeat acknowledgement is not delivered.
+/// - A segment that a bound ended early delivers a notice, so a broken
+///   unattended run does not fail in silence.
 #[must_use]
-pub fn report_text(stop: AgentStop, text: &str) -> Option<String> {
-    let answered = matches!(stop, AgentStop::Completed | AgentStop::OutputCapped);
-    (answered && !text.trim().is_empty() && !is_silent(text)).then(|| text.to_owned())
+pub fn report_text(source: ReportSource, stop: AgentStop, text: &str) -> Option<String> {
+    let text = text.trim();
+    match stop {
+        AgentStop::Completed => {
+            let silent = source == ReportSource::Heartbeat && is_silent(text);
+            (!text.is_empty() && !silent).then(|| text.to_owned())
+        }
+        AgentStop::OutputCapped if !text.is_empty() => Some(text.to_owned()),
+        AgentStop::OutputCapped
+        | AgentStop::StepsExhausted
+        | AgentStop::TokensExhausted
+        | AgentStop::TranscriptFull
+        | AgentStop::LoopDetected => {
+            let notice = format!("The agent stopped early: {}.", stop_name(stop));
+            Some(if text.is_empty() {
+                notice
+            } else {
+                format!("{notice}\n\n{text}")
+            })
+        }
+    }
+}
+
+/// The recorded name of a stop.
+fn stop_name(stop: AgentStop) -> String {
+    serde_json::to_value(stop)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| format!("{stop:?}"))
 }
 
 /// Sends reports to people: mail, chat, push, or an in-app inbox.
@@ -89,10 +132,13 @@ pub struct LogDelivery;
 
 impl Delivery for LogDelivery {
     fn deliver<'a>(&'a self, report: &'a Report) -> BoxFuture<'a, Result<(), AgentError>> {
+        // The text can hold private data, so only its size is logged.
         tracing::info!(
             run_id = %report.run_id.as_str(),
+            segment = report.segment,
             source = ?report.source,
-            text = %report.text,
+            stop = ?report.stop,
+            chars = report.text.chars().count(),
             "agent report"
         );
         Box::pin(std::future::ready(Ok(())))
@@ -106,24 +152,53 @@ mod tests {
     #[test]
     fn silence_rules() {
         assert!(is_silent("HEARTBEAT_OK"));
-        assert!(is_silent("  HEARTBEAT_OK \n"));
-        assert!(is_silent("HEARTBEAT_OK - all quiet"));
-        assert!(is_silent("All quiet. HEARTBEAT_OK"));
+        assert!(is_silent("  HEARTBEAT_OK. \n"));
+        assert!(is_silent("**HEARTBEAT_OK**"));
+        assert!(!is_silent("HEARTBEAT_OK, but the prod DB is down"));
+        assert!(!is_silent("All quiet. HEARTBEAT_OK"));
         assert!(!is_silent("The disk is 95% full."));
-        assert!(!is_silent(&format!("HEARTBEAT_OK {}", "x".repeat(301))));
         assert!(!is_silent("heartbeat_ok"));
     }
 
     #[test]
-    fn only_a_final_answer_is_delivered() {
+    fn a_final_answer_is_delivered() {
+        let run = ReportSource::Run;
         assert_eq!(
-            report_text(AgentStop::Completed, "Disk full"),
+            report_text(run, AgentStop::Completed, "Disk full"),
             Some("Disk full".to_owned())
         );
-        assert_eq!(report_text(AgentStop::Completed, HEARTBEAT_OK), None);
-        assert_eq!(report_text(AgentStop::Completed, "  "), None);
-        assert_eq!(report_text(AgentStop::StepsExhausted, "partial"), None);
-        assert!(report_text(AgentStop::OutputCapped, "cut").is_some());
+        assert_eq!(report_text(run, AgentStop::Completed, "  "), None);
+        assert!(report_text(run, AgentStop::OutputCapped, "cut").is_some());
+        let capped = report_text(run, AgentStop::OutputCapped, "").unwrap();
+        assert!(capped.contains("output_capped"), "{capped}");
+    }
+
+    #[test]
+    fn only_a_heartbeat_can_be_silent() {
+        let beat = ReportSource::Heartbeat;
+        assert_eq!(report_text(beat, AgentStop::Completed, HEARTBEAT_OK), None);
+        assert!(report_text(ReportSource::Run, AgentStop::Completed, HEARTBEAT_OK).is_some());
+    }
+
+    #[test]
+    fn an_early_stop_delivers_a_notice() {
+        let text = report_text(ReportSource::Heartbeat, AgentStop::LoopDetected, "").unwrap();
+        assert_eq!(text, "The agent stopped early: loop_detected.");
+        let text = report_text(ReportSource::Run, AgentStop::StepsExhausted, "partial").unwrap();
+        assert!(text.ends_with("partial"), "{text}");
+    }
+
+    #[test]
+    fn the_key_names_the_run_and_the_segment() {
+        let report = Report {
+            source: ReportSource::Followup,
+            run_id: RunId::new("r"),
+            segment: 2,
+            session_id: None,
+            text: "hi".into(),
+            stop: AgentStop::Completed,
+        };
+        assert_eq!(report.key(), "r:2");
     }
 
     #[tokio::test]
@@ -131,6 +206,7 @@ mod tests {
         let report = Report {
             source: ReportSource::Run,
             run_id: RunId::new("r"),
+            segment: 0,
             session_id: None,
             text: "hi".into(),
             stop: AgentStop::Completed,

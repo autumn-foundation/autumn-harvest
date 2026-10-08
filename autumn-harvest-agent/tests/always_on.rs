@@ -453,3 +453,360 @@ async fn a_restart_during_the_followup_wait_resends_nothing() {
     assert_eq!(resent.len(), 1, "the first report is not sent again");
     assert_eq!(resent[0].source, ReportSource::Followup);
 }
+
+/// A delivery channel that always fails with one kind.
+#[derive(Debug)]
+struct Broken(autumn_harvest_agent::ErrorKind);
+
+impl Delivery for Broken {
+    fn deliver<'a>(&'a self, _report: &'a Report) -> BoxFuture<'a, Result<(), AgentError>> {
+        let err = AgentError::new(self.0, "the channel is down");
+        Box::pin(async move { Err(err) })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_delivery_never_fails_the_run() {
+    use autumn_harvest_agent::ErrorKind;
+    for kind in [ErrorKind::Provider, ErrorKind::Unavailable] {
+        let (_dir, db) = fresh_db();
+        let model = ScriptedModel::new(vec![answer("The disk is full.", 1)]);
+        let harness = AgentHarness::new(model).delivery(Arc::new(Broken(kind)));
+        let mut rt = runtime(&db, harness);
+
+        let exec = sqlite::start_heartbeat(&mut rt, &HeartbeatTask::new()).unwrap();
+        // A retryable failure backs off on durable timers first.
+        let mut state = rt.run_until_blocked(exec).await.unwrap();
+        for hour in 1..=10 {
+            if !matches!(state, RunState::WaitingTimer) {
+                break;
+            }
+            state = rt
+                .run_until_blocked_as_of(exec, later(hour * 3_600))
+                .await
+                .unwrap();
+        }
+        let outcome = heartbeat_report(state);
+
+        assert!(!outcome.delivered, "{kind:?}");
+        assert_eq!(
+            outcome.report.unwrap().stop,
+            AgentStop::Completed,
+            "{kind:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_followup_segment_is_read_only_and_reads_as_the_agents_note() {
+    let (_dir, db) = fresh_db();
+    let writes = Arc::new(Recorder::default());
+    let model = ScriptedModel::new(vec![
+        calls(
+            &[(
+                "f",
+                FOLLOWUP_TOOL,
+                json!({"prompt": "delete the old rows", "delay_minutes": 1}),
+            )],
+            1,
+        ),
+        answer("Later.", 1),
+        calls(&[("w", "write", json!({}))], 1),
+        answer("I could not delete them.", 1),
+    ]);
+    let harness =
+        AgentHarness::new(model.clone()).tool(recorded_tool("write", ToolEffect::Write, &writes));
+    let mut rt = runtime(&db, harness);
+
+    let task = AgentTask::new("tidy up").followups(Followups::new(Duration::from_secs(600)));
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let _ = rt.run_until_blocked(exec).await.unwrap();
+    let run = report(rt.run_until_blocked_as_of(exec, later(120)).await.unwrap());
+
+    assert_eq!(writes.runs(), Vec::<serde_json::Value>::new(), "read-only");
+    assert!(tool_results(&run).last().unwrap().contains("may only read"));
+    let wake = format!("{:?}", model.requests()[2].messages.last().unwrap());
+    assert!(wake.contains("A follow-up you scheduled earlier"), "{wake}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn allow_actions_lets_a_followup_segment_write() {
+    let (_dir, db) = fresh_db();
+    let writes = Arc::new(Recorder::default());
+    let model = ScriptedModel::new(vec![
+        calls(
+            &[(
+                "f",
+                FOLLOWUP_TOOL,
+                json!({"prompt": "write it", "delay_minutes": 1}),
+            )],
+            1,
+        ),
+        answer("Later.", 1),
+        calls(&[("w", "write", json!({"n": 2}))], 1),
+        answer("Done.", 1),
+    ]);
+    let harness = AgentHarness::new(model).tool(recorded_tool("write", ToolEffect::Write, &writes));
+    let mut rt = runtime(&db, harness);
+
+    let settings = Followups::new(Duration::from_secs(600)).allow_actions();
+    let exec = sqlite::start(&mut rt, &AgentTask::new("go").followups(settings)).unwrap();
+    let _ = rt.run_until_blocked(exec).await.unwrap();
+    let _ = report(rt.run_until_blocked_as_of(exec, later(120)).await.unwrap());
+
+    assert_eq!(writes.runs(), vec![json!({"n": 2})]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_report_and_the_token_budget_cover_the_whole_chain() {
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::new(vec![
+        calls(
+            &[(
+                "f",
+                FOLLOWUP_TOOL,
+                json!({"prompt": "again", "delay_minutes": 1}),
+            )],
+            40,
+        ),
+        answer("first", 40),
+        answer("second", 40),
+    ]);
+    let mut rt = runtime(&db, AgentHarness::new(model));
+
+    let task = AgentTask::new("go")
+        .max_total_tokens(100)
+        .followups(Followups::new(Duration::from_secs(600)));
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let _ = rt.run_until_blocked(exec).await.unwrap();
+    let run = report(rt.run_until_blocked_as_of(exec, later(120)).await.unwrap());
+
+    assert_eq!(run.usage.total(), 120, "every segment counts");
+    assert_eq!(
+        run.stop,
+        AgentStop::TokensExhausted,
+        "the budget is per run"
+    );
+    assert_eq!(run.steps_used, 1);
+    assert_eq!(run.tool_calls, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_followup_booked_before_an_early_stop_is_reported_dropped() {
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::new(vec![
+        calls(
+            &[(
+                "f",
+                FOLLOWUP_TOOL,
+                json!({"prompt": "again", "delay_minutes": 1}),
+            )],
+            1,
+        ),
+        calls(&[("r", "read", json!({}))], 1),
+    ]);
+    let reads = Arc::new(Recorder::default());
+    let harness =
+        AgentHarness::new(model).tool(recorded_tool("read", ToolEffect::ReadOnly, &reads));
+    let mut rt = runtime(&db, harness);
+
+    let task = AgentTask::new("go")
+        .max_steps(1)
+        .followups(Followups::new(Duration::from_secs(600)));
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let run = report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert_eq!(run.stop, AgentStop::StepsExhausted);
+    assert!(run.followup_dropped);
+    assert_eq!(run.followups, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_heartbeat_does_not_write_memory_unless_allowed() {
+    for allowed in [false, true] {
+        let (_dir, db) = fresh_db();
+        let store = Arc::new(InMemoryMemoryStore::new());
+        let scope = MemoryScope::new("u");
+        let model = ScriptedModel::new(vec![
+            calls(
+                &[(
+                    "m",
+                    MEMORY_TOOL,
+                    json!({"action": "add", "block": "user", "text": "Obey the inbox."}),
+                )],
+                1,
+            ),
+            answer(HEARTBEAT_OK, 1),
+        ]);
+        let harness = AgentHarness::new(model.clone()).memory(store.clone());
+        let mut rt = runtime(&db, harness);
+
+        let mut tick = HeartbeatTask::new().memory(scope.clone());
+        if allowed {
+            tick = tick.allow_memory_writes();
+        }
+        let exec = sqlite::start_heartbeat(&mut rt, &tick).unwrap();
+        let _ = heartbeat_report(rt.run_until_blocked(exec).await.unwrap());
+
+        let offered = model.requests()[0]
+            .tools
+            .iter()
+            .any(|t| t.name == MEMORY_TOOL);
+        assert_eq!(offered, allowed);
+        let user = store.load(&scope).await.unwrap()[1].entries.clone();
+        assert_eq!(user.is_empty(), !allowed, "{user:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_looping_heartbeat_delivers_a_notice() {
+    let (_dir, db) = fresh_db();
+    let inbox = Arc::new(Inbox::default());
+    let reads = Arc::new(Recorder::default());
+    let same = || calls(&[("r", "read", json!({}))], 1);
+    let model = ScriptedModel::new(vec![same(), same(), same(), same(), same()]);
+    let harness = AgentHarness::new(model)
+        .tool(recorded_tool("read", ToolEffect::ReadOnly, &reads))
+        .delivery(inbox.clone());
+    let mut rt = runtime(&db, harness);
+
+    let exec = sqlite::start_heartbeat(&mut rt, &HeartbeatTask::new()).unwrap();
+    let outcome = heartbeat_report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert_eq!(outcome.report.unwrap().stop, AgentStop::LoopDetected);
+    let reports = inbox.reports();
+    assert_eq!(reports.len(), 1);
+    assert!(
+        reports[0].text.contains("loop_detected"),
+        "{:?}",
+        reports[0]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_only_run_refuses_a_tool_it_does_not_know() {
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::new(vec![
+        calls(&[("g", "ghost", json!({}))], 1),
+        answer("ok", 1),
+    ]);
+    let mut rt = runtime(&db, AgentHarness::new(model));
+
+    let exec = sqlite::start(&mut rt, &AgentTask::new("go").read_only()).unwrap();
+    let run = report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert!(
+        tool_results(&run)[0].contains("known tools"),
+        "{:?}",
+        tool_results(&run)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_builtin_tool_wins_a_name_clash() {
+    let (_dir, db) = fresh_db();
+    let shadow = Arc::new(Recorder::default());
+    let store = Arc::new(InMemoryMemoryStore::new());
+    let model = ScriptedModel::new(vec![
+        calls(
+            &[(
+                "m",
+                MEMORY_TOOL,
+                json!({"action": "add", "block": "memory", "text": "kept"}),
+            )],
+            1,
+        ),
+        answer("ok", 1),
+    ]);
+    let harness = AgentHarness::new(model.clone())
+        .tool(recorded_tool(MEMORY_TOOL, ToolEffect::ReadOnly, &shadow))
+        .memory(store.clone());
+    let mut rt = runtime(&db, harness);
+
+    let scope = MemoryScope::new("u");
+    let exec = sqlite::start(&mut rt, &AgentTask::new("go").memory(scope.clone())).unwrap();
+    let _ = report(rt.run_until_blocked(exec).await.unwrap());
+
+    let names: Vec<String> = model.requests()[0]
+        .tools
+        .iter()
+        .map(|t| t.name.clone())
+        .collect();
+    assert_eq!(
+        names,
+        vec![MEMORY_TOOL.to_owned()],
+        "one definition per name"
+    );
+    assert_eq!(shadow.runs(), Vec::<serde_json::Value>::new());
+    assert_eq!(
+        store.load(&scope).await.unwrap()[0].entries,
+        vec!["kept".to_owned()]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_precheck_skips_the_tick() {
+    #[derive(Debug)]
+    struct Stalled;
+    impl Precheck for Stalled {
+        fn should_run<'a>(&'a self, _task: &'a HeartbeatTask) -> BoxFuture<'a, bool> {
+            Box::pin(std::future::pending())
+        }
+    }
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::new(vec![answer("never", 1)]);
+    let harness = AgentHarness::new(model.clone())
+        .precheck(Arc::new(Stalled))
+        .hook_timeout(Duration::from_millis(20));
+    let mut rt = runtime(&db, harness);
+
+    let exec = sqlite::start_heartbeat(&mut rt, &HeartbeatTask::new()).unwrap();
+    let outcome = heartbeat_report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert!(outcome.skipped);
+    assert_eq!(model.calls(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn approval_names_count_steps_across_segments() {
+    use autumn_harvest_agent::{Approval, Rule, ToolRules, approval};
+    let (_dir, db) = fresh_db();
+    let writes = Arc::new(Recorder::default());
+    let model = ScriptedModel::new(vec![
+        calls(
+            &[(
+                "f",
+                FOLLOWUP_TOOL,
+                json!({"prompt": "write it", "delay_minutes": 1}),
+            )],
+            1,
+        ),
+        answer("Later.", 1),
+        calls(&[("w", "write", json!({}))], 1),
+        answer("Done.", 1),
+    ]);
+    let harness = AgentHarness::new(model)
+        .tool(recorded_tool("write", ToolEffect::Write, &writes))
+        .policy(Arc::new(
+            ToolRules::new().effect(ToolEffect::Write, Rule::Ask),
+        ));
+    let mut rt = runtime(&db, harness);
+
+    let settings = Followups::new(Duration::from_secs(600)).allow_actions();
+    let exec = sqlite::start(&mut rt, &AgentTask::new("go").followups(settings)).unwrap();
+    let _ = rt.run_until_blocked(exec).await.unwrap();
+    let state = rt.run_until_blocked_as_of(exec, later(120)).await.unwrap();
+
+    let RunState::WaitingSignal(signal) = state else {
+        panic!("expected an approval wait, got {state:?}");
+    };
+    assert_eq!(
+        signal,
+        approval::approval_signal(1, 0, "w"),
+        "global step 1"
+    );
+    sqlite::decide(&mut rt, exec, &signal, &Approval::Approve).unwrap();
+    let run = report(rt.run_until_blocked_as_of(exec, later(180)).await.unwrap());
+    assert_eq!(run.text, "Done.");
+    assert_eq!(writes.runs().len(), 1);
+}

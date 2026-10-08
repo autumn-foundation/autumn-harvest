@@ -139,21 +139,28 @@ A worker with a payload cap other than the default must say so. Set
 - `policy_timeout(d)` — the time budget of the policy for all calls of one
   turn. The default is one minute. A call with no decision when the budget
   ends is denied, and the decision is recorded.
-
+- `hook_timeout(d)` — the time budget of one memory read, delivery or
+  precheck. The default is 30 seconds.
 - `memory(store)` — the `MemoryStore` for runs with a memory scope.
 - `delivery(delivery)` — where reports go. The default is `LogDelivery`.
 - `precheck(precheck)` — the cheap check that can skip a heartbeat tick.
 
+The names `memory` and `schedule_followup` belong to the built-in tools.
+When a built-in is active, it hides an app tool with the same name.
+
 A tool error is cut to fit the result cap too, so a huge error message
 cannot fail the run.
 
-`AgentTask` sets the run: `input`, `system`, `history`, `session`,
-`max_steps` (default 8), `max_total_tokens`, `max_output_tokens`,
-`approval_timeout` (default one hour, rounded up to whole seconds),
-`max_request_bytes` (default: the engine default), `deliver`, `memory`,
-`followups`, `loop_guard` and `read_only`. Section 10 explains the last
-five. A system message inside
-`history` is dropped. Only `system` reaches the model as the prompt.
+`AgentTask` sets the run. Its bounds are `max_steps` (default 8, per
+segment), `max_total_tokens` (per run), `max_output_tokens`,
+`approval_timeout` (default one hour, rounded up to whole seconds) and
+`max_request_bytes` (default: the engine default). Its content is `input`,
+`system`, `history` and `session`. Section 10 explains the always-on
+settings: `deliver`, `memory`, `followups`, `loop_guard`, `read_only` and
+`read_only_memory_writes`.
+
+The loop drops a system message inside `history`. Only `system` reaches
+the model as the prompt.
 
 ## 5. Approvals
 
@@ -185,7 +192,7 @@ the signal endpoint as you guard the tool.
 |---|---|
 | Nothing | Nothing runs again. |
 | A model call | That one call is sent again. Providers take no idempotency key. |
-| A tool call | That one call runs again. Use `ToolContext::run_id` and `call_id` as an idempotency key. |
+| A tool call | That one call runs again. Use `ToolContext::run_id`, `step` and `call_id` as an idempotency key. |
 | An approval wait | The wait resumes. Its deadline is durable. |
 
 Two tests prove the model-call and tool-call rows. Each one runs its own
@@ -211,7 +218,7 @@ A bound is a normal end, not an error. `AgentReport.stop` names it:
 | `completed` | The model gave a final answer. |
 | `output_capped` | The last turn hit the output cap. Its tool calls do not run. |
 | `steps_exhausted` | The model asked for tools after `max_steps` rounds. |
-| `tokens_exhausted` | The run spent more than `max_total_tokens`. |
+| `tokens_exhausted` | The run spent more than `max_total_tokens`, follow-ups included. |
 | `transcript_full` | The next request, or the results of one round, could not fit the request cap. The request was not sent. |
 | `loop_detected` | The loop guard saw the same call, with the same result, too many times. |
 
@@ -237,9 +244,12 @@ example a rejected API key, or four failed attempts.
 
 The adapter owns the payloads it records: `AgentTask`, `ModelTurnRequest`,
 `ModelTurn`, `ToolCallRequest`, `ToolOutcome`, `AgentReport`,
-`HeartbeatTask`, `HeartbeatReport`, `Report` and `MemoryScope`. They hold
-only types this crate defines, so the crate owns their serde shape. Replay
-reads these payloads back, so add a field only with `#[serde(default)]`.
+`HeartbeatTask`, `HeartbeatReport`, `Report`, `ReportSource`,
+`MemoryScope`, `Followups` and `LoopGuard`. They hold only types this crate
+defines, so the crate owns their serde shape. Replay reads these payloads
+back, so add a field only with `#[serde(default)]`. A new field of an
+activity input also needs `skip_serializing_if` at its default, because a
+strict replay compares each recorded input as it was written.
 
 ## 9. Limits
 
@@ -274,84 +284,141 @@ flowchart LR
   S["engine schedule"] --> H["workflow agent_heartbeat"]
   H --> P["activity agent_precheck"]
   P -->|false| E[skipped]
-  P -->|true| L["agent loop, read-only"]
-  L -->|schedule_followup| T["durable timer"]
-  T --> L
-  L --> D["activity agent_deliver"]
+  P -->|true| B["agent loop, read-only"]
+  B --> D["activity agent_deliver"]
+  R["workflow agent_loop"] -->|schedule_followup| T["durable timer"]
+  T -->|"new segment, read-only"| R
+  R --> D
 ```
+
+### Unattended runs are read-only
+
+No person watches a heartbeat tick or a follow-up segment. Both are
+read-only by default:
+
+- The policy denies a tool with the `Write` or `External` effect, and a tool
+  that the harness does not know. The model reads why.
+- The tool-call activity checks the effect again before it runs a tool.
+- The run cannot write its memory. A note from a run that read untrusted
+  data would reach the system prompt of every later run in the scope.
+
+`HeartbeatTask::allow_actions` and `Followups::allow_actions` lift the
+first two rules. `HeartbeatTask::allow_memory_writes` and
+`AgentTask::read_only_memory_writes` lift the third. `AgentTask::read_only`
+applies the same rules to any run.
 
 ### Heartbeats
 
 A tick is one short workflow:
 
 1. The `Precheck` runs. A `false` answer ends the tick with no model call.
-   Use it to look for new work, for example an unread inbox.
+   Use it to look for new work, for example an unread inbox. A precheck over
+   the hook budget skips the tick.
 2. The agent loop runs the heartbeat prompt. The default prompt tells the
    model to reply with exactly `HEARTBEAT_OK` when nothing needs attention.
-3. A report that is not a silent acknowledgement goes to the delivery.
+3. The workflow delivers the answer, unless it is a silent acknowledgement:
+   `HEARTBEAT_OK` with no other letter or digit.
 
-A tick is **read-only** by default. A tool with the `Write` or `External`
-effect is denied with a result the model reads. Call
-`HeartbeatTask::allow_actions` only for a tick that must act.
+A tick never books a follow-up. `HeartbeatTask` takes its own budget:
+`max_steps`, `max_total_tokens`, `max_output_tokens` and
+`approval_timeout`. The approval wait defaults to 15 minutes, because the
+schedule starts no new tick while one runs.
 
 On Postgres, register the schedule that `heartbeat::schedule` builds:
 
 ```rust
+use std::time::Duration;
+use autumn_harvest::builder::HarvestBuilder;
 use autumn_harvest::policy::Schedule;
 use autumn_harvest_agent::heartbeat::{self, HeartbeatTask};
+use autumn_harvest_agent::{AgentHarness, activities, workflows};
 
 let tick = HeartbeatTask::new().system("You watch the build queue.");
-let schedule = heartbeat::schedule(Schedule::Interval(Duration::from_secs(1_800)), &tick)?;
+let every_30_minutes = Schedule::Interval(Duration::from_secs(1_800));
+let built = HarvestBuilder::new()
+    .workflows(workflows())
+    .activities(activities())
+    .workflow_schedule(heartbeat::schedule(every_30_minutes, &tick)?)
+    .state(AgentHarness::new(model))
+    .build();
 ```
 
-SQLite has no scheduler. The app calls `sqlite::start_heartbeat` on each
-tick.
+The engine keeps one schedule per workflow name, so a deployment has one
+heartbeat schedule. For one heartbeat per user, start each tick from the
+app, or let one scheduled workflow start the ticks. SQLite has no
+scheduler: the app calls `sqlite::start_heartbeat` on each tick.
 
 ### Follow-ups
 
 A task with `AgentTask::followups` gives the model the `schedule_followup`
 tool. The tool takes a `prompt` and a `delay_minutes`. When the segment
 completes, the workflow waits on a durable timer. Then a new segment runs
-the prompt in the same conversation.
+in the same conversation. The model wrote the prompt, so the segment shows
+it as the agent's own note, not as words from the user.
 
-- One follow-up per segment. A second call in the same segment is refused.
-- The delay is at most `Followups::new(max_delay)`.
+- The workflow refuses a second follow-up in one segment.
+- The delay is at most the `max_delay` of `Followups::new`. The shortest
+  delay is one minute.
 - A chain cap (`Followups::max_chain`, 10 by default) stops an agent that
   wakes itself forever.
-- A segment that ends under any stop other than `completed` books nothing.
-- Approval names count steps across segments, so a name never repeats.
+- A segment that ends under any stop other than `completed` runs no
+  follow-up. The report then sets `followup_dropped`.
+- `max_total_tokens` and the loop guard cover the whole chain. `max_steps`
+  counts each segment from zero.
+- Approval names and `ToolContext::step` count steps across segments, so
+  they never repeat. The report covers the whole run.
 
 A restart during the wait resumes the timer. It sends no report again and
 asks the model nothing again.
 
 ### Delivery
 
-`AgentTask::deliver` sends the answer of each segment to the `Delivery` on
-the harness, once. The default `LogDelivery` writes a `tracing` event. A
-report is sent only for a `completed` or `output_capped` segment with a
-non-empty answer that is not a silent acknowledgement. A failed delivery
-never fails the run.
+`AgentTask::deliver` sends the result of each segment to the `Delivery` on
+the harness. The default `LogDelivery` logs the run id and the size of the
+text, never the text itself.
+
+- A `completed` answer goes out, unless it is empty or a silent heartbeat
+  acknowledgement.
+- A segment that a bound ended early sends a notice, for example
+  `The agent stopped early: loop_detected.`. An unattended run therefore
+  does not fail in silence.
+- A failed delivery never fails the run.
+
+The workflow sends each report once, and replay does not send it again. The
+activity itself can retry, for example after a send that timed out. So a
+`Delivery` that must not repeat a message dedupes on `Report::key()`: the
+run id and the segment.
 
 ### Memory
 
 `AgentTask::memory` gives the run a memory scope, and the model a `memory`
 tool to add, replace and remove entries. The store is a `MemoryStore` on
 the harness. `InMemoryMemoryStore` suits tests. Use a durable store in
-production.
+production. A run with a scope and no store fails as `MemoryStoreMissing`.
 
-The snapshot is read **once per segment**, by an activity, and added to the
-system prompt. A write during the segment goes to the store at once, but the
-prompt does not change until the next segment. A stable prompt keeps
-provider prompt caching working, and replay reads the recorded snapshot.
+An activity reads the snapshot once per segment. The workflow adds it to
+the system prompt. A write during the segment goes to the store at once,
+but the prompt does not change until the next segment. A stable prompt
+keeps provider prompt caching working, and replay reads the recorded
+snapshot.
+
+The snapshot escapes each entry onto one line, so an entry cannot close its
+block or add a prompt section. The snapshot tells the model that the
+entries are its own notes, not instructions from the user. An `add` of an
+entry that already exists changes nothing, so a retried call does not
+store it twice.
 
 ### Loop guard
 
 The loop guard counts identical calls: same tool, same arguments, same
-result. With the defaults, the third repeat in the last 30 calls adds a
-warning to the result. The fifth stops the run as `loop_detected`, and no
-later call in that round runs. `LoopGuard::disabled()` turns it off. The
-fingerprint is FNV-1a, which gives the same value in every build, so replay
-reaches the same verdicts.
+result. With the defaults, the third identical call in the last 30 calls
+adds a warning to its result. The fifth stops the run as `loop_detected`,
+and no later call in that round runs. One guard covers the whole run,
+follow-ups included. `LoopGuard::disabled()` turns it off.
+
+The guard is not a cost control. A model that changes its arguments, or a
+tool whose result changes, does not trip it. Use `max_steps`,
+`max_total_tokens` and the chain cap for cost.
 
 ## 11. The daemon example
 

@@ -7,6 +7,11 @@
 //!
 //! The timer is durable, so a restart keeps the wake-up. A chain cap and a
 //! maximum delay stop an agent from waking itself forever.
+//!
+//! No person is present when a follow-up wakes. A follow-up segment is
+//! therefore read-only unless [`Followups::allow_actions`] is set. The model
+//! wrote the prompt, so the segment shows it as the agent's own note, not as
+//! words from the user.
 
 use std::time::Duration;
 
@@ -23,23 +28,43 @@ pub const MAX_PROMPT_CHARS: usize = 2_000;
 /// The default cap on follow-ups in one chain.
 pub const DEFAULT_MAX_CHAIN: u32 = 10;
 
+const fn default_max_chain() -> u32 {
+    DEFAULT_MAX_CHAIN
+}
+
 /// The follow-up settings of a run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Followups {
     /// The longest delay a follow-up may ask for, in seconds.
     pub max_delay_secs: u64,
     /// The most follow-ups one run may chain.
+    #[serde(default = "default_max_chain")]
     pub max_chain: u32,
+    /// Let a follow-up segment run tools that write or act outside.
+    #[serde(default)]
+    pub allow_actions: bool,
 }
 
 impl Followups {
-    /// Follow-ups up to `max_delay`, with the default chain cap.
+    /// Read-only follow-ups up to `max_delay`, with the default chain cap.
+    ///
+    /// The shortest delay the model can ask for is one minute. A `max_delay`
+    /// under one minute therefore refuses every follow-up.
     #[must_use]
     pub const fn new(max_delay: Duration) -> Self {
         Self {
             max_delay_secs: max_delay.as_secs(),
             max_chain: DEFAULT_MAX_CHAIN,
+            allow_actions: false,
         }
+    }
+
+    /// Let a follow-up segment run tools that write or act outside. The run
+    /// must also not be read-only.
+    #[must_use]
+    pub const fn allow_actions(mut self) -> Self {
+        self.allow_actions = true;
+        self
     }
 
     /// Set the chain cap.
@@ -56,8 +81,9 @@ pub fn definition() -> ToolDefinition {
     ToolDefinition {
         name: FOLLOWUP_TOOL.to_owned(),
         description: "Wake yourself up later. After delay_minutes, a new turn starts \
-                      with `prompt` in this conversation, and its answer goes to the \
-                      user. Use it to check back on something that is not ready yet."
+                      in this conversation with `prompt` as your own note. No person \
+                      is present then. Use it to check back on something that is not \
+                      ready yet."
             .to_owned(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -75,6 +101,15 @@ pub fn definition() -> ToolDefinition {
 pub(crate) struct Planned {
     pub(crate) prompt: String,
     pub(crate) delay_secs: u64,
+}
+
+/// The user message that starts a follow-up segment.
+///
+/// The model wrote the prompt, maybe under the influence of a tool result.
+/// The frame marks it as the agent's own note, so it does not read as an
+/// instruction from the user.
+pub(crate) fn wake_message(prompt: &str) -> String {
+    format!("[A follow-up you scheduled earlier. No person is present. Your note:] {prompt}")
 }
 
 /// Check one follow-up call.

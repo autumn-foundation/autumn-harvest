@@ -35,7 +35,7 @@ primitives:
 | `ErrorKind::is_retryable` | `ErrorKind` | Retry policy |
 | `agent_loop` | `Agent` loop and budgets | Workflow |
 | `agent_heartbeat`, `Precheck` | `Heartbeat` | Workflow, started by a schedule |
-| `schedule_followup` | `FollowupTool` | Durable timer |
+| `Followups`, `schedule_followup` tool | `FollowupTool` | Durable timer |
 | `Delivery` | `Delivery` | Activity `agent_deliver` |
 | `MemoryStore`, `memory` tool | `MemoryStore`, `MemoryTool` | Activity `agent_memory_snapshot` |
 | `LoopGuard` | `LoopGuard` | Workflow code over recorded results |
@@ -83,3 +83,6 @@ already uses. The adapter ships no HTTP client.
   schedule starts. A follow-up is a durable timer in the same workflow.
   Delivery and the memory snapshot are activities. The loop guard runs in
   the workflow over recorded results.
+- An unattended run, a heartbeat tick or a follow-up segment, is read-only
+  by default. It can neither act outside nor write memory unless the app
+  opts in.

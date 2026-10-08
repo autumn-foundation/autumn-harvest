@@ -91,6 +91,7 @@ async fn the_tool_handler_runs_the_named_tool_with_its_context() {
         session_id: None,
         step: 0,
         memory_scope: None,
+        read_only: false,
         call: ToolCall {
             id: "c1".into(),
             name: "read".into(),
@@ -261,6 +262,7 @@ async fn the_deliver_handler_hands_the_report_to_the_delivery() {
     let report = Report {
         source: ReportSource::Run,
         run_id: RunId::new("run-1"),
+        segment: 0,
         session_id: None,
         text: "done".into(),
         stop: AgentStop::Completed,
@@ -297,6 +299,7 @@ async fn a_huge_tool_error_still_fits_the_result_cap() {
             session_id: None,
             step: 0,
             memory_scope: None,
+            read_only: false,
             call: ToolCall {
                 id: "c".into(),
                 name: "fail".into(),
@@ -383,4 +386,32 @@ async fn one_deadline_bounds_every_policy_decision_of_a_turn() {
     );
     // Twenty calls share one budget. They do not each wait for it.
     assert!(elapsed < budget * 5, "{elapsed:?}");
+}
+
+#[tokio::test]
+async fn a_read_only_call_refuses_a_write_tool_at_run_time() {
+    let recorder = Arc::new(Recorder::default());
+    let harness = AgentHarness::new(ScriptedModel::new(Vec::new())).tool(recorded_tool(
+        "write",
+        ToolEffect::Write,
+        &recorder,
+    ));
+    let outcome = harness
+        .tool_call(ToolCallRequest {
+            run_id: "run-1".into(),
+            session_id: None,
+            step: 0,
+            memory_scope: None,
+            read_only: true,
+            call: ToolCall {
+                id: "c".into(),
+                name: "write".into(),
+                arguments: json!({}),
+            },
+        })
+        .await
+        .unwrap();
+    assert!(outcome.is_error);
+    assert!(outcome.content.contains("may only read"));
+    assert_eq!(recorder.runs(), Vec::<serde_json::Value>::new());
 }

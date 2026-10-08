@@ -85,10 +85,14 @@ pub enum Rule {
 }
 
 /// Rules per tool name, then per [`ToolEffect`], then [`Rule::Allow`].
+///
+/// A call to a tool that the harness does not know has no effect. The
+/// [`ToolRules::unknown`] rule decides it.
 #[derive(Debug, Clone, Default)]
 pub struct ToolRules {
     by_name: HashMap<String, Rule>,
     by_effect: HashMap<ToolEffect, Rule>,
+    unknown: Option<Rule>,
 }
 
 impl ToolRules {
@@ -98,14 +102,15 @@ impl ToolRules {
         Self::default()
     }
 
-    /// Rules for an unattended run: read-only and internal tools run, and
-    /// every other tool is refused.
+    /// Rules for an unattended run: read-only and internal tools run. A tool
+    /// that writes, acts outside, or is not known is refused.
     #[must_use]
     pub fn read_only() -> Self {
-        let deny = Rule::Deny("this run may only read data and update its own notes".to_owned());
+        let deny = Rule::Deny("this run may only read data".to_owned());
         Self::new()
             .effect(ToolEffect::Write, deny.clone())
             .effect(ToolEffect::External, deny)
+            .unknown(Rule::Deny("this run may only call known tools".to_owned()))
     }
 
     /// Ask a person before any write or external call.
@@ -123,6 +128,13 @@ impl ToolRules {
         self
     }
 
+    /// Set the rule for a call to a tool that the harness does not know.
+    #[must_use]
+    pub fn unknown(mut self, rule: Rule) -> Self {
+        self.unknown = Some(rule);
+        self
+    }
+
     /// Set the rule for every tool with this effect.
     #[must_use]
     pub fn effect(mut self, effect: ToolEffect, rule: Rule) -> Self {
@@ -134,8 +146,9 @@ impl ToolRules {
     #[must_use]
     pub fn decide_now(&self, call: &ToolCall, tool: Option<&dyn Tool>) -> ToolDecision {
         let rule = self.by_name.get(&call.name).or_else(|| {
-            tool.map(Tool::effect)
-                .and_then(|effect| self.by_effect.get(&effect))
+            tool.map_or(self.unknown.as_ref(), |tool| {
+                self.by_effect.get(&tool.effect())
+            })
         });
         match rule {
             None | Some(Rule::Allow) => ToolDecision::Allow,
@@ -248,7 +261,6 @@ mod tests {
             rules.decide_now(&call("write"), Some(&write)),
             ToolDecision::Deny { .. }
         ));
-        assert_eq!(rules.decide_now(&call("ghost"), None), ToolDecision::Allow);
     }
 
     #[tokio::test]
@@ -285,6 +297,19 @@ mod tests {
         assert_eq!(
             json!(ToolDecision::Deny { reason: "r".into() }),
             json!({"decision": "deny", "reason": "r"})
+        );
+    }
+
+    #[test]
+    fn read_only_refuses_an_unknown_tool() {
+        let rules = ToolRules::read_only();
+        assert!(matches!(
+            rules.decide_now(&call("ghost"), None),
+            ToolDecision::Deny { .. }
+        ));
+        assert_eq!(
+            ToolRules::new().decide_now(&call("ghost"), None),
+            ToolDecision::Allow
         );
     }
 }

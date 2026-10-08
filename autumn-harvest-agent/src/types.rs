@@ -38,9 +38,11 @@ pub struct AgentTask {
     /// The session this run belongs to. Tools and the policy see it.
     #[serde(default)]
     pub session_id: Option<SessionId>,
-    /// The bound on tool rounds. The model may answer once more after it.
+    /// The bound on tool rounds in one segment. The model may answer once
+    /// more after it. Each follow-up segment starts a new count.
     pub max_steps: u32,
-    /// The bound on provider-reported tokens for the whole run.
+    /// The bound on provider-reported tokens for the whole run, follow-ups
+    /// included.
     #[serde(default)]
     pub max_total_tokens: Option<u32>,
     /// The output cap of one model call.
@@ -57,7 +59,8 @@ pub struct AgentTask {
     #[serde(default)]
     pub deliver: bool,
     /// The memory scope. With a scope, the run reads a memory snapshot and
-    /// gets the `memory` tool.
+    /// gets the `memory` tool. A read-only segment gets the tool only with
+    /// [`read_only_memory_writes`](Self::read_only_memory_writes).
     #[serde(default)]
     pub memory_scope: Option<MemoryScope>,
     /// The follow-up settings. With settings, the run gets the
@@ -70,6 +73,13 @@ pub struct AgentTask {
     /// Refuse every tool call that writes or acts outside the app.
     #[serde(default)]
     pub read_only: bool,
+    /// Let a read-only segment write its memory.
+    ///
+    /// Off by default. A read-only run often reads untrusted data, such as an
+    /// inbox. A note it writes shows in the system prompt of every later run
+    /// in the scope, and those runs can have write tools.
+    #[serde(default)]
+    pub read_only_memory_writes: bool,
 }
 
 impl AgentTask {
@@ -91,6 +101,7 @@ impl AgentTask {
             followups: None,
             loop_guard: LoopGuard::default(),
             read_only: false,
+            read_only_memory_writes: false,
         }
     }
 
@@ -126,6 +137,23 @@ impl AgentTask {
     #[must_use]
     pub const fn read_only(mut self) -> Self {
         self.read_only = true;
+        self
+    }
+
+    /// The memory scope whose `memory` tool this task offers, if any.
+    pub(crate) fn memory_tool_scope(&self) -> Option<MemoryScope> {
+        if self.read_only && !self.read_only_memory_writes {
+            None
+        } else {
+            self.memory_scope.clone()
+        }
+    }
+
+    /// Let a read-only segment write its memory. See
+    /// [`read_only_memory_writes`](Self::read_only_memory_writes).
+    #[must_use]
+    pub const fn read_only_memory_writes(mut self) -> Self {
+        self.read_only_memory_writes = true;
         self
     }
 
@@ -177,9 +205,14 @@ impl AgentTask {
     /// an immediate deny.
     #[must_use]
     pub const fn approval_timeout(mut self, timeout: Duration) -> Self {
-        let partial = if timeout.subsec_nanos() > 0 { 1 } else { 0 };
-        self.approval_timeout_secs = timeout.as_secs().saturating_add(partial);
+        self.approval_timeout_secs = Self::new_timeout_secs(timeout);
         self
+    }
+
+    /// `timeout` in whole seconds, rounded up.
+    pub(crate) const fn new_timeout_secs(timeout: Duration) -> u64 {
+        let partial = if timeout.subsec_nanos() > 0 { 1 } else { 0 };
+        timeout.as_secs().saturating_add(partial)
     }
 
     /// Set the activity-input cap of the workers, in bytes.
@@ -205,11 +238,11 @@ pub struct ModelTurnRequest {
     /// The session the run belongs to.
     #[serde(default)]
     pub session_id: Option<SessionId>,
-    /// Tool rounds used before this turn.
+    /// Tool rounds used in this segment before this turn.
     pub steps_used: u32,
-    /// The run's bound on tool rounds.
+    /// The bound on tool rounds in one segment.
     pub max_steps: u32,
-    /// Tokens spent before this turn.
+    /// Tokens the run spent before this turn, earlier segments included.
     pub usage: TokenUsage,
     /// The whole conversation so far, the system prompt first.
     pub messages: Vec<ChatMessage>,
@@ -217,13 +250,13 @@ pub struct ModelTurnRequest {
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
     /// Apply read-only rules on top of the harness policy.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub read_only: bool,
-    /// The memory scope of the run, if any.
-    #[serde(default)]
+    /// The memory scope whose `memory` tool this turn offers, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_scope: Option<MemoryScope>,
     /// Tools that the workflow handles itself, such as `schedule_followup`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_tools: Vec<ToolDefinition>,
 }
 
@@ -287,13 +320,23 @@ pub struct ToolCallRequest {
     /// The session the run belongs to.
     #[serde(default)]
     pub session_id: Option<SessionId>,
-    /// The tool round (0-based) that issued the call.
+    /// The tool round (0-based) that issued the call, counted across
+    /// segments.
     pub step: u32,
     /// The call to run, with the arguments a reviewer may have edited.
     pub call: ToolCall,
-    /// The memory scope of the run, if any.
-    #[serde(default)]
+    /// The memory scope whose `memory` tool this call may use, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_scope: Option<MemoryScope>,
+    /// Refuse a tool that writes or acts outside, whatever the recorded
+    /// decision says.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub read_only: bool,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// The recorded result of one tool call.
@@ -328,6 +371,7 @@ impl ToolOutcome {
 /// Why a run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum AgentStop {
     /// The model gave a final answer.
     Completed,
@@ -350,12 +394,12 @@ pub struct AgentReport {
     pub stop: AgentStop,
     /// The last text the model produced.
     pub text: String,
-    /// Tool rounds used.
+    /// Tool rounds used in the whole run, follow-ups included.
     pub steps_used: u32,
-    /// Tool calls answered, whether they ran or not. A round cut at the
-    /// request cap answers its remaining calls with an error.
+    /// Tool calls answered in the whole run, whether they ran or not. A round
+    /// cut at the request cap answers its remaining calls with an error.
     pub tool_calls: u32,
-    /// Provider-reported tokens for the whole run.
+    /// Provider-reported tokens for the whole run, follow-ups included.
     pub usage: TokenUsage,
     /// The transcript without the system prompt. Pass it as the history of the
     /// next run to continue the conversation.
@@ -363,6 +407,10 @@ pub struct AgentReport {
     /// Follow-ups that ran before this report.
     #[serde(default)]
     pub followups: u32,
+    /// The last segment booked a follow-up, but it ended under a stop other
+    /// than `completed`, so the follow-up did not run.
+    #[serde(default)]
+    pub followup_dropped: bool,
 }
 
 /// The transcript without system messages.
@@ -460,5 +508,42 @@ mod tests {
         let calls = turn.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id, "c");
+    }
+
+    #[test]
+    fn requests_from_before_the_always_on_fields_decode_and_encode_alike() {
+        let old = json!({
+            "run_id": "r", "steps_used": 0, "max_steps": 8,
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "messages": [],
+        });
+        let request: ModelTurnRequest = serde_json::from_value(old).unwrap();
+        assert!(!request.read_only);
+        let mut encoded = serde_json::to_value(&request).unwrap();
+        // The new fields are left out at their defaults, so a recorded input
+        // from before them still matches on strict replay.
+        let fields = encoded.as_object_mut().unwrap();
+        for key in ["read_only", "memory_scope", "extra_tools"] {
+            assert!(!fields.contains_key(key), "{key}");
+        }
+        let old_call = json!({
+            "run_id": "r", "step": 0,
+            "call": {"id": "c", "name": "t", "arguments": {}},
+        });
+        let call: ToolCallRequest = serde_json::from_value(old_call).unwrap();
+        let encoded = serde_json::to_value(&call).unwrap();
+        assert!(encoded.get("read_only").is_none());
+        assert!(encoded.get("memory_scope").is_none());
+    }
+
+    #[test]
+    fn a_report_from_before_the_always_on_fields_decodes() {
+        let old = json!({
+            "stop": "completed", "text": "hi", "steps_used": 0, "tool_calls": 0,
+            "usage": {"input_tokens": 0, "output_tokens": 0}, "messages": [],
+        });
+        let report: AgentReport = serde_json::from_value(old).unwrap();
+        assert_eq!(report.followups, 0);
+        assert!(!report.followup_dropped);
     }
 }

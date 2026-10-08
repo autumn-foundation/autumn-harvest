@@ -74,8 +74,16 @@ pub mod types;
 pub mod workflow;
 
 pub use approval::Approval;
+pub use delivery::{Delivery, LogDelivery, Report, ReportSource};
 pub use error::{AgentError, ErrorKind};
+pub use followup::Followups;
 pub use harness::AgentHarness;
+pub use heartbeat::{
+    HEARTBEAT_WORKFLOW_NAME, HeartbeatReport, HeartbeatTask, Precheck, agent_heartbeat,
+    agent_heartbeat_info,
+};
+pub use loop_guard::LoopGuard;
+pub use memory::{InMemoryMemoryStore, MemoryBlock, MemoryScope, MemoryStore};
 pub use message::{
     ChatMessage, ChatRole, ContentPart, RunId, SessionId, StopReason, TokenUsage, ToolCall,
     ToolDefinition,
