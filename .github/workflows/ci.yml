@@ -397,6 +397,9 @@ jobs:
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features sqs -- -D warnings
       - name: Clippy autumn-harvest-plugin (aws-kms feature, issue #1825)
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features aws-kms -- -D warnings
+      # Issue #1978: the OIDC login module is `cfg`d out of the default build.
+      - name: Clippy autumn-harvest-plugin (oidc feature, issue #1978)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features oidc -- -D warnings
       # Issue #1312: the runtime wiring for the Redis dispatch channel is
       # `cfg`d out of the default build, so only this step compiles it.
       - name: Clippy autumn-harvest-plugin (redis feature)
@@ -1020,6 +1023,12 @@ jobs:
       - name: Run plugin lib tests (aws-kms feature, issue #1825)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test -p autumn-harvest-plugin --features aws-kms --lib aws_kms
+      # Issue #1978. The OIDC unit tests and the `api_with_oidc` builder test
+      # compile only with the feature. The round-trip suite runs from the
+      # manifest (`oidc_login`).
+      - name: Run plugin lib tests (oidc feature, issue #1978)
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
+        run: cargo test -p autumn-harvest-plugin --features oidc --lib oidc
       # No CI step ran the plugin's doctests, so a broken `///` example landed
       # silently (issue #944 review found exactly that). These are compile-only
       # (`no_run`), so they cost seconds and need no database.

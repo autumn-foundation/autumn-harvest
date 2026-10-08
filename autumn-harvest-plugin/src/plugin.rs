@@ -242,6 +242,13 @@ pub struct HarvestPlugin {
     /// The per-client API rate limiter (issue #1827). Set via
     /// [`Self::with_api_rate_limit`]. `None` installs no layer.
     api_rate_limit: Option<crate::api_rate_limit::ApiRateLimit>,
+    /// The custom roles (issue #1978). Set via [`Self::with_roles`] or
+    /// `api_with_oidc`. `None` installs no layer.
+    roles: Option<crate::roles::HarvestRoles>,
+    /// The OIDC login (issue #1978). Set via `api_with_oidc`. It declares the
+    /// auth boundary.
+    #[cfg(feature = "oidc")]
+    oidc: Option<crate::oidc::OidcLogin>,
     /// Opt-out that opens mutating routes with no auth (issue #1802). Set
     /// true by [`Self::allow_unauthenticated_mutations`]. Default off.
     allow_unauthenticated_mutations: bool,
@@ -345,6 +352,9 @@ impl HarvestPlugin {
             api_tokens_enabled: false,
             authorizer: None,
             api_rate_limit: None,
+            roles: None,
+            #[cfg(feature = "oidc")]
+            oidc: None,
             allow_unauthenticated_mutations: false,
             status_thresholds: crate::status_summary::StatusThresholds::default(),
             canary_config: None,
@@ -530,6 +540,12 @@ impl HarvestPlugin {
             Send + 'static,
     {
         self.api_path = Some(path.into());
+        // Issue #1978: host auth and OIDC login are alternatives. The last
+        // call wins.
+        #[cfg(feature = "oidc")]
+        {
+            self.oidc = None;
+        }
         let mcp_middleware = middleware.clone();
         self.mcp_tool_middleware = Some(std::sync::Arc::new(move |method_router| {
             method_router.layer(mcp_middleware.clone())
@@ -626,6 +642,47 @@ impl HarvestPlugin {
     #[must_use]
     pub fn with_authorizer(mut self, authorizer: impl crate::authz::HarvestAuthorizer) -> Self {
         self.authorizer = Some(crate::authz::SharedAuthorizer::new(authorizer));
+        self
+    }
+
+    /// Install custom roles on the management API and Vantage (issue #1978).
+    ///
+    /// Each request needs a role that allows its route. Host middleware gives
+    /// the roles, through a [`crate::roles::RoleGrant`] extension or the
+    /// session key [`crate::roles::SESSION_ROLES_KEY`]. A verified token skips
+    /// the check. See [`crate::roles`].
+    ///
+    /// Default off: with no roles the router is byte-for-byte unchanged.
+    #[must_use]
+    pub fn with_roles(mut self, roles: crate::roles::HarvestRoles) -> Self {
+        self.roles = Some(roles);
+        self
+    }
+
+    /// Mount the management API under `path`, with OIDC login for Vantage and
+    /// the API (issue #1978).
+    ///
+    /// It adds the login routes under `path`, a session boundary, and the
+    /// role layer with the roles of `login`. It declares the auth boundary.
+    /// The generated MCP tool routes get the same session check: a `GET`
+    /// tool needs a `read` role, any other tool a `mutate` role.
+    ///
+    /// It replaces an earlier [`Self::api_with_auth`]. A later
+    /// [`Self::api_with_auth`] replaces it. See [`crate::oidc`].
+    #[cfg(feature = "oidc")]
+    #[must_use]
+    pub fn api_with_oidc(mut self, path: impl Into<String>, login: crate::oidc::OidcLogin) -> Self {
+        self.api_path = Some(path.into());
+        self.api_middleware = None;
+        self.roles = Some(login.roles().clone());
+        let gate = login.clone();
+        self.mcp_tool_middleware = Some(std::sync::Arc::new(move |method_router| {
+            method_router.layer(autumn_web::reexports::axum::middleware::from_fn_with_state(
+                gate.clone(),
+                crate::oidc::gate_mcp_tool,
+            ))
+        }));
+        self.oidc = Some(login);
         self
     }
 
@@ -1203,6 +1260,9 @@ impl Plugin for HarvestPlugin {
             api_tokens_enabled,
             authorizer,
             api_rate_limit,
+            roles,
+            #[cfg(feature = "oidc")]
+            oidc,
             allow_unauthenticated_mutations,
             status_thresholds,
             canary_config,
@@ -1499,6 +1559,14 @@ impl Plugin for HarvestPlugin {
                 builder.dag_infos(),
             );
             crate::mcp_tools::record_schemas(&descriptors);
+            // Issue #1978: custom roles also gate the tool routes. The role
+            // gate sits inside the host auth layer, which sets the roles. An
+            // OIDC mount checks roles in its own tool gate.
+            #[cfg(feature = "oidc")]
+            let host_roles = roles.clone().filter(|_| oidc.is_none());
+            #[cfg(not(feature = "oidc"))]
+            let host_roles = roles.clone();
+            let mcp_tool_middleware = with_mcp_tool_roles(mcp_tool_middleware.clone(), host_roles);
             Some(crate::mcp_tools::build_mcp_tool_routes(
                 &prefix,
                 &descriptors,
@@ -1541,7 +1609,11 @@ impl Plugin for HarvestPlugin {
         // issue #377: arm fail-closed so any request in the window between
         // HTTP server bind and the boot-time gate load is safely rejected.
         api_state.arm_gate_cache_fail_closed();
-        api_state.set_admin_auth_boundary(api_middleware.is_some());
+        #[cfg(feature = "oidc")]
+        let auth_boundary = api_middleware.is_some() || oidc.is_some();
+        #[cfg(not(feature = "oidc"))]
+        let auth_boundary = api_middleware.is_some();
+        api_state.set_admin_auth_boundary(auth_boundary);
 
         let startup_slot = Arc::clone(&slot);
         let shutdown_slot = Arc::clone(&slot);
@@ -1606,10 +1678,15 @@ impl Plugin for HarvestPlugin {
                     read_only_role: role_auth_enabled,
                     authorizer,
                     rate_limit: api_rate_limit,
+                    roles,
                 },
             );
             if let Some(mw) = api_middleware {
                 router = mw(router);
+            }
+            #[cfg(feature = "oidc")]
+            if let Some(login) = &oidc {
+                router = crate::oidc::apply_oidc(router, login, api_tokens_enabled);
             }
             // `AppBuilder::nest` takes a `Router<AppState>`. The router is
             // `Router<()>`, so it declares the state type it never reads
@@ -1617,10 +1694,36 @@ impl Plugin for HarvestPlugin {
             // extractor for it.
             app.nest(&path, router.with_state(()))
         } else {
-            let _ = (api_tokens_enabled, authorizer, api_rate_limit);
+            let _ = (api_tokens_enabled, authorizer, api_rate_limit, roles);
             app
         }
     }
+}
+
+/// Put the custom-role gate inside the tool-route auth layer (issue #1978).
+///
+/// `outer` is the host auth layer, if any. It runs first and sets the roles.
+/// With no roles, `outer` is returned unchanged.
+#[cfg(feature = "mcp")]
+fn with_mcp_tool_roles(
+    outer: Option<McpToolMiddlewareFn>,
+    roles: Option<crate::roles::HarvestRoles>,
+) -> Option<McpToolMiddlewareFn> {
+    let Some(roles) = roles else {
+        return outer;
+    };
+    let composed: McpToolMiddlewareFn = Arc::new(move |method_router| {
+        let gated =
+            method_router.layer(autumn_web::reexports::axum::middleware::from_fn_with_state(
+                roles.clone(),
+                crate::roles::enforce_mcp_tool_roles,
+            ));
+        let Some(outer) = &outer else {
+            return gated;
+        };
+        outer(gated)
+    });
+    Some(composed)
 }
 
 /// The application configuration this startup hook should read.
@@ -3212,6 +3315,95 @@ mod tests {
             plugin.mcp_tool_middleware.is_some(),
             "api_with_auth must configure the same layer for generated MCP tool routes"
         );
+    }
+
+    #[test]
+    fn with_roles_sets_the_role_set() {
+        let plugin = HarvestPlugin::new();
+        assert!(plugin.roles.is_none());
+        let plugin = plugin.with_roles(crate::roles::HarvestRoles::builtin());
+        assert!(plugin.roles.is_some());
+    }
+
+    /// Issue #1978: with custom roles, a tool route needs a role whose scope
+    /// fits the method.
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn mcp_tool_routes_get_the_role_gate() {
+        use autumn_web::reexports::axum;
+        use tower::ServiceExt;
+
+        assert!(with_mcp_tool_roles(None, None).is_none());
+        let gate = with_mcp_tool_roles(None, Some(crate::roles::HarvestRoles::builtin()))
+            .expect("roles add a gate");
+        let tool: axum::routing::MethodRouter<AppState> =
+            axum::routing::get(|| async { "status" }).post(|| async { "start" });
+        let app = axum::Router::new()
+            .route("/tool", gate(tool))
+            .with_state(AppState::for_test());
+        let call = |method: axum::http::Method, role: Option<&'static str>| {
+            let app = app.clone();
+            async move {
+                let mut request = axum::http::Request::builder()
+                    .method(method)
+                    .uri("/tool")
+                    .body(axum::body::Body::empty())
+                    .expect("request");
+                if let Some(role) = role {
+                    request
+                        .extensions_mut()
+                        .insert(crate::roles::RoleGrant::new([role]));
+                }
+                app.oneshot(request).await.expect("served").status()
+            }
+        };
+        let ok = axum::http::StatusCode::OK;
+        let forbidden = axum::http::StatusCode::FORBIDDEN;
+        let viewer = Some(crate::roles::ROLE_VIEWER);
+        let operator = Some(crate::roles::ROLE_OPERATOR);
+        assert_eq!(call(axum::http::Method::GET, viewer).await, ok);
+        assert_eq!(call(axum::http::Method::POST, viewer).await, forbidden);
+        assert_eq!(call(axum::http::Method::POST, operator).await, ok);
+        assert_eq!(call(axum::http::Method::GET, None).await, forbidden);
+    }
+
+    #[cfg(feature = "oidc")]
+    fn oidc_login() -> crate::oidc::OidcLogin {
+        let provider = crate::oidc::OAuth2ProviderConfig {
+            client_id: "c".to_string(),
+            client_secret: "s".to_string(),
+            authorize_url: "https://idp.example.com/authorize".to_string(),
+            token_url: "https://idp.example.com/token".to_string(),
+            userinfo_url: None,
+            redirect_uri: "https://h.example.com/api/auth/oidc/callback".to_string(),
+            scope: "openid".to_string(),
+            issuer: Some("https://idp.example.com".to_string()),
+            jwks_url: Some("https://idp.example.com/jwks".to_string()),
+            discovery_url: None,
+        };
+        crate::oidc::OidcLogin::new(
+            provider,
+            crate::roles::HarvestRoles::builtin(),
+            crate::roles::ClaimRoleMap::new(),
+        )
+        .expect("valid login")
+    }
+
+    #[cfg(feature = "oidc")]
+    #[test]
+    fn api_with_oidc_sets_roles_the_tool_gate_and_replaces_host_auth() {
+        let plugin = HarvestPlugin::new()
+            .api_with_auth("/old", autumn_web::auth::RequireAuth::new("test"))
+            .api_with_oidc("/api", oidc_login());
+        assert_eq!(plugin.api_path.as_deref(), Some("/api"));
+        assert!(plugin.api_middleware.is_none());
+        assert!(plugin.oidc.is_some());
+        assert!(plugin.roles.is_some());
+        assert!(plugin.mcp_tool_middleware.is_some());
+
+        let plugin = plugin.api_with_auth("/api", autumn_web::auth::RequireAuth::new("test"));
+        assert!(plugin.oidc.is_none());
+        assert!(plugin.api_middleware.is_some());
     }
 
     /// Regression test (issue #597, PR #908 review): `mcp_tools()` combined

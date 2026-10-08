@@ -4,12 +4,15 @@ This document defines the supported security postures for the Harvest management
 API, explains how to mount it safely in an Autumn application, and provides a
 production-readiness checklist.
 
-Harvest does not ship its own identity provider, session system, or RBAC engine.
-Authentication and authorization are **delegated to the host Autumn application**,
+Harvest does not ship its own identity provider or session store. By default,
+authentication and authorization are **delegated to the host Autumn application**,
 exactly as Oban Web and Sidekiq Web are mounted behind Plug/Rack authentication
-in their respective ecosystems. The responsibility of this document is to make
-the API surface explicit so embedders can make informed decisions and verify
-their posture before deployment.
+in their respective ecosystems. Two opt-in layers are built in. One is
+[OIDC login with custom roles](#sso-and-custom-roles-issue-1978). The other is
+[scoped API tokens](#scoped-api-tokens-built-in-opt-in--issue-942). The
+responsibility of this document is to make the API surface explicit so
+embedders can make informed decisions and verify their posture before
+deployment.
 
 ---
 
@@ -507,6 +510,192 @@ A deny row costs one insert. A token scope deny comes only from a valid token,
 so its author is known. The hook can also deny a caller with no credential.
 For such a request, return `Allow` and let `require_admin` answer `401` with
 no audit write. Keep the rate-limiting proxy advice above.
+
+---
+
+## SSO and custom roles (issue #1978)
+
+**Decision: SSO lives in Harvest, as a thin opt-in layer.** The record is
+[ADR 0006](./adr/0006-oidc-sso-and-custom-roles.md). Harvest owns the login
+routes, the claim-to-role map and the session boundary. autumn-web owns the
+OIDC protocol and the crypto. mTLS stays in autumn-web.
+
+### Custom roles
+
+A role has a base scope and a list of extra routes. The scope is `read`,
+`mutate` or `admin`, as for a [token](#scopes-read--mutate--admin). An extra
+route is one `CLASSIFIED_ROUTES` entry.
+
+```rust
+use autumn_harvest_plugin::api_token::TokenScope;
+use autumn_harvest_plugin::roles::{HarvestRole, HarvestRoles};
+
+let roles = HarvestRoles::builder()
+    .builtin_roles() // harvest-viewer, harvest-operator, harvest-admin
+    .role(
+        HarvestRole::new("dlq-operator")
+            .with_scope(TokenScope::Read)
+            .allow_route("POST /dead-letters/replay"),
+    )
+    .build()?;
+```
+
+`build` refuses a bad name, a duplicate name, a role with no scope and no
+route, and a route that is not in `CLASSIFIED_ROUTES`. A name is 1 to 64 of
+`a-z`, `0-9`, `-` and `_`.
+
+| Built-in role | Scope |
+|---|---|
+| `harvest-viewer` | `read` |
+| `harvest-operator` | `mutate` |
+| `harvest-admin` | `admin` |
+
+Turn the role layer on with `HarvestPlugin::with_roles(roles)` or
+`StandaloneAdminAuth::with_roles(roles)`. The OIDC login turns it on for you.
+
+**Where roles come from.** The layer reads role names from one of two places:
+
+1. A `RoleGrant` request extension. Host middleware sets it.
+2. Else, the session key `harvest_roles`, a comma-separated list. The OIDC
+   login sets it. Host middleware can set it too.
+
+A client cannot set either one. No header grants a role.
+
+**The decision.**
+
+- A `PublicSafe` route needs no role.
+- A role allows a route when its scope allows the route, or when the role
+  names the route.
+- A Vantage (`/ui`) `GET` or `HEAD` is a read. Any other Vantage method is a
+  mutation. An extra route does not cover Vantage.
+- An unclassified API path is a mutation, so a `read` role cannot reach it.
+- An unknown role name grants nothing.
+- A verified `hvst_` token skips the role check. Its scope applies.
+- A deny is `403` with `{"error":"role does not allow this route"}`. It
+  writes one `authz.deny` audit row.
+
+An allowed request carries a `RolePrincipal` extension. The admin gate and
+the #1802 mutation gate admit it, as they admit a token. The
+[authorizer hook](#authorizer-hook-issue-1803) can read it from
+`extensions`. The hook runs after the role layer, so it can only narrow.
+
+**MCP tool routes.** A generated tool route has no route class. With roles
+on, a `GET` tool needs a `read` scope or wider. Any other tool needs `mutate`
+or wider. Extra routes do not apply.
+
+### OIDC login
+
+Turn on the `oidc` feature of `autumn-harvest-plugin`. It turns on the
+autumn-web OIDC client and adds no other crate.
+
+```rust
+use autumn_harvest_plugin::oidc::{OidcLogin, discover_provider};
+use autumn_harvest_plugin::roles::{ClaimRoleMap, ClaimRule, HarvestRoles};
+
+let provider = discover_provider(
+    "https://login.example.com",
+    std::env::var("OIDC_CLIENT_ID")?,
+    std::env::var("OIDC_CLIENT_SECRET")?,
+    "https://harvest.example.com/api/harvest/auth/oidc/callback",
+)
+.await?;
+let claims = ClaimRoleMap::new()
+    .rule(ClaimRule::new("groups", "harvest-admins", "harvest-admin"))
+    .rule(ClaimRule::new("groups", "support", "harvest-viewer"))
+    .rule(ClaimRule::new("realm_access.roles", "dlq", "dlq-operator"));
+let login = OidcLogin::new(provider, roles, claims)?;
+
+let plugin = HarvestPlugin::new().api_with_oidc("/api/harvest", login);
+```
+
+A standalone mount uses `StandaloneAdminAuth::with_oidc(login)`. It needs an
+autumn-web session layer outside the mounted router.
+
+**Routes.** They are under the API mount. They sit outside the boundary.
+
+| Route | Effect |
+|---|---|
+| `GET /auth/oidc/login` | `303` to the identity provider, with PKCE, `state` and `nonce`. |
+| `GET /auth/oidc/callback` | Check the code, the ID token and the claims. Then `303` to Vantage. |
+| `POST /auth/oidc/logout` | Clear the Harvest session. |
+
+Register the callback URL with the identity provider as the redirect URI.
+
+**The callback.** autumn-web checks `state`, then trades the code with the
+PKCE verifier. It checks the ID-token signature against the JWKS, with the
+algorithm the key allows. It checks `iss`, `aud`, `exp`, `nbf` and `nonce`.
+Any failure is `401`. Then Harvest maps the claims to roles:
+
+- `ClaimRule::new(claim, value, role)` matches when the claim equals `value`,
+  or when an array claim holds `value`. The claim path is dot-separated.
+- `ClaimRoleMap::default_role` gives a role to every identity that logs in.
+- An identity with no role gets `403` and no session.
+- `OidcLogin::new` refuses a rule for an undefined role.
+
+**The session boundary.**
+
+- A session user reaches the role layer. The audit actor is
+  `oidc:{subject}`. The boundary strips an inbound `oidc:` actor from every
+  other request.
+- A `PublicSafe` route needs no session.
+- An `hvst_` bearer passes when API tokens are on. The token layer verifies
+  it.
+- Any other Vantage `GET` gets `303` to the login route.
+- Any other request gets `401`.
+
+**Configuration checks.** `OidcLogin::new` needs `client_id`,
+`authorize_url`, `token_url`, `redirect_uri`, `issuer` and `jwks_url`. Each
+provider URL must use `https`, unless its host is loopback. The scope must
+include `openid`. `discover_provider` refuses a document that names another
+issuer.
+
+**Limits.**
+
+- Roles are fixed at login. After `max_session_age` (default 12 hours) the
+  user must log in again. Set it with `OidcLogin::with_max_session_age`.
+- The claim map reads the ID token, not the userinfo endpoint.
+- Logout does not end the session at the identity provider.
+- `api_with_oidc` and `api_with_auth` replace each other. The last call wins.
+
+### mTLS on the management API
+
+autumn-web owns the listener, so it verifies client certificates. Require a
+certificate on the management API:
+
+```toml
+[server.tls.client_auth]
+mode = "optional"
+ca_bundle_path = "/etc/harvest/client-ca.pem"
+required_paths = ["/api/harvest"]
+```
+
+A request to `/api/harvest` with no verified certificate gets `403`. Map the
+certificate to a role in host middleware. This needs the autumn-web `tls`
+feature:
+
+```rust
+use autumn_harvest_plugin::roles::RoleGrant;
+use autumn_web::tls::client_auth::OptionalClientCert;
+
+async fn cert_roles(cert: OptionalClientCert, mut req: Request, next: Next) -> Response {
+    let role = match cert.0.as_deref().and_then(|id| id.common_name()) {
+        Some("ci-deployer") => Some("harvest-operator"),
+        Some(_) => Some("harvest-viewer"),
+        None => None,
+    };
+    if let Some(role) = role {
+        req.extensions_mut().insert(RoleGrant::new([role]));
+    }
+    next.run(req).await
+}
+
+let plugin = HarvestPlugin::new()
+    .with_roles(roles)
+    .api_with_auth("/api/harvest", axum::middleware::from_fn(cert_roles));
+```
+
+Keep `mode = "optional"` when browsers also use the listener. Use `required`
+when every client presents a certificate.
 
 ---
 
@@ -1206,7 +1395,13 @@ Turn on the [API rate limiter](#api-rate-limiting) with
 one client, then check for `429` with `Retry-After`. Watch
 `harvest_api_rate_limited_total` for refusals of real clients.
 
-### 7. Payloads that carry PII are encrypted
+### 7. SSO users have the least role they need
+
+With [OIDC login](#oidc-login), map each group to the narrowest role. Log in
+as a viewer and check that a mutation gets `403`. Give `harvest-admin` to as
+few groups as you can, because it can mint API tokens.
+
+### 8. Payloads that carry PII are encrypted
 
 If a workflow carries PII or secrets, register an `AeadCodec` with
 `aead_payload_codec_key`. Load the key from a `KeyProvider`, never from
