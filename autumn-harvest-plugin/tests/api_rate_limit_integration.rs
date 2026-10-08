@@ -8,6 +8,8 @@
 //!   token is unaffected.
 //! - AC2: each rejection is a metric sample. Sustained rejections write one
 //!   `api.rate_limit_sustained` audit row with the token as the actor.
+//! - A made-up token pays from its address bucket before the token lookup. A
+//!   valid token gets that charge back.
 
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::items_after_statements)]
@@ -177,7 +179,12 @@ async fn send(
 
 /// Mint a `mutate` token. Return its secret and id.
 async fn mint(app: &axum::Router, name: &str) -> (String, String) {
-    let body = json!({ "name": name, "scope": "mutate" });
+    mint_scoped(app, name, "mutate").await
+}
+
+/// Mint a token with `scope`. Return its secret and id.
+async fn mint_scoped(app: &axum::Router, name: &str, scope: &str) -> (String, String) {
+    let body = json!({ "name": name, "scope": scope });
     let (status, _, created) = send(app, "POST", "/admin/tokens", Some(body), None).await;
     assert_eq!(status, StatusCode::CREATED, "mint should 201: {created:?}");
     let secret = created["secret"].as_str().unwrap().to_owned();
@@ -320,4 +327,93 @@ async fn sustained_rejections_write_one_audit_row() {
         );
     }
     assert!(row.summary.contains("mutating"), "{}", row.summary);
+}
+
+/// A made-up token pays from its address bucket before the token lookup. A
+/// valid token gets that charge back, so valid tokens from one address do not
+/// share its bucket.
+#[tokio::test]
+async fn made_up_tokens_are_limited_before_the_lookup_and_valid_tokens_are_not() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    let minting = minting_app(&pool);
+    let (first, _) = mint(&minting, "first").await;
+    let (second, _) = mint(&minting, "second").await;
+    let metrics = Arc::new(CapturingMetrics::default());
+    let app = limited_app(&pool, Arc::clone(&metrics), ten_per_second());
+
+    // These requests carry no address, so all share the `unknown` bucket of
+    // 10. Twenty valid requests pass only because each charge comes back.
+    let (first_limited, _) = burst(&app, &first, 10).await;
+    let (second_limited, _) = burst(&app, &second, 10).await;
+    assert_eq!(
+        first_limited, 0,
+        "a valid token is not charged to its address"
+    );
+    assert_eq!(
+        second_limited, 0,
+        "a second valid token is not charged either"
+    );
+
+    let mut unauthorized = 0;
+    let mut limited = 0;
+    for i in 0..40 {
+        let made_up = format!("hvst_made_up_{i}");
+        let (status, _, _) = send(&app, "POST", START, Some(json!({})), Some(&made_up)).await;
+        match status {
+            StatusCode::UNAUTHORIZED => unauthorized += 1,
+            StatusCode::TOO_MANY_REQUESTS => limited += 1,
+            other => panic!("unexpected status {other}"),
+        }
+    }
+
+    // The bucket refills during the flood, so a slow runner sees more lookups.
+    assert!(
+        (10..=30).contains(&unauthorized),
+        "about 10 made-up tokens reach the lookup, got {unauthorized}"
+    );
+    assert_eq!(unauthorized + limited, 40);
+    let samples = metrics.rate_limited();
+    assert_eq!(samples.len(), limited);
+    assert!(
+        samples
+            .iter()
+            .all(|(class, kind)| class == "mutating" && kind == "unknown"),
+        "a made-up token is charged to its address: {samples:?}"
+    );
+}
+
+/// A valid token that its scope refuses gets its address charge back. So a
+/// read token that keeps calling a mutating route does not empty the bucket
+/// of the address it shares with other tokens.
+#[tokio::test]
+async fn a_scope_denied_token_does_not_empty_its_address_bucket() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    let minting = minting_app(&pool);
+    let (reader, _) = mint_scoped(&minting, "reader", "read").await;
+    let (writer, _) = mint(&minting, "writer").await;
+    let app = limited_app(&pool, Arc::default(), ten_per_second());
+
+    // Twice the address bucket of 10. Each request is a scope deny.
+    let mut statuses = Vec::new();
+    for _ in 0..20 {
+        let (status, _, _) = send(&app, "POST", START, Some(json!({})), Some(&reader)).await;
+        statuses.push(status);
+    }
+    let (writer_status, _, body) = send(&app, "POST", START, Some(json!({})), Some(&writer)).await;
+
+    assert!(
+        statuses.iter().all(|s| *s == StatusCode::FORBIDDEN),
+        "every scope deny is a 403, never a 429: {statuses:?}"
+    );
+    assert_ne!(
+        writer_status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "another token from the address still passes the pre-auth charge: {body:?}"
+    );
 }
