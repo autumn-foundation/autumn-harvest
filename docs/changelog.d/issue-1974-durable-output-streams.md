@@ -23,7 +23,8 @@ streaming needs a stream that a client can resume at any offset.
 - Cap: 10,000 chunks per execution, then one terminal marker at offset
   `i64::MAX`. The 7,000-byte chunk cap of the best-effort mode applies.
 - PII erasure deletes the chunks and reports `stream_chunks_deleted`. A shard
-  rebalance copies them. `ON DELETE CASCADE` ties them to the execution.
+  rebalance copies them at staging, and at activation it copies the chunks
+  that the source stored after verification. `ON DELETE CASCADE` ties them to the execution.
 - `TestRunOutcome::recorded_durable_progress()` returns the chunks of a no-DB
   test run.
 

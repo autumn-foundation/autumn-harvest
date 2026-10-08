@@ -1240,6 +1240,12 @@ mod db {
     }
 
     #[derive(diesel::QueryableByName)]
+    struct NullableBigIntRow {
+        #[diesel(sql_type = Nullable<BigInt>)]
+        value: Option<i64>,
+    }
+
+    #[derive(diesel::QueryableByName)]
     struct StagedKeyRow {
         #[diesel(sql_type = Text)]
         state: String,
@@ -1261,16 +1267,17 @@ mod db {
     /// Rows in one page of [`read_stream_chunk_pages`].
     const STREAM_CHUNK_COPY_PAGE: i64 = 1_000;
 
-    /// Read an execution's durable stream chunks (issue #1974) as JSON pages.
+    /// Read an execution's durable stream chunks above `after` (issue #1974)
+    /// as JSON pages.
     ///
     /// A stream can hold 10,000 chunks of up to 7,000 bytes, about 70 MB.
     /// Pages of 1,000 rows keep each query result and each insert small.
     async fn read_stream_chunk_pages(
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,
+        mut after: i64,
     ) -> HarvestResult<Vec<Value>> {
         let mut pages = Vec::new();
-        let mut after = -1_i64;
         loop {
             let row: JsonRow = diesel::sql_query(
                 "SELECT COALESCE(jsonb_agg(to_jsonb(c) ORDER BY c.stream_offset), \
@@ -1303,6 +1310,34 @@ mod db {
             }
         }
         Ok(pages)
+    }
+
+    /// Insert stream chunk pages from [`read_stream_chunk_pages`].
+    ///
+    /// Stream chunks take an explicit column list: `id` is a shard-local
+    /// `BIGSERIAL`. `stream_offset` carries the order. A chunk that the
+    /// target already holds is kept, so a re-run is safe.
+    async fn insert_stream_chunk_pages(
+        conn: &mut AsyncPgConnection,
+        pages: &[Value],
+    ) -> HarvestResult<()> {
+        for page in pages {
+            diesel::sql_query(
+                "INSERT INTO harvest_stream_chunks \
+                     (workflow_exec_id, stream_offset, chunk, created_at) \
+                 SELECT workflow_exec_id, stream_offset, chunk, created_at \
+                 FROM jsonb_to_recordset($1::jsonb) AS r( \
+                     workflow_exec_id uuid, stream_offset bigint, chunk jsonb, \
+                     created_at timestamptz) \
+                 ORDER BY stream_offset \
+                 ON CONFLICT (workflow_exec_id, stream_offset) DO NOTHING",
+            )
+            .bind::<Jsonb, _>(page)
+            .execute(&mut *conn)
+            .await
+            .map_err(database_error)?;
+        }
+        Ok(())
     }
 
     /// Copy one execution's durable state onto the target shard as an inert
@@ -1403,7 +1438,7 @@ mod db {
         // Durable stream chunks (issue #1974). Copied for the same reason as
         // the logs: they are author output, and erasure must reach them on
         // the execution's own shard.
-        let stream_chunk_pages = read_stream_chunk_pages(source, exec_id).await?;
+        let stream_chunk_pages = read_stream_chunk_pages(source, exec_id, -1).await?;
 
         // The parked workflow task, captured but NOT staged (see the doc
         // comment). `to_jsonb` keeps every column, including the sticky hint and
@@ -1609,23 +1644,7 @@ mod db {
             .await
             .map_err(database_error)?;
 
-            // Stream chunks take an explicit column list too: `id` is a
-            // shard-local `BIGSERIAL`. `stream_offset` carries the order.
-            for page in &stream_chunk_pages {
-                diesel::sql_query(
-                    "INSERT INTO harvest_stream_chunks \
-                         (workflow_exec_id, stream_offset, chunk, created_at) \
-                     SELECT workflow_exec_id, stream_offset, chunk, created_at \
-                     FROM jsonb_to_recordset($1::jsonb) AS r( \
-                         workflow_exec_id uuid, stream_offset bigint, chunk jsonb, \
-                         created_at timestamptz) \
-                     ORDER BY stream_offset",
-                )
-                .bind::<Jsonb, _>(page)
-                .execute(&mut *conn)
-                .await
-                .map_err(database_error)?;
-            }
+            insert_stream_chunk_pages(&mut *conn, &stream_chunk_pages).await?;
 
             Ok(())
         }))
@@ -2960,6 +2979,24 @@ mod db {
         })?;
         let staged_task: Option<Value> = staged.payload;
 
+        // Durable stream chunks stored after the copy (issue #1974). A
+        // decision between verification and cutover can store chunks and park
+        // with no new event, so the history guard does not see it. The source
+        // is sealed now and gets no more chunks. Copy every chunk above the
+        // target's highest real offset. The marker sorts last, so it comes too.
+        let target_high: Option<i64> = diesel::sql_query(
+            "SELECT max(stream_offset) AS value FROM harvest_stream_chunks \
+              WHERE workflow_exec_id = $1 AND stream_offset < $2",
+        )
+        .bind::<SqlUuid, _>(exec_id.as_uuid())
+        .bind::<BigInt, _>(crate::store::DURABLE_STREAM_TRUNCATION_OFFSET)
+        .get_result::<NullableBigIntRow>(target)
+        .await
+        .map_err(database_error)?
+        .value;
+        let late_chunk_pages =
+            read_stream_chunk_pages(source, exec_id, target_high.unwrap_or(-1)).await?;
+
         Box::pin(target.transaction::<(), HarvestError, _>(async |conn| {
             if fenced && let Some(settle) = settle {
                 crate::replication::assert_fence(conn, settle.target_shard).await?;
@@ -2994,6 +3031,10 @@ mod db {
                 .execute(&mut *conn)
                 .await
                 .map_err(database_error)?;
+
+                // Not gated on `activated`: the chunks are author output that
+                // erasure must reach on the live shard, whatever the state.
+                insert_stream_chunk_pages(&mut *conn, &late_chunk_pages).await?;
 
                 // Staging can have vacated an unrelated same-key row to free
                 // the target's active-uniqueness slot for this copy (issue

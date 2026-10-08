@@ -13849,14 +13849,16 @@ impl WorkflowContext {
             return Ok(());
         }
         // Bound the queue at cap + 1. The extra command lets the store see
-        // the overflow and write its marker.
-        let queued = self
-            .durable_progress_queued
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if queued > u64::from(DURABLE_STREAM_MAX_CHUNKS) {
+        // the overflow and write its marker. Check first, so a call over the
+        // bound does no serialization. Take the slot only after serialization
+        // succeeds, because a failed call queues nothing.
+        let queued = &self.durable_progress_queued;
+        if queued.load(std::sync::atomic::Ordering::Relaxed) > u64::from(DURABLE_STREAM_MAX_CHUNKS)
+        {
             return Ok(());
         }
         let value = cap_progress_chunk(&chunk)?;
+        queued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.push_command(WorkflowCommand::PublishDurableProgress {
             offset,
             chunk: value,
@@ -26057,6 +26059,27 @@ mod tests {
         assert_eq!(
             chunks[0].1.get("_harvest_progress_truncated"),
             Some(&Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn a_failed_serialization_does_not_use_a_queue_slot() {
+        // Regression (issue #1974 review). A failed call queues nothing, so it
+        // must not use a slot. Otherwise the overflow command is lost and the
+        // store never writes its marker.
+        let ctx = WorkflowContext::new_test();
+        let unserializable: std::collections::BTreeMap<(i32, i32), i32> =
+            std::iter::once(((1, 2), 3)).collect();
+        assert!(ctx.publish_durable_progress(unserializable).is_err());
+        let cap = u64::from(DURABLE_STREAM_MAX_CHUNKS);
+        for i in 0..=cap {
+            ctx.publish_durable_progress(i).expect("publish");
+        }
+        let queued = durable_chunks(&ctx.drain_commands()).len();
+        assert_eq!(
+            u64::try_from(queued).expect("fits"),
+            cap + 1,
+            "all cap + 1 good chunks are queued"
         );
     }
 

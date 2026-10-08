@@ -646,6 +646,58 @@ async fn a_timer_parked_execution_migrates_end_to_end() {
     assert_eq!(attrs.value.as_deref(), Some("acme"));
 }
 
+/// Issue #1974: a decision between verification and cutover can store
+/// durable stream chunks and park again with no new event. The history guard
+/// then still passes. Activation copies such chunks from the sealed source,
+/// so the target misses none.
+#[tokio::test]
+async fn activation_copies_stream_chunks_written_after_verification() {
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "entity-stream").await;
+    let mut source = shards.source().await;
+    let mut target = shards.target().await;
+    let chunk = |offset: i64| store::DurableStreamChunk {
+        offset,
+        chunk: json!({ "token": offset }),
+    };
+    store::append_stream_chunks(&mut source, exec_id, &[chunk(0), chunk(1)], 100)
+        .await
+        .expect("chunks before staging");
+
+    begin_migration(&mut source, exec_id, SOURCE, TARGET)
+        .await
+        .expect("begin");
+    stage_copy(&mut source, &mut target, exec_id, TARGET)
+        .await
+        .expect("stage");
+    verify_target_copy(&mut source, &mut target, exec_id, &codecs())
+        .await
+        .expect("verify");
+
+    // An eventless decision on the source after verification.
+    store::append_stream_chunks(&mut source, exec_id, &[chunk(2), chunk(3)], 100)
+        .await
+        .expect("chunks after verification");
+
+    assert!(
+        commit_cutover(&mut source, exec_id, TARGET)
+            .await
+            .expect("cutover"),
+        "no event was appended, so the history guard passes"
+    );
+    activate_target(&mut source, &mut target, exec_id)
+        .await
+        .expect("activate");
+
+    let offsets: Vec<i64> = store::load_stream_chunks(&mut target, exec_id, None, 100)
+        .await
+        .expect("target chunks")
+        .into_iter()
+        .map(|row| row.stream_offset)
+        .collect();
+    assert_eq!(offsets, vec![0, 1, 2, 3], "the target must miss no chunk");
+}
+
 /// Issue #1317 review, P1: a retained terminal copy of an UNRELATED
 /// execution can already occupy the target's active-uniqueness slot for
 /// this business key. Reconciliation lets a fresh run start on the shard a
