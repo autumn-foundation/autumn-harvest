@@ -349,6 +349,13 @@ pub(crate) async fn enforce_tenant_binding(
     }
 
     let (method, path) = (fields.method.clone(), fields.path.clone());
+    // Later layers, the authorizer included, see the verified tenant on
+    // every route. `verified_tenant` checked the key above.
+    if request.extensions().get::<VerifiedTenant>().is_none() {
+        request
+            .extensions_mut()
+            .insert(VerifiedTenant(tenant.clone()));
+    }
     if classify_route(&method, &path) == RouteClass::PublicSafe {
         return next.run(request).await;
     }
@@ -375,12 +382,6 @@ pub(crate) async fn enforce_tenant_binding(
         }
     }
 
-    if request.extensions().get::<VerifiedTenant>().is_none() {
-        // `verified_tenant` checked the key above.
-        request
-            .extensions_mut()
-            .insert(VerifiedTenant(tenant.clone()));
-    }
     if scope == Scope::Run {
         return next.run(request).await;
     }

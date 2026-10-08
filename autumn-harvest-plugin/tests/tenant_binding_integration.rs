@@ -636,6 +636,9 @@ async fn authorizer_sees_the_verified_tenant() {
     assert_eq!(status, StatusCode::OK);
     let (status, _) = send(&app, Call::new("GET", "/workflows").tenant("initech")).await;
     assert_eq!(status, StatusCode::OK);
+    // A public route also carries the verified tenant to the hook.
+    let (status, _) = send(&app, Call::new("GET", "/health").bearer(&acme)).await;
+    assert_eq!(status, StatusCode::OK);
 
     let seen = seen.lock().unwrap().clone();
     assert_eq!(
@@ -643,6 +646,7 @@ async fn authorizer_sees_the_verified_tenant() {
         vec![
             (Some("acme".to_string()), true),
             (Some("initech".to_string()), false),
+            (Some("acme".to_string()), true),
         ]
     );
 }
