@@ -755,6 +755,28 @@ by its stable `(workflow_name, workflow_id)` business key instead of its
 
 ---
 
+## Keyed entities (issue #1975)
+
+[ADR 0006](./adr/0006-keyed-entity.md) records the design. An entity adds no
+route and no table.
+
+- **An operation is a signal-with-start.** A caller sends it through
+  `POST /workflows/{name}/signal-with-start`. The route keeps its own
+  authentication and admin rules. A caller who may use that route for an
+  entity type may create an entity under any key. That caller may also send
+  any operation to it, a delete included.
+- **A read is a query.** A caller reads the state through
+  `GET /workflows/by-id/{name}/{key}/query/harvest.entity.state`. The query
+  route keeps its own rules.
+- **The key is a business id, not a secret.** A key appears in requests,
+  audit rows and logs. Do not put a secret or a customer name in it. To
+  confine a caller to its own keys, install an
+  [authorizer hook](#authorizer-hook-issue-1803) that checks the key.
+- **Operations are history.** Each operation is a `SignalReceived` payload.
+  The payload codec, retention and erasure apply to it as to any signal.
+
+---
+
 ## CLI token semantics
 
 The Harvest CLI supports `--token <value>` and the `HARVEST_TOKEN` environment

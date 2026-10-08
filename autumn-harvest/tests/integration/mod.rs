@@ -134,6 +134,8 @@ mod drain_release_tests;
 mod dst_differential_tests;
 mod e2e_bench_cell_timeout_tests;
 mod e2e_bench_support;
+#[cfg(feature = "db")]
+mod entity_tests;
 mod event_batch_tests;
 mod event_partitioning_tests;
 mod executor_span_tests;

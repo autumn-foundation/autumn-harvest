@@ -232,6 +232,9 @@ name = "business_day_escalation"
 name = "long_lived_entity_deadline"
 
 [[example]]
+name = "agent_session_entity"
+
+[[example]]
 name = "cancellable_timer_sla"
 
 [[example]]
