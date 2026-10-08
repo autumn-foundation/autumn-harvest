@@ -36,10 +36,10 @@ fn fake_gcs(seen: Seen) -> Router {
         .route(
             "/storage/v1/b/{bucket}",
             get(|Path(bucket): Path<String>| async move {
-                if bucket == "b" {
-                    (StatusCode::OK, "{}")
-                } else {
-                    (StatusCode::NOT_FOUND, "")
+                match bucket.as_str() {
+                    "b" => (StatusCode::OK, "{}"),
+                    "denied" => (StatusCode::FORBIDDEN, "denied"),
+                    _ => (StatusCode::NOT_FOUND, ""),
                 }
             }),
         )
@@ -108,6 +108,14 @@ async fn a_missing_bucket_is_an_error_not_a_missing_object() {
     let backend = GcsBackend::new("no-such-bucket", NoAuth).with_endpoint(&endpoint);
     let err = backend.get("missing").await.unwrap_err();
     assert!(err.to_string().contains("does not exist"), "{err}");
+}
+
+#[tokio::test]
+async fn a_failed_bucket_check_is_an_error_not_a_missing_object() {
+    let endpoint = serve(fake_gcs(Seen::default())).await;
+    let backend = GcsBackend::new("denied", NoAuth).with_endpoint(&endpoint);
+    let err = backend.get("missing").await.unwrap_err();
+    assert!(err.to_string().contains("403"), "{err}");
 }
 
 #[tokio::test]

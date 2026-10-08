@@ -306,6 +306,11 @@ impl GcsBackend {
                 self.bucket
             )));
         }
+        // Only a successful probe proves that the object is the missing part.
+        // An auth error or an outage stays an error.
+        if !response.status().is_success() {
+            return Err(status_error("bucket check", &self.bucket, response).await);
+        }
         Ok(())
     }
 

@@ -1827,6 +1827,7 @@ async fn archived_history_ui(
         exec_id,
         decoder,
         "GET /ui/workflows/{id}/archived-history",
+        Some(SOURCE_UI),
     )
     .await?;
     let title = format!("Archived history · {} · Vantage", doc.workflow_name);

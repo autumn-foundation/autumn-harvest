@@ -11668,7 +11668,8 @@ async fn get_workflow_history(
 ///
 /// Issue #1983. The API route and the Vantage page share this. Payload
 /// fields decode only when `decoder` is `Some`, under the same gate as live
-/// history. A decoded read is audited.
+/// history. A decoded read is audited. `source` overrides the audit source,
+/// for example `SOURCE_UI` for the Vantage page.
 ///
 /// # Errors
 ///
@@ -11681,6 +11682,7 @@ pub(crate) async fn fetch_archived_history(
     exec_id: ExecutionId,
     decoder: Option<PayloadCodecs>,
     route: &'static str,
+    source: Option<&'static str>,
 ) -> Result<autumn_harvest::history_export::HistoryExportDocument, AutumnError> {
     let runtime = api_state.runtime().map_err(map_error)?;
     let Some(archiver) = runtime.history_archiver().cloned() else {
@@ -11722,7 +11724,7 @@ pub(crate) async fn fetch_archived_history(
             // The audit row lives on the shard that held the run.
             Some(ShardId::new(doc.shard_id)),
             outcome,
-            None,
+            source,
         )
         .await;
     }
@@ -11747,6 +11749,7 @@ async fn get_archived_workflow_history(
         exec_id,
         decoder,
         "GET /workflows/{id}/archived-history",
+        None,
     )
     .await?;
     Ok(Json(doc))

@@ -211,5 +211,24 @@ pub async fn retention_archive_reads_back_through_api_and_vantage<B: ObjectBacke
     assert!(html.contains("Archived history"), "page title");
     assert!(html.contains(MARKER), "decoded event data");
 
+    // Each decoded read is audited, with the source of the caller.
+    for (route, source) in [
+        ("GET /workflows/{id}/archived-history", "api"),
+        ("GET /ui/workflows/{id}/archived-history", "ui"),
+    ] {
+        let audited = diesel::sql_query(
+            "SELECT COUNT(*) AS count FROM harvest_audit_log
+             WHERE route_or_command = $1 AND source = $2 AND target_id = $3",
+        )
+        .bind::<diesel::sql_types::Text, _>(route)
+        .bind::<diesel::sql_types::Text, _>(source)
+        .bind::<diesel::sql_types::Text, _>(exec_id.to_string())
+        .get_result::<Count>(&mut conn)
+        .await
+        .expect("count audit rows")
+        .count;
+        assert_eq!(audited, 1, "{route} audits one decoded read as {source}");
+    }
+
     runner.stop().await;
 }
