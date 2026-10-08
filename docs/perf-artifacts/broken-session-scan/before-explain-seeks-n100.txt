@@ -1,33 +1,33 @@
 === running-member probe ===
 SELECT EXISTS (SELECT 1 FROM harvest_task_queue WHERE session_id = '00000020-0000-0000-0000-000000000010' AND state = 'RUNNING')
-Result  (cost=17.86..17.87 rows=1 width=1) (actual time=0.250..0.250 rows=1 loops=1)
+Result  (cost=17.86..17.87 rows=1 width=1) (actual time=0.276..0.276 rows=1 loops=1)
   Output: $0
   Buffers: shared hit=55
   InitPlan 1 (returns $0)
-    ->  Index Scan using idx_harvest_tq_running_started on public.harvest_task_queue  (cost=0.14..17.86 rows=1 width=0) (actual time=0.248..0.248 rows=1 loops=1)
+    ->  Index Scan using idx_harvest_tq_running_started on public.harvest_task_queue  (cost=0.14..17.86 rows=1 width=0) (actual time=0.274..0.275 rows=1 loops=1)
           Filter: (harvest_task_queue.session_id = '00000020-0000-0000-0000-000000000010'::uuid)
           Rows Removed by Filter: 150
           Buffers: shared hit=55
-Query Identifier: 2115821882766918692
+Query Identifier: 4019524289936864894
 Planning:
   Buffers: shared hit=270
-Planning Time: 0.702 ms
-Execution Time: 0.264 ms
+Planning Time: 0.765 ms
+Execution Time: 0.291 ms
 
 === member-task load ===
 SELECT * FROM harvest_task_queue WHERE session_id = '00000020-0000-0000-0000-000000000000' AND state IN ('PENDING', 'RUNNING')
-Bitmap Heap Scan on public.harvest_task_queue  (cost=39.53..181.28 rows=1 width=659) (actual time=0.089..0.323 rows=1 loops=1)
+Bitmap Heap Scan on public.harvest_task_queue  (cost=39.53..181.28 rows=1 width=659) (actual time=0.077..0.325 rows=1 loops=1)
   Output: id, queue_name, task_type, workflow_exec_id, activity_name, input, state, priority, worker_id, attempt, max_attempts, scheduled_at, started_at, completed_at, last_heartbeat_at, heartbeat_timeout, start_to_close, schedule_to_start, retry_policy, output, error, sticky_worker_id, sticky_until, sticky_timeout, trace_context, concurrency_key, concurrency_cap, heartbeat_details, required_build_id, activity_id, rate_limit_key, crash_strikes, schedule_to_close_at, required_capabilities, context_headers, created_at, wake_requested, session_id, capability_misses, capability_miss_workers, capability_miss_handler, timer_fires_at, new_start
   Recheck Cond: (harvest_task_queue.state = ANY ('{PENDING,RUNNING}'::text[]))
   Filter: (harvest_task_queue.session_id = '00000020-0000-0000-0000-000000000000'::uuid)
   Rows Removed by Filter: 649
   Heap Blocks: exact=72
   Buffers: shared hit=80
-  ->  Bitmap Index Scan on idx_harvest_tq_live_created  (cost=0.00..39.52 rows=650 width=0) (actual time=0.063..0.063 rows=785 loops=1)
+  ->  Bitmap Index Scan on idx_harvest_tq_live_created  (cost=0.00..39.52 rows=650 width=0) (actual time=0.050..0.050 rows=785 loops=1)
         Buffers: shared hit=8
-Query Identifier: -7404343945847212347
+Query Identifier: 8765694492700543980
 Planning:
   Buffers: shared hit=128
-Planning Time: 0.342 ms
-Execution Time: 0.342 ms
+Planning Time: 0.316 ms
+Execution Time: 0.345 ms
 

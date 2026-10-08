@@ -94,7 +94,7 @@ enum Shape {
     Healthy,
 }
 
-fn shape_of(i: u128) -> Shape {
+const fn shape_of(i: u128) -> Shape {
     match i % 20 {
         0..=8 => Shape::Ghost,
         9..=11 => Shape::Stale,
@@ -105,13 +105,13 @@ fn shape_of(i: u128) -> Shape {
     }
 }
 
-fn exec_uuid(i: u128) -> Uuid {
+const fn exec_uuid(i: u128) -> Uuid {
     Uuid::from_u128((1 << 100) | i)
 }
-fn session_uuid(i: u128) -> Uuid {
+const fn session_uuid(i: u128) -> Uuid {
     Uuid::from_u128((2 << 100) | i)
 }
-fn activity_uuid(i: u128, k: u128) -> Uuid {
+const fn activity_uuid(i: u128, k: u128) -> Uuid {
     Uuid::from_u128((3 << 100) | (i << 4) | k)
 }
 
@@ -223,8 +223,8 @@ async fn seed_fixture(conn: &mut AsyncPgConnection, n: i64) {
         )
         .await
         .expect("append WorkflowStarted");
-        let mut next_event_id = 1;
-        for k in 0..members {
+        for (offset, k) in (0..members).enumerate() {
+            let next_event_id = 1 + i32::try_from(offset).unwrap();
             let activity_id = ActivityExecId::from_uuid(activity_uuid(i, k));
             store::append_events(
                 conn,
@@ -239,7 +239,6 @@ async fn seed_fixture(conn: &mut AsyncPgConnection, n: i64) {
             )
             .await
             .expect("append ActivityScheduled");
-            next_event_id += 1;
 
             let mut params =
                 EnqueueParams::new("gpu-workers", TaskType::Activity, serde_json::json!(null));
@@ -431,6 +430,12 @@ async fn dump_state(conn: &mut AsyncPgConnection) -> String {
     rows.into_iter().map(|r| r.line + "\n").collect()
 }
 
+#[derive(diesel::QueryableByName)]
+struct Cnt {
+    #[diesel(sql_type = BigInt)]
+    c: i64,
+}
+
 struct Point {
     n: i64,
     total_calls: i64,
@@ -443,8 +448,7 @@ struct Point {
     candidates: i64,
     seek_calls: i64,
     seek_buffers: i64,
-    session_enqueue_wal: i64,
-    plain_enqueue_wal: i64,
+    probe: EnqueueProbe,
     tq_seq_scans: i64,
     tq_seq_tup_read: i64,
     tq_idx_scans: i64,
@@ -465,11 +469,6 @@ async fn measure(admin: &str, label: &str, n: i64, out_dir: &std::path::Path, fu
     let mut pass = AsyncPgConnection::establish(&url).await.unwrap();
     let mut stats = AsyncPgConnection::establish(&url).await.unwrap();
 
-    #[derive(diesel::QueryableByName)]
-    struct Cnt {
-        #[diesel(sql_type = BigInt)]
-        c: i64,
-    }
     let candidates = diesel::sql_query(format!(
         "SELECT count(*) AS c FROM ({}) q",
         sessions::broken_session_candidates_query().replace("$1", &STALE_SECS.to_string())
@@ -542,11 +541,6 @@ async fn measure(admin: &str, label: &str, n: i64, out_dir: &std::path::Path, fu
         .unwrap();
     }
     let rows = snapshot(&mut stats, &db_name).await;
-    let (session_enqueue_wal, plain_enqueue_wal) = if full {
-        enqueue_wal_cost(&mut seed, &mut stats).await
-    } else {
-        (0, 0)
-    };
 
     let reverify: Vec<&StatRow> = rows
         .iter()
@@ -576,6 +570,12 @@ async fn measure(admin: &str, label: &str, n: i64, out_dir: &std::path::Path, fu
         )
         .unwrap();
     }
+    // The probe adds rows, so it runs after the state dump is written.
+    let probe = if full {
+        enqueue_wal_cost(&mut seed, &mut stats).await
+    } else {
+        EnqueueProbe::default()
+    };
     Point {
         n,
         total_calls: rows.iter().map(|r| r.calls).sum(),
@@ -596,8 +596,7 @@ async fn measure(admin: &str, label: &str, n: i64, out_dir: &std::path::Path, fu
             .filter(|r| is_session_seek_statement(&r.query))
             .map(|r| r.total_buffers)
             .sum(),
-        session_enqueue_wal,
-        plain_enqueue_wal,
+        probe,
         tq_seq_scans: scans_after.seq_scan - scans_before.seq_scan,
         tq_seq_tup_read: scans_after.seq_tup_read - scans_before.seq_tup_read,
         tq_idx_scans: scans_after.idx_scan - scans_before.idx_scan,
@@ -649,30 +648,56 @@ async fn index_scans(conn: &mut AsyncPgConnection) -> String {
 
 const ENQUEUE_PROBE_ROWS: i64 = 500;
 
+/// WAL bytes for the enqueue probe. Cold is the first pass after a
+/// checkpoint, so it includes full-page images. Warm is the second pass.
+#[derive(Default, Clone, Copy)]
+struct EnqueueProbe {
+    pinned_cold: i64,
+    pinned_warm: i64,
+    plain_cold: i64,
+    plain_warm: i64,
+}
+
 /// WAL bytes for `ENQUEUE_PROBE_ROWS` session-pinned enqueues and the same
 /// number of plain ones. The difference is the write tax of any index keyed
-/// on `session_id`. Runs after the pass, so the state dump is unaffected.
+/// on `session_id`.
 async fn enqueue_wal_cost(
     writer: &mut AsyncPgConnection,
     meter: &mut AsyncPgConnection,
-) -> (i64, i64) {
-    let mut run = async |pinned: bool| {
-        let before = wal_lsn(meter).await;
-        for _ in 0..ENQUEUE_PROBE_ROWS {
-            let mut params =
-                EnqueueParams::new("probe", TaskType::Activity, serde_json::json!(null));
-            if pinned {
-                params = params.with_session_id(Uuid::new_v4());
-            }
-            queue::enqueue(writer, &params)
-                .await
-                .expect("probe enqueue");
+) -> EnqueueProbe {
+    let mut out = EnqueueProbe::default();
+    for pinned in [true, false] {
+        diesel::sql_query("CHECKPOINT")
+            .execute(meter)
+            .await
+            .expect("checkpoint needs a superuser role");
+        let cold = enqueue_pass(writer, meter, pinned).await;
+        let warm = enqueue_pass(writer, meter, pinned).await;
+        if pinned {
+            (out.pinned_cold, out.pinned_warm) = (cold, warm);
+        } else {
+            (out.plain_cold, out.plain_warm) = (cold, warm);
         }
-        wal_lsn(meter).await - before
-    };
-    let session = run(true).await;
-    let plain = run(false).await;
-    (session, plain)
+    }
+    out
+}
+
+async fn enqueue_pass(
+    writer: &mut AsyncPgConnection,
+    meter: &mut AsyncPgConnection,
+    pinned: bool,
+) -> i64 {
+    let before = wal_lsn(meter).await;
+    for _ in 0..ENQUEUE_PROBE_ROWS {
+        let mut params = EnqueueParams::new("probe", TaskType::Activity, serde_json::json!(null));
+        if pinned {
+            params = params.with_session_id(Uuid::new_v4());
+        }
+        queue::enqueue(writer, &params)
+            .await
+            .expect("probe enqueue");
+    }
+    wal_lsn(meter).await - before
 }
 
 async fn wal_lsn(conn: &mut AsyncPgConnection) -> i64 {
@@ -706,14 +731,14 @@ async fn zz_capture_broken_session_scan_perf_evidence() {
         "-- {label}: enforce_broken_sessions, pg_stat_statements sweep --\n\
          n\tcandidates\tfailed_members\ttotal_calls\treverify_calls\treverify_buffers\t\
          total_buffers\ttemp_blks_written\twal_bytes\tseek_calls\tseek_buffers\t\
-         session_enqueue_wal\tplain_enqueue_wal\ttq_seq_scans\ttq_seq_tup_read\t\
+         pinned_cold_wal\tpinned_warm_wal\tplain_cold_wal\tplain_warm_wal\ttq_seq_scans\ttq_seq_tup_read\t\
          tq_idx_scans\n"
     );
     for n in [100_i64, 400, 1_600] {
         let p = measure(&admin, &label, n, &out_dir, true).await;
         let _ = writeln!(
             table,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             p.n,
             p.candidates,
             p.failed,
@@ -725,8 +750,10 @@ async fn zz_capture_broken_session_scan_perf_evidence() {
             p.wal_bytes,
             p.seek_calls,
             p.seek_buffers,
-            p.session_enqueue_wal,
-            p.plain_enqueue_wal,
+            p.probe.pinned_cold,
+            p.probe.pinned_warm,
+            p.probe.plain_cold,
+            p.probe.plain_warm,
             p.tq_seq_scans,
             p.tq_seq_tup_read,
             p.tq_idx_scans
