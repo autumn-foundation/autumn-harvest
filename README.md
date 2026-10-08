@@ -416,7 +416,7 @@ this section documents.
 
 Match each route's own declared content type instead: `harvest events
 tail` sends `Accept: text/event-stream`, and so must any direct client
-of the `.../events/stream` or `.../stream` routes. `GET /admin/metrics`
+of the `.../events/stream`, `.../stream` or `.../stream/durable` routes. `GET /admin/metrics`
 and `GET /admin/queues/scaling?format=prometheus` return Prometheus
 plain text; do not send `Accept: application/json` to either.
 

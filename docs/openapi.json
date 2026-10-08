@@ -10950,6 +10950,7 @@
                     "retired_residences": {},
                     "signals_scrubbed": {},
                     "skipped_children": {},
+                    "stream_chunks_deleted": {},
                     "summary_scrubbed": {}
                   },
                   "type": "object"
@@ -12305,6 +12306,62 @@
           }
         },
         "summary": "Server-Sent Events stream of the EPHEMERAL live-output progress chunks a running workflow publishes via ctx.publish_progress (issue #791).",
+        "tags": [
+          "workflow"
+        ],
+        "x-harvest-idempotency": "Fully idempotent; read-only.",
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only",
+        "x-harvest-stream": true
+      }
+    },
+    "/workflows/{id}/stream/durable": {
+      "get": {
+        "description": "Server-Sent Events stream of the DURABLE output chunks a workflow stores via ctx.publish_durable_progress (issue #1974). The worker stores each chunk in harvest_stream_chunks in the same transaction as its decision cycle. Each chunk has a 0-based offset, the call ordinal, which is the SSE id. The stream sends every stored chunk above the resume cursor in offset order, then tails new chunks. A reader that disconnects resumes with ?after=<offset> or the Last-Event-ID header and gets every later chunk with no gap and no duplicate. The producer sends with back-pressure, so a slow client loses no chunk. A terminal run still streams its stored chunks, then event:end. Chunks are not in harvest_events and do not count toward the history caps. A stream holds at most 100000 chunks; above the cap the newest are dropped and one terminal marker frame is stored at offset 9223372036854775807. AUTH: the same posture as GET /workflows/{id}/stream. The route is NOT admin-gated, exec_id is a bearer capability for the stored chunk content, and each reader holds one Postgres LISTEN connection.",
+        "operationId": "get_workflows_by_id_stream_durable",
+        "parameters": [
+          {
+            "description": "Execution UUID.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Exclusive resume offset. The stream sends chunks with a higher offset. It wins over the Last-Event-ID header. Omit both to start at the first chunk.",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "description": "Server-sent event frames. See the response description.",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Content-Type: text/event-stream. Frames: event:progress (id = the chunk offset, data = the stored chunk JSON), a terminal event:end with {\"reason\": <terminal-state>}, or event:error. Offsets are contiguous from 0 and the first stored copy of a chunk is canonical. A cap marker has data {\"_harvest_stream_truncated\": true, \"max_chunks\": N}."
+          },
+          "400": {
+            "description": "Malformed execution ID, or an after or Last-Event-ID value that is not a non-negative integer."
+          },
+          "404": {
+            "description": "Execution not found."
+          },
+          "503": {
+            "description": "Streaming is unavailable server-side (retriable): the LISTEN/NOTIFY notification URL is not configured, or that database is unreachable."
+          }
+        },
+        "summary": "Server-Sent Events stream of the DURABLE output chunks a workflow stores via ctx.publish_durable_progress (issue #1974).",
         "tags": [
           "workflow"
         ],

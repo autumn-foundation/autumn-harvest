@@ -2812,6 +2812,179 @@ pub async fn delete_workflow_logs(
         .map_err(crate::error::database_error)
 }
 
+// ── Durable workflow output streams (issue #1974) ───────────────────────────
+
+/// Offset of the terminal marker that a capped durable stream stores.
+///
+/// The marker sorts after every real chunk, so a reader sees it last. A
+/// reader that resumes after it gets nothing more, which is correct.
+pub const DURABLE_STREAM_TRUNCATION_OFFSET: i64 = i64::MAX;
+
+/// Rows in one `INSERT` of [`append_stream_chunks`].
+///
+/// Postgres allows 65,535 bind parameters in one statement. Each row binds
+/// three, so 1,000 rows stay well below the limit.
+const STREAM_CHUNK_INSERT_BATCH: usize = 1_000;
+
+/// One durable stream chunk to store, from the drained command list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableStreamChunk {
+    /// The call ordinal. It orders the chunks and is the dedup key.
+    pub offset: i64,
+    /// The chunk, already size-capped by the context.
+    pub chunk: serde_json::Value,
+}
+
+/// Store a cycle's durable stream chunks (issue #1974).
+///
+/// The caller runs this in the persist transaction, so the chunks commit
+/// with the cycle or not at all.
+///
+/// **Keep-first dedup.** A re-driven cycle offers the same offsets again.
+/// `ON CONFLICT DO NOTHING` on `(workflow_exec_id, stream_offset)` keeps the
+/// stored row, so a reader never sees a chunk change or repeat.
+///
+/// **Cap.** Once the execution holds `max_chunks` real chunks, the store
+/// drops newer chunks and stores one marker at
+/// [`DURABLE_STREAM_TRUNCATION_OFFSET`]. The marker latches: a later batch
+/// adds nothing, also when a later worker has a larger cap. The stored rows
+/// then stay a gap-free prefix of the stream.
+///
+/// Returns the number of real chunks that this call inserted.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] if a statement fails.
+pub async fn append_stream_chunks(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    chunks: &[DurableStreamChunk],
+    max_chunks: u32,
+) -> HarvestResult<usize> {
+    use crate::schema::harvest_stream_chunks::dsl;
+
+    if chunks.is_empty() {
+        return Ok(0);
+    }
+
+    let truncated: bool = diesel::select(diesel::dsl::exists(
+        dsl::harvest_stream_chunks
+            .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
+            .filter(dsl::stream_offset.eq(DURABLE_STREAM_TRUNCATION_OFFSET)),
+    ))
+    .get_result(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    if truncated {
+        return Ok(0);
+    }
+
+    // Count stored rows that this batch does not offer again. A re-driven
+    // batch is already stored, so counting it would charge the cap twice.
+    let batch_offsets: Vec<i64> = chunks.iter().map(|c| c.offset).collect();
+    let existing: i64 = dsl::harvest_stream_chunks
+        .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
+        .filter(dsl::stream_offset.ne_all(batch_offsets))
+        .count()
+        .get_result(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    let remaining = i64::from(max_chunks).saturating_sub(existing).max(0);
+    let admit = usize::try_from(remaining)
+        .unwrap_or(usize::MAX)
+        .min(chunks.len());
+
+    let mut inserted = 0usize;
+    for batch in chunks[..admit].chunks(STREAM_CHUNK_INSERT_BATCH) {
+        let rows: Vec<crate::models::NewHarvestStreamChunk<'_>> = batch
+            .iter()
+            .map(|c| crate::models::NewHarvestStreamChunk {
+                workflow_exec_id: exec_id.as_uuid(),
+                stream_offset: c.offset,
+                chunk: &c.chunk,
+            })
+            .collect();
+        inserted += diesel::insert_into(dsl::harvest_stream_chunks)
+            .values(&rows)
+            .on_conflict((dsl::workflow_exec_id, dsl::stream_offset))
+            .do_nothing()
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+    }
+
+    // Gate the marker on `admit`, not on `inserted`. A re-drive inserts
+    // nothing and drops nothing.
+    if admit < chunks.len() {
+        let marker = serde_json::json!({
+            "_harvest_stream_truncated": true,
+            "max_chunks": max_chunks,
+        });
+        diesel::insert_into(dsl::harvest_stream_chunks)
+            .values(crate::models::NewHarvestStreamChunk {
+                workflow_exec_id: exec_id.as_uuid(),
+                stream_offset: DURABLE_STREAM_TRUNCATION_OFFSET,
+                chunk: &marker,
+            })
+            .on_conflict((dsl::workflow_exec_id, dsl::stream_offset))
+            .do_nothing()
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+    }
+
+    Ok(inserted)
+}
+
+/// Load up to `limit` durable stream chunks above `after`, in offset order.
+///
+/// `after` is exclusive. `None` reads from the first chunk.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] if the query fails.
+pub async fn load_stream_chunks(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    after: Option<i64>,
+    limit: i64,
+) -> HarvestResult<Vec<crate::models::HarvestStreamChunk>> {
+    use crate::schema::harvest_stream_chunks::dsl;
+
+    let mut q = dsl::harvest_stream_chunks
+        .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
+        .into_boxed();
+    if let Some(after) = after {
+        q = q.filter(dsl::stream_offset.gt(after));
+    }
+    q.order(dsl::stream_offset.asc())
+        .limit(limit)
+        .select(crate::models::HarvestStreamChunk::as_select())
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)
+}
+
+/// Delete every durable stream chunk of an execution (issue #1974 and #495).
+///
+/// The PII erasure path calls it. Chunk content is free-form author output,
+/// so it can carry personal data. Returns the number of deleted rows.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] if the delete fails.
+pub async fn delete_stream_chunks(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<usize> {
+    use crate::schema::harvest_stream_chunks::dsl;
+
+    diesel::delete(dsl::harvest_stream_chunks.filter(dsl::workflow_exec_id.eq(exec_id.as_uuid())))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)
+}
+
 /// Guarded exactly-once stamp for the operator early-warning soft threshold
 /// on workflow history bloat (issue #704).
 ///

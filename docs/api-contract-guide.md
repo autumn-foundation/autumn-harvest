@@ -155,7 +155,7 @@ instead of `application/json`. `docs/api-contract.json` marks each
 one's `content_type`:
 
 - A streaming route: send `Accept: text/event-stream` to
-  `.../events/stream` or `.../stream`.
+  `.../events/stream`, `.../stream` or `.../stream/durable`.
 - A Prometheus-format route: `GET /admin/metrics` and
   `GET /admin/queues/scaling?format=prometheus` return plain text, not
   JSON.

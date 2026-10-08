@@ -4981,9 +4981,43 @@ fn accumulate_recorded_logs(
     }
 }
 
+/// Side-table output that a test run would have stored (issues #790 and
+/// #1974). Each map is keyed by its dedup key, like the store's unique index.
+#[derive(Default)]
+struct RecordedSideOutput {
+    logs: std::collections::BTreeMap<u64, RecordedLogLine>,
+    durable_progress: std::collections::BTreeMap<u64, RecordedProgressChunk>,
+}
+
+impl RecordedSideOutput {
+    /// Record one cycle's log lines and durable chunks. The first copy wins.
+    fn accumulate(&mut self, commands: &[WorkflowCommand]) {
+        accumulate_recorded_logs(commands, &mut self.logs);
+        for cmd in commands {
+            if let WorkflowCommand::PublishDurableProgress { offset, chunk } = cmd {
+                self.durable_progress
+                    .entry(*offset)
+                    .or_insert_with(|| RecordedProgressChunk {
+                        offset: *offset,
+                        chunk: chunk.clone(),
+                    });
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
+
+/// One durable stream chunk that a test run would have stored (issue #1974).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedProgressChunk {
+    /// The 0-based call ordinal. Production uses it as the SSE `id:`.
+    pub offset: u64,
+    /// The chunk, size-capped by the context.
+    pub chunk: Value,
+}
 
 /// One durable workflow log line a test run would have persisted (issue #790).
 ///
@@ -5071,6 +5105,9 @@ pub struct TestRunOutcome {
     /// `UNIQUE (workflow_exec_id, seq)` + `ON CONFLICT DO NOTHING` produces.
     /// Empty unless the env opted in via [`WorkflowTestEnv::with_log_policy`].
     recorded_logs: Vec<RecordedLogLine>,
+    /// The durable stream chunks this run would have stored (issue #1974),
+    /// in offset order, first copy kept.
+    durable_progress: Vec<RecordedProgressChunk>,
 }
 
 /// Reconstruct the final virtual-clock elapsed (in seconds) from the durable
@@ -5162,6 +5199,15 @@ impl TestRunOutcome {
     #[must_use]
     pub fn recorded_logs(&self) -> &[RecordedLogLine] {
         &self.recorded_logs
+    }
+
+    /// The durable stream chunks this run would have stored (issue #1974).
+    ///
+    /// The harness models the keep-first dedup by offset. It does not model
+    /// the per-execution cap. The database tests cover the cap.
+    #[must_use]
+    pub fn durable_progress(&self) -> &[RecordedProgressChunk] {
+        &self.durable_progress
     }
 
     /// The virtual "now" at the end of the run (issue #526).
@@ -5887,8 +5933,7 @@ impl WorkflowTestEnv {
         // Issue #790: the durable log lines this run would have persisted,
         // accumulated across every decision cycle and de-duplicated by `seq`
         // exactly the way the store's unique index does.
-        let mut recorded_logs: std::collections::BTreeMap<u64, RecordedLogLine> =
-            std::collections::BTreeMap::new();
+        let mut side_output = RecordedSideOutput::default();
 
         let start_time = self.simulated_now;
 
@@ -5975,9 +6020,9 @@ impl WorkflowTestEnv {
             // `pending_cmds` (the executor returns an empty `pending_cmds` for
             // a suspension), so collecting from both covers every cycle shape.
             if let WorkflowOutcome::Suspended { commands } = &outcome {
-                accumulate_recorded_logs(commands, &mut recorded_logs);
+                side_output.accumulate(commands);
             }
-            accumulate_recorded_logs(&pending_cmds, &mut recorded_logs);
+            side_output.accumulate(&pending_cmds);
 
             match outcome {
                 WorkflowOutcome::Suspended { commands } => {
@@ -6008,7 +6053,11 @@ impl WorkflowTestEnv {
                                 // Issue #798: likewise carry the env's build id, so a build-gated
                                 // workflow's self-check replays under the same build the live run saw.
                                 build_id: self.build_id.clone(),
-                                recorded_logs: recorded_logs.into_values().collect(),
+                                recorded_logs: side_output.logs.into_values().collect(),
+                                durable_progress: side_output
+                                    .durable_progress
+                                    .into_values()
+                                    .collect(),
                             };
                         }
                     };
@@ -6035,7 +6084,8 @@ impl WorkflowTestEnv {
                             // Issue #798: likewise carry the env's build id, so a build-gated
                             // workflow's self-check replays under the same build the live run saw.
                             build_id: self.build_id.clone(),
-                            recorded_logs: recorded_logs.into_values().collect(),
+                            recorded_logs: side_output.logs.into_values().collect(),
+                            durable_progress: side_output.durable_progress.into_values().collect(),
                         };
                     }
                 }
@@ -6046,7 +6096,7 @@ impl WorkflowTestEnv {
                         history,
                         exec_id,
                         start_time,
-                        recorded_logs.into_values().collect(),
+                        side_output,
                     );
                 }
             }
@@ -6074,7 +6124,8 @@ impl WorkflowTestEnv {
             // Issue #798: likewise carry the env's build id, so a build-gated
             // workflow's self-check replays under the same build the live run saw.
             build_id: self.build_id.clone(),
-            recorded_logs: recorded_logs.into_values().collect(),
+            recorded_logs: side_output.logs.into_values().collect(),
+            durable_progress: side_output.durable_progress.into_values().collect(),
         }
     }
 
@@ -6085,7 +6136,7 @@ impl WorkflowTestEnv {
         mut history: Vec<WorkflowEvent>,
         exec_id: ExecutionId,
         start_time: DateTime<Utc>,
-        recorded_logs: Vec<RecordedLogLine>,
+        side_output: RecordedSideOutput,
     ) -> TestRunOutcome {
         Self::record_terminal_pending_commands(pending_cmds, &mut history);
         let should_record_cascades = matches!(
@@ -6154,7 +6205,8 @@ impl WorkflowTestEnv {
             // Issue #798: likewise carry the env's build id, so a build-gated
             // workflow's self-check replays under the same build the live run saw.
             build_id: self.build_id.clone(),
-            recorded_logs,
+            recorded_logs: side_output.logs.into_values().collect(),
+            durable_progress: side_output.durable_progress.into_values().collect(),
         }
     }
 
@@ -6765,6 +6817,7 @@ impl WorkflowTestEnv {
             // Ephemeral progress (issue #791): a bookkeeping no-op in the test
             // harness — appends no event, changes no history, drives no wait.
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             // Durable per-execution logs (issue #790): event-less bookkeeping
             // (mirrors `SetCurrentDetails`). The worker persists it to
             // `harvest_workflow_logs` in production; the harness has no DB, so

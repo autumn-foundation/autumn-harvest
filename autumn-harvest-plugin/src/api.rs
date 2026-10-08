@@ -4868,6 +4868,12 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
         // inherits the general management API auth middleware (api_with_auth)
         // like the other non-admin `/workflows/{id}/…` read routes.
         .route("/workflows/{id}/stream", get(stream_workflow_progress))
+        // Durable, resumable output stream (issue #1974). Same auth posture
+        // as `/stream`: not admin-gated.
+        .route(
+            "/workflows/{id}/stream/durable",
+            get(stream_workflow_progress_durable),
+        )
         .route("/workflows/{workflow_name}/start", post(start_workflow))
         .route(
             "/workflows/{workflow_name}/signal-with-start",
@@ -6706,6 +6712,8 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         // Ephemeral workflow progress SSE stream (issue #791). Read-only,
         // text/event-stream; NOT admin-gated (AC5). See docs/api-contract.json.
         ("GET", "/workflows/{id}/stream"),
+        // Durable output stream (issue #1974): text/event-stream, NOT admin-gated.
+        ("GET", "/workflows/{id}/stream/durable"),
         ("POST", "/workflows/{workflow_name}/start"),
         ("POST", "/workflows/{workflow_name}/signal-with-start"),
         ("POST", "/workflows/{workflow_name}/update-with-start"),
@@ -7634,6 +7642,8 @@ pub const fn management_api_response_fields()
         // no JSON body. Frames: `event: progress` (data = the chunk JSON, `id:` =
         // monotonic seq), a terminal `event: end`, or `event: error`.
         ("GET", "/workflows/{id}/stream", None),
+        // Durable output stream (issue #1974): text/event-stream, free-form.
+        ("GET", "/workflows/{id}/stream/durable", None),
         (
             "POST",
             "/workflows/{workflow_name}/start",
@@ -7763,6 +7773,7 @@ pub const fn management_api_response_fields()
                 "summary_scrubbed",
                 "signals_scrubbed",
                 "logs_deleted",
+                "stream_chunks_deleted",
                 "completion_deliveries_scrubbed",
                 "dead_letters_scrubbed",
                 "children",
@@ -45290,6 +45301,261 @@ async fn stream_workflow_progress(
             }
         }));
     }
+
+    Sse::new(rx)
+        .keep_alive(KeepAlive::new().interval(keepalive).text("ping"))
+        .into_response()
+}
+
+/// Rows that one table read of the durable stream returns (issue #1974).
+///
+/// The producer sends a page before it reads the next one, so this also
+/// bounds the rows in memory for one stream.
+const DURABLE_STREAM_PAGE: i64 = 256;
+
+/// Query of `GET /workflows/{id}/stream/durable` (issue #1974).
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct DurableStreamQuery {
+    /// Exclusive resume offset. It wins over the `Last-Event-ID` header.
+    #[serde(default)]
+    after: Option<u64>,
+}
+
+/// Resolve the resume cursor of a durable stream (issue #1974).
+///
+/// `?after=` wins over `Last-Event-ID`, which a browser `EventSource` sends
+/// on reconnect. `None` reads from the first chunk. An offset above
+/// `i64::MAX` clamps to it, so the reader gets nothing more.
+fn durable_stream_cursor(
+    after: Option<u64>,
+    headers: &axum::http::HeaderMap,
+) -> Result<Option<i64>, AutumnError> {
+    let raw = match after {
+        Some(after) => Some(after),
+        None => match headers.get("last-event-id") {
+            None => None,
+            Some(value) => {
+                let parsed = value
+                    .to_str()
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok());
+                match parsed {
+                    Some(offset) => Some(offset),
+                    None => {
+                        return Err(AutumnError::bad_request_msg(
+                            "Last-Event-ID must be a non-negative integer offset",
+                        ));
+                    }
+                }
+            }
+        },
+    };
+    Ok(raw.map(|offset| i64::try_from(offset).unwrap_or(i64::MAX)))
+}
+
+/// Result of one drain of the durable stream table.
+enum DurableDrain {
+    /// Every stored chunk above the cursor went to the client.
+    Done,
+    /// A read failed for a transient reason. The next tick retries.
+    Incomplete,
+    /// The client disconnected.
+    ClientGone,
+    /// The run left the request's shard fence (issue #1803).
+    LeftFence,
+}
+
+/// Send every stored chunk above `cursor`, in pages, and move the cursor.
+///
+/// The send blocks while the client is slow. Nothing is dropped, because the
+/// next page comes from the table. No pooled connection is held during a
+/// send.
+async fn drain_durable_stream(
+    api_state: &HarvestApiState,
+    exec_id: ExecutionId,
+    cursor: &mut Option<i64>,
+    tx: &mut futures::channel::mpsc::Sender<
+        Result<axum::response::sse::Event, std::convert::Infallible>,
+    >,
+) -> DurableDrain {
+    use futures::SinkExt as _;
+    loop {
+        let rows =
+            match stream_conn_for_execution(api_state, exec_id).await {
+                FencedCheckout::Ready(mut conn) => match autumn_harvest::store::load_stream_chunks(
+                    &mut conn,
+                    exec_id,
+                    *cursor,
+                    DURABLE_STREAM_PAGE,
+                )
+                .await
+                {
+                    Ok(rows) => rows,
+                    Err(_) => return DurableDrain::Incomplete,
+                },
+                FencedCheckout::Retry => return DurableDrain::Incomplete,
+                FencedCheckout::LeftFence => return DurableDrain::LeftFence,
+            };
+        let full = i64::try_from(rows.len()).unwrap_or(i64::MAX) >= DURABLE_STREAM_PAGE;
+        for row in rows {
+            let event = axum::response::sse::Event::default()
+                .id(row.stream_offset.to_string())
+                .event("progress")
+                .data(row.chunk.to_string());
+            if tx.send(Ok(event)).await.is_err() {
+                return DurableDrain::ClientGone;
+            }
+            *cursor = Some(row.stream_offset);
+        }
+        if !full {
+            return DurableDrain::Done;
+        }
+    }
+}
+
+/// `GET /workflows/{id}/stream/durable`
+///
+/// Durable, resumable output stream (issue #1974). It streams the chunks that
+/// [`WorkflowContext::publish_durable_progress`](autumn_harvest::context::WorkflowContext::publish_durable_progress)
+/// stored in `harvest_stream_chunks`, in offset order.
+///
+/// - **Resume**: `?after=<offset>` or `Last-Event-ID` sets an exclusive
+///   cursor. The query parameter wins. With neither, the stream starts at the
+///   first chunk.
+/// - **No gap, no duplicate**: `LISTEN` opens before the first read. Each
+///   wake and each keepalive tick reads the rows above the cursor.
+/// - **No drop**: the producer sends with back-pressure. A slow client
+///   slows the reads and loses nothing.
+/// - **End**: after a terminal state, the producer reads once more, sends
+///   `event: end` and closes. A terminal run still streams its stored chunks.
+///
+/// The frames are the `/stream` frames, and the SSE `id:` is the offset.
+/// Auth and the 400, 404 and 503 responses are the same as for `/stream`.
+/// Each stream holds one `LISTEN` connection. A pooled connection is held
+/// for one page read only.
+async fn stream_workflow_progress_durable(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(exec_id_raw): Path<String>,
+    Query(query): Query<DurableStreamQuery>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use autumn_harvest::notify::{StreamWaitOutcome, WorkflowStreamListener};
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use futures::SinkExt as _;
+
+    let exec_id = match parse_execution_id(&exec_id_raw) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+    let mut cursor = match durable_stream_cursor(query.after, &headers) {
+        Ok(cursor) => cursor,
+        Err(e) => return e.into_response(),
+    };
+    let Some(shard) = resolve_shard_best_effort(&api_state, exec_id).await else {
+        return AutumnError::service_unavailable_msg(
+            "progress streaming is not configured (no LISTEN/NOTIFY database URL)",
+        )
+        .into_response();
+    };
+    let Ok(notification_url) = api_state.sse_notification_url(shard) else {
+        return AutumnError::service_unavailable_msg(
+            "progress streaming is not configured (no LISTEN/NOTIFY database URL)",
+        )
+        .into_response();
+    };
+    // LISTEN before the first read, so no commit falls between the two.
+    let listener = match WorkflowStreamListener::connect(&notification_url, exec_id.as_uuid()).await
+    {
+        Ok(l) => l,
+        Err(e) => return map_error(e).into_response(),
+    };
+    {
+        let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
+            Ok(c) => c,
+            Err(e) => return e.into_response(),
+        };
+        if let Err(e) = load_execution(&mut conn, exec_id).await {
+            return map_error(e).into_response();
+        }
+    }
+
+    let keepalive = api_state
+        .sse_keepalive_interval()
+        .min(PROGRESS_STREAM_KEEPALIVE);
+    let (mut tx, rx) = futures::channel::mpsc::channel::<Result<Event, std::convert::Infallible>>(
+        PROGRESS_STREAM_CHANNEL_CAPACITY,
+    );
+    let api_clone = api_state.clone();
+    let fence = ::autumn_harvest::shard_fence::current();
+    tokio::spawn(::autumn_harvest::shard_fence::scoped(fence, async move {
+        let mut listener = listener;
+        let mut listener_shard = shard;
+        let mut end_reason: Option<String> = None;
+        loop {
+            match drain_durable_stream(&api_clone, exec_id, &mut cursor, &mut tx).await {
+                DurableDrain::Done => {
+                    // Every chunk of the terminal cycle is in the table, so
+                    // the drain after the terminal poll is the last one.
+                    if let Some(reason) = end_reason.take() {
+                        let data = serde_json::json!({ "reason": reason }).to_string();
+                        let _ = tx.send(Ok(Event::default().event("end").data(data))).await;
+                        return;
+                    }
+                }
+                DurableDrain::Incomplete => {}
+                DurableDrain::ClientGone => return,
+                DurableDrain::LeftFence => {
+                    let _ = tx.send(Ok(shard_fence_error_event())).await;
+                    return;
+                }
+            }
+
+            // Rebind the listener after a shard move, as `/stream` does.
+            match stream_live_shard(&api_clone, exec_id).await {
+                FencedCheckout::Ready(current) if current != listener_shard => {
+                    if let Ok(url) = api_clone.sse_notification_url(current)
+                        && let Ok(l) =
+                            WorkflowStreamListener::connect(&url, exec_id.as_uuid()).await
+                    {
+                        listener = l;
+                        listener_shard = current;
+                    }
+                }
+                FencedCheckout::LeftFence => {
+                    let _ = tx.send(Ok(shard_fence_error_event())).await;
+                    return;
+                }
+                FencedCheckout::Ready(_) | FencedCheckout::Retry => {}
+            }
+
+            match listener.wait_timeout(keepalive).await {
+                StreamWaitOutcome::Woken => {}
+                StreamWaitOutcome::TimedOut => {
+                    if tx.is_closed() {
+                        return;
+                    }
+                    // The tick also reads the table, so a lost wake only
+                    // delays a chunk by one keepalive.
+                    match progress_stream_end_reason(&api_clone, exec_id).await {
+                        ProgressPoll::End(reason) => end_reason = Some(reason),
+                        ProgressPoll::Wait => {}
+                        ProgressPoll::LeftFence => {
+                            let _ = tx.send(Ok(shard_fence_error_event())).await;
+                            return;
+                        }
+                    }
+                }
+                StreamWaitOutcome::ChannelClosed => {
+                    let data =
+                        serde_json::json!({ "error": "listen_connection_closed" }).to_string();
+                    let _ = tx
+                        .send(Ok(Event::default().event("error").data(data)))
+                        .await;
+                    return;
+                }
+            }
+        }
+    }));
 
     Sse::new(rx)
         .keep_alive(KeepAlive::new().interval(keepalive).text("ping"))

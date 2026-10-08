@@ -1600,6 +1600,10 @@ impl SqliteRuntime {
                 WorkflowCommand::WaitForActivity { .. }
                 | WorkflowCommand::SetCurrentDetails { .. }
                 | WorkflowCommand::PublishProgress { .. }
+                // Durable streams (issue #1974) need the Postgres-only
+                // `harvest_stream_chunks` table. A benign NO-OP here, as for
+                // `PublishProgress`.
+                | WorkflowCommand::PublishDurableProgress { .. }
                 // `RecordLog` (issue #790) is the OPT-IN durable per-execution
                 // log sink, backed by a Postgres-only `harvest_workflow_logs`
                 // table this backend does not have. A benign NO-OP here: the
@@ -2161,6 +2165,8 @@ fn persist_terminal_pending_commands(
             WorkflowCommand::WaitForActivity { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            // Durable streams (issue #1974): Postgres-only, a NO-OP here.
+            | WorkflowCommand::PublishDurableProgress { .. }
             // Durable workflow logs (issue #790) — Postgres-only sink; a benign
             // NO-OP here for the same reason as `PublishProgress`.
             | WorkflowCommand::RecordLog { .. } => {}
@@ -2336,6 +2342,7 @@ const fn command_name(cmd: &WorkflowCommand) -> &'static str {
         WorkflowCommand::UpsertSearchAttributes { .. } => "UpsertSearchAttributes",
         WorkflowCommand::SetCurrentDetails { .. } => "SetCurrentDetails",
         WorkflowCommand::PublishProgress { .. } => "PublishProgress",
+        WorkflowCommand::PublishDurableProgress { .. } => "PublishDurableProgress",
         WorkflowCommand::RecordLog { .. } => "RecordLog",
         WorkflowCommand::CancelRaceLosers { .. } => "CancelRaceLosers",
         WorkflowCommand::ArmTimer { .. } => "ArmTimer",

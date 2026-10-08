@@ -496,6 +496,7 @@ pub(crate) const fn is_replay_significant_command(cmd: &WorkflowCommand) -> bool
         WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
             | WorkflowCommand::ReleaseMutex { .. }

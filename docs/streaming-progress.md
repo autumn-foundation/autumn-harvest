@@ -1,5 +1,17 @@
 # Live workflow output streaming — `ctx.publish_progress`
 
+*Issues #791 and #1974.* Two modes stream author-defined output from a workflow:
+
+| Mode | Publish | Read | Stored? | Resume? | Slow client |
+|---|---|---|---|---|---|
+| **Best-effort** (default) | `ctx.publish_progress` | `GET /workflows/{id}/stream` | no | no | excess chunks drop |
+| **Durable** (opt-in) | `ctx.publish_durable_progress` | `GET /workflows/{id}/stream/durable` | yes, `harvest_stream_chunks` | yes, from any offset | no drop |
+
+Use the best-effort mode when a lost chunk does not matter. Use the durable
+mode when a client must see every chunk, for example LLM token streaming with
+reconnects. See [Durable mode](#durable-mode-issue-1974) below. The rest of
+this page up to that section describes the best-effort mode.
+
 *Issue #791.* An **ephemeral, best-effort live-output side channel** for workflow
 authors: an AI agent streaming tokens, a long import reporting per-item progress,
 any interactive flow that wants to push incremental, author-defined output to a
@@ -203,14 +215,120 @@ Embedders should rate-limit stream opens and/or cap concurrent streams per user.
 A global concurrent-stream cap is a possible future enhancement; today it is the
 embedder's responsibility.
 
+## Durable mode (issue #1974)
+
+The durable mode stores each chunk and lets a reader resume at any offset. The
+best-effort mode stays the default.
+
+```rust
+#[workflow]
+async fn answer(ctx: &WorkflowContext, prompt: Prompt) -> Result<Answer, String> {
+    let tokens = ctx
+        .execute_activity(&generate_info(), prompt)
+        .await
+        .map_err(|e| e.to_string())?;
+    for token in &tokens {
+        ctx.publish_durable_progress(serde_json::json!({ "token": token }))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(Answer::from(tokens))
+}
+```
+
+### Storage and its effect on history
+
+The worker writes each chunk to the side table `harvest_stream_chunks`, in the
+same transaction as the decision cycle. The table is not `harvest_events`.
+
+- **History caps.** A chunk is not an event. It does not count toward the
+  50,000-event or 50 MiB history caps.
+- **Replay.** Replay never reads the table. During replay the call pushes no
+  command. A workflow that publishes durable chunks has the same history as
+  one that does not.
+- **Append-only invariant.** The change does not write `harvest_events`. No new
+  `WorkflowEvent` variant.
+- **Retention.** Rows have `ON DELETE CASCADE` on the execution. PII erasure
+  deletes them and reports `stream_chunks_deleted`. A shard rebalance copies them.
+
+[`DESIGN-1974.md`](../DESIGN-1974.md) records the decision.
+
+### Offsets
+
+Each chunk has a 0-based **offset**: the ordinal of the call in the workflow
+body. The SSE `id:` carries it. Offsets are contiguous: 0, 1, 2 and so on.
+
+A re-driven decision cycle runs the body again and gives each chunk the same
+offset. The store keeps the first copy, so a reader never sees a chunk twice
+or a chunk change. The chunk content can be non-deterministic. The **number
+and order** of `publish_durable_progress` calls must be deterministic, as for
+any workflow code.
+
+### Delivery
+
+- **No gap, no duplicate.** A chunk commits with its decision cycle, or not
+  at all. The reader opens `LISTEN` before its first read. Each wake and each
+  keepalive tick reads the rows above the reader's cursor.
+- **Resume.** Send `Last-Event-ID: <offset>` (a browser `EventSource` does this
+  on reconnect) or `?after=<offset>`. The query parameter wins. The stream
+  sends every chunk with a higher offset. With neither, it starts at offset 0.
+- **No drop under back-pressure.** The producer waits for a slow client. It
+  reads the next page of 256 rows only after the client takes the last one.
+- **Terminal runs.** A reader that connects after the run ends still gets
+  every stored chunk above its cursor, then `event: end`.
+- **Write errors.** A failed chunk write fails the decision cycle, like a
+  failed `set_current_details` write. The mode does not commit a cycle with a
+  missing chunk.
+
+### Limits
+
+- **Chunk size.** The 7,000-byte cap of the best-effort mode applies. An
+  oversize chunk becomes the `_harvest_progress_truncated` marker.
+- **Chunk count.** 100,000 chunks for each execution
+  (`DURABLE_STREAM_MAX_CHUNKS`). Above the cap the newest chunks drop. One
+  terminal marker frame then has the offset `9223372036854775807` and the
+  data `{"_harvest_stream_truncated": true, "max_chunks": 100000}`. The stored
+  chunks stay a gap-free prefix.
+- **Postgres only.** The SQLite runtime ignores durable chunks.
+- **Plain JSON at rest.** Payload codecs do not encrypt stored chunks. Do not
+  put secrets in a chunk.
+- **Continue-as-new.** A successor is a new `exec_id` and a new stream.
+
+### The route
+
+```
+GET /api/harvest/workflows/{id}/stream/durable[?after=<offset>]
+```
+
+The frames are the frames of `/stream`. The `id:` of a `progress` frame is the
+offset. A malformed `after` or `Last-Event-ID` returns `400`. The auth posture
+is the same as `/stream`: the route is not admin-gated, and `exec_id` is a
+bearer capability for **all stored** chunk content. Each reader holds one
+Postgres `LISTEN` connection, and a pooled connection for one page read at a
+time.
+
+```console
+$ curl -N -H 'Last-Event-ID: 41' \
+    http://localhost:8080/api/harvest/workflows/{exec_id}/stream/durable
+event: progress
+id: 42
+data: {"token":"Hello"}
+
+event: end
+data: {"reason":"completed"}
+```
+
+In a no-DB test, `TestRunOutcome::durable_progress()` returns the chunks that
+the run would store.
+
 ## Out of scope
 
-Explicitly **not** provided by this feature (see the issue for rationale):
+Explicitly **not** provided by the best-effort mode (see the issue for rationale):
 
-- **Durable persistence or replay of chunks** — that is the durable per-execution
-  logs primitive (#790). Progress chunks are ephemeral.
+- **Durable persistence or replay of chunks** — use the
+  [durable mode](#durable-mode-issue-1974).
 - **At-least-once / exactly-once delivery, cross-reconnect ordering guarantees,
-  or buffering for late subscribers** — best-effort only.
+  or buffering for late subscribers** — best-effort only. The durable mode
+  gives all three.
 - **Final-result delivery** — use the await-completion long-poll (#527).
 - **Snapshot state reads** — use a query handler or `set_current_details`
   (#473/#593).

@@ -132,6 +132,7 @@ mod dispatch_tests;
 mod drain_release_tests;
 #[cfg(feature = "db")]
 mod dst_differential_tests;
+mod durable_stream_tests;
 mod e2e_bench_cell_timeout_tests;
 mod e2e_bench_support;
 mod event_batch_tests;

@@ -2309,6 +2309,9 @@ fn render_command(command: &WorkflowCommand) -> CommandSnapshot {
         WorkflowCommand::UpsertSearchAttributes { .. } => ("UpsertSearchAttributes", String::new()),
         WorkflowCommand::SetCurrentDetails { .. } => ("SetCurrentDetails", String::new()),
         WorkflowCommand::PublishProgress { seq, .. } => ("PublishProgress", seq.to_string()),
+        WorkflowCommand::PublishDurableProgress { offset, .. } => {
+            ("PublishDurableProgress", offset.to_string())
+        }
         WorkflowCommand::RecordLog { seq, level, .. } => {
             ("RecordLog", format!("{seq} {}", level.as_str()))
         }
@@ -2461,6 +2464,7 @@ fn command_payload(command: &WorkflowCommand) -> Option<Value> {
         }
         WorkflowCommand::RecordSideEffect { value, .. } => Some(value.clone()),
         WorkflowCommand::PublishProgress { chunk: payload, .. }
+        | WorkflowCommand::PublishDurableProgress { chunk: payload, .. }
         | WorkflowCommand::Complete { output: payload } => Some(payload.clone()),
         WorkflowCommand::UpsertSearchAttributes { patch, .. } => serde_json::to_value(patch).ok(),
         WorkflowCommand::SetCurrentDetails {

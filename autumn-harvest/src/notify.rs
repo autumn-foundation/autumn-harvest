@@ -123,6 +123,31 @@ pub fn workflow_progress_channel(exec_id: Uuid) -> String {
     format!("harvest_progress_{}", exec_id.simple())
 }
 
+/// Postgres NOTIFY channel that wakes the readers of one execution's durable
+/// output stream (issue #1974).
+///
+/// The name is `harvest_stream_{exec_hex}`, which is 47 characters. The
+/// payload is a wake only. A reader reads the chunks from
+/// `harvest_stream_chunks`, so a lost wake delays a chunk but never loses it.
+/// The best-effort channel [`workflow_progress_channel`] is separate, so the
+/// two offset namespaces never mix.
+///
+/// # Examples
+///
+/// ```
+/// # use autumn_harvest::notify::workflow_stream_channel;
+/// # use uuid::Uuid;
+/// let id = Uuid::parse_str("0191c1a2-3b4c-7d5e-8f60-112233445566").unwrap();
+/// assert_eq!(
+///     workflow_stream_channel(id),
+///     "harvest_stream_0191c1a23b4c7d5e8f60112233445566"
+/// );
+/// ```
+#[must_use]
+pub fn workflow_stream_channel(exec_id: Uuid) -> String {
+    format!("harvest_stream_{}", exec_id.simple())
+}
+
 #[must_use]
 fn quote_pg_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
@@ -1570,6 +1595,26 @@ pub async fn notify_workflow_progress(
     Ok(())
 }
 
+/// Wake the readers of `workflow_exec_id`'s durable stream (issue #1974).
+///
+/// Inside a transaction, Postgres sends the wake on commit only, so a reader
+/// never wakes for chunks that roll back.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] if `pg_notify` fails.
+pub async fn notify_workflow_stream(
+    conn: &mut AsyncPgConnection,
+    workflow_exec_id: Uuid,
+) -> HarvestResult<()> {
+    diesel::sql_query("SELECT pg_notify($1, '')")
+        .bind::<Text, _>(workflow_stream_channel(workflow_exec_id))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Listener connections (TLS: issue #1717)
 // ---------------------------------------------------------------------------
@@ -1972,6 +2017,72 @@ impl WorkflowProgressListener {
         match tokio::time::timeout(timeout, self.wait_for_progress()).await {
             Ok(outcome) => outcome,
             Err(_elapsed) => Ok(ProgressWaitOutcome::TimedOut),
+        }
+    }
+}
+
+/// Outcome of waiting on a [`WorkflowStreamListener`] (issue #1974).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamWaitOutcome {
+    /// At least one wake arrived. New chunks can be in the table.
+    Woken,
+    /// No wake arrived before the timeout.
+    TimedOut,
+    /// The `LISTEN` connection closed.
+    ChannelClosed,
+}
+
+/// Listener for one execution's durable stream wakes (issue #1974).
+///
+/// The `GET /workflows/{id}/stream/durable` route opens it before its first
+/// read. Postgres then sends a wake for each later commit, so the read loop
+/// misses no chunk.
+pub struct WorkflowStreamListener {
+    /// Client handle kept alive so the LISTEN connection stays open.
+    _client: tokio_postgres::Client,
+    /// Receiver for notifications forwarded by the connection driver task.
+    rx: tokio::sync::mpsc::Receiver<tokio_postgres::Notification>,
+    /// Background connection driver handle kept alive for the connection's lifetime.
+    _connection_handle: tokio::task::JoinHandle<()>,
+}
+
+impl WorkflowStreamListener {
+    /// Connect to Postgres and `LISTEN` on [`workflow_stream_channel`].
+    ///
+    /// TLS follows the `sslmode` rules of [`WorkflowProgressListener::connect`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Database`] if the connection or LISTEN fails.
+    /// Returns [`HarvestError::Config`] if the URL or its TLS settings are
+    /// not valid.
+    pub async fn connect(database_url: &str, exec_id: Uuid) -> HarvestResult<Self> {
+        let ListenConnection { client, rx, driver } =
+            open_listen_connection(database_url, "postgres workflow stream listener error").await?;
+        let channel = quote_pg_identifier(&workflow_stream_channel(exec_id));
+        client
+            .batch_execute(&format!("LISTEN {channel}"))
+            .await
+            .map_err(|e| {
+                HarvestError::Database(format!("LISTEN {channel} failed: {}", error_chain(&e)))
+            })?;
+        Ok(Self {
+            _client: client,
+            rx,
+            _connection_handle: driver,
+        })
+    }
+
+    /// Wait up to `timeout` for a wake. Wakes that are already queued merge
+    /// into one, because one table read serves all of them.
+    pub async fn wait_timeout(&mut self, timeout: Duration) -> StreamWaitOutcome {
+        match tokio::time::timeout(timeout, self.rx.recv()).await {
+            Err(_elapsed) => StreamWaitOutcome::TimedOut,
+            Ok(None) => StreamWaitOutcome::ChannelClosed,
+            Ok(Some(_)) => {
+                while self.rx.try_recv().is_ok() {}
+                StreamWaitOutcome::Woken
+            }
         }
     }
 }

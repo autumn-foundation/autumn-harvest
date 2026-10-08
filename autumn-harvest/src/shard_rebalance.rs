@@ -507,6 +507,7 @@ pub const COPIED_RELATIONS: &[&str] = &[
     "harvest_signals",
     "harvest_payload_refs",
     "harvest_workflow_logs",
+    "harvest_stream_chunks",
 ];
 
 /// Relations whose schemas must match between source and target before a
@@ -526,6 +527,7 @@ pub const SCHEMA_PARITY_RELATIONS: &[&str] = &[
     "harvest_signals",
     "harvest_payload_refs",
     "harvest_workflow_logs",
+    "harvest_stream_chunks",
     "harvest_task_queue",
 ];
 
@@ -1256,6 +1258,54 @@ mod db {
         Ok(row.payload)
     }
 
+    /// Rows in one page of [`read_stream_chunk_pages`].
+    const STREAM_CHUNK_COPY_PAGE: i64 = 1_000;
+
+    /// Read an execution's durable stream chunks (issue #1974) as JSON pages.
+    ///
+    /// A stream can hold 100,000 chunks of up to 7,000 bytes. One
+    /// `jsonb_agg` of all of them can pass the 255 MB `jsonb` limit, so this
+    /// reads pages in offset order.
+    async fn read_stream_chunk_pages(
+        conn: &mut AsyncPgConnection,
+        exec_id: ExecutionId,
+    ) -> HarvestResult<Vec<Value>> {
+        let mut pages = Vec::new();
+        let mut after = -1_i64;
+        loop {
+            let row: JsonRow = diesel::sql_query(
+                "SELECT COALESCE(jsonb_agg(to_jsonb(c) ORDER BY c.stream_offset), \
+                     '[]'::jsonb) AS payload \
+                 FROM (SELECT * FROM harvest_stream_chunks \
+                       WHERE workflow_exec_id = $1 AND stream_offset > $2 \
+                       ORDER BY stream_offset LIMIT $3) c",
+            )
+            .bind::<SqlUuid, _>(exec_id.as_uuid())
+            .bind::<BigInt, _>(after)
+            .bind::<BigInt, _>(STREAM_CHUNK_COPY_PAGE)
+            .get_result(conn)
+            .await
+            .map_err(database_error)?;
+            let Some(rows) = row.payload.as_array() else {
+                break;
+            };
+            let Some(last) = rows
+                .last()
+                .and_then(|r| r.get("stream_offset"))
+                .and_then(Value::as_i64)
+            else {
+                break;
+            };
+            let full = i64::try_from(rows.len()).unwrap_or(i64::MAX) >= STREAM_CHUNK_COPY_PAGE;
+            after = last;
+            pages.push(row.payload);
+            if !full {
+                break;
+            }
+        }
+        Ok(pages)
+    }
+
     /// Copy one execution's durable state onto the target shard as an inert
     /// `MIGRATING` row.
     ///
@@ -1350,6 +1400,11 @@ mod db {
             exec_id,
         )
         .await?;
+
+        // Durable stream chunks (issue #1974). Copied for the same reason as
+        // the logs: they are author output, and erasure must reach them on
+        // the execution's own shard.
+        let stream_chunk_pages = read_stream_chunk_pages(source, exec_id).await?;
 
         // The parked workflow task, captured but NOT staged (see the doc
         // comment). `to_jsonb` keeps every column, including the sticky hint and
@@ -1555,6 +1610,24 @@ mod db {
             .await
             .map_err(database_error)?;
 
+            // Stream chunks take an explicit column list too: `id` is a
+            // shard-local `BIGSERIAL`. `stream_offset` carries the order.
+            for page in &stream_chunk_pages {
+                diesel::sql_query(
+                    "INSERT INTO harvest_stream_chunks \
+                         (workflow_exec_id, stream_offset, chunk, created_at) \
+                     SELECT workflow_exec_id, stream_offset, chunk, created_at \
+                     FROM jsonb_to_recordset($1::jsonb) AS r( \
+                         workflow_exec_id uuid, stream_offset bigint, chunk jsonb, \
+                         created_at timestamptz) \
+                     ORDER BY stream_offset",
+                )
+                .bind::<Jsonb, _>(page)
+                .execute(&mut *conn)
+                .await
+                .map_err(database_error)?;
+            }
+
             Ok(())
         }))
         .await?;
@@ -1694,6 +1767,7 @@ mod db {
         "DELETE FROM harvest_signals WHERE workflow_exec_id = $1",
         "DELETE FROM harvest_payload_refs WHERE workflow_exec_id = $1",
         "DELETE FROM harvest_workflow_logs WHERE workflow_exec_id = $1",
+        "DELETE FROM harvest_stream_chunks WHERE workflow_exec_id = $1",
         "DELETE FROM harvest_task_queue WHERE workflow_exec_id = $1",
     ];
 

@@ -163,6 +163,29 @@ pub const DEFAULT_CURRENT_DETAILS_CAP_BYTES: usize = 1024;
 /// [`publish_progress`]: WorkflowContext::publish_progress
 pub const PROGRESS_CHUNK_MAX_BYTES: usize = 7000;
 
+/// Per-execution cap on stored durable stream chunks (issue #1974).
+///
+/// The store drops chunks above the cap and stores one terminal marker. The
+/// context queues at most `cap + 1` commands in one cycle, so the store can
+/// see the overflow.
+pub const DURABLE_STREAM_MAX_CHUNKS: u32 = 100_000;
+
+/// Serialize a progress chunk and apply [`PROGRESS_CHUNK_MAX_BYTES`].
+///
+/// An oversize chunk becomes a truncation marker. The chunk slot stays, and
+/// the client sees that the content was cut (issues #791 and #1974).
+fn cap_progress_chunk(chunk: &impl serde::Serialize) -> HarvestResult<Value> {
+    let value = serde_json::to_value(chunk).map_err(HarvestError::Serialization)?;
+    let serialized_len = serde_json::to_vec(&value).map_or(usize::MAX, |v| v.len());
+    if serialized_len > PROGRESS_CHUNK_MAX_BYTES {
+        return Ok(serde_json::json!({
+            "_harvest_progress_truncated": true,
+            "bytes": serialized_len,
+        }));
+    }
+    Ok(value)
+}
+
 /// Bits reserved for the per-cycle local index in a progress `seq` (issue #791).
 ///
 /// A progress `seq` is `(epoch << PROGRESS_SEQ_LOCAL_BITS) | local_index`, where
@@ -703,6 +726,19 @@ pub enum WorkflowCommand {
         /// marker).
         chunk: Value,
     },
+    /// Store one durable output-stream chunk (issue #1974).
+    ///
+    /// Emitted by [`WorkflowContext::publish_durable_progress`] during live
+    /// execution only. Bookkeeping: no result channel, no suspension shape and
+    /// no `harvest_events` row. The worker writes it to
+    /// `harvest_stream_chunks` in the persist transaction.
+    PublishDurableProgress {
+        /// The 0-based call ordinal. A re-drive gets the same offset again,
+        /// so the store keeps the first copy.
+        offset: u64,
+        /// The chunk, already size-capped like a best-effort chunk.
+        chunk: Value,
+    },
     /// Persist one author-emitted log line to the durable per-execution log
     /// store (issue #790).
     ///
@@ -965,6 +1001,7 @@ impl WorkflowCommand {
             | Self::UpsertSearchAttributes { .. }
             | Self::SetCurrentDetails { .. }
             | Self::PublishProgress { .. }
+            | Self::PublishDurableProgress { .. }
             | Self::RecordLog { .. }
             | Self::SpawnDetachedChildWorkflow { .. }
             | Self::CancelRaceLosers { .. }
@@ -1080,6 +1117,11 @@ impl std::fmt::Debug for WorkflowCommand {
             Self::PublishProgress { seq, chunk } => f
                 .debug_struct("PublishProgress")
                 .field("seq", seq)
+                .field("chunk", chunk)
+                .finish(),
+            Self::PublishDurableProgress { offset, chunk } => f
+                .debug_struct("PublishDurableProgress")
+                .field("offset", offset)
                 .field("chunk", chunk)
                 .finish(),
             Self::RecordLog {
@@ -2894,6 +2936,16 @@ pub struct WorkflowContext {
     /// epoch (in the high bits) is what carries monotonicity across cycles.
     /// Not part of replay state: `publish_progress` is a no-op during replay.
     progress_local_index: std::sync::atomic::AtomicU64,
+    /// 0-based call ordinal of `publish_durable_progress` (issue #1974).
+    ///
+    /// It is the chunk offset. Each call claims one value, also during replay.
+    /// A re-drive re-runs the body from the top, so a chunk gets the same
+    /// offset again. The epoch `seq` of `publish_progress` cannot do this.
+    /// See `log_call_ordinal` for the cases that move the epoch.
+    durable_progress_ordinal: std::sync::atomic::AtomicU64,
+    /// Count of `PublishDurableProgress` commands queued this cycle
+    /// (issue #1974). It bounds memory at `DURABLE_STREAM_MAX_CHUNKS + 1`.
+    durable_progress_queued: std::sync::atomic::AtomicU64,
     /// 0-based **call ordinal** for durable-log `seq` generation (issue #790):
     /// the count of `ctx.log_*` calls made so far by *this run of the workflow
     /// body*.
@@ -3571,6 +3623,8 @@ impl WorkflowContext {
             session_seq: Mutex::new(0),
             business_day_seq: Mutex::new(0),
             progress_local_index: std::sync::atomic::AtomicU64::new(0),
+            durable_progress_ordinal: std::sync::atomic::AtomicU64::new(0),
+            durable_progress_queued: std::sync::atomic::AtomicU64::new(0),
             log_call_ordinal: std::sync::atomic::AtomicU64::new(0),
             log_commands_queued: std::sync::atomic::AtomicU64::new(0),
             log_policy: None,
@@ -3744,6 +3798,8 @@ impl WorkflowContext {
             session_seq: Mutex::new(0),
             business_day_seq: Mutex::new(0),
             progress_local_index: std::sync::atomic::AtomicU64::new(0),
+            durable_progress_ordinal: std::sync::atomic::AtomicU64::new(0),
+            durable_progress_queued: std::sync::atomic::AtomicU64::new(0),
             log_call_ordinal: std::sync::atomic::AtomicU64::new(0),
             log_commands_queued: std::sync::atomic::AtomicU64::new(0),
             log_policy: None,
@@ -3815,6 +3871,8 @@ impl WorkflowContext {
             session_seq: Mutex::new(0),
             business_day_seq: Mutex::new(0),
             progress_local_index: std::sync::atomic::AtomicU64::new(0),
+            durable_progress_ordinal: std::sync::atomic::AtomicU64::new(0),
+            durable_progress_queued: std::sync::atomic::AtomicU64::new(0),
             log_call_ordinal: std::sync::atomic::AtomicU64::new(0),
             log_commands_queued: std::sync::atomic::AtomicU64::new(0),
             log_policy: None,
@@ -7296,6 +7354,8 @@ impl WorkflowContext {
         self.log_commands_queued
             .store(0, std::sync::atomic::Ordering::Relaxed);
         self.progress_local_index
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.durable_progress_queued
             .store(0, std::sync::atomic::Ordering::Relaxed);
         self.matcher
             .lock()
@@ -13725,24 +13785,65 @@ impl WorkflowContext {
             let matcher = self.matcher.lock().expect("matcher lock poisoned");
             matcher.event_count()
         };
-        // Serialize the caller's chunk (the only fallible step).
-        let mut value = serde_json::to_value(&chunk).map_err(HarvestError::Serialization)?;
-        // Cap the serialized size below the Postgres NOTIFY payload limit.
-        // Oversize chunks are REPLACED with a truncation marker (never silently
-        // dropped) so the ordered seq slot survives and the SSE client learns
-        // content was cut.
-        let serialized_len = serde_json::to_vec(&value).map_or(usize::MAX, |v| v.len());
-        if serialized_len > PROGRESS_CHUNK_MAX_BYTES {
-            value = serde_json::json!({
-                "_harvest_progress_truncated": true,
-                "bytes": serialized_len,
-            });
-        }
+        let value = cap_progress_chunk(&chunk)?;
         let local_index = self
             .progress_local_index
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let seq = encode_progress_seq(epoch, local_index);
         self.push_command(WorkflowCommand::PublishProgress { seq, chunk: value });
+        Ok(())
+    }
+
+    /// Publish a durable, resumable output chunk (issue #1974).
+    ///
+    /// This is the opt-in durable mode of [`publish_progress`](Self::publish_progress).
+    /// The worker stores the chunk in `harvest_stream_chunks` in the same
+    /// transaction as the decision cycle. A reader of
+    /// `GET /workflows/{id}/stream/durable` gets every stored chunk in order.
+    /// It can disconnect and resume after its last offset.
+    ///
+    /// - **Offset**: the 0-based ordinal of this call in the workflow body.
+    ///   The SSE `id:` carries it. A re-drive gives a chunk the same offset,
+    ///   and the store keeps the first copy.
+    /// - **Determinism**: the content can change between runs. The number and
+    ///   order of calls must be deterministic, as for any workflow code.
+    /// - **Replay-neutral**: during replay the call claims its offset and
+    ///   pushes no command. No event goes to `harvest_events`.
+    /// - **Bounded**: [`DURABLE_STREAM_MAX_CHUNKS`] chunks per execution, then
+    ///   one terminal marker. A chunk above [`PROGRESS_CHUNK_MAX_BYTES`]
+    ///   becomes a truncation marker, as in the best-effort mode.
+    /// - **Postgres only**: the SQLite runtime ignores the chunk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Serialization`] if `chunk` cannot be
+    /// serialized. On replay it returns `Ok(())` without touching `chunk`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher mutex is poisoned.
+    pub fn publish_durable_progress(&self, chunk: impl serde::Serialize) -> HarvestResult<()> {
+        // Claim the offset first, also on replay. Otherwise each later chunk
+        // moves down one offset and collides with a stored row.
+        let offset = self
+            .durable_progress_ordinal
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.replay_suppresses_side_effects() {
+            return Ok(());
+        }
+        // Bound the queue at cap + 1. The extra command lets the store see
+        // the overflow and write its marker.
+        let queued = self
+            .durable_progress_queued
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if queued > u64::from(DURABLE_STREAM_MAX_CHUNKS) {
+            return Ok(());
+        }
+        let value = cap_progress_chunk(&chunk)?;
+        self.push_command(WorkflowCommand::PublishDurableProgress {
+            offset,
+            chunk: value,
+        });
         Ok(())
     }
 
@@ -25750,6 +25851,186 @@ mod tests {
         assert!(encode_progress_seq(5, 1) > encode_progress_seq(5, 0));
         // Deterministic on a crash-retry of the same cycle: same inputs → same seq.
         assert_eq!(encode_progress_seq(7, 3), encode_progress_seq(7, 3));
+    }
+
+    // ── Durable output streams (issue #1974) ──────────────────────────
+
+    /// Collect every `PublishDurableProgress` command as `(offset, chunk)`.
+    fn durable_chunks(cmds: &[WorkflowCommand]) -> Vec<(u64, Value)> {
+        cmds.iter()
+            .filter_map(|cmd| match cmd {
+                WorkflowCommand::PublishDurableProgress { offset, chunk } => {
+                    Some((*offset, chunk.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn durable_progress_offsets_start_at_zero_and_increase_by_one() {
+        let ctx = WorkflowContext::new_test();
+        ctx.publish_durable_progress(serde_json::json!("a"))
+            .expect("first");
+        ctx.publish_durable_progress(serde_json::json!("b"))
+            .expect("second");
+        let chunks = durable_chunks(&ctx.drain_commands());
+        assert_eq!(
+            chunks,
+            vec![(0, serde_json::json!("a")), (1, serde_json::json!("b"))]
+        );
+    }
+
+    #[test]
+    fn durable_progress_does_not_change_the_best_effort_command() {
+        let ctx = WorkflowContext::new_test();
+        ctx.publish_progress(serde_json::json!("x")).expect("live");
+        let cmds = ctx.drain_commands();
+        assert!(durable_chunks(&cmds).is_empty());
+        assert!(matches!(
+            cmds.as_slice(),
+            [WorkflowCommand::PublishProgress { .. }]
+        ));
+    }
+
+    #[test]
+    fn durable_progress_is_suppressed_during_replay_but_claims_an_offset() {
+        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now());
+        let side_effect = WorkflowEvent::SideEffectRecorded {
+            kind: crate::event::SideEffectKind::Uuid,
+            name: None,
+            value: serde_json::json!("00000000-0000-7000-8000-000000000000"),
+        };
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), vec![started, side_effect]);
+        assert!(ctx.is_replaying(), "the side effect is not consumed yet");
+        ctx.publish_durable_progress(serde_json::json!("old"))
+            .expect("replay call");
+        let _ = ctx.new_uuid();
+        assert!(!ctx.is_replaying(), "the cycle is at the frontier");
+        ctx.publish_durable_progress(serde_json::json!("new"))
+            .expect("live call");
+        assert_eq!(
+            durable_chunks(&ctx.drain_commands()),
+            vec![(1, serde_json::json!("new"))],
+            "the replayed call pushes nothing but still claims offset 0"
+        );
+    }
+
+    #[test]
+    fn durable_progress_offset_is_stable_when_the_cycle_appends_an_event() {
+        // The ephemeral epoch seq fails this case. The same chunk gets a new
+        // value in cycle 2, so the store holds it twice.
+        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now());
+        let cycle1 = WorkflowContext::for_replay(ExecutionId::new(), vec![started.clone()]);
+        cycle1
+            .publish_durable_progress(serde_json::json!("A"))
+            .expect("A");
+        let _ = cycle1.new_uuid();
+        cycle1
+            .publish_durable_progress(serde_json::json!("B"))
+            .expect("B");
+        let first = durable_chunks(&cycle1.drain_commands());
+        assert_eq!(first.len(), 2, "both chunks are live in cycle 1");
+
+        let side_effect = WorkflowEvent::SideEffectRecorded {
+            kind: crate::event::SideEffectKind::Uuid,
+            name: None,
+            value: serde_json::json!("00000000-0000-7000-8000-000000000000"),
+        };
+        let cycle2 = WorkflowContext::for_replay(ExecutionId::new(), vec![started, side_effect]);
+        cycle2
+            .publish_durable_progress(serde_json::json!("A"))
+            .expect("A");
+        let _ = cycle2.new_uuid();
+        cycle2
+            .publish_durable_progress(serde_json::json!("B"))
+            .expect("B");
+        let second = durable_chunks(&cycle2.drain_commands());
+        assert_eq!(second.len(), 1, "only B is live in cycle 2");
+        assert_eq!(second[0], first[1], "B keeps its offset across cycles");
+    }
+
+    #[test]
+    fn durable_progress_offset_is_stable_across_a_pause_resume() {
+        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now());
+        let before = WorkflowContext::for_replay(ExecutionId::new(), vec![started.clone()]);
+        before
+            .publish_durable_progress(serde_json::json!("waiting"))
+            .expect("before");
+        let now = Utc::now();
+        let after = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started,
+                WorkflowEvent::WorkflowExecutionPaused {
+                    paused_at: now,
+                    reason: None,
+                    actor: "operator".to_string(),
+                },
+                WorkflowEvent::WorkflowExecutionResumed {
+                    resumed_at: now,
+                    actor: "operator".to_string(),
+                },
+            ],
+        );
+        after
+            .publish_durable_progress(serde_json::json!("waiting"))
+            .expect("after");
+        let before_chunks = durable_chunks(&before.drain_commands());
+        assert_eq!(before_chunks.len(), 1, "the chunk is live before the pause");
+        assert_eq!(
+            before_chunks,
+            durable_chunks(&after.drain_commands()),
+            "a pause and resume must not move the offset"
+        );
+    }
+
+    #[test]
+    fn durable_progress_offset_continues_across_a_resident_cycle() {
+        let ctx = WorkflowContext::new_test();
+        ctx.publish_durable_progress(serde_json::json!(0))
+            .expect("cycle 1");
+        let _ = ctx.drain_commands();
+        ctx.begin_resident_cycle(&[]);
+        ctx.publish_durable_progress(serde_json::json!(1))
+            .expect("cycle 2");
+        assert_eq!(
+            durable_chunks(&ctx.drain_commands()),
+            vec![(1, serde_json::json!(1))],
+            "a resident cycle does not re-run the body, so the counter continues"
+        );
+    }
+
+    #[test]
+    fn durable_progress_oversize_chunk_becomes_truncation_marker() {
+        let ctx = WorkflowContext::new_test();
+        let huge = "x".repeat(PROGRESS_CHUNK_MAX_BYTES + 1);
+        ctx.publish_durable_progress(Value::String(huge))
+            .expect("oversize publish succeeds");
+        let chunks = durable_chunks(&ctx.drain_commands());
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].0, 0, "the marker keeps the offset");
+        assert_eq!(
+            chunks[0].1.get("_harvest_progress_truncated"),
+            Some(&Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn durable_progress_queue_is_bounded_at_cap_plus_one() {
+        let ctx = WorkflowContext::new_test();
+        let cap = u64::from(DURABLE_STREAM_MAX_CHUNKS);
+        for i in 0..cap + 5 {
+            ctx.publish_durable_progress(i).expect("publish");
+        }
+        let chunks = durable_chunks(&ctx.drain_commands());
+        let queued = u64::try_from(chunks.len()).expect("fits");
+        assert_eq!(
+            queued,
+            cap + 1,
+            "one extra command lets the store detect overflow and write its marker"
+        );
+        assert_eq!(chunks.last().map(|c| c.0), Some(cap));
     }
 
     // ── Durable workflow logs (issue #790) ────────────────────────────

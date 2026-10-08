@@ -1519,6 +1519,10 @@ path = "parent_execution_id"
 receiver = "WorkflowContext"
 reason = "context.rs:4069; workflow-execution identity metadata, fixed at start and identical on every replay and every worker."
 [[non_sink]]
+path = "publish_durable_progress"
+receiver = "WorkflowContext"
+reason = "context.rs:13825. Issue #1974. The chunk goes to a side table and is never replayed. On replay the call pushes no command."
+[[non_sink]]
 path = "publish_progress"
 receiver = "WorkflowContext"
 reason = "context.rs:13238. \"an ordered, **ephemeral** progress chunk\"; doc 13240-13256: \"a progress chunk is never recorded and never replayed, so on replay we push no command and consume no seq slot\"."
