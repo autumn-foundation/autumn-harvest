@@ -758,12 +758,25 @@ jobs:
           python3 docs/audits/openapi-response-coverage.py --self-test
           python3 docs/audits/openapi-response-coverage.py
 
+      # Comment hygiene. The release PR (trunk-dev into trunk) runs Tier A
+      # only. Each change in it already passed Tier B on its way into
+      # trunk-dev, on its PR and again on its push. A ratchet against trunk
+      # counts the whole release as new. That includes the legacy debt from
+      # before the gate existed. The guard checks the head repo, so a fork
+      # branch named trunk-dev still gets the full ratchet.
       - name: Comment hygiene (docs/audits/comment-hygiene.py)
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
         run: |
           python3 docs/audits/comment-hygiene.py --self-test
           BEFORE="${{ github.event.before }}"
-          if [ -n "${{ github.base_ref }}" ]; then
-            git fetch --no-tags origin "${{ github.base_ref }}"
+          if [ "$BASE_REF" = "trunk" ] && [ "$HEAD_REF" = "trunk-dev" ] \
+            && [ "$HEAD_REPO" = "$GITHUB_REPOSITORY" ]; then
+            python3 docs/audits/comment-hygiene.py --tier-a-only
+          elif [ -n "$BASE_REF" ]; then
+            git fetch --no-tags origin "$BASE_REF"
             python3 docs/audits/comment-hygiene.py --base FETCH_HEAD
           elif [ -n "$BEFORE" ] \
             && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
