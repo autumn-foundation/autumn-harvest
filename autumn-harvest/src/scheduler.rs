@@ -1411,6 +1411,10 @@ pub async fn tick_once_sharded_with_backoff(
 
         // The whole pass runs under the barrier. A lost barrier stops it.
         let pass = async {
+            // Issue #1823: the connection predates the pass, so it joins it.
+            // A lost guard then ends its backend.
+            #[cfg(feature = "db")]
+            let _member = crate::replication::join_fenced_pass(shard_pool, &mut conn).await;
             // Issue #1157: on a converged shard this pass is read-only — no
             // transaction, no advisory lock, no UPDATE. Only a schedule that
             // genuinely needs a write opens a transaction and contends for the
