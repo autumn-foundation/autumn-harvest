@@ -2255,32 +2255,45 @@ impl HistoryMatcher {
         n
     }
 
-    /// Count the unconsumed `ActivityScheduled` events at or after the cursor
-    /// that match `expected` in order (issue #1986).
+    /// The ids of the unconsumed `ActivityScheduled` events at or after the
+    /// cursor, at most `cap` of them (issue #1986).
     ///
-    /// Read-only, like
-    /// [`count_pending_scheduled_activities`](Self::count_pending_scheduled_activities).
-    /// The scan stops at the first event whose name or input differs from the
-    /// next expected slot. A fan-out that stopped early on its failure
-    /// tolerance then never claims an activity that the workflow scheduled
-    /// after it.
+    /// Read-only. Like
+    /// [`count_pending_scheduled_activities`](Self::count_pending_scheduled_activities),
+    /// but it returns the ids, so a fan-out that stops can consume the start
+    /// events of its slots that still run.
     #[must_use]
-    pub(crate) fn count_scheduled_prefix_matching(&self, expected: &[(&str, &Value)]) -> usize {
-        let mut n = 0;
+    pub(crate) fn pending_scheduled_activity_ids(&self, cap: usize) -> Vec<ActivityExecId> {
+        let mut ids = Vec::new();
         let mut cursor = self.cursor;
-        while cursor < self.events.len() && n < expected.len() {
+        while cursor < self.events.len() && ids.len() < cap {
             if !self.is_consumed(cursor)
-                && let WorkflowEvent::ActivityScheduled { name, input, .. } = &self.events[cursor]
+                && let WorkflowEvent::ActivityScheduled { activity_id, .. } = &self.events[cursor]
             {
-                let (want_name, want_input) = expected[n];
-                if name != want_name || input != want_input {
-                    break;
-                }
-                n += 1;
+                ids.push(*activity_id);
             }
             cursor += 1;
         }
-        n
+        ids
+    }
+
+    /// The `u64` value of the first unconsumed marker named `name` at or
+    /// after the cursor (issue #1986).
+    ///
+    /// Read-only. A fan-out that stopped on its tolerance records a stop
+    /// marker. The marker comes after the slots in history, but replay must
+    /// know the slot count before it reaches the marker.
+    #[must_use]
+    pub(crate) fn peek_u64_marker_ahead(&self, name: &str) -> Option<u64> {
+        (self.cursor..self.events.len())
+            .filter(|&i| !self.is_consumed(i))
+            .find_map(|i| match &self.events[i] {
+                WorkflowEvent::MarkerRecorded {
+                    name: recorded,
+                    details,
+                } if recorded == name => details.as_u64(),
+                _ => None,
+            })
     }
 
     /// Total number of events in history.

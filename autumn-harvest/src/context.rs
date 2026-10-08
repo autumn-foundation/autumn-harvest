@@ -10236,10 +10236,10 @@ impl WorkflowContext {
     /// recorded count with the current count, returning `Ok(false)` on a
     /// match. Returns a [`HarvestError::NonDeterministic`] when they differ.
     ///
-    /// Used as-is by the activity fan-out methods, which have no pre-dispatch
-    /// validation step to sequence around the marker. Child fan-out instead
-    /// uses [`peek_fan_out_count`](Self::peek_fan_out_count) +
-    /// [`record_fan_out_marker`](Self::record_fan_out_marker) so the marker
+    /// The activity fan-out methods use it as-is, except `fan_out_with_impl`.
+    /// That method checks the store between the peek and the marker. Child
+    /// fan-out also uses [`peek_fan_out_count`](Self::peek_fan_out_count) +
+    /// [`record_fan_out_marker`](Self::record_fan_out_marker), so the marker
     /// is recorded only *after* payload validation succeeds — see those
     /// methods' docs for why.
     fn check_fan_out_count(&self, seq: u32, count: usize) -> HarvestResult<bool> {
@@ -10295,6 +10295,39 @@ impl WorkflowContext {
             name: format!("fan_out:{seq}"),
             details: Value::from(count as u64),
         });
+    }
+
+    /// Record or verify the stop marker of a fan-out (issue #1986).
+    ///
+    /// A fan-out that stops on its failure tolerance records how many slots
+    /// it dispatched. Replay reads the count ahead of the slots, through
+    /// `peek_u64_marker_ahead`, so the recorded prefix never takes an
+    /// activity that the workflow scheduled after the stop.
+    fn record_fan_out_stop(&self, name: &str, dispatched: usize) -> HarvestResult<()> {
+        let dispatched = dispatched as u64;
+        match self.match_history(|m| m.match_u64_marker(name, dispatched)) {
+            HistoryMatch::NoMatch => {
+                self.push_command(WorkflowCommand::RecordMarker {
+                    name: name.to_string(),
+                    details: Value::from(dispatched),
+                });
+                Ok(())
+            }
+            HistoryMatch::Diverged {
+                expected,
+                actual,
+                event_index,
+            } => Err(self.nd_error(
+                format!(
+                    "{name}: the fan-out stopped with {expected} but history has {actual}; \
+                     use ctx.version() to guard a tolerance change for in-flight runs"
+                ),
+                event_index,
+                Some(expected),
+                Some(actual),
+            )),
+            _ => Ok(()),
+        }
     }
 
     /// Record or verify a condition-skip decision for a DAG node in event history.
@@ -10490,17 +10523,10 @@ impl WorkflowContext {
             .map(|(name, input, queue)| {
                 let retry = retry.clone();
                 async move {
-                    match self
-                        .execute_activity_raw_with_opts(&name, input, &queue, retry, timeout)
-                        .await
-                    {
-                        Ok(v) => Ok(Ok(v)),
-                        Err(
-                            e
-                            @ (HarvestError::ActivityFailed { .. } | HarvestError::Timeout { .. }),
-                        ) => Ok(Err(e.to_string())),
-                        Err(e) => Err(e),
-                    }
+                    classify_fan_out_slot(
+                        self.execute_activity_raw_with_opts(&name, input, &queue, retry, timeout)
+                            .await,
+                    )
                 }
             })
             .collect();
@@ -10840,13 +10866,7 @@ impl WorkflowContext {
         // Per-slot classification shared by both phases: engine errors abort the
         // fan-out (`Err`); an activity failure/timeout is captured in the slot
         // (`Ok(Err(..))`) so `try_join_all` never short-circuits.
-        let classify = |slot: HarvestResult<Value>| match slot {
-            Ok(v) => Ok(Ok(v)),
-            Err(e @ (HarvestError::ActivityFailed { .. } | HarvestError::Timeout { .. })) => {
-                Ok(Err(e.to_string()))
-            }
-            Err(e) => Err(e),
-        };
+        let classify = classify_fan_out_slot;
 
         let mut activities = activities;
         let mut results = Vec::with_capacity(count);
@@ -11020,16 +11040,17 @@ impl WorkflowContext {
     ///
     /// - **Window.** `max_in_flight` limits the items in flight, as
     ///   [`execute_activity_fan_out_collect_raw_windowed`](Self::execute_activity_fan_out_collect_raw_windowed)
-    ///   does.
+    ///   does. A value of 0 counts as 1.
     /// - **Failure tolerance.** The fan-out completes when at most N items
     ///   fail. It fails with
     ///   [`HarvestError::FanOutFailureThresholdExceeded`] when more fail. A
     ///   windowed fan-out then dispatches no further wave. Activities already
     ///   in flight keep running, as with the fail-fast helpers.
     /// - **Result writer.** The worker writes each result through the
-    ///   `PayloadStore`. History records a fixed-size
+    ///   `PayloadStore`. History records a small
     ///   [`StoredResult`](crate::fan_out::StoredResult) for the item, not the
-    ///   value. A worker without a store records the value inline.
+    ///   value. Its size does not depend on the result. An activity worker
+    ///   without a store records the value inline.
     ///
     /// The returned [`FanOutResults`](crate::fan_out::FanOutResults) is the
     /// manifest. It holds one item per input, in input order.
@@ -11037,13 +11058,19 @@ impl WorkflowContext {
     /// # Replay safety
     ///
     /// The fan-out records the same `fan_out:{n}` marker as the other
-    /// helpers. Neither the window nor the tolerance is recorded.
+    /// helpers. History records neither the window nor the tolerance.
     ///
     /// Each wave polls every slot before it counts the failures. So the
     /// fan-out consumes every recorded slot of the wave, and a workflow can
     /// catch the threshold error and go on (issue #1791). Failures only
     /// accumulate, so a replay that sees more results makes the same decision.
-    /// Change a tolerance for in-flight runs behind `ctx.version()`.
+    ///
+    /// A fan-out that stops records a `fan_out_stop:{n}` marker with the
+    /// number of slots it dispatched. Replay reads it ahead, so the fan-out
+    /// never takes an activity that the workflow scheduled after the stop. The
+    /// stop also consumes the start events of its slots that still run, and
+    /// removes their waits. Change a tolerance for in-flight runs behind
+    /// `ctx.version()`.
     ///
     /// # Errors
     ///
@@ -11064,7 +11091,7 @@ impl WorkflowContext {
         activities: Vec<(String, Value, String)>,
         options: &crate::fan_out::FanOutOptions,
     ) -> HarvestResult<crate::fan_out::FanOutResults<Value>> {
-        let writer = options.writes_results();
+        let writer = options.result_writer();
         let (slots, tolerated) = self
             .fan_out_with_impl(activities, options, None, None)
             .await?;
@@ -11112,7 +11139,7 @@ impl WorkflowContext {
             })
             .collect::<Result<Vec<_>, serde_json::Error>>()?;
 
-        let writer = options.writes_results();
+        let writer = options.result_writer();
         let (slots, tolerated) = self
             .fan_out_with_impl(
                 activities,
@@ -11148,7 +11175,7 @@ impl WorkflowContext {
 
         let seq = self.next_fan_out_seq();
         let count = activities.len();
-        let writer = options.writes_results();
+        let writer = options.result_writer();
         // Check the store before the marker, so a failed check records
         // nothing. Replay does not check again: the store can change.
         if self.peek_fan_out_count(seq, count)? {
@@ -11166,16 +11193,20 @@ impl WorkflowContext {
         if activities.is_empty() {
             return Ok((Vec::new(), tolerated));
         }
-        let window = options.window().map_or(count, |w| w.max(1));
+        let window = options.max_in_flight().map_or(count, |w| w.max(1));
 
         // The recorded prefix holds only this fan-out's slots. A fan-out that
-        // stopped on its tolerance can be followed by other activities, so
-        // the scan matches each slot's name and input.
-        let expected: Vec<(&str, &Value)> = activities
-            .iter()
-            .map(|(name, input, _)| (name.as_str(), input))
-            .collect();
-        let scheduled_prefix = self.match_history(|m| m.count_scheduled_prefix_matching(&expected));
+        // stopped recorded how many slots it dispatched. The prefix stops
+        // there, so it never takes an activity that the workflow scheduled
+        // after a caught threshold error.
+        let stop_marker = format!("fan_out_stop:{seq}");
+        let dispatched_before_stop = self
+            .match_history(|m| m.peek_u64_marker_ahead(&stop_marker))
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(count)
+            .min(count);
+        let prefix_ids =
+            self.match_history(|m| m.pending_scheduled_activity_ids(dispatched_before_stop));
 
         let dispatch = |(name, input, queue): (String, Value, String)| {
             let retry = retry.clone();
@@ -11198,20 +11229,44 @@ impl WorkflowContext {
         };
         // Phase 1 resumes the recorded prefix as one batch. Phase 2 sends the
         // rest in waves. See `fan_out_raw_windowed_impl` for why.
-        if scheduled_prefix > 0 {
-            self.check_cancellation()?;
-            let wave = activities
-                .drain(..scheduled_prefix)
-                .map(&dispatch)
-                .collect();
-            join_fan_out_wave(wave, &mut failures, limit, &mut results).await?;
+        let joined = async {
+            if !prefix_ids.is_empty() {
+                self.check_cancellation()?;
+                let wave = activities
+                    .drain(..prefix_ids.len())
+                    .map(&dispatch)
+                    .collect();
+                join_fan_out_wave(wave, &mut failures, limit, &mut results).await?;
+            }
+            while !activities.is_empty() {
+                self.check_cancellation()?;
+                let take = window.min(activities.len());
+                let wave = activities.drain(..take).map(&dispatch).collect();
+                join_fan_out_wave(wave, &mut failures, limit, &mut results).await?;
+            }
+            Ok(())
         }
-        while !activities.is_empty() {
-            self.check_cancellation()?;
-            let take = window.min(activities.len());
-            let wave = activities.drain(..take).map(&dispatch).collect();
-            join_fan_out_wave(wave, &mut failures, limit, &mut results).await?;
+        .await;
+        if let Err(HarvestError::FanOutFailureThresholdExceeded { .. }) = &joined {
+            // A slot still in flight leaves its start and heartbeat events in
+            // front of the cursor. Consume them, so the step after a caught
+            // error does not diverge on them (as `ctx.race()` does, issue
+            // #1126). Only a recorded slot can be in flight at a stop.
+            self.match_history(|m| m.consume_race_loser_frontier(&prefix_ids, &[]));
+            // Nothing waits on an abandoned slot. Its `WaitForActivity` would
+            // read as a new command to strict replay, so remove it, as
+            // `AwaitConditionTimeoutFut` removes a stale `StartTimer`.
+            let abandoned: std::collections::HashSet<_> = prefix_ids.iter().collect();
+            self.commands
+                .lock()
+                .expect("commands lock poisoned")
+                .retain(|cmd| {
+                    !matches!(cmd, WorkflowCommand::WaitForActivity { activity_id, .. }
+                        if abandoned.contains(activity_id))
+                });
+            self.record_fan_out_stop(&stop_marker, count - activities.len())?;
         }
+        joined?;
         Ok((results, tolerated))
     }
 
@@ -14583,7 +14638,7 @@ fn fan_out_item<T>(
     use crate::fan_out::{FanOutItem, StoredResult};
     match slot {
         Err(error) => Ok(FanOutItem::Failed(error)),
-        Ok(value) => StoredResult::from_value(&value)
+        Ok(value) => StoredResult::from_recorded_value(&value)
             .filter(|_| writer)
             .map_or_else(
                 || decode(value).map(FanOutItem::Value),

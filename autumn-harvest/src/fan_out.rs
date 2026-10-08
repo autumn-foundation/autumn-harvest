@@ -11,23 +11,30 @@ use crate::error::{HarvestError, HarvestResult};
 
 /// The task-row header that asks the worker to write the result (issue #1986).
 ///
-/// The fan-out sets it on each row through `context_headers`. The activity
-/// handler can see it in `ActivityContext::headers`.
+/// Only the engine sets it, on each row of a fan-out with the result writer.
+/// The engine removes a copy that a caller supplies. An activity handler can
+/// read it through `ActivityContext::headers`.
 pub const RESULT_WRITER_HEADER: &str = "x-harvest-result-writer";
 
 /// The discriminator key of a recorded [`StoredResult`].
+///
+/// The key is reserved. In a writer fan-out, a worker without a store fails
+/// an activity whose result carries it. An older worker records such a
+/// result as is, and the fan-out then reads it as a reference.
 pub const STORED_RESULT_KEY: &str = "_harvest_stored_result";
 
 /// How many item failures a fan-out tolerates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureTolerance {
-    /// No failure is tolerated.
+    /// The fan-out tolerates no failure.
     #[default]
     None,
-    /// Up to this many items can fail.
+    /// Up to this many items can fail. A count over the item count tolerates
+    /// every failure.
     Count(usize),
-    /// Up to this percent of the items can fail.
+    /// Up to this percent of the items can fail, rounded down. A value over
+    /// 100 counts as 100.
     Percent(u8),
 }
 
@@ -45,7 +52,7 @@ impl FailureTolerance {
 }
 
 /// Options for a fan-out.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FanOutOptions {
     max_in_flight: Option<usize>,
     tolerance: FailureTolerance,
@@ -59,30 +66,34 @@ impl FanOutOptions {
         Self::default()
     }
 
-    /// Limit the items in flight at a time.
+    /// Limit the items in flight at a time. A value of 0 counts as 1.
     #[must_use]
-    pub const fn max_in_flight(mut self, max_in_flight: usize) -> Self {
+    pub const fn with_max_in_flight(mut self, max_in_flight: usize) -> Self {
         self.max_in_flight = Some(max_in_flight);
         self
     }
 
     /// Tolerate item failures up to `tolerance`.
     #[must_use]
-    pub const fn tolerate(mut self, tolerance: FailureTolerance) -> Self {
+    pub const fn with_tolerance(mut self, tolerance: FailureTolerance) -> Self {
         self.tolerance = tolerance;
         self
     }
 
     /// Write each item result through the `PayloadStore`.
+    ///
+    /// The workflow worker needs a store, or a fresh dispatch fails with
+    /// `HarvestError::Config`. An activity worker without a store records the
+    /// value inline.
     #[must_use]
-    pub const fn write_results(mut self) -> Self {
-        self.result_writer = true;
+    pub const fn with_result_writer(mut self, result_writer: bool) -> Self {
+        self.result_writer = result_writer;
         self
     }
 
     /// The window, if one is set.
     #[must_use]
-    pub const fn window(&self) -> Option<usize> {
+    pub const fn max_in_flight(&self) -> Option<usize> {
         self.max_in_flight
     }
 
@@ -94,12 +105,15 @@ impl FanOutOptions {
 
     /// Whether the worker writes each result through the `PayloadStore`.
     #[must_use]
-    pub const fn writes_results(&self) -> bool {
+    pub const fn result_writer(&self) -> bool {
         self.result_writer
     }
 }
 
 /// A reference to one item result in the `PayloadStore`.
+///
+/// The serde form of this type is for a manifest. History records another
+/// form, through [`to_recorded_value`](Self::to_recorded_value).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredResult {
     /// The store that holds the blob.
@@ -110,6 +124,16 @@ pub struct StoredResult {
     pub len: u64,
     /// The hex SHA-256 of the blob.
     pub checksum: String,
+}
+
+/// The blob that the worker writes for one result.
+///
+/// The activity id makes each blob unique. So two runs never share a key,
+/// and retention can delete a blob without a race on a shared key.
+#[derive(Serialize, Deserialize)]
+struct ResultBlob {
+    activity_id: String,
+    result: Value,
 }
 
 impl StoredResult {
@@ -131,7 +155,7 @@ impl StoredResult {
 
     /// The form that `ActivityCompleted.output` records.
     #[must_use]
-    pub fn to_value(&self) -> Value {
+    pub fn to_recorded_value(&self) -> Value {
         serde_json::json!({
             STORED_RESULT_KEY: 1,
             "store_id": self.store_id,
@@ -143,10 +167,10 @@ impl StoredResult {
 
     /// Parse the form that `ActivityCompleted.output` records.
     ///
-    /// Returns `None` when `value` does not carry [`STORED_RESULT_KEY`] or a
-    /// field is missing.
+    /// This form differs from the serde form. Returns `None` when `value` does
+    /// not carry [`STORED_RESULT_KEY`] or a field is missing.
     #[must_use]
-    pub fn from_value(value: &Value) -> Option<Self> {
+    pub fn from_recorded_value(value: &Value) -> Option<Self> {
         let obj = value.as_object()?;
         if obj.get(STORED_RESULT_KEY).and_then(Value::as_i64) != Some(1) {
             return None;
@@ -161,8 +185,10 @@ impl StoredResult {
 
     /// Read the result back from `store` and decode it with `codecs`.
     ///
-    /// Use the codecs that the worker had. The worker encodes the result
-    /// before it writes it.
+    /// Call this from an activity, never from workflow code. Use the store and
+    /// codecs that the worker has. The worker encodes the result before it
+    /// writes it. The reference is not proof of ownership: read only the
+    /// references that your own runs recorded.
     ///
     /// # Errors
     ///
@@ -200,8 +226,8 @@ impl StoredResult {
                 self.key, self.checksum
             )));
         }
-        let encoded: Value = serde_json::from_slice(&bytes)?;
-        codecs.decode_payload(&encoded)
+        let blob: ResultBlob = serde_json::from_slice(&bytes)?;
+        codecs.decode_payload(&blob.result)
     }
 
     /// Encode `value` with `codecs` and write it to `store` (issue #1986).
@@ -213,10 +239,14 @@ impl StoredResult {
     pub(crate) async fn write(
         store: &dyn crate::payload_store::PayloadStore,
         codecs: &crate::payload_codec::PayloadCodecs,
+        activity_id: crate::types::ActivityExecId,
         value: &Value,
     ) -> HarvestResult<Self> {
-        let encoded = codecs.encode_payload(value)?;
-        let bytes = serde_json::to_vec(&encoded)?;
+        let blob = ResultBlob {
+            activity_id: activity_id.to_string(),
+            result: codecs.encode_payload(value)?,
+        };
+        let bytes = serde_json::to_vec(&blob)?;
         let checksum = crate::payload_store::hex_sha256(&bytes);
         let key = store
             .put(&bytes)
@@ -282,7 +312,7 @@ impl<T> FanOutResults<T> {
         self.items.len() - self.failed_count()
     }
 
-    /// The largest number of failures the fan-out tolerated.
+    /// The largest number of failures that the fan-out tolerates.
     #[must_use]
     pub const fn tolerated(&self) -> usize {
         self.tolerated

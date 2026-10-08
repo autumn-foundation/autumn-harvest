@@ -8,15 +8,18 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use autumn_harvest::context::{ActivityContext, WorkflowContext};
 use autumn_harvest::error::HarvestError;
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString as _};
-use autumn_harvest::fan_out::{FailureTolerance, FanOutItem, FanOutOptions, FanOutResults};
+use autumn_harvest::fan_out::{
+    FailureTolerance, FanOutItem, FanOutOptions, FanOutResults, StoredResult,
+};
 use autumn_harvest::info::{ActivityInfo, WorkflowHandlerFn, WorkflowInfo};
-use autumn_harvest::payload_codec::PayloadCodecs;
+use autumn_harvest::payload_codec::{CodecError, PayloadCodec, PayloadCodecs};
 use autumn_harvest::payload_store::{
     PayloadOffloader, PayloadStore, PayloadStoreError, PayloadStoreFuture,
 };
@@ -43,25 +46,18 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
-/// A content-addressed in-memory store.
+/// A content-addressed in-memory store that counts its calls.
 #[derive(Default)]
 struct MemStore {
     blobs: Mutex<HashMap<String, Vec<u8>>>,
+    puts: AtomicUsize,
+    gets: AtomicUsize,
 }
 
 impl MemStore {
-    fn contains(&self, key: &str) -> bool {
-        self.blobs.lock().unwrap().contains_key(key)
+    fn blob(&self, key: &str) -> Option<Vec<u8>> {
+        self.blobs.lock().unwrap().get(key).cloned()
     }
-}
-
-/// One store for every worker in this file.
-///
-/// The tests share the `default` queue, so a worker can run another test's
-/// activity. A shared store keeps each blob where its test looks for it.
-fn shared_store() -> Arc<MemStore> {
-    static STORE: std::sync::OnceLock<Arc<MemStore>> = std::sync::OnceLock::new();
-    Arc::clone(STORE.get_or_init(|| Arc::new(MemStore::default())))
 }
 
 impl PayloadStore for MemStore {
@@ -70,6 +66,7 @@ impl PayloadStore for MemStore {
     }
 
     fn put(&self, bytes: &[u8]) -> PayloadStoreFuture<'_, String> {
+        self.puts.fetch_add(1, Ordering::SeqCst);
         let key = hex(&Sha256::digest(bytes));
         self.blobs
             .lock()
@@ -79,7 +76,8 @@ impl PayloadStore for MemStore {
     }
 
     fn get(&self, key: &str) -> PayloadStoreFuture<'_, Vec<u8>> {
-        let found = self.blobs.lock().unwrap().get(key).cloned();
+        self.gets.fetch_add(1, Ordering::SeqCst);
+        let found = self.blob(key);
         let key = key.to_string();
         Box::pin(async move { found.ok_or_else(|| PayloadStoreError(format!("missing {key}"))) })
     }
@@ -88,6 +86,29 @@ impl PayloadStore for MemStore {
         self.blobs.lock().unwrap().remove(key);
         Box::pin(async move { Ok(()) })
     }
+}
+
+/// A test cipher: XOR with one byte. It makes the stored bytes differ from
+/// the plaintext, which is all the codec check needs.
+#[derive(Debug)]
+struct XorCodec(u8);
+
+impl PayloadCodec for XorCodec {
+    fn codec_id(&self) -> &'static str {
+        "xor"
+    }
+    fn encode(&self, raw: &[u8]) -> Result<Vec<u8>, CodecError> {
+        Ok(raw.iter().map(|b| b ^ self.0).collect())
+    }
+    fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, CodecError> {
+        Ok(encoded.iter().map(|b| b ^ self.0).collect())
+    }
+}
+
+fn xor_codecs() -> PayloadCodecs {
+    let mut codecs = PayloadCodecs::default();
+    codecs.set_default(Arc::new(XorCodec(0x5a)));
+    codecs
 }
 
 /// Item `i` returns a string of `size` bytes that starts with `i:`.
@@ -137,12 +158,13 @@ fn fan_out_workflow<'a>(
                 ("make_blob".to_string(), item, "default".to_string())
             })
             .collect();
-        let mut options = FanOutOptions::new().max_in_flight(50);
+        let window = usize::try_from(input["w"].as_u64().unwrap_or(50)).unwrap_or(50);
+        let mut options = FanOutOptions::new().with_max_in_flight(window);
         if input["writer"].as_bool() == Some(true) {
-            options = options.write_results();
+            options = options.with_result_writer(true);
         }
         if let Some(k) = input["count"].as_u64() {
-            options = options.tolerate(FailureTolerance::Count(usize::try_from(k).unwrap()));
+            options = options.with_tolerance(FailureTolerance::Count(usize::try_from(k).unwrap()));
         }
         let results = match ctx
             .execute_activity_fan_out_raw_with(activities, &options)
@@ -221,7 +243,8 @@ fn registry(store: Arc<MemStore>) -> Arc<HandlerRegistry> {
     let offloader = PayloadOffloader::new(store, 1024 * 1024, Arc::new(NoOpMetrics));
     Arc::new(
         HandlerRegistry::new(vec![workflow], vec![activity])
-            .with_payload_offloader(Some(Arc::new(offloader))),
+            .with_payload_offloader(Some(Arc::new(offloader)))
+            .with_payload_codecs(xor_codecs()),
     )
 }
 
@@ -269,77 +292,88 @@ async fn run_fan_out(
     (exec_id, execution)
 }
 
-/// Done when #2: with a result writer, the history bytes per item do not
-/// depend on the width or on the result size.
-///
-/// Each item still records its activity events. Those have a fixed size. The
-/// result bytes go to the store, so a wider fan-out adds only that fixed size
-/// per item.
+/// Bytes per event of one type, and the number of such events.
+async fn per_event(conn: &mut AsyncPgConnection, exec_id: ExecutionId, kind: &str) -> (i64, i64) {
+    let history = store::load_history_with_codecs(conn, exec_id, &xor_codecs())
+        .await
+        .expect("load history");
+    let n = history
+        .events
+        .iter()
+        .filter(|e| e.type_name() == kind)
+        .count();
+    let n = i64::try_from(n).unwrap();
+    (history_bytes(conn, exec_id, kind).await / n.max(1), n)
+}
+
+fn stored_items(execution: &autumn_harvest::models::WorkflowExecution) -> Value {
+    execution.output.as_ref().unwrap()["stored"].clone()
+}
+
+/// Every scenario runs on one worker, one after another. The tests share the
+/// `default` queue, so a second worker with other codecs could take these
+/// rows. The worker encrypts every payload with a test codec.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::too_many_lines)]
-async fn result_writer_keeps_history_bytes_per_item_fixed() {
+async fn fan_out_options_on_a_real_worker() {
     let (database_url, _container) = setup_test_database_url_or_env().await;
     let mut conn = AsyncPgConnection::establish(&database_url)
         .await
         .expect("connect");
-    let store = shared_store();
-    let worker = build_runtime_worker("worker-fan-out-writer", 4, 50, registry(Arc::clone(&store)));
+    let store = Arc::new(MemStore::default());
+    let worker = build_runtime_worker(
+        "worker-fan-out-options",
+        4,
+        50,
+        registry(Arc::clone(&store)),
+    );
     let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&database_url));
+    let db = database_url.as_str();
 
+    // ── Done when #2: the result writer keeps bytes per item fixed ──────────
     let (narrow, narrow_run) = run_fan_out(
-        &database_url,
+        db,
         &mut conn,
-        "writer-narrow",
+        "narrow",
         json!({ "n": 20, "size": 1024, "writer": true }),
         "COMPLETED",
     )
     .await;
     let (wide, wide_run) = run_fan_out(
-        &database_url,
+        db,
         &mut conn,
-        "writer-wide",
+        "wide",
         json!({ "n": 400, "size": 1024, "writer": true }),
         "COMPLETED",
     )
     .await;
     let (large, _) = run_fan_out(
-        &database_url,
+        db,
         &mut conn,
-        "writer-large-results",
+        "large",
         json!({ "n": 20, "size": 65536, "writer": true }),
         "COMPLETED",
     )
     .await;
     let (plain, _) = run_fan_out(
-        &database_url,
+        db,
         &mut conn,
-        "plain-large-results",
+        "plain",
         json!({ "n": 20, "size": 65536 }),
         "COMPLETED",
     )
     .await;
+    assert_eq!(stored_items(&narrow_run), json!(20));
+    assert_eq!(stored_items(&wide_run), json!(400));
 
-    assert_eq!(narrow_run.output.as_ref().unwrap()["stored"], json!(20));
-    assert_eq!(wide_run.output.as_ref().unwrap()["stored"], json!(400));
-
-    // Result bytes per item are fixed: the same for 20 or 400 items, and for
-    // 1 KiB or 64 KiB results.
-    let per_item = |total: i64, n: i64| total / n;
-    let narrow_item = per_item(
-        history_bytes(&mut conn, narrow, "ActivityCompleted").await,
-        20,
-    );
-    let wide_item = per_item(
-        history_bytes(&mut conn, wide, "ActivityCompleted").await,
-        400,
-    );
-    let large_item = per_item(
-        history_bytes(&mut conn, large, "ActivityCompleted").await,
-        20,
-    );
-    let plain_item = per_item(
-        history_bytes(&mut conn, plain, "ActivityCompleted").await,
-        20,
+    let (narrow_item, narrow_n) = per_event(&mut conn, narrow, "ActivityCompleted").await;
+    let (wide_item, wide_n) = per_event(&mut conn, wide, "ActivityCompleted").await;
+    let (large_item, large_n) = per_event(&mut conn, large, "ActivityCompleted").await;
+    let (plain_item, _) = per_event(&mut conn, plain, "ActivityCompleted").await;
+    assert_eq!(
+        (narrow_n, wide_n, large_n),
+        (20, 400, 20),
+        "one completion per item"
     );
     assert!(
         narrow_item <= 512,
@@ -357,69 +391,114 @@ async fn result_writer_keeps_history_bytes_per_item_fixed() {
         plain_item > 10 * large_item,
         "the control run keeps results inline: {plain_item} vs {large_item}"
     );
-
-    // The whole history grows by a fixed amount per item.
-    let narrow_total = history_bytes(&mut conn, narrow, "").await;
-    let wide_total = history_bytes(&mut conn, wide, "").await;
-    let large_total = history_bytes(&mut conn, large, "").await;
-    let marginal = (wide_total - narrow_total) / 380;
+    // The other event types do not depend on the result either.
+    for kind in ["ActivityScheduled", "ActivityStarted"] {
+        let (n_bytes, _) = per_event(&mut conn, narrow, kind).await;
+        let (w_bytes, _) = per_event(&mut conn, wide, kind).await;
+        let (l_bytes, _) = per_event(&mut conn, large, kind).await;
+        assert!(
+            (n_bytes - w_bytes).abs() <= 8 && (n_bytes - l_bytes).abs() <= 8,
+            "{kind} bytes per item: {n_bytes}, {w_bytes}, {l_bytes}"
+        );
+    }
+    let marginal = (history_bytes(&mut conn, wide, "").await
+        - history_bytes(&mut conn, narrow, "").await)
+        / 380;
     assert!(
-        marginal <= 2048,
-        "each added item costs a fixed {marginal} bytes, not its result"
+        marginal <= 1024,
+        "each added item costs a fixed {marginal} bytes"
     );
-    assert!(
-        (large_total - narrow_total).abs() <= 20 * 16,
-        "64 KiB results must not grow history: {large_total} vs {narrow_total}"
+    eprintln!(
+        "bytes per completed item: 20 x 1 KiB = {narrow_item}, 400 x 1 KiB = {wide_item}, \
+         20 x 64 KiB = {large_item}, inline 20 x 64 KiB = {plain_item}; \
+         whole history per added item = {marginal}"
     );
 
-    // Each result is one blob with a GC reference, and it reads back.
+    // One blob and one reference row per item. Replay fetched no blob.
     let refs = store::load_payload_refs(&mut conn, wide).await.unwrap();
     assert_eq!(refs.len(), 400, "each blob has a harvest_payload_refs row");
-    assert!(
-        refs.iter().all(|r| store.contains(&r.blob_key)),
-        "each reference names a blob in the store"
+    assert!(refs.iter().all(|r| store.blob(&r.blob_key).is_some()));
+    assert_eq!(
+        AtomicUsize::load(&store.puts, Ordering::SeqCst),
+        440,
+        "one upload per stored item"
     );
+    assert_eq!(
+        AtomicUsize::load(&store.gets, Ordering::SeqCst),
+        0,
+        "replay reads no blob"
+    );
+
+    // ── Codec: the blob holds ciphertext, and `fetch` decodes it ───────────
     let first: FanOutItem<Value> =
-        serde_json::from_value(wide_run.output.unwrap()["first"].clone()).unwrap();
+        serde_json::from_value(wide_run.output.clone().unwrap()["first"].clone()).unwrap();
     let FanOutItem::Stored(stored) = first else {
         panic!("expected a stored item, got {first:?}");
     };
-    let value = stored
+    let value = stored.fetch(store.as_ref(), &xor_codecs()).await.unwrap();
+    let text = value.as_str().unwrap().to_string();
+    assert_eq!(text.len(), 1024);
+    assert!(text.starts_with("0:"));
+    let raw = store.blob(&stored.key).unwrap();
+    assert!(
+        !raw.windows(64).any(|w| w == &text.as_bytes()[2..66]),
+        "the blob must not hold the plaintext"
+    );
+    let plain_codecs = stored
         .fetch(store.as_ref(), &PayloadCodecs::default())
-        .await
-        .unwrap();
-    assert_eq!(value.as_str().unwrap().len(), 1024);
-    assert!(value.as_str().unwrap().starts_with("0:"));
+        .await;
+    assert!(
+        plain_codecs.map_or(true, |v| v != value),
+        "default codecs must not decode it"
+    );
 
-    worker.shutdown();
-    handle.await.expect("worker joins");
-}
+    // ── `fetch` rejects a reference whose blob does not match ──────────────
+    let tampered = StoredResult {
+        len: stored.len + 1,
+        ..stored.clone()
+    };
+    assert!(tampered.fetch(store.as_ref(), &xor_codecs()).await.is_err());
 
-/// Done when #1 against a real worker: a tolerance of 1 completes with one
-/// failure and fails with two.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn tolerance_completes_at_n_and_fails_at_n_plus_one_on_a_worker() {
-    let (database_url, _container) = setup_test_database_url_or_env().await;
-    let mut conn = AsyncPgConnection::establish(&database_url)
-        .await
-        .expect("connect");
-    let worker = build_runtime_worker("worker-fan-out-tolerance", 4, 50, registry(shared_store()));
-    let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&database_url));
-
-    let (_, within) = run_fan_out(
-        &database_url,
+    // ── Writer, window and tolerance together ───────────────────────────────
+    let puts_before = AtomicUsize::load(&store.puts, Ordering::SeqCst);
+    let (mixed, mixed_run) = run_fan_out(
+        db,
         &mut conn,
-        "tolerance-within",
+        "mixed",
+        json!({ "n": 60, "w": 10, "size": 64, "writer": true, "count": 2, "fail": [3, 41] }),
+        "COMPLETED",
+    )
+    .await;
+    let output = mixed_run.output.unwrap();
+    assert_eq!(output["stored"], json!(58));
+    assert_eq!(output["failed"], json!(2));
+    assert_eq!(
+        store::load_payload_refs(&mut conn, mixed)
+            .await
+            .unwrap()
+            .len(),
+        58
+    );
+    assert_eq!(
+        AtomicUsize::load(&store.puts, Ordering::SeqCst) - puts_before,
+        58,
+        "no blob for a failed item"
+    );
+
+    // ── Done when #1 on a worker: N completes, N+1 fails ────────────────────
+    let (_, within) = run_fan_out(
+        db,
+        &mut conn,
+        "within",
         json!({ "n": 5, "size": 8, "count": 1, "fail": [3] }),
         "COMPLETED",
     )
     .await;
     assert_eq!(within.output.unwrap()["failed"], json!(1));
-
     let (_, beyond) = run_fan_out(
-        &database_url,
+        db,
         &mut conn,
-        "tolerance-beyond",
+        "beyond",
         json!({ "n": 5, "size": 8, "count": 1, "fail": [1, 3] }),
         "FAILED",
     )
@@ -443,6 +522,7 @@ fn manifest_round_trips_through_json() {
     }))
     .unwrap();
     assert_eq!(results.failed_count(), 1);
+    assert_eq!(results.tolerated(), 1);
     assert_eq!(
         serde_json::to_value(&results).unwrap()["tolerated"],
         json!(1)

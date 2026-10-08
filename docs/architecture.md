@@ -1017,41 +1017,72 @@ manifest. It holds one `FanOutItem` per input, in input order: `Value`,
 step.
 
 ```rust
-use autumn_harvest::fan_out::{FailureTolerance, FanOutOptions};
+use autumn_harvest::fan_out::{FailureTolerance, FanOutItem, FanOutOptions, FanOutResults};
 
 let options = FanOutOptions::new()
-    .max_in_flight(50)
-    .tolerate(FailureTolerance::Percent(5))
-    .write_results();
-let manifest = ctx
-    .execute_activity_fan_out_with::<_, ItemResult>(&process_item_info(), items, &options)
+    .with_max_in_flight(50)
+    .with_tolerance(FailureTolerance::Percent(5))
+    .with_result_writer(true);
+let manifest: FanOutResults<ItemResult> = ctx
+    .execute_activity_fan_out_with(&process_item_info(), items, &options)
     .await
     .map_err(|e| e.to_string())?;
+for item in manifest.items() {
+    match item {
+        FanOutItem::Value(result) => { /* an inline result */ }
+        FanOutItem::Stored(reference) => { /* an activity reads it with `fetch` */ }
+        FanOutItem::Failed(error) => { /* a tolerated failure */ }
+    }
+}
 ```
 
 - **Failure tolerance.** `FailureTolerance::Count(n)` tolerates `n` failed
-  items. `Percent(p)` tolerates `total * p / 100`, rounded down. The default
-  tolerates none. One failure more fails the fan-out with
-  `HarvestError::FanOutFailureThresholdExceeded { tolerated, total }`. A
-  windowed fan-out then dispatches no further wave. Only `ActivityFailed` and
-  `Timeout` count. Other errors abort, as in the collect-all helpers.
-- **Replay.** The tolerance is not recorded. Each wave polls every slot
-  before it decides, so a workflow can catch the error and go on (issue
-  #1791). The error carries no failure count, because a replay can see more
-  results. Change a tolerance for in-flight runs behind `ctx.version()`.
-- **Result writer.** `write_results()` sets the row header
-  `x-harvest-result-writer`. The worker encodes the result with the payload
-  codecs and writes it through the `PayloadStore`. `ActivityCompleted.output`
-  then holds a fixed-size `StoredResult`. Replay fetches no blob.
-  `StoredResult::fetch` reads one back. A fresh dispatch without a store fails
-  with `HarvestError::Config`. A worker without a store records the value
-  inline, and the item is a `Value`.
+  items. `Percent(p)` tolerates `total * p / 100`, rounded down. A `p` over
+  100 counts as 100. The default tolerates none. One more failure fails the
+  fan-out with `HarvestError::FanOutFailureThresholdExceeded { tolerated,
+  total }`. A windowed fan-out then dispatches no further wave. Only
+  `ActivityFailed` and `Timeout` count. Other errors abort, as in the
+  collect-all helpers.
+- **Replay.** History does not record the tolerance. Each wave polls every
+  slot before it decides, so a workflow can catch the error and go on (issue
+  #1791). A fan-out that stops records `fan_out_stop:{n}` with the number of
+  slots it dispatched. Replay reads it ahead, so the fan-out never takes an
+  activity that the workflow scheduled after the stop. The stop also consumes
+  the start events of slots that still run. The error carries no failure
+  count, because a replay can see more results. Change a tolerance for
+  in-flight runs behind `ctx.version()`.
+- **Result writer.** `with_result_writer(true)` sets the row header
+  `x-harvest-result-writer`. Only the engine sets it; it removes a copy that a
+  caller supplies. The worker encodes the result with the payload codecs and
+  writes it through the `PayloadStore` once, before it takes any lock. The
+  blob holds the activity id, so two runs never share a key.
+  `ActivityCompleted.output` then holds a small `StoredResult`, and the
+  completion transaction adds its `harvest_payload_refs` row. Replay fetches
+  no blob.
+- **Reading a result.** `StoredResult::fetch` reads one back. Call it from an
+  activity, never from workflow code. Pass it the store and codecs that the
+  worker has. The reference is not proof of ownership: read only the
+  references that your own runs recorded.
+- **No store.** A fresh dispatch fails with `HarvestError::Config` when the
+  workflow worker has no store. An activity worker without a store records the
+  value inline, and the item is a `Value`. It fails an activity whose result
+  carries the reserved key `_harvest_stored_result`. An older worker records
+  such a result as is. A transactional activity (`run_transactional`) also
+  records its result inline.
+- **Result cap.** With a store, the result cap (issue #252) does not apply to
+  a writer row. Every result goes to the store.
 - **History size.** Each item still records its activity events. With the
   writer, their size does not depend on the result. So history grows by a
   fixed amount per item, not by the result size. A map run with an item
-  reader would remove the per-item events too. It is not built.
-- **Retention.** Each blob has a `harvest_payload_refs` row. Retention deletes
-  the blob when it purges the run. Read the results before then.
+  reader would remove the per-item events too. Harvest does not have it yet.
+- **Lifetime.** Retention deletes a blob when it purges the run that wrote
+  it. A manifest passed to another run (a child, or a continue-as-new
+  successor) is valid only while the writing run exists. Read or copy the
+  results before then.
+- **Known gaps.** PII erasure replaces the reference but leaves the blob in
+  the store until retention purges the run. The codec rotation sweep does
+  not re-encrypt blobs, so keep a retired key decode-only while its blobs
+  remain. Both gaps exist for offloaded payloads (issue #524) too.
 
 ### External Workflow Family — signal / cancel / await
 
