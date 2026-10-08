@@ -760,20 +760,38 @@ by its stable `(workflow_name, workflow_id)` business key instead of its
 [ADR 0006](./adr/0006-keyed-entity.md) records the design. An entity adds no
 route and no table.
 
-- **An operation is a signal-with-start.** A caller sends it through
-  `POST /workflows/{name}/signal-with-start`. The route keeps its own
-  authentication and admin rules. A caller who may use that route for an
-  entity type may create an entity under any key. That caller may also send
-  any operation to it, a delete included.
-- **A read is a query.** A caller reads the state through
-  `GET /workflows/by-id/{name}/{key}/query/harvest.entity.state`. The query
-  route keeps its own rules.
+- **Any signal route sends an operation.** Signal-with-start, the signal
+  routes by execution id and by business id, and batch signal jobs all reach
+  the entity. Each route keeps its own authentication. A caller who may use
+  one of them for an entity type may create an entity under any key. That
+  caller may also send any operation to it, a delete included. Cancel,
+  terminate and reset end or rewind an entity like any workflow.
+- **The start input is trusted.** Signal-with-start passes `start_input` to a
+  new run as its checkpoint. A caller can set the first state and pending
+  operations that way. Validate state in the handler if callers are not
+  trusted.
+- **Reads are not admin-gated.** The by-id query route
+  `GET /workflows/by-id/{name}/{key}/query/harvest.entity.state` returns the
+  full state. It is a read route like `GET /workflows/{id}`, and it is not
+  audited. Outside the `dev` profile, mount the API behind your own auth, for
+  example `api_with_auth`. A key is guessable.
+- **The authorizer hook sees the path, not the body.** It can check the key
+  on the by-id query and signal routes. On signal-with-start the key is in
+  the body, so the hook cannot see it. To confine a caller to its own keys,
+  deny signal-with-start in the hook and send ops through the by-id signal
+  route. Or check the body in your own middleware.
 - **The key is a business id, not a secret.** A key appears in requests,
-  audit rows and logs. Do not put a secret or a customer name in it. To
-  confine a caller to its own keys, install an
-  [authorizer hook](#authorizer-hook-issue-1803) that checks the key.
-- **Operations are history.** Each operation is a `SignalReceived` payload.
-  The payload codec, retention and erasure apply to it as to any signal.
+  audit rows and logs. Do not put a secret or a customer name in it.
+- **State is stored in clear unless you encrypt it.** Each operation is a
+  `SignalReceived` payload. Each checkpoint writes the full state to the
+  continue-as-new event and to the `input` column of the next run. The
+  payload codec covers event payloads. Encrypt sensitive state in the
+  handler if a column must not hold it in clear.
+- **Erasure is per run.** Erasure acts on one terminal run. It does not walk
+  the continue-as-new chain, and it cannot act on a live entity. A delete
+  operation erases nothing.
+- **`harvest.entity.stats` shows `last_error`.** A decode error can quote
+  part of the bad payload.
 
 ---
 

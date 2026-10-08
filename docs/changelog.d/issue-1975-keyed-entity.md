@@ -5,39 +5,49 @@ or an Azure durable entity. [ADR 0006](../adr/0006-keyed-entity.md) records
 the design and the priority call: P1 for this library layer, rank 13 for a
 native primitive.
 
-**Shape.** A `#[workflow]` calls `Entity::new(ctx, checkpoint).run(handler)`.
-The key is the `workflow_id`. An operation is an `EntityMessage` on the
-`harvest.entity.op` signal, sent with signal-with-start (the generated
-`<Name>Stub::signal_with_start`, or the HTTP route). The queries
-`harvest.entity.state` and `harvest.entity.status` read the committed state
-and the counters.
+**Shape.** A root `#[workflow]` calls
+`Entity::new(ctx, checkpoint).run(handler)`. The key is the `workflow_id`. An
+operation is an `EntityMessage` on the `harvest.entity.op` signal, sent with
+signal-with-start (the generated `<Name>Stub::signal_with_start`, or the HTTP
+route). The queries `harvest.entity.state` and `harvest.entity.stats` read
+the committed state and the counters. A start input of `{}` or `null` starts
+a new entity.
 
 **Guarantees.**
 
 - One handler at a time for each key. One active run exists for each
   `(workflow_name, workflow_id)`, and the loop awaits each handler.
 - State survives a worker crash. Replay rebuilds it.
-- An operation is atomic. A handler gets a copy of the state, and only `Ok`
-  replaces it. An `Err` or an undecodable message counts as failed, and the
-  entity goes on.
-- No operation is lost at a checkpoint. The loop drains waiting op signals
-  into the continue-as-new input.
-- A checkpoint is replay-stable. The loop records each
-  `should_continue_as_new()` answer as a side effect. A hand-written loop
-  over that call can diverge on replay, because it reads the loaded history
-  size. `max_ops_per_run(n)` adds a fixed bound with no event.
-- A delete completes the run only when no operation waits.
+- State changes are atomic. A handler gets a copy of the state, and only
+  `Ok` replaces it. An `Err` or an undecodable message counts as failed, and
+  the entity goes on.
+- No operation is lost at a checkpoint. The loop carries waiting op signals
+  in the continue-as-new input while it fits the workflow input cap. An op
+  that does not fit runs first.
+- A checkpoint is replay-stable. The loop records each decision as a side
+  effect. A hand-written loop over `should_continue_as_new()` can diverge on
+  replay, because it reads the loaded history size. The decision also counts
+  this run's own ops and op bytes, so a backlog in one task still
+  checkpoints. `max_ops_per_run(n)` adds a fixed bound with no event.
+- A delete completes the run only when no operation waits in history.
+
+**Limits.** See the ADR consequences: the delete race, the state size cap,
+root workflows only, replay-bound settings, no `execution_timeout`, and a
+trusted start input.
 
 **Invariants.** No new `WorkflowEvent` variant, no migration and no new
-route. Each operation adds one `SideEffectRecorded` event.
+route. Each operation adds one `SideEffectRecorded` event, or two with an
+`execution_timeout`. Two crate-private `WorkflowContext` accessors feed the
+checkpoint decision.
 
 **Tests.**
 
-- `entity::tests` (13): serialization, rollback, decode errors, delete,
-  checkpoint carry, recorded-decision replay, replay stability against a
-  naive loop, and queries.
-- `tests/integration/entity_tests.rs` (Postgres):
-  `entity_state_survives_a_worker_crash_in_the_middle_of_an_op` and
-  `entity_ops_survive_history_checkpoints`.
+- `entity::tests` (19): serialization, rollback, decode errors, delete,
+  checkpoint carry, the input-cap budget, recorded-decision replay, replay
+  stability against a naive loop, the deadline probe, cancellation, bad
+  input and queries.
+- `tests/integration/entity_tests.rs` (Postgres): a worker crash in the
+  middle of an op, with a later op held back; two clients racing on a new
+  key; thirty ops across live history checkpoints, with a duplicate key.
 - `examples/agent_session_entity.rs`: an agent session entity with its own
-  tests.
+  tests, now run in CI.

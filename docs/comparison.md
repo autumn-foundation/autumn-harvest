@@ -302,8 +302,9 @@ where one exists.
   gives each key one handler at a time and durable state
   ([ADR 0006](adr/0006-keyed-entity.md),
   [#1975](https://github.com/autumn-foundation/autumn-harvest/issues/1975)). An
-  operation has no reply, so a caller reads state with a query. Restate virtual
-  objects and Azure durable entities return a result from each call.
+  operation has no reply, so a caller reads state with a query. A Restate
+  virtual object call returns a result. An Azure durable entity call made from
+  an orchestration also returns one.
 - **No cross-engine benchmark on equal hardware.** harvest now publishes its
   own reproducible end-to-end numbers and the harness that produces them
   ([`benchmarks.md`](benchmarks.md),

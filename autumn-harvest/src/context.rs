@@ -3980,6 +3980,23 @@ impl WorkflowContext {
         matches!(self.payload_offload_threshold, Some(t) if observed > t)
     }
 
+    /// The history policy this run runs under.
+    pub(crate) const fn history_policy(&self) -> WorkflowHistoryPolicy {
+        self.history_policy
+    }
+
+    /// The largest same-type continue-as-new input this run can write inline.
+    ///
+    /// Returns `None` when no cap applies: the cap is `0`, or payload offload
+    /// is on. The entity loop uses it to size a checkpoint (issue #1975).
+    pub(crate) const fn continue_as_new_input_budget(&self) -> Option<u64> {
+        if self.payload_max_workflow_input == 0 || self.payload_offload_threshold.is_some() {
+            None
+        } else {
+            Some(self.payload_max_workflow_input)
+        }
+    }
+
     /// Add or replace a per-activity input cap override.
     ///
     /// The effective cap is `max(global, override)` — overrides can only raise,

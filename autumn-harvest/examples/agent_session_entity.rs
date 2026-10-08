@@ -10,9 +10,13 @@
 //! - Two messages to one session never run at the same time. The second
 //!   message waits until the first reply is in the transcript.
 //! - A worker crash loses no turn. Replay rebuilds the transcript, and a
-//!   recorded model reply is not bought again.
-//! - A long session does not grow its history without a bound. The loop
-//!   takes a checkpoint and carries the transcript forward.
+//!   recorded model reply is not requested again.
+//! - The history of a long session has a bound. The loop takes a checkpoint
+//!   and carries the transcript forward. The transcript itself has no bound,
+//!   and it must fit the workflow input cap. A real session trims or
+//!   summarizes old turns.
+//! - The model sees the last [`CONTEXT_TURNS`] turns only, so the activity
+//!   input has a bound too.
 //!
 //! ## Send a message
 //!
@@ -32,6 +36,7 @@
 //!
 //! ```console
 //! $ curl -X POST $HARVEST/workflows/agent_session/signal-with-start \
+//!     -H 'content-type: application/json' \
 //!     -d '{"workflow_id":"session-42","start_input":{},
 //!          "signal_name":"harvest.entity.op",
 //!          "signal_payload":{"kind":"op","op":{"user_message":{"text":"hi"}}},
@@ -72,6 +77,9 @@ pub enum SessionOp {
     Clear,
 }
 
+/// The number of recent turns the model sees.
+pub const CONTEXT_TURNS: usize = 20;
+
 /// One model call. A real build calls the Messages API here.
 ///
 /// The stub answers from the transcript only, so the example needs no key.
@@ -95,8 +103,9 @@ async fn agent_session(
                         role: "user".into(),
                         text,
                     });
+                    let start = session.turns.len().saturating_sub(CONTEXT_TURNS);
                     let reply: String = ctx
-                        .execute_activity(&agent_reply_info(), session.turns.clone())
+                        .execute_activity(&agent_reply_info(), session.turns[start..].to_vec())
                         .await
                         .map_err(|e| e.to_string())?;
                     session.turns.push(Turn {
@@ -194,13 +203,15 @@ mod tests {
         );
     }
 
-    /// A crash is a replay of the recorded history. The replay buys no new
-    /// model call and rebuilds the same transcript.
+    /// A crash is a replay of the recorded history. The replay reads the
+    /// recorded replies and reaches the same commands.
     #[tokio::test]
     async fn a_replay_after_a_crash_rebuilds_the_session() {
         let outcome = env(&[say("one"), say("two"), end()])
             .run(agent_session_info().handler, json!({}))
             .await;
+        let session = outcome.result.clone().expect("session ends at the delete");
+        assert_eq!(turns(&session).len(), 4);
         let report = WorkflowReplayer::new()
             .register(vec![agent_session_info()])
             .replay_from_events(outcome.events().to_vec())
@@ -209,5 +220,27 @@ mod tests {
             matches!(report.status, ReplayStatus::ReplaySucceeded),
             "{report}"
         );
+    }
+
+    /// The model sees a bounded window of the transcript.
+    #[tokio::test]
+    async fn the_model_sees_a_bounded_window() {
+        let messages: Vec<Value> = (0..12)
+            .map(|n| say(&format!("m{n}")))
+            .chain([end()])
+            .collect();
+        let outcome = env(&messages)
+            .run(agent_session_info().handler, json!({}))
+            .await;
+        assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+        let largest = outcome
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                WorkflowEvent::ActivityScheduled { input, .. } => input.as_array().map(Vec::len),
+                _ => None,
+            })
+            .max();
+        assert_eq!(largest, Some(CONTEXT_TURNS));
     }
 }
