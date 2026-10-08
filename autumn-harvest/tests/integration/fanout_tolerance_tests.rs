@@ -572,8 +572,13 @@ fn started_on_worker(id: ActivityExecId) -> WorkflowEvent {
 
 /// Item 0 failed and item 1 still runs when the fan-out stops.
 fn stop_with_a_slot_in_flight(input: &Value) -> Vec<WorkflowEvent> {
+    stop_with_a_slot_in_flight_ids(input).0
+}
+
+/// [`stop_with_a_slot_in_flight`] and the id of the slot still in flight.
+fn stop_with_a_slot_in_flight_ids(input: &Value) -> (Vec<WorkflowEvent>, ActivityExecId) {
     let (id0, id1) = (ActivityExecId::new(), ActivityExecId::new());
-    vec![
+    let history = vec![
         started(input),
         WorkflowEvent::MarkerRecorded {
             name: "fan_out:1".into(),
@@ -591,7 +596,8 @@ fn stop_with_a_slot_in_flight(input: &Value) -> Vec<WorkflowEvent> {
             non_retryable: true,
             details: None,
         },
-    ]
+    ];
+    (history, id1)
 }
 
 /// A slot still in flight at the stop leaves its start event in history. The
@@ -614,6 +620,39 @@ async fn an_in_flight_slot_does_not_block_the_step_after_the_stop() {
         })
         .collect();
     assert_eq!(next, vec![("item".to_string(), json!(5))]);
+}
+
+/// The stop cancels a slot still in flight, as `ctx.race()` cancels a loser.
+/// So the slot cannot append its result after the workflow ends.
+#[tokio::test]
+async fn the_stop_cancels_a_slot_still_in_flight() {
+    let (history, in_flight) = stop_with_a_slot_in_flight_ids(&json!({ "n": 2 }));
+    let ctx = WorkflowContext::for_replay(ExecutionId::new(), history);
+    let activities: Vec<_> = (0..2u64)
+        .map(|i| ("item".to_string(), json!(i), "default".to_string()))
+        .collect();
+    let result = ctx
+        .execute_activity_fan_out_raw_with(activities, &FanOutOptions::new())
+        .await;
+    assert!(matches!(
+        result,
+        Err(HarvestError::FanOutFailureThresholdExceeded { .. })
+    ));
+    let commands = ctx.drain_commands();
+    let cancelled: Vec<_> = commands
+        .iter()
+        .filter_map(|c| match c {
+            WorkflowCommand::CancelRaceLosers { activities, .. } => Some(activities.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(cancelled, vec![vec![in_flight]], "got {commands:?}");
+    assert!(
+        !commands
+            .iter()
+            .any(|c| matches!(c, WorkflowCommand::WaitForActivity { .. })),
+        "nothing waits on an abandoned slot: {commands:?}"
+    );
 }
 
 /// Strict replay reports any unconsumed event. A run that catches the error

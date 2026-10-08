@@ -119,6 +119,9 @@ fn make_blob<'a>(
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
         let i = input["i"].as_u64().unwrap_or(0);
+        if let Some(ms) = input["sleep_ms"].as_u64() {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+        }
         if input["fail"].as_bool() == Some(true) {
             return Err(
                 ActivityFailure::non_retryable("Boom", format!("item {i}")).into_error_payload()
@@ -166,6 +169,7 @@ fn fan_out_workflow<'a>(
                     "i": i,
                     "size": input["size"],
                     "fail": failing.contains(&i),
+                    "sleep_ms": input["sleep_ms"][i.to_string()],
                 });
                 let activity = input["activity"].as_str().unwrap_or("make_blob");
                 (activity.to_string(), item, "default".to_string())
@@ -185,6 +189,9 @@ fn fan_out_workflow<'a>(
         {
             Ok(results) => results,
             Err(error @ HarvestError::FanOutFailureThresholdExceeded { .. }) => {
+                if input["catch"].as_bool() == Some(true) {
+                    return Ok(json!({ "caught": error.to_string() }));
+                }
                 return Err(error.to_string());
             }
             Err(error) => return Err(error.to_string()),
@@ -535,6 +542,44 @@ async fn fan_out_options_on_a_real_worker() {
         tx_item <= 512,
         "a transactional reference is small: {tx_item} bytes"
     );
+
+    // ── A caught stop cancels a slot still in flight ────────────────────────
+    let (caught, caught_run) = run_fan_out(
+        db,
+        &mut conn,
+        "caught-stop",
+        json!({ "n": 2, "size": 8, "fail": [0], "sleep_ms": { "1": 3000 }, "catch": true }),
+        "COMPLETED",
+    )
+    .await;
+    assert!(
+        caught_run.output.unwrap()["caught"]
+            .as_str()
+            .unwrap()
+            .contains("more than 0 of 2")
+    );
+    // Wait past the slow item. Its late result must not land after the end.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let history = store::load_history_with_codecs(&mut conn, caught, &xor_codecs())
+        .await
+        .expect("load history");
+    let last = history.events.last().unwrap();
+    assert_eq!(
+        last.type_name(),
+        "WorkflowCompleted",
+        "history must end at the terminal: {last:?}"
+    );
+    let failures = history
+        .events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                autumn_harvest::event::WorkflowEvent::ActivityFailed { .. }
+            )
+        })
+        .count();
+    assert_eq!(failures, 2, "item 0 failed and item 1 was cancelled");
 
     // ── Done when #1 on a worker: N completes, N+1 fails ────────────────────
     let (_, within) = run_fan_out(

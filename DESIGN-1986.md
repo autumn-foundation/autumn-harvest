@@ -56,6 +56,8 @@ Issue #1986 asks for two options on the activity fan-out helpers:
 | R15 | Share a blob key across runs. Retention of one run deletes a blob that another run still needs. | The blob holds the activity id, so each key is unique. |
 | R16 | Read a business value that carries the reserved key as a reference. | A new worker without a store fails such a result. |
 | R17 | Let a transactional activity commit its own result inline, past the writer. | `run_transactional` writes the blob and commits the reference row in its own transaction. |
+| R18 | Leave a slot running after a caught stop. Its result lands after the workflow terminal, and replay reports drift. | The stop cancels the slot, as a race loser. |
+| R19 | Offload a stored reference again under a low threshold. | The completion append skips ordinary offload for a stored result. |
 
 ### 0.4 Six thinking hats
 
@@ -116,8 +118,6 @@ replay with more results makes the same decision. The error carries only
 `tolerated` and `total`. A failure count would change when a replay sees more
 results.
 
-Activities in flight when the failures pass the limit keep running. This is
-the same as the fail-fast helpers.
 
 A fan-out that stops records `fan_out_stop:{n}` with the number of slots it
 dispatched. The marker comes after the slots in history. Replay reads it
@@ -126,7 +126,11 @@ fan-out never takes an activity that the workflow scheduled after the stop,
 even one with the same name and input as the next slot. The stop also
 consumes the start and heartbeat events of the slots that still run, as
 `ctx.race()` does for its losers (issue #1126). It removes their
-`WaitForActivity` commands, because nothing waits on them.
+`WaitForActivity` commands, because nothing waits on them. It cancels them
+with `CancelRaceLosers`: the worker cancels each open task row and records a
+synthetic `ActivityFailed`. Without that, a late result could land after the
+workflow terminal, where replay never consumes it. The synthetic terminal
+reuses the race text, "lost race to a sibling branch".
 
 ### 1.3 Result writer
 

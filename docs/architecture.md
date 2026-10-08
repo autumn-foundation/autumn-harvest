@@ -1048,7 +1048,9 @@ for item in manifest.items() {
   #1791). A fan-out that stops records `fan_out_stop:{n}` with the number of
   slots it dispatched. Replay reads it ahead, so the fan-out never takes an
   activity that the workflow scheduled after the stop. The stop also consumes
-  the start events of slots that still run. The error carries no failure
+  the start events of slots that still run, and cancels those slots as
+  `ctx.race()` cancels its losers. Their synthetic terminal reads "lost race
+  to a sibling branch". The error carries no failure
   count, because a replay can see more results. Change a tolerance for
   in-flight runs behind `ctx.version()`.
 - **Result writer.** `with_result_writer(true)` sets the row header

@@ -13,8 +13,10 @@ Issue #1986 adds two options to the activity fan-out helpers. The new
   - A fan-out that stops records a `fan_out_stop:{n}` marker with the number
     of slots it dispatched. Replay reads it ahead, so the fan-out never takes
     an activity that the workflow scheduled after the stop.
-  - The stop consumes the start events of slots that still run, and removes
-    their waits. So the next step and strict replay stay clean.
+  - The stop consumes the start events of slots that still run, removes
+    their waits and cancels them, as `ctx.race()` cancels its losers. So the
+    next step and strict replay stay clean, and no result arrives after the
+    workflow ends.
 - **Result writer.** `FanOutOptions::with_result_writer(true)` tells the worker
   to write each item result through the `PayloadStore`.
   - The flag rides in the task row's `context_headers` as

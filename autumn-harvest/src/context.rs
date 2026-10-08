@@ -11048,8 +11048,8 @@ impl WorkflowContext {
     /// - **Failure tolerance.** The fan-out completes when at most N items
     ///   fail. It fails with
     ///   [`HarvestError::FanOutFailureThresholdExceeded`] when more fail. A
-    ///   windowed fan-out then dispatches no further wave. Activities already
-    ///   in flight keep running, as with the fail-fast helpers.
+    ///   windowed fan-out then dispatches no further wave. The stop cancels
+    ///   the activities still in flight, as `ctx.race()` cancels its losers.
     /// - **Result writer.** The worker writes each result through the
     ///   `PayloadStore`. History records a small
     ///   [`StoredResult`](crate::fan_out::StoredResult) for the item, not the
@@ -11260,14 +11260,31 @@ impl WorkflowContext {
             // Nothing waits on an abandoned slot. Its `WaitForActivity` would
             // read as a new command to strict replay, so remove it, as
             // `AwaitConditionTimeoutFut` removes a stale `StartTimer`.
-            let abandoned: std::collections::HashSet<_> = prefix_ids.iter().collect();
+            let candidates: std::collections::HashSet<_> = prefix_ids.iter().collect();
+            let mut in_flight = Vec::new();
             self.commands
                 .lock()
                 .expect("commands lock poisoned")
-                .retain(|cmd| {
-                    !matches!(cmd, WorkflowCommand::WaitForActivity { activity_id, .. }
-                        if abandoned.contains(activity_id))
+                .retain(|cmd| match cmd {
+                    WorkflowCommand::WaitForActivity { activity_id, .. }
+                        if candidates.contains(activity_id) =>
+                    {
+                        in_flight.push(*activity_id);
+                        false
+                    }
+                    _ => true,
                 });
+            // Cancel the slots still in flight, as `ctx.race()` cancels its
+            // losers. The worker cancels each open task row and records a
+            // terminal for it. So no result can arrive after the workflow
+            // ends, where replay would not consume it.
+            if !in_flight.is_empty() {
+                self.push_command(WorkflowCommand::CancelRaceLosers {
+                    activities: in_flight,
+                    children: Vec::new(),
+                    timers: Vec::new(),
+                });
+            }
             self.record_fan_out_stop(&stop_marker, count - activities.len())?;
         }
         joined?;
