@@ -146,9 +146,8 @@ impl MemoryOp {
 ///
 /// # Errors
 ///
-/// Returns a `Tool` error, written for the model, for an empty entry, an edit
-/// that does not fit, or an `old` text that matches no entry or more than
-/// one.
+/// Returns a `Tool` error that the model can read. The causes are an empty
+/// entry, an edit that does not fit, or an `old` text with no unique match.
 pub fn apply_op(block: &mut MemoryBlock, op: &MemoryOp) -> Result<(), AgentError> {
     match op {
         MemoryOp::Add { text, .. } => {

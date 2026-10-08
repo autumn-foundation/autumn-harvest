@@ -80,7 +80,7 @@ runtime.
 
 ## 3. Run it on Postgres
 
-Register the workflow and both activities. Install the harness as worker
+Register the workflows and the activities. Install the harness as worker
 state, because the activities read it with `ActivityContext::state`:
 
 ```rust
@@ -98,9 +98,10 @@ let built = HarvestBuilder::new()
     .build();
 ```
 
-`workflows()` returns `agent_loop`. `activities()` returns `agent_model_turn`
-and `agent_tool_call`. The test `the_engine_registration_builds` builds this
-exact registration.
+`workflows()` returns `agent_loop` and `agent_heartbeat`. `activities()`
+returns `agent_model_turn`, `agent_tool_call`, `agent_memory_snapshot`,
+`agent_deliver` and `agent_precheck`. The test
+`the_engine_registration_builds` builds this exact registration.
 
 Start a run under the name `agent_loop` with an `AgentTask` as input. To
 decide on a gated call, send a signal to the run. Build the name with
@@ -139,13 +140,19 @@ A worker with a payload cap other than the default must say so. Set
   turn. The default is one minute. A call with no decision when the budget
   ends is denied, and the decision is recorded.
 
+- `memory(store)` — the `MemoryStore` for runs with a memory scope.
+- `delivery(delivery)` — where reports go. The default is `LogDelivery`.
+- `precheck(precheck)` — the cheap check that can skip a heartbeat tick.
+
 A tool error is cut to fit the result cap too, so a huge error message
 cannot fail the run.
 
 `AgentTask` sets the run: `input`, `system`, `history`, `session`,
 `max_steps` (default 8), `max_total_tokens`, `max_output_tokens`,
-`approval_timeout` (default one hour, rounded up to whole seconds), and
-`max_request_bytes` (default: the engine default). A system message inside
+`approval_timeout` (default one hour, rounded up to whole seconds),
+`max_request_bytes` (default: the engine default), `deliver`, `memory`,
+`followups`, `loop_guard` and `read_only`. Section 10 explains the last
+five. A system message inside
 `history` is dropped. Only `system` reaches the model as the prompt.
 
 ## 5. Approvals
@@ -206,6 +213,7 @@ A bound is a normal end, not an error. `AgentReport.stop` names it:
 | `steps_exhausted` | The model asked for tools after `max_steps` rounds. |
 | `tokens_exhausted` | The run spent more than `max_total_tokens`. |
 | `transcript_full` | The next request, or the results of one round, could not fit the request cap. The request was not sent. |
+| `loop_detected` | The loop guard saw the same call, with the same result, too many times. |
 
 A turn that ends the run before its tool calls run is left out of
 `AgentReport.messages`. Its text is not the answer either. A round whose
@@ -228,7 +236,8 @@ example a rejected API key, or four failed attempts.
 ## 8. History types
 
 The adapter owns the payloads it records: `AgentTask`, `ModelTurnRequest`,
-`ModelTurn`, `ToolCallRequest`, `ToolOutcome` and `AgentReport`. They hold
+`ModelTurn`, `ToolCallRequest`, `ToolOutcome`, `AgentReport`,
+`HeartbeatTask`, `HeartbeatReport`, `Report` and `MemoryScope`. They hold
 only types this crate defines, so the crate owns their serde shape. Replay
 reads these payloads back, so add a field only with `#[serde(default)]`.
 
@@ -240,10 +249,111 @@ reads these payloads back, so add a field only with `#[serde(default)]`.
 - **No streaming.** An activity result is a value, not a stream.
 - **Tool definitions are read at call time.** A deploy that changes the tool
   list changes only later turns. Recorded turns replay as they were.
+- **A follow-up chain shares one workflow history.** Each segment adds to
+  it. Keep `max_chain` low, or start a new run from the report.
 - **The session entity is separate.** It is a sibling issue. Per-step token
   cost belongs to the agent cost ledger (#1970).
 
-## 10. The daemon example
+## 10. Always-on agents
+
+An always-on agent wakes on a schedule, books its own follow-ups, keeps
+notes, and speaks only when something needs attention. Five primitives do
+this. Each one maps onto an engine primitive, so a crash costs no more than
+it does in a plain run.
+
+| Primitive | Engine primitive | Turn it on |
+|---|---|---|
+| Heartbeat | Workflow `agent_heartbeat`: one tick per run | `heartbeat::schedule` (Postgres), `sqlite::start_heartbeat` |
+| Follow-up | A durable timer, then a new segment in the same workflow | `AgentTask::followups` |
+| Delivery | Activity `agent_deliver` | `AgentTask::deliver`, `AgentHarness::delivery` |
+| Memory | Activity `agent_memory_snapshot`, once per segment | `AgentTask::memory`, `AgentHarness::memory` |
+| Loop guard | A fingerprint of each recorded call, in the workflow | On by default: `AgentTask::loop_guard` |
+
+```mermaid
+flowchart LR
+  S["engine schedule"] --> H["workflow agent_heartbeat"]
+  H --> P["activity agent_precheck"]
+  P -->|false| E[skipped]
+  P -->|true| L["agent loop, read-only"]
+  L -->|schedule_followup| T["durable timer"]
+  T --> L
+  L --> D["activity agent_deliver"]
+```
+
+### Heartbeats
+
+A tick is one short workflow:
+
+1. The `Precheck` runs. A `false` answer ends the tick with no model call.
+   Use it to look for new work, for example an unread inbox.
+2. The agent loop runs the heartbeat prompt. The default prompt tells the
+   model to reply with exactly `HEARTBEAT_OK` when nothing needs attention.
+3. A report that is not a silent acknowledgement goes to the delivery.
+
+A tick is **read-only** by default. A tool with the `Write` or `External`
+effect is denied with a result the model reads. Call
+`HeartbeatTask::allow_actions` only for a tick that must act.
+
+On Postgres, register the schedule that `heartbeat::schedule` builds:
+
+```rust
+use autumn_harvest::policy::Schedule;
+use autumn_harvest_agent::heartbeat::{self, HeartbeatTask};
+
+let tick = HeartbeatTask::new().system("You watch the build queue.");
+let schedule = heartbeat::schedule(Schedule::Interval(Duration::from_secs(1_800)), &tick)?;
+```
+
+SQLite has no scheduler. The app calls `sqlite::start_heartbeat` on each
+tick.
+
+### Follow-ups
+
+A task with `AgentTask::followups` gives the model the `schedule_followup`
+tool. The tool takes a `prompt` and a `delay_minutes`. When the segment
+completes, the workflow waits on a durable timer. Then a new segment runs
+the prompt in the same conversation.
+
+- One follow-up per segment. A second call in the same segment is refused.
+- The delay is at most `Followups::new(max_delay)`.
+- A chain cap (`Followups::max_chain`, 10 by default) stops an agent that
+  wakes itself forever.
+- A segment that ends under any stop other than `completed` books nothing.
+- Approval names count steps across segments, so a name never repeats.
+
+A restart during the wait resumes the timer. It sends no report again and
+asks the model nothing again.
+
+### Delivery
+
+`AgentTask::deliver` sends the answer of each segment to the `Delivery` on
+the harness, once. The default `LogDelivery` writes a `tracing` event. A
+report is sent only for a `completed` or `output_capped` segment with a
+non-empty answer that is not a silent acknowledgement. A failed delivery
+never fails the run.
+
+### Memory
+
+`AgentTask::memory` gives the run a memory scope, and the model a `memory`
+tool to add, replace and remove entries. The store is a `MemoryStore` on
+the harness. `InMemoryMemoryStore` suits tests. Use a durable store in
+production.
+
+The snapshot is read **once per segment**, by an activity, and added to the
+system prompt. A write during the segment goes to the store at once, but the
+prompt does not change until the next segment. A stable prompt keeps
+provider prompt caching working, and replay reads the recorded snapshot.
+
+### Loop guard
+
+The loop guard counts identical calls: same tool, same arguments, same
+result. With the defaults, the third repeat in the last 30 calls adds a
+warning to the result. The fifth stops the run as `loop_detected`, and no
+later call in that round runs. `LoopGuard::disabled()` turns it off. The
+fingerprint is FNV-1a, which gives the same value in every build, so replay
+reaches the same verdicts.
+
+## 11. The daemon example
 
 `examples/claude-agent-daemon` speaks the Anthropic Messages API and replays
 thinking blocks verbatim, which the provider-neutral `ChatMessage` cannot
