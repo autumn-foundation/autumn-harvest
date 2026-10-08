@@ -206,6 +206,11 @@ pub struct HarvestApiRuntime {
     /// captured from the resolved configuration.
     /// Wrapped in `Arc` so the per-request `runtime()` clone stays cheap.
     effective_config: Option<Arc<autumn_harvest::effective_config::EffectiveConfigView>>,
+    /// The history archiver that retention writes to (issue #1983).
+    ///
+    /// `GET /workflows/{id}/archived-history` and its Vantage page read
+    /// pruned runs back through it. `None` when no archiver is set.
+    history_archiver: Option<Arc<dyn autumn_harvest::HistoryArchiver>>,
 }
 
 impl HarvestApiRuntime {
@@ -250,6 +255,7 @@ impl HarvestApiRuntime {
             // override fails closed on `GET /admin/config` (see the field doc)
             // rather than serving a fabricated defaults placeholder.
             effective_config: None,
+            history_archiver: None,
         };
         if let Some(first_queue) = this.queues.as_slice().first()
             && let Ok(mut lock) =
@@ -286,6 +292,24 @@ impl HarvestApiRuntime {
         registered.extend(names);
         self.registered_dag_names = Arc::new(registered);
         self
+    }
+
+    /// Attach the history archiver that retention writes to (issue #1983).
+    ///
+    /// The archived-history route and page read pruned runs through it.
+    #[must_use]
+    pub fn with_history_archiver(
+        mut self,
+        archiver: Arc<dyn autumn_harvest::HistoryArchiver>,
+    ) -> Self {
+        self.history_archiver = Some(archiver);
+        self
+    }
+
+    /// The history archiver on this runtime, if any (issue #1983).
+    #[must_use]
+    pub fn history_archiver(&self) -> Option<&Arc<dyn autumn_harvest::HistoryArchiver>> {
+        self.history_archiver.as_ref()
     }
 
     /// Attach the resolved, secret-free effective-config snapshot (issue #695).
@@ -4824,6 +4848,12 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
             get(export_workflow_history),
         )
         .route("/workflows/{id}/history", get(get_workflow_history))
+        // Archived history read-back (issue #1983). Admin only: the archive
+        // can hold a full history of a pruned run.
+        .route(
+            "/workflows/{id}/archived-history",
+            get(get_archived_workflow_history).route_layer(require_admin.clone()),
+        )
         .route("/workflows/{id}", get(get_workflow))
         .route("/workflows/{id}/result", get(get_workflow_result))
         .route("/workflows/{id}/children", get(list_workflow_children))
@@ -6761,6 +6791,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/workflows/{id}/history"),
         ("GET", "/workflows/{id}/result"),
         ("GET", "/workflows/{id}/history/export"),
+        ("GET", "/workflows/{id}/archived-history"),
         ("GET", "/workflows/{id}/children"),
         ("GET", "/workflows/{id}/tree"),
         ("GET", "/workflows/{id}/stack"),
@@ -7552,6 +7583,7 @@ pub const fn management_api_response_fields()
             Some(&["state", "output", "error", "completed_at"]),
         ),
         ("GET", "/workflows/{id}/history/export", None), // HistoryExportDocument (external)
+        ("GET", "/workflows/{id}/archived-history", None), // HistoryExportDocument (external)
         (
             "GET",
             "/workflows/{id}/children",
@@ -11630,6 +11662,93 @@ async fn get_workflow_history(
         total_events: page.total_events,
         last_event_id: page.last_event_id,
     }))
+}
+
+/// Read the archived history of `exec_id` from the runtime's archiver.
+///
+/// Issue #1983. The API route and the Vantage page share this. Payload
+/// fields decode only when `decoder` is `Some`, under the same gate as live
+/// history. A decoded read is audited.
+///
+/// # Errors
+///
+/// - 503 when no archiver is set, the archiver cannot read back, the store
+///   fails, or the read times out.
+/// - 404 when the archive has no document for the run.
+pub(crate) async fn fetch_archived_history(
+    api_state: &HarvestApiState,
+    headers: &axum::http::HeaderMap,
+    exec_id: ExecutionId,
+    decoder: Option<PayloadCodecs>,
+    route: &'static str,
+) -> Result<autumn_harvest::history_export::HistoryExportDocument, AutumnError> {
+    let runtime = api_state.runtime().map_err(map_error)?;
+    let Some(archiver) = runtime.history_archiver().cloned() else {
+        return Err(AutumnError::service_unavailable_msg(
+            "no history archiver is configured",
+        ));
+    };
+    let timeout = runtime.retention.config.archival_timeout();
+    let fetched = tokio::time::timeout(timeout, archiver.fetch(&exec_id))
+        .await
+        .map_err(|_| {
+            AutumnError::service_unavailable_msg(format!(
+                "archived history read timed out after {}s",
+                timeout.as_secs()
+            ))
+        })?;
+    let mut doc = match fetched {
+        Ok(Some(doc)) => doc,
+        Ok(None) => {
+            return Err(AutumnError::not_found_msg(format!(
+                "archived history for workflow execution {exec_id}"
+            )));
+        }
+        Err(err) => return Err(AutumnError::service_unavailable_msg(err.to_string())),
+    };
+    if let Some(codecs) = decoder.as_ref() {
+        let mut outcome = LossyDecodeOutcome::default();
+        for event in &mut doc.events {
+            outcome = outcome.merged(codecs.decode_value_lossy(event));
+        }
+        let target = exec_id.to_string();
+        audit_decoded_read(
+            api_state,
+            None,
+            headers,
+            TARGET_WORKFLOW,
+            Some(&target),
+            route,
+            None,
+            outcome,
+            None,
+        )
+        .await;
+    }
+    Ok(doc)
+}
+
+/// `GET /workflows/{id}/archived-history` (issue #1983).
+///
+/// Returns the `HistoryExportDocument` that retention archived for a run.
+/// The route reads the archiver only. It does not need the run in Postgres.
+async fn get_archived_workflow_history(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    maybe_session: Option<Extension<Session>>,
+) -> Result<Json<autumn_harvest::history_export::HistoryExportDocument>, AutumnError> {
+    let exec_id = parse_execution_id(&id)?;
+    let decoder = read_path_decoder(&api_state, extension_session(maybe_session)).await;
+    let doc = fetch_archived_history(
+        &api_state,
+        &headers,
+        exec_id,
+        decoder,
+        "GET /workflows/{id}/archived-history",
+    )
+    .await?;
+    Ok(Json(doc))
 }
 
 async fn get_workflow_result(

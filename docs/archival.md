@@ -55,18 +55,21 @@ pub trait HistoryArchiver: Send + Sync + 'static {
     /// If this returns `Err`, the retention janitor skips deleting the
     /// workflow execution and its associated events on this tick, retrying
     /// on the next tick to prevent data loss.
-    fn archive(
-        &self,
-        doc: &crate::history_export::HistoryExportDocument,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<(), Box<dyn std::error::Error + Send + Sync>>,
-                > + Send,
-        >,
-    >;
+    fn archive(&self, doc: &HistoryExportDocument) -> ArchiverFuture<'_>;
+
+    /// Read back the archived document (issue #1983). The default returns
+    /// `ArchiveFetchError::Unsupported`.
+    fn fetch(&self, execution_id: &ExecutionId) -> ArchiveFetchFuture<'_> { /* ... */ }
 }
 ```
+
+Implement `fetch` to make an archive readable through the management API and
+Vantage. See [Reading an archive back](#reading-an-archive-back-issue-1983).
+
+Payload fields in the document are in their stored form. With a payload codec
+on, they are codec envelopes (ciphertext). Before issue #1983, retention
+decoded them with the identity codec. With a real codec, that decode failed,
+and retention never archived or deleted the run.
 
 ### Example: Archiving to local files
 
@@ -111,9 +114,11 @@ impl HistoryArchiver for FileSystemArchiver {
 }
 ```
 
-### Example: Archiving to AWS S3 (mocked)
+### Example: Archiving to AWS S3 (hand-written)
 
-For production, you can wire up an SDK client such as `aws-sdk-s3` inside the future block:
+The plugin crate ships S3 and GCS archivers. See
+[First-party S3 and GCS adapters](#first-party-s3-and-gcs-adapters-issue-1983).
+This example shows the shape of a hand-written archiver only:
 
 ```rust
 use std::future::Future;
@@ -152,6 +157,102 @@ impl HistoryArchiver for S3Archiver {
     }
 }
 ```
+
+---
+
+## First-party S3 and GCS adapters (issue #1983)
+
+The `autumn-harvest-plugin` crate ships adapters for `PayloadStore` and
+`HistoryArchiver`. The core crate keeps no cloud dependency.
+
+| Feature | Adds |
+|---------|------|
+| `object-store` | `ObjectBackend`, `ObjectPayloadStore`, `ObjectHistoryArchiver`, `MemoryBackend`. No client. |
+| `s3` | `object_store::s3::S3Backend` on `aws-sdk-s3`. Works with any S3-compatible store, for example MinIO. |
+| `gcs` | `object_store::gcs::GcsBackend` on the GCS JSON API. It uses the `reqwest` client that the plugin already has. |
+
+```toml
+autumn-harvest-plugin = { version = "0.7", features = ["s3"] }
+```
+
+```rust
+use std::sync::Arc;
+use autumn_harvest_plugin::object_store::s3::{S3Backend, aws_sdk_s3};
+use autumn_harvest_plugin::object_store::{ObjectHistoryArchiver, ObjectPayloadStore};
+
+let builder = autumn_harvest::HarvestBuilder::new();
+let codecs = builder.payload_codecs().clone();
+let client = aws_sdk_s3::Client::new(&aws_config::load_from_env().await);
+let backend = Arc::new(S3Backend::new(client, "harvest-archive"));
+
+let builder = builder
+    .payload_store(ObjectPayloadStore::new(Arc::clone(&backend)).with_prefix("blobs/"))
+    .history_archiver(
+        ObjectHistoryArchiver::new(backend)
+            .with_prefix("history/")
+            .with_codecs(codecs),
+    );
+```
+
+For GCS, use `GcsBackend::new("harvest-archive", GceMetadataToken::new())`.
+`GceMetadataToken` reads the service-account token on GCE, GKE and Cloud
+Run. `StaticToken` sends a fixed token. For a service-account JSON key,
+implement `GcsTokenSource`.
+
+### Object keys
+
+| Adapter | Key | Note |
+|---------|-----|------|
+| `ObjectPayloadStore` | `{prefix}{sha256-hex}` | Identical bytes share one object. Retention deletes a blob when no run refers to it. |
+| `ObjectHistoryArchiver` | `{prefix}{execution_id}.json` | A second archive of a run overwrites the object. |
+
+A missing object reads as "not found". A delete of a missing object succeeds.
+
+`ObjectPayloadStore` records the store id `"default"` in each reference, like
+the trait default. To keep reading references that another store wrote, set
+the same id with `with_store_id`.
+
+### Codec
+
+- **Offloaded payloads.** The offloader encodes a payload with the codec
+  before upload. With a codec on, each blob is a codec envelope.
+- **Archived histories.** Payload fields arrive in their stored form, so they
+  are codec envelopes too. `with_codecs` also encodes the whole document.
+  This hides metadata such as `workflow_id`.
+
+Pass the builder's `payload_codecs()` to `with_codecs`. The key registry is
+shared, so a key rotation applies at once. The codec-rotation sweep does not
+re-encrypt archive objects. Keep a retired key registered while its archives
+must stay readable.
+
+### Emulator tests
+
+The `object_store_s3_minio` and `object_store_gcs_emulator` suites run each
+adapter against an emulator in Docker:
+
+```sh
+cargo test -p autumn-harvest-plugin --features s3 --test object_store_s3_minio
+cargo test -p autumn-harvest-plugin --features gcs --test object_store_gcs_emulator
+```
+
+The official MinIO images are no longer published. The suite uses
+`pgsty/minio`, the maintained community build. GCS tests use
+`fsouza/fake-gcs-server`.
+
+---
+
+## Reading an archive back (issue #1983)
+
+An archiver that implements `fetch` makes a pruned run readable again:
+
+- `GET /workflows/{id}/archived-history` returns the archived document.
+  Admin only. See [`docs/management-api.md`](management-api.md#archived-history-issue-1983).
+- Vantage shows it at `/ui/workflows/{id}/archived-history`. When an archiver
+  is set, the "not found" page of a pruned run links there.
+
+Payload fields decode under the same gate as live history. The read times out
+after `archival_timeout_secs`. Use the document for display and replay
+debugging. `WorkflowReplayer` reads the same export format.
 
 ---
 

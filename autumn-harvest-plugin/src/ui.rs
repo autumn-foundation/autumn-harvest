@@ -80,8 +80,8 @@ use crate::api::{
     DagRetryFailure, DagRetryResponse, HarvestApiRuntime, HarvestApiState, KNOWN_WORKFLOW_STATES,
     WorkflowFilters, acquire_conn, audit_decoded_read, db_conn_for_execution, db_conn_for_shard,
     decode_error_field, decode_workflow_execution_fields, extension_session, load_execution,
-    load_workflows, load_workflows_from_shards, map_error, parse_execution_id, read_path_decoder,
-    require_harvest_admin, retry_dag_run_inner,
+    fetch_archived_history, load_workflows, load_workflows_from_shards, map_error,
+    parse_execution_id, read_path_decoder, require_harvest_admin, retry_dag_run_inner,
 };
 use crate::dag_graph::{DagNodeStatus, DagRunNode, build_run_graph};
 use crate::shard_fanout::UnavailableShard;
@@ -794,6 +794,12 @@ pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<()> {
         // issue #960: standalone execution timeline / Gantt view (read-only,
         // non-admin — parity with the #739 API and the detail page).
         .route("/workflows/{id}/timeline", get(workflow_timeline_ui))
+        // Issue #1983: archived history of a pruned run. Admin only, like the
+        // API route.
+        .route(
+            "/workflows/{id}/archived-history",
+            get(archived_history_ui).route_layer(require_admin.clone()),
+        )
         .route("/workflows/{id}/cancel", post(cancel_workflow_ui))
         .route(
             "/workflows/{id}/terminate",
@@ -1743,8 +1749,8 @@ async fn workflow_detail_ui(
     Query(params): Query<WorkflowDetailParams>,
     headers: axum::http::HeaderMap,
     maybe_session: Option<Extension<Session>>,
-) -> Result<Markup, AutumnError> {
-    render_workflow_detail_page(
+) -> axum::response::Response {
+    let page = render_workflow_detail_page(
         &api_state,
         &id,
         params.event_page.as_deref(),
@@ -1757,7 +1763,124 @@ async fn workflow_detail_ui(
         &headers,
         maybe_session,
     )
-    .await
+    .await;
+    match page {
+        Ok(markup) => markup.into_response(),
+        Err(err) => archived_history_hint(&api_state, &id, err),
+    }
+}
+
+/// Turn a 404 on the detail page into a link to the archive (issue #1983).
+///
+/// Retention deletes a pruned run from Postgres. When an archiver is set, the
+/// 404 page links to the archived history. Other errors pass through.
+fn archived_history_hint(
+    api_state: &HarvestApiState,
+    id: &str,
+    err: AutumnError,
+) -> axum::response::Response {
+    let has_archiver = api_state
+        .runtime()
+        .is_ok_and(|runtime| runtime.history_archiver().is_some());
+    let exec_id = match parse_execution_id(id) {
+        Ok(exec_id) if has_archiver && err.status() == axum::http::StatusCode::NOT_FOUND => {
+            exec_id
+        }
+        _ => return err.into_response(),
+    };
+    let body = html! {
+        div.card {
+            h3 { "Execution not found" }
+            p {
+                "Postgres has no row for execution " code { (exec_id) } ". "
+                "Retention deletes a finished run after its retention age."
+            }
+            // The page is at `ui/workflows/{id}`, so this resolves to
+            // `ui/workflows/{id}/archived-history`.
+            a href={ (exec_id) "/archived-history" } { "View archived history" }
+        }
+    };
+    let page = layout("Execution not found · Vantage", &body, "../", None);
+    (axum::http::StatusCode::NOT_FOUND, page).into_response()
+}
+
+/// Vantage page for the archived history of a run (issue #1983).
+async fn archived_history_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    maybe_session: Option<Extension<Session>>,
+) -> Result<Markup, AutumnError> {
+    let exec_id = parse_execution_id(&id)?;
+    let decoder = read_path_decoder(&api_state, extension_session(maybe_session)).await;
+    let doc = fetch_archived_history(
+        &api_state,
+        &headers,
+        exec_id,
+        decoder,
+        "GET /ui/workflows/{id}/archived-history",
+    )
+    .await?;
+    let title = format!("Archived history · {} · Vantage", doc.workflow_name);
+    Ok(layout(&title, &render_archived_history_body(&doc), "../../", None))
+}
+
+/// Body of the archived-history page: run metadata, then the event table.
+fn render_archived_history_body(doc: &autumn_harvest::history_export::HistoryExportDocument) -> Markup {
+    let optional = |value: Option<&str>| value.unwrap_or("—").to_string();
+    html! {
+        div.card {
+            h2 { "Archived history" }
+            p {
+                "Read from the history archiver. "
+                "Retention archived this run and then deleted it from Postgres."
+            }
+            table {
+                tbody {
+                    tr { th { "Workflow" } td { (doc.workflow_name) } }
+                    tr { th { "Workflow ID" } td { (optional(doc.workflow_id.as_deref())) } }
+                    tr { th { "Execution ID" } td { code { (doc.execution_id) } } }
+                    tr { th { "State" } td { (doc.status.state) } }
+                    tr { th { "Queue" } td { (optional(doc.queue_name.as_deref())) } }
+                    tr { th { "Shard" } td { (doc.shard_id) } }
+                    @if let Some(parent) = doc.parent_execution_id {
+                        tr { th { "Parent" } td { code { (parent) } } }
+                    }
+                    tr { th { "Archived at" } td { (format_timestamp(Some(doc.exported_at))) } }
+                }
+            }
+        }
+        div.card {
+            h3 { "Event history (" (doc.events.len()) " events)" }
+            @if doc.events.is_empty() {
+                div.empty { "The archive holds no events." }
+            } @else {
+                table {
+                    thead {
+                        tr {
+                            th { "#" }
+                            th { "Type" }
+                            th { "Data" }
+                        }
+                    }
+                    tbody {
+                        @for (index, event) in doc.events.iter().enumerate() {
+                            tr {
+                                td { (index + 1) }
+                                td { code { (event.get("type").and_then(Value::as_str).unwrap_or("?")) } }
+                                td {
+                                    details {
+                                        summary { "view payload" }
+                                        pre { (pretty_json(event.get("data").unwrap_or(&Value::Null))) }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Loads and renders the workflow detail page.

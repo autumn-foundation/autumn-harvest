@@ -22,6 +22,8 @@ const FORBIDDEN: &[&str] = &[
     "kafka",
     // AWS / SQS
     "aws_sdk_sqs",
+    // S3 object store (issue #1983)
+    "aws_sdk_s3",
     "aws_config",
     "aws_smithy_runtime",
     "aws_smithy_client",

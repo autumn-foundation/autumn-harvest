@@ -1082,6 +1082,46 @@
     },
     {
       "method": "GET",
+      "path": "/workflows/{id}/archived-history",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Read back the archived history of a run (issue #1983). Retention archives a finished run through the configured HistoryArchiver, then deletes it from Postgres. This route reads the archive only, so it serves a pruned run. The response is the HistoryExportDocument that retention archived. Payload fields decode under the same admin and decode-on-read gate as GET /workflows/{id}/history; otherwise they stay in their stored form. Admin only.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "Execution UUID."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed execution ID."
+        },
+        {
+          "status": 401,
+          "description": "Caller lacks Harvest admin access."
+        },
+        {
+          "status": 404,
+          "description": "The archive holds no document for this execution."
+        },
+        {
+          "status": 503,
+          "description": "No history archiver is configured, the archiver cannot read back, the store failed, or the read timed out."
+        }
+      ],
+      "idempotency": "Fully idempotent; read-only."
+    },
+    {
+      "method": "GET",
       "path": "/workflows/{id}/children",
       "category": "workflow",
       "read_only": true,

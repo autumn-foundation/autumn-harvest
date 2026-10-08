@@ -479,6 +479,8 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     // Paginated, filterable single-execution history (issue #529): read-only cursor walk.
     ("GET /workflows/{id}/history", RouteClass::ReadOnly),
     ("GET /workflows/{id}/history/export", RouteClass::ReadOnly),
+    // Issue #1983: read back an archived history. Admin only.
+    ("GET /workflows/{id}/archived-history", RouteClass::ReadOnly),
     // Completion-callback delivery listing (issue #605): read-only, no audit.
     (
         "GET /workflows/{id}/completion-deliveries",
@@ -1014,6 +1016,7 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "POST /workflows/{id}/update/{update_name}",
     "GET /workflows/{id}/history",
     "GET /workflows/{id}/history/export",
+    "GET /workflows/{id}/archived-history",
     "GET /workflows/{id}/completion-deliveries",
     "GET /dags",
     "GET /dags/{dag_name}/runs",
@@ -1188,6 +1191,7 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /workflows/{id}/result", None),
     ("GET /workflows/{id}/history", None),
     ("GET /workflows/{id}/history/export", None),
+    ("GET /workflows/{id}/archived-history", None),
     ("GET /workflows/{id}/completion-deliveries", None),
     (
         "POST /workflows/{id}/completion-deliveries/{delivery_id}/redrive",

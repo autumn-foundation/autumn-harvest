@@ -52,6 +52,8 @@ pub mod dev;
 /// One entry point for a standalone embedding (issue #1613).
 pub mod embedding;
 pub mod lineage;
+#[cfg(feature = "object-store")]
+pub mod object_store;
 pub mod outbox;
 pub mod plugin;
 pub mod preflight;

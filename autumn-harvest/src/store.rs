@@ -1382,6 +1382,53 @@ pub async fn load_history_undecoded(
     })
 }
 
+/// [`load_history_undecoded`] that also inflates offloaded payload fields.
+///
+/// Each offload reference is replaced with the bytes it points at. Codec
+/// envelopes stay as they are, so the payloads stay ciphertext. The retention
+/// archive uses this (issue #1983). With no offloader, this is
+/// [`load_history_undecoded`].
+///
+/// **Never use this to feed workflow code.** Replay needs decoded plaintext.
+///
+/// # Errors
+///
+/// As [`load_history_undecoded`], and a payload-store error when a blob
+/// fetch or its checksum check fails.
+pub async fn load_history_inflated_undecoded(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    offloader: Option<&crate::payload_store::PayloadOffloader>,
+) -> HarvestResult<EventHistory> {
+    use crate::models::HarvestEvent;
+
+    let Some(offloader) = offloader else {
+        return load_history_undecoded(conn, exec_id).await;
+    };
+
+    let rows: Vec<HarvestEvent> = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .order(harvest_events::event_id.asc())
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    let next_event_id = rows.last().map_or(0, |r| r.event_id.saturating_add(1));
+
+    let mut events = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut data = row.event_data;
+        offloader.inflate_event_value(&mut data).await?;
+        events.push(serde_json::from_value::<WorkflowEvent>(data)?);
+    }
+
+    Ok(EventHistory {
+        exec_id,
+        events,
+        next_event_id,
+    })
+}
+
 /// Batched form of [`load_history_undecoded`] for many executions at once.
 ///
 /// One `eq_any` query loads every requested execution's history. This

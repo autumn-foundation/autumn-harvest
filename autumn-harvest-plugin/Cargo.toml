@@ -41,6 +41,14 @@ sqs = ["connectors", "dep:aws-config", "dep:aws-sdk-sqs"]
 # `aws-lc-rs`, which needs cmake and a C compiler. The locked `aws-sdk-kms`
 # 1.99.0 needs Rust 1.88, so the effective MSRV does not rise.
 aws-kms = ["dep:aws-sdk-kms", "dep:async-trait"]
+# Object-store adapters for `PayloadStore` and `HistoryArchiver` (issue #1983).
+# `object-store` holds the backend-agnostic adapters and adds no client.
+# `s3` adds an `aws-sdk-s3` backend. `gcs` adds a GCS JSON API backend on the
+# `reqwest` client that this crate already uses. The core crate gains no
+# cloud dependency (`tests/connector_dependency_graph.rs`).
+object-store = ["dep:sha2"]
+s3 = ["object-store", "dep:aws-sdk-s3"]
+gcs = ["object-store"]
 # Zero-setup local dev runtime (issue #525) — the `harvest-dev` binary.
 #
 # Off by default and never in a release build. It provisions an **ephemeral**
@@ -158,6 +166,9 @@ aws-sdk-sqs = { version = "1", default-features = false, features = ["rt-tokio",
 # KMS client for the `aws-kms` feature. Same feature choice as `aws-sdk-sqs`,
 # for the same reason.
 aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"], optional = true }
+# S3 client for the `s3` feature. Same feature choice as `aws-sdk-sqs`, for the
+# same reason.
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"], optional = true }
 
 [[bin]]
 # Zero-setup local dev runtime (issue #525). `cargo dev` is the workspace alias
