@@ -28,7 +28,7 @@ Harvest refuses a `userinfo_url` (that path is unsigned) and a Microsoft
 multi-tenant issuer.
 `ClaimRoleMap` maps claims to roles. An identity with no role cannot log
 in. The session boundary sends Vantage to the login page and answers `401`
-elsewhere. The audit actor is `oidc:{subject}`. Sessions expire after
+elsewhere. The audit actor is `oidc:{subject}@{issuer}`. Sessions expire after
 `max_session_age` (default 12 hours). `discover_provider` reads the
 discovery document and checks its issuer.
 

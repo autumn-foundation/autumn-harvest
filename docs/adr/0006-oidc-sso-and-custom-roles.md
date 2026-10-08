@@ -48,7 +48,7 @@ login for Vantage and the management API.
   no role cannot log in. A failed callback does not change the session.
 - The session keeps the subject, the roles and the login time. After
   `max_session_age` (default 12 hours) the user must log in again.
-- The audit actor of a session user is `oidc:{subject}`. The boundary strips
+- The audit actor of a session user is `oidc:{subject}@{issuer}`. The boundary strips
   an inbound `oidc:` actor from every other request.
 - A verified `hvst_` token still works for machine clients.
 - The generated MCP tool routes get the same session check.

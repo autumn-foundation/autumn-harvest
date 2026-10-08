@@ -49,7 +49,7 @@ mTLS on the management API. The decision record is
 | R5 | A forged ID token, a replay, or a wrong audience logs in. | autumn-web checks signature, `kid`, algorithm, `iss`, `aud`, `exp`, `state` and `nonce`. Tests: a bad `state`, a token signed with an unknown key, and a wrong audience each fail. |
 | R6 | The login page is an open redirect. | No `return_to` parameter. The callback redirects only to the configured page. |
 | R7 | Login routes sit behind the boundary, so nobody can log in. | The login router is merged outside the boundary and the role layer. The round-trip test proves it. |
-| R8 | A spoofed `x-harvest-actor` hides who acted. | The OIDC boundary overwrites the actor with `oidc:{subject}` for a session principal. It strips an inbound `oidc:` actor on every other request. Test. |
+| R8 | A spoofed `x-harvest-actor` hides who acted. | The OIDC boundary overwrites the actor with `oidc:{subject}@{issuer}` for a session principal. It strips an inbound `oidc:` actor on every other request. Test. |
 | R9 | Declaring the boundary opens the MCP tool routes. | `api_with_oidc` applies the same OIDC boundary and role check to each generated MCP tool route. |
 | R10 | A token caller loses access. | A verified `hvst_` token skips the role check. Its scope still applies. The boundary passes an `hvst_` bearer only when tokens are on. |
 | R11 | A stale session keeps old roles forever. | The session stores the login time. After `max_session_age` (default 12 h) the user must log in again. Test. |

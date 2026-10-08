@@ -215,6 +215,14 @@ impl HarvestRolesBuilder {
     }
 }
 
+/// Append `field` to `out` with a length prefix.
+#[cfg(feature = "oidc")]
+fn push_field(out: &mut String, field: &str) {
+    out.push_str(&field.len().to_string());
+    out.push(':');
+    out.push_str(field);
+}
+
 /// Whether `name` is 1 to 64 of `a-z`, `0-9`, `-` and `_`.
 ///
 /// The session stores a comma-separated list, so a name has no comma, no
@@ -275,6 +283,24 @@ impl HarvestRoles {
     /// The role names, sorted.
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.roles.keys().map(String::as_str)
+    }
+
+    /// A canonical text of the role set: each name, scope and route.
+    ///
+    /// Each field has a length prefix, so two different sets never give the
+    /// same text. The OIDC login hashes it into the session binding.
+    #[cfg(feature = "oidc")]
+    pub(crate) fn policy_text(&self) -> String {
+        let mut out = String::new();
+        for (name, role) in self.roles.iter() {
+            push_field(&mut out, name);
+            push_field(&mut out, role.scope.map_or("-", TokenScope::as_str));
+            for route in &role.routes {
+                push_field(&mut out, route);
+            }
+            out.push(';');
+        }
+        out
     }
 
     /// Whether any of `roles` allows `method` on `path`.
@@ -745,6 +771,23 @@ impl ClaimRoleMap {
             return Err(RoleConfigError::UndefinedRole(role.clone()));
         }
         Ok(())
+    }
+
+    /// A canonical text of the map: each rule, in order, and the default role.
+    ///
+    /// Each field has a length prefix, so two different maps never give the
+    /// same text.
+    #[cfg(feature = "oidc")]
+    pub(crate) fn policy_text(&self) -> String {
+        let mut out = String::new();
+        for rule in &self.rules {
+            push_field(&mut out, &rule.claim);
+            push_field(&mut out, &rule.value);
+            push_field(&mut out, &rule.role);
+            out.push(';');
+        }
+        push_field(&mut out, self.default_role.as_deref().unwrap_or("-"));
+        out
     }
 
     /// The role names that `claims` map to, sorted and without duplicates.

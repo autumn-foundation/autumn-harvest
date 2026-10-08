@@ -647,7 +647,7 @@ user out. Then Harvest maps the claims to roles:
 **The session boundary.**
 
 - A session user reaches the role layer. The audit actor is
-  `oidc:{subject}`. The boundary strips an inbound `oidc:` actor from every
+  `oidc:{subject}@{issuer}`. The boundary strips an inbound `oidc:` actor from every
   other request.
 - A `PublicSafe` route needs no session.
 - An `hvst_` bearer passes when API tokens are on. The token layer verifies
@@ -683,8 +683,9 @@ loopback. The scope must include `openid`.
   turns off the read-only layer of an earlier `api_with_role_auth`.
   `StandaloneAdminAuth::with_oidc` turns off `with_read_only_role` too.
 - Two mounts can share one session. The session binds its principal to the
-  login that made it (`client_id@issuer`). A principal of one login is not a
-  principal on a mount with another login. The roles of a login
+  login that made it: the client, the issuer, and a digest of the redirect
+  URI, the roles and the claim map. A principal of one login is not a
+  principal on a mount with another login or another policy. The roles of a login
   replace any set by `with_roles`.
 
 ### mTLS on the management API

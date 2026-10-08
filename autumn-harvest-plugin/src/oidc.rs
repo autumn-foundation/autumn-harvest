@@ -23,7 +23,7 @@
 //! # The session boundary
 //!
 //! - A session principal reaches the role layer. Its audit actor is
-//!   `oidc:{subject}`.
+//!   `oidc:{subject}@{issuer}`.
 //! - A request with a host `RoleGrant` reaches the role layer.
 //! - A `PublicSafe` route needs no session.
 //! - An `hvst_` bearer passes when API tokens are on. The token layer
@@ -139,6 +139,8 @@ pub enum OidcConfigError {
 
 #[derive(Clone)]
 struct OidcInner {
+    /// The session binding of this login. See [`OidcLogin::fingerprint`].
+    fingerprint: String,
     provider: OAuth2ProviderConfig,
     roles: HarvestRoles,
     claim_map: ClaimRoleMap,
@@ -190,8 +192,10 @@ impl OidcLogin {
     ) -> Result<Self, OidcConfigError> {
         validate_provider(&provider)?;
         claim_map.validate(&roles)?;
+        let fingerprint = login_fingerprint(&provider, &roles, &claim_map);
         Ok(Self {
             inner: Arc::new(OidcInner {
+                fingerprint,
                 provider,
                 roles,
                 claim_map,
@@ -257,15 +261,18 @@ impl OidcLogin {
         self.inner.max_session_age
     }
 
-    /// The identity of this login: `{client_id}@{issuer}`.
+    /// The identity of this login: `{client_id}@{issuer}#{digest}`.
     ///
-    /// The session stores it with the principal under [`SESSION_LOGIN_KEY`].
+    /// The digest covers the redirect URI, the role set and the claim map.
+    /// So two mounts that share a client, but not a policy, never accept each
+    /// other's principal. The session stores it under [`SESSION_LOGIN_KEY`].
     fn fingerprint(&self) -> String {
-        format!(
-            "{}@{}",
-            self.inner.provider.client_id,
-            self.inner.provider.issuer.as_deref().unwrap_or_default()
-        )
+        self.inner.fingerprint.clone()
+    }
+
+    /// The issuer, for the audit actor.
+    fn issuer(&self) -> &str {
+        self.inner.provider.issuer.as_deref().unwrap_or_default()
     }
 
     /// The provider name autumn-web puts in its session keys.
@@ -275,6 +282,40 @@ impl OidcLogin {
     fn provider_name(&self) -> String {
         format!("harvest:{}", self.fingerprint())
     }
+}
+
+/// The session binding of a login. See [`OidcLogin::fingerprint`].
+fn login_fingerprint(
+    provider: &OAuth2ProviderConfig,
+    roles: &HarvestRoles,
+    claim_map: &ClaimRoleMap,
+) -> String {
+    let policy = format!(
+        "{}:{}|{}|{}",
+        provider.redirect_uri.len(),
+        provider.redirect_uri,
+        roles.policy_text(),
+        claim_map.policy_text()
+    );
+    format!(
+        "{}@{}#{:016x}",
+        provider.client_id,
+        provider.issuer.as_deref().unwrap_or_default(),
+        fnv1a_64(policy.as_bytes())
+    )
+}
+
+/// FNV-1a, 64 bit.
+///
+/// The value must be the same in every process, so a session stays valid
+/// across instances. The standard hasher is seeded per process. The digest
+/// is a namespace, not a secret: the operator writes every input.
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    bytes.iter().fold(OFFSET, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(PRIME)
+    })
 }
 
 /// Check the required fields, the URL schemes and the scope.
@@ -673,9 +714,12 @@ fn strip_reserved_actor(request: &mut Request) {
 }
 
 /// Set the authoritative actor of a session principal.
-fn set_actor(request: &mut Request, subject: &str) {
+///
+/// The actor is `oidc:{subject}@{issuer}`, because `sub` is unique only
+/// within one issuer.
+fn set_actor(request: &mut Request, subject: &str, issuer: &str) {
     request.headers_mut().remove(HEADER_ACTOR);
-    if let Ok(value) = HeaderValue::from_str(&format!("{OIDC_ACTOR_PREFIX}{subject}")) {
+    if let Ok(value) = HeaderValue::from_str(&format!("{OIDC_ACTOR_PREFIX}{subject}@{issuer}")) {
         request.headers_mut().insert(HEADER_ACTOR, value);
         // The role layer keeps an `oidc:` actor only with this marker.
         request.extensions_mut().insert(crate::roles::OidcActor);
@@ -703,7 +747,7 @@ pub(crate) async fn require_oidc_session(
     if let Some(session) = session
         && let Some(subject) = session_subject(&session, &login).await
     {
-        set_actor(&mut request, &subject);
+        set_actor(&mut request, &subject, login.issuer());
         return next.run(request).await;
     }
     // Host middleware can give roles, for example from an mTLS certificate.
@@ -774,7 +818,7 @@ pub(crate) async fn gate_mcp_tool(
         (Some(subject), roles)
     };
     if let Some(subject) = &subject {
-        set_actor(&mut request, subject);
+        set_actor(&mut request, subject, login.issuer());
     }
     if !login
         .roles()
@@ -794,6 +838,7 @@ pub(crate) async fn gate_mcp_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api_token::TokenScope;
     #[cfg(feature = "mcp")]
     use crate::roles::ROLE_OPERATOR;
     use crate::roles::ROLE_VIEWER;
@@ -897,6 +942,36 @@ mod tests {
         data.insert(SESSION_LOGIN_KEY.to_string(), l.fingerprint());
         let bad = Session::new_for_test("b".to_string(), data);
         assert_eq!(session_subject(&bad, &l).await, None);
+    }
+
+    /// The binding covers the mount and the policy, not only the client.
+    #[test]
+    fn the_fingerprint_covers_the_mount_and_the_policy() {
+        let base = login().fingerprint();
+        assert_eq!(login().fingerprint(), base, "stable for one config");
+
+        let mut other_mount = provider();
+        other_mount.redirect_uri = "https://harvest.example.com/b/auth/oidc/callback".to_string();
+        let other_mount =
+            OidcLogin::new(other_mount, HarvestRoles::builtin(), ClaimRoleMap::new()).expect("ok");
+        assert_ne!(other_mount.fingerprint(), base);
+
+        // The same names with other meanings.
+        let read_only_admin = HarvestRoles::builder()
+            .role(crate::roles::HarvestRole::new("harvest-admin").with_scope(TokenScope::Read))
+            .build()
+            .expect("roles");
+        let other_roles =
+            OidcLogin::new(provider(), read_only_admin, ClaimRoleMap::new()).expect("ok");
+        assert_ne!(other_roles.fingerprint(), base);
+
+        let other_claims = OidcLogin::new(
+            provider(),
+            HarvestRoles::builtin(),
+            ClaimRoleMap::new().default_role(ROLE_VIEWER),
+        )
+        .expect("ok");
+        assert_ne!(other_claims.fingerprint(), base);
     }
 
     /// Two mounts can share one session. A login on one is not a login on
@@ -1097,7 +1172,14 @@ mod tests {
     async fn the_boundary_sets_the_actor_of_a_session_principal() {
         let s = session(Some("user-42"), ROLE_VIEWER, now_unix());
         let out = call(bounded(), Method::GET, Some(s), "oidc:someone-else").await;
-        assert_eq!(out, (StatusCode::OK, "oidc:user-42".to_string()));
+        // `sub` is unique only within an issuer, so the actor names both.
+        assert_eq!(
+            out,
+            (
+                StatusCode::OK,
+                "oidc:user-42@https://idp.example.com".to_string()
+            )
+        );
     }
 
     #[tokio::test]
