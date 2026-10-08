@@ -10,7 +10,8 @@ the full scan would pick. When the guard cannot prove it, the same statement
 runs the full scan, as before.
 
 **One migration (one index). No new `WorkflowEvent` variant. No new bind.
-No change to the claim order.**
+No change to the claim order.** The claim transaction also turns JIT off and
+forces the generic plan, with `SET LOCAL` (§1.6).
 
 ---
 
@@ -55,6 +56,8 @@ PgQ, pgmq, DBOS, Postgres source and docs. URLs are in the PR body.
 | R9 | The migration blocks the hot table. | `lock_timeout = '5s'`, a guarded build, and an out-of-band `CONCURRENTLY` recipe (issue #1810). |
 | R10 | The fence, kind and by-id splices break or claim the wrong row. | The fence and kind splices apply to both candidate scans. The by-id claim keeps the full-scan form. Shape tests count each anchor. |
 | R11 | A double claim, or a concurrency-cap overrun. | The window only selects the candidate. `FOR UPDATE SKIP LOCKED`, the advisory-lock recheck and the `claimed` update are unchanged. The existing concurrency suites run. |
+| R12 | A head gate that the planner misjudges makes it read the whole head. | Found in measurement: with one activity type, the plain activity-name gates estimate near zero rows. The head scans write them as one `CASE`. Test: `a_single_activity_type_backlog_keeps_the_window_bounded`. |
+| R13 | JIT or planning time eats the gain. | Found in measurement: the plan carries the full-scan estimate, so JIT ran on every claim. A custom plan costs about 6 ms. The claim sets `jit = off` and `force_generic_plan` for its own transaction. |
 
 ### 0.4 Six thinking hats — B4
 
@@ -97,6 +100,10 @@ row and constant arrays:
 - an expired `schedule_to_close_at`.
 
 Every row these gates skip is ineligible. So the guard argument in §1.3 holds.
+The three activity-name gates sit in one `CASE`. The planner cannot read
+their arrays at plan time, and in their plain form it can estimate that no
+row passes. It then reads the whole head. A `CASE` gets a fixed default
+estimate.
 
 `seek_bounds` keeps the last row of each full head.
 
@@ -128,6 +135,18 @@ Otherwise the scan never runs. `candidate` is the union of the two. The
   every head scan.
 - By id (#1312): the by-id claim names one row. It keeps the full-scan form.
 
+### 1.6 Planner settings
+
+The claim transaction sends `SET LOCAL jit = off; SET LOCAL plan_cache_mode =
+force_generic_plan` as one batch, before the claim.
+
+- The plan carries the estimated cost of the full scan, even when the
+  one-time filter skips it. That estimate passes `jit_above_cost` at depth.
+  JIT then compiled about 330 functions per claim, about 250 ms.
+- A custom plan costs about 6 ms to plan. The generic plan has the same
+  shape, and Postgres builds it once per connection.
+- `SET LOCAL` ends with the transaction, so the session keeps its settings.
+
 ## 2. Test plan
 
 | Phase | Test | Expected in red | Expected in green |
@@ -135,6 +154,7 @@ Otherwise the scan never runs. `candidate` is the union of the two. The
 | Red | `claim_buffers_stay_flat_from_1k_to_100k_pending_rows` | Fail: buffers grow, temp blocks at 100K. | Pass. |
 | Red | `a_large_activity_pause_array_does_not_spill_the_claim_at_100k` | Fail: the sort spills. | Pass. |
 | Red | Shape tests for `seek_heads`, the guard and the fallback | Fail: no window. | Pass. |
+| Red, added in green | `a_single_activity_type_backlog_keeps_the_window_bounded` | Fail with plain head gates: 1,393 to 10,916 buffers. | Pass: 668 to 638. |
 | Both | Order tests and the randomized drain | Pass. | Pass. |
 | Both | Existing claim suites: concurrency, pause, build routing, DR fence, run deadline, continuation priority, batched | Pass. | Pass. |
 

@@ -1572,6 +1572,17 @@ macro_rules! claim_full_scan_fallback_sql {
 /// `timeout.rs` `*_query()` convention) so its eligibility predicate is
 /// shape-testable without a database.
 ///
+/// # Seek window (issue #1971)
+///
+/// The query has two candidate scans. `seek_candidate` reads a bounded
+/// window from the head of each queue. `legacy_candidate` is the full scan.
+/// The full scan runs only when the window cannot prove its pick. See
+/// `claim_seek_ctes_sql!`, `claim_seek_guard_sql!` and
+/// `claim_full_scan_fallback_sql!`. Both scans apply the same gates, from
+/// `claim_candidate_gates_sql!`. So the claim picks the same row as one full
+/// scan would. Its cost no longer grows with the backlog when the window
+/// decides. `docs/performance.md` has the measurements.
+///
 /// Binds: `$1` worker id, `$2` queue names, `$3` worker build id,
 /// `$4` priority-aging seconds, `$5` circuit-breaker-tracked activities,
 /// `$6` ineligible activities. The queue-pause exclusion (issue #619) needs no
@@ -1656,6 +1667,29 @@ const fn claim_task_full_scan_query() -> &'static str {
         claim_trailing_ctes_sql!()
     )
 }
+
+/// The planner settings for the rest of the claim transaction (issue #1971).
+///
+/// **JIT off.** The claim plan holds two candidate scans. Postgres adds the
+/// estimated cost of the full scan to the plan, even when its one-time
+/// filter skips it. At a deep backlog that estimate passes
+/// `jit_above_cost`. JIT then compiles about 330 functions on every claim,
+/// about 250 ms on the reference box, for a statement that runs in about
+/// 2 ms. Postgres does not cache JIT code between executions.
+///
+/// **Generic plan.** The claim statement is prepared once per connection.
+/// A custom plan costs about 6 ms of planning on each claim, which is more
+/// than the claim itself. Postgres may keep a custom plan because it
+/// compares estimated costs, not planning time. The generic plan has the
+/// same shape: bounded head scans and a gated full scan. An `ANALYZE` of
+/// the table invalidates it, so it follows the table statistics.
+///
+/// `SET LOCAL` ends with the transaction, so the session settings of the
+/// connection do not change. The settings travel with the claim, as the
+/// isolation level does, so they do not depend on the pool configuration.
+/// Both go in one batch, so they cost one round trip.
+pub const CLAIM_PLAN_SETTINGS_SQL: &str =
+    "SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan";
 
 /// Resolve the cross-region DR fence binding for a claim (issue #954).
 ///
@@ -2006,6 +2040,9 @@ pub async fn claim_task_of_kind_on_shard(
     let outcome: ClaimOutcome = tx
         .run(
             async |conn: &mut AsyncPgConnection| -> HarvestResult<ClaimOutcome> {
+                diesel_async::SimpleAsyncConnection::batch_execute(conn, CLAIM_PLAN_SETTINGS_SQL)
+                    .await
+                    .map_err(crate::error::database_error)?;
                 // Cross-region DR fence (issue #954). Two fully separate
                 // arms rather than one boxed builder: `BoxedSqlQuery::bind`
                 // heap-allocates per bind and dispatches dynamically, and the
@@ -10198,6 +10235,17 @@ mod tests {
         }
     }
 
+    /// The claim sets its planner settings for its own transaction only
+    /// (issue #1971).
+    #[test]
+    fn claim_plan_settings_are_transaction_scoped() {
+        for setting in CLAIM_PLAN_SETTINGS_SQL.split("; ") {
+            assert!(setting.starts_with("SET LOCAL "), "{setting}");
+        }
+        assert!(CLAIM_PLAN_SETTINGS_SQL.contains("jit = off"));
+        assert!(CLAIM_PLAN_SETTINGS_SQL.contains("plan_cache_mode = force_generic_plan"));
+    }
+
     /// A kind-filtered claim applies its kind to every head scan too.
     #[test]
     fn kind_claim_query_filters_every_head_scan() {
@@ -10671,8 +10719,8 @@ mod tests {
     fn claim_task_query_honors_the_effective_rate_limit_override() {
         let sql = claim_task_query();
         let effective = effective_available_tokens_expr("b");
-        // Four occurrences: the EXISTS gate of each candidate scan (issue
-        // #1971), and the rate_limit_debit CTE's own SET (the debit) and
+        // Four occurrences. Each candidate scan has one EXISTS gate (issue
+        // #1971). The rate_limit_debit CTE has its SET (the debit) and its
         // WHERE (the re-check immediately before debiting).
         assert_eq!(
             sql.matches(&effective).count(),

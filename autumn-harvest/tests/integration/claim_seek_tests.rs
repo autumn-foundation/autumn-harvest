@@ -179,8 +179,9 @@ struct ClaimCost {
 /// Run `EXPLAIN (ANALYZE, BUFFERS)` of the claim statement that
 /// [`queue::claim_task`] sends, and roll the claim back.
 ///
-/// The statement is prepared with typed parameters. So the plan is the plan
-/// that real binds get, not a plan for substituted literals.
+/// The statement is prepared with typed parameters, under the planner
+/// settings that the claim transaction sets. So the plan is the plan that a
+/// real claim gets, not a plan for substituted literals.
 async fn claim_cost(conn: &mut AsyncPgConnection, queues: &[String]) -> ClaimCost {
     #[derive(diesel::QueryableByName)]
     struct Plan {
@@ -190,8 +191,9 @@ async fn claim_cost(conn: &mut AsyncPgConnection, queues: &[String]) -> ClaimCos
     exec(
         conn,
         &format!(
-            "BEGIN; SET LOCAL jit = off; \
+            "BEGIN; {}; \
              PREPARE seek_probe(text, text[], text, bigint, text[], text[]) AS {}",
+            queue::CLAIM_PLAN_SETTINGS_SQL,
             queue::claim_task_query()
         ),
     )
@@ -215,7 +217,11 @@ async fn claim_cost(conn: &mut AsyncPgConnection, queues: &[String]) -> ClaimCos
 }
 
 /// Claim through the public API and return the claimed row id.
-async fn claim(conn: &mut AsyncPgConnection, queues: &[String], aging: Option<u32>) -> Option<Uuid> {
+async fn claim(
+    conn: &mut AsyncPgConnection,
+    queues: &[String],
+    aging: Option<u32>,
+) -> Option<Uuid> {
     queue::claim_task(conn, queues, WORKER, "", aging, &[], &[])
         .await
         .expect("claim")
@@ -379,7 +385,11 @@ async fn a_row_pinned_to_this_worker_claims_first_from_deep_in_the_backlog() {
     .await;
     let claimed = claim(&mut conn, &qs, None).await;
     delete_queues(&mut conn, &qs).await;
-    assert_eq!(claimed, Some(pinned), "a live pin to this worker sorts first");
+    assert_eq!(
+        claimed,
+        Some(pinned),
+        "a live pin to this worker sorts first"
+    );
 }
 
 /// An eligible row behind a saturated head beats a lower-priority queue.
@@ -453,7 +463,11 @@ async fn ageing_lifts_an_old_row_over_a_deep_high_priority_backlog() {
     .await;
     let claimed = claim(&mut conn, &qs, Some(60)).await;
     delete_queues(&mut conn, &qs).await;
-    assert_eq!(claimed, Some(old), "one hour at 60 s ageing adds 60 priority");
+    assert_eq!(
+        claimed,
+        Some(old),
+        "one hour at 60 s ageing adds 60 priority"
+    );
 }
 
 /// Rows of an ineligible or saturated activity type at the head do not hide
@@ -584,7 +598,51 @@ async fn a_kind_filtered_claim_finds_its_kind_behind_the_other_kind() {
     .expect("claim")
     .map(|t| t.id);
     delete_queues(&mut conn, &qs).await;
-    assert_eq!(claimed, Some(workflow), "the workflow claimer skips activities");
+    assert_eq!(
+        claimed,
+        Some(workflow),
+        "the workflow claimer skips activities"
+    );
+}
+
+/// The claim sets its planner settings for its own transaction only (issue
+/// #1971).
+///
+/// The connection keeps its session settings after the claim, whether the
+/// claim takes a row or not.
+#[tokio::test]
+async fn the_claim_leaves_the_session_planner_settings_unchanged() {
+    #[derive(diesel::QueryableByName)]
+    struct Settings {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        jit: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        plan_cache_mode: String,
+    }
+    let (mut conn, _container) = setup_db().await;
+    let qs = queues(1);
+    let q = &qs[0];
+    insert_row(
+        &mut conn,
+        "queue_name, task_type, activity_name, scheduled_at",
+        &format!("'{q}', 'activity', 'noop', NOW() - INTERVAL '1 second'"),
+    )
+    .await;
+    exec(&mut conn, "SET jit = on; SET plan_cache_mode = auto").await;
+    let claimed = claim(&mut conn, &qs, None).await;
+    let empty = claim(&mut conn, &qs, None).await;
+    let after: Settings = diesel::sql_query(
+        "SELECT current_setting('jit') AS jit, \
+                current_setting('plan_cache_mode') AS plan_cache_mode",
+    )
+    .get_result(&mut conn)
+    .await
+    .expect("read settings");
+    exec(&mut conn, "RESET jit; RESET plan_cache_mode").await;
+    delete_queues(&mut conn, &qs).await;
+    assert!(claimed.is_some() && empty.is_none(), "one row, then none");
+    assert_eq!(after.jit, "on", "SET LOCAL must not leak into the session");
+    assert_eq!(after.plan_cache_mode, "auto", "SET LOCAL must not leak");
 }
 
 /// The claim key of the best eligible row, by the reference order.
@@ -624,7 +682,9 @@ async fn reference_best(
     .load(conn)
     .await
     .expect("reference order");
-    rows.into_iter().next().map(|k| (k.sticky_rank, k.priority, k.due))
+    rows.into_iter()
+        .next()
+        .map(|k| (k.sticky_rank, k.priority, k.due))
 }
 
 /// The claim key of one row, read before it is claimed.
@@ -654,9 +714,10 @@ async fn key_of(conn: &mut AsyncPgConnection, id: Uuid) -> (i32, i32, f64) {
 
 /// Random backlogs drain in the reference order.
 ///
-/// Each round seeds two queues with a random mix of priorities, new starts,
-/// pins to this worker and to others, a paused activity and a saturated
-/// concurrency key. Then it drains part of the backlog. Each claim must take
+/// Each round seeds two queues with a random mix of rows. The mix covers
+/// priorities, new starts, pins to this worker and to others, a paused
+/// activity and a saturated concurrency key. Then it drains part of the
+/// backlog. Each claim must take
 /// a row with the best reference key. Ties may go either way.
 #[tokio::test]
 async fn randomized_drains_follow_the_reference_order() {
