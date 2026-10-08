@@ -43,8 +43,9 @@ Done when: the page exists and `docs/comparison.md` links it.
   requires each asset from the issue: the HVG range, `det_check`,
   `harvest-verify`, replay canaries, drift gates and the park state.
 - **R5. Nobody can find the page.** Foreclosed: the guard requires links from
-  `docs/comparison.md` and the docs index. `corpus-link-check.py` checks the
-  link targets.
+  the determinism row and the Related list of `docs/comparison.md`. The
+  determinism guide links it too. `corpus-link-check.py` checks each link
+  target and reports an orphan page.
 - **R6. The guard never runs on a docs-only change.** Foreclosed: an ungated
   `lint` step runs the module, and a guard test fails if that step is removed
   or gains an `if:`.
@@ -78,7 +79,8 @@ Done when: the page exists and `docs/comparison.md` links it.
 1. **Red.** Add `replay_positioning_docs.rs`, register it in `mod.rs`, add the
    `lint` step. Run it and record the failures.
 2. **Green.** Write `docs/why-deterministic-replay.md`. Link it from
-   `docs/comparison.md` and the docs index. Add the changelog fragment.
+   `docs/comparison.md` and the determinism guide. Fix the stale claims in
+   the pages it links. Add the changelog fragment.
 3. **Refactor.** Tighten the prose and the guard. Run the guard,
    `corpus-link-check.py`, `doc-claim-drift.py`, `workflow-yaml-parse.py` and
    `comment-hygiene.py --base origin/trunk-dev`.

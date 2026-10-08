@@ -95,7 +95,10 @@ fn page_cites_the_current_hvg_range() {
 #[test]
 fn page_cites_only_shipped_issues() {
     let cited = issue_refs(&read(PAGE));
-    assert!(!cited.is_empty(), "{PAGE} must cite the issues that shipped each asset");
+    assert!(
+        !cited.is_empty(),
+        "{PAGE} must cite the issues that shipped each asset"
+    );
     let shipped = issue_refs(&read("docs/shipped-work.md"));
     let unshipped: Vec<u32> = cited.difference(&shipped).copied().collect();
     assert!(
@@ -143,8 +146,12 @@ fn prose_sentences_stay_short() {
 #[test]
 fn guards_run_on_docs_only_changes() {
     let workflow = read(".github/workflows/ci.yml");
-    let lint = workflow.find("\n  lint:").expect("ci.yml must define `lint`");
-    let test = workflow.find("\n  test:").expect("ci.yml must define `test`");
+    let lint = workflow
+        .find("\n  lint:")
+        .expect("ci.yml must define `lint`");
+    let test = workflow
+        .find("\n  test:")
+        .expect("ci.yml must define `test`");
     let step_at = workflow
         .find(FILTER)
         .expect("ci.yml must run the replay_positioning_docs guards");
@@ -180,10 +187,19 @@ fn helpers_parse_their_inputs() {
         BTreeSet::from([603, 1817])
     );
     let text = "# Title\n\nOne two. Three [four](x.md) five.\n\n```rust\nlet a = b. c;\n```\n\
-                \n| a | b |\n|---|---|\n| Six seven. | x |\n\n- Eight nine.\n";
+                \n| a | b |\n|---|---|\n| Six seven. | x |\n\n- **Eight nine.** Ten (eleven.)\n";
     assert_eq!(
         prose_sentences(text),
-        ["One two.", "Three four five.", "a", "b", "Six seven.", "x", "Eight nine."]
+        [
+            "One two.",
+            "Three four five.",
+            "a",
+            "b",
+            "Six seven.",
+            "x",
+            "**Eight nine.**",
+            "Ten (eleven.)"
+        ]
     );
 }
 
@@ -281,7 +297,10 @@ fn strip_link_targets(block: &str) -> String {
     out.replace('[', "")
 }
 
-/// Split on `. `, `? ` and `! `, and drop empty pieces.
+/// Split after a word that ends in `.`, `?` or `!`.
+///
+/// Closing emphasis, code, quote and bracket marks after the stop still end
+/// the sentence, so `**Lead-in.**` is one sentence.
 fn split_sentences(block: &str) -> Vec<String> {
     let mut sentences = Vec::new();
     let mut current = String::new();
@@ -291,7 +310,8 @@ fn split_sentences(block: &str) -> Vec<String> {
             current.push(' ');
         }
         current.push_str(word);
-        if word.ends_with(['.', '?', '!']) {
+        let bare = word.trim_end_matches(['*', '_', '`', ')', '"', '\'']);
+        if bare.ends_with(['.', '?', '!']) {
             sentences.push(std::mem::take(&mut current));
         }
     }

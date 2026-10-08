@@ -1,7 +1,9 @@
 # Gating deploys with replay-verify
 
-`harvest replay-verify` is the CI gate that ensures code changes to `#[workflow]` functions
-do not break in-flight production executions. It batch-replays exported history fixtures
+Replay-verify is the CI gate that ensures code changes to `#[workflow]` functions
+do not break in-flight production executions. You run it from your own binary through
+`ReplayVerifier::verify_dir`, or with the `harvest-replay` binary. The `harvest` CLI has
+no `replay-verify` subcommand. It batch-replays exported history fixtures
 against the current codebase and exits non-zero on any regression, blocking the merge.
 
 ## What it catches — and what it does not
@@ -249,6 +251,6 @@ cargo bench -p autumn-harvest \
   No new key-management surface is introduced by the verifier.
 - **DAG runs:** The verifier covers `#[workflow]`-annotated event histories only. A DAG-level
   verifier is a planned follow-up.
-- **Fixture lifecycle:** The verifier consumes a fixture directory produced by
-  `harvest history export --batch` (issue #169). Fixture rotation, pruning, and
+- **Fixture lifecycle:** The verifier consumes a fixture directory that
+  `harvest history export-batch --output-file` fills (issue #169). Fixture rotation, pruning, and
   auto-export-on-merge are deployment concerns outside the verifier's scope.

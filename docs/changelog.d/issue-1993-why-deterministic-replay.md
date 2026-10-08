@@ -1,0 +1,7 @@
+## Docs — Why Harvest keeps deterministic replay (issue #1993)
+
+Docs-only. New page `docs/why-deterministic-replay.md` answers engines that sell "no deterministic replay" as a feature. It compares replay with checkpoint-only steps and process snapshots. It states what replay buys: full history, reset, replay debugging and drift detection. It states what replay costs, and pairs each cost with the shipped tool that lowers it: HVG001–HVG011, `det_check`, `harvest-verify`, deterministic primitives, patch markers, the replayer, the in-flight drift gate, the replay canary and ND-blocking. It also says when a checkpoint-only engine is the better choice.
+
+`docs/comparison.md` links the page from its determinism row, its determinism narrative and its Related list. The same edit fixes three stale claims. The comparison page labelled the `WorkflowReplayer` harness "Phase 3.5", which is local activities; it now cites #251. The determinism guide said a divergent run moves to the dead-letter queue; since #603 it is parked. `docs/replay-verify.md` named a `harvest replay-verify` subcommand and an `export --batch` flag; neither exists.
+
+Guard: `tests/integration/replay_positioning_docs.rs` (8 tests). It checks the sections, the cited assets, the HVG range against `determinism_lint.rs`, that each cited issue is in `docs/shipped-work.md`, the comparison links, and that no prose sentence exceeds 25 words. A new ungated `lint` step runs it on docs-only changes. No public API, migration or `harvest_events` change.

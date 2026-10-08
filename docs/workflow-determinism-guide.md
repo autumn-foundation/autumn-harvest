@@ -8,7 +8,7 @@ This guide explains the rule catalog (`autumn_harvest::guardrail`) that document
 
 ## Why replay determinism matters
 
-When a workflow suspends (waiting for an activity, a timer, or a signal), Harvest saves its progress as an ordered sequence of events in `harvest_events`. On resume, the engine re-invokes the workflow function and drives it forward by replaying those saved events. If the function produces a different command on replay than it produced originally, the engine raises a `NonDeterminismError` and moves the execution to the dead-letter queue.
+When a workflow suspends (waiting for an activity, a timer, or a signal), Harvest saves its progress as an ordered sequence of events in `harvest_events`. On resume, the engine re-invokes the workflow function and drives it forward by replaying those saved events. If the function produces a different command on replay than it produced originally, the engine detects a divergence. Since issue #603 it parks the execution: the state stays `RUNNING`, no terminal event is written, and a rollback lets it resume. See the [non-determinism block runbook](runbooks/nondeterminism-block.md). [Why Harvest keeps deterministic replay](why-deterministic-replay.md) explains why Harvest accepts this constraint.
 
 Common replay footguns all share the same root cause: **code that returns a different value each time it is called**.
 
