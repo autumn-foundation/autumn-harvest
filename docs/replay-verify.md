@@ -207,6 +207,9 @@ jobs:
       #       --limit 200 \
       #       --payload-policy full \
       #       --output-file ./batch.json
+      #     # A partial export omits histories, so fail the gate on it.
+      #     jq -e '.status == "complete" and (.failures | length == 0)' ./batch.json
+      #     mkdir -p ./fixtures/replay
       #     jq -c '.exports[]' ./batch.json | while read -r doc; do
       #       id=$(jq -r '.execution_id' <<<"$doc")
       #       printf '%s\n' "$doc" > "./fixtures/replay/$id.json"
@@ -264,5 +267,6 @@ cargo bench -p autumn-harvest \
 - **Fixture lifecycle:** The verifier reads a directory of `HistorySnapshot` files.
   `harvest history export` writes one such file per run (issue #169).
   `harvest history export-batch` writes one envelope file, so split its `exports`
-  array into one file per run first. Fixture rotation, pruning, and
+  array into one file per run first. A `partial` envelope omits histories, so treat
+  it as a failed export. Fixture rotation, pruning, and
   auto-export-on-merge are deployment concerns outside the verifier's scope.

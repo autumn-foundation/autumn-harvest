@@ -67,8 +67,9 @@ reports no error.
   code can diverge from the history of a run that started under old code.
 - **Patch markers stay in the code.** Each `ctx.patched` branch stays until
   every run that started before it ends. Then `ctx.deprecate_patch` retires it.
-- **History stores every payload.** Each activity input and result is an event
-  in Postgres. Replay fixtures with full payloads are production data.
+- **History stores every payload.** By default, each activity input and result
+  is an event in Postgres. A payload store can keep large payloads outside it.
+  Replay fixtures with full payloads are production data.
 - **A history has a size limit.** An optional ceiling fails a run past a set
   event count (#493). A long loop must use continue-as-new.
 - **Cold resume cost grows with history.** A cold resume re-runs the body from
