@@ -398,6 +398,14 @@ async fn the_snapshot_is_taken_before_the_database_is_dropped() {
         "the workload claims tasks: {workload:?}"
     );
     assert_eq!(workload.errors, 0, "the workload fails: {workload:?}");
+    {
+        let mut conn = fixture::connect(&db.url()).await;
+        assert_eq!(
+            fixture::live_task_rows(&mut conn).await,
+            spec.live_rows,
+            "the workload keeps the table at its seeded depth"
+        );
+    }
 
     let snapshot = db.snapshot_and_drop().await;
     assert!(

@@ -708,6 +708,15 @@ async fn census(conn: &mut AsyncPgConnection, live: u64) -> FixtureShape {
     }
 }
 
+/// Rows in `harvest_task_queue` now.
+///
+/// # Panics
+/// Panics when the query fails.
+#[allow(clippy::cast_sign_loss)]
+pub async fn live_task_rows(conn: &mut AsyncPgConnection) -> u64 {
+    count(conn, "SELECT COUNT(*) AS n FROM harvest_task_queue").await as u64
+}
+
 /// An `md5` over the seeded content and the physical row order.
 ///
 /// The hash leaves out columns with a server default, because the seed does
@@ -869,6 +878,8 @@ impl WorkloadConfig {
 pub struct WorkloadReport {
     pub claims: u64,
     pub completions: u64,
+    /// Completed tasks deleted, as the hygiene sweep would.
+    pub reclaims: u64,
     pub enqueues: u64,
     pub empty_polls: u64,
     pub errors: u64,
@@ -882,6 +893,7 @@ pub struct WorkloadReport {
 struct Tally {
     claims: AtomicU64,
     completions: AtomicU64,
+    reclaims: AtomicU64,
     enqueues: AtomicU64,
     empty_polls: AtomicU64,
     errors: AtomicU64,
@@ -914,6 +926,22 @@ async fn by_deadline<T>(deadline: Instant, fut: impl std::future::Future<Output 
         .ok()
 }
 
+/// Delete the completed task `id`, as the hygiene sweep does later.
+///
+/// With the replacement, this keeps the table at its seeded depth. Without
+/// it, each claim leaves a terminal row, and a shallow table grows by half
+/// over its run. The statement shows in `pg_stat_statements` as the only one
+/// that the engine does not issue.
+async fn reclaim(conn: &mut AsyncPgConnection, id: uuid::Uuid) -> Result<(), String> {
+    use diesel_async::RunQueryDsl;
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE id = $1 AND state = 'COMPLETED'")
+        .bind::<diesel::sql_types::Uuid, _>(id)
+        .execute(conn)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 /// A replacement for a completed task, so the backlog keeps its depth.
 ///
 /// The replacement is always an activity task of the same execution, queue,
@@ -937,11 +965,97 @@ fn replacement(task: &autumn_harvest::models::TaskQueueItem) -> EnqueueParams {
     params
 }
 
+/// One claimer of [`drive_claims`]: claim, complete, delete and replace, until
+/// the deadline or `max` claims in all.
+async fn run_claimer(
+    conn: &mut AsyncPgConnection,
+    queues: &[String],
+    worker: &str,
+    deadline: Instant,
+    max: u64,
+    tally: &Tally,
+) {
+    let mut consecutive_errors = 0;
+    while Instant::now() < deadline && tally.claims.load(Ordering::Relaxed) < max {
+        let claim = queue::claim_task(conn, queues, worker, "", None, &[], &[]);
+        let Some(claimed) = by_deadline(deadline, claim).await else {
+            tally.cut_at_deadline.fetch_add(1, Ordering::Relaxed);
+            break;
+        };
+        let task = match claimed {
+            Ok(Some(task)) => {
+                consecutive_errors = 0;
+                task
+            }
+            Ok(None) => {
+                tally.empty_polls.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
+            Err(e) => {
+                tally.error("claim", &e);
+                consecutive_errors += 1;
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                    break;
+                }
+                tokio::time::sleep(ERROR_BACKOFF).await;
+                continue;
+            }
+        };
+        tally.claims.fetch_add(1, Ordering::Relaxed);
+        let complete = queue::complete_task(conn, task.id, serde_json::json!({}));
+        match by_deadline(deadline, complete).await {
+            None => {
+                tally.cut_at_deadline.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+            Some(Ok(())) => {
+                tally.completions.fetch_add(1, Ordering::Relaxed);
+            }
+            Some(Err(e)) => {
+                tally.error("complete", &e);
+                consecutive_errors += 1;
+            }
+        }
+        match by_deadline(deadline, reclaim(conn, task.id)).await {
+            None => {
+                tally.cut_at_deadline.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+            Some(Ok(())) => {
+                tally.reclaims.fetch_add(1, Ordering::Relaxed);
+            }
+            Some(Err(e)) => {
+                tally.error("reclaim", &e);
+                consecutive_errors += 1;
+            }
+        }
+        let params = replacement(&task);
+        match by_deadline(deadline, queue::enqueue(conn, &params)).await {
+            None => {
+                tally.cut_at_deadline.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+            Some(Ok(_)) => {
+                consecutive_errors = 0;
+                tally.enqueues.fetch_add(1, Ordering::Relaxed);
+            }
+            Some(Err(e)) => {
+                tally.error("enqueue", &e);
+                consecutive_errors += 1;
+            }
+        }
+        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+            break;
+        }
+    }
+}
+
 /// Drive the engine claim path against the fixture at `url`.
 ///
 /// Each claimer claims with [`queue::claim_task`] over every queue, completes
-/// the task, and enqueues a replacement. So the measured statements are the
-/// engine statements, and the backlog keeps its depth.
+/// the task, deletes it, and enqueues a replacement. Every measured statement
+/// but the delete comes from the engine, and the table keeps its depth.
 ///
 /// # Panics
 /// Panics when a claimer cannot connect.
@@ -965,67 +1079,7 @@ pub async fn drive_claims(
         handles.push(tokio::spawn(async move {
             let mut conn = connect(&url).await;
             let worker = format!("{PREFIX}-worker-{n}");
-            let mut consecutive_errors = 0;
-            while Instant::now() < deadline && tally.claims.load(Ordering::Relaxed) < max {
-                let claim = queue::claim_task(&mut conn, &queues, &worker, "", None, &[], &[]);
-                let Some(claimed) = by_deadline(deadline, claim).await else {
-                    tally.cut_at_deadline.fetch_add(1, Ordering::Relaxed);
-                    break;
-                };
-                let task = match claimed {
-                    Ok(Some(task)) => {
-                        consecutive_errors = 0;
-                        task
-                    }
-                    Ok(None) => {
-                        tally.empty_polls.fetch_add(1, Ordering::Relaxed);
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                        continue;
-                    }
-                    Err(e) => {
-                        tally.error("claim", &e);
-                        consecutive_errors += 1;
-                        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                            break;
-                        }
-                        tokio::time::sleep(ERROR_BACKOFF).await;
-                        continue;
-                    }
-                };
-                tally.claims.fetch_add(1, Ordering::Relaxed);
-                let complete = queue::complete_task(&mut conn, task.id, serde_json::json!({}));
-                match by_deadline(deadline, complete).await {
-                    None => {
-                        tally.cut_at_deadline.fetch_add(1, Ordering::Relaxed);
-                        break;
-                    }
-                    Some(Ok(())) => {
-                        tally.completions.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Some(Err(e)) => {
-                        tally.error("complete", &e);
-                        consecutive_errors += 1;
-                    }
-                }
-                let params = replacement(&task);
-                match by_deadline(deadline, queue::enqueue(&mut conn, &params)).await {
-                    None => {
-                        tally.cut_at_deadline.fetch_add(1, Ordering::Relaxed);
-                        break;
-                    }
-                    Some(Ok(_)) => {
-                        consecutive_errors = 0;
-                        tally.enqueues.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Some(Err(e)) => {
-                        tally.error("enqueue", &e);
-                        consecutive_errors += 1;
-                    }
-                }
-                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                    break;
-                }
-            }
+            run_claimer(&mut conn, &queues, &worker, deadline, max, &tally).await;
         }));
     }
     for handle in handles {
@@ -1035,6 +1089,7 @@ pub async fn drive_claims(
     WorkloadReport {
         claims: tally.claims.load(Ordering::Relaxed),
         completions: tally.completions.load(Ordering::Relaxed),
+        reclaims: tally.reclaims.load(Ordering::Relaxed),
         enqueues: tally.enqueues.load(Ordering::Relaxed),
         empty_polls: tally.empty_polls.load(Ordering::Relaxed),
         errors: tally.errors.load(Ordering::Relaxed),
@@ -1279,10 +1334,11 @@ pub async fn capture_run(
     );
     let _ = writeln!(
         s,
-        "workload: {} claimers, {} claims, {} completions, {} enqueues, {} empty polls, {} errors, {} cut at the budget, in {:.1}s ({:.1} claims/s)",
+        "workload: {} claimers, {} claims, {} completions, {} reclaims, {} enqueues, {} empty polls, {} errors, {} cut at the budget, in {:.1}s ({:.1} claims/s)",
         workload.claimers,
         report.claims,
         report.completions,
+        report.reclaims,
         report.enqueues,
         report.empty_polls,
         report.errors,
