@@ -43,6 +43,13 @@ async fn setup_server() -> (String, DbGuard) {
     }
     let container = Postgres::default()
         .with_tag("16")
+        // The command replaces the image default, so repeat `fsync=off`.
+        .with_cmd([
+            "-c",
+            "shared_preload_libraries=pg_stat_statements",
+            "-c",
+            "fsync=off",
+        ])
         .start()
         .await
         .expect("postgres container should start");
