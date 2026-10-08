@@ -28,7 +28,8 @@ number here.
 
 **This is not the 0.6.0 box.** The 0.6.0 numbers came from another 4-core
 host. A change between the two files can come from the host or from the
-release. The same-box control below separates the two.
+release. The [same-box control](#same-box-control-060-on-this-host) below
+separates the two.
 
 ## Headline numbers
 
@@ -61,8 +62,42 @@ the cause.
 
 ### Same-box control: 0.6.0 on this host
 
-Pending. The 0.6.0 harness (`b407659`) runs on this host next, with the same
-clusters and settings. Its numbers land here.
+The 0.6.0 harness (`b407659`) ran on this host right after the 0.7.0 sweep,
+against the same four clusters. Its verbatim report is
+[`control-v0.6.0-on-v0.7.0-host.md`](control-v0.6.0-on-v0.7.0-host.md). It is
+one post-hoc sweep, with a replay spread of 3.1%.
+
+| scenario | metric | shards | 0.6.0, its own host | 0.6.0, this host | 0.7.0, this host |
+|:--|:--|--:|--:|--:|--:|
+| `throughput` | workflows/sec | 1 | 23.73 | 17.91 | 15.46 |
+| `throughput` | workflows/sec | 2 | 35.70 | 21.23 | 18.84 |
+| `throughput` | workflows/sec | 4 | 33.58 | 19.38 | 19.50 |
+| `dispatch_latency` | p50 ms | 1 | 40.98 | 45.31 | 16.12 |
+| `dispatch_latency` | p50 ms | 2 | 47.22 | 42.86 | 26.17 |
+| `dispatch_latency` | p50 ms | 4 | 58.02 | 4 020.33 | 69.98 |
+| `dispatch_latency` | p99 ms | 1 | 58.63 | 78.44 | 90.86 |
+| `signal_roundtrip` | p50 ms | 1 | 53.59 | 45.01 | 47.53 |
+| `signal_roundtrip` | p99 ms | 1 | 65.96 | 73.84 | 92.99 |
+
+What it shows:
+
+* **Most of the throughput drop is the host.** The same 0.6.0 code reads
+  17.91 here against 23.73 on its own host, 25% lower.
+* **0.7.0 is slower than 0.6.0 at one and two shards on this host.** It is
+  14% lower at one shard and 11% lower at two. At four shards the two are
+  level. Each figure is one sweep, and the 0.7.0 sweep's noise control read
+  7.9%, so the size of the change is uncertain. Its direction holds at both
+  shard counts.
+* **0.7.0 dispatches faster at low shard counts.** The dispatch p50 is 16.12
+  ms against 45.31 at one shard, and 26.17 against 42.86 at two.
+* **0.6.0 broke down at four shards on this host.** Its dispatch p50 read
+  4,020 ms. The harness marked the cell sound, because the pace and the clock
+  held. 0.7.0 reads 69.98 ms in the same cell.
+* **0.7.0's tails are wider.** The 1-shard dispatch p99 and signal p99 are
+  both higher than 0.6.0's on this host.
+
+This suite cannot attribute any of these changes. `docs/performance.md` and
+the assay ledger are where a cause gets found.
 
 ## What the shard sweep showed
 

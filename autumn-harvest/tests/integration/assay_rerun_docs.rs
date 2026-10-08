@@ -156,11 +156,16 @@ fn comparison_cites_the_rerun_instead_of_disclaiming() {
 #[test]
 fn benchmarks_points_at_the_rerun_without_naming_the_engine() {
     // `benchmarks_docs.rs` forbids a competitor name on this page (#1309).
-    // The page can still point at the ledger entry.
-    let page = read("docs/benchmarks.md");
+    // The report's file name holds one, so the page names the ledger entry
+    // and links the ledger.
+    let page = flat(&read("docs/benchmarks.md"));
     assert!(
-        page.contains(REPORT_LINK),
-        "docs/benchmarks.md must point at the rerun ({REPORT_LINK})"
+        page.contains("(assays/README.md)") && page.contains("entries 10, 11 and 14"),
+        "docs/benchmarks.md must point at ledger entry 14 through the ledger"
+    );
+    assert!(
+        !page.contains(REPORT_LINK),
+        "docs/benchmarks.md must not link {REPORT_LINK}: its name holds the engine"
     );
 }
 

@@ -51,9 +51,12 @@ full environment, the per-cell notes and the verbatim run output are in
 
 Read these four points before the table:
 
-* **This is a different host from 0.6.0.** The 0.6.0 figures came from
-  another 4-core box. Do not read the change between the two tables as a
-  release effect. The results file runs 0.6.0 on this host as a control.
+* **This is a different host from 0.6.0, and most of the drop is the host.**
+  The results file runs the 0.6.0 suite on this host as a control. There,
+  0.6.0 reads 17.91 workflows/sec at one shard, against 23.73 on its own
+  host. On the same host, 0.7.0 is 14% below 0.6.0 at one shard, 11% below at
+  two and level at four. It dispatches faster: a 1-shard p50 of 16.12 ms
+  against 45.31.
 * **The box was quiet, but less quiet than for 0.6.0.** The replay control
   spread **7.9%** against 0.8% for 0.6.0. That is inside the 10% bar. On four
   cores, a concurrent build once moved a published latency by more than 10x,
@@ -119,10 +122,10 @@ Harvest lost them.** They are reported in the assay ledger rather than here.
 The engine is deliberately not named on this page: issue #1309's acceptance
 criterion is that no competitor figure appears on it, and
 `benchmarks_docs.rs` enforces that. See [the assay ledger](assays/README.md),
-entries 10, 11 and 14. Entry 14,
-[the 0.7.0 rerun](assays/0014-harvest-vs-temporal-0.7.0-depth-sweep.md), is
-the current one. Each entry carries its pre-registration, which fixed in
-advance what its numbers may not be read to mean.
+entries 10, 11 and 14. Entry 14, the 0.7.0 rerun, is the current one. The
+ledger links its report without this page naming the engine. Each entry
+carries its pre-registration, which fixed in advance what its numbers may not
+be read to mean.
 
 Two things from entry 14 bear on this page's own numbers:
 
