@@ -66,7 +66,7 @@
 //! a compromised Harvest process.
 
 use chrono::{DateTime, Utc};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 use crate::audit_export::AuditExportRecord;

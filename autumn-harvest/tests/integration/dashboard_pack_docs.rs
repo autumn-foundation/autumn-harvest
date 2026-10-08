@@ -212,6 +212,17 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     // series per process).
     "harvest_notify_send_failures",
     "harvest_notify_queue_usage",
+    // Issue #1815 — DB pool, DB op latency, pollers and the outlier signal.
+    "harvest_db_pool_in_use",
+    "harvest_db_pool_idle",
+    "harvest_db_pool_wait_duration_bucket",
+    "harvest_db_pool_wait_duration_count",
+    "harvest_db_pool_wait_duration_sum",
+    "harvest_db_query_duration_bucket",
+    "harvest_db_query_duration_count",
+    "harvest_db_query_duration_sum",
+    "harvest_worker_pollers",
+    "harvest_worker_outlier",
     // Issue #954 — cross-region DR. Four gauges (bare) and one counter.
     "harvest_replication_lag_seconds",
     "harvest_replication_lag_bytes",
@@ -378,6 +389,14 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ("harvest_dispatch_dropped_hints", &[]),
     ("harvest_notify_send_failures", &[]),
     ("harvest_notify_queue_usage", &[]),
+    // Issue #1815. Each label is bounded: shard ids, the `DbOp` and
+    // `OutlierDimension` enums, and configured queue names.
+    ("harvest_db_pool_in_use", &["shard"]),
+    ("harvest_db_pool_idle", &["shard"]),
+    ("harvest_db_pool_wait_duration", &["shard"]),
+    ("harvest_db_query_duration", &["op"]),
+    ("harvest_worker_pollers", &["queue"]),
+    ("harvest_worker_outlier", &["dimension"]),
     // Issue #954 — cross-region DR. All `{shard}`-only: a standby's
     // `application_name` is operator-chosen and unbounded (ADR-0001 §7).
     ("harvest_replication_lag_seconds", &["shard"]),

@@ -4279,6 +4279,7 @@ async fn a_fence_stops_an_activity_heartbeat_flusher() {
         autumn_harvest::heartbeat::HeartbeatFlushOptions {
             acquire_timeout: std::time::Duration::from_secs(1),
             metrics: std::sync::Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+            shards: std::sync::Arc::from([0]),
         },
     );
 
