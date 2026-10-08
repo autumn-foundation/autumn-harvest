@@ -121,7 +121,10 @@ checks that the SQL claim follows the model step by step.
   than the queue drains, a backlogged key gets every other claim.
 
 Concurrent claimers see the same snapshot. With `C` claimers, one key can
-take up to `C` claims in a row. The charge of each claim is still exact.
+take up to `C` claims in a row. A key with no debt can therefore wait up to
+`C - 1` more claims. The charge of each claim is still exact, so the next
+claims pay that debt back. A stricter bound needs one lock per queue, which
+every keyed claim of the queue would wait on.
 
 ## Cost
 

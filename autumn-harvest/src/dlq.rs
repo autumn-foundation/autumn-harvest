@@ -561,9 +561,9 @@ fn requeue_params(
     params.workflow_exec_id = entry.workflow_exec_id;
     params.activity_name = entry.activity_name;
     params.max_attempts = entry.attempts.max(1);
-    // The dead letter keeps the run's quota key. It is the redriven task's
-    // fairness key (issue #1976).
-    params.fairness_key = entry.quota_key;
+    // The dead letter keeps the run's quota key. A valid quota key is the
+    // redriven task's fairness key (issue #1976).
+    params.fairness_key = crate::queue_fairness::fairness_key_for(None, entry.quota_key.as_deref());
     if let Some(at) = not_before {
         params.scheduled_at = at;
     }
@@ -2417,6 +2417,48 @@ async fn load_workflow_names(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dead_letter_with_quota_key(quota_key: Option<&str>) -> DeadLetter {
+        DeadLetter {
+            id: Uuid::nil(),
+            original_task_id: Uuid::nil(),
+            queue_name: "q".into(),
+            task_type: "workflow".into(),
+            workflow_exec_id: None,
+            activity_name: None,
+            input: serde_json::json!({}),
+            error: String::new(),
+            attempts: 1,
+            failed_at: Utc::now(),
+            owner: None,
+            severity: None,
+            workflow_name: None,
+            quota_key: quota_key.map(str::to_owned),
+        }
+    }
+
+    /// A redrive takes a valid quota key as its fairness key. An invalid
+    /// quota key gives the default key, which the weight API can address
+    /// (issue #1976).
+    #[test]
+    fn redrive_uses_only_a_valid_quota_key_as_its_fairness_key() {
+        let p = requeue_params(
+            dead_letter_with_quota_key(Some("tenant-a")),
+            TaskType::Workflow,
+            None,
+        );
+        assert_eq!(p.fairness_key.as_deref(), Some("tenant-a"));
+        for bad in ["", " x", "..", "a\u{7}b"] {
+            let p = requeue_params(
+                dead_letter_with_quota_key(Some(bad)),
+                TaskType::Workflow,
+                None,
+            );
+            assert_eq!(p.fairness_key, None, "quota key {bad:?}");
+        }
+        let p = requeue_params(dead_letter_with_quota_key(None), TaskType::Workflow, None);
+        assert_eq!(p.fairness_key, None);
+    }
 
     // ── Redrive filter unit tests (issue #510) ───────────────────────────────
 

@@ -1641,7 +1641,7 @@ async fn enqueue_fork_workflow_task(
     );
     enqueue.workflow_exec_id = Some(new_exec_id.as_uuid());
     enqueue.required_build_id = fork.assigned_build_id.clone();
-    enqueue.fairness_key = source_quota_key.map(str::to_owned);
+    enqueue.fairness_key = crate::queue_fairness::fairness_key_for(None, source_quota_key);
     if let Some(reg) = registry
         && let Some(info) = reg.workflows.get(&fork.workflow_name)
         && let Some(policy) = &info.concurrency

@@ -58,6 +58,9 @@ survives.
   proof is `tenant_flood_holds_tenant_b_within_the_bound_with_fairness_keys`.
   The bound counts claims. At a fixed service rate, one claim stands for one
   task duration.
+- Concurrent claimers read the same state. With `C` claimers the bound
+  grows by up to `C - 1` claims. Each charge stays exact. Serializing the
+  choice would need a per-queue lock, rejected below.
 - New keys get a claim before any key in debt. While they arrive more slowly
   than the queue drains, that is max-min fair. When they arrive as fast as
   the queue drains, they take every claim. Two variants that advance `V` on
