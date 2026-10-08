@@ -457,7 +457,7 @@ jobs:
             exit 1
           fi
           curl -fsS http://127.0.0.1:8082/api/harvest/health/live
-          docker stop --time 60 worker
+          docker stop --timeout 60 worker
           code="$(docker inspect --format '{{.State.ExitCode}}' worker)"
           docker logs worker 2>&1 | tail -n 20
           if [ "$code" != 0 ]; then
