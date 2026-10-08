@@ -14025,6 +14025,7 @@ impl WorkflowContext {
                         && !matches!(buffered.cmd, WorkflowCommand::ReleaseMutex { .. })
                 });
         *cmds = kept;
+        drop(cmds);
         withdrawn.into_iter().map(|buffered| buffered.cmd).collect()
     }
 

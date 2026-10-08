@@ -57,31 +57,29 @@ impl ScopeMembers {
         match cmd {
             WorkflowCommand::ScheduleActivity { activity_id, .. }
             | WorkflowCommand::WaitForActivity { activity_id, .. }
-            | WorkflowCommand::ScheduleExternalActivity { activity_id, .. } => {
-                if !self.activities.contains(activity_id) {
-                    self.activities.push(*activity_id);
-                }
+            | WorkflowCommand::ScheduleExternalActivity { activity_id, .. }
+                if !self.activities.contains(activity_id) =>
+            {
+                self.activities.push(*activity_id);
             }
-            WorkflowCommand::StartChildWorkflow { child_id, .. } => {
-                if !self.children.contains(child_id) {
-                    self.children.push(*child_id);
-                }
+            WorkflowCommand::StartChildWorkflow { child_id, .. }
+                if !self.children.contains(child_id) =>
+            {
+                self.children.push(*child_id);
             }
             WorkflowCommand::StartTimer { timer_id, .. }
             | WorkflowCommand::ArmTimer {
                 timer_id,
                 for_await: true,
                 ..
-            } => {
-                if !self.timers.contains(timer_id) {
-                    self.timers.push(timer_id.clone());
-                }
+            } if !self.timers.contains(timer_id) => {
+                self.timers.push(timer_id.clone());
             }
             _ => {}
         }
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    pub(crate) const fn is_empty(&self) -> bool {
         self.activities.is_empty() && self.children.is_empty() && self.timers.is_empty()
     }
 }
@@ -136,7 +134,9 @@ struct ScopeInner {
 
 impl ScopeShared {
     fn lock(&self) -> MutexGuard<'_, ScopeInner> {
-        self.inner.lock().expect("scope lock poisoned")
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -470,26 +470,25 @@ impl<F: Future> Future for NonCancellable<'_, F> {
             )));
         }
         let ctx = this.ctx;
-        let seq = match this.seq {
-            Some(seq) => seq,
-            None => {
-                if ctx.in_cancellable_scope() {
-                    this.finished = true;
-                    this.body = None;
-                    return Poll::Ready(Err(HarvestError::Config(
-                        "ctx.non_cancellable cannot run inside a cancellation scope".to_string(),
-                    )));
-                }
-                let seq = ctx.next_shield_seq();
-                this.seq = Some(seq);
-                if let Err(err) = record_shield_marker(ctx, shield_open_marker_name(seq)) {
-                    this.finished = true;
-                    this.body = None;
-                    return Poll::Ready(Err(err));
-                }
-                this.open = true;
-                seq
+        let seq = if let Some(seq) = this.seq {
+            seq
+        } else {
+            if ctx.in_cancellable_scope() {
+                this.finished = true;
+                this.body = None;
+                return Poll::Ready(Err(HarvestError::Config(
+                    "ctx.non_cancellable cannot run inside a cancellation scope".to_string(),
+                )));
             }
+            let seq = ctx.next_shield_seq();
+            this.seq = Some(seq);
+            if let Err(err) = record_shield_marker(ctx, shield_open_marker_name(seq)) {
+                this.finished = true;
+                this.body = None;
+                return Poll::Ready(Err(err));
+            }
+            this.open = true;
+            seq
         };
         let Some(body) = this.body.as_mut() else {
             return Poll::Pending;
@@ -1293,9 +1292,6 @@ mod tests {
     /// Replay consumes it, so the next command still matches.
     #[tokio::test]
     async fn a_late_external_result_of_a_cancelled_member_is_consumed() {
-        let exec_id = ExecutionId::new();
-        let a = ActivityExecId::new();
-        let token = crate::types::ExternalActivityToken::new();
         async fn wf(ctx: &WorkflowContext) -> HarvestResult<Value> {
             let scope = ctx.cancellation_scope();
             let (approved, ()) = tokio::join!(
@@ -1309,6 +1305,9 @@ mod tests {
             ctx.execute_activity_raw("after", Value::Null, "default")
                 .await
         }
+        let exec_id = ExecutionId::new();
+        let a = ActivityExecId::new();
+        let token = crate::types::ExternalActivityToken::new();
         let mut history = vec![
             started(),
             WorkflowEvent::ActivityAwaitingExternal {
