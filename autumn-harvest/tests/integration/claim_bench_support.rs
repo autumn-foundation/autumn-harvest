@@ -60,20 +60,15 @@
 /// 3.7. These variants let the benchmark attribute cost to **five** of them
 /// instead of reporting a single opaque number.
 ///
-/// Deliberately **not exhaustive**, and the gap is not visible from this
-/// list. Capability labels (#382), queue pauses (#619), `schedule_to_close`
-/// (#378), worker sessions (#606), sticky routing (#235) and activity pauses
-/// (#807) are in the query on every claim. `db::seed_backlog` leaves their
-/// columns null. No scenario here ever inserts a `harvest_queue_pauses` or
-/// `harvest_activity_pauses` row, so those subplans only ever see empty or
-/// null input. They are evaluated, not measured — the cheapest path each of
-/// them has. Adding one means a seed variant *and* a report row; see the
-/// "Known limitations" section of `docs/performance.md`, which ranks them by
-/// how much the omission is likely to matter.
-///
-/// `db::seed_queue_pauses` and `db::seed_activity_pauses` do insert real
-/// pause rows, but only for the dedicated pause-array-size evidence capture
-/// (issue #1215) — no `ClaimGate` scenario here uses them.
+/// Deliberately **not exhaustive**, and the gap is not visible from this list:
+/// capability labels (#382), queue pauses (#619), `schedule_to_close` (#378),
+/// worker sessions (#606) and sticky routing (#235) are all in the query on
+/// every claim, but `db::seed_backlog` leaves their columns null and nothing
+/// ever inserts a `harvest_queue_pauses` row, so those subplans only ever see
+/// empty or null input. They are evaluated, not measured — the cheapest path
+/// each of them has. Adding one means a seed variant *and* a report row; see
+/// the "Known limitations" section of `docs/performance.md`, which ranks them
+/// by how much the omission is likely to matter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimGate {
     /// Plain rows: no build id, no concurrency key, no rate limit, no pauses.
@@ -1313,10 +1308,7 @@ pub const BENCH_DB_PREFIX: &str = "harvest_claim_bench_";
 /// Width of the [`db::run_token`] field in a bench database name.
 ///
 /// `format!("{:016x}", u64)` is always exactly this many lowercase hex digits.
-///
-/// Public: the e2e harness's own database names carry the same
-/// [`db::run_token`] field and reuse this width rather than a second copy.
-pub const RUN_TOKEN_HEX_LEN: usize = 16;
+const RUN_TOKEN_HEX_LEN: usize = 16;
 
 /// What the stale-database sweep should do with one candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1419,10 +1411,7 @@ pub fn sweep_step(datname: &str) -> SweepStep {
 /// This gates a `DROP DATABASE`, so "could parse to something we might hold" is
 /// the wrong question. The right one is "is this byte-for-byte a name we would
 /// have written", and only the round-trip asks it.
-///
-/// Public so the e2e harness's own name-shape check reuses this rather than a
-/// second round-trip parser.
-pub fn is_canonical_decimal<T: std::str::FromStr + std::fmt::Display>(s: &str) -> bool {
+fn is_canonical_decimal<T: std::str::FromStr + std::fmt::Display>(s: &str) -> bool {
     s.parse::<T>().is_ok_and(|v| v.to_string() == s)
 }
 
@@ -1454,10 +1443,7 @@ pub fn sweep_probe_decoy_name(pid: u32, token: &str) -> String {
 ///
 /// Uppercase is rejected for the same reason a fourth component is: we never
 /// produce it, so a name carrying it is not ours.
-///
-/// Public so the e2e harness's own name-shape check can reuse the one
-/// definition of "is this a run token" instead of growing a second one.
-pub fn is_run_token(s: &str) -> bool {
+fn is_run_token(s: &str) -> bool {
     s.len() == RUN_TOKEN_HEX_LEN
         && s.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -1650,7 +1636,7 @@ mod pure_tests {
         assert_eq!(out.total_claimed, 0);
         assert_eq!(out.claimed, 0);
         assert_eq!(out.empty, 0);
-        assert_eq!(out.samples, [] as [f64; 0]);
+        assert!(out.samples.is_empty());
         assert!(out.truncated, "truncation must survive the split");
     }
 
@@ -3144,7 +3130,7 @@ pub mod db {
             with_provision_deadline(
                 "run migrations",
                 deadline,
-                conn.batch_execute(&autumn_harvest::test_init_sql()),
+                conn.batch_execute(autumn_harvest::full_migrations_sql()),
             )
             .await?
             .map_err(|e| SkipReason(format!("migrate {db}: {e}")))?;
@@ -3173,7 +3159,7 @@ pub mod db {
             "start the benchmark container",
             deadline,
             Postgres::default()
-                .with_init_sql(autumn_harvest::test_init_sql().as_bytes().to_vec())
+                .with_init_sql(autumn_harvest::full_migrations_sql().as_bytes().to_vec())
                 .with_tag("16")
                 // Preload `pg_stat_statements` so the evidence-capture test's
                 // real-claim_task() snapshot (`zz_capture_queue_pause_claim_evidence`)
@@ -3557,9 +3543,7 @@ pub mod db {
     /// Conservative by design — a failed check reports "in use", so the worst
     /// outcome is a leaked database, never a live run dropped out from under
     /// itself.
-    /// Public so the e2e harness's own stale-database sweep reuses this
-    /// server-visible liveness check rather than a second copy of the query.
-    pub async fn database_has_connections(admin: &mut AsyncPgConnection, datname: &str) -> bool {
+    async fn database_has_connections(admin: &mut AsyncPgConnection, datname: &str) -> bool {
         #[derive(QueryableByName)]
         struct CountRow {
             #[diesel(sql_type = diesel::sql_types::BigInt)]
@@ -3627,8 +3611,7 @@ pub mod db {
             conn,
             "TRUNCATE harvest_task_queue, harvest_workflow_executions, \
              harvest_rate_limit_buckets, harvest_build_compat, harvest_build_policies, \
-             harvest_workers, harvest_queue_pauses, harvest_activity_pauses \
-             RESTART IDENTITY CASCADE",
+             harvest_workers, harvest_queue_pauses RESTART IDENTITY CASCADE",
         )
         .await;
     }
@@ -3776,58 +3759,6 @@ pub mod db {
              SELECT e.queue_name, 'workflow', e.id, '{}'::jsonb, 'PENDING', 0, 3, \
                     NOW() - INTERVAL '1 second' \
              FROM harvest_workflow_executions e",
-        )
-        .await;
-    }
-
-    /// Seed `harvest_queue_pauses` with `count` rows. One is a real pause on
-    /// the scenario's first polled queue. The rest are unrelated names, so
-    /// the anti-join's array is realistically wide, not a single element.
-    ///
-    /// Set-based, like every other seed function here -- see issue #1215,
-    /// which found the anti-join's cost scales with array size, not just
-    /// backlog depth.
-    ///
-    /// # Panics
-    /// Panics if `count` is `0`: there is no real pause to seed then, and every
-    /// caller wants at least one.
-    pub async fn seed_queue_pauses(conn: &mut AsyncPgConnection, real: &str, count: usize) {
-        assert!(count > 0, "seed_queue_pauses needs at least one real pause");
-        exec(
-            conn,
-            &format!(
-                "INSERT INTO harvest_queue_pauses (queue_name, reason) \
-                 VALUES ('{real}', 'bench-real') \
-                 UNION ALL \
-                 SELECT '{BENCH_PREFIX}-paused-q-' || i, 'bench-ballast' \
-                 FROM generate_series(1, {}) AS s(i)",
-                count - 1
-            ),
-        )
-        .await;
-    }
-
-    /// Seed `harvest_activity_pauses` with `count` rows: one real pause (the
-    /// scenario's activity name) plus `count - 1` unrelated names. See
-    /// [`seed_queue_pauses`] -- same shape, mirrored table.
-    ///
-    /// # Panics
-    /// Panics if `count` is `0`.
-    pub async fn seed_activity_pauses(conn: &mut AsyncPgConnection, real: &str, count: usize) {
-        assert!(
-            count > 0,
-            "seed_activity_pauses needs at least one real pause"
-        );
-        exec(
-            conn,
-            &format!(
-                "INSERT INTO harvest_activity_pauses (activity_name, reason) \
-                 VALUES ('{real}', 'bench-real') \
-                 UNION ALL \
-                 SELECT '{BENCH_PREFIX}-paused-a-' || i, 'bench-ballast' \
-                 FROM generate_series(1, {}) AS s(i)",
-                count - 1
-            ),
         )
         .await;
     }
@@ -4072,24 +4003,7 @@ pub mod db {
         // this while the code passed `budget` — the measured-phase ceiling —
         // so an injected budget bounded seeding too.
         let seed_outcome = connect_and_seed(db, scenario, super::setup_time_budget()).await;
-        measure_seeded_claims(db, scenario, seed_outcome, budget).await
-    }
 
-    /// Measure claims against a database that the caller already seeded.
-    ///
-    /// [`run_claim_scenario_with_budget`] seeds and then calls this. A bench
-    /// that must change the table between seed and measure calls [`seed`]
-    /// itself and then this (issue #1811).
-    ///
-    /// # Panics
-    ///
-    /// Panics if claiming fails.
-    pub async fn measure_seeded_claims(
-        db: &BenchDb,
-        scenario: Scenario,
-        seed_outcome: SeedOutcome,
-        budget: std::time::Duration,
-    ) -> ClaimReport {
         let pool = build_pool(&db.url, scenario.claimers);
         let queues = Arc::new(queue_names(scenario));
         let cb_set = Arc::new(circuit_breaker_set(scenario.gate));
@@ -4304,7 +4218,7 @@ pub mod db {
             workflow_exec_id: None,
             activity_name: Some(BENCH_ACTIVITY.to_string()),
             activity_id: Some(uuid::Uuid::new_v4()),
-            input: serde_json::json!({}).into(),
+            input: serde_json::json!({}),
             priority: 0,
             max_attempts: 3,
             scheduled_at: chrono::Utc::now(),
@@ -4323,7 +4237,6 @@ pub mod db {
             required_capabilities: None,
             context_headers: None,
             session_id: None,
-            new_start: false,
         }
     }
 

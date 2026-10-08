@@ -19,9 +19,10 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
+use autumn_web::AppState;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::test_init_sql().as_bytes().to_vec()
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
 }
 
 async fn setup_database() -> (String, ContainerAsync<Postgres>) {
@@ -59,7 +60,7 @@ fn build_app(pool: &autumn_harvest::worker::DbPool) -> axum::Router {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::default(),
     ));
-    harvest_api_router(api_state)
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
 
 #[tokio::test]
@@ -143,7 +144,7 @@ fn build_app_with_wf(pool: &autumn_harvest::worker::DbPool) -> axum::Router {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::default(),
     ));
-    harvest_api_router(api_state)
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
 
 #[tokio::test]

@@ -35,7 +35,6 @@ use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use serde_json::json;
 use testcontainers::ContainerAsync;
-use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use uuid::Uuid;
@@ -58,17 +57,12 @@ fn scheduled_time_recorder<'a>(
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 async fn setup_db() -> (AsyncPgConnection, String, ContainerAsync<Postgres>) {
-    // Pin Postgres 16 like every other suite. The image default is 11.
-    let container = Postgres::default()
-        .with_tag("16")
-        .start()
-        .await
-        .expect("postgres start");
+    let container = Postgres::default().start().await.expect("postgres start");
     let host = container.get_host().await.expect("host");
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@{host}:{port}/postgres");
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
-    conn.batch_execute(&autumn_harvest::test_init_sql())
+    conn.batch_execute(autumn_harvest::full_migrations_sql())
         .await
         .expect("migration");
     (conn, url, container)
@@ -127,9 +121,6 @@ fn make_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
     Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
-                codec_rotation_batch_size: 0,
-                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
-                dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: worker_id.to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
@@ -145,7 +136,6 @@ fn make_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 100,
-                resident_workflows: true,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
@@ -298,7 +288,7 @@ async fn manual_start_has_no_scheduled_time() {
             workflow_name: wf_name,
             workflow_id: "manual-test-wf",
             exec_id,
-            input: json!(null).into(),
+            input: json!(null),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,

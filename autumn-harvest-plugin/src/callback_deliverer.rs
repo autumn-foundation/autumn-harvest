@@ -8,7 +8,7 @@
 //! without supplying their own deliverer.
 
 use autumn_harvest::completion_callback::{
-    CompletionCallbackDeliverer, DeliverFuture, DeliveryAttempt, parse_retry_after,
+    CompletionCallbackDeliverer, DeliverFuture, DeliveryAttempt,
 };
 use std::time::Duration;
 
@@ -25,9 +25,6 @@ pub const DEFAULT_DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
 /// which `DeliveryAttempt::is_success` correctly classifies as a failure
 /// (only 2xx is success), so it flows through the normal retry/backoff/
 /// dead-letter path like any other non-2xx response.
-///
-/// A `Retry-After` response header goes onto the attempt. Core uses it as
-/// the backoff floor (issue #1832).
 pub struct ReqwestCallbackDeliverer {
     client: reqwest::Client,
 }
@@ -46,10 +43,6 @@ impl ReqwestCallbackDeliverer {
     /// `reqwest::Client` builder failure, which cannot occur for this
     /// static, valid configuration (a timeout and a redirect policy).
     #[must_use]
-    #[expect(
-        clippy::expect_used,
-        reason = "the static client configuration is valid"
-    )]
     pub fn with_timeout(timeout: Duration) -> Self {
         let client = reqwest::Client::builder()
             .timeout(timeout)
@@ -84,19 +77,7 @@ impl CompletionCallbackDeliverer for ReqwestCallbackDeliverer {
             }
 
             match request.send().await {
-                Ok(response) => {
-                    let attempt = DeliveryAttempt::success(response.status().as_u16());
-                    // Core clamps the hint and ignores it on a permanent 4xx.
-                    let retry_after = response
-                        .headers()
-                        .get(reqwest::header::RETRY_AFTER)
-                        .and_then(|value| value.to_str().ok())
-                        .and_then(|value| parse_retry_after(value, chrono::Utc::now()));
-                    match retry_after {
-                        Some(delay) => attempt.with_retry_after(delay),
-                        None => attempt,
-                    }
-                }
+                Ok(response) => DeliveryAttempt::success(response.status().as_u16()),
                 Err(error) => DeliveryAttempt::transport_error(error.to_string()),
             }
         })
@@ -112,49 +93,6 @@ mod tests {
         fn assert_bounds<T: CompletionCallbackDeliverer>() {}
         assert_bounds::<ReqwestCallbackDeliverer>();
         let _: Box<dyn CompletionCallbackDeliverer> = Box::new(ReqwestCallbackDeliverer::new());
-    }
-
-    /// Serve one canned HTTP response on a loopback port.
-    async fn one_response_server(response: &'static str) -> String {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("accept");
-            let mut buf = [0_u8; 4096];
-            let _ = socket.read(&mut buf).await;
-            let _ = socket.write_all(response.as_bytes()).await;
-        });
-        format!("http://{addr}/hook")
-    }
-
-    #[tokio::test]
-    async fn deliver_reports_the_retry_after_header() {
-        let url = one_response_server(
-            "HTTP/1.1 429 Too Many Requests\r\nretry-after: 10\r\n\
-             content-length: 0\r\nconnection: close\r\n\r\n",
-        )
-        .await;
-        let attempt = ReqwestCallbackDeliverer::new()
-            .deliver(&url, b"{}", &[])
-            .await;
-        assert_eq!(attempt.status, Some(429));
-        assert_eq!(attempt.retry_after, Some(Duration::from_secs(10)));
-    }
-
-    #[tokio::test]
-    async fn deliver_without_retry_after_reports_none() {
-        let url = one_response_server(
-            "HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
-        )
-        .await;
-        let attempt = ReqwestCallbackDeliverer::new()
-            .deliver(&url, b"{}", &[])
-            .await;
-        assert_eq!(attempt.status, Some(400));
-        assert_eq!(attempt.retry_after, None);
     }
 
     #[test]

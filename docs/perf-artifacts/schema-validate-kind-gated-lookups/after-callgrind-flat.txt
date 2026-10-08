@@ -1,8 +1,0 @@
-Ir                    file:function
---------------------------------------------------------------------------------
-133,655,000 (52.67%)  ???:autumn_harvest::info::validate_node'2 [/home/user/autumn-harvest/target/release/deps/schema_validate_profile-6026eade0f55225
- 83,822,315 (33.03%)  ./string/../sysdeps/x86_64/multiarch/memcmp-avx2-movbe.S:__memcmp_avx2_movbe [/usr/lib/x86_64-linux-gnu/libc.so.6]
- 11,355,006 ( 4.47%)  ???:autumn_harvest::info::validate_node [/home/user/autumn-harvest/target/release/deps/schema_validate_profile-6026eade0f552257]
- 11,310,000 ( 4.46%)  ???:<str as serde_json::value::index::Index>::index_into [/home/user/autumn-harvest/target/release/deps/schema_validate_profile-
-  5,010,000 ( 1.97%)  ???:core::str::count::char_count_general_case [/home/user/autumn-harvest/target/release/deps/schema_validate_profile-6026eade0f5
-  3,915,000 ( 1.54%)  ???:autumn_harvest::info::type_matches [/home/user/autumn-harvest/target/release/deps/schema_validate_profile-6026eade0f552257]

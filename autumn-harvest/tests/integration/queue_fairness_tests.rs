@@ -34,7 +34,7 @@ use uuid::Uuid;
 // ---------------------------------------------------------------------------
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::test_init_sql().as_bytes().to_vec()
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
 }
 
 // ---------------------------------------------------------------------------
@@ -75,7 +75,7 @@ async fn insert_execution_for_queue(
         workflow_id: &format!("fairness-{queue_name}-{suffix}"),
         run_id: Uuid::new_v4(),
         shard_id: 0,
-        input: serde_json::json!({}).into(),
+        input: serde_json::json!({}),
         parent_id: None,
         queue_name,
         execution_timeout: None,
@@ -214,8 +214,8 @@ async fn weighted_claim_distribution_tracks_3_to_1_ratio() {
         let order = weighted_queue_order(&pairs, &mut rng);
 
         for queue_name in &order {
-            let single = [(*queue_name).to_owned()];
-            let result = queue::claim_task(&mut conn, &single, worker_id, "", None, &[], &[])
+            let single = std::slice::from_ref(queue_name);
+            let result = queue::claim_task(&mut conn, single, worker_id, "", None, &[], &[])
                 .await
                 .expect("claim_task");
 
@@ -297,8 +297,8 @@ async fn no_starvation_low_weight_queue_drains_to_completion() {
         let order = weighted_queue_order(&pairs, &mut rng);
 
         for queue_name in &order {
-            let single = [(*queue_name).to_owned()];
-            let result = queue::claim_task(&mut conn, &single, worker_id, "", None, &[], &[])
+            let single = std::slice::from_ref(queue_name);
+            let result = queue::claim_task(&mut conn, single, worker_id, "", None, &[], &[])
                 .await
                 .expect("claim_task");
             if let Some(task) = result {

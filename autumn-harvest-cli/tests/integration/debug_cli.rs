@@ -228,50 +228,6 @@ fn step_detail_surfaces_a_resolved_signal_payload() {
     assert!(out.contains("approved"), "{out}");
 }
 
-/// `base_events` with a decision boundary after the schedule (issue #1833).
-fn events_with_boundary(build: &str) -> Vec<WorkflowEvent> {
-    let mut events = base_events();
-    events.insert(
-        2,
-        WorkflowEvent::DecisionCommitted {
-            build_id: autumn_harvest::types::BuildId::new(build),
-            worker_id: autumn_harvest::types::WorkerId::new("worker-eu-1"),
-        },
-    );
-    events
-}
-
-#[test]
-fn overview_shows_build_and_worker_per_decision() {
-    let out = render_trace_overview(&trace_of(&events_with_boundary("build-7")));
-    let row = out
-        .lines()
-        .find(|line| line.contains("DecisionCommitted"))
-        .unwrap_or_else(|| panic!("no decision row:\n{out}"));
-    assert!(
-        row.contains("decision: build build-7, worker worker-eu-1"),
-        "{row}"
-    );
-}
-
-#[test]
-fn overview_marks_a_decision_without_a_build() {
-    let out = render_trace_overview(&trace_of(&events_with_boundary("")));
-    assert!(
-        out.contains("decision: build <none>, worker worker-eu-1"),
-        "{out}"
-    );
-}
-
-#[test]
-fn step_detail_shows_the_decision_build_and_worker() {
-    let out = render_step_detail(&trace_of(&events_with_boundary("build-7")), 2);
-    assert!(
-        out.contains("\n  decision:\n    build:  build-7\n    worker: worker-eu-1"),
-        "{out}"
-    );
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // run_replay / run_diff — end to end
 // ─────────────────────────────────────────────────────────────────────────────
@@ -484,10 +440,7 @@ fn timer_history_opens_and_closes_its_awaitable() {
     ];
     let trace = trace_of(&events);
     assert_eq!(trace.steps[1].open_awaitables.len(), 1);
-    assert_eq!(
-        trace.steps[2].open_awaitables,
-        [] as [autumn_harvest::debugger::OpenAwaitable; 0]
-    );
+    assert!(trace.steps[2].open_awaitables.is_empty());
     let out = render_step_detail(&trace, 1);
     assert!(out.contains("cooldown"), "{out}");
 }

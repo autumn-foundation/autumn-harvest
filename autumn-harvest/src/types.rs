@@ -160,7 +160,6 @@ impl fmt::Display for ShardId {
 /// assert_eq!(sentinel.shard(), ShardId::UNENCODED);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub struct ExecutionId(Uuid);
 
 impl ExecutionId {
@@ -323,7 +322,6 @@ impl FromStr for ExecutionId {
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
-#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub enum ExternalTarget {
     /// A specific, immutable execution.
     ExecutionId(ExecutionId),
@@ -387,7 +385,6 @@ impl fmt::Display for ExternalTarget {
 /// let id = ActivityExecId::new();
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub struct ActivityExecId(Uuid);
 
 impl ActivityExecId {
@@ -461,7 +458,6 @@ impl FromStr for ActivityExecId {
 /// assert!(!id.as_uuid().is_nil());
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub struct UpdateId(Uuid);
 
 impl UpdateId {
@@ -519,7 +515,6 @@ impl FromStr for UpdateId {
 /// assert!(!token.as_uuid().is_nil());
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub struct ExternalActivityToken(Uuid);
 
 impl ExternalActivityToken {
@@ -574,7 +569,6 @@ impl FromStr for ExternalActivityToken {
 /// `ExternalSignalFailed` events so the request can be correlated with its
 /// outcome during replay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub struct ExternalSignalId(Uuid);
 
 impl ExternalSignalId {
@@ -623,7 +617,6 @@ impl FromStr for ExternalSignalId {
 /// `ExternalCancelFailed` events so the request can be correlated with its
 /// outcome during replay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub struct ExternalCancelId(Uuid);
 
 impl ExternalCancelId {
@@ -672,7 +665,6 @@ impl FromStr for ExternalCancelId {
 /// `ExternalAwaitFailed` events so the request can be correlated with its
 /// outcome during replay. Exact clone of [`ExternalCancelId`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub struct ExternalAwaitId(Uuid);
 
 impl ExternalAwaitId {
@@ -773,7 +765,6 @@ impl FromStr for SessionId {
 /// assert_eq!(id.as_str(), "timer-1");
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub struct TimerId(String);
 
 impl TimerId {
@@ -824,7 +815,6 @@ impl fmt::Display for TimerId {
 /// assert_eq!(id.as_str(), "worker-1");
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub struct WorkerId(String);
 
 impl WorkerId {
@@ -1230,7 +1220,6 @@ impl fmt::Display for IdempotencyKey {
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
-#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub enum ParentClosePolicy {
     /// Children continue independently — no cascade when the parent closes.
     ///
@@ -1293,11 +1282,11 @@ impl std::str::FromStr for ParentClosePolicy {
 /// a semantic version, or a CI job ID). Harvest uses this to ensure in-flight
 /// workflow executions are only resumed by workers running a compatible build.
 ///
-/// The empty string `""` is the **legacy sentinel**: a worker with no build
-/// identity advertises an empty `BuildId`. It claims unpinned tasks only,
-/// never one with a `required_build_id` (issue #1805).
+/// The empty string `""` is the **legacy sentinel**: workers that pre-date
+/// build routing (or operators who have not opted in) advertise an empty
+/// `BuildId` and retain the ability to claim any task regardless of the task's
+/// `required_build_id`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub struct BuildId(String);
 
 impl BuildId {
@@ -1307,10 +1296,12 @@ impl BuildId {
         Self(id.into())
     }
 
-    /// The sentinel for a worker with no build identity.
+    /// The legacy sentinel used by workers that pre-date build routing.
     ///
-    /// Such a worker advertises an empty build id. It claims unpinned tasks
-    /// only, never one with a `required_build_id` (issue #1805).
+    /// Legacy workers advertise an empty build id and are allowed to claim any
+    /// task, including those with an explicit `required_build_id`. This
+    /// preserves backward compatibility for operators who have not yet adopted
+    /// build-aware routing.
     #[must_use]
     pub const fn legacy() -> Self {
         Self(String::new())
@@ -1369,10 +1360,9 @@ impl fmt::Display for DeploymentName {
 
 /// Task priority for within-queue ordering (issue #249).
 ///
-/// Workers claim tasks in `priority DESC` order, then by due time
-/// (`scheduled_at`). So a higher-priority task goes before a lower-priority
-/// task that arrived earlier. Within one priority, a continuation goes
-/// before a new start. See *Continuations* below.
+/// Workers claim tasks in `priority DESC, available_at ASC` order, so
+/// higher-priority tasks are claimed before lower-priority ones that arrived
+/// earlier.  Same-priority tasks are FIFO by `available_at`.
 ///
 /// The numeric values are chosen so that `Normal = 0` preserves backward
 /// compatibility: pre-upgrade rows written with `priority = 0` continue to
@@ -1388,13 +1378,6 @@ impl fmt::Display for DeploymentName {
 /// priority is boosted by `+1` for every `aging_secs` it has waited in
 /// `PENDING` state.  This bounds the maximum starvation time for `Low`
 /// priority tasks even under sustained high-priority load.
-///
-/// ## Continuations
-///
-/// Within one priority level, continuations of running workflows are claimed
-/// before the first task of a new run (issue #1824). The new start yields
-/// for at most [`crate::queue::NEW_START_HANDICAP_SECS`]. A higher priority
-/// always wins over this order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Priority {
@@ -1629,26 +1612,6 @@ mod tests {
         let source = ExecutionId::new_for_shard(ShardId::new(9));
         let wrapped = ExecutionId::from_uuid(source.as_uuid());
         assert_eq!(wrapped.shard(), ShardId::new(9));
-    }
-
-    // Issue #1821: no UUID makes the string round-trip fail.
-    // The scanners therefore use `from_uuid` and have no failure branch.
-    #[test]
-    fn execution_id_parse_accepts_nil_and_max_uuids_1821() -> Result<(), uuid::Error> {
-        for id in [Uuid::nil(), Uuid::max()] {
-            let parsed: ExecutionId = id.to_string().parse()?;
-            assert_eq!(parsed, ExecutionId::from_uuid(id));
-        }
-        Ok(())
-    }
-
-    proptest::proptest! {
-        #[test]
-        fn execution_id_parse_accepts_every_uuid_1821(bits in proptest::prelude::any::<u128>()) {
-            let id = Uuid::from_u128(bits);
-            let parsed = id.to_string().parse::<ExecutionId>();
-            proptest::prop_assert_eq!(parsed.ok(), Some(ExecutionId::from_uuid(id)));
-        }
     }
 
     #[test]

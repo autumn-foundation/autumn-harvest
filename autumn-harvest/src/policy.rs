@@ -32,20 +32,12 @@ pub fn compute_retry_delay(
 }
 
 /// Retry jitter strategy.
-///
-/// The default is [`Full`](Self::Full), so tasks that fail together do not
-/// retry together (issue #1792). Use [`None`](Self::None) for exact timing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub enum JitterPolicy {
-    /// Exact backoff, with no jitter.
-    None,
-    /// Uniform in `[0, base]`.
     #[default]
+    None,
     Full,
-    /// Uniform in `[base/2, base]`.
     Equal,
-    /// Uniform in `[initial, min(prev * 3, max)]`.
     Decorrelated,
 }
 
@@ -67,40 +59,6 @@ const fn uniform_inclusive(seed: u64, lo: u64, hi: u64) -> u64 {
     lo.wrapping_add(offset)
 }
 
-/// Full jitter in nanoseconds: a value in `[0, hi]`.
-const fn full_jitter_nanos(hi: u64, seed: u64) -> u64 {
-    uniform_inclusive(seed, 0, hi)
-}
-
-/// Equal jitter in nanoseconds: a value in `[hi/2, hi]`.
-///
-/// For `hi <= 1` the value is `hi`.
-const fn equal_jitter_nanos(hi: u64, seed: u64) -> u64 {
-    if hi <= 1 {
-        return hi;
-    }
-    uniform_inclusive(seed, hi / 2, hi)
-}
-
-/// Full jitter: a deterministic delay in `[0, base]`.
-///
-/// `stream_seed` and `attempt` select the value, so a replay gets the same delay.
-#[must_use]
-pub(crate) fn full_jitter(base: Duration, stream_seed: u64, attempt: u32) -> Duration {
-    let hi = u64::try_from(base.as_nanos()).unwrap_or(u64::MAX);
-    Duration::from_nanos(full_jitter_nanos(hi, stream_seed ^ u64::from(attempt)))
-}
-
-/// Equal jitter: a deterministic delay in `[base/2, base]`.
-///
-/// The delay is at least half of `base`. Thus a loop with no attempt cap cannot
-/// become a hot loop.
-#[must_use]
-pub(crate) fn equal_jitter(base: Duration, stream_seed: u64, attempt: u32) -> Duration {
-    let hi = u64::try_from(base.as_nanos()).unwrap_or(u64::MAX);
-    Duration::from_nanos(equal_jitter_nanos(hi, stream_seed ^ u64::from(attempt)))
-}
-
 /// Compute deterministic retry delay with jitter.
 #[must_use]
 pub fn compute_retry_delay_with_seed(
@@ -116,8 +74,21 @@ pub fn compute_retry_delay_with_seed(
     );
     match policy.jitter {
         JitterPolicy::None => base,
-        JitterPolicy::Full => full_jitter(base, stream_seed, attempt),
-        JitterPolicy::Equal => equal_jitter(base, stream_seed, attempt),
+        JitterPolicy::Full => {
+            let hi = u64::try_from(base.as_nanos()).unwrap_or(u64::MAX);
+            if hi == 0 {
+                return Duration::ZERO;
+            }
+            Duration::from_nanos(uniform_inclusive(stream_seed ^ u64::from(attempt), 0, hi))
+        }
+        JitterPolicy::Equal => {
+            let hi = u64::try_from(base.as_nanos()).unwrap_or(u64::MAX);
+            if hi <= 1 {
+                return base;
+            }
+            let lo = hi / 2;
+            Duration::from_nanos(uniform_inclusive(stream_seed ^ u64::from(attempt), lo, hi))
+        }
         JitterPolicy::Decorrelated => {
             let prev = if attempt <= 1 {
                 policy.initial_interval
@@ -152,27 +123,23 @@ pub fn compute_retry_delay_with_seed(
 /// assert_eq!(policy.max_attempts, 3);
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub struct RetryPolicy {
     /// Maximum number of attempts (including the first). 1 = no retries.
     pub max_attempts: u32,
     /// Delay before the first retry.
     pub initial_interval: Duration,
     /// Multiplier applied after each retry (`1.0` = fixed delay).
-    #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::finite_f64))]
     pub backoff_coefficient: f64,
     /// Upper bound on delay between retries.
     pub max_interval: Duration,
     /// Error type names that must not be retried.
     pub non_retryable_errors: Vec<String>,
-    /// Jitter strategy. Defaults to [`JitterPolicy::Full`]. A serialized policy
-    /// with no `jitter` key also gets `Full`.
     #[serde(default)]
     pub jitter: JitterPolicy,
 }
 
 impl RetryPolicy {
-    /// Exponential backoff: doubles each retry, capped at 5 minutes, with Full jitter.
+    /// Exponential backoff: doubles each retry, capped at 5 minutes.
     ///
     /// ## Examples
     ///
@@ -192,11 +159,11 @@ impl RetryPolicy {
             backoff_coefficient: 2.0,
             max_interval: Duration::from_secs(300),
             non_retryable_errors: vec![],
-            jitter: JitterPolicy::Full,
+            jitter: JitterPolicy::None,
         }
     }
 
-    /// Fixed delay: same interval every retry, with Full jitter.
+    /// Fixed delay: same interval every retry.
     ///
     /// ## Examples
     ///
@@ -216,7 +183,7 @@ impl RetryPolicy {
             backoff_coefficient: 1.0,
             max_interval: interval,
             non_retryable_errors: vec![],
-            jitter: JitterPolicy::Full,
+            jitter: JitterPolicy::None,
         }
     }
 
@@ -224,17 +191,13 @@ impl RetryPolicy {
     ///
     /// `attempt` is 1-based: 1 = first retry (after the initial failure).
     ///
-    /// This uses seed `0`, so every caller gets the same jitter. Use
-    /// [`next_delay_with_seed`](Self::next_delay_with_seed) to spread tasks.
-    ///
     /// ## Examples
     ///
     /// ```rust
     /// use std::time::Duration;
-    /// use autumn_harvest::policy::{JitterPolicy, RetryPolicy};
+    /// use autumn_harvest::policy::RetryPolicy;
     ///
-    /// let policy = RetryPolicy::exponential(3, Duration::from_secs(1))
-    ///     .with_jitter(JitterPolicy::None);
+    /// let policy = RetryPolicy::exponential(3, Duration::from_secs(1));
     /// assert_eq!(policy.next_delay(1), Some(Duration::from_secs(1)));
     /// assert_eq!(policy.next_delay(3), None); // attempt >= max_attempts
     /// ```
@@ -335,37 +298,27 @@ pub fn resolve_retry_after_hint(
 /// When attached to an activity (via the `#[activity(circuit_breaker = ...)]`
 /// attribute or builder registration), the worker tracks consecutive failures
 /// of that activity within a rolling window. Once `failure_threshold` failures
-/// accumulate inside `window`, the breaker **trips open**. `open_mode` then
-/// decides what happens to each later dispatch:
-///
-/// - [`CircuitOpenMode::Defer`] (default): the task goes back to `PENDING`
-///   until the next probe. It uses no attempt and appends no event.
-/// - [`CircuitOpenMode::FailFast`]: the attempt fails with a non-retryable
-///   [`ActivityFailure`](crate::failure::ActivityFailure) of error type
-///   `"CircuitOpen"`.
-///
-/// After `cooldown` elapses the breaker moves to half-open and
+/// accumulate inside `window`, the breaker **trips open** and subsequent
+/// dispatches fast-fail with a non-retryable
+/// [`ActivityFailure`](crate::failure::ActivityFailure) of error type
+/// `"CircuitOpen"` instead of being retried against a downstream that is known
+/// to be down. After `cooldown` elapses the breaker moves to half-open and
 /// admits a single probe; success re-closes it, failure re-opens it.
 ///
 /// Circuit state is tracked in-process and per-shard — it never touches the
 /// workflow event log, so the append-only contract is unchanged and replay is
-/// unaffected. A deferral appends no event. A fail-fast short circuit
-/// records an ordinary `ActivityFailed` event.
+/// unaffected (a short-circuited attempt records an ordinary `ActivityFailed`
+/// event).
 ///
 /// ## Examples
 ///
 /// ```rust
 /// use std::time::Duration;
-/// use autumn_harvest::policy::{CircuitBreakerPolicy, CircuitOpenMode};
+/// use autumn_harvest::policy::CircuitBreakerPolicy;
 ///
 /// // Trip after 10 failures within 30s; re-probe after 60s.
 /// let policy = CircuitBreakerPolicy::new(10, Duration::from_secs(30), Duration::from_secs(60));
 /// assert_eq!(policy.failure_threshold, 10);
-/// assert_eq!(policy.open_mode, CircuitOpenMode::Defer);
-///
-/// // A Saga that compensates on `CircuitOpen` needs the fast failure.
-/// let fail_fast = policy.with_open_mode(CircuitOpenMode::FailFast);
-/// assert_eq!(fail_fast.open_mode, CircuitOpenMode::FailFast);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CircuitBreakerPolicy {
@@ -377,27 +330,6 @@ pub struct CircuitBreakerPolicy {
     /// Cooldown after the breaker opens before a single half-open probe is
     /// admitted.
     pub cooldown: Duration,
-    /// What a dispatch does while the breaker is open (issue #1809).
-    /// A policy serialized before this field existed reads as the default.
-    #[serde(default)]
-    pub open_mode: CircuitOpenMode,
-}
-
-/// What a dispatch does while its circuit breaker is open (issue #1809).
-///
-/// `docs/adr/0005-activity-timeout-retry-and-open-circuit.md` records why
-/// [`Defer`](Self::Defer) is the default.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CircuitOpenMode {
-    /// Put the claimed task back to `PENDING` until the next probe. The
-    /// deferral uses no attempt and appends no event.
-    #[default]
-    Defer,
-    /// Fail the attempt with a non-retryable `CircuitOpen` failure. Use it
-    /// when a workflow must react to the outage at once, for example with a
-    /// Saga compensation.
-    FailFast,
 }
 
 impl CircuitBreakerPolicy {
@@ -412,198 +344,6 @@ impl CircuitBreakerPolicy {
             failure_threshold: failure_threshold.max(1),
             window,
             cooldown,
-            open_mode: CircuitOpenMode::Defer,
-        }
-    }
-
-    /// Set what a dispatch does while the breaker is open (issue #1809).
-    #[must_use]
-    pub const fn with_open_mode(mut self, open_mode: CircuitOpenMode) -> Self {
-        self.open_mode = open_mode;
-        self
-    }
-}
-
-/// Retry budget for one activity type (issue #1793).
-///
-/// The worker keeps one token bucket for each activity type. A first attempt
-/// deposits `ratio` tokens. A retry spends one token. Time adds
-/// `min_retries_per_sec` tokens each second. The bucket holds at most
-/// `max_tokens` and starts full.
-///
-/// An empty bucket defers the retry. It does not drop it. See
-/// [`crate::retry_budget`] for the full semantics.
-///
-/// ## Examples
-///
-/// ```rust
-/// use autumn_harvest::policy::RetryBudgetPolicy;
-///
-/// // Let retries add at most 20 % load, with a floor of 2 retries per second.
-/// let policy = RetryBudgetPolicy::new(0.2, 20.0, 2.0);
-/// assert_eq!(policy.ratio, 0.2);
-/// assert_eq!(RetryBudgetPolicy::default().ratio, 0.1);
-/// ```
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct RetryBudgetPolicy {
-    /// Tokens that each first attempt deposits.
-    pub ratio: f64,
-    /// Bucket capacity and start level. At least 1.
-    pub max_tokens: f64,
-    /// Tokens that time adds each second. A value above 0 keeps retries
-    /// from starving. With 0, only first-attempt deposits refill the bucket.
-    pub min_retries_per_sec: f64,
-}
-
-impl RetryBudgetPolicy {
-    /// Default deposit for each first attempt: a 10 % retry budget.
-    pub const DEFAULT_RATIO: f64 = 0.1;
-    /// Default bucket capacity.
-    pub const DEFAULT_MAX_TOKENS: f64 = 10.0;
-    /// Default time refill, in tokens each second.
-    pub const DEFAULT_MIN_RETRIES_PER_SEC: f64 = 1.0;
-
-    /// Construct a retry budget policy.
-    ///
-    /// A negative or non-finite `ratio` or `min_retries_per_sec` becomes 0.
-    /// `max_tokens` becomes at least 1, so one retry can always run.
-    #[must_use]
-    pub fn new(ratio: f64, max_tokens: f64, min_retries_per_sec: f64) -> Self {
-        let rate = |v: f64| if v.is_finite() && v > 0.0 { v } else { 0.0 };
-        let cap = if max_tokens.is_finite() {
-            max_tokens.max(1.0)
-        } else {
-            1.0
-        };
-        Self {
-            ratio: rate(ratio),
-            max_tokens: cap,
-            min_retries_per_sec: rate(min_retries_per_sec),
-        }
-    }
-}
-
-impl Default for RetryBudgetPolicy {
-    fn default() -> Self {
-        Self::new(
-            Self::DEFAULT_RATIO,
-            Self::DEFAULT_MAX_TOKENS,
-            Self::DEFAULT_MIN_RETRIES_PER_SEC,
-        )
-    }
-}
-
-/// Adaptive concurrency limit for one activity type (issue #1836).
-///
-/// The worker caps the in-flight attempts of the type. The cap follows the
-/// handler latency and the retryable failures. See [`crate::adaptive_limit`]
-/// for the rules.
-///
-/// ## Examples
-///
-/// ```rust
-/// use autumn_harvest::policy::AdaptiveLimitPolicy;
-///
-/// // Let the cap move between 2 and 64 in-flight attempts.
-/// let policy = AdaptiveLimitPolicy::new(2, 64);
-/// assert_eq!(policy.max_limit, 64);
-/// assert_eq!(AdaptiveLimitPolicy::default().min_limit, 1);
-/// ```
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct AdaptiveLimitPolicy {
-    /// Lowest cap. At least 1.
-    pub min_limit: u32,
-    /// Highest cap. At least `min_limit`.
-    pub max_limit: u32,
-    /// Latency inflation over the no-load baseline that the limit accepts.
-    /// At 1.25, the gradient stays at 1 until latency is 25 % above the
-    /// baseline. Above that, the cap grows more slowly and settles. At
-    /// least 1.
-    pub tolerance: f64,
-    /// Factor that an overloaded window applies to the cap. It is in the
-    /// range from 0.5 to 1.
-    pub backoff_ratio: f64,
-    /// Share of retryable failures above which a window is overloaded. It
-    /// is in the range from 0 to 1. At 0, one failure cuts the cap. A higher
-    /// value keeps rare failures from throttling a healthy dependency.
-    pub error_threshold: f64,
-    /// Samples between two baseline probes. At least
-    /// [`AdaptiveLimitPolicy::MIN_PROBE_INTERVAL`].
-    pub probe_interval: u32,
-}
-
-impl AdaptiveLimitPolicy {
-    /// Default lowest cap.
-    pub const DEFAULT_MIN_LIMIT: u32 = 1;
-    /// Default highest cap.
-    pub const DEFAULT_MAX_LIMIT: u32 = 200;
-    /// Default latency tolerance.
-    pub const DEFAULT_TOLERANCE: f64 = 1.25;
-    /// Default backoff factor for an overloaded window.
-    pub const DEFAULT_BACKOFF_RATIO: f64 = 0.9;
-    /// Default failure share above which a window is overloaded.
-    pub const DEFAULT_ERROR_THRESHOLD: f64 = 0.05;
-    /// Default samples between two baseline probes.
-    pub const DEFAULT_PROBE_INTERVAL: u32 = 1_000;
-    /// Fewest samples between two baseline probes.
-    pub const MIN_PROBE_INTERVAL: u32 = 10;
-
-    /// Construct a policy with the given cap range and default tuning.
-    #[must_use]
-    pub fn new(min_limit: u32, max_limit: u32) -> Self {
-        Self {
-            min_limit,
-            max_limit,
-            ..Self::default()
-        }
-        .sanitized()
-    }
-
-    /// Apply the field rules. The fields are public, so a caller can set a
-    /// NaN or an inverted range directly.
-    ///
-    /// `min_limit` becomes at least 1, and `max_limit` at least `min_limit`.
-    /// A non-finite or low `tolerance` becomes 1. A `backoff_ratio` outside
-    /// the range from 0.5 to 1 is clamped, and NaN becomes the default.
-    /// `error_threshold` follows the same rule in the range from 0 to 1.
-    #[must_use]
-    pub fn sanitized(self) -> Self {
-        let min_limit = self.min_limit.max(1);
-        let tolerance = if self.tolerance.is_finite() {
-            self.tolerance.max(1.0)
-        } else {
-            1.0
-        };
-        let backoff_ratio = if self.backoff_ratio.is_nan() {
-            Self::DEFAULT_BACKOFF_RATIO
-        } else {
-            self.backoff_ratio.clamp(0.5, 1.0)
-        };
-        let error_threshold = if self.error_threshold.is_nan() {
-            Self::DEFAULT_ERROR_THRESHOLD
-        } else {
-            self.error_threshold.clamp(0.0, 1.0)
-        };
-        Self {
-            min_limit,
-            max_limit: self.max_limit.max(min_limit),
-            tolerance,
-            backoff_ratio,
-            error_threshold,
-            probe_interval: self.probe_interval.max(Self::MIN_PROBE_INTERVAL),
-        }
-    }
-}
-
-impl Default for AdaptiveLimitPolicy {
-    fn default() -> Self {
-        Self {
-            min_limit: Self::DEFAULT_MIN_LIMIT,
-            max_limit: Self::DEFAULT_MAX_LIMIT,
-            tolerance: Self::DEFAULT_TOLERANCE,
-            backoff_ratio: Self::DEFAULT_BACKOFF_RATIO,
-            error_threshold: Self::DEFAULT_ERROR_THRESHOLD,
-            probe_interval: Self::DEFAULT_PROBE_INTERVAL,
         }
     }
 }
@@ -647,10 +387,7 @@ pub enum TaskStatus {
 
 /// When a DAG task with multiple upstreams should execute.
 ///
-/// With no upstreams (a root node), `AllSuccess` and `AllDone` fire.
-/// `OneSuccess`, `OneFailed`, `AllFailed` and `Manual` do not fire, so a root
-/// node with one of those rules is always skipped. The skip writes no
-/// history marker.
+/// All rules vacuously fire when `upstream_statuses` is empty (no dependencies).
 ///
 /// ## Examples
 ///
@@ -673,8 +410,7 @@ pub enum TriggerRule {
     OneFailed,
     /// Run when all upstream tasks failed.
     AllFailed,
-    /// Never fires. No API triggers a single DAG node, so a `Manual` node is
-    /// always skipped, and so is every node that needs it to succeed.
+    /// Never auto-trigger; must be triggered manually.
     Manual,
 }
 
@@ -736,8 +472,6 @@ pub enum Schedule {
     /// UTC on upgrade.
     Cron(String),
     /// Fixed interval from the end of the previous run.
-    ///
-    /// The period must be a whole number of seconds greater than zero.
     Interval(Duration),
     /// Only runs when triggered manually via API.
     Manual,
@@ -1138,10 +872,7 @@ pub struct WorkflowSchedule {
     ///
     /// The actual fire time is shifted forward by a deterministic offset in
     /// `[0, jitter)` derived from `(schedule_id, scheduled_fire_time)`.
-    /// [`WorkflowSchedule::new`] sets [`default_schedule_jitter`]:
-    /// [`DEFAULT_CRON_JITTER`] for a cron with no seconds field, else zero. Set
-    /// `Duration::ZERO` to opt out. A deserialized schedule with no `jitter` key
-    /// gets zero.
+    /// Defaults to `Duration::ZERO` (no jitter — today's behaviour).
     ///
     /// ## Example
     ///
@@ -1287,11 +1018,9 @@ impl WorkflowSchedule {
     /// Defaults: `input = null`, `catchup = false`, `max_active_runs = 1`,
     /// `paused = false`, `queue_name = "default"`, `overlap_policy = Skip`,
     /// `buffer_all_max = 100`, `calendar = None`, `skip_policy = Skip`,
-    /// `catchup_policy = None` (falls back to the `catchup` bool),
-    /// `jitter = default_schedule_jitter(&schedule)`.
+    /// `catchup_policy = None` (falls back to the `catchup` bool).
     #[must_use]
     pub fn new(workflow_name: impl Into<String>, schedule: Schedule) -> Self {
-        let jitter = default_schedule_jitter(&schedule);
         Self {
             workflow_name: workflow_name.into(),
             dag_name: None,
@@ -1301,7 +1030,7 @@ impl WorkflowSchedule {
             max_active_runs: 1,
             paused: false,
             queue_name: "default".to_string(),
-            jitter,
+            jitter: Duration::ZERO,
             overlap_policy: OverlapPolicy::Skip,
             buffer_all_max: 100,
             execution_timeout: None,
@@ -1423,8 +1152,6 @@ impl WorkflowSchedule {
     /// Validation at build time rejects values that would cause consecutive fires
     /// to collide (`jitter >= period` for `Interval` schedules) or exceed the
     /// 1-hour sane upper bound for `Cron` schedules.
-    ///
-    /// `Duration::ZERO` turns off the default cron jitter.
     #[must_use]
     pub const fn with_jitter(mut self, jitter: Duration) -> Self {
         self.jitter = jitter;
@@ -1568,14 +1295,13 @@ impl WorkflowSchedule {
 /// Validate a [`Schedule`] value, returning an error string if it is invalid.
 ///
 /// For [`Schedule::Cron`] expressions this parses the expression using
-/// `croner` (5-field or 6-field with seconds). A [`Schedule::Interval`] period
-/// must be a whole number of seconds greater than zero.
+/// `croner` (5-field or 6-field with seconds). For other variants the schedule
+/// is always valid.
 ///
 /// # Errors
 ///
 /// Returns a human-readable error string if the cron expression is
-/// syntactically invalid. Also returns one if the interval is zero or has a
-/// fractional second.
+/// syntactically invalid.
 pub fn validate_schedule(schedule: &Schedule) -> Result<(), String> {
     match schedule {
         Schedule::Cron(expr) => Cron::new(expr)
@@ -1603,34 +1329,7 @@ pub fn validate_schedule(schedule: &Schedule) -> Result<(), String> {
         Schedule::Interval(period) if period.is_zero() => {
             Err("interval schedule period must be greater than zero".to_string())
         }
-        // `schedule_expr` drops a fraction on write. A sub-second period reads
-        // back as zero (issue #1967). The scheduler ticks once a second, so it
-        // cannot keep a shorter cadence.
-        Schedule::Interval(period) if period.subsec_nanos() != 0 => Err(format!(
-            "interval schedule period must be a whole number of seconds, got {period:?}"
-        )),
         Schedule::Interval(_) | Schedule::Manual => Ok(()),
-    }
-}
-
-/// Default fire jitter for a cron schedule with no seconds field (issue #1792).
-pub const DEFAULT_CRON_JITTER: Duration = Duration::from_secs(10);
-
-/// Return the default fire jitter for `schedule`.
-///
-/// A cron with fewer than six fields, such as `"0 9 * * *"` or `"@hourly"`,
-/// fires at most once a minute. A 10 s offset thus cannot move a fire past the
-/// next slot. A six-field cron has a seconds field. It can fire more often than
-/// every 10 s, so it gets zero. Interval and manual schedules also get zero.
-#[must_use]
-pub fn default_schedule_jitter(schedule: &Schedule) -> Duration {
-    match schedule {
-        Schedule::Cron(expr) | Schedule::CronInTimezone { expr, .. }
-            if expr.split_whitespace().count() < 6 =>
-        {
-            DEFAULT_CRON_JITTER
-        }
-        _ => Duration::ZERO,
     }
 }
 
@@ -1731,8 +1430,8 @@ pub(crate) fn resolve_effective_retry(
 /// Resolve the effective activity `start_to_close` at schedule time (issue #620).
 ///
 /// Same precedence as [`resolve_effective_retry`]: call-site override →
-/// activity default → builder default. `None` means that no timeout applies.
-/// `WorkerConfig` sets a 10-minute builder default (issue #1808).
+/// activity default → builder default. `None` when unset (no timeout enforced),
+/// preserving today's behaviour.
 ///
 /// The sole non-test consumer is the `db`-gated worker dispatch path; unused
 /// under `--no-default-features` (the pure precedence is still test-covered).
@@ -1750,47 +1449,6 @@ pub(crate) fn resolve_effective_start_to_close(
 mod tests {
     use super::*;
     use std::time::Duration;
-
-    // ── Circuit open mode (issue #1809) ────────────────────────────────────
-
-    #[test]
-    fn circuit_breaker_policy_defers_by_default() {
-        let policy = CircuitBreakerPolicy::new(3, Duration::from_secs(30), Duration::from_secs(60));
-        assert_eq!(policy.open_mode, CircuitOpenMode::Defer);
-        assert_eq!(CircuitOpenMode::default(), CircuitOpenMode::Defer);
-    }
-
-    #[test]
-    fn circuit_breaker_policy_with_open_mode_sets_fail_fast() {
-        let policy = CircuitBreakerPolicy::new(3, Duration::from_secs(30), Duration::from_secs(60))
-            .with_open_mode(CircuitOpenMode::FailFast);
-        assert_eq!(policy.open_mode, CircuitOpenMode::FailFast);
-    }
-
-    #[test]
-    fn circuit_breaker_policy_without_open_mode_deserializes_to_defer() {
-        let mut json = serde_json::to_value(CircuitBreakerPolicy::new(
-            3,
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-        ))
-        .unwrap();
-        json.as_object_mut().unwrap().remove("open_mode");
-        let policy: CircuitBreakerPolicy = serde_json::from_value(json).unwrap();
-        assert_eq!(policy.open_mode, CircuitOpenMode::Defer);
-    }
-
-    #[test]
-    fn circuit_open_mode_serializes_as_snake_case() {
-        assert_eq!(
-            serde_json::to_value(CircuitOpenMode::FailFast).unwrap(),
-            serde_json::json!("fail_fast")
-        );
-        assert_eq!(
-            serde_json::to_value(CircuitOpenMode::Defer).unwrap(),
-            serde_json::json!("defer")
-        );
-    }
 
     // ── Retry-After hint clamp/resolve (issue #744) ────────────────────────────
     //
@@ -1976,57 +1634,8 @@ mod tests {
     // ── Schedule jitter ───────────────────────────────────────────────────────
 
     #[test]
-    fn workflow_schedule_manual_jitter_defaults_to_zero() {
+    fn workflow_schedule_jitter_defaults_to_zero() {
         let sched = WorkflowSchedule::new("my_workflow", Schedule::Manual);
-        assert_eq!(sched.jitter, Duration::ZERO);
-    }
-
-    #[test]
-    fn workflow_schedule_cron_defaults_to_small_jitter() {
-        let cron = WorkflowSchedule::new("wf", Schedule::Cron("0 * * * *".to_string()));
-        assert_eq!(cron.jitter, DEFAULT_CRON_JITTER);
-        assert_eq!(DEFAULT_CRON_JITTER, Duration::from_secs(10));
-        let alias = WorkflowSchedule::new("wf", Schedule::Cron("@hourly".to_string()));
-        assert_eq!(alias.jitter, DEFAULT_CRON_JITTER);
-        let zoned = WorkflowSchedule::new(
-            "wf",
-            Schedule::CronInTimezone {
-                expr: "0 9 * * *".to_string(),
-                tz: "Europe/Paris".to_string(),
-            },
-        );
-        assert_eq!(zoned.jitter, DEFAULT_CRON_JITTER);
-        assert!(validate_jitter(&cron.schedule, cron.jitter).is_ok());
-    }
-
-    #[test]
-    fn workflow_schedule_default_jitter_is_zero_when_it_could_collide() {
-        // A cron with a seconds field can fire more often than the default window.
-        let seconds = Schedule::Cron("*/5 * * * * *".to_string());
-        assert_eq!(default_schedule_jitter(&seconds), Duration::ZERO);
-        let zoned_seconds = Schedule::CronInTimezone {
-            expr: "0 */5 * * * *".to_string(),
-            tz: "UTC".to_string(),
-        };
-        assert_eq!(default_schedule_jitter(&zoned_seconds), Duration::ZERO);
-        let interval = Schedule::Interval(Duration::from_secs(5));
-        assert_eq!(default_schedule_jitter(&interval), Duration::ZERO);
-        assert_eq!(default_schedule_jitter(&Schedule::Manual), Duration::ZERO);
-    }
-
-    #[test]
-    fn default_cron_jitter_is_whole_seconds_below_one_minute() {
-        // `harvest_schedules.jitter_secs` stores whole seconds. A fractional
-        // default would lose its fraction.
-        assert_eq!(DEFAULT_CRON_JITTER.subsec_nanos(), 0);
-        assert!(DEFAULT_CRON_JITTER > Duration::ZERO);
-        assert!(DEFAULT_CRON_JITTER < Duration::from_secs(60));
-    }
-
-    #[test]
-    fn workflow_schedule_cron_jitter_opt_out_is_zero() {
-        let sched = WorkflowSchedule::new("wf", Schedule::Cron("0 * * * *".to_string()))
-            .with_jitter(Duration::ZERO);
         assert_eq!(sched.jitter, Duration::ZERO);
     }
 
@@ -2144,55 +1753,8 @@ mod tests {
     }
 
     #[test]
-    fn retry_policy_constructors_default_to_full_jitter() {
-        assert_eq!(JitterPolicy::default(), JitterPolicy::Full);
-        assert_eq!(RetryPolicy::default().jitter, JitterPolicy::Full);
-        let exp = RetryPolicy::exponential(3, Duration::from_secs(1));
-        assert_eq!(exp.jitter, JitterPolicy::Full);
-        let fixed = RetryPolicy::fixed(3, Duration::from_secs(1));
-        assert_eq!(fixed.jitter, JitterPolicy::Full);
-    }
-
-    #[test]
-    fn retry_policy_without_jitter_key_deserializes_to_full() {
-        let json = serde_json::json!({
-            "max_attempts": 3,
-            "initial_interval": {"secs": 1, "nanos": 0},
-            "backoff_coefficient": 2.0,
-            "max_interval": {"secs": 300, "nanos": 0},
-            "non_retryable_errors": [],
-        });
-        let policy: RetryPolicy = serde_json::from_value(json).expect("valid policy");
-        assert_eq!(policy.jitter, JitterPolicy::Full);
-    }
-
-    #[test]
-    fn retry_policy_explicit_none_jitter_round_trips() {
-        let policy = RetryPolicy::default().with_jitter(JitterPolicy::None);
-        let json = serde_json::to_value(&policy).expect("serializes");
-        let back: RetryPolicy = serde_json::from_value(json).expect("deserializes");
-        assert_eq!(back.jitter, JitterPolicy::None);
-    }
-
-    /// Tasks that fail together must not retry together (issue #1792).
-    #[test]
-    fn default_retry_policy_jitters_delays_across_tasks() {
-        let policy = RetryPolicy::default();
-        for attempt in 1..policy.max_attempts {
-            let delays: std::collections::HashSet<Duration> = (0..100_u64)
-                .map(|task| policy.next_delay_with_seed(attempt, mix64(task)).unwrap())
-                .collect();
-            assert!(
-                delays.len() > 1,
-                "attempt {attempt}: 100 tasks got one delay {delays:?}"
-            );
-        }
-    }
-
-    #[test]
     fn exponential_backoff_doubles() {
-        let policy =
-            RetryPolicy::exponential(5, Duration::from_secs(1)).with_jitter(JitterPolicy::None);
+        let policy = RetryPolicy::exponential(5, Duration::from_secs(1));
         assert_eq!(policy.next_delay(1), Some(Duration::from_secs(1)));
         assert_eq!(policy.next_delay(2), Some(Duration::from_secs(2)));
         assert_eq!(policy.next_delay(3), Some(Duration::from_secs(4)));
@@ -2200,7 +1762,7 @@ mod tests {
 
     #[test]
     fn fixed_backoff_stays_constant() {
-        let policy = RetryPolicy::fixed(3, Duration::from_secs(5)).with_jitter(JitterPolicy::None);
+        let policy = RetryPolicy::fixed(3, Duration::from_secs(5));
         assert_eq!(policy.next_delay(1), Some(Duration::from_secs(5)));
         assert_eq!(policy.next_delay(2), Some(Duration::from_secs(5)));
     }
@@ -2212,9 +1774,8 @@ mod tests {
     }
 
     #[test]
-    fn retry_jitter_none_ignores_the_seed() {
-        let policy =
-            RetryPolicy::exponential(5, Duration::from_secs(1)).with_jitter(JitterPolicy::None);
+    fn retry_jitter_none_is_bit_identical_default() {
+        let policy = RetryPolicy::exponential(5, Duration::from_secs(1));
         for attempt in 1..5 {
             assert_eq!(
                 policy.next_delay(attempt),
@@ -2225,8 +1786,7 @@ mod tests {
 
     #[test]
     fn retry_jitter_bounds_over_10k_seeds() {
-        let base =
-            RetryPolicy::exponential(8, Duration::from_millis(200)).with_jitter(JitterPolicy::None);
+        let base = RetryPolicy::exponential(8, Duration::from_millis(200));
         for attempt in 1..6 {
             let base_delay = base.next_delay(attempt).unwrap();
             for seed in 0..10_000_u64 {
@@ -2315,15 +1875,10 @@ mod tests {
     }
 
     #[test]
-    fn trigger_rule_empty_slice_matches_the_documented_root_behavior() {
-        // A root node has no upstreams. Only these two rules fire for it.
+    fn trigger_rule_vacuous_empty_slice() {
+        // All rules fire vacuously when there are no upstreams
         assert!(TriggerRule::AllSuccess.should_run(&[]));
         assert!(TriggerRule::AllDone.should_run(&[]));
-        // The other four rules skip a root node.
-        assert!(!TriggerRule::OneSuccess.should_run(&[]));
-        assert!(!TriggerRule::OneFailed.should_run(&[]));
-        assert!(!TriggerRule::AllFailed.should_run(&[]));
-        assert!(!TriggerRule::Manual.should_run(&[]));
     }
 
     // ── Bounded schedules (issue #543 / #478) ───────────────────────────────────
@@ -2596,23 +2151,6 @@ mod tests {
     }
 
     #[test]
-    fn subsecond_interval_schedule_rejected() {
-        // The stored form holds whole seconds only (issue #1967).
-        for interval in [
-            Duration::from_nanos(1),
-            Duration::from_millis(500),
-            Duration::from_millis(1_500),
-        ] {
-            let err = validate_schedule(&Schedule::Interval(interval)).unwrap_err();
-            assert!(
-                err.contains("whole number of seconds"),
-                "{interval:?} must be rejected: {err}"
-            );
-        }
-        assert!(validate_schedule(&Schedule::Interval(Duration::from_secs(u64::MAX))).is_ok());
-    }
-
-    #[test]
     fn cron_in_timezone_validate_jitter_applies_cron_rules() {
         let sched = Schedule::CronInTimezone {
             expr: "0 * * * *".to_string(),
@@ -2822,13 +2360,6 @@ fn compute_retry_delay_attempt_zero() {
 }
 
 #[test]
-fn compute_retry_delay_zero_initial_with_overflowing_power() {
-    // 2.0^4999 is infinite, and 0 * inf is NaN. The clamp turns NaN into 0.
-    let d = compute_retry_delay(Duration::ZERO, 2.0, Duration::from_secs(300), 5000);
-    assert_eq!(d, Duration::ZERO);
-}
-
-#[test]
 fn compute_retry_delay_negative_nan() {
     let d = compute_retry_delay(
         Duration::from_secs(1),
@@ -2840,75 +2371,4 @@ fn compute_retry_delay_negative_nan() {
 
     let d2 = compute_retry_delay(Duration::from_secs(1), -1.0, Duration::from_secs(300), 2);
     assert_eq!(d2, Duration::from_secs(0));
-}
-
-/// Kani proofs of the retry-delay bounds (issue #1819).
-///
-/// The `kani` CI job runs them. See `docs/testing/formal-methods.md`.
-///
-/// The jitter proofs replace `mix64` with a stub that returns any `u64`. The
-/// bounds hold for every stub value, so they hold for the real mixer. The
-/// seed is any `u64` too, and `mix64` is a bijection, so the stub loses no
-/// case. With the real mixer, CBMC does not finish.
-///
-/// The proofs work in nanoseconds. A proof through `Duration` must relate
-/// `as_nanos` to `from_nanos`, and CBMC does not finish that either.
-#[cfg(kani)]
-mod kani_proofs {
-    use super::*;
-
-    fn any_mix(_x: u64) -> u64 {
-        kani::any()
-    }
-
-    /// The jitter draw stays in `[lo, hi]` for every seed.
-    #[kani::proof]
-    #[kani::stub(mix64, any_mix)]
-    fn uniform_inclusive_stays_in_range() {
-        let lo: u64 = kani::any();
-        let hi: u64 = kani::any();
-        kani::assume(lo <= hi);
-        let v = uniform_inclusive(kani::any(), lo, hi);
-        assert!(lo <= v && v <= hi);
-        kani::cover!(v == hi);
-    }
-
-    /// Full jitter never exceeds its base.
-    #[kani::proof]
-    #[kani::stub(mix64, any_mix)]
-    fn full_jitter_is_at_most_base() {
-        let hi: u64 = kani::any();
-        assert!(full_jitter_nanos(hi, kani::any()) <= hi);
-    }
-
-    /// Equal jitter stays in `[base/2, base]`. A loop with no attempt cap
-    /// therefore cannot become a hot loop.
-    #[kani::proof]
-    #[kani::stub(mix64, any_mix)]
-    fn equal_jitter_stays_in_upper_half() {
-        let hi: u64 = kani::any();
-        let v = equal_jitter_nanos(hi, kani::any());
-        assert!(hi / 2 <= v && v <= hi);
-    }
-
-    /// The backoff never panics for any coefficient that is not NaN.
-    ///
-    /// The final `min` makes `d <= max` true by construction. The value of the
-    /// proof is that no float conversion panics on the way.
-    ///
-    /// CBMC reports any NaN result as an error, but the code handles NaN on
-    /// purpose. The proof therefore excludes a NaN coefficient and an initial
-    /// interval of 0, because `0 * inf` is NaN. The unit tests
-    /// `compute_retry_delay_negative_nan` and
-    /// `compute_retry_delay_zero_initial_with_overflowing_power` pin those cases.
-    #[kani::proof]
-    fn retry_delay_never_exceeds_max_interval() {
-        let coefficient: f64 = kani::any();
-        kani::assume(!coefficient.is_nan());
-        let initial = Duration::from_millis(u64::from(kani::any::<u32>()));
-        kani::assume(!initial.is_zero());
-        let max = Duration::from_millis(u64::from(kani::any::<u32>()));
-        let d = compute_retry_delay(initial, coefficient, max, kani::any());
-        assert!(d <= max);
-    }
 }

@@ -9,13 +9,7 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use syn::{Ident, Token, parse::Parser, punctuated::Punctuated};
 
-/// Shared body for every `{thing}s![...]` collect macro: parse a comma-separated
-/// name list and call each name's companion info function, named by `prefix`.
-///
-/// `docs/architecture.md` documents the companion-function naming convention
-/// once, under "Companion Function Pattern". Each collect macro below expands
-/// that one convention for its own entity type.
-fn collect_macro(input: TokenStream, prefix: &str) -> TokenStream {
+pub fn workflows_macro(input: TokenStream) -> TokenStream {
     let names = match Punctuated::<Ident, Token![,]>::parse_terminated.parse2(input) {
         Ok(n) => n,
         Err(e) => return e.to_compile_error(),
@@ -24,7 +18,7 @@ fn collect_macro(input: TokenStream, prefix: &str) -> TokenStream {
     let calls: Vec<_> = names
         .iter()
         .map(|name| {
-            let companion = quote::format_ident!("{prefix}{name}");
+            let companion = quote::format_ident!("__autumn_workflow_info_{name}");
             quote! { #companion() }
         })
         .collect();
@@ -34,30 +28,116 @@ fn collect_macro(input: TokenStream, prefix: &str) -> TokenStream {
     }
 }
 
-pub fn workflows_macro(input: TokenStream) -> TokenStream {
-    collect_macro(input, "__autumn_workflow_info_")
-}
-
 pub fn activities_macro(input: TokenStream) -> TokenStream {
-    collect_macro(input, "__autumn_activity_info_")
+    let names = match Punctuated::<Ident, Token![,]>::parse_terminated.parse2(input) {
+        Ok(n) => n,
+        Err(e) => return e.to_compile_error(),
+    };
+
+    let calls: Vec<_> = names
+        .iter()
+        .map(|name| {
+            let companion = quote::format_ident!("__autumn_activity_info_{name}");
+            quote! { #companion() }
+        })
+        .collect();
+
+    quote! {
+        vec![ #(#calls),* ]
+    }
 }
 
 pub fn dags_macro(input: TokenStream) -> TokenStream {
-    collect_macro(input, "__autumn_dag_info_")
+    let names = match Punctuated::<Ident, Token![,]>::parse_terminated.parse2(input) {
+        Ok(n) => n,
+        Err(e) => return e.to_compile_error(),
+    };
+
+    let calls: Vec<_> = names
+        .iter()
+        .map(|name| {
+            let companion = quote::format_ident!("__autumn_dag_info_{name}");
+            quote! { #companion() }
+        })
+        .collect();
+
+    quote! {
+        vec![ #(#calls),* ]
+    }
 }
 
 pub fn queries_macro(input: TokenStream) -> TokenStream {
-    collect_macro(input, "__autumn_query_handler_info_")
+    let names = match Punctuated::<Ident, Token![,]>::parse_terminated.parse2(input) {
+        Ok(n) => n,
+        Err(e) => return e.to_compile_error(),
+    };
+
+    let calls: Vec<_> = names
+        .iter()
+        .map(|name| {
+            let companion = quote::format_ident!("__autumn_query_handler_info_{name}");
+            quote! { #companion() }
+        })
+        .collect();
+
+    quote! {
+        vec![ #(#calls),* ]
+    }
 }
 
 pub fn updates_macro(input: TokenStream) -> TokenStream {
-    collect_macro(input, "__autumn_update_handler_info_")
+    let names = match Punctuated::<Ident, Token![,]>::parse_terminated.parse2(input) {
+        Ok(n) => n,
+        Err(e) => return e.to_compile_error(),
+    };
+
+    let calls: Vec<_> = names
+        .iter()
+        .map(|name| {
+            let companion = quote::format_ident!("__autumn_update_handler_info_{name}");
+            quote! { #companion() }
+        })
+        .collect();
+
+    quote! {
+        vec![ #(#calls),* ]
+    }
 }
 
 pub fn signals_macro(input: TokenStream) -> TokenStream {
-    collect_macro(input, "__autumn_signal_handler_info_")
+    let names = match Punctuated::<Ident, Token![,]>::parse_terminated.parse2(input) {
+        Ok(n) => n,
+        Err(e) => return e.to_compile_error(),
+    };
+
+    let calls: Vec<_> = names
+        .iter()
+        .map(|name| {
+            let companion = quote::format_ident!("__autumn_signal_handler_info_{name}");
+            quote! { #companion() }
+        })
+        .collect();
+
+    quote! {
+        vec![ #(#calls),* ]
+    }
 }
 
 pub fn webhooks_macro(input: TokenStream) -> TokenStream {
-    collect_macro(input, "__autumn_webhook_info_")
+    let names = match Punctuated::<Ident, Token![,]>::parse_terminated.parse2(input) {
+        Ok(n) => n,
+        Err(e) => return e.to_compile_error(),
+    };
+
+    let calls: Vec<_> = names
+        .iter()
+        .map(|name| {
+            let companion = quote::format_ident!("__autumn_webhook_info_{name}");
+            quote! { #companion() }
+        })
+        .collect();
+
+    quote! {
+        vec![ #(#calls),* ]
+    }
 }

@@ -292,11 +292,9 @@ async fn unsupported_command_rolls_the_whole_cycle_back() {
             .all(|e| !matches!(e, WorkflowEvent::SideEffectRecorded { .. })),
         "no partial side-effect write may survive a rolled-back cycle:\n{history:?}"
     );
-    // `start_workflow` committed WorkflowStarted. The seal (issue #1834)
-    // committed WorkflowFailed in its own transaction, after the rollback.
-    assert_eq!(history.len(), 2, "start event plus the seal only");
+    // Only WorkflowStarted was committed (by start_workflow, a separate tx).
+    assert_eq!(history.len(), 1, "only the committed start event remains");
     assert!(matches!(history[0], WorkflowEvent::WorkflowStarted { .. }));
-    assert!(matches!(history[1], WorkflowEvent::WorkflowFailed { .. }));
 }
 
 // ── Timer-id reuse: a re-armed timer id fires again (Codex round-5) ────────────

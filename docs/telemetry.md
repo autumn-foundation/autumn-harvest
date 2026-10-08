@@ -15,7 +15,7 @@ dependency (rendering is done entirely through autumn-web's existing
 
 ```toml
 [dependencies]
-autumn-harvest-plugin = { version = "0.7", features = ["metrics"] }
+autumn-harvest-plugin = { version = "0.4", features = ["metrics"] }
 ```
 
 ```rust
@@ -62,18 +62,13 @@ discarded. It also covers the four broker-connector families
 (`harvest.connector.received`, `harvest.connector.dispatched`,
 `harvest.connector.poisoned`, `harvest.connector.lag`), which back the shipped
 connector dashboard panels — without them a dropped metric would be
-indistinguishable from an idle consumer. It also covers
-`harvest.build.ramp_aborted` from the build ramp guard (issue #1814), which
-backs the starter dashboard's ramp-abort panel. **It does not back the full starter alert pack**
+indistinguishable from an idle consumer. **It does not back the full starter alert pack**
 (`docs/alerts/starter-pack-v0.1.0.json`), which also references metrics this
 endpoint never emits (e.g. `harvest_workflow_terminal_total`,
 `harvest_activity_attempts_total`/`retries_total`,
 `harvest_schedule_fire_attempts_total`, `harvest_no_active_workers`). If you
 want the full starter alert pack to work, use the `metrics-rs` adapter
 escape hatch below, which bridges every `MetricsRecorder` method.
-The optional SLO burn-rate pack (`docs/alerts/slo.md`) also needs that
-adapter. It reads the task-timeout counter, the canary counters, and
-histogram buckets.
 
 **Trade-off:** `autumn_web::actuator::MetricsSource`'s `MetricKind` only
 supports `Counter`/`Gauge` (no histogram variant), so `harvest.workflow.duration`
@@ -101,7 +96,7 @@ Enable the in-tree `metrics-rs` adapter in your application's `Cargo.toml`:
 
 ```toml
 [dependencies]
-autumn-harvest = { version = "0.7", features = ["metrics-rs"] }
+autumn-harvest = { version = "0.2", features = ["metrics-rs"] }
 metrics-exporter-prometheus = "0.16"
 ```
 
@@ -155,17 +150,6 @@ metrics_exporter_prometheus::PrometheusBuilder::new()
         LATENCY_BUCKETS,
     )
     .expect("valid bucket boundaries")
-    // Issue #1815: pool wait and DB op latency use the same seconds buckets.
-    .set_buckets_for_metric(
-        Matcher::Full("harvest_db_pool_wait_duration".into()),
-        LATENCY_BUCKETS,
-    )
-    .expect("valid bucket boundaries")
-    .set_buckets_for_metric(
-        Matcher::Full("harvest_db_query_duration".into()),
-        LATENCY_BUCKETS,
-    )
-    .expect("valid bucket boundaries")
     // history-size is a *count* histogram (durable events), not seconds — give
     // it its own boundaries so it stays usable for count dashboards/alerts.
     .set_buckets_for_metric(
@@ -197,11 +181,6 @@ Replace step 1 with your OTel SDK setup and a `metrics-exporter-otlp` or
 `opentelemetry-prometheus` bridge. The `MetricsRsRecorder` adapter is
 backend-agnostic — it writes to whichever exporter the `metrics` crate's
 global recorder is pointing at.
-
-To keep the Prometheus exporter and send OTLP from an OpenTelemetry Collector,
-use the [Collector recipe](operations/otel-collector.md) (issue #1838). It also
-copies the metrics that match an OTel messaging semantic convention under the
-semconv name.
 
 ## Custom recorder
 
@@ -336,70 +315,36 @@ metric is emitted in the source code.
 | `harvest.workflow.duration` | Histogram | `worker.rs` — `process_workflow_task`, on executor cycle completion |
 | `harvest.workflow.timeout` | Counter | `timeout.rs` — `enforce_workflow_execution_timeouts`, when a run's per-run `deadline_at` (issue #243) elapses. Labels: `workflow`, `queue` |
 | `harvest.workflow.chain_timeout` | Counter | `timeout.rs` — `enforce_workflow_execution_timeouts`, when a run's chain-scoped `chain_deadline_at` (issue #617) elapses. The chain cap is anchored at the first run's start and carried verbatim across every continue-as-new, so this counter — distinct from `harvest.workflow.timeout` — fires when a whole continue-as-new chain (not a single run) outlives its lifetime cap. Labels: `workflow`, `queue`. Both a chain and a run timeout still emit `harvest.workflow.terminal{outcome="timed_out"}`; the chain-vs-run distinction lives only in these two counters |
-| `harvest.workflow.history_bloat` | Counter | `worker.rs` — via the shared `emit_history_bloat_warning_if_crossed` helper, called from two places: (1) `process_workflow_task`'s `Persisted` arm, post-commit, for a still-**RUNNING** (non-terminal, `WorkflowOutcome::Suspended`) execution (same "compute pre-transaction, act only after commit" discipline as `harvest.signal.unhandled`/`harvest.update.completed`/`harvest.update.failed`, issue #684, so an ND-blocked / paused-parked / persist-failed cycle can never emit); and (2) `fail_workflow_for_history_cap`, when a single decision cycle grows history from below the soft threshold straight past `event_hard_cap` in one inline append batch (e.g. local-activity or external-signal persistence), bypassing (1) entirely — the crossing still happened in the same decision, so it is emitted there too, before the execution is terminally DLQ'd. Fires once per still-**RUNNING** or newly-hard-cap-terminal-failed execution the moment its recorded `harvest_events` count first crosses `history_bloat_warn_fraction * event_hard_cap` (`WorkflowHistoryPolicy`, default fraction `0.2048` since issue #1804, so 10,240 events under the default 50,000-event cap, clamped below `1.0`); a guarded `history_bloat_warned_at` column on the execution row makes the crossing idempotent across replays/retries once the mark is durably set. **Delivery is at-least-once, not exactly-once**: the counter is emitted BEFORE the guard is persisted, so a worker crash in the narrow window between the two leaves the guard unset and a future retry of the same decision cycle may re-emit rather than silently losing the signal forever — deliberate, since the guard is a one-shot, non-recurring gate with no later crossing to fall back on for a given execution (PR #1139 review). Observation-only — the run keeps executing normally; a permanently flat, never-incrementing series when the event cap is unlimited (`history_event_hard_cap_unlimited()`) or the warn fraction is `0` (`history_bloat_warn_fraction(0.0)`), which is the disabled/no-op state, not a health issue. Pair with `GET /api/harvest/workflows?history_bloat_min_events=<N>` (or `harvest workflow list --history-bloat-min-events <N>`) to discover and rank the specific offending, still-live execution(s) by current history size (issue #704) |
+| `harvest.workflow.history_bloat` | Counter | `worker.rs` — via the shared `emit_history_bloat_warning_if_crossed` helper, called from two places: (1) `process_workflow_task`'s `Persisted` arm, post-commit, for a still-**RUNNING** (non-terminal, `WorkflowOutcome::Suspended`) execution (same "compute pre-transaction, act only after commit" discipline as `harvest.signal.unhandled`/`harvest.update.completed`/`harvest.update.failed`, issue #684, so an ND-blocked / paused-parked / persist-failed cycle can never emit); and (2) `fail_workflow_for_history_cap`, when a single decision cycle grows history from below the soft threshold straight past `event_hard_cap` in one inline append batch (e.g. local-activity or external-signal persistence), bypassing (1) entirely — the crossing still happened in the same decision, so it is emitted there too, before the execution is terminally DLQ'd. Fires once per still-**RUNNING** or newly-hard-cap-terminal-failed execution the moment its recorded `harvest_events` count first crosses `history_bloat_warn_fraction * event_hard_cap` (`WorkflowHistoryPolicy`, default fraction `0.75`, clamped below `1.0`); a guarded `history_bloat_warned_at` column on the execution row makes the crossing idempotent across replays/retries once the mark is durably set. **Delivery is at-least-once, not exactly-once**: the counter is emitted BEFORE the guard is persisted, so a worker crash in the narrow window between the two leaves the guard unset and a future retry of the same decision cycle may re-emit rather than silently losing the signal forever — deliberate, since the guard is a one-shot, non-recurring gate with no later crossing to fall back on for a given execution (PR #1139 review). Observation-only — the run keeps executing normally; a permanently flat, never-incrementing series for any workflow type with no `event_hard_cap` configured, which is the disabled/no-op state, not a health issue. Pair with `GET /api/harvest/workflows?history_bloat_min_events=<N>` (or `harvest workflow list --history-bloat-min-events <N>`) to discover and rank the specific offending, still-live execution(s) by current history size (issue #704) |
 | `harvest.activity.duration` | Histogram | `worker.rs` — `dispatch_activity_handler`, on activity completion (success or failure) |
 | `harvest.activity.failed` | Counter | `worker.rs` — `dispatch_activity_handler`, on each failed attempt; richer labels than `harvest.activity.attempts` (`workflow.type`, `error.type`, `non_retryable`) |
 | `harvest.activity.attempts` | Counter | `worker.rs` — `dispatch_activity_handler`, once per attempt for **both** outcomes; use for success-rate SLOs: `rate(attempts{outcome="completed"}[5m]) / rate(attempts[5m])` (issue #528) |
-| `harvest.activity.retries` | Counter | `worker.rs` — `handle_activity_result`, once per retry actually scheduled (after the `schedule_to_close` deadline check); also `timeout.rs` — `enforce_activity_timeout`, once per start-to-close or heartbeat timeout retry (issue #1809); use for retry-storm detection (issue #528) |
-| `harvest.retry.budget.available` | Gauge | `retry_budget.rs` — `RetryBudgetRegistry`, after every bucket access, under the bucket lock, so samples follow the mutation order. Tokens left in one activity type's retry budget on this worker (issue #1793) |
-| `harvest.retry.budget.exhausted` | Counter | `worker.rs` — `process_activity_task`, once per retry that the retry budget deferred. Prometheus: `harvest_retry_budget_exhausted_total`. A deferred retry is not lost; it runs later (issue #1793) |
-| `harvest.activity.concurrency_limit` | Gauge | `adaptive_limit.rs` — `AdaptiveLimitRegistry`, after every change, under its lock. The adaptive cap on in-flight attempts of one activity type on this worker. Only a type with an adaptive limit has it (issue #1836) |
-| `harvest.activity.concurrency_in_flight` | Gauge | `adaptive_limit.rs` — `AdaptiveLimitRegistry`, with the cap. Attempts that hold a slot. At the cap, the worker claims no more tasks of the type (issue #1836) |
-| `harvest.activity.latency_baseline_seconds` | Gauge | `adaptive_limit.rs` — `AdaptiveLimitRegistry`, with the cap. The no-load handler latency estimate that the limit compares each window mean with. A probe clears it, and the gauge keeps its last value until the probe window closes (issue #1836) |
-| `harvest.activity.concurrency_deferred` | Counter | `worker.rs` — `process_activity_task`, once per claimed attempt that the adaptive limit deferred. The claim skips a type at its cap, so a steady rate means claims race past the cap. Prometheus: `harvest_activity_concurrency_deferred_total` (issue #1836) |
+| `harvest.activity.retries` | Counter | `worker.rs` — `handle_activity_result`, once per retry actually scheduled (after the `schedule_to_close` deadline check); use for retry-storm detection (issue #528) |
 | `harvest.activity.pause_actions` | Counter | `activity_pause.rs` — the `pause_activity` / `resume_activity` write path, once per operator action on a whole activity type (issue #807). **Gated on the action having genuinely changed state** (`ActivityPauseOutcome::newly_paused` / `ActivityResumeOutcome::newly_resumed`) so an idempotent retry after a lost response does not read as a second hold — the same gating `harvest.workflow.paused` uses (issue #383). Deliberately a counter, not a gauge: it records *actions*, so a flat line says nothing about whether a hold is currently in effect — `GET /api/harvest/activities` is the read model for the state. Contrast its sibling `harvest.queue.paused` (issue #619), a gauge, because there the alertable thing is the *duration* of the hold |
 | `harvest.timer.started` | Counter | `worker.rs` — `persist_timer_command`, when a durable timer is written |
 | `harvest.queue.depth` | Gauge | `worker.rs` — `spawn_queue_depth_sampler`, periodic (5 s default). Aggregated **across all shards** of the worker's `ShardedDbPool` (summed per queue) so multi-shard backlog is fleet-wide, not default-shard-only (issue #522) |
-| `harvest.queue.schedule_to_start` | Histogram | `worker.rs` — recorded at handler start in `process_workflow_task` / `process_activity_task`. The sample runs from eligibility, so it includes the `PENDING` wait behind a saturated worker (issue #1787); skew-discounted (issue #501) |
+| `harvest.queue.schedule_to_start` | Histogram | `worker.rs` — `dispatch_task`, recorded after the concurrency permit is acquired so it captures worker-local backpressure; skew-discounted (issue #501) |
 | `harvest.queue.oldest_pending_age` | Gauge | `worker.rs` — `spawn_queue_depth_sampler`, alongside depth; excludes PAUSED executions, skew-discounted, periodic (5 s default) (issue #501). Aggregated across all shards as the **max** age per queue (the single oldest task fleet-wide) (issue #522) |
-| `harvest.load_shed.active` | Gauge | `load_shed.rs` — `sample_once`, the load-shed sampler. It writes 1 or 0 for every configured queue on every tick, also after a failed read (issue #1794) |
-| `harvest.load_shed.rejected` | Counter | `execution.rs` — `admit_fresh_start`, once per fresh start that load shedding refuses. The start and batch routes in `api.rs` (plugin) also count a throttled start that they shed before its defer (issue #1794) |
-| `harvest.build.ramp_aborted` | Counter | `ramp_guard.rs` — `guard_once`, once per build ramp that the ramp guard aborts. See `docs/operations/build-ramp-guard.md` (issue #1814) |
-| `harvest.api.rate_limited` | Counter | `api_rate_limit.rs` (plugin) — `enforce_api_rate_limit`, once per request the optional API rate limiter refuses with `429` (issue #1827) |
 | `harvest.queue.dispatched` | Counter | `worker.rs` — `dispatch_task`, once per dispatched task; lets operators confirm the live per-queue dispatch split matches `WorkerConfig::queue_weights` (issue #515) |
 | `harvest.dlq.entries` | Gauge | `worker.rs` — `spawn_dlq_depth_sampler`, periodic (5 s default) |
 | `harvest.shard.stranded_pending` | Gauge | `worker.rs` — `spawn_stranded_work_sampler`, periodic (`poll_interval`). Claimable pending tasks on a shard with **no covering live worker** (issue #522). Iterates **every** shard of the worker's `ShardedDbPool`, not just its assigned ones, so a writable shard nobody polls is still surfaced. Emits `0` for a covered shard so the gauge resets cleanly |
 | `harvest.shard.dispatched` | Counter | `worker.rs` — the poll loop, once per dispatched task (issue #961). The shard-dimension twin of `harvest.queue.dispatched`: confirms the live dispatch split across a multi-shard worker's assigned shards, i.e. that a deep backlog on one shard is not starving its siblings. Emitted by the poll loop rather than `dispatch_task` because a task row carries no `shard_id` column — "which shard" *is* "which pool", and only the poll loop knows which pool it claimed from |
-| `harvest.replication.lag_seconds` | Gauge | `worker.rs` — the DR sampler, per shard (issue #954). The **measured RPO**: how many seconds of acknowledged work a failover to the standby region would lose right now, from the age of the newest `harvest_replication_heartbeat` watermark the slowest standby has confirmed. **The series is ABSENT, not zero, when the RPO is unknown** (no standby, no slot, or a standby further behind than the retained trail) — a dead standby reported as `0` reads as a perfect RPO. Alert on `harvest.replication.standbys == 0` for "down"; alert on this for "slow" |
-| `harvest.replication.lag_bytes` | Gauge | `worker.rs` — the DR sampler, per shard (issue #954). Worst-case WAL backlog. Survives a disconnected standby (a slot pins WAL with no walsender), so it stays real when the time lag is unknowable; also the disk-pressure signal for an abandoned slot |
-| `harvest.replication.observable` | Gauge | `worker.rs` — the DR sampler, per shard, on **every** tick (issue #954). `1` while the shard's replication views are readable, `0` when they are not (usually a missing `GRANT pg_monitor`). Exists because a Prometheus gauge keeps exporting its last value: withholding the RPO and standby gauges does not make them stale, it freezes them at the last healthy reading. This is the signal that says the others cannot be trusted right now |
-| `harvest.replication.standbys` | Gauge | `worker.rs` — the DR sampler, per shard (issue #954). Live walsenders. `0` means replication is **down** for that shard: the RPO is unbounded and growing. Always emitted, `0` included — `0` is the signal |
-| `harvest.shard.generation` | Gauge | `worker.rs` — the DR sampler, per shard (issue #954). The write-authority epoch the shard's database reports. Its value is uninteresting; its **skew across shards** is the point, since shards fail over independently |
-| `harvest.shard.fenced` | Counter | `worker.rs` — the DR sampler, once immediately before a worker stops because its pinned generation was superseded (issue #954). Never self-healing: a fenced worker is recovered by restarting it, never by re-pinning |
-| `harvest.audit.export_lag` | Gauge | `audit_export.rs` — the audit exporter, per shard, on **every** tick (issue #953). Age in seconds of the **oldest** audit record the SIEM sink has not acknowledged; `0` when fully caught up. Oldest, not newest, deliberately: under sustained mutating load a stuck exporter always has a brand-new unexported record, so a newest-based lag would read ≈0 during exactly the outage that matters. Emitted on ticks that deliver nothing too — the signal must not go stale precisely when delivery has stopped. **Caveat:** it is written only on a *successful* observation, so a shard whose cursor cannot be read (failing query, unacquirable connection) keeps serving its previous value rather than going absent or high. `harvest.audit.export_observed` (below) is the metric-only signal for that case, closing the gap autumn-foundation/autumn-harvest#1268 tracked. See the runbook's coverage table. The common case — a sink that is down or rejecting — is unaffected: the exporter still reads the cursor and the gauge climbs as designed. A rising line means privileged-action logs are not reaching the SIEM; nothing is lost (the cursor is held, never advanced past the failure) but the window in which a compromise would be invisible is growing |
-| `harvest.audit.export_observed` | Gauge | `audit_export.rs` — the audit exporter, per shard, on every tick that reaches a shard (issue #1268). `1` when the cursor read and the lag query both succeeded this tick; `0` on a connection failure, a cursor read failure, or a lag query failure. Exists for the same reason as `harvest.replication.observable`: a Prometheus gauge keeps its last value, so a shard the exporter cannot observe would otherwise leave `harvest.audit.export_lag` frozen — commonly at `0` — with no series ever going high or absent. Does not cover a shard missing from a worker's `shard_assignments` altogether, since no code path runs for it; see the runbook's coverage table |
-| `harvest.audit.exported` | Counter | `audit_export.rs` — the audit exporter, once per acknowledged batch with that batch's record count (issue #953). Counted only **after** the cursor advanced, so this is a delivery rate, not an attempt rate. Delivery is at-least-once, so a redelivered batch counts again; receiver-side `(shard, seq)` accounting, not this counter, is the completeness proof. See [`docs/audit-export.md`](audit-export.md) |
 | `harvest.task.capability_miss` | Counter | `worker.rs` — `process_task`, once per claim of a task whose workflow/activity type this worker has **no handler registered** for (issue #804). `outcome=released` when the claim is handed back to `PENDING` for a capable peer (the benign, self-healing rolling-deploy signature); `outcome=escalated` when the per-task redelivery budget (`WorkerConfig::capability_miss_max_redeliveries`, default 5, capped exponential backoff) is exhausted and the task falls through to the terminal-failure path with a `no_capable_worker:` reason — the *fleet-exhaustion* signal, and the only outcome that can support concluding no live worker on the queue has the handler. That budget is **gated on the live fleet**: it may only escalate once the workers recorded as having missed the task cover the live workers advertising its queue in `harvest_workers`, so a capable peer that is up and merely losing claim races can never be failed underneath (an ungated `10 ×` absolute ceiling on total releases remains as the bound for the cases coverage cannot reach). Read the reason string before acting: it states whether the fleet was actually confirmed, and reports the *persisted* release/worker counts rather than counting the claim that escalated; `outcome=escalated_never_offered` when the task was failed on its **first** claim after **zero** releases (`capability_miss_max_redeliveries = 0`, or a worker-session pin (#606) whose host lacks the handler), where a capable peer may be live and idle the whole time. Kept separate so the fleet-exhaustion page cannot fire on a cause that carries the opposite conclusion. A clean capability miss never increments `crash_strikes`, so it can never trip poison-pill quarantine (`harvest.task.quarantined`, issue #367) |
 | `harvest.queue.paused` | Gauge | `worker.rs` — `spawn_queue_pause_sampler`, periodic (`poll_interval`, 5 s default). `1` while an operator hold is in effect on a queue, `0` otherwise. Read across all shards of the worker's `ShardedDbPool`. A hold observed on a readable shard is **always** emitted, even when another shard's read failed — pause is boolean per queue, so suppressing it would leave this gauge (and the `harvest_queue_paused_too_long` alert) silent for the duration of an unrelated shard outage. A read failure suppresses only the **zero-fill**, so an outage never false-clears the gauge; a queue absent from an incomplete scan is retained and zero-filled exactly once on a later complete scan rather than going stale at `1` (issue #619) |
-| `harvest.worker.empty_build_policy` | Gauge | `worker.rs` — `register_in_fleet`, once at registration. `1` per served queue that has a build policy when the worker `build_id` is empty. Such a worker cannot claim pinned runs (issue #1805). Set-only and startup-only: a policy created after the worker starts is not flagged, and the series ends only when the worker exits |
 | `harvest.worker.slots_in_use` | Gauge | `worker.rs` — `spawn_worker_slot_sampler`, periodic (5 s default). Pure in-memory read of the workflow/activity dispatch `Semaphore`s against their configured maxima — no DB access (issue #531) |
 | `harvest.worker.slots_available` | Gauge | `worker.rs` — `spawn_worker_slot_sampler`, alongside `slots_in_use`. Invariant: `slots_in_use + slots_available == configured_max` per `slot_type` within one sampler interval (issue #531) |
 | `harvest.workflow.active` | Gauge | `worker.rs` — `spawn_workflow_active_sampler`, periodic (`poll_interval`, 5 s default). Shard-local `COUNT(*) … GROUP BY (workflow_name, state) WHERE state IN ('RUNNING','PAUSED')`, aggregated **across all shards** of the worker's `ShardedDbPool` (summed per `(workflow, state)`) so the population is fleet-wide, not default-shard-only. A read failure skips the whole tick so an outage never false-clears the gauge; drained `(workflow, state)` pairs are zero-filled (issue #770) |
 | `harvest.worker.slot_target` | Gauge | `slot_tuner.rs` — `spawn_slot_tuner_loop`, periodic (`poll_interval`). The adaptive slot tuner's current band-clamped resize target for one slot type; only emitted when `WorkerConfig::with_slot_tuner` is configured (issue #548) |
-| `harvest.db.pool.in_use` | Gauge | `worker.rs` — `spawn_db_pool_sampler`, periodic (`poll_interval`). Connections each shard pool lends out now, read from the deadpool status. No query runs. Runtimes in one process that share a sink report the sum of their distinct pools for the shard (issue #1815) |
-| `harvest.db.pool.idle` | Gauge | `worker.rs` — `spawn_db_pool_sampler`, alongside `in_use`. Open connections that wait idle in the pool. Runtimes in one process that share a sink report the sum of their distinct pools, or 0 while any of them is exhausted (issue #1815) |
-| `harvest.db.pool.wait_duration` | Histogram | `worker.rs` — `Worker::acquire_timed` on the claim path; `timeout.rs` — the timeout scanner's acquire (a single-pool scanner reports each assigned shard, as its pool gauges do); `heartbeat.rs` — the activity heartbeat flush. Seconds to get a pooled connection, recorded on success and on failure. A worker without a sharded pool records each wait under each assigned shard, as its pool gauges do (issue #1815) |
-| `harvest.db.query.duration` | Histogram | One sample per op (issue #1815): `claim` in `poll_once` and `consume_reference`; `persist` around the workflow-task persist transaction, COMMIT included, and around a terminal failure write that an early error path or a history-cap breach commits instead; `scan` per `enforce_timeouts_once` pass; `heartbeat` per activity heartbeat write. A guard records a persist that a timeout cancels, too. A worker without a sharded pool records each sample under each assigned shard, as its pool gauges do. A direct `enforce_timeouts_once` call labels its `scan` with the shard assignments it is given. Not `harvest.query.duration`, which times workflow query handlers |
-| `harvest.worker.pollers` | Gauge | `worker.rs` — `PollerGuard`, set when a poll loop starts and when it ends. One loop claims from all the worker's queues. The count covers every worker that shares the metrics recorder, so a second worker's drain does not hide the first. A runtime with its own recorder keeps its own count. A drained process reads 0 (issue #1815) |
-| `harvest.worker.outlier` | Gauge | `workers.rs` — `run_outlier_tick`, on each liveness heartbeat of the worker. Each heartbeat merges the peer rows of all the worker's shards, so all of them see the same peers. `1` when this worker is an outlier against the median of its live peers on the same queues, else `0`. A draining worker clears its verdict. A tick that cannot compare clears it only when no other shard heartbeat of the worker is healthy. A stopped or aborted worker's verdict is removed, and a shard view that stops refreshing expires. The series has no worker label, so it reports the OR of the verdicts of every local worker that shares the recorder. See `worker_outlier.rs` for the rules (issue #1815) |
 | `harvest.worker.tuner_decisions` | Counter | `slot_tuner.rs` — `spawn_slot_tuner_loop`, once per control-loop tick, with the decision that actually took effect after band clamping (issue #548) |
 | `harvest.schedule.runs` | Counter | `scheduler.rs` — `tick_one_workflow_schedule` / DAG tick, on successful dispatch |
 | `harvest.schedule.skipped` | Counter | `scheduler.rs` — `tick_one_workflow_schedule` / DAG tick, when a run is skipped |
 | `harvest.schedule.overdue` | Gauge | `scheduler.rs` — `sample_overdue_schedules`, emitted per schedule by the worker's overdue sampler (`spawn_schedule_overdue_sampler`, on the `poll_interval` cadence, per shard). `1` when an *active* schedule is past its own cadence grace (`now − next_run_at > cadence step + jitter + tick`), `0` otherwise. Runs on the worker, not the scheduler tick, so a wedged tick cannot suppress its own health signal (issue #696). Paused / auto-paused / manual / exhausted / at-capacity schedules read `0`; deleted schedules go stale (standard gauge property). |
 | `harvest.retention.deleted` | Counter | `retention.rs` — `RetentionRuntime` tick, once per workflow type with a real (non-dry-run) deletion; labeled by workflow type so per-type retention overrides are confirmable (issue #737). `sum(harvest.retention.deleted)` equals the aggregate **workflow-history** deletion count for the tick, excluding orphaned `harvest_completion_deliveries` reclaims (issue #921), which have no workflow to attribute. |
 | `harvest.retention.summary_deleted` | Counter | `retention.rs` — summaries deleted by the tiered-retention summary GC pass, once per workflow type with a real (non-dry-run) deletion; labeled by workflow type. A distinct member of the retention metric family from `harvest.retention.deleted` (history rows), so the two tiers are observable independently (issue #752). |
-| `harvest.retention.rate_limit_buckets_deleted` | Counter | `retention.rs` — inert per-tenant rate-limit buckets collected by the idle-bucket GC pass, once per key family with a real (non-dry-run) deletion, per shard (issue #1127). Labeled by the bounded `family` (`dyn-rate` / `start-throttle`), **never** by the bucket key — the key is the unbounded per-tenant value this pass exists to collect, so labelling by it would trade an unbounded table for an unbounded metric series. A flat zero while `harvest_rate_limit_buckets` keeps growing means either the GC is disabled (`RetentionConfig::rate_limit_bucket_retention_secs = None`) or every candidate is pinned by a live dependent; `GET /admin/retention` reports the per-shard count either way. |
-| `harvest.retention.terminal_tasks_deleted` | Counter | `retention.rs` — terminal `harvest_task_queue` rows deleted by the terminal-task janitor, once per task state with a real (non-dry-run) deletion, per shard (issue #1811). Labeled by `state` (`COMPLETED` / `FAILED` / `CANCELLED`). A flat zero while the table grows means the janitor is off (`RetentionConfig::terminal_task_retention_secs = None`) or the role lacks `DELETE`; `GET /admin/retention` reports the per-shard outcome and any error. |
-| `harvest.scanner.tick` | Counter | `timeout.rs` / `poison_pill.rs` / `worker.rs` / `retention.rs` / `scheduler.rs` / `audit_export.rs` — incremented **unconditionally at the end of every background control-loop iteration**, including no-work iterations and iterations whose pass returned an error, via the single `scanner_health::record_scanner_tick` choke point (issue #797). Unlike every other loop metric here (which only emits when there is work), a **flat-lined series means the loop is wedged**, not idle. There are eight labels but **six** spawned loops: `sla` and `external_outbox` are enforcement responsibilities inside the `timeout` loop and are ticked **by that loop**, so the three share one liveness fate and cannot diverge (ticking them mid-pass instead would put them behind a `?` and skip them on a transient DB error, giving a flat-lined counter two possible meanings). A multi-shard worker runs one `timeout`/`poison_pill`/`pause_auto_resume`/`audit_export` loop **per shard** under one label, so the counter carries a bounded `shard` label (the shard id, or `none` for the process-wide `retention`/`schedule` loops and single-shard deployments). Without it every per-shard instance would share one series on one scrape target and a healthy shard's ticks would hold `rate(...) > 0` while a sibling's loop was dead — **masking** the wedge, not merely failing to localise it. The `scanner_liveness` check complements this by tracking each instance, reporting the worst, and listing **every** stale shard in the check payload. `audit_export` registers its own threshold against `poll_interval + SHARD_ACQUIRE_BOUND + its configured export lease` (the sleep, the initial connection checkout, and the lease-bounded cycle -- three sequential stages, summed) rather than the bare poll interval, so a legitimately slow-but-within-lease delivery is not misclassified as wedged. The same choke point bumps an in-process last-tick registry surfaced by the `scanner_liveness` check in `GET /admin/preflight`, so liveness is observable with no metrics pipeline configured. |
-| `harvest.scanner.pass` | Counter | `timeout.rs` — one sample per timeout-checker tick that reached the database, labelled by `scanner`, `shard` and `role` (issue #1795). `role` has four values. `leader`: this replica holds the shard lease and ran the pass. `standby`: another replica holds the lease, so this replica skipped the pass. `unelected`: election is off, so this replica ran the pass. `fail_open`: the lease query failed, so this replica ran the pass anyway. Summed over the fleet, the non-`standby` rate is the scan load per shard. Without election it is the replica count times the tick rate. With election it is about one tick rate. See `docs/runbooks/ha-deployment.md`. |
-| `harvest.db.pool_acquire_timeout` | Counter | `worker.rs` / `heartbeat.rs` — a pool acquire hit its bound (issue #1788). The bound is the pool's deadpool `wait` timeout, or 30 s when the pool has none. A steady rate means the pool is too small or a connection is stuck. See [`docs/operations/postgres-timeouts.md`](operations/postgres-timeouts.md). |
-| `harvest.db.transaction_retry` | Counter | `tx_retry.rs` / `worker.rs` — Postgres aborted a transaction with `40P01` (deadlock) or `40001` (serialization failure), and the engine ran it again (issue #1822). Each retry counts once. The last failed attempt does not count. `site="workflow_task"` is a workflow-task persist that resets to `PENDING`. The other sites run again in place. A steady `deadlock` rate points to a lock-order defect. See [Lock-order table](architecture.md#lock-order-table). |
-| `harvest.db.transaction_retry_exhausted` | Counter | `tx_retry.rs` — a conflict abort remained after the last retry, so the error reached the caller (issue #1822). Any non-zero rate needs attention. See [`docs/operations/postgres-timeouts.md`](operations/postgres-timeouts.md#deadlock-and-serialization-retries). |
-| `harvest.heartbeat.flush_failed` | Counter | `heartbeat.rs` — an activity heartbeat flush failed (issue #1788). The flusher keeps the payload and tries again on the next tick. A run of failures longer than `heartbeat_timeout` fails a healthy activity. See [`docs/operations/postgres-timeouts.md`](operations/postgres-timeouts.md). |
+| `harvest.scanner.tick` | Counter | `timeout.rs` / `poison_pill.rs` / `worker.rs` / `retention.rs` / `scheduler.rs` — incremented **unconditionally at the end of every background control-loop iteration**, including no-work iterations and iterations whose pass returned an error, via the single `scanner_health::record_scanner_tick` choke point (issue #797). Unlike every other loop metric here (which only emits when there is work), a **flat-lined series means the loop is wedged**, not idle. There are seven labels but **five** spawned loops: `sla` and `external_outbox` are enforcement responsibilities inside the `timeout` loop and are ticked **by that loop**, so the three share one liveness fate and cannot diverge (ticking them mid-pass instead would put them behind a `?` and skip them on a transient DB error, giving a flat-lined counter two possible meanings). A multi-shard worker runs one `timeout`/`poison_pill`/`pause_auto_resume` loop **per shard** under one label, so the counter carries a bounded `shard` label (the shard id, or `none` for the process-wide `retention`/`schedule` loops and single-shard deployments). Without it every per-shard instance would share one series on one scrape target and a healthy shard's ticks would hold `rate(...) > 0` while a sibling's loop was dead — **masking** the wedge, not merely failing to localise it. The `scanner_liveness` check complements this by tracking each instance, reporting the worst, and listing **every** stale shard in the check payload. The same choke point bumps an in-process last-tick registry surfaced by the `scanner_liveness` check in `GET /admin/preflight`, so liveness is observable with no metrics pipeline configured. |
 | `harvest.workflow.nondeterministic_block` | Counter | `worker.rs` — `block_workflow_for_non_determinism`, once per non-terminal replay-divergence block entry (incl. re-blocks); the runtime companion to the `harvest.workflow.non_determinism` detection counter (issue #603) |
 | `harvest.workflow.start_throttled` | Counter | `api.rs` (HTTP/batch) + `scheduler.rs` (scheduled/buffered fires) — once per workflow start deferred by a start throttle because the per-key token bucket was empty (issue #607) |
-| `harvest.concurrency.superseded` | Counter | `execution.rs` — `emit_start_cancel_metrics`, called after the start transaction commits, once per running execution cancelled because a newer run for the same concurrency key superseded it under the latest-wins strategy (`on_conflict = cancel_running`, issue #811). A superseded run **also** increments `harvest.workflow.terminal{outcome="cancelled"}` — this counter isolates the supersede subset from operator/parent-close cancellations. A same-shard completion-trigger target's own supersede is collected (not emitted) by `completion_trigger::evaluate_triggers_for_execution_collecting` and emitted by its caller only after THAT caller's own enclosing transaction commits (issue #1197, item 1) — closing a residual where the prior eager, in-transaction emission could over-count on a rollback. |
-| `harvest.concurrency.residual_over_limit` | Counter | `concurrency.rs` — `supersede_inner`, once per latest-wins admission that could not shed its full computed overflow because every remaining over-limit run was a protected in-flight (nested) admission (issue #1197, item 2). Promotes a pre-existing `tracing::warn!` to a counter for a nested self-referential `cancel_running` trigger admission (cancelling an incumbent synchronously starts a target that also declares `cancel_running` on the same key); the key stays transiently over its limit and self-heals on the next ordinary admission. The only reachable code path passes no caller-supplied recorder, so emission falls back to the process-global `admission_gate::global_admission_metrics()` recorder (mirroring the identical fallback `completion_trigger.rs`'s admission-gate-block branch already uses). |
+| `harvest.concurrency.superseded` | Counter | `execution.rs` — `emit_start_cancel_metrics`, called after the start transaction commits, once per running execution cancelled because a newer run for the same concurrency key superseded it under the latest-wins strategy (`on_conflict = cancel_running`, issue #811). A superseded run **also** increments `harvest.workflow.terminal{outcome="cancelled"}` — this counter isolates the supersede subset from operator/parent-close cancellations. |
 | `harvest.webhook.received` | Counter | `webhook_receiver.rs` — every request that reaches an inbound webhook receiver route, regardless of outcome (issue #344) |
 | `harvest.webhook.rejected` | Counter | `webhook_receiver.rs` — every inbound webhook request rejected: signature/timestamp/replay verification failure, payload parse failure, mapping-function rejection, or missing idempotency key. Never fires for `accepted`/`idempotent_replay` (issue #344) |
 | `harvest.saga.compensated` | Counter | `saga.rs` — `run_compensations` (via `WorkflowContext::observe_saga_unwind_start`), exactly once per real compensation sequence: a non-empty `compensate_all` / step-failure unwind actually running forward (issue #801) |
@@ -409,7 +354,7 @@ metric is emitted in the source code.
 | `harvest.canary.roundtrip` | Histogram | `worker.rs` — `process_workflow_task` Completed arm, when the workflow is a built-in synthetic liveness canary (`canary::is_canary_workflow`): wall-clock seconds from start-requested to terminal completion of the throwaway probe workflow. Distinct from the #512 replay canary (issue #796) |
 | `harvest.canary.success` | Counter | `worker.rs` — `process_workflow_task` Completed arm, once per canary probe reaching terminal completion (canary runs emit this **instead of** `harvest.workflow.terminal`, so probes never pollute business SLO counters — AC8) (issue #796) |
 | `harvest.canary.failure` | Counter | `worker.rs` — `process_workflow_task` Failed arm, and `timeout.rs` — `enforce_workflow_execution_timeouts` (a probe that does not complete within its per-probe timeout is a failure, AC6): once per canary probe that did not reach terminal completion (issue #796) |
-| `harvest.completion_trigger.skipped` | Counter | `completion_trigger.rs` — `evaluate_triggers_for_execution`, on output-guard skips (`condition_unmet` = guard evaluated false, once per fresh skip — a redelivered, already-resolved skip records `deduped` on `harvest.completion_trigger.fires` instead; `condition_invalid` = stored condition unparseable/over-cap, fail-closed with no fires row — the fire is lost for that terminal unless evaluation re-enters, so alert on this reason and re-trigger by hand; see [`docs/completion-triggers.md`](completion-triggers.md) "Fail-closed on invalid stored conditions"). Best-effort on the operator cancel/terminate and parent-close-cascade paths (no recorder threaded there); the fires-row `outcome` column is the authoritative skip record (issue #810) |
+| `harvest.completion_trigger.skipped` | Counter | `completion_trigger.rs` — `evaluate_triggers_for_execution`, on output-guard skips (`condition_unmet` = guard evaluated false, once per fresh skip — a redelivered, already-resolved skip records `deduped` on `harvest.completion_trigger.fires` instead; `condition_invalid` = stored condition unparseable/over-cap, fail-closed with no fires row — the fire is lost for that terminal unless evaluation re-enters, so alert on this reason and re-trigger by hand; see docs/completion-triggers.md "Fail-closed on invalid stored conditions"). Best-effort on the operator cancel/terminate and parent-close-cascade paths (no recorder threaded there); the fires-row `outcome` column is the authoritative skip record (issue #810) |
 | `harvest.signal.received` | Counter | `worker.rs` — `process_workflow_task`, once per durably-delivered `SignalReceived` (the live-only `ingest_due_timers_and_signals` choke point, beside the `harvest.signal.deliver` span). Never on replay (issue #684). Labeled `workflow`+`queue` only — the signal name is a span-only attribute, never a metric label (issue #684, Codex P2: free-form send route, no declared registry to bound it) |
 | `harvest.signal.unhandled` | Counter | `worker.rs` — `process_workflow_task`, emitted **post-commit in the `Persisted` arm** (same discipline as `harvest.update.completed/failed`), so it counts **durable terminal outcomes only**. The terminal outcome's `unhandled_signals` map is computed by `drive_workflow` after the #546 push-handler flush and collected before persist; the worker **sums** the per-name map into one increment per unconsumed occurrence against the single `(workflow, queue)` series — the signal name is NOT a metric label (issue #684, Codex P2). Emission is downstream of a successful commit — and therefore of the #603 ND-block gate (`Failed{nd:Some}` early-returns) and `check_paused_and_park` (a claimed-then-paused race returns via `ParkedPaused`, a persist failure via `Err` — neither reaches the emit), so a discarded cycle's retry/resume cannot double-count. Once per delivered signal left unconsumed at a **graceful Completed/Failed** terminal outcome reached through the workflow drive; lost signal-or-deadline races (#476) excluded. **Known limitation: forced-failure / scanner terminal paths are NOT counted** (they have no driven matcher) — `TIMED_OUT`, `CANCELLED`, `TERMINATED`, parent-close cascade, and history-cap failure. For a timed-out stuck run watch `harvest.workflow.timeout` + the stack API instead (issue #684) |
 | `harvest.update.admitted` | Counter | `store.rs` — `admit_update_event`, post-commit, once per durably admitted update (HTTP `admit_update`, Vantage UI, `update_with_start` — the latter emits at its own outer-commit boundary — and the in-process typed client, which now threads a `MetricsRecorder` through `WorkflowHandleClient::execute_update_in_process` so this path is also counted). Labeled `workflow`+`queue` only — the update name is NOT a metric label (issue #684, Codex P2: admission is at the free-form update route boundary before the name is resolved against a declarative-or-imperative handler, so it cannot be bounded by construction) |
@@ -430,70 +375,36 @@ metric is emitted in the source code.
 | Metric | Labels |
 |--------|--------|
 | `harvest.workflow.started` | `workflow`, `queue` |
-| `harvest.workflow.duration` | `workflow`, `queue`, `status` (`completed\|failed\|suspended\|continued_as_new`), `build_id` — capped, see [`build_id` label](#build_id-label) (issue #1814) |
-| `harvest.activity.duration` | `activity`, `queue`, `status` (`completed\|failed`), `build_id` — capped, see [`build_id` label](#build_id-label) (issue #1814) |
+| `harvest.workflow.duration` | `workflow`, `queue`, `status` (`completed\|failed\|suspended\|continued_as_new`) |
+| `harvest.activity.duration` | `activity`, `queue`, `status` (`completed\|failed`) |
 | `harvest.activity.failed` | `activity`, `workflow.type`, `error.type`, `non_retryable` |
-| `harvest.activity.attempts` | `activity`, `queue`, `outcome` (`completed\|failed`), `build_id` — capped, see [`build_id` label](#build_id-label) (issue #1814) |
+| `harvest.activity.attempts` | `activity`, `queue`, `outcome` (`completed\|failed`) |
 | `harvest.activity.retries` | `activity`, `queue` |
-| `harvest.retry.budget.available` | `activity` |
-| `harvest.retry.budget.exhausted` | `activity` |
-| `harvest.activity.concurrency_limit` | `activity` |
-| `harvest.activity.concurrency_in_flight` | `activity` |
-| `harvest.activity.latency_baseline_seconds` | `activity` |
-| `harvest.activity.concurrency_deferred` | `activity` |
 | `harvest.activity.pause_actions` | `activity` (bounded **by bucketing**: the pause routes accept an unregistered name on purpose, so the raw value is caller-controlled free text — the emitter resolves it against the registered activity catalogue and substitutes `__unregistered__` when absent, exactly as the #684 update-name label does), `action` (`pause\|resume`, bounded by `ActivityPauseAction`) |
 | `harvest.timer.started` | _(none)_ |
 | `harvest.queue.depth` | `queue` |
 | `harvest.queue.schedule_to_start` | `queue` |
 | `harvest.queue.oldest_pending_age` | `queue` |
-| `harvest.load_shed.active` | `queue` — only queues with a load-shed policy (issue #1794) |
-| `harvest.load_shed.rejected` | `queue` — only queues with a load-shed policy (issue #1794) |
-| `harvest.build.ramp_aborted` | `queue`, `reason` (`failure_rate\|nd_block_rate\|unreported`) (issue #1814) |
-| `harvest.api.rate_limited` | `route_class` (`mutating`, `read`), `client_kind` (`token`, `ip`, `unknown`, `overflow`). Never the token id or address (issue #1827) |
 | `harvest.dlq.entries` | `shard` |
 | `harvest.shard.stranded_pending` | `shard` |
 | `harvest.shard.dispatched` | `shard` |
-| `harvest.replication.lag_seconds` | `shard` |
-| `harvest.replication.lag_bytes` | `shard` |
-| `harvest.replication.standbys` | `shard` |
-| `harvest.replication.observable` | `shard` |
-| `harvest.shard.generation` | `shard` |
-| `harvest.shard.fenced` | `shard` |
-| `harvest.audit.export_lag` | `shard` |
-| `harvest.audit.export_observed` | `shard` |
-| `harvest.audit.exported` | `shard` |
 | `harvest.task.capability_miss` | `queue`, `task_type` (`workflow\|activity`), `outcome` (`released\|escalated\|escalated_never_offered`) |
 | `harvest.queue.paused` | `queue` |
-| `harvest.worker.empty_build_policy` | `queue` |
 | `harvest.worker.slots_in_use` | `slot_type` (`workflow\|activity`) |
 | `harvest.worker.slots_available` | `slot_type` (`workflow\|activity`) |
 | `harvest.worker.slot_target` | `slot_type` (`workflow\|activity`) |
-| `harvest.db.pool.in_use` | `shard` |
-| `harvest.db.pool.idle` | `shard` |
-| `harvest.db.pool.wait_duration` | `shard` |
-| `harvest.db.query.duration` | `op` (`claim\|persist\|scan\|heartbeat`), `shard` |
-| `harvest.worker.pollers` | `queue` |
-| `harvest.worker.outlier` | `dimension` (`failure_ratio\|latency_p99`) |
 | `harvest.workflow.active` | `workflow`, `state` (`running\|paused`) |
 | `harvest.worker.tuner_decisions` | `slot_type` (`workflow\|activity`), `decision` (`grow\|shrink\|hold`) |
 | `harvest.schedule.runs` | `kind` (`workflow\|dag`), `name` |
 | `harvest.schedule.skipped` | `kind`, `name`, `reason` (`paused\|max_active_runs_reached\|catchup_disabled`) |
 | `harvest.schedule.overdue` | `kind` (`workflow\|dag`), `name` |
 | `harvest.retention.deleted` | `workflow` |
-| `harvest.scanner.tick` | `scanner` (`timeout\|sla\|poison_pill\|external_outbox\|retention\|schedule\|pause_auto_resume\|audit_export`) |
-| `harvest.scanner.pass` | `scanner` (`timeout`), `shard`, `role` (`leader\|standby\|unelected\|fail_open`) |
-| `harvest.db.pool_acquire_timeout` | `site` (`claim\|heartbeat_flush`) |
-| `harvest.db.transaction_retry` | `site` (`persist\|workflow_task\|claim\|scanner`), `reason` (`deadlock\|serialization_failure`) |
-| `harvest.db.transaction_retry_exhausted` | `site` (`persist\|claim\|scanner`), `reason` (`deadlock\|serialization_failure`) |
-| `harvest.heartbeat.flush_failed` | `reason` (`acquire_timeout\|acquire_error\|write_error`) |
+| `harvest.scanner.tick` | `scanner` (`timeout\|sla\|poison_pill\|external_outbox\|retention\|schedule\|pause_auto_resume`) |
 | `harvest.retention.summary_deleted` | `workflow` |
-| `harvest.retention.rate_limit_buckets_deleted` | `family` (`dyn-rate\|start-throttle`) — never the bucket key (unbounded per tenant) |
-| `harvest.retention.terminal_tasks_deleted` | `state` (`COMPLETED\|FAILED\|CANCELLED`) |
-| `harvest.workflow.nondeterministic_block` | `workflow`, `queue`, `build_id` — capped, see [`build_id` label](#build_id-label) (issue #1814) |
+| `harvest.workflow.nondeterministic_block` | `workflow`, `queue` |
 | `harvest.workflow.history_bloat` | `workflow` (= `METRIC_LABEL_WORKFLOW`) — no `execution.id` label (ADR-0001 §7); see `GET /api/harvest/workflows?history_bloat_min_events=<N>` to find the specific execution(s) driving a crossing (issue #704) |
 | `harvest.workflow.start_throttled` | `workflow` (the resolved throttle key is deliberately **not** a label — unbounded cardinality; see `GET /admin/start-throttle` for per-key backlog, issue #607) |
 | `harvest.concurrency.superseded` | `workflow` (the **superseded** run's workflow type; the concurrency key is deliberately **not** a label — unbounded tenant input, per ADR-0001 §7. Use `GET /admin/concurrency` for the per-key view and the effective `on_conflict` strategy, issue #811) |
-| `harvest.concurrency.residual_over_limit` | `workflow`, `gap` (how many runs the key is over its limit, bounded by `SUPERSEDE_SCAN_LIMIT`) — the concurrency key is never a label, same ADR-0001 §7 rule as its `superseded` sibling (issue #1197) |
 | `harvest.webhook.received` | `path` (registered `#[webhook(path = ...)]` bindings only, closed set), `outcome` (`accepted\|idempotent_replay\|verify_failed\|parse_failed\|missing_idempotency\|internal_error`) |
 | `harvest.webhook.rejected` | `path`, `outcome` (never `accepted`/`idempotent_replay`) |
 | `harvest.saga.compensated` | `workflow`, `queue` |
@@ -522,31 +433,6 @@ metric is emitted in the source code.
 **Cardinality rule:** `execution.id` is **never** a metric label. It is
 span-only (see ADR-0001 §4). The `MetricsRecorder` API enforces this by
 construction — no `record_*` method accepts an `ExecutionId`.
-
-### `build_id` label
-
-Five families carry a `build_id` label (issue #1814):
-`harvest.workflow.terminal`, `harvest.activity.attempts`,
-`harvest.workflow.nondeterministic_block`, `harvest.workflow.duration` and
-`harvest.activity.duration`. The value is the build of the worker that ran the
-task. An outcome that no worker code produced reports `none`. Examples are the
-timeout scanner, a cancel through a signal and a race-loser cancel.
-
-`telemetry::build_id_label` caps the values. A process admits the first 16
-distinct builds that it sees (`MAX_BUILD_ID_LABELS`), and it never evicts one.
-A later build, or a build id longer than 128 bytes, reports `__other__`. A
-real build id equal to a sentinel, or one that starts with `build:`, gets a
-`build:` prefix, so it never merges with a sentinel or another build. A
-worker process normally reports only its own build.
-`harvest.workflow.non_determinism` goes through the same cap.
-
-A custom recorder gets the build through the `*_for_build` methods of
-`MetricsRecorder`. Their defaults drop the build and call the method without
-it, so an existing recorder needs no change. A recorder that forwards to
-another recorder must forward these methods too, or the build is lost.
-
-The ramp guard does not read these metrics. It counts runs in the database by
-`assigned_build_id`. See `docs/operations/build-ramp-guard.md`.
 
 ### Saga compensation metrics (issue #801)
 
@@ -608,7 +494,7 @@ harvest_dlq_entries{shard="0"}
 
 # Workflow history-bloat early warnings per type, per 15m window (issue #704).
 # One increase per still-running execution the moment it first crosses the
-# configured soft threshold (default 20.48% of event_hard_cap) -- pair a
+# configured soft threshold (default 75% of event_hard_cap) -- pair a
 # crossing with `GET /workflows?history_bloat_min_events=<N>` to rank offenders.
 sum by (workflow) (increase(harvest_workflow_history_bloat_total[15m]))
 

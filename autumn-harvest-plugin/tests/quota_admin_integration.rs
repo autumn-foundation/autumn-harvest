@@ -37,6 +37,7 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
+use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -66,7 +67,7 @@ use tower::ServiceExt;
 static TEST_SERIAL: Mutex<()> = Mutex::new(());
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::test_init_sql().as_bytes().to_vec()
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
 }
 
 type HarvestApiApp = axum::Router;
@@ -149,7 +150,7 @@ async fn create_and_migrate_shard_pair(admin_url: &str, url_prefix: &str) -> (St
             .expect("connect to shard database");
         diesel_async::SimpleAsyncConnection::batch_execute(
             &mut conn,
-            &autumn_harvest::test_init_sql(),
+            autumn_harvest::full_migrations_sql(),
         )
         .await
         .expect("apply migrations to shard database");
@@ -227,7 +228,7 @@ fn build_app_inner(pool: HarvestDbPool, infos: Vec<WorkflowInfo>, admin: bool) -
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::default(),
     ));
-    harvest_api_router(api_state)
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
 
 fn build_app(pool: &DbPool, infos: Vec<WorkflowInfo>) -> HarvestApiApp {
@@ -333,7 +334,7 @@ async fn insert_running_execution(
         workflow_id: &workflow_id,
         run_id: uuid::Uuid::new_v4(),
         shard_id: shard,
-        input: json!({ "tenant_id": quota_key }).into(),
+        input: json!({ "tenant_id": quota_key }),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,

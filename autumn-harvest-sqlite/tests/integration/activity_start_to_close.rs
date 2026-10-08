@@ -5,14 +5,12 @@
 //! `execute_activity_with_opts` and `ActivityInfo::default_start_to_close`). Pre-fix
 //! this backend dropped it, so a slow registered body ran to completion and recorded
 //! `ActivityCompleted` instead of `ActivityTimedOut`. The backend now persists the
-//! budget on the task row. The worker enforces it as a **post-execution outcome**. A
-//! synchronous body cannot be cancelled mid-flight in a single-writer runtime. A body
-//! whose real wall-clock runtime exceeds its budget records a terminal
-//! `ActivityTimedOut { StartToClose }`. That event is byte-equivalent to the one the
-//! Postgres timeout scanner (`enforce_activity_timeout`) records on the last attempt.
-//! Terminal, no retry (the workflow observes `HarvestError::Timeout` and drives its
-//! own timeout branch). Postgres retries the earlier attempts per the retry policy
-//! (issue #1809). This backend does not.
+//! budget on the task row and the worker enforces it as a **post-execution outcome**:
+//! a synchronous body cannot be cancelled mid-flight in a single-writer runtime, but a
+//! body whose real wall-clock runtime exceeds its budget records a terminal
+//! `ActivityTimedOut { StartToClose }` — byte-equivalent to the durable event the
+//! Postgres timeout scanner (`enforce_activity_timeout`) records. Terminal, no retry
+//! (the workflow observes `HarvestError::Timeout` and drives its own timeout branch).
 //!
 //! The session fields (`session_id`/`session_worker_id`, issue #606) and the
 //! session-acquire-only `schedule_to_start_override` are OUTSIDE the single-writer

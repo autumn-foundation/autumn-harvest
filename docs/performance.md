@@ -17,21 +17,13 @@ and the one that has accreted roughly a `WHERE` predicate per phase since 3.7:
 | queue pauses | #619 |
 | capability labels | #382 |
 | sticky routing | #235 |
-| activity pauses | #807 |
 
 Each was added for correctness. None was measured. This page is the measurement
 — **for five of them**. The attribution table below varies build-id routing,
 per-key concurrency, the rate-limit gate, the circuit-breaker tracked set and
-the PAUSED skip. The other six are present in the query and held constant, so
-this page says nothing about what they cost in *that* table; see
+the PAUSED skip. The other five are present in the query and held constant, so
+this page says nothing about what they cost; see
 [known limitations](#known-limitations).
-
-> **Looking for end-to-end numbers?** This page measures the claim and enqueue
-> path in isolation. [`benchmarks.md`](benchmarks.md) publishes what the engine
-> does end to end — workflows/sec, dispatch and signal latency, replay
-> throughput — at 1, 2 and 4 shards, with a one-command reproduction. The two
-> are complements: when an end-to-end number there moves, this page is where you
-> find out whether the claim path is why.
 
 > **These are starter reference numbers, not an SLO.** They were taken on one
 > machine with one Postgres configuration (below). Your hardware, your
@@ -41,29 +33,15 @@ this page says nothing about what they cost in *that* table; see
 
 ## TL;DR
 
-* **Since issue #1971, the default claim no longer scans the whole backlog.**
-  It reads a bounded seek window from the head of each queue. On the issue
-  #1956 fixture, from 10K to 1M pending rows, claim buffers grow from 721 to
-  3,649. The full scan reads 1,551 to 124,641, and its sort spills. The new
-  claim does not spill. At 100K, 8 claimers sustain 573 claims/s against 1.2 before. The
-  full scan that the rest of this page measures now runs only as a
-  fallback. See [the seek window](#the-seek-window-issue-1971).
-* **Before issue #1971, claim latency scaled superlinearly with
-  pending-backlog depth.** The bullets below describe the full scan. 1k → 10k
+* **Claim latency scales superlinearly with pending-backlog depth.** 1k → 10k
   rows (10x) costs ~19x latency; 10k → 100k (10x) costs a further ~15x. Claim
   cost is a function of how deep your queue is, not how much work you dispatch.
   **This is the single biggest lever on this page** — bigger than any individual
   predicate, and it dominates the per-gate table below.
-* **The cause is structural, not incidental — and it is not only the `CASE`
-  key.** The claim query's `ORDER BY` leads with a non-indexable `CASE`
-  expression, so `idx_harvest_tq_poll` cannot serve the ordering, and the full
-  scan reads and sorts every eligible pending row on each claim. See
-  [the plan](#the-plan) below.
-  **Fixing that key would not be sufficient on its own**: issue #1177 shows
-  any single one of ten other residual `WHERE` predicates it tested
-  independently defeats sort-elision and `LIMIT` pushdown too, even at zero
-  selectivity — the query carries an eleventh, untested by that issue. See
-  [any residual predicate defeats sort-elision](#any-residual-predicate-defeats-sort-elision-issue-1177).
+* **The cause is structural, not incidental.** The claim query's `ORDER BY`
+  leads with a non-indexable `CASE` expression, so `idx_harvest_tq_poll` cannot
+  serve the ordering. Postgres sequentially scans and sorts every eligible
+  pending row on every single claim. See [the plan](#the-plan) below.
 * **Only one predicate is genuinely expensive: per-key concurrency (+644% p50).**
   Build-id routing (+13%), the rate-limit gate (+2%) and the circuit-breaker
   tracked set (+4%) are cheap or free.
@@ -94,8 +72,8 @@ this page says nothing about what they cost in *that* table; see
   [the queue-pause anti-join fix](#the-queue-pause-anti-join-fix).
 * **Enqueue is not the problem.** ~4 800 rows/s sustained at p50 ~1.5 ms, flat
   from 1k to 100k backlog (inside run-to-run noise). At 100k the write side
-  sustains ~4 600 rows/s while the full-scan read side managed ~3 claims/s —
-  **before issue #1971, a queue that deep did not drain.**
+  sustains ~4 600 rows/s while the read side manages ~3 claims/s — **a queue
+  that deep does not drain.**
 * Issue #786 deliberately **measures without tuning**: the claim query is
   byte-for-byte unchanged by this work.
 
@@ -201,11 +179,6 @@ With the variable unset the benchmark starts a `postgres:16` testcontainer
 instead; with neither available it prints a skip notice and exits 0.
 
 ## Claim latency vs backlog depth
-
-> **Follow-up (issue #1971):** this table measures the full scan. The default
-> claim now reads a bounded window first. See
-> [the seek window](#the-seek-window-issue-1971) for a sweep of the new path.
-> It uses another fixture and harness, so compare ratios only.
 
 Baseline gate (no build policy, no concurrency key, no rate limit, no pauses),
 8 concurrent claimers across 4 queues:
@@ -440,10 +413,6 @@ What each row exercises, and what it means:
 
 ## The plan
 
-> **Follow-up (issue #1971):** this plan is the full scan. The default claim
-> now runs it only as a fallback. See
-> [the seek window](#the-seek-window-issue-1971).
-
 `EXPLAIN (ANALYZE, BUFFERS)` of a single headline claim, trimmed to the nodes
 that matter (the benchmark prints it in full). The worker-id literal is
 shortened to `'worker-0'` for width; the real bind is
@@ -484,18 +453,6 @@ Three things to read here:
    scheduled_at` cannot rescue it. So every claim reads and sorts all eligible
    pending rows to return one. That is the superlinear scaling in the table
    above.
-
-   > **Follow-up (issue #1177):** the `CASE` key is *sufficient* to force this
-   > plan shape, but it is not *necessary* — removing it would not restore
-   > sort-elision, because any one of ten other residual `WHERE` predicates
-   > issue #1177 tested independently forces the same collapsed shape (a
-   > full-backlog scan plus `Sort`), including several that are total no-ops
-   > at 100% selectivity; the query carries an eleventh, untested by that
-   > issue. See
-   > [any residual predicate defeats sort-elision](#any-residual-predicate-defeats-sort-elision-issue-1177)
-   > below. Point 1 above remains accurate as far as it goes; it is incomplete
-   > as an explanation of the superlinear scaling, since dropping the `CASE`
-   > alone would not fix it.
 2. **`actual rows=10000` feeding a `Limit 1`.** The plan materialises and sorts
    ten thousand rows in order to return a single task. That ratio — not the
    absolute time — is the shape of the problem, and it is why doubling the
@@ -538,218 +495,6 @@ actually use the feature.
 is left byte-for-byte unchanged; measuring it and tuning it are separate pieces
 of work, and tuning without a published baseline is how you get an unfalsifiable
 "optimisation". This page is the baseline.
-
-## Any residual predicate defeats sort-elision (issue #1177)
-
-[The plan](#the-plan) above shows the sticky-routing `CASE` expression
-defeating `idx_harvest_tq_poll`'s ability to serve the `ORDER BY`. Read on its
-own, that finding invites a natural next step: drop the `CASE` (or index the
-sticky columns) and the ordering falls back to `priority DESC, scheduled_at` —
-exactly `idx_harvest_tq_poll`'s key — so the cheap plan should return.
-
-**It does not.** Issue #1177 reproduces that, with the `CASE` removed entirely
-from `ORDER BY` (leaving only `priority DESC, scheduled_at` — an exact match
-for `idx_harvest_tq_poll`'s key) and **no planner hints in play**, adding
-**any single one** of ten other residual `WHERE` predicates it tested —
-including several with **zero actual selectivity** (100% of rows pass the
-filter) — is already enough on its own for the planner to choose a
-full-backlog scan (`Seq Scan` for most predicates tested, `Bitmap Heap Scan`
-for a few) plus a `Sort`, instead of the ordered index scan. This holds with
-and without `FOR UPDATE SKIP LOCKED`. (The query carries an eleventh
-residual predicate this reproduction did not test — see below.)
-
-Ten predicates were tested independently against a 255 020-row fixture
-(119 940 PENDING rows in the `default` queue), each added alone to the base
-`queue_name = ANY($1) AND state = 'PENDING' AND scheduled_at <= NOW()` query
-with `ORDER BY priority DESC, scheduled_at ASC LIMIT 1`: the sticky/session
-OR-chains (#235, #606), the queue-pause anti-join (#619), the
-`required_build_id` `EXISTS` (#171), the PAUSED-workflow `NOT EXISTS` (#383),
-both capability-label predicates (#382), the `rate_limit_key` `EXISTS`
-(#332/#699), the `schedule_to_close_at` check (#378), and the concurrency-key
-gate (#247). **All ten** independently reproduce the collapse — even the
-ones that are total no-ops in the fixture (`Rows Removed by Filter: 0`).
-That figure is the *actual*, execution-time row count, not the planner's
-pre-execution selectivity *estimate*; by itself it doesn't prove the
-estimate was accurate, so it doesn't on its own rule out a selectivity
-misestimate. What does rule that out is the separate diagnostic below: it
-shows the sort-elision candidate isn't rejected on a cost comparison at all
-— it is never generated as a candidate in the first place, regardless of
-what any selectivity estimate says.
-
-**These ten are not the query's complete set of residual predicates.**
-`claim_task_query()` also carries an eleventh: the activity-pause exclusion,
-`NOT (activity_name = ANY(paused_activities.names))` (issue #807) —
-structurally the same array-membership anti-join shape as the queue-pause
-predicate above (#619). Issue #1177's reproduction did not test it; nothing
-above should be read as covering it. Issue #1215 tested it separately, with
-`harvest_activity_pauses` actually populated (every predicate above was
-tested against an empty pause table) rather than as a structural no-op, and
-found it triggers the claim sort's disk spill at roughly 10x lower backlog
-depth than this issue's own no-op-predicate threshold — a materially
-different, and independently interesting, cost profile from the one
-established here.
-
-**A separate, narrower diagnostic goes further, for the sticky-routing
-predicate specifically, under `FOR UPDATE SKIP LOCKED`.** With the competing
-`idx_harvest_tq_coverage_sample` index hidden and `enable_seqscan=off;
-enable_bitmapscan=off` set (session-local, inside a rolled-back transaction)
-to bias the planner away from those plan types — these are cost penalties,
-not a hard directive, which is exactly why the natural, unhinted
-ten-predicate results above still show `Seq Scan`/`Bitmap Heap Scan` for most
-rows rather than being universally overridden — Postgres does walk a
-**serial** `Index Scan` on `idx_harvest_tq_poll` for the sticky predicate
-(not a parallel one here, so there is no `Gather`/`Gather Merge` question to
-resolve for this specific plan), already producing rows in the required
-order. But it still inserts a `Sort` node on top and materialises every
-matching row before applying `LIMIT 1` — genuinely redundant, since a serial
-scan over an index whose key already matches the `ORDER BY` needs no further
-sorting.
-
-Two separate, compounding effects are at work, not one:
-
-1. **In this reproduction, every residual `Filter` tested defeats
-   sort-elision and `LIMIT` pushdown**, independent of `FOR UPDATE` — shown
-   directly by the forced-index diagnostic above for the sticky predicate,
-   and consistent with (though not independently re-run as the same
-   diagnostic for) the other nine predicates' natural-planner results. For
-   the sticky predicate, the sort-elision/limit-pushdown candidate plan is
-   not generated at all once its residual `Filter` sits on the scan; this is
-   not a cost-based choice of a worse plan over a better one the planner
-   considered.
-
-   **This is not a general Postgres rule, and this page does not claim it is
-   one.** `idx_harvest_tq_coverage_sample`'s own migration
-   (`20260718000000_harvest_queue_coverage_sample_index/up.sql`) documents
-   the opposite case in this same codebase: `sample_execution_ids`'s
-   `workflow_exec_id IS NOT NULL` filter is not itself index-satisfied, is
-   evaluated per candidate row during the same ordered walk, and the scan
-   *does* still stop early at `LIMIT 5` without a `Sort` node — for every
-   queue except a pathological one. Whatever distinguishes
-   `claim_task_query()`'s tested predicates from that case — `SubPlan`-bearing
-   filters (`EXISTS`, `jsonb_array_elements`) versus a plain scalar NULL
-   check, or something else — is not established here. What issue #1177
-   establishes is narrower and still load-bearing: for the specific query and
-   predicates tested, sort-elision does not survive adding any one of them;
-   that is demonstrably not a `CASE`-key-specific problem, but it is not
-   shown to be a universal one either. With or without the `CASE` key, this
-   alone makes every claim O(backlog) in this fixture.
-2. **`FOR UPDATE SKIP LOCKED` additionally disables the bounded Top-N sort**
-   once (1) has already forced a `Sort` node to exist for the locked variant.
-   Without `FOR UPDATE`, the same sticky-predicate diagnostic restores a
-   bounded Top-N heapsort (in-memory, no disk spill) — it still scans the
-   full eligible set to get there, but stays in memory, whereas the locked
-   variant's sort is unbounded and spills to disk past a few hundred
-   thousand rows (`Sort Method: external merge Disk: 5640-7057kB` in the
-   #1177 fixture). This unlocked comparison uses a **parallel**
-   `Parallel Index Scan using idx_harvest_tq_poll`, per the issue's own
-   excerpt, rather than the serial scan in (1); the excerpt doesn't show
-   whether a `Gather` or `Gather Merge` sits above it, so — unlike the locked
-   case — this page does not claim that unlocked sort is redundant, only that
-   it stays bounded and in-memory rather than spilling to disk. The
-   bounded-versus-unbounded/disk-spill contrast holds regardless of that
-   ambiguity, since both figures come from the same measured `EXPLAIN`
-   output.
-
-A semantically-identical rewrite — the ordered scan wrapped in a subquery,
-with the residual filter applied as an outer `WHERE` — does not help either,
-for the same sticky-predicate case; the planner flattens it back into the
-identical collapsed shape. This is not a syntax-sensitivity quirk with a
-free rewrite.
-
-**This reproduction is issue #1177's own**, cited here rather than
-independently re-run for this page. Unlike
-[the queue-pause anti-join fix](#the-queue-pause-anti-join-fix) and
-[the concurrency-key gate fix](#the-concurrency-key-gate-fix), it has not
-(yet) been folded into `claim_bench_support.rs`'s scenario harness or given
-a `docs/perf-artifacts/` capture of its own — doing so is future work, not a
-blocker for correcting the attribution here. One predicate needs its own
-caveat: the concurrency-key row above was captured against the correlated
-`COUNT(*)` shape that predated
-[the concurrency-key gate fix](#the-concurrency-key-gate-fix) below, which
-has since replaced it with a CTE-backed lookup. That specific predicate's
-contribution to the collapse has not been independently re-tested against
-the current query; the other nine are unaffected by that fix and remain as
-implemented today.
-
-**Multiple queues: partially controlled for, not fully.**
-`idx_harvest_tq_poll` leads with `queue_name`; for `queue_name = ANY($1)`
-over several values, its output is grouped by queue rather than necessarily
-a single global `priority`/`scheduled_at` order, and merging those groups
-can itself require a `Sort` — independent of any residual predicate. Issue
-#1177's own baseline (the identical `queue_name = ANY($1)` binding, no added
-predicate — "each added alone to the base query") already functions as a
-same-array no-residual control: it shows `Index Scan using
-idx_harvest_tq_poll`, **no `Sort` node at all**, whatever `$1` held in that
-reproduction. That rules out multi-queue ordering as the explanation for the
-ten-predicate collapse *in that fixture specifically* — the `Sort` those ten
-scenarios needed is absent from the zero-predicate baseline run against the
-identical binding. What remains unconfirmed: issue #1177's own text does not
-say how many queue names `$1` actually held (its fixture description
-mentions rows seeded into a single `default` queue, which would make this a
-non-issue for that reproduction specifically), and this page's own
-attribution-table scenarios default `Scenario.queues` to 4 (see
-[known limitations](#known-limitations)) — a separate harness this
-reproduction was not run against. Whether the ten-predicate finding
-transfers to a genuinely multi-queue bind has not been checked here.
-
-**What this means for the query as it stands today:** there is no realistic
-deployment shape that gets the cheap index-ordered plan back, because
-`claim_task_query()` always carries at least the `schedule_to_close_at`
-check, the sticky/session OR-chains, and the queue-pause and activity-pause
-anti-joins unconditionally — dropping just the `CASE` key would not be
-sufficient, and no single index can make the `sticky`/`session`/
-`schedule_to_close` scalar checks, the concurrency-key gate, three different
-`EXISTS` subqueries against three different tables, and the
-`jsonb_array_elements` capability walk simultaneously sargable against one
-ordered index — eleven residual predicates in total, not the ten this
-section's own reproduction tested (see above).
-
-**This page does not propose a query change for it.** Per the same
-measure-before-tune discipline issue #786 established, a genuine fix here
-looks architectural — e.g. a seek-and-refine restructuring (claim an ordered
-batch of candidate ids, apply the residual filters and `FOR UPDATE SKIP
-LOCKED` to the small batch, retry on an empty batch) — and that changes
-claim-fairness/latency guarantees under contention in ways that need
-checking against this hot path's documented advisory-lock-ordering,
-exactly-once-claim, and `SKIP LOCKED`-concurrency-safety invariants by
-someone with full context on `queue.rs`. It is out of scope for this page and
-is not decided here; it is tracked separately as issue #1340.
-`docs/assays/0005-claim-batched-seek-and-refine.md` prototyped that shape and
-`docs/performance-claim-batched-seek-and-refine.md` measures a real,
-DB-tested implementation (`queue::claim_task_batched`, additive, not wired
-into the default claim path) against the single-row query above.
-
-> **Follow-up (issue #1971):** the default claim now reads a bounded,
-> index-ordered window per queue head before this scan, and runs this scan
-> only as a fallback. It keeps the claim order exactly, so it needs no
-> sign-off on a fairness change. See
-> [the seek window](#the-seek-window-issue-1971).
-
-This also corrects, without fully resolving, the
-[known limitations](#known-limitations) bullet that called `schedule_to_close`
-(#378), worker sessions (#606) and sticky routing (#235) "cheap inline column
-tests": reproduced here, each independently defeats sort-elision regardless
-of the value it is tested against, so "cheap" was never an established
-finding — it was this page's own retracted reading of their *plan-eligibility*
-effect. Their marginal *cost* on the attribution table above is a different
-question: in the full production query the `CASE` key and the always-present
-queue-pause/`schedule_to_close`-adjacent predicates already force the same
-collapsed plan shape regardless of any one of these three predicates, so
-none of their incremental contributions can be isolated through a
-plan-shape change — that needs the seed-variant scenario work
-[known limitations](#known-limitations) already calls for. That work has
-since been done for all three — `schedule_to_close` (#378, PR #1339),
-worker sessions (#606, PR #1358), and sticky routing (#235,
-[`docs/performance-sticky-routing.md`](performance-sticky-routing.md)) — see
-the [known limitations](#known-limitations) bullet above — by holding the
-same already-collapsed plan shape fixed and measuring each column's
-marginal buffer/storage cost directly, rather than trying to isolate it
-through a plan-shape change that #1177 shows does not happen either way.
-
-**Zero engine impact.** Like issue #786 and every fix on this page, this
-finding changes nothing about `claim_task_query()`: no new `WorkflowEvent`
-variant, no migration, no schema change, no public API change, and the claim
-query is byte-for-byte unchanged. This page is the measurement, not the fix.
 
 ## The queue-pause anti-join fix
 
@@ -838,83 +583,6 @@ which also covers resuming the queue). Reproduce with
 `autumn-harvest/scripts/queue_pause_claim_perf_repro.sh`, which needs either
 `HARVEST_TEST_DATABASE_URL` (an admin connection string) or a reachable Docker
 daemon for its testcontainer fallback — not both.
-
-## The pause-array-size sweep (issue #1215)
-
-The fix above closes the queue-pause anti-join's per-row cost, but every
-measurement on this page still tests both pause tables at a single array
-size: one active pause, or none. Issue #1215 swept array size instead — 0,
-1, 20 and 199 ballast rows, each excluding zero real candidate rows (0%
-selectivity, isolating array width from backlog depth the same way issue
-#1177 isolates predicate presence from selectivity). The `paused_activities`
-sweep is crossed against every depth in the published `BACKLOG_SWEEP`
-(1,000 / 10,000 / 100,000), not held at the headline depth alone — the
-queue-pause sweeps stay at the 10,000-row headline, since they answer a
-yes/no bound question the query already settles identically at every depth,
-not a magnitude question depth could shift. Full artifacts are committed
-under [`docs/perf-artifacts/pause-array-size/`](perf-artifacts/pause-array-size/),
-reproducible via
-`autumn-harvest/scripts/pause_array_size_claim_perf_repro.sh`.
-
-| Predicate | Backlog | Worker's own `$2` | Ballast pauses seeded | `paused_*` array size | Sort method |
-|:--|--:|:--|--:|--:|:--|
-| `paused_activities` (#807) | 1 000 | 4 queues | 0 / 1 / 20 | 0 / 1 / 20 | quicksort, in memory |
-| `paused_activities` (#807) | 1 000 | 4 queues | 199 | 199 | external merge, 6 368kB disk |
-| `paused_activities` (#807) | 10 000 | 4 queues | 0 / 1 | 0 / 1 | quicksort, in memory |
-| `paused_activities` (#807) | 10 000 | 4 queues | 20 | 20 | external merge, 7 504kB disk |
-| `paused_activities` (#807) | 10 000 | 4 queues | 199 | 199 | external merge, 63 656kB disk |
-| `paused_activities` (#807) | 100 000 | 4 queues | 0 | 0 | external merge, 15 280kB disk |
-| `paused_activities` (#807) | 100 000 | 4 queues | 1 | 1 | external merge, 18 432kB disk |
-| `paused_activities` (#807) | 100 000 | 4 queues | 20 | 20 | external merge, 74 992kB disk |
-| `paused_activities` (#807) | 100 000 | 4 queues | 199 | 199 | external merge, 635 488kB disk |
-| `paused_queues` (#619) | 10 000 | 4 queues (typical) | 0 / 1 / 20 / 199 | 0 (none of these ballast queues are in `$2`) | quicksort, in memory |
-| `paused_queues` (#619) | 10 000 | 203 queues (atypical) | 0 | 0 | quicksort, in memory |
-| `paused_queues` (#619) | 10 000 | 203 queues (atypical) | 199 | 199 | external merge, 40 704kB disk |
-
-For `paused_activities`, ballast seeded and array size are always equal — it
-reads the whole table unconditionally, so nothing filters the array down.
-For `paused_queues`, they diverge exactly when `$2` excludes the ballast:
-the typical-worker rows above seed up to 199 pauses but never widen the
-array past zero, because `$2` (this worker's 4 polled queues) never
-includes any of the seeded names. The Sort Method column tracks array
-size, not ballast count, in every row — consistently zero disk cost while
-the array stays at zero, regardless of how large the underlying pause
-table grows.
-
-**`paused_activities` has no bound to protect it, and the array-size
-threshold that spills it is itself lower at greater backlog depth.** It
-reads the whole `harvest_activity_pauses` table on every claim, so array
-size tracks the pause table's total population directly. At the
-10,000-row headline depth, twenty paused activity types — a realistic
-response to a multi-service incident, not an edge case — is enough to
-spill the claim sort to disk; that is far below the
-[few-hundred-thousand-row depth](#any-residual-predicate-defeats-sort-elision-issue-1177)
-issue #1177's own locked-scenario reproduction needed to trigger the same
-spill against an empty pause table. At 1,000 rows the threshold is higher
-(between 20 and 199). At 100,000 rows this sweep found the sort already
-spilling with **zero** paused activities — a backlog-depth-driven spill
-this page's own [claim-latency-vs-backlog-depth table](#claim-latency-vs-backlog-depth)
-is already consistent with, independent of this predicate; array size
-still compounds it further there, from 15 280kB at zero paused activities
-to 635 488kB at 199.
-
-**`paused_queues` stays cheap only while the worker's own bind stays
-small.** [The `$2` bound above](#the-queue-pause-anti-join-fix) keeps a
-typical worker's array width capped at its own polled-queue count, so 199
-fleet-wide pauses on queues this worker never polls never widened its array
-past zero real elements, and the sort stayed in-memory throughout. The same
-mechanism does reappear once a worker's own `$2` bind is itself wide:
-pairing 199 polled queues with 199 matching pauses reproduced the identical
-disk-spill shape. A worker subscribed to hundreds of distinct queues is not
-this page's measured or expected deployment shape (`Scenario.queues` holds
-at 4 everywhere else on this page), so this is reported as a confirmed
-mechanism, not a claimed realistic exposure — unlike `paused_activities`,
-whose exposure needs no unusual worker shape at all.
-
-**Zero engine impact.** Like every other finding on this page, this changes
-nothing about `claim_task_query()`: no code-shape fix is proposed here, only
-a documented cost and a committed regression surface (see
-`tests/integration/claim_budget_tests.rs::zz_capture_pause_array_size_claim_evidence`).
 
 ## The concurrency-key gate fix
 
@@ -1173,415 +841,11 @@ a new supporting partial index (e.g. on
 NULL`) to make each per-candidate-row lookup an indexed probe instead of a
 CTE linear scan. Adding an index is outside what this PR changes
 unilaterally; see the review discussion on this PR for the concrete proposal
-and open question.
-
-**That proposal was measured and killed:**
-`docs/assays/0003-concurrency-gate-cardinality-index.md` (ledger #3) found
-the partial-index rewrite fixes this exact 5,000-key blowup (~48.8x faster
-than control) without regressing the 256-key case, but at zero `RUNNING`
-rows it costs ~10,000 real per-candidate-row index probes where the current
-fix costs ~10,000 near-free probes of a small, resident, empty CTE — 200x+
-over its pre-set idle-cost line, at any key cardinality. Re-assaying this
-exact formulation without new information is a re-dig; see that report for
-what else remains untested.
-
-**The un-re-chartered pit ledger #3 left open was also measured and
-killed, a different way:**
-`docs/assays/0004-concurrency-gate-deferred-recheck.md` (ledger #4) tried
-removing the candidate-side gate entirely — no predicate, no new index —
-and enforcing the cap only in the `claimed` CTE's existing authoritative
-recheck, retrying against the next candidate on a failed recheck. Idle cost,
-the 5,000-key blowup, and the 256-key case all pass decisively (idle ties
-the committed fix; 5,000-key is 218.5x faster than control; 256-key is 30.4x
-faster than control). It still kills, on a line neither #3 nor the committed
-fix needed: a 50-row adversarial fixture where the highest-priority PENDING
-rows are themselves keyed to an already-saturated concurrency key costs
-313.8ms against a 100ms line, because each retry re-runs the full
-candidate-selection scan and nothing bounds how many consecutive
-high-priority rows can share a saturated key — an unbounded,
-workload-dependent worst case neither prior candidate has. (`LEFT JOIN
-LATERAL` + planner hints, the *other* shape #3 named, was never re-tested:
-the three-rewrites section above already closes it.)
-
-**A third shape — batching #4's per-row retry into a single-round-trip
-per-batch fetch, the specific rewrite issue #1340 was deferred pending —
-was measured and also killed, on its pre-registration's arithmetic and on a
-narrower mechanism than first reported:**
-`docs/assays/0005-claim-batched-seek-and-refine.md` (ledger #5) fetches the
-top 50 ordered candidates per round trip, then walks them procedurally
-applying the production path's own per-candidate advisory-lock-and-recheck
-(`queue.rs:750-770`) rather than a batch-wide snapshot. Idle cost, the
-5,000-key blowup, the 256-key case, and both adversarial fixtures'
-wall-clock all pass decisively; batch-count scaling under adversarial depth
-is linear, not catastrophic. It still kills: both adversarial fixtures
-resolved in one more batch than their pre-registered "exactly N" line
-allowed, because that line's own formula undercounted by the one slot the
-claimable row itself occupies. Five rounds of post-review (Codex) further
-found: the report had mischaracterized the candidate fetch as an
-index-ordered seek through `idx_harvest_tq_poll`; the archived `EXPLAIN`
-output shows a `Seq Scan` of the whole matching backlog instead (the same
-shape the committed fix's own control query plans as, at this apparatus's
-10,000-row depth), and a forced-index diagnostic shows forcing the index
-doesn't recover a bounded scan either — still reads every matching row,
-costs more, no `LIMIT` pushdown (a proposed alternative explanation, that
-the assay's own added tiebreak column caused this, was checked directly
-and did not hold up). Separately, the first fix's winner-pick used a stale
-batch-wide snapshot with no serialization at all instead of the advisory
-lock above — a real concurrency-correctness gap a single-session apparatus
-can't surface on its own, fixed to match the mechanism ledger #4 already
-had right (grading the fix against the original lines rather than
-re-chartering was itself reviewed and defended: the lines never changed,
-only an unsound implementation was corrected, and the fixture's own
-adversarial scenarios already exercise the corrected mechanism's cost
-without regressing). And the recheck's own cost, cited as "~1 buffer," is
-34 buffers once the `RUNNING` population reaches 2,000 rows — cardinality
-independence holds for distinct key count, not for `RUNNING` population
-size, a distinction this apparatus's fixtures didn't separate. So the
-assay's surviving claim is narrower than first reported: the per-candidate
-recheck's cost is independent of distinct key count, and batching doesn't
-cost more than the current (already `O(backlog)` at this depth) fix — not
-that batching bounds cost as backlog depth grows, which remains untested.
-That gap also surfaces an unresolved discrepancy against this page's own
-#1177 baseline (reported there as a clean index scan with no `Sort` node,
-at a much larger fixture); a corrected-arithmetic re-charter, a
-depth-varying re-charter, that discrepancy, real concurrent-claimer
-throughput, and cost when many in-batch rejections coincide with a large
-`RUNNING` population all remain open, un-run pits.
-
-Until a fix clears every line of some registered assay, deployments with
-concurrency-key cardinality in the low hundreds (the tested, committed
-range) get the full measured win above; deployments with concurrency keys
-numbering in the thousands or more should expect the candidate-side gate's
-cost to grow with that cardinality and are not covered by this fix's
-evidence.
-
-## The continuation band and the expired-run gate (issue #1824)
-
-Issue #1824 adds two things to the claim statement. See
-[`operations/claim-order.md`](operations/claim-order.md).
-
-- **The order term.** The last sort key is now `scheduled_at` plus a
-  30-second handicap for a new start, not plain `scheduled_at`.
-- **The expired-run gate.** A `MATERIALIZED` set of expired `RUNNING` runs,
-  and a `NOT EXISTS` test against it in `candidate`.
-
-Measured on Postgres 16 with JIT off. The backlog was 20k `PENDING` rows in
-one queue, of mixed types, at two priorities, with 25% new starts. Each
-figure is the median of 12 runs.
-
-| Case | Before | After | Order term only | Gate only |
-|---|---|---|---|---|
-| 0 expired runs | 36.5 ms | 54.7 ms | 55.4 ms | 36.8 ms |
-| 200 expired runs at the head | 37.5 ms | 52.1 ms | 52.3 ms | 34.6 ms |
-| 5k expired runs | 33.3 ms | 34.9 ms | 56.6 ms | 26.4 ms |
-
-- **The gate costs about nothing.** It runs as a hashed subplan, once per
-  claim. It reads `idx_harvest_executions_deadline` and
-  `idx_harvest_executions_chain_deadline`. Since issue #1971 each index has
-  its own branch, because the claim turns bitmap scans off. Rows that the
-  gate removes also shrink the sort.
-- **The order term costs about 18 ms at this depth.** The plan shape does not
-  change: an index scan on `idx_harvest_tq_poll`, then a sort. Before, the
-  sort keys followed the index order, so the sort input was almost sorted.
-  The term breaks that for the new-start rows.
-- **A cheaper term was tried and rejected.** A boolean "young new start" key
-  ahead of plain `scheduled_at` gives the same 30-second bound. In an
-  isolated sort test at the same depth, it took about 17 ms against 13 ms for
-  the chosen term and 10.5 ms before.
-
-No index can remove the sort. The sticky `CASE` key already forces it. See
-[any residual predicate defeats sort-elision](#any-residual-predicate-defeats-sort-elision-issue-1177).
-
-## The seek window (issue #1971)
-
-The sections above measure the full scan. Since issue #1971, the default
-claim runs that scan only as a fallback. It first reads a bounded **seek
-window** from the head of each polled queue. The claim order does not
-change. Design record: [`DESIGN-1971.md`](../DESIGN-1971.md).
-
-### Mechanism
-
-- Each polled queue has four heads: one per task type, for continuations
-  and for new starts. A new start is a row with `new_start AND
-  attempt = 0`. Each head reads at most `queue::CLAIM_SEEK_WINDOW` (32)
-  due rows from one ordered range of `idx_harvest_tq_claim_seek`.
-- Inside one head, the claim due time follows `scheduled_at`. A
-  continuation is due at `scheduled_at`, a new start 30 s later. So each
-  head is already in claim order, `priority DESC, due ASC`. The due time
-  itself cannot be an index key: `timestamptz + interval` is not
-  immutable, and Harvest supports Postgres 12 and later.
-- The task type in the index lets a claim for one kind skip the heads of
-  the other kind. A saturated worker claims for one kind only.
-- A pin head reads every live pin of this worker through
-  `idx_harvest_tq_sticky_poll` and keeps the best 32.
-- Each head scan skips the rows that a row-local gate rejects. These are a
-  live pin to another worker, a session pin, an expired
-  `schedule_to_close_at`, a paused activity, a `$6` name and a saturated
-  type. Such a row then does not use a window slot.
-- A guard keeps a window row only if no row outside the window can sort
-  before it. A row outside a head sorts at or after the last row of that
-  head. So a row must sort at or before the last row of each full head. A
-  row pinned to this worker outranks the queue heads, and only a full pin
-  head bounds it.
-- The window candidate scan reads the rows that pass the guard by primary
-  key and applies every gate. Its row test matches no partial index on
-  `PENDING` rows, and the claim turns bitmap scans off. So stale statistics
-  leave only a primary-key probe or a scan of the whole table. See the
-  stale-statistics result below.
-- When the window finds no candidate and a head is full, or when priority
-  ageing is on, the same statement runs the full scan. A one-time filter
-  gates it, and `EXPLAIN` shows it as `never executed` otherwise.
-- The rate-limit debit, the advisory-lock recheck and the `claimed` update
-  are unchanged.
-- After the claim, the claim counts a capped key again in a fresh snapshot.
-  Every claim path does this: the default, the by-id and the batched claim. See
-  [the concurrency cap](#the-concurrency-cap-holds-through-commit).
-
-### The claim transaction
-
-- `diesel::sql_query` never caches a statement, so the old claim parsed and
-  planned its statement on every call. The default claim now goes through
-  `CachedClaimQuery`, which diesel caches once per connection.
-- The claim returns a fixed column list. A migration that adds a column to
-  `harvest_task_queue` therefore does not change the result type of the
-  cached statement.
-- The transaction first sends `queue::CLAIM_PLAN_SETTINGS_SQL` in one
-  batch: `SET LOCAL jit = off`, `SET LOCAL plan_cache_mode =
-  force_generic_plan` and `SET LOCAL enable_bitmapscan = off`.
-  - The plan carries the cost estimate of the full scan, which passes
-    `jit_above_cost`.
-  - A custom plan costs about 6 ms to plan on each call. On a small backlog
-    that is more than the claim costs to run.
-  - A bitmap scan reads every due row of a head and sorts them. The planner
-    picks it when it estimates a head below the window size. A generic plan,
-    skewed queues and stale statistics all give that estimate. On the issue
-    #1956 fixture at 10K pending rows, the bitmap form read 2,515 buffers.
-    The ordered form read 721.
-- A claim with priority ageing on sends `queue::CLAIM_AGEING_PLAN_SETTINGS_SQL`
-  instead, without the bitmap setting. Ageing always runs the full scan,
-  which reads faster with bitmap scans: 16K buffers against 46K at 100K
-  pending rows. Postgres keeps a cached plan when a setting changes, so the
-  ageing claim starts with a comment and caches as its own statement.
-
-### Claim cost against backlog depth
-
-The fixture is the deep-backlog generator of issue #1956, from PR #2045.
-It is the shape that issue #1956 asks every claim change to report against:
-
-- seed 1971 and 64 queues with power-skewed sizes;
-- 4,096 concurrency keys on half the runs, capped at 32;
-- 1% `RUNNING` rows, up to a fleet of 1,024 slots;
-- 5% future rows and 10% dead tuples at the head of the backlog;
-- one workflow task per four rows.
-
-Each figure is the median of four `EXPLAIN (ANALYZE, BUFFERS)` runs of the
-prepared claim statement, each rolled back, on Postgres 16 with JIT off. The
-old claim runs with a custom plan, as it did. The new claim runs with the
-generic plan and the planner settings that it uses. "4 queues" polls the
-four largest queues. "64 queues" polls all of them.
-
-| pending rows | 4 queues, old | 4 queues, new | 64 queues, old | 64 queues, new |
-|--:|--:|--:|--:|--:|
-| 1,000 | 189 buf, 3.4 ms | 554 buf, 4.4 ms | 315 buf, 5.7 ms | 1,901 buf, 8.2 ms |
-| 10,000 | 1,551 buf, 28 ms | 721 buf, 6.8 ms | 1,665 buf, 61 ms | 4,646 buf, 31 ms |
-| 100,000 | 15,820 buf, spill, 560 ms | 2,884 buf, 12 ms | 15,538 buf, spill, 1.4 s | 7,920 buf, 46 ms |
-| 1,000,000 | 124,641 buf, spill, 6.5 s | 3,649 buf, 38 ms | 986,040 buf, spill, 18 s | 8,700 buf, 185 ms |
-
-- **The old claim grows with the backlog.** From 10K to 1M on 4 queues it
-  reads 80 times the buffers, and it spills its sort from 100K.
-- **The new claim does not.** From 10K to 1M its buffers grow 5 times on
-  4 queues and 2 times on 64 queues, for 100 times the backlog.
-- **The rest follows the `RUNNING` population.** `seek_running_counts`
-  walks every `RUNNING` row: 9 rows at 1K, 897 at 100K and the fleet cap of
-  1,024 at 1M. The dead tuples at the head cost a heap visit once, until
-  Postgres marks their index entries dead.
-- **A small backlog costs more, in milliseconds.** At 1K the window reads
-  almost every row by index. The old full scan reads the small table at
-  once. On 64 queues the window holds up to about 8,200 rows. Both cost a few
-  milliseconds, and the old claim also planned on every call.
-
-`claim_buffers_stay_flat_from_1k_to_100k_pending_rows` asserts the flat
-shape in CI on the synthetic `claim_seek_tests` fixture. Its red run, before the
-change, measured 1,248, 8,739 and 109,675 buffers, with a spill at 100K.
-
-The issue #1215 case, 199 paused activities at a 100K backlog, no longer
-spills: 109,321 buffers and a spill before, 535 buffers and no spill after.
-
-**Stale statistics do not change the plan.** An `ANALYZE` saw 20 `PENDING`
-rows among 400K terminal rows. Then 30K rows arrived. The claim reads 479 to
-496 buffers, within 1% of the fresh plan. The window scan gives the planner
-no partial index on `PENDING` rows, so it probes the primary key. Before
-that fix, the same case read 11,704 buffers through a bitmap head scan, then
-30,278 through a partial index.
-
-### Latency and throughput under contention
-
-`pgbench` with 8 concurrent claimers on the 4-core box, each claim its own
-transaction, on the issue #1956 fixture, polling the four largest queues.
-200 claims per row, 800 for the new claim at 1M.
-
-- "Old" is the old claim: the full scan, parsed and planned on every call
-  (`-M extended`). "JIT on" is the server default.
-- "New" is the new claim: the seek window, cached once per connection
-  (`-M prepared`), with the planner settings of the claim transaction.
-
-| pending rows | old, JIT on | old, JIT off | new |
-|--:|--:|--:|--:|
-| 1,000 | 575/s, 11.8 / 46.9 ms | 574/s, 12.2 / 40.9 ms | 994/s, 5.7 / 53.8 ms |
-| 10,000 | 19.6/s, 396 / 556 ms | 136/s, 56 / 92 ms | 689/s, 9.2 / 53.1 ms |
-| 100,000 | 1.2/s, 6,596 / 7,056 ms | 7.1/s, 1,120 / 1,400 ms | 573/s, 10.2 / 84.3 ms |
-| 1,000,000 | not run | 0.6/s, 13,598 / 14,082 ms | 372/s, 11.9 / 846 ms |
-
-Each cell is claims per second, then p50 / p99 latency.
-
-- **JIT alone cost 7 times at 10K.** The full-scan estimate passes
-  `jit_above_cost`, so JIT compiled about 330 functions on each claim.
-- **The new claim is flat.** From 1K to 1M the p50 stays between 6 and
-  12 ms, and the throughput stays within a factor of 3.
-- **The p99 at 1M is the first claim of each connection.** It prepares the
-  statement on a cold cache, 8 claims in 800. Every other claim took less
-  than 200 ms.
-- **A fallback costs what the old claim cost.** In an earlier run at 1M, one
-  claim in 800 fell back and took 9.1 s, and the run reached 62 claims/s.
-  The claimers never complete their tasks, so hot concurrency keys fill up.
-  See [when the window falls back](#when-the-window-falls-back).
-
-These are loopback figures, from the same box as the rest of this page.
-Read the ratios, not the absolute numbers.
-
-### Fairness
-
-The guard makes the window pick the row that the full scan would pick.
-Ties may go either way, as before. So with ageing off, the claim order does
-not change. With ageing on, the full scan runs, as before.
-
-`randomized_drains_follow_the_reference_order` checks this. It seeds random
-backlogs and drains them. Each claim must take a row with the best
-reference key. The backlogs mix priorities, new starts, pins to this worker
-and to others, a paused activity and a saturated concurrency key. The order
-tests cover a continuation behind a new-start storm, a deep pin, a
-saturated head in a higher-priority queue, `$6` and saturated types at the
-head, ageing and a kind filter. An independent review drove about 360
-random drains through both forms, with locks held by a second session, and
-found no difference in the claimed keys.
-
-Under contention, `SKIP LOCKED` lets claimers take rows slightly out of
-order in both paths. `pgbench` runs on the `claim_seek_tests` fixture, with
-800 claims per row, counted the claimed pairs that left in the wrong key
-order:
-
-| pending rows | before | after |
-|--:|--:|--:|
-| 1,000 | 0.21% | 0.22% |
-| 10,000 | 0.17% | 0.16% |
-| 100,000 | 0.06% | 0.02% |
-
-The window does not add a measurable inversion.
-
-### When the window falls back
-
-The window cannot decide when a full head holds only rows that the
-row-local gates do not catch. These rows are:
-
-- rows on a saturated concurrency key, or with an empty rate-limit bucket;
-- rows with a build or capability mismatch;
-- rows of a paused workflow or an expired run;
-- rows locked by other claimers. The guard passes only the rows that sort
-  before the last row of every full head. When gates reject the other rows
-  of the tightest head, that set can be smaller than the number of claims
-  in flight.
-
-Priority ageing also falls back. The fallback costs the full scan plus the
-window.
-
-Measured with 200 rows on a saturated concurrency key at the head of the
-queues:
-
-| pending rows | full scan alone | seek window with fallback |
-|--:|--:|--:|
-| 1,000 | 199 buffers, 5.5 ms | 903 buffers, 12.1 ms |
-| 100,000 | 4,601 buffers, 1,720 temp blocks, 393 ms | 103,023 buffers, 2,037 temp blocks, 418 ms |
-
-So a blocked head costs about what it cost before. Issue #1971 does not fix
-that case. See [what this does not establish](#what-the-seek-window-does-not-establish).
-
-### The concurrency cap holds through commit
-
-`concurrent_claimers_never_exceed_a_cap_at_depth` found a cap race that
-predates the seek window. Eight claimers claimed from a backlog with a
-capped key at its head. Four rows ran on a key capped at three.
-
-- The `claimed` CTE takes the advisory lock of the key, then counts the
-  `RUNNING` rows of the key.
-- Under `READ COMMITTED`, every subquery of one statement reads the snapshot
-  from the start of the statement. That snapshot predates the lock.
-- A claim on the same key can commit after the snapshot and before the
-  lock. The count misses it. Several claimers can miss earlier claims in
-  turn, so the key can run more than one task over its cap.
-
-The fix is `release_claim_if_over_cap`, one more statement after a claim on
-a capped key. It counts in a fresh snapshot while the transaction holds the
-lock, and gives the row back if the key is over its cap. A later claim
-cannot take the lock until this transaction commits. It skips the row, or
-it takes the lock after the commit and sees this claim. Every claim path
-runs the re-check: the default, the by-id and the batched claim. Claims
-without a capped key pay nothing.
-
-### Costs of the seek window
-
-- **One more index.** `idx_harvest_tq_claim_seek` is a partial index on
-  `PENDING` rows. It adds one index entry per enqueue and per non-HOT
-  update of a `PENDING` row. It was 33 MB for 700,000 pending rows with distinct due times, against
-  27 MB for `idx_harvest_tq_poll`, and took 2.0 s to build.
-- **One more round trip.** The planner settings go in one batch before the
-  claim. A claim on a capped key adds one more for the cap re-check. See
-  [what is actually timed](#what-is-actually-timed).
-- **Generic plan.** Postgres builds it once per connection, and an
-  `ANALYZE` of the table invalidates it.
-- **A misjudged gate, avoided.** The planner cannot read the arrays of the
-  activity-pause and saturated-type gates at plan time. In their plain form
-  it may judge that no row passes, and then read the whole head. The head
-  scans write those gates as one `CASE`, which gets a fixed default
-  estimate. `a_single_activity_type_backlog_keeps_the_window_bounded` pins
-  this.
-
-### What the seek window does not establish
-
-- **A blocked head is still O(backlog).** A fully blocked head falls back
-  to the full scan. Moving parked rows out of the ready index would remove
-  that. See the follow-ups in [`DESIGN-1971.md`](../DESIGN-1971.md).
-- **Ageing is still O(backlog).** With `priority_aging_secs` set, every
-  claim runs the full scan, as before.
-- **A long run of skipped rows.** A head scan reads past each row that a
-  row-local gate skips, one heap read per row. A deep run of live pins to
-  other workers, session pins, paused activities or saturated types at a
-  head makes each claim read the whole run. Live pins last one sticky
-  timeout, so they follow the claim rate. Session pins and paused
-  activities do not.
-- **A large live pin set.** The pin head reads every live pin of this
-  worker. More than 32 of them that pass the gates also make every rank-0
-  row wait for the fallback.
-- **Many polled queues.** The window has four heads per queue, so its cost
-  grows with the number of polled queues. At 64 queues on the issue #1956
-  fixture it read 7,920 buffers in 46 ms at 100K, and 8,700 buffers in
-  185 ms at 1M. The full scan took 1.4 s and 18 s.
-- **The `RUNNING` population.** `seek_running_counts` walks every `RUNNING`
-  row, so its cost follows the size of the fleet: about 900 buffers with
-  1,024 tasks in flight.
-- **Future-dated rows in a higher band.** A head scan steps over the index
-  entries of rows that are not yet due, inside a higher priority band.
-  Those steps read index pages only.
-- **A held snapshot.** A long transaction, `pg_dump` or a standby with
-  `hot_standby_feedback` keeps the index entries of claimed rows alive at
-  the queue head. Each claim then reads them again. Every Postgres queue
-  has this.
-- **Postgres 12 to 15.** Measured on Postgres 16 only. A review checked
-  that the index definition and the settings work on 12 and 17.
-- **A remote database.** Every figure here is loopback. Across a network,
-  the round-trip count dominates, as [what is actually
-  timed](#what-is-actually-timed) explains.
-- **A production fleet.** The fixture follows issue #1956's shape, but no
-  production trace was replayed.
+and open question. Until that lands, deployments with concurrency-key
+cardinality in the low hundreds (the tested, committed range) get the full
+measured win above; deployments with concurrency keys numbering in the
+thousands or more should expect the candidate-side gate's cost to grow with
+that cardinality and are not covered by this fix's evidence.
 
 ## Enqueue throughput
 
@@ -1606,10 +870,6 @@ Put the two sides together and the operational picture is stark: at a 100 000-ro
 backlog this machine sustains ~4 600 enqueues/s against ~3 claims/s — three
 orders of magnitude apart. **A queue that deep does not drain.** Nothing in the
 write path warns you about it; the backlog table above is the warning.
-
-> **Follow-up (issue #1971):** these figures describe the full scan. With the
-> seek window, the claim side no longer falls with depth. See
-> [the seek window](#the-seek-window-issue-1971).
 
 Two caveats on this table. `queue::enqueue` is not a bare `INSERT`: it resolves
 defaults and writes one row inside its own transaction, so the per-row latency
@@ -1748,52 +1008,28 @@ whole transaction**, not the single statement the `EXPLAIN` below shows — and 
 a single round trip either. It issues, in order:
 
 1. `BEGIN ISOLATION LEVEL READ COMMITTED`. The level is pinned on the `BEGIN`
-   itself rather than inherited, so steps 5 and 6 always get a fresh snapshot.
-2. `SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan;
-   SET LOCAL enable_bitmapscan = off` (issue #1971), one batch, one round
-   trip. The claim plan carries the cost estimate of its fallback scan, and
-   that estimate can pass `jit_above_cost`. A custom plan costs more to plan
-   than the claim costs to run. A bitmap scan would read a whole queue head
-   instead of the window. Since issue #1971 the claim statement is also cached once per
-   connection. See [the seek window](#the-seek-window-issue-1971).
-3. **The claim CTE.** The rate-limit debit and the per-key concurrency
+   itself rather than inherited, so step 4 always gets a fresh snapshot.
+2. **The claim CTE.** The rate-limit debit and the per-key concurrency
    advisory-lock re-check are branches *within* this statement, not extra ones —
-   this is the statement the `EXPLAIN` below plans. When the DR fence is in
-   force (issue #954; by default only on a database with a DR marker, issue
-   #1823) it carries one additional `MATERIALIZED` CTE probing
-   `harvest_shard_generation` — still the same single statement and the same
-   round-trip count. The published figures below were measured unfenced: the
-   configuration on a database with no DR marker, and the one the plan
-   applies to.
-4. *(hit only)* `queue_pause::try_lock_queue_for_claim` — a
+   this is the statement the `EXPLAIN` below plans.
+3. *(hit only)* `queue_pause::try_lock_queue_for_claim` — a
    `pg_try_advisory_xact_lock` on the queue. If it loses the race against a
    concurrent pause or resume, `queue_pause::release_claim` hands the row back
    and the call returns "no task": same round-trip count, no claim.
-5. *(hit only)* `queue_pause::release_claim_if_queue_paused` — the authoritative
+4. *(hit only)* `queue_pause::release_claim_if_queue_paused` — the authoritative
    queue-pause re-check. It is a *separate statement* precisely so it takes a
    snapshot the claim could not have; folding it into the CTE would defeat it.
-   The activity-pause and workflow-pause re-checks follow, each only for the
-   task type it can hold.
-6. *(hit on a capped concurrency key only)* `release_claim_if_over_cap`
-   (issue #1971). The claim counts the key under its own snapshot, which
-   predates the advisory lock. This statement counts again in a fresh
-   snapshot, under the lock, and gives the row back if the key is over its
-   cap.
-7. `COMMIT`.
+5. `COMMIT`.
 
-So a published number is **seven** client↔server round trips when the claim
-lands on a row, **eight** on a capped key and **four** when the queue is empty —
-plus transaction overhead. A workflow task without a run skips the type-gated
-pause re-check, so it takes six. The
-`EXPLAIN` plan explains the *dominant* statement rather than the whole
+So a published number is **five** client↔server round trips when the claim lands
+on a row and **three** when the queue is empty — plus transaction overhead — and
+the `EXPLAIN` plan explains the *dominant* statement rather than the whole
 measured operation. The seeded scenarios claim at most a fifth of the backlog
-they seed, so their samples are overwhelmingly hits. The tables
-measured before issue #1971 had no step 2 and no step 6, so they count one
-fewer, two fewer on a capped key.
+they seed, so their samples are overwhelmingly hits.
 
 That distinction is the first thing to reason about when moving this workload to
 a **remote** database: the round-trip count, not the query plan, is what network
-latency multiplies. Seven round trips at 1 ms of network RTT is 7 ms of floor per
+latency multiplies. Five round trips at 1 ms of network RTT is 5 ms of floor per
 claim that no amount of index tuning removes. Every number on this page was
 measured against a loopback server, so that floor is ~0 here and the plan
 dominates; that ordering inverts across a network.
@@ -1895,13 +1131,12 @@ from the benchmark are directly comparable.
 * **Half the claim-path predicates are varied; the other half are not measured
   at all.** The attribution table covers five: build-id routing (#171), per-key
   concurrency (#247), the rate-limit gate (#332/#699), the circuit-breaker
-  tracked set (#369) and the PAUSED skip (#383). Six more are present in the
-  query on every claim but are never given anything to match in *this*
-  table, so their subplans run against empty or null input here and this
-  table reports nothing about their cost. Ranked by how much that omission
-  is likely to matter:
+  tracked set (#369) and the PAUSED skip (#383). Five more are present in the
+  query on every claim but are never given anything to match, so their subplans
+  run against empty or null input and this page reports nothing about their
+  cost. Ranked by how much that omission is likely to matter:
   * **Capability labels (#382)** — measured directly:
-    [`docs/performance-capability-labels.md`](performance-capability-labels.md) seeds `required_capabilities`
+    `docs/performance-capability-labels.md` seeds `required_capabilities`
     (rather than leaving it null) and finds a real, +24–36% buffer cost on the
     claim query across the same backlog-depth sweep used everywhere else on
     this page, corroborated three independent ways (`EXPLAIN` buffers,
@@ -1914,183 +1149,12 @@ from the benchmark are directly comparable.
     predicate's cost on its own. A dedicated harness variant that actively
     pauses a queue closed that specific gap and, as a direct result, replaced
     the correlated anti-join with a one-time prefilter — see
-    [the queue-pause anti-join fix](#the-queue-pause-anti-join-fix). That fix
-    was measured against exactly one active pause. Issue #1215 swept the
-    array wider — up to 199 paused queues — and confirms the fix holds at
-    that scale for a typical worker: see
-    [the pause-array-size sweep](#the-pause-array-size-sweep-issue-1215) for
-    why, and for the one atypical worker shape where it does not.
-  * **Activity pauses (#807)** — not previously in this list at all. Issue
-    #1215 swept `harvest_activity_pauses`' array size, crossed against the
-    full `BACKLOG_SWEEP`, and found the claim sort spills to disk once the
-    array holds around 20 rows at the 10,000-row headline depth — far below
-    the [few-hundred-thousand-row depth issue #1177's own locked-scenario
-    reproduction needed](#any-residual-predicate-defeats-sort-elision-issue-1177)
-    to trigger the same spill against an empty pause table. That threshold
-    is depth-dependent, not fixed: higher at 1,000 rows, and already crossed
-    at 100,000 rows with zero paused activities. Unlike queue pauses,
-    `paused_activities` reads the whole table on every claim with no bind to
-    keep the array small, so this exposure needs no unusual worker shape —
-    pausing 20 or more activity types during a multi-service incident is
-    realistic on its own, at the headline depth. See
-    [the pause-array-size sweep](#the-pause-array-size-sweep-issue-1215) for
-    the full measurement. No query-shape fix is proposed here.
-    **Follow-up (issue #1971):** the seek window sorts at most a few hundred
-    window rows, so this spill no longer occurs when the window decides the
-    claim. The full scan still spills when it runs as a fallback. See
-    [the seek window](#the-seek-window-issue-1971).
-  * **`schedule_to_close` (#378)** — measured directly:
-    [`docs/performance-schedule-to-close.md`](performance-schedule-to-close.md) seeds `schedule_to_close_at`
-    (rather than leaving it null) and **confirms this page's own suspicion on
-    magnitude, but not on mechanism**: a small, real shared-buffer-hit cost
-    (+3.6% to +7.5% across the two backlog depths where both labels land on
-    the same plan — the 100,000-row depth's committed run has the two
-    labels land on *different* plans for the candidate scan, so it does not
-    get a clean percentage; see that page's "100,000-row plan choice"
-    section), corroborated by two
-    standalone MVCC-bloat scripts, one bulk and one per-row — heap +5.2%
-    both, the partial index itself +90% (30→57 pages, a small base that
-    reads as a large percentage for the same reason the `dirtied`/`written`
-    EXPLAIN counters do below) —
-    nowhere near the 20% impact floor, measured where a percentage is
-    stable: shared-buffer-hit totals, and `harvest_task_queue`'s total
-    on-disk footprint growth (+12.3%: heap plus every index plus TOAST,
-    measured directly with `pg_total_relation_size` rather than summed
-    from a chosen subset of relations — `no-schedule-to-close` grows 324
-    pages total, `schedule-to-close` grows 364), not against the
-    `dirtied`/`written` EXPLAIN counters' own small base (4→5, 2→3) or the
-    index's own page count on its own, which that page reports as absolute
-    counts instead of floor-compared percentages — Codex review flagged
-    that a percentage on a base that small (+25%/+50% dirtied/written;
-    +90% for the index alone) is unstable and would not track the real
-    per-claim cost. Codex review
-    caught that the predicate text alone (a plain inline column test) is not
-    the whole story: `harvest_task_queue` carries a partial index on this
-    column for the timeout scanner, and the claim `UPDATE` writes a new
-    entry to it for every `schedule-to-close` row — a fixed, depth-independent
-    +1 dirtied/+1 written page at every backlog depth tested, additive with a
-    separate row-width effect on the candidate scan that *does* scale with
-    depth. Review also caught that the harness's first seeded deadline gave
-    every row the byte-identical value, letting B-tree deduplication
-    understate the index's real growth by roughly 3x — fixed by seeding a
-    distinct, per-row deadline instead. See that page's "Plan" and
-    "Write-side cost" sections for the buffer- and storage-level evidence.
-    One thing did **not** reproduce cleanly across this pass's several
-    capture runs: the real 10,001-call `pg_stat_statements` drain's
-    aggregate delta varied run to run, but only the most recent run's
-    artifacts are ever committed -- the repro script overwrites the same
-    canonical filenames each time -- so that page states only the one
-    auditable, committed number for driving the real `claim_task()`
-    function (**+4.2%**, combining `claim_task_query()`'s own SQL with the
-    two post-claim queue-/activity-pause rechecks it also issues on every
-    successful claim — `claim_task_query()` alone is +1.9%, reported
-    separately since it's what the `EXPLAIN`-based evidence above is built
-    on), without asserting a range, a frequency, or a direction (e.g.
-    "always positive") for runs whose evidence no longer exists in the
-    repository to audit. An earlier revision of this page's real-drain
-    figures and buffer deltas used a confounded seeding methodology
-    instead: the two labels had been seeded with independently-random
-    `id`/`activity_id` values, and since every claim's non-HOT `UPDATE`
-    touches every applicable index on the table, not just the one this
-    predicate adds, some of what had looked like a `schedule_to_close_at`
-    effect on the main query may have been that confound instead — see
-    that page's "Workload" section for the fix. That earlier revision's
-    own artifacts are no longer committed (the repro script overwrites
-    the same canonical filenames every run), so this page does not cite
-    its pre-fix percentages or draw a magnitude conclusion from the
-    comparison. The committed run now shows the two labels landing on *different* plans at
-    the 100,000-row depth, with the expensive one on `no-schedule-to-close`
-    this time (an earlier, since-superseded committed run had neither
-    label on the expensive plan, so this is the only committed data point
-    for which label it lands on). That page's "100,000-row plan choice"
-    section is explicit that this does **not** show the instability is
-    unrelated to `schedule_to_close_at` — populating that column changes
-    the planner's actual row-count estimate for the shared candidate scan
-    (68,360 vs. 99,990 in this run's own committed plans, both against a
-    real 100,000 rows), so a plan flip either way is equally consistent
-    with that predicate's effect on planner inputs and with unrelated
-    `ANALYZE`-sample noise; the page does not have the evidence to tell
-    those apart. That same section also explains why it asserts
-    no frequency, ratio, or before/after count for this, including why an
-    earlier revision's "N of M runs" framing, and later a spelled-out
-    sample-of-two-against-two restating the same statistic in prose, both
-    had to be walked back once those runs' artifacts were no longer
-    available to audit. **This is a different question from issue #1177's
-    finding** (see
-    [any residual predicate defeats sort-elision](#any-residual-predicate-defeats-sort-elision-issue-1177))
-    that this same column independently defeats sort-elision/`LIMIT`
-    pushdown regardless of its value — a plan-*eligibility* effect. This
-    page's capture measures the column's marginal buffer/storage cost
-    against `claim_task_query()` exactly as it stands today, where the
-    `CASE` key and the other always-present residual predicates already
-    force the collapsed plan shape in both the seeded and unseeded state
-    (every committed plan needs the same external-merge `Sort` regardless
-    of which scan feeds it, including the 100,000-row depth's committed
-    run, where the two labels land on different scans but the identical
-    sort either way) — so the two findings don't conflict: #1177 explains why
-    dropping this predicate alone would not recover the cheap plan, while
-    this page measures what it costs to keep it, holding the already-collapsed
-    plan shape fixed.
-  * **Worker sessions (#606)** — measured directly, on a genuinely different
-    axis from issue #1177 just below: `docs/performance-worker-sessions.md`
-    seeds `session_id` and `sticky_worker_id`/`sticky_until`/`sticky_timeout`
-    via a per-row `INSERT`-then-`UPDATE`-then-`COMMIT` lifecycle matching
-    `queue::enqueue()`'s real per-task write (as issue #606's hard-pin design
-    always writes them) and finds a real, moderate-to-large buffer cost on the
-    claim query — +40.9% on a single first claim against a cache-warm table
-    at the 10,000-row headline depth, corroborated by a real 10,001-call
-    production-shaped drain at +29.0% (same order of magnitude, unlike an
-    earlier bulk-transaction capture this page's own history superseded).
-    Mechanism: row-width growth compounded by MVCC bloat from the second
-    write, not a plan inefficiency — no query-shape fix applies; see that
-    page for the full measurement, including why it does not isolate worker
-    sessions from ordinary sticky routing's own cost (measured separately,
-    immediately below), and an open question about seeding transaction
-    granularity for multi-activity decision fan-outs that a review round
-    raised but this pass did not chase down.
-    This is a buffer-cost measurement, not a plan-eligibility one — it does
-    not supersede or overlap with issue #1177's finding that worker
-    sessions' predicate, like `schedule_to_close`'s and sticky routing's,
-    independently defeats sort-elision (see immediately below); the two are
-    answers to different questions about the same predicate.
-  * **Sticky routing (#235)** — measured directly:
-    [`docs/performance-sticky-routing.md`](performance-sticky-routing.md)
-    seeds `sticky_worker_id`/`sticky_until`/`sticky_timeout` (session_id left
-    `NULL`, isolating this predicate from worker sessions' own) via the same
-    per-row `INSERT`-then-`UPDATE`-then-`COMMIT` lifecycle
-    `queue::enqueue()`'s real write uses for an ordinary sticky pin, reusing
-    the `no-sticky` control's exact `id`/`activity_id` values in their
-    original physical insertion order (a Codex review finding on this page's
-    own PR caught an earlier revision seeding each label's B-trees with
-    independently-random keys instead — see that page's Harness correction
-    section), and finds a real, moderate buffer cost that **grows
-    monotonically across every published depth** — +18.9% at 1,000 rows,
-    +32.9% at the 10,000-row headline depth, +36.2% at 100,000 rows —
-    corroborated by a real 10,001-call production-shaped drain at +18.3%.
-    Mechanism: the same row-width/MVCC growth worker sessions' page
-    documents, smaller in magnitude since only one column pair is set
-    rather than two — no query-shape fix applies. Both labels choose the
-    identical `Seq Scan` plan shape at every depth including 100,000 rows;
-    an earlier revision of this measurement reported a plan-shape crossover
-    there, which review traced to the same seeding confound rather than to
-    `sticky_worker_id` itself — see that page for the corrected capture.
-    What issue #1177 adds is a
-    different kind of evidence, not a cost figure: in isolation, sticky
-    routing's predicate — together with `schedule_to_close`'s and worker
-    sessions', both also measured — independently defeats sort-elision and
-    `LIMIT` pushdown regardless of the value it is tested against,
-    reproducing the same collapsed plan shape this page's own headline
-    finding describes. See
-    [any residual predicate defeats sort-elision](#any-residual-predicate-defeats-sort-elision-issue-1177).
-    In the full production query the `CASE` key and the always-present
-    predicates already force that same collapse regardless of any one of
-    these three, so this page's own cost measurement above is what fills
-    the gap that plan-eligibility finding cannot. "cheap inline column
-    tests" was this page's own now-retracted reading of their
-    *plan-eligibility* effect, not a corrected *cost* measurement —
-    replacing one unsupported cost claim with another would have been no
-    improvement, which is why all three now carry a real measurement
-    instead.
+    [the queue-pause anti-join fix](#the-queue-pause-anti-join-fix).
+  * **`schedule_to_close` (#378), worker sessions (#606), sticky routing
+    (#235)** — cheap inline column tests, against columns the seed leaves null.
+
+  Adding these is scenario work, not query work: each needs a seed variant and a
+  report row, on a bench that already runs 15-30 minutes.
 * **Queue count is a parameter, but it is not swept.** `Scenario.queues`
   parameterizes how many distinct queues the backlog spreads across, and every
   published row holds it at 4. Backlog depth and claimer count *are* varied.
@@ -2114,257 +1178,14 @@ from the benchmark are directly comparable.
   [the queue-pause anti-join fix](#the-queue-pause-anti-join-fix).
 * `autumn-harvest/scripts/queue_pause_claim_perf_repro.sh` — regenerates that
   evidence from a clean checkout.
-* `docs/perf-artifacts/pause-array-size/` — committed `EXPLAIN` evidence for
-  [the pause-array-size sweep](#the-pause-array-size-sweep-issue-1215).
-* `autumn-harvest/scripts/pause_array_size_claim_perf_repro.sh` — regenerates
-  that evidence from a clean checkout.
 * `docs/perf-artifacts/concurrency-key-claim-predicate/` — committed
   before/after `EXPLAIN`/`pg_stat_statements` evidence for
   [the concurrency-key gate fix](#the-concurrency-key-gate-fix).
 * `autumn-harvest/scripts/concurrency_key_claim_perf_repro.sh` — regenerates
   that evidence from a clean checkout.
-* [`docs/performance-capability-labels.md`](performance-capability-labels.md) — the capability-labels claim
+* `docs/performance-capability-labels.md` — the capability-labels claim
   predicate (#382) measurement referenced above.
 * `docs/perf-artifacts/capability-labels-claim-predicate/` — committed
   `EXPLAIN`/`pg_stat_statements` evidence for that measurement.
 * `autumn-harvest/scripts/capability_labels_claim_perf_repro.sh` — regenerates
   that evidence from a clean checkout.
-* [`docs/performance-schedule-to-close.md`](performance-schedule-to-close.md) — the `schedule_to_close_at` claim
-  predicate (#378) measurement referenced above.
-* `docs/perf-artifacts/schedule-to-close-claim-predicate/` — committed
-  `EXPLAIN`/`pg_stat_statements`/heap-growth evidence for that measurement.
-* `autumn-harvest/scripts/schedule_to_close_claim_perf_repro.sh` — regenerates
-  that evidence from a clean checkout.
-* [`docs/performance-worker-sessions.md`](performance-worker-sessions.md) — the worker-sessions claim predicate
-  (#606) measurement referenced above.
-* `docs/perf-artifacts/worker-session-claim-predicate/` — committed
-  `EXPLAIN`/`pg_stat_statements` evidence for that measurement.
-* `autumn-harvest/scripts/worker_session_claim_perf_repro.sh` — regenerates
-  that evidence from a clean checkout.
-* [`docs/performance-history-ceiling.md`](performance-history-ceiling.md) — a separate scanner, not part of
-  `claim_task_query()`: the workflow-history-ceiling check
-  (`timeout::enforce_workflow_history_ceiling`, issue #493) fixed a
-  correlated `harvest_events` event-count subquery that was evaluated twice
-  per RUNNING execution on every timeout-scanner tick.
-* Issue #1177 — reproduction and full `EXPLAIN` captures for
-  [any residual predicate defeats sort-elision](#any-residual-predicate-defeats-sort-elision-issue-1177).
-* [`DESIGN-1971.md`](../DESIGN-1971.md) — the planning record and design of
-  [the seek window](#the-seek-window-issue-1971).
-* [`docs/performance-claim-batched-seek-and-refine.md`](performance-claim-batched-seek-and-refine.md) —
-  issue #1340's batched seek-and-refine claim (`queue::claim_task_batched`,
-  additive, not wired into the default claim path), measured against the
-  single-row query above.
-* `docs/perf-artifacts/claim-batched-seek-and-refine/` — committed `EXPLAIN`
-  evidence for that measurement.
-* `autumn-harvest/scripts/claim_batched_seek_and_refine_perf_repro.sh` —
-  regenerates that evidence from a clean checkout.
-* [`docs/performance-task-queue-hygiene.md`](performance-task-queue-hygiene.md) —
-  claim latency after 1M terminal task rows, before and after the
-  terminal-task janitor and table tuning (issue #1811).
-
-### Other profiling notes
-
-Instruction/allocation-count profiling passes over other hot paths, each a
-standalone note rather than part of the claim-path attribution table above:
-
-* [`docs/performance-replay.md`](performance-replay.md) — `WorkflowReplayer`'s
-  in-memory replay path against issue #135's CPU-path budget; shipped fix.
-* [`docs/performance-verify.md`](performance-verify.md) —
-  `ReplayVerifier::verify_dir`'s opaque-payload guard fast-path; shipped under
-  maintainer override after falling short of the autonomous gate.
-* [`docs/performance-schema-validation-lazy-path.md`](performance-schema-validation-lazy-path.md)
-  — lazy JSON-Pointer path construction in schema validation (issue #373).
-* [`docs/performance-schema-validate-kind-gated-lookups.md`](performance-schema-validate-kind-gated-lookups.md)
-  — kind-gated keyword lookups in schema validation (Ir -18.8%).
-* [`docs/performance-det-check.md`](performance-det-check.md) — fusing a
-  redundant per-line comment scan in `harvest det-check` (issue #778).
-* [`docs/performance-det-check-line-trim.md`](performance-det-check-line-trim.md)
-  — an ASCII-fast-path `str::trim()` replacement for the same scan's
-  per-line whitespace trim; a real but sub-floor win (best corrected
-  variant: 2.35% instruction reduction against a >=5% floor) — a negative
-  result. An earlier cut of the same variant had a real vertical-tab
-  correctness bug, caught by review before it shipped.
-* [`docs/performance-dag-graph.md`](performance-dag-graph.md) — hoisting a
-  per-node rebuild out of `GET /dag-run-graph` (issue #690).
-* [`docs/performance-dlq-aggregate.md`](performance-dlq-aggregate.md) — DLQ
-  aggregate grouping (issue #385/#613); a measured fix that was reverted after
-  review found a regressing input shape — a negative result.
-* [`docs/performance-dlq-merge.md`](performance-dlq-merge.md) — the DLQ
-  cross-shard merge stage that runs after the grouping above; redundant key
-  clones removed.
-* [`docs/performance-stall-diagnosis.md`](performance-stall-diagnosis.md) — an
-  allocation-free ranking pass over `GET /api/harvest/workflows/{id}/diagnose`
-  (issue #809).
-* [`docs/performance-diagnose-latency.md`](performance-diagnose-latency.md) —
-  end-to-end wall-clock latency of that same endpoint against a real
-  Postgres, confirming issue #809's published `p95 < 500 ms` claim with a
-  measured number across fan-out width, fleet size, and the replay path
-  (issue #1194).
-* [`docs/performance-workflow-children-traversal.md`](performance-workflow-children-traversal.md)
-  — batching the N+1 in `GET /workflows/{id}/children?depth=N` (issue #786-adjacent).
-* [`docs/performance-schedule-overdue-aux.md`](performance-schedule-overdue-aux.md)
-  — the same N+1 shape in `GET /admin/schedules`'s overdue-aux computation
-  (issue #696).
-* [`docs/performance-schedule-overdue-pass.md`](performance-schedule-overdue-pass.md)
-  — the aux-lookup fix's own named follow-up: the identical N+1 shape in
-  `scheduler::overdue_schedule_pass`, the scheduler tick's periodic
-  overdue-gauge sampler (issue #696).
-* [`docs/performance-usage-report-activity-lookback.md`](performance-usage-report-activity-lookback.md)
-  — indexing the activity-attempt lookback LATERAL join in `GET /admin/usage`
-  (issue #596), the one CTE the 2026-07 usage-report-indexes migration missed.
-* [`docs/performance-external-outbox-scan.md`](performance-external-outbox-scan.md)
-  — indexing both sides of the three external signal/cancel/await outbox claim
-  queries, and pinning their plan against a stale row estimate (issue #1486).
-* [`docs/performance-quota-history-bytes.md`](performance-quota-history-bytes.md)
-  — measuring the `history_bytes` admission check's cost claim (issue #946
-  AC7); partially inaccurate claim, no fix identified.
-* [`docs/performance-quota-reconcile-candidate-scan.md`](performance-quota-reconcile-candidate-scan.md)
-  — `reconcile_quota_keys_from` candidate-scan cost under mixed-deployment
-  skew (issue #1226 follow-up); confirms the scaling risk is a permanent
-  per-tick cost, not a rollout expense, and diagnoses a planner
-  cardinality misestimate as the cause. No fix ships in this pass.
-* [`docs/performance-codec-rotation-reencrypt.md`](performance-codec-rotation-reencrypt.md)
-  — skipping a JSON round-trip in the codec-key-rotation re-encryption sweep
-  (issue #948).
-* [`docs/performance-sqlite-runtime-drive.md`](performance-sqlite-runtime-drive.md)
-  — the first profiling harness for `autumn-harvest-sqlite`; findings only, no
-  local fix cleared the floor.
-* [`docs/performance-redis-claim-roundtrip.md`](performance-redis-claim-roundtrip.md)
-  — a duplicate `ensure_group` round trip on every `RedisTaskQueue::claim`
-  poll, measured in socket-syscall counts (PR #1387).
-* [`docs/performance-schedule-bulk-audit.md`](performance-schedule-bulk-audit.md)
-  — the per-row audit-insert N+1 in the Vantage schedules bulk-pause/resume
-  actions (issue #951), batched into one chunked insert call per shard
-  (multiple statements past 4,999 matched rows).
-* [`docs/performance-dlq-bulk-discard.md`](performance-dlq-bulk-discard.md) —
-  the per-row `DELETE` N+1 in `POST /dead-letters/discard` (issue #1421),
-  batched into one `DELETE ... WHERE id = ANY($1)` call.
-* [`docs/performance-mixed-suspension-timer-batch.md`](performance-mixed-suspension-timer-batch.md)
-  — the per-timer lookup, `NOW()` and `INSERT` N+1 in a mixed suspension
-  batch (`persist_mixed_suspension_batch`), batched to one statement each
-  (statements per park `4n` → 4).
-* [`docs/performance-activity-fanout-enqueue.md`](performance-activity-fanout-enqueue.md)
-  — the per-activity `INSERT` N+1 in a workflow decision's
-  `ScheduleActivity` fan-out (`persist_scheduled_activities` /
-  `persist_mixed_suspension_batch`), batched into one multi-row `INSERT`
-  call via `queue::enqueue_batch` (`enqueue_calls` n → 1 at every swept
-  size).
-* [`docs/performance-mutex-lease-reclaim.md`](performance-mutex-lease-reclaim.md)
-  — the per-key three-statement N+1 in `mutex::reclaim_expired_leases_and_wake`,
-  the durable-mutex lease scanner's crash-recovery sweep, collapsed into
-  one statement per key (`calls` -66.7% at every swept size; buffers flat
-  by design, so the fix is measured in DB-socket syscalls instead: `sendto`
-  -44.5%, `recvfrom` -40.9%).
-* [`docs/performance-mutex-terminal-sweep-table-present.md`](performance-mutex-terminal-sweep-table-present.md)
-  — `mutex::sweep_terminal_holder_and_wake`, reached from the workflow
-  completion-trigger evaluator (skipped on a successfully-retried failure),
-  continue-as-new sealing, and reset, issuing its `table_present()`
-  migration guard three redundant times in one transaction (issue #691
-  follow-up); `calls` is really 3 → 1, but measured on a single reused
-  connection (matching production) the buffer delta is 0 — Postgres's own
-  backend-local syscache
-  already makes calls 2 and 3 free. No fix ships.
-* [`docs/performance-metrics-sampler-guard.md`](performance-metrics-sampler-guard.md)
-  — four worker samplers issuing SQL with no `metrics.is_enabled()` guard
-  (issue #1428), eliminated entirely rather than reduced (pool-touch count
-  and corroborating `strace` `connect` calls both N → 0).
-* [`docs/performance-completion-trigger-outbox-queue.md`](performance-completion-trigger-outbox-queue.md)
-  — the per-row `harvest_schedules` lookup in
-  `completion_trigger::enforce_completion_triggers_outbox`'s cross-shard
-  relay scan, batched into one `workflow_name = ANY($1)` call via
-  `resolve_target_queues_batch` (`lookup_calls` n → 1 at every swept size).
-* [`docs/performance-completion-callback-outcome-batch.md`](performance-completion-callback-outcome-batch.md)
-  — the completion-callback scanner's per-row `apply_outcome` UPDATE in
-  `completion_callback::fire_due_on_conn`, batched into one write per outcome
-  class (`Delivered`, `Backoff`), not one per row (statement calls 100 → 2 on
-  the measured mixed tick, PR #1748).
-* [`docs/performance-critical-path.md`](performance-critical-path.md) — a
-  redundant second edge-set traversal in
-  `critical_path::CriticalPathAnalyzer::analyze`'s sink detection, folded
-  into the existing per-level DP loop (instructions -15.45%, PR #1500).
-* [`docs/performance-poison-pill-orphan-recheck.md`](performance-poison-pill-orphan-recheck.md)
-  — the per-orphan worker-liveness re-check in
-  `poison_pill::reclaim_orphaned_tasks`'s requeue path, folded into the
-  write that follows the row-lock statement, not the row lock itself
-  (3-to-2 statement reduction; total statements -33% at every swept size;
-  worker-liveness calls n → 0, PR #1545).
-* [`docs/performance-queue-coverage.md`](performance-queue-coverage.md) — the
-  O(pending queues x workers x queues-per-worker) nested scan in
-  `queue_coverage::partition_uncovered_and_paused`, the per-shard core of
-  `GET /admin/queue-coverage` (issue #774), indexed into an O(1)-average
-  `HashSet` lookup per pending queue (instructions -83.6%; falls back to
-  the original direct scan for a `?queue_name=`-filtered single-row call).
-* [`docs/performance-build-reachability-fanout.md`](performance-build-reachability-fanout.md)
-  — the per-build N+1 in `build_routing::all_build_reachability`, the
-  Vantage Builds page and `GET /admin/builds`'s counter query (issue #171),
-  batched into three grouped queries (one per source table) instead of one
-  combined query per distinct build id.
-* [`docs/performance-history-export.md`](performance-history-export.md) — a
-  self-referential re-serialization loop in `history_export::export_history`,
-  the archival-export path `retention.rs`'s reclamation sweep calls per
-  retiring execution (issue #524/#698/#772/#798), solved as an O(1) fixed
-  point (instructions -22.08%, alloc bytes -19.89%).
-* [`docs/performance-history-fingerprint.md`](performance-history-fingerprint.md)
-  — a per-event canonicalization buffer in
-  `shard_rebalance::history_fingerprint`, the replay-determinism check a
-  shard migration runs on both sides of a copy (`docs/sharding.md`), fixed
-  by reusing one buffer across events (alloc bytes -16.45%).
-* [`docs/performance-timeline-acckey-hash.md`](performance-timeline-acckey-hash.md)
-  — SipHash over `AccKey` in `timeline::derive_timeline`, the read model behind
-  `GET /workflows/{id}/timeline` (issue #739), replaced by one 128-bit hash
-  write per key (instructions -8.3%).
-* [`docs/performance-lineage.md`](performance-lineage.md) — the `visited`/
-  `next`/`node.children` vecs in `lineage::LineageWalk`/
-  `LineageTreeReport::finish`, the in-memory half of
-  `GET /workflows/{id}/lineage` (issue #621), pre-sized from what each level
-  actually admits; `nodes` and `by_parent` stay growing from empty after a
-  post-review correction (instructions -2.37%, alloc bytes -27.12%, this
-  fix's final fifth-round-corrected numbers).
-* [`docs/performance-outbox-start-relay.md`](performance-outbox-start-relay.md)
-  — the per-row delivery-mark N+1 in
-  `outbox::drain_workflow_start_outbox_batch`, the workflow-start outbox
-  relay's periodic drain (issue #1620), batched into one
-  `UPDATE ... FROM UNNEST(...)` call per outcome (delivered, failed) per
-  chunk of `OUTBOX_MARK_FLUSH_EVERY` outcomes, not one call per row and
-  not one call per drain (review-round correction: chunking, not a single
-  end-of-drain flush, bounds how long a row's claim stays held;
-  `mark_calls` n → 1/3/7 at n=5/20/50, an eightfold constant-factor
-  reduction, not a complexity-class one; `mark_buffers` -28.2% at n=50).
-* [`docs/performance-harvest-verify-split-top.md`](performance-harvest-verify-split-top.md)
-  — `autumn-harvest-verify`'s `util::split_top`, the balanced-delimiter
-  splitter every path/type decomposition in the MIR-level determinism
-  analyzer goes through (issue #962), guarded with a first-byte check
-  before its `starts_with` call (instructions -13.54%, PR #1597).
-* [`docs/performance-status-summary-stalled.md`](performance-status-summary-stalled.md)
-  — `status_summary::count_stalled_candidates`'s correlated `NOT EXISTS`
-  anti-join, 86.9% of a `GET /admin/status` request's buffers on a
-  3,000-active-execution fixture (issue #1643), rewritten as a
-  `MATERIALIZED` CTE anti-joined by equality (`Nested Loop Anti Join` →
-  `Hash Anti Join`; -97.8% buffers in the execution-heavy regime, a
-  smaller but real win in the other two measured regimes, PR #1656).
-* [`docs/performance-queue-fairness.md`](performance-queue-fairness.md) —
-  `queue_fairness::weighted_queue_order`, the weighted-random queue-selection
-  step `Worker::poll_once` runs on every poll once an operator configures
-  `WorkerConfig::queue_weights` (issue #515), 53.72% of a 16-queue/20,000-poll
-  harness; a per-queue `String` clone eliminated by returning a borrowed
-  permutation instead (instructions -36.26%, allocations -76.18%).
-* [`docs/performance-payload-codec-owned-transform.md`](performance-payload-codec-owned-transform.md)
-  — `payload_codec::{encode_payload, decode_payload}`'s identity-codec fast
-  path, run once per payload-bearing field of every workflow event ever
-  appended or replayed (`store.rs`'s `encode_event`/`decode_event`), 52.05%
-  of a 454,000-event-round-trip harness's allocation blocks; a redundant
-  `serde_json::Value` clone eliminated by taking the field by value
-  (`std::mem::take`) instead of borrowing it from the event tree the caller
-  already owns (instructions -36.89%, allocation blocks -52.05%).
-* [`docs/performance-parent-close-cascade-unfinished-handlers.md`](performance-parent-close-cascade-unfinished-handlers.md)
-  — the per-child `harvest_events` N+1 in
-  `check_and_report_unfinished_handlers`'s parent-close-cascade callers,
-  spanning eighteen call sites across `worker.rs`, `timeout.rs`,
-  `execution.rs`, and `completion_trigger.rs`; batched into a chunked
-  `eq_any` query via `check_and_report_unfinished_handlers_batch` (calls
-  400→4 at a 400-child fixture, 100 executions per chunk).
-* [`docs/performance-timeline-acckey-hash.md`](performance-timeline-acckey-hash.md)
-  — the three-write derived `Hash` for `timeline::AccKey`, the lookup key of
-  `derive_timeline` behind `GET /workflows/{id}/timeline` (PR #1894);
-  replaced by a manual impl that writes one 128-bit value (instructions
-  -8.3%, callgrind).

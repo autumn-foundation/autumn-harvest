@@ -27,7 +27,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 static TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::test_init_sql().as_bytes().to_vec()
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
 }
 
 // Rewrite the database (path) component of a Postgres URL, preserving scheme,
@@ -69,7 +69,7 @@ async fn setup_test_database_url() -> (String, Option<ContainerAsync<Postgres>>)
         let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&new_url)
             .await
             .expect("failed to connect to per-test database");
-        conn.batch_execute(&autumn_harvest::test_init_sql())
+        conn.batch_execute(autumn_harvest::full_migrations_sql())
             .await
             .expect("failed to apply migrations to per-test database");
         return (new_url, None);
@@ -159,11 +159,6 @@ fn mixed_suspension_workflow<'a>(
             ctx.signal_external_workflow(target, "my_signal", serde_json::json!({"data": "hello"}));
 
         tokio::select! {
-            // DET011/HVG010: poll in source order. The durable branch must
-            // consume its recorded events before the external branch resolves
-            // from history. An unbiased select! polls at random, and a replay
-            // that returns early is ND-blocked with a 5 s to 20 s backoff.
-            biased;
             res = timer_fut => {
                 res.map_err(|e| e.to_string())?;
                 Ok(serde_json::json!({"status": "timer_fired"}))
@@ -207,11 +202,6 @@ fn mixed_suspension_cancel_workflow<'a>(
         let cancel_fut = ctx.request_cancel_external_workflow(target);
 
         tokio::select! {
-            // DET011/HVG010: poll in source order. The durable branch must
-            // consume its recorded events before the external branch resolves
-            // from history. An unbiased select! polls at random, and a replay
-            // that returns early is ND-blocked with a 5 s to 20 s backoff.
-            biased;
             res = timer_fut => {
                 res.map_err(|e| e.to_string())?;
                 Ok(serde_json::json!({"status": "timer_fired"}))
@@ -283,11 +273,6 @@ fn mixed_signal_wait_external_signal_workflow<'a>(
             ctx.signal_external_workflow(target, "my_signal", serde_json::json!({"data": "hello"}));
 
         tokio::select! {
-            // DET011/HVG010: poll in source order. The durable branch must
-            // consume its recorded events before the external branch resolves
-            // from history. An unbiased select! polls at random, and a replay
-            // that returns early is ND-blocked with a 5 s to 20 s backoff.
-            biased;
             res = wait_fut => {
                 res.map_err(|e| e.to_string())?;
                 Ok(serde_json::json!({"status": "signal_received"}))
@@ -316,11 +301,6 @@ fn mixed_signal_wait_external_cancel_workflow<'a>(
         let cancel_fut = ctx.request_cancel_external_workflow(target);
 
         tokio::select! {
-            // DET011/HVG010: poll in source order. The durable branch must
-            // consume its recorded events before the external branch resolves
-            // from history. An unbiased select! polls at random, and a replay
-            // that returns early is ND-blocked with a 5 s to 20 s backoff.
-            biased;
             res = wait_fut => {
                 res.map_err(|e| e.to_string())?;
                 Ok(serde_json::json!({"status": "signal_received"}))
@@ -370,11 +350,6 @@ fn mixed_activity_external_signal_workflow<'a>(
             ctx.signal_external_workflow(target, "my_signal", serde_json::json!({"data": "hello"}));
 
         tokio::select! {
-            // DET011/HVG010: poll in source order. The durable branch must
-            // consume its recorded events before the external branch resolves
-            // from history. An unbiased select! polls at random, and a replay
-            // that returns early is ND-blocked with a 5 s to 20 s backoff.
-            biased;
             res = activity_fut => {
                 res.map_err(|e| e.to_string())?;
                 Ok(serde_json::json!({"status": "activity_done"}))
@@ -426,11 +401,6 @@ fn mixed_child_workflow_external_signal_workflow<'a>(
             ctx.signal_external_workflow(target, "my_signal", serde_json::json!({"data": "hello"}));
 
         tokio::select! {
-            // DET011/HVG010: poll in source order. The durable branch must
-            // consume its recorded events before the external branch resolves
-            // from history. An unbiased select! polls at random, and a replay
-            // that returns early is ND-blocked with a 5 s to 20 s backoff.
-            biased;
             res = child_fut => {
                 res.map_err(|e| e.to_string())?;
                 Ok(serde_json::json!({"status": "child_done"}))
@@ -513,7 +483,7 @@ fn mk_start_params(
         exec_id,
         workflow_name,
         workflow_id,
-        input: input.into(),
+        input,
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -580,7 +550,7 @@ async fn test_same_shard_not_found_retry() {
     let pool = build_test_pool(&database_url);
     let _sharded_pool = autumn_harvest::shard::ShardedDbPool::single(pool.clone());
 
-    // Target workflow ID and ExecutionId, both on shard 0.
+    // Target workflow ID and ExecutionId (same shard, let's say Shard 0)
     let target_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
 
     // Caller workflow ExecutionId
@@ -666,7 +636,7 @@ async fn test_same_shard_not_found_retry() {
         exec_id: caller_exec_id,
         workflow_name: "caller_workflow",
         workflow_id: "caller-1",
-        input: serde_json::json!({"target": target_exec_id.to_string()}).into(),
+        input: serde_json::json!({"target": target_exec_id.to_string()}),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -722,7 +692,7 @@ async fn test_same_shard_not_found_retry() {
         exec_id: target_exec_id,
         workflow_name: "target_workflow",
         workflow_id: "target-1",
-        input: serde_json::json!({}).into(),
+        input: serde_json::json!({}),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -886,7 +856,7 @@ async fn test_cross_shard_outbox_delivery() {
         exec_id: target_exec_id,
         workflow_name: "target_workflow",
         workflow_id: "target-2",
-        input: serde_json::json!({}).into(),
+        input: serde_json::json!({}),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -935,7 +905,7 @@ async fn test_cross_shard_outbox_delivery() {
         exec_id: caller_exec_id,
         workflow_name: "caller_workflow",
         workflow_id: "caller-2",
-        input: serde_json::json!({"target": target_exec_id.to_string()}).into(),
+        input: serde_json::json!({"target": target_exec_id.to_string()}),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -1067,7 +1037,7 @@ async fn test_grace_window_expiration() {
         exec_id: caller_exec_id,
         workflow_name: "caller_workflow",
         workflow_id: "caller-3",
-        input: serde_json::json!({"target": target_exec_id.to_string()}).into(),
+        input: serde_json::json!({"target": target_exec_id.to_string()}),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -1128,8 +1098,7 @@ async fn test_grace_window_expiration() {
     .expect("caller should fail after grace window expiration");
     assert_eq!(completed.state, "FAILED");
 
-    // The caller fails because the signal failed. Assert that history records
-    // the failure event.
+    // The caller fails because the signal failed. Let's make sure history contains the failure event.
     let history = autumn_harvest::store::load_history(&mut conn, caller_exec_id)
         .await
         .unwrap();
@@ -1243,7 +1212,7 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
         exec_id: caller_exec_id,
         workflow_name: "mixed_suspension_workflow",
         workflow_id: "caller-mixed-1",
-        input: serde_json::json!({"target": target_exec_id.to_string()}).into(),
+        input: serde_json::json!({"target": target_exec_id.to_string()}),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -1299,7 +1268,7 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
         exec_id: target_exec_id,
         workflow_name: "target_workflow",
         workflow_id: "target-mixed-1",
-        input: serde_json::json!({}).into(),
+        input: serde_json::json!({}),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,

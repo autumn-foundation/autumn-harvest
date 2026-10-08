@@ -59,7 +59,7 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     // First parameter must be ctx: &WorkflowContext.
-    if !crate::attr_util::first_param_is_ctx_type(&func.sig.inputs, "WorkflowContext") {
+    if !first_param_is_ctx(&func.sig.inputs) {
         return syn::Error::new_spanned(
             &func.sig,
             "#[signal] handlers must take `ctx: &WorkflowContext` as the first argument",
@@ -80,8 +80,7 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     );
 
     // Best-effort Rust type name for the payload (params after `ctx`).
-    let arg_type_hint =
-        crate::attr_util::arg_type_hint(&func.sig.inputs.iter().skip(1).collect::<Vec<_>>());
+    let arg_type_hint = build_arg_type_hint(&func.sig.inputs.iter().skip(1).collect::<Vec<_>>());
 
     let parsed_path = match crate::parse_and_validate_workflow_path(
         &workflow_name,
@@ -90,14 +89,23 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Ok(p) => p,
         Err(e) => return e.to_compile_error(),
     };
-    let (leading_colon, nested_path_tokens) = parsed_path.nested_stub_use_tokens();
     let workflow_simple_name = parsed_path.workflow_simple_name;
-    let camel_wf = crate::to_pascal_case(&workflow_simple_name);
+    let camel_wf = to_pascal_case(&workflow_simple_name);
     let stub_ident = format_ident!("{camel_wf}Stub");
 
     // Skip the leading ctx param when building signal args.
     let params: Vec<_> = func.sig.inputs.iter().skip(1).collect();
-    let param_names: Vec<_> = crate::attr_util::param_idents(&params);
+    let param_names: Vec<_> = params
+        .iter()
+        .filter_map(|arg| {
+            if let syn::FnArg::Typed(pt) = arg
+                && let syn::Pat::Ident(ident) = &*pt.pat
+            {
+                return Some(&ident.ident);
+            }
+            None
+        })
+        .collect();
 
     let serialize_payload = if param_names.is_empty() {
         quote! { ::autumn_harvest::serde_json::Value::Null }
@@ -110,6 +118,38 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let mod_name = format_ident!("__autumn_signal_impl_{fn_name}");
     let path_tokens = parsed_path.path_tokens;
+    let is_absolute = parsed_path.is_absolute;
+    let leading_colon = if is_absolute {
+        quote! { :: }
+    } else {
+        quote! {}
+    };
+    let nested_path_tokens = if is_absolute
+        || parsed_path
+            .original_module_parts
+            .first()
+            .is_some_and(|s| s == "crate")
+    {
+        path_tokens.clone()
+    } else if parsed_path.original_module_parts.is_empty() {
+        Vec::new()
+    } else {
+        let mut tokens = Vec::new();
+        tokens.push(quote! { super });
+        let first = parsed_path.original_module_parts.first().unwrap();
+        if first == "self" {
+            for p in parsed_path.original_module_parts.iter().skip(1) {
+                let id = format_ident!("{}", p);
+                tokens.push(quote! { #id });
+            }
+        } else {
+            for p in &parsed_path.original_module_parts {
+                let id = format_ident!("{}", p);
+                tokens.push(quote! { #id });
+            }
+        }
+        tokens
+    };
     // Shared prologue: validate the target type, serialize the payload, and
     // enforce the signal payload cap before any insert.
     let cap_check = quote! {
@@ -228,81 +268,48 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
-// ── Characterization tests: signature-validation error paths ────────────────
-//
-// Sibling of `query.rs`'s/`update.rs`'s tests of the same name -- pins
-// `signal_macro`'s current rejection message for `first_param_is_ctx` before
-// that check routes through the already-shared
-// `attr_util::first_param_is_ctx_type`.
-#[cfg(test)]
-mod signature_validation_characterization_tests {
-    use super::signal_macro;
-    use quote::quote;
-
-    #[test]
-    fn wrong_first_param_type_is_rejected() {
-        let attr = quote! { workflow = "MyWorkflow" };
-        let item = quote! {
-            fn my_signal(n: u32) {}
-        };
-        let out = signal_macro(attr, item).to_string();
-        assert!(
-            out.contains("must take") && out.contains("WorkflowContext"),
-            "expected the ctx-param rejection message, got:\n{out}"
-        );
+/// Returns a `String` describing the payload params for `arg_type_hint`.
+fn build_arg_type_hint(params: &[&syn::FnArg]) -> String {
+    if params.is_empty() {
+        return "()".to_string();
     }
+    if params.len() == 1
+        && let syn::FnArg::Typed(pt) = params[0]
+    {
+        return crate::type_name_hint(&pt.ty);
+    }
+    let parts: Vec<_> = params
+        .iter()
+        .filter_map(|arg| {
+            if let syn::FnArg::Typed(pt) = arg {
+                Some(crate::type_name_hint(&pt.ty))
+            } else {
+                None
+            }
+        })
+        .collect();
+    format!("({})", parts.join(", "))
 }
 
-#[cfg(test)]
-mod stub_path_resolution_characterization_tests {
-    use super::signal_macro;
-    use quote::quote;
+fn first_param_is_ctx(inputs: &syn::punctuated::Punctuated<syn::FnArg, syn::token::Comma>) -> bool {
+    let Some(first) = inputs.first() else {
+        return false;
+    };
+    let syn::FnArg::Typed(pt) = first else {
+        return false;
+    };
+    let syn::Type::Reference(r) = &*pt.ty else {
+        return false;
+    };
+    let syn::Type::Path(tp) = &*r.elem else {
+        return false;
+    };
+    tp.path
+        .segments
+        .last()
+        .is_some_and(|s| s.ident == "WorkflowContext")
+}
 
-    fn generate(workflow_path: &str) -> String {
-        let attr = quote! { workflow = #workflow_path };
-        let item = quote! {
-            fn my_signal(ctx: &WorkflowContext, n: u32) {}
-        };
-        signal_macro(attr, item).to_string()
-    }
-
-    fn use_line(full: &str) -> &str {
-        let start = full
-            .find("use ")
-            .unwrap_or_else(|| panic!("no `use` in generated output:\n{full}"));
-        let end = start
-            + full[start..]
-                .find("impl ")
-                .unwrap_or_else(|| panic!("no `impl` after `use` in:\n{full}"));
-        full[start..end].trim()
-    }
-
-    /// Pins the exact stub-`use` tokens `signal_macro` emits for each shape
-    /// of `workflow = "..."` path. See `query.rs`/`update.rs`'s identical
-    /// sibling tests. All three handler macros resolve a `workflow` path to
-    /// a stub `use` the same way. That derivation is moving to a single
-    /// `WorkflowPath::nested_stub_use_tokens`.
-    #[test]
-    fn stub_use_tokens_pinned_per_path_shape() {
-        assert_eq!(
-            use_line(&generate("some_mod::MyWorkflow")),
-            "use super :: * ; use super :: some_mod :: MyWorkflowStub ;"
-        );
-        assert_eq!(
-            use_line(&generate("self::MyWorkflow")),
-            "use super :: * ; use super :: MyWorkflowStub ;"
-        );
-        assert_eq!(
-            use_line(&generate("self::a::b::MyWorkflow")),
-            "use super :: * ; use super :: a :: b :: MyWorkflowStub ;"
-        );
-        assert_eq!(
-            use_line(&generate("crate::some_mod::MyWorkflow")),
-            "use super :: * ; use crate :: some_mod :: MyWorkflowStub ;"
-        );
-        assert_eq!(
-            use_line(&generate("::abs_mod::MyWorkflow")),
-            "use super :: * ; use :: abs_mod :: MyWorkflowStub ;"
-        );
-    }
+fn to_pascal_case(s: &str) -> String {
+    crate::to_pascal_case(s)
 }

@@ -104,12 +104,6 @@ events: 9
 
 Nine events, three activities, one timer. Now find the interesting one.
 
-A history from a worker with [decision boundaries](decision-boundaries.md)
-(issue #1833) also has `DecisionCommitted` rows. The detail column of each one
-names the build and the worker of that decision, for example
-`decision: build 2026.10.1, worker worker-eu-1`. `replay --step` shows the
-same values under `decision`. Replay skips these rows.
-
 ### 3. Run to a breakpoint
 
 Break on the activity you suspect:
@@ -302,9 +296,6 @@ first divergence at step 3
       open_awaitables: activity fraud_check (opened at 3)
 ```
 
-The diff ignores the build and the worker of a `DecisionCommitted` row. Those
-values change from build to build by design. The event type still compares.
-
 It exits `1` when a divergence is found, mirroring `diff(1)`'s "differences
 found", so it drops straight into a CI pipeline. Both sides render the **value**
 of the field that differs, not just its name — a handler-free trace has no
@@ -423,7 +414,7 @@ Enable the `debugger` feature (it implies `testing`):
 
 ```toml
 [dev-dependencies]
-autumn-harvest = { version = "0.7", default-features = false, features = ["debugger"] }
+autumn-harvest = { version = "0.5", default-features = false, features = ["debugger"] }
 ```
 
 | Item | Purpose |
@@ -447,7 +438,6 @@ changed, or a certified build whose real branch was never exercised).
 | `.queries(...)` / `.updates(...)` | The candidate's declarative `#[query]` / `#[update]` registrations. A body branching on `ctx.list_query_names()` sees an **empty** registry without these. Pass the same `queries![…]` / `updates![…]` collection the build registers; entries for other workflow types are filtered out exactly as the worker filters them. |
 | `.payload_caps(...)` / `.payload_offload_threshold(...)` | The candidate's payload limits (#252, #524). |
 | `.payload_offloader(...)` | A `PayloadOffloader` over the deployment's `PayloadStore`, so claim-check reference envelopes (#524) are inflated back to the real payload before the body sees them. **Optional:** with none configured an envelope displays as an envelope and is never an error, which is the contract for an export debugged with no store to hand. |
-| `.activity_defaults(...)` | The candidate's worker-level activity retry and start-to-close defaults. Replay applies them to frontier local-activity commands (#620). |
 | `.history_policy(...)` / `.build_id(...)` / `.state(...)` | The candidate's history thresholds, build id, and shared application state. |
 
 The `HistorySnapshot`'s own replay inputs — `workflow_id`, `queue_name`,

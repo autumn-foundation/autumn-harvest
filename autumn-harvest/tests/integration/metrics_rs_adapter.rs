@@ -5,7 +5,6 @@
 
 #![cfg(feature = "metrics-rs")]
 
-use autumn_harvest::adaptive_limit::LimitSnapshot;
 use autumn_harvest::error::PayloadKind;
 use autumn_harvest::metrics_rs_adapter::MetricsRsRecorder;
 use autumn_harvest::telemetry::{
@@ -13,7 +12,6 @@ use autumn_harvest::telemetry::{
 };
 use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 #[test]
 fn metrics_rs_recorder_implements_metrics_recorder_trait() {
@@ -250,146 +248,5 @@ fn record_payload_rejected_bridges_counter() {
     assert!(
         labels.contains(&("workflow.type", "onboarding")),
         "harvest.payload.rejected must carry the workflow.type label, got {labels:?}"
-    );
-}
-
-#[test]
-fn record_retry_budget_available_bridges_gauge_with_activity_label() {
-    let keys = captured_keys(|| {
-        MetricsRsRecorder.record_retry_budget_available("charge_card", 4.5);
-    });
-    let key = find_key(
-        &keys,
-        "harvest.retry.budget.available",
-        InstrumentKind::Gauge,
-    );
-    let labels = labels_of(key);
-    assert_eq!(labels, vec![("activity", "charge_card")], "issue #1793");
-}
-
-/// The adaptive limit state is three gauges, each labeled by `activity`
-/// (issue #1836).
-#[test]
-fn record_activity_concurrency_limit_bridges_three_gauges() {
-    let keys = captured_keys(|| {
-        MetricsRsRecorder.record_activity_concurrency_limit(
-            "charge_card",
-            &LimitSnapshot {
-                limit: 12,
-                in_flight: 7,
-                baseline: Some(Duration::from_millis(250)),
-            },
-        );
-    });
-    for name in [
-        "harvest.activity.concurrency_limit",
-        "harvest.activity.concurrency_in_flight",
-        "harvest.activity.latency_baseline_seconds",
-    ] {
-        let key = find_key(&keys, name, InstrumentKind::Gauge);
-        assert_eq!(labels_of(key), vec![("activity", "charge_card")], "{name}");
-    }
-}
-
-/// With no baseline estimate, the baseline gauge is not touched.
-#[test]
-fn record_activity_concurrency_limit_skips_an_unknown_baseline() {
-    let keys = captured_keys(|| {
-        MetricsRsRecorder.record_activity_concurrency_limit(
-            "charge_card",
-            &LimitSnapshot {
-                limit: 4,
-                in_flight: 0,
-                baseline: None,
-            },
-        );
-    });
-    assert!(
-        !keys.iter().any(|(kind, key)| *kind == InstrumentKind::Gauge
-            && key.name() == "harvest.activity.latency_baseline_seconds"),
-        "an unknown baseline must not set the gauge"
-    );
-}
-
-#[test]
-fn record_activity_concurrency_deferred_bridges_counter_with_activity_label() {
-    let keys = captured_keys(|| {
-        MetricsRsRecorder.record_activity_concurrency_deferred("charge_card");
-    });
-    let key = find_key(
-        &keys,
-        "harvest.activity.concurrency_deferred",
-        InstrumentKind::Counter,
-    );
-    assert_eq!(
-        labels_of(key),
-        vec![("activity", "charge_card")],
-        "issue #1836"
-    );
-}
-
-#[test]
-fn record_retry_budget_exhausted_bridges_counter_with_activity_label() {
-    let keys = captured_keys(|| {
-        MetricsRsRecorder.record_retry_budget_exhausted("charge_card");
-    });
-    let key = find_key(
-        &keys,
-        "harvest.retry.budget.exhausted",
-        InstrumentKind::Counter,
-    );
-    let labels = labels_of(key);
-    assert_eq!(labels, vec![("activity", "charge_card")], "issue #1793");
-}
-
-#[test]
-fn record_db_transaction_retry_bridges_counter_with_site_and_reason_labels() {
-    let keys = captured_keys(|| {
-        MetricsRsRecorder.record_db_transaction_retry("persist", "deadlock");
-    });
-    let key = find_key(
-        &keys,
-        "harvest.db.transaction_retry",
-        InstrumentKind::Counter,
-    );
-    let mut labels = labels_of(key);
-    labels.sort_unstable();
-    assert_eq!(
-        labels,
-        vec![("reason", "deadlock"), ("site", "persist")],
-        "issue #1822"
-    );
-}
-
-#[test]
-fn record_db_transaction_retry_exhausted_bridges_counter_with_site_and_reason_labels() {
-    let keys = captured_keys(|| {
-        MetricsRsRecorder.record_db_transaction_retry_exhausted("claim", "serialization_failure");
-    });
-    let key = find_key(
-        &keys,
-        "harvest.db.transaction_retry_exhausted",
-        InstrumentKind::Counter,
-    );
-    let mut labels = labels_of(key);
-    labels.sort_unstable();
-    assert_eq!(
-        labels,
-        vec![("reason", "serialization_failure"), ("site", "claim")],
-        "issue #1822"
-    );
-}
-
-#[test]
-fn record_api_rate_limited_bridges_counter_with_class_and_kind() {
-    let keys = captured_keys(|| {
-        MetricsRsRecorder.record_api_rate_limited("mutating", "token");
-    });
-    let key = find_key(&keys, "harvest.api.rate_limited", InstrumentKind::Counter);
-    let labels = labels_of(key);
-    assert_eq!(
-        labels,
-        vec![("route_class", "mutating"), ("client_kind", "token")],
-        "issue #1827"
     );
 }

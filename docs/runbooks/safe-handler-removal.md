@@ -12,10 +12,8 @@ invisible failure into a one-call pre-flight gate.
 
 **When to use:** before any deploy that removes/renames a workflow type, and as
 a CI gate on the rollout. For where this sits in the full deploy sequence — and
-the boot-time `[harvest.startup] orphaned_workflows = warn|fail|off` gate, which
-runs on **both** boot paths — see the [Pre-cutover handler-coverage gate](safe-deploy.md#runbook-pre-cutover-handler-coverage-gate) in the safe-deploy runbook.
-The two boot paths are `HarvestPlugin` and the standalone path. The standalone
-path is [`HarvestEmbedding`](../embedding.md), or `HarvestRunner::start` alone.
+the optional boot-time `[harvest.startup] orphaned_workflows = warn|fail|off`
+gate — see the [Pre-cutover handler-coverage gate](safe-deploy.md#runbook-pre-cutover-handler-coverage-gate) in the safe-deploy runbook.
 
 **When _not_ to use:** retiring a *worker build* (use `build_reachability`,
 below) or removing a *`ctx.version()` branch inside a handler* (use the
@@ -136,7 +134,7 @@ rg -n 'continue_as_new_as(_type)?\b' --glob '*.rs' | rg 'legacy_export'
 
 This is the *delete* direction of the same rule the #803 rollout ordering states
 for the *deploy* direction ("deploy the new phase's handler fleet-wide first").
-See the "Cross-type continue-as-new" section in [`docs/architecture.md`](../architecture.md#cross-type-continue-as-new--multi-phase-entities-issue-803).
+See the "Cross-type continue-as-new" section in `CLAUDE.md`.
 
 ---
 

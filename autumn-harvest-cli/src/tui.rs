@@ -21,21 +21,12 @@ use serde_json::Value;
 use crate::Cli;
 use crate::CliError;
 
-/// Limit on one list refresh (issue #1832).
-const REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// Run the interactive TUI dashboard.
 ///
 /// # Errors
 /// Returns `CliError` if terminal initialization fails, if the API client fails
 /// to fetch data, or if there is an error drawing to the terminal.
 pub async fn run_tui(cli: &Cli) -> Result<(), CliError> {
-    // The refresh runs inside the input loop, so a slow API delays a key
-    // press. Use a short limit, so a stuck refresh delays it by a few
-    // seconds at most (issue #1832). Build the client before raw mode starts,
-    // so a build error leaves the terminal usable.
-    let client = crate::http_client(cli.http_timeout().min(REFRESH_TIMEOUT))?;
-
     // Setup terminal
     enable_raw_mode().map_err(|e| CliError::ReadJson {
         label: "setup raw mode",
@@ -55,6 +46,7 @@ pub async fn run_tui(cli: &Cli) -> Result<(), CliError> {
         source: e,
     })?;
 
+    let client = reqwest::Client::new();
     let url = format!("{}/workflows?limit=50", cli.base_url.trim_end_matches('/'));
 
     let res = run_app(&mut terminal, &client, &url, cli).await;

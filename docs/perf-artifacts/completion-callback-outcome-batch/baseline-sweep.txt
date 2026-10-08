@@ -1,5 +1,0 @@
--- baseline: completion-callback outcome-write sweep, pg_stat_statements --
-n	processed	outcome_write_calls	outcome_write_buffers	total_calls	total_buffers	wal_bytes
-10	10	10	131	15	260	16600
-50	50	50	678	55	1309	91488
-100	100	100	1370	105	2621	184152

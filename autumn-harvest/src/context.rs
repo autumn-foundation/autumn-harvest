@@ -48,19 +48,6 @@ pub fn empty_shared_state() -> SharedState {
 /// Default soft history-size threshold for recommending `continue_as_new`.
 pub const DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD: u64 = 10_000;
 
-/// Default hard cap on durable history events per run (issue #1804).
-///
-/// A run that reaches this count fails and moves to the DLQ with
-/// `HistoryCapExceeded`. Temporal terminates at 51,200 events.
-pub const DEFAULT_HISTORY_EVENT_HARD_CAP: u64 = 50_000;
-
-/// Default hard cap on stored history bytes per run (issue #1804): 50 MiB.
-///
-/// The worker measures `pg_column_size(event_data)`, the same measure as the
-/// tenant `max_history_bytes` quota. A run that reaches the cap fails and moves
-/// to the DLQ with `HistoryBytesCapExceeded`.
-pub const DEFAULT_HISTORY_BYTE_HARD_CAP: u64 = 50 * 1024 * 1024;
-
 /// Default deadline-fraction trigger for [`WorkflowContext::should_continue_as_new`]
 /// (issue #772).
 ///
@@ -73,16 +60,11 @@ pub const DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION: f64 = 0.8;
 /// Default fraction of [`WorkflowHistoryPolicy::event_hard_cap`] at which the
 /// operator early-warning soft threshold fires (issue #704).
 ///
-/// `0.2048` warns a still-running execution at 20.48% of the hard cap. Under
-/// the default cap that is 10,240 events, the same as Temporal's warning
-/// point (issue #1804). The gap gives an operator time to act before the cap
-/// fails the run.
-///
-/// The warning sits above the default `continue_as_new` threshold of 10,000.
-/// [`WorkflowContext::should_continue_as_new`] turns true only past that
-/// threshold. A warning at exactly 10,000 would page every run that rotates
-/// on the advisory. The 240-event margin covers the rotating decision.
-pub const DEFAULT_HISTORY_BLOAT_WARN_FRACTION: f64 = 0.2048;
+/// `0.75` means a still-running execution is warned once it has accumulated
+/// 75% of the configured hard-cap event count -- giving an operator a window
+/// to intervene (e.g. trigger a manual `continue_as_new`, or investigate a
+/// runaway loop) before the hard cap terminally fails the workflow.
+pub const DEFAULT_HISTORY_BLOAT_WARN_FRACTION: f64 = 0.75;
 
 /// Upper clamp for [`WorkflowContext::with_history_bloat_warn_fraction`]
 /// (issue #704, PR #1139 review, P2).
@@ -104,44 +86,16 @@ pub const DEFAULT_HISTORY_BLOAT_WARN_FRACTION: f64 = 0.2048;
 /// `ceil(100 * 0.999) = ceil(99.9) = 100 == cap`), which -- absent a further
 /// fix -- would collapse the promised "warn before the hard cap" window into
 /// "warn on the same decision cycle as the hard cap" for small caps (PR
-/// #1139 review, a later round). [`history_bloat_warn_threshold`] holds the
-/// real below-`cap` guarantee. It clamps the threshold to `cap - 1` for any
-/// `fraction`. That clamp keeps the signal working for every
-/// `(cap, fraction)` pair the public builder API can build. This
+/// #1139 review, a later round). The actual below-`cap` guarantee is
+/// enforced in `worker.rs`'s `history_bloat_threshold_crossed`, which clamps
+/// its computed threshold to `cap - 1` unconditionally of what `fraction`
+/// resolves to -- that clamp is what keeps the signal functional for every
+/// `(cap, fraction)` combination the public builder API can produce. This
 /// constant's `< 1.0` ceiling remains as an independent, secondary safety
 /// margin (and a reasonable API choice on its own: a fraction of exactly
 /// `1.0` is a confusing "wait until literally the entire cap" configuration
 /// regardless of the below-cap clamp).
 pub const MAX_HISTORY_BLOAT_WARN_FRACTION: f64 = 0.999;
-
-/// The event count at which the history-bloat warning fires (issue #704).
-///
-/// Returns `None` when `fraction <= 0.0`, the disabled sentinel. Otherwise
-/// the threshold is `ceil(cap * fraction)`, clamped to `cap - 1`.
-///
-/// The ceiling rounds up, not down. For cap 10 and fraction 0.75 the product
-/// is 7.5. A truncating cast warns at 7 events, which is 70% of the cap. The
-/// warning must fire at or past the configured fraction, so it fires at 8.
-///
-/// The clamp keeps at least one event of warning room below the hard cap.
-/// [`MAX_HISTORY_BLOAT_WARN_FRACTION`] limits `fraction` alone and cannot see
-/// `cap`. For cap 100, `ceil(100 * 0.999)` is 100, which equals the cap. The
-/// warning would then fire in the same decision as the hard cap, with no time
-/// to act. Only a clamp that sees both values prevents that, for every
-/// `(cap, fraction)` pair the public API can build.
-#[must_use]
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
-)]
-pub fn history_bloat_warn_threshold(cap: u64, fraction: f64) -> Option<u64> {
-    if fraction <= 0.0 {
-        return None;
-    }
-    let raw_threshold = (cap as f64 * fraction).ceil() as u64;
-    Some(raw_threshold.min(cap.saturating_sub(1)))
-}
 
 /// Default maximum byte length for the `current_details` string (issue #473).
 /// Values longer than this cap are truncated to this length on the byte boundary.
@@ -215,8 +169,6 @@ const fn encode_progress_seq(epoch: u64, local_index: u64) -> u64 {
 pub struct WorkflowHistoryPolicy {
     continue_as_new_threshold: u64,
     event_hard_cap: Option<u64>,
-    /// Hard cap on stored history bytes (issue #1804). `None` is unlimited.
-    byte_hard_cap: Option<u64>,
     /// Fraction of `execution_timeout` consumed at which
     /// [`WorkflowContext::should_continue_as_new`] additionally recommends a
     /// checkpoint (issue #772). Clamped into `[0.0, 1.0]`.
@@ -229,20 +181,15 @@ pub struct WorkflowHistoryPolicy {
     /// via [`Self::with_history_bloat_warn_fraction`], the sole (guarded)
     /// entry point, since this field is private.
     history_bloat_warn_fraction: f64,
-    /// Whether each decision appends a `DecisionCommitted` boundary
-    /// (issue #1833). Defaults to `false`.
-    decision_boundaries: bool,
 }
 
 impl Default for WorkflowHistoryPolicy {
     fn default() -> Self {
         Self {
             continue_as_new_threshold: DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD,
-            event_hard_cap: Some(DEFAULT_HISTORY_EVENT_HARD_CAP),
-            byte_hard_cap: Some(DEFAULT_HISTORY_BYTE_HARD_CAP),
+            event_hard_cap: None,
             continue_as_new_deadline_fraction: DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION,
             history_bloat_warn_fraction: DEFAULT_HISTORY_BLOAT_WARN_FRACTION,
-            decision_boundaries: false,
         }
     }
 }
@@ -254,8 +201,7 @@ impl WorkflowHistoryPolicy {
         self.continue_as_new_threshold
     }
 
-    /// Hard cap that moves an execution to the DLQ when reached. Defaults to
-    /// [`DEFAULT_HISTORY_EVENT_HARD_CAP`]; `None` is unlimited.
+    /// Optional hard cap that moves an execution to the DLQ when exceeded.
     #[must_use]
     pub const fn event_hard_cap(self) -> Option<u64> {
         self.event_hard_cap
@@ -277,39 +223,10 @@ impl WorkflowHistoryPolicy {
         self
     }
 
-    /// Override the event hard cap.
+    /// Override the optional hard cap.
     #[must_use]
     pub const fn with_event_hard_cap(mut self, cap: u64) -> Self {
         self.event_hard_cap = Some(cap);
-        self
-    }
-
-    /// Remove the event hard cap (issue #1804). This also turns off the
-    /// history-bloat warning, because the warning is a fraction of the cap.
-    #[must_use]
-    pub const fn without_event_hard_cap(mut self) -> Self {
-        self.event_hard_cap = None;
-        self
-    }
-
-    /// Hard cap on stored history bytes (issue #1804). Defaults to
-    /// [`DEFAULT_HISTORY_BYTE_HARD_CAP`]; `None` is unlimited.
-    #[must_use]
-    pub const fn byte_hard_cap(self) -> Option<u64> {
-        self.byte_hard_cap
-    }
-
-    /// Override the stored-history byte cap (issue #1804).
-    #[must_use]
-    pub const fn with_byte_hard_cap(mut self, cap: u64) -> Self {
-        self.byte_hard_cap = Some(cap);
-        self
-    }
-
-    /// Remove the stored-history byte cap (issue #1804).
-    #[must_use]
-    pub const fn without_byte_hard_cap(mut self) -> Self {
-        self.byte_hard_cap = None;
         self
     }
 
@@ -329,35 +246,6 @@ impl WorkflowHistoryPolicy {
     #[must_use]
     pub const fn history_bloat_warn_fraction(self) -> f64 {
         self.history_bloat_warn_fraction
-    }
-
-    /// Whether each decision appends a
-    /// [`DecisionCommitted`](crate::event::WorkflowEvent::DecisionCommitted)
-    /// boundary (issue #1833). Defaults to `false`.
-    #[must_use]
-    pub const fn decision_boundaries(self) -> bool {
-        self.decision_boundaries
-    }
-
-    /// Turn decision boundaries on or off (issue #1833).
-    ///
-    /// A process older than this release cannot decode a boundary. An old
-    /// worker fails the execution that holds one. So boundaries are off by
-    /// default, as the rolling-deploy contract requires. Turn them on when
-    /// no older process runs.
-    #[must_use]
-    pub const fn with_decision_boundaries(mut self, enabled: bool) -> Self {
-        self.decision_boundaries = enabled;
-        self
-    }
-
-    /// The event count at which the history-bloat warning fires (issue
-    /// #1804). `None` when the event cap is unlimited or the fraction is
-    /// `0.0`. See [`history_bloat_warn_threshold`].
-    #[must_use]
-    pub fn history_bloat_warn_threshold(self) -> Option<u64> {
-        self.event_hard_cap
-            .and_then(|cap| history_bloat_warn_threshold(cap, self.history_bloat_warn_fraction))
     }
 
     /// Override the history-bloat soft-warning fraction (issue #704). The
@@ -412,9 +300,8 @@ pub struct TransactionalState {
     pub(crate) exec_id: crate::types::ExecutionId,
     /// Unique ID of this activity invocation attempt.
     pub(crate) activity_id: crate::types::ActivityExecId,
-    /// The claim this attempt holds. It fences the lock and the completion
-    /// (issue #1789).
-    pub(crate) claim: crate::queue::TaskClaim,
+    /// Task queue row ID — used to lock and complete the task atomically.
+    pub(crate) task_id: uuid::Uuid,
     /// Maximum serialized result size in bytes (0 = unlimited).  Checked
     /// inside the transaction so an oversized result is caught before
     /// `ActivityCompleted` is committed.
@@ -425,7 +312,7 @@ const LOCAL_ACTIVITY_HEARTBEAT_REASON: &str =
 
 #[cfg(feature = "db")]
 struct ActivityCancellationCheck {
-    claim: crate::queue::TaskClaim,
+    task_id: uuid::Uuid,
     pool: ActivityCancellationPool,
     last_checked_at: Mutex<Option<Instant>>,
 }
@@ -501,9 +388,8 @@ pub enum WorkflowCommand {
     WaitForActivity {
         /// The existing activity execution ID from history.
         activity_id: ActivityExecId,
-        /// The parked coroutine waits on this channel. The open channel tells
-        /// the executor that the cycle is suspended (issue #1797). The worker
-        /// then re-parks durably.
+        /// The parked coroutine waits on this channel until the executor
+        /// suspension timeout drops it and the worker can re-park durably.
         result_tx: oneshot::Sender<Result<Value, String>>,
     },
     /// Start a durable timer.
@@ -589,10 +475,10 @@ pub enum WorkflowCommand {
     /// same `WorkflowId` (logical identity) but a new `ExecutionId` and a
     /// fresh event history.
     ///
-    /// The future that [`WorkflowContext::continue_as_new`] returns never
-    /// resolves. The worker drains this command after the executor suspends
-    /// the cycle. It treats the command as terminal, even if the workflow
-    /// function later returns.
+    /// The accompanying future returned by
+    /// [`WorkflowContext::continue_as_new`] never resolves: the worker drains
+    /// this command after the executor's suspension timeout and treats it as
+    /// terminal regardless of whether the workflow function later returns.
     ContinueAsNew {
         /// Input passed to the next iteration of the workflow.
         input: Value,
@@ -936,45 +822,6 @@ pub enum WorkflowCommand {
 }
 
 // Manual Debug because oneshot::Sender is not Debug.
-impl WorkflowCommand {
-    /// Returns `true` when a parked Harvest future still waits on this
-    /// command's result channel (issue #1797).
-    ///
-    /// The worker sends results only after the cycle drains, so an open
-    /// channel means the handler is parked here. The match is exhaustive on
-    /// purpose: a new variant must decide whether it parks.
-    pub(crate) fn awaits_result(&self) -> bool {
-        match self {
-            Self::ScheduleActivity { result_tx, .. }
-            | Self::WaitForActivity { result_tx, .. }
-            | Self::StartChildWorkflow { result_tx, .. }
-            | Self::ScheduleExternalActivity { result_tx, .. }
-            | Self::RunLocalActivity { result_tx, .. } => !result_tx.is_closed(),
-            Self::StartTimer { result_tx, .. } => !result_tx.is_closed(),
-            Self::WaitForSignal { result_tx, .. } => !result_tx.is_closed(),
-            Self::SignalExternalWorkflow { result_tx, .. }
-            | Self::RequestCancelExternalWorkflow { result_tx, .. }
-            | Self::AwaitExternalWorkflow { result_tx, .. } => !result_tx.is_closed(),
-            Self::AcquireMutex { result_tx, .. } => !result_tx.is_closed(),
-            Self::RecordMarker { .. }
-            | Self::RecordSideEffect { .. }
-            | Self::Complete { .. }
-            | Self::Fail { .. }
-            | Self::ContinueAsNew { .. }
-            | Self::RecordUpdateResult { .. }
-            | Self::UpsertSearchAttributes { .. }
-            | Self::SetCurrentDetails { .. }
-            | Self::PublishProgress { .. }
-            | Self::RecordLog { .. }
-            | Self::SpawnDetachedChildWorkflow { .. }
-            | Self::CancelRaceLosers { .. }
-            | Self::ArmTimer { .. }
-            | Self::CancelTimer { .. }
-            | Self::ReleaseMutex { .. } => false,
-        }
-    }
-}
-
 impl std::fmt::Debug for WorkflowCommand {
     #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1183,62 +1030,13 @@ impl std::fmt::Debug for WorkflowCommand {
     }
 }
 
-/// Counts the Harvest futures that wait with no result channel (issue #1797).
-///
-/// Most Harvest futures wait on a oneshot whose sender is in the command
-/// buffer, and the executor sees those there. A forever park or a false
-/// `await_condition` has no channel, so it holds a [`ParkToken`] instead.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct ParkCounter(Arc<std::sync::atomic::AtomicUsize>);
-
-impl ParkCounter {
-    /// Returns `true` when at least one token holds a park.
-    fn is_held(&self) -> bool {
-        self.0.load(std::sync::atomic::Ordering::Acquire) > 0
-    }
-}
-
-/// Marks one Harvest future as parked while it waits (issue #1797).
-///
-/// The mark is released when the future resolves or is dropped. A dropped
-/// future therefore never keeps a cycle suspended.
-#[derive(Debug)]
-pub(crate) struct ParkToken {
-    counter: ParkCounter,
-    held: bool,
-}
-
-impl ParkToken {
-    fn new(counter: &ParkCounter) -> Self {
-        Self {
-            counter: counter.clone(),
-            held: false,
-        }
-    }
-
-    fn hold(&mut self) {
-        if !self.held {
-            self.held = true;
-            self.counter
-                .0
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        }
-    }
-
-    fn release(&mut self) {
-        if self.held {
-            self.held = false;
-            self.counter
-                .0
-                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-        }
-    }
-}
-
-impl Drop for ParkToken {
-    fn drop(&mut self) {
-        self.release();
-    }
+/// Suspend forever — used by terminal commands like `continue_as_new` whose
+/// resolution is performed by the worker after draining the command rather
+/// than by completing a oneshot. The executor's suspension timeout will fire
+/// long before this future could resolve naturally.
+async fn park_until_dropped() -> HarvestResult<()> {
+    std::future::pending::<()>().await;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1436,9 +1234,7 @@ impl<'a> MutexHandle<'a> {
                     result_tx: tx,
                 });
                 let _ = rx.await;
-                self.context
-                    .park_forever::<HarvestResult<MutexGuard<'a>>>()
-                    .await
+                std::future::pending::<HarvestResult<MutexGuard<'a>>>().await
             }
             MutexGrantMatch::Diverged {
                 expected,
@@ -1541,15 +1337,13 @@ enum RaceBranchKind {
         workflow_name: String,
         input: Value,
     },
-    /// A durable deadline branch. Composes freely with every other branch kind
-    /// (issue #950); the exactly-one-timer + exactly-one-signal pair keeps its
-    /// dedicated legacy path — see [`RaceBuilder::run`].
+    /// Paired with exactly one [`RaceBranchKind::Signal`] branch and no other
+    /// branches — see [`RaceBuilder::run`] for the supported-shape rules.
     Timer {
         duration_secs: u64,
     },
-    /// A signal-arrival branch. Composes freely with every other branch kind
-    /// (issue #950); the exactly-one-timer + exactly-one-signal pair keeps its
-    /// dedicated legacy path — see [`RaceBuilder::run`].
+    /// Paired with exactly one [`RaceBranchKind::Timer`] branch and no other
+    /// branches — see [`RaceBuilder::run`] for the supported-shape rules.
     Signal {
         signal_name: String,
     },
@@ -1568,10 +1362,6 @@ struct RaceDispatch {
     index: usize,
     activity_id: Option<ActivityExecId>,
     child_id: Option<ExecutionId>,
-    /// The reserved `__race:{seq}:{index}` id of a timer branch's durable timer
-    /// (issue #950). `Some` only for [`RaceBranchKind::Timer`] branches; a
-    /// losing timer's still-armed row is deleted via `CancelRaceLosers.timers`.
-    timer_id: Option<TimerId>,
     /// `true` when this branch has never been dispatched before (its command
     /// must carry full scheduling parameters); `false` when it is already in
     /// history and only needs a `WaitForActivity` re-park.
@@ -1582,10 +1372,9 @@ struct RaceDispatch {
 #[derive(Debug, Clone)]
 pub struct RaceWinner {
     /// Index of the winning branch, in the order branches were added to the
-    /// [`RaceBuilder`] -- **except** for the legacy exactly-one-timer +
-    /// exactly-one-signal shape, where this is a fixed role-based index
-    /// (timer = `0`, signal = `1`) independent of `.timer()`/`.signal()` call
-    /// order; see [`RaceBuilder`]'s docs.
+    /// [`RaceBuilder`] -- **except** for the timer+signal shape, where this
+    /// is a fixed role-based index (timer = `0`, signal = `1`) independent of
+    /// `.timer()`/`.signal()` call order; see [`RaceBuilder`]'s docs.
     pub index: usize,
     /// The label attached via [`RaceBuilder::label`], if any.
     pub label: Option<String>,
@@ -1621,37 +1410,28 @@ impl RaceWinner {
 ///   races child workflows; every losing child is durably cancelled via the
 ///   same `cancel_workflow_execution_collect` primitive the external-cancel
 ///   feature uses (issue #492).
-/// - **Any mix of the four kinds** (issue #950): activities, child workflows,
-///   [`Self::timer`] deadlines and [`Self::signal`] waits compose freely in one
-///   call — hedging a slow activity against a deadline, awaiting a child under
-///   a timeout, or listening for an abort signal while an activity runs. The
-///   whole heterogeneous batch is persisted by the worker in **one
-///   transaction**, and every branch resolves independently as its own event
-///   arrives. A timer branch arms a durable timer under the reserved,
-///   deterministic id `__race:{seq}:{index}`; when it loses, that still-armed
-///   row is deleted by the same `CancelRaceLosers` teardown that cancels a
-///   losing activity or child. A losing signal branch needs no teardown — an
-///   undelivered signal simply stays observable to a later wait. A timer
-///   branch's [`RaceWinner::value`] is [`Value::Null`].
-/// - **Exactly one [`Self::timer`] + exactly one [`Self::signal`]**: kept as a
-///   thin wrapper around the fully-tested
+/// - **Exactly one [`Self::timer`] + exactly one [`Self::signal`]**: a thin
+///   wrapper around the fully-tested
 ///   [`WorkflowContext::receive_signal_timeout`]/`wait_for_signal_timeout`
-///   primitive (issue #476), so histories recorded before #950 replay
-///   unchanged. This shape records the reserved
-///   `__signal_timeout:{seq}:{name}` timer id and **no** `race:{seq}` open
-///   marker, and [`RaceWinner::index`] is a **fixed, role-based** value (the
-///   timer branch is always `0`, the signal branch is always `1`) rather than
-///   each branch's position in the builder chain — reordering
-///   `.timer()`/`.signal()` calls between deploys can never flip which index
-///   an in-flight execution observes, because the underlying winner
-///   determination is itself decided purely by recorded history order,
-///   independent of call order.
+///   primitive (issue #476). A losing signal simply stays observable to a
+///   later signal wait (nothing to durably cancel); a losing timer's
+///   still-armed durable timer row is removed by the worker exactly as it is
+///   today. Unlike the two homogeneous shapes above, [`RaceWinner::index`]
+///   for this shape is a **fixed, role-based** value (the timer branch is
+///   always `0`, the signal branch is always `1`) rather than each branch's
+///   position in the builder chain — reordering `.timer()`/`.signal()` calls
+///   between deploys can never flip which index an in-flight execution
+///   observes, because the underlying winner determination is itself decided
+///   purely by recorded history order, independent of call order.
 ///
-/// The only awaitable that cannot join a race is an inline **local activity**:
-/// it resolves within the decision cycle rather than parking, so it is
-/// rejected with a typed error rather than silently deferring its siblings
-/// (issue #950). Arbitrary non-ctx user futures remain outside the determinism
-/// contract (guardrail HVG010).
+/// Mixing branch kinds outside of these three shapes (e.g. racing an activity
+/// against a timer in the same call) returns [`HarvestError::Config`] from
+/// [`Self::run`] — the worker's suspension-persistence layer does not yet
+/// support a fully heterogeneous mixed-command batch (see the crate-level
+/// determinism guide, HVG010, for the rationale). Bound an individual
+/// activity with its own `start_to_close`/`schedule_to_close` timeout, or use
+/// `receive_signal_timeout` directly, to express a deadline-bounded branch
+/// instead.
 ///
 /// # Determinism contract
 ///
@@ -1751,10 +1531,9 @@ impl RaceBuilder<'_> {
         })
     }
 
-    /// Add a durable-timer branch — the deadline arm of a hedged or
-    /// timeout-bounded race. Composes with any other branch kind (issue #950).
-    /// `timeout` is rounded **up** to whole seconds. A timer win resolves to
-    /// [`RaceWinner::value`] `Value::Null`.
+    /// Add a durable-timer branch. Must be paired with exactly one
+    /// [`Self::signal`] branch and no other branches — see [`Self::run`].
+    /// `timeout` is rounded **up** to whole seconds.
     #[must_use]
     pub fn timer(self, timeout: std::time::Duration) -> Self {
         let duration_secs = timeout
@@ -1763,9 +1542,8 @@ impl RaceBuilder<'_> {
         self.push(RaceBranchKind::Timer { duration_secs })
     }
 
-    /// Add a signal branch — e.g. an abort signal interrupting a running
-    /// activity or child workflow. Composes with any other branch kind (issue
-    /// #950). A signal win resolves to the signal's payload.
+    /// Add a signal branch. Must be paired with exactly one [`Self::timer`]
+    /// branch and no other branches — see [`Self::run`].
     #[must_use]
     pub fn signal(self, signal_name: &str) -> Self {
         self.push(RaceBranchKind::Signal {
@@ -1796,7 +1574,9 @@ impl RaceBuilder<'_> {
     ///   [`Self::child_workflow`] branch's input could not be serialized
     ///   (surfaced here rather than silently running the branch with a
     ///   `null` input).
-    /// - [`HarvestError::Config`] if zero branches were added.
+    /// - [`HarvestError::Config`] if zero branches were added, or if the
+    ///   branch kinds don't form one of the three supported shapes (see the
+    ///   type-level docs).
     /// - [`HarvestError::Cancelled`] if the workflow has been cancelled.
     /// - [`HarvestError::NonDeterministic`] if replay disagrees with a
     ///   previously recorded winner or branch count.
@@ -1809,42 +1589,6 @@ impl RaceBuilder<'_> {
     }
 }
 
-/// The live-mode receiving end of one race branch (issue #950).
-///
-/// The four branch kinds park on channels of three different payload types
-/// (`Result<Value, String>` for activities and child workflows, `Value` for a
-/// signal, `()` for a timer), so a mixed race cannot hold a homogeneous
-/// `Vec<oneshot::Receiver<_>>`. Each variant normalises to the same
-/// `Result<Value, String>` the race future yields.
-enum RaceBranchReceiver {
-    /// An activity or child-workflow branch: the worker sends the branch's
-    /// output or its error string.
-    Output(oneshot::Receiver<Result<Value, String>>),
-    /// A signal branch: the worker sends the signal payload.
-    Signal(oneshot::Receiver<Value>),
-    /// A timer branch: the fire carries no value, so it normalises to
-    /// [`Value::Null`] — the same value [`RaceWinner::value`] documents for a
-    /// timer win.
-    Timer(oneshot::Receiver<()>),
-}
-
-impl RaceBranchReceiver {
-    /// Poll this branch, normalising its payload. `Ready(Err(_))` means the
-    /// sender was dropped (the branch will never resolve live).
-    fn poll_normalized(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<Result<Value, String>, oneshot::error::RecvError>> {
-        match self {
-            Self::Output(rx) => std::pin::Pin::new(rx).poll(cx),
-            Self::Signal(rx) => std::pin::Pin::new(rx).poll(cx).map(|r| r.map(Ok)),
-            Self::Timer(rx) => std::pin::Pin::new(rx)
-                .poll(cx)
-                .map(|r| r.map(|()| Ok(Value::Null))),
-        }
-    }
-}
-
 /// Live-mode future for `ctx.race()` (issue #600): polls every still-pending
 /// branch receiver in ascending index order on each poll, so a live in-cycle
 /// tie (multiple receivers ready in the same poll) always resolves to the
@@ -1853,7 +1597,7 @@ impl RaceBranchReceiver {
 /// treated as "will never resolve"; only when every receiver is gone does the
 /// future resolve to [`HarvestError::Cancelled`].
 struct RaceFirstFut {
-    receivers: Vec<(usize, RaceBranchReceiver)>,
+    receivers: Vec<(usize, oneshot::Receiver<Result<Value, String>>)>,
 }
 
 impl std::future::Future for RaceFirstFut {
@@ -1866,7 +1610,7 @@ impl std::future::Future for RaceFirstFut {
         let this = self.get_mut();
         let mut i = 0;
         while i < this.receivers.len() {
-            match this.receivers[i].1.poll_normalized(cx) {
+            match std::pin::Pin::new(&mut this.receivers[i].1).poll(cx) {
                 std::task::Poll::Ready(Ok(result)) => {
                     let (index, _) = this.receivers.remove(i);
                     return std::task::Poll::Ready(Ok((index, result)));
@@ -2170,8 +1914,11 @@ impl WorkflowLogger<'_> {
         // never triggers the `pump_signal_handlers` post-hook (mirroring
         // `publish_progress` and `info()`; `is_replaying()` locks the same way,
         // so this is behaviourally identical to the pre-#790 guard).
-        if self.ctx.replay_suppresses_side_effects() {
-            return;
+        {
+            let matcher = self.ctx.matcher.lock().expect("matcher lock poisoned");
+            if matcher.is_replaying() {
+                return;
+            }
         }
 
         // Sink 1: tracing (unchanged from issue #379).
@@ -2312,44 +2059,12 @@ pub const DEFAULT_SESSION_ACQUISITION_TIMEOUT: std::time::Duration =
 /// timer id as `{CHILD_TIMEOUT_TIMER_PREFIX}{seq}:{workflow_name}` from the
 /// per-context `child_timeout_seq` counter. The worker's
 /// `extract_child_timeout_race` extractor requires this exact prefix so a
-/// hand-rolled `futures::join!(spawn_child_workflow(..), timer(..))` batch
+/// hand-rolled `tokio::join!(spawn_child_workflow(..), timer(..))` batch
 /// (one plain child + one ordinary timer) is NOT mistaken for the
-/// child-timeout primitive, whose child-win teardown deletes the deadline row.
-///
-/// Since issue #950 such a batch is persisted by the generalized mixed path
-/// rather than failing loud — which is correct for its actual semantics: a
-/// `join!` is a wait-**all**, so the workflow awaits the ordinary timer too and
-/// there is no "child won, deadline abandoned" case to tear down. The
-/// wait-**first** form is `ctx.race().child_workflow(..).timer(..)`, whose timer
-/// branch carries the distinct [`RACE_TIMER_PREFIX`] id and IS torn down by that
-/// race's own `CancelRaceLosers`. Keeping the prefix check therefore still
-/// matters: it stops an ordinary timer from inheriting the child-timeout
-/// primitive's teardown (and its `Ok(None)` timeout semantics) by accident.
+/// child-timeout primitive — it must stay on the generic fail-loud
+/// "unsupported commands" path so its ordinary timer is never silently left
+/// undeleted on a child-win.
 pub(crate) const CHILD_TIMEOUT_TIMER_PREFIX: &str = "__child_timeout:";
-
-/// Reserved timer-id prefix for a [`RaceBuilder`] timer branch (issue #950).
-///
-/// A `ctx.race()` timer branch derives its durable timer id as
-/// `{RACE_TIMER_PREFIX}{seq}:{index}` — the race's own sequence number plus the
-/// branch's position in the builder chain. Both are deterministic, so every
-/// replay re-derives the identical id and the recorded `TimerStarted` always
-/// matches; the worker's new-vs-existing row check then makes a re-park (the
-/// workflow woke on a sibling branch while this timer is still pending)
-/// idempotent.
-///
-/// The reserved prefix keeps race timers out of the user timer-id namespace,
-/// mirroring [`CHILD_TIMEOUT_TIMER_PREFIX`] (#779) and the
-/// `__signal_timeout:{seq}:{name}` convention of #476. It is deliberately
-/// DISTINCT from both, so `extract_child_timeout_race` never mistakes a
-/// `race().child_workflow(..).timer(..)` batch for the `spawn_child_workflow_timeout`
-/// primitive (that batch takes the generalized mixed path instead, where a
-/// losing timer is torn down by this race's own `CancelRaceLosers`).
-pub(crate) const RACE_TIMER_PREFIX: &str = "__race:";
-
-/// The deterministic durable timer id for race `seq`'s branch `index`.
-pub(crate) fn race_timer_id(seq: u32, index: usize) -> String {
-    format!("{RACE_TIMER_PREFIX}{seq}:{index}")
-}
 
 /// Saturating `Duration` → milliseconds conversion for error reporting
 /// (a multi-year timeout would otherwise overflow `u64` millis on `as_millis`).
@@ -2780,8 +2495,6 @@ pub struct WorkflowContext {
     matcher: Mutex<HistoryMatcher>,
     /// Commands accumulated during live execution, drained by the worker.
     commands: Mutex<Vec<WorkflowCommand>>,
-    /// Harvest futures parked with no result channel (issue #1797).
-    parks: ParkCounter,
     /// Deterministic "now" -- the timestamp from the `WorkflowStarted` event.
     start_time: DateTime<Utc>,
     /// History-size thresholds visible to author code.
@@ -2819,47 +2532,6 @@ pub struct WorkflowContext {
     /// this once so each race has a stable, unique `__child_timeout:{seq}:{name}`
     /// timer ID across replays, distinct from `signal_timeout_seq`.
     child_timeout_seq: Mutex<u32>,
-    /// Monotonically increasing counter for the deterministic child *placement*
-    /// key (issue #956). Combined with the parent's `ExecutionId` by
-    /// [`crate::shard::child_placement_key`] into the rendezvous key, so the
-    /// Nth placement-aware child spawn in a workflow always hashes the same key
-    /// and therefore lands on the same shard.
-    ///
-    /// Incremented on **every** invocation of a placement-aware spawn — live and
-    /// replay alike — exactly like `fan_out_seq`, `race_seq` and
-    /// `child_timeout_seq`, and deliberately unlike `activity_seq`. That
-    /// distinction is load-bearing: a fresh `WorkflowContext` is built per
-    /// decision cycle, so a counter that only advanced on a *fresh* dispatch
-    /// would restart at zero every cycle and hand the same key to every child of
-    /// a sequential `for … { spawn(…).await }` loop — each of those children is
-    /// the only fresh dispatch in its own cycle — collapsing the whole loop onto
-    /// one shard. Counting invocations instead makes the Nth spawn's key depend
-    /// on its position in the workflow, not on which cycle happened to dispatch
-    /// it, which is also what gives a crash-retried cycle the identical
-    /// placement (the restart-stability contract a top-level start gets from its
-    /// caller-supplied `workflow_id`).
-    child_placement_seq: Mutex<u32>,
-    /// Shard router used to resolve a non-default [`ChildPlacement`]
-    /// (issue #956).
-    ///
-    /// `None` — the default, and what every executor entry point constructs —
-    /// falls back to the process-global [`crate::shard::GLOBAL_SHARD_ROUTER`]
-    /// the runtime installs at boot. An explicit router is threaded in by tests
-    /// and by embedders that run several topologies in one process, so
-    /// placement never depends on mutating a process global.
-    shard_router: Option<crate::shard::ShardRouter>,
-    /// The shard the parent row lives on RIGHT NOW (issue #1405). Read live
-    /// from the execution row's `shard_id` column at context construction,
-    /// the same pattern as `deadline_at`. `self.exec_id.shard()` names
-    /// where this run was MINTED, not where a rebalanced run lives today.
-    ///
-    /// Used only to place a `ParentShard` child (the default) on the row's
-    /// true current shard. `None` -- the replayer / test-env paths that carry
-    /// no live row -- falls back to `self.exec_id.shard()`, the pre-#1405
-    /// behaviour. A fresh dispatch never reaches this during pure replay: a
-    /// history-matched child spawn reuses its recorded `child_id` and never
-    /// mints (see [`Self::mint_child_id`]).
-    current_shard_id: Option<crate::types::ShardId>,
     /// Monotonically increasing counter for naming `ctx.race()` markers
     /// (issue #600). Each `race()` call increments this once so each race has
     /// stable, unique `race:{seq}` / `race_winner:{seq}` marker names across
@@ -3001,20 +2673,6 @@ pub struct WorkflowContext {
     /// history. Registration is idempotent -- the first registration wins on
     /// each replay, mirroring `update_registry`.
     signal_registry: Mutex<SignalHandlerRegistry>,
-    /// Depth of the current *signal-pump hold* (issue #950 post-ship
-    /// hardening, issue #1252).
-    ///
-    /// `pump_signal_handlers` normally runs after every `match_history` call.
-    /// A `ctx.race()` with a signal branch has to open a window in that rule:
-    /// it makes several matcher calls between reading its own `race:{seq}`
-    /// open marker and giving each signal branch a chance to claim, and a
-    /// handler registered for a branch's name would otherwise claim the
-    /// signal in one of those gaps -- before the branch it belongs to has
-    /// run. `race_impl` raises this counter across that window and pumps once
-    /// on the way out. A counter rather than a flag so nesting cannot clear
-    /// an outer hold early; a `Drop` guard so `race_impl`'s several early
-    /// `return Err(..)` paths cannot leak one.
-    signal_pump_hold: std::sync::atomic::AtomicUsize,
     /// Cancellation reason captured from a `WorkflowCancelled` event in history,
     /// if any. When set, `is_cancelled()` returns true and `check_cancellation()`
     /// yields [`HarvestError::Cancelled`]. Cooperative: the workflow function is
@@ -3212,26 +2870,6 @@ pub struct WorkflowExecutionInfo {
     pub parent_execution_id: Option<ExecutionId>,
 }
 
-/// RAII guard returned by `WorkflowContext::hold_signal_pump` (issue #1252).
-///
-/// Holds `pump_signal_handlers` off for the lifetime of the guard so a
-/// multi-call signal phase -- `ctx.race()`'s branch loop -- cannot lose one of
-/// its own signals to a push handler registered for the same name. The guard
-/// exists so the holder's early-error paths release the hold too; releasing it
-/// is *not* the same as flushing, so the holder still calls
-/// `flush_pending_signal_handlers` on its success path.
-struct SignalPumpHold<'a> {
-    ctx: &'a WorkflowContext,
-}
-
-impl Drop for SignalPumpHold<'_> {
-    fn drop(&mut self) {
-        self.ctx
-            .signal_pump_hold
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
 impl WorkflowContext {
     // ── Internal Helpers ──────────────────────────────────────────────────
 
@@ -3283,32 +2921,7 @@ impl WorkflowContext {
     /// strict replay the matcher is never locked, so no `pump_signal_handlers`
     /// side effect is introduced on the non-strict path.
     fn strict_replay_no_match_is_divergence(&self) -> bool {
-        self.strict_replay
-            && !(self.canary_mode && self.match_history(|m| m.position() >= m.len()))
-            // Issue #952 — the FAILING-FRONTIER exception. A history sealed by a
-            // terminal `WorkflowFailed` is truncated by construction: the
-            // commands the failing cycle issued were never turned into events,
-            // and no further event can ever be appended to the sealed run. So
-            // once every pre-terminal event is consumed there is nothing left to
-            // compare a new command against, and the `NoMatch` the transparent
-            // tail produces is "the run is failing", not drift. Divergence
-            // BEFORE that point is still fully reported — every recorded event
-            // is matched positionally exactly as before.
-            && !self.at_terminal_failure_frontier()
-    }
-
-    /// Whether the matcher sits at the **failing frontier** of a history sealed
-    /// by a terminal `WorkflowFailed` (issue #952) — see
-    /// [`crate::replay::HistoryMatcher::at_terminal_failure_frontier`].
-    ///
-    /// Locks the matcher directly rather than going through `match_history`, so
-    /// this read triggers no `pump_signal_handlers` post-hook — it is a
-    /// question ABOUT the cursor, never a step of it.
-    pub(crate) fn at_terminal_failure_frontier(&self) -> bool {
-        self.matcher
-            .lock()
-            .expect("matcher lock poisoned")
-            .at_terminal_failure_frontier()
+        self.strict_replay && !(self.canary_mode && self.match_history(|m| m.position() >= m.len()))
     }
 
     fn check_strict_replay_no_match(&self, actual_event: &str) -> HarvestResult<()> {
@@ -3321,28 +2934,6 @@ impl WorkflowContext {
             ));
         }
         Ok(())
-    }
-
-    /// [`check_strict_replay_no_match`](Self::check_strict_replay_no_match) for a
-    /// signal wait (issue #950).
-    ///
-    /// The generic check treats "the cursor is at end of history" as the canary
-    /// frontier. That is the wrong question for a signal wait inside a MIXED
-    /// suspension batch: `join!(ctx.wait_for_signal(..), ctx.execute_activity(..))`
-    /// records only the sibling's events, so when the deploy canary samples the
-    /// parked execution the signal branch has nothing to match while the
-    /// sibling's `ActivityScheduled`/`ActivityCompleted` are still unconsumed
-    /// ahead of the cursor — a healthy in-flight park reported as a false
-    /// non-determinism, which would block a deploy.
-    ///
-    /// The frontier question that actually holds for a signal wait is whether
-    /// any matching signal remains available at all. Mirrors the #779 fix, which
-    /// exempted the child-timeout race's `InProgress` arm for the same reason.
-    fn check_strict_replay_signal_no_match(&self, signal_name: &str) -> HarvestResult<()> {
-        if self.canary_mode && !self.match_history(|m| m.has_unconsumed_signal(signal_name)) {
-            return Ok(());
-        }
-        self.check_strict_replay_no_match(&format!("WaitForSignal({signal_name})"))
     }
 
     fn match_history<F, R>(&self, f: F) -> R
@@ -3383,20 +2974,6 @@ impl WorkflowContext {
     /// the handlers registered so far, not ones about to register on the
     /// next line.
     fn pump_signal_handlers(&self) {
-        // A signal-phase hold is in force (issue #1252): some caller is
-        // mid-way through a sequence of matcher calls whose own branches have
-        // first claim on the signals now sitting in `pending_signals`.
-        // Claiming here would resolve a handler with a signal its rightful
-        // waiter never got to see. The holder pumps once on release, so
-        // nothing is dropped -- only deferred to the end of that sequence.
-        if self
-            .signal_pump_hold
-            .load(std::sync::atomic::Ordering::Relaxed)
-            > 0
-        {
-            return;
-        }
-
         let names = self
             .signal_registry
             .lock()
@@ -3448,20 +3025,6 @@ impl WorkflowContext {
     /// are registered (the overwhelmingly common case).
     pub(crate) fn flush_pending_signal_handlers(&self) {
         self.match_history(|_| ());
-    }
-
-    /// Suspends [`pump_signal_handlers`](Self::pump_signal_handlers) until the
-    /// returned guard drops (issue #1252).
-    ///
-    /// Callers that need this are the ones whose *own* matcher calls are the
-    /// thing standing between a recorded signal and its rightful consumer --
-    /// today that is `race_impl`'s signal phase. Drop the guard and call
-    /// [`flush_pending_signal_handlers`](Self::flush_pending_signal_handlers)
-    /// to dispatch whatever the phase left unclaimed.
-    fn hold_signal_pump(&self) -> SignalPumpHold<'_> {
-        self.signal_pump_hold
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        SignalPumpHold { ctx: self }
     }
 
     pub(crate) fn is_timer_started_next(&self, timer_id: &str) -> bool {
@@ -3555,18 +3118,14 @@ impl WorkflowContext {
             exec_id,
             matcher: Mutex::new(matcher),
             commands: Mutex::new(Vec::new()),
-            parks: ParkCounter::default(),
             start_time,
             history_policy,
             execution_timeout: None,
             deadline_at: None,
-            current_shard_id: None,
             activity_seq: Mutex::new(0),
             fan_out_seq: Mutex::new(0),
             signal_timeout_seq: Mutex::new(0),
             child_timeout_seq: Mutex::new(0),
-            child_placement_seq: Mutex::new(0),
-            shard_router: None,
             race_seq: Mutex::new(0),
             session_seq: Mutex::new(0),
             business_day_seq: Mutex::new(0),
@@ -3585,7 +3144,6 @@ impl WorkflowContext {
             update_registry: Mutex::new(UpdateRegistry::new()),
             declarative_updates: Mutex::new(std::collections::HashMap::new()),
             signal_registry: Mutex::new(SignalHandlerRegistry::new()),
-            signal_pump_hold: std::sync::atomic::AtomicUsize::new(0),
             cancellation_reason,
             strict_replay: false,
             canary_mode: false,
@@ -3665,25 +3223,8 @@ impl WorkflowContext {
     /// Terminal lifecycle events are excluded because they are appended by the
     /// executor after the workflow returns and are never consumed by workflow
     /// commands.
-    ///
-    /// The worker path uses the narrower `first_unconsumed_command_event`
-    /// (issue #1791).
     pub fn history_has_unconsumed_events(&self) -> bool {
         self.match_history(|m| m.has_non_lifecycle_unconsumed())
-    }
-
-    /// Returns the first recorded command event that this cycle did not
-    /// consume, as `(event_index, event_name)` (issue #1791).
-    ///
-    /// See [`crate::replay::HistoryMatcher::first_unconsumed_command_event`].
-    /// The read locks the matcher directly, so it runs no signal-handler
-    /// pump. A pump here could dispatch a signal handler after the cycle
-    /// ends. The read does not move the cursor.
-    pub(crate) fn first_unconsumed_command_event(&self) -> Option<(usize, String)> {
-        self.matcher
-            .lock()
-            .expect("matcher lock poisoned")
-            .first_unconsumed_command_event()
     }
 
     /// Delivered signals this workflow left unconsumed at the current frontier,
@@ -3728,18 +3269,14 @@ impl WorkflowContext {
             exec_id,
             matcher: Mutex::new(crate::replay::HistoryMatcher::new(vec![])),
             commands: Mutex::new(Vec::new()),
-            parks: ParkCounter::default(),
             start_time,
             history_policy: WorkflowHistoryPolicy::default(),
             execution_timeout: None,
             deadline_at: None,
-            current_shard_id: None,
             activity_seq: Mutex::new(0),
             fan_out_seq: Mutex::new(0),
             signal_timeout_seq: Mutex::new(0),
             child_timeout_seq: Mutex::new(0),
-            child_placement_seq: Mutex::new(0),
-            shard_router: None,
             race_seq: Mutex::new(0),
             session_seq: Mutex::new(0),
             business_day_seq: Mutex::new(0),
@@ -3758,7 +3295,6 @@ impl WorkflowContext {
             update_registry: Mutex::new(UpdateRegistry::new()),
             declarative_updates: Mutex::new(std::collections::HashMap::new()),
             signal_registry: Mutex::new(SignalHandlerRegistry::new()),
-            signal_pump_hold: std::sync::atomic::AtomicUsize::new(0),
             cancellation_reason,
             strict_replay: false,
             canary_mode: false,
@@ -3799,18 +3335,14 @@ impl WorkflowContext {
             exec_id,
             matcher: Mutex::new(HistoryMatcher::new(vec![])),
             commands: Mutex::new(Vec::new()),
-            parks: ParkCounter::default(),
             start_time,
             history_policy: WorkflowHistoryPolicy::default(),
             execution_timeout: None,
             deadline_at: None,
-            current_shard_id: None,
             activity_seq: Mutex::new(0),
             fan_out_seq: Mutex::new(0),
             signal_timeout_seq: Mutex::new(0),
             child_timeout_seq: Mutex::new(0),
-            child_placement_seq: Mutex::new(0),
-            shard_router: None,
             race_seq: Mutex::new(0),
             session_seq: Mutex::new(0),
             business_day_seq: Mutex::new(0),
@@ -3829,7 +3361,6 @@ impl WorkflowContext {
             update_registry: Mutex::new(UpdateRegistry::new()),
             declarative_updates: Mutex::new(std::collections::HashMap::new()),
             signal_registry: Mutex::new(SignalHandlerRegistry::new()),
-            signal_pump_hold: std::sync::atomic::AtomicUsize::new(0),
             cancellation_reason: None,
             strict_replay: false,
             canary_mode: false,
@@ -3894,16 +3425,6 @@ impl WorkflowContext {
     /// deadline rather than the SUM of durations — matching production, where all
     /// deadlines in one `await_fire` batch start at the same instant. A no-op in
     /// production (no virtual clock).
-    /// Read the virtual timer clock's current elapsed seconds — the shared
-    /// **anchor** for a set of concurrently-armed timers (issue #950). `0` in
-    /// production (no virtual clock).
-    #[cfg(any(test, feature = "testing"))]
-    fn timer_clock_elapsed(&self) -> u64 {
-        self.timer_clock_elapsed_secs
-            .as_ref()
-            .map_or(0, |a| a.load(std::sync::atomic::Ordering::Relaxed))
-    }
-
     #[cfg(any(test, feature = "testing"))]
     fn advance_timer_clock_to(&self, target_secs: u64) {
         if let Some(ref atomic) = self.timer_clock_elapsed_secs {
@@ -3960,8 +3481,8 @@ impl WorkflowContext {
     /// Install the builder-level default activity retry/timeout floor (issue #620).
     ///
     /// Consumed by the LOCAL activity path (`execute_local_activity_with_opts`)
-    /// as the lowest-priority fallback. `None` sets no floor. The regular/DAG
-    /// activity path resolves the same floor
+    /// as the lowest-priority fallback. Both `None` (the default) preserves
+    /// today's behaviour. The regular/DAG activity path resolves the same floor
     /// worker-side in `persist_scheduled_activities`.
     #[must_use]
     pub fn with_activity_defaults(
@@ -4091,21 +3612,6 @@ impl WorkflowContext {
     #[must_use]
     pub const fn with_deadline(mut self, deadline_at: Option<DateTime<Utc>>) -> Self {
         self.deadline_at = deadline_at;
-        self
-    }
-
-    /// Set the shard the parent row lives on right now (issue #1405).
-    ///
-    /// Threaded by the executor from the loaded execution row's `shard_id`
-    /// column, mirroring [`with_deadline`](Self::with_deadline). Used to
-    /// place a `ParentShard` child on the row's true current shard rather
-    /// than the origin bits encoded in `self.exec_id`.
-    #[must_use]
-    pub const fn with_current_shard_id(
-        mut self,
-        current_shard_id: Option<crate::types::ShardId>,
-    ) -> Self {
-        self.current_shard_id = current_shard_id;
         self
     }
 
@@ -4379,12 +3885,12 @@ impl WorkflowContext {
         // [`history_event_count`](Self::history_event_count) accessor stays the
         // total, because [`should_continue_as_new`](Self::should_continue_as_new)
         // needs the whole-history size for its checkpoint decision.)
-        // Issue #952: `is_replaying` here must agree with `ctx.is_replaying()`
-        // at the same position, so it carries the sealed-run clause too.
-        let is_replaying = self.replay_suppresses_side_effects();
-        let history_event_count = {
+        let (history_event_count, is_replaying) = {
             let matcher = self.matcher.lock().expect("matcher lock poisoned");
-            u64::try_from(matcher.position()).unwrap_or(u64::MAX)
+            (
+                u64::try_from(matcher.position()).unwrap_or(u64::MAX),
+                matcher.is_replaying(),
+            )
         };
         WorkflowExecutionInfo {
             execution_id: self.execution_id(),
@@ -4799,39 +4305,7 @@ impl WorkflowContext {
     /// Panics if the internal matcher mutex is poisoned.
     #[must_use]
     pub fn is_replaying(&self) -> bool {
-        self.replay_suppresses_side_effects()
-    }
-
-    /// The single "this cycle must not re-fire side effects" predicate — the
-    /// cursor-based replay check, PLUS (issue #952) a run already sealed by a
-    /// terminal `WorkflowFailed`.
-    ///
-    /// A sealed run is finished history, so re-executing it (a post-mortem query
-    /// replay (#612), the `WorkflowReplayer`) is always a replay — even though
-    /// the transparent terminal-failure tail leaves the cursor-based check
-    /// reporting "past history". Without this every replay-suppressed side
-    /// effect (the #379 logger, #532 business metrics, `set_current_details`,
-    /// search-attribute patches, #791 progress chunks) would re-fire on a sealed
-    /// run, and a `version()` gate would try to grow a history that can never
-    /// accept another event.
-    ///
-    /// Every suppression guard in this file routes through here — including the
-    /// ones that lock the matcher directly rather than calling
-    /// [`Self::is_replaying`] — so the two spellings can never drift.
-    pub(crate) fn replay_suppresses_side_effects(&self) -> bool {
-        let matcher = self.matcher.lock().expect("matcher lock poisoned");
-        matcher.is_replaying() || matcher.has_terminal_failure_tail()
-    }
-
-    /// Cursor-only "is there recorded history left to consume?" — the
-    /// live-frontier question, which (unlike [`Self::is_replaying`]) answers
-    /// `false` inside a transparent terminal-failure tail (issue #952).
-    ///
-    /// Used only where the question really is "did the matcher run off the end
-    /// of recorded history?", never as a replay-suppression guard.
-    fn at_history_frontier(&self) -> bool {
-        !self
-            .matcher
+        self.matcher
             .lock()
             .expect("matcher lock poisoned")
             .is_replaying()
@@ -5542,13 +5016,7 @@ impl WorkflowContext {
 
         // During live execution (matcher returned max_version and is past
         // history), emit a marker so future replays see this version.
-        //
-        // Cursor-only frontier check (issue #952): `match_version` decided it was
-        // past history from the same cursor state and latched
-        // `patch_ids_recorded_this_cycle` expecting this push, so the two must
-        // ask the same question. `is_replaying()` additionally reports `true`
-        // for a sealed-failed run, which would latch without pushing.
-        if self.at_history_frontier() && version == max {
+        if !self.is_replaying() && version == max {
             self.push_command(WorkflowCommand::RecordMarker {
                 name: crate::replay::version_marker_name(change_id),
                 details: Value::from(u64::from(max)),
@@ -5683,12 +5151,8 @@ impl WorkflowContext {
                 // recorded history (live frontier) by construction — the
                 // marker is recorded exactly once per call site, never during
                 // a replay pass.
-                // Cursor-only frontier check: a `patched()` call reached
-                // inside a transparent terminal-failure tail (issue #952) is
-                // still "past recorded history" for the matcher, even though
-                // `is_replaying()` reports `true` for the sealed run.
                 debug_assert!(
-                    self.at_history_frontier(),
+                    !self.is_replaying(),
                     "NewlyPatched must only be returned on the live frontier"
                 );
                 self.push_command(WorkflowCommand::RecordMarker {
@@ -6118,16 +5582,6 @@ impl WorkflowContext {
     ///   not match `name`.
     /// - [`HarvestError::ActivityFailed`] if recorded history shows exhausted retries.
     /// - [`HarvestError::Cancelled`] if the result channel was dropped.
-    /// - [`HarvestError::Config`] if this call shares a suspension batch with a
-    ///   **durable** awaitable — an activity, timer, signal wait or child
-    ///   workflow (issue #950). A local activity resolves *within* the decision
-    ///   cycle rather than parking, so it cannot be joined with waits that do:
-    ///   `futures::join!(ctx.execute_local_activity_raw(..), ctx.timer(..))` is
-    ///   rejected, naming the sibling commands. (Before #950 the siblings were
-    ///   silently dropped and the timer was armed a whole decision cycle late.)
-    ///   Await the local activity before or after the concurrent block, or use a
-    ///   regular `ctx.execute_activity`, which composes freely in
-    ///   `join!`/`try_join!`/`ctx.race()`.
     ///
     /// # Panics
     ///
@@ -6185,7 +5639,7 @@ impl WorkflowContext {
         // so appending the builder default here yields the full precedence
         // (call → activity → builder). A direct `_raw` caller with `None`
         // (e.g. a DAG/raw local dispatch) falls straight through to the builder
-        // default. `None` sets no floor. The
+        // default. Both `None` = today's behaviour, byte-for-byte. The
         // regular/remote path resolves the same floor worker-side via the
         // shared `policy::resolve_effective_*` helpers.
         let retry_policy = retry_policy.or_else(|| self.default_activity_retry_policy.clone());
@@ -7203,120 +6657,6 @@ impl WorkflowContext {
         self.suspending.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Returns why this context cannot stay resident, or `None` (issue #1798).
-    ///
-    /// A resident workflow resumes its parked future with one new result. A
-    /// warm decision must then equal a cold replay. Each state below can make
-    /// a cold replay read the new events in a way that a parked future cannot:
-    ///
-    /// - A held park token resolves only by a replay match.
-    /// - A push signal handler runs inside history matching.
-    /// - A held mutex depends on the suspension flag of each cycle.
-    /// - A cancel request, a non-determinism record or a strict, canary or
-    ///   test-clock context changes how replay reads events.
-    /// - Unread history means that the cursor is not at the live frontier.
-    ///
-    /// # Panics
-    ///
-    /// Panics if an internal mutex is poisoned.
-    pub(crate) fn resident_blocker(&self) -> Option<&'static str> {
-        if self.parks.is_held() {
-            return Some("a park token is held");
-        }
-        if self.strict_replay || self.canary_mode {
-            return Some("strict or canary replay");
-        }
-        #[cfg(any(test, feature = "testing"))]
-        if self.timer_clock_elapsed_secs.is_some() {
-            return Some("the advancing test clock is on");
-        }
-        if self.cancellation_reason.is_some() {
-            return Some("the run is cancelled");
-        }
-        if !self
-            .signal_registry
-            .lock()
-            .expect("signal_registry lock poisoned")
-            .list_names()
-            .is_empty()
-        {
-            return Some("a push signal handler is registered");
-        }
-        if !self
-            .held_mutex_keys
-            .lock()
-            .expect("held_mutex_keys lock poisoned")
-            .is_empty()
-        {
-            return Some("a durable mutex is held");
-        }
-        if self
-            .nd_details
-            .lock()
-            .expect("nd_details lock poisoned")
-            .is_some()
-            || self
-                .deferred_nd_error
-                .lock()
-                .expect("deferred_nd_error lock poisoned")
-                .is_some()
-        {
-            return Some("a non-determinism record is set");
-        }
-        if self
-            .matcher
-            .lock()
-            .expect("matcher lock poisoned")
-            .has_buffered_history()
-        {
-            return Some("history is not fully read");
-        }
-        None
-    }
-
-    /// Starts the next cycle of a resident workflow (issue #1798).
-    ///
-    /// A cold cycle builds a new context. A resident cycle reuses this one,
-    /// so it resets the state that a new context starts with:
-    ///
-    /// - The suspension flag, so that a mutex guard drop releases again.
-    /// - The per-cycle log and progress counters.
-    ///
-    /// It also appends `delta` to the matcher as consumed events. The replay
-    /// position, the history length and the history scans then match a cold
-    /// replay. The call ordinals and sequence counters keep their values. A
-    /// replay from the top counts up to the same values.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the matcher mutex is poisoned.
-    #[cfg_attr(not(any(feature = "db", feature = "testing")), allow(dead_code))] // Resident paths need the worker or the test harness.
-    pub(crate) fn begin_resident_cycle(&self, delta: &[WorkflowEvent]) {
-        self.set_suspending(false);
-        self.log_commands_queued
-            .store(0, std::sync::atomic::Ordering::Relaxed);
-        self.progress_local_index
-            .store(0, std::sync::atomic::Ordering::Relaxed);
-        self.matcher
-            .lock()
-            .expect("matcher lock poisoned")
-            .append_consumed(delta);
-    }
-
-    /// Whether a non-blocking signal claim probed `signal_name` with a scan
-    /// that reached the end of history (issue #1798). A resident workflow
-    /// must not resume a wait for such a signal.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the matcher mutex is poisoned.
-    pub(crate) fn signal_probed_at_frontier(&self, signal_name: &str) -> bool {
-        self.matcher
-            .lock()
-            .expect("matcher lock poisoned")
-            .signal_probed_at_frontier(signal_name)
-    }
-
     /// Cancel an author-controlled durable timer by id.
     ///
     /// Deletes the pending durable timer row and records a `TimerCancelled`
@@ -7611,195 +6951,10 @@ impl WorkflowContext {
                     });
                     // Park: the armed timer wakes the task on fire (or a cancel
                     // recorded earlier is observed on the next cycle).
-                    self.park_until_dropped().await?;
+                    park_until_dropped().await?;
                 }
             }
         }
-    }
-
-    /// Thread an explicit [`ShardRouter`](crate::shard::ShardRouter) for
-    /// resolving non-default [`ChildPlacement`](crate::shard::ChildPlacement)
-    /// (issue #956).
-    ///
-    /// Without this the context falls back to the process-global router the
-    /// runtime installs at boot, which is the production path. Supplying one
-    /// explicitly is for tests and for embedders running more than one topology
-    /// in a single process — neither should have to mutate a process global to
-    /// exercise placement.
-    #[must_use]
-    pub fn with_shard_router(mut self, router: crate::shard::ShardRouter) -> Self {
-        self.shard_router = Some(router);
-        self
-    }
-
-    /// The EXPLICITLY threaded router, if [`Self::with_shard_router`] installed
-    /// one — never the process-global fallback (issue #1263 items 11/15/17).
-    ///
-    /// The worker's persist-time preflight
-    /// (`crate::cross_shard_child::preflight_target_shard`) needs to
-    /// validate a placement against the SAME router that resolved it. Not
-    /// against whichever router happens to be installed by the time
-    /// persistence runs.
-    ///
-    /// Handing it the global router's OWN snapshot here would defeat that.
-    /// A context with no explicit router intends "ask the global, fresh,
-    /// at the time each question is asked". That is exactly what the
-    /// persist layer already does on its own when this returns `None`.
-    ///
-    /// Only an EXPLICIT context-local router is a genuine second topology
-    /// that the persist layer cannot otherwise see. Only that case is
-    /// worth carrying forward.
-    pub(crate) fn resolved_placement_router(&self) -> Option<crate::shard::ShardRouter> {
-        self.shard_router.clone()
-    }
-
-    /// The router placement resolution should consult: the explicitly threaded
-    /// one, else the process-global one, else none.
-    fn placement_router(&self) -> Option<crate::shard::ShardRouter> {
-        if let Some(router) = self.shard_router.clone() {
-            return Some(router);
-        }
-        // The process-global router is itself `db`-gated (it is installed by the
-        // runtime/plugin at boot). In a `--no-default-features` build there is
-        // no global to fall back to, so an explicitly threaded router is the
-        // only source — which is exactly what the pure executor tests use.
-        #[cfg(feature = "db")]
-        {
-            crate::shard::GLOBAL_SHARD_ROUTER
-                .read()
-                .ok()
-                .and_then(|guard| guard.as_ref().cloned())
-        }
-        #[cfg(not(feature = "db"))]
-        None
-    }
-
-    /// The next child-placement sequence number (issue #956).
-    ///
-    /// Called once at the top of **every** placement-aware child spawn, before
-    /// the history matcher runs and regardless of whether this cycle will
-    /// dispatch the child freshly or replay it — see the field's own note for
-    /// why counting invocations rather than fresh dispatches is what makes a
-    /// sequential spawn loop spread across shards.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal `child_placement_seq` mutex is poisoned.
-    fn next_child_placement_seq(&self) -> u32 {
-        let mut seq = self
-            .child_placement_seq
-            .lock()
-            .expect("child_placement_seq lock poisoned");
-        *seq += 1;
-        *seq
-    }
-
-    /// Prove a `placement` can be resolved at all, before a fan-out records its
-    /// count marker (issue #956).
-    ///
-    /// Every child in a fan-out shares one `&ChildPlacement`, and the only
-    /// placement failures — no router installed, an unknown or drained shard, an
-    /// undeclared residency key, no writable shard — depend solely on the
-    /// placement and the router, never on which child is being placed. So one
-    /// resolution answers the question for the whole group.
-    ///
-    /// Doing it up front is load-bearing, not tidy. `record_fan_out_marker`
-    /// pushes a durable `MarkerRecorded { name: "fan_out:{n}" }` command, and
-    /// `peek_fan_out_count`'s own contract is that no such marker is ever
-    /// persisted without a corresponding dispatch attempt. A placement rejection
-    /// discovered *inside* `try_join_all` lands strictly after the marker: no
-    /// child is pushed, but the marker persists — and on the next replay the
-    /// marker matches, so `fresh_dispatch` is `false` and the child-input
-    /// payload cap is silently skipped on what is in fact the first real
-    /// dispatch.
-    ///
-    /// It is equally load-bearing that this runs on a **fresh dispatch only**
-    /// (issue #956 Codex round 6). Replay needs no placement at all — the child
-    /// ids are already recorded in `ChildWorkflowStarted` and are reused
-    /// verbatim, which is what makes AC6's byte-identical replay true. Probing
-    /// the router anyway means an operational change made *after* dispatch — a
-    /// worker that has not yet installed a router, a pinned shard removed from
-    /// the topology, a residency mapping edited — raises `Config` on a parent
-    /// that was replaying perfectly well. The handler ABI erases the type (a
-    /// workflow's `?` stringifies it and the executor maps a handler `Err` to a
-    /// terminal `Failed`), so that would turn a routine topology edit into the
-    /// permanent failure of every parent that had ever placed a fan-out. The two
-    /// constraints compose: inside `if fresh_dispatch`, above
-    /// `record_fan_out_marker`.
-    ///
-    /// # Errors
-    ///
-    /// Whatever [`resolve_child_placement`](crate::shard::resolve_child_placement)
-    /// returns for this placement.
-    fn preflight_placement(
-        &self,
-        placement: &crate::shard::ChildPlacement,
-        workflow_name: &str,
-    ) -> HarvestResult<()> {
-        if placement.is_parent_shard() {
-            return Ok(());
-        }
-        // The key is irrelevant to every failure mode this is checking for; a
-        // stable sentinel keeps the probe from perturbing the real counter.
-        crate::shard::resolve_child_placement(
-            self.placement_router().as_ref(),
-            placement,
-            self.exec_id.shard(),
-            workflow_name,
-            &crate::shard::child_placement_key(self.exec_id, 0),
-        )
-        .map(|_| ())
-    }
-
-    /// Mint a **fresh** child `ExecutionId` on the shard `placement` selects.
-    ///
-    /// The default [`ChildPlacement::ParentShard`](crate::shard::ChildPlacement::ParentShard)
-    /// short-circuits to today's `ExecutionId::new_for_shard(parent_shard)` and
-    /// never touches the router, so a deployment that never opts in is
-    /// byte-for-byte unchanged.
-    ///
-    /// `parent_shard` is the row's CURRENT shard (issue #1405), not the
-    /// origin bits `self.exec_id` encodes. A rebalanced parent's child must
-    /// land where the parent actually lives. Otherwise `worker.rs` classifies
-    /// it as cross-shard against the parent's live residence and silently
-    /// relays it onto the stale origin shard instead. Falls back to
-    /// `self.exec_id.shard()` only when no live shard was threaded in, the
-    /// replayer / test-env paths' pre-#1405 behaviour.
-    ///
-    /// Only ever called on a **fresh dispatch**. A replay reuses the `child_id`
-    /// recorded in `ChildWorkflowStarted`, so placement is decided exactly once
-    /// in a child's lifetime and the parent's history replays identically
-    /// wherever the child physically lives (issue #956 AC6). `seq` is supplied by
-    /// the caller (from [`next_child_placement_seq`](Self::next_child_placement_seq))
-    /// rather than taken here, precisely because it must advance on the replay
-    /// invocations this function is never reached from.
-    ///
-    /// # Errors
-    ///
-    /// Propagates [`HarvestError::Config`] when a non-default placement is
-    /// requested with no router installed, or when the router rejects the pin.
-    /// Never falls back to the parent's shard (issue #956 AC8).
-    fn mint_child_id(
-        &self,
-        placement: &crate::shard::ChildPlacement,
-        workflow_name: &str,
-        seq: u32,
-    ) -> HarvestResult<ExecutionId> {
-        let parent_shard = self
-            .current_shard_id
-            .unwrap_or_else(|| self.exec_id.shard());
-        if placement.is_parent_shard() {
-            return Ok(ExecutionId::new_for_shard(parent_shard));
-        }
-        let key = crate::shard::child_placement_key(self.exec_id, seq);
-        let shard = crate::shard::resolve_child_placement(
-            self.placement_router().as_ref(),
-            placement,
-            parent_shard,
-            workflow_name,
-            &key,
-        )?;
-        Ok(ExecutionId::new_for_shard(shard))
     }
 
     /// Spawn a child workflow and await its terminal result.
@@ -7818,61 +6973,12 @@ impl WorkflowContext {
     /// # Panics
     ///
     /// Panics if the internal replay matcher mutex is poisoned.
+    #[allow(clippy::too_many_lines)]
     pub async fn spawn_child_workflow_raw(
         &self,
         workflow_name: &str,
         input: Value,
     ) -> HarvestResult<Value> {
-        self.spawn_child_workflow_raw_placed(
-            workflow_name,
-            input,
-            &crate::shard::ChildPlacement::ParentShard,
-        )
-        .await
-    }
-
-    /// Spawn a child workflow on the shard `placement` selects and await its
-    /// terminal result (issue #956).
-    ///
-    /// Identical to [`spawn_child_workflow_raw`](Self::spawn_child_workflow_raw)
-    /// in every respect except where the child's rows live. With the default
-    /// [`ChildPlacement::ParentShard`](crate::shard::ChildPlacement::ParentShard)
-    /// the two are the same call.
-    ///
-    /// # Cross-shard semantics
-    ///
-    /// When `placement` resolves to a shard other than the parent's, the child
-    /// is **not** created inside the parent's decision transaction — that
-    /// transaction stays shard-local by design. Instead the spawn durably
-    /// records a cross-shard outbox row alongside `ChildWorkflowStarted`, and
-    /// the runtime's cross-shard relay creates the child on the target shard and
-    /// later delivers its terminal back. The effects are **at-least-once with
-    /// dedupe**; the observable contract for the workflow author is unchanged,
-    /// but the child's start and its terminal wake are each one scanner tick
-    /// away rather than one transaction away.
-    ///
-    /// # Errors
-    ///
-    /// Everything [`spawn_child_workflow_raw`](Self::spawn_child_workflow_raw)
-    /// returns, plus [`HarvestError::Config`] when a non-default placement is
-    /// requested and no [`ShardRouter`](crate::shard::ShardRouter) is installed
-    /// or the router rejects the requested pin. Placement never silently falls
-    /// back to the parent's shard.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal replay matcher mutex is poisoned.
-    #[allow(clippy::too_many_lines)]
-    pub async fn spawn_child_workflow_raw_placed(
-        &self,
-        workflow_name: &str,
-        input: Value,
-        placement: &crate::shard::ChildPlacement,
-    ) -> HarvestResult<Value> {
-        // Advance the placement counter FIRST, on every invocation (live or
-        // replay) — see `next_child_placement_seq`. Taken before the matcher runs
-        // so an early return from any arm cannot desynchronise it.
-        let placement_seq = self.next_child_placement_seq();
         let history_match = self.match_history(|m| m.match_child_workflow(workflow_name, &input));
 
         match history_match {
@@ -7998,17 +7104,14 @@ impl WorkflowContext {
                     });
                 }
 
-                // Inherit the parent's shard so data residency is transitive
-                // across the workflow tree (issue #697 AC4) — unless the caller
-                // opted this spawn out via `placement` (issue #956). Either way
-                // the encoded shard is what makes every later id-based lookup
-                // route to the child's database in O(1), with no directory.
-                // Resolved BEFORE the command is pushed so a rejected placement
-                // fails the spawn with nothing recorded.
-                let child_id = self.mint_child_id(placement, workflow_name, placement_seq)?;
                 let (tx, rx) = oneshot::channel();
                 self.push_command(WorkflowCommand::StartChildWorkflow {
-                    child_id,
+                    // Inherit the parent's shard so data residency is transitive
+                    // across the workflow tree (issue #697 AC4). The worker
+                    // already writes the child's row on the parent's shard; the
+                    // encoded shard is what makes every later id-based lookup
+                    // route there too, instead of the default shard.
+                    child_id: ExecutionId::new_for_shard(self.exec_id.shard()),
                     workflow_name: workflow_name.to_string(),
                     input,
                     result_tx: tx,
@@ -8054,14 +7157,12 @@ impl WorkflowContext {
     /// The default policy is `RequestCancel`. Use `Abandon` for "fire-and-forget"
     /// fan-out and long-lived monitor patterns.
     ///
-    /// # Shard placement
+    /// # Shard restriction
     ///
-    /// The child is placed on the **same shard** as the parent. To place a
-    /// detached child elsewhere, use
-    /// [`spawn_child_workflow_detached_raw_placed`](Self::spawn_child_workflow_detached_raw_placed)
-    /// with an explicit [`ChildPlacement`](crate::shard::ChildPlacement)
-    /// (issue #956); the `ParentClosePolicy` cascade reaches a cross-shard
-    /// child too.
+    /// The child is placed on the **same shard** as the parent. Cross-shard
+    /// detached spawns are not supported in this release; pass an
+    /// `ExecutionId` from a different shard and you will receive
+    /// [`HarvestError::Config`].
     ///
     /// # Errors
     ///
@@ -8079,50 +7180,6 @@ impl WorkflowContext {
         input: Value,
         parent_close_policy: crate::types::ParentClosePolicy,
     ) -> HarvestResult<ExecutionId> {
-        self.spawn_child_workflow_detached_raw_placed(
-            workflow_name,
-            input,
-            parent_close_policy,
-            &crate::shard::ChildPlacement::ParentShard,
-        )
-    }
-
-    /// Spawn a **detached** child workflow on the shard `placement` selects
-    /// (issue #956).
-    ///
-    /// Identical to
-    /// [`spawn_child_workflow_detached_raw`](Self::spawn_child_workflow_detached_raw)
-    /// except for where the child's rows live; the default placement makes the
-    /// two the same call.
-    ///
-    /// The `ParentClosePolicy` cascade reaches a cross-shard detached child too:
-    /// the parent's close is observed by the cross-shard relay, which applies
-    /// `RequestCancel`/`Terminate` on the target shard with the same
-    /// at-least-once + idempotent-delivery semantics as the external
-    /// signal/cancel outboxes. Because that hop is not inside the parent's
-    /// terminal transaction, the cascade lands one scanner tick after the parent
-    /// seals rather than atomically with it.
-    ///
-    /// # Errors
-    ///
-    /// Everything
-    /// [`spawn_child_workflow_detached_raw`](Self::spawn_child_workflow_detached_raw)
-    /// returns, plus [`HarvestError::Config`] when a non-default placement
-    /// cannot be resolved. Never falls back to the parent's shard.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal replay matcher mutex is poisoned.
-    pub fn spawn_child_workflow_detached_raw_placed(
-        &self,
-        workflow_name: &str,
-        input: Value,
-        parent_close_policy: crate::types::ParentClosePolicy,
-        placement: &crate::shard::ChildPlacement,
-    ) -> HarvestResult<ExecutionId> {
-        // Advance on every invocation, before the matcher — see
-        // `next_child_placement_seq`.
-        let placement_seq = self.next_child_placement_seq();
         let history_match = self.match_history(|m| {
             m.match_detached_child_spawn(workflow_name, &input, parent_close_policy)
         });
@@ -8153,7 +7210,7 @@ impl WorkflowContext {
                     });
                 }
 
-                let child_id = self.mint_child_id(placement, workflow_name, placement_seq)?;
+                let child_id = ExecutionId::new_for_shard(self.exec_id.shard());
                 self.push_command(WorkflowCommand::SpawnDetachedChildWorkflow {
                     child_id,
                     workflow_name: workflow_name.to_string(),
@@ -8201,40 +7258,8 @@ impl WorkflowContext {
     where
         I: serde::Serialize,
     {
-        self.spawn_child_workflow_detached_placed(
-            info,
-            input,
-            parent_close_policy,
-            &crate::shard::ChildPlacement::ParentShard,
-        )
-    }
-
-    /// Typed wrapper around
-    /// [`spawn_child_workflow_detached_raw_placed`](Self::spawn_child_workflow_detached_raw_placed)
-    /// (issue #956).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`HarvestError::Serialization`] if `input` cannot be serialized.
-    /// Propagates all errors from
-    /// [`spawn_child_workflow_detached_raw_placed`](Self::spawn_child_workflow_detached_raw_placed).
-    pub fn spawn_child_workflow_detached_placed<I>(
-        &self,
-        info: &crate::info::WorkflowInfo,
-        input: I,
-        parent_close_policy: crate::types::ParentClosePolicy,
-        placement: &crate::shard::ChildPlacement,
-    ) -> HarvestResult<ExecutionId>
-    where
-        I: serde::Serialize,
-    {
         let json_input = serde_json::to_value(input).map_err(HarvestError::Serialization)?;
-        self.spawn_child_workflow_detached_raw_placed(
-            info.name,
-            json_input,
-            parent_close_policy,
-            placement,
-        )
+        self.spawn_child_workflow_detached_raw(info.name, json_input, parent_close_policy)
     }
 
     // ── Typed dispatch helpers ────────────────────────────────────────────────
@@ -8316,9 +7341,6 @@ impl WorkflowContext {
     /// Returns [`HarvestError::Serialization`] if `input` cannot be serialized.
     /// Propagates all errors from
     /// [`execute_local_activity_with_opts`](Self::execute_local_activity_with_opts).
-    /// In particular, [`HarvestError::Config`] when the call shares a suspension
-    /// batch with a durable awaitable (issue #950) — see
-    /// [`execute_local_activity_raw`](Self::execute_local_activity_raw).
     pub async fn execute_local_activity<I, O>(
         &self,
         info: &crate::info::ActivityInfo,
@@ -8343,9 +7365,6 @@ impl WorkflowContext {
     /// [`execute_activity_with_opts`](Self::execute_activity_with_opts) for remote activities.
     /// Returns [`HarvestError::Serialization`] if `input` cannot be serialized.
     /// Propagates all errors from
-    /// [`execute_local_activity_raw`](Self::execute_local_activity_raw).
-    /// In particular, [`HarvestError::Config`] when the call shares a suspension
-    /// batch with a durable awaitable (issue #950) — see
     /// [`execute_local_activity_raw`](Self::execute_local_activity_raw).
     pub async fn execute_local_activity_with_opts<I, O>(
         &self,
@@ -8401,33 +7420,8 @@ impl WorkflowContext {
         I: serde::Serialize,
         O: serde::de::DeserializeOwned,
     {
-        self.spawn_child_workflow_placed(info, input, &crate::shard::ChildPlacement::ParentShard)
-            .await
-    }
-
-    /// Typed wrapper around
-    /// [`spawn_child_workflow_raw_placed`](Self::spawn_child_workflow_raw_placed)
-    /// (issue #956).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`HarvestError::Serialization`] if `input` cannot be serialized
-    /// or the child output cannot be deserialized. Propagates all errors from
-    /// [`spawn_child_workflow_raw_placed`](Self::spawn_child_workflow_raw_placed).
-    pub async fn spawn_child_workflow_placed<I, O>(
-        &self,
-        info: &crate::info::WorkflowInfo,
-        input: I,
-        placement: &crate::shard::ChildPlacement,
-    ) -> HarvestResult<O>
-    where
-        I: serde::Serialize,
-        O: serde::de::DeserializeOwned,
-    {
         let json_input = serde_json::to_value(input)?;
-        let raw = self
-            .spawn_child_workflow_raw_placed(info.name, json_input, placement)
-            .await?;
+        let raw = self.spawn_child_workflow_raw(info.name, json_input).await?;
         Ok(serde_json::from_value(raw)?)
     }
 
@@ -8495,54 +7489,15 @@ impl WorkflowContext {
     /// # Panics
     ///
     /// Panics if the internal `child_timeout_seq` mutex is poisoned.
+    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::single_match_else)]
     pub async fn spawn_child_workflow_timeout(
         &self,
         workflow_name: &str,
         input: Value,
         timeout: std::time::Duration,
     ) -> HarvestResult<Option<Value>> {
-        self.spawn_child_workflow_timeout_placed(
-            workflow_name,
-            input,
-            timeout,
-            &crate::shard::ChildPlacement::ParentShard,
-        )
-        .await
-    }
-
-    /// Spawn a child on the shard `placement` selects and await its result with
-    /// a deadline (issue #956, extending #779).
-    ///
-    /// Identical to
-    /// [`spawn_child_workflow_timeout`](Self::spawn_child_workflow_timeout)
-    /// except for where the child's rows live. The deadline timer is a
-    /// **parent-side** durable timer, so it is unaffected by placement and still
-    /// arms in the same suspension batch as the child.
-    ///
-    /// # Errors
-    ///
-    /// Everything
-    /// [`spawn_child_workflow_timeout`](Self::spawn_child_workflow_timeout)
-    /// returns, plus [`HarvestError::Config`] when a non-default placement
-    /// cannot be resolved.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal `child_timeout_seq` mutex is poisoned.
-    #[allow(clippy::too_many_lines)]
-    #[allow(clippy::single_match_else)]
-    pub async fn spawn_child_workflow_timeout_placed(
-        &self,
-        workflow_name: &str,
-        input: Value,
-        timeout: std::time::Duration,
-        placement: &crate::shard::ChildPlacement,
-    ) -> HarvestResult<Option<Value>> {
         use crate::replay::ChildOrTimerMatch;
-
-        // Advance on every invocation, before any matching — see
-        // `next_child_placement_seq`.
-        let placement_seq = self.next_child_placement_seq();
 
         // Deterministic timer ID: the counter increments on every call (live and
         // replay alike), so the Nth race in workflow code always carries the same
@@ -8740,12 +7695,8 @@ impl WorkflowContext {
                 // recorded id is reused verbatim (`recorded_child_id`), so
                 // pre-fix in-flight children keep their unencoded ids and replay
                 // unchanged.
-                let child_id = match recorded_child_id {
-                    Some(id) => id,
-                    // Fresh dispatch: resolve placement (issue #956). The
-                    // default keeps the pre-#956 `new_for_shard(parent)` mint.
-                    None => self.mint_child_id(placement, workflow_name, placement_seq)?,
-                };
+                let child_id = recorded_child_id
+                    .unwrap_or_else(|| ExecutionId::new_for_shard(self.exec_id.shard()));
                 let (child_tx, child_rx) = oneshot::channel();
                 let (timer_tx, timer_rx) = oneshot::channel();
                 self.push_command(WorkflowCommand::StartChildWorkflow {
@@ -8794,37 +7745,9 @@ impl WorkflowContext {
     where
         O: serde::de::DeserializeOwned,
     {
-        self.execute_child_workflow_timeout_placed(
-            info,
-            input,
-            timeout,
-            &crate::shard::ChildPlacement::ParentShard,
-        )
-        .await
-    }
-
-    /// Typed wrapper around
-    /// [`spawn_child_workflow_timeout_placed`](Self::spawn_child_workflow_timeout_placed)
-    /// (issue #956).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`HarvestError::Serialization`] if the input cannot be serialized
-    /// or the child output cannot be deserialized. Propagates all errors from
-    /// [`spawn_child_workflow_timeout_placed`](Self::spawn_child_workflow_timeout_placed).
-    pub async fn execute_child_workflow_timeout_placed<O>(
-        &self,
-        info: &crate::info::WorkflowInfo,
-        input: impl serde::Serialize,
-        timeout: std::time::Duration,
-        placement: &crate::shard::ChildPlacement,
-    ) -> HarvestResult<Option<O>>
-    where
-        O: serde::de::DeserializeOwned,
-    {
         let json_input = serde_json::to_value(input)?;
         match self
-            .spawn_child_workflow_timeout_placed(info.name, json_input, timeout, placement)
+            .spawn_child_workflow_timeout(info.name, json_input, timeout)
             .await?
         {
             Some(raw) => Ok(Some(serde_json::from_value(raw)?)),
@@ -9040,14 +7963,11 @@ impl WorkflowContext {
     }
 
     /// Block until a predicate over workflow local state evaluates to true.
-    pub fn await_condition<F>(&self, predicate: F) -> AwaitConditionFut<F>
+    pub const fn await_condition<F>(&self, predicate: F) -> AwaitConditionFut<F>
     where
         F: FnMut() -> bool + Unpin,
     {
-        AwaitConditionFut {
-            predicate,
-            park: ParkToken::new(&self.parks),
-        }
+        AwaitConditionFut { predicate }
     }
 
     /// Block until a predicate over workflow local state evaluates to true, or the timeout expires.
@@ -9122,7 +8042,7 @@ impl WorkflowContext {
                 ))
             }
             HistoryMatch::NoMatch => {
-                self.check_strict_replay_signal_no_match(signal_name)?;
+                self.check_strict_replay_no_match(&format!("WaitForSignal({signal_name})"))?;
 
                 let (tx, rx) = oneshot::channel();
                 self.push_command(WorkflowCommand::WaitForSignal {
@@ -9501,33 +8421,25 @@ impl WorkflowContext {
     /// successor rather than misdelivering to — or failing against — the
     /// sealed predecessor.
     ///
-    /// # Shard resolution (issue #1146)
+    /// # Known limitation — explicit shard placement (issue #697)
     ///
-    /// Which shard owns `(workflow_name, workflow_id)` is resolved by
-    /// **observation**, not by prediction: delivery fans out across every
-    /// shard the deployment expects to exist and merges the per-shard answers
-    /// (see the `external_target_location` module, which is `db`-gated and so
-    /// deliberately not linked from here). Any placement is therefore
-    /// addressable by business key — including a target started with an
-    /// explicit shard pin (`ShardPlacement::Shard`/`ShardPlacement::ResidencyKey`,
-    /// issue #697), which can live on a shard the routing hash never computes,
-    /// and one left behind on a shard that has since been drained out of
-    /// `writable_shards`. Both previously resolved to the wrong shard and
-    /// reported `target_unknown` for a running target.
-    ///
-    /// A shard that cannot be inspected (no pool configured in this process,
-    /// or unreachable) never counts as "the target is not there": the delivery
-    /// attempt is retried instead, so a shard outage cannot turn into a
-    /// permanent `target_unknown` in this workflow's history. The cost is one
-    /// query per shard per delivery attempt (two when a shard holds no active
-    /// run of the key); a single-shard deployment expects one shard, skips the
-    /// fan-out entirely, and is unchanged.
-    ///
-    /// One user-visible consequence in a **multi-shard** deployment: a by-id
-    /// signal or cancel is never delivered inside the caller's own decision
-    /// transaction any more. It is handed to the background outbox, so delivery
-    /// completes up to one scanner poll interval later. `ExecutionId`-addressed
-    /// delivery and every single-shard deployment keep the inline path.
+    /// Resolving which shard owns `(workflow_name, workflow_id)` is done by
+    /// re-deriving the SAME rendezvous hash a fresh start of that business
+    /// key would use ([`crate::shard::external_target_owning_shard`]). This
+    /// is correct for a target started under the default
+    /// [`crate::shard::ShardPlacement::Auto`] placement — the overwhelming
+    /// majority of workflows. It is **not** correct for a target started
+    /// with an *explicit* shard pin (`ShardPlacement::Shard`/
+    /// `ShardPlacement::ResidencyKey`, issue #697): the pin can place the
+    /// workflow on a shard the pure hash would never compute, and this
+    /// resolution has no way to discover that. A `workflow_id`-addressed
+    /// signal to such a target may resolve to the wrong shard and report
+    /// [`HarvestError::ExternalSignalFailed`] with `reason_code =
+    /// "target_unknown"` even though the target is running (just not where
+    /// the hash predicts). If a workflow is started with explicit shard
+    /// placement, address it by [`ExecutionId`](Self::signal_external_workflow)
+    /// instead of by business key. A shard-placement-aware directory lookup
+    /// is a documented follow-up, out of scope for issue #751.
     ///
     /// # Errors
     ///
@@ -9822,15 +8734,15 @@ impl WorkflowContext {
     /// cancelled, rather than misdelivering to — or reporting a spurious
     /// success against — the already-sealed predecessor.
     ///
-    /// # Shard resolution (issue #1146)
+    /// # Known limitation — explicit shard placement (issue #697)
     ///
-    /// Identical to
+    /// See the identical limitation documented on
     /// [`signal_external_workflow_by_id`](Self::signal_external_workflow_by_id):
-    /// the owning shard is found by fanning out across every expected shard
-    /// rather than by re-deriving the placement hash, so an explicitly pinned
-    /// target (issue #697) or one on a drained shard is addressable by business
-    /// key, and a shard that cannot be inspected leads to a retry rather than a
-    /// `target_unknown`.
+    /// shard resolution for a `WorkflowId` target re-derives the same
+    /// rendezvous hash a fresh start would use and cannot see an explicit
+    /// shard pin (`ShardPlacement::Shard`/`ShardPlacement::ResidencyKey`,
+    /// issue #697). Address a pinned workflow by
+    /// [`ExecutionId`](Self::request_cancel_external_workflow) instead.
     ///
     /// # Cancel semantics vs signal
     ///
@@ -10180,7 +9092,7 @@ impl WorkflowContext {
         // forever as a belt-and-braces guard so a spuriously-dropped sender
         // re-parks rather than resolving with a bogus value.
         let _ = rx.await;
-        self.park_forever::<HarvestResult<Value>>().await
+        std::future::pending::<HarvestResult<Value>>().await
     }
 
     // ── Fan-out / parallel activities (issue #359) ───────────────────────────
@@ -10198,15 +9110,11 @@ impl WorkflowContext {
     /// case, its recorded children) — a **silent misattribution**, strictly
     /// worse than the plain "expected `fan_out:N`, got `fan_out:M`" divergence
     /// burning the number produces. A caught-and-continued fan-out failure
-    /// simply not replaying cleanly is an accepted instance of a narrower
-    /// remaining limitation — not something a numbering trick should try to
-    /// paper over. (Issue #952 fixed the *uncaught* half: a cycle that fails
-    /// on a config-dependent check now replays cleanly, because its trailing
-    /// terminal `WorkflowFailed` is transparent to in-progress matches — see
-    /// `replayer_tests::early_config_dependent_failure_replays_cleanly`. A
-    /// failure the workflow **catches** and continues past leaves no terminal
-    /// event and no history footprint at all, so replay still re-decides it
-    /// against live configuration; #952 defers that case explicitly.)
+    /// simply not replaying cleanly is an accepted instance of the broader,
+    /// pre-existing, engine-wide limitation documented on
+    /// `known_limitation_early_config_dependent_failure_does_not_replay_cleanly`
+    /// (`tests/replayer_tests.rs`) — not something a numbering trick should
+    /// try to paper over.
     fn next_fan_out_seq(&self) -> u32 {
         let mut seq = self.fan_out_seq.lock().expect("fan_out_seq lock poisoned");
         *seq += 1;
@@ -10638,11 +9546,8 @@ impl WorkflowContext {
     /// that prefix is fully resolved does it dispatch the fresh remainder in
     /// `W`-sized waves. This is what prevents a mid-flight window **increase**
     /// from regrouping an in-flight slot with never-scheduled fresh slots into a
-    /// mixed `[WaitForActivity + ScheduleActivity]` suspension batch. (Issue #950
-    /// made that batch persistable, so it is no longer a terminal failure — but
-    /// the two-phase resume is retained: it is what keeps the recorded command
-    /// order independent of the configured window, which is the determinism
-    /// property this doc is about.) On a window **decrease**, already-scheduled work (up to
+    /// mixed `[WaitForActivity + ScheduleActivity]` suspension batch the worker
+    /// cannot persist. On a window **decrease**, already-scheduled work (up to
     /// the old, larger window) drains during the resume phase before the smaller
     /// window governs any further dispatch, so peak in-flight can briefly exceed
     /// the newly-lowered window — inherent and correct (the window bounds *new*
@@ -11107,54 +10012,13 @@ impl WorkflowContext {
         &self,
         children: Vec<(String, Value)>,
     ) -> HarvestResult<Vec<Value>> {
-        self.spawn_child_workflow_fan_out_raw_placed(
-            children,
-            &crate::shard::ChildPlacement::ParentShard,
-        )
-        .await
-    }
-
-    /// Spawn N child workflows in parallel, placing each one per `placement`
-    /// (issue #956) — fail-fast variant.
-    ///
-    /// This is the call the issue exists for: with
-    /// [`ChildPlacement::Distributed`](crate::shard::ChildPlacement::Distributed)
-    /// a large fan-out's children rendezvous-spread across `writable_shards`
-    /// instead of concentrating every child's event log, task-queue row, timer
-    /// and signal on the parent's database.
-    ///
-    /// Each child gets its own deterministic placement key, so the spread is
-    /// uniform *and* a decision cycle retried after a crash re-derives the
-    /// identical placement for every slot.
-    ///
-    /// # Errors
-    ///
-    /// Everything
-    /// [`spawn_child_workflow_fan_out_raw`](Self::spawn_child_workflow_fan_out_raw)
-    /// returns, plus [`HarvestError::Config`] when a non-default placement
-    /// cannot be resolved — raised before any child in the group is dispatched
-    /// where the failure is placement-configuration (no router, rejected pin),
-    /// so a misconfigured fan-out never half-dispatches.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal matcher or commands mutex is poisoned.
-    pub async fn spawn_child_workflow_fan_out_raw_placed(
-        &self,
-        children: Vec<(String, Value)>,
-        placement: &crate::shard::ChildPlacement,
-    ) -> HarvestResult<Vec<Value>> {
         self.check_cancellation()?;
+
         let seq = self.next_fan_out_seq();
         let count = children.len();
         let fresh_dispatch = self.peek_fan_out_count(seq, count)?;
         self.validate_child_payload_caps(fresh_dispatch, &children)?;
         if fresh_dispatch {
-            // Fresh dispatch only, and still before the marker — see
-            // `preflight_placement` for both halves of that ordering.
-            if let Some((name, _)) = children.first() {
-                self.preflight_placement(placement, name)?;
-            }
             self.record_fan_out_marker(seq, count);
         }
 
@@ -11165,8 +10029,7 @@ impl WorkflowContext {
         let futures: Vec<_> = children
             .into_iter()
             .map(|(workflow_name, input)| async move {
-                self.spawn_child_workflow_raw_placed(&workflow_name, input, placement)
-                    .await
+                self.spawn_child_workflow_raw(&workflow_name, input).await
             })
             .collect();
 
@@ -11210,49 +10073,13 @@ impl WorkflowContext {
         &self,
         children: Vec<(String, Value)>,
     ) -> HarvestResult<Vec<Result<Value, String>>> {
-        self.spawn_child_workflow_fan_out_collect_raw_placed(
-            children,
-            &crate::shard::ChildPlacement::ParentShard,
-        )
-        .await
-    }
-
-    /// Spawn N child workflows in parallel, placing each one per `placement`
-    /// (issue #956) — collect-all variant.
-    ///
-    /// Same placement semantics as
-    /// [`spawn_child_workflow_fan_out_raw_placed`](Self::spawn_child_workflow_fan_out_raw_placed);
-    /// same per-slot failure capture as
-    /// [`spawn_child_workflow_fan_out_collect_raw`](Self::spawn_child_workflow_fan_out_collect_raw).
-    ///
-    /// # Errors
-    ///
-    /// Everything
-    /// [`spawn_child_workflow_fan_out_collect_raw`](Self::spawn_child_workflow_fan_out_collect_raw)
-    /// returns, plus [`HarvestError::Config`] when a non-default placement
-    /// cannot be resolved. A placement-configuration failure is an engine-level
-    /// error (the outer `Result`), never a per-slot `Err(String)`: it means the
-    /// deployment is misconfigured, not that one child failed.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal matcher or commands mutex is poisoned.
-    pub async fn spawn_child_workflow_fan_out_collect_raw_placed(
-        &self,
-        children: Vec<(String, Value)>,
-        placement: &crate::shard::ChildPlacement,
-    ) -> HarvestResult<Vec<Result<Value, String>>> {
         self.check_cancellation()?;
+
         let seq = self.next_fan_out_seq();
         let count = children.len();
         let fresh_dispatch = self.peek_fan_out_count(seq, count)?;
         self.validate_child_payload_caps(fresh_dispatch, &children)?;
         if fresh_dispatch {
-            // Fresh dispatch only, and still before the marker — see
-            // `preflight_placement` for both halves of that ordering.
-            if let Some((name, _)) = children.first() {
-                self.preflight_placement(placement, name)?;
-            }
             self.record_fan_out_marker(seq, count);
         }
 
@@ -11263,10 +10090,7 @@ impl WorkflowContext {
         let futures: Vec<_> = children
             .into_iter()
             .map(|(workflow_name, input)| async move {
-                match self
-                    .spawn_child_workflow_raw_placed(&workflow_name, input, placement)
-                    .await
-                {
+                match self.spawn_child_workflow_raw(&workflow_name, input).await {
                     Ok(v) => Ok(Ok(v)),
                     // A failed child surfaces as a typed `WorkflowFailed` (issue #767);
                     // it is the collect-all per-slot failure to capture rather than
@@ -11311,40 +10135,6 @@ impl WorkflowContext {
         I: serde::Serialize,
         O: serde::de::DeserializeOwned,
     {
-        self.spawn_child_workflow_fan_out_placed(
-            info,
-            inputs,
-            &crate::shard::ChildPlacement::ParentShard,
-        )
-        .await
-    }
-
-    /// Typed fail-fast fan-out with an explicit
-    /// [`ChildPlacement`](crate::shard::ChildPlacement) (issue #956).
-    ///
-    /// The ergonomic form of the primitive this issue exists for:
-    ///
-    /// ```rust,ignore
-    /// let results: Vec<Receipt> = ctx
-    ///     .spawn_child_workflow_fan_out_placed(&process_one_info(), items, &ChildPlacement::Distributed)
-    ///     .await?;
-    /// ```
-    ///
-    /// # Errors
-    ///
-    /// Returns [`HarvestError::Serialization`] if any input cannot be
-    /// serialized. Propagates all errors from
-    /// [`spawn_child_workflow_fan_out_raw_placed`](Self::spawn_child_workflow_fan_out_raw_placed).
-    pub async fn spawn_child_workflow_fan_out_placed<I, O>(
-        &self,
-        info: &crate::info::WorkflowInfo,
-        inputs: Vec<I>,
-        placement: &crate::shard::ChildPlacement,
-    ) -> HarvestResult<Vec<O>>
-    where
-        I: serde::Serialize,
-        O: serde::de::DeserializeOwned,
-    {
         let children = inputs
             .into_iter()
             .map(|i| {
@@ -11353,9 +10143,7 @@ impl WorkflowContext {
             })
             .collect::<Result<Vec<_>, serde_json::Error>>()?;
 
-        let raw_results = self
-            .spawn_child_workflow_fan_out_raw_placed(children, placement)
-            .await?;
+        let raw_results = self.spawn_child_workflow_fan_out_raw(children).await?;
         raw_results
             .into_iter()
             .map(|v| serde_json::from_value(v).map_err(HarvestError::Serialization))
@@ -11384,32 +10172,6 @@ impl WorkflowContext {
         I: serde::Serialize,
         O: serde::de::DeserializeOwned,
     {
-        self.spawn_child_workflow_fan_out_collect_placed(
-            info,
-            inputs,
-            &crate::shard::ChildPlacement::ParentShard,
-        )
-        .await
-    }
-
-    /// Typed collect-all fan-out with an explicit
-    /// [`ChildPlacement`](crate::shard::ChildPlacement) (issue #956).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`HarvestError::Serialization`] if any input cannot be
-    /// serialized. Propagates engine-level errors from
-    /// [`spawn_child_workflow_fan_out_collect_raw_placed`](Self::spawn_child_workflow_fan_out_collect_raw_placed).
-    pub async fn spawn_child_workflow_fan_out_collect_placed<I, O>(
-        &self,
-        info: &crate::info::WorkflowInfo,
-        inputs: Vec<I>,
-        placement: &crate::shard::ChildPlacement,
-    ) -> HarvestResult<Vec<Result<O, String>>>
-    where
-        I: serde::Serialize,
-        O: serde::de::DeserializeOwned,
-    {
         let children = inputs
             .into_iter()
             .map(|i| {
@@ -11419,7 +10181,7 @@ impl WorkflowContext {
             .collect::<Result<Vec<_>, serde_json::Error>>()?;
 
         let raw_results = self
-            .spawn_child_workflow_fan_out_collect_raw_placed(children, placement)
+            .spawn_child_workflow_fan_out_collect_raw(children)
             .await?;
         let typed: Vec<Result<O, String>> = raw_results
             .into_iter()
@@ -11465,15 +10227,12 @@ impl WorkflowContext {
             ));
         }
 
-        // The #476 exactly-one-timer + exactly-one-signal pair keeps its own
-        // dedicated implementation (issue #950, AC6): it delegates to the
-        // fully-tested `wait_for_signal_timeout` primitive, records the reserved
-        // `__signal_timeout:{seq}:{name}` timer id, records NO `race:{seq}` open
-        // marker, and reports fixed role-based indices. Routing it through the
-        // generalized path below would change all three, so histories recorded
-        // before this issue would no longer replay. Checked BEFORE
-        // `next_race_seq` so the legacy shape does not consume a race sequence
-        // number either.
+        let all_activity = branches
+            .iter()
+            .all(|b| matches!(b.kind, RaceBranchKind::Activity { .. }));
+        let all_child = branches
+            .iter()
+            .all(|b| matches!(b.kind, RaceBranchKind::ChildWorkflow { .. }));
         let is_timer_signal_pair = branches.len() == 2
             && branches
                 .iter()
@@ -11486,21 +10245,19 @@ impl WorkflowContext {
             return self.race_timer_signal_impl(branches).await;
         }
 
-        // Every other combination — including fully heterogeneous ones — is
-        // handled below (issue #950). The worker's suspension-persistence layer
-        // now persists an arbitrary mixed command batch in one transaction
-        // (`persist_mixed_suspension_batch`), so the pre-#950
-        // `HarvestError::Config` rejection for mixed branch kinds is gone.
-
-        // Hold the signal pump across this race's entire signal phase (issue
-        // #1252). It starts HERE, not at the branch loop: the open-marker read
-        // below is itself a `match_history` call, and its `prepare_match`
-        // sweep is what first stashes this cycle's `SignalReceived` events
-        // into `pending_signals` -- so the pump that would follow it is
-        // already early enough to claim a branch's signal before any branch
-        // has run. The hold is released after Phase A, and the deferred
-        // handlers are dispatched there.
-        let pump_hold = self.hold_signal_pump();
+        if !all_activity && !all_child {
+            return Err(HarvestError::Config(
+                "ctx.race() only supports a homogeneous race of activity branches, a \
+                 homogeneous race of child-workflow branches, or exactly one timer branch \
+                 paired with exactly one signal branch in this release — mixing branch kinds \
+                 (e.g. an activity racing a timer) is out of scope for issue #600's initial \
+                 slice because the worker's suspension-persistence layer does not yet support \
+                 a fully heterogeneous mixed-command batch. Bound an individual activity with \
+                 its own start_to_close/schedule_to_close timeout, or use \
+                 receive_signal_timeout for a signal-or-deadline race, instead."
+                    .to_string(),
+            ));
+        }
 
         let seq = self.next_race_seq();
         let count = branches.len();
@@ -11542,52 +10299,8 @@ impl WorkflowContext {
         // never re-emits a stray dispatch/wait command for a cancelled sibling.
         let mut resolved: Vec<(usize, HarvestResult<Value>)> = Vec::new();
         let mut to_dispatch: Vec<RaceDispatch> = Vec::new();
-        // This race's settlement marker, used to bound a signal branch's scan
-        // (see `HistoryMatcher::match_race_signal`). `settle_race` derives the
-        // same name.
-        let winner_marker_name = format!("race_winner:{seq}");
 
-        // Issue #950: evaluate SIGNAL branches first, then the rest.
-        //
-        // This is ordering hygiene, NOT the protection against a push handler
-        // stealing a branch's signal -- the `pump_hold` taken above is. An
-        // earlier revision claimed otherwise; issue #1252 showed why it cannot
-        // be true. Claiming first only narrows the window to the calls a race
-        // makes *before* its first signal branch, and there is always at least
-        // one of those (the open-marker read), so the window never closes.
-        //
-        // The reservation index that protects the #476 timer+signal race
-        // (`race_reserved_signal_events`) keys off the `__signal_timeout:{seq}:{name}`
-        // timer id, which encodes the signal name; a mixed race's `__race:{seq}:{index}`
-        // id encodes no name, and an activity-vs-signal race arms no timer at
-        // all. Nothing a general race records -- `race:{seq}` and
-        // `race_winner:{seq}` -- names its signal branches, so no
-        // history-derived reservation can cover this shape either. Holding the
-        // pump is what covers it.
-        //
-        // The ordering is kept, but do not read correctness into it: with the
-        // hold in place, deleting this sort leaves every race test green
-        // (measured). It is outcome-neutral by construction too -- the branch
-        // INDEX decides the tie-break (`settle_race` takes the minimum
-        // resolved index), so evaluation order cannot change which branch
-        // wins. It stays because a signal branch reaching its own event before
-        // a sibling's scan stashes it is the simpler cursor path, not because
-        // anything depends on it.
-        let mut eval_order: Vec<usize> = (0..branches.len()).collect();
-        eval_order.sort_by_key(|&i| !matches!(branches[i].kind, RaceBranchKind::Signal { .. }));
-
-        // Every timer branch of one race is armed at the SAME instant, so they
-        // share this anchor and each resolved branch advances the virtual clock
-        // to `anchor + its own duration` (a monotonic max), never by summing
-        // durations. `TestRunOutcome::final_now` computes the same max from the
-        // recorded history, so `ctx.now()` agrees with it after a race in which
-        // more than one timer fired (issue #768's `advance_timer_clock_to`
-        // rationale, applied to concurrently-armed race deadlines).
-        #[cfg(any(test, feature = "testing"))]
-        let clock_anchor = self.timer_clock_elapsed();
-
-        for index in eval_order {
-            let branch = &branches[index];
+        for (index, branch) in branches.iter().enumerate() {
             match &branch.kind {
                 RaceBranchKind::Activity { name, input, .. } => {
                     let history_match = if self.strict_replay {
@@ -11640,7 +10353,6 @@ impl WorkflowContext {
                                 index,
                                 activity_id: Some(activity_id),
                                 child_id: None,
-                                timer_id: None,
                                 is_new: false,
                             });
                         }
@@ -11649,7 +10361,6 @@ impl WorkflowContext {
                                 index,
                                 activity_id: Some(self.next_activity_id()),
                                 child_id: None,
-                                timer_id: None,
                                 is_new: true,
                             });
                         }
@@ -11708,7 +10419,6 @@ impl WorkflowContext {
                                 index,
                                 activity_id: None,
                                 child_id: Some(child_id),
-                                timer_id: None,
                                 is_new: false,
                             });
                         }
@@ -11716,146 +10426,20 @@ impl WorkflowContext {
                             to_dispatch.push(RaceDispatch {
                                 index,
                                 activity_id: None,
-                                // Inherit the parent's CURRENT shard (issue
-                                // #697 AC4, #1405) -- same rationale as
-                                // `mint_child_id`, not the origin bits
-                                // `self.exec_id` encodes.
-                                child_id: Some(ExecutionId::new_for_shard(
-                                    self.current_shard_id
-                                        .unwrap_or_else(|| self.exec_id.shard()),
-                                )),
-                                timer_id: None,
+                                // Inherit the parent's shard (issue #697 AC4) --
+                                // same rationale as the plain awaited-child path.
+                                child_id: Some(ExecutionId::new_for_shard(self.exec_id.shard())),
                                 is_new: true,
                             });
                         }
                         _ => unreachable!("match_child_workflow never returns this variant"),
                     }
                 }
-                RaceBranchKind::Timer { duration_secs } => {
-                    // Deterministic, reserved id: re-derived identically on every
-                    // replay from the race seq + branch index, so the recorded
-                    // `TimerStarted` always matches and the worker recognises an
-                    // idempotent re-park of the same row. The reserved prefix keeps
-                    // it out of the user timer-id namespace (mirroring #476's
-                    // `__signal_timeout:` and #779's `__child_timeout:`).
-                    let timer_id = race_timer_id(seq, index);
-                    let history_match = self
-                        .match_history(|m| m.match_timer_strict(&timer_id, Some(*duration_secs)));
-                    match history_match {
-                        HistoryMatch::Matched { .. } => {
-                            // Keep ctx.now() in step with the recorded fire.
-                            // `_to` (max), not `advance_timer_clock` (sum):
-                            // concurrent race deadlines share `clock_anchor`.
-                            #[cfg(any(test, feature = "testing"))]
-                            self.advance_timer_clock_to(
-                                clock_anchor.saturating_add(*duration_secs),
-                            );
-                            resolved.push((index, Ok(Value::Null)));
-                        }
-                        HistoryMatch::Diverged {
-                            expected,
-                            actual,
-                            event_index,
-                        } => {
-                            return Err(self.nd_error(
-                                format!(
-                                    "race #{seq} branch {index} (timer): timer mismatch: \
-                                     expected {expected}, got {actual}"
-                                ),
-                                event_index,
-                                Some(expected),
-                                Some(actual),
-                            ));
-                        }
-                        // NoMatch covers BOTH "never dispatched" and "TimerStarted
-                        // recorded but not yet fired" — the same command
-                        // (`StartTimer`) is correct for each, and the worker's
-                        // new-vs-existing row check makes the re-park idempotent.
-                        HistoryMatch::NoMatch => {
-                            to_dispatch.push(RaceDispatch {
-                                index,
-                                activity_id: None,
-                                child_id: None,
-                                timer_id: Some(TimerId::new(&timer_id)),
-                                is_new: true,
-                            });
-                        }
-                        other => {
-                            return Err(self.nd_error(
-                                format!(
-                                    "race #{seq} branch {index} (timer): unexpected history \
-                                     match {other:?}"
-                                ),
-                                None,
-                                Some(format!("TimerStarted({timer_id})")),
-                                Some(format!("{other:?}")),
-                            ));
-                        }
-                    }
-                }
-                RaceBranchKind::Signal { signal_name } => {
-                    // `match_race_signal`, not `match_signal`: a race branch
-                    // whose signal never arrived is the normal "this branch
-                    // lost" outcome and its siblings legitimately record their
-                    // own events around it, so neither is a divergence (#950).
-                    // The scan is bounded by this race's own winner marker so a
-                    // LOSING branch can never consume a signal delivered after
-                    // the race resolved (which belongs to a later waiter).
-                    match self
-                        .match_history(|m| m.match_race_signal(signal_name, &winner_marker_name))
-                    {
-                        HistoryMatch::Matched { output } => resolved.push((index, Ok(output))),
-                        HistoryMatch::Diverged {
-                            expected,
-                            actual,
-                            event_index,
-                        } => {
-                            return Err(self.nd_error(
-                                format!(
-                                    "race #{seq} branch {index} ({signal_name}): signal \
-                                     mismatch: expected {expected}, got {actual}"
-                                ),
-                                event_index,
-                                Some(expected),
-                                Some(actual),
-                            ));
-                        }
-                        // A signal branch has no in-flight durable resource: it is
-                        // either already delivered (Matched above) or still waiting.
-                        HistoryMatch::NoMatch => {
-                            to_dispatch.push(RaceDispatch {
-                                index,
-                                activity_id: None,
-                                child_id: None,
-                                timer_id: None,
-                                is_new: true,
-                            });
-                        }
-                        other => {
-                            return Err(self.nd_error(
-                                format!(
-                                    "race #{seq} branch {index} ({signal_name}): unexpected \
-                                     history match {other:?}"
-                                ),
-                                None,
-                                Some(format!("SignalReceived({signal_name})")),
-                                Some(format!("{other:?}")),
-                            ));
-                        }
-                    }
+                RaceBranchKind::Timer { .. } | RaceBranchKind::Signal { .. } => {
+                    unreachable!("timer/signal branches only occur in the paired shape")
                 }
             }
         }
-
-        // Every signal branch has now had its chance to claim, so the pump can
-        // resume and dispatch anything they left behind -- a handler whose
-        // signal no branch wanted still fires, one cycle position later than
-        // an unheld pump would have run it. Releasing is not flushing: the
-        // pump is a post-hook on `match_history`, so it has to be driven once
-        // explicitly here, or a claimable signal could sit undispatched until
-        // the workflow's next unrelated matcher call.
-        drop(pump_hold);
-        self.flush_pending_signal_handlers();
 
         // Validate payload caps for every branch about to be freshly
         // dispatched *before* pushing any bookkeeping for this cycle (the
@@ -11903,34 +10487,10 @@ impl WorkflowContext {
                         });
                     }
                 }
-                // Neither a timer nor a signal branch carries an author-supplied
-                // payload, so there is no input to cap-check.
-                RaceBranchKind::Timer { .. } | RaceBranchKind::Signal { .. } => {}
+                RaceBranchKind::Timer { .. } | RaceBranchKind::Signal { .. } => {
+                    unreachable!("timer/signal branches only occur in the paired shape")
+                }
             }
-        }
-
-        // Defence in depth (issue #950): a race whose winner is ALREADY recorded
-        // must be able to re-resolve that branch on every later replay. If
-        // nothing resolved yet the marker is still in history unconsumed, so the
-        // recorded winner could not be reproduced — fail loudly here rather than
-        // re-dispatching every branch and parking on a resolution that already
-        // happened (a silent hang). `settle_race` raises the same class of error
-        // for the case where SOMETHING resolved but not the recorded winner;
-        // this covers the empty case it cannot see. A pure read: it consumes
-        // nothing, so `settle_race` still claims the marker itself below.
-        if resolved.is_empty()
-            && self.match_history(|m| m.has_unconsumed_marker(&winner_marker_name))
-        {
-            return Err(self.nd_error(
-                format!(
-                    "race #{seq}: a winner is already recorded in history but no branch \
-                     could re-resolve it on this replay — the race's branches no longer \
-                     match the recorded ones"
-                ),
-                None,
-                Some(winner_marker_name),
-                Some("no branch resolved".to_string()),
-            ));
         }
 
         if needs_open_marker {
@@ -11949,35 +10509,10 @@ impl WorkflowContext {
         // the race future's poll-order tie-break (lowest index first)
         // matches the documented tie-break used when multiple branches are
         // already resolved by the time a later replay cycle checks them.
-        let mut receivers: Vec<(usize, RaceBranchReceiver)> = Vec::with_capacity(to_dispatch.len());
+        let mut receivers: Vec<(usize, oneshot::Receiver<Result<Value, String>>)> =
+            Vec::with_capacity(to_dispatch.len());
         for dispatch in &to_dispatch {
             let branch = &branches[dispatch.index];
-            // A timer branch parks on a `oneshot::Sender<()>` and a signal branch
-            // on a `oneshot::Sender<Value>`, so each kind mints its own channel
-            // inside its arm and normalises through `RaceBranchReceiver`.
-            if let RaceBranchKind::Timer { duration_secs } = &branch.kind {
-                let timer_id = dispatch
-                    .timer_id
-                    .clone()
-                    .expect("timer dispatch always carries a timer_id");
-                let (tx, rx) = oneshot::channel::<()>();
-                self.push_command(WorkflowCommand::StartTimer {
-                    timer_id,
-                    duration_secs: *duration_secs,
-                    result_tx: tx,
-                });
-                receivers.push((dispatch.index, RaceBranchReceiver::Timer(rx)));
-                continue;
-            }
-            if let RaceBranchKind::Signal { signal_name } = &branch.kind {
-                let (tx, rx) = oneshot::channel::<Value>();
-                self.push_command(WorkflowCommand::WaitForSignal {
-                    signal_name: signal_name.clone(),
-                    result_tx: tx,
-                });
-                receivers.push((dispatch.index, RaceBranchReceiver::Signal(rx)));
-                continue;
-            }
             let (tx, rx) = oneshot::channel();
             match &branch.kind {
                 RaceBranchKind::Activity {
@@ -12030,10 +10565,10 @@ impl WorkflowContext {
                     });
                 }
                 RaceBranchKind::Timer { .. } | RaceBranchKind::Signal { .. } => {
-                    unreachable!("timer/signal branches are dispatched above")
+                    unreachable!("timer/signal branches only occur in the paired shape")
                 }
             }
-            receivers.push((dispatch.index, RaceBranchReceiver::Output(rx)));
+            receivers.push((dispatch.index, rx));
         }
 
         let (winner_index, winner_raw) = RaceFirstFut { receivers }.await?;
@@ -12051,12 +10586,9 @@ impl WorkflowContext {
                         &error,
                     ))
                 }
-                // A timer fire and a signal delivery carry no error channel:
-                // `RaceBranchReceiver` only ever yields `Ok` for them, so this
-                // arm is reached solely if a future refactor changes that.
-                RaceBranchKind::Timer { .. } | RaceBranchKind::Signal { .. } => Err(
-                    HarvestError::Cancelled(format!("race #{seq} branch {winner_index}: {error}")),
-                ),
+                RaceBranchKind::Timer { .. } | RaceBranchKind::Signal { .. } => {
+                    unreachable!("timer/signal branches only occur in the paired shape")
+                }
             },
         };
 
@@ -12112,12 +10644,6 @@ impl WorkflowContext {
 
             let mut activities = Vec::new();
             let mut children = Vec::new();
-            // Issue #950: a losing TIMER branch's still-armed `harvest_timers`
-            // row must be deleted too, or it would fire later against a race
-            // that is already decided (and block retention). A losing SIGNAL
-            // branch needs no teardown — an undelivered signal simply stays
-            // observable to a later wait, exactly as in the #476 pair shape.
-            let mut timers = Vec::new();
             for dispatch in to_dispatch {
                 // Skip the winner: its own progress-frontier events are consumed
                 // by the terminal-settling path (`settle_terminal` /
@@ -12133,9 +10659,6 @@ impl WorkflowContext {
                 if let Some(id) = dispatch.child_id {
                     children.push(id);
                 }
-                if let Some(id) = dispatch.timer_id.clone() {
-                    timers.push(id);
-                }
             }
             // Issue #1126: the loser branches that resolved as `*InProgress`
             // this cycle have their synthetic terminal appended only at persist
@@ -12147,11 +10670,11 @@ impl WorkflowContext {
             // (a plain activity, `ctx.mutex(k).acquire()`, a timer, ...) lands
             // cleanly instead of diverging on the leftover event -> nd-block.
             self.match_history(|m| m.consume_race_loser_frontier(&activities, &children));
-            if !activities.is_empty() || !children.is_empty() || !timers.is_empty() {
+            if !activities.is_empty() || !children.is_empty() {
                 self.push_command(WorkflowCommand::CancelRaceLosers {
                     activities,
                     children,
-                    timers,
+                    timers: Vec::new(),
                 });
             }
             winner_index
@@ -12568,7 +11091,7 @@ impl WorkflowContext {
     /// The returned future never resolves on its own — calling
     /// `ctx.continue_as_new(input).await?` is effectively a "tail call" to a
     /// new execution. The worker drains the emitted command after the
-    /// executor suspends the cycle and performs the transition in a
+    /// executor's suspension window elapses and performs the transition in a
     /// single transaction. Any code after the await is therefore unreachable
     /// in practice.
     ///
@@ -12606,60 +11129,33 @@ impl WorkflowContext {
     ///
     /// The successor's **lifecycle defaults are resolved from
     /// `workflow_type`'s own [`WorkflowInfo`]** — not the predecessor's:
-    ///
-    /// - `execution_timeout` (#243).
-    /// - `sla` (#487), clamped to at most the execution timeout, exactly as
-    ///   at start.
-    /// - The `concurrency` key/limit (#247).
-    /// - The `quota` key (#946).
-    /// - The `max_input_bytes` payload cap (#1161).
-    /// - The workflow-level `retry_policy` (#523).
-    /// - The `owner`/`runbook_url`/`severity` ops metadata (#372).
-    ///
-    /// This mirrors how a spawned child resolves its own type's defaults. An
-    /// alert on the new phase pages the team that owns *that* phase.
-    ///
-    /// `max_input_bytes` re-resolves at the **worker**, not here. This
-    /// in-process context has no registry, so it cannot look up another
-    /// type's declared cap. An over-cap transition input is therefore not
-    /// rejected synchronously from this call. The command is still pushed;
-    /// the worker fails the predecessor terminally at persist time (see
-    /// *Errors*) if the TARGET type's cap rejects it.
+    /// `execution_timeout` (#243), `sla` (#487, clamped to at most the
+    /// execution timeout exactly as at start), the `concurrency` key/limit
+    /// (#247), the workflow-level `retry_policy` (#523), and the
+    /// `owner`/`runbook_url`/`severity` ops metadata (#372). This mirrors how
+    /// a spawned child resolves its own type's defaults, and means an alert
+    /// on the new phase pages the team that owns *that* phase.
     ///
     /// Carried forward verbatim (identical to a same-type continuation):
     /// `workflow_id`, shard, `queue_name`, `memo`, search attributes, context
     /// headers, build id, schedule lineage (#488/#534), completion callbacks
     /// (#605), the run-chain back-links (#701), and — deliberately — the
     /// chain-scoped lifetime cap `chain_execution_timeout`/`chain_deadline_at`
-    /// (#617). The chain cap is anchored at the *first* run of the chain.
-    /// Changing type must not reset it: cross-type continuation is not an
+    /// (#617). The chain cap is anchored at the *first* run of the chain, so
+    /// changing type must not reset it: cross-type continuation is not an
     /// escape hatch from a runaway-loop budget.
     ///
     /// The fleet-wide `max_workflow_execution_timeout` ceiling is applied to
-    /// the target's declared timeout, exactly as at every other
-    /// registry-aware start path. A type change is not an escape hatch from
-    /// that either.
+    /// the target's declared timeout exactly as at every other registry-aware
+    /// start path, so a type change is not an escape hatch from that either.
     ///
     /// **Not consulted on this path**: the target type's `throttle` (#607),
-    /// `debounce` (#499) and `batch` (#518). These are *admission* policies
-    /// that defer or collapse a *start*. Continue-as-new is in-flight
-    /// continuation, not a start, so a target declaring one of these gets no
-    /// pacing when entered via continue-as-new. If a phase must be paced or
-    /// rate-limited on entry, gate it at the caller instead.
-    ///
-    /// Every other `WorkflowInfo` field falls into one of two remaining
-    /// tiers:
-    ///
-    /// - Declarative metadata this path never reads: `description`,
-    ///   `input_schema`, `output_schema`, `error_schema`, `mcp`,
-    ///   `declared_activities`, `declared_children`.
-    /// - Identifies the target itself rather than governing successor
-    ///   behavior: `name`, `module`, `handler`.
-    ///
-    /// This partition is exhaustive. A newly added `WorkflowInfo` field must
-    /// be placed in one of the tiers above. Update this rustdoc and the
-    /// table in `docs/architecture.md`'s "Cross-type continue-as-new"
-    /// section together.
+    /// `debounce` (#499), `batch` (#518) and `max_input_bytes` (#252). Those
+    /// are *admission* policies, and continue-as-new is in-flight continuation
+    /// rather than a start — so a cross-type transition does not pass through
+    /// the target type's admission gates, and the payload cap enforced is the
+    /// predecessor's. If a phase must be paced or rate-limited on entry, gate
+    /// it at the caller instead.
     ///
     /// # Addressing consequence (read this)
     ///
@@ -12697,7 +11193,7 @@ impl WorkflowContext {
     ///
     /// Same as [`continue_as_new`](Self::continue_as_new). Additionally, the
     /// worker fails the execution terminally (a `WorkflowFailed` event, no
-    /// successor created, no retry offered) in five cases:
+    /// successor created, no retry offered) in four cases:
     ///
     /// 1. `workflow_type` is empty or blank.
     /// 2. `workflow_type` is not registered on the worker running the
@@ -12710,9 +11206,6 @@ impl WorkflowContext {
     ///    `(workflow_type, workflow_id)`. Harvest admits exactly one active
     ///    run per pair, and this path never displaces a bystander. Recovery is
     ///    to resolve that run, then restart or reset (#148) the entity.
-    /// 5. The input exceeds the target type's own `max_input_bytes` cap
-    ///    (#1161), resolved at the worker rather than returned synchronously
-    ///    from this call (see *Successor defaults*).
     ///
     /// Naming the *current* type is **not** an error — it is a supported
     /// request for that type's declared defaults (which plain
@@ -12802,7 +11295,7 @@ impl WorkflowContext {
                     input: output,
                     new_workflow_type,
                 });
-                self.park_until_dropped().await
+                park_until_dropped().await
             }
             HistoryMatch::Diverged {
                 expected,
@@ -12837,36 +11330,31 @@ impl WorkflowContext {
             }
             HistoryMatch::NoMatch => {
                 self.check_strict_replay_no_match("ContinueAsNew")?;
-                // Issue #1161: check the cap only for a SAME-type
-                // continuation. `self.payload_max_workflow_input` is
-                // resolved for the CURRENT type, which is also the successor
-                // type here, so the value is correct. A cross-type target's
-                // cap can differ in either direction. This in-process
-                // context has no registry to look the target up in. So a
-                // cross-type transition skips this check. It relies instead
-                // on the worker's own authoritative re-check at persist time
-                // (`persist_workflow_continue_as_new`), which resolves the
-                // TARGET type's `max_input_bytes` correctly.
-                if new_workflow_type.is_none() {
-                    let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
-                    if self.payload_max_workflow_input > 0
-                        && observed > self.payload_max_workflow_input
-                        && !self.offload_will_apply(observed)
-                    {
-                        return Err(HarvestError::PayloadTooLarge {
-                            kind: crate::error::PayloadKind::WorkflowInput,
-                            observed_bytes: observed,
-                            cap_bytes: self.payload_max_workflow_input,
-                            workflow_type: self.workflow_name.clone(),
-                            activity_name: None,
-                        });
-                    }
+                let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
+                if self.payload_max_workflow_input > 0
+                    && observed > self.payload_max_workflow_input
+                    && !self.offload_will_apply(observed)
+                {
+                    return Err(HarvestError::PayloadTooLarge {
+                        kind: crate::error::PayloadKind::WorkflowInput,
+                        observed_bytes: observed,
+                        cap_bytes: self.payload_max_workflow_input,
+                        // Name the run this input is destined for: the target
+                        // type for a cross-type continuation (#803), else our
+                        // own. The cap value itself is still the *current*
+                        // type's — the context cannot see the target's
+                        // `max_input_bytes` override.
+                        workflow_type: new_workflow_type
+                            .clone()
+                            .unwrap_or_else(|| self.workflow_name.clone()),
+                        activity_name: None,
+                    });
                 }
                 self.push_command(WorkflowCommand::ContinueAsNew {
                     input,
                     new_workflow_type,
                 });
-                self.park_until_dropped().await
+                park_until_dropped().await
             }
         }
     }
@@ -13120,11 +11608,6 @@ impl WorkflowContext {
         // unlike the workflow body and query handlers — never sees them.
         let execution_timeout = self.execution_timeout;
         let deadline_at = self.deadline_at;
-        // Issue #1405: inherit the parent's current shard, mirroring
-        // deadline_at above. A child spawned from an update handler then
-        // also places on the row's true residence. It does not fall back
-        // to the origin bits `new_for_handler` would otherwise leave unset.
-        let current_shard_id = self.current_shard_id;
         // Carryover is frozen in WorkflowStarted, so a handler on a scheduled workflow
         // must observe the same last_completion_result/last_error as the workflow body
         // (issue #488).
@@ -13159,8 +11642,6 @@ impl WorkflowContext {
                 // Issue #772 (Codex P2): inherit the parent's deadline budget.
                 inner.execution_timeout = execution_timeout;
                 inner.deadline_at = deadline_at;
-                // Issue #1405: inherit the parent's current shard.
-                inner.current_shard_id = current_shard_id;
                 // Issue #698: inherit the spawning parent's execution id.
                 inner.parent_execution_id = parent_execution_id;
             }
@@ -13236,8 +11717,6 @@ impl WorkflowContext {
                 // `ctx.deadline()` works inside the handler.
                 inner.execution_timeout = self.execution_timeout;
                 inner.deadline_at = self.deadline_at;
-                // Issue #1405: inherit the parent's current shard.
-                inner.current_shard_id = self.current_shard_id;
                 // Issue #698: inherit the spawning parent's execution id so
                 // `ctx.info().parent_execution_id` is visible inside the handler.
                 inner.parent_execution_id = self.parent_execution_id;
@@ -13715,14 +12194,10 @@ impl WorkflowContext {
         //   history (epoch) to have grown; a same-position re-drive (spurious
         //   wake / rolled-back retry) re-emits the SAME seq deterministically.
         let epoch = {
-            // Issue #952: the sealed-run clause matters here too — see
-            // `replay_suppresses_side_effects`. Locked separately from that
-            // predicate (rather than via `match_history`) so this read still
-            // triggers no `pump_signal_handlers` post-hook.
-            if self.replay_suppresses_side_effects() {
+            let matcher = self.matcher.lock().expect("matcher lock poisoned");
+            if matcher.is_replaying() {
                 return Ok(());
             }
-            let matcher = self.matcher.lock().expect("matcher lock poisoned");
             matcher.event_count()
         };
         // Serialize the caller's chunk (the only fallible step).
@@ -13811,40 +12286,6 @@ impl WorkflowContext {
         ActivityExecId::new()
     }
 
-    /// Park forever and hold a park mark (issue #1797).
-    ///
-    /// Terminal commands such as `continue_as_new` use this. The worker
-    /// acts on the drained command, so this future never resolves.
-    async fn park_forever<T>(&self) -> T {
-        let mut park = ParkToken::new(&self.parks);
-        park.hold();
-        std::future::pending::<T>().await
-    }
-
-    /// Park forever, typed for the `HarvestResult<()>` call sites.
-    async fn park_until_dropped(&self) -> HarvestResult<()> {
-        self.park_forever().await
-    }
-
-    /// Returns `true` when a Harvest future is parked (issue #1797).
-    ///
-    /// A future is parked when a buffered command still holds an open result
-    /// channel, or when a [`ParkToken`] is held. The executor treats a pending
-    /// handler with a parked future as suspended.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the commands mutex is poisoned.
-    pub(crate) fn has_parked_harvest_future(&self) -> bool {
-        self.parks.is_held()
-            || self
-                .commands
-                .lock()
-                .expect("commands lock poisoned")
-                .iter()
-                .any(WorkflowCommand::awaits_result)
-    }
-
     /// Push a command onto the pending commands queue.
     fn push_command(&self, cmd: WorkflowCommand) {
         self.commands
@@ -13858,8 +12299,6 @@ impl WorkflowContext {
 #[must_use = "futures do nothing unless you .await or poll them"]
 pub struct AwaitConditionFut<F> {
     predicate: F,
-    /// Holds the park mark while the predicate is false (issue #1797).
-    park: ParkToken,
 }
 
 impl<F> std::future::Future for AwaitConditionFut<F>
@@ -13874,10 +12313,8 @@ where
     ) -> std::task::Poll<Self::Output> {
         let this = self.get_mut();
         if (this.predicate)() {
-            this.park.release();
             std::task::Poll::Ready(Ok(()))
         } else {
-            this.park.hold();
             std::task::Poll::Pending
         }
     }
@@ -14259,79 +12696,6 @@ impl ActivityExecutionInfo {
     }
 }
 
-/// A heartbeat payload and the time the activity sent it (issue #1788).
-///
-/// The sender takes the time. A busy runtime can run the flush loop late. A
-/// time taken there would make a stale heartbeat look new.
-#[doc(hidden)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StampedHeartbeat {
-    /// The heartbeat payload.
-    pub details: serde_json::Value,
-    /// When the activity sent the heartbeat, by the monotonic clock. The
-    /// flush writes the database clock minus the age of this time.
-    pub sent_order: std::time::Instant,
-    /// The stamp order. Each stamp takes the next value of one counter, so
-    /// two stamps never tie. The flusher keeps the heartbeat with the
-    /// highest value.
-    pub sequence: u64,
-}
-
-/// The next [`StampedHeartbeat::sequence`] (issue #1788).
-static NEXT_HEARTBEAT_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-impl StampedHeartbeat {
-    /// Stamp `details` with the current time.
-    #[must_use]
-    pub fn now(details: serde_json::Value) -> Self {
-        Self {
-            details,
-            sent_order: std::time::Instant::now(),
-            sequence: NEXT_HEARTBEAT_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        }
-    }
-}
-
-impl From<serde_json::Value> for StampedHeartbeat {
-    fn from(details: serde_json::Value) -> Self {
-        Self::now(details)
-    }
-}
-
-/// Where [`ActivityContext::heartbeat`] sends a payload.
-#[derive(Debug, Clone)]
-pub(crate) enum HeartbeatSink {
-    /// A channel of bare payloads, for tests.
-    Plain(tokio::sync::mpsc::Sender<serde_json::Value>),
-    /// The worker's flusher. Each payload carries its send time.
-    #[cfg(feature = "db")]
-    Stamped(crate::heartbeat::HeartbeatSlot),
-}
-
-impl HeartbeatSink {
-    /// Send `details`. Returns `false` when the receiver is gone.
-    async fn send(&self, details: serde_json::Value) -> bool {
-        match self {
-            Self::Plain(tx) => tx.send(details).await.is_ok(),
-            #[cfg(feature = "db")]
-            Self::Stamped(slot) => slot.send(StampedHeartbeat::now(details)),
-        }
-    }
-}
-
-impl From<tokio::sync::mpsc::Sender<serde_json::Value>> for HeartbeatSink {
-    fn from(tx: tokio::sync::mpsc::Sender<serde_json::Value>) -> Self {
-        Self::Plain(tx)
-    }
-}
-
-#[cfg(feature = "db")]
-impl From<crate::heartbeat::HeartbeatSlot> for HeartbeatSink {
-    fn from(slot: crate::heartbeat::HeartbeatSlot) -> Self {
-        Self::Stamped(slot)
-    }
-}
-
 /// Context passed to every activity function.
 ///
 /// Activities may perform I/O, call external services, and interact with the
@@ -14341,7 +12705,7 @@ pub struct ActivityContext {
     /// Shared state map.
     state: SharedState,
     /// Heartbeat channel -- `None` in test contexts.
-    heartbeat_tx: Option<HeartbeatSink>,
+    heartbeat_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
     /// Latest heartbeat payload durably persisted by the previous attempt.
     heartbeat_details: Option<serde_json::Value>,
     /// Why heartbeat APIs are unavailable for this activity context.
@@ -14379,18 +12743,6 @@ pub struct ActivityContext {
     /// was not constructed by the worker's regular activity dispatch path.
     #[cfg(feature = "db")]
     transactional_state: Option<TransactionalState>,
-    /// Payload-codec registry for writes this context issues (issue #1243).
-    ///
-    /// `ActivityCompleted.output` is payload-bearing, so the inline commit in
-    /// `run_transactional` must encode through the same registry the worker
-    /// writes and replays with. Defaults to identity, so a context built
-    /// without one behaves exactly as before.
-    ///
-    /// `db`-gated because its only reader is that commit, which is itself
-    /// `db`-gated: without the feature there is no transactional write path and
-    /// the field would be dead.
-    #[cfg(feature = "db")]
-    payload_codecs: crate::payload_codec::PayloadCodecs,
     /// Ambient context headers propagated from the parent workflow (issue #481).
     /// Read via `header()` / `headers()`. Empty for activities dispatched before
     /// this feature was deployed.
@@ -14521,7 +12873,7 @@ impl ActivityContext {
     #[allow(dead_code)]
     pub(crate) fn new(
         state: SharedState,
-        heartbeat_tx: Option<HeartbeatSink>,
+        heartbeat_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
         cancel: tokio_util::sync::CancellationToken,
         identity: ActivityIdentity,
     ) -> Self {
@@ -14544,8 +12896,6 @@ impl ActivityContext {
             max_attempts: None,
             #[cfg(feature = "db")]
             transactional_state: None,
-            #[cfg(feature = "db")]
-            payload_codecs: crate::payload_codec::PayloadCodecs::default(),
             context_headers: std::sync::Arc::new(HashMap::new()),
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             #[cfg(feature = "db")]
@@ -14564,14 +12914,13 @@ impl ActivityContext {
     #[cfg(feature = "db")]
     pub(crate) fn new_with_cancellation_check(
         state: SharedState,
-        heartbeat_tx: Option<HeartbeatSink>,
+        heartbeat_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
         heartbeat_details: Option<serde_json::Value>,
         cancel: tokio_util::sync::CancellationToken,
-        claim: crate::queue::TaskClaim,
+        task_id: uuid::Uuid,
         pool: ActivityCancellationPool,
         identity: ActivityIdentity,
     ) -> Self {
-        let task_id = claim.task_id;
         let heartbeat_unsupported_reason = heartbeat_tx
             .is_none()
             .then_some(NO_HEARTBEAT_FLUSHER_REASON);
@@ -14589,7 +12938,7 @@ impl ActivityContext {
             heartbeat_unsupported_reason,
             cancel,
             cancellation_check: Some(ActivityCancellationCheck {
-                claim,
+                task_id,
                 pool,
                 last_checked_at: Mutex::new(None),
             }),
@@ -14599,8 +12948,6 @@ impl ActivityContext {
             previous_failure: None,
             max_attempts: None,
             transactional_state: None,
-            #[cfg(feature = "db")]
-            payload_codecs: crate::payload_codec::PayloadCodecs::default(),
             context_headers: std::sync::Arc::new(HashMap::new()),
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             transactional_commit_occurred: std::sync::atomic::AtomicBool::new(false),
@@ -14637,8 +12984,6 @@ impl ActivityContext {
             max_attempts: None,
             #[cfg(feature = "db")]
             transactional_state: None,
-            #[cfg(feature = "db")]
-            payload_codecs: crate::payload_codec::PayloadCodecs::default(),
             context_headers: std::sync::Arc::new(HashMap::new()),
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             #[cfg(feature = "db")]
@@ -14920,23 +13265,6 @@ impl ActivityContext {
     #[must_use]
     pub const fn with_deadline(mut self, deadline: Option<DateTime<Utc>>) -> Self {
         self.deadline = deadline;
-        self
-    }
-
-    /// Install the payload-codec registry this context's writes encode through
-    /// (issue #1243).
-    ///
-    /// `ActivityCompleted.output` is payload-bearing, so the inline commit in
-    /// [`Self::run_transactional`] has to encode through the same registry the
-    /// worker writes and replays with. `db`-gated alongside that commit and the
-    /// field it sets.
-    #[cfg(feature = "db")]
-    #[must_use]
-    pub(crate) fn with_payload_codecs(
-        mut self,
-        codecs: crate::payload_codec::PayloadCodecs,
-    ) -> Self {
-        self.payload_codecs = codecs;
         self
     }
 
@@ -15406,11 +13734,9 @@ impl ActivityContext {
         let Some(ref tx) = self.heartbeat_tx else {
             return Ok(());
         };
-        if !tx.send(payload).await {
-            return Err(HarvestError::ActivityCancelled(
-                "activity cancelled: heartbeat channel closed".into(),
-            ));
-        }
+        tx.send(payload).await.map_err(|_| {
+            HarvestError::ActivityCancelled("activity cancelled: heartbeat channel closed".into())
+        })?;
 
         Ok(())
     }
@@ -15531,7 +13857,7 @@ impl ActivityContext {
                         };
                         // Channel closed => the flusher is gone; stop silently
                         // (never panic).
-                        if !tx.send(payload).await {
+                        if tx.send(payload).await.is_err() {
                             break;
                         }
                     }
@@ -15590,38 +13916,6 @@ impl ActivityContext {
         self.start_auto_heartbeat(interval)
     }
 
-    /// Keep this activity alive after a drain cancel (issue #1813).
-    ///
-    /// The drain cancel stops the auto-heartbeat ticker and fails each manual
-    /// heartbeat. A handler that ignores the cancel keeps its claim. Without
-    /// pings, the heartbeat-timeout scanner fails the task, and a retry then
-    /// runs next to the live handler.
-    ///
-    /// This future re-sends the last payload at `heartbeat_timeout / 3`, as
-    /// [`Self::start_auto_heartbeat_default`] does. The checkpoint therefore
-    /// does not change. It never completes. Without a heartbeat timeout or a
-    /// flusher, it only pends. The `start_to_close` ceiling still applies.
-    #[cfg(feature = "db")]
-    pub(crate) async fn keep_alive_after_drain(&self) -> std::convert::Infallible {
-        let (Some(timeout), Some(tx)) = (self.heartbeat_timeout, self.heartbeat_tx.as_ref()) else {
-            return std::future::pending().await;
-        };
-        let mut ticker =
-            tokio::time::interval((timeout / 3).max(std::time::Duration::from_millis(1)));
-        loop {
-            ticker.tick().await;
-            let payload = self
-                .last_heartbeat_payload
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
-                .unwrap_or(serde_json::Value::Null);
-            if !tx.send(payload).await {
-                return std::future::pending().await;
-            }
-        }
-    }
-
     /// Check whether the owning workflow has been cancelled.
     ///
     /// This is a lightweight convenience that works for both regular and local
@@ -15677,6 +13971,10 @@ impl ActivityContext {
 
     #[cfg(feature = "db")]
     async fn check_durable_cancellation(&self) -> crate::HarvestResult<()> {
+        use crate::schema::harvest_task_queue::dsl;
+        use diesel::{OptionalExtension, QueryDsl};
+        use diesel_async::RunQueryDsl;
+
         let Some(check) = &self.cancellation_check else {
             return Ok(());
         };
@@ -15685,30 +13983,35 @@ impl ActivityContext {
             return Ok(());
         }
 
-        let mut conn = crate::replication::fenced_checkout(&check.pool)
+        let mut conn = check
+            .pool
+            .get()
             .await
             .map_err(crate::error::database_error)?;
-        let task_id = check.claim.task_id;
-        let row = crate::queue::task_status_for_claim(&mut conn, &check.claim).await?;
+        let row = dsl::harvest_task_queue
+            .find(check.task_id)
+            .select((dsl::state, dsl::error))
+            .first::<(String, Option<String>)>(&mut conn)
+            .await
+            .optional()
+            .map_err(crate::error::database_error)?;
 
         match row {
-            Some((_, _, true)) => Ok(()),
-            // A later claim holds the row (issue #1789). This attempt must
-            // stop, so its late writes do not race the live attempt.
-            Some((state, _, false)) if state == "RUNNING" => Err(HarvestError::ActivityCancelled(
-                format!("activity task {task_id} lease lost: a later claim holds it"),
-            )),
-            Some((_, Some(error), _)) if error.contains("workflow cancelled") => {
+            Some((state, _)) if state == "RUNNING" => Ok(()),
+            Some((_, Some(error))) if error.contains("workflow cancelled") => {
                 Err(HarvestError::ActivityCancelled(error))
             }
-            Some((state, Some(error), _)) => Err(HarvestError::Cancelled(format!(
-                "activity task {task_id} is no longer running ({state}): {error}"
+            Some((state, Some(error))) => Err(HarvestError::Cancelled(format!(
+                "activity task {} is no longer running ({state}): {error}",
+                check.task_id
             ))),
-            Some((state, None, _)) => Err(HarvestError::Cancelled(format!(
-                "activity task {task_id} is no longer running ({state})"
+            Some((state, None)) => Err(HarvestError::Cancelled(format!(
+                "activity task {} is no longer running ({state})",
+                check.task_id
             ))),
             None => Err(HarvestError::Cancelled(format!(
-                "activity task {task_id} is no longer present"
+                "activity task {} is no longer present",
+                check.task_id
             ))),
         }
     }
@@ -15845,122 +14148,87 @@ impl ActivityContext {
 
         let exec_id = txn.exec_id;
         let activity_id = txn.activity_id;
-        let claim = txn.claim.clone();
-        let task_id = claim.task_id;
-        // Issue #1243: bound out here so the transaction closure owns a clone.
-        // The registry's rotation state is shared across clones, so this still
-        // observes a `set_active_key` that lands mid-activity.
-        let codecs = self.payload_codecs.clone();
+        let task_id = txn.task_id;
         let max_result_bytes = txn.max_result_bytes;
 
-        let mut conn = crate::replication::fenced_checkout(&txn.pool)
-            .await
-            .map_err(|e| format!("transactional activity failed to acquire DB connection: {e}"))?;
+        let mut conn =
+            txn.pool.get().await.map_err(|e| {
+                format!("transactional activity failed to acquire DB connection: {e}")
+            })?;
 
-        // Issue #1429 (Codex review): `wake_workflow_task` below raises a
-        // dispatch hint. `buffered_checkpoint` ties its publish to this
-        // transaction's own commit, even when nested inside the worker's
-        // outer buffering scope. A plain `buffered_settled` call degrades
-        // to a no-op passthrough when nested. So a nested transaction's
-        // hint would flush with the outer task's outcome, instead of this
-        // transaction's own.
-        let result = crate::dispatch::buffered_checkpoint(Box::pin(
-            conn.transaction::<T, TxError, _>(async |conn| {
-                // Run user domain writes.
-                let user_result = f(conn).await.map_err(TxError::User)?;
+        let result = Box::pin(conn.transaction::<T, TxError, _>(async |conn| {
+            // Run user domain writes.
+            let user_result = f(conn).await.map_err(TxError::User)?;
 
-                // Serialize the result for the event log.
-                let output =
-                    serde_json::to_value(&user_result).map_err(HarvestError::Serialization)?;
+            // Serialize the result for the event log.
+            let output = serde_json::to_value(&user_result).map_err(HarvestError::Serialization)?;
 
-                // Enforce the result-size cap before committing.  The worker's
-                // post-handler cap check runs after the handler returns, which
-                // is too late for transactional activities — the event would
-                // already be committed.  Rolling back here ensures an oversized
-                // result never lands in harvest_events.
-                if max_result_bytes > 0 {
-                    let observed = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
-                    if observed > max_result_bytes {
-                        use crate::failure::IntoActivityErrorString as _;
-                        let payload = crate::failure::ActivityFailure::non_retryable(
-                            "PayloadTooLarge",
-                            format!(
-                                "transactional activity result exceeds cap: \
+            // Enforce the result-size cap before committing.  The worker's
+            // post-handler cap check runs after the handler returns, which
+            // is too late for transactional activities — the event would
+            // already be committed.  Rolling back here ensures an oversized
+            // result never lands in harvest_events.
+            if max_result_bytes > 0 {
+                let observed = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
+                if observed > max_result_bytes {
+                    use crate::failure::IntoActivityErrorString as _;
+                    let payload = crate::failure::ActivityFailure::non_retryable(
+                        "PayloadTooLarge",
+                        format!(
+                            "transactional activity result exceeds cap: \
                              {observed} bytes (cap {max_result_bytes} bytes)"
-                            ),
-                        )
-                        .into_error_payload();
-                        return Err(TxError::Payload(payload));
-                    }
+                        ),
+                    )
+                    .into_error_payload();
+                    return Err(TxError::Payload(payload));
                 }
+            }
 
-                // Lock the execution row first (consistent with the rest of the
-                // codebase: harvest_workflow_executions → harvest_task_queue)
-                // and load history so we can compute the next sequential
-                // event_id before appending.
-                // Undecoded: this reads `next_event_id` only (see the helper's docs).
-                let history = crate::store::lock_and_load_history_undecoded(conn, exec_id).await?;
+            // Lock the execution row first (consistent with the rest of the
+            // codebase: harvest_workflow_executions → harvest_task_queue)
+            // and load history so we can compute the next sequential
+            // event_id before appending.
+            let history = crate::store::lock_and_load_history(conn, exec_id).await?;
 
-                // Idempotency guard: confirm that this attempt still holds the
-                // claim before the commit. The task can already be COMPLETED,
-                // for example after a crash-recovery attempt whose first
-                // transaction succeeded. The guard then rolls back the user
-                // writes, so the caller sees a clean slate. This matches the
-                // exactly-once contract. A later claim of the same row also
-                // rolls back, because that attempt owns the outcome (issue
-                // #1789).
-                match crate::queue::lock_claim_for_update(conn, &claim).await? {
-                    crate::queue::ClaimLock::Held => {}
-                    crate::queue::ClaimLock::Lost { state: Some(other) } if other == "RUNNING" => {
-                        return Err(TxError::Harvest(HarvestError::Config(format!(
-                            "transactional activity task {task_id} is held by a later \
-                         claim; rolling back user writes (the lease of this attempt \
-                         was lost)"
-                        ))));
-                    }
-                    crate::queue::ClaimLock::Lost { state: Some(other) } => {
-                        return Err(TxError::Harvest(HarvestError::Config(format!(
-                            "transactional activity task {task_id} is in state '{other}', \
+            // Idempotency guard: verify the task is still RUNNING before
+            // we commit.  If it's already COMPLETED (e.g. this is a
+            // crash-recovery attempt where the first transaction succeeded)
+            // we roll back the user writes so the caller sees a clean
+            // slate, matching the "exactly-once" contract.
+            match crate::queue::task_state_for_update(conn, task_id).await? {
+                Some(ref s) if s == "RUNNING" => {}
+                Some(other) => {
+                    return Err(TxError::Harvest(HarvestError::Config(format!(
+                        "transactional activity task {task_id} is in state '{other}', \
                          not RUNNING; rolling back user writes (the ActivityCompleted \
                          event was already committed by a prior attempt)"
-                        ))));
-                    }
-                    crate::queue::ClaimLock::Lost { state: None } => {
-                        return Err(TxError::Harvest(HarvestError::Config(format!(
-                            "transactional activity task {task_id} no longer exists; \
-                         rolling back user writes"
-                        ))));
-                    }
+                    ))));
                 }
+                None => {
+                    return Err(TxError::Harvest(HarvestError::Config(format!(
+                        "transactional activity task {task_id} no longer exists; \
+                         rolling back user writes"
+                    ))));
+                }
+            }
 
-                // Append ActivityCompleted within the same transaction.
-                let completion_event = crate::event::WorkflowEvent::ActivityCompleted {
-                    activity_id,
-                    output: output.clone(),
-                };
-                crate::store::append_events_with_codecs(
-                    conn,
-                    exec_id,
-                    &[completion_event],
-                    history.next_event_id,
-                    &codecs,
-                )
+            // Append ActivityCompleted within the same transaction.
+            let completion_event = crate::event::WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: output.clone(),
+            };
+            crate::store::append_events(conn, exec_id, &[completion_event], history.next_event_id)
                 .await?;
 
-                // Mark the task COMPLETED. The row lock above keeps the claim
-                // current, so a lost lease here is a bug, and the error rolls
-                // back.
-                crate::queue::complete_claimed_task(conn, &claim, output)
-                    .await?
-                    .require_applied(task_id)?;
+            // Mark the task COMPLETED.
+            crate::queue::complete_task(conn, task_id, output).await?;
 
-                // Wake the workflow so it can pick up the ActivityCompleted
-                // result on its next execution cycle.
-                crate::queue::wake_workflow_task(conn, exec_id).await?;
+            // Wake the workflow so it can pick up the ActivityCompleted
+            // result on its next execution cycle.
+            crate::queue::wake_workflow_task(conn, exec_id).await?;
 
-                Ok(user_result)
-            }),
-        ))
+            Ok(user_result)
+        }))
         .await;
 
         match result {
@@ -16072,7 +14340,7 @@ impl ActivityContext {
         };
         Self::new(
             empty_shared_state(),
-            Some(heartbeat_tx.into()),
+            Some(heartbeat_tx),
             tokio_util::sync::CancellationToken::new(),
             identity,
         )
@@ -16147,7 +14415,6 @@ impl ActivityContext {
 mod tests {
     use super::*;
     use crate::error::TimeoutType;
-    use crate::shard::ShardRouter;
     use crate::types::{ActivityExecId, ShardId};
     use chrono::Utc;
     use std::time::Duration;
@@ -16162,39 +14429,6 @@ mod tests {
             last_error: None,
             scheduled_time: None,
         }
-    }
-
-    // ── Cross-shard placement router (issue #1263 items 11/15/17) ──────────
-
-    /// `resolved_placement_router` must return `None` for the ordinary
-    /// production shape: no router explicitly threaded via
-    /// `with_shard_router`. The persist-time preflight then asks the
-    /// process-global router fresh, exactly as it always has.
-    #[test]
-    fn resolved_placement_router_is_none_without_an_explicit_router() {
-        let ctx = WorkflowContext::new_test();
-        assert!(ctx.resolved_placement_router().is_none());
-    }
-
-    /// `resolved_placement_router` must return the EXACT router installed
-    /// via `with_shard_router`. The worker's persist-time preflight can
-    /// then validate a placement against the same topology that resolved
-    /// it. It need not independently re-ask the process-global router,
-    /// which can be a different topology, or absent (issue #1263 items
-    /// 11/15/17).
-    #[test]
-    fn resolved_placement_router_returns_the_explicitly_installed_router() {
-        let router = ShardRouter::new(
-            vec![ShardId::new(0), ShardId::new(1)],
-            vec![ShardId::new(0), ShardId::new(1)],
-            ShardId::new(0),
-        );
-        let ctx = WorkflowContext::new_test().with_shard_router(router.clone());
-        let resolved = ctx
-            .resolved_placement_router()
-            .expect("an explicitly installed router must be returned");
-        assert_eq!(resolved.default_shard(), router.default_shard());
-        assert_eq!(resolved.writable_shards(), router.writable_shards());
     }
 
     #[test]
@@ -16608,10 +14842,7 @@ mod tests {
             ]
         );
         // A second drain sees nothing (no double delivery).
-        assert_eq!(
-            ctx.drain_signals_raw("event").unwrap(),
-            [] as [serde_json::Value; 0]
-        );
+        assert!(ctx.drain_signals_raw("event").unwrap().is_empty());
     }
 
     #[test]
@@ -16759,7 +14990,7 @@ mod tests {
 
         // Same for drain_signals over an empty buffer.
         let drained = ctx.drain_signals_raw("event").unwrap();
-        assert_eq!(drained, [] as [serde_json::Value; 0]);
+        assert!(drained.is_empty());
         assert!(
             ctx.drain_commands().is_empty(),
             "drain_signals must not emit any command"
@@ -17482,52 +15713,6 @@ mod tests {
         assert!((mid.continue_as_new_deadline_fraction() - 0.6).abs() < f64::EPSILON);
     }
 
-    // ── Default history caps (issue #1804) ──────────────────────────────────
-
-    #[test]
-    fn workflow_history_policy_ships_default_hard_caps() {
-        let policy = WorkflowHistoryPolicy::default();
-        assert_eq!(DEFAULT_HISTORY_EVENT_HARD_CAP, 50_000);
-        assert_eq!(DEFAULT_HISTORY_BYTE_HARD_CAP, 50 * 1024 * 1024);
-        assert_eq!(
-            policy.event_hard_cap(),
-            Some(DEFAULT_HISTORY_EVENT_HARD_CAP)
-        );
-        assert_eq!(policy.byte_hard_cap(), Some(DEFAULT_HISTORY_BYTE_HARD_CAP));
-    }
-
-    #[test]
-    fn workflow_history_policy_default_warning_lands_at_10240_events() {
-        // 50,000 * 0.2048 = 10,240: the default soft threshold.
-        let policy = WorkflowHistoryPolicy::default();
-        assert_eq!(policy.history_bloat_warn_threshold(), Some(10_240));
-        assert_eq!(
-            policy
-                .without_event_hard_cap()
-                .history_bloat_warn_threshold(),
-            None
-        );
-        assert_eq!(
-            policy
-                .with_history_bloat_warn_fraction(0.0)
-                .history_bloat_warn_threshold(),
-            None
-        );
-    }
-
-    #[test]
-    fn workflow_history_policy_caps_accept_unlimited() {
-        let policy = WorkflowHistoryPolicy::default()
-            .without_event_hard_cap()
-            .without_byte_hard_cap();
-        assert_eq!(policy.event_hard_cap(), None);
-        assert_eq!(policy.byte_hard_cap(), None);
-
-        let capped = policy.with_event_hard_cap(7).with_byte_hard_cap(9);
-        assert_eq!(capped.event_hard_cap(), Some(7));
-        assert_eq!(capped.byte_hard_cap(), Some(9));
-    }
-
     // ── Operator early-warning for history bloat (issue #704) ────────────────
 
     #[test]
@@ -18054,47 +16239,22 @@ mod tests {
         );
     }
 
-    /// A SAME-type continuation's payload-cap check names the run's own
-    /// type and uses its own resolved cap — unchanged by issue #1161.
+    /// The payload-cap rejection names the run the input is destined for —
+    /// the *target* type on a cross-type continuation.
     #[tokio::test]
-    async fn continue_as_new_payload_cap_names_the_current_type() {
+    async fn continue_as_new_as_type_payload_cap_names_the_target_type() {
         let ctx = WorkflowContext::new_test().with_payload_caps(1, 1, 1, 1);
-        let own = ctx.workflow_type().to_string();
         let big = serde_json::json!({"blob": "x".repeat(256)});
 
         let err = ctx
-            .continue_as_new(big)
+            .continue_as_new_as_type("paid_subscription", big)
             .await
             .expect_err("an oversized input must be rejected");
         match err {
             HarvestError::PayloadTooLarge { workflow_type, .. } => {
-                assert_eq!(workflow_type, own);
+                assert_eq!(workflow_type, "paid_subscription");
             }
             other => panic!("expected PayloadTooLarge, got {other:?}"),
-        }
-    }
-
-    /// Issue #1161: a cross-type continuation's payload cap can only be the
-    /// TARGET type's, which this in-process context cannot resolve. An input
-    /// over the *current* type's cap is therefore no longer rejected here.
-    /// The command is still pushed, deferring the real check to the
-    /// worker's authoritative re-check at persist time
-    /// (`persist_workflow_continue_as_new`).
-    #[tokio::test]
-    async fn continue_as_new_as_type_defers_the_payload_cap_to_the_worker() {
-        let ctx = WorkflowContext::new_test().with_payload_caps(1, 1, 1, 1);
-        let big = serde_json::json!({"blob": "x".repeat(256)});
-
-        let drained = drain_parked_continue_as_new(
-            &ctx,
-            ctx.continue_as_new_as_type("paid_subscription", big.clone()),
-        )
-        .await;
-
-        assert_eq!(drained.len(), 1);
-        match &drained[0] {
-            WorkflowCommand::ContinueAsNew { input, .. } => assert_eq!(input, &big),
-            other => panic!("expected ContinueAsNew, got {other:?}"),
         }
     }
 
@@ -18309,7 +16469,7 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let ctx = ActivityContext::new(
             Arc::new(HashMap::new()),
-            Some(HeartbeatSink::Plain(tx)),
+            Some(tx),
             cancel,
             ActivityIdentity::for_test(),
         );
@@ -18336,7 +16496,7 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let ctx = ActivityContext::new(
             Arc::new(HashMap::new()),
-            Some(HeartbeatSink::Plain(tx)),
+            Some(tx),
             cancel.clone(),
             ActivityIdentity::for_test(),
         );
@@ -18363,7 +16523,7 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let ctx = ActivityContext::new(
             Arc::new(HashMap::new()),
-            Some(HeartbeatSink::Plain(tx)),
+            Some(tx),
             cancel,
             ActivityIdentity::for_test(),
         );
@@ -18376,7 +16536,7 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let ctx = ActivityContext::new(
             Arc::new(HashMap::new()),
-            Some(HeartbeatSink::Plain(tx)),
+            Some(tx),
             cancel.clone(),
             ActivityIdentity::for_test(),
         );
@@ -18403,7 +16563,7 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let ctx = ActivityContext::new(
             empty_shared_state(),
-            Some(HeartbeatSink::Plain(tx)),
+            Some(tx),
             cancel.clone(),
             ActivityIdentity::for_test(),
         )
@@ -18635,10 +16795,10 @@ mod tests {
 
         let ctx = ActivityContext::new_with_cancellation_check(
             empty_shared_state(),
-            Some(HeartbeatSink::Plain(tx)),
+            Some(tx),
             Some(serde_json::json!({"checkpoint": 42})),
             cancel,
-            crate::queue::TaskClaim::new(uuid::Uuid::new_v4(), "test-worker", 1),
+            uuid::Uuid::new_v4(),
             pool,
             ActivityIdentity::for_test(),
         )
@@ -18670,7 +16830,7 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let ctx = ActivityContext::new(
             empty_shared_state(),
-            Some(HeartbeatSink::Plain(tx)),
+            Some(tx),
             cancel,
             ActivityIdentity::for_test(),
         );
@@ -18777,7 +16937,7 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let ctx = ActivityContext::new(
             Arc::new(HashMap::new()),
-            Some(HeartbeatSink::Plain(tx)),
+            Some(tx),
             cancel,
             ActivityIdentity::for_test(),
         );
@@ -21071,12 +19231,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn freeze_completes_well_under_a_decision_budget_at_max_n() {
-        // R10: a decision cycle must stay cheap. The scan is bounded and uses
-        // BTreeSet lookups, so even MAX_BUSINESS_DAYS is cheap.
-        // Every tenth day stays open, so no run is longer than 30 days (issue #1968).
+    async fn freeze_completes_well_under_suspension_timeout_at_max_n() {
+        // R10: the executor gives a decision cycle a 100 ms budget. The scan is
+        // bounded and uses BTreeSet lookups, so even MAX_BUSINESS_DAYS is cheap.
         let holidays: Vec<chrono::NaiveDate> = (0..400)
-            .filter(|i| i % 10 != 0)
             .filter_map(|i| {
                 chrono::NaiveDate::from_ymd_opt(2026, 1, 1)?.checked_add_days(chrono::Days::new(i))
             })
@@ -21089,7 +19247,7 @@ mod tests {
         // Assert the outcome, not just the timing: discarding the Result would
         // let the scan bail out immediately with an error and still "pass".
         // With no declared coverage horizon the resolution must SUCCEED, and it
-        // must land past the 400-day holiday span.
+        // must land past the 400 blocked days.
         let deadline = out.expect("MAX_BUSINESS_DAYS must resolve, not reject");
         assert!(
             deadline > bd_utc("2027-02-05T00:00:00Z"),
@@ -21097,7 +19255,7 @@ mod tests {
         );
         assert!(
             elapsed < std::time::Duration::from_millis(50),
-            "the bounded scan must stay far under 50 ms, took {elapsed:?}"
+            "the bounded scan must stay far under the 100 ms suspension budget, took {elapsed:?}"
         );
     }
 
@@ -21611,9 +19769,11 @@ mod tests {
         // Yield to let it emit the command.
         tokio::task::yield_now().await;
 
-        // The spawned task owns the context, so this test cannot drain its
-        // commands directly. Abort the task instead and verify the handle
-        // reports the cancellation.
+        // Drop the handle -- the oneshot sender will be dropped when
+        // the JoinHandle's task is aborted. But we actually need to
+        // explicitly drop the sender. Let's approach differently:
+        // The task holds the context, so we can't drain commands from here.
+        // Instead, just abort the spawned task and verify the handle errors.
         handle.abort();
         let result = handle.await;
         assert!(result.is_err()); // JoinError from abort
@@ -21746,48 +19906,6 @@ mod tests {
         );
     }
 
-    /// Issue #1405: a parent minted on ORIGIN shard 7 has since been
-    /// rebalanced to shard 12. It must place a `ParentShard` child on 12,
-    /// its CURRENT residence, not on 7, the id's stale origin bits.
-    ///
-    /// A child placed on 7 does not fail closed. `worker.rs`'s
-    /// `child_target_shard` classifies placement by comparing the id's
-    /// encoded bits against the parent's LIVE shard. A mismatch reads as a
-    /// genuine cross-shard placement. It relays the child onto shard 7
-    /// through the ordinary cross-shard-child path. Shard 7 is a normal,
-    /// healthy shard, simply not where this parent lives any more, so the
-    /// relay succeeds. It silently creates the row there. The failure is
-    /// silent misplacement, not an unresolvable id.
-    #[tokio::test]
-    async fn awaited_child_workflow_inherits_the_parents_current_shard_not_its_origin() {
-        let origin_shard = ShardId::new(7);
-        let current_shard = ShardId::new(12);
-        let ctx = WorkflowContext::for_replay(
-            ExecutionId::new_for_shard(origin_shard),
-            started_history(),
-        )
-        .with_current_shard_id(Some(current_shard));
-
-        let fut = ctx.spawn_child_workflow_raw("process_order", serde_json::json!({"sku": "book"}));
-        let mut fut = Box::pin(fut);
-        let waker = std::task::Waker::noop();
-        let mut poll_cx = std::task::Context::from_waker(waker);
-        assert!(
-            std::future::Future::poll(fut.as_mut(), &mut poll_cx).is_pending(),
-            "a fresh awaited child must suspend on its result channel"
-        );
-
-        let cmds = ctx.drain_commands();
-        let WorkflowCommand::StartChildWorkflow { child_id, .. } = &cmds[0] else {
-            panic!("expected StartChildWorkflow, got {cmds:?}");
-        };
-        assert_eq!(
-            child_id.shard(),
-            current_shard,
-            "a child must inherit the parent's CURRENT shard (issue #1405), not its origin"
-        );
-    }
-
     /// AC4 (issue #697): the `ctx.race()` child-workflow branch mints its own
     /// `ExecutionId` and must inherit the parent's shard for the same reason
     /// the plain awaited path does.
@@ -21826,51 +19944,6 @@ mod tests {
                 child_id.shard(),
                 parent_shard,
                 "a raced child must inherit the parent's shard (issue #697 AC4)"
-            );
-        }
-    }
-
-    /// Issue #1405: `race()`'s child-workflow branch mints its own
-    /// `ExecutionId` inline, separately from [`mint_child_id`]. It must also
-    /// place on the parent's CURRENT shard, not the origin bits encoded in
-    /// `self.exec_id`.
-    #[tokio::test]
-    async fn race_child_workflow_branch_inherits_the_parents_current_shard_not_its_origin() {
-        let origin_shard = ShardId::new(11);
-        let current_shard = ShardId::new(21);
-        let ctx = WorkflowContext::for_replay(
-            ExecutionId::new_for_shard(origin_shard),
-            started_history(),
-        )
-        .with_current_shard_id(Some(current_shard));
-
-        let fut = ctx
-            .race()
-            .child_workflow_raw("leg_a", serde_json::json!({}))
-            .child_workflow_raw("leg_b", serde_json::json!({}))
-            .run();
-        let mut fut = Box::pin(fut);
-        let waker = std::task::Waker::noop();
-        let mut poll_cx = std::task::Context::from_waker(waker);
-        assert!(
-            std::future::Future::poll(fut.as_mut(), &mut poll_cx).is_pending(),
-            "a fresh child race must suspend awaiting its branches"
-        );
-
-        let started: Vec<ExecutionId> = ctx
-            .drain_commands()
-            .iter()
-            .filter_map(|c| match c {
-                WorkflowCommand::StartChildWorkflow { child_id, .. } => Some(*child_id),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(started.len(), 2, "both race branches must be dispatched");
-        for child_id in started {
-            assert_eq!(
-                child_id.shard(),
-                current_shard,
-                "a raced child must inherit the parent's CURRENT shard (issue #1405), not its origin"
             );
         }
     }
@@ -22373,28 +20446,8 @@ mod tests {
         assert!(ctx.drain_commands().is_empty());
     }
 
-    /// A `wait_for_signal` over a history carrying a stray, unconsumed
-    /// `TimerStarted` PARKS, leaving the stray event unclaimed for the
-    /// executor's end-of-cycle authority to nd-block on.
-    ///
-    /// This used to return `HarvestError::NonDeterministic` synchronously.
-    /// Issue #950 moved the verdict, because at match time the scan cannot tell
-    /// a stray timer from the timer of a `join!(wait_for_signal, ctx.timer)`
-    /// mixed batch whose sibling branch has not been polled yet — deciding early
-    /// nd-blocked that advertised composition on its first wake (Codex round 3
-    /// on PR #1245). The signal scan is a lookahead; a lookahead must not return
-    /// a verdict on events it merely passed over.
-    ///
-    /// This mirrors the choice already made for `wait_for_signal_timeout`'s
-    /// strict-`Suspended` arm (see the `has_non_lifecycle_unconsumed` comment in
-    /// `wait_for_signal_timeout`), which likewise re-parks and defers to
-    /// `history_has_unconsumed_events` run once after the whole `join!` is
-    /// polled. The end-to-end outcome is unchanged and is pinned by the
-    /// integration test
-    /// `interleaved_sibling_signal_stray_timer_started_still_diverges`, which
-    /// asserts the replay is reported as non-determinism.
     #[tokio::test]
-    async fn wait_for_signal_parks_and_leaves_a_stray_timer_for_the_cycle_guard() {
+    async fn wait_for_signal_returns_nondeterministic_on_diverged_history() {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
@@ -22409,27 +20462,13 @@ mod tests {
             },
         ];
         let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx.wait_for_signal("my-signal").await;
 
-        // The wait must PARK, not resolve either way. Racing it against a
-        // timeout is the assertion: a synchronous error (the old behaviour) or a
-        // spurious value would both complete here.
-        let parked = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            ctx.wait_for_signal("my-signal"),
-        )
-        .await;
-        assert!(
-            parked.is_err(),
-            "the wait must park on the undelivered signal, not resolve: {parked:?}"
-        );
-
-        // ...and the stray timer must still be unclaimed, which is exactly what
-        // the executor's suspend-time guard keys on to fail the workflow.
-        assert!(
-            ctx.history_has_unconsumed_events(),
-            "the stray TimerStarted must be left unconsumed so the end-of-cycle \
-             guard nd-blocks the run instead of parking it forever"
-        );
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            HarvestError::NonDeterministic { .. }
+        ));
     }
 
     #[tokio::test]
@@ -22504,8 +20543,8 @@ mod tests {
         else {
             panic!("expected CancelRaceLosers, got {:?}", commands[0]);
         };
-        assert_eq!(activities.as_slice(), []);
-        assert_eq!(children.as_slice(), []);
+        assert!(activities.is_empty());
+        assert!(children.is_empty());
         assert_eq!(
             timers,
             &vec![TimerId::new("__signal_timeout:1:approval")],
@@ -22565,8 +20604,8 @@ mod tests {
         else {
             panic!("expected CancelRaceLosers, got {:?}", commands[0]);
         };
-        assert_eq!(activities.as_slice(), []);
-        assert_eq!(children.as_slice(), []);
+        assert!(activities.is_empty());
+        assert!(children.is_empty());
         assert_eq!(
             timers,
             &vec![timer_id],
@@ -23431,8 +21470,8 @@ mod tests {
         else {
             panic!("expected CancelRaceLosers, got {:?}", commands[0]);
         };
-        assert_eq!(activities.as_slice(), []);
-        assert_eq!(children.as_slice(), []);
+        assert!(activities.is_empty());
+        assert!(children.is_empty());
         assert_eq!(
             timers,
             &vec![timer_id],
@@ -23488,8 +21527,8 @@ mod tests {
         else {
             panic!("expected CancelRaceLosers, got {:?}", commands[0]);
         };
-        assert_eq!(activities.as_slice(), []);
-        assert_eq!(timers.as_slice(), []);
+        assert!(activities.is_empty());
+        assert!(timers.is_empty());
         assert_eq!(
             children,
             &vec![child_id],
@@ -23720,8 +21759,8 @@ mod tests {
         else {
             panic!("expected CancelRaceLosers, got {:?}", commands[0]);
         };
-        assert_eq!(activities.as_slice(), []);
-        assert_eq!(children.as_slice(), []);
+        assert!(activities.is_empty());
+        assert!(children.is_empty());
         assert_eq!(timers, &vec![timer_id]);
     }
 
@@ -26425,39 +24464,17 @@ mod tests {
         assert!(matches!(err, HarvestError::Config(_)));
     }
 
-    /// Issue #950 flipped this from a pinned rejection to a supported shape:
-    /// an activity racing a timer no longer returns `HarvestError::Config`, it
-    /// dispatches both branches and suspends on the mixed batch the worker now
-    /// persists. (Pre-#950 this asserted the `Config` rejection.)
     #[tokio::test]
-    async fn race_accepts_mixed_activity_and_timer_shape() {
-        let ctx = std::sync::Arc::new(WorkflowContext::new_test());
-        let race_ctx = ctx.clone();
-        let handle = tokio::spawn(async move {
-            race_ctx
-                .race()
-                .activity_raw("fetch_a", Value::Null, "default")
-                .timer(std::time::Duration::from_secs(60))
-                .run()
-                .await
-        });
-        let timeout_result =
-            tokio::time::timeout(std::time::Duration::from_millis(50), handle).await;
-        assert!(
-            timeout_result.is_err(),
-            "an activity-vs-timer race must suspend on its mixed batch, not \
-             return HarvestError::Config"
-        );
-        let commands = ctx.drain_commands();
-        assert!(
-            commands
-                .iter()
-                .any(|c| matches!(c, WorkflowCommand::ScheduleActivity { .. }))
-                && commands
-                    .iter()
-                    .any(|c| matches!(c, WorkflowCommand::StartTimer { .. })),
-            "both branches must be dispatched in one batch: {commands:?}"
-        );
+    async fn race_rejects_mixed_activity_and_timer_shape() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .race()
+            .activity_raw("fetch_a", Value::Null, "default")
+            .timer(std::time::Duration::from_secs(60))
+            .run()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HarvestError::Config(_)));
     }
 
     /// Regression test (Codex review, PR #902): a payload-cap failure on a
@@ -27276,729 +25293,6 @@ mod tests {
             c,
             WorkflowCommand::CancelRaceLosers { children, .. } if children == &vec![loser_id]
         )));
-        Ok(())
-    }
-
-    // ── mixed-kind races (issue #950) ───────────────────────────────────────
-
-    /// AC2: `ctx.race()` accepts mixed branch kinds. On the first live cycle
-    /// every branch is dispatched in one suspension batch — an activity
-    /// schedule, a durable timer, a signal wait and a child start side by side.
-    #[tokio::test]
-    async fn race_mixed_kinds_dispatches_every_branch_in_one_batch() {
-        let ctx = std::sync::Arc::new(WorkflowContext::new_test());
-        let race_ctx = ctx.clone();
-        let handle = tokio::spawn(async move {
-            race_ctx
-                .race()
-                .activity_raw("fetch_quote", Value::Null, "default")
-                .timer(std::time::Duration::from_secs(30))
-                .signal("abort")
-                .child_workflow_raw("settle", Value::Null)
-                .run()
-                .await
-        });
-
-        let timeout_result =
-            tokio::time::timeout(std::time::Duration::from_millis(50), handle).await;
-        assert!(
-            timeout_result.is_err(),
-            "a mixed race with no resolution must suspend, not error"
-        );
-
-        let commands = ctx.drain_commands();
-        assert!(
-            matches!(
-                commands.first(),
-                Some(WorkflowCommand::RecordMarker { name, .. }) if name == "race:1"
-            ),
-            "the open marker fixes the branch count: {commands:?}"
-        );
-        assert_eq!(
-            commands
-                .iter()
-                .filter(|c| matches!(c, WorkflowCommand::ScheduleActivity { .. }))
-                .count(),
-            1,
-            "the activity branch must be scheduled: {commands:?}"
-        );
-        assert_eq!(
-            commands
-                .iter()
-                .filter(|c| matches!(c, WorkflowCommand::StartTimer { .. }))
-                .count(),
-            1,
-            "the timer branch must arm a durable timer: {commands:?}"
-        );
-        assert_eq!(
-            commands
-                .iter()
-                .filter(|c| matches!(c, WorkflowCommand::WaitForSignal { .. }))
-                .count(),
-            1,
-            "the signal branch must park on a signal wait: {commands:?}"
-        );
-        assert_eq!(
-            commands
-                .iter()
-                .filter(|c| matches!(c, WorkflowCommand::StartChildWorkflow { .. }))
-                .count(),
-            1,
-            "the child branch must start a child workflow: {commands:?}"
-        );
-    }
-
-    /// The mixed race's timer branch uses a reserved, deterministic id derived
-    /// from the race seq + branch index, so every replay re-derives the same id
-    /// and the worker's idempotent re-park recognises the existing row.
-    #[tokio::test]
-    async fn race_mixed_timer_branch_uses_a_deterministic_reserved_id() {
-        let ctx = std::sync::Arc::new(WorkflowContext::new_test());
-        let race_ctx = ctx.clone();
-        let handle = tokio::spawn(async move {
-            race_ctx
-                .race()
-                .activity_raw("fetch_quote", Value::Null, "default")
-                .timer(std::time::Duration::from_secs(30))
-                .run()
-                .await
-        });
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(50), handle).await;
-
-        let commands = ctx.drain_commands();
-        let timer_id = commands
-            .iter()
-            .find_map(|c| match c {
-                WorkflowCommand::StartTimer { timer_id, .. } => Some(timer_id.clone()),
-                _ => None,
-            })
-            .expect("the timer branch must push a StartTimer");
-        assert_eq!(
-            timer_id.as_str(),
-            "__race:1:1",
-            "race timer ids are `__race:{{seq}}:{{index}}` so they are stable \
-             across replays and never collide with a user timer id"
-        );
-    }
-
-    /// Activity beats the timer: the activity's recorded terminal wins, the
-    /// winner marker is recorded, and the still-armed loser timer is torn down
-    /// durably via `CancelRaceLosers.timers` (the #600 contract, unchanged for
-    /// mixed batches).
-    #[tokio::test]
-    async fn race_mixed_activity_beats_timer_and_cancels_the_loser_timer()
-    -> Result<(), HarvestError> {
-        let activity_id = ActivityExecId::new();
-        let events = vec![
-            race_started_event(),
-            WorkflowEvent::MarkerRecorded {
-                name: "race:1".to_string(),
-                details: Value::from(2u64),
-            },
-            WorkflowEvent::ActivityScheduled {
-                activity_id,
-                name: "fetch_quote".to_string(),
-                input: Value::Null,
-                queue: "default".to_string(),
-            },
-            WorkflowEvent::TimerStarted {
-                timer_id: TimerId::new("__race:1:1"),
-                duration_secs: 30,
-            },
-            WorkflowEvent::ActivityCompleted {
-                activity_id,
-                output: serde_json::json!({"price": 42}),
-            },
-        ];
-        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
-
-        let winner = ctx
-            .race()
-            .activity_raw("fetch_quote", Value::Null, "default")
-            .label("quote")
-            .timer(std::time::Duration::from_secs(30))
-            .label("deadline")
-            .run()
-            .await?;
-
-        assert_eq!(winner.index, 0, "the activity branch won");
-        assert_eq!(winner.label.as_deref(), Some("quote"));
-        assert_eq!(winner.value, serde_json::json!({"price": 42}));
-
-        let commands = ctx.drain_commands();
-        assert!(
-            commands.iter().any(|c| matches!(
-                c,
-                WorkflowCommand::RecordMarker { name, details }
-                    if name == "race_winner:1" && *details == serde_json::json!(0u64)
-            )),
-            "the winner marker fixes the outcome for every later replay: {commands:?}"
-        );
-        assert!(
-            commands.iter().any(|c| matches!(
-                c,
-                WorkflowCommand::CancelRaceLosers { timers, .. }
-                    if timers == &vec![TimerId::new("__race:1:1")]
-            )),
-            "the losing timer's still-armed durable row must be deleted: {commands:?}"
-        );
-        Ok(())
-    }
-
-    /// Timer beats the activity: the timer branch resolves to `Value::Null` and
-    /// the losing activity is durably cancelled.
-    #[tokio::test]
-    async fn race_mixed_timer_beats_activity_and_cancels_the_loser_activity()
-    -> Result<(), HarvestError> {
-        let activity_id = ActivityExecId::new();
-        let events = vec![
-            race_started_event(),
-            WorkflowEvent::MarkerRecorded {
-                name: "race:1".to_string(),
-                details: Value::from(2u64),
-            },
-            WorkflowEvent::ActivityScheduled {
-                activity_id,
-                name: "fetch_quote".to_string(),
-                input: Value::Null,
-                queue: "default".to_string(),
-            },
-            WorkflowEvent::TimerStarted {
-                timer_id: TimerId::new("__race:1:1"),
-                duration_secs: 30,
-            },
-            WorkflowEvent::TimerFired {
-                timer_id: TimerId::new("__race:1:1"),
-            },
-        ];
-        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
-
-        let winner = ctx
-            .race()
-            .activity_raw("fetch_quote", Value::Null, "default")
-            .timer(std::time::Duration::from_secs(30))
-            .run()
-            .await?;
-
-        assert_eq!(winner.index, 1, "the timer branch won");
-        assert_eq!(winner.value, Value::Null, "a timer branch carries no value");
-
-        let commands = ctx.drain_commands();
-        assert!(
-            commands.iter().any(|c| matches!(
-                c,
-                WorkflowCommand::CancelRaceLosers { activities, .. }
-                    if activities == &vec![activity_id]
-            )),
-            "the losing activity must be durably cancelled: {commands:?}"
-        );
-        Ok(())
-    }
-
-    /// An abort signal interrupting a running activity — the composition the
-    /// issue calls out as blocked today.
-    #[tokio::test]
-    async fn race_mixed_signal_beats_activity() -> Result<(), HarvestError> {
-        let activity_id = ActivityExecId::new();
-        let events = vec![
-            race_started_event(),
-            WorkflowEvent::MarkerRecorded {
-                name: "race:1".to_string(),
-                details: Value::from(2u64),
-            },
-            WorkflowEvent::ActivityScheduled {
-                activity_id,
-                name: "long_running".to_string(),
-                input: Value::Null,
-                queue: "default".to_string(),
-            },
-            WorkflowEvent::SignalReceived {
-                signal_name: "abort".to_string(),
-                payload: serde_json::json!({"reason": "user"}),
-            },
-        ];
-        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
-
-        let winner = ctx
-            .race()
-            .activity_raw("long_running", Value::Null, "default")
-            .signal("abort")
-            .run()
-            .await?;
-
-        assert_eq!(winner.index, 1, "the signal branch won");
-        assert_eq!(winner.value, serde_json::json!({"reason": "user"}));
-
-        let commands = ctx.drain_commands();
-        assert!(
-            commands.iter().any(|c| matches!(
-                c,
-                WorkflowCommand::CancelRaceLosers { activities, timers, .. }
-                    if activities == &vec![activity_id] && timers.is_empty()
-            )),
-            "a losing signal needs no teardown, but the losing activity does: {commands:?}"
-        );
-        Ok(())
-    }
-
-    /// A child workflow raced against a deadline, with an ORDINARY race timer
-    /// (not the `__child_timeout:` primitive of #779).
-    #[tokio::test]
-    async fn race_mixed_child_workflow_beats_timer() -> Result<(), HarvestError> {
-        let child_id = ExecutionId::new();
-        let events = vec![
-            race_started_event(),
-            WorkflowEvent::MarkerRecorded {
-                name: "race:1".to_string(),
-                details: Value::from(2u64),
-            },
-            WorkflowEvent::ChildWorkflowStarted {
-                child_id,
-                workflow_name: "settle".to_string(),
-                input: Value::Null,
-            },
-            WorkflowEvent::TimerStarted {
-                timer_id: TimerId::new("__race:1:1"),
-                duration_secs: 30,
-            },
-            WorkflowEvent::ChildWorkflowCompleted {
-                child_id,
-                output: serde_json::json!({"settled": true}),
-            },
-        ];
-        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
-
-        let winner = ctx
-            .race()
-            .child_workflow_raw("settle", Value::Null)
-            .timer(std::time::Duration::from_secs(30))
-            .run()
-            .await?;
-
-        assert_eq!(winner.index, 0);
-        assert_eq!(winner.value, serde_json::json!({"settled": true}));
-        Ok(())
-    }
-
-    /// AC6: the #476 exactly-one-timer + exactly-one-signal pair keeps its
-    /// dedicated `race_timer_signal_impl` path — same reserved
-    /// `__signal_timeout:{seq}:{name}` id, same fixed role-based indices — so
-    /// in-flight executions recorded before this change replay unchanged.
-    #[tokio::test]
-    async fn race_timer_signal_pair_still_takes_the_legacy_path() -> Result<(), HarvestError> {
-        let ctx = std::sync::Arc::new(WorkflowContext::new_test());
-        let race_ctx = ctx.clone();
-        let handle = tokio::spawn(async move {
-            race_ctx
-                .race()
-                .timer(std::time::Duration::from_secs(300))
-                .signal("approval")
-                .run()
-                .await
-        });
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(50), handle).await;
-
-        let commands = ctx.drain_commands();
-        let timer_id = commands
-            .iter()
-            .find_map(|c| match c {
-                WorkflowCommand::StartTimer { timer_id, .. } => Some(timer_id.clone()),
-                _ => None,
-            })
-            .expect("the legacy pair must still push a StartTimer");
-        assert_eq!(
-            timer_id.as_str(),
-            "__signal_timeout:1:approval",
-            "the timer+signal pair must keep the #476 reserved id, NOT the \
-             #950 `__race:` id — otherwise in-flight histories diverge"
-        );
-        assert!(
-            !commands.iter().any(
-                |c| matches!(c, WorkflowCommand::RecordMarker { name, .. } if name == "race:1")
-            ),
-            "the legacy pair records no `race:{{seq}}` open marker: {commands:?}"
-        );
-        Ok(())
-    }
-
-    /// The branch count recorded in the open marker still guards a code change
-    /// that adds or removes a branch, for mixed races too.
-    #[tokio::test]
-    async fn race_mixed_branch_count_change_is_non_deterministic() {
-        let events = vec![
-            race_started_event(),
-            WorkflowEvent::MarkerRecorded {
-                name: "race:1".to_string(),
-                details: Value::from(2u64),
-            },
-        ];
-        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
-        let err = ctx
-            .race()
-            .activity_raw("fetch_quote", Value::Null, "default")
-            .timer(std::time::Duration::from_secs(30))
-            .signal("abort")
-            .run()
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, HarvestError::NonDeterministic { .. }),
-            "growing a mixed race from 2 to 3 branches must be rejected, got {err:?}"
-        );
-    }
-
-    /// A race of a single timer branch is still a valid (degenerate) race and
-    /// must not be mistaken for the legacy timer+signal pair.
-    #[tokio::test]
-    async fn race_single_timer_branch_resolves_on_the_recorded_fire() -> Result<(), HarvestError> {
-        let events = vec![
-            race_started_event(),
-            WorkflowEvent::MarkerRecorded {
-                name: "race:1".to_string(),
-                details: Value::from(1u64),
-            },
-            WorkflowEvent::TimerStarted {
-                timer_id: TimerId::new("__race:1:0"),
-                duration_secs: 5,
-            },
-            WorkflowEvent::TimerFired {
-                timer_id: TimerId::new("__race:1:0"),
-            },
-        ];
-        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
-        let winner = ctx
-            .race()
-            .timer(std::time::Duration::from_secs(5))
-            .run()
-            .await?;
-        assert_eq!(winner.index, 0);
-        Ok(())
-    }
-
-    /// A race re-entered in a loop must derive a FRESH timer id per iteration.
-    /// `race_timer_id` keys on the race sequence number, so iteration 2 arms
-    /// `__race:2:{index}`; dropping `seq` from the id would make iteration 2
-    /// collide with iteration 1's still-armed row, which the worker's
-    /// new-vs-existing check would then treat as an idempotent re-park carrying
-    /// the STALE `fires_at` — the second deadline would fire at the first one's
-    /// instant.
-    #[tokio::test]
-    async fn race_timer_ids_are_distinct_per_race_sequence() {
-        let ctx = std::sync::Arc::new(WorkflowContext::new_test());
-
-        // Iteration 1.
-        let c1 = ctx.clone();
-        let h1 = tokio::spawn(async move {
-            c1.race()
-                .activity_raw("fetch", Value::Null, "default")
-                .timer(std::time::Duration::from_secs(30))
-                .run()
-                .await
-        });
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(50), h1).await;
-        let first = ctx.drain_commands();
-
-        // Iteration 2 on the SAME context (the loop's next pass).
-        let c2 = ctx.clone();
-        let h2 = tokio::spawn(async move {
-            c2.race()
-                .activity_raw("fetch", Value::Null, "default")
-                .timer(std::time::Duration::from_secs(30))
-                .run()
-                .await
-        });
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(50), h2).await;
-        let second = ctx.drain_commands();
-
-        let timer_id = |cmds: &[WorkflowCommand]| {
-            cmds.iter()
-                .find_map(|c| match c {
-                    WorkflowCommand::StartTimer { timer_id, .. } => {
-                        Some(timer_id.as_str().to_string())
-                    }
-                    _ => None,
-                })
-                .expect("each iteration arms a race timer")
-        };
-        assert_eq!(timer_id(&first), "__race:1:1");
-        assert_eq!(
-            timer_id(&second),
-            "__race:2:1",
-            "the second iteration must arm a DISTINCT durable timer id, or it \
-             would inherit the first iteration's still-armed row and deadline"
-        );
-    }
-
-    // ── mixed-race review regressions (issue #950) ──────────────────────────
-
-    /// A signal branch must cross **more than one** sibling event to reach its
-    /// signal. The normal shape is two — a sibling activity's
-    /// `ActivityScheduled` AND its `ActivityStarted` (the worker picked it up) —
-    /// so a scan that bails after the first crossed event parks the race forever
-    /// on a signal that already arrived.
-    #[tokio::test]
-    async fn race_mixed_signal_branch_crosses_multiple_sibling_events() -> Result<(), HarvestError>
-    {
-        let activity_id = ActivityExecId::new();
-        let events = vec![
-            race_started_event(),
-            WorkflowEvent::MarkerRecorded {
-                name: "race:1".to_string(),
-                details: Value::from(2u64),
-            },
-            WorkflowEvent::ActivityScheduled {
-                activity_id,
-                name: "long_running".to_string(),
-                input: Value::Null,
-                queue: "default".to_string(),
-            },
-            WorkflowEvent::ActivityStarted {
-                activity_id,
-                worker_id: crate::types::WorkerId::new("worker-a"),
-            },
-            WorkflowEvent::SignalReceived {
-                signal_name: "abort".to_string(),
-                payload: serde_json::json!({"reason": "user"}),
-            },
-        ];
-        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
-
-        // Signal branch declared FIRST — the order that previously bailed.
-        let winner = ctx
-            .race()
-            .signal("abort")
-            .activity_raw("long_running", Value::Null, "default")
-            .run()
-            .await?;
-        assert_eq!(winner.index, 0, "the signal branch won");
-        assert_eq!(winner.value, serde_json::json!({"reason": "user"}));
-        Ok(())
-    }
-
-    /// A **losing** signal branch must never consume a `SignalReceived`
-    /// delivered AFTER the race settled — that signal belongs to a later
-    /// `ctx.wait_for_signal`, which would otherwise park on a signal that was
-    /// already delivered.
-    #[tokio::test]
-    async fn race_losing_signal_branch_does_not_steal_a_later_wait() -> Result<(), HarvestError> {
-        let activity_id = ActivityExecId::new();
-        let events = vec![
-            race_started_event(),
-            WorkflowEvent::MarkerRecorded {
-                name: "race:1".to_string(),
-                details: Value::from(2u64),
-            },
-            WorkflowEvent::ActivityScheduled {
-                activity_id,
-                name: "fetch".to_string(),
-                input: Value::Null,
-                queue: "default".to_string(),
-            },
-            WorkflowEvent::ActivityCompleted {
-                activity_id,
-                output: serde_json::json!({"ok": true}),
-            },
-            WorkflowEvent::MarkerRecorded {
-                name: "race_winner:1".to_string(),
-                details: Value::from(0u64),
-            },
-            // Delivered AFTER the race resolved: it belongs to the plain wait
-            // the workflow performs next, not to the race's losing branch.
-            WorkflowEvent::SignalReceived {
-                signal_name: "go".to_string(),
-                payload: serde_json::json!({"n": 7}),
-            },
-        ];
-        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
-
-        let winner = ctx
-            .race()
-            .activity_raw("fetch", Value::Null, "default")
-            .signal("go")
-            .run()
-            .await?;
-        assert_eq!(winner.index, 0, "the activity won the race");
-
-        // The later, unrelated wait must still find its signal.
-        let payload = ctx.wait_for_signal("go").await?;
-        assert_eq!(
-            payload,
-            serde_json::json!({"n": 7}),
-            "the post-race wait_for_signal must still receive its own signal — a \
-             losing race branch must not have consumed it"
-        );
-        Ok(())
-    }
-
-    /// A push signal handler registered for the same name must not steal the
-    /// signal a mixed race is waiting to resolve on. (The #476 reservation index
-    /// keys off the `__signal_timeout:{seq}:{name}` timer id, which a mixed race
-    /// does not have, so the race claims its signal first instead.)
-    #[tokio::test]
-    async fn race_mixed_signal_is_not_stolen_by_a_push_handler() -> Result<(), HarvestError> {
-        let activity_id = ActivityExecId::new();
-        let events = vec![
-            race_started_event(),
-            WorkflowEvent::MarkerRecorded {
-                name: "race:1".to_string(),
-                details: Value::from(2u64),
-            },
-            WorkflowEvent::ActivityScheduled {
-                activity_id,
-                name: "long_running".to_string(),
-                input: Value::Null,
-                queue: "default".to_string(),
-            },
-            WorkflowEvent::SignalReceived {
-                signal_name: "abort".to_string(),
-                payload: serde_json::json!({"reason": "user"}),
-            },
-            WorkflowEvent::MarkerRecorded {
-                name: "race_winner:1".to_string(),
-                details: Value::from(1u64),
-            },
-        ];
-        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
-        ctx.register_signal_handler_raw("abort", |_payload: Value| {});
-
-        let winner = ctx
-            .race()
-            .activity_raw("long_running", Value::Null, "default")
-            .signal("abort")
-            .run()
-            .await?;
-        assert_eq!(
-            winner.index, 1,
-            "the recorded winner is the signal branch; a push handler must not \
-             have claimed the signal out from under it"
-        );
-        Ok(())
-    }
-
-    /// A **signal-only** race must not lose its signal to a push handler
-    /// registered for the same name.
-    ///
-    /// `match_history` pumps registered handlers after *every* matcher call,
-    /// and `race_impl` reads its `race:{seq}` open marker through
-    /// `match_history` before it evaluates a single branch. So the pump that
-    /// follows the open-marker read runs while the race is mid-flight, with no
-    /// branch having had a chance to claim anything yet. Nothing in the history
-    /// names a race's signal branches (only `race:{seq}` and
-    /// `race_winner:{seq}` are recorded), so no reservation index can protect
-    /// them the way `__signal_timeout:{seq}:{name}` protects #476 waits --
-    /// the race must instead hold the pump off across its signal phase.
-    #[tokio::test]
-    async fn race_signal_only_is_not_stolen_by_a_push_handler() -> Result<(), HarvestError> {
-        let events = vec![
-            race_started_event(),
-            WorkflowEvent::MarkerRecorded {
-                name: "race:1".to_string(),
-                details: Value::from(1u64),
-            },
-            WorkflowEvent::SignalReceived {
-                signal_name: "abort".to_string(),
-                payload: serde_json::json!({"reason": "user"}),
-            },
-            WorkflowEvent::MarkerRecorded {
-                name: "race_winner:1".to_string(),
-                details: Value::from(0u64),
-            },
-        ];
-        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
-        ctx.register_signal_handler_raw("abort", |_payload: Value| {});
-
-        let winner = ctx.race().signal("abort").run().await?;
-        assert_eq!(
-            winner.index, 0,
-            "the sole branch is the recorded winner; the pump that follows the \
-             race's own open-marker read must not have claimed the signal first"
-        );
-        Ok(())
-    }
-
-    /// The same theft one branch later: branch 0 scans past branch 1's signal
-    /// without consuming it, and the pump that follows *branch 0's* matcher
-    /// call claims it before branch 1 is ever evaluated. Suppressing the pump
-    /// for the open-marker read alone would leave this shape broken, so the
-    /// hold has to span the whole branch loop.
-    #[tokio::test]
-    async fn race_second_signal_branch_is_not_stolen_by_a_push_handler() -> Result<(), HarvestError>
-    {
-        let events = vec![
-            race_started_event(),
-            WorkflowEvent::MarkerRecorded {
-                name: "race:1".to_string(),
-                details: Value::from(2u64),
-            },
-            WorkflowEvent::SignalReceived {
-                signal_name: "second".to_string(),
-                payload: serde_json::json!({"n": 2}),
-            },
-            WorkflowEvent::MarkerRecorded {
-                name: "race_winner:1".to_string(),
-                details: Value::from(1u64),
-            },
-        ];
-        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
-        ctx.register_signal_handler_raw("second", |_payload: Value| {});
-
-        let winner = ctx.race().signal("first").signal("second").run().await?;
-        assert_eq!(
-            winner.index, 1,
-            "branch 1 is the recorded winner; branch 0's scan crossed its \
-             signal without consuming it, and the pump must not claim it in \
-             the gap before branch 1 runs"
-        );
-        Ok(())
-    }
-
-    /// Concurrently-armed race deadlines share one anchor, so firing both must
-    /// advance the virtual clock to the MAX deadline, never the SUM — otherwise
-    /// `ctx.now()` disagrees with `TestRunOutcome::final_now`, which computes the
-    /// max from the same history, and a time-branching workflow replays down a
-    /// different path than it ran.
-    #[tokio::test]
-    async fn race_two_timer_branches_advance_the_clock_to_the_max_deadline()
-    -> Result<(), HarvestError> {
-        let events = vec![
-            race_started_event(),
-            WorkflowEvent::MarkerRecorded {
-                name: "race:1".to_string(),
-                details: Value::from(2u64),
-            },
-            WorkflowEvent::TimerStarted {
-                timer_id: TimerId::new("__race:1:0"),
-                duration_secs: 30,
-            },
-            WorkflowEvent::TimerStarted {
-                timer_id: TimerId::new("__race:1:1"),
-                duration_secs: 60,
-            },
-            WorkflowEvent::TimerFired {
-                timer_id: TimerId::new("__race:1:0"),
-            },
-            WorkflowEvent::TimerFired {
-                timer_id: TimerId::new("__race:1:1"),
-            },
-        ];
-        let ctx =
-            WorkflowContext::for_replay(ExecutionId::new(), events).with_advancing_timer_clock();
-        let start = ctx.now();
-
-        let winner = ctx
-            .race()
-            .timer(std::time::Duration::from_secs(30))
-            .timer(std::time::Duration::from_secs(60))
-            .run()
-            .await?;
-        assert_eq!(winner.index, 0, "the lowest-index resolved branch wins");
-
-        let elapsed = (ctx.now() - start).num_seconds();
-        assert_eq!(
-            elapsed, 60,
-            "two concurrently-armed race deadlines share an anchor, so the clock \
-             must reach the MAX deadline (60s), not the SUM (90s)"
-        );
         Ok(())
     }
 

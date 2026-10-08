@@ -91,7 +91,7 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     // First parameter must be ctx: &WorkflowContext.
-    if !crate::attr_util::first_param_is_ctx_type(&func.sig.inputs, "WorkflowContext") {
+    if !first_param_is_ctx(&func.sig.inputs) {
         return syn::Error::new_spanned(
             &func.sig,
             "#[update] handlers must take `ctx: &WorkflowContext` as the first argument",
@@ -100,7 +100,7 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     // Return type must be Result<T, E>.
-    if !crate::attr_util::returns_result(&func.sig.output) {
+    if !returns_result(&func.sig.output) {
         return syn::Error::new_spanned(
             &func.sig.output,
             "#[update] return type must be `Result<T, E>`",
@@ -122,10 +122,20 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Skip the leading ctx param when building type hints and dispatch args.
     let params: Vec<_> = func.sig.inputs.iter().skip(1).collect();
-    let param_names: Vec<_> = crate::attr_util::param_idents(&params);
+    let param_names: Vec<_> = params
+        .iter()
+        .filter_map(|arg| {
+            if let syn::FnArg::Typed(pt) = arg
+                && let syn::Pat::Ident(ident) = &*pt.pat
+            {
+                return Some(&ident.ident);
+            }
+            None
+        })
+        .collect();
 
-    let input_type_hint = crate::attr_util::arg_type_hint(&params);
-    let output_type_hint = crate::extract_ok_type_hint(&func.sig.output);
+    let input_type_hint = build_input_type_hint(&params);
+    let output_type_hint = extract_ok_type_hint(&func.sig.output);
 
     let dispatch = build_update_dispatch(fn_name, &param_names);
 
@@ -149,13 +159,12 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Ok(p) => p,
         Err(e) => return e.to_compile_error(),
     };
-    let (leading_colon, nested_path_tokens) = parsed_path.nested_stub_use_tokens();
     let workflow_simple_name = parsed_path.workflow_simple_name;
-    let camel_wf = crate::to_pascal_case(&workflow_simple_name);
+    let camel_wf = to_pascal_case(&workflow_simple_name);
     let stub_ident = format_ident!("{camel_wf}Stub");
     let method_name = format_ident!("update_{fn_name}");
     let method_name_uws = format_ident!("update_with_start_{fn_name}");
-    let ok_type = crate::extract_ok_type(&func.sig.output);
+    let ok_type = extract_ok_type(&func.sig.output);
 
     let serialize_payload = if param_names.is_empty() {
         quote! { ::autumn_harvest::serde_json::Value::Null }
@@ -170,175 +179,225 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let mod_name = format_ident!("__autumn_update_impl_{fn_name}");
     let path_tokens = parsed_path.path_tokens;
-    // The three typed-stub methods are identical whether `#stub_ident` is
-    // implemented directly (same-module case) or inside a private mod that
-    // re-imports it (nested-module case, needed so the `impl` sees the type
-    // through a `use` rather than an unresolvable relative path). Splicing
-    // one `method_defs` block into both `impl_block` arms keeps them in
-    // lockstep by construction; hand-duplicating this block previously let
-    // the chain-timeout-cap fields land in only one copy (commit 896978eb,
-    // issue #617), caught by a compile error rather than a test. Mirrors the
-    // same hoist already done for `#[signal]` in signal.rs.
-    let method_defs = quote! {
-        /// Execute this typed update handler in-process with a default 30-second timeout.
-        pub async fn #method_name(
-            conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
-            handle: &::autumn_harvest::WorkflowHandle,
-            #(#params),*
-        ) -> ::autumn_harvest::HarvestResult<#ok_type> {
-            Self::#method_name_with_timeout(
-                conn,
-                handle,
-                #(#param_names,)*
-                ::std::time::Duration::from_secs(30)
-            ).await
-        }
-
-        /// Execute this typed update handler in-process with a custom timeout.
-        pub async fn #method_name_with_timeout(
-            conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
-            handle: &::autumn_harvest::WorkflowHandle,
-            #(#params,)*
-            timeout: ::std::time::Duration,
-        ) -> ::autumn_harvest::HarvestResult<#ok_type> {
-            let args = #serialize_payload;
-            let raw = handle.execute_update_in_process(
-                conn,
-                #workflow_simple_name,
-                #fn_name_str,
-                args,
-                timeout
-            ).await?;
-            ::autumn_harvest::serde_json::from_value(raw)
-                .map_err(::autumn_harvest::error::HarvestError::Serialization)
-        }
-
-        /// Atomically start-or-attach the workflow and admit this update.
-        ///
-        /// Returns [`UpdateWithStartOutcome`] describing whether a fresh
-        /// execution was started and whether the update was admitted.
-        /// Use the `update_id` in the outcome to poll for the result via the
-        /// management API (`GET /workflows/{exec_id}/updates/{update_id}`) or
-        /// the `poll_update_result` helper.
-        ///
-        /// `start_input` is the JSON-serialised workflow input. The update
-        /// arguments are typed from the `#[update]` function signature.
-        /// Use [`TypedUpdateWithStartOptions`] to control the reuse policy,
-        /// idempotency key, queue, and other per-call settings.
-        ///
-        /// [`UpdateWithStartOutcome`]: ::autumn_harvest::UpdateWithStartOutcome
-        /// [`TypedUpdateWithStartOptions`]: ::autumn_harvest::TypedUpdateWithStartOptions
-        pub async fn #method_name_uws(
-            conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
-            client: &::autumn_harvest::WorkflowHandleClient,
-            workflow_id: impl Into<::std::string::String>,
-            start_input: ::autumn_harvest::serde_json::Value,
-            #(#params,)*
-            opts: ::autumn_harvest::TypedUpdateWithStartOptions,
-        ) -> ::autumn_harvest::HarvestResult<::autumn_harvest::UpdateWithStartOutcome>
-        {
-            let workflow_id = workflow_id.into();
-            let update_args = #serialize_payload;
-            // Issue #499: a debounced workflow cannot be started through the
-            // typed client (it can't route to the debounce-key shard or admit
-            // through the gate); debounce admission is HTTP-only. Same
-            // rationale covers the sibling throttle and batch checks
-            // `reject_if_admission_may_defer` also runs. Reject early.
-            Self::info().reject_if_admission_may_defer(&start_input)?;
-            let update_id = opts.idempotency_key.as_ref().map_or_else(
-                ::autumn_harvest::types::UpdateId::new,
-                |key| {
-                    let ns = ::autumn_harvest::uuid::Uuid::parse_str(
-                        "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
-                    ).expect("static namespace UUID is valid");
-                    ::autumn_harvest::types::UpdateId::from_uuid(
-                        ::autumn_harvest::uuid::Uuid::new_v5(&ns, key.as_bytes())
-                    )
-                }
-            );
-            let exec_id = opts.exec_id.unwrap_or_else(|| {
-                let shard = client.pick_shard_for_new_workflow(#workflow_simple_name, &workflow_id);
-                ::autumn_harvest::types::ExecutionId::new_for_shard(shard)
-            });
-            let execution_timeout = match opts.execution_timeout {
-                ::std::option::Option::Some(d) => ::std::option::Option::Some(
-                    ::autumn_harvest::chrono::Duration::from_std(d)
-                        .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
-                            "execution_timeout exceeds chrono duration range".to_string()
-                        ))?
-                ),
-                ::std::option::Option::None => ::std::option::Option::None,
-            };
-            let max_execution_timeout_ceiling = match client.max_workflow_execution_timeout() {
-                ::std::option::Option::Some(d) => ::std::option::Option::Some(
-                    ::autumn_harvest::chrono::Duration::from_std(d)
-                        .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
-                            "max_execution_timeout_ceiling exceeds chrono duration range".to_string()
-                        ))?
-                ),
-                ::std::option::Option::None => ::std::option::Option::None,
-            };
-            let concurrency_key = Self::info().concurrency.and_then(|p|
-                ::autumn_harvest::concurrency::resolve_concurrency_key(p.key_expr, &start_input)
-            );
-            let concurrency_limit = Self::info().concurrency.map(|p| p.limit);
-            let params = ::autumn_harvest::UpdateWithStartParams {
-                workflow_name: #workflow_simple_name,
-                workflow_id: &workflow_id,
-                exec_id,
-                input: start_input,
-                parent_id: opts.parent_id,
-                queue_name: opts.queue_name.as_deref().unwrap_or("default"),
-                execution_timeout,
-                memo: opts.memo,
-                search_attrs: opts.search_attrs,
-                reuse_policy: opts.reuse_policy.unwrap_or(
-                    ::autumn_harvest::types::WorkflowIdReusePolicy::AllowDuplicate
-                ),
-                trace_context: opts.trace_context,
-                max_execution_timeout_ceiling,
-                // Chain-scoped lifetime cap (issue #617): the typed-stub
-                // update-with-start does NOT thread the chain cap; it is
-                // resolved on the HTTP update-with-start route and the
-                // typed stub's own `start`/`start_with_options` path.
-                chain_execution_timeout: ::std::option::Option::None,
-                max_workflow_chain_timeout_ceiling: ::std::option::Option::None,
-                concurrency_key,
-                concurrency_limit,
-                concurrency_on_conflict: Self::info()
-                    .concurrency
-                    .map_or(
-                        ::autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
-                        |p| p.on_conflict,
-                    ),
-                update_id,
-                update_name: #fn_name_str.to_string(),
-                update_args,
-                idempotency_key: opts.idempotency_key,
-                max_workflow_input_bytes: client.max_workflow_input_bytes(::std::option::Option::None),
-                owner: ::std::option::Option::None,
-                runbook_url: ::std::option::Option::None,
-                severity: ::std::option::Option::None,
-                context_headers: opts.context_headers,
-                sla: opts.sla.or_else(|| Self::info().sla).and_then(|d|
-                    ::autumn_harvest::chrono::Duration::from_std(d).ok()
-                ),
-                workflow_retry_policy: Self::info().retry_policy
-                    .and_then(|p| ::autumn_harvest::serde_json::to_value(&p).ok()),
-                max_workflow_attempts_ceiling: client.max_workflow_attempts(),
-                // Typed stubs already reject debounced workflows up front.
-                reject_fresh_if_debounced: false,
-            };
-            let _ = client;
-            ::autumn_harvest::update_with_start_workflow_execution(conn, params).await
-        }
+    let is_absolute = parsed_path.is_absolute;
+    let leading_colon = if is_absolute {
+        quote! { :: }
+    } else {
+        quote! {}
     };
-
+    let nested_path_tokens = if is_absolute
+        || parsed_path
+            .original_module_parts
+            .first()
+            .is_some_and(|s| s == "crate")
+    {
+        path_tokens.clone()
+    } else if parsed_path.original_module_parts.is_empty() {
+        Vec::new()
+    } else {
+        let mut tokens = Vec::new();
+        tokens.push(quote! { super });
+        let first = parsed_path.original_module_parts.first().unwrap();
+        if first == "self" {
+            for p in parsed_path.original_module_parts.iter().skip(1) {
+                let id = format_ident!("{}", p);
+                tokens.push(quote! { #id });
+            }
+        } else {
+            for p in &parsed_path.original_module_parts {
+                let id = format_ident!("{}", p);
+                tokens.push(quote! { #id });
+            }
+        }
+        tokens
+    };
     let impl_block = if path_tokens.is_empty() {
         quote! {
             ::autumn_harvest::cfg_db! {
                 impl #stub_ident {
-                    #method_defs
+                    /// Execute this typed update handler in-process with a default 30-second timeout.
+                    pub async fn #method_name(
+                        conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
+                        handle: &::autumn_harvest::WorkflowHandle,
+                        #(#params),*
+                    ) -> ::autumn_harvest::HarvestResult<#ok_type> {
+                        Self::#method_name_with_timeout(
+                            conn,
+                            handle,
+                            #(#param_names,)*
+                            ::std::time::Duration::from_secs(30)
+                        ).await
+                    }
+
+                    /// Execute this typed update handler in-process with a custom timeout.
+                    pub async fn #method_name_with_timeout(
+                        conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
+                        handle: &::autumn_harvest::WorkflowHandle,
+                        #(#params,)*
+                        timeout: ::std::time::Duration,
+                    ) -> ::autumn_harvest::HarvestResult<#ok_type> {
+                        let args = #serialize_payload;
+                        let raw = handle.execute_update_in_process(
+                            conn,
+                            #workflow_simple_name,
+                            #fn_name_str,
+                            args,
+                            timeout
+                        ).await?;
+                        ::autumn_harvest::serde_json::from_value(raw)
+                            .map_err(::autumn_harvest::error::HarvestError::Serialization)
+                    }
+
+                    /// Atomically start-or-attach the workflow and admit this update.
+                    ///
+                    /// Returns [`UpdateWithStartOutcome`] describing whether a fresh
+                    /// execution was started and whether the update was admitted.
+                    /// Use the `update_id` in the outcome to poll for the result via the
+                    /// management API (`GET /workflows/{exec_id}/updates/{update_id}`) or
+                    /// the `poll_update_result` helper.
+                    ///
+                    /// `start_input` is the JSON-serialised workflow input. The update
+                    /// arguments are typed from the `#[update]` function signature.
+                    /// Use [`TypedUpdateWithStartOptions`] to control the reuse policy,
+                    /// idempotency key, queue, and other per-call settings.
+                    ///
+                    /// [`UpdateWithStartOutcome`]: ::autumn_harvest::UpdateWithStartOutcome
+                    /// [`TypedUpdateWithStartOptions`]: ::autumn_harvest::TypedUpdateWithStartOptions
+                    pub async fn #method_name_uws(
+                        conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
+                        client: &::autumn_harvest::WorkflowHandleClient,
+                        workflow_id: impl Into<::std::string::String>,
+                        start_input: ::autumn_harvest::serde_json::Value,
+                        #(#params,)*
+                        opts: ::autumn_harvest::TypedUpdateWithStartOptions,
+                    ) -> ::autumn_harvest::HarvestResult<::autumn_harvest::UpdateWithStartOutcome>
+                    {
+                        let workflow_id = workflow_id.into();
+                        let update_args = #serialize_payload;
+                        // Issue #499: a debounced workflow cannot be started through the
+                        // typed client (it can't route to the debounce-key shard or admit
+                        // through the gate); debounce admission is HTTP-only. Reject early.
+                        if let ::std::option::Option::Some(debounce_policy) = Self::info().debounce {
+                            if ::autumn_harvest::debounce::resolve_debounce_key(
+                                debounce_policy.key_expr,
+                                &start_input,
+                            )
+                            .is_some()
+                            {
+                                return ::std::result::Result::Err(
+                                    ::autumn_harvest::error::HarvestError::Config(::std::format!(
+                                        "workflow '{0}' has a debounce policy; debounced starts \
+                                         must use the HTTP start route POST /workflows/{0}/start \
+                                         (the typed client cannot express a deferred debounced start)",
+                                        #workflow_simple_name,
+                                    )),
+                                );
+                            }
+                        }
+                        if let ::std::option::Option::Some(batch_policy) = Self::info().batch.as_ref() {
+                            if ::autumn_harvest::concurrency::resolve_concurrency_key(
+                                &batch_policy.key_expr,
+                                &start_input,
+                            )
+                            .is_some()
+                            {
+                                return ::std::result::Result::Err(
+                                    ::autumn_harvest::error::HarvestError::Config(::std::format!(
+                                        "workflow '{0}' has an event batching policy; batched starts \
+                                         must use the HTTP start route POST /workflows/{0}/start \
+                                         (the typed client cannot express a deferred batched start)",
+                                        #workflow_simple_name,
+                                    )),
+                                );
+                            }
+                        }
+                        let update_id = opts.idempotency_key.as_ref().map_or_else(
+                            ::autumn_harvest::types::UpdateId::new,
+                            |key| {
+                                let ns = ::autumn_harvest::uuid::Uuid::parse_str(
+                                    "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                                ).expect("static namespace UUID is valid");
+                                ::autumn_harvest::types::UpdateId::from_uuid(
+                                    ::autumn_harvest::uuid::Uuid::new_v5(&ns, key.as_bytes())
+                                )
+                            }
+                        );
+                        let exec_id = opts.exec_id.unwrap_or_else(|| {
+                            let shard = client.pick_shard_for_new_workflow(#workflow_simple_name, &workflow_id);
+                            ::autumn_harvest::types::ExecutionId::new_for_shard(shard)
+                        });
+                        let execution_timeout = match opts.execution_timeout {
+                            ::std::option::Option::Some(d) => ::std::option::Option::Some(
+                                ::autumn_harvest::chrono::Duration::from_std(d)
+                                    .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
+                                        "execution_timeout exceeds chrono duration range".to_string()
+                                    ))?
+                            ),
+                            ::std::option::Option::None => ::std::option::Option::None,
+                        };
+                        let max_execution_timeout_ceiling = match client.max_workflow_execution_timeout() {
+                            ::std::option::Option::Some(d) => ::std::option::Option::Some(
+                                ::autumn_harvest::chrono::Duration::from_std(d)
+                                    .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
+                                        "max_execution_timeout_ceiling exceeds chrono duration range".to_string()
+                                    ))?
+                            ),
+                            ::std::option::Option::None => ::std::option::Option::None,
+                        };
+                        let concurrency_key = Self::info().concurrency.and_then(|p|
+                            ::autumn_harvest::concurrency::resolve_concurrency_key(p.key_expr, &start_input)
+                        );
+                        let concurrency_limit = Self::info().concurrency.map(|p| p.limit);
+                        let params = ::autumn_harvest::UpdateWithStartParams {
+                            workflow_name: #workflow_simple_name,
+                            workflow_id: &workflow_id,
+                            exec_id,
+                            input: start_input,
+                            parent_id: opts.parent_id,
+                            queue_name: opts.queue_name.as_deref().unwrap_or("default"),
+                            execution_timeout,
+                            memo: opts.memo,
+                            search_attrs: opts.search_attrs,
+                            reuse_policy: opts.reuse_policy.unwrap_or(
+                                ::autumn_harvest::types::WorkflowIdReusePolicy::AllowDuplicate
+                            ),
+                            trace_context: opts.trace_context,
+                            max_execution_timeout_ceiling,
+                            // Chain-scoped lifetime cap (issue #617): the typed-stub
+                            // update-with-start does NOT thread the chain cap; it is
+                            // resolved on the HTTP update-with-start route and the
+                            // typed stub's own `start`/`start_with_options` path.
+                            chain_execution_timeout: ::std::option::Option::None,
+                            max_workflow_chain_timeout_ceiling: ::std::option::Option::None,
+                            concurrency_key,
+                            concurrency_limit,
+                            concurrency_on_conflict: Self::info()
+                                .concurrency
+                                .map_or(
+                                    ::autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+                                    |p| p.on_conflict,
+                                ),
+                            update_id,
+                            update_name: #fn_name_str.to_string(),
+                            update_args,
+                            idempotency_key: opts.idempotency_key,
+                            max_workflow_input_bytes: client.max_workflow_input_bytes(::std::option::Option::None),
+                            owner: ::std::option::Option::None,
+                            runbook_url: ::std::option::Option::None,
+                            severity: ::std::option::Option::None,
+                            context_headers: opts.context_headers,
+                            sla: opts.sla.or_else(|| Self::info().sla).and_then(|d|
+                                ::autumn_harvest::chrono::Duration::from_std(d).ok()
+                            ),
+                            workflow_retry_policy: Self::info().retry_policy
+                                .and_then(|p| ::autumn_harvest::serde_json::to_value(&p).ok()),
+                            max_workflow_attempts_ceiling: client.max_workflow_attempts(),
+                            // Typed stubs already reject debounced workflows up front.
+                            reject_fresh_if_debounced: false,
+                        };
+                        let _ = client;
+                        ::autumn_harvest::update_with_start_workflow_execution(conn, params).await
+                    }
                 }
             }
         }
@@ -349,7 +408,177 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use super::*;
                     use #leading_colon #(#nested_path_tokens::)*#stub_ident;
                     impl #stub_ident {
-                        #method_defs
+                        /// Execute this typed update handler in-process with a default 30-second timeout.
+                        pub async fn #method_name(
+                            conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
+                            handle: &::autumn_harvest::WorkflowHandle,
+                            #(#params),*
+                        ) -> ::autumn_harvest::HarvestResult<#ok_type> {
+                            Self::#method_name_with_timeout(
+                                conn,
+                                handle,
+                                #(#param_names,)*
+                                ::std::time::Duration::from_secs(30)
+                            ).await
+                        }
+
+                        /// Execute this typed update handler in-process with a custom timeout.
+                        pub async fn #method_name_with_timeout(
+                            conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
+                            handle: &::autumn_harvest::WorkflowHandle,
+                            #(#params,)*
+                            timeout: ::std::time::Duration,
+                        ) -> ::autumn_harvest::HarvestResult<#ok_type> {
+                            let args = #serialize_payload;
+                            let raw = handle.execute_update_in_process(
+                                conn,
+                                #workflow_simple_name,
+                                #fn_name_str,
+                                args,
+                                timeout
+                            ).await?;
+                            ::autumn_harvest::serde_json::from_value(raw)
+                                .map_err(::autumn_harvest::error::HarvestError::Serialization)
+                        }
+
+                        /// Atomically start-or-attach the workflow and admit this update.
+                        ///
+                        /// See the same-module variant for full documentation.
+                        pub async fn #method_name_uws(
+                            conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
+                            client: &::autumn_harvest::WorkflowHandleClient,
+                            workflow_id: impl Into<::std::string::String>,
+                            start_input: ::autumn_harvest::serde_json::Value,
+                            #(#params,)*
+                            opts: ::autumn_harvest::TypedUpdateWithStartOptions,
+                        ) -> ::autumn_harvest::HarvestResult<::autumn_harvest::UpdateWithStartOutcome>
+                        {
+                            let workflow_id = workflow_id.into();
+                            let update_args = #serialize_payload;
+                            // Issue #499: a debounced workflow cannot be started through the
+                            // typed client (it can't route to the debounce-key shard or admit
+                            // through the gate); debounce admission is HTTP-only. Reject early.
+                            if let ::std::option::Option::Some(debounce_policy) = Self::info().debounce {
+                                if ::autumn_harvest::debounce::resolve_debounce_key(
+                                    debounce_policy.key_expr,
+                                    &start_input,
+                                )
+                                .is_some()
+                                {
+                                    return ::std::result::Result::Err(
+                                        ::autumn_harvest::error::HarvestError::Config(::std::format!(
+                                            "workflow '{0}' has a debounce policy; debounced starts \
+                                             must use the HTTP start route POST /workflows/{0}/start \
+                                             (the typed client cannot express a deferred debounced start)",
+                                            #workflow_simple_name,
+                                        )),
+                                    );
+                                }
+                            }
+                            if let ::std::option::Option::Some(batch_policy) = Self::info().batch.as_ref() {
+                                if ::autumn_harvest::concurrency::resolve_concurrency_key(
+                                    &batch_policy.key_expr,
+                                    &start_input,
+                                )
+                                .is_some()
+                                {
+                                    return ::std::result::Result::Err(
+                                        ::autumn_harvest::error::HarvestError::Config(::std::format!(
+                                            "workflow '{0}' has an event batching policy; batched starts \
+                                             must use the HTTP start route POST /workflows/{0}/start \
+                                             (the typed client cannot express a deferred batched start)",
+                                            #workflow_simple_name,
+                                        )),
+                                    );
+                                }
+                            }
+                            let update_id = opts.idempotency_key.as_ref().map_or_else(
+                                ::autumn_harvest::types::UpdateId::new,
+                                |key| {
+                                    let ns = ::autumn_harvest::uuid::Uuid::parse_str(
+                                        "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                                    ).expect("static namespace UUID is valid");
+                                    ::autumn_harvest::types::UpdateId::from_uuid(
+                                        ::autumn_harvest::uuid::Uuid::new_v5(&ns, key.as_bytes())
+                                    )
+                                }
+                            );
+                            let exec_id = opts.exec_id.unwrap_or_else(|| {
+                                let shard = client.pick_shard_for_new_workflow(#workflow_simple_name, &workflow_id);
+                                ::autumn_harvest::types::ExecutionId::new_for_shard(shard)
+                            });
+                            let execution_timeout = match opts.execution_timeout {
+                                ::std::option::Option::Some(d) => ::std::option::Option::Some(
+                                    ::autumn_harvest::chrono::Duration::from_std(d)
+                                        .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
+                                            "execution_timeout exceeds chrono duration range".to_string()
+                                        ))?
+                                ),
+                                ::std::option::Option::None => ::std::option::Option::None,
+                            };
+                            let max_execution_timeout_ceiling = match client.max_workflow_execution_timeout() {
+                                ::std::option::Option::Some(d) => ::std::option::Option::Some(
+                                    ::autumn_harvest::chrono::Duration::from_std(d)
+                                        .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
+                                            "max_execution_timeout_ceiling exceeds chrono duration range".to_string()
+                                        ))?
+                                ),
+                                ::std::option::Option::None => ::std::option::Option::None,
+                            };
+                            let concurrency_key = Self::info().concurrency.and_then(|p|
+                                ::autumn_harvest::concurrency::resolve_concurrency_key(p.key_expr, &start_input)
+                            );
+                            let concurrency_limit = Self::info().concurrency.map(|p| p.limit);
+                            let params = ::autumn_harvest::UpdateWithStartParams {
+                                workflow_name: #workflow_simple_name,
+                                workflow_id: &workflow_id,
+                                exec_id,
+                                input: start_input,
+                                parent_id: opts.parent_id,
+                                queue_name: opts.queue_name.as_deref().unwrap_or("default"),
+                                execution_timeout,
+                                memo: opts.memo,
+                                search_attrs: opts.search_attrs,
+                                reuse_policy: opts.reuse_policy.unwrap_or(
+                                    ::autumn_harvest::types::WorkflowIdReusePolicy::AllowDuplicate
+                                ),
+                                trace_context: opts.trace_context,
+                                max_execution_timeout_ceiling,
+                                // Chain-scoped lifetime cap (issue #617): the typed-stub
+                                // update-with-start does NOT thread the chain cap; it is
+                                // resolved on the HTTP update-with-start route and the
+                                // typed stub's own `start`/`start_with_options` path.
+                                chain_execution_timeout: ::std::option::Option::None,
+                                max_workflow_chain_timeout_ceiling: ::std::option::Option::None,
+                                concurrency_key,
+                                concurrency_limit,
+                                concurrency_on_conflict: Self::info()
+                                    .concurrency
+                                    .map_or(
+                                        ::autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+                                        |p| p.on_conflict,
+                                    ),
+                                update_id,
+                                update_name: #fn_name_str.to_string(),
+                                update_args,
+                                idempotency_key: opts.idempotency_key,
+                                max_workflow_input_bytes: client.max_workflow_input_bytes(::std::option::Option::None),
+                                owner: ::std::option::Option::None,
+                                runbook_url: ::std::option::Option::None,
+                                severity: ::std::option::Option::None,
+                                context_headers: opts.context_headers,
+                                sla: opts.sla.or_else(|| Self::info().sla).and_then(|d|
+                                    ::autumn_harvest::chrono::Duration::from_std(d).ok()
+                                ),
+                                workflow_retry_policy: Self::info().retry_policy
+                                    .and_then(|p| ::autumn_harvest::serde_json::to_value(&p).ok()),
+                                max_workflow_attempts_ceiling: client.max_workflow_attempts(),
+                                // Typed stubs already reject debounced workflows up front.
+                                reject_fresh_if_debounced: false,
+                            };
+                            let _ = client;
+                            ::autumn_harvest::update_with_start_workflow_execution(conn, params).await
+                        }
                     }
                 }
             }
@@ -404,301 +633,112 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// Returns `true` when the first parameter matches `ctx: &WorkflowContext`.
+fn first_param_is_ctx(inputs: &syn::punctuated::Punctuated<syn::FnArg, syn::token::Comma>) -> bool {
+    let Some(first) = inputs.first() else {
+        return false;
+    };
+    let syn::FnArg::Typed(pt) = first else {
+        return false;
+    };
+    let syn::Type::Reference(r) = &*pt.ty else {
+        return false;
+    };
+    let syn::Type::Path(tp) = &*r.elem else {
+        return false;
+    };
+    tp.path
+        .segments
+        .last()
+        .is_some_and(|s| s.ident == "WorkflowContext")
+}
+
+fn returns_result(output: &syn::ReturnType) -> bool {
+    let syn::ReturnType::Type(_, ty) = output else {
+        return false;
+    };
+    let syn::Type::Path(type_path) = &**ty else {
+        return false;
+    };
+    type_path
+        .path
+        .segments
+        .last()
+        .is_some_and(|s| s.ident == "Result")
+}
+
 fn build_update_dispatch(fn_name: &syn::Ident, param_names: &[&syn::Ident]) -> TokenStream {
-    crate::attr_util::build_handler_dispatch(
-        fn_name,
-        param_names,
-        &format_ident!("args"),
-        &quote! { ctx.as_ref() },
-        &quote! { .await },
-        &quote! { |e| e.to_string() },
-    )
-}
-
-// ── Characterization tests ──────────────────────────────────────────────────
-//
-// `update_macro` generates the same three typed-stub methods twice: once for
-// the same-module case (`path_tokens.is_empty()`) and once wrapped in a
-// private `mod` for the nested-module case. The two copies are hand-kept in
-// sync; commit 896978eb (issue #617) shipped a diff that updated the first
-// copy's `UpdateWithStartParams` literal and initially missed the second,
-// caught only by `cargo clippy --all-features --tests` failing to compile
-// (a struct-literal missing-field error), not by any test. These tests pin
-// the two branches to token-identical method bodies (module wrapper and doc
-// comments aside) so a future one-sided edit fails a fast `cargo test
-// -p autumn-harvest-macros` instead of waiting for a full clippy run.
-#[cfg(test)]
-mod same_module_vs_nested_module_parity_tests {
-    use super::update_macro;
-    use quote::quote;
-
-    /// Removes `# [doc = r"..."]` attribute tokens (the `///` doc comments on
-    /// `#method_name_uws` are deliberately fuller in the same-module branch;
-    /// everything else must match). `quote!`'s fallback (non-bridged, i.e.
-    /// `cargo test`) `Display` renders doc comments as *raw* string literals
-    /// (`r"..."`), and the doc text can itself contain `]` (e.g. markdown
-    /// links like `[UpdateWithStartOutcome]`), so the closing quote is found
-    /// by scanning the string content rather than by a naive search for the
-    /// next `]`.
-    fn strip_docs(s: &str) -> String {
-        const PREFIX: &str = "# [doc = r\"";
-        let mut out = String::new();
-        let mut rest = s;
-        loop {
-            match rest.find(PREFIX) {
-                None => {
-                    out.push_str(rest);
-                    break;
-                }
-                Some(start) => {
-                    out.push_str(&rest[..start]);
-                    let after_prefix = &rest[start + PREFIX.len()..];
-                    // Raw strings have no escapes: the next `"` always closes it.
-                    let quote_end = after_prefix
-                        .find('"')
-                        .expect("unterminated raw string in doc attribute");
-                    let after_quote = &after_prefix[quote_end + 1..];
-                    let close = after_quote
-                        .find(']')
-                        .expect("expected ']' closing the doc attribute");
-                    rest = &after_quote[close + 1..];
-                }
-            }
+    if param_names.is_empty() {
+        quote! {
+            let result = #fn_name(ctx.as_ref()).await;
+            result.map_err(|e| e.to_string())
+                .and_then(|v| {
+                    ::autumn_harvest::serde_json::to_value(v).map_err(|e| e.to_string())
+                })
         }
-        out
-    }
-
-    /// Collapses every run of whitespace to a single space. `quote!`'s
-    /// fallback `Display` reproduces string-literal *source spelling*
-    /// verbatim rather than the resolved value (verified empirically: a
-    /// `"a \<newline>   b"` continuation literal round-trips with the
-    /// original newline and indentation still embedded), so a debounce/batch
-    /// rejection message written at two different nesting depths in the two
-    /// branches otherwise looks like a content difference when it is really
-    /// only a difference in how many leading spaces preceded it in
-    /// `update.rs`'s own source -- irrelevant once real `rustc` resolves the
-    /// `\`-continuation the same way for both. Real content differences
-    /// (an added/removed field, a different call) still show up as
-    /// different words, which whitespace collapsing does not hide.
-    fn normalize_whitespace(s: &str) -> String {
-        s.split_whitespace().collect::<Vec<_>>().join(" ")
-    }
-
-    /// Extracts the contents of the (single, outermost) `impl #stub_ident {
-    /// ... }` block via balanced-brace scanning over the `Display`ed
-    /// `TokenStream`, which normalises whitespace deterministically.
-    fn extract_impl_body(full: &str, stub_ident: &str) -> String {
-        let marker = format!("impl {stub_ident} {{");
-        let start = full
-            .find(&marker)
-            .unwrap_or_else(|| panic!("no `{marker}` in generated output:\n{full}"))
-            + marker.len();
-        let mut depth = 1i32;
-        let bytes = full.as_bytes();
-        let mut i = start;
-        while i < bytes.len() && depth > 0 {
-            match bytes[i] as char {
-                '{' => depth += 1,
-                '}' => depth -= 1,
-                _ => {}
-            }
-            i += 1;
+    } else if param_names.len() == 1 {
+        let name = &param_names[0];
+        quote! {
+            let #name = ::autumn_harvest::serde_json::from_value(args)
+                .map_err(|e| e.to_string())?;
+            let result = #fn_name(ctx.as_ref(), #name).await;
+            result.map_err(|e| e.to_string())
+                .and_then(|v| {
+                    ::autumn_harvest::serde_json::to_value(v).map_err(|e| e.to_string())
+                })
         }
-        normalize_whitespace(&strip_docs(full[start..i - 1].trim()))
-    }
-
-    fn generate(workflow_path: &str) -> String {
-        let attr = quote! { workflow = #workflow_path };
-        let item = quote! {
-            async fn my_update(ctx: &WorkflowContext, n: u32) -> Result<u32, String> {
-                Ok(n)
-            }
-        };
-        update_macro(attr, item).to_string()
-    }
-
-    #[test]
-    fn same_module_and_nested_module_branches_generate_identical_impl_bodies() {
-        let same_module = generate("MyWorkflow");
-        let nested = generate("some_mod::MyWorkflow");
-
-        let same_module_body = extract_impl_body(&same_module, "MyWorkflowStub");
-        let nested_body = extract_impl_body(&nested, "MyWorkflowStub");
-
-        assert_eq!(
-            same_module_body, nested_body,
-            "the same-module and nested-module branches of `update_macro` must \
-             generate identical method bodies (module wrapper and doc comments \
-             aside) -- a divergence here is exactly the missed-fix class fixed \
-             for `chain_execution_timeout`/`max_workflow_chain_timeout_ceiling` \
-             in commit 896978eb (issue #617)"
-        );
-        // Sanity: make sure the extraction actually found real content, not
-        // two empty strings that would trivially "match".
-        assert!(same_module_body.contains("update_with_start_workflow_execution"));
-    }
-
-    fn use_line(full: &str) -> &str {
-        let start = full
-            .find("use ")
-            .unwrap_or_else(|| panic!("no `use` in generated output:\n{full}"));
-        let end = start
-            + full[start..]
-                .find("impl ")
-                .unwrap_or_else(|| panic!("no `impl` after `use` in:\n{full}"));
-        full[start..end].trim()
-    }
-
-    /// Pins the exact stub-`use` tokens `update_macro` emits for each shape
-    /// of `workflow = "..."` path. See `query.rs`'s identical sibling test.
-    /// All three handler macros resolve a `workflow` path to a stub `use`
-    /// the same way. That derivation is moving to a single
-    /// `WorkflowPath::nested_stub_use_tokens`.
-    #[test]
-    fn stub_use_tokens_pinned_per_path_shape() {
-        assert_eq!(
-            use_line(&generate("some_mod::MyWorkflow")),
-            "use super :: * ; use super :: some_mod :: MyWorkflowStub ;"
-        );
-        assert_eq!(
-            use_line(&generate("self::MyWorkflow")),
-            "use super :: * ; use super :: MyWorkflowStub ;"
-        );
-        assert_eq!(
-            use_line(&generate("self::a::b::MyWorkflow")),
-            "use super :: * ; use super :: a :: b :: MyWorkflowStub ;"
-        );
-        assert_eq!(
-            use_line(&generate("crate::some_mod::MyWorkflow")),
-            "use super :: * ; use crate :: some_mod :: MyWorkflowStub ;"
-        );
-        assert_eq!(
-            use_line(&generate("::abs_mod::MyWorkflow")),
-            "use super :: * ; use :: abs_mod :: MyWorkflowStub ;"
-        );
+    } else {
+        let indices = (0..param_names.len()).map(syn::Index::from);
+        let names = param_names.to_owned();
+        quote! {
+            let __args: ::autumn_harvest::serde_json::Value = args;
+            #(
+                let #names = ::autumn_harvest::serde_json::from_value(__args[#indices].clone())
+                    .map_err(|e| e.to_string())?;
+            )*
+            let result = #fn_name(ctx.as_ref(), #(#names),*).await;
+            result.map_err(|e| e.to_string())
+                .and_then(|v| {
+                    ::autumn_harvest::serde_json::to_value(v).map_err(|e| e.to_string())
+                })
+        }
     }
 }
 
-// ── Characterization tests: signature-validation error paths ────────────────
-//
-// Sibling of `query.rs`'s test of the same name. Pins `update_macro`'s
-// current rejection messages for `first_param_is_ctx`/`returns_result`/the
-// async check. A later change routes those checks through the
-// already-shared `attr_util` helpers.
-#[cfg(test)]
-mod signature_validation_characterization_tests {
-    use super::update_macro;
-    use quote::quote;
-
-    #[test]
-    fn sync_handler_is_rejected() {
-        let attr = quote! { workflow = "MyWorkflow" };
-        let item = quote! {
-            fn my_update(ctx: &WorkflowContext) -> Result<(), String> {
-                Ok(())
-            }
-        };
-        let out = update_macro(attr, item).to_string();
-        assert!(
-            out.contains("must be async"),
-            "expected the async rejection message, got:\n{out}"
-        );
+fn build_input_type_hint(params: &[&syn::FnArg]) -> String {
+    if params.is_empty() {
+        return "()".to_string();
     }
-
-    #[test]
-    fn wrong_first_param_type_is_rejected() {
-        let attr = quote! { workflow = "MyWorkflow" };
-        let item = quote! {
-            async fn my_update(n: u32) -> Result<u32, String> {
-                Ok(n)
-            }
-        };
-        let out = update_macro(attr, item).to_string();
-        assert!(
-            out.contains("must take") && out.contains("WorkflowContext"),
-            "expected the ctx-param rejection message, got:\n{out}"
-        );
+    if params.len() == 1
+        && let syn::FnArg::Typed(pt) = params[0]
+    {
+        return type_name_hint(&pt.ty);
     }
-
-    #[test]
-    fn non_result_return_type_is_rejected() {
-        let attr = quote! { workflow = "MyWorkflow" };
-        let item = quote! {
-            async fn my_update(ctx: &WorkflowContext) -> u32 {
-                0
+    let parts: Vec<_> = params
+        .iter()
+        .filter_map(|arg| {
+            if let syn::FnArg::Typed(pt) = arg {
+                Some(type_name_hint(&pt.ty))
+            } else {
+                None
             }
-        };
-        let out = update_macro(attr, item).to_string();
-        assert!(
-            out.contains("return type must be") && out.contains("Result"),
-            "expected the return-type rejection message, got:\n{out}"
-        );
-    }
+        })
+        .collect();
+    format!("({})", parts.join(", "))
 }
 
-// Pins the output of `attr_util::build_handler_dispatch` as used by `#[update]`
-// (issue #1632).
-#[cfg(test)]
-mod dispatch_characterization_tests {
-    use super::update_macro;
-    use quote::quote;
+fn extract_ok_type_hint(output: &syn::ReturnType) -> String {
+    crate::extract_ok_type_hint(output)
+}
 
-    /// Isolate the `async move` body of the generated `__dispatch` function.
-    fn extract_dispatch_body(full: &str) -> String {
-        let marker = "Box :: pin (async move {";
-        let start = full
-            .find(marker)
-            .unwrap_or_else(|| panic!("no dispatch marker in generated output:\n{full}"))
-            + marker.len();
-        let mut depth = 1i32;
-        let bytes = full.as_bytes();
-        let mut i = start;
-        while i < bytes.len() && depth > 0 {
-            match bytes[i] as char {
-                '{' => depth += 1,
-                '}' => depth -= 1,
-                _ => {}
-            }
-            i += 1;
-        }
-        full[start..i - 1].trim().to_string()
-    }
+fn type_name_hint(ty: &syn::Type) -> String {
+    crate::type_name_hint(ty)
+}
 
-    fn generate(item: proc_macro2::TokenStream) -> String {
-        update_macro(quote! { workflow = "MyWorkflow" }, item).to_string()
-    }
+fn to_pascal_case(s: &str) -> String {
+    crate::to_pascal_case(s)
+}
 
-    const UPDATE_DISPATCH_0: &str = "let result = my_update (ctx . as_ref ()) . await ; result . map_err (| e | e . to_string ()) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
-    const UPDATE_DISPATCH_1: &str = "let n = :: autumn_harvest :: serde_json :: from_value (args) . map_err (| e | e . to_string ()) ? ; let result = my_update (ctx . as_ref () , n) . await ; result . map_err (| e | e . to_string ()) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
-    const UPDATE_DISPATCH_N: &str = "let __args : :: autumn_harvest :: serde_json :: Value = args ; let a = :: autumn_harvest :: serde_json :: from_value (__args [0] . clone ()) . map_err (| e | e . to_string ()) ? ; let b = :: autumn_harvest :: serde_json :: from_value (__args [1] . clone ()) . map_err (| e | e . to_string ()) ? ; let result = my_update (ctx . as_ref () , a , b) . await ; result . map_err (| e | e . to_string ()) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
-
-    #[test]
-    fn zero_params_dispatch_is_pinned() {
-        let out = generate(quote! {
-            async fn my_update(ctx: &WorkflowContext) -> Result<u32, String> {
-                Ok(1)
-            }
-        });
-        assert_eq!(extract_dispatch_body(&out), UPDATE_DISPATCH_0);
-    }
-
-    #[test]
-    fn one_params_dispatch_is_pinned() {
-        let out = generate(quote! {
-            async fn my_update(ctx: &WorkflowContext, n: u32) -> Result<u32, String> {
-                Ok(1)
-            }
-        });
-        assert_eq!(extract_dispatch_body(&out), UPDATE_DISPATCH_1);
-    }
-
-    #[test]
-    fn multi_params_dispatch_is_pinned() {
-        let out = generate(quote! {
-            async fn my_update(ctx: &WorkflowContext, a: u32, b: u32) -> Result<u32, String> {
-                Ok(1)
-            }
-        });
-        assert_eq!(extract_dispatch_body(&out), UPDATE_DISPATCH_N);
-    }
+fn extract_ok_type(output: &syn::ReturnType) -> syn::Type {
+    crate::extract_ok_type(output)
 }

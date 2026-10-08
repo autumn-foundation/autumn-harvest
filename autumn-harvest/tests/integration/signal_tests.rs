@@ -12,7 +12,7 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::test_init_sql().as_bytes().to_vec()
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
 }
 
 async fn setup_test_db() -> (
@@ -60,7 +60,7 @@ async fn test_send_and_load_signals() {
         workflow_id: "test_id",
         run_id: exec_id.as_uuid(),
         shard_id: 0,
-        input: serde_json::json!({}).into(),
+        input: serde_json::json!({}),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -130,7 +130,7 @@ async fn test_mark_signals_consumed() {
         workflow_id: "test_id",
         run_id: exec_id.as_uuid(),
         shard_id: 0,
-        input: serde_json::json!({}).into(),
+        input: serde_json::json!({}),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -215,7 +215,7 @@ async fn insert_running_execution(conn: &mut diesel_async::AsyncPgConnection) ->
         workflow_id: &workflow_id,
         run_id: exec_id.as_uuid(),
         shard_id: 0,
-        input: serde_json::json!({}).into(),
+        input: serde_json::json!({}),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,

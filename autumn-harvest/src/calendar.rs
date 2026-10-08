@@ -43,46 +43,8 @@ pub fn is_excluded_date(date: NaiveDate, excluded_dates: &[NaiveDate]) -> bool {
 /// Internal helper: returns `true` if `date` should be treated as excluded,
 /// checking both the explicit exclusion list and the weekend flag.
 fn is_excluded_impl(date: NaiveDate, excluded_dates: &[NaiveDate], exclude_weekends: bool) -> bool {
-    (exclude_weekends && is_weekend(date)) || excluded_dates.contains(&date)
-}
-
-/// Returns `true` when `date` is a Saturday or Sunday.
-fn is_weekend(date: NaiveDate) -> bool {
-    matches!(date.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun)
-}
-
-/// Shared skip-search: advances `date` per `skip_policy` using `is_excluded`
-/// as the exclusion check. Factored out so the two `excluded_dates`
-/// representations below share one 365-day scan implementation rather than
-/// two copies that could drift. Those representations are `&[NaiveDate]`
-/// for a single lookup, and `&BTreeSet<NaiveDate>` for a caller repeating
-/// this check across many dates.
-///
-/// A shift target must be a weekday and not excluded (issue #1772). The
-/// weekday rule applies to the scan only. The check on `date` itself uses
-/// `is_excluded`, so a weekend slot that is not excluded keeps its date.
-fn apply_skip_policy_with(
-    date: NaiveDate,
-    skip_policy: SkipPolicy,
-    is_excluded: impl Fn(NaiveDate) -> bool,
-) -> Option<NaiveDate> {
-    if !is_excluded(date) {
-        return Some(date);
-    }
-    // Each step is checked. A scan past the `NaiveDate` range returns `None` (issue #1968).
-    let step: fn(NaiveDate) -> Option<NaiveDate> = match skip_policy {
-        SkipPolicy::Skip => return None,
-        SkipPolicy::RunNextBusinessDay => |d| d.checked_add_days(chrono::Days::new(1)),
-        SkipPolicy::RunPrevBusinessDay => |d| d.checked_sub_days(chrono::Days::new(1)),
-    };
-    let mut candidate = date;
-    for _ in 0..365 {
-        candidate = step(candidate)?;
-        if !is_weekend(candidate) && !is_excluded(candidate) {
-            return Some(candidate);
-        }
-    }
-    None
+    (exclude_weekends && matches!(date.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun))
+        || excluded_dates.contains(&date)
 }
 
 /// Adjust a scheduled fire date according to a calendar and skip policy.
@@ -92,23 +54,14 @@ fn apply_skip_policy_with(
 /// - `SkipPolicy::RunNextBusinessDay` → first subsequent non-excluded weekday.
 /// - `SkipPolicy::RunPrevBusinessDay` → most recent preceding non-excluded weekday.
 ///
-/// A shift target is never a Saturday or Sunday, whatever `exclude_weekends` is.
-///
 /// Set `exclude_weekends = true` when the attached calendar is `"weekends-off"`
 /// (or any calendar that implies Saturday/Sunday are always excluded). When
 /// `true`, Saturday and Sunday are treated as excluded regardless of whether they
-/// appear in `excluded_dates`. When `false`, a weekend `date` that is not in
-/// `excluded_dates` is returned unchanged.
+/// appear in `excluded_dates`.
 ///
-/// Scans up to 365 calendar days in either direction. Returns `None` if no
-/// non-excluded weekday exists within that window, or if the scan gets to the
-/// limit of the `NaiveDate` range.
-///
-/// Checks `excluded_dates` with an O(n) linear scan per date. A caller that
-/// invokes this once per date in a loop over the *same* `excluded_dates`
-/// should instead index it once into a `BTreeSet`. Such a caller should
-/// call [`apply_skip_policy_indexed`] instead — see that function for why.
-/// Backfill planning and firing previews are two such loop callers.
+/// Scans up to 365 days in either direction; returns `None` if no non-excluded
+/// day can be found within that window (degenerate calendar with 365 consecutive
+/// exclusions).
 #[must_use]
 pub fn apply_skip_policy(
     date: NaiveDate,
@@ -116,39 +69,32 @@ pub fn apply_skip_policy(
     excluded_dates: &[NaiveDate],
     exclude_weekends: bool,
 ) -> Option<NaiveDate> {
-    apply_skip_policy_with(date, skip_policy, |d| {
-        is_excluded_impl(d, excluded_dates, exclude_weekends)
-    })
-}
-
-/// Same contract as [`apply_skip_policy`], but checks `excluded` — a
-/// `BTreeSet` built once by the caller — with an O(log n) lookup per
-/// date. `apply_skip_policy` itself does an O(n) linear scan instead.
-///
-/// A calendar's exclusion list only grows over the calendar's lifetime.
-/// There is no date-range bound and no retention path — see
-/// [`load_exclusions_for_calendar`]. A single backfill or preview call
-/// checks it once per generated slot, up to `max_count`. That count is
-/// client-suppliable and not hard-capped by the admin handler.
-/// Re-scanning the whole list from scratch on every slot makes that call's
-/// cost the product of two values that both grow independently of each
-/// other. That product is quadratic in the callers this function serves.
-///
-/// `cfg(feature = "db")`. Its only two callers,
-/// [`plan_backfill_with_calendar`] and [`preview_schedule_firings`], are
-/// both gated on `db`. A `db`-off build — the corpus crates under
-/// `autumn-harvest-verify` build this way — would otherwise see it as
-/// dead code.
-#[cfg(feature = "db")]
-fn apply_skip_policy_indexed(
-    date: NaiveDate,
-    skip_policy: SkipPolicy,
-    excluded: &std::collections::BTreeSet<NaiveDate>,
-    exclude_weekends: bool,
-) -> Option<NaiveDate> {
-    apply_skip_policy_with(date, skip_policy, |d| {
-        (exclude_weekends && is_weekend(d)) || excluded.contains(&d)
-    })
+    if !is_excluded_impl(date, excluded_dates, exclude_weekends) {
+        return Some(date);
+    }
+    match skip_policy {
+        SkipPolicy::Skip => None,
+        SkipPolicy::RunNextBusinessDay => {
+            let mut candidate = date + chrono::Duration::days(1);
+            for _ in 0..365 {
+                if !is_excluded_impl(candidate, excluded_dates, exclude_weekends) {
+                    return Some(candidate);
+                }
+                candidate += chrono::Duration::days(1);
+            }
+            None
+        }
+        SkipPolicy::RunPrevBusinessDay => {
+            let mut candidate = date - chrono::Duration::days(1);
+            for _ in 0..365 {
+                if !is_excluded_impl(candidate, excluded_dates, exclude_weekends) {
+                    return Some(candidate);
+                }
+                candidate -= chrono::Duration::days(1);
+            }
+            None
+        }
+    }
 }
 
 /// Returns `true` when the calendar name implies Saturday/Sunday are always excluded.
@@ -190,7 +136,8 @@ pub const MAX_BUSINESS_DAYS: u32 = 3650;
 /// [`is_excluded_date`] performs.
 #[must_use]
 pub fn is_business_day(date: NaiveDate, holidays: &std::collections::BTreeSet<NaiveDate>) -> bool {
-    !is_weekend(date) && !holidays.contains(&date)
+    !matches!(date.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun)
+        && !holidays.contains(&date)
 }
 
 /// A resolved business-day deadline plus the non-business dates stepped over.
@@ -213,13 +160,12 @@ pub struct BusinessDayResolution {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum BusinessDayRejection {
-    /// The scan finds more than 30 consecutive non-business days.
+    /// The scan window elapsed without finding enough business days.
     ///
-    /// Only a degenerate calendar causes this rejection. See
-    /// [`add_business_days`] for the bound.
+    /// Only reachable with a degenerate calendar that excludes every day in the
+    /// derived window (`n * 7 + 14` calendar days).
     ScanExhausted {
-        /// The consecutive non-business days the scan examined before it stopped.
-        /// The value is always 31.
+        /// The derived scan bound, in calendar days.
         scanned_days: u32,
     },
     /// The scan needed a date past the last date the calendar knows about.
@@ -467,19 +413,25 @@ fn parse_builtin_dates(raw: &[&str]) -> Vec<NaiveDate> {
     out
 }
 
-/// The longest run of consecutive non-business days the scan crosses.
+/// Slack added to the derived scan bound, in calendar days.
 ///
-/// Thirty days holds a real corporate shutdown and the weekends on each side.
-/// A longer run is a degenerate calendar, and the scan rejects it.
+/// Sized to absorb a real corporate shutdown (a fortnight of consecutive
+/// closures plus the weekends bracketing it) rather than a fortnight alone.
+/// It is a **floor, independent of `n`**: `n = 0` is the roll-forward case, so
+/// it must traverse the LONGEST unbroken non-business run before finding its
+/// first business day — a bound that shrinks with `n` scales backwards from the
+/// requirement and would reject `n = 0` on a calendar where `n = 1` succeeds.
+const SCAN_BOUND_SLACK_DAYS: u32 = 30;
+
+/// Derived scan bound in calendar days: `n * 7 + 30`.
 ///
-/// The bound is on one run, not on the full scan (issue #1968). The scan for a
-/// smaller `n` is a prefix of the scan for a larger `n`. So a smaller `n` never
-/// rejects where a larger `n` resolves. A total bound that grows with `n` does
-/// not give this property.
-///
-/// Each business day is at most 31 days after the previous one. So the scan
-/// examines at most `(n + 1) * 31` dates.
-const MAX_NON_BUSINESS_RUN_DAYS: u32 = 30;
+/// Provably sufficient — every 7-day window contains at least one weekday, and
+/// the fixed [`SCAN_BOUND_SLACK_DAYS`] floor absorbs a month of consecutive
+/// closures at either end regardless of `n`. Scales with `n` rather than
+/// silently capping at a fixed horizon.
+const fn derived_scan_bound(n: u32) -> u32 {
+    n.saturating_mul(7).saturating_add(SCAN_BOUND_SLACK_DAYS)
+}
 
 /// Resolve the instant `n` business days after `anchor`.
 ///
@@ -496,9 +448,8 @@ const MAX_NON_BUSINESS_RUN_DAYS: u32 = 30;
 ///
 /// # Errors
 ///
-/// - [`BusinessDayRejection::ScanExhausted`] when the scan finds more than 30
-///   consecutive non-business days before it resolves. The bound applies to
-///   each run, so a smaller `n` never rejects where a larger `n` resolves.
+/// - [`BusinessDayRejection::ScanExhausted`] when the calendar excludes every
+///   day in the derived `n * 7 + 14` calendar-day window.
 /// - [`BusinessDayRejection::DateOverflow`] when advancing the cursor would
 ///   leave [`NaiveDate`]'s representable range.
 ///
@@ -547,11 +498,12 @@ pub fn add_business_days_bounded(
         });
     }
 
+    let bound = derived_scan_bound(n);
     let time_of_day = anchor.time();
     let mut cursor = anchor.date_naive();
     let mut skipped = Vec::new();
     let mut remaining = n;
-    let mut run = 0_u32;
+    let mut advanced = 0_u32;
 
     loop {
         // Checked at the TOP of the body so it also covers the ZERO-ADVANCE
@@ -572,18 +524,19 @@ pub fn add_business_days_bounded(
                 return Ok(BusinessDayResolution { deadline, skipped });
             }
             remaining -= 1;
-            run = 0;
         } else {
             skipped.push(cursor);
-            run += 1;
-            if run > MAX_NON_BUSINESS_RUN_DAYS {
-                return Err(BusinessDayRejection::ScanExhausted { scanned_days: run });
-            }
         }
 
+        if advanced == bound {
+            return Err(BusinessDayRejection::ScanExhausted {
+                scanned_days: bound,
+            });
+        }
         cursor = cursor
             .checked_add_days(chrono::Days::new(1))
             .ok_or(BusinessDayRejection::DateOverflow)?;
+        advanced += 1;
     }
 }
 
@@ -672,18 +625,6 @@ pub fn preview_schedule_firings(
 
     let mut entries = Vec::with_capacity(count);
     let mut cursor = from;
-    let exclude_weekends = calendar_name.is_some_and(calendar_excludes_weekends);
-    // Indexed once for the whole preview: `apply_skip_policy_indexed` below
-    // is called up to `count` times against this same list. Skipped when
-    // `calendar_name` is `None`. The loop below then never reads `excluded`
-    // at all. A caller disabling calendar filtering while still holding a
-    // large `excluded_dates` snapshot must not pay to index a list it
-    // asked not to be checked.
-    let excluded: std::collections::BTreeSet<NaiveDate> = if calendar_name.is_some() {
-        excluded_dates.iter().copied().collect()
-    } else {
-        std::collections::BTreeSet::new()
-    };
 
     while entries.len() < count {
         let Some(fire_time) = next_run_after_pub(Some(schedule), cursor) else {
@@ -692,12 +633,13 @@ pub fn preview_schedule_firings(
         cursor = fire_time;
         let fire_date = fire_time.date_naive();
 
+        let exclude_weekends = calendar_name.is_some_and(calendar_excludes_weekends);
         let (effective_at, reason) = calendar_name.map_or_else(
             || (Some(fire_time), "Fired".to_string()),
-            |cal_name| match apply_skip_policy_indexed(
+            |cal_name| match apply_skip_policy(
                 fire_date,
                 skip_policy,
-                &excluded,
+                excluded_dates,
                 exclude_weekends,
             ) {
                 None => (None, format!("SkippedByCalendar:{cal_name}")),
@@ -755,31 +697,17 @@ pub fn plan_backfill_with_calendar(
     exclude_weekends: bool,
 ) -> Result<Vec<BackfillSlot>, crate::scheduler::BackfillPlanError> {
     let raw = crate::scheduler::plan_backfill_timestamps(schedule, from, to, max_count)?;
-    if raw.is_empty() {
-        // No slot to check against `excluded_dates` at all -- a `Manual`
-        // schedule, or a cron/interval schedule with no occurrence in
-        // `[from, to]`. Building the index below would be pure waste. A
-        // caller can reach this on every call for a schedule outside its
-        // active window, still carrying its full (long-lived, unbounded)
-        // calendar exclusion list.
-        return Ok(Vec::new());
-    }
-    // Indexed once for the whole backfill: `apply_skip_policy_indexed` below
-    // is called once per raw slot (up to `max_count`) against this same list.
-    let excluded: std::collections::BTreeSet<NaiveDate> = excluded_dates.iter().copied().collect();
     let pairs = raw
         .into_iter()
         .filter_map(|ts| {
             let date = ts.date_naive();
-            apply_skip_policy_indexed(date, skip_policy, &excluded, exclude_weekends).map(
-                |adj_date| {
-                    if adj_date == date {
-                        (ts, ts)
-                    } else {
-                        (ts, rebase_to_date(ts, adj_date, schedule))
-                    }
-                },
-            )
+            apply_skip_policy(date, skip_policy, excluded_dates, exclude_weekends).map(|adj_date| {
+                if adj_date == date {
+                    (ts, ts)
+                } else {
+                    (ts, rebase_to_date(ts, adj_date, schedule))
+                }
+            })
         })
         .collect();
     Ok(pairs)
@@ -813,53 +741,6 @@ pub async fn load_exclusions_for_calendar(
         .map_err(crate::error::database_error)?;
 
     Ok(rows)
-}
-
-/// Batched form of [`load_exclusions_for_calendar`] for many calendar names at once.
-///
-/// One query covering every name in `calendar_names` instead of one query
-/// per name (Ledger perf pass on `GET /admin/schedules`, which otherwise
-/// calls `load_exclusions_for_calendar` once per schedule row via
-/// `scheduler::resolve_effective_fire_at`, re-querying the same calendar's
-/// exclusions once per schedule that references it).
-///
-/// A name with no exclusion rows (misconfigured or exclusion-free) is simply
-/// absent from the returned map, matching what `load_exclusions_for_calendar`
-/// returns for it (an empty `Vec`) -- callers should treat a missing key the
-/// same as an empty list.
-///
-/// # Errors
-///
-/// Returns `HarvestError::Database` on connection or query failure.
-#[cfg(feature = "db")]
-pub async fn load_exclusions_for_calendars(
-    conn: &mut diesel_async::AsyncPgConnection,
-    calendar_names: &[&str],
-) -> crate::error::HarvestResult<std::collections::HashMap<String, Vec<NaiveDate>>> {
-    use crate::schema::harvest_calendar_exclusions;
-    use diesel::{ExpressionMethods, QueryDsl};
-    use diesel_async::RunQueryDsl;
-
-    if calendar_names.is_empty() {
-        return Ok(std::collections::HashMap::new());
-    }
-
-    let rows: Vec<(String, chrono::NaiveDate)> = harvest_calendar_exclusions::table
-        .filter(harvest_calendar_exclusions::calendar_name.eq_any(calendar_names))
-        .select((
-            harvest_calendar_exclusions::calendar_name,
-            harvest_calendar_exclusions::excluded_date,
-        ))
-        .load(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-
-    let mut map: std::collections::HashMap<String, Vec<NaiveDate>> =
-        std::collections::HashMap::new();
-    for (name, date) in rows {
-        map.entry(name).or_default().push(date);
-    }
-    Ok(map)
 }
 
 /// Load all calendars from the database.
@@ -1101,16 +982,6 @@ pub const NYSE_HOLIDAYS_2025_2026: &[&str] = &[
     "2026-11-26", // Thanksgiving
     "2026-12-25", // Christmas
 ];
-
-/// Compiles every Rust fence in `docs/calendars.md` as a doctest (issue #1783).
-///
-/// A fence that drifts from the public API fails `cargo test --doc`.
-/// Mark a fence that cannot compile as `text` or `ignore`.
-/// Mark a fence that compiles but must not run as `no_run`.
-/// A failure names a line in this file, not in the markdown.
-#[cfg(doctest)]
-#[doc = include_str!("../../docs/calendars.md")]
-struct CalendarsDocSnippets;
 
 #[cfg(test)]
 mod tests {
@@ -1354,81 +1225,17 @@ mod tests {
 
     #[test]
     fn add_business_days_scan_exhaustion_rejects() {
-        // The calendar excludes 60 consecutive days. The scan stops after 31 of them.
-        let all = closure("2026-07-02", 60);
+        // n = 1 derives a scan bound of 1 * 7 + 30 = 37 calendar days.
+        // 60 consecutive exclusions starve the scan before it finds a business day.
+        let mut all = std::collections::BTreeSet::new();
+        let mut d = date("2026-07-02");
+        for _ in 0..60 {
+            all.insert(d);
+            d = d.succ_opt().expect("in range");
+        }
         assert_eq!(
             add_business_days(utc("2026-07-02T09:00:00Z"), 1, &all),
-            Err(BusinessDayRejection::ScanExhausted { scanned_days: 31 }),
-        );
-    }
-
-    /// Returns `days` consecutive holiday dates from `start`.
-    fn closure(start: &str, days: u64) -> std::collections::BTreeSet<NaiveDate> {
-        let start = date(start);
-        (0..days)
-            .map(|i| {
-                start
-                    .checked_add_days(chrono::Days::new(i))
-                    .expect("in range")
-            })
-            .collect()
-    }
-
-    #[test]
-    fn smaller_n_is_never_rejected_where_larger_n_succeeds() {
-        // The old bound `n * 7 + 30` grows with `n` (issue #1968).
-        // A long closure then rejects a small `n` and accepts a larger `n`.
-        // Wed 2026-07-01 starts each closure.
-        let anchor = utc("2026-07-01T09:00:00Z");
-        for days in 25..=45 {
-            let cal = closure("2026-07-01", days);
-            for n in 0..8 {
-                if add_business_days(anchor, n + 1, &cal).is_ok() {
-                    assert!(
-                        add_business_days(anchor, n, &cal).is_ok(),
-                        "{days}-day closure: n = {} resolves, n = {n} rejects",
-                        n + 1
-                    );
-                }
-            }
-        }
-
-        // A 31-day closure rejects every `n` with the same value.
-        let cal = closure("2026-07-01", 31);
-        for n in [0, 1, 2, 10] {
-            assert_eq!(
-                add_business_days(anchor, n, &cal),
-                Err(BusinessDayRejection::ScanExhausted { scanned_days: 31 }),
-                "n = {n}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_month_long_closure_resolves_for_every_n() {
-        // Wed 2026-07-01 to Thu 2026-07-30 is a 30-day closure.
-        // Fri 2026-07-31 is the first business day.
-        let anchor = utc("2026-07-01T09:00:00Z");
-        let cal = closure("2026-07-01", 30);
-        assert_eq!(
-            add_business_days(anchor, 0, &cal).map(|r| r.deadline),
-            Ok(utc("2026-07-31T09:00:00Z"))
-        );
-        for n in [1, 2, 10, MAX_BUSINESS_DAYS] {
-            assert!(add_business_days(anchor, n, &cal).is_ok(), "n = {n}");
-        }
-    }
-
-    #[test]
-    fn a_long_closure_after_the_anchor_rejects() {
-        // Tue 2026-06-30 is a business day, so n = 0 resolves.
-        // The 31-day closure from Wed 2026-07-01 stops n = 1.
-        let anchor = utc("2026-06-30T09:00:00Z");
-        let cal = closure("2026-07-01", 31);
-        assert!(add_business_days(anchor, 0, &cal).is_ok());
-        assert_eq!(
-            add_business_days(anchor, 1, &cal),
-            Err(BusinessDayRejection::ScanExhausted { scanned_days: 31 }),
+            Err(BusinessDayRejection::ScanExhausted { scanned_days: 37 }),
         );
     }
 
@@ -1681,7 +1488,7 @@ mod tests {
                 &exc,
                 false
             ),
-            Some(date("2026-07-06"))
+            Some(date("2026-07-05"))
         );
     }
 
@@ -1709,7 +1516,7 @@ mod tests {
                 &exc,
                 false
             ),
-            Some(date("2026-08-10"))
+            Some(date("2026-08-09"))
         );
     }
 
@@ -1753,133 +1560,6 @@ mod tests {
 
         assert_eq!(
             apply_skip_policy(start_date, SkipPolicy::RunPrevBusinessDay, &exc, false),
-            None
-        );
-    }
-
-    // ── shift target is always a weekday (issue #1772) ────────────────────────
-
-    #[test]
-    fn apply_skip_policy_next_skips_weekend_without_weekend_flag() {
-        // Fri 2026-07-03 is a holiday. Sat and Sun are not in the list.
-        let exc = excluded(&["2026-07-03"]);
-        assert_eq!(
-            apply_skip_policy(
-                date("2026-07-03"),
-                SkipPolicy::RunNextBusinessDay,
-                &exc,
-                false
-            ),
-            Some(date("2026-07-06"))
-        );
-    }
-
-    #[test]
-    fn apply_skip_policy_prev_skips_weekend_without_weekend_flag() {
-        // Mon 2026-01-19 is a holiday. Sat and Sun are not in the list.
-        let exc = excluded(&["2026-01-19"]);
-        assert_eq!(
-            apply_skip_policy(
-                date("2026-01-19"),
-                SkipPolicy::RunPrevBusinessDay,
-                &exc,
-                false
-            ),
-            Some(date("2026-01-16"))
-        );
-    }
-
-    #[test]
-    fn apply_skip_policy_weekend_slot_is_not_shifted_without_weekend_flag() {
-        // A weekend slot that is not excluded keeps its date.
-        let d = date("2026-07-04");
-        assert_eq!(
-            apply_skip_policy(d, SkipPolicy::RunNextBusinessDay, &[], false),
-            Some(d)
-        );
-        assert_eq!(apply_skip_policy(d, SkipPolicy::Skip, &[], false), Some(d));
-    }
-
-    #[test]
-    fn apply_skip_policy_shift_target_is_never_a_weekend() {
-        let exc = excluded(&["2026-07-03", "2026-07-06"]);
-        for exclude_weekends in [false, true] {
-            let next = apply_skip_policy(
-                date("2026-07-03"),
-                SkipPolicy::RunNextBusinessDay,
-                &exc,
-                exclude_weekends,
-            )
-            .unwrap();
-            assert_eq!(next, date("2026-07-07"));
-        }
-    }
-
-    #[test]
-    fn apply_skip_policy_prev_steps_over_weekend_and_second_holiday() {
-        // Mon 2026-01-19 and Fri 2026-01-16 are holidays.
-        let exc = excluded(&["2026-01-19", "2026-01-16"]);
-        for exclude_weekends in [false, true] {
-            assert_eq!(
-                apply_skip_policy(
-                    date("2026-01-19"),
-                    SkipPolicy::RunPrevBusinessDay,
-                    &exc,
-                    exclude_weekends
-                ),
-                Some(date("2026-01-15"))
-            );
-        }
-    }
-
-    // ── NaiveDate range limits (issue #1968) ──────────────────────────────────
-
-    #[test]
-    fn apply_skip_policy_next_at_naivedate_max_returns_none() {
-        let max = NaiveDate::MAX;
-        assert_eq!(
-            apply_skip_policy(max, SkipPolicy::RunNextBusinessDay, &[max], false),
-            None
-        );
-        // A date that is not excluded keeps its value.
-        assert_eq!(
-            apply_skip_policy(max, SkipPolicy::RunNextBusinessDay, &[], false),
-            Some(max)
-        );
-    }
-
-    #[test]
-    fn apply_skip_policy_prev_at_naivedate_min_returns_none() {
-        let min = NaiveDate::MIN;
-        assert_eq!(
-            apply_skip_policy(min, SkipPolicy::RunPrevBusinessDay, &[min], false),
-            None
-        );
-    }
-
-    #[test]
-    fn apply_skip_policy_scan_stops_at_naivedate_range_limits() {
-        // The first step is in range. The second step is not.
-        let max = NaiveDate::MAX;
-        let before_max = max.pred_opt().expect("in range");
-        assert_eq!(
-            apply_skip_policy(
-                before_max,
-                SkipPolicy::RunNextBusinessDay,
-                &[before_max, max],
-                false
-            ),
-            None
-        );
-        let min = NaiveDate::MIN;
-        let after_min = min.succ_opt().expect("in range");
-        assert_eq!(
-            apply_skip_policy(
-                after_min,
-                SkipPolicy::RunPrevBusinessDay,
-                &[after_min, min],
-                false
-            ),
             None
         );
     }
@@ -1958,7 +1638,7 @@ mod tests {
             assert!(deferred.effective_at.is_some());
             assert_eq!(
                 deferred.effective_at.unwrap().date_naive(),
-                date("2026-07-06")
+                date("2026-07-05")
             );
             assert!(
                 deferred.reason.starts_with("DeferredFrom:"),

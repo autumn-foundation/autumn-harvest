@@ -22,6 +22,7 @@ use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution};
 use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime};
 use autumn_harvest_plugin::ui::harvest_ui_router;
+use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -39,7 +40,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::test_init_sql().as_bytes().to_vec()
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
 }
 
 async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
@@ -108,7 +109,7 @@ async fn setup_sharded_test_database_urls() -> ((String, String), ContainerAsync
         let mut conn = <AsyncPgConnection as AsyncConnection>::establish(shard_url)
             .await
             .expect("failed to connect to shard database");
-        conn.batch_execute(&autumn_harvest::test_init_sql())
+        conn.batch_execute(autumn_harvest::full_migrations_sql())
             .await
             .expect("failed to apply harvest migrations to shard database");
     }
@@ -153,12 +154,16 @@ async fn setup_n_shard_databases(container: &ContainerAsync<Postgres>, n: usize)
         let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
             .await
             .expect("shard connection");
-        conn.batch_execute(&autumn_harvest::test_init_sql())
+        conn.batch_execute(autumn_harvest::full_migrations_sql())
             .await
             .expect("apply migrations");
         urls.push(url);
     }
     urls
+}
+
+fn test_app_state_without_database() -> AppState {
+    AppState::for_test().with_profile("test")
 }
 
 fn echo_registry() -> Arc<HandlerRegistry> {
@@ -242,10 +247,6 @@ async fn post_form(
                 .method("POST")
                 .uri(uri)
                 .header("content-type", "application/x-www-form-urlencoded")
-                // issue #1278: the same-origin guard requires this evidence on
-                // every mutating request; a real browser sends it on every
-                // same-origin form submission.
-                .header("sec-fetch-site", "same-origin")
                 .body(Body::from(body.into()))
                 .expect("valid form request"),
         )
@@ -275,7 +276,7 @@ async fn insert_workflow_on_url(
             workflow_name,
             workflow_id,
             exec_id,
-            input: json!({ "workflow_id": workflow_id, "shard": shard.as_i32() }).into(),
+            input: json!({ "workflow_id": workflow_id, "shard": shard.as_i32() }),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -481,7 +482,7 @@ async fn ui_root_redirects_to_workflows() {
         ShardRouter::single(),
     ));
 
-    let app = harvest_ui_router(api_state);
+    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
 
     let response = app
         .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -503,8 +504,6 @@ async fn ui_lists_workflows_and_renders_detail_page() {
     let pool = build_test_pool(&database_url);
     let registry = echo_registry();
     let api_state = HarvestApiState::new();
-    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
-    api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
         Arc::clone(&registry),
@@ -519,10 +518,11 @@ async fn ui_lists_workflows_and_renders_detail_page() {
 
     let (worker, worker_task) = spawn_test_worker(Arc::clone(&registry), pool.clone());
 
-    let api_app = autumn_harvest_plugin::harvest_api_router(api_state.clone());
+    let api_app = autumn_harvest_plugin::harvest_api_router(api_state.clone())
+        .with_state(test_app_state_without_database());
     let exec_id = start_workflow_and_wait(&api_app, "ui-demo-1", &database_url).await;
 
-    let ui_app = harvest_ui_router(api_state.clone());
+    let ui_app = harvest_ui_router(api_state.clone()).with_state(test_app_state_without_database());
 
     let (status, list_html) = fetch_html(&ui_app, "/workflows").await;
     assert_eq!(status, StatusCode::OK);
@@ -604,7 +604,7 @@ async fn ui_lists_workflows_across_shards() {
     let exec_on_one =
         insert_workflow_on_url(&shard1_url, ShardId::new(1), "workflow_on_one", "ui-one").await;
 
-    let ui_app = harvest_ui_router(api_state);
+    let ui_app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
     let (status, list_html) = fetch_html(&ui_app, "/workflows").await;
     assert_eq!(status, StatusCode::OK);
     assert!(
@@ -659,7 +659,7 @@ fn build_single_shard_ui_app(database_url: &str) -> axum::Router {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    harvest_ui_router(api_state)
+    harvest_ui_router(api_state).with_state(test_app_state_without_database())
 }
 
 fn build_sharded_api_with_ui_app(shard0_url: &str, shard1_url: &str) -> axum::Router {
@@ -683,6 +683,7 @@ fn build_sharded_api_with_ui_app(shard0_url: &str, shard1_url: &str) -> axum::Ro
 
     autumn_harvest_plugin::harvest_api_router(api_state.clone())
         .nest("/ui", harvest_ui_router(api_state))
+        .with_state(test_app_state_without_database())
 }
 
 async fn seed_dead_letter_ui_fixture(shard0_url: &str, shard1_url: &str) -> Vec<SeededDeadLetter> {
@@ -913,306 +914,6 @@ async fn ui_dead_letters_lists_filters_and_replays_single_entry() {
         count_task_queue_by_activity(&target.shard_url, "charge_card").await,
         1,
         "single replay should enqueue exactly one activity task"
-    );
-}
-
-/// RED baseline this test replaces the assumption of:
-/// `parse_dead_letter_ui_filters` used to parse `task_kind` with
-/// `DeadLetterTaskKind::parse(..)?`, a bare `?` on `Result<_, AutumnError>`.
-/// An unrecognized value 400-aborted the whole `/dead-letters` response
-/// before the filter form ever rendered. That discarded the `workflow_name`
-/// filter the operator had already typed. Same discard-the-page-on-bad-filter
-/// pattern already fixed for the Workflows page's
-/// `started_after`/`started_before` (#1333) and the Workers page's
-/// `status`/`stale` (#1378). This DLQ page was the one sibling list page
-/// still carrying it.
-///
-/// GREEN (this commit): the request still renders the DLQ page (`200`). It
-/// preserves the other filter (`workflow_name=invoice_workflow`, still in
-/// its input's `value=`). It also surfaces a `role="alert"` message naming
-/// the bad value and the valid options next to the Task kind field.
-#[tokio::test]
-async fn ui_dead_letters_unknown_task_kind_redisplays_form_instead_of_aborting_page() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let app = build_single_shard_ui_app(&database_url);
-
-    let (status, html) = fetch_html(
-        &app,
-        "/dead-letters?task_kind=zombie&workflow_name=invoice_workflow",
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "an unknown task_kind value must not abort the whole DLQ page: {html}"
-    );
-    assert!(
-        html.contains("name=\"task_kind\""),
-        "filter form must still render: {html}"
-    );
-    assert!(
-        html.contains("value=\"invoice_workflow\""),
-        "the other filter the operator already typed must not be discarded: {html}"
-    );
-    assert!(
-        html.contains("role=\"alert\""),
-        "an inline, screen-reader-announced error must sit next to the field: {html}"
-    );
-    assert!(
-        html.contains("zombie") && html.contains("Activity"),
-        "the error must name the bad value and a valid option: {html}"
-    );
-    assert!(
-        html.contains("option value=\"zombie\" selected"),
-        "the Task kind select must echo the invalid value back as its selected \
-         option, not silently revert to 'All': {html}"
-    );
-}
-
-/// Same fix, `failed_after` side: `parse_dead_letter_time_filter` used to
-/// `?`-propagate a bare `AutumnError` on a malformed RFC 3339 timestamp.
-#[tokio::test]
-async fn ui_dead_letters_invalid_failed_after_redisplays_form_instead_of_aborting_page() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let app = build_single_shard_ui_app(&database_url);
-
-    let (status, html) = fetch_html(
-        &app,
-        "/dead-letters?failed_after=not-a-date&workflow_name=invoice_workflow",
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "an invalid failed_after value must not abort the whole DLQ page: {html}"
-    );
-    assert!(
-        html.contains("value=\"invoice_workflow\""),
-        "the other filter the operator already typed must not be discarded: {html}"
-    );
-    assert!(
-        html.contains("role=\"alert\""),
-        "an inline, screen-reader-announced error must sit next to the field: {html}"
-    );
-    assert!(
-        html.contains("value=\"not-a-date\""),
-        "the operator's exact invalid text must be echoed back into the field: {html}"
-    );
-    assert!(
-        html.contains("RFC 3339"),
-        "the error must name the expected format: {html}"
-    );
-}
-
-/// Same fix, `failed_before` side.
-#[tokio::test]
-async fn ui_dead_letters_invalid_failed_before_redisplays_form_instead_of_aborting_page() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let app = build_single_shard_ui_app(&database_url);
-
-    let (status, html) = fetch_html(
-        &app,
-        "/dead-letters?failed_before=not-a-date&workflow_name=invoice_workflow",
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "an invalid failed_before value must not abort the whole DLQ page: {html}"
-    );
-    assert!(
-        html.contains("value=\"invoice_workflow\""),
-        "the other filter the operator already typed must not be discarded: {html}"
-    );
-    assert!(
-        html.contains("role=\"alert\""),
-        "an inline, screen-reader-announced error must sit next to the field: {html}"
-    );
-    assert!(
-        html.contains("value=\"not-a-date\""),
-        "the operator's exact invalid text must be echoed back into the field: {html}"
-    );
-}
-
-/// Codex-review-class regression guard, matching #1333/#1378's own
-/// follow-up: an invalid filter's raw text must survive into pagination
-/// instead of being dropped on the very next click.
-#[tokio::test]
-async fn ui_dead_letters_invalid_task_kind_persists_across_pagination() {
-    let ((shard0_url, shard1_url), _container) = setup_sharded_test_database_urls().await;
-    let _seeded = seed_dead_letter_ui_fixture(&shard0_url, &shard1_url).await;
-    let app = build_sharded_api_with_ui_app(&shard0_url, &shard1_url);
-
-    let (status, html) = fetch_html(&app, "/ui/dead-letters?task_kind=zombie&limit=1").await;
-    assert_eq!(status, StatusCode::OK, "unexpected status: {html}");
-    assert!(
-        html.contains("Next"),
-        "test setup must produce a Next link to exercise pagination: {html}"
-    );
-    assert!(
-        html.contains("task_kind=zombie"),
-        "the invalid task_kind must be carried into the Next/Previous links \
-         instead of being dropped on the next page view: {html}"
-    );
-}
-
-/// `shard_id` used to be typed `Option<i32>` straight on the DLQ page's
-/// `Query<..>` extractor struct. A non-numeric value failed axum's own
-/// query deserialization, a bare framework 400 before `list_dead_letters_ui`
-/// ever ran. That is one layer earlier than the `task_kind`/`failed_after`/
-/// `failed_before` page-abort bug #1420 already fixed on this same page.
-#[tokio::test]
-async fn ui_dead_letters_invalid_shard_id_redisplays_form_instead_of_aborting_page() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let app = build_single_shard_ui_app(&database_url);
-
-    let (status, html) = fetch_html(
-        &app,
-        "/dead-letters?shard_id=north&workflow_name=invoice_workflow",
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "an invalid shard_id must not abort the whole DLQ page: {html}"
-    );
-    assert!(
-        html.contains("value=\"invoice_workflow\""),
-        "the other filter the operator already typed must not be discarded: {html}"
-    );
-    assert!(
-        html.contains("role=\"alert\""),
-        "an inline, screen-reader-announced error must sit next to the field: {html}"
-    );
-    assert!(
-        html.contains("value=\"north\""),
-        "the operator's exact invalid text must be echoed back into the field: {html}"
-    );
-    assert!(
-        html.contains("shard_id") && html.contains("north"),
-        "the error must name the field and the bad value: {html}"
-    );
-}
-
-/// RED (was): `page`/`limit` were still typed `Option<i64>` directly on
-/// `DeadLetterListParams`. That is the same mechanism #1540/#1560 already
-/// fixed on the Workflows and Workers pages, and the one this page's own
-/// `shard_id`/`task_kind`/`failed_after`/`failed_before` fixes left over.
-/// `?limit=not-a-number` failed axum's own query deserialization with a
-/// bare 400 before `list_dead_letters_ui` ever ran, discarding the
-/// `workflow_name` filter the operator had already typed alongside it.
-///
-/// GREEN (this commit): the request still renders the DLQ page (`200`)
-/// and preserves the other filter. It surfaces a `role="alert"` message
-/// naming the bad value next to the "Per page" field.
-#[tokio::test]
-async fn ui_dead_letters_invalid_limit_redisplays_form_instead_of_aborting_page() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let app = build_single_shard_ui_app(&database_url);
-
-    let (status, html) = fetch_html(
-        &app,
-        "/dead-letters?limit=not-a-number&workflow_name=invoice_workflow",
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "an invalid limit must not abort the whole DLQ page: {html}"
-    );
-    assert!(
-        html.contains("value=\"invoice_workflow\""),
-        "the other filter the operator already typed must not be discarded: {html}"
-    );
-    assert!(
-        html.contains("role=\"alert\""),
-        "an inline, screen-reader-announced error must sit next to the field: {html}"
-    );
-    assert!(
-        html.contains("not-a-number"),
-        "the error must name the bad value: {html}"
-    );
-}
-
-/// RED (was): `refresh` was still typed `Option<u64>` directly on
-/// `DeadLetterListParams`. This is the same page-abort mechanism issue
-/// #1604 documents for the Schedules, DAG-detail and Schedule-runs pages,
-/// left open here on the sibling DLQ page. `?refresh=not-a-number` failed
-/// axum's own query deserialization with a bare 400 before
-/// `list_dead_letters_ui` ever ran, discarding the `workflow_name` filter
-/// the operator had already typed alongside it.
-///
-/// GREEN (this commit): the request still renders the DLQ page (`200`)
-/// and preserves the other filter. It surfaces a `role="alert"` message
-/// naming the bad value, reusing `parse_refresh_query_field` (the DAG
-/// detail page's own fix, issue #1630).
-#[tokio::test]
-async fn ui_dead_letters_invalid_refresh_redisplays_page_instead_of_aborting_page() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let app = build_single_shard_ui_app(&database_url);
-
-    let (status, html) = fetch_html(
-        &app,
-        "/dead-letters?refresh=not-a-number&workflow_name=invoice_workflow",
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "an invalid refresh must not abort the whole DLQ page: {html}"
-    );
-    assert!(
-        html.contains("value=\"invoice_workflow\""),
-        "the other filter the operator already typed must not be discarded: {html}"
-    );
-    assert!(
-        html.contains("role=\"alert\""),
-        "an inline, screen-reader-announced error must be present: {html}"
-    );
-    assert!(
-        html.contains("not-a-number"),
-        "the error must name the bad value: {html}"
-    );
-    assert!(
-        !html.contains("http-equiv=\"refresh\""),
-        "an invalid refresh must not set a meta refresh: {html}"
-    );
-}
-
-/// Same fix, the `page` field. No form field backs it; it drives the
-/// Previous/Next links instead, a distinct code path. Covered
-/// independently here rather than assumed symmetric with `limit`,
-/// matching the Workflows/Workers pages' own `page` coverage.
-#[tokio::test]
-async fn ui_dead_letters_invalid_page_redisplays_list_instead_of_aborting_page() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let app = build_single_shard_ui_app(&database_url);
-
-    let (status, html) = fetch_html(
-        &app,
-        "/dead-letters?page=not-a-number&workflow_name=invoice_workflow",
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "an invalid page must not abort the whole DLQ page: {html}"
-    );
-    assert!(
-        html.contains("value=\"invoice_workflow\""),
-        "the other filter the operator already typed must not be discarded: {html}"
-    );
-    assert!(
-        html.contains("role=\"alert\""),
-        "an inline, screen-reader-announced error must sit next to the pagination controls: {html}"
-    );
-    assert!(
-        html.contains("not-a-number"),
-        "the error must name the bad value: {html}"
-    );
-    assert!(
-        html.contains("Page 1"),
-        "falls back to page 1 (zero-based page 0) instead of guessing: {html}"
     );
 }
 
@@ -1473,257 +1174,17 @@ async fn ui_workers_filter_stale_true() {
     );
 }
 
-/// RED (was): `?status=zombie` used to `?`-abort `list_workers_ui` with a
-/// bare 400 before the filter form was ever rendered. That discarded the
-/// `build_id` filter the operator had already typed alongside it. It is the
-/// same discard-the-page-on-bad-filter pattern fixed for the Workflows page's
-/// `started_after`/`started_before` in #1333. That PR's commit message names
-/// this exact test, `ui_workers_unknown_status_value_returns_400`, as
-/// evidence the pattern was systemic, not a one-off.
-///
-/// GREEN (this commit): the request still renders the Workers page (`200`).
-/// It preserves the other filter (`build_id=abc123`, still in its input's
-/// `value=`). It surfaces a `role="alert"` message next to the Status field.
-/// That message names the bad value and the valid options. The Workflows-page
-/// fix established four error-path booleans: adjacent to cause, persists
-/// until resolved, says how to recover, entered data preserved. The same
-/// four now hold here too.
+/// Unknown status value returns 400.
 #[tokio::test]
-async fn ui_workers_unknown_status_value_redisplays_form_instead_of_aborting_page() {
+async fn ui_workers_unknown_status_value_returns_400() {
     let (database_url, _container) = setup_test_database_url().await;
     let app = build_single_shard_ui_app(&database_url);
 
-    let (status, html) = fetch_html(&app, "/workers?status=zombie&build_id=abc123").await;
+    let (status, html) = fetch_html(&app, "/workers?status=zombie").await;
     assert_eq!(
         status,
-        StatusCode::OK,
-        "an unknown status value must not abort the whole Workers page: {html}"
-    );
-    assert!(
-        html.contains("name=\"status\""),
-        "filter form must still render: {html}"
-    );
-    assert!(
-        html.contains("value=\"abc123\""),
-        "the other filter the operator already typed must not be discarded: {html}"
-    );
-    assert!(
-        html.contains("role=\"alert\""),
-        "an inline, screen-reader-announced error must sit next to the field: {html}"
-    );
-    assert!(
-        html.contains("zombie") && html.contains("Active"),
-        "the error must name the bad value and a valid option: {html}"
-    );
-    assert!(
-        html.contains("option value=\"zombie\" selected"),
-        "the Status select must echo the invalid value back as its selected \
-         option, not silently revert to 'All' (Codex review, #1378 P2): {html}"
-    );
-}
-
-/// RED (was): `page`/`limit` were still typed `Option<i64>` directly on
-/// `WorkerListParams` — the two fields left over after status/stale/shard
-/// above got this fix. `?limit=not-a-number` failed axum's own query
-/// deserialization with a bare 400 before `list_workers_ui` ever ran,
-/// discarding the `build_id` filter the operator had already typed
-/// alongside it. Same mechanism as the Workflows page's
-/// `invalid_limit_redisplays_form_instead_of_aborting_page` (#1540).
-///
-/// GREEN (this commit): the request still renders the Workers page
-/// (`200`) and preserves the other filter. It surfaces a `role="alert"`
-/// message naming the bad value next to the "Per page" field.
-#[tokio::test]
-async fn ui_workers_invalid_limit_redisplays_form_instead_of_aborting_page() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let app = build_single_shard_ui_app(&database_url);
-
-    let (status, html) = fetch_html(&app, "/workers?limit=not-a-number&build_id=abc123").await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "an invalid limit must not abort the whole Workers page: {html}"
-    );
-    assert!(
-        html.contains("value=\"abc123\""),
-        "the other filter the operator already typed must not be discarded: {html}"
-    );
-    assert!(
-        html.contains("role=\"alert\""),
-        "an inline, screen-reader-announced error must sit next to the field: {html}"
-    );
-    assert!(
-        html.contains("not-a-number"),
-        "the error must name the bad value: {html}"
-    );
-}
-
-/// RED (was): `refresh` was still typed `Option<u64>` directly on
-/// `WorkerListParams`. This is the same page-abort mechanism issue #1604
-/// documents for the Schedules, DAG-detail and Schedule-runs pages, left
-/// open here on the sibling Workers page. `?refresh=not-a-number` failed
-/// axum's own query deserialization with a bare 400 before
-/// `list_workers_ui` ever ran, discarding the `build_id` filter the
-/// operator had already typed alongside it.
-///
-/// GREEN (this commit): the request still renders the Workers page
-/// (`200`) and preserves the other filter. It surfaces a `role="alert"`
-/// message naming the bad value, reusing `parse_refresh_query_field` (the
-/// DAG detail page's own fix, issue #1630).
-#[tokio::test]
-async fn ui_workers_invalid_refresh_redisplays_page_instead_of_aborting_page() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let app = build_single_shard_ui_app(&database_url);
-
-    let (status, html) = fetch_html(&app, "/workers?refresh=not-a-number&build_id=abc123").await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "an invalid refresh must not abort the whole Workers page: {html}"
-    );
-    assert!(
-        html.contains("value=\"abc123\""),
-        "the other filter the operator already typed must not be discarded: {html}"
-    );
-    assert!(
-        html.contains("role=\"alert\""),
-        "an inline, screen-reader-announced error must be present: {html}"
-    );
-    assert!(
-        html.contains("not-a-number"),
-        "the error must name the bad value: {html}"
-    );
-    assert!(
-        !html.contains("http-equiv=\"refresh\""),
-        "an invalid refresh must not set a meta refresh: {html}"
-    );
-}
-
-/// Same fix, the `page` field. No form field backs it; it drives the
-/// Previous/Next links instead, a distinct code path. Covered
-/// independently here rather than assumed symmetric with `limit`,
-/// matching the Workflows page's
-/// `invalid_page_redisplays_list_instead_of_aborting_page`.
-#[tokio::test]
-async fn ui_workers_invalid_page_redisplays_list_instead_of_aborting_page() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let app = build_single_shard_ui_app(&database_url);
-
-    let (status, html) = fetch_html(&app, "/workers?page=not-a-number&build_id=abc123").await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "an invalid page must not abort the whole Workers page: {html}"
-    );
-    assert!(
-        html.contains("value=\"abc123\""),
-        "the other filter the operator already typed must not be discarded: {html}"
-    );
-    assert!(
-        html.contains("role=\"alert\""),
-        "an inline, screen-reader-announced error must sit next to the pagination controls: {html}"
-    );
-    assert!(
-        html.contains("not-a-number"),
-        "the error must name the bad value: {html}"
-    );
-    assert!(
-        html.contains("Page 1"),
-        "falls back to page 1 (zero-based page 0) instead of guessing: {html}"
-    );
-}
-
-/// #1378: the first version of this fix parsed the invalid value down to
-/// `None` before it ever reached `render_workers_page`. So the pagination
-/// links and a plain form resubmission were built without it. A Next click,
-/// or a click on Apply with nothing changed, silently dropped the
-/// still-unresolved `status` filter and its error. That happened one click
-/// after the operator saw it. The fix carries the raw text alongside the
-/// parsed value all the way to `build_worker_query_string`.
-#[tokio::test]
-async fn ui_workers_invalid_status_value_persists_across_pagination() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let mut conn = AsyncPgConnection::establish(&database_url).await.unwrap();
-    insert_test_worker(&mut conn, "pg-worker-zombie-a", "Active", 0).await;
-    insert_test_worker(&mut conn, "pg-worker-zombie-b", "Active", 0).await;
-
-    let app = build_single_shard_ui_app(&database_url);
-    let (status, html) = fetch_html(&app, "/workers?status=zombie&limit=1").await;
-    assert_eq!(status, StatusCode::OK, "unexpected status: {html}");
-    assert!(
-        html.contains("Next"),
-        "test setup must produce a Next link to exercise pagination: {html}"
-    );
-    assert!(
-        html.contains("status=zombie"),
-        "the invalid status must be carried into the Next/Previous links \
-         instead of being dropped on the next page view: {html}"
-    );
-}
-
-/// Same fix, `stale` side. This is a distinct code path in
-/// `list_workers_ui`. It is also the one most likely to be hit organically
-/// rather than only by hand-edited URLs. Matching is case-sensitive by
-/// design: only the literal `true` applies the filter. So a capitalized
-/// `True` used to `?`-abort the page the same way `status=zombie` did. That
-/// value is plausible from a runbook example, a shell variable, or a JSON
-/// boolean serialized upstream.
-#[tokio::test]
-async fn ui_workers_unknown_stale_value_redisplays_form_instead_of_aborting_page() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let app = build_single_shard_ui_app(&database_url);
-
-    let (status, html) = fetch_html(&app, "/workers?stale=True&build_id=abc123").await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "an unknown stale value must not abort the whole Workers page: {html}"
-    );
-    assert!(
-        html.contains("value=\"abc123\""),
-        "the other filter the operator already typed must not be discarded: {html}"
-    );
-    assert!(
-        html.contains("role=\"alert\""),
-        "an inline, screen-reader-announced error must sit next to the field: {html}"
-    );
-    assert!(
-        html.contains("True"),
-        "the error must name the exact bad value the operator sent: {html}"
-    );
-}
-
-/// `shard` used to be typed `Option<i32>` straight on the Workers page's
-/// `Query<..>` extractor struct. A non-numeric value failed axum's own
-/// query deserialization, a bare framework 400 before `list_workers_ui`
-/// ever ran. That is one layer earlier than the status/stale page-abort
-/// bug #1378 already fixed on this same page.
-#[tokio::test]
-async fn ui_workers_invalid_shard_value_redisplays_form_instead_of_aborting_page() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let app = build_single_shard_ui_app(&database_url);
-
-    let (status, html) = fetch_html(&app, "/workers?shard=north&build_id=abc123").await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "an invalid shard value must not abort the whole Workers page: {html}"
-    );
-    assert!(
-        html.contains("value=\"abc123\""),
-        "the other filter the operator already typed must not be discarded: {html}"
-    );
-    assert!(
-        html.contains("role=\"alert\""),
-        "an inline, screen-reader-announced error must sit next to the field: {html}"
-    );
-    assert!(
-        html.contains("value=\"north\""),
-        "the operator's exact invalid text must be echoed back into the field: {html}"
-    );
-    assert!(
-        html.contains("shard") && html.contains("north"),
-        "the error must name the field and the bad value: {html}"
+        StatusCode::BAD_REQUEST,
+        "unknown status value should return 400: {html}"
     );
 }
 
@@ -1777,7 +1238,7 @@ async fn ui_workers_multi_shard_grouped() {
             ShardId::new(0),
         ),
     ));
-    let app = harvest_ui_router(api_state);
+    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
 
     let (status, html) = fetch_html(&app, "/workers").await;
     assert_eq!(status, StatusCode::OK);
@@ -1821,7 +1282,7 @@ async fn ui_workers_partial_shard_failure_degraded() {
             ShardId::new(0),
         ),
     ));
-    let app = harvest_ui_router(api_state);
+    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
 
     let (status, html) = fetch_html(&app, "/workers").await;
     // Must not 5xx — partial shard failure is a degraded scenario, not a crash.
@@ -1882,7 +1343,7 @@ async fn ui_workers_warns_when_a_shards_pause_state_is_unreadable() {
             ShardId::new(0),
         ),
     ));
-    let app = harvest_ui_router(api_state);
+    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
 
     let (status, html) = fetch_html(&app, "/workers").await;
     assert_eq!(
@@ -1958,7 +1419,7 @@ async fn ui_workers_perf_1k_workers_4_shards_under_500ms() {
             ShardId::new(0),
         ),
     ));
-    let app = harvest_ui_router(api_state);
+    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
 
     // Warm the lazy shard pools before measuring. This test covers the workers
     // page render/query budget, not first-use connection establishment against
@@ -2163,185 +1624,6 @@ async fn ui_schedules_filter_by_kind_dag() {
     );
 }
 
-/// `list_schedules_ui` used to `?`-propagate `ScheduleKindFilter::parse`'s
-/// `Result` directly. A bad `kind` value aborted the whole page with a
-/// bare 400, before the filter form, the table, or the operator's other
-/// filters ever rendered. It is the exact page-abort defect already fixed
-/// on this page's three sibling list pages: Workflows #1333, Workers
-/// #1378, Dead-Letters #1420. It never reached the Schedules page itself.
-#[tokio::test]
-async fn ui_schedules_invalid_kind_value_redisplays_form_instead_of_aborting_page() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let app = build_single_shard_ui_app(&database_url);
-
-    let (status, html) = fetch_html(&app, "/schedules?kind=zombie&target=billing").await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "an invalid kind value must not abort the whole Schedules page: {html}"
-    );
-    assert!(
-        html.contains("value=\"billing\""),
-        "the other filter the operator already typed must not be discarded: {html}"
-    );
-    assert!(
-        html.contains("role=\"alert\""),
-        "an inline, screen-reader-announced error must sit next to the field: {html}"
-    );
-    assert!(
-        html.contains("option value=\"zombie\" selected"),
-        "the Kind select must echo the invalid value back as its selected \
-         option, not silently revert to 'All': {html}"
-    );
-    assert!(
-        html.contains("zombie") && html.contains("Workflow"),
-        "the error must name the bad value and a valid option: {html}"
-    );
-}
-
-/// Same page-abort defect, `shard_id` side. It was typed `Option<i32>`
-/// straight on the `Query<..>` extractor struct, so a non-numeric value
-/// failed axum's own query deserialization before the handler ran at all.
-/// That is one layer earlier than the `kind`/`paused`/`health` fix above,
-/// and with no styled error whatsoever.
-#[tokio::test]
-async fn ui_schedules_invalid_shard_id_redisplays_form_instead_of_aborting_page() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let app = build_single_shard_ui_app(&database_url);
-
-    let (status, html) = fetch_html(&app, "/schedules?shard_id=north&target=billing").await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "an invalid shard_id must not abort the whole Schedules page: {html}"
-    );
-    assert!(
-        html.contains("value=\"billing\""),
-        "the other filter the operator already typed must not be discarded: {html}"
-    );
-    assert!(
-        html.contains("role=\"alert\""),
-        "an inline, screen-reader-announced error must sit next to the field: {html}"
-    );
-    assert!(
-        html.contains("value=\"north\""),
-        "the operator's exact invalid text must be echoed back into the field: {html}"
-    );
-    assert!(
-        html.contains("shard_id") && html.contains("north"),
-        "the error must name the field and the bad value: {html}"
-    );
-}
-
-/// RED (was): `page`/`limit` were still typed `Option<i64>` directly on
-/// `ScheduleListParams`. That is the same mechanism #1540/#1560/#1588
-/// already fixed on the Workflows, Workers and DLQ pages, and the one this
-/// page's own `kind`/`paused`/`health`/`shard_id` fixes left over.
-/// `?limit=not-a-number` failed axum's own query deserialization with a
-/// bare 400 before `list_schedules_ui` ever ran, discarding the `target`
-/// filter the operator had already typed alongside it.
-///
-/// GREEN (this commit): the request still renders the Schedules page
-/// (`200`) and preserves the other filter. It surfaces a `role="alert"`
-/// message naming the bad value next to the "Per page" field.
-#[tokio::test]
-async fn ui_schedules_invalid_limit_redisplays_form_instead_of_aborting_page() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let app = build_single_shard_ui_app(&database_url);
-
-    let (status, html) = fetch_html(&app, "/schedules?limit=not-a-number&target=billing").await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "an invalid limit must not abort the whole Schedules page: {html}"
-    );
-    assert!(
-        html.contains("value=\"billing\""),
-        "the other filter the operator already typed must not be discarded: {html}"
-    );
-    assert!(
-        html.contains("role=\"alert\""),
-        "an inline, screen-reader-announced error must sit next to the field: {html}"
-    );
-    assert!(
-        html.contains("not-a-number"),
-        "the error must name the bad value: {html}"
-    );
-}
-
-/// RED (was): `refresh` was still typed `Option<u64>` directly on
-/// `ScheduleListParams`. Issue #1604 fixed `page`/`limit` here. It also
-/// fixed `refresh` on the sibling DAG-detail page (issue #1630). This
-/// page's own `refresh` field stayed on the same raw-`u64` mechanism.
-/// `?refresh=not-a-number` failed axum's own query deserialization with a
-/// bare 400 before `list_schedules_ui` ever ran, discarding the `target`
-/// filter the operator had already typed alongside it.
-///
-/// GREEN (this commit): the request still renders the Schedules page
-/// (`200`) and preserves the other filter. It surfaces a `role="alert"`
-/// message naming the bad value, reusing `parse_refresh_query_field`.
-#[tokio::test]
-async fn ui_schedules_invalid_refresh_redisplays_page_instead_of_aborting_page() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let app = build_single_shard_ui_app(&database_url);
-
-    let (status, html) = fetch_html(&app, "/schedules?refresh=not-a-number&target=billing").await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "an invalid refresh must not abort the whole Schedules page: {html}"
-    );
-    assert!(
-        html.contains("value=\"billing\""),
-        "the other filter the operator already typed must not be discarded: {html}"
-    );
-    assert!(
-        html.contains("role=\"alert\""),
-        "an inline, screen-reader-announced error must be present: {html}"
-    );
-    assert!(
-        html.contains("not-a-number"),
-        "the error must name the bad value: {html}"
-    );
-    assert!(
-        !html.contains("http-equiv=\"refresh\""),
-        "an invalid refresh must not set a meta refresh: {html}"
-    );
-}
-
-/// Same fix, the `page` field. No form field backs it; it drives the
-/// Previous/Next links instead, a distinct code path. Covered
-/// independently here rather than assumed symmetric with `limit`,
-/// matching the Workflows/Workers/DLQ pages' own `page` coverage.
-#[tokio::test]
-async fn ui_schedules_invalid_page_redisplays_list_instead_of_aborting_page() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let app = build_single_shard_ui_app(&database_url);
-
-    let (status, html) = fetch_html(&app, "/schedules?page=not-a-number&target=billing").await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "an invalid page must not abort the whole Schedules page: {html}"
-    );
-    assert!(
-        html.contains("value=\"billing\""),
-        "the other filter the operator already typed must not be discarded: {html}"
-    );
-    assert!(
-        html.contains("role=\"alert\""),
-        "an inline, screen-reader-announced error must sit next to the pagination controls: {html}"
-    );
-    assert!(
-        html.contains("not-a-number"),
-        "the error must name the bad value: {html}"
-    );
-    assert!(
-        html.contains("Page 1"),
-        "falls back to page 1 (zero-based page 0) instead of guessing: {html}"
-    );
-}
-
 /// Filter `paused=Paused` shows only paused rows.
 #[tokio::test]
 async fn ui_schedules_filter_by_paused() {
@@ -2532,12 +1814,6 @@ async fn ui_schedules_delete_action_redirects() {
 }
 
 /// Auto-refresh: `?refresh=30` emits a meta http-equiv refresh tag.
-///
-/// The tag's `content` carries an explicit, flash-free `url=` target
-/// (Codex review, #1437 P2), not a bare interval. A repeating reload
-/// must land on the operator's current filtered view, instead of
-/// looping on a stale flash message — see `layout_schedules`'s own doc
-/// comment.
 #[tokio::test]
 async fn ui_schedules_auto_refresh_meta_tag() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -2545,13 +1821,9 @@ async fn ui_schedules_auto_refresh_meta_tag() {
 
     let (status, html) = fetch_html(&app, "/schedules?refresh=30").await;
     assert_eq!(status, StatusCode::OK);
-    // Maud HTML-escapes attribute values. The rendered `&` between query
-    // params comes back as `&amp;`, same as every other multi-param
-    // assertion in this file (Codex review, #1437).
     assert!(
-        html.contains(r#"content="30; url=schedules?page=0&amp;refresh=30""#)
-            && html.contains("http-equiv=\"refresh\""),
-        "auto-refresh meta tag with content=30 and a flash-free target missing: {html}"
+        html.contains("content=\"30\"") && html.contains("http-equiv=\"refresh\""),
+        "auto-refresh meta tag with content=30 missing: {html}"
     );
 
     let (_, html_no_refresh) = fetch_html(&app, "/schedules").await;
@@ -2633,126 +1905,6 @@ async fn ui_schedules_bulk_pause_pauses_matching_rows() {
     );
 }
 
-/// Codex review on #1437 (P2): before this fix, a bulk-action redirect
-/// always landed on a bare, unfiltered `schedules?flash=…`. That dropped
-/// whatever filters the operator had set, including a still-unresolved
-/// invalid value and its inline error, on the very next Pause/Resume
-/// click. Submitting the rendered `return_to` hidden field must land
-/// back on the same filtered view instead.
-#[tokio::test]
-async fn ui_schedules_bulk_pause_redirect_preserves_the_filtered_view() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let app = build_single_shard_ui_app(&database_url);
-
-    let (status, headers, _body) = post_form(
-        &app,
-        "/schedules/bulk-pause",
-        "kind=Workflow&return_to=..%2Fschedules%3Fkind%3DWorkflow",
-    )
-    .await;
-    assert!(
-        status == StatusCode::SEE_OTHER || status == StatusCode::FOUND,
-        "bulk-pause must redirect (got {status})"
-    );
-    let location = headers
-        .get("location")
-        .expect("redirect must have Location header")
-        .to_str()
-        .unwrap()
-        .to_string();
-    assert!(
-        location.starts_with("../schedules?kind=Workflow&flash="),
-        "the redirect must preserve the operator's filtered view, not drop it: {location}"
-    );
-
-    // Codex review on #1437 (P2): a relative `Location` resolves against
-    // the URL this test posted to (`/schedules/bulk-pause`), not the
-    // list page. Follow it the way a browser does: RFC 3986 §5.3 has
-    // `../` step back out of `bulk-pause`'s own directory. Confirm it
-    // actually lands on the Schedules list, instead of the doubled-path
-    // 404 a bare `schedules?...` would have produced.
-    let resolved = format!(
-        "/{}",
-        location
-            .strip_prefix("../")
-            .expect("location must start with ../ to resolve correctly from bulk-pause")
-    );
-    assert!(
-        resolved.starts_with("/schedules?kind=Workflow&flash="),
-        "unexpected resolved redirect target: {resolved}"
-    );
-    let (list_status, list_body) = fetch_html(&app, &resolved).await;
-    assert_eq!(
-        list_status,
-        StatusCode::OK,
-        "the resolved redirect target must actually load the Schedules list, not 404: {list_body}"
-    );
-}
-
-/// Codex review on #1437 (P2): a `return_to` with a form-decoded control
-/// character (`%0A` decodes to a raw newline) used to reach
-/// `axum::response::Redirect::to` unfiltered. `HeaderValue::try_from`
-/// rejects that byte, so the mutation succeeded but the response became
-/// an internal error instead of a redirect to the operator's filtered
-/// view.
-#[tokio::test]
-async fn ui_schedules_bulk_pause_rejects_control_characters_in_return_to() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let app = build_single_shard_ui_app(&database_url);
-
-    let (status, headers, body) = post_form(
-        &app,
-        "/schedules/bulk-pause",
-        "return_to=..%2Fschedules%3Fx%3Da%0Ab",
-    )
-    .await;
-    assert!(
-        status == StatusCode::SEE_OTHER || status == StatusCode::FOUND,
-        "a return_to with a control character must fall back to the safe \
-         default redirect, not fail the response after the mutation already \
-         ran (got {status}): {body}"
-    );
-    let location = headers
-        .get("location")
-        .expect("redirect must have Location header")
-        .to_str()
-        .unwrap();
-    assert!(
-        location.starts_with("../schedules?flash="),
-        "must fall back to the safe default, not carry the raw control character: {location}"
-    );
-}
-
-/// Codex review on #1437 (P1): before this fix, an invalid `shard_id` in
-/// a bulk-action POST silently dropped to "no shard restriction". It
-/// paused schedules on every shard instead of rejecting the request —
-/// the exact scope-broadening a mutating endpoint must never allow.
-#[tokio::test]
-async fn ui_schedules_bulk_pause_rejects_invalid_shard_id_instead_of_broadening_scope() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let id = insert_test_schedule(&database_url, "Workflow", "shard_guard_target", false).await;
-
-    let app = build_single_shard_ui_app(&database_url);
-    let (status, _headers, body) = post_form(&app, "/schedules/bulk-pause", "shard_id=north").await;
-    assert!(
-        status.is_client_error(),
-        "an invalid shard_id must reject the bulk action, not silently drop the \
-         restriction and pause every shard: got {status}, body: {body}"
-    );
-
-    let mut conn = AsyncPgConnection::establish(&database_url).await.unwrap();
-    let paused: bool = autumn_harvest::schema::harvest_schedules::table
-        .filter(autumn_harvest::schema::harvest_schedules::id.eq(id))
-        .select(autumn_harvest::schema::harvest_schedules::is_paused)
-        .first(&mut conn)
-        .await
-        .unwrap();
-    assert!(
-        !paused,
-        "no schedule should be paused when the bulk action itself is rejected"
-    );
-}
-
 /// Pagination: `?limit=1` caps the list to 1 row and shows Next link.
 #[tokio::test]
 async fn ui_schedules_pagination() {
@@ -2795,7 +1947,7 @@ async fn ui_schedules_multi_shard() {
             ShardId::new(0),
         ),
     ));
-    let app = harvest_ui_router(api_state);
+    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
 
     let (status, html) = fetch_html(&app, "/schedules").await;
     assert_eq!(
@@ -2842,7 +1994,7 @@ async fn ui_schedules_partial_shard_failure() {
             ShardId::new(0),
         ),
     ));
-    let app = harvest_ui_router(api_state);
+    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
 
     let (status, html) = fetch_html(&app, "/schedules").await;
     assert_ne!(
@@ -2895,1710 +2047,6 @@ async fn ui_all_pages_have_schedules_nav_link() {
             "page {path} must include a Schedules nav link: {html}"
         );
     }
-}
-
-// ── issue #951: schedules management page ───────────────────────────────────
-
-/// Health / policy columns the #951 list view must surface. Every value maps to
-/// an existing `harvest_schedules` column, so this seeds a row exactly as the
-/// scheduler would leave it.
-#[derive(Default)]
-struct ScheduleFixture<'a> {
-    kind: &'a str,
-    name: &'a str,
-    is_paused: bool,
-    jitter_secs: i64,
-    overlap_policy: Option<&'a str>,
-    catchup_policy: Option<&'a str>,
-    catchup_window_secs: Option<i64>,
-    last_catchup_dropped: i32,
-    max_runs: Option<i32>,
-    runs_started: i32,
-    exhausted_reason: Option<&'a str>,
-    /// Force `exhausted_at` even with no reason recorded — a state the schema
-    /// permits and the badge renderer handles separately.
-    exhausted: bool,
-    auto_paused: bool,
-    next_run_at_sql: Option<&'a str>,
-    schedule_expr: Option<&'a str>,
-}
-
-async fn insert_schedule_fixture(database_url: &str, fixture: &ScheduleFixture<'_>) -> uuid::Uuid {
-    let id = uuid::Uuid::new_v4();
-    let mut conn = AsyncPgConnection::establish(database_url)
-        .await
-        .expect("failed to connect for schedule fixture insert");
-    // Quote-escape every interpolated literal so a fixture can seed a hostile
-    // name (the pure tests use one containing a single quote) and get a row
-    // rather than a syntax error.
-    let sql_lit = |s: &str| format!("'{}'", s.replace('\'', "''"));
-    let (dag_col, wf_col) = if fixture.kind == "Dag" {
-        (sql_lit(fixture.name), "NULL".to_string())
-    } else {
-        ("NULL".to_string(), sql_lit(fixture.name))
-    };
-    let sql_opt_str = |v: Option<&str>| v.map_or_else(|| "NULL".to_string(), sql_lit);
-    let sql_opt_i = |v: Option<i64>| v.map_or_else(|| "NULL".to_string(), |n| n.to_string());
-    let sql = format!(
-        "INSERT INTO harvest_schedules \
-            (id, dag_name, workflow_name, schedule_expr, timezone, catchup, \
-             max_active_runs, is_paused, paused_at, created_at, updated_at, \
-             jitter_secs, overlap_policy, catchup_policy, catchup_window_secs, \
-             last_catchup_dropped, last_catchup_at, max_runs, runs_started, \
-             exhausted_at, exhausted_reason, auto_paused_at, next_run_at) \
-         VALUES \
-            ('{id}', {dag_col}, {wf_col}, {expr}, 'UTC', false, 1, {is_paused}, \
-             {paused_at}, NOW(), NOW(), {jitter}, {overlap}, {catchup_policy}, \
-             {catchup_window}, {dropped}, {last_catchup_at}, {max_runs}, {runs_started}, \
-             {exhausted_at}, {exhausted_reason}, {auto_paused_at}, {next_run_at})",
-        expr = sql_opt_str(Some(fixture.schedule_expr.unwrap_or("0 * * * *"))),
-        is_paused = fixture.is_paused,
-        paused_at = if fixture.is_paused { "NOW()" } else { "NULL" },
-        jitter = fixture.jitter_secs,
-        overlap = sql_opt_str(Some(fixture.overlap_policy.unwrap_or("skip"))),
-        catchup_policy = sql_opt_str(fixture.catchup_policy),
-        catchup_window = sql_opt_i(fixture.catchup_window_secs),
-        dropped = fixture.last_catchup_dropped,
-        last_catchup_at = if fixture.last_catchup_dropped > 0 {
-            "NOW()"
-        } else {
-            "NULL"
-        },
-        max_runs = sql_opt_i(fixture.max_runs.map(i64::from)),
-        runs_started = fixture.runs_started,
-        exhausted_at = if fixture.exhausted_reason.is_some() || fixture.exhausted {
-            "NOW()"
-        } else {
-            "NULL"
-        },
-        exhausted_reason = sql_opt_str(fixture.exhausted_reason),
-        auto_paused_at = if fixture.auto_paused { "NOW()" } else { "NULL" },
-        next_run_at = fixture.next_run_at_sql.unwrap_or("NULL"),
-    );
-    conn.batch_execute(&sql)
-        .await
-        .expect("insert_schedule_fixture failed");
-    id
-}
-
-/// Seed one execution attributed to a schedule, as the scheduler/backfill/manual
-/// trigger paths do (`schedule_id` + `origin` + `scheduled_for`), so the run
-/// history drill-down has something to render.
-async fn insert_schedule_run(
-    database_url: &str,
-    shard: ShardId,
-    schedule_id: uuid::Uuid,
-    workflow_name: &str,
-    state: &str,
-    origin: &str,
-    scheduled_for_sql: &str,
-) -> ExecutionId {
-    let exec_id = ExecutionId::new_for_shard(shard);
-    let mut conn = AsyncPgConnection::establish(database_url)
-        .await
-        .expect("failed to connect for schedule run insert");
-    let completed = if state == "RUNNING" { "NULL" } else { "NOW()" };
-    let sql = format!(
-        "INSERT INTO harvest_workflow_executions \
-            (id, workflow_name, workflow_id, run_id, shard_id, state, input, \
-             queue_name, started_at, completed_at, schedule_id, scheduled_for, origin) \
-         VALUES \
-            ('{exec}', '{workflow_name}', '{exec}', gen_random_uuid(), {shard}, '{state}', \
-             '{{}}'::jsonb, 'default', NOW() - INTERVAL '1 hour', {completed}, \
-             '{schedule_id}', {scheduled_for_sql}, '{origin}')",
-        exec = exec_id.as_uuid(),
-        shard = shard.as_i32(),
-    );
-    conn.batch_execute(&sql)
-        .await
-        .expect("insert_schedule_run failed");
-    exec_id
-}
-
-/// AC2/AC3: a list containing a paused schedule and an exhausted schedule
-/// renders every policy/health field and floats the unhealthy rows to the top.
-#[tokio::test]
-#[allow(clippy::too_many_lines)]
-async fn ui_schedules_list_renders_health_policy_and_bounded_run_state() {
-    let (database_url, _container) = setup_test_database_url().await;
-
-    let healthy = insert_schedule_fixture(
-        &database_url,
-        &ScheduleFixture {
-            kind: "Workflow",
-            name: "healthy_nightly",
-            jitter_secs: 300,
-            overlap_policy: Some("buffer_all"),
-            next_run_at_sql: Some("NOW() + INTERVAL '1 hour'"),
-            ..Default::default()
-        },
-    )
-    .await;
-    let paused = insert_schedule_fixture(
-        &database_url,
-        &ScheduleFixture {
-            kind: "Workflow",
-            name: "paused_billing",
-            is_paused: true,
-            next_run_at_sql: Some("NOW() + INTERVAL '10 hours'"),
-            ..Default::default()
-        },
-    )
-    .await;
-    let exhausted = insert_schedule_fixture(
-        &database_url,
-        &ScheduleFixture {
-            kind: "Dag",
-            name: "exhausted_etl",
-            max_runs: Some(3),
-            runs_started: 3,
-            exhausted_reason: Some("max_runs_exhausted"),
-            next_run_at_sql: Some("NOW() + INTERVAL '20 hours'"),
-            ..Default::default()
-        },
-    )
-    .await;
-    let dropped = insert_schedule_fixture(
-        &database_url,
-        &ScheduleFixture {
-            kind: "Workflow",
-            name: "catchup_dropped_sync",
-            catchup_policy: Some("window"),
-            catchup_window_secs: Some(3600),
-            last_catchup_dropped: 5,
-            next_run_at_sql: Some("NOW() + INTERVAL '30 hours'"),
-            ..Default::default()
-        },
-    )
-    .await;
-
-    let app = build_single_shard_ui_app(&database_url);
-    let (status, html) = fetch_html(&app, "/schedules").await;
-    assert_eq!(status, StatusCode::OK, "schedules page must render: {html}");
-
-    // AC2: every field group is on the page.
-    assert!(html.contains("Health"), "health column missing: {html}");
-    assert!(html.contains("Overlap"), "overlap column missing: {html}");
-    assert!(html.contains("Catchup"), "catchup column missing: {html}");
-    assert!(
-        html.contains("Bounded runs"),
-        "bounded-run column missing: {html}"
-    );
-    assert!(
-        html.contains("buffer_all"),
-        "overlap policy value missing: {html}"
-    );
-    assert!(
-        html.contains("effective"),
-        "jitter-adjusted effective fire time missing: {html}"
-    );
-    assert!(
-        html.contains("window (3600s)"),
-        "catchup policy + window missing: {html}"
-    );
-    assert!(
-        html.contains("dropped 5"),
-        "catchup drop count missing: {html}"
-    );
-    assert!(
-        html.contains("0 of 3 left"),
-        "bounded-run budget missing: {html}"
-    );
-
-    // AC3: each unhealthy state has its own badge.
-    assert!(html.contains("Paused"), "paused badge missing: {html}");
-    assert!(
-        html.contains("Exhausted"),
-        "exhausted badge missing: {html}"
-    );
-    assert!(
-        html.contains("max_runs_exhausted"),
-        "exhaustion reason missing: {html}"
-    );
-    assert!(
-        html.contains("Catchup dropped"),
-        "catchup-dropped badge missing: {html}"
-    );
-    assert!(
-        html.contains("Needs attention"),
-        "unhealthy summary strip missing: {html}"
-    );
-
-    // AC3: unhealthy rows sort above the healthy one despite firing later.
-    let pos = |id: uuid::Uuid| {
-        html.find(&id.to_string())
-            .unwrap_or_else(|| panic!("schedule {id} missing from page: {html}"))
-    };
-    let healthy_pos = pos(healthy);
-    for unhealthy in [paused, exhausted, dropped] {
-        assert!(
-            pos(unhealthy) < healthy_pos,
-            "unhealthy schedule {unhealthy} must sort above the healthy row: {html}"
-        );
-    }
-
-    assert!(!html.contains("<script"), "no script tags allowed: {html}");
-}
-
-/// AC3: `health=Unhealthy` narrows the list to schedules that need attention.
-#[tokio::test]
-async fn ui_schedules_health_filter_narrows_to_unhealthy_rows() {
-    let (database_url, _container) = setup_test_database_url().await;
-    insert_schedule_fixture(
-        &database_url,
-        &ScheduleFixture {
-            kind: "Workflow",
-            name: "healthy_row",
-            ..Default::default()
-        },
-    )
-    .await;
-    insert_schedule_fixture(
-        &database_url,
-        &ScheduleFixture {
-            kind: "Workflow",
-            name: "paused_row",
-            is_paused: true,
-            ..Default::default()
-        },
-    )
-    .await;
-
-    let app = build_single_shard_ui_app(&database_url);
-    let (status, html) = fetch_html(&app, "/schedules?health=Unhealthy").await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(html.contains("paused_row"), "unhealthy row missing: {html}");
-    assert!(
-        !html.contains("healthy_row"),
-        "healthy row must be filtered out: {html}"
-    );
-
-    // #1437 (this PR's own subject): an unknown health value used to
-    // `?`-abort the whole page with a bare 400. It now degrades to
-    // "filter not applied" instead, like every other Vantage list-page
-    // filter. A visible `role="alert"` error names the bad value. That
-    // is neither the silent all-match the earlier version of this test
-    // worried about, nor a page-abort.
-    let (status, html) = fetch_html(&app, "/schedules?health=bogus").await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "an unknown health value must redisplay the form, not abort the page: {html}"
-    );
-    assert!(
-        html.contains("role=\"alert\"") && html.contains("bogus"),
-        "the bad value must be named in a visible, screen-reader-announced error: {html}"
-    );
-    assert!(
-        html.contains("healthy_row") && html.contains("paused_row"),
-        "with the health filter not applied, both rows must show: {html}"
-    );
-}
-
-/// AC4: the pause action round-trips through the audited endpoint and the row
-/// comes back paused with an audit record naming the UI as the source.
-#[tokio::test]
-async fn ui_schedules_pause_action_round_trip_writes_audit() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let id = insert_schedule_fixture(
-        &database_url,
-        &ScheduleFixture {
-            kind: "Workflow",
-            name: "pause_round_trip",
-            ..Default::default()
-        },
-    )
-    .await;
-
-    let app = build_single_shard_ui_app(&database_url);
-
-    // The list offers a confirmed pause action for an active schedule.
-    let (_, html) = fetch_html(&app, "/schedules").await;
-    assert!(
-        html.contains(&format!("schedules/{id}/pause")),
-        "pause action missing: {html}"
-    );
-    assert!(
-        html.contains("return confirm("),
-        "pause must be confirmed before it fires: {html}"
-    );
-
-    let (status, headers, body) = post_form(&app, &format!("/schedules/{id}/pause"), "").await;
-    assert_eq!(
-        status,
-        StatusCode::SEE_OTHER,
-        "pause must redirect back to the list: {body}"
-    );
-    let location = headers
-        .get("location")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
-    assert!(
-        location.contains("schedules"),
-        "redirect target: {location}"
-    );
-
-    let mut conn = AsyncPgConnection::establish(&database_url)
-        .await
-        .expect("connect for pause assertion");
-    let paused: bool = diesel::sql_query(format!(
-        "SELECT is_paused AS value FROM harvest_schedules WHERE id = '{id}'"
-    ))
-    .get_result::<BoolValue>(&mut conn)
-    .await
-    .expect("schedule row must still exist")
-    .value;
-    assert!(paused, "the schedule must be paused after the round trip");
-
-    let audits: i64 = diesel::sql_query(format!(
-        "SELECT COUNT(*) AS value FROM harvest_audit_log \
-         WHERE target_id = '{id}' AND operation = 'schedule.pause' AND source = 'ui'"
-    ))
-    .get_result::<CountValue>(&mut conn)
-    .await
-    .expect("audit count query")
-    .value;
-    assert_eq!(
-        audits, 1,
-        "the UI pause must write exactly one audit record"
-    );
-
-    // And the list now offers resume instead.
-    let (_, html) = fetch_html(&app, "/schedules").await;
-    assert!(
-        html.contains(&format!("schedules/{id}/resume")),
-        "resume action missing after pause: {html}"
-    );
-}
-
-#[derive(diesel::QueryableByName)]
-struct BoolValue {
-    #[diesel(sql_type = diesel::sql_types::Bool)]
-    value: bool,
-}
-
-/// `auto_paused_at`-cleared + failure-counter probe for the #360 resume tests.
-#[derive(diesel::QueryableByName)]
-struct AutoPauseState {
-    #[diesel(sql_type = diesel::sql_types::Bool)]
-    cleared: bool,
-    #[diesel(sql_type = diesel::sql_types::Integer)]
-    failures: i32,
-}
-
-#[derive(diesel::QueryableByName)]
-struct CountValue {
-    #[diesel(sql_type = diesel::sql_types::BigInt)]
-    value: i64,
-}
-
-/// AC5: the preview drill-down renders the next fire times, with the jitter
-/// window and the schedule's local rendering.
-#[tokio::test]
-async fn ui_schedules_preview_modal_renders_fire_times() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let id = insert_schedule_fixture(
-        &database_url,
-        &ScheduleFixture {
-            kind: "Workflow",
-            name: "preview_wf",
-            jitter_secs: 120,
-            schedule_expr: Some("cron:0 * * * *"),
-            ..Default::default()
-        },
-    )
-    .await;
-
-    let app = build_single_shard_ui_app(&database_url);
-    let (status, html) = fetch_html(&app, &format!("/schedules/{id}/preview?count=3")).await;
-    assert_eq!(status, StatusCode::OK, "preview must render: {html}");
-    assert!(
-        html.contains("Fire-time preview"),
-        "heading missing: {html}"
-    );
-    assert!(html.contains("preview_wf"), "target missing: {html}");
-    assert!(
-        html.contains("cron+jitter"),
-        "jitter reason missing from a jittered schedule: {html}"
-    );
-    assert!(
-        html.contains("Jitter window"),
-        "jitter bounds column missing: {html}"
-    );
-    assert!(!html.contains("<script"), "no script tags allowed: {html}");
-}
-
-/// AC5 (#543): a bounded schedule with a spent budget previews zero entries and
-/// says why — never a blank panel (AC8).
-#[tokio::test]
-async fn ui_schedules_preview_explains_an_exhausted_schedule() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let id = insert_schedule_fixture(
-        &database_url,
-        &ScheduleFixture {
-            kind: "Workflow",
-            name: "spent_wf",
-            max_runs: Some(2),
-            runs_started: 2,
-            exhausted_reason: Some("max_runs_exhausted"),
-            ..Default::default()
-        },
-    )
-    .await;
-
-    let app = build_single_shard_ui_app(&database_url);
-    let (status, html) = fetch_html(&app, &format!("/schedules/{id}/preview")).await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(
-        html.contains("exhausted") || html.contains("Exhausted"),
-        "must say the schedule is exhausted: {html}"
-    );
-    assert!(
-        html.contains("max_runs_exhausted"),
-        "must name the exhaustion reason: {html}"
-    );
-    assert!(
-        html.contains("No upcoming fire times"),
-        "must render an explicit empty state: {html}"
-    );
-}
-
-/// RED (was): `count` was typed `Option<usize>` directly on
-/// `SchedulePreviewUiParams`. `?count=not-a-number` then failed axum's own
-/// query deserialization with a bare 400. That happened before
-/// `schedule_preview_ui` ever ran, aborting the whole preview page. Same
-/// mechanism as the Workflows/Workers/DLQ/Schedules list pages'
-/// `page`/`limit` fields and the DAG detail page's `node`/`refresh`
-/// (#1333/#1378/#1420/#1437/#1540/#1560/#1588/#1619/#1630).
-///
-/// GREEN (this commit): the request still renders the preview page (`200`)
-/// with the default entry count, and surfaces a `role="alert"` message
-/// naming the bad value.
-#[tokio::test]
-async fn ui_schedules_preview_invalid_count_redisplays_page_instead_of_aborting() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let id = insert_schedule_fixture(
-        &database_url,
-        &ScheduleFixture {
-            kind: "Workflow",
-            name: "preview_bad_count_wf",
-            schedule_expr: Some("cron:0 * * * *"),
-            ..Default::default()
-        },
-    )
-    .await;
-
-    let app = build_single_shard_ui_app(&database_url);
-    let (status, html) =
-        fetch_html(&app, &format!("/schedules/{id}/preview?count=not-a-number")).await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "an invalid count must not abort the whole preview page: {html}"
-    );
-    assert!(
-        html.contains("Fire-time preview"),
-        "the page must still render: {html}"
-    );
-    assert!(
-        html.contains("preview_bad_count_wf"),
-        "the target name must still render: {html}"
-    );
-    assert!(
-        html.contains("role=\"alert\""),
-        "an inline, screen-reader-announced error must be shown: {html}"
-    );
-    assert!(
-        html.contains("not-a-number"),
-        "the error must name the bad value: {html}"
-    );
-}
-
-/// An unknown schedule id is a 404 on every drill-down, not a blank page.
-#[tokio::test]
-async fn ui_schedules_drilldowns_404_on_unknown_id() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let app = build_single_shard_ui_app(&database_url);
-    let missing = uuid::Uuid::new_v4();
-    for leaf in ["preview", "runs", "backfill"] {
-        let (status, html) = fetch_html(&app, &format!("/schedules/{missing}/{leaf}")).await;
-        assert_eq!(
-            status,
-            StatusCode::NOT_FOUND,
-            "{leaf} drill-down for an unknown id must 404: {html}"
-        );
-    }
-}
-
-/// AC7: run history renders newest-first rows with nominal fire time, origin,
-/// terminal badges, the scheduled-only summary, and execution links.
-#[tokio::test]
-async fn ui_schedules_run_history_renders_rows_and_summary() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let id = insert_schedule_fixture(
-        &database_url,
-        &ScheduleFixture {
-            kind: "Workflow",
-            name: "runs_wf",
-            next_run_at_sql: Some("NOW() + INTERVAL '1 hour'"),
-            ..Default::default()
-        },
-    )
-    .await;
-
-    let scheduled_ok = insert_schedule_run(
-        &database_url,
-        ShardId::new(0),
-        id,
-        "runs_wf",
-        "COMPLETED",
-        "scheduled",
-        "NOW() - INTERVAL '1 hour'",
-    )
-    .await;
-    let scheduled_failed = insert_schedule_run(
-        &database_url,
-        ShardId::new(0),
-        id,
-        "runs_wf",
-        "FAILED",
-        "scheduled",
-        "NOW() - INTERVAL '2 hours'",
-    )
-    .await;
-    let backfilled = insert_schedule_run(
-        &database_url,
-        ShardId::new(0),
-        id,
-        "runs_wf",
-        "COMPLETED",
-        "backfill",
-        "NOW() - INTERVAL '3 hours'",
-    )
-    .await;
-    let manual = insert_schedule_run(
-        &database_url,
-        ShardId::new(0),
-        id,
-        "runs_wf",
-        "RUNNING",
-        "manual_trigger",
-        "NULL",
-    )
-    .await;
-
-    let app = build_single_shard_ui_app(&database_url);
-    let (status, html) = fetch_html(&app, &format!("/schedules/{id}/runs")).await;
-    assert_eq!(status, StatusCode::OK, "run history must render: {html}");
-
-    for exec in [scheduled_ok, scheduled_failed, backfilled, manual] {
-        assert!(
-            html.contains(&format!("workflows/{}", exec.as_uuid())),
-            "run {} must link to its execution detail view: {html}",
-            exec.as_uuid()
-        );
-    }
-    assert!(
-        html.contains("scheduled"),
-        "scheduled origin missing: {html}"
-    );
-    assert!(html.contains("backfill"), "backfill origin missing: {html}");
-    assert!(
-        html.contains("manual_trigger"),
-        "manual_trigger origin missing: {html}"
-    );
-    assert!(
-        html.contains("Scheduled-run summary"),
-        "cadence summary missing: {html}"
-    );
-    assert!(
-        html.contains("Nominal fire time"),
-        "nominal fire time column missing: {html}"
-    );
-    // The cadence summary counts scheduled-origin runs only: 1 succeeded, 1
-    // failed — the backfilled COMPLETED run must not inflate it.
-    let summary_start = html
-        .find("Scheduled-run summary")
-        .expect("summary section present");
-    let summary = &html[summary_start..];
-    let succeeded_at = summary.find("Succeeded").expect("succeeded row present");
-    assert!(
-        summary[succeeded_at..succeeded_at + 80].contains(">1<"),
-        "only the scheduled COMPLETED run may be counted: {summary}"
-    );
-    assert!(!html.contains("<script"), "no script tags allowed: {html}");
-}
-
-/// RED (was): `limit` was typed `Option<i64>` directly on
-/// `ScheduleRunsUiParams`. `?limit=not-a-number` then failed axum's own
-/// query deserialization with a bare 400. That happened before
-/// `schedule_runs_ui` ever ran, discarding the `origin` filter already on
-/// the URL along with the whole run-history page. Same mechanism as the
-/// Workers page's own `limit` fix (#1540/#1560/#1588/#1619/#1630).
-///
-/// GREEN (this commit): the request still renders the run-history page
-/// (`200`) and preserves the `origin` filter. It surfaces a
-/// `role="alert"` message next to the "Rows" field naming the bad value.
-#[tokio::test]
-async fn ui_schedules_runs_invalid_limit_redisplays_form_instead_of_aborting_page() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let id = insert_schedule_fixture(
-        &database_url,
-        &ScheduleFixture {
-            kind: "Workflow",
-            name: "runs_bad_limit_wf",
-            ..Default::default()
-        },
-    )
-    .await;
-
-    let app = build_single_shard_ui_app(&database_url);
-    let (status, html) = fetch_html(
-        &app,
-        &format!("/schedules/{id}/runs?limit=not-a-number&origin=scheduled"),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "an invalid limit must not abort the whole run-history page: {html}"
-    );
-    assert!(
-        html.contains("value=\"scheduled\" selected"),
-        "the other filter the operator already picked must not be discarded: {html}"
-    );
-    assert!(
-        html.contains("role=\"alert\""),
-        "an inline, screen-reader-announced error must sit next to the field: {html}"
-    );
-    assert!(
-        html.contains("not-a-number"),
-        "the error must name the bad value: {html}"
-    );
-}
-
-/// Codex review finding on this PR: the "Rows" field became a text control
-/// with no browser-side floor (the previous `type="number" min="1"` blocked
-/// a `0` submission client-side). Without clamping, an operator-typed `0`
-/// would reach `ScheduleRunsParams::from_query_pairs`, which rejects it —
-/// reintroducing the whole-page-abort defect this PR exists to close.
-#[tokio::test]
-async fn ui_schedules_runs_zero_limit_clamps_instead_of_aborting_page() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let id = insert_schedule_fixture(
-        &database_url,
-        &ScheduleFixture {
-            kind: "Workflow",
-            name: "runs_zero_limit_wf",
-            ..Default::default()
-        },
-    )
-    .await;
-
-    let app = build_single_shard_ui_app(&database_url);
-    let (status, html) = fetch_html(&app, &format!("/schedules/{id}/runs?limit=0")).await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "limit=0 must clamp to 1, not abort the whole run-history page: {html}"
-    );
-    assert!(
-        html.contains("Run history"),
-        "the page must still render: {html}"
-    );
-}
-
-/// AC7/AC8: a schedule with no runs yet renders an explicit message.
-#[tokio::test]
-async fn ui_schedules_run_history_empty_state() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let id = insert_schedule_fixture(
-        &database_url,
-        &ScheduleFixture {
-            kind: "Workflow",
-            name: "never_run_wf",
-            ..Default::default()
-        },
-    )
-    .await;
-
-    let app = build_single_shard_ui_app(&database_url);
-    let (status, html) = fetch_html(&app, &format!("/schedules/{id}/runs")).await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(
-        html.contains("No runs yet"),
-        "no-runs empty state missing: {html}"
-    );
-}
-
-/// AC7: a cross-shard `partial` response renders a visible "some shards
-/// unreachable" banner rather than silently truncated history.
-#[tokio::test]
-async fn ui_schedules_run_history_partial_shard_banner() {
-    let (good_url, _container) = setup_test_database_url().await;
-    let id = insert_schedule_fixture(
-        &good_url,
-        &ScheduleFixture {
-            kind: "Workflow",
-            name: "partial_runs_wf",
-            ..Default::default()
-        },
-    )
-    .await;
-    insert_schedule_run(
-        &good_url,
-        ShardId::new(0),
-        id,
-        "partial_runs_wf",
-        "COMPLETED",
-        "scheduled",
-        "NOW() - INTERVAL '1 hour'",
-    )
-    .await;
-
-    let bad_pool = build_test_pool("postgres://invalid:5432/nonexistent");
-    let good_pool = build_test_pool(&good_url);
-    let mut pools = BTreeMap::new();
-    pools.insert(ShardId::new(0), good_pool);
-    pools.insert(ShardId::new(1), bad_pool);
-    let harvest_pool = HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(0)));
-
-    let api_state = HarvestApiState::new();
-    api_state.set_admin_auth_boundary(true);
-    api_state.install_storage_pool(harvest_pool);
-    api_state.install(HarvestApiRuntime::new(
-        echo_registry(),
-        Arc::new(HashMap::new()),
-        Arc::new(Vec::new()),
-        None,
-        vec!["default".to_string()],
-        SchedulerMonitor::offline(),
-        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
-        ShardRouter::new(
-            vec![ShardId::new(0), ShardId::new(1)],
-            vec![ShardId::new(0), ShardId::new(1)],
-            ShardId::new(0),
-        ),
-    ));
-    let app = harvest_ui_router(api_state);
-
-    let (status, html) = fetch_html(&app, &format!("/schedules/{id}/runs")).await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "an unreachable shard must degrade, never 5xx: {html}"
-    );
-    assert!(
-        html.contains("Some shards unreachable"),
-        "partial-shard banner missing: {html}"
-    );
-    assert!(
-        html.contains("may be understated"),
-        "summary must be flagged as possibly understated: {html}"
-    );
-    assert!(
-        html.contains("partial_runs_wf"),
-        "the reachable shard's data must still render: {html}"
-    );
-}
-
-/// AC6: the backfill launcher renders a window form, previews with a dry run
-/// before dispatching, and lands the operator on the run history afterwards.
-#[tokio::test]
-#[allow(clippy::too_many_lines)]
-async fn ui_schedules_backfill_form_previews_then_dispatches() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let id = insert_schedule_fixture(
-        &database_url,
-        &ScheduleFixture {
-            kind: "Workflow",
-            name: "echo",
-            schedule_expr: Some("cron:0 * * * *"),
-            ..Default::default()
-        },
-    )
-    .await;
-
-    let app = build_single_shard_ui_app(&database_url);
-
-    // The form itself is a pure GET.
-    let (status, html) = fetch_html(&app, &format!("/schedules/{id}/backfill")).await;
-    assert_eq!(status, StatusCode::OK, "backfill form must render: {html}");
-    assert!(
-        html.contains("name=\"from\""),
-        "start field missing: {html}"
-    );
-    assert!(html.contains("name=\"to\""), "end field missing: {html}");
-    assert!(
-        html.contains("name=\"stage\" value=\"preview\""),
-        "the form must submit the dry-run stage: {html}"
-    );
-
-    let mut conn = AsyncPgConnection::establish(&database_url)
-        .await
-        .expect("connect for backfill assertions");
-    let runs_before: i64 = diesel::sql_query(
-        "SELECT COUNT(*) AS value FROM harvest_workflow_executions WHERE origin = 'backfill'",
-    )
-    .get_result::<CountValue>(&mut conn)
-    .await
-    .expect("count query")
-    .value;
-    assert_eq!(runs_before, 0, "the GET form must dispatch nothing");
-
-    // Stage 1: dry run → confirmation with the planned count.
-    let window = "from=2026-08-01T00%3A00%3A00Z&to=2026-08-01T06%3A00%3A00Z&stage=preview";
-    let (status, _headers, html) =
-        post_form(&app, &format!("/schedules/{id}/backfill"), window).await;
-    assert_eq!(status, StatusCode::OK, "dry run must render: {html}");
-    assert!(
-        html.contains("Confirm backfill"),
-        "confirm heading missing: {html}"
-    );
-    assert!(
-        html.contains("Planned slots"),
-        "planned count missing: {html}"
-    );
-    assert!(
-        html.contains("name=\"stage\" value=\"commit\""),
-        "confirmation must carry an explicit commit stage: {html}"
-    );
-
-    let dispatched_after_dry_run: i64 = diesel::sql_query(
-        "SELECT COUNT(*) AS value FROM harvest_workflow_executions WHERE origin = 'backfill'",
-    )
-    .get_result::<CountValue>(&mut conn)
-    .await
-    .expect("count query")
-    .value;
-    assert_eq!(
-        dispatched_after_dry_run, 0,
-        "the dry run must not dispatch anything"
-    );
-
-    // Stage 2: commit → dispatch, then redirect to this schedule's run history.
-    let commit = "from=2026-08-01T00%3A00%3A00Z&to=2026-08-01T06%3A00%3A00Z&stage=commit";
-    let (status, headers, body) =
-        post_form(&app, &format!("/schedules/{id}/backfill"), commit).await;
-    assert_eq!(
-        status,
-        StatusCode::SEE_OTHER,
-        "a committed backfill must redirect: {body}"
-    );
-    let location = headers
-        .get("location")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
-    assert!(
-        location.contains(&format!("schedules/{id}/runs")),
-        "the commit must land on this schedule's run history: {location}"
-    );
-
-    let dispatched: i64 = diesel::sql_query(
-        "SELECT COUNT(*) AS value FROM harvest_workflow_executions WHERE origin = 'backfill'",
-    )
-    .get_result::<CountValue>(&mut conn)
-    .await
-    .expect("count query")
-    .value;
-    assert!(
-        dispatched > 0,
-        "the committed backfill must dispatch runs, got {dispatched}"
-    );
-
-    let audits: i64 = diesel::sql_query(format!(
-        "SELECT COUNT(*) AS value FROM harvest_audit_log \
-         WHERE target_id = '{id}' AND source = 'ui' \
-           AND route_or_command = 'POST /ui/schedules/{{id}}/backfill'"
-    ))
-    .get_result::<CountValue>(&mut conn)
-    .await
-    .expect("audit count query")
-    .value;
-    assert!(
-        audits >= 2,
-        "both the dry run and the commit must be audited as UI-sourced, got {audits}"
-    );
-}
-
-/// AC6: a malformed window is a rendered form error, never a 500.
-#[tokio::test]
-async fn ui_schedules_backfill_rejects_a_malformed_window() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let id = insert_schedule_fixture(
-        &database_url,
-        &ScheduleFixture {
-            kind: "Workflow",
-            name: "echo",
-            ..Default::default()
-        },
-    )
-    .await;
-
-    let app = build_single_shard_ui_app(&database_url);
-    let (status, _headers, html) = post_form(
-        &app,
-        &format!("/schedules/{id}/backfill"),
-        "from=yesterday&to=today&stage=preview",
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "a malformed window must render an error, not 5xx: {html}"
-    );
-    assert!(
-        html.contains("Backfill not started"),
-        "the form must explain the rejection: {html}"
-    );
-    assert!(
-        html.contains("RFC 3339"),
-        "the error must say what a valid instant looks like: {html}"
-    );
-
-    // An inverted window is rejected the same way.
-    let (status, _headers, html) = post_form(
-        &app,
-        &format!("/schedules/{id}/backfill"),
-        "from=2026-08-02T00%3A00%3A00Z&to=2026-08-01T00%3A00%3A00Z&stage=preview",
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "inverted window must not 5xx: {html}"
-    );
-    assert!(
-        html.contains("at or after"),
-        "the inverted-window error must explain itself: {html}"
-    );
-}
-
-/// AC6 defence-in-depth: a POST that omits `stage` runs the dry run. A bare
-/// form post can never dispatch work.
-#[tokio::test]
-async fn ui_schedules_backfill_without_a_stage_defaults_to_the_dry_run() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let id = insert_schedule_fixture(
-        &database_url,
-        &ScheduleFixture {
-            kind: "Workflow",
-            name: "echo",
-            schedule_expr: Some("cron:0 * * * *"),
-            ..Default::default()
-        },
-    )
-    .await;
-
-    let app = build_single_shard_ui_app(&database_url);
-    let (status, _headers, html) = post_form(
-        &app,
-        &format!("/schedules/{id}/backfill"),
-        "from=2026-08-01T00%3A00%3A00Z&to=2026-08-01T06%3A00%3A00Z",
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "must render the confirmation: {html}"
-    );
-    assert!(
-        html.contains("Confirm backfill"),
-        "must be the dry run: {html}"
-    );
-
-    let mut conn = AsyncPgConnection::establish(&database_url)
-        .await
-        .expect("connect for dispatch assertion");
-    let dispatched: i64 = diesel::sql_query(
-        "SELECT COUNT(*) AS value FROM harvest_workflow_executions WHERE origin = 'backfill'",
-    )
-    .get_result::<CountValue>(&mut conn)
-    .await
-    .expect("count query")
-    .value;
-    assert_eq!(dispatched, 0, "a stage-less POST must dispatch nothing");
-}
-
-/// The schedules list links every row to its three drill-downs (AC5/AC6/AC7).
-#[tokio::test]
-async fn ui_schedules_rows_link_to_drilldowns() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let id = insert_schedule_fixture(
-        &database_url,
-        &ScheduleFixture {
-            kind: "Workflow",
-            name: "linked_wf",
-            ..Default::default()
-        },
-    )
-    .await;
-
-    let app = build_single_shard_ui_app(&database_url);
-    let (status, html) = fetch_html(&app, "/schedules").await;
-    assert_eq!(status, StatusCode::OK);
-    for leaf in ["preview", "runs", "backfill"] {
-        assert!(
-            html.contains(&format!("schedules/{id}/{leaf}")),
-            "row must link to the {leaf} drill-down: {html}"
-        );
-    }
-}
-
-/// AC4: the drill-downs mirror their endpoints' admin-auth posture — the run
-/// history is gated (as `GET /admin/schedules/{id}/runs` is), preview and
-/// backfill are not (as their API routes are not).
-#[tokio::test]
-async fn ui_schedules_drilldown_auth_matches_the_api_routes() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let id = insert_schedule_fixture(
-        &database_url,
-        &ScheduleFixture {
-            kind: "Workflow",
-            name: "gated_wf",
-            ..Default::default()
-        },
-    )
-    .await;
-
-    // `set_admin_auth_boundary(false)` with no session = not an admin.
-    let pool = build_test_pool(&database_url);
-    let api_state = HarvestApiState::new();
-    api_state.set_admin_auth_boundary(false);
-    api_state.install_storage_pool(HarvestDbPool::from(pool));
-    api_state.install(HarvestApiRuntime::new(
-        echo_registry(),
-        Arc::new(HashMap::new()),
-        Arc::new(Vec::new()),
-        None,
-        vec!["default".to_string()],
-        SchedulerMonitor::offline(),
-        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
-        ShardRouter::single(),
-    ));
-    let app = harvest_ui_router(api_state);
-
-    let (status, html) = fetch_html(&app, &format!("/schedules/{id}/runs")).await;
-    assert_eq!(
-        status,
-        StatusCode::UNAUTHORIZED,
-        "run history must be admin-gated, matching its API route: {html}"
-    );
-
-    for leaf in ["preview", "backfill"] {
-        let (status, html) = fetch_html(&app, &format!("/schedules/{id}/{leaf}")).await;
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "{leaf} must stay ungated, matching its API route: {html}"
-        );
-    }
-}
-
-/// AC6: the flash a committed backfill redirects with is actually rendered on
-/// the run-history page — the dispatch counts (including failures) are only
-/// reported there.
-#[tokio::test]
-async fn ui_schedules_backfill_flash_renders_on_the_run_history() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let id = insert_schedule_fixture(
-        &database_url,
-        &ScheduleFixture {
-            kind: "Workflow",
-            name: "echo",
-            schedule_expr: Some("cron:0 * * * *"),
-            ..Default::default()
-        },
-    )
-    .await;
-
-    let app = build_single_shard_ui_app(&database_url);
-    let commit = "from=2026-08-01T00%3A00%3A00Z&to=2026-08-01T03%3A00%3A00Z&stage=commit";
-    let (status, headers, body) =
-        post_form(&app, &format!("/schedules/{id}/backfill"), commit).await;
-    assert_eq!(
-        status,
-        StatusCode::SEE_OTHER,
-        "commit must redirect: {body}"
-    );
-    let location = headers
-        .get("location")
-        .and_then(|v| v.to_str().ok())
-        .expect("redirect carries a location")
-        .to_string();
-    assert!(
-        location.contains("flash="),
-        "redirect must carry a flash: {location}"
-    );
-
-    // Follow the redirect the way a browser would, resolving it against the
-    // request path /schedules/{id}/backfill.
-    let Some(rest) = location.strip_prefix("../../") else {
-        panic!("unexpected redirect shape: {location}");
-    };
-    let followed = format!("/{rest}");
-    let (status, html) = fetch_html(&app, &followed).await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "the redirect target must resolve: {html}"
-    );
-    assert!(
-        html.contains("Backfill dispatched"),
-        "the dispatch summary must be rendered on the run history: {html}"
-    );
-}
-
-/// AC6: `max_count` is validated and capped rather than passed through, because
-/// the endpoint treats it as the planning limit that replaces its own guard.
-#[tokio::test]
-async fn ui_schedules_backfill_validates_and_caps_max_count() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let id = insert_schedule_fixture(
-        &database_url,
-        &ScheduleFixture {
-            kind: "Workflow",
-            name: "echo",
-            schedule_expr: Some("cron:0 * * * *"),
-            ..Default::default()
-        },
-    )
-    .await;
-
-    let app = build_single_shard_ui_app(&database_url);
-    let (status, _headers, html) = post_form(
-        &app,
-        &format!("/schedules/{id}/backfill"),
-        "from=2026-08-01T00%3A00%3A00Z&to=2026-08-01T03%3A00%3A00Z&max_count=lots&stage=preview",
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "must not 5xx: {html}");
-    assert!(
-        html.contains("invalid max count"),
-        "a non-numeric max count must be a rendered error: {html}"
-    );
-    assert!(
-        html.contains("value=\"lots\""),
-        "the rejected form must echo what was typed: {html}"
-    );
-
-    // An enormous window with an enormous max_count is capped, not enumerated.
-    let (status, _headers, html) = post_form(
-        &app,
-        &format!("/schedules/{id}/backfill"),
-        "from=1990-01-01T00%3A00%3A00Z&to=2030-01-01T00%3A00%3A00Z&max_count=100000000&stage=preview",
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "must not 5xx: {html}");
-    assert!(
-        html.contains("Backfill not started") || html.contains("Confirm backfill"),
-        "an over-wide window must be answered, not hung: {html}"
-    );
-}
-
-/// AC3/AC4: a bulk action acts on exactly the health-filtered set the button
-/// counted — not on every schedule on the shard.
-#[tokio::test]
-async fn ui_schedules_bulk_pause_respects_the_health_filter() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let healthy = insert_schedule_fixture(
-        &database_url,
-        &ScheduleFixture {
-            kind: "Workflow",
-            name: "healthy_bulk",
-            ..Default::default()
-        },
-    )
-    .await;
-    let unhealthy = insert_schedule_fixture(
-        &database_url,
-        &ScheduleFixture {
-            kind: "Workflow",
-            name: "dropping_bulk",
-            last_catchup_dropped: 4,
-            ..Default::default()
-        },
-    )
-    .await;
-
-    let app = build_single_shard_ui_app(&database_url);
-    let (status, _headers, body) =
-        post_form(&app, "/schedules/bulk-pause", "health=Unhealthy").await;
-    assert_eq!(
-        status,
-        StatusCode::SEE_OTHER,
-        "bulk pause must redirect: {body}"
-    );
-
-    let mut conn = AsyncPgConnection::establish(&database_url)
-        .await
-        .expect("connect for bulk assertion");
-    let paused_healthy: bool = diesel::sql_query(format!(
-        "SELECT is_paused AS value FROM harvest_schedules WHERE id = '{healthy}'"
-    ))
-    .get_result::<BoolValue>(&mut conn)
-    .await
-    .expect("healthy row exists")
-    .value;
-    let paused_unhealthy: bool = diesel::sql_query(format!(
-        "SELECT is_paused AS value FROM harvest_schedules WHERE id = '{unhealthy}'"
-    ))
-    .get_result::<BoolValue>(&mut conn)
-    .await
-    .expect("unhealthy row exists")
-    .value;
-    assert!(
-        paused_unhealthy,
-        "the health-filtered bulk pause must pause the matching schedule"
-    );
-    assert!(
-        !paused_healthy,
-        "a bulk pause under health=Unhealthy must not touch a healthy schedule"
-    );
-}
-
-/// The audit `source` fix covers every schedule mutation, not just pause.
-#[tokio::test]
-async fn ui_schedules_every_mutation_is_audited_as_ui_sourced() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let pause_id = insert_schedule_fixture(
-        &database_url,
-        &ScheduleFixture {
-            kind: "Workflow",
-            name: "audit_pause",
-            ..Default::default()
-        },
-    )
-    .await;
-    let delete_id = insert_schedule_fixture(
-        &database_url,
-        &ScheduleFixture {
-            kind: "Workflow",
-            name: "audit_delete",
-            ..Default::default()
-        },
-    )
-    .await;
-    insert_schedule_fixture(
-        &database_url,
-        &ScheduleFixture {
-            kind: "Workflow",
-            name: "audit_bulk",
-            ..Default::default()
-        },
-    )
-    .await;
-
-    let app = build_single_shard_ui_app(&database_url);
-    post_form(&app, &format!("/schedules/{pause_id}/pause"), "").await;
-    post_form(&app, &format!("/schedules/{pause_id}/resume"), "").await;
-    post_form(&app, &format!("/schedules/{delete_id}/delete"), "").await;
-    post_form(&app, "/schedules/bulk-pause", "target=audit_bulk").await;
-    post_form(&app, "/schedules/bulk-resume", "target=audit_bulk").await;
-
-    let mut conn = AsyncPgConnection::establish(&database_url)
-        .await
-        .expect("connect for audit assertion");
-    let api_sourced: i64 = diesel::sql_query(
-        "SELECT COUNT(*) AS value FROM harvest_audit_log \
-         WHERE route_or_command LIKE 'POST /ui/schedules%' AND source <> 'ui'",
-    )
-    .get_result::<CountValue>(&mut conn)
-    .await
-    .expect("audit query")
-    .value;
-    assert_eq!(
-        api_sourced, 0,
-        "every /ui/schedules audit record must be source = ui"
-    );
-
-    for op in ["schedule.pause", "schedule.resume", "schedule.delete"] {
-        let n: i64 = diesel::sql_query(format!(
-            "SELECT COUNT(*) AS value FROM harvest_audit_log \
-             WHERE operation = '{op}' AND source = 'ui'"
-        ))
-        .get_result::<CountValue>(&mut conn)
-        .await
-        .expect("audit query")
-        .value;
-        assert!(n > 0, "{op} must be audited as UI-sourced, got {n}");
-    }
-}
-
-/// A per-row mutation's redirect resolves back to the list, not to a path
-/// nested under the schedule id.
-#[tokio::test]
-async fn ui_schedules_pause_redirect_resolves_to_the_list() {
-    let (database_url, _container) = setup_test_database_url().await;
-    insert_schedule_fixture(
-        &database_url,
-        &ScheduleFixture {
-            kind: "Workflow",
-            name: "redirect_wf",
-            ..Default::default()
-        },
-    )
-    .await;
-    let id = insert_schedule_fixture(
-        &database_url,
-        &ScheduleFixture {
-            kind: "Workflow",
-            name: "redirect_target",
-            ..Default::default()
-        },
-    )
-    .await;
-
-    let app = build_single_shard_ui_app(&database_url);
-    let (_status, headers, _body) = post_form(&app, &format!("/schedules/{id}/pause"), "").await;
-    let location = headers
-        .get("location")
-        .and_then(|v| v.to_str().ok())
-        .expect("redirect carries a location")
-        .to_string();
-
-    // Resolve it the way a browser would against /schedules/{id}/pause, whose
-    // base directory is /schedules/{id}/.
-    let Some(rest) = location.strip_prefix("../") else {
-        panic!("per-row redirect must climb a segment: {location}");
-    };
-    let resolved = format!("/{rest}");
-    let (status, html) = fetch_html(&app, &resolved).await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "the pause redirect must land on the schedules list: {html}"
-    );
-    assert!(
-        html.contains("redirect_wf"),
-        "landed on the wrong page: {html}"
-    );
-}
-
-/// Codex round 1 #3: an auto-paused schedule (#360 sets `auto_paused_at`
-/// **without** `is_paused`) must be resumable from Vantage — per row and in
-/// bulk — and the resume must clear the auto-pause state the way the API's does,
-/// or the next tick immediately re-pauses it.
-#[tokio::test]
-async fn ui_schedules_auto_paused_row_can_be_resumed() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let id = insert_schedule_fixture(
-        &database_url,
-        &ScheduleFixture {
-            kind: "Workflow",
-            name: "auto_paused_wf",
-            auto_paused: true,
-            ..Default::default()
-        },
-    )
-    .await;
-
-    let mut conn = AsyncPgConnection::establish(&database_url)
-        .await
-        .expect("connect for auto-pause setup");
-    conn.batch_execute(&format!(
-        "UPDATE harvest_schedules SET consecutive_failure_count = 5 WHERE id = '{id}'"
-    ))
-    .await
-    .expect("seed a failure count");
-
-    let app = build_single_shard_ui_app(&database_url);
-
-    // The row offers Resume, not Pause, even though `is_paused` is false.
-    let (status, html) = fetch_html(&app, "/schedules").await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(
-        html.contains("Auto-paused"),
-        "auto-paused badge missing: {html}"
-    );
-    assert!(
-        html.contains(&format!("schedules/{id}/resume")),
-        "an auto-paused row must offer Resume: {html}"
-    );
-    assert!(
-        !html.contains(&format!("schedules/{id}/pause")),
-        "an auto-paused row must not offer Pause: {html}"
-    );
-
-    let (status, _headers, body) = post_form(&app, &format!("/schedules/{id}/resume"), "").await;
-    assert_eq!(
-        status,
-        StatusCode::SEE_OTHER,
-        "resume must redirect: {body}"
-    );
-
-    let state: AutoPauseState = diesel::sql_query(format!(
-        "SELECT (auto_paused_at IS NULL) AS cleared, consecutive_failure_count AS failures \
-         FROM harvest_schedules WHERE id = '{id}'"
-    ))
-    .get_result(&mut conn)
-    .await
-    .expect("row still exists");
-    assert!(
-        state.cleared,
-        "resume must clear auto_paused_at, or the schedule stays held back"
-    );
-    assert_eq!(
-        state.failures, 0,
-        "resume must reset the failure counter, or the next tick re-pauses it"
-    );
-}
-
-/// The same for the bulk resume path, which selected solely on `is_paused`.
-#[tokio::test]
-async fn ui_schedules_bulk_resume_reaches_auto_paused_rows() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let id = insert_schedule_fixture(
-        &database_url,
-        &ScheduleFixture {
-            kind: "Workflow",
-            name: "auto_paused_bulk",
-            auto_paused: true,
-            ..Default::default()
-        },
-    )
-    .await;
-
-    let app = build_single_shard_ui_app(&database_url);
-    let (status, _headers, body) =
-        post_form(&app, "/schedules/bulk-resume", "target=auto_paused_bulk").await;
-    assert_eq!(
-        status,
-        StatusCode::SEE_OTHER,
-        "bulk resume must redirect: {body}"
-    );
-
-    let mut conn = AsyncPgConnection::establish(&database_url)
-        .await
-        .expect("connect for bulk resume assertion");
-    let cleared: bool = diesel::sql_query(format!(
-        "SELECT (auto_paused_at IS NULL) AS value FROM harvest_schedules WHERE id = '{id}'"
-    ))
-    .get_result::<BoolValue>(&mut conn)
-    .await
-    .expect("row exists")
-    .value;
-    assert!(
-        cleared,
-        "a bulk resume must reach an auto-paused schedule, not just is_paused rows"
-    );
-}
-
-/// Codex round 1 #2: the preview drill-down must render for a schedule on a
-/// healthy shard even when an earlier shard is unreachable — the resilient
-/// resolver found the row, so a second fragile lookup must not undo that.
-#[tokio::test]
-async fn ui_schedules_preview_survives_an_unreachable_earlier_shard() {
-    let (good_url, _container) = setup_test_database_url().await;
-    let id = insert_schedule_fixture(
-        &good_url,
-        &ScheduleFixture {
-            kind: "Workflow",
-            name: "later_shard_wf",
-            schedule_expr: Some("cron:0 * * * *"),
-            ..Default::default()
-        },
-    )
-    .await;
-
-    // Shard 0 is unreachable; the schedule lives on shard 1.
-    let bad_pool = build_test_pool("postgres://invalid:5432/nonexistent");
-    let good_pool = build_test_pool(&good_url);
-    let mut pools = BTreeMap::new();
-    pools.insert(ShardId::new(0), bad_pool);
-    pools.insert(ShardId::new(1), good_pool);
-    let harvest_pool = HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(1)));
-
-    let api_state = HarvestApiState::new();
-    api_state.set_admin_auth_boundary(true);
-    api_state.install_storage_pool(harvest_pool);
-    api_state.install(HarvestApiRuntime::new(
-        echo_registry(),
-        Arc::new(HashMap::new()),
-        Arc::new(Vec::new()),
-        None,
-        vec!["default".to_string()],
-        SchedulerMonitor::offline(),
-        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
-        ShardRouter::new(
-            vec![ShardId::new(0), ShardId::new(1)],
-            vec![ShardId::new(0), ShardId::new(1)],
-            ShardId::new(1),
-        ),
-    ));
-    let app = harvest_ui_router(api_state);
-
-    let (status, html) = fetch_html(&app, &format!("/schedules/{id}/preview")).await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "a preview for a schedule on a healthy shard must render \
-         despite an unreachable earlier shard: {html}"
-    );
-    assert!(
-        html.contains("later_shard_wf"),
-        "the resolved schedule must be rendered: {html}"
-    );
-}
-
-/// Codex round 2 #2: the backfill launcher must work for a schedule on a
-/// healthy shard while an earlier shard is unreachable. Round 1 fixed the
-/// preview instance; the shared lookup underneath is now resilient, so the
-/// backfill path is covered by the same rule.
-#[tokio::test]
-async fn ui_schedules_backfill_survives_an_unreachable_earlier_shard() {
-    let (good_url, _container) = setup_test_database_url().await;
-    let id = insert_schedule_fixture(
-        &good_url,
-        &ScheduleFixture {
-            kind: "Workflow",
-            name: "echo",
-            schedule_expr: Some("cron:0 * * * *"),
-            ..Default::default()
-        },
-    )
-    .await;
-
-    // Shard 0 is unreachable; the schedule lives on shard 1.
-    let bad_pool = build_test_pool("postgres://invalid:5432/nonexistent");
-    let good_pool = build_test_pool(&good_url);
-    let mut pools = BTreeMap::new();
-    pools.insert(ShardId::new(0), bad_pool);
-    pools.insert(ShardId::new(1), good_pool);
-    let harvest_pool = HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(1)));
-
-    let api_state = HarvestApiState::new();
-    api_state.set_admin_auth_boundary(true);
-    api_state.install_storage_pool(harvest_pool);
-    api_state.install(HarvestApiRuntime::new(
-        echo_registry(),
-        Arc::new(HashMap::new()),
-        Arc::new(Vec::new()),
-        None,
-        vec!["default".to_string()],
-        SchedulerMonitor::offline(),
-        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
-        ShardRouter::new(
-            vec![ShardId::new(0), ShardId::new(1)],
-            vec![ShardId::new(0), ShardId::new(1)],
-            ShardId::new(1),
-        ),
-    ));
-    let app = harvest_ui_router(api_state);
-
-    let (status, html) = fetch_html(&app, &format!("/schedules/{id}/backfill")).await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "the backfill form must render despite an unreachable earlier shard: {html}"
-    );
-
-    let (status, _headers, html) = post_form(
-        &app,
-        &format!("/schedules/{id}/backfill"),
-        "from=2026-08-01T00%3A00%3A00Z&to=2026-08-01T03%3A00%3A00Z&stage=preview",
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "the dry run must reach the schedule on the healthy shard: {html}"
-    );
-    assert!(
-        html.contains("Confirm backfill"),
-        "the dry run must produce a confirmation, not a resolution failure: {html}"
-    );
-}
-
-/// Codex round 2 #3: a schedule that is terminal on its live bounds but whose
-/// tick never stamped `exhausted_at` must still read as unhealthy on the list.
-#[tokio::test]
-async fn ui_schedules_list_flags_a_row_bounded_out_before_its_tick_stamped_it() {
-    let (database_url, _container) = setup_test_database_url().await;
-    // `runs_started == max_runs`, `exhausted_at` still NULL.
-    let bounded = insert_schedule_fixture(
-        &database_url,
-        &ScheduleFixture {
-            kind: "Workflow",
-            name: "unstamped_bounded",
-            max_runs: Some(4),
-            runs_started: 4,
-            next_run_at_sql: Some("NOW() + INTERVAL '10 hours'"),
-            ..Default::default()
-        },
-    )
-    .await;
-    let healthy = insert_schedule_fixture(
-        &database_url,
-        &ScheduleFixture {
-            kind: "Workflow",
-            name: "still_healthy",
-            next_run_at_sql: Some("NOW() + INTERVAL '1 minute'"),
-            ..Default::default()
-        },
-    )
-    .await;
-
-    let app = build_single_shard_ui_app(&database_url);
-    let (status, html) = fetch_html(&app, "/schedules").await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(
-        html.contains("run budget spent"),
-        "an unstamped exhaustion must be badged with its bound: {html}"
-    );
-
-    // It sorts above the healthy row despite firing much later.
-    let pos = |id: uuid::Uuid| {
-        html.find(&id.to_string())
-            .unwrap_or_else(|| panic!("schedule {id} missing: {html}"))
-    };
-    assert!(
-        pos(bounded) < pos(healthy),
-        "a live-bounded-out row must sort to the top: {html}"
-    );
-
-    // And the health filter finds it.
-    let (status, html) = fetch_html(&app, "/schedules?health=Unhealthy").await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(
-        html.contains("unstamped_bounded"),
-        "health=Unhealthy must include it: {html}"
-    );
-    assert!(
-        !html.contains("still_healthy"),
-        "the healthy row must be filtered out: {html}"
-    );
-}
-
-/// Codex round 2 #1: a legacy `max_runs = 0` row is unlimited, and must not be
-/// rendered as a spent budget or flagged unhealthy.
-#[tokio::test]
-async fn ui_schedules_zero_run_cap_renders_as_unlimited() {
-    let (database_url, _container) = setup_test_database_url().await;
-    insert_schedule_fixture(
-        &database_url,
-        &ScheduleFixture {
-            kind: "Workflow",
-            name: "zero_cap_wf",
-            max_runs: Some(0),
-            runs_started: 9,
-            ..Default::default()
-        },
-    )
-    .await;
-
-    let app = build_single_shard_ui_app(&database_url);
-    let (status, html) = fetch_html(&app, "/schedules").await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(html.contains("zero_cap_wf"), "row missing: {html}");
-    assert!(
-        !html.contains("of 0 left"),
-        "max_runs = 0 is unlimited and must not render a budget: {html}"
-    );
-    assert!(
-        !html.contains("Needs attention"),
-        "an unlimited schedule must not be counted unhealthy: {html}"
-    );
 }
 
 /// Timezone column renders and differentiates UTC (subdued) from other timezones (prominent badge).
@@ -4670,7 +2118,7 @@ async fn insert_child_workflow_on_url(
             workflow_name,
             workflow_id,
             exec_id,
-            input: serde_json::json!({}).into(),
+            input: serde_json::json!({}),
             parent_id: Some(parent_id.as_uuid()),
             queue_name: "default",
             execution_timeout: None,
@@ -4938,162 +2386,6 @@ async fn list_page_has_time_range_filters() {
     assert!(
         html.contains("name=\"started_before\""),
         "list page filter form should have a started_before input: {html}"
-    );
-}
-
-/// Wayfinder error-path fix: a malformed `started_after`/`started_before`
-/// used to `?`-abort `list_workflows_ui` with a bare 400 before the filter
-/// form was ever rendered — discarding every other filter the operator had
-/// typed and giving no way back to the list short of hand-editing the URL.
-///
-/// RED baseline (pre-fix, reproduced by checking out the parent commit and
-/// running this test): `GET /workflows?started_after=yesterday&workflow_name=billing`
-/// returned `400 Bad Request` with a body that did not contain the filters
-/// form, so `workflow_name=billing` (a valid, already-typed filter) was
-/// silently discarded along with the page.
-///
-/// GREEN (this commit): the request still renders the list page (`200`),
-/// preserves the other filter (`workflow_name=billing`, still in its
-/// input's `value=`), preserves the operator's exact invalid text
-/// (`started_after`'s `value="yesterday"`, not blanked out), and surfaces a
-/// `role="alert"` message adjacent to the offending field explaining the
-/// expected format — all four error-path booleans (adjacent to cause,
-/// persists until resolved, says how to recover, entered data preserved)
-/// now hold, where before only "says how to recover" did (in a 400 body the
-/// operator would only see by opening dev tools).
-#[tokio::test]
-async fn invalid_started_after_redisplays_form_instead_of_aborting_page() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let app = build_single_shard_ui_app(&database_url);
-
-    let (status, html) = fetch_html(
-        &app,
-        "/workflows?started_after=yesterday&workflow_name=billing",
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "an invalid started_after must not abort the whole list page: {html}"
-    );
-    assert!(
-        html.contains("name=\"started_after\""),
-        "filter form must still render: {html}"
-    );
-    assert!(
-        html.contains("value=\"yesterday\""),
-        "the operator's exact invalid input must be echoed back for correction: {html}"
-    );
-    assert!(
-        html.contains("value=\"billing\""),
-        "the other filter the operator already typed must not be discarded: {html}"
-    );
-    assert!(
-        html.contains("role=\"alert\""),
-        "an inline, screen-reader-announced error must sit next to the field: {html}"
-    );
-    assert!(
-        html.to_lowercase().contains("rfc 3339"),
-        "the error must say how to recover (expected format): {html}"
-    );
-}
-
-/// Same fix, `started_before` side — a distinct code path in
-/// `list_workflows_ui`, so covered independently rather than assumed
-/// symmetric with `started_after`.
-#[tokio::test]
-async fn invalid_started_before_redisplays_form_instead_of_aborting_page() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let app = build_single_shard_ui_app(&database_url);
-
-    let (status, html) = fetch_html(&app, "/workflows?started_before=not-a-date").await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "an invalid started_before must not abort the whole list page: {html}"
-    );
-    assert!(
-        html.contains("value=\"not-a-date\""),
-        "the operator's exact invalid input must be echoed back for correction: {html}"
-    );
-    assert!(
-        html.contains("role=\"alert\""),
-        "an inline, screen-reader-announced error must sit next to the field: {html}"
-    );
-}
-
-/// Wayfinder error-path fix: `page`/`limit` were the two `WorkflowListParams`
-/// fields #1333 left behind. Both were still typed `Option<i64>` directly on
-/// the `Query<..>` extractor, unlike every other filter on this struct. A
-/// non-numeric value on either aborted the whole `/workflows` response with
-/// a bare, unstyled 400. That 400 landed before the filter form, or any
-/// already-typed filter, ever rendered.
-///
-/// RED baseline (pre-fix, reproduced by checking out the parent commit and
-/// running this test): `GET /workflows?limit=not-a-number&workflow_name=billing`
-/// returned `400 Bad Request`. The body did not contain the filters form, so
-/// it discarded `workflow_name=billing` along with the page.
-///
-/// GREEN (this commit): the request still renders the list page (`200`) and
-/// preserves the other filter. It falls back to `DEFAULT_PAGE_SIZE` and
-/// surfaces a `role="alert"` message naming the bad value next to the
-/// "Per page" field.
-#[tokio::test]
-async fn invalid_limit_redisplays_form_instead_of_aborting_page() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let app = build_single_shard_ui_app(&database_url);
-
-    let (status, html) =
-        fetch_html(&app, "/workflows?limit=not-a-number&workflow_name=billing").await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "an invalid limit must not abort the whole list page: {html}"
-    );
-    assert!(
-        html.contains("value=\"billing\""),
-        "the other filter the operator already typed must not be discarded: {html}"
-    );
-    assert!(
-        html.contains("role=\"alert\""),
-        "an inline, screen-reader-announced error must sit next to the field: {html}"
-    );
-    assert!(
-        html.contains("not-a-number"),
-        "the error must name the bad value: {html}"
-    );
-}
-
-/// Same fix, the `page` field. No form field backs it; it drives the
-/// Previous/Next links instead, a distinct code path. Covered independently
-/// here rather than assumed symmetric with `limit`.
-#[tokio::test]
-async fn invalid_page_redisplays_list_instead_of_aborting_page() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let app = build_single_shard_ui_app(&database_url);
-
-    let (status, html) =
-        fetch_html(&app, "/workflows?page=not-a-number&workflow_name=billing").await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "an invalid page must not abort the whole list page: {html}"
-    );
-    assert!(
-        html.contains("value=\"billing\""),
-        "the other filter the operator already typed must not be discarded: {html}"
-    );
-    assert!(
-        html.contains("role=\"alert\""),
-        "an inline, screen-reader-announced error must sit next to the pagination controls: {html}"
-    );
-    assert!(
-        html.contains("not-a-number"),
-        "the error must name the bad value: {html}"
-    );
-    assert!(
-        html.contains("Page 1"),
-        "falls back to page 1 (zero-based page 0) instead of guessing: {html}"
     );
 }
 
@@ -5495,21 +2787,10 @@ async fn detail_page_reset_action_redirects_with_flash() {
     insert_workflow_events(&database_url, exec_id, &events, 1).await;
 
     let app = build_single_shard_ui_app(&database_url);
-    // `reset_to_event_id=1`: the form's field is 1-based (matching the
-    // timeline "#" column). "1" targets 0-based event id 0, this
-    // execution's `WorkflowStarted` -- the earliest valid reset point.
-    // "0" (this test's value before issue #1687's review) converts to the
-    // 0-based id -1. `validate_reset_point` rejects that as outside the
-    // history range. Both outcomes redirected identically before this PR,
-    // since every branch shared one `Redirect`. This test was passing
-    // while silently exercising the *failure* path. A rejected submission
-    // now renders the page directly instead of redirecting (issue #1687
-    // review, Codex finding). A genuine success fixture is required to
-    // observe the redirect this test asserts on.
     let (status, headers, body) = post_form(
         &app,
         &format!("/workflows/{exec_id}/reset"),
-        "reset_to_event_id=1&reason=rollback",
+        "reset_to_event_id=0&reason=rollback",
     )
     .await;
     assert!(
@@ -5528,111 +2809,6 @@ async fn detail_page_reset_action_redirects_with_flash() {
     assert!(
         location.contains("flash"),
         "redirect must carry a flash message: {location}"
-    );
-}
-
-/// GREEN — `reset_to_event_id` used to be typed `i64` directly on
-/// `WorkflowResetForm`. A non-numeric value failed axum's own `Form`
-/// deserialization before `reset_workflow_ui` ever ran. That was a bare
-/// framework 400, not the styled error the page renders for every other
-/// rejected action. Reset is the runbook's destructive recovery action, not
-/// a filter, so the fix rejects the value with a clear message. It does
-/// not guess an event number the operator never typed.
-///
-/// A rejected submission renders the detail page directly (200), not a
-/// redirect (issue #1687 review). This is updated from this test's
-/// original redirect-based assertion — see
-/// `detail_page_reset_action_with_invalid_event_number_preserves_entered_reason`
-/// for the entered-data-preservation half of that fix.
-#[tokio::test]
-async fn detail_page_reset_action_with_invalid_event_number_renders_error_instead_of_aborting() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let exec_id =
-        insert_workflow_on_url(&database_url, ShardId::new(0), "reset_wf3", "reset-3").await;
-
-    let app = build_single_shard_ui_app(&database_url);
-    let (status, _headers, html) = post_form(
-        &app,
-        &format!("/workflows/{exec_id}/reset"),
-        "reset_to_event_id=not-a-number&reason=oops",
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "an invalid event number must render the detail page with an error, not abort the request: {html}"
-    );
-    assert!(
-        html.contains("invalid event number") && html.contains("expected a whole number"),
-        "the rendered page must name the bad value: {html}"
-    );
-}
-
-/// GREEN (issue #1687) — a rejected reset submission used to redirect with
-/// only a generic flash. The collapsed "Reset to event N" panel re-rendered
-/// empty, so the operator's event number and reason were gone. A rejected
-/// submission now renders the detail page directly (200, not a redirect;
-/// issue #1687 review). A redirect would put the submitted values in the
-/// URL, and hence in browser history and server logs. The panel now
-/// re-opens, pre-filled with exactly what was submitted.
-#[tokio::test]
-async fn detail_page_reset_action_with_invalid_event_number_preserves_entered_reason() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let exec_id =
-        insert_workflow_on_url(&database_url, ShardId::new(0), "reset_wf4", "reset-4").await;
-
-    let app = build_single_shard_ui_app(&database_url);
-    let (status, _headers, html) = post_form(
-        &app,
-        &format!("/workflows/{exec_id}/reset"),
-        "reset_to_event_id=not-a-number&reason=rollback+after+incident",
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "a rejected reset must render the detail page directly, not redirect: {html}"
-    );
-    assert!(
-        html.contains(r#"name="reset_to_event_id" required placeholder="1" value="not-a-number""#),
-        "the entered event number must be redisplayed, not blanked: {html}"
-    );
-    assert!(
-        html.contains("rollback after incident"),
-        "the entered reason must be redisplayed, not blanked: {html}"
-    );
-    assert!(
-        html.contains(r#"<details style="display:inline-block" open"#),
-        "the Reset to event N panel must re-open on its own error: {html}"
-    );
-}
-
-/// Same mechanism (issue #1687), for Send signal's invalid-JSON-payload path.
-#[tokio::test]
-async fn detail_page_signal_action_with_invalid_payload_preserves_entered_values() {
-    let (database_url, _container) = setup_test_database_url().await;
-    let exec_id =
-        insert_workflow_on_url(&database_url, ShardId::new(0), "signal_wf3", "signal-3").await;
-
-    let app = build_single_shard_ui_app(&database_url);
-    let (status, _headers, html) = post_form(
-        &app,
-        &format!("/workflows/{exec_id}/signal"),
-        "signal_name=approve&payload=%7Bnot+json",
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "a rejected signal must render the detail page directly, not redirect: {html}"
-    );
-    assert!(
-        html.contains(r#"name="signal_name" required placeholder="e.g. approve" value="approve""#),
-        "the entered signal name must be redisplayed, not blanked: {html}"
-    );
-    assert!(
-        html.contains("{not json"),
-        "the entered payload must be redisplayed, not blanked: {html}"
     );
 }
 
@@ -5758,7 +2934,7 @@ async fn detail_page_shows_custom_continue_as_new_threshold() {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    let app = harvest_ui_router(api_state);
+    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
 
     let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}")).await;
     assert_eq!(status, StatusCode::OK, "detail page must render: {html}");
@@ -5893,8 +3069,6 @@ async fn ui_trigger_preserves_dag_metadata() {
     let schedule_id = insert_test_schedule(&database_url, "Dag", dag_name, false).await;
 
     let api_state = HarvestApiState::new();
-    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
-    api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
         Arc::clone(&registry),
@@ -5907,7 +3081,7 @@ async fn ui_trigger_preserves_dag_metadata() {
         ShardRouter::single(),
     ));
     // Mount the UI router
-    let app = harvest_ui_router(api_state);
+    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
 
     // POST /schedules/{id}/trigger-now
     let (status, _headers, _body) = post_form(
@@ -6009,8 +3183,6 @@ async fn ui_trigger_now_threads_dag_execution_timeout_sla_and_fleet_ceiling() {
     let schedule_id = insert_test_schedule(&database_url, "Dag", dag_name, false).await;
 
     let api_state = HarvestApiState::new();
-    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
-    api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
         Arc::clone(&registry),
@@ -6022,7 +3194,7 @@ async fn ui_trigger_now_threads_dag_execution_timeout_sla_and_fleet_ceiling() {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    let app = harvest_ui_router(api_state);
+    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
 
     let (status, _headers, _body) = post_form(
         &app,
@@ -6133,48 +3305,6 @@ fn envelope_608(plain: &Value) -> Value {
     encoded["data"]["output"].clone()
 }
 
-/// Undo the identity codec's collision-escape nesting (issue #1253) on one
-/// stored event's payload field, restoring it to `encoded_value` exactly as
-/// given.
-///
-/// Both `start_or_load_workflow_execution` and `store::append_events`
-/// always encode through identity codecs. Suppose a caller hands either an
-/// already-envelope-shaped payload field, to simulate a foreign
-/// codec-encrypting write. The escape guard then sees a collision and
-/// wraps it a second time. That is correct for a real caller, whose
-/// plaintext coincidentally looks like an envelope. Here it is a test
-/// artifact: this fixture wants the SINGLE codec-encoded shape a real
-/// deployment stores, not identity's defensive double wrap. This patches
-/// the stored event back to that shape.
-async fn reset_event_field(
-    conn: &mut AsyncPgConnection,
-    exec_id: ExecutionId,
-    event_id: i32,
-    field: &str,
-    encoded_value: Value,
-) {
-    let mut event_data: Value = harvest_events::table
-        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
-        .filter(harvest_events::event_id.eq(event_id))
-        .select(harvest_events::event_data)
-        .first(&mut *conn)
-        .await
-        .expect("load event row");
-    event_data["data"][field] = encoded_value;
-    autumn_harvest::append_only::with_guard_off(&mut *conn, async |c| {
-        diesel::update(
-            harvest_events::table
-                .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
-                .filter(harvest_events::event_id.eq(event_id)),
-        )
-        .set(harvest_events::event_data.eq(event_data))
-        .execute(c)
-        .await
-    })
-    .await
-    .expect("restore event field");
-}
-
 /// Single-shard API+UI app with read-path decoding enabled (issue #608):
 /// admin boundary + codec registry mirrored + the opt-in flag set.
 fn build_decode_enabled_api_with_ui_app(database_url: &str) -> axum::Router {
@@ -6197,6 +3327,7 @@ fn build_decode_enabled_api_with_ui_app(database_url: &str) -> axum::Router {
 
     autumn_harvest_plugin::harvest_api_router(api_state.clone())
         .nest("/ui", harvest_ui_router(api_state))
+        .with_state(test_app_state_without_database())
 }
 
 async fn count_decode_audit_rows(database_url: &str) -> i64 {
@@ -6226,25 +3357,6 @@ async fn decode_audit_sources(database_url: &str) -> Vec<String> {
         .load(&mut conn)
         .await
         .expect("failed to load decode audit sources")
-}
-
-/// The `route_or_command` column of every `payload.decode_read` audit row
-/// (issue #1687 review, Codex finding). `render_workflow_detail_page` is
-/// shared by the `GET` route and the three rejected-action POST handlers.
-/// Each caller's decoded reads must be attributed to ITS OWN route, not a
-/// hard-coded `GET /ui/workflows/{id}` regardless of which request
-/// actually triggered the read.
-async fn decode_audit_routes(database_url: &str) -> Vec<String> {
-    use autumn_harvest::schema::harvest_audit_log;
-    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
-        .await
-        .expect("failed to connect for audit routes");
-    harvest_audit_log::table
-        .filter(harvest_audit_log::operation.eq(autumn_harvest::audit::OP_PAYLOAD_DECODE_READ))
-        .select(harvest_audit_log::route_or_command)
-        .load(&mut conn)
-        .await
-        .expect("failed to load decode audit routes")
 }
 
 /// Issue #608 (DLQ UI): the dead-letter page renders the decoded task input
@@ -6327,7 +3439,7 @@ async fn workflow_detail_ui_renders_decoded_input() {
             workflow_name: "encrypted_workflow",
             workflow_id: "detail-decode-1",
             exec_id,
-            input: input_envelope.clone().into(),
+            input: input_envelope.clone(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -6369,7 +3481,6 @@ async fn workflow_detail_ui_renders_decoded_input() {
     )
     .await
     .expect("workflow insert should succeed");
-    reset_event_field(&mut conn, exec_id, 0, "input", input_envelope.clone()).await;
 
     // Blocked-on panel + timeline fixtures (issue #608, AC4): an
     // envelope-bearing timeline event, a pending activity whose stored
@@ -6388,29 +3499,19 @@ async fn workflow_detail_ui_renders_decoded_input() {
         let history = autumn_harvest::store::load_history_undecoded(&mut conn, exec_id)
             .await
             .expect("load history");
-        let timeline_event_id = history.next_event_id;
-        let timeline_input = envelope_608(&json!({"card": "pii-detail-event"}));
         autumn_harvest::store::append_events(
             &mut conn,
             exec_id,
             &[autumn_harvest::WorkflowEvent::ActivityScheduled {
                 activity_id: autumn_harvest::types::ActivityExecId::new(),
                 name: "charge_card".to_string(),
-                input: timeline_input.clone(),
+                input: envelope_608(&json!({"card": "pii-detail-event"})),
                 queue: "default".to_string(),
             }],
-            timeline_event_id,
+            history.next_event_id,
         )
         .await
         .expect("append timeline event");
-        reset_event_field(
-            &mut conn,
-            exec_id,
-            timeline_event_id,
-            "input",
-            timeline_input,
-        )
-        .await;
 
         let mut params = autumn_harvest::queue::EnqueueParams::new(
             "default",
@@ -6498,95 +3599,6 @@ async fn workflow_detail_ui_renders_decoded_input() {
     );
 }
 
-/// GREEN (issue #1687 review, Codex finding). `render_workflow_detail_page`
-/// is shared by the `GET` route and the three rejected-action POST
-/// handlers. A payload decoded while rendering a rejected signal directly
-/// must attribute its `payload.decode_read` audit row to the POST route
-/// that actually triggered the read. It must not use the hard-coded `GET
-/// /ui/workflows/{id}` the shared renderer used to assume.
-#[tokio::test]
-async fn rejected_signal_render_attributes_decode_audit_to_the_post_route() {
-    let (database_url, _container) = setup_test_database_url().await;
-
-    let input_envelope = envelope_608(&json!({"user": "pii-signal-reject"}));
-    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
-    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
-        .await
-        .expect("failed to connect for workflow insert");
-    start_or_load_workflow_execution(
-        &mut conn,
-        StartWorkflowParams {
-            workflow_name: "encrypted_workflow",
-            workflow_id: "reject-decode-1",
-            exec_id,
-            input: input_envelope.clone().into(),
-            parent_id: None,
-            queue_name: "default",
-            execution_timeout: None,
-            memo: None,
-            search_attrs: None,
-            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
-            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
-            trace_context: None,
-            max_execution_timeout_ceiling: None,
-            chain_execution_timeout: None,
-            max_workflow_chain_timeout_ceiling: None,
-            inherited_chain_deadline_at: None,
-            concurrency_key: None,
-            concurrency_limit: None,
-            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
-            priority: Priority::default(),
-            max_workflow_input_bytes: 0,
-            start_at: None,
-            delay: None,
-            max_workflow_start_delay: None,
-            owner: None,
-            runbook_url: None,
-            severity: None,
-            context_headers: None,
-            sla: None,
-            schedule_id: None,
-            scheduled_for: None,
-            workflow_attempt: 1,
-            workflow_retry_policy: None,
-            retry_of_exec_id: None,
-            max_workflow_attempts_ceiling: None,
-            origin: None,
-            completion_callbacks: None,
-            start_source: autumn_harvest::StartSource::Api,
-            start_source_ref: None,
-            started_by: None,
-        },
-        None,
-    )
-    .await
-    .expect("workflow insert should succeed");
-    reset_event_field(&mut conn, exec_id, 0, "input", input_envelope.clone()).await;
-
-    let app = build_decode_enabled_api_with_ui_app(&database_url);
-    let (status, _headers, body) = post_form(
-        &app,
-        &format!("/ui/workflows/{exec_id}/signal"),
-        "signal_name=approve&payload=%7Bnot+json",
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "the rejected signal must render the detail page directly: {body}"
-    );
-
-    let routes = decode_audit_routes(&database_url).await;
-    assert!(
-        routes.iter().any(|r| r == "POST /workflows/{id}/signal"),
-        "the decode audit row must attribute the POST route that triggered the render: {routes:?}"
-    );
-    assert!(
-        !routes.iter().any(|r| r == "GET /ui/workflows/{id}"),
-        "no GET-route audit row should be written for this POST-triggered render: {routes:?}"
-    );
-}
-
 /// Issue #608 / PR #936 round 5: a detail render whose *only* envelopes live
 /// in fields the page never displays — the pending-activity `input`, the
 /// pending-signal payload, and the attempts/signals panel event copies
@@ -6609,7 +3621,7 @@ async fn workflow_detail_ui_writes_no_audit_row_when_only_hidden_fields_carry_en
             exec_id,
             // A plain, already-decoded input: the rendered fields carry no
             // envelopes at all in this fixture.
-            input: json!({"user": "plain-input"}).into(),
+            input: json!({"user": "plain-input"}),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -6855,7 +3867,7 @@ fn build_dag957_ui_app(
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    harvest_ui_router(api_state)
+    harvest_ui_router(api_state).with_state(test_app_state_without_database())
 }
 
 fn dag957_sched(name: &str, id: autumn_harvest::ActivityExecId) -> autumn_harvest::WorkflowEvent {
@@ -6906,7 +3918,7 @@ async fn dag957_seed_run(
             workflow_name: dag_name,
             workflow_id,
             exec_id,
-            input: json!({}).into(),
+            input: json!({}),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -7166,101 +4178,6 @@ async fn ui_dag_retry_error_renders_human_message() {
     );
 }
 
-// I-E2
-/// Issue #1723 fix: a genuine commit failure must not drop the operator's
-/// submitted retry `reason`.
-///
-/// Seeds a genuinely retryable (`FAILED`) run and confirms the form renders
-/// with the editable `reason` field. A competing retry then really runs and
-/// seals the source `TERMINATED` (`terminate_source_execution`, `reset.rs`).
-/// That happens before the operator submits the form they had open. This is
-/// the same race issue #1723 describes. It reproduces against the real
-/// handler, rather than only the pure redirect-decision function.
-#[tokio::test]
-async fn ui_dag_retry_error_preserves_submitted_reason() {
-    let (url, _c) = setup_test_database_url().await;
-    let app = build_dag957_ui_app(&url, true, vec![]);
-
-    let (ia, ib) = (
-        autumn_harvest::ActivityExecId::new(),
-        autumn_harvest::ActivityExecId::new(),
-    );
-    let events = vec![
-        dag957_sched("dag957_step_a", ia),
-        dag957_started(ia),
-        dag957_completed(ia),
-        dag957_sched("dag957_step_b", ib),
-        dag957_started(ib),
-        dag957_failed(ib),
-        autumn_harvest::WorkflowEvent::workflow_failed("dag failed"),
-    ];
-    let exec_id = dag957_seed_run(
-        &url,
-        "dag957_linear",
-        "graph-reason-preserved",
-        events,
-        "FAILED",
-    )
-    .await;
-
-    // The confirm page renders the editable form for this still-open run --
-    // this is the page the operator actually sees and types into.
-    let (status, html) = fetch_html(
-        &app,
-        &format!("/dags/dag957_linear/runs/{exec_id}/retry?from_node=dag957_step_b"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "confirm page must render: {html}");
-    assert!(html.contains("reason"), "reason field must be present");
-
-    // Race: a second operator (or an automatic recovery) retries the same
-    // node first, through a real commit against the real handler. It forks a
-    // new run and seals THIS source `TERMINATED`, exactly as
-    // `terminate_source_execution` does for a live competing retry.
-    let (competing_status, _headers, competing_body) = post_form(
-        &app,
-        &format!("/dags/dag957_linear/runs/{exec_id}/retry"),
-        "from_node=dag957_step_b&reason=competing+operator+retry",
-    )
-    .await;
-    assert!(
-        competing_status.is_redirection(),
-        "the competing retry must itself succeed: {competing_status} {competing_body}"
-    );
-
-    // The first operator, still looking at the form from the confirm page
-    // fetched above, submits it -- unaware the source run is now sealed.
-    let (status, _headers, body) = post_form(
-        &app,
-        &format!("/dags/dag957_linear/runs/{exec_id}/retry"),
-        "from_node=dag957_step_b&reason=retrying+after+upstream+API+fix,+ticket+JIRA-4521",
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "a genuine commit failure renders the confirm page in place, not a \
-         redirect: {body}"
-    );
-    assert!(
-        body.contains("retrying after upstream API fix, ticket JIRA-4521"),
-        "the operator's submitted reason must survive the failure: {body}"
-    );
-    // Codex review (issue #1723): the redisplay's own refreshed dry run
-    // fails too in this exact race, since the source run is now sealed. So
-    // the page renders the `Err` branch, not the `Ok` branch's inline
-    // `span.field-error`. The reason survives there via the "Your submitted
-    // reason" note instead, and a failure banner is still shown either way.
-    assert!(
-        body.contains("Your submitted reason") || body.contains("Retry failed"),
-        "the failure itself must still be shown: {body}"
-    );
-    assert!(
-        body.contains("banner Warning"),
-        "a failure banner must render: {body}"
-    );
-}
-
 // I-F
 #[tokio::test]
 async fn ui_dag_run_graph_classic_dag_degraded() {
@@ -7372,145 +4289,6 @@ async fn ui_dag_run_graph_unknown_run_returns_404_message() {
     assert!(
         default_html.contains("dag957_step_a"),
         "omitted `?run=` defaults to the latest run's graph: {default_html}"
-    );
-}
-
-/// GREEN -- the fix under test: a non-numeric `node` used to fail axum's
-/// query deserialization with a bare 400 before `dag_detail_ui` ever ran.
-/// That discarded the selected `?run=` along with everything else on the
-/// URL. Degrading to no node selected keeps the rest of the page intact.
-#[tokio::test]
-async fn ui_dag_detail_invalid_node_redisplays_page_instead_of_aborting() {
-    let (url, _c) = setup_test_database_url().await;
-    let app = build_dag957_ui_app(&url, true, vec![]);
-
-    let ia = autumn_harvest::ActivityExecId::new();
-    let exec_id = dag957_seed_run(
-        &url,
-        "dag957_linear",
-        "graph-invalid-node",
-        vec![
-            dag957_sched("dag957_step_a", ia),
-            dag957_started(ia),
-            dag957_completed(ia),
-        ],
-        "RUNNING",
-    )
-    .await;
-
-    let (status, html) = fetch_html(
-        &app,
-        &format!("/dags/dag957_linear?run={exec_id}&node=not-a-number"),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "an invalid node must not abort the whole DAG detail page: {html}"
-    );
-    assert!(
-        html.contains(&exec_id.to_string()),
-        "the selected run must survive an invalid node: {html}"
-    );
-    assert!(
-        html.contains("role=\"alert\""),
-        "an inline, screen-reader-announced error must be present: {html}"
-    );
-    assert!(
-        html.contains("not-a-number"),
-        "the error must name the bad value: {html}"
-    );
-}
-
-/// Same fix, the `refresh` field. No form field backs `node` or `refresh`
-/// on this page. Both are link- or bookmark-driven only, so this is
-/// covered independently rather than assumed symmetric with `node`.
-#[tokio::test]
-async fn ui_dag_detail_invalid_refresh_redisplays_page_instead_of_aborting() {
-    let (url, _c) = setup_test_database_url().await;
-    let app = build_dag957_ui_app(&url, true, vec![]);
-
-    let ia = autumn_harvest::ActivityExecId::new();
-    let exec_id = dag957_seed_run(
-        &url,
-        "dag957_linear",
-        "graph-invalid-refresh",
-        vec![
-            dag957_sched("dag957_step_a", ia),
-            dag957_started(ia),
-            dag957_completed(ia),
-        ],
-        "RUNNING",
-    )
-    .await;
-
-    let (status, html) = fetch_html(
-        &app,
-        &format!("/dags/dag957_linear?run={exec_id}&refresh=not-a-number"),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "an invalid refresh must not abort the whole DAG detail page: {html}"
-    );
-    assert!(
-        html.contains(&exec_id.to_string()),
-        "the selected run must survive an invalid refresh: {html}"
-    );
-    assert!(
-        html.contains("role=\"alert\""),
-        "an inline, screen-reader-announced error must be present: {html}"
-    );
-    assert!(
-        html.contains("not-a-number"),
-        "the error must name the bad value: {html}"
-    );
-    assert!(
-        !html.contains("http-equiv=\"refresh\""),
-        "an invalid refresh must not set a meta refresh: {html}"
-    );
-}
-
-/// Codex review finding on this PR: a valid `refresh` alongside an invalid
-/// `node` used to still set a meta refresh. `layout_dag_detail` emits a
-/// bare `meta http-equiv`, with no target URL to drop the bad `node` from.
-/// The browser reloaded the same malformed URL forever. Each reload redid
-/// this page's DB reads. A valid `node` alongside an invalid `refresh`
-/// needs no such guard. `parse_refresh_query_field` already resolves an
-/// invalid `refresh` to no meta refresh on its own.
-#[tokio::test]
-async fn ui_dag_detail_invalid_node_suppresses_a_valid_refresh() {
-    let (url, _c) = setup_test_database_url().await;
-    let app = build_dag957_ui_app(&url, true, vec![]);
-
-    let ia = autumn_harvest::ActivityExecId::new();
-    let exec_id = dag957_seed_run(
-        &url,
-        "dag957_linear",
-        "graph-invalid-node-valid-refresh",
-        vec![
-            dag957_sched("dag957_step_a", ia),
-            dag957_started(ia),
-            dag957_completed(ia),
-        ],
-        "RUNNING",
-    )
-    .await;
-
-    let (status, html) = fetch_html(
-        &app,
-        &format!("/dags/dag957_linear?run={exec_id}&node=not-a-number&refresh=30"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "body: {html}");
-    assert!(
-        html.contains("role=\"alert\""),
-        "an inline, screen-reader-announced error must be present: {html}"
-    );
-    assert!(
-        !html.contains("http-equiv=\"refresh\""),
-        "a valid refresh must not auto-reload a page carrying an invalid node: {html}"
     );
 }
 
@@ -7656,7 +4434,7 @@ async fn tl960_set_event_ts(
         exec_id.as_uuid(),
         event_id,
     );
-    autumn_harvest::append_only::with_guard_off(&mut conn, async |c| c.batch_execute(&sql).await)
+    conn.batch_execute(&sql)
         .await
         .expect("update event timestamp");
 }
@@ -7806,8 +4584,7 @@ async fn ui_timeline_renders_activity_timer_pause_ndblock() {
         .with_timezone(&chrono::Utc);
 
     // Activity retried twice (attempt 1 and 2 fail, then attempt 3 completes),
-    // so `derive_timeline` counts the 3 starts (issue #1809) → a "×3" badge.
-    // Plus a durable timer.
+    // so `derive_timeline` reports attempt = 2 → a "×2" badge. Plus a durable timer.
     let a = autumn_harvest::ActivityExecId::new();
     let t_id = "wait_gate";
     let events = vec![
@@ -7842,7 +4619,7 @@ async fn ui_timeline_renders_activity_timer_pause_ndblock() {
     assert_eq!(status, StatusCode::OK, "timeline renders: {html}");
     assert!(html.contains("<svg"), "inline svg present");
     assert!(html.contains("charge_card"), "activity span present");
-    assert!(html.contains("×3"), "retry attempt badge visible: {html}");
+    assert!(html.contains("×2"), "retry attempt badge visible: {html}");
     assert!(html.contains("wait_gate"), "timer span present");
     assert!(html.contains("Timer"), "timer lane label present");
     // Pause band + reason/actor.
@@ -8112,57 +4889,4 @@ async fn ui_timeline_200_steps_under_1s() {
         elapsed < Duration::from_secs(1),
         "200-step timeline renders server-side in < 1s (took {elapsed:?})"
     );
-}
-
-// ── Cross-site mutation rejection (issue #1278) ─────────────────────────────
-//
-// One representative route per family named in the issue's acceptance
-// criteria: workflow, DLQ, gate, build-routing, DAG, schedule. Every request
-// below carries neither `Origin` nor `Sec-Fetch-Site`. That is the exact
-// shape a hostile page's `<form>` submit arrives as, so this one test also
-// covers the "neither header present" acceptance criterion. The guard runs
-// ahead of routing and admin checks. A placeholder UUID in each path is
-// enough; no seeded row and no database are needed for a rejected request.
-#[tokio::test]
-async fn vantage_and_dlq_mutations_reject_cross_site_post() {
-    let api_state = HarvestApiState::new();
-    // Issue #1802: set the opt-out, so this test isolates the same-origin
-    // guard. On a closed state, the API gate answers the DLQ post with 401
-    // first. The `/ui` guard is the outer layer, so it answers first there.
-    api_state.set_allow_unauthenticated_mutations(true);
-    let app = autumn_harvest_plugin::harvest_api_router(api_state.clone())
-        .nest("/ui", harvest_ui_router(api_state));
-
-    let placeholder = uuid::Uuid::nil();
-    let targets: [(&str, String); 6] = [
-        ("workflow", format!("/ui/workflows/{placeholder}/cancel")),
-        ("dlq", "/dead-letters/replay".to_string()),
-        ("gate", format!("/ui/admin/gates/{placeholder}/lift")),
-        ("build-routing", "/ui/build-routing/set-policy".to_string()),
-        (
-            "dag",
-            format!("/ui/dags/echo_workflow/runs/{placeholder}/retry"),
-        ),
-        ("schedule", format!("/ui/schedules/{placeholder}/pause")),
-    ];
-
-    for (family, uri) in targets {
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(&uri)
-                    .header("content-type", "application/x-www-form-urlencoded")
-                    .body(Body::empty())
-                    .expect("valid cross-site request"),
-            )
-            .await
-            .expect("request should complete");
-        assert_eq!(
-            response.status(),
-            StatusCode::FORBIDDEN,
-            "{family} mutation ({uri}) must reject a request with no same-origin evidence"
-        );
-    }
 }

@@ -1,5 +1,0 @@
-                     query                     | calls | shared_blks_hit | shared_blks_read |   total_exec_time   
------------------------------------------------+-------+-----------------+------------------+---------------------
- SELECT to_regclass($1) IS NOT NULL AS present |     3 |              18 |                0 | 0.13770700000000002
-(1 row)
-

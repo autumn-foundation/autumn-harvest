@@ -48,7 +48,7 @@ async fn setup_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@{host}:{port}/postgres");
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
-    conn.batch_execute(&autumn_harvest::test_init_sql())
+    conn.batch_execute(autumn_harvest::full_migrations_sql())
         .await
         .expect("migration");
     (conn, container)
@@ -66,7 +66,7 @@ async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> ExecutionId 
             workflow_id: &format!("wf-ff-{}", Uuid::new_v4()),
             run_id: Uuid::new_v4(),
             shard_id: 0,
-            input: serde_json::json!({}).into(),
+            input: serde_json::json!({}),
             memo: None,
             search_attrs: None,
             queue_name: "default",
@@ -284,15 +284,9 @@ async fn running_task_is_force_failed() {
         .events
         .len();
 
-    let outcome = force_fail_activity(
-        &mut conn,
-        exec_id.as_uuid(),
-        task_id,
-        Some("INC-42"),
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
-    )
-    .await
-    .expect("force_fail_activity should succeed for a RUNNING activity task");
+    let outcome = force_fail_activity(&mut conn, exec_id.as_uuid(), task_id, Some("INC-42"))
+        .await
+        .expect("force_fail_activity should succeed for a RUNNING activity task");
 
     assert!(outcome.forced, "this call performed the force-fail");
     assert!(!outcome.already_forced);
@@ -352,15 +346,9 @@ async fn workflow_task_is_woken() {
     let task_id = insert_running_activity_task(&mut conn, exec_id, activity_id, 1, 5).await;
     let wf_task_id = insert_parked_workflow_task(&mut conn, exec_id).await;
 
-    force_fail_activity(
-        &mut conn,
-        exec_id.as_uuid(),
-        task_id,
-        None,
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
-    )
-    .await
-    .expect("force fail");
+    force_fail_activity(&mut conn, exec_id.as_uuid(), task_id, None)
+        .await
+        .expect("force fail");
 
     // The parked workflow task was re-pended (PENDING, immediately claimable)
     // so the workflow advances to its own failure path within one poll cycle.
@@ -380,15 +368,9 @@ async fn remaining_retries_are_skipped() {
     // attempt 1 of 5: four retry attempts remain — all must be skipped.
     let task_id = insert_running_activity_task(&mut conn, exec_id, activity_id, 1, 5).await;
 
-    force_fail_activity(
-        &mut conn,
-        exec_id.as_uuid(),
-        task_id,
-        None,
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
-    )
-    .await
-    .expect("force fail");
+    force_fail_activity(&mut conn, exec_id.as_uuid(), task_id, None)
+        .await
+        .expect("force fail");
 
     let row = load_task_row(&mut conn, task_id).await;
     assert_eq!(row.state, "FAILED", "no PENDING requeue may exist");
@@ -419,26 +401,14 @@ async fn second_call_is_idempotent_no_op() {
     seed_scheduled_activity_history(&mut conn, exec_id, activity_id).await;
     let task_id = insert_running_activity_task(&mut conn, exec_id, activity_id, 1, 5).await;
 
-    let first = force_fail_activity(
-        &mut conn,
-        exec_id.as_uuid(),
-        task_id,
-        Some("first"),
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
-    )
-    .await
-    .expect("first call succeeds");
+    let first = force_fail_activity(&mut conn, exec_id.as_uuid(), task_id, Some("first"))
+        .await
+        .expect("first call succeeds");
     assert!(first.forced);
 
-    let second = force_fail_activity(
-        &mut conn,
-        exec_id.as_uuid(),
-        task_id,
-        Some("second"),
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
-    )
-    .await
-    .expect("second call is an idempotent no-op success");
+    let second = force_fail_activity(&mut conn, exec_id.as_uuid(), task_id, Some("second"))
+        .await
+        .expect("second call is an idempotent no-op success");
     assert!(!second.forced);
     assert!(second.already_forced);
 
@@ -478,15 +448,9 @@ async fn retry_after_forced_run_sealed_is_idempotent_no_op() {
     seed_scheduled_activity_history(&mut conn, exec_id, activity_id).await;
     let task_id = insert_running_activity_task(&mut conn, exec_id, activity_id, 1, 5).await;
 
-    let first = force_fail_activity(
-        &mut conn,
-        exec_id.as_uuid(),
-        task_id,
-        Some("first"),
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
-    )
-    .await
-    .expect("first call succeeds");
+    let first = force_fail_activity(&mut conn, exec_id.as_uuid(), task_id, Some("first"))
+        .await
+        .expect("first call succeeds");
     assert!(first.forced);
 
     // The woken workflow consumes the forced ActivityFailed and seals its own
@@ -509,15 +473,9 @@ async fn retry_after_forced_run_sealed_is_idempotent_no_op() {
     // documented idempotent no-op success — NOT flip to the terminal 409
     // (PR #974 Codex review): the already-forced short-circuit wins over the
     // terminal-execution guard.
-    let second = force_fail_activity(
-        &mut conn,
-        exec_id.as_uuid(),
-        task_id,
-        Some("second"),
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
-    )
-    .await
-    .expect("retry after the run sealed is an idempotent no-op success");
+    let second = force_fail_activity(&mut conn, exec_id.as_uuid(), task_id, Some("second"))
+        .await
+        .expect("retry after the run sealed is an idempotent no-op success");
     assert!(!second.forced);
     assert!(second.already_forced);
 
@@ -574,14 +532,7 @@ async fn pending_task_returns_conflict() {
     .await
     .expect("insert pending task");
 
-    let result = force_fail_activity(
-        &mut conn,
-        exec_id.as_uuid(),
-        task_id,
-        None,
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
-    )
-    .await;
+    let result = force_fail_activity(&mut conn, exec_id.as_uuid(), task_id, None).await;
     assert!(
         matches!(result, Err(HarvestError::Config(_))),
         "PENDING (backing-off) task must conflict, got: {result:?}"
@@ -599,14 +550,7 @@ async fn completed_task_returns_conflict() {
         .await
         .expect("complete");
 
-    let result = force_fail_activity(
-        &mut conn,
-        exec_id.as_uuid(),
-        task_id,
-        None,
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
-    )
-    .await;
+    let result = force_fail_activity(&mut conn, exec_id.as_uuid(), task_id, None).await;
     assert!(
         matches!(result, Err(HarvestError::Config(_))),
         "COMPLETED task must conflict, got: {result:?}"
@@ -624,14 +568,7 @@ async fn genuinely_failed_task_returns_conflict() {
         .await
         .expect("fail with genuine error");
 
-    let result = force_fail_activity(
-        &mut conn,
-        exec_id.as_uuid(),
-        task_id,
-        None,
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
-    )
-    .await;
+    let result = force_fail_activity(&mut conn, exec_id.as_uuid(), task_id, None).await;
     assert!(
         matches!(result, Err(HarvestError::Config(_))),
         "FAILED-with-genuine-error task must conflict (NOT idempotent success), got: {result:?}"
@@ -661,14 +598,7 @@ async fn terminal_execution_returns_conflict() {
         .events
         .len();
 
-    let result = force_fail_activity(
-        &mut conn,
-        exec_id.as_uuid(),
-        task_id,
-        None,
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
-    )
-    .await;
+    let result = force_fail_activity(&mut conn, exec_id.as_uuid(), task_id, None).await;
     assert!(
         matches!(result, Err(HarvestError::Config(_))),
         "terminal execution must conflict (409) — a sealed run's history must \
@@ -697,14 +627,7 @@ async fn terminal_history_with_running_row_returns_conflict() {
     append_activity_completed(&mut conn, exec_id, activity_id).await;
     let task_id = insert_running_activity_task(&mut conn, exec_id, activity_id, 1, 5).await;
 
-    let result = force_fail_activity(
-        &mut conn,
-        exec_id.as_uuid(),
-        task_id,
-        None,
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
-    )
-    .await;
+    let result = force_fail_activity(&mut conn, exec_id.as_uuid(), task_id, None).await;
     assert!(
         matches!(result, Err(HarvestError::Config(_))),
         "terminal-in-history must conflict (409) — a second terminal event \
@@ -750,14 +673,7 @@ async fn legacy_task_terminal_history_returns_conflict_not_404() {
     // id-resolved branch).
     let task_id = insert_legacy_running_activity_task(&mut conn, exec_id).await;
 
-    let result = force_fail_activity(
-        &mut conn,
-        exec_id.as_uuid(),
-        task_id,
-        None,
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
-    )
-    .await;
+    let result = force_fail_activity(&mut conn, exec_id.as_uuid(), task_id, None).await;
     assert!(
         matches!(result, Err(HarvestError::Config(_))),
         "legacy terminal-in-history must be a 409 Config, not a 404 NotFound, got: {result:?}"
@@ -772,14 +688,7 @@ async fn workflow_task_type_returns_conflict() {
     let exec_id = insert_workflow_execution(&mut conn).await;
     let wf_task_id = insert_parked_workflow_task(&mut conn, exec_id).await;
 
-    let result = force_fail_activity(
-        &mut conn,
-        exec_id.as_uuid(),
-        wf_task_id,
-        None,
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
-    )
-    .await;
+    let result = force_fail_activity(&mut conn, exec_id.as_uuid(), wf_task_id, None).await;
     assert!(
         matches!(result, Err(HarvestError::Config(_))),
         "a workflow task is not force-failable → 409 Config, got: {result:?}"
@@ -793,14 +702,7 @@ async fn unknown_task_returns_not_found() {
     let (mut conn, _container) = setup_db().await;
     let exec_id = insert_workflow_execution(&mut conn).await;
 
-    let result = force_fail_activity(
-        &mut conn,
-        exec_id.as_uuid(),
-        Uuid::new_v4(),
-        None,
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
-    )
-    .await;
+    let result = force_fail_activity(&mut conn, exec_id.as_uuid(), Uuid::new_v4(), None).await;
     assert!(
         matches!(result, Err(HarvestError::NotFound(_))),
         "unknown task id must be NotFound, got: {result:?}"
@@ -816,14 +718,7 @@ async fn task_for_different_workflow_returns_not_found() {
     seed_scheduled_activity_history(&mut conn, exec_a, activity_id).await;
     let task_id = insert_running_activity_task(&mut conn, exec_a, activity_id, 1, 5).await;
 
-    let result = force_fail_activity(
-        &mut conn,
-        exec_b.as_uuid(),
-        task_id,
-        None,
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
-    )
-    .await;
+    let result = force_fail_activity(&mut conn, exec_b.as_uuid(), task_id, None).await;
     assert!(
         matches!(result, Err(HarvestError::NotFound(_))),
         "task belonging to a different workflow must be NotFound, got: {result:?}"
@@ -840,15 +735,9 @@ async fn late_completion_after_force_fail_is_ignored() {
     seed_scheduled_activity_history(&mut conn, exec_id, activity_id).await;
     let task_id = insert_running_activity_task(&mut conn, exec_id, activity_id, 1, 5).await;
 
-    force_fail_activity(
-        &mut conn,
-        exec_id.as_uuid(),
-        task_id,
-        None,
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
-    )
-    .await
-    .expect("force fail");
+    force_fail_activity(&mut conn, exec_id.as_uuid(), task_id, None)
+        .await
+        .expect("force fail");
 
     // The still-running worker attempt finally returns Ok — the queue-layer
     // transition rejects it because the row is no longer RUNNING.
@@ -885,15 +774,9 @@ async fn late_retryable_error_cannot_resurrect_failed_row() {
     seed_scheduled_activity_history(&mut conn, exec_id, activity_id).await;
     let task_id = insert_running_activity_task(&mut conn, exec_id, activity_id, 1, 5).await;
 
-    force_fail_activity(
-        &mut conn,
-        exec_id.as_uuid(),
-        task_id,
-        None,
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
-    )
-    .await
-    .expect("force fail");
+    force_fail_activity(&mut conn, exec_id.as_uuid(), task_id, None)
+        .await
+        .expect("force fail");
 
     // The still-running worker attempt returns a retryable Err and the worker
     // tries to requeue it for retry. `requeue_for_retry`'s UPDATE filters
@@ -942,15 +825,9 @@ async fn force_fail_on_paused_execution_succeeds() {
 
     // In-flight enforcement is pause-blind (mirrors Heartbeat/StartToClose):
     // the force-fail succeeds while paused.
-    let outcome = force_fail_activity(
-        &mut conn,
-        exec_id.as_uuid(),
-        task_id,
-        None,
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
-    )
-    .await
-    .expect("force-fail must succeed on a paused execution");
+    let outcome = force_fail_activity(&mut conn, exec_id.as_uuid(), task_id, None)
+        .await
+        .expect("force-fail must succeed on a paused execution");
     assert!(outcome.forced);
 
     let row = load_task_row(&mut conn, task_id).await;

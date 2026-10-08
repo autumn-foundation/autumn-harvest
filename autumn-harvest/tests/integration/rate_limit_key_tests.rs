@@ -65,7 +65,7 @@ async fn setup_db_url() -> (String, ContainerAsync<Postgres>) {
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@{host}:{port}/postgres");
     let mut conn = connect(&url).await;
-    conn.batch_execute(&autumn_harvest::test_init_sql())
+    conn.batch_execute(autumn_harvest::full_migrations_sql())
         .await
         .expect("migrations");
     (url, container)
@@ -435,7 +435,7 @@ fn resolution_start_params(
         workflow_name: "tenant_wf",
         workflow_id,
         exec_id,
-        input: input.into(),
+        input,
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,

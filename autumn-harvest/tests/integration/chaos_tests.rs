@@ -20,28 +20,17 @@
 //! seed and the fired-action trace, so a failure is replayable with one command
 //! (`CHAOS_SEEDS=<seed> cargo test --features chaos ...`).
 
-// Unix only: the SIGKILL test reads the signal of the child process. CI runs
-// the module on the Linux chaos runner.
-#[cfg(unix)]
-mod infra_faults;
-
-mod drain_hold;
-
 use std::sync::Arc;
 use std::time::Duration;
 
 use autumn_harvest::chaos::points::{
     ChaosPoint, OUTBOX_INLINE_AFTER_REQUESTED, QUEUE_PARK_BEFORE_UPDATE, SCHED_AFTER_CLAIM,
-    SCHED_AFTER_START_BEFORE_ADVANCE, WORKER_AFTER_OUTER_COMMIT, WORKER_PERSIST_BEFORE_COMMIT,
+    SCHED_AFTER_START_BEFORE_ADVANCE, WORKER_PERSIST_BEFORE_COMMIT,
 };
 use autumn_harvest::chaos::{ChaosPlan, arm};
-use autumn_harvest::context::empty_shared_state;
 use autumn_harvest::prelude::*;
 use autumn_harvest::telemetry::NoOpMetrics;
-use autumn_harvest::worker::{
-    DbPool, HandlerRegistry, chaos_drive_one_workflow_task,
-    chaos_drive_one_workflow_task_cancel_at_hold,
-};
+use autumn_harvest::worker::{DbPool, HandlerRegistry, chaos_drive_one_workflow_task};
 use autumn_harvest::{
     DagCatalog, ExecutionId, SchedulerMonitor, ShardId, StartWorkflowParams, WorkflowIdReusePolicy,
     tick_once,
@@ -55,10 +44,6 @@ use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use testcontainers::ContainerAsync;
 use testcontainers_modules::postgres::Postgres;
-
-use crate::history_checker::{
-    ExactlyOnceFire, FireInput, FireOutput, Recorder, assert_linearizable,
-};
 
 // ── Test workflows (macro-generated companions are field-growth-resilient) ──
 
@@ -162,7 +147,7 @@ async fn chaos_db() -> (
         let port = container.get_host_port_ipv4(5432).await.expect("port");
         let url = format!("postgresql://postgres:postgres@{host}:{port}/postgres");
         let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
-        conn.batch_execute(&autumn_harvest::test_init_sql())
+        conn.batch_execute(autumn_harvest::full_migrations_sql())
             .await
             .expect("migration");
         (body, url, Some(container))
@@ -197,7 +182,7 @@ fn base_params(
         workflow_name,
         workflow_id,
         exec_id,
-        input: input.into(),
+        input,
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -330,32 +315,6 @@ async fn exec_count(conn: &mut AsyncPgConnection, wf_name: &str) -> i64 {
         .get_result(conn)
         .await
         .expect("count executions")
-}
-
-/// The sorted ids of every execution of a workflow type, for a history read.
-async fn run_ids(conn: &mut AsyncPgConnection, wf_name: &str) -> Vec<uuid::Uuid> {
-    use autumn_harvest::schema::harvest_workflow_executions::dsl;
-    let mut ids: Vec<uuid::Uuid> = dsl::harvest_workflow_executions
-        .filter(dsl::workflow_name.eq(wf_name))
-        .select(dsl::id)
-        .load(conn)
-        .await
-        .expect("load execution ids");
-    ids.sort();
-    ids
-}
-
-/// Record a read of the slot `key` into `history`.
-async fn record_read(
-    history: &Recorder<FireInput, FireOutput>,
-    url: &str,
-    key: &str,
-    wf_name: &str,
-    input: FireInput,
-) {
-    let op = history.invoke(1, key, input);
-    let ids = run_ids(&mut connect(url).await, wf_name).await;
-    history.ok(op, FireOutput::Read(ids));
 }
 
 /// Read a schedule's `(fire_claim_token, live)` where `live` is true iff the
@@ -597,16 +556,10 @@ async fn chaos_repro_367_crash_orphan_is_reclaimed() {
     assert_eq!(worker.as_deref(), Some("c367-crash-worker"), "{diag}");
 
     // The dead worker was never registered → no live heartbeat → orphaned.
-    let summary = autumn_harvest::poison_pill::reclaim_orphaned_tasks(
-        &mut conn,
-        3,
-        0,
-        None,
-        &NoOpMetrics,
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
-    )
-    .await
-    .expect("reclaim");
+    let summary =
+        autumn_harvest::poison_pill::reclaim_orphaned_tasks(&mut conn, 3, 0, &NoOpMetrics)
+            .await
+            .expect("reclaim");
     assert_eq!(
         summary.requeued, 1,
         "the orphan must be re-queued once; {diag}"
@@ -621,164 +574,6 @@ async fn chaos_repro_367_crash_orphan_is_reclaimed() {
     assert!(
         worker.is_none(),
         "recovered task must have no worker_id; {diag}"
-    );
-}
-
-// ── Reproducer 2b — issue #1348 terminal metrics lost to post-commit cancel ──
-
-/// A minimal recorder that captures only the two calls
-/// [`emit_pending_workflow_metrics`](autumn_harvest::worker) makes on a
-/// non-canary `Completed` outcome. Every other [`MetricsRecorder`] method
-/// keeps its no-op default.
-#[derive(Default)]
-struct TerminalMetricsRecorder {
-    completed: std::sync::atomic::AtomicUsize,
-    terminal: std::sync::atomic::AtomicUsize,
-}
-
-impl MetricsRecorder for TerminalMetricsRecorder {
-    fn record_workflow_completed(
-        &self,
-        _workflow_name: &str,
-        _queue: &str,
-        _duration_secs: f64,
-        _status: WorkflowStatus,
-    ) {
-        self.completed
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    fn record_workflow_terminal(
-        &self,
-        _workflow_name: &str,
-        _queue: &str,
-        _outcome: WorkflowStatus,
-    ) {
-        self.terminal
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-/// `run_under_workflow_body_budget` (issue #494) races the whole decision
-/// cycle against a wall-clock budget. It DROPS the cycle, uncompleted, on a
-/// timeout -- even when the persist transaction inside it already
-/// committed. HOLD at `WORKER_AFTER_OUTER_COMMIT`: the very first thing the
-/// `Persisted` arm does once that transaction has committed. Then cancel
-/// the cycle right there (`chaos_drive_one_workflow_task_cancel_at_hold`)
-/// instead of releasing it -- modelling that drop deterministically, with
-/// no wall-clock race.
-///
-/// The outcome is durable either way (`COMPLETED` in the DB): the persist
-/// transaction committed before this hold was ever reached. The terminal
-/// metrics must be durable too, on the same footing as the outcome they
-/// describe. They must not be lost to unrelated post-commit housekeeping
-/// (`.await`) that happens to be pending when the budget elapses.
-///
-/// RED procedure: this reproducer fails on the pre-fix shape. There,
-/// `emit_pending_workflow_metrics` ran only after several deferred
-/// post-commit `.await`s: a dispatch-hint flush, the schedule-failure
-/// counter, unfinished-handler checks, the history-bloat read. All of
-/// those sit AFTER `WORKER_AFTER_OUTER_COMMIT`. Cancelling at that hold
-/// therefore always cancelled before the emit call was reached, and the
-/// metric asserts below failed. The fix moves the call to run immediately
-/// at that hold, before any of those `.await`s.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-// `_body` (the shared-DB isolation guard from `chaos_db`) intentionally lives to
-// end-of-scope; see `DB_BODY_SERIAL`.
-#[allow(clippy::significant_drop_tightening)]
-async fn chaos_repro_1348_terminal_metrics_survive_post_commit_cancellation() {
-    let (_body, url, _c) = chaos_db().await;
-    let mut conn = connect(&url).await;
-
-    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
-    let params = base_params("chaos_noop", "c1348-wf", exec_id, serde_json::json!(null));
-    autumn_harvest::execution::start_or_load_workflow_execution(&mut conn, params, None)
-        .await
-        .expect("start chaos_noop");
-
-    let recorder = Arc::new(TerminalMetricsRecorder::default());
-    let telemetry = Arc::new(
-        TelemetryConfig::builder()
-            .metrics(Arc::clone(&recorder) as Arc<dyn MetricsRecorder>)
-            .build(),
-    );
-    let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
-        vec![chaos_noop_info()],
-        vec![],
-        empty_shared_state(),
-        telemetry,
-    ));
-
-    let task = autumn_harvest::queue::claim_task(
-        &mut conn,
-        &["default".to_string()],
-        "c1348-worker",
-        "",
-        None,
-        &[],
-        &[],
-    )
-    .await
-    .expect("claim")
-    .expect("workflow task claimable");
-
-    let guard = arm(ChaosPlan::scripted().hold_at(WORKER_AFTER_OUTER_COMMIT)).await;
-    let hold = guard.hold(WORKER_AFTER_OUTER_COMMIT);
-
-    let cancelled = chaos_drive_one_workflow_task_cancel_at_hold(
-        &url,
-        Arc::clone(&registry),
-        task,
-        "c1348-worker".to_string(),
-        hold,
-    )
-    .await;
-    let diag = guard.diagnostics();
-    assert!(
-        cancelled,
-        "the cycle must have been cancelled AT the post-commit hold, not finished on its \
-         own first (non-vacuity); {diag}"
-    );
-    assert!(
-        guard.actions_fired() >= 1,
-        "the HOLD must have fired; {diag}"
-    );
-    assert_eq!(
-        guard.hits(WORKER_AFTER_OUTER_COMMIT),
-        1,
-        "the post-commit hold point must have been hit exactly once; {diag}"
-    );
-    drop(guard);
-
-    let state = exec_state(&mut conn, exec_id).await;
-    assert_eq!(
-        state, "COMPLETED",
-        "the persist transaction had already committed before the hold -- the outcome must \
-         be durable regardless of the cancellation; {diag}"
-    );
-
-    // Fully qualified: a bare `.load(...)` here resolves to
-    // `diesel_async::RunQueryDsl::load` (imported in this file), whose
-    // `self` parameter is by value. Method lookup matches that by-value
-    // step before it ever reaches `AtomicUsize::load`, an inherent method
-    // that takes `&self`.
-    assert_eq!(
-        std::sync::atomic::AtomicUsize::load(
-            &recorder.completed,
-            std::sync::atomic::Ordering::SeqCst
-        ),
-        1,
-        "harvest.workflow.duration must be recorded once the outcome is durable, even though \
-         the cycle was cancelled immediately after commit; {diag}"
-    );
-    assert_eq!(
-        std::sync::atomic::AtomicUsize::load(
-            &recorder.terminal,
-            std::sync::atomic::Ordering::SeqCst
-        ),
-        1,
-        "harvest.workflow.terminal must be recorded once the outcome is durable, even though \
-         the cycle was cancelled immediately after commit; {diag}"
     );
 }
 
@@ -890,7 +685,6 @@ async fn chaos_repro_492_outbox_cannot_double_deliver_inline_external_signal() {
         Duration::from_secs(300),
         &None,
         &[],
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await
     .expect("outbox sweep");
@@ -968,8 +762,6 @@ async fn chaos_repro_492_outbox_cannot_double_deliver_inline_external_signal() {
 // `_body` (the shared-DB isolation guard from `chaos_db`) intentionally lives to
 // end-of-scope; see `DB_BODY_SERIAL`.
 #[allow(clippy::significant_drop_tightening)]
-// Issue #1829: the history check pushed this test one line over the limit.
-#[allow(clippy::too_many_lines)]
 async fn chaos_repro_350_crashed_fire_claim_is_refired_exactly_once() {
     let (_body, url, _c) = chaos_db().await;
     let wf = "chaos_sched_350";
@@ -978,14 +770,10 @@ async fn chaos_repro_350_crashed_fire_claim_is_refired_exactly_once() {
         insert_due_schedule(&mut conn, wf).await
     };
     let registry = Arc::new(HandlerRegistry::new(vec![chaos_noop_info()], vec![]));
-    // Issue #1829: the history of ticks and reads must be exactly-once.
-    let history = Recorder::<FireInput, FireOutput>::new();
-    let key = sched_id.to_string();
 
     // Crash mid-fire: KILL after the claim commits, before the fire. The tick is
     // spawned so the panic surfaces as a JoinError instead of aborting the test.
     let guard = arm(ChaosPlan::scripted().kill_at(SCHED_AFTER_CLAIM)).await;
-    let crashed_fire = history.invoke(0, &*key, FireInput::Fire);
     let crash = tokio::spawn(tick_once(
         make_pool(&url),
         Arc::clone(&registry),
@@ -1006,10 +794,6 @@ async fn chaos_repro_350_crashed_fire_claim_is_refired_exactly_once() {
     );
     let diag = guard.diagnostics();
     drop(guard);
-    history.info(crashed_fire);
-    // The killed tick has joined, so it can no longer take effect.
-    history.bound_open_infos();
-    record_read(&history, &url, &key, wf, FireInput::Read).await;
 
     // The crash left the claim held (committed in autocommit) with no fire.
     {
@@ -1031,7 +815,6 @@ async fn chaos_repro_350_crashed_fire_claim_is_refired_exactly_once() {
     }
 
     // A healthy peer tick while the claim is live must NOT double-fire.
-    let peer = history.invoke(1, &*key, FireInput::Fire);
     tick_once(
         make_pool(&url),
         Arc::clone(&registry),
@@ -1041,8 +824,6 @@ async fn chaos_repro_350_crashed_fire_claim_is_refired_exactly_once() {
     )
     .await
     .expect("peer tick (live claim)");
-    history.ok(peer, FireOutput::Ticked);
-    record_read(&history, &url, &key, wf, FireInput::Read).await;
     {
         let mut conn = connect(&url).await;
         assert_eq!(
@@ -1064,7 +845,6 @@ async fn chaos_repro_350_crashed_fire_claim_is_refired_exactly_once() {
         .await
         .expect("expire claim");
     }
-    let peer = history.invoke(1, &*key, FireInput::Fire);
     tick_once(
         make_pool(&url),
         registry,
@@ -1074,9 +854,6 @@ async fn chaos_repro_350_crashed_fire_claim_is_refired_exactly_once() {
     )
     .await
     .expect("peer tick (expired claim)");
-    history.ok(peer, FireOutput::Ticked);
-    record_read(&history, &url, &key, wf, FireInput::FinalRead).await;
-    assert_linearizable(&ExactlyOnceFire, &history.snapshot(), &diag);
 
     let mut conn = connect(&url).await;
     assert_eq!(
@@ -1120,15 +897,11 @@ async fn chaos_repro_350_post_start_crash_dedupes_to_exactly_one() {
         insert_due_schedule(&mut conn, wf).await
     };
     let registry = Arc::new(HandlerRegistry::new(vec![chaos_noop_info()], vec![]));
-    // Issue #1829: the history of ticks and reads must be exactly-once.
-    let history = Recorder::<FireInput, FireOutput>::new();
-    let key = sched_id.to_string();
 
     // Crash AFTER the start commits, BEFORE next_run_at advances. Only reachable
     // because a start committed this tick (the `dispatched > 0` gate); the tick is
     // spawned so the panic surfaces as a JoinError instead of aborting the test.
     let guard = arm(ChaosPlan::scripted().kill_at(SCHED_AFTER_START_BEFORE_ADVANCE)).await;
-    let crashed_fire = history.invoke(0, &*key, FireInput::Fire);
     let crash = tokio::spawn(tick_once(
         make_pool(&url),
         Arc::clone(&registry),
@@ -1149,10 +922,6 @@ async fn chaos_repro_350_post_start_crash_dedupes_to_exactly_one() {
     );
     let diag = guard.diagnostics();
     drop(guard);
-    history.info(crashed_fire);
-    // The killed tick has joined, so it can no longer take effect.
-    history.bound_open_infos();
-    record_read(&history, &url, &key, wf, FireInput::Read).await;
 
     // The crash committed exactly one start (the point fires AFTER the start), but
     // did NOT advance the schedule — so the claim is still held and the slot is
@@ -1172,7 +941,6 @@ async fn chaos_repro_350_post_start_crash_dedupes_to_exactly_one() {
     }
 
     // A healthy peer tick while the claim is live must NOT fire again.
-    let peer = history.invoke(1, &*key, FireInput::Fire);
     tick_once(
         make_pool(&url),
         Arc::clone(&registry),
@@ -1182,8 +950,6 @@ async fn chaos_repro_350_post_start_crash_dedupes_to_exactly_one() {
     )
     .await
     .expect("peer tick (live claim)");
-    history.ok(peer, FireOutput::Ticked);
-    record_read(&history, &url, &key, wf, FireInput::Read).await;
     {
         let mut conn = connect(&url).await;
         assert_eq!(
@@ -1206,7 +972,6 @@ async fn chaos_repro_350_post_start_crash_dedupes_to_exactly_one() {
         .await
         .expect("expire claim");
     }
-    let peer = history.invoke(1, &*key, FireInput::Fire);
     tick_once(
         make_pool(&url),
         registry,
@@ -1216,9 +981,6 @@ async fn chaos_repro_350_post_start_crash_dedupes_to_exactly_one() {
     )
     .await
     .expect("peer tick (expired claim)");
-    history.ok(peer, FireOutput::Ticked);
-    record_read(&history, &url, &key, wf, FireInput::FinalRead).await;
-    assert_linearizable(&ExactlyOnceFire, &history.snapshot(), &diag);
 
     let mut conn = connect(&url).await;
     assert_eq!(
@@ -1304,7 +1066,6 @@ async fn chaos_ac1d_session_lease_expiry_marks_broken() {
         None,
         &std::collections::HashMap::new(),
         1,
-        &[],
     )
     .await
     .expect("register live host worker");
@@ -1331,13 +1092,9 @@ async fn chaos_ac1d_session_lease_expiry_marks_broken() {
     // Run the broken-session scanner with a generous worker-staleness window
     // (120 s) so the fresh host heartbeat is NOT stale — the only broken reason
     // that can apply is the expired lease.
-    let member_tasks_failed = autumn_harvest::sessions::enforce_broken_sessions(
-        &mut conn,
-        120,
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
-    )
-    .await
-    .expect("enforce_broken_sessions");
+    let member_tasks_failed = autumn_harvest::sessions::enforce_broken_sessions(&mut conn, 120)
+        .await
+        .expect("enforce_broken_sessions");
     // `enforce_broken_sessions` returns the count of member *tasks* failed, not
     // the count of sessions reclaimed. This session is intentionally memberless
     // (it seeds no `harvest_task_queue` rows) to isolate the pure lease-expiry
@@ -1495,9 +1252,6 @@ fn default_sweep_seeds_are_at_least_five_and_strand_an_orphan() {
 // `_body` (the shared-DB isolation guard from `chaos_db`) intentionally lives to
 // end-of-scope; see `DB_BODY_SERIAL`.
 #[allow(clippy::significant_drop_tightening)]
-// Issue #1459: one line added to a `reclaim_orphaned_tasks` call site pushed
-// this test one line over the limit.
-#[allow(clippy::too_many_lines)]
 async fn chaos_seeded_convergence_sweep() {
     const WORKLOAD: usize = 6;
 
@@ -1598,16 +1352,9 @@ async fn chaos_seeded_convergence_sweep() {
         // remaining claimable tasks until quiescent.
         for _round in 0..(WORKLOAD + 4) {
             let mut conn = connect(&url).await;
-            autumn_harvest::poison_pill::reclaim_orphaned_tasks(
-                &mut conn,
-                3,
-                0,
-                None,
-                &NoOpMetrics,
-                &autumn_harvest::payload_codec::PayloadCodecs::default(),
-            )
-            .await
-            .expect("reclaim in sweep");
+            autumn_harvest::poison_pill::reclaim_orphaned_tasks(&mut conn, 3, 0, &NoOpMetrics)
+                .await
+                .expect("reclaim in sweep");
             let claimed = autumn_harvest::queue::claim_task(
                 &mut conn,
                 &["default".to_string()],
@@ -1630,118 +1377,32 @@ async fn chaos_seeded_convergence_sweep() {
         }
 
         // Convergence invariant.
-        assert_converged(&url, &format!("seed {seed}"), &execs, &diag).await;
+        assert_converged(&url, seed, &execs, &diag).await;
     }
 }
 
-/// Assert the post-recovery convergence invariant for one case, such as a
-/// sweep seed. Every workflow is `COMPLETED` and has exactly one terminal
-/// event. No task is stranded `RUNNING` with a dead worker. No
-/// `ExternalSignalRequested` lacks an eventual terminal.
-async fn assert_converged(url: &str, case: &str, execs: &[ExecutionId], diag: &str) {
+/// Assert the post-recovery convergence invariant for one sweep seed: every
+/// workflow terminal (`COMPLETED`), no task stranded `RUNNING` with a dead
+/// worker, and no `ExternalSignalRequested` without an eventual terminal.
+async fn assert_converged(url: &str, seed: u64, execs: &[ExecutionId], diag: &str) {
     let mut conn = connect(url).await;
     for exec_id in execs {
         let state = exec_state(&mut conn, *exec_id).await;
         assert_eq!(
             state, "COMPLETED",
-            "{case}: workflow {exec_id:?} must converge to terminal; got {state}; {diag}"
-        );
-        let terminals = terminal_event_count(&mut conn, *exec_id).await;
-        assert_eq!(
-            terminals, 1,
-            "{case}: workflow {exec_id:?} must have exactly one terminal event; {diag}"
+            "seed {seed}: workflow {exec_id:?} must converge to terminal; got {state}; {diag}"
         );
     }
     let stranded = stranded_running_with_dead_worker(&mut conn).await;
     assert_eq!(
         stranded, 0,
-        "{case}: no task may be stranded RUNNING with a dead worker; {diag}"
+        "seed {seed}: no task may be stranded RUNNING with a dead worker; {diag}"
     );
     let dangling = dangling_external_requests(&mut conn).await;
     assert_eq!(
         dangling, 0,
-        "{case}: no ExternalSignalRequested without a terminal; {diag}"
+        "seed {seed}: no ExternalSignalRequested without a terminal; {diag}"
     );
-}
-
-/// Oracle self-test (issue #1801): a forged second terminal event must fail
-/// [`assert_converged`]. The table key is `(workflow_exec_id, event_id)`. A
-/// duplicate at a new event id does not violate that key, so only the oracle
-/// catches it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[allow(clippy::significant_drop_tightening)]
-async fn oracle_flags_a_duplicate_terminal_event() {
-    use futures::FutureExt;
-
-    let (_body, url, _c) = chaos_db().await;
-    let registry = Arc::new(HandlerRegistry::new(vec![chaos_noop_info()], vec![]));
-    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
-    let mut conn = connect(&url).await;
-    let params = base_params("chaos_noop", "oracle-dup", exec_id, serde_json::json!(null));
-    autumn_harvest::execution::start_or_load_workflow_execution(&mut conn, params, None)
-        .await
-        .expect("start");
-    let task = autumn_harvest::queue::claim_task(
-        &mut conn,
-        &["default".to_string()],
-        "oracle-w",
-        "",
-        None,
-        &[],
-        &[],
-    )
-    .await
-    .expect("claim")
-    .expect("a task is due");
-    let _ =
-        chaos_drive_one_workflow_task(&url, Arc::clone(&registry), task, "oracle-w".into()).await;
-
-    // The clean history converges.
-    assert_converged(&url, "oracle", &[exec_id], "clean").await;
-
-    // Forge a second `WorkflowCompleted` at a new event id.
-    conn.batch_execute(&format!(
-        "INSERT INTO harvest_events (workflow_exec_id, event_id, event_type, event_data, timestamp) \
-         SELECT workflow_exec_id, event_id + 1000, event_type, event_data, timestamp \
-         FROM harvest_events WHERE workflow_exec_id = '{}' AND event_type = 'WorkflowCompleted'",
-        exec_id.as_uuid()
-    ))
-    .await
-    .expect("forge duplicate terminal event");
-
-    let panic =
-        std::panic::AssertUnwindSafe(assert_converged(&url, "oracle", &[exec_id], "forged"))
-            .catch_unwind()
-            .await
-            .expect_err("the oracle must flag a duplicate terminal event");
-    // Match the message, so a panic for another reason cannot pass the test.
-    let message = panic.downcast_ref::<String>().cloned().unwrap_or_default();
-    assert!(
-        message.contains("exactly one terminal event"),
-        "the oracle panicked for another reason: {message}"
-    );
-}
-
-/// Count the workflow-level terminal events of one execution (issue #1801).
-/// The table key `(workflow_exec_id, event_id)` does not stop a second
-/// terminal event at a new event id.
-///
-/// The list is `WorkflowEvent::is_terminal_lifecycle` without its two
-/// linkage events. Those events follow a real terminal event, so counting
-/// them flags a false duplicate. Keep the two lists in step.
-async fn terminal_event_count(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> i64 {
-    diesel::sql_query(
-        "SELECT COUNT(*)::bigint AS n FROM harvest_events \
-         WHERE workflow_exec_id = $1 AND event_type IN ( \
-           'WorkflowCompleted', 'WorkflowFailed', 'WorkflowCancelled', \
-           'WorkflowContinuedAsNew', 'WorkflowResetTerminated', \
-           'WorkflowExecutionTimedOut')",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-    .get_result::<CountRow>(conn)
-    .await
-    .expect("count terminal events")
-    .n
 }
 
 /// Count `RUNNING` tasks whose `worker_id` has no live `harvest_workers`

@@ -22,7 +22,7 @@ use std::sync::Mutex;
 use autumn_harvest::dlq::{DeadLetterReason, dead_letter_count};
 use autumn_harvest::telemetry::MetricsRecorder;
 use autumn_harvest::worker::{
-    ClaimRecovery, DbPool, quarantine_workflow_task_timeout, reset_timed_out_workflow_task,
+    DbPool, quarantine_workflow_task_timeout, reset_timed_out_workflow_task,
 };
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
@@ -65,17 +65,9 @@ struct ReasonRow {
 struct RecordingMetrics {
     task_timeouts: Mutex<Vec<(String, String)>>,
     terminal: Mutex<Vec<(String, String, String)>>,
-    canary_failures: Mutex<Vec<(String, u16)>>,
 }
 
 impl MetricsRecorder for RecordingMetrics {
-    fn record_canary_failure(&self, queue: &str, shard: u16) {
-        self.canary_failures
-            .lock()
-            .unwrap()
-            .push((queue.to_owned(), shard));
-    }
-
     fn record_workflow_task_timeout(&self, workflow_name: &str, queue: &str) {
         self.task_timeouts
             .lock()
@@ -127,7 +119,7 @@ async fn setup() -> (AsyncPgConnection, DbPool, Keepalive) {
         let mut conn = AsyncPgConnection::establish(&test_url)
             .await
             .expect("connect to test DB");
-        conn.batch_execute(&autumn_harvest::test_init_sql())
+        conn.batch_execute(autumn_harvest::full_migrations_sql())
             .await
             .expect("migration");
 
@@ -149,7 +141,7 @@ async fn setup() -> (AsyncPgConnection, DbPool, Keepalive) {
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@{host}:{port}/postgres");
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
-    conn.batch_execute(&autumn_harvest::test_init_sql())
+    conn.batch_execute(autumn_harvest::full_migrations_sql())
         .await
         .expect("migration");
 
@@ -164,24 +156,13 @@ async fn setup() -> (AsyncPgConnection, DbPool, Keepalive) {
 
 /// Insert a RUNNING workflow execution and return its UUID.
 async fn insert_running_workflow(conn: &mut AsyncPgConnection) -> Uuid {
-    insert_running_workflow_named(conn, "timeout_wf", 0).await
-}
-
-/// Insert a RUNNING execution of `workflow_name` on `shard_id`.
-async fn insert_running_workflow_named(
-    conn: &mut AsyncPgConnection,
-    workflow_name: &str,
-    shard_id: i32,
-) -> Uuid {
     let id = Uuid::new_v4();
     diesel::sql_query(
         "INSERT INTO harvest_workflow_executions \
          (id, workflow_name, workflow_id, shard_id, state, input, queue_name) \
-         VALUES ($1, $2, 'wf-timeout-1', $3, 'RUNNING', '{}'::jsonb, 'default')",
+         VALUES ($1, 'timeout_wf', 'wf-timeout-1', 0, 'RUNNING', '{}'::jsonb, 'default')",
     )
     .bind::<diesel::sql_types::Uuid, _>(id)
-    .bind::<diesel::sql_types::Text, _>(workflow_name)
-    .bind::<diesel::sql_types::Int4, _>(shard_id)
     .execute(conn)
     .await
     .expect("insert execution");
@@ -263,7 +244,7 @@ async fn reset_reverts_running_task_to_pending() {
 
     assert_eq!(task_state(&mut conn, task_id).await, "RUNNING");
 
-    reset_timed_out_workflow_task(&pool, task_id, "worker-1", 0, 1).await;
+    reset_timed_out_workflow_task(&pool, task_id, "worker-1").await;
 
     assert_eq!(
         task_state(&mut conn, task_id).await,
@@ -285,7 +266,7 @@ async fn reset_is_idempotent_on_wrong_state_or_worker() {
     let task_id = insert_running_workflow_task(&mut conn, exec_id, "worker-1").await;
 
     // Wrong worker_id — should not transition.
-    reset_timed_out_workflow_task(&pool, task_id, "worker-99", 0, 1).await;
+    reset_timed_out_workflow_task(&pool, task_id, "worker-99").await;
     assert_eq!(
         task_state(&mut conn, task_id).await,
         "RUNNING",
@@ -293,116 +274,11 @@ async fn reset_is_idempotent_on_wrong_state_or_worker() {
     );
 
     // Correct worker — transitions.
-    reset_timed_out_workflow_task(&pool, task_id, "worker-1", 0, 1).await;
+    reset_timed_out_workflow_task(&pool, task_id, "worker-1").await;
     assert_eq!(task_state(&mut conn, task_id).await, "PENDING");
 
     // Second call on PENDING task — no crash, still PENDING.
-    reset_timed_out_workflow_task(&pool, task_id, "worker-1", 0, 1).await;
-    assert_eq!(task_state(&mut conn, task_id).await, "PENDING");
-}
-
-/// A stale reset must not clobber a re-claim taken at a newer claim epoch.
-///
-/// `poison_pill::requeue_orphan` hands an orphan back as `PENDING` with
-/// `crash_strikes + 1`, and nothing stops the same worker from winning it
-/// again. A `(state, worker_id)` guard alone matches that new claim. A reset
-/// still in flight from the previous dispatch would then re-`PENDING` a row
-/// whose replacement handler already runs. That invites a second concurrent
-/// claim of one workflow task.
-///
-/// `crash_strikes` is one discriminator, because the requeue that creates
-/// this particular race is what bumps it (issue #1459). It is the same
-/// argument `queue::release_task_for_capability_miss` already records.
-/// `claim_task` also bumps `attempt` on the re-claim itself, so this test
-/// advances both — matching what a real orphan-requeue-then-reclaim does.
-#[tokio::test]
-async fn reset_does_not_clobber_a_reclaim_at_a_newer_claim_epoch() {
-    let (mut conn, pool, _container) = setup().await;
-
-    let exec_id = insert_running_workflow(&mut conn).await;
-    let task_id = insert_running_workflow_task(&mut conn, exec_id, "worker-1").await;
-
-    // The orphan requeue bumped crash_strikes; the re-claim that followed
-    // bumped attempt. The same worker won it back.
-    diesel::sql_query("UPDATE harvest_task_queue SET crash_strikes = 1, attempt = 2 WHERE id = $1")
-        .bind::<diesel::sql_types::Uuid, _>(task_id)
-        .execute(&mut conn)
-        .await
-        .expect("bump the claim epoch");
-
-    // The in-flight reset still carries the epoch it claimed at.
-    reset_timed_out_workflow_task(&pool, task_id, "worker-1", 0, 1).await;
-    assert_eq!(
-        task_state(&mut conn, task_id).await,
-        "RUNNING",
-        "a reset from the previous claim epoch must not release the new claim"
-    );
-
-    // The reset that belongs to the current claim still applies.
-    reset_timed_out_workflow_task(&pool, task_id, "worker-1", 1, 2).await;
-    assert_eq!(task_state(&mut conn, task_id).await, "PENDING");
-}
-
-/// Issue #1815: the reset reports whether it applied under this claim. The
-/// worker leaves a failed attempt out of its outlier window when a peer owns
-/// the task.
-#[tokio::test]
-async fn reset_reports_a_lost_claim() {
-    let (mut conn, pool, _container) = setup().await;
-
-    let exec_id = insert_running_workflow(&mut conn).await;
-    let task_id = insert_running_workflow_task(&mut conn, exec_id, "worker-1").await;
-
-    assert_eq!(
-        reset_timed_out_workflow_task(&pool, task_id, "worker-99", 0, 1).await,
-        ClaimRecovery::ClaimLost,
-        "another worker's claim"
-    );
-    assert_eq!(
-        reset_timed_out_workflow_task(&pool, task_id, "worker-1", 0, 2).await,
-        ClaimRecovery::ClaimLost,
-        "a newer claim epoch"
-    );
-    assert_eq!(
-        reset_timed_out_workflow_task(&pool, task_id, "worker-1", 0, 1).await,
-        ClaimRecovery::Applied
-    );
-    assert_eq!(task_state(&mut conn, task_id).await, "PENDING");
-}
-
-/// The same race, through the OTHER requeue path: `poison_pill::
-/// requeue_stuck_task` (issue #1459's stuck-running backstop) deliberately
-/// never bumps `crash_strikes` — being stuck is not a crash. A stale reset
-/// that only checked `crash_strikes` would then match the fresh re-claim
-/// unchanged crash-strike count and clobber it. `attempt` is what still
-/// discriminates, since `claim_task` bumps it on every claim regardless of
-/// which requeue path freed the row.
-#[tokio::test]
-async fn reset_does_not_clobber_a_stuck_running_reclaim_at_a_newer_attempt() {
-    let (mut conn, pool, _container) = setup().await;
-
-    let exec_id = insert_running_workflow(&mut conn).await;
-    let task_id = insert_running_workflow_task(&mut conn, exec_id, "worker-1").await;
-
-    // The stuck-running backstop requeued this row without touching
-    // crash_strikes; the re-claim that followed bumped attempt only.
-    diesel::sql_query("UPDATE harvest_task_queue SET attempt = 2 WHERE id = $1")
-        .bind::<diesel::sql_types::Uuid, _>(task_id)
-        .execute(&mut conn)
-        .await
-        .expect("bump attempt only, as the stuck-running requeue path does");
-
-    // The in-flight reset from the wedged prior attempt still matches on
-    // crash_strikes (unchanged) — attempt is the only thing that moved.
-    reset_timed_out_workflow_task(&pool, task_id, "worker-1", 0, 1).await;
-    assert_eq!(
-        task_state(&mut conn, task_id).await,
-        "RUNNING",
-        "a crash_strikes-only guard would wrongly match here; attempt must too"
-    );
-
-    // The reset that belongs to the current claim still applies.
-    reset_timed_out_workflow_task(&pool, task_id, "worker-1", 0, 2).await;
+    reset_timed_out_workflow_task(&pool, task_id, "worker-1").await;
     assert_eq!(task_state(&mut conn, task_id).await, "PENDING");
 }
 
@@ -423,13 +299,11 @@ async fn quarantine_writes_dlq_and_fails_execution() {
         task_id,
         Some(exec_id),
         "worker-1",
-        1,
         3,  // new_strikes (= threshold)
         10, // timeout_secs
         "timeout_wf",
         "default",
         &*metrics,
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await;
 
@@ -464,138 +338,6 @@ async fn quarantine_writes_dlq_and_fails_execution() {
     );
 }
 
-/// A quarantined canary probe is a canary failure (issue #1816).
-///
-/// The quarantine path skips the business terminal for a probe. The
-/// workflow-task SLO leaves out probe timeouts. So without a canary failure,
-/// no SLO sees the failed probe.
-#[tokio::test]
-async fn quarantine_of_a_canary_probe_records_a_canary_failure() {
-    let (mut conn, pool, _container) = setup().await;
-
-    let probe = format!(
-        "{}__default",
-        autumn_harvest::canary::CANARY_WORKFLOW_NAME_PREFIX
-    );
-    let exec_id = insert_running_workflow_named(&mut conn, &probe, 2).await;
-    let task_id = insert_running_workflow_task(&mut conn, exec_id, "worker-1").await;
-
-    let metrics = RecordingMetrics::default();
-    let quarantined = quarantine_workflow_task_timeout(
-        &pool,
-        task_id,
-        Some(exec_id),
-        "worker-1",
-        1,
-        3,
-        1,
-        &probe,
-        "default",
-        &metrics,
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
-    )
-    .await;
-
-    assert!(quarantined, "the quarantine must commit");
-    assert_eq!(execution_state(&mut conn, exec_id).await, "FAILED");
-    assert_eq!(
-        *metrics.canary_failures.lock().unwrap(),
-        vec![("default".to_owned(), 2)],
-        "one canary failure on the probe's queue and shard"
-    );
-    assert!(
-        metrics.terminal.lock().unwrap().is_empty(),
-        "a probe never records a business terminal"
-    );
-}
-
-/// The caller's labels can be the `unknown` and `default` fallbacks.
-/// The quarantine reads the execution row, so it must use its name and queue.
-#[tokio::test]
-async fn quarantine_finds_a_canary_probe_behind_an_unknown_label() {
-    let (mut conn, pool, _container) = setup().await;
-
-    let probe = format!(
-        "{}__default",
-        autumn_harvest::canary::CANARY_WORKFLOW_NAME_PREFIX
-    );
-    let exec_id = insert_running_workflow_named(&mut conn, &probe, 1).await;
-    diesel::sql_query("UPDATE harvest_workflow_executions SET queue_name = 'email' WHERE id = $1")
-        .bind::<diesel::sql_types::Uuid, _>(exec_id)
-        .execute(&mut conn)
-        .await
-        .expect("put the probe on the email queue");
-    let task_id = insert_running_workflow_task(&mut conn, exec_id, "worker-1").await;
-
-    let metrics = RecordingMetrics::default();
-    let quarantined = quarantine_workflow_task_timeout(
-        &pool,
-        task_id,
-        Some(exec_id),
-        "worker-1",
-        1,
-        3,
-        1,
-        "unknown",
-        "default",
-        &metrics,
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
-    )
-    .await;
-
-    assert!(quarantined, "the quarantine must commit");
-    assert_eq!(
-        *metrics.canary_failures.lock().unwrap(),
-        vec![("email".to_owned(), 1)],
-        "the execution row names the probe and its queue"
-    );
-    assert!(
-        metrics.terminal.lock().unwrap().is_empty(),
-        "a probe never records a business terminal"
-    );
-}
-
-/// A late quarantine does not touch a peer's claim (issue #1788).
-///
-/// The quarantine retries its acquire. In that time the stuck-running backstop
-/// can requeue the task, and a peer can claim it. The quarantine then must not
-/// fail the task, write a DLQ entry, or fail the execution that the peer runs.
-#[tokio::test]
-async fn quarantine_skips_a_task_that_a_peer_reclaimed() {
-    let (mut conn, pool, _container) = setup().await;
-
-    let exec_id = insert_running_workflow(&mut conn).await;
-    let task_id = insert_running_workflow_task(&mut conn, exec_id, "worker-1").await;
-    diesel::sql_query(
-        "UPDATE harvest_task_queue SET worker_id = 'worker-2', attempt = 2 WHERE id = $1",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(task_id)
-    .execute(&mut conn)
-    .await
-    .expect("model the peer's claim");
-
-    let metrics = RecordingMetrics::default();
-    let quarantined = quarantine_workflow_task_timeout(
-        &pool,
-        task_id,
-        Some(exec_id),
-        "worker-1",
-        1,
-        3,
-        10,
-        "timeout_wf",
-        "default",
-        &metrics,
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
-    )
-    .await;
-
-    assert!(!quarantined, "a lost claim is not a committed quarantine");
-    assert_eq!(task_state(&mut conn, task_id).await, "RUNNING");
-    assert_eq!(execution_state(&mut conn, exec_id).await, "RUNNING");
-    assert_eq!(dead_letter_count(&mut conn).await.expect("dlq count"), 0);
-}
-
 /// The DLQ entry carries a `WorkflowTaskTimeout` typed reason so operators
 /// can distinguish this from poison-pill quarantines.
 #[tokio::test]
@@ -611,13 +353,11 @@ async fn quarantine_writes_typed_dlq_reason() {
         task_id,
         Some(exec_id),
         "worker-1",
-        1,
         3,
         10,
         "timeout_wf",
         "default",
         &metrics,
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await;
 
@@ -662,17 +402,8 @@ async fn quarantine_with_no_exec_id_only_fails_task() {
 
     let metrics = RecordingMetrics::default();
     quarantine_workflow_task_timeout(
-        &pool,
-        task_id,
-        None, // no exec_id
-        "worker-1",
-        1,
-        3,
-        10,
-        "unknown",
-        "default",
-        &metrics,
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        &pool, task_id, None, // no exec_id
+        "worker-1", 3, 10, "unknown", "default", &metrics,
     )
     .await;
 
@@ -732,13 +463,11 @@ async fn quarantine_does_not_overwrite_an_execution_that_already_completed() {
         task_id,
         Some(exec_id),
         "worker-1",
-        1,
         3,
         10,
         "timeout_wf",
         "default",
         &*metrics,
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await;
 

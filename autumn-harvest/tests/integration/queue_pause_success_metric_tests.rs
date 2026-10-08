@@ -191,7 +191,7 @@ async fn setup_db_url() -> (String, Option<ContainerAsync<Postgres>>) {
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@{host}:{port}/postgres");
     let mut conn = connect(&url).await;
-    conn.batch_execute(&autumn_harvest::test_init_sql())
+    conn.batch_execute(autumn_harvest::full_migrations_sql())
         .await
         .expect("migrations");
     (url, Some(container))
@@ -257,7 +257,7 @@ async fn start_one(url: &str, n: usize) -> ExecutionId {
             workflow_name: "held_workflow",
             workflow_id: &workflow_id,
             exec_id,
-            input: json!({ "n": n }).into(),
+            input: json!({ "n": n }),
             parent_id: None,
             queue_name: TEST_QUEUE,
             execution_timeout: None,

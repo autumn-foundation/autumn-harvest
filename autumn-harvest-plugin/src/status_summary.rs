@@ -20,13 +20,7 @@
 use std::collections::BTreeMap;
 
 use autumn_harvest::worker::DbPool;
-use autumn_harvest::worker_outlier::{
-    OutlierConfig, WorkerOutlier, WorkerTaskStats, detect_outliers_in_cohorts,
-};
-use autumn_harvest::workers::{
-    LiveWorkerTaskStats, WorkerFilters, WorkerHealth, WorkerRow, WorkerStatus, list_workers,
-    load_live_worker_task_stats_per_cohort,
-};
+use autumn_harvest::workers::{WorkerFilters, WorkerHealth, WorkerRow, WorkerStatus, list_workers};
 use chrono::{DateTime, Utc};
 use diesel::sql_types::{BigInt, Nullable};
 use diesel_async::AsyncPgConnection;
@@ -45,11 +39,6 @@ use crate::shard_health::{
 
 const REASON_WORKER_NO_ACTIVE: &str = "worker_no_active";
 const REASON_WORKER_UNHEALTHY_FRACTION: &str = "worker_unhealthy_fraction";
-/// A live worker fails or slows far more than its peers (issue #1815).
-const REASON_WORKER_OUTLIER: &str = "worker_outlier";
-/// The most outliers the workers block lists (issue #1815). The block also
-/// reports `outliers_total`, so a cut list still shows the full count.
-const MAX_LISTED_OUTLIERS: usize = 20;
 const REASON_DLQ_BACKLOG: &str = "dlq_backlog";
 const REASON_DLQ_RECENT_ENTRY: &str = "dlq_recent_entry";
 const REASON_QUEUE_BACKLOG: &str = "queue_backlog";
@@ -409,11 +398,6 @@ pub struct StatusBundleMerge {
     pub queue_max_backlog_queue: Option<String>,
     /// Stalled-execution count summed across shards (bounded per shard).
     pub stalled_count: i64,
-    /// Live workers that are outliers against their peers (issue #1815),
-    /// the worst first. Holds at most [`MAX_LISTED_OUTLIERS`] entries.
-    pub worker_outliers: Vec<WorkerOutlier>,
-    /// All outliers found, including any cut from `worker_outliers`.
-    pub worker_outliers_total: usize,
     /// `true` when at least one expected shard could not be inspected in the
     /// bundle pass — the non-shard subsystems cannot assert `healthy` on
     /// incomplete data.
@@ -430,8 +414,6 @@ struct ShardBundle {
     dlq_newest_age_secs: Option<i64>,
     by_queue: BTreeMap<String, i64>,
     stalled_count: i64,
-    /// Task stats of the live workers in this shard (issue #1815).
-    task_stats: Vec<LiveWorkerTaskStats>,
 }
 
 /// Merge per-shard bundle observations into the cross-shard numbers (pure).
@@ -449,21 +431,10 @@ fn merge_bundle(observations: Vec<ShardObservation<ShardBundle>>) -> StatusBundl
     let mut dlq_newest: Option<i64> = None;
     let mut by_queue: BTreeMap<String, i64> = BTreeMap::new();
     let mut stalled_count = 0i64;
-    // One entry per worker. A multi-shard worker writes a snapshot to each
-    // shard, so the newest one wins.
-    let mut task_stats: BTreeMap<String, LiveWorkerTaskStats> = BTreeMap::new();
 
     for observation in observations {
         for bundle in observation.rows {
             all_workers.extend(bundle.workers);
-            for row in bundle.task_stats {
-                match task_stats.get(&row.worker_id) {
-                    Some(kept) if !row.is_fresher_than(kept) => {}
-                    _ => {
-                        task_stats.insert(row.worker_id.clone(), row);
-                    }
-                }
-            }
             dlq_total += bundle.dlq_total;
             if let Some(age) = bundle.dlq_newest_age_secs {
                 dlq_newest = Some(dlq_newest.map_or(age, |cur| cur.min(age)));
@@ -514,22 +485,6 @@ fn merge_bundle(observations: Vec<ShardObservation<ShardBundle>>) -> StatusBundl
         }
     }
 
-    let fleet: Vec<(String, String, WorkerTaskStats)> = task_stats
-        .into_values()
-        .map(|row| (row.worker_id, row.cohort, row.stats))
-        .collect();
-    let mut worker_outliers = detect_outliers_in_cohorts(&fleet, &OutlierConfig::default());
-    let worker_outliers_total = worker_outliers.len();
-    // The worst first: the highest failure ratio, then the slowest p99.
-    worker_outliers.sort_by(|a, b| {
-        let ratio = |o: &WorkerOutlier| o.stats.failure_ratio().unwrap_or(0.0);
-        ratio(b)
-            .total_cmp(&ratio(a))
-            .then(b.stats.p99_latency_ms.cmp(&a.stats.p99_latency_ms))
-            .then(a.worker_id.cmp(&b.worker_id))
-    });
-    worker_outliers.truncate(MAX_LISTED_OUTLIERS);
-
     StatusBundleMerge {
         workers_active,
         workers_draining,
@@ -541,8 +496,6 @@ fn merge_bundle(observations: Vec<ShardObservation<ShardBundle>>) -> StatusBundl
         queue_max_backlog,
         queue_max_backlog_queue,
         stalled_count,
-        worker_outliers,
-        worker_outliers_total,
         incomplete,
         unavailable_shards,
     }
@@ -621,7 +574,7 @@ pub fn build_status_response(
     thresholds: &StatusThresholds,
 ) -> HealthSummaryReport {
     // workers
-    let (mut workers_status, mut workers_codes) = classify_workers(
+    let (workers_status, workers_codes) = classify_workers(
         bundle.workers_active,
         bundle.workers_supposed_running,
         bundle.workers_unhealthy,
@@ -629,12 +582,6 @@ pub fn build_status_response(
         bundle.queue_max_backlog,
         thresholds,
     );
-    // A gray failure (issue #1815) passes the heartbeat check, so it degrades
-    // the workers verdict on its own.
-    if bundle.worker_outliers_total > 0 {
-        workers_status = worst_status([workers_status, SubsystemStatus::Degraded]);
-        workers_codes.push(REASON_WORKER_OUTLIER.to_string());
-    }
     let workers = make_subsystem(
         "workers",
         workers_status,
@@ -646,8 +593,6 @@ pub fn build_status_response(
             "draining": bundle.workers_draining,
             "unhealthy": bundle.workers_unhealthy,
             "total": bundle.workers_total,
-            "outliers": bundle.worker_outliers,
-            "outliers_total": bundle.worker_outliers_total,
         }),
     );
 
@@ -792,9 +737,21 @@ async fn observe_bundle_shard(
     thresholds: &StatusThresholds,
     circuit_breaker_activities: &[String],
 ) -> ShardObservation<ShardBundle> {
-    let mut conn = match shard_fanout::acquire_shard_conn(shard_id, pool).await {
-        Ok(conn) => conn,
-        Err(observation) => return observation,
+    let Some(pool) = pool else {
+        return ShardObservation {
+            shard_id,
+            rows: Vec::new(),
+            error: Some(format!("shard {shard_id} has no configured storage pool")),
+        };
+    };
+    let Ok(mut conn) = pool.get().await else {
+        return ShardObservation {
+            shard_id,
+            rows: Vec::new(),
+            error: Some(format!(
+                "database connection for shard {shard_id} could not be acquired"
+            )),
+        };
     };
     match gather_bundle(
         &mut conn,
@@ -856,27 +813,12 @@ async fn gather_bundle(
     let stalled_count =
         count_stalled_candidates(conn, thresholds.stalled_no_progress_minutes, cap).await?;
 
-    // Issue #1815. A failed read loses only the outlier signal, so the shard
-    // still counts as inspected.
-    let stale_secs = i64::try_from(stale_threshold.as_secs())
-        .unwrap_or(i64::MAX)
-        .saturating_add(i64::from(stale_threshold.subsec_nanos() > 0));
-    // Each cohort keeps its rows for its own freshness limit, as its
-    // heartbeat does. This runtime's threshold covers a key without one.
-    let task_stats = load_live_worker_task_stats_per_cohort(conn, stale_secs)
-        .await
-        .unwrap_or_else(|error| {
-            tracing::warn!(error = %error, "worker task stats unavailable; outliers skipped");
-            Vec::new()
-        });
-
     Ok(ShardBundle {
         workers,
         dlq_total,
         dlq_newest_age_secs,
         by_queue,
         stalled_count,
-        task_stats,
     })
 }
 
@@ -908,95 +850,77 @@ struct CountRow {
 /// Bounded count of stalled *candidate* executions on this shard.
 ///
 /// Mirrors the candidate predicate of [`crate::api::load_stalled_workflows`]
-/// (its default `include_sleeping = false` shape). An active-state execution
-/// (`RUNNING`/`SUSPENDED`) counts as a candidate when it has no recent
-/// `harvest_events` row, and it is not "correctly sleeping". "Correctly
-/// sleeping" means: no other pending work (task-queue row, non-terminal
-/// child, unconsumed signal), and a sole future-dated timer to wait on. The
-/// future-timer exclusion below copies `load_stalled_workflows` verbatim, so
-/// a workflow idling on a long `ctx.timer` or `receive_signal_timeout` never
-/// counts as stalled. The count stops at `cap`, so this endpoint never scans
-/// an unbounded backlog. The drill-down link stays authoritative for the
-/// full list.
+/// (its default `include_sleeping = false` shape): an active-state execution
+/// (`RUNNING`/`SUSPENDED`) with no `harvest_events` row newer than `minutes`,
+/// **and** which is not "correctly sleeping" — i.e. it either has other pending
+/// work (a claimable task-queue row, a non-terminal child, or an unconsumed
+/// signal) or has no sole future-dated durable timer to be legitimately parked
+/// on / has an already-overdue timer. The future-timer exclusion predicate
+/// below is copied verbatim from `load_stalled_workflows` so the two agree: a
+/// workflow idling on a long `ctx.timer`/`receive_signal_timeout` is **not**
+/// counted as stalled. Counting stops at `cap` so the status endpoint never
+/// scans an unbounded backlog; the drill-down link remains authoritative.
 ///
-/// Cost note (issue #1643): `recent_event_execs` is a `MATERIALIZED` CTE.
-/// Postgres builds it once per call, then anti-joins it by equality against
-/// active executions. This replaces a `NOT EXISTS` correlated on a
-/// `timestamp` range, which ran once per `RUNNING`/`SUSPENDED` row as a
-/// `Nested Loop Anti Join`. The CTE scans `harvest_events` by timestamp
-/// once, fleet-wide, so its cost tracks event-write volume in the window,
-/// not active-execution count. See
-/// `docs/performance-status-summary-stalled.md` for the measured trade-off
-/// across both workload shapes.
+/// Cost note: this is a `NOT EXISTS` anti-join per `RUNNING`/`SUSPENDED` row
+/// (backed by the `idx_harvest_events_exec_last` covering index), so its cost
+/// scales with the active-execution count. `GET /admin/status` is an on-demand
+/// triage surface, not a per-second dashboard poll.
 async fn count_stalled_candidates(
     conn: &mut AsyncPgConnection,
     minutes: i64,
     cap: i64,
 ) -> Result<i64, String> {
-    let row: CountRow = diesel::sql_query(count_stalled_candidates_query())
-        .bind::<BigInt, _>(minutes)
-        .bind::<BigInt, _>(cap)
-        .get_result(conn)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(row.cnt)
-}
-
-/// SQL text for [`count_stalled_candidates`].
-///
-/// Pulled into its own function, and `pub`. The in-crate unit tests and the
-/// external perf harness (`tests/status_summary_stalled_perf.rs`) both need
-/// to pin or `EXPLAIN` the exact query text. This avoids a hand-copied
-/// second source of truth that could drift from it (issue #1643).
-///
-/// The `AND (... future-timer exclusion ...)` block mirrors the
-/// `!include_sleeping` filter in `crate::api::load_stalled_workflows` exactly
-/// (only the correlation alias differs: `e.id` here vs. the qualified
-/// `harvest_workflow_executions.id` there). Keep the two in sync.
-#[must_use]
-pub const fn count_stalled_candidates_query() -> &'static str {
-    "WITH recent_event_execs AS MATERIALIZED ( \
-         SELECT DISTINCT workflow_exec_id FROM harvest_events \
-         WHERE timestamp >= NOW() - ($1 * INTERVAL '1 minute') \
-     ) \
-     SELECT COUNT(*)::BIGINT AS cnt FROM ( \
-         SELECT 1 FROM harvest_workflow_executions e \
-         WHERE e.state IN ('RUNNING', 'SUSPENDED') \
-         AND NOT EXISTS ( \
-             SELECT 1 FROM recent_event_execs r \
-             WHERE r.workflow_exec_id = e.id \
-         ) \
-         AND ( \
-             EXISTS ( \
-                 SELECT 1 FROM harvest_task_queue \
-                 WHERE workflow_exec_id = e.id \
-                 AND state IN ('PENDING','CLAIMED','RUNNING','BACKOFF') \
+    // The `AND (... future-timer exclusion ...)` block mirrors the
+    // `!include_sleeping` filter in `crate::api::load_stalled_workflows` exactly
+    // (only the correlation alias differs: `e.id` here vs. the qualified
+    // `harvest_workflow_executions.id` there). Keep the two in sync.
+    let row: CountRow = diesel::sql_query(
+        "SELECT COUNT(*)::BIGINT AS cnt FROM ( \
+             SELECT 1 FROM harvest_workflow_executions e \
+             WHERE e.state IN ('RUNNING', 'SUSPENDED') \
+             AND NOT EXISTS ( \
+                 SELECT 1 FROM harvest_events ev \
+                 WHERE ev.workflow_exec_id = e.id \
+                 AND ev.timestamp >= NOW() - ($1 * INTERVAL '1 minute') \
              ) \
-          OR EXISTS ( \
-                 SELECT 1 FROM harvest_workflow_executions c \
-                 WHERE c.parent_id = e.id \
-                 AND c.state NOT IN ( \
-                     'COMPLETED','FAILED','CANCELLED', \
-                     'TIMED_OUT','CONTINUED_AS_NEW','TERMINATED' \
+             AND ( \
+                 EXISTS ( \
+                     SELECT 1 FROM harvest_task_queue \
+                     WHERE workflow_exec_id = e.id \
+                     AND state IN ('PENDING','CLAIMED','RUNNING','BACKOFF') \
+                 ) \
+              OR EXISTS ( \
+                     SELECT 1 FROM harvest_workflow_executions c \
+                     WHERE c.parent_id = e.id \
+                     AND c.state NOT IN ( \
+                         'COMPLETED','FAILED','CANCELLED', \
+                         'TIMED_OUT','CONTINUED_AS_NEW','TERMINATED' \
+                     ) \
+                 ) \
+              OR EXISTS ( \
+                     SELECT 1 FROM harvest_signals \
+                     WHERE workflow_exec_id = e.id AND consumed = false \
+                 ) \
+              OR NOT EXISTS ( \
+                     SELECT 1 FROM harvest_timers \
+                     WHERE workflow_exec_id = e.id \
+                     AND fired = false AND fires_at > NOW() \
+                 ) \
+              OR EXISTS ( \
+                     SELECT 1 FROM harvest_timers \
+                     WHERE workflow_exec_id = e.id \
+                     AND fired = false AND fires_at <= NOW() \
                  ) \
              ) \
-          OR EXISTS ( \
-                 SELECT 1 FROM harvest_signals \
-                 WHERE workflow_exec_id = e.id AND consumed = false \
-             ) \
-          OR NOT EXISTS ( \
-                 SELECT 1 FROM harvest_timers \
-                 WHERE workflow_exec_id = e.id \
-                 AND fired = false AND fires_at > NOW() \
-             ) \
-          OR EXISTS ( \
-                 SELECT 1 FROM harvest_timers \
-                 WHERE workflow_exec_id = e.id \
-                 AND fired = false AND fires_at <= NOW() \
-             ) \
-         ) \
-         LIMIT $2 \
-     ) t"
+             LIMIT $2 \
+         ) t",
+    )
+    .bind::<BigInt, _>(minutes)
+    .bind::<BigInt, _>(cap)
+    .get_result(conn)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(row.cnt)
 }
 
 #[cfg(test)]
@@ -1007,7 +931,6 @@ mod tests {
         DlqSummary, QueueDepthSummary, ShardHealthReport, ShardHealthRow, ShardReadiness,
         ShardSchedulerCoverage, ShardSchemaHealth,
     };
-    use autumn_harvest::worker_outlier::OutlierDimension;
     use chrono::{TimeZone as _, Utc};
     use std::collections::BTreeMap;
 
@@ -1085,181 +1008,9 @@ mod tests {
             queue_max_backlog: 0,
             queue_max_backlog_queue: None,
             stalled_count: 0,
-            worker_outliers: Vec::new(),
-            worker_outliers_total: 0,
             incomplete: false,
             unavailable_shards: Vec::new(),
         }
-    }
-
-    // ── worker outliers (issue #1815) ────────────────────────────────────────
-
-    fn task_stats(tasks: u32, failures: u32) -> WorkerTaskStats {
-        WorkerTaskStats {
-            tasks,
-            failures,
-            p99_latency_ms: Some(25),
-        }
-    }
-
-    fn live(worker_id: &str, cohort: &str, stats: WorkerTaskStats) -> LiveWorkerTaskStats {
-        live_aged(worker_id, cohort, stats, 0)
-    }
-
-    /// A live row published `age_secs` ago.
-    fn live_aged(
-        worker_id: &str,
-        cohort: &str,
-        stats: WorkerTaskStats,
-        age_secs: i64,
-    ) -> LiveWorkerTaskStats {
-        LiveWorkerTaskStats {
-            worker_id: worker_id.to_string(),
-            cohort: cohort.to_string(),
-            stats,
-            // A newer row has a higher sequence, as `next_snapshot_seq` gives.
-            snapshot_seq: 1_000_000 - age_secs,
-        }
-    }
-
-    fn stats_bundle(task_stats: Vec<LiveWorkerTaskStats>) -> ShardBundle {
-        ShardBundle {
-            workers: Vec::new(),
-            dlq_total: 0,
-            dlq_newest_age_secs: None,
-            by_queue: BTreeMap::new(),
-            stalled_count: 0,
-            task_stats,
-        }
-    }
-
-    fn observe(shard_id: i32, bundle: ShardBundle) -> ShardObservation<ShardBundle> {
-        ShardObservation {
-            shard_id,
-            rows: vec![bundle],
-            error: None,
-        }
-    }
-
-    /// The issue #1815 RED test for `status_summary`: one worker fails 50% of
-    /// its tasks while its peers fail none. The merge flags it once, even when
-    /// two shards report the same multi-shard worker.
-    #[test]
-    fn merge_bundle_flags_the_worker_failing_half_its_tasks() {
-        const Q: &str = "[\"default\"]";
-        let ok = |id: &str| live(id, Q, task_stats(100, 0));
-        let shard0 = stats_bundle(vec![
-            live("w-sick", Q, task_stats(100, 50)),
-            ok("w-1"),
-            ok("w-2"),
-        ]);
-        // Shard 1 holds an older snapshot of the same worker, with more tasks.
-        // The merge keeps the newest snapshot, not the biggest.
-        let shard1 = stats_bundle(vec![
-            live_aged("w-sick", Q, task_stats(200, 0), 30),
-            ok("w-3"),
-        ]);
-        let merged = merge_bundle(vec![observe(0, shard0), observe(1, shard1)]);
-        assert_eq!(
-            merged.worker_outliers.len(),
-            1,
-            "{:?}",
-            merged.worker_outliers
-        );
-        assert_eq!(merged.worker_outliers_total, 1);
-        let outlier = &merged.worker_outliers[0];
-        assert_eq!(outlier.worker_id, "w-sick");
-        assert_eq!(outlier.dimensions, vec![OutlierDimension::FailureRatio]);
-        assert_eq!(outlier.stats, task_stats(100, 50));
-        assert_eq!(outlier.peer_median_failure_ratio, Some(0.0));
-    }
-
-    #[test]
-    fn merge_bundle_compares_workers_only_within_their_queue_cohort() {
-        let bundle = stats_bundle(vec![
-            live("transcode", "[\"video\"]", task_stats(100, 60)),
-            live("mail-1", "[\"email\"]", task_stats(100, 0)),
-            live("mail-2", "[\"email\"]", task_stats(100, 0)),
-        ]);
-        let merged = merge_bundle(vec![observe(0, bundle)]);
-        assert!(
-            merged.worker_outliers.is_empty(),
-            "a worker alone in its cohort has no peers: {:?}",
-            merged.worker_outliers
-        );
-    }
-
-    #[test]
-    fn merge_bundle_lists_at_most_the_cap_and_reports_the_total() {
-        const Q: &str = "[\"default\"]";
-        let mut rows: Vec<LiveWorkerTaskStats> = (0..100)
-            .map(|i| live(&format!("ok-{i:03}"), Q, task_stats(100, 0)))
-            .collect();
-        rows.extend((0..30).map(|i| live(&format!("sick-{i:02}"), Q, task_stats(100, 40 + i))));
-        let merged = merge_bundle(vec![observe(0, stats_bundle(rows))]);
-        assert_eq!(merged.worker_outliers_total, 30);
-        assert_eq!(merged.worker_outliers.len(), MAX_LISTED_OUTLIERS);
-        assert_eq!(
-            merged.worker_outliers[0].worker_id, "sick-29",
-            "worst first"
-        );
-    }
-
-    #[test]
-    fn build_status_response_degrades_workers_and_lists_outliers() {
-        let report = shard_report(
-            ShardReadiness::Ready,
-            vec![shard_row(0, ShardReadiness::Ready, true, &[])],
-        );
-        let mut bundle = healthy_bundle();
-        bundle.worker_outliers_total = 1;
-        bundle.worker_outliers = vec![WorkerOutlier {
-            worker_id: "w-sick".to_string(),
-            dimensions: vec![OutlierDimension::FailureRatio],
-            stats: task_stats(100, 50),
-            peer_median_failure_ratio: Some(0.0),
-            peer_median_p99_latency_ms: Some(25),
-        }];
-        let resp = build_status_response(
-            Utc.timestamp_opt(2000, 0).unwrap(),
-            &report,
-            &bundle,
-            &thresholds(),
-        );
-        let workers = &resp.subsystems[0];
-        assert_eq!(workers.name, "workers");
-        assert_eq!(workers.status, SubsystemStatus::Degraded);
-        assert_eq!(
-            workers.reason_codes,
-            vec![REASON_WORKER_OUTLIER.to_string()]
-        );
-        assert_eq!(workers.drill_down.as_deref(), Some(DRILL_DOWN_WORKERS));
-        assert_eq!(workers.metrics["outliers"][0]["worker_id"], "w-sick");
-        assert_eq!(
-            workers.metrics["outliers"][0]["dimensions"],
-            serde_json::json!(["failure_ratio"])
-        );
-        assert_eq!(resp.status, SubsystemStatus::Degraded);
-    }
-
-    #[test]
-    fn build_status_response_without_outliers_reports_an_empty_list() {
-        let report = shard_report(
-            ShardReadiness::Ready,
-            vec![shard_row(0, ShardReadiness::Ready, true, &[])],
-        );
-        let resp = build_status_response(
-            Utc.timestamp_opt(2000, 0).unwrap(),
-            &report,
-            &healthy_bundle(),
-            &thresholds(),
-        );
-        assert_eq!(
-            resp.subsystems[0].metrics["outliers"],
-            serde_json::json!([])
-        );
-        assert_eq!(resp.subsystems[0].metrics["outliers_total"], 0);
-        assert_eq!(resp.subsystems[0].status, SubsystemStatus::Healthy);
     }
 
     // ── worst_status ─────────────────────────────────────────────────────────
@@ -1319,7 +1070,7 @@ mod tests {
         // No workers, no queued work ⇒ genuinely idle fresh install ⇒ healthy.
         let (status, codes) = classify_workers(0, 0, 0, 0, 0, &thresholds());
         assert_eq!(status, SubsystemStatus::Healthy);
-        assert_eq!(codes, [] as [std::string::String; 0]);
+        assert!(codes.is_empty());
     }
 
     #[test]
@@ -1356,7 +1107,7 @@ mod tests {
             "an all-Stopped fleet with no backlog must not read critical"
         );
         assert!(!codes.contains(&"worker_no_active".to_string()));
-        assert_eq!(codes, [] as [std::string::String; 0]);
+        assert!(codes.is_empty());
     }
 
     #[test]
@@ -1388,7 +1139,7 @@ mod tests {
     fn classify_workers_all_healthy() {
         let (status, codes) = classify_workers(5, 5, 0, 5, 0, &thresholds());
         assert_eq!(status, SubsystemStatus::Healthy);
-        assert_eq!(codes, [] as [std::string::String; 0]);
+        assert!(codes.is_empty());
     }
 
     #[test]
@@ -1403,7 +1154,7 @@ mod tests {
             SubsystemStatus::Healthy,
             "a scaled-down fleet of stale Stopped workers must not read critical"
         );
-        assert_eq!(codes, [] as [std::string::String; 0]);
+        assert!(codes.is_empty());
     }
 
     #[test]
@@ -1429,7 +1180,7 @@ mod tests {
         // healthy — no work is waiting for a claimant.
         let (status, codes) = classify_workers(0, 3, 0, 3, 0, &thresholds());
         assert_eq!(status, SubsystemStatus::Healthy);
-        assert_eq!(codes, [] as [std::string::String; 0]);
+        assert!(codes.is_empty());
     }
 
     #[test]
@@ -1452,7 +1203,7 @@ mod tests {
         // concern, not a worker-fleet fault.
         let (status, codes) = classify_workers(3, 6, 0, 6, 1_000_000, &thresholds());
         assert_eq!(status, SubsystemStatus::Healthy);
-        assert_eq!(codes, [] as [std::string::String; 0]);
+        assert!(codes.is_empty());
     }
 
     #[test]
@@ -1472,7 +1223,7 @@ mod tests {
     fn classify_dead_letters_none_is_healthy() {
         let (status, codes) = classify_dead_letters(0, None, &thresholds());
         assert_eq!(status, SubsystemStatus::Healthy);
-        assert_eq!(codes, [] as [std::string::String; 0]);
+        assert!(codes.is_empty());
     }
 
     #[test]
@@ -1505,7 +1256,7 @@ mod tests {
     fn classify_queues_below_thresholds_is_healthy() {
         let (status, codes) = classify_queues(10, &thresholds());
         assert_eq!(status, SubsystemStatus::Healthy);
-        assert_eq!(codes, [] as [std::string::String; 0]);
+        assert!(codes.is_empty());
     }
 
     #[test]
@@ -1528,7 +1279,7 @@ mod tests {
     fn classify_stalled_zero_is_healthy() {
         let (status, codes) = classify_stalled(0, &thresholds());
         assert_eq!(status, SubsystemStatus::Healthy);
-        assert_eq!(codes, [] as [std::string::String; 0]);
+        assert!(codes.is_empty());
     }
 
     #[test]
@@ -1556,7 +1307,7 @@ mod tests {
         let (status, codes, ready, degraded, unavailable) = classify_shards(&report);
         assert_eq!(status, SubsystemStatus::Healthy);
         assert_eq!((ready, degraded, unavailable), (1, 0, 0));
-        assert_eq!(codes, [] as [std::string::String; 0]);
+        assert!(codes.is_empty());
     }
 
     #[test]
@@ -1763,81 +1514,6 @@ mod tests {
         assert_eq!(
             stalled.drill_down.as_deref(),
             Some("/workflows?no_progress_minutes=42")
-        );
-    }
-
-    /// Pins the issue #1643 rewrite: the "no recent event" check must read a
-    /// `MATERIALIZED` CTE, not a per-row correlated `NOT EXISTS` against
-    /// `harvest_events` directly. The anti-join's full clause (including the
-    /// join column) is checked verbatim, not just its opening tokens, so a
-    /// mis-wired correlation predicate cannot pass silently.
-    #[test]
-    fn count_stalled_candidates_query_uses_materialized_recent_event_cte() {
-        let sql = count_stalled_candidates_query();
-        assert!(
-            sql.contains("recent_event_execs AS MATERIALIZED"),
-            "expected a MATERIALIZED recent_event_execs CTE, got: {sql}"
-        );
-        assert!(
-            sql.contains(
-                "NOT EXISTS ( SELECT 1 FROM recent_event_execs r \
-                 WHERE r.workflow_exec_id = e.id )"
-            ),
-            "expected the outer anti-join to probe recent_event_execs by \
-             workflow_exec_id, got: {sql}"
-        );
-        assert_eq!(
-            sql.matches("FROM harvest_events").count(),
-            1,
-            "expected exactly one scan of harvest_events -- the CTE's own \
-             base scan, not a second per-row correlated scan under a \
-             different alias, got: {sql}"
-        );
-    }
-
-    /// `recent_event_execs` must be defined once and referenced exactly once
-    /// more (issue #1643). A second reference would revert to a per-row
-    /// probe of the CTE instead of a single equality anti-join.
-    #[test]
-    fn recent_event_execs_cte_is_defined_and_referenced_exactly_once() {
-        let sql = count_stalled_candidates_query();
-        assert_eq!(
-            sql.matches("recent_event_execs").count(),
-            2,
-            "recent_event_execs: one CTE definition + one reference \
-             expected, got: {sql}"
-        );
-    }
-
-    /// The future-timer exclusion block must stay byte-identical to the one
-    /// in `load_stalled_workflows` (only the correlation alias differs). The
-    /// #1643 rewrite must not touch this block.
-    ///
-    /// Checking every gate's own text is not enough. It would still pass if
-    /// every connective were corrupted from `OR` to `AND`. That turns the
-    /// block from "any pending work keeps this stalled" into a
-    /// near-impossible "all conditions must hold". So the `OR` count is
-    /// pinned too.
-    #[test]
-    fn count_stalled_candidates_query_keeps_every_or_block_gate() {
-        let sql = count_stalled_candidates_query();
-        for gate in [
-            "state IN ('PENDING','CLAIMED','RUNNING','BACKOFF')",
-            "c.parent_id = e.id",
-            "consumed = false",
-            "fired = false AND fires_at > NOW()",
-            "fired = false AND fires_at <= NOW()",
-        ] {
-            assert!(
-                sql.contains(gate),
-                "missing OR-block gate {gate:?} in: {sql}"
-            );
-        }
-        assert_eq!(
-            sql.matches(" OR ").count(),
-            4,
-            "the OR-block has 5 branches joined by 4 OR connectives; \
-             got: {sql}"
         );
     }
 }

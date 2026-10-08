@@ -23,6 +23,7 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
+use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -41,7 +42,7 @@ use tower::ServiceExt;
 type HarvestApiApp = axum::Router;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::test_init_sql().as_bytes().to_vec()
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
 }
 
 async fn setup_database() -> (String, Option<ContainerAsync<Postgres>>) {
@@ -85,7 +86,7 @@ fn build_app_with_router(pool: HarvestDbPool, router: ShardRouter) -> HarvestApi
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         router,
     ));
-    harvest_api_router(api_state)
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
 
 fn build_app(pool: &DbPool) -> HarvestApiApp {
@@ -135,11 +136,7 @@ fn router_for(shards: &[i32]) -> ShardRouter {
 /// exercise the admin-guard rejection: without an admin session, admin-only
 /// routes return 401 before reaching the handler (no storage needed).
 fn build_unauth_app() -> HarvestApiApp {
-    let api_state = HarvestApiState::new();
-    // Issue #1802: set the opt-out, so the 401 comes from the admin gate and
-    // not from the mutation gate.
-    api_state.set_allow_unauthenticated_mutations(true);
-    harvest_api_router(api_state)
+    harvest_api_router(HarvestApiState::new()).with_state(AppState::for_test())
 }
 
 async fn scrub(conn: &mut AsyncPgConnection) {

@@ -91,7 +91,7 @@ fn main() {
         .workflows(workflows![poll_customer_exports])
         .activities(activities![poll_customer_export_page])
         .history_continue_as_new_threshold(10_000)
-        .history_event_hard_cap(60_000)
+        .history_event_hard_cap(20_000)
         .try_build()
         .expect("example registration should be valid");
 

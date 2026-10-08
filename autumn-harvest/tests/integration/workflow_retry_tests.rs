@@ -41,7 +41,7 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::test_init_sql().as_bytes().to_vec()
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
 }
 
 // ── Recording metrics ──────────────────────────────────────────────────────
@@ -296,9 +296,6 @@ fn make_worker(
     ));
     Worker::new(
         WorkerRuntimeConfig {
-            codec_rotation_batch_size: 0,
-            scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
-            dr: autumn_harvest::replication::DrConfig::default(),
             worker_id: uuid::Uuid::new_v4().to_string(),
             queues: vec!["default".to_string()],
             queue_weights: std::collections::HashMap::new(),
@@ -316,7 +313,6 @@ fn make_worker(
             build_id: String::new(),
             deployment_name: None,
             workflow_cache_size: 100,
-            resident_workflows: true,
             priority_aging_secs: None,
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
@@ -367,7 +363,7 @@ async fn start_workflow_on_shard(
             workflow_name,
             workflow_id,
             exec_id: ExecutionId::new_for_shard(shard),
-            input: serde_json::Value::Null.into(),
+            input: serde_json::Value::Null,
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -430,7 +426,7 @@ async fn start_workflow_with_source(
             workflow_name,
             workflow_id,
             exec_id: ExecutionId::new_for_shard(ShardId::new(0)),
-            input: serde_json::Value::Null.into(),
+            input: serde_json::Value::Null,
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,

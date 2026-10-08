@@ -17,6 +17,7 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
+use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -31,7 +32,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::test_init_sql().as_bytes().to_vec()
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
 }
 
 async fn setup_database() -> (String, ContainerAsync<Postgres>) {
@@ -72,7 +73,7 @@ fn build_app(pool: &DbPool) -> axum::Router {
         ShardRouter::default(),
     ));
 
-    harvest_api_router(api_state)
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
 
 async fn admin_get(app: &axum::Router, uri: &str) -> (StatusCode, Value) {

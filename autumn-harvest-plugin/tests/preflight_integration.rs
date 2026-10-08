@@ -15,6 +15,7 @@ use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
 use autumn_harvest_plugin::preflight::{PreflightStatus, build_preflight_report};
+use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -327,7 +328,6 @@ async fn register_active_worker(pool: &DbPool, worker_id: &str, queues: &[String
         None,
         &std::collections::HashMap::new(),
         0,
-        &[],
     )
     .await
     .expect("worker registration should succeed");
@@ -391,7 +391,7 @@ async fn preflight_endpoint_returns_all_green_single_shard_report() {
         "prod",
         true,
     );
-    let app = harvest_api_router(state);
+    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("prod"));
 
     let (status, body) = get_json(&app, "/admin/preflight").await;
 
@@ -419,12 +419,11 @@ async fn preflight_endpoint_returns_all_green_single_shard_report() {
         .expect("scanner_liveness must be part of the preflight report");
     assert_eq!(scanner_check["status"], "pass");
     assert_eq!(scanner_check["details"]["scanners_registered"], 0);
-    assert_eq!(
+    assert!(
         scanner_check["details"]["scanners"]
             .as_array()
             .expect("scanners must be an array")
-            .as_slice(),
-        [] as [serde_json::Value; 0]
+            .is_empty()
     );
 }
 

@@ -31,6 +31,7 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
+use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -54,7 +55,7 @@ const TEST_ACTOR: &str = "rerun-operator";
 type HarvestApiApp = axum::Router;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::test_init_sql().as_bytes().to_vec()
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
 }
 
 async fn setup_database() -> (String, Option<ContainerAsync<Postgres>>) {
@@ -178,6 +179,7 @@ fn api_state_with(
 
 fn build_app(pool: &DbPool, infos: Vec<WorkflowInfo>) -> HarvestApiApp {
     harvest_api_router(api_state_with(infos, pool, true))
+        .with_state(AppState::for_test().with_profile("test"))
 }
 
 /// Extra knobs a few tests need beyond `build_app`'s defaults.
@@ -221,17 +223,14 @@ fn build_app_with(pool: &DbPool, infos: Vec<WorkflowInfo>, opts: &AppOpts) -> Ha
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::default(),
     ));
-    harvest_api_router(api_state)
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
 
 /// An app whose admin-auth boundary is NOT installed, so the `require_admin`
 /// route layer rejects an unauthenticated caller (mirrors `security.rs`).
 fn build_app_no_admin(pool: &DbPool, infos: Vec<WorkflowInfo>) -> HarvestApiApp {
-    let api_state = api_state_with(infos, pool, false);
-    // Issue #1802: set the opt-out, so the 401 comes from the admin gate and
-    // not from the mutation gate.
-    api_state.set_allow_unauthenticated_mutations(true);
-    harvest_api_router(api_state)
+    harvest_api_router(api_state_with(infos, pool, false))
+        .with_state(AppState::for_test().with_profile("test"))
 }
 
 /// An app whose completion-callback SSRF policy allowlists `hook.example`
@@ -245,7 +244,7 @@ fn build_app_allowing_hook_example(pool: &DbPool, infos: Vec<WorkflowInfo>) -> H
             autumn_harvest::completion_callback::HostAllowlist::new().with_pattern("hook.example"),
         ),
     );
-    harvest_api_router(api_state)
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
 
 async fn post_json(app: &HarvestApiApp, uri: &str, body: Value) -> (StatusCode, Value) {
@@ -758,7 +757,7 @@ fn build_multi_shard_app(
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         two_shard_router(),
     ));
-    harvest_api_router(api_state)
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
 
 /// Variant of [`build_multi_shard_app`] whose SHARDED-POOL default is shard 1
@@ -794,7 +793,7 @@ fn build_multi_shard_app_default_shard1(
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         two_shard_router(),
     ));
-    harvest_api_router(api_state)
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
 
 /// Seed a terminal (COMPLETED) source directly on shard 0's connection, with
@@ -837,89 +836,18 @@ async fn seed_terminal_on_shard0(
     exec_id.to_string()
 }
 
-/// Seed an execution directly on `shard`'s connection, with an
-/// explicitly shard-encoded exec id. For a caller that needs the row in a
-/// specific state — issue #1308's LIVE occupant on the hash-derived shard.
-async fn seed_execution_on_shard(
-    conn: &mut AsyncPgConnection,
-    shard: autumn_harvest::types::ShardId,
-    workflow_name: &str,
-    workflow_id: &str,
-    state: &str,
-) -> String {
-    let exec_id = autumn_harvest::types::ExecutionId::new_for_shard(shard);
-    let now = Utc::now();
-    diesel::sql_query(
-        "INSERT INTO harvest_workflow_executions
-            (id, workflow_name, workflow_id, shard_id, state, input, started_at, completed_at,
-             queue_name)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, CASE WHEN $5 IN ('COMPLETED', 'FAILED', 'CANCELLED', \
-                 'TIMED_OUT', 'TERMINATED', 'CONTINUED_AS_NEW') THEN $7 ELSE NULL END, 'default')",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-    .bind::<Text, _>(workflow_name)
-    .bind::<Text, _>(workflow_id)
-    .bind::<diesel::sql_types::Integer, _>(shard.as_i32())
-    .bind::<Text, _>(state)
-    .bind::<Jsonb, _>(json!({}))
-    .bind::<Timestamptz, _>(now)
-    .execute(conn)
-    .await
-    .expect("insert execution");
-
-    diesel::sql_query(
-        "INSERT INTO harvest_events (workflow_exec_id, event_id, event_type, event_data)
-         VALUES ($1, 0, 'WorkflowStarted',
-                 '{\"type\":\"WorkflowStarted\",\"data\":{\"input\":{},\"timestamp\":\"2026-01-01T00:00:00Z\"}}'::jsonb)",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-    .execute(conn)
-    .await
-    .expect("insert event");
-
-    exec_id.to_string()
-}
-
-/// `ShardedDbPool` wired with ONLY shard 0's pool, against a router that
-/// still expects shard 1 to exist. Issue #1308: an occupancy fan-out that
-/// cannot inspect an expected shard must fail closed. It must never treat
-/// an uninspectable shard as unoccupied.
-fn build_multi_shard_app_pool0_only(pool0: &DbPool, infos: Vec<WorkflowInfo>) -> HarvestApiApp {
-    let mut pools = std::collections::BTreeMap::new();
-    pools.insert(autumn_harvest::types::ShardId::new(0), pool0.clone());
-    let api_state = HarvestApiState::new();
-    api_state.set_admin_auth_boundary(true);
-    api_state.install_storage_pool(HarvestDbPool::sharded(
-        autumn_harvest::shard::ShardedDbPool::from_map(
-            pools,
-            autumn_harvest::types::ShardId::new(0),
-        ),
-    ));
-    let registry = HandlerRegistry::new(infos, vec![]);
-    api_state.install(HarvestApiRuntime::new(
-        Arc::new(registry),
-        Arc::new(DagCatalog::default()),
-        Arc::new(Vec::new()),
-        Some("rerun-test".to_string()),
-        vec!["default".to_string()],
-        SchedulerMonitor::offline(),
-        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
-        two_shard_router(),
-    ));
-    harvest_api_router(api_state)
-}
-
-/// Issue #1308: a `workflow_id` override that hashes to a DIFFERENT shard
-/// than the source now succeeds when the override key is not actually
-/// occupied there. This replaces the pre-#1308 behavior (PR #1152), which
-/// refused on the hash mismatch alone.
-///
-/// The new run still lands on the SOURCE's shard: this transaction is
-/// pinned to one connection and cannot insert elsewhere. What changed is
-/// that a divergent hash is no longer enough, by itself, to refuse the
-/// re-run.
+/// Codex review finding (PR #1152, P1): `rerun_workflow_execution` always
+/// minted the new execution's id on `source.shard_id`, ignoring where
+/// `ShardRouter::pick_for_new_workflow` — the SAME function every ordinary
+/// explicit-`workflow_id` start uses (`api.rs:13162`) — would route the
+/// override. In a multi-shard deployment this could silently create the
+/// override's execution on the WRONG shard: invisible to the override's own
+/// `RejectDuplicate` uniqueness check (which only queries the source's shard
+/// connection) and to by-id addressing (issue #751), which resolves a
+/// `WorkflowId` target's shard via the identical hash. Fixed by rejecting a
+/// `workflow_id` override that hashes to a different shard than the source.
 #[tokio::test]
-async fn rerun_workflow_id_override_that_hashes_elsewhere_but_is_free_now_succeeds() {
+async fn rerun_workflow_id_override_that_hashes_to_a_different_shard_is_rejected() {
     let (admin, _guard) = setup_shard_server().await;
     let url0 = create_shard_db(&admin, &unique("rerun_x0").replace('-', "_")).await;
     let url1 = create_shard_db(&admin, &unique("rerun_x1").replace('-', "_")).await;
@@ -933,97 +861,20 @@ async fn rerun_workflow_id_override_that_hashes_elsewhere_but_is_free_now_succee
         .expect("connect shard 1");
 
     let router = two_shard_router();
-    let wf = "rr_xshard_free_wf";
-    let source_wf_id = unique("rr-xshard-free-src");
+    let wf = "rr_xshard_wf";
+    let source_wf_id = unique("rr-xshard-src");
 
     // Find an override workflow_id the router hashes to a DIFFERENT shard
     // than the source's (shard 0) — computed via the SAME hashing function
     // every ordinary start uses, not hand-picked.
     let override_id = (0..1000)
-        .map(|i| format!("rr-xshard-free-override-{i}"))
+        .map(|i| format!("rr-xshard-override-{i}"))
         .find(|candidate| {
             router.pick_for_new_workflow(wf, candidate) != autumn_harvest::types::ShardId::new(0)
         })
         .expect("a candidate hashing to a different shard exists within 1000 tries");
 
     let source = seed_terminal_on_shard0(&mut conn0, wf, &source_wf_id).await;
-
-    let app = build_multi_shard_app(&pool0, &pool1, vec![plain_info(wf)]);
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(rerun_uri(&source))
-                .header("content-type", "application/json")
-                .header("x-harvest-admin", "true")
-                .header("x-harvest-actor", TEST_ACTOR)
-                .body(Body::from(
-                    json!({ "workflow_id": override_id }).to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    let (status, body) = read_response(response).await;
-    assert_eq!(status, StatusCode::CREATED, "body: {body}");
-    let new_exec = body["execution_id"].as_str().unwrap().to_string();
-
-    assert_eq!(
-        autumn_harvest::types::ExecutionId::from_uuid(uuid::Uuid::parse_str(&new_exec).unwrap())
-            .shard(),
-        autumn_harvest::types::ShardId::new(0),
-        "the new execution must land on the SOURCE's shard: this transaction \
-         is pinned to one connection and cannot insert on the hash-derived one"
-    );
-
-    let on_shard0 = load_execs_for_key(&mut conn0, wf, &override_id).await;
-    let on_shard1 = load_execs_for_key(&mut conn1, wf, &override_id).await;
-    assert_eq!(
-        on_shard0.len(),
-        1,
-        "exactly one execution under the override key, on the source's shard"
-    );
-    assert!(
-        on_shard1.is_empty(),
-        "nothing should be created on the hash-derived shard: {on_shard1:?}"
-    );
-}
-
-/// Issue #1308 regression guard: a `workflow_id` override that hashes to a
-/// DIFFERENT shard is still rejected when a LIVE run already holds that key
-/// there. That is the reason the guard exists in the first place. Only the
-/// unoccupied case above was loosened.
-#[tokio::test]
-async fn rerun_workflow_id_override_that_hashes_elsewhere_and_is_occupied_is_still_rejected() {
-    let (admin, _guard) = setup_shard_server().await;
-    let url0 = create_shard_db(&admin, &unique("rerun_xo0").replace('-', "_")).await;
-    let url1 = create_shard_db(&admin, &unique("rerun_xo1").replace('-', "_")).await;
-    let pool0 = build_pool(&url0);
-    let pool1 = build_pool(&url1);
-    let mut conn0 = AsyncPgConnection::establish(&url0)
-        .await
-        .expect("connect shard 0");
-    let mut conn1 = AsyncPgConnection::establish(&url1)
-        .await
-        .expect("connect shard 1");
-
-    let router = two_shard_router();
-    let wf = "rr_xshard_occ_wf";
-    let source_wf_id = unique("rr-xshard-occ-src");
-
-    let override_id = (0..1000)
-        .map(|i| format!("rr-xshard-occ-override-{i}"))
-        .find(|candidate| {
-            router.pick_for_new_workflow(wf, candidate) != autumn_harvest::types::ShardId::new(0)
-        })
-        .expect("a candidate hashing to a different shard exists within 1000 tries");
-    let target_shard = router.pick_for_new_workflow(wf, &override_id);
-
-    let source = seed_terminal_on_shard0(&mut conn0, wf, &source_wf_id).await;
-    // A LIVE run already holds the override key on the shard it hashes to —
-    // invisible to the source-shard-only `RejectDuplicate` check.
-    seed_execution_on_shard(&mut conn1, target_shard, wf, &override_id, "RUNNING").await;
 
     let app = build_multi_shard_app(&pool0, &pool1, vec![plain_info(wf)]);
     let response = app
@@ -1044,163 +895,37 @@ async fn rerun_workflow_id_override_that_hashes_elsewhere_and_is_occupied_is_sti
 
     let (status, body) = read_response(response).await;
     assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    // `conflict_from` (autumn-web `AutumnError::bad_request_msg`) surfaces
+    // the core's `Config` message under RFC 7807's "detail" key, not
+    // "error" (which is reserved for a handful of hand-built JSON bodies
+    // elsewhere in this file, e.g. the admission-blocked/validation-failure
+    // responses).
     let msg = body["detail"].as_str().unwrap_or_default();
     assert!(
         msg.to_lowercase().contains("shard"),
-        "error should name the occupied shard: {msg}"
+        "error should name the shard mismatch: {msg}"
     );
 
-    // No SECOND execution was created for the override key anywhere.
+    // No execution was created for the override key on EITHER physical
+    // database — the whole point of rejecting rather than silently
+    // corrupting the routing invariant.
     let on_shard0 = load_execs_for_key(&mut conn0, wf, &override_id).await;
     let on_shard1 = load_execs_for_key(&mut conn1, wf, &override_id).await;
     assert!(
-        on_shard0.is_empty(),
-        "no execution should be created on the source's shard: {on_shard0:?}"
-    );
-    assert_eq!(
-        on_shard1.len(),
-        1,
-        "the pre-existing occupant on the hash-derived shard must be untouched: {on_shard1:?}"
+        on_shard0.is_empty() && on_shard1.is_empty(),
+        "no execution should exist for the override key on either shard: \
+         shard0={on_shard0:?} shard1={on_shard1:?}"
     );
 
     // The source is untouched (state, still COMPLETED — never sealed).
     let source_row = load_exec(&mut conn0, &source).await;
     assert_eq!(source_row.state, "COMPLETED");
 
+    // A failed audit row was written.
     let rows = audit_rows(&mut conn0, "workflow.rerun", &source).await;
     assert!(
         rows.iter().any(|r| r.status == "failed"),
         "expected a failed audit row: {rows:?}"
-    );
-}
-
-/// Issue #1308 review finding: an ORDINARY terminal occupant (`COMPLETED`,
-/// never sealed) on the hash-derived shard must still be rejected, exactly
-/// like a live one. `resolve_successor_slot` and the re-run `RejectDuplicate`
-/// check both treat a same-shard terminal-but-unsealed row as occupying the
-/// key. Only `CONTINUED_AS_NEW`/`TERMINATED` release it. So the cross-shard
-/// occupancy check must agree, not just check for a LIVE run.
-#[tokio::test]
-async fn rerun_workflow_id_override_that_hashes_elsewhere_and_has_a_completed_occupant_is_still_rejected()
- {
-    let (admin, _guard) = setup_shard_server().await;
-    let url0 = create_shard_db(&admin, &unique("rerun_xc0").replace('-', "_")).await;
-    let url1 = create_shard_db(&admin, &unique("rerun_xc1").replace('-', "_")).await;
-    let pool0 = build_pool(&url0);
-    let pool1 = build_pool(&url1);
-    let mut conn0 = AsyncPgConnection::establish(&url0)
-        .await
-        .expect("connect shard 0");
-    let mut conn1 = AsyncPgConnection::establish(&url1)
-        .await
-        .expect("connect shard 1");
-
-    let router = two_shard_router();
-    let wf = "rr_xshard_completed_wf";
-    let source_wf_id = unique("rr-xshard-completed-src");
-
-    let override_id = (0..1000)
-        .map(|i| format!("rr-xshard-completed-override-{i}"))
-        .find(|candidate| {
-            router.pick_for_new_workflow(wf, candidate) != autumn_harvest::types::ShardId::new(0)
-        })
-        .expect("a candidate hashing to a different shard exists within 1000 tries");
-    let target_shard = router.pick_for_new_workflow(wf, &override_id);
-
-    let source = seed_terminal_on_shard0(&mut conn0, wf, &source_wf_id).await;
-    // A COMPLETED (never sealed) row already holds the override key on the
-    // shard it hashes to — terminal, not live, but still occupying the key.
-    seed_execution_on_shard(&mut conn1, target_shard, wf, &override_id, "COMPLETED").await;
-
-    let app = build_multi_shard_app(&pool0, &pool1, vec![plain_info(wf)]);
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(rerun_uri(&source))
-                .header("content-type", "application/json")
-                .header("x-harvest-admin", "true")
-                .header("x-harvest-actor", TEST_ACTOR)
-                .body(Body::from(
-                    json!({ "workflow_id": override_id }).to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    let (status, body) = read_response(response).await;
-    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
-
-    let on_shard0 = load_execs_for_key(&mut conn0, wf, &override_id).await;
-    let on_shard1 = load_execs_for_key(&mut conn1, wf, &override_id).await;
-    assert!(
-        on_shard0.is_empty(),
-        "no execution should be created on the source's shard: {on_shard0:?}"
-    );
-    assert_eq!(
-        on_shard1.len(),
-        1,
-        "the pre-existing COMPLETED occupant must be untouched: {on_shard1:?}"
-    );
-}
-
-/// Issue #1308: a `workflow_id` override that hashes to a shard this process
-/// has no pool for must fail closed (`Indeterminate` → reject). It must never
-/// treat an uninspectable shard as unoccupied.
-#[tokio::test]
-async fn rerun_workflow_id_override_that_hashes_to_an_unreachable_shard_fails_closed() {
-    let (admin, _guard) = setup_shard_server().await;
-    let url0 = create_shard_db(&admin, &unique("rerun_xi0").replace('-', "_")).await;
-    let pool0 = build_pool(&url0);
-    let mut conn0 = AsyncPgConnection::establish(&url0)
-        .await
-        .expect("connect shard 0");
-
-    let router = two_shard_router();
-    let wf = "rr_xshard_indet_wf";
-    let source_wf_id = unique("rr-xshard-indet-src");
-
-    let override_id = (0..1000)
-        .map(|i| format!("rr-xshard-indet-override-{i}"))
-        .find(|candidate| {
-            router.pick_for_new_workflow(wf, candidate) != autumn_harvest::types::ShardId::new(0)
-        })
-        .expect("a candidate hashing to a different shard exists within 1000 tries");
-
-    let source = seed_terminal_on_shard0(&mut conn0, wf, &source_wf_id).await;
-
-    // Only shard 0's pool is wired up; the router still expects shard 1 to
-    // exist, so the fan-out cannot inspect it.
-    let app = build_multi_shard_app_pool0_only(&pool0, vec![plain_info(wf)]);
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(rerun_uri(&source))
-                .header("content-type", "application/json")
-                .header("x-harvest-admin", "true")
-                .header("x-harvest-actor", TEST_ACTOR)
-                .body(Body::from(
-                    json!({ "workflow_id": override_id }).to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    let (status, body) = read_response(response).await;
-    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
-
-    let on_shard0 = load_execs_for_key(&mut conn0, wf, &override_id).await;
-    assert!(
-        on_shard0.is_empty(),
-        "no execution should be created while occupancy is unknown: {on_shard0:?}"
-    );
-    let source_row = load_exec(&mut conn0, &source).await;
-    assert_eq!(
-        source_row.state, "COMPLETED",
-        "source must never be sealed on a failed re-run"
     );
 }
 
@@ -1392,7 +1117,7 @@ fn build_multi_shard_app_with_router(
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         router,
     ));
-    harvest_api_router(api_state)
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
 
 /// Codex review finding (PR #1152, P1): the DEFAULT (no `workflow_id`
@@ -2224,7 +1949,7 @@ async fn rerun_respects_admission_gate() {
         expires_at: None,
     }]);
     set_global_admission_gate_cache(Some(api_state.gate_cache()));
-    let app = harvest_api_router(api_state);
+    let app = harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"));
 
     let mut conn = pool.get().await.unwrap();
     let wf_id = unique("rr-gated");
@@ -3909,29 +3634,4 @@ async fn rerun_of_failed_source_with_no_retry_successor_still_works() {
 
     let (status, body) = post_json(&app, &rerun_uri(&source), json!({})).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
-}
-
-/// R-66: issue #1353 — an explicit empty `workflow_id` override is rejected
-/// 400, the same rejection `start_workflow` now applies. An empty override is
-/// distinct from omitting the field (R-18: reuses the source's key). It is
-/// never a valid literal business id, so the source is left untouched.
-#[tokio::test]
-async fn rerun_with_empty_workflow_id_override_is_rejected_400() {
-    let (url, _c) = setup_database().await;
-    let pool = build_pool(&url);
-    let wf = "rr_empty_override_wf";
-    let app = build_app(&pool, vec![plain_info(wf)]);
-    let mut conn = pool.get().await.unwrap();
-
-    let wf_id = unique("rr-empty-override");
-    let source = seed_terminal(&mut conn, wf, &wf_id, "COMPLETED").await;
-
-    let (status, body) = post_json(&app, &rerun_uri(&source), json!({"workflow_id": ""})).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(body["error"], json!("workflow_id must not be empty"));
-    assert_eq!(
-        load_exec(&mut conn, &source).await.state,
-        "COMPLETED",
-        "a rejected override must not seal or touch the source"
-    );
 }

@@ -1710,8 +1710,6 @@ fn audit_list_all_filters_builds_correct_query_string() {
         "2026-01-01T00:00:00Z",
         "--before",
         "2026-02-01T00:00:00Z",
-        "--before-id",
-        "00000000-0000-0000-0000-000000000002",
         "--limit",
         "25",
     ])
@@ -1733,7 +1731,6 @@ fn audit_list_all_filters_builds_correct_query_string() {
         "status=succeeded",
         "since=2026-01-01T00:00:00Z",
         "before=2026-02-01T00:00:00Z",
-        "before_id=00000000-0000-0000-0000-000000000002",
         "limit=25",
     ] {
         assert!(
@@ -1943,47 +1940,6 @@ fn schedule_runs_threads_filters_into_query() {
     assert!(path.contains("origin=scheduled"), "path was {path}");
     assert!(path.contains("since=24h"), "path was {path}");
     assert!(path.contains("limit=50"), "path was {path}");
-}
-
-// ── schedule create-workflow jitter (issue #1792) ───────────────────────────
-
-#[test]
-fn schedule_create_workflow_sends_jitter_secs_only_when_set() {
-    let request = Cli::try_parse_from([
-        "harvest",
-        "schedule",
-        "create-workflow",
-        "--name",
-        "nightly",
-        "--cron",
-        "0 0 * * *",
-        "--jitter-secs",
-        "0",
-    ])
-    .expect("create-workflow args should parse")
-    .api_request()
-    .expect("create-workflow request should build");
-    let body = request.body.expect("create request must have a body");
-    assert_eq!(body["jitter_secs"], 0);
-
-    let request = Cli::try_parse_from([
-        "harvest",
-        "schedule",
-        "create-workflow",
-        "--name",
-        "nightly",
-        "--cron",
-        "0 0 * * *",
-    ])
-    .expect("create-workflow args should parse")
-    .api_request()
-    .expect("create-workflow request should build");
-    let body = request.body.expect("create request must have a body");
-    let obj = body.as_object().expect("body must be an object");
-    assert!(
-        !obj.contains_key("jitter_secs"),
-        "an omitted flag must leave the server default"
-    );
 }
 
 // ── schedule update (issue #771) ─────────────────────────────────────────────
@@ -3397,61 +3353,4 @@ fn workflow_diagnose_maps_to_the_diagnose_route() {
         );
         assert_eq!(diagnose_request.body, None);
     }
-}
-
-// Issue #1832: `--spread-secs` reaches the redrive and bulk-replay bodies.
-#[test]
-fn dlq_redrive_sends_spread_secs() {
-    let cli = Cli::try_parse_from([
-        "harvest",
-        "dlq",
-        "redrive",
-        "--queue",
-        "email-workers",
-        "--spread-secs",
-        "120",
-    ])
-    .expect("redrive args should parse");
-
-    let request = cli.api_request().expect("request should build");
-
-    assert_eq!(
-        request.body,
-        Some(json!({ "queue": "email-workers", "spread_secs": 120 }))
-    );
-}
-
-#[test]
-fn dlq_bulk_replay_sends_spread_secs() {
-    let cli = Cli::try_parse_from([
-        "harvest",
-        "dlq",
-        "bulk-replay",
-        "--queue-name",
-        "email-workers",
-        "--spread-secs",
-        "0",
-    ])
-    .expect("bulk-replay args should parse");
-
-    let request = cli.api_request().expect("request should build");
-
-    assert_eq!(
-        request.body,
-        Some(json!({ "queue_name": "email-workers", "spread_secs": 0 }))
-    );
-}
-
-#[test]
-fn dlq_redrive_rejects_a_spread_over_one_hour() {
-    let parsed = Cli::try_parse_from([
-        "harvest",
-        "dlq",
-        "redrive",
-        "--queue",
-        "q",
-        "--spread-secs",
-        "3601",
-    ]);
-    assert!(parsed.is_err(), "--spread-secs is capped at 3600");
 }

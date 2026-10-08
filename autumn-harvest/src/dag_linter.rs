@@ -162,7 +162,7 @@ impl DagRule for MissingTimeoutRule {
                 warnings.push(DagWarning {
                     rule_name: self.name().to_string(),
                     message: format!(
-                        "Task '{}' has no start_to_close timeout configured. If the activity hangs, only the worker default activity start_to_close stops it.",
+                        "Task '{}' has no start_to_close timeout configured. If the activity hangs, the workflow will stall indefinitely.",
                         task.activity_name
                     ),
                 });
@@ -215,57 +215,6 @@ impl DagRule for ExcessiveParallelismRule {
         }
 
         warnings
-    }
-}
-
-/// Flags two or more nodes that share one name.
-///
-/// A gate's name is its signal name. `build()` accepts duplicate names, but
-/// the run graph and retry-from-node match nodes by name. A DAG with a
-/// duplicate name cannot be retried from a node: the resolver returns
-/// `AmbiguousNodes` for the whole DAG. A compensator unwind is classified by
-/// name too.
-pub struct DuplicateNodeNameRule;
-
-impl DuplicateNodeNameRule {
-    /// Create a new `DuplicateNodeNameRule`.
-    #[must_use]
-    pub const fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for DuplicateNodeNameRule {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl DagRule for DuplicateNodeNameRule {
-    fn name(&self) -> &'static str {
-        "DuplicateNodeName"
-    }
-
-    fn analyze(
-        &self,
-        dag: &DagDefinition,
-        _activities: &std::collections::HashMap<String, crate::info::ActivityInfo>,
-    ) -> Vec<DagWarning> {
-        let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
-        for task in dag.tasks() {
-            *counts.entry(task.activity_name.as_str()).or_default() += 1;
-        }
-        counts
-            .into_iter()
-            .filter(|(_, count)| *count > 1)
-            .map(|(name, count)| DagWarning {
-                rule_name: self.name().to_string(),
-                message: format!(
-                    "{count} nodes share the name '{name}'. The run graph and retry-from-node \
-                     match nodes by name, so this DAG cannot be retried from a node."
-                ),
-            })
-            .collect()
     }
 }
 
@@ -402,27 +351,5 @@ mod tests {
 
         let warnings = linter.analyze(&dag, &activities);
         assert_eq!(warnings.len(), 0);
-    }
-
-    #[test]
-    fn duplicate_node_name_flags_each_shared_name_once() {
-        fn shared() {}
-        fn unique() {}
-
-        let mut builder = DagBuilder::new();
-        let first = builder.activity(shared);
-        let _second = builder.activity(shared).upstream(&first);
-        let _third = builder.activity(unique);
-        let dag = builder.build().expect("duplicate names still build");
-
-        let warnings =
-            DuplicateNodeNameRule::new().analyze(&dag, &std::collections::HashMap::new());
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert_eq!(warnings[0].rule_name, "DuplicateNodeName");
-        assert!(
-            warnings[0].message.contains("'shared'"),
-            "{}",
-            warnings[0].message
-        );
     }
 }

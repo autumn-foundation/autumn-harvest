@@ -28,13 +28,12 @@ Passed to every workflow function. Behavior changes based on mode:
 
 ### 2. WorkflowExecutor (`executor.rs`)
 
-Builds `WorkflowContext` from event history and polls the workflow handler until
-it returns or blocks on Harvest futures (issue #1797). Returns one of:
+Builds `WorkflowContext` from event history and invokes the workflow handler with
+a 100ms timeout. Returns one of:
 
 - `Completed { output }` — handler returned Ok
 - `Failed { error }` — handler returned Err
-- `Suspended { commands }` — handler blocked on a parked Harvest future (a oneshot or a park token)
-- `TaskFailed { error }` — handler waited on a foreign future past the deadlock timeout; the task is retried
+- `Suspended { commands }` — handler blocked on oneshot (waiting for activity/timer)
 
 ### 3. HistoryMatcher (`replay.rs`)
 

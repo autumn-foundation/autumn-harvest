@@ -10,18 +10,16 @@ use diesel::prelude::*;
 use uuid::Uuid;
 
 use crate::schema::{
-    harvest_admission_gates, harvest_api_tokens, harvest_audit_export_cursor, harvest_audit_log,
-    harvest_backfill_log, harvest_batch_jobs, harvest_build_compat, harvest_build_policies,
-    harvest_calendar_exclusions, harvest_calendars, harvest_completion_deliveries,
-    harvest_completion_trigger_fires, harvest_completion_trigger_outbox,
-    harvest_completion_triggers, harvest_cross_shard_children, harvest_dead_letters,
+    harvest_admission_gates, harvest_api_tokens, harvest_audit_log, harvest_backfill_log,
+    harvest_batch_jobs, harvest_build_compat, harvest_build_policies, harvest_calendar_exclusions,
+    harvest_calendars, harvest_completion_deliveries, harvest_completion_trigger_fires,
+    harvest_completion_trigger_outbox, harvest_completion_triggers, harvest_dead_letters,
     harvest_events, harvest_execution_summaries, harvest_external_tasks, harvest_mutex_locks,
     harvest_mutex_waiters, harvest_payload_refs, harvest_rate_limit_buckets,
     harvest_schedule_decisions, harvest_schedules, harvest_sessions, harvest_signals,
     harvest_task_queue, harvest_timers, harvest_wasm_modules, harvest_workers,
     harvest_workflow_executions, harvest_workflow_logs,
 };
-use crate::shared_json::SharedJson;
 
 // ── Calendar ──────────────────────────────────────────────────────────────────
 
@@ -220,76 +218,6 @@ pub struct WorkflowExecution {
     /// aggregate queries in `quota.rs`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quota_key: Option<String>,
-    /// Forwarding pointer for a shard-rebalanced execution (issue #964): the
-    /// shard this run now physically lives on, after an operator migrated it
-    /// off this one. Non-NULL exactly when `state = 'MIGRATED'`, and `None` for
-    /// every execution that never moved. The `ExecutionId` is never re-minted
-    /// by a migration, so an id captured before the move still routes to this
-    /// row and resolves through this column.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub migrated_to_shard: Option<i32>,
-    /// Wall-clock of the cutover commit that sealed this row (issue #964).
-    /// Non-NULL exactly when `state = 'MIGRATED'`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub migrated_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// Every shard that previously hosted this execution (issue #964), oldest
-    /// first, as a JSON array of shard ids. `None` for a run that never moved.
-    /// Together with the shard this row is on, it is the complete set of shards
-    /// still holding a copy of the run's bytes — which is what a cross-residence
-    /// payload erasure traverses, and why it is kept separately from the
-    /// deliberately-collapsed `migrated_to_shard` pointer.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub migrated_from_shards: Option<serde_json::Value>,
-    /// Wall-clock a reconciler observed this seal's live copy as terminal
-    /// (issue #1317). `None` until observed; non-`None` releases the row
-    /// from active-conflict classification without changing `state`, so
-    /// retention and erasure keep treating it as a `MIGRATED` seal.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub migrated_run_terminal_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// The live copy's own terminal state, recorded alongside
-    /// `migrated_run_terminal_at` by the same reconciler pass (fresh
-    /// review, P2 follow-up). `state` on this row stays `MIGRATED`
-    /// forever; a reuse-policy decision that needs to know whether the
-    /// live copy actually finished FAILED/CANCELLED reads this instead.
-    /// See [`Self::effective_terminal_state`].
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub migrated_run_terminal_state: Option<String>,
-    /// The state a shard-rebalance staging vacate sealed over (issue #1317
-    /// review). Non-`None` only while the migration that vacated this row
-    /// is still in flight. An abort restores `state` to this value and
-    /// clears it. A successful cutover just clears it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub staging_vacated_state: Option<String>,
-    /// The execution id of the migration whose staging vacated this row
-    /// (issue #1596 review). Non-`None` exactly when `staging_vacated_state`
-    /// is. Lets `activate_target` finalize this row's marker with a direct
-    /// match on the vacating migration's own execution id, with no
-    /// cross-database write and no retry race.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub staging_vacated_by: Option<Uuid>,
-}
-
-impl WorkflowExecution {
-    /// The state a reuse-policy decision should judge this row by (fresh
-    /// review, P2 follow-up).
-    ///
-    /// `state` stays `MIGRATED` forever once a run rebalances, even after a
-    /// reconciler observes the live copy finish. A caller that needs to
-    /// distinguish a failed live copy (`AllowDuplicateFailedOnly` should
-    /// replace) from a successful one (it should attach) cannot read
-    /// `state` for that. It reads `migrated_run_terminal_state` instead,
-    /// falling back to `state` itself when the row is not a reconciled
-    /// `MIGRATED` seal, or was reconciled before this column existed.
-    #[must_use]
-    pub fn effective_terminal_state(&self) -> &str {
-        if self.state == "MIGRATED" {
-            self.migrated_run_terminal_state
-                .as_deref()
-                .unwrap_or(&self.state)
-        } else {
-            &self.state
-        }
-    }
 }
 
 /// Serialize a nullable `start_source` column, reporting a `None` (pre-upgrade /
@@ -315,7 +243,7 @@ pub struct NewWorkflowExecution<'a> {
     pub workflow_id: &'a str,
     pub run_id: Uuid,
     pub shard_id: i32,
-    pub input: SharedJson,
+    pub input: serde_json::Value,
     pub parent_id: Option<Uuid>,
     pub queue_name: &'a str,
     pub execution_timeout: Option<chrono::Duration>,
@@ -572,32 +500,6 @@ pub struct TaskQueueItem {
     /// `0 -> 1` and a mismatch resets to `1` — the same row either way.
     #[serde(default)]
     pub capability_miss_handler: Option<String>,
-    /// The `fires_at` of the durable timer this row is armed for (issue
-    /// #1402). Set only by `queue::reschedule_task`. Survives a later
-    /// `scheduled_at` drift with the same wake reason. `NULL` when no timer
-    /// owns this row, or once a different wake reason repends it.
-    #[serde(default)]
-    pub timer_fires_at: Option<DateTime<Utc>>,
-    /// The `attempt` whose activity handler started (issue #1809). Written
-    /// with `ActivityStarted`. Equal to `attempt` only after the current
-    /// claim started its handler. `NULL` when no attempt started.
-    #[serde(default)]
-    pub handler_started_attempt: Option<i32>,
-    /// One entry per claim that the timeout enforcer timed out after its
-    /// handler started, newest last (issue #1809). An entry names the claim
-    /// by `attempt` and `started_at` (see `queue::timed_out_claim_key`). The
-    /// worker that held a claim takes its own entry out of here. `NULL`
-    /// until a claim times out.
-    #[serde(default)]
-    pub timed_out_claims: Option<Vec<Option<String>>>,
-    /// When the handler of `handler_started_attempt` started (issue #1809).
-    /// A timeout enforcer measures the attempt duration from it.
-    #[serde(default)]
-    pub handler_started_at: Option<DateTime<Utc>>,
-    /// `true` on the first workflow task of a freshly admitted run (issue
-    /// #1824). See [`crate::queue::CLAIM_ORDER_DUE_SQL`].
-    #[serde(default)]
-    pub new_start: bool,
 }
 
 /// Insert struct for enqueuing a new task.
@@ -610,7 +512,7 @@ pub struct NewTaskQueueItem<'a> {
     pub workflow_exec_id: Option<Uuid>,
     pub activity_name: Option<&'a str>,
     pub activity_id: Option<Uuid>,
-    pub input: SharedJson,
+    pub input: serde_json::Value,
     pub priority: i32,
     pub max_attempts: i32,
     pub scheduled_at: DateTime<Utc>,
@@ -639,9 +541,6 @@ pub struct NewTaskQueueItem<'a> {
     /// Worker session this activity belongs to (issue #606). `None` for an
     /// ordinary activity dispatch.
     pub session_id: Option<Uuid>,
-    /// `true` on the first workflow task of a freshly admitted run (issue
-    /// #1824).
-    pub new_start: bool,
 }
 
 /// Database representation of a rate limit bucket.
@@ -678,15 +577,6 @@ pub struct RateLimitBucket {
     /// take precedence, per-field, over the declared baseline) while this is
     /// set and in the future (issue #945).
     pub override_expires_at: Option<DateTime<Utc>>,
-    /// When `queue::ensure_rate_limit_bucket` last (re-)registered this bucket
-    /// (issue #1127). Part of the idle-bucket GC's idleness clock; `None` on a
-    /// row that has not been registered since the upgrade.
-    pub last_registered_at: Option<DateTime<Utc>>,
-    /// When an operator last wrote this bucket's permanent baseline through
-    /// `POST /admin/rate-limits/{key}` (issue #332). Non-`None` makes the row
-    /// **exempt** from the idle-bucket GC (issue #1127), so this is also the
-    /// answer to "why is this bucket never collected?".
-    pub baseline_set_at: Option<DateTime<Utc>>,
 }
 
 /// Insert struct for a rate limit bucket.
@@ -733,8 +623,7 @@ pub struct HarvestSchedule {
     pub paused_by: Option<String>,
     /// Free-text reason recorded with the most recent pause. NULL when active or no reason given.
     pub pause_reason: Option<String>,
-    /// Maximum jitter window in seconds. 0 = no jitter. The column defaults to 0;
-    /// `default_schedule_jitter` sets the value a registration writes.
+    /// Maximum jitter window in seconds. 0 = no jitter (default).
     pub jitter_secs: i64,
     /// Overlap policy variant stored as a `snake_case` string (issue #241).
     pub overlap_policy: String,
@@ -1001,7 +890,7 @@ pub struct NewHarvestWorker<'a> {
     pub max_concurrency: i32,
     pub host: &'a str,
     pub version: Option<&'a str>,
-    /// Build ID advertised by this worker (empty string = unset; claims no pinned task).
+    /// Build ID advertised by this worker (empty string = legacy/unset).
     pub build_id: &'a str,
     /// Optional deployment name for operator observability.
     pub deployment_name: Option<&'a str>,
@@ -1095,75 +984,6 @@ pub struct NewAuditRecord<'a> {
     pub source: &'a str,
 }
 
-// ── Audit export (issue #953) ─────────────────────────────────────────────────
-
-/// One audit row as read by the exporter.
-///
-/// A separate struct from [`AuditRecord`] deliberately: `AuditRecord` is the
-/// shape the management API serializes for `GET /audit`, and must not grow an
-/// internal bookkeeping column just because the exporter needs it.
-#[derive(Debug, Clone, Queryable, Selectable)]
-#[diesel(table_name = harvest_audit_log)]
-#[diesel(check_for_backend(diesel::pg::Pg))]
-pub struct AuditExportRow {
-    pub id: Uuid,
-    pub occurred_at: DateTime<Utc>,
-    pub actor: String,
-    pub operation: String,
-    pub target_type: String,
-    pub target_id: Option<String>,
-    pub route_or_command: String,
-    pub request_id: Option<String>,
-    pub idempotency_key: Option<String>,
-    pub status: String,
-    pub error_summary: Option<String>,
-    pub shard_id: Option<i32>,
-    pub source: String,
-    pub export_seq: Option<i64>,
-    /// Audit-chain link of the previous row (issue #1838).
-    pub chain_prev: Option<Vec<u8>>,
-    /// Newest `occurred_at` chained before this row (issue #1838).
-    pub chain_newest_before: Option<DateTime<Utc>>,
-    /// Audit-chain link of this row (issue #1838).
-    pub chain_hash: Option<Vec<u8>>,
-    /// The shard whose exporter made the links (issue #1838).
-    pub chain_shard: Option<i32>,
-}
-
-/// The per-shard audit-export delivery cursor (issue #953).
-#[derive(Debug, Clone, Queryable, Selectable, Identifiable)]
-#[diesel(table_name = harvest_audit_export_cursor)]
-#[diesel(primary_key(shard_id))]
-#[diesel(check_for_backend(diesel::pg::Pg))]
-pub struct AuditExportCursor {
-    pub shard_id: i32,
-    pub last_assigned_seq: i64,
-    pub last_acked_seq: i64,
-    pub claim_epoch: i64,
-    pub lease_until: Option<DateTime<Utc>>,
-    pub next_attempt_at: DateTime<Utc>,
-    pub consecutive_failures: i32,
-    pub last_status: Option<i32>,
-    pub last_error: Option<String>,
-    pub last_delivered_at: Option<DateTime<Utc>>,
-    pub updated_at: DateTime<Utc>,
-    /// Set when an operator retired audit export for this shard. The row is
-    /// kept rather than deleted so `last_assigned_seq` outlives the audit rows
-    /// themselves; a retired cursor is inert — retention ignores it and a
-    /// redrive refuses it.
-    pub retired_at: Option<DateTime<Utc>>,
-    /// Newest audit-chain link on this shard (issue #1838).
-    pub chain_head: Option<Vec<u8>>,
-    /// First chained `export_seq` on this shard (issue #1838).
-    pub chain_start_seq: Option<i64>,
-    /// `export_seq` of the newest chained row (issue #1838).
-    pub chain_head_seq: Option<i64>,
-    /// Newest `occurred_at` of the chain, through the head (issue #1838).
-    pub chain_newest_at: Option<DateTime<Utc>>,
-    /// Keyed MAC over the checkpoint columns (issue #1838).
-    pub chain_mac: Option<Vec<u8>>,
-}
-
 // ── ApiToken ──────────────────────────────────────────────────────────────────
 
 /// A single scoped API token for the management API (issue #942).
@@ -1233,12 +1053,6 @@ pub struct HarvestBuildPolicy {
     pub target_build_id: Option<String>,
     /// Ramp percentage 0..=100 (issue #604). `None` = no ramp configured.
     pub ramp_percent: Option<i32>,
-    /// One operator ramp's identity, the same on every shard pool (issue
-    /// #1814). `None` = no ramp, or a ramp set before the column existed.
-    pub ramp_id: Option<Uuid>,
-    /// The ramp guard's abort markers on this pool, newest first (issue
-    /// #1814). Each is `{"id": ramp_id, "base": build_id}`.
-    pub ramp_aborted: serde_json::Value,
 }
 
 /// Insert struct for a new build policy.
@@ -1405,12 +1219,6 @@ pub struct CompletionTriggerFireDb {
     /// NULL = fired; `condition_unmet` / `condition_invalid` =
     /// resolved-skipped by the output guard (issue #810).
     pub outcome: Option<String>,
-    /// The target shard resolved at relay time (issue #1401). NULL on a
-    /// resolved-skip row or a pre-migration row.
-    pub target_shard: Option<i32>,
-    /// The target workflow name resolved at relay time (issue #1401). NULL
-    /// on a resolved-skip row or a pre-migration row.
-    pub target_workflow_name: Option<String>,
 }
 
 /// Insertable model for registering a fired completion trigger.
@@ -1421,13 +1229,6 @@ pub struct NewCompletionTriggerFireDb {
     pub trigger_id: Uuid,
     /// NULL = fired; Some(reason) = resolved-skipped (issue #810).
     pub outcome: Option<String>,
-    /// The target shard resolved at relay time. `None` for a resolved-skip
-    /// row, which never picks a target (issue #1401).
-    pub target_shard: Option<i32>,
-    /// `harvest_completion_triggers.target_workflow_name` at relay time,
-    /// captured because that column can change after the fire (issue
-    /// #1401). `None` for a resolved-skip row.
-    pub target_workflow_name: Option<String>,
 }
 
 /// Queryable model representing a deferred completion trigger outbox task.
@@ -1448,7 +1249,6 @@ pub struct CompletionTriggerOutboxDb {
     pub priority: serde_json::Value,
     pub max_workflow_input_bytes: i64,
     pub created_at: DateTime<Utc>,
-    pub next_attempt_at: Option<DateTime<Utc>>,
 }
 
 /// Insertable model for registering a deferred completion trigger outbox task.
@@ -1466,47 +1266,6 @@ pub struct NewCompletionTriggerOutboxDb {
     pub concurrency_limit: Option<i32>,
     pub priority: serde_json::Value,
     pub max_workflow_input_bytes: i64,
-}
-
-// ── Cross-shard child workflows (issue #956) ─────────────────────────────────
-
-/// One in-flight cross-shard child, as stored on the **parent's** shard.
-///
-/// See `harvest_cross_shard_children` in `schema.rs` and
-/// [`crate::cross_shard_child`] for the lifecycle this row drives.
-#[derive(Debug, Clone, Queryable, Selectable, serde::Serialize, serde::Deserialize)]
-#[diesel(table_name = harvest_cross_shard_children)]
-#[diesel(check_for_backend(diesel::pg::Pg))]
-pub struct CrossShardChildRow {
-    pub child_exec_id: Uuid,
-    pub parent_exec_id: Uuid,
-    pub target_shard: i32,
-    pub status: String,
-    pub cancel_requested: bool,
-    /// `None` = awaited child; `Some(policy)` = detached child.
-    pub parent_close_policy: Option<String>,
-    pub workflow_name: String,
-    /// A serialized `crate::cross_shard_child::CrossShardChildSpec`.
-    pub child_spec: serde_json::Value,
-    pub created_at: DateTime<Utc>,
-    pub attempts: i32,
-    pub last_error: Option<String>,
-    pub last_attempt_at: Option<DateTime<Utc>>,
-}
-
-/// Insertable form of [`CrossShardChildRow`], written inside the parent's own
-/// decision transaction so the row and the parent's `ChildWorkflowStarted`
-/// event commit together or not at all.
-#[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
-#[diesel(table_name = harvest_cross_shard_children)]
-pub struct NewCrossShardChildRow {
-    pub child_exec_id: Uuid,
-    pub parent_exec_id: Uuid,
-    pub target_shard: i32,
-    pub status: String,
-    pub parent_close_policy: Option<String>,
-    pub workflow_name: String,
-    pub child_spec: serde_json::Value,
 }
 
 // ── AdmissionGate ─────────────────────────────────────────────────────────────
@@ -1738,11 +1497,6 @@ pub struct ExecutionSummary {
     /// cascade.
     pub parent_id: Option<Uuid>,
     pub summarized_at: DateTime<Utc>,
-    /// The residence history carried over from the demoted execution row
-    /// (issue #964), so a cross-residence erasure can still reach the sealed
-    /// source copies after that row is collected. `None` for a run that never
-    /// moved.
-    pub migrated_from_shards: Option<serde_json::Value>,
 }
 
 /// Insert struct for a newly written execution summary (issue #752).
@@ -1765,10 +1519,6 @@ pub struct NewExecutionSummary {
     /// Parent execution UUID when demoting a child workflow, else `None`
     /// (issue #752).
     pub parent_id: Option<Uuid>,
-    /// The demoted execution's residence history (issue #964), carried over so
-    /// a cross-residence erasure can still reach the sealed source copies after
-    /// the execution row is gone. `None` for a run that never moved.
-    pub migrated_from_shards: Option<serde_json::Value>,
 }
 
 // ── WASM activity module storage (issue #965) ───────────────────────────────
@@ -1802,8 +1552,6 @@ pub struct NewHarvestWasmModule<'a> {
     pub activity_name: &'a str,
     pub wasm_bytes: &'a [u8],
     pub active: bool,
-    /// Hex Ed25519 publisher signature (issue #1838). `None` = unsigned.
-    pub signature: Option<&'a str>,
 }
 
 // ── Durable mutex locks (issue #691) ────────────────────────────────────────
@@ -1895,124 +1643,4 @@ pub struct NewHarvestWorkflowLog {
     pub seq: i64,
     pub level: String,
     pub message: String,
-}
-
-#[cfg(test)]
-mod effective_terminal_state_tests {
-    use super::WorkflowExecution;
-
-    /// A minimal row, defaulted to a live `RUNNING` execution untouched by
-    /// shard rebalancing. Callers override only the fields their case needs.
-    fn stub(state: &str) -> WorkflowExecution {
-        WorkflowExecution {
-            id: uuid::Uuid::new_v4(),
-            workflow_name: "entity_flow".to_string(),
-            workflow_id: "eff-terminal-state".to_string(),
-            run_id: uuid::Uuid::new_v4(),
-            shard_id: 0,
-            state: state.to_string(),
-            input: serde_json::json!({}),
-            output: None,
-            error: None,
-            parent_id: None,
-            sticky_worker_id: None,
-            queue_name: "default".to_string(),
-            started_at: chrono::Utc::now(),
-            completed_at: None,
-            execution_timeout: None,
-            deadline_at: None,
-            chain_execution_timeout: None,
-            chain_deadline_at: None,
-            memo: None,
-            search_attrs: None,
-            created_at: chrono::Utc::now(),
-            assigned_build_id: None,
-            parent_close_policy: None,
-            owner: None,
-            runbook_url: None,
-            severity: None,
-            paused_at: None,
-            pause_reason: None,
-            pause_actor: None,
-            current_details: None,
-            context_headers: None,
-            sla: None,
-            sla_deadline_at: None,
-            sla_breached: false,
-            sla_breached_at: None,
-            schedule_id: None,
-            scheduled_for: None,
-            workflow_attempt: 1,
-            workflow_retry_policy: None,
-            retry_of_exec_id: None,
-            origin: None,
-            nd_blocked_at: None,
-            nd_block_reason: None,
-            nd_block_count: 0,
-            completion_callbacks: None,
-            continued_from_exec_id: None,
-            first_exec_id: None,
-            legal_hold_set_at: None,
-            legal_hold_until: None,
-            legal_hold_reason: None,
-            legal_hold_actor: None,
-            start_source: None,
-            start_source_ref: None,
-            started_by: None,
-            history_bloat_warned_at: None,
-            triage_note: None,
-            quota_key: None,
-            migrated_to_shard: None,
-            migrated_at: None,
-            migrated_from_shards: None,
-            migrated_run_terminal_at: None,
-            migrated_run_terminal_state: None,
-            staging_vacated_state: None,
-            staging_vacated_by: None,
-        }
-    }
-
-    #[test]
-    fn a_non_migrated_row_reads_its_own_state_unchanged() {
-        let row = stub("FAILED");
-        assert_eq!(row.effective_terminal_state(), "FAILED");
-    }
-
-    #[test]
-    fn an_unreconciled_migrated_seal_reads_as_migrated() {
-        // Still live elsewhere; `migrated_run_terminal_state` is never set
-        // until a reconciler observes the live copy terminal.
-        let row = stub("MIGRATED");
-        assert_eq!(row.effective_terminal_state(), "MIGRATED");
-    }
-
-    #[test]
-    fn a_reconciled_seal_reads_the_live_copy_s_recorded_outcome() {
-        let mut row = stub("MIGRATED");
-        row.migrated_run_terminal_at = Some(chrono::Utc::now());
-        row.migrated_run_terminal_state = Some("FAILED".to_string());
-        assert_eq!(
-            row.effective_terminal_state(),
-            "FAILED",
-            "a failed live copy must read as FAILED, not the seal's own MIGRATED state"
-        );
-    }
-
-    #[test]
-    fn a_reconciled_seal_with_a_successful_outcome_still_reads_as_that_outcome() {
-        let mut row = stub("MIGRATED");
-        row.migrated_run_terminal_at = Some(chrono::Utc::now());
-        row.migrated_run_terminal_state = Some("COMPLETED".to_string());
-        assert_eq!(row.effective_terminal_state(), "COMPLETED");
-    }
-
-    #[test]
-    fn a_reconciled_seal_with_no_recorded_outcome_falls_back_to_migrated() {
-        // A seal reconciled before `migrated_run_terminal_state` existed
-        // (or by a reconciler build that predates it): the fallback must
-        // not panic or fabricate an outcome.
-        let mut row = stub("MIGRATED");
-        row.migrated_run_terminal_at = Some(chrono::Utc::now());
-        assert_eq!(row.effective_terminal_state(), "MIGRATED");
-    }
 }

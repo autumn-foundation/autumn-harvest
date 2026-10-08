@@ -12,7 +12,7 @@
 //! |---|---|---|---|---|
 //! | Admission gate | workflow **starts** | manual | halts new starts; in-flight runs keep scheduling activities | #377 / #618 |
 //! | Queue pause | a whole **task queue** | manual | holds dispatch for every activity on that queue | #619 |
-//! | Circuit breaker | one **activity type** | *automatic*, reactive | **short-circuits** dispatch after failures accumulate (defers by default, #1809) | #369 |
+//! | Circuit breaker | one **activity type** | *automatic*, reactive | **fast-fails** dispatch after failures accumulate | #369 |
 //! | **Activity pause (this)** | one **activity type** | *manual*, proactive | **holds** dispatch: nothing fails, retries, or dead-letters | **#807** |
 //!
 //! The breaker and this feature share a granularity but not a job. The breaker
@@ -286,13 +286,15 @@ pub async fn release_claim_if_activity_paused(
     task_id: uuid::Uuid,
     worker_id: &str,
 ) -> HarvestResult<bool> {
-    crate::queue::release_claim_via(
-        conn,
-        release_claim_if_activity_paused_query(),
-        task_id,
-        worker_id,
-    )
-    .await
+    use diesel_async::RunQueryDsl;
+
+    let released = diesel::sql_query(release_claim_if_activity_paused_query())
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .bind::<diesel::sql_types::Text, _>(worker_id)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(released > 0)
 }
 
 /// The resume-time `scheduled_at` credit.
@@ -1046,11 +1048,11 @@ pub async fn resume_activity(
             let released = shifted.len();
             let shifted_ids: Vec<uuid::Uuid> = shifted.into_iter().map(|r| r.id).collect();
 
-            // Ring the doorbell INSIDE the transaction. The sender sends the
-            // wake only after COMMIT (issue #1796), so listeners wake exactly
-            // when the hold lifts. An earlier wake would still see the
-            // uncommitted pause row and skip the task. A rollback sends no
-            // wake.
+            // Ring the doorbell INSIDE the transaction: Postgres queues NOTIFY
+            // and delivers it at COMMIT, so listeners wake exactly when the
+            // hold lifts -- never earlier (an early wake would still see the
+            // uncommitted pause row and skip the task) and never at all if this
+            // rolls back.
             //
             // Ordered BEFORE the late-arrivals credit pass so that pass is the
             // last statement this transaction runs (issue #807 review, Codex

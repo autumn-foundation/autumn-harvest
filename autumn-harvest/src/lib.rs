@@ -1,10 +1,5 @@
 //! Durable workflow orchestration engine core.
 
-// Issue #1821: one bad row can stop the same scanner loop on every replica.
-// Non-test code returns an error instead. Each remaining site carries an
-// `expect` attribute with its reason. Whole-module exceptions are on `mod` items.
-#![warn(clippy::expect_used, clippy::unwrap_used)]
-
 /// Embedded migrations for the harvest engine schema.
 ///
 /// Downstream crates (such as `autumn-harvest-plugin`) should consume this
@@ -141,83 +136,17 @@ pub const fn full_migrations_sql() -> &'static str {
     include_str!(concat!(env!("OUT_DIR"), "/all_migrations_bundle.sql"))
 }
 
-/// The migration bundle a testcontainers-backed suite should apply, honouring
-/// the `HARVEST_TEST_PARTITIONED` layout switch (issue #958).
-///
-/// Identical to [`full_migrations_sql`] unless `HARVEST_TEST_PARTITIONED` is
-/// set to something other than `0`/`false`/empty, in which case the opt-in
-/// partitioned layout is enabled on the fresh database as well.
-///
-/// **Why this exists.** Issue #958 requires that per-execution event semantics
-/// be "byte-identical between layouts, asserted by running the existing
-/// store/replay integration suites against both layouts". Every DB-backed suite
-/// bootstraps through this one helper, so *any* of them can be re-run against
-/// the partitioned layout by setting one environment variable — no per-suite
-/// port, and no separate set of assertions that could drift from the originals.
-///
-/// CI re-runs the subset listed with osclass `linuxpart` in
-/// `.github/ci/integration-suites.txt`: the store, replay, history, retention,
-/// legal-hold and end-to-end suites. That is a deliberate subset, not the whole
-/// corpus — every suite would double the Docker-backed CI time for suites that
-/// never touch `harvest_events`. Adding one is a single manifest line.
-///
-/// The enable script is exactly the one
-/// [`partition::enable_partitioning`](crate::partition::enable_partitioning)
-/// executes — not a test-only reimplementation — so a suite passing here is
-/// evidence about the layout operators actually get.
-///
-/// Returns `String` rather than `&'static str` because the payload now depends
-/// on the environment. Callers that need bytes can use `.as_bytes()`.
-///
-/// `#[doc(hidden)]`: test-support, not semver-stable surface. Stays `pub` so
-/// the plugin crate's integration tests can call it across the crate boundary.
-#[doc(hidden)]
-#[must_use]
-pub fn test_init_sql() -> String {
-    let mut sql = full_migrations_sql().to_string();
-    if test_partitioned_layout_requested() {
-        sql.push_str("\n\n");
-        sql.push_str(&crate::partition::enable_sql(
-            &crate::partition::EnableOptions::default(),
-        ));
-    }
-    sql
-}
-
-/// Whether `HARVEST_TEST_PARTITIONED` asks for the partitioned layout.
-///
-/// Treats `0`, `false` and empty as off so a CI matrix can set the variable
-/// unconditionally and vary only its value.
-#[doc(hidden)]
-#[must_use]
-pub fn test_partitioned_layout_requested() -> bool {
-    std::env::var("HARVEST_TEST_PARTITIONED").is_ok_and(|v| {
-        let v = v.trim();
-        !(v.is_empty() || v == "0" || v.eq_ignore_ascii_case("false"))
-    })
-}
-
 /// Per-activity-type pause/resume for surgical outage containment (issue #807).
 pub mod activity_pause;
-/// Adaptive concurrency limit per activity type (issue #1836).
-pub mod adaptive_limit;
 /// Admission gate primitive for incident-response operators (issue #377).
 pub mod admission_gate;
-/// AES-256-GCM payload codec and data-key providers (issue #1825).
-pub mod aead_codec;
 /// History analyzer and linter.
 pub mod analyzer;
 /// Pure token-secret helpers shared by the mint route and the CLI (issue #942).
 pub mod api_token;
-/// The database guard on append-only `harvest_events` (issue #1817).
-pub mod append_only;
 /// Audit trail for management API mutations (issue #158).
 #[cfg(feature = "db")]
 pub mod audit;
-/// Keyed hash chain over exported audit rows (issue #1838).
-pub mod audit_chain;
-/// Audit-record export to an external sink for SIEM compliance (issue #953).
-pub mod audit_export;
 /// Open-awaitables diagnostic projection (issue #615).
 pub mod awaitables;
 /// Post-restore resumability verification for backup/PITR drills (issue #943).
@@ -246,14 +175,9 @@ pub mod canary;
 /// `#[cfg(feature = "chaos")]` and never part of a production binary.
 #[doc(hidden)]
 pub mod chaos;
-/// Per-activity circuit breaker that stops dispatch during downstream
-/// outages (issues #369, #1809).
+/// Per-activity circuit breaker that fast-fails dispatch during downstream
+/// outages (issue #369).
 pub mod circuit_breaker;
-/// Payload-codec key rotation and the lazy re-encryption sweep (issue #948).
-///
-/// Home of **sanctioned in-place mutation exception #3** — see the module docs
-/// and the "Engine invariants" section of `CLAUDE.md`.
-pub mod codec_rotation;
 /// Durable completion callbacks (issue #605).
 ///
 /// Pushes a workflow's terminal result to an operator-registered URL,
@@ -262,23 +186,8 @@ pub mod completion_callback;
 pub mod completion_trigger;
 /// Per-key concurrency limits for tenant fair-share scheduling (issue #247).
 pub mod concurrency;
-// Issue #1821 exempts this module. Each workflow poll runs under
-// `catch_unwind`, so a panic here fails one workflow task, and replay builds a
-// new context. Recovery from a poisoned lock can keep partial replay state.
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    reason = "a panic fails one workflow task and replay recovers it"
-)]
 pub mod context;
 pub mod critical_path;
-/// Cross-shard child workflow placement (issue #956).
-///
-/// The relay that creates opt-in cross-shard children on their target shard,
-/// delivers their terminals back to the awaiting parent, and applies the
-/// parent-close cascade — all with shard-local ACID preserved.
-#[cfg(feature = "db")]
-pub mod cross_shard_child;
 pub mod dag;
 /// Export format types for Directed Acyclic Graphs (DAGs) representing workflows.
 pub mod dag_export;
@@ -299,11 +208,6 @@ pub mod debugger;
 /// Deterministic workflow guardrails: static source-level check for replay-breaking patterns.
 pub mod det_check;
 pub mod diagnostic;
-/// Task dispatch channel seam (issue #1312): Postgres stays the source of
-/// truth, a [`dispatch::TaskDispatch`] carries task references.
-pub mod dispatch;
-/// Deterministic simulation of the activity claim protocol (issue #1830).
-pub mod dst;
 /// Effective runtime-configuration introspection (issue #695).
 ///
 /// [`effective_config::EffectiveConfigView`] is the serialisable, secret-free
@@ -327,49 +231,20 @@ pub mod event_batch;
 #[doc(hidden)]
 pub mod execution;
 pub mod executor;
-/// Shard-placement-aware resolution for `workflow_id`-addressed external
-/// signal/cancel targets (issue #1146).
-#[cfg(feature = "db")]
-pub mod external_target_location;
 #[cfg(feature = "db")]
 pub mod external_task;
 pub mod failure;
-/// Replay fuzz harness (issue #1835). Not a stable API.
-#[cfg(feature = "fuzzing")]
-#[doc(hidden)]
-#[allow(
-    clippy::expect_used,
-    reason = "fuzz harness code: a failed `expect` is a finding"
-)]
-pub mod fuzzing;
 /// Deterministic workflow guardrail rule catalog (issue #173).
 pub mod guardrail;
 #[cfg(feature = "db")]
 pub mod handle;
 #[cfg(feature = "db")]
 pub mod handle_typed;
-/// Activity heartbeat flusher. The flush loop has no DB dependency. The
-/// Postgres sink needs the `db` feature (issue #1800).
-#[doc(hidden)]
-pub mod heartbeat;
 pub mod history_export;
-/// Hot code swap for workflow definitions via runtime modules (issue #967).
-///
-/// R&D spike. Hosts a `#[workflow]` body as a runtime-loaded WebAssembly
-/// module registered under an explicit `BuildId`, so the shipped build-routing
-/// machinery governs a swap with no new safety machinery and no replay-surface
-/// change. See `docs/rnd/hot-code-swap.md`.
-#[cfg(feature = "hot-code-swap")]
-pub mod hot_swap;
-/// Postgres registry for hot-swappable workflow modules (issue #967).
-#[cfg(feature = "hot-code-swap")]
-pub mod hot_swap_store;
 pub mod info;
 /// Activity execution interceptors (issue #680): an ordered middleware chain
 /// wrapping every activity execution on the worker (regular + local).
 pub mod interceptor;
-/// Every persisted workflow execution state and every sanctioned transition.
-pub mod lifecycle;
 /// `cfg(loom)` synchronization-primitive shim (std under normal builds).
 ///
 /// Contained to the modules that opt into loom model checking; see
@@ -384,18 +259,10 @@ mod loom_sync;
 /// Enabled by the `metrics-rs` cargo feature.
 #[cfg(feature = "metrics-rs")]
 pub mod metrics_rs_adapter;
-/// Migration applier for a dedicated Harvest database (issue #1240).
-#[cfg(feature = "db")]
-pub mod migrate;
 /// Durable mutual-exclusion locks for workflow code (`ctx.mutex`, issue #691).
 pub mod mutex;
-pub mod partition;
 pub mod payload_codec;
 pub mod payload_store;
-/// The connection transport a DSN's `sslmode` selects, with TLS through
-/// rustls.
-#[cfg(feature = "db")]
-pub mod pg_tls;
 pub mod poison_pill;
 pub mod policy;
 pub mod pool;
@@ -412,17 +279,6 @@ pub mod queue_pause;
 /// `db` feature; [`quota::load_quota_usage`]/[`quota::list_quota_usage`] are
 /// DB-gated.
 pub mod quota;
-#[cfg(feature = "db")]
-mod quota_lock_order;
-/// Registry-aware `quota_key` backfill for pre-upgrade executions (issue #1226).
-///
-/// Pure logic ([`quota_reconcile::resolve_backfill`],
-/// [`quota_reconcile::ReconcileSummary`]) compiles without the `db` feature;
-/// the sweep and its periodic spawner are DB-gated.
-pub mod quota_reconcile;
-/// Automatic resume of a shard rebalance stalled after its cutover (issue
-/// #1839).
-pub mod rebalance_resume;
 pub mod replay;
 /// Stratified in-flight history sampling for the replay-drift gate (issue #798).
 ///
@@ -431,26 +287,14 @@ pub mod replay;
 /// CLI bundle writer, and [`testing::ReplayVerifier::replay_bundle`], so the
 /// bundle wire shape cannot drift between producer and consumer.
 pub mod replay_sample;
-/// Cross-region DR fencing and replication-lag measurement (issue #954).
-pub mod replication;
 #[cfg(feature = "db")]
 pub mod reset;
-/// Resident workflow state between decisions (issue #1798).
-///
-/// Only the `testing` feature can create a [`resident::ResidentWorkflow`].
-/// Other builds hide the module from the docs.
-#[cfg_attr(not(feature = "testing"), doc(hidden))]
-pub mod resident;
 pub mod retention;
-/// Per-activity-type retry budget that bounds retry load (issue #1793).
-pub mod retry_budget;
 /// Continue-as-new run-chain assembly (issue #701).
 pub mod run_chain;
 pub mod saga;
 /// Background control-loop liveness heartbeats (issue #797).
 pub mod scanner_health;
-/// One active background scanner per shard, elected by a lease (issue #1795).
-pub mod scanner_lease;
 /// Workflow payload-schema contract baseline and replay-compatibility diffing (issue #794).
 ///
 /// Deliberately ungated: the CLI links `autumn-harvest` with
@@ -460,26 +304,6 @@ pub mod schema_contract;
 /// Worker session fleet-side registry and pure decision functions (issue #606).
 pub mod sessions;
 pub mod shard;
-/// A task-local fence on the shards one request may reach (issue #1803).
-pub mod shard_fence;
-/// Shard rebalancing: migrating quiescent workflow executions across shards
-/// (issue #964).
-pub mod shard_rebalance;
-/// Shared, immutable JSON payload for the workflow start path (issue #1733).
-pub mod shared_json;
-/// Retry a transaction after a deadlock or serialization abort (issue #1822).
-///
-/// Engine internal with no stability guarantee. It is `pub` for the
-/// integration tests only.
-#[cfg(feature = "db")]
-#[doc(hidden)]
-pub mod tx_retry;
-
-/// `cfg(shuttle)` async-primitive shim (tokio under normal builds).
-///
-/// Only the modules that opt into Shuttle model checking use it. See
-/// `docs/testing/shuttle.md`. Internal, not part of the public API.
-mod shuttle_sync;
 /// Signal handler registry for push-based reactive signal handling (issue #546).
 pub mod signal_handler;
 pub mod simulator;
@@ -495,11 +319,6 @@ pub mod telemetry;
 pub mod test_generator;
 /// Replay test harness for verifying workflow determinism pre-deploy.
 #[cfg(any(test, feature = "testing"))]
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    reason = "test harness code, not a production path"
-)]
 pub mod testing;
 /// Workflow-start throttle — pace admissions, defer the excess (issue #607).
 pub mod throttle;
@@ -528,8 +347,9 @@ pub mod webhook_trigger;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub mod dlq;
-/// Automatic load shedding driven by backlog age (issue #1794).
-pub mod load_shed;
+#[cfg(feature = "db")]
+#[doc(hidden)]
+pub mod heartbeat;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub mod models;
@@ -539,8 +359,6 @@ pub mod notify;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub mod queue;
-/// Metric-gated automatic abort of a build ramp (issue #1814).
-pub mod ramp_guard;
 #[cfg(feature = "db")]
 pub mod schedule_decision;
 #[cfg(feature = "db")]
@@ -560,21 +378,15 @@ pub mod store;
 pub mod timeout;
 #[cfg(feature = "wasm-activities")]
 pub mod wasm_activities;
-/// Ed25519 publisher signatures for WASM modules (issue #1838).
-#[cfg(feature = "wasm-activities")]
-pub mod wasm_signing;
 /// Postgres storage and dispatch resolution for WASM activities (issue #965).
 #[cfg(feature = "wasm-activities")]
 pub mod wasm_store;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub mod worker;
-/// Per-worker outlier (gray-failure) detection (issue #1815).
-pub mod worker_outlier;
 #[cfg(feature = "db")]
 pub mod workers;
 
-pub use adaptive_limit::AdaptiveLimitConfig;
 pub use admission_gate::{
     AdmissionGate, AdmissionGateCache, AdmissionGateId, AdmissionGateView, GateMode, GateScope,
     MAX_ACTIVE_GATES, ProducerContractEntry, ProducerGateStatus, StartProducer, check_admission,
@@ -608,13 +420,12 @@ pub use completion_trigger::{
 };
 pub use context::{
     ActivityContext, ActivityExecutionInfo, ActivityIdentity, AutoHeartbeatGuard,
-    DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION, DEFAULT_HISTORY_BLOAT_WARN_FRACTION,
-    DEFAULT_HISTORY_BYTE_HARD_CAP, DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD,
-    DEFAULT_HISTORY_EVENT_HARD_CAP, DEFAULT_SESSION_ACQUISITION_TIMEOUT,
-    DEFAULT_WORKFLOW_LOG_MAX_LINES, DEFAULT_WORKFLOW_LOG_MAX_MESSAGE_BYTES, MutexGuard,
-    MutexHandle, RaceBuilder, RaceWinner, Session, SessionOptions, TimerHandle, TimerOutcome,
-    WorkflowCommand, WorkflowContext, WorkflowExecutionInfo, WorkflowHistoryPolicy,
-    WorkflowLogLevel, WorkflowLogPolicy, WorkflowLogger, is_reserved_session_activity_name,
+    DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION, DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD,
+    DEFAULT_SESSION_ACQUISITION_TIMEOUT, DEFAULT_WORKFLOW_LOG_MAX_LINES,
+    DEFAULT_WORKFLOW_LOG_MAX_MESSAGE_BYTES, MutexGuard, MutexHandle, RaceBuilder, RaceWinner,
+    Session, SessionOptions, TimerHandle, TimerOutcome, WorkflowCommand, WorkflowContext,
+    WorkflowExecutionInfo, WorkflowHistoryPolicy, WorkflowLogLevel, WorkflowLogPolicy,
+    WorkflowLogger, is_reserved_session_activity_name,
 };
 pub use critical_path::{CriticalPathAnalyzer, CriticalPathResult};
 pub use dag::{
@@ -625,8 +436,8 @@ pub use dag::{
 pub use dag_export::export_profile_mermaid_gantt;
 pub use dag_export::{export_dot, export_mermaid, export_mermaid_with_critical_path};
 pub use dag_linter::{
-    DagLinter, DagRule, DagWarning, DuplicateNodeNameRule, ExcessiveParallelismRule,
-    MissingRetryPolicyRule, MissingTimeoutRule,
+    DagLinter, DagRule, DagWarning, ExcessiveParallelismRule, MissingRetryPolicyRule,
+    MissingTimeoutRule,
 };
 #[cfg(any(test, feature = "testing"))]
 pub use dag_profiler::{DagProfile, DagProfiler, ProfilerEvent, ProfilerEventKind};
@@ -653,15 +464,10 @@ pub use execution::{
     redrive_target, resolve_execution_id_by_workflow_id, resolve_live_attempt,
     resolve_live_attempt_id, resume_live_attempt, resume_workflow_execution,
     schedule_run_state_summary, select_resolved_run, signal_with_start_workflow_execution,
-    signal_with_start_workflow_execution_with_metrics,
-    signal_with_start_workflow_execution_with_metrics_and_codecs, start_or_load_workflow_execution,
-    start_or_load_workflow_execution_idempotent,
-    start_or_load_workflow_execution_idempotent_with_codecs,
-    start_or_load_workflow_execution_with_codecs, start_or_load_workflow_execution_with_metrics,
-    start_or_load_workflow_execution_with_metrics_and_codecs, terminate_live_attempt,
-    terminate_workflow_execution, update_with_start_workflow_execution,
+    signal_with_start_workflow_execution_with_metrics, start_or_load_workflow_execution,
+    start_or_load_workflow_execution_idempotent, start_or_load_workflow_execution_with_metrics,
+    terminate_live_attempt, terminate_workflow_execution, update_with_start_workflow_execution,
     update_with_start_workflow_execution_with_metrics,
-    update_with_start_workflow_execution_with_metrics_and_codecs,
 };
 pub use executor::{WorkflowOutcome, run_workflow};
 pub use guardrail::{
@@ -706,9 +512,8 @@ pub use payload_store::{
 };
 pub use policy::validate_schedule;
 pub use policy::{
-    AdaptiveLimitPolicy, CatchupPolicy, JitterPolicy, MapFailurePolicy, OverlapPolicy,
-    RetryBudgetPolicy, RetryPolicy, Schedule, SkipPolicy, TaskStatus, TriggerRule,
-    WorkflowSchedule,
+    CatchupPolicy, MapFailurePolicy, OverlapPolicy, RetryPolicy, Schedule, SkipPolicy, TaskStatus,
+    TriggerRule, WorkflowSchedule,
 };
 pub use pool::{HarvestPoolConfig, compute_pool_sizes};
 pub use query::QueryRegistry;
@@ -732,7 +537,6 @@ pub use retention::{
     RetentionMonitor, RetentionRuntime, RetentionStatus, RetentionTickResult, release_legal_hold,
     set_legal_hold,
 };
-pub use retry_budget::RetryBudgetConfig;
 pub use run_chain::{
     RunChainRecord, RunChainResponse, RunChainRow, assemble_run_chain, outcome_for_state,
 };
@@ -753,7 +557,6 @@ pub use schema_contract::{
 #[cfg(feature = "db")]
 pub use shard::ShardedDbPool;
 pub use shard::{ShardPlacement, ShardPlacementError, ShardRouter, ShardRouterParts};
-pub use shared_json::SharedJson;
 pub use signal_handler::SignalHandlerRegistry;
 pub use simulator::{SimulatorResult, WorkflowSimulator};
 pub use stall_diagnosis::{
@@ -809,25 +612,6 @@ pub use webhook_trigger::{
     validate_webhook_triggers,
 };
 
-#[cfg(feature = "hot-code-swap")]
-pub use hot_swap::{
-    DECIDE_ABI_VERSION, DECIDE_FUEL, DECIDE_MAX_WALL_CLOCK, DECIDE_MEMORY_BYTES,
-    DECIDE_RUN_FUEL_BUDGET, DECIDE_RUN_WALL_CLOCK_BACKSTOP, DecideOutcome, DecideRequest,
-    DecideResponse, DecisionCache, HotSwapError, LoadedWorkflowModule, MAX_CACHED_DECISION_BYTES,
-    MAX_CACHED_DECISIONS, MAX_CACHED_RESPONSE_BYTES, MAX_DECIDE_REQUEST_BYTES, MAX_DECIDE_STEPS,
-    MAX_GUEST_TEXT_BYTES, MAX_QUEUE_NAME_BYTES, MAX_WORKFLOW_MODULE_BYTES, MIN_SIGNING_KEY_BYTES,
-    ModuleDescriptor, ModuleHost, ModuleRegistry, ModuleVerification, PreparedBinding,
-    clamp_decide_limits, compute_module_hash, default_decide_limits, encode_decide_request,
-    is_module_hosted, module_workflow_handler, sign_module_binding, verify_module_bytes,
-    with_module_host,
-};
-#[cfg(feature = "hot-code-swap")]
-pub use hot_swap_store::{
-    WorkflowModuleRow, fetch_workflow_module, list_workflow_modules,
-    list_workflow_modules_for_build, publish_workflow_module, retire_build_modules,
-    sync_build_into_registry,
-};
-
 #[cfg(feature = "wasm-activities")]
 pub use wasm_activities::{
     DEFAULT_FUEL, DEFAULT_MAX_WALL_CLOCK, DEFAULT_MEMORY_BYTES, EPOCH_TICK_INTERVAL,
@@ -837,10 +621,9 @@ pub use wasm_activities::{
 #[cfg(feature = "wasm-activities")]
 pub use wasm_store::{
     MAX_WASM_MODULE_BYTES, PreparedWasmActivity, WasmActivityRegistration, WasmBinding,
-    WasmDispatch, WasmModuleRow, fetch_wasm_module_bytes, list_wasm_modules,
-    publish_signed_wasm_module, publish_wasm_module, resolve_active_wasm_hash,
-    resolve_active_wasm_module, resolve_active_wasm_version, resolve_wasm_dispatch,
-    seed_registered_wasm_modules, seed_signed_wasm_module, seed_wasm_module,
+    WasmDispatch, WasmModuleRow, fetch_wasm_module_bytes, list_wasm_modules, publish_wasm_module,
+    resolve_active_wasm_hash, resolve_active_wasm_module, resolve_wasm_dispatch,
+    seed_registered_wasm_modules, seed_wasm_module,
 };
 
 #[cfg(feature = "db")]

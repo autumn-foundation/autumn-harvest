@@ -22,9 +22,8 @@ use crate::completion_trigger::DeferredTriggerStart;
 use crate::error::{HarvestError, HarvestResult, TimeoutType, database_error};
 use crate::execution::{
     CancelledWorkflowExecution, StartWorkflowParams, StartedWorkflowExecution,
-    check_and_report_unfinished_handlers, load_execution,
-    start_or_load_workflow_execution_collect_with_codecs,
-    start_or_load_workflow_execution_with_codecs,
+    check_and_report_unfinished_handlers, load_execution, start_or_load_workflow_execution,
+    start_or_load_workflow_execution_collect,
 };
 use crate::models::WorkflowExecution;
 use crate::notify::{WorkflowEventListener, WorkflowEventWaitOutcome};
@@ -270,23 +269,6 @@ pub struct WorkflowHandleClient {
 }
 
 impl WorkflowHandleClient {
-    /// Send the wakes of this client's last writes (issue #1796).
-    ///
-    /// A start, signal or cancel returns after its commit. A sender task on
-    /// the current runtime then sends its wake. A runtime that stops first
-    /// loses that wake, and a worker finds the task only at its next poll.
-    /// Call this before a short-lived runtime stops.
-    ///
-    /// Waits up to `timeout` for each shard's sender. Returns `true` when
-    /// every sender holds no notes.
-    pub async fn flush_notifications(&self, timeout: Duration) -> bool {
-        let mut drained = true;
-        for (_, pool) in self.inner.pools.iter_shards() {
-            drained &= crate::notify::register_pool(pool).flush(timeout).await;
-        }
-        drained
-    }
-
     /// Build a single-shard handle client.
     #[must_use]
     pub fn single(pool: DbPool, notification_database_url: impl Into<String>) -> Self {
@@ -312,10 +294,6 @@ impl WorkflowHandleClient {
         I: IntoIterator<Item = (ShardId, S)>,
         S: Into<String>,
     {
-        // Start the post-commit notify sender for each pool (issue #1796).
-        for (_, pool) in pools.iter_shards() {
-            crate::notify::register_pool(pool);
-        }
         Self {
             inner: Arc::new(WorkflowHandleClientInner {
                 pools,
@@ -671,13 +649,7 @@ impl WorkflowHandleClient {
         conn: &mut AsyncPgConnection,
         request: StartWorkflowParams<'_>,
     ) -> HarvestResult<StartedWorkflowHandle> {
-        let started = start_or_load_workflow_execution_with_codecs(
-            conn,
-            request,
-            None,
-            &self.inner.payload_codecs,
-        )
-        .await?;
+        let started = start_or_load_workflow_execution(conn, request, None).await?;
         let handle = self.handle(started.exec_id);
         Ok(StartedWorkflowHandle { started, handle })
     }
@@ -837,19 +809,10 @@ impl WorkflowHandleClient {
         // start and increments `harvest.admission.blocked`, exactly like every
         // other in-process producer. See `StartProducer::Transactional` in the
         // admission-gate contract (`admission_gate.rs`) for the full rationale.
-        // The start writes a `PENDING` task row inside the caller's own
-        // transaction (issue #1312). Its dispatch hint must therefore not
-        // reach the channel until that transaction commits. The scope holds
-        // it. `TransactionalStartOutcome::finish` — this method's documented
-        // post-commit hook — publishes it. A caller that never calls `finish`
-        // loses only latency: the worker's reconcile sweep republishes the row.
-        //
-        // `Box::pin` keeps this future off the caller's stack, as the two
-        // `start_or_load_workflow_execution` call sites do.
-        let (collected, start_hints) = Box::pin(crate::dispatch::buffered(async {
+        let (started, deferred_starts, deferred_checks, cancel_metrics) =
             if let Some(key) = options.idempotency_key.as_deref() {
                 self.start_workflow_transactional_idempotent(conn, params, key)
-                    .await
+                    .await?
             } else {
                 // Issue #763 review (Codex finding): `in_outer_transaction = true`
                 // below tells `start_or_load_workflow_execution_collect` that a
@@ -890,7 +853,7 @@ impl WorkflowHandleClient {
                     Vec<crate::execution::StartCancelledRun>,
                 ), HarvestError, _>(async |conn| {
                     let params = params;
-                    start_or_load_workflow_execution_collect_with_codecs(
+                    start_or_load_workflow_execution_collect(
                         conn,
                         params,
                         /* in_outer_transaction = */ true,
@@ -898,15 +861,11 @@ impl WorkflowHandleClient {
                         Some(self.inner.metrics.as_ref()
                             as &(dyn crate::telemetry::MetricsRecorder + Send + Sync)),
                         Some(crate::admission_gate::GateMode::CheckCached),
-                        &self.inner.payload_codecs,
                     )
                     .await
                 }))
-                .await
-            }
-        }))
-        .await;
-        let (started, deferred_starts, deferred_checks, cancel_metrics) = collected?;
+                .await?
+            };
 
         Ok(TransactionalStartOutcome {
             exec_id: started.exec_id,
@@ -920,7 +879,6 @@ impl WorkflowHandleClient {
                 starts: deferred_starts,
                 checks: deferred_checks,
                 cancel_metrics,
-                hints: start_hints,
             },
         })
     }
@@ -979,9 +937,7 @@ impl WorkflowHandleClient {
             // `options.shard` -- a probe hit never produces deferred
             // follow-ups (below), so this is inert for `finish()` today, but
             // it is the semantically correct value if that ever changes.
-            // Read off `execution.shard_id`, not `claim_exec_id.shard()`
-            // (issue #1317): the id's origin bits do not track a rebalance.
-            shard: ShardId::new(execution.shard_id),
+            shard: claim_exec_id.shard(),
             deferred: PendingStartFollowUps::default(),
         })
     }
@@ -1179,28 +1135,52 @@ impl WorkflowHandleClient {
             input,
         } = identity;
         StartWorkflowParams {
+            workflow_name,
+            workflow_id,
+            exec_id,
+            input,
             parent_id: options.parent_id,
+            queue_name,
             execution_timeout: defaults.execution_timeout,
             memo: options.memo.clone(),
             search_attrs: options.search_attrs.clone(),
             reuse_policy: options.reuse_policy,
             conflict_policy: options.conflict_policy,
+            trace_context: None,
             max_execution_timeout_ceiling: defaults.max_workflow_execution_timeout_ceiling,
             chain_execution_timeout: defaults.chain_execution_timeout,
             max_workflow_chain_timeout_ceiling: defaults.max_workflow_chain_timeout_ceiling,
+            inherited_chain_deadline_at: None,
             concurrency_key: defaults.concurrency_key,
             concurrency_limit: defaults.concurrency_limit,
             concurrency_on_conflict: defaults.concurrency_on_conflict,
+            priority: crate::types::Priority::default(),
             max_workflow_input_bytes: defaults.max_workflow_input_bytes,
+            start_at: None,
+            delay: None,
             max_workflow_start_delay: Some(defaults.max_workflow_start_delay),
             owner: info.owner,
             runbook_url: info.runbook_url,
             severity: info.severity,
+            context_headers: None,
             sla: defaults.sla,
+            schedule_id: None,
+            scheduled_for: None,
+            // 1 = first attempt (see `StartWorkflowParams::workflow_attempt`'s doc
+            // comment). Every other fresh-start call site in the workspace uses
+            // `1`; using `0` here would silently grant one extra retry attempt
+            // beyond a workflow's configured `max_attempts` (e.g. a
+            // `max_attempts = 1` "never retry" policy would still retry once,
+            // since `0 >= 1` is false on the first attempt).
+            workflow_attempt: 1,
             workflow_retry_policy: info.retry_policy.clone(),
+            retry_of_exec_id: None,
             max_workflow_attempts_ceiling: self.inner.max_workflow_attempts,
+            origin: None,
+            completion_callbacks: None,
             start_source: StartSource::Transactional,
-            ..StartWorkflowParams::new(workflow_name, workflow_id, exec_id, input, queue_name)
+            start_source_ref: None,
+            started_by: None,
         }
     }
 
@@ -1347,14 +1327,13 @@ impl WorkflowHandleClient {
                 )),
                 StartIdempotencyReservation::Reserved => {
                     let (started, deferred_starts, deferred_checks, cancel_metrics) =
-                        start_or_load_workflow_execution_collect_with_codecs(
+                        start_or_load_workflow_execution_collect(
                             conn,
                             params,
                             true,
                             false,
                             metrics,
                             Some(crate::admission_gate::GateMode::CheckCached),
-                            &self.inner.payload_codecs,
                         )
                         .await?;
                     // The reserve wrote the claim pointing at `new_exec_id`. If the
@@ -1512,9 +1491,6 @@ struct PendingStartFollowUps {
     starts: Vec<DeferredTriggerStart>,
     checks: Vec<(ExecutionId, String)>,
     cancel_metrics: Vec<crate::execution::StartCancelledRun>,
-    /// Dispatch hints the start raised (issue #1312), held until the caller's
-    /// transaction commits.
-    hints: Vec<crate::dispatch::DispatchHint>,
 }
 
 /// Result of a staged, in-transaction workflow start (issue #763).
@@ -1564,10 +1540,6 @@ impl TransactionalStartOutcome {
     /// `deferred` is empty unless a `WorkflowIdConflictPolicy::Terminate`
     /// collision was resolved) to skip entirely.
     pub async fn finish(self) {
-        // Publish the dispatch hints the start raised (issue #1312). The
-        // caller's transaction has committed by contract, so the task row this
-        // hint names is durable and a worker may claim it.
-        crate::dispatch::publish_now(self.deferred.hints).await;
         for start in self.deferred.starts {
             start.spawn();
         }
@@ -1579,7 +1551,7 @@ impl TransactionalStartOutcome {
             // `ShardedDbPool::single`/`from_map` guarantee a default-shard entry,
             // so `pool_for` never needs its own fallible path here.
             let pool = self.client.inner.pools.pool_for(self.shard);
-            match crate::replication::fenced_checkout(pool).await {
+            match pool.get().await {
                 Ok(mut fresh_conn) => {
                     for (exec_id, workflow_name) in self.deferred.checks {
                         let _ = check_and_report_unfinished_handlers(
@@ -1623,46 +1595,6 @@ pub struct StartedWorkflowHandle {
 pub struct WorkflowHandle {
     exec_id: ExecutionId,
     client: WorkflowHandleClient,
-}
-
-/// What a result wait blocks on between two reads of the execution state.
-enum ResultWaiter {
-    /// A listener on the shard's `harvest_events` channel.
-    Listen(WorkflowEventListener),
-    /// A fixed sleep. Used when the listener cannot connect (issue #1717).
-    Poll {
-        /// When to try the listener again.
-        retry_at: Instant,
-    },
-}
-
-impl ResultWaiter {
-    /// A polling waiter that tries the listener again after
-    /// [`WorkflowHandle::LISTEN_RETRY_INTERVAL`].
-    fn poll() -> Self {
-        Self::Poll {
-            retry_at: Instant::now() + WorkflowHandle::LISTEN_RETRY_INTERVAL,
-        }
-    }
-
-    /// Block until a notification arrives or `max_wait` elapses.
-    ///
-    /// A polling waiter sleeps for `max_wait` or for
-    /// [`WorkflowHandle::RESULT_POLL_INTERVAL`], whichever is shorter. When
-    /// its retry time is past, it returns `ChannelClosed` at once. The caller
-    /// then connects a new waiter.
-    async fn wait(&mut self, max_wait: Duration) -> HarvestResult<WorkflowEventWaitOutcome> {
-        match self {
-            Self::Listen(listener) => listener.wait_for_notification_timeout(max_wait).await,
-            Self::Poll { retry_at } => {
-                if Instant::now() >= *retry_at {
-                    return Ok(WorkflowEventWaitOutcome::ChannelClosed);
-                }
-                tokio::time::sleep(max_wait.min(WorkflowHandle::RESULT_POLL_INTERVAL)).await;
-                Ok(WorkflowEventWaitOutcome::TimedOut)
-            }
-        }
-    }
 }
 
 impl WorkflowHandle {
@@ -1741,13 +1673,14 @@ impl WorkflowHandle {
     /// [`HarvestError::Config`] when the execution is already terminal, and
     /// [`HarvestError::Database`] for persistence failures.
     pub async fn cancel(&self, reason: &str) -> HarvestResult<CancelledWorkflowExecution> {
-        // Resolve residence, not origin (issue #1317): `self.shard()` names
-        // where `exec_id` was minted, not where a rebalanced run lives now.
-        let mut conn = crate::shard_rebalance::conn_for_execution_forwarded(
-            &self.client.inner.pools,
-            self.exec_id,
-        )
-        .await?;
+        let mut conn = self
+            .client
+            .inner
+            .pools
+            .pool_for(self.shard())
+            .get()
+            .await
+            .map_err(|error| HarvestError::Database(error.to_string()))?;
         crate::execution::cancel_live_attempt(
             &mut conn,
             self.exec_id,
@@ -1771,12 +1704,14 @@ impl WorkflowHandle {
     /// Returns [`HarvestError::NotFound`] when the execution does not exist and
     /// [`HarvestError::Database`] for persistence failures.
     pub async fn terminate(&self, reason: &str) -> HarvestResult<CancelledWorkflowExecution> {
-        // Resolve residence, not origin (issue #1317): see `cancel` above.
-        let mut conn = crate::shard_rebalance::conn_for_execution_forwarded(
-            &self.client.inner.pools,
-            self.exec_id,
-        )
-        .await?;
+        let mut conn = self
+            .client
+            .inner
+            .pools
+            .pool_for(self.shard())
+            .get()
+            .await
+            .map_err(|error| HarvestError::Database(error.to_string()))?;
         crate::execution::terminate_live_attempt(
             &mut conn,
             self.exec_id,
@@ -1832,7 +1767,7 @@ impl WorkflowHandle {
     ///
     /// # Errors
     ///
-    /// Returns database, listener configuration, notification payload, or not-found
+    /// Returns database, listener setup, notification payload, or not-found
     /// errors.
     pub async fn result_snapshot_with_wait(
         &self,
@@ -1851,8 +1786,7 @@ impl WorkflowHandle {
             return Ok(None);
         }
 
-        let mut listener_shard = self.shard().await?;
-        let mut listener = self.connect_waiter().await?;
+        let mut listener = self.connect_listener().await?;
 
         loop {
             let snapshot = WorkflowResult::from_execution(&self.load_effective_execution().await?);
@@ -1865,80 +1799,23 @@ impl WorkflowHandle {
                 return Ok(None);
             }
             let remaining = deadline.saturating_duration_since(now);
-
-            // Shard-residence rebind (issue #1317 review, P1 follow-up),
-            // the same mechanism `result_raw` uses via
-            // `RESULT_WAIT_SAFETY_NET`. A listener stays bound to whichever
-            // shard it resolved at connect time. A mid-wait migration
-            // would otherwise go unnoticed for this call's entire
-            // (potentially very long) caller-supplied timeout.
-            let current_shard = self.shard().await?;
-            if current_shard != listener_shard {
-                listener = self.connect_waiter().await?;
-                listener_shard = current_shard;
-            }
-            let wait_for = remaining.min(Self::RESULT_WAIT_SAFETY_NET);
-
-            match listener.wait(wait_for).await? {
+            match listener.wait_for_notification_timeout(remaining).await? {
                 WorkflowEventWaitOutcome::Notification(_payload) => {}
                 WorkflowEventWaitOutcome::TimedOut => {
-                    // Distinguish the safety-net tick from the caller's
-                    // real deadline: only the latter ends the wait.
-                    if Instant::now() >= deadline {
-                        let snapshot =
-                            WorkflowResult::from_execution(&self.load_effective_execution().await?);
-                        return if snapshot.is_terminal() {
-                            Ok(Some(snapshot))
-                        } else {
-                            Ok(None)
-                        };
-                    }
+                    let snapshot =
+                        WorkflowResult::from_execution(&self.load_effective_execution().await?);
+                    return if snapshot.is_terminal() {
+                        Ok(Some(snapshot))
+                    } else {
+                        Ok(None)
+                    };
                 }
                 WorkflowEventWaitOutcome::ChannelClosed => {
-                    listener = self.connect_waiter().await?;
-                    listener_shard = self.shard().await?;
+                    listener = self.connect_listener().await?;
                 }
             }
         }
     }
-
-    /// Upper bound on how long each of [`result_raw`](Self::result_raw),
-    /// [`result_raw_with_timeout`](Self::result_raw_with_timeout), and
-    /// [`result_snapshot_with_wait`](Self::result_snapshot_with_wait)
-    /// blocks on one listener tick. Each re-checks residence and terminal
-    /// state on its own before continuing (issue #1317 review, P1).
-    ///
-    /// This is the whole mechanism, not merely a fallback. The shard-change
-    /// check that rebinds the listener only runs BETWEEN ticks, never while
-    /// one is in flight. A migration that lands mid-tick is invisible until
-    /// the current tick ends one way or another.
-    ///
-    /// An earlier version of this constant used 30 seconds. A long interval
-    /// starves that check for the entire duration of whatever tick was
-    /// already running when the migration happened. That defeats the
-    /// point, since the check exists to notice the migration promptly.
-    ///
-    /// A few seconds bounds that blind spot to something a caller waiting
-    /// on a live workflow result would not perceive as a stall. The cost
-    /// is one cheap residence/state read per tick in the overwhelmingly
-    /// common case where nothing unusual happens for the whole interval.
-    const RESULT_WAIT_SAFETY_NET: Duration = Duration::from_secs(3);
-
-    /// How long a polling [`ResultWaiter`] sleeps between state reads.
-    ///
-    /// This is shorter than [`Self::RESULT_WAIT_SAFETY_NET`], because no
-    /// notification can end the sleep early.
-    const RESULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
-
-    /// How long a polling [`ResultWaiter`] waits before it tries the listener
-    /// again. A short outage thus does not make the rest of a long wait poll.
-    const LISTEN_RETRY_INTERVAL: Duration = Duration::from_secs(30);
-
-    /// The longest time a listener connect can take before the wait polls.
-    ///
-    /// A host that drops packets can otherwise hold the connect until the OS
-    /// TCP timeout. That can be minutes, past the caller's own deadline.
-    const LISTEN_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
     /// Wait until the workflow reaches a terminal state and return its raw JSON
     /// output. Failure terminal states are returned as typed [`HarvestError`]
@@ -1946,9 +1823,8 @@ impl WorkflowHandle {
     ///
     /// # Errors
     ///
-    /// Returns terminal workflow errors, database errors, listener
-    /// configuration errors, or not-found errors. A listener that cannot
-    /// connect makes the wait poll. It is not an error.
+    /// Returns terminal workflow errors, database errors, listener setup errors,
+    /// or not-found errors.
     pub async fn result_raw(&self) -> HarvestResult<Value> {
         let execution = self.load_effective_execution().await?;
         if let Some(result) = terminal_raw_result(&execution) {
@@ -1957,8 +1833,7 @@ impl WorkflowHandle {
                 .await;
         }
 
-        let mut listener_shard = self.shard().await?;
-        let mut listener = self.connect_waiter().await?;
+        let mut listener = self.connect_listener().await?;
 
         loop {
             let execution = self.load_effective_execution().await?;
@@ -1968,31 +1843,11 @@ impl WorkflowHandle {
                     .await;
             }
 
-            // A listener stays bound to whichever shard it resolved at
-            // connect time (issue #1317 review, P1). If the execution
-            // migrates mid-wait, that connection stays healthy, with no
-            // `ChannelClosed`. But nothing fires on it again: every future
-            // event notifies the NEW shard's channel instead. Rebind
-            // whenever the resolved shard changes.
-            //
-            // `RESULT_WAIT_SAFETY_NET` bounds the wait regardless. A
-            // residence change this check narrowly misses is still caught
-            // on the very next tick. That covers a migration landing
-            // between this read and the wait below. It is not stuck until
-            // the next real notification on a channel that may never fire
-            // again.
-            let current_shard = self.shard().await?;
-            if current_shard != listener_shard {
-                listener = self.connect_waiter().await?;
-                listener_shard = current_shard;
-            }
-
-            match listener.wait(Self::RESULT_WAIT_SAFETY_NET).await? {
+            match listener.wait_for_notification().await? {
                 WorkflowEventWaitOutcome::Notification(_payload) => {}
                 WorkflowEventWaitOutcome::TimedOut => {}
                 WorkflowEventWaitOutcome::ChannelClosed => {
-                    listener = self.connect_waiter().await?;
-                    listener_shard = self.shard().await?;
+                    listener = self.connect_listener().await?;
                 }
             }
         }
@@ -2005,7 +1860,7 @@ impl WorkflowHandle {
     /// # Errors
     ///
     /// Returns terminal workflow errors, timeout, database errors, listener
-    /// configuration errors, or not-found errors.
+    /// setup errors, or not-found errors.
     pub async fn result_raw_with_timeout(&self, timeout: Duration) -> HarvestResult<Value> {
         let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
             HarvestError::Config("workflow result timeout duration overflowed".to_string())
@@ -2020,8 +1875,7 @@ impl WorkflowHandle {
             return Err(wait_timeout_error(&execution));
         }
 
-        let mut listener_shard = self.shard().await?;
-        let mut listener = self.connect_waiter().await?;
+        let mut listener = self.connect_listener().await?;
 
         loop {
             let execution = self.load_effective_execution().await?;
@@ -2036,40 +1890,19 @@ impl WorkflowHandle {
                 return Err(wait_timeout_error(&execution));
             }
             let remaining = deadline.saturating_duration_since(now);
-
-            // Shard-residence rebind (issue #1317 review, P1 follow-up),
-            // the same mechanism `result_raw` uses via
-            // `RESULT_WAIT_SAFETY_NET`. Without it a mid-wait migration
-            // would go unnoticed for this call's entire caller-supplied
-            // timeout, which can run minutes or hours.
-            let current_shard = self.shard().await?;
-            if current_shard != listener_shard {
-                listener = self.connect_waiter().await?;
-                listener_shard = current_shard;
-            }
-            let wait_for = remaining.min(Self::RESULT_WAIT_SAFETY_NET);
-
-            match listener.wait(wait_for).await? {
+            match listener.wait_for_notification_timeout(remaining).await? {
                 WorkflowEventWaitOutcome::Notification(_payload) => {}
                 WorkflowEventWaitOutcome::TimedOut => {
-                    // Distinguish the safety-net tick from the caller's
-                    // real deadline: only the latter ends the wait.
-                    if Instant::now() >= deadline {
-                        let execution = self.load_effective_execution().await?;
-                        if let Some(result) = terminal_raw_result(&execution) {
-                            return self
-                                .enrich_terminal_result(
-                                    ExecutionId::from_uuid(execution.id),
-                                    result,
-                                )
-                                .await;
-                        }
-                        return Err(wait_timeout_error(&execution));
+                    let execution = self.load_effective_execution().await?;
+                    if let Some(result) = terminal_raw_result(&execution) {
+                        return self
+                            .enrich_terminal_result(ExecutionId::from_uuid(execution.id), result)
+                            .await;
                     }
+                    return Err(wait_timeout_error(&execution));
                 }
                 WorkflowEventWaitOutcome::ChannelClosed => {
-                    listener = self.connect_waiter().await?;
-                    listener_shard = self.shard().await?;
+                    listener = self.connect_listener().await?;
                 }
             }
         }
@@ -2098,10 +1931,15 @@ impl WorkflowHandle {
         &self,
         exec_id: ExecutionId,
     ) -> HarvestResult<Option<crate::failure::DecodedWorkflowFailure>> {
-        // Resolve residence, not origin (issue #1317): see `cancel` above.
-        let mut conn =
-            crate::shard_rebalance::conn_for_execution_forwarded(&self.client.inner.pools, exec_id)
-                .await?;
+        let shard = self.client.inner.router.shard_for_execution(exec_id);
+        let mut conn = self
+            .client
+            .inner
+            .pools
+            .pool_for(shard)
+            .get()
+            .await
+            .map_err(|error| HarvestError::Database(error.to_string()))?;
         let history = crate::store::load_history_with_codecs(
             &mut conn,
             exec_id,
@@ -2186,17 +2024,12 @@ impl WorkflowHandle {
         }
     }
 
-    /// The shard `exec_id` currently lives on (issue #1317). A rebalanced
-    /// run's `ExecutionId` still encodes its ORIGIN. Callers needing the
-    /// live residence must resolve through the forwarding pointer rather
-    /// than decode the id directly.
-    async fn shard(&self) -> HarvestResult<ShardId> {
-        crate::shard_rebalance::resolve_execution_shard(&self.client.inner.pools, self.exec_id)
-            .await
+    fn shard(&self) -> ShardId {
+        self.client.inner.router.shard_for_execution(self.exec_id)
     }
 
-    async fn notification_database_url(&self) -> HarvestResult<String> {
-        let shard = self.shard().await?;
+    fn notification_database_url(&self) -> HarvestResult<String> {
+        let shard = self.shard();
         self.client
             .inner
             .notification_database_urls
@@ -2209,31 +2042,8 @@ impl WorkflowHandle {
             })
     }
 
-    /// Connect a result waiter for this execution's shard.
-    ///
-    /// A listener that cannot connect gives a polling waiter, not an error.
-    /// Each loop reads the execution state again, so polling changes only the
-    /// wake-up latency (issue #1717). A configuration error is still returned.
-    /// Examples are a missing notification URL, or `sslmode=require` with no
-    /// usable TLS configuration.
-    async fn connect_waiter(&self) -> HarvestResult<ResultWaiter> {
-        let database_url = self.notification_database_url().await?;
-        let connect = WorkflowEventListener::connect(&database_url);
-        let error = match tokio::time::timeout(Self::LISTEN_CONNECT_TIMEOUT, connect).await {
-            Ok(Ok(listener)) => return Ok(ResultWaiter::Listen(listener)),
-            Ok(Err(error @ HarvestError::Config(_))) => return Err(error),
-            Ok(Err(error)) => error.to_string(),
-            Err(_elapsed) => format!(
-                "listener connect took longer than {:?}",
-                Self::LISTEN_CONNECT_TIMEOUT
-            ),
-        };
-        tracing::warn!(
-            exec_id = %self.exec_id,
-            error = %error,
-            "failed to start LISTEN/NOTIFY listener; result wait falls back to polling"
-        );
-        Ok(ResultWaiter::poll())
+    async fn connect_listener(&self) -> HarvestResult<WorkflowEventListener> {
+        WorkflowEventListener::connect(&self.notification_database_url()?).await
     }
 
     /// Load the *effective* execution for this handle: the **live attempt** of
@@ -2245,60 +2055,16 @@ impl WorkflowHandle {
     /// management API cannot drift on what "the live attempt" means (#843).
     /// For workflows without a retry policy this is exactly `load_execution()`
     /// — the original row — so behavior is unchanged for the non-retry case.
-    ///
-    /// Passes the shard `conn` was actually checked out from (issue #1596
-    /// review). A retry successor found mid-walk can itself have been
-    /// rebalanced away from that shard.
-    /// [`crate::execution::resolve_live_attempt`] must follow it there,
-    /// rather than trust the origin-side `MIGRATED` stub it would otherwise
-    /// read.
     async fn load_effective_execution(&self) -> HarvestResult<WorkflowExecution> {
-        // Resolve residence, not origin (issue #1317): see `cancel` above.
-        let (mut conn, shard) = crate::shard_rebalance::conn_for_execution_forwarded_with_shard(
-            &self.client.inner.pools,
-            self.exec_id,
-        )
-        .await?;
-        // Only the row is needed here (issue #1596 follow-up review, comment
-        // 4052389744). Every caller of this method reads fields off the
-        // returned `WorkflowExecution` directly. None reuses a connection
-        // carried over from this resolution. A caller that DOES need to
-        // follow up against the resolved execution, such as
-        // `execute_query_in_process` below, re-resolves its own connection
-        // for that execution's own id. That re-resolve already follows ITS
-        // forwarding pointer correctly.
-        let (mut execution, live_shard) = crate::execution::resolve_live_attempt(
-            &mut conn,
-            &self.client.inner.pools,
-            shard,
-            self.exec_id,
-        )
-        .await?;
-        // A start-replace seals a finished run `CONTINUED_AS_NEW` with no
-        // event. Report the outcome its own history records, not a success.
-        if execution.state == "CONTINUED_AS_NEW" {
-            let replaced_id = ExecutionId::from_uuid(execution.id);
-            // Reuse the held connection when the row lives on its shard. Else
-            // release it before a new checkout, so a pool of size one cannot
-            // deadlock against this call.
-            let outcome = if live_shard == shard {
-                crate::execution::replaced_run_outcome_state(&mut conn, replaced_id).await?
-            } else {
-                drop(conn);
-                let (mut replaced_conn, _) =
-                    crate::shard_rebalance::conn_for_execution_forwarded_with_shard(
-                        &self.client.inner.pools,
-                        replaced_id,
-                    )
-                    .await?;
-                crate::execution::replaced_run_outcome_state(&mut replaced_conn, replaced_id)
-                    .await?
-            };
-            if let Some(state) = outcome {
-                execution.state = state.to_string();
-            }
-        }
-        Ok(execution)
+        let mut conn = self
+            .client
+            .inner
+            .pools
+            .pool_for(self.shard())
+            .get()
+            .await
+            .map_err(|error| HarvestError::Database(error.to_string()))?;
+        crate::execution::resolve_live_attempt(&mut conn, self.exec_id).await
     }
 
     /// Execute a registered query handler in-process by replaying event history.
@@ -2337,12 +2103,15 @@ impl WorkflowHandle {
             return Err(HarvestError::WorkflowNotRunning(target));
         }
 
-        // Resolve residence for `target` -- the effective execution after the
-        // retry-chain walk above, which can differ from `self.exec_id`. Not
-        // its origin (issue #1317): see `cancel` above.
-        let mut conn =
-            crate::shard_rebalance::conn_for_execution_forwarded(&self.client.inner.pools, target)
-                .await?;
+        let shard = self.shard();
+        let mut conn = self
+            .client
+            .inner
+            .pools
+            .pool_for(shard)
+            .get()
+            .await
+            .map_err(|error| HarvestError::Database(error.to_string()))?;
         let history = crate::store::load_history_with_codecs(
             &mut conn,
             target,
@@ -2360,18 +2129,6 @@ impl WorkflowHandle {
         // #772 round 6: thread the deadline budget (see `hydrate_ctx_for_query`).
         .with_execution_timeout(execution.execution_timeout)
         .with_deadline(execution.deadline_at)
-        // #1405: thread the row's current shard (mirrors the deadline
-        // budget). A `ParentShard` child spawned from a query handler then
-        // places on the row's true residence, not the origin bits `target`
-        // encodes.
-        //
-        // `execution.shard_id` above and `history` below resolve residence
-        // separately (line 2246). A migration landing between the two reads
-        // could make this value stale by the time `history` is read.
-        // Currently inert: a query replay emits no commands and appends no
-        // events, so no fresh child mint is ever reachable from here. It
-        // would become live risk if this path is ever extended to persist.
-        .with_current_shard_id(Some(crate::types::ShardId::new(execution.shard_id)))
         // #698: thread the spawning-parent id (mirrors the deadline budget) so a
         // query handler running against a loaded execution reads the correct
         // `ctx.info().parent_execution_id` for a child workflow.
@@ -2492,27 +2249,8 @@ impl WorkflowHandle {
         // `RUNNING` under a `FOR UPDATE` lock and rolls back otherwise, so
         // re-driving against a freshly resolved live attempt can never admit
         // the same update twice.
-        //
-        // `conn` is supplied by the caller (generated typed-update code
-        // predating sharding), so its shard is not known here the way
-        // `load_effective_execution` knows its own. `shard_of_held_row`
-        // recovers it from the row itself. It falls back to `self.exec_id`'s
-        // own encoded shard (the pre-#964 behavior) when the row is not
-        // visible on `conn` at all.
-        //
-        // Every follow-up operation below runs through `bound`, not `conn`
-        // directly (issue #1596 follow-up review, comment 4052389744). The
-        // resolved live attempt can live on a different shard than `conn`.
-        // `conn` itself does not move there on its own.
-        let pool = &self.client.inner.pools;
-        let held_shard = crate::shard_rebalance::shard_of_held_row(conn, self.exec_id)
-            .await
-            .unwrap_or_else(|| self.exec_id.shard());
-        let (mut target, mut target_shard) =
-            crate::execution::resolve_live_attempt_id(conn, pool, held_shard, self.exec_id).await?;
-        let mut bound =
-            crate::shard_rebalance::bind_to_shard(conn, pool, held_shard, target_shard).await?;
-        self.validate_workflow_type_for(bound.as_mut(), target, workflow_name)
+        let mut target = crate::execution::resolve_live_attempt_id(conn, self.exec_id).await?;
+        self.validate_workflow_type_for(conn, target, workflow_name)
             .await?;
         let update_id = crate::types::UpdateId::new();
         // Issue #684: emit harvest.update.admitted post-commit for the in-process
@@ -2520,52 +2258,45 @@ impl WorkflowHandle {
         // (woken below), which emits update.completed/failed, so admitting
         // without recording admitted would leave this path asymmetric. The
         // recorder defaults to a no-op when the client was built without one.
-        let mut admit = crate::store::admit_update_event_with_codecs(
-            bound.as_mut(),
+        let mut admit = crate::store::admit_update_event(
+            conn,
             target,
             update_id,
             name.to_string(),
             input.clone(),
             Some(self.client.inner.metrics.as_ref()),
-            &self.client.inner.payload_codecs,
         )
         .await;
         for _ in 0..crate::execution::RETRY_CHAIN_MAX_REDRIVES {
             let Err(error) = admit else { break };
-            drop(bound);
-            let (fresh, fresh_shard) =
-                crate::execution::resolve_live_attempt_id(conn, pool, held_shard, self.exec_id)
-                    .await
-                    .unwrap_or((target, target_shard));
+            let fresh = crate::execution::resolve_live_attempt_id(conn, self.exec_id)
+                .await
+                .unwrap_or(target);
             if !crate::execution::redrive_target(target, fresh) {
                 return Err(error);
             }
             target = fresh;
-            target_shard = fresh_shard;
-            bound =
-                crate::shard_rebalance::bind_to_shard(conn, pool, held_shard, target_shard).await?;
-            self.validate_workflow_type_for(bound.as_mut(), target, workflow_name)
+            self.validate_workflow_type_for(conn, target, workflow_name)
                 .await?;
-            admit = crate::store::admit_update_event_with_codecs(
-                bound.as_mut(),
+            admit = crate::store::admit_update_event(
+                conn,
                 target,
                 update_id,
                 name.to_string(),
                 input.clone(),
                 Some(self.client.inner.metrics.as_ref()),
-                &self.client.inner.payload_codecs,
             )
             .await;
         }
         admit?;
-        crate::queue::wake_workflow_task(bound.as_mut(), target).await?;
+        crate::queue::wake_workflow_task(conn, target).await?;
         let start = Instant::now();
         let poll_interval = Duration::from_millis(100);
 
         loop {
             let result = {
                 let h = crate::store::load_history_with_codecs(
-                    bound.as_mut(),
+                    conn,
                     target,
                     &self.client.inner.payload_codecs,
                 )

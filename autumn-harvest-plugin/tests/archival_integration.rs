@@ -43,7 +43,7 @@ struct CountByName {
 }
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::test_init_sql().as_bytes().to_vec()
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
 }
 
 struct TestArchiver {
@@ -217,7 +217,6 @@ async fn archival_hook_executes_successfully_and_preserves_on_failure() {
             batch: autumn_harvest_plugin::HarvestBatchConfig::default(),
             readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
             startup: autumn_harvest_plugin::HarvestStartupConfig::default(),
-            redis: autumn_harvest_plugin::HarvestRedisConfig::default(),
         },
         HarvestRunnerResources::new(pool.clone()),
     )
@@ -244,7 +243,7 @@ async fn archival_hook_executes_successfully_and_preserves_on_failure() {
     api_state.install_storage_pool(runner.storage_pool());
     api_state.install(runner.api_runtime());
     api_state.set_admin_auth_boundary(true);
-    let app = harvest_api_router(api_state);
+    let app = harvest_api_router(api_state).with_state(autumn_web::AppState::for_test());
 
     // 1. Run retention with archiver returning success.
     // The execution should be successfully archived and deleted.
@@ -377,7 +376,6 @@ async fn archival_hook_fires_for_override_deleted_row() {
             batch: autumn_harvest_plugin::HarvestBatchConfig::default(),
             readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
             startup: autumn_harvest_plugin::HarvestStartupConfig::default(),
-            redis: autumn_harvest_plugin::HarvestRedisConfig::default(),
         },
         HarvestRunnerResources::new(pool.clone()),
     )
@@ -403,7 +401,7 @@ async fn archival_hook_fires_for_override_deleted_row() {
     api_state.install_storage_pool(runner.storage_pool());
     api_state.install(runner.api_runtime());
     api_state.set_admin_auth_boundary(true);
-    let app = harvest_api_router(api_state);
+    let app = harvest_api_router(api_state).with_state(autumn_web::AppState::for_test());
 
     let (run_now_status, run_now_json) =
         post_json(&app, "/admin/retention/run-now", json!({})).await;
@@ -491,7 +489,6 @@ async fn archival_hook_times_out_and_preserves_execution() {
             batch: autumn_harvest_plugin::HarvestBatchConfig::default(),
             readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
             startup: autumn_harvest_plugin::HarvestStartupConfig::default(),
-            redis: autumn_harvest_plugin::HarvestRedisConfig::default(),
         },
         HarvestRunnerResources::new(pool.clone()),
     )
@@ -517,7 +514,7 @@ async fn archival_hook_times_out_and_preserves_execution() {
     api_state.install_storage_pool(runner.storage_pool());
     api_state.install(runner.api_runtime());
     api_state.set_admin_auth_boundary(true);
-    let app = harvest_api_router(api_state);
+    let app = harvest_api_router(api_state).with_state(autumn_web::AppState::for_test());
 
     // Trigger retention
     let (run_now_status, run_now_json) =
@@ -578,7 +575,6 @@ async fn retention_preserves_a_failed_callback_delivery_and_its_dead_letter() {
             batch: autumn_harvest_plugin::HarvestBatchConfig::default(),
             readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
             startup: autumn_harvest_plugin::HarvestStartupConfig::default(),
-            redis: autumn_harvest_plugin::HarvestRedisConfig::default(),
         },
         HarvestRunnerResources::new(pool.clone()),
     )
@@ -655,7 +651,7 @@ async fn retention_preserves_a_failed_callback_delivery_and_its_dead_letter() {
     api_state.install_storage_pool(runner.storage_pool());
     api_state.install(runner.api_runtime());
     api_state.set_admin_auth_boundary(true);
-    let app = harvest_api_router(api_state);
+    let app = harvest_api_router(api_state).with_state(autumn_web::AppState::for_test());
 
     let (run_now_status, run_now_json) =
         post_json(&app, "/admin/retention/run-now", json!({})).await;
@@ -784,7 +780,6 @@ async fn retention_reclaims_an_orphaned_delivered_completion_delivery() {
             batch: autumn_harvest_plugin::HarvestBatchConfig::default(),
             readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
             startup: autumn_harvest_plugin::HarvestStartupConfig::default(),
-            redis: autumn_harvest_plugin::HarvestRedisConfig::default(),
         },
         HarvestRunnerResources::new(pool.clone()),
     )
@@ -869,7 +864,7 @@ async fn retention_reclaims_an_orphaned_delivered_completion_delivery() {
     api_state.install_storage_pool(runner.storage_pool());
     api_state.install(runner.api_runtime());
     api_state.set_admin_auth_boundary(true);
-    let app = harvest_api_router(api_state);
+    let app = harvest_api_router(api_state).with_state(autumn_web::AppState::for_test());
 
     let (run_now_status, run_now_json) =
         post_json(&app, "/admin/retention/run-now", json!({})).await;

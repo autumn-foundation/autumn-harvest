@@ -74,28 +74,10 @@ fn dag_macro_jitter_attribute_populates_field() {
     assert_eq!(info.name, "hourly_report");
 }
 
-/// A scheduled DAG gets the cron default jitter (issue #1792).
 #[test]
-fn dag_macro_cron_schedule_defaults_to_cron_jitter() {
+fn dag_macro_default_jitter_is_zero() {
     let info = __autumn_dag_info_daily_etl();
-    assert_eq!(info.jitter, autumn_harvest::policy::DEFAULT_CRON_JITTER);
-}
-
-#[test]
-fn dag_macro_without_schedule_has_zero_jitter() {
-    let info = __autumn_dag_info_explicit_non_mcp_dag();
-    assert_eq!(info.jitter, Duration::ZERO);
-}
-
-#[dag(schedule = "0 5 * * *", jitter = "0s")]
-fn opted_out_daily_etl(dag: &mut DagBuilder) {
-    let _ = dag.activity(extract_users);
-}
-
-#[test]
-fn dag_macro_zero_jitter_attribute_opts_out() {
-    let info = __autumn_dag_info_opted_out_daily_etl();
-    assert_eq!(info.jitter, Duration::ZERO);
+    assert_eq!(info.jitter, Duration::ZERO, "jitter must default to zero");
 }
 
 #[test]

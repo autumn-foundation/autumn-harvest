@@ -16,24 +16,6 @@
 //! The pure decision logic ([`quarantine_decision`]) carries no database
 //! dependency and is unit-tested without the `db` feature. The DB scanner
 //! ([`reclaim_orphaned_tasks`]) is gated behind `db`.
-//!
-//! The reclaimer loop uses `reclaim_orphaned_tasks_witnessed` (issue #1879).
-//! It holds the last strike until an [`OrphanWitness`] and the heartbeat age
-//! confirm the death of the worker.
-//!
-//! [`reclaim_orphaned_tasks`] also runs a second, independent backstop pass
-//! (issue #1459). A `workflow` decision-cycle task can stay `RUNNING` on a
-//! worker that is still alive. This happens when the in-process timeout's
-//! own reset call fails to reach the database in time. The worker-liveness
-//! pass above never catches that case, since the worker itself never died.
-//! See [`stuck_running_tasks_query`].
-//!
-//! Neither pass waits on a task row that another session locks (issue
-//! #1876). A partitioned worker can keep its transaction, and its row locks,
-//! open on the server. Each pass skips such a row and retries it on the next
-//! pass. A quarantine also locks the owning execution and its open tasks.
-//! Those locks still wait, up to the session `lock_timeout`. A timeout or a
-//! deadlock on one row skips that row, not the pass.
 
 /// What to do with an orphaned `RUNNING` task whose claiming worker has died.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,134 +54,13 @@ pub struct ReclaimSummary {
     pub requeued: usize,
     /// Orphaned tasks quarantined to the dead-letter queue.
     pub quarantined: usize,
-    /// Stuck `workflow` tasks re-queued via the live-worker backstop path
-    /// (issue #1459). Distinct from `requeued`: that count is the
-    /// dead-worker orphan path, this one requires no worker liveness signal
-    /// at all. See [`stuck_running_tasks_query`].
-    pub stuck_requeued: usize,
-    /// Orphans at the quarantine threshold that this sweep left `RUNNING`
-    /// (issue #1879). The death of their workers is not yet confirmed.
-    /// [`Self::total`] does not count them, because no row changed.
-    pub held: usize,
 }
 
 impl ReclaimSummary {
     /// Total tasks acted on this sweep.
     #[must_use]
     pub const fn total(&self) -> usize {
-        self.requeued + self.quarantined + self.stuck_requeued
-    }
-}
-
-/// One claim of an orphaned task, as a reclaim sweep saw it (issue #1879).
-///
-/// Each new claim of a task has a different key. A workflow-task reset keeps
-/// `crash_strikes`, and the same worker can claim the row again. A deferral
-/// can also restore `attempt`. So the key also holds `attempt` and
-/// `started_at`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct OrphanClaim {
-    /// The orphaned task.
-    pub task_id: uuid::Uuid,
-    /// The worker that holds the claim.
-    pub worker_id: String,
-    /// The strike count of the claim, before this reclaim.
-    pub crash_strikes: i32,
-    /// The attempt of the claim.
-    pub attempt: i32,
-    /// The start time of the claim.
-    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
-}
-
-/// The orphan claims that one reclaimer saw, and when it first saw each one
-/// (issue #1879).
-///
-/// The last strike needs the claim in two sweeps in a row. One sweep after
-/// a database pause sees every heartbeat as old. The next sweep sees the
-/// heartbeats of the live workers again.
-///
-/// A worker with no row has no heartbeat age. For such a claim, the
-/// reclaimer measures how long it saw the claim as an orphan without a break.
-#[derive(Debug, Default)]
-pub struct OrphanWitness {
-    first_seen: std::collections::HashMap<OrphanClaim, (u64, std::time::Instant)>,
-    sweep: u64,
-}
-
-impl OrphanWitness {
-    /// Record the orphan claims of one sweep, seen at `now`.
-    ///
-    /// The witness forgets each claim that is not in `claims`.
-    pub fn observe<I>(&mut self, claims: I, now: std::time::Instant)
-    where
-        I: IntoIterator<Item = OrphanClaim>,
-    {
-        self.sweep += 1;
-        let sweep = self.sweep;
-        let seen = std::mem::take(&mut self.first_seen);
-        self.first_seen = claims
-            .into_iter()
-            .map(|claim| {
-                let first = seen.get(&claim).copied().unwrap_or((sweep, now));
-                (claim, first)
-            })
-            .collect();
-    }
-
-    /// Forget `claim`. A fresh sighting of its worker breaks the watch, so
-    /// a later sighting starts a new hold.
-    pub fn forget(&mut self, claim: &OrphanClaim) {
-        self.first_seen.remove(claim);
-    }
-
-    /// Tell if the last two sweeps both saw `claim` as an orphan.
-    #[must_use]
-    pub fn seen_twice(&self, claim: &OrphanClaim) -> bool {
-        self.first_seen
-            .get(claim)
-            .is_some_and(|(first, _)| *first < self.sweep)
-    }
-
-    /// Tell if the sweeps saw `claim` as an orphan without a break for at
-    /// least `hold`, up to `now`.
-    #[must_use]
-    pub fn seen_for(
-        &self,
-        claim: &OrphanClaim,
-        now: std::time::Instant,
-        hold: std::time::Duration,
-    ) -> bool {
-        self.first_seen
-            .get(claim)
-            .is_some_and(|(_, first)| now.saturating_duration_since(*first) >= hold)
-    }
-}
-
-/// SQL that reports how a worker looks to the reclaimer (issue #1879).
-///
-/// `$1` is the worker id. `$2` is a silence in seconds. The row has `fresh`
-/// true when the last heartbeat is newer than `$2` seconds ago. No row comes
-/// back when the worker has no row.
-#[must_use]
-pub const fn worker_sighting_query() -> &'static str {
-    "SELECT last_heartbeat_at > clock_timestamp() - ($2::bigint * INTERVAL '1 second') \
-            AS fresh \
-     FROM harvest_workers \
-     WHERE worker_id = $1"
-}
-
-/// The silence, in seconds, that confirms the death of a worker before its
-/// task takes the last strike (issue #1879).
-///
-/// It is two stale windows. A worker that writes no heartbeat for that long
-/// is not only late. The value is clamped to [`MAX_WORKER_STALE_SECS`].
-#[must_use]
-pub const fn quarantine_confirm_secs(worker_stale_secs: i64) -> i64 {
-    let confirm = worker_stale_secs.saturating_mul(2);
-    if confirm > MAX_WORKER_STALE_SECS {
-        MAX_WORKER_STALE_SECS
-    } else {
-        confirm
+        self.requeued + self.quarantined
     }
 }
 
@@ -210,12 +71,6 @@ pub const fn quarantine_confirm_secs(worker_stale_secs: i64) -> i64 {
 /// so an absurd `worker_heartbeat_interval` can never overflow or panic. A
 /// one-year staleness window is already far beyond any sane fleet config.
 pub const MAX_WORKER_STALE_SECS: i64 = 31_536_000;
-
-/// Upper bound (one year, in seconds) applied to the stuck-running threshold.
-///
-/// Mirrors [`MAX_WORKER_STALE_SECS`]'s overflow-safety role for
-/// [`stuck_running_tasks_query`].
-pub const MAX_STUCK_RUNNING_SECS: i64 = 31_536_000;
 
 /// SQL selecting `RUNNING` tasks whose claiming worker is no longer live.
 ///
@@ -239,104 +94,6 @@ pub const fn orphaned_running_tasks_query() -> &'static str {
        )"
 }
 
-/// SQL selecting `RUNNING` `workflow` decision-cycle tasks stuck long past any
-/// legitimate single decision cycle's budget, regardless of worker liveness
-/// (issue #1459).
-///
-/// The engine hard-cancels a workflow-task dispatch once it exceeds its
-/// configured `workflow_task_timeout` (`run_under_workflow_body_budget` in
-/// `worker.rs`). A `workflow` row still `RUNNING` well past that budget did
-/// not merely run long: its processing already stopped. The reset call
-/// (`reset_timed_out_workflow_task`) is the only thing that could still leave
-/// the row `RUNNING`. It failed — most often a database-pool connection that
-/// could not be acquired within its own bounded retry budget.
-///
-/// [`orphaned_running_tasks_query`] does not catch this case: the claiming
-/// worker is still alive, busy with other tasks, so the dead-worker liveness
-/// check never fires.
-///
-/// `activity` tasks are deliberately excluded. Their own
-/// `start_to_close_timeout` is unrelated to `workflow_task_timeout` and can
-/// legitimately keep a row `RUNNING` for a long time.
-///
-/// `$1` is the stuck-running threshold in seconds (BIGINT).
-#[must_use]
-pub const fn stuck_running_tasks_query() -> &'static str {
-    "SELECT * FROM harvest_task_queue t \
-     WHERE t.state = 'RUNNING' \
-       AND t.worker_id IS NOT NULL \
-       AND t.task_type = 'workflow' \
-       AND t.started_at IS NOT NULL \
-       AND t.started_at < NOW() - ($1::bigint * INTERVAL '1 second')"
-}
-
-/// Re-queue an orphaned task for another attempt, folding what were two
-/// separate round trips into one.
-///
-/// Runs *after* the caller already holds the row lock. That lock comes
-/// from a `SELECT ... FOR UPDATE SKIP LOCKED` naming only
-/// `harvest_task_queue`, in [`requeue_orphan`]. This statement then
-/// combines the row-state re-check and the worker-liveness re-check into a
-/// single `UPDATE ... WHERE ... RETURNING`. It replaces what used to be a
-/// dedicated liveness `SELECT` followed by the `UPDATE`.
-///
-/// **This statement must never be the first one to touch the row in its
-/// transaction.** An `UPDATE`'s own row lock only guarantees a fresh read
-/// of *that row*, and only if it has to wait for a concurrent holder.
-/// Postgres's `EvalPlanQual` re-check re-reads the target tuple. But it
-/// evaluates the rest of the `WHERE` clause using the snapshot the
-/// statement started with, taken *before* any wait. That includes this
-/// statement's `NOT EXISTS` against `harvest_workers`. A worker that
-/// resurrects while this statement is blocked on the row lock would then
-/// be invisible to the `NOT EXISTS` check. The task would be wrongly
-/// requeued out from under a worker still processing it. Confirmed
-/// against a real Postgres: two concurrent sessions plus a third
-/// committing the resurrection mid-wait (see this PR's review history for
-/// the reproduction).
-///
-/// The caller's preceding `SELECT ... FOR UPDATE SKIP LOCKED` takes the
-/// lock first. It never waits. It skips a row that another session holds
-/// (issue #1876). By the time *this* statement runs, the row lock is
-/// already ours, so this statement can never itself block. A fresh
-/// top-level statement in `READ COMMITTED` always starts with a snapshot
-/// as of its own start. That is what makes the liveness check here as
-/// fresh as the dedicated `SELECT` it replaces, not merely close to it.
-///
-/// `$1` = task id, `$2` = claiming worker id, `$3` = the crash-strike
-/// count the caller observed at scan time. `$4` = the new crash-strike
-/// count to record. `$5` = the worker-stale threshold in seconds. `$6` =
-/// the current time, bound by the caller rather than read via SQL `NOW()`
-/// -- see [`requeue_orphan`]'s call site for why. Only the liveness check
-/// uses `$6`. The new `scheduled_at` is `clock_timestamp()`, the database
-/// clock that `claim_task` reads (issue #1807).
-///
-/// Returns the row's id if it was actually transitioned. Returns no row
-/// otherwise: state/worker/strikes no longer match what the scan
-/// observed, or the claiming worker is not dead after all.
-#[must_use]
-pub const fn requeue_orphan_stmt() -> &'static str {
-    "UPDATE harvest_task_queue \
-     SET state = 'PENDING', \
-         worker_id = NULL, \
-         started_at = NULL, \
-         sticky_worker_id = NULL, \
-         sticky_until = NULL, \
-         last_heartbeat_at = NULL, \
-         error = NULL, \
-         crash_strikes = $4, \
-         scheduled_at = clock_timestamp() \
-     WHERE id = $1 \
-       AND state = 'RUNNING' \
-       AND worker_id = $2 \
-       AND crash_strikes = $3 \
-       AND NOT EXISTS ( \
-           SELECT 1 FROM harvest_workers w \
-           WHERE w.worker_id = $2 \
-             AND w.last_heartbeat_at > $6 - ($5::bigint * INTERVAL '1 second') \
-       ) \
-     RETURNING id"
-}
-
 // ---------------------------------------------------------------------------
 // Orphan-reclaim scanner (DB)
 // ---------------------------------------------------------------------------
@@ -353,10 +110,7 @@ mod scanner {
     use diesel_async::RunQueryDsl;
     use tokio_util::sync::CancellationToken;
 
-    use super::{
-        OrphanClaim, OrphanWitness, ReclaimAction, ReclaimSummary, orphaned_running_tasks_query,
-        quarantine_decision, stuck_running_tasks_query,
-    };
+    use super::{ReclaimAction, ReclaimSummary, orphaned_running_tasks_query, quarantine_decision};
     use crate::completion_trigger::DeferredTriggerStart;
     use crate::error::{HarvestError, HarvestResult};
     use crate::event::WorkflowEvent;
@@ -369,60 +123,32 @@ mod scanner {
     /// in the dead-letter reason discriminator.
     pub const QUARANTINE_REASON: &str = "poison_pill";
 
-    /// How a worker looks to the reclaimer (issue #1879).
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum WorkerSighting {
-        /// The last heartbeat is inside the window.
-        Fresh,
-        /// The last heartbeat is older than the window.
-        Stale,
-        /// The worker has no row, so it has no heartbeat age.
-        Absent,
+    fn execution_id_from_uuid(id: uuid::Uuid) -> ExecutionId {
+        id.to_string()
+            .parse()
+            .expect("database UUIDs must round-trip into ExecutionId")
     }
 
-    /// Read how `worker_id` looks against a window of `silence_secs`.
-    ///
-    /// The age comes from the database clock (issue #1879). The heartbeat
-    /// stamps use that clock, so a skewed host clock cannot change the age.
-    async fn worker_sighting(
-        conn: &mut AsyncPgConnection,
-        worker_id: &str,
-        silence_secs: i64,
-    ) -> HarvestResult<WorkerSighting> {
-        #[derive(diesel::QueryableByName)]
-        struct Row {
-            #[diesel(sql_type = diesel::sql_types::Bool)]
-            fresh: bool,
-        }
-
-        let row: Option<Row> = diesel::sql_query(super::worker_sighting_query())
-            .bind::<diesel::sql_types::Text, _>(worker_id)
-            .bind::<diesel::sql_types::BigInt, _>(silence_secs)
-            .get_result(conn)
-            .await
-            .optional()
-            .map_err(crate::error::database_error)?;
-        Ok(match row {
-            Some(Row { fresh: true }) => WorkerSighting::Fresh,
-            Some(Row { fresh: false }) => WorkerSighting::Stale,
-            None => WorkerSighting::Absent,
-        })
-    }
-
-    /// Re-check, under a row lock, whether the worker that holds `worker_id`
-    /// is still dead. Guards against a worker that resurrected between the
-    /// broad scan and acquiring the task lock.
-    ///
-    /// Must run as its own statement, after the caller already holds the
-    /// task row's lock. See `requeue_orphan_stmt`'s doc comment: a
-    /// statement combining this check with the row's own lock acquisition
-    /// is unsafe under lock contention.
+    /// Re-check, under a row lock, whether the worker that holds `worker_id` is
+    /// still dead. Guards against a worker that resurrected between the broad
+    /// scan and acquiring the task lock.
     async fn worker_still_dead(
         conn: &mut AsyncPgConnection,
         worker_id: &str,
         worker_stale_secs: i64,
     ) -> HarvestResult<bool> {
-        Ok(worker_sighting(conn, worker_id, worker_stale_secs).await? != WorkerSighting::Fresh)
+        use crate::schema::harvest_workers::dsl;
+
+        let cutoff = Utc::now() - chrono::Duration::seconds(worker_stale_secs);
+        let live: Option<String> = dsl::harvest_workers
+            .filter(dsl::worker_id.eq(worker_id))
+            .filter(dsl::last_heartbeat_at.gt(cutoff))
+            .select(dsl::worker_id)
+            .first(conn)
+            .await
+            .optional()
+            .map_err(crate::error::database_error)?;
+        Ok(live.is_none())
     }
 
     /// Re-queue an orphaned task for another attempt, recording the new
@@ -440,13 +166,6 @@ mod scanner {
     ) -> HarvestResult<bool> {
         use crate::schema::harvest_task_queue::dsl;
 
-        #[derive(diesel::QueryableByName)]
-        struct IdRow {
-            #[diesel(sql_type = diesel::sql_types::Uuid)]
-            #[allow(dead_code)]
-            id: uuid::Uuid,
-        }
-
         let task_id = task.id;
         let worker = task.worker_id.clone();
         let prior_strikes = task.crash_strikes;
@@ -455,127 +174,22 @@ mod scanner {
             let Some(worker_id) = worker else {
                 return Ok(false);
             };
-            // Lock the row first, in its own statement that names only
-            // `harvest_task_queue`. This is what makes the combined
-            // statement below safe. See `requeue_orphan_stmt`'s doc
-            // comment: the liveness re-check cannot share a statement
-            // with the row's own lock acquisition. `SKIP LOCKED` returns
-            // no row while another session holds the lock. The next pass
-            // retries the orphan (issue #1876).
-            let locked: Option<uuid::Uuid> = dsl::harvest_task_queue
+            // Lock the row and re-verify it is still the same orphan.
+            let current: Option<(String, Option<String>, i32)> = dsl::harvest_task_queue
                 .find(task_id)
                 .for_update()
-                .skip_locked()
-                .select(dsl::id)
+                .select((dsl::state, dsl::worker_id, dsl::crash_strikes))
                 .first(conn)
                 .await
                 .optional()
                 .map_err(crate::error::database_error)?;
-            if locked.is_none() {
-                return Ok(false);
-            }
-
-            // Now guaranteed a fresh snapshot: a new top-level statement,
-            // issued only after the lock above is already ours. This one
-            // can never itself have to wait. Re-verifies the row is still
-            // the same orphan, and re-checks the claiming worker is still
-            // dead, together in the write's own WHERE clause.
-            //
-            // `now` is read here, in Rust, rather than via SQL `NOW()`.
-            // Postgres fixes `NOW()` at the transaction's start, not the
-            // statement's. A lock wait before this point would make `NOW()`
-            // stale. `SKIP LOCKED` removes that wait, but this read does not
-            // depend on it. It matches the pre-fix code, which computed
-            // `Utc::now()` at this same point -- after the row lock.
-            let now = Utc::now();
-            let updated: Option<IdRow> = diesel::sql_query(super::requeue_orphan_stmt())
-                .bind::<diesel::sql_types::Uuid, _>(task_id)
-                .bind::<diesel::sql_types::Text, _>(&worker_id)
-                .bind::<diesel::sql_types::Integer, _>(prior_strikes)
-                .bind::<diesel::sql_types::Integer, _>(new_strikes)
-                .bind::<diesel::sql_types::BigInt, _>(worker_stale_secs)
-                .bind::<diesel::sql_types::Timestamptz, _>(now)
-                .get_result(conn)
-                .await
-                .optional()
-                .map_err(crate::error::database_error)?;
-            Ok(updated.is_some())
-        }))
-        .await
-    }
-
-    /// Re-queue a `workflow` task stuck `RUNNING` past the stuck-running
-    /// backstop threshold, on a worker that may still be alive (issue #1459).
-    ///
-    /// Never touches `crash_strikes` and never quarantines. Being stuck this
-    /// way says nothing about the task itself. It means a reset attempt could
-    /// not reach the database in time, not that the task is poisonous.
-    ///
-    /// Leaving `crash_strikes` untouched matters beyond quarantine counting.
-    /// A re-claim of the row this frees still carries the same `crash_strikes`
-    /// value. `worker.rs`'s `reset_timed_out_workflow_task` also guards its
-    /// own write on `attempt`, not only `crash_strikes`. A delayed reset from
-    /// this row's PRIOR attempt then cannot match the fresh claim and undo
-    /// it. See that function's own doc comment.
-    ///
-    /// Returns `true` if the row was actually transitioned (it was still the
-    /// same stuck `RUNNING` attempt), `false` if a concurrent actor already
-    /// handled it.
-    async fn requeue_stuck_task(
-        conn: &mut AsyncPgConnection,
-        task: &TaskQueueItem,
-        stuck_running_secs: i64,
-    ) -> HarvestResult<bool> {
-        use crate::schema::harvest_task_queue::dsl;
-
-        // Row shape re-read fresh under the lock below: state, worker id,
-        // crash strikes, task type, started-at.
-        type StuckRowState = (
-            String,
-            Option<String>,
-            i32,
-            String,
-            Option<chrono::DateTime<Utc>>,
-        );
-
-        let task_id = task.id;
-        let Some(worker_id) = task.worker_id.clone() else {
-            return Ok(false);
-        };
-        let prior_strikes = task.crash_strikes;
-
-        Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
-            // Lock the row and re-verify it is still the same stuck attempt.
-            // `started_at` is re-read fresh under the lock, not taken from
-            // the pre-scan snapshot. A reset or a fresh re-claim between the
-            // scan and here always changes it. Re-checking its age here is
-            // what stops this from undoing a legitimate new attempt.
-            // `SKIP LOCKED` skips the row while another session holds it.
-            // The next pass retries it (issue #1876).
-            let current: Option<StuckRowState> = dsl::harvest_task_queue
-                .find(task_id)
-                .for_update()
-                .skip_locked()
-                .select((
-                    dsl::state,
-                    dsl::worker_id,
-                    dsl::crash_strikes,
-                    dsl::task_type,
-                    dsl::started_at,
-                ))
-                .first(conn)
-                .await
-                .optional()
-                .map_err(crate::error::database_error)?;
-            let cutoff = Utc::now() - chrono::Duration::seconds(stuck_running_secs);
             match current {
-                Some((state, Some(wid), strikes, task_type, Some(started_at)))
-                    if state == "RUNNING"
-                        && wid == worker_id
-                        && strikes == prior_strikes
-                        && task_type == "workflow"
-                        && started_at < cutoff => {}
+                Some((state, Some(wid), strikes))
+                    if state == "RUNNING" && wid == worker_id && strikes == prior_strikes => {}
                 _ => return Ok(false),
+            }
+            if !worker_still_dead(conn, &worker_id, worker_stale_secs).await? {
+                return Ok(false);
             }
 
             diesel::update(dsl::harvest_task_queue.find(task_id))
@@ -585,14 +199,19 @@ mod scanner {
                     dsl::started_at.eq(None::<chrono::DateTime<Utc>>),
                     dsl::sticky_worker_id.eq(None::<String>),
                     dsl::sticky_until.eq(None::<chrono::DateTime<Utc>>),
+                    // Clear the dead attempt's heartbeat timestamp so the
+                    // fresh attempt is not immediately timed out by the
+                    // COALESCE(last_heartbeat_at, started_at) scanner.
+                    // heartbeat_details is preserved so a retry can still
+                    // read the last flushed checkpoint.
                     dsl::last_heartbeat_at.eq(None::<chrono::DateTime<Utc>>),
-                    // Mirrors `requeue_orphan_stmt`: a stale `error` from an
-                    // earlier attempt must not survive into the fresh one it
-                    // no longer describes.
+                    // Clear the previous error: crashes don't leave a
+                    // meaningful error string, and the stale message from an
+                    // earlier clean failure would otherwise appear as
+                    // previous_failure() on the next attempt.
                     dsl::error.eq(None::<String>),
-                    // Database clock, as `claim_task` reads it (issue #1807).
-                    dsl::scheduled_at
-                        .eq(crate::queue::db_clock_stamp::<diesel::sql_types::Timestamptz>()),
+                    dsl::crash_strikes.eq(new_strikes),
+                    dsl::scheduled_at.eq(Utc::now()),
                 ))
                 .execute(conn)
                 .await
@@ -606,28 +225,22 @@ mod scanner {
     /// `WorkflowFailed` event path (issue #367 AC4 — no new event variant).
     ///
     /// Only transitions executions still in `RUNNING`; a workflow that already
-    /// reached a terminal state is left untouched.
-    ///
-    /// Returns `(workflow_id, workflow_name, schedule_id, origin, shard_id)`
-    /// only when the execution moved from `RUNNING` to `FAILED`. After the
-    /// transaction commits, the caller counts the failure toward schedule
-    /// auto-pause. The origin keeps a backfill quarantine out of the cadence
-    /// counter. The shard labels the canary failure for a quarantined probe
-    /// (#1816).
+    /// reached a terminal state is left untouched. Returns the
+    /// `(workflow_id, workflow_name, schedule_id, origin)` of the execution when
+    /// (and only when) it actually transitioned `RUNNING` → `FAILED`, so the
+    /// caller can count the failure toward schedule auto-pause once the
+    /// transaction commits (with the correct origin so backfill quarantines are
+    /// not mis-attributed to the cadence counter).
     #[allow(clippy::too_many_lines)]
     async fn fail_owning_workflow(
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,
         error: &str,
         metrics: Option<&(dyn MetricsRecorder + Send + Sync)>,
-        // Issue #1243: `WorkflowFailed` carries `details`, a payload-bearing
-        // field, so this write encodes through the configured registry.
-        codecs: &crate::payload_codec::PayloadCodecs,
     ) -> HarvestResult<(
-        Option<(String, String, Option<uuid::Uuid>, Option<String>, i32)>,
+        Option<(String, String, Option<uuid::Uuid>, Option<String>)>,
         Vec<DeferredTriggerStart>,
         Vec<(ExecutionId, String)>,
-        Vec<crate::execution::StartCancelledRun>,
     )> {
         use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
 
@@ -639,7 +252,6 @@ mod scanner {
             String,
             Option<uuid::Uuid>,
             Option<String>,
-            i32,
         );
         let current: Option<ExecRow> = exec_dsl::harvest_workflow_executions
             .find(exec_id.as_uuid())
@@ -652,7 +264,6 @@ mod scanner {
                 exec_dsl::workflow_name,
                 exec_dsl::schedule_id,
                 exec_dsl::origin,
-                exec_dsl::shard_id,
             ))
             .first(conn)
             .await
@@ -666,10 +277,9 @@ mod scanner {
             workflow_name,
             schedule_id,
             origin,
-            shard_id,
         )) = current
         else {
-            return Ok((None, Vec::new(), Vec::new(), Vec::new()));
+            return Ok((None, Vec::new(), Vec::new()));
         };
         // PAUSED is a non-terminal active state (issue #383): an in-flight
         // activity that was admitted before the pause can still be running, so a
@@ -677,16 +287,15 @@ mod scanner {
         // owning workflow rather than leave it parked in PAUSED forever with a
         // dead task. Treat PAUSED like RUNNING here.
         if state != "RUNNING" && state != "PAUSED" {
-            return Ok((None, Vec::new(), Vec::new(), Vec::new()));
+            return Ok((None, Vec::new(), Vec::new()));
         }
 
-        let history = crate::store::load_history_with_codecs(conn, exec_id, codecs).await?;
-        crate::store::append_events_with_codecs(
+        let history = crate::store::load_history(conn, exec_id).await?;
+        crate::store::append_events(
             conn,
             exec_id,
             &[WorkflowEvent::workflow_failed(error.to_string())],
             history.next_event_id,
-            codecs,
         )
         .await?;
         diesel::update(
@@ -734,19 +343,14 @@ mod scanner {
             .map_err(crate::error::database_error)?;
         }
 
-        let (mut deferred, closed_children) =
-            apply_parent_close_cascade(conn, exec_id, codecs).await?;
-        let mut pending_cancel_metrics = Vec::new();
-        let failed_triggers =
-            crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
-                conn,
-                exec_id,
-                crate::completion_trigger::TerminalState::Failed,
-                metrics,
-                &mut pending_cancel_metrics,
-                codecs,
-            )
-            .await?;
+        let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
+        let failed_triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+            conn,
+            exec_id,
+            crate::completion_trigger::TerminalState::Failed,
+            metrics,
+        )
+        .await?;
         deferred.extend(failed_triggers);
 
         // Wake a parent that is blocked on this child. When a parent-close
@@ -756,67 +360,36 @@ mod scanner {
         if parent_close_policy.is_none()
             && let Some(parent_uuid) = parent_id
         {
-            let parent_exec_id = ExecutionId::from_uuid(parent_uuid);
-            // Issue #956: a cross-shard parent is not on this connection.
-            // `append_single_event` requires the parent row, so appending here
-            // would `NotFound` and roll back this poison-pill seal — leaving the
-            // child neither sealed nor retried. The cross-shard relay delivers
-            // the wake instead, from the parent's own shard, once it observes
-            // this child terminal. Mirrors the identical guard in
-            // `worker::wake_parent_for_child_completion`/`_failure` and
-            // `timeout::wake_parent_for_child_timeout`.
-            if crate::worker::parent_is_on_another_shard(conn, parent_exec_id, exec_id).await? {
-                tracing::debug!(
-                    parent_execution_id = %parent_exec_id,
-                    child_execution_id = %exec_id,
-                    "cross-shard child poison-pilled; the parent wake is the \
-                     relay's to deliver"
-                );
-            } else {
-                crate::store::append_single_event_with_codecs(
-                    conn,
-                    parent_exec_id,
-                    WorkflowEvent::child_workflow_failed(exec_id, error.to_string()),
-                    codecs,
-                )
-                .await?;
-                crate::queue::wake_workflow_task(conn, parent_exec_id).await?;
-            }
+            let parent_exec_id = execution_id_from_uuid(parent_uuid);
+            crate::store::append_single_event(
+                conn,
+                parent_exec_id,
+                WorkflowEvent::child_workflow_failed(exec_id, error.to_string()),
+            )
+            .await?;
+            crate::queue::wake_workflow_task(conn, parent_exec_id).await?;
         }
         Ok((
-            Some((workflow_id, workflow_name, schedule_id, origin, shard_id)),
+            Some((workflow_id, workflow_name, schedule_id, origin)),
             deferred,
             closed_children,
-            pending_cancel_metrics,
         ))
     }
-
-    /// State, worker, strikes, attempt and start time of a locked task row.
-    type LockedClaim = (
-        String,
-        Option<String>,
-        i32,
-        i32,
-        Option<chrono::DateTime<Utc>>,
-    );
 
     /// Quarantine an orphaned poison-pill task: move it to the dead-letter
     /// queue with a [`PoisonPill`](super::super::dlq::DeadLetterReason) reason,
     /// mark the queue row `FAILED`, and fail the owning workflow terminally.
     ///
-    /// Returns what happened to the row. See [`QuarantineOutcome`].
+    /// Returns `true` if the task was quarantined, `false` if a concurrent
+    /// actor already handled the row.
     #[allow(clippy::too_many_lines)]
     async fn quarantine_orphan(
         conn: &mut AsyncPgConnection,
         task: &TaskQueueItem,
         new_strikes: i32,
-        // The silence, in seconds, that marks the worker as dead. The
-        // witnessed sweep passes a wider window here (issue #1879).
-        dead_secs: i64,
+        worker_stale_secs: i64,
         metrics: &dyn MetricsRecorder,
-        // Issue #1243: forwarded to the owning-workflow failure write.
-        codecs: &crate::payload_codec::PayloadCodecs,
-    ) -> HarvestResult<QuarantineOutcome> {
+    ) -> HarvestResult<bool> {
         use crate::dlq::{DeadLetterReason, NewDeadLetterEntry, dead_letter};
         use crate::schema::harvest_task_queue::dsl;
 
@@ -847,8 +420,6 @@ mod scanner {
         let task_id = task.id;
         let worker = task.worker_id.clone();
         let prior_strikes = task.crash_strikes;
-        let prior_attempt = task.attempt;
-        let prior_started_at = task.started_at;
 
         let entry = NewDeadLetterEntry {
             original_task_id: task.id,
@@ -868,150 +439,79 @@ mod scanner {
         // workflow's (id, name, schedule_id, origin) when it was actually failed
         // RUNNING → FAILED so the schedule failure counter can be bumped (with
         // the correct origin) after commit.
-        //
-        // `fail_owning_workflow` wakes a detached parent, which raises a
-        // dispatch hint (issue #1429). This scanner runs on its own timer,
-        // outside any worker task body's catch-all buffering scope. The hint
-        // would otherwise reach the channel before this COMMIT. The
-        // buffering scope holds it until then, matching every other
-        // transaction owner that calls `wake_workflow_task`.
-        //
-        // `reclaim_orphaned_tasks` claims one row per loop iteration over an
-        // unbounded orphan set, the same shape as the outbox sweeps
-        // `buffered_settled_in_background` already covers. An inline
-        // `buffered_settled` awaits the dispatch channel's publish call
-        // after every commit. That can cost up to `DISPATCH_CALL_TIMEOUT`
-        // per quarantined row when the channel is slow (Codex review, issue
-        // #1429). It delays the rest of the sweep even though Postgres
-        // already committed. Reconciliation is the durability fallback
-        // regardless, so `buffered_settled_in_background` hands the hint to
-        // the existing non-blocking background publisher instead of
-        // awaiting it inline.
-        // Issue #1879: set when the locked re-check finds the worker fresh.
-        let worker_alive = std::sync::atomic::AtomicBool::new(false);
-        let worker_alive = &worker_alive;
-        let (acted, failed_workflow, deferred_starts, closed_children, pending_cancel_metrics) =
-            crate::dispatch::buffered_settled_in_background(Box::pin(conn.transaction::<(
+        let (acted, failed_workflow, deferred_starts, closed_children) =
+            Box::pin(conn.transaction::<(
                 bool,
-                Option<(String, String, Option<uuid::Uuid>, Option<String>, i32)>,
+                Option<(String, String, Option<uuid::Uuid>, Option<String>)>,
                 Vec<DeferredTriggerStart>,
                 Vec<(ExecutionId, String)>,
-                Vec<crate::execution::StartCancelledRun>,
-            ), HarvestError, _>(
-                async |conn| {
-                    let Some(worker_id) = worker else {
-                        return Ok((false, None, Vec::new(), Vec::new(), Vec::new()));
-                    };
-                    // Lock the row and re-verify it is still the same orphan.
-                    // This cannot fold the worker-liveness check into the same
-                    // statement. See `requeue_orphan_stmt`'s doc comment: a
-                    // wait on this row's lock would leave the liveness check
-                    // reading a stale pre-wait snapshot of `harvest_workers`.
-                    // `worker_still_dead` below is deliberately a separate,
-                    // later statement instead. It runs only once this lock is
-                    // already ours, so it is guaranteed a fresh snapshot.
-                    // `SKIP LOCKED` skips the row while another session
-                    // holds it. The next pass retries it (issue #1876).
-                    // Issue #1879: `attempt` and `started_at` fence the claim
-                    // too. A reset keeps `crash_strikes`, and the same worker
-                    // can claim the row again between the scan and this lock.
-                    let current: Option<LockedClaim> = dsl::harvest_task_queue
-                        .find(task_id)
-                        .for_update()
-                        .skip_locked()
-                        .select((
-                            dsl::state,
-                            dsl::worker_id,
-                            dsl::crash_strikes,
-                            dsl::attempt,
-                            dsl::started_at,
-                        ))
-                        .first(conn)
-                        .await
-                        .optional()
-                        .map_err(crate::error::database_error)?;
-                    match current {
-                        Some((state, Some(wid), strikes, attempt, started_at))
-                            if state == "RUNNING"
-                                && wid == worker_id
-                                && strikes == prior_strikes
-                                && attempt == prior_attempt
-                                && started_at == prior_started_at => {}
-                        _ => return Ok((false, None, Vec::new(), Vec::new(), Vec::new())),
-                    }
-                    if !worker_still_dead(conn, &worker_id, dead_secs).await? {
-                        worker_alive.store(true, std::sync::atomic::Ordering::Relaxed);
-                        return Ok((false, None, Vec::new(), Vec::new(), Vec::new()));
-                    }
+            ), HarvestError, _>(async |conn| {
+                let Some(worker_id) = worker else {
+                    return Ok((false, None, Vec::new(), Vec::new()));
+                };
+                let current: Option<(String, Option<String>, i32)> = dsl::harvest_task_queue
+                    .find(task_id)
+                    .for_update()
+                    .select((dsl::state, dsl::worker_id, dsl::crash_strikes))
+                    .first(conn)
+                    .await
+                    .optional()
+                    .map_err(crate::error::database_error)?;
+                match current {
+                    Some((state, Some(wid), strikes))
+                        if state == "RUNNING" && wid == worker_id && strikes == prior_strikes => {}
+                    _ => return Ok((false, None, Vec::new(), Vec::new())),
+                }
+                if !worker_still_dead(conn, &worker_id, worker_stale_secs).await? {
+                    return Ok((false, None, Vec::new(), Vec::new()));
+                }
 
-                    dead_letter(conn, &entry).await?;
+                dead_letter(conn, &entry).await?;
 
-                    diesel::update(dsl::harvest_task_queue.find(task_id))
-                        .set((
-                            dsl::state.eq("FAILED"),
-                            dsl::worker_id.eq(None::<String>),
-                            dsl::crash_strikes.eq(new_strikes),
-                            dsl::error.eq(Some(error.clone())),
-                            dsl::completed_at.eq(Some(Utc::now())),
-                        ))
-                        .execute(conn)
-                        .await
-                        .map_err(crate::error::database_error)?;
-
-                    let (failed_workflow, deferred, closed_children, pending_cancel_metrics) =
-                        match workflow_exec_id {
-                            Some(exec_uuid) => {
-                                fail_owning_workflow(
-                                    conn,
-                                    ExecutionId::from_uuid(exec_uuid),
-                                    &error,
-                                    Some(metrics),
-                                    codecs,
-                                )
-                                .await?
-                            }
-                            None => (None, Vec::new(), Vec::new(), Vec::new()),
-                        };
-                    Ok((
-                        true,
-                        failed_workflow,
-                        deferred,
-                        closed_children,
-                        pending_cancel_metrics,
+                diesel::update(dsl::harvest_task_queue.find(task_id))
+                    .set((
+                        dsl::state.eq("FAILED"),
+                        dsl::worker_id.eq(None::<String>),
+                        dsl::crash_strikes.eq(new_strikes),
+                        dsl::error.eq(Some(error.clone())),
+                        dsl::completed_at.eq(Some(Utc::now())),
                     ))
-                },
-            )))
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+
+                let (failed_workflow, deferred, closed_children) = match workflow_exec_id {
+                    Some(exec_uuid) => {
+                        fail_owning_workflow(
+                            conn,
+                            execution_id_from_uuid(exec_uuid),
+                            &error,
+                            Some(metrics),
+                        )
+                        .await?
+                    }
+                    None => (None, Vec::new(), Vec::new()),
+                };
+                Ok((true, failed_workflow, deferred, closed_children))
+            }))
             .await?;
 
         if acted {
-            // issue #1197, item 1: emitted only now that this transaction has
-            // actually committed.
-            crate::execution::emit_start_cancel_metrics(metrics, &pending_cancel_metrics);
             metrics.record_task_quarantined(&task.queue_name, QUARANTINE_REASON);
             // Best-effort: count the poison-pill workflow failure toward the
             // schedule auto-pause threshold (issue #360), mirroring the normal
             // failure and timeout paths. Runs after the transaction commits so
             // a counter error can never abort the quarantine.
-            if let Some((workflow_id, workflow_name, schedule_id, origin, shard_id)) =
-                failed_workflow
-            {
+            if let Some((workflow_id, workflow_name, schedule_id, origin)) = failed_workflow {
                 crate::telemetry::emit_workflow_terminal(
                     metrics,
                     &workflow_name,
                     &task.queue_name,
                     crate::telemetry::WorkflowStatus::Failed,
                 );
-                // The terminal above skips a canary probe. A quarantined probe
-                // is a failed probe, so the canary SLI must count it (#1816).
-                if crate::canary::is_canary_workflow(&workflow_name) {
-                    metrics.record_canary_failure(
-                        &task.queue_name,
-                        u16::try_from(shard_id).unwrap_or(0),
-                    );
-                }
 
                 if let Some(exec_uuid) = task.workflow_exec_id {
-                    let exec_id = ExecutionId::from_uuid(exec_uuid);
+                    let exec_id = execution_id_from_uuid(exec_uuid);
                     if let Err(e) = crate::execution::check_and_report_unfinished_handlers(
                         conn,
                         exec_id,
@@ -1060,219 +560,33 @@ mod scanner {
                 start.spawn();
             }
         }
-        Ok(if acted {
-            QuarantineOutcome::Quarantined
-        } else if worker_alive.load(std::sync::atomic::Ordering::Relaxed) {
-            QuarantineOutcome::WorkerFresh
-        } else {
-            QuarantineOutcome::Skipped
-        })
+        Ok(acted)
     }
 
-    /// What [`quarantine_orphan`] did with one row.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum QuarantineOutcome {
-        /// The task went to the dead-letter queue.
-        Quarantined,
-        /// The locked re-check found the worker fresh (issue #1879). The
-        /// witness must forget the claim, because the watch has a break.
-        WorkerFresh,
-        /// Another actor changed the row, or the row was locked.
-        Skipped,
-    }
-
-    /// Whether `error` ends the work on one row but leaves the pass able to
-    /// continue (issue #1876).
+    /// Scan for `RUNNING` tasks whose claiming worker has died and reclaim them.
     ///
-    /// A `lock_timeout` or `statement_timeout` cancels one statement, for
-    /// example a lock on the owning execution. A deadlock (SQLSTATE 40P01)
-    /// aborts one transaction. `SKIP LOCKED` makes it possible: two
-    /// reclaimers can each lock a sibling orphan of one execution. In each
-    /// case the per-row transaction rolls back, and the connection stays
-    /// usable.
-    ///
-    /// Like [`crate::pool::is_session_timeout`], the check reads the English
-    /// message text.
-    pub(super) fn is_row_conflict(error: &HarvestError) -> bool {
-        crate::pool::is_session_timeout(error)
-            || matches!(error, HarvestError::Database(msg) if msg.contains("deadlock detected"))
-    }
-
-    /// Turn a row conflict into a skip (issue #1876).
-    fn skip_on_row_conflict<T>(
-        outcome: HarvestResult<T>,
-        task: &TaskQueueItem,
-        skipped: T,
-    ) -> HarvestResult<T> {
-        match outcome {
-            Err(e) if is_row_conflict(&e) => {
-                tracing::warn!(
-                    task_id = %task.id,
-                    error = %e,
-                    "orphan reclaim skipped a task after a row conflict; the next pass retries it"
-                );
-                Ok(skipped)
-            }
-            other => other,
-        }
-    }
-
-    /// Reclaim `RUNNING` tasks orphaned by a dead worker, then (issue #1459)
-    /// tasks stuck long past their budget regardless of worker liveness.
-    ///
-    /// Each dead-worker orphan's `crash_strikes` is incremented; the task is
-    /// then re-queued (under threshold) or quarantined to the DLQ (at or over
-    /// threshold) per [`quarantine_decision`]. Runs shard-local against the
-    /// connection's database.
+    /// Each orphan's `crash_strikes` is incremented; the task is then re-queued
+    /// (under threshold) or quarantined to the DLQ (at or over threshold) per
+    /// [`quarantine_decision`]. Runs shard-local against the connection's
+    /// database.
     ///
     /// `worker_stale_secs` is how long a worker may go without a heartbeat
     /// before its in-flight tasks are considered orphaned (typically
     /// `2 × worker_heartbeat_interval`).
     ///
-    /// `stuck_running_secs` gates the second, independent backstop pass
-    /// ([`stuck_running_tasks_query`]): `None` disables it, so behavior is
-    /// unchanged from before issue #1459. `Some(secs)` re-queues a stuck
-    /// `workflow` task whether or not its worker is alive. This pass never
-    /// touches `crash_strikes` and never quarantines — being stuck this way
-    /// says nothing about the task itself.
-    ///
-    /// A task row that another session locks is skipped. A timeout or a
-    /// deadlock on one row skips that row too. The next pass retries a
-    /// skipped row (issue #1876).
-    ///
-    /// This sweep quarantines an orphan on first sight. A late heartbeat can
-    /// then quarantine a live worker's task (issue #1879). In a reclaim loop,
-    /// use [`reclaim_orphaned_tasks_witnessed`] instead.
-    ///
     /// # Errors
     ///
-    /// Returns [`HarvestError::Database`] on query failure, except for a
-    /// skipped row.
+    /// Returns [`HarvestError::Database`] on query failure.
     pub async fn reclaim_orphaned_tasks(
         conn: &mut AsyncPgConnection,
         threshold: i32,
         worker_stale_secs: i64,
-        stuck_running_secs: Option<i64>,
         metrics: &dyn MetricsRecorder,
-        // Issue #1243: forwarded to the quarantine path, whose
-        // `WorkflowFailed` carries a payload-bearing `details` field.
-        codecs: &crate::payload_codec::PayloadCodecs,
     ) -> HarvestResult<ReclaimSummary> {
-        reclaim_sweep(
-            conn,
-            threshold,
-            worker_stale_secs,
-            stuck_running_secs,
-            metrics,
-            codecs,
-            None,
-        )
-        .await
-    }
-
-    /// [`reclaim_orphaned_tasks`], with a last strike that waits until the
-    /// death of the worker is confirmed (issue #1879).
-    ///
-    /// The last strike needs two conditions. `witness` saw the same claim in
-    /// the previous sweep too. The worker also wrote no heartbeat for
-    /// [`quarantine_confirm_secs`], on the database clock. A worker with no
-    /// row needs that long of unbroken sightings instead. Until then the row
-    /// stays `RUNNING` and
-    /// gets no strike. A worker that heartbeats again keeps its task. A
-    /// requeue under the threshold does not wait.
-    ///
-    /// Use one `witness` for all sweeps of one reclaim loop. The sweep reads
-    /// `clock` once, after the orphan scan returns. A delay before the scan
-    /// then cannot count toward a hold.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`HarvestError::Database`] on query failure.
-    // One more parameter than `reclaim_orphaned_tasks`, which is at the limit.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn reclaim_orphaned_tasks_witnessed(
-        conn: &mut AsyncPgConnection,
-        threshold: i32,
-        worker_stale_secs: i64,
-        stuck_running_secs: Option<i64>,
-        metrics: &dyn MetricsRecorder,
-        codecs: &crate::payload_codec::PayloadCodecs,
-        witness: &mut OrphanWitness,
-        clock: &(dyn Fn() -> std::time::Instant + Sync),
-    ) -> HarvestResult<ReclaimSummary> {
-        reclaim_sweep(
-            conn,
-            threshold,
-            worker_stale_secs,
-            stuck_running_secs,
-            metrics,
-            codecs,
-            Some((witness, clock)),
-        )
-        .await
-    }
-
-    /// The claim that `task` shows, or `None` for a row with no worker.
-    fn orphan_claim(task: &TaskQueueItem) -> Option<OrphanClaim> {
-        task.worker_id.clone().map(|worker_id| OrphanClaim {
-            task_id: task.id,
-            worker_id,
-            crash_strikes: task.crash_strikes,
-            attempt: task.attempt,
-            started_at: task.started_at,
-        })
-    }
-
-    /// Tell if the last strike of `task` must wait (issue #1879).
-    async fn hold_last_strike(
-        conn: &mut AsyncPgConnection,
-        task: &TaskQueueItem,
-        witness: &mut OrphanWitness,
-        now: std::time::Instant,
-        confirm_secs: i64,
-    ) -> HarvestResult<bool> {
-        let Some(claim) = orphan_claim(task) else {
-            return Ok(true);
-        };
-        if !witness.seen_twice(&claim) {
-            return Ok(true);
-        }
-        Ok(
-            match worker_sighting(conn, &claim.worker_id, confirm_secs).await? {
-                // A fresh heartbeat breaks the watch. Time seen before it
-                // must not count toward a later hold.
-                WorkerSighting::Fresh => {
-                    witness.forget(&claim);
-                    true
-                }
-                WorkerSighting::Stale => false,
-                // A live worker can lose its row for a short time, for
-                // example during a registration retry. So the reclaimer
-                // measures the silence itself.
-                WorkerSighting::Absent => {
-                    let hold = std::time::Duration::from_secs(confirm_secs.unsigned_abs());
-                    !witness.seen_for(&claim, now, hold)
-                }
-            },
-        )
-    }
-
-    /// The body of both reclaim sweeps. `watch` is the witness and its clock.
-    /// With no `watch`, the last strike does not wait.
-    async fn reclaim_sweep(
-        conn: &mut AsyncPgConnection,
-        threshold: i32,
-        worker_stale_secs: i64,
-        stuck_running_secs: Option<i64>,
-        metrics: &dyn MetricsRecorder,
-        codecs: &crate::payload_codec::PayloadCodecs,
-        mut watch: Option<(&mut OrphanWitness, &(dyn Fn() -> std::time::Instant + Sync))>,
-    ) -> HarvestResult<ReclaimSummary> {
-        // Clamp once at the entry point. Neither the candidate scan nor
-        // the per-row liveness re-check can then overflow the SQL
-        // interval arithmetic on an out-of-range caller value.
+        // Clamp once at the entry point so neither the SQL interval arithmetic
+        // nor the chrono::Duration re-check (in `worker_still_dead`) can ever
+        // overflow on an out-of-range caller value.
         let worker_stale_secs = worker_stale_secs.clamp(0, super::MAX_WORKER_STALE_SECS);
-        let confirm_secs = super::quarantine_confirm_secs(worker_stale_secs);
         // Chaos: inject a transient DB/connection error before the orphan scan
         // (issue #940 AC1(b)). The reclaim is idempotent and the poll loop
         // retries it on the next tick, so a transient error must not strand an
@@ -1283,77 +597,22 @@ mod scanner {
             .load(conn)
             .await
             .map_err(crate::error::database_error)?;
-        // Issue #1879: read the clock after the scan returns. A delay before
-        // the scan is not time that the reclaimer saw the orphan.
-        let swept_at = watch.as_ref().map(|(_, clock)| clock());
-        if let (Some((witness, _)), Some(now)) = (watch.as_mut(), swept_at) {
-            witness.observe(orphans.iter().filter_map(orphan_claim), now);
-        }
 
         let mut summary = ReclaimSummary::default();
-        // The stuck-running pass below must not requeue a held row. That
-        // requeue counts no strike, so a poison pill would never quarantine.
-        let mut held = std::collections::HashSet::new();
         for task in orphans {
             let new_strikes = task.crash_strikes.saturating_add(1);
             match quarantine_decision(new_strikes, threshold) {
                 ReclaimAction::Quarantine => {
-                    // Issue #1879: the strike is permanent and the quarantine
-                    // is terminal. Hold the row until the death of the worker
-                    // is confirmed. A late worker is not a dead one.
-                    let (wait, dead_secs) = match (watch.as_mut(), swept_at) {
-                        (Some((witness, _)), Some(now)) => (
-                            hold_last_strike(conn, &task, witness, now, confirm_secs).await?,
-                            confirm_secs,
-                        ),
-                        _ => (false, worker_stale_secs),
-                    };
-                    if wait {
-                        summary.held += 1;
-                        held.insert(task.id);
-                        continue;
-                    }
-                    let outcome =
-                        quarantine_orphan(conn, &task, new_strikes, dead_secs, metrics, codecs)
-                            .await;
-                    match skip_on_row_conflict(outcome, &task, QuarantineOutcome::Skipped)? {
-                        QuarantineOutcome::Quarantined => summary.quarantined += 1,
-                        // Issue #1879: a fresh worker breaks the watch.
-                        QuarantineOutcome::WorkerFresh => {
-                            if let (Some((witness, _)), Some(claim)) =
-                                (watch.as_mut(), orphan_claim(&task))
-                            {
-                                witness.forget(&claim);
-                            }
-                        }
-                        QuarantineOutcome::Skipped => {}
+                    if quarantine_orphan(conn, &task, new_strikes, worker_stale_secs, metrics)
+                        .await?
+                    {
+                        summary.quarantined += 1;
                     }
                 }
                 ReclaimAction::Requeue => {
-                    let outcome = requeue_orphan(conn, &task, new_strikes, worker_stale_secs).await;
-                    if skip_on_row_conflict(outcome, &task, false)? {
+                    if requeue_orphan(conn, &task, new_strikes, worker_stale_secs).await? {
                         summary.requeued += 1;
-                        // Dispatch hint (issue #1312). The orphan is `PENDING`
-                        // again and its inner transaction has committed, so the
-                        // channel gets a reference to it.
-                        crate::queue::record_pending_hints(conn, &[task.id]).await;
                     }
-                }
-            }
-        }
-
-        if let Some(stuck_running_secs) = stuck_running_secs {
-            let stuck_running_secs = stuck_running_secs.clamp(0, super::MAX_STUCK_RUNNING_SECS);
-            let stuck: Vec<TaskQueueItem> = diesel::sql_query(stuck_running_tasks_query())
-                .bind::<diesel::sql_types::BigInt, _>(stuck_running_secs)
-                .load(conn)
-                .await
-                .map_err(crate::error::database_error)?;
-            for task in stuck.into_iter().filter(|task| !held.contains(&task.id)) {
-                let outcome = requeue_stuck_task(conn, &task, stuck_running_secs).await;
-                if skip_on_row_conflict(outcome, &task, false)? {
-                    summary.stuck_requeued += 1;
-                    crate::queue::record_pending_hints(conn, &[task.id]).await;
                 }
             }
         }
@@ -1364,18 +623,9 @@ mod scanner {
     /// tasks. Stops when `cancel` is triggered.
     ///
     /// Equivalent to [`spawn_poison_pill_reclaimer_for_shard`] with no shard
-    /// attributed and the issue #1459 stuck-running backstop disabled. The
-    /// shard is only used to label this loop in the `scanner_liveness` health
-    /// check (issue #797); it never affects which tasks the loop reclaims --
-    /// that is the connection's own database.
-    ///
-    /// This function's signature is frozen. See
-    /// `the_public_spawn_signatures_are_unchanged_by_shard_attribution` in
-    /// `tests/integration/scanner_tick_db_tests.rs`. The reason matches why
-    /// the shard parameter never reached it. An embedder calling this
-    /// directly should not have to opt into a feature it never asked for.
-    /// Call [`spawn_poison_pill_reclaimer_for_shard`] directly to enable the
-    /// backstop.
+    /// attributed. The shard is only used to label this loop in the
+    /// `scanner_liveness` health check (issue #797); it never affects which
+    /// tasks the loop reclaims -- that is the connection's own database.
     #[must_use]
     pub fn spawn_poison_pill_reclaimer(
         pool: diesel_async::pooled_connection::deadpool::Pool<AsyncPgConnection>,
@@ -1384,8 +634,6 @@ mod scanner {
         threshold: i32,
         worker_stale_secs: i64,
         telemetry: std::sync::Arc<crate::telemetry::TelemetryConfig>,
-        // Issue #1243: forwarded to the sharded spawner.
-        payload_codecs: crate::payload_codec::PayloadCodecs,
     ) -> tokio::task::JoinHandle<()> {
         spawn_poison_pill_reclaimer_for_shard(
             pool,
@@ -1393,10 +641,8 @@ mod scanner {
             interval,
             threshold,
             worker_stale_secs,
-            None,
             telemetry,
             None,
-            payload_codecs,
         )
     }
 
@@ -1411,26 +657,14 @@ mod scanner {
     ///
     /// Pass `None` for a process-wide loop or a single-shard deployment.
     #[must_use]
-    // Issue #1243: the codec registry pushed this spawner past the
-    // pedantic argument limit; its parameters are already a flat
-    // shard-runtime bundle and restructuring them is out of scope here.
-    #[allow(clippy::too_many_arguments)]
     pub fn spawn_poison_pill_reclaimer_for_shard(
         pool: diesel_async::pooled_connection::deadpool::Pool<AsyncPgConnection>,
         cancel: CancellationToken,
         interval: std::time::Duration,
         threshold: i32,
         worker_stale_secs: i64,
-        // Issue #1459: gates the stuck-running backstop pass (a `workflow`
-        // task stuck long past its decision-cycle budget, worker liveness
-        // notwithstanding). `None` disables it, matching pre-#1459 behavior.
-        stuck_running_secs: Option<i64>,
         telemetry: std::sync::Arc<crate::telemetry::TelemetryConfig>,
         shard: Option<crate::types::ShardId>,
-        // Issue #1243: owned so it can move into the spawned loop. The
-        // registry's rotation state is shared across clones, so a later
-        // `set_active_key` still reaches this long-lived task.
-        payload_codecs: crate::payload_codec::PayloadCodecs,
     ) -> tokio::task::JoinHandle<()> {
         // Issue #797: declare the loop before its first iteration so the
         // `scanner_liveness` check expects it and grants it boot grace. The
@@ -1442,85 +676,30 @@ mod scanner {
             interval,
             shard,
         );
-        // Keep the worker dispatch binding for hints (issue #1431).
-        crate::dispatch::spawn_bound(async move {
-            // Issue #1879: one witness for the life of this loop.
-            let mut witness = OrphanWitness::default();
+        tokio::spawn(async move {
             loop {
                 tokio::select! {
                     () = cancel.cancelled() => break,
                     () = tokio::time::sleep(interval) => {}
                 }
-                // Issue #1823: a held shard skips the tick before it takes a connection.
-                // It can be an unreachable standby, so a checkout could wait on it.
-                if crate::replication::shard_writes_held(shard) {
-                    // The loop is still alive, so a skipped tick still counts.
-                    crate::scanner_health::record_scanner_tick(&*telemetry.metrics, owner);
-                    continue;
-                }
-                // Selected against `cancel` (issue #1426). A pool may have no
-                // deadpool `Timeouts`, so `pool.get()` alone can park this task
-                // indefinitely on an exhausted shard pool. The top-of-loop select
-                // only guards the sleep between ticks. A tick already
-                // parked here would otherwise never observe shutdown. The
-                // join in `shutdown_and_cleanup_monitors` would then wait
-                // forever.
-                let get_result = tokio::select! {
-                    () = cancel.cancelled() => break,
-                    result = pool.get() => result,
-                };
-                // The fence opens only after the checkout. A tick that waits for a
-                // connection holds no barrier, so pool pressure cannot block a bump. The
-                // tick runs under the barrier of this shard and each pinned shard
-                // colocated with it. A fenced shard skips the tick, and a lost barrier
-                // stops it.
-                let Some(fence) = crate::replication::begin_shard_tick(&pool, shard).await else {
-                    // The loop is still alive, so a skipped tick still counts.
-                    crate::scanner_health::record_scanner_tick(&*telemetry.metrics, owner);
-                    continue;
-                };
-                match get_result {
+                match pool.get().await {
                     Ok(mut conn) => {
-                        match crate::replication::run_fenced_pass(
-                            &fence,
-                            Box::pin(async {
-                                // Issue #1823: the older connection joins the pass.
-                                // A lost guard then ends its backend.
-                                let _member =
-                                    crate::replication::join_fenced_pass(&pool, &mut conn).await;
-                                reclaim_orphaned_tasks_witnessed(
-                                    &mut conn,
-                                    threshold,
-                                    worker_stale_secs,
-                                    stuck_running_secs,
-                                    &*telemetry.metrics,
-                                    &payload_codecs,
-                                    &mut witness,
-                                    &std::time::Instant::now,
-                                )
-                                .await
-                            }),
+                        match reclaim_orphaned_tasks(
+                            &mut conn,
+                            threshold,
+                            worker_stale_secs,
+                            &*telemetry.metrics,
                         )
                         .await
-                        .and_then(|done| done)
                         {
-                            Ok(summary) => {
-                                if summary.total() > 0 {
-                                    tracing::warn!(
-                                        requeued = summary.requeued,
-                                        quarantined = summary.quarantined,
-                                        stuck_requeued = summary.stuck_requeued,
-                                        "reclaimed orphaned poison-pill tasks"
-                                    );
-                                }
-                                if summary.held > 0 {
-                                    tracing::info!(
-                                        held = summary.held,
-                                        "held orphans at the poison-pill threshold until \
-                                         their workers are confirmed dead"
-                                    );
-                                }
+                            Ok(summary) if summary.total() > 0 => {
+                                tracing::warn!(
+                                    requeued = summary.requeued,
+                                    quarantined = summary.quarantined,
+                                    "reclaimed orphaned poison-pill tasks"
+                                );
                             }
+                            Ok(_) => {}
                             Err(e) => {
                                 tracing::error!(error = %e, "poison-pill reclaim sweep failed");
                             }
@@ -1544,60 +723,15 @@ mod scanner {
     }
 }
 
-#[cfg(all(test, feature = "db"))]
-mod scanner_tests {
-    use super::scanner::is_row_conflict;
-    use crate::error::HarvestError;
-
-    fn db(msg: &str) -> HarvestError {
-        HarvestError::Database(msg.to_owned())
-    }
-
-    /// Issue #1876: these errors end one row's work, so the pass skips the row.
-    #[test]
-    fn a_timeout_or_deadlock_on_one_row_is_a_row_conflict() {
-        assert!(is_row_conflict(&db(
-            "canceling statement due to lock timeout"
-        )));
-        assert!(is_row_conflict(&db(
-            "canceling statement due to statement timeout"
-        )));
-        assert!(is_row_conflict(&db("deadlock detected")));
-    }
-
-    /// Any other error ends the pass, so the poll loop reports it.
-    #[test]
-    fn other_errors_are_not_a_row_conflict() {
-        assert!(!is_row_conflict(&db("connection closed")));
-        assert!(!is_row_conflict(&db(
-            "canceling statement due to user request"
-        )));
-        assert!(!is_row_conflict(&HarvestError::Config("bad".to_owned())));
-    }
-}
-
 #[cfg(feature = "db")]
 pub use scanner::{
-    QUARANTINE_REASON, reclaim_orphaned_tasks, reclaim_orphaned_tasks_witnessed,
-    spawn_poison_pill_reclaimer, spawn_poison_pill_reclaimer_for_shard,
+    QUARANTINE_REASON, reclaim_orphaned_tasks, spawn_poison_pill_reclaimer,
+    spawn_poison_pill_reclaimer_for_shard,
 };
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Issue #1402: an orphan reclaim keeps the SAME wake reason a
-    /// crashed worker was already processing. It must NOT clear
-    /// `timer_fires_at` -- that would defeat the marker for a genuinely
-    /// timer-owned row recovering from a crash.
-    #[test]
-    fn requeue_orphan_stmt_preserves_the_timer_marker() {
-        let sql = requeue_orphan_stmt();
-        assert!(
-            !sql.contains("timer_fires_at"),
-            "an orphan reclaim must leave timer_fires_at untouched: {sql}"
-        );
-    }
 
     #[test]
     fn first_strike_under_threshold_requeues() {
@@ -1649,150 +783,11 @@ mod tests {
     }
 
     #[test]
-    fn reclaim_summary_total_sums_all_three_buckets() {
+    fn reclaim_summary_total_sums_both_buckets() {
         let summary = ReclaimSummary {
             requeued: 2,
             quarantined: 1,
-            stuck_requeued: 4,
-            held: 8,
         };
-        assert_eq!(summary.total(), 7, "a held orphan changed no row");
-    }
-
-    #[test]
-    fn stuck_query_targets_running_workflow_rows_past_deadline() {
-        let sql = stuck_running_tasks_query();
-        assert!(sql.contains("harvest_task_queue"), "scans the task queue");
-        assert!(sql.contains("state = 'RUNNING'"), "only RUNNING rows");
-        assert!(
-            sql.contains("task_type = 'workflow'"),
-            "activity tasks are excluded -- their own start_to_close is unrelated"
-        );
-        assert!(
-            sql.contains("started_at"),
-            "stuck is judged by wall-clock age, not worker liveness"
-        );
-        assert!(
-            !sql.contains("harvest_workers"),
-            "this backstop applies regardless of worker liveness"
-        );
-    }
-
-    fn claim(task: u128, worker: &str, strikes: i32) -> OrphanClaim {
-        OrphanClaim {
-            task_id: uuid::Uuid::from_u128(task),
-            worker_id: worker.to_owned(),
-            crash_strikes: strikes,
-            attempt: 1,
-            started_at: None,
-        }
-    }
-
-    /// Issue #1879: a claim that no sweep saw is not seen twice.
-    #[test]
-    fn witness_does_not_confirm_an_unseen_claim() {
-        let witness = OrphanWitness::default();
-        assert!(!witness.seen_twice(&claim(1, "w", 2)));
-    }
-
-    fn at(secs: u64) -> std::time::Instant {
-        static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-        *ORIGIN.get_or_init(std::time::Instant::now) + std::time::Duration::from_secs(secs)
-    }
-
-    /// Issue #1879: the first sight of a claim is not enough.
-    #[test]
-    fn witness_needs_two_sweeps_in_a_row() {
-        let mut witness = OrphanWitness::default();
-        witness.observe([claim(1, "w", 2)], at(1));
-        assert!(!witness.seen_twice(&claim(1, "w", 2)));
-        witness.observe([claim(1, "w", 2)], at(2));
-        assert!(witness.seen_twice(&claim(1, "w", 2)));
-    }
-
-    /// Issue #1879: a worker that heartbeats again leaves the orphan set.
-    /// A later stall then starts again from the first sight.
-    #[test]
-    fn witness_forgets_a_claim_that_leaves_the_orphan_set() {
-        let mut witness = OrphanWitness::default();
-        witness.observe([claim(1, "w", 2), claim(2, "w", 0)], at(3));
-        witness.observe([claim(2, "w", 0)], at(4));
-        witness.observe([claim(1, "w", 2), claim(2, "w", 0)], at(5));
-        assert!(!witness.seen_twice(&claim(1, "w", 2)));
-        assert!(witness.seen_twice(&claim(2, "w", 0)));
-    }
-
-    /// A new claim of the same task is a new key.
-    #[test]
-    fn witness_treats_a_new_claim_of_the_same_task_as_new() {
-        let mut witness = OrphanWitness::default();
-        witness.observe([claim(1, "w", 2)], at(6));
-        witness.observe([claim(1, "other", 2)], at(7));
-        assert!(!witness.seen_twice(&claim(1, "other", 2)));
-        witness.observe([claim(1, "other", 3)], at(8));
-        assert!(!witness.seen_twice(&claim(1, "other", 3)));
-    }
-
-    /// Issue #1879: the confirm window is two stale windows, clamped.
-    #[test]
-    fn quarantine_confirm_window_is_two_stale_windows() {
-        assert_eq!(quarantine_confirm_secs(10), 20);
-        assert_eq!(quarantine_confirm_secs(1), 2);
-        assert_eq!(quarantine_confirm_secs(0), 0);
-        assert_eq!(
-            quarantine_confirm_secs(MAX_WORKER_STALE_SECS),
-            MAX_WORKER_STALE_SECS
-        );
-    }
-
-    const CONFIRM: std::time::Duration = std::time::Duration::from_secs(20);
-
-    /// Issue #1879: a claim with no worker row needs the full confirm window
-    /// of unbroken sightings. Two quick sweeps are not enough.
-    #[test]
-    fn witness_measures_how_long_a_claim_stays_an_orphan() {
-        let mut witness = OrphanWitness::default();
-        witness.observe([claim(1, "w", 2)], at(100));
-        witness.observe([claim(1, "w", 2)], at(101));
-        assert!(witness.seen_twice(&claim(1, "w", 2)));
-        assert!(!witness.seen_for(&claim(1, "w", 2), at(101), CONFIRM));
-        witness.observe([claim(1, "w", 2)], at(120));
-        assert!(witness.seen_for(&claim(1, "w", 2), at(120), CONFIRM));
-    }
-
-    /// A slow sweep does not reset the time. Only a break in the sightings
-    /// does.
-    #[test]
-    fn witness_time_restarts_only_after_a_break() {
-        let mut witness = OrphanWitness::default();
-        witness.observe([claim(1, "w", 2)], at(200));
-        witness.observe([claim(1, "w", 2)], at(215));
-        assert!(witness.seen_for(&claim(1, "w", 2), at(220), CONFIRM));
-        witness.observe([], at(221));
-        witness.observe([claim(1, "w", 2)], at(222));
-        assert!(!witness.seen_for(&claim(1, "w", 2), at(241), CONFIRM));
-        assert!(witness.seen_for(&claim(1, "w", 2), at(242), CONFIRM));
-    }
-
-    /// Issue #1879: a forgotten claim starts a new watch.
-    #[test]
-    fn witness_restarts_a_forgotten_claim() {
-        let mut witness = OrphanWitness::default();
-        witness.observe([claim(1, "w", 2)], at(300));
-        witness.observe([claim(1, "w", 2)], at(301));
-        witness.forget(&claim(1, "w", 2));
-        witness.observe([claim(1, "w", 2)], at(320));
-        assert!(!witness.seen_twice(&claim(1, "w", 2)));
-        assert!(!witness.seen_for(&claim(1, "w", 2), at(320), CONFIRM));
-    }
-
-    /// Issue #1879: the heartbeat age comes from the database clock. A host
-    /// clock that runs ahead must not shorten the confirm window.
-    #[test]
-    fn worker_sighting_query_uses_the_database_clock() {
-        let sql = worker_sighting_query();
-        assert!(sql.contains("clock_timestamp()"), "{sql}");
-        assert!(sql.contains("$2::bigint * INTERVAL '1 second'"), "{sql}");
-        assert!(sql.contains("harvest_workers"), "{sql}");
+        assert_eq!(summary.total(), 3);
     }
 }

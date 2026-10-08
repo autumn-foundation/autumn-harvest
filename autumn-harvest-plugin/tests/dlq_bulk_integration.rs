@@ -6,6 +6,7 @@ use autumn_harvest::types::ShardId;
 use autumn_harvest::worker::DbPool;
 use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
+use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -24,7 +25,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::test_init_sql().as_bytes().to_vec()
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
 }
 
 type HarvestApiApp = axum::Router;
@@ -88,7 +89,7 @@ async fn setup_sharded_test_database_urls() -> ((String, String), ContainerAsync
         let mut conn = <AsyncPgConnection as AsyncConnection>::establish(shard_url)
             .await
             .expect("failed to connect to shard database");
-        conn.batch_execute(&autumn_harvest::test_init_sql())
+        conn.batch_execute(autumn_harvest::full_migrations_sql())
             .await
             .expect("failed to apply harvest migrations to shard database");
     }
@@ -115,14 +116,14 @@ fn build_dlq_app(pool: DbPool) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool));
-    harvest_api_router(api_state)
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
 
 fn build_sharded_dlq_app(shard0_url: &str, shard1_url: &str) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(build_two_shard_pool(shard0_url, shard1_url));
-    harvest_api_router(api_state)
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
 
 async fn read_json_response(response: axum::response::Response) -> Value {
@@ -531,8 +532,6 @@ async fn post_form(app: &HarvestApiApp, uri: &str, body: &str) -> (StatusCode, V
                 .method("POST")
                 .uri(uri)
                 .header("content-type", "application/x-www-form-urlencoded")
-                // issue #1278: required by the same-origin guard.
-                .header("sec-fetch-site", "same-origin")
                 .body(Body::from(body.to_string()))
                 .unwrap(),
         )

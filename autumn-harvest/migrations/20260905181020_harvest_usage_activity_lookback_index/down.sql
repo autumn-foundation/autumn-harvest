@@ -1,1 +1,0 @@
-DROP INDEX IF EXISTS idx_harvest_events_activity_started_lookup;

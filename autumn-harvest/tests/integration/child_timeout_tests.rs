@@ -584,7 +584,9 @@ async fn setup_parent_racing_overdue_real_child(
     use diesel::{ExpressionMethods, QueryDsl};
 
     let parent_exec_id = insert_workflow_execution(conn).await;
-    // A `child-*` workflow_id marks this row as the child, for readability.
+    // The child is a SEPARATE live execution, so it needs a distinct workflow_id
+    // — reusing `insert_workflow_execution` (hardcoded id) would collide with the
+    // parent on the partial UNIQUE(workflow_name, workflow_id) active index.
     let child_exec_id =
         insert_workflow_execution_with_id(conn, &format!("child-{}", uuid::Uuid::new_v4())).await;
 
@@ -707,7 +709,6 @@ async fn over_deadline_child_failure_orders_deadline_first_and_resolves_none() {
         parent_exec_id,
         child_exec_id,
         "downstream 503",
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await
     .expect("wake parent for child failure");
@@ -1430,7 +1431,6 @@ async fn transient_event_id_conflict_requeues_parent_instead_of_failing() {
         &mut conn,
         exec_id,
         stale_next_event_id,
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await
     .expect_err("stale-id ingest must conflict on the committed event_id");
@@ -1448,7 +1448,6 @@ async fn transient_event_id_conflict_requeues_parent_instead_of_failing() {
         Duration::from_secs(5),
         exec_id,
         stale_next_event_id,
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await
     .expect("a transient conflict is NOT a genuine error");
@@ -1529,7 +1528,6 @@ async fn transient_event_id_conflict_requeues_parent_instead_of_failing() {
         Duration::from_secs(5),
         exec_id,
         fresh.next_event_id,
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await
     .expect("clean re-drive")

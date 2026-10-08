@@ -15,11 +15,11 @@ deduplicates. Every activity gets a stable, retry-safe key from
 async fn charge_card(
     ctx: &ActivityContext,
     input: serde_json::Value,
-) -> Result<serde_json::Value, String> {
+) -> HarvestResult<serde_json::Value> {
     let amount_cents = input["amount_cents"].as_u64().unwrap_or(0);
     let customer_id = input["customer_id"].as_str().unwrap_or("").to_owned();
 
-    let idem_key = ctx.idempotency_key().map_err(|e| e.to_string())?.as_str().to_owned();
+    let idem_key = ctx.idempotency_key()?.as_str().to_owned();
 
     // Pass idem_key as Stripe's Idempotency-Key header. Subsequent retries
     // for this attempt carry the same key, so Stripe returns the original

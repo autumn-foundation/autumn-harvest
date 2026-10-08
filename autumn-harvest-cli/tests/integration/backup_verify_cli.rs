@@ -14,7 +14,6 @@ use autumn_harvest::backup_verify::{
 use autumn_harvest_cli::{
     BackupVerifyFormat, CliError, backup_verify_gate, backup_verify_json,
     format_backup_verify_text, parse_shard_targets, scratch_guard, scratch_guard_warning,
-    validate_default_shard,
 };
 
 fn shard(findings: Vec<Finding>) -> ShardVerifyReport {
@@ -209,29 +208,6 @@ fn the_largest_encodable_shard_id_is_accepted() {
     assert_eq!(targets[0].shard_id, 65534);
 }
 
-/// Issue #1205. An out-of-range `--default-shard` can never match a `--shard`
-/// target; that range is enforced there too. Every unencoded reference would
-/// then silently fall to the advisory `uninspected_shard_reference` path.
-/// That reads exit 0 on a value that was never valid.
-#[test]
-fn an_unencodable_default_shard_is_rejected() {
-    for bad in [-1, 65535, 65536, 70000] {
-        match validate_default_shard(bad) {
-            Ok(()) => panic!("default shard {bad} must be rejected: it cannot encode"),
-            Err(e) => assert!(
-                e.to_string().contains(&bad.to_string()),
-                "the error must name the offending id: {e}"
-            ),
-        }
-    }
-}
-
-#[test]
-fn the_largest_encodable_default_shard_is_accepted() {
-    validate_default_shard(65534).expect("0xFFFE is the largest encodable shard");
-    validate_default_shard(0).expect("0 is the default configuration");
-}
-
 // ── AC2(d): exit-code mapping ──────────────────────────────────────────────
 
 #[test]
@@ -385,130 +361,6 @@ fn text_output_reports_replay_coverage_honestly() {
     assert!(
         !r.replay.verified(),
         "replay must not count as verified when every sample was skipped"
-    );
-}
-
-#[test]
-fn text_output_does_not_claim_partial_coverage_when_nothing_replayed_at_all() {
-    // A run where every sampled history was unreadable replayed NOTHING. It
-    // must print the plain "NOT VERIFIED" message, not "PARTIALLY VERIFIED",
-    // which claims some coverage actually happened.
-    let mut s = shard(Vec::new());
-    s.replay = ReplaySummary {
-        sampled: 2,
-        clean: 0,
-        divergent: 0,
-        failed: 0,
-        skipped_no_handler: 0,
-        unreadable: 2,
-    };
-    let r = RestoreVerifyReport::assemble(chrono::Utc::now(), vec![s], Vec::new());
-    let text = format_backup_verify_text(&r);
-    assert!(
-        text.contains("NOT VERIFIED") && !text.contains("PARTIALLY VERIFIED"),
-        "zero coverage must not be reported as partial coverage: {text}"
-    );
-}
-
-/// Issue #1205's replay-messaging fix, completed. An all-unreadable run is
-/// a distinct cause from an all-skipped one. Handlers ARE registered here;
-/// something WOULD have replayed had the histories been readable. Telling
-/// the operator to register handlers sends them chasing the wrong fix.
-#[test]
-fn text_output_does_not_blame_handlers_when_every_history_is_unreadable() {
-    let mut s = shard(Vec::new());
-    s.replay = ReplaySummary {
-        sampled: 2,
-        clean: 0,
-        divergent: 0,
-        failed: 0,
-        skipped_no_handler: 0,
-        unreadable: 2,
-    };
-    let r = RestoreVerifyReport::assemble(chrono::Utc::now(), vec![s], Vec::new());
-    let text = format_backup_verify_text(&r);
-    assert!(
-        !text.contains("Register the workflow handlers"),
-        "handlers are not the cause when nothing was skipped for lack of one: {text}"
-    );
-    assert!(
-        text.contains("unreadable"),
-        "the message must name the actual cause: {text}"
-    );
-}
-
-/// Issue #1410. A fleet-wide summary can merge an all-unreadable shard with
-/// an all-skipped shard. Neither single-cause branch may fire: the message
-/// must name both counts and must not blame, or clear, handlers outright.
-#[test]
-fn text_output_names_both_causes_when_unreadable_and_skipped_combine() {
-    let mut s = shard(Vec::new());
-    s.replay = ReplaySummary {
-        sampled: 5,
-        clean: 0,
-        divergent: 0,
-        failed: 0,
-        skipped_no_handler: 3,
-        unreadable: 2,
-    };
-    let r = RestoreVerifyReport::assemble(chrono::Utc::now(), vec![s], Vec::new());
-    let text = format_backup_verify_text(&r);
-    assert!(
-        text.contains("NOT VERIFIED") && !text.contains("PARTIALLY VERIFIED"),
-        "nothing replayed here, so this is zero coverage, not partial: {text}"
-    );
-    assert!(
-        !text.contains("Every sampled history failed to read"),
-        "some samples were skipped, not unreadable, so this claim is false: {text}"
-    );
-    assert!(
-        !text.contains("Registering workflow handlers will not fix this"),
-        "handlers would fix the skipped subset, so this overclaims: {text}"
-    );
-    assert!(
-        text.contains("2 unreadable") && text.contains("3 skipped"),
-        "both counts must be named so an operator can tell the causes apart: {text}"
-    );
-}
-
-/// Three causes at once: some replayed, some unreadable, some skipped. The
-/// PARTIALLY VERIFIED branch must still win, since it checks only whether
-/// anything replayed at all -- `skipped_no_handler` does not change that.
-#[test]
-fn text_output_reports_partial_coverage_even_when_skipped_is_also_present() {
-    let mut s = shard(Vec::new());
-    s.replay = ReplaySummary {
-        sampled: 6,
-        clean: 2,
-        divergent: 0,
-        failed: 0,
-        skipped_no_handler: 3,
-        unreadable: 1,
-    };
-    let r = RestoreVerifyReport::assemble(chrono::Utc::now(), vec![s], Vec::new());
-    let text = format_backup_verify_text(&r);
-    assert!(
-        text.contains("PARTIALLY VERIFIED") && !text.contains("NOT VERIFIED"),
-        "something replayed, so this is partial coverage, not zero: {text}"
-    );
-}
-
-#[test]
-fn text_output_reports_partial_coverage_when_some_unreadable_but_others_replayed() {
-    let mut s = shard(Vec::new());
-    s.replay = ReplaySummary {
-        sampled: 3,
-        clean: 2,
-        divergent: 0,
-        failed: 0,
-        skipped_no_handler: 0,
-        unreadable: 1,
-    };
-    let r = RestoreVerifyReport::assemble(chrono::Utc::now(), vec![s], Vec::new());
-    let text = format_backup_verify_text(&r);
-    assert!(
-        text.contains("PARTIALLY VERIFIED"),
-        "some replayed plus some unreadable is a coverage gap, not zero coverage: {text}"
     );
 }
 

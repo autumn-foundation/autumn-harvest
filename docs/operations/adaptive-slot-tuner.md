@@ -75,11 +75,9 @@ signals harvest already owns in-process** — no new external dependency, no
 2. **Worker DB-pool pressure** (`pool.rs` / the worker's `deadpool` pool
    `status()`) — is the pool at capacity, or does it have callers waiting for
    a connection?
-3. **Dispatch-wait latency** — the longest time, since the tuner's last
-   tick, that a task waited for a local dispatch permit. A worker claims only
-   against a free permit (issue #1787), so a backlog waits in the queue. When
-   the claim gate held a task kind back, the next dispatch wait of that kind
-   also includes the queue wait, from task eligibility to the claim.
+3. **Claim-to-dispatch permit-wait latency** — the longest time, since the
+   tuner's last tick, that a claimed task spent waiting for a local dispatch
+   permit before starting.
 
 Decision order (first match wins), evaluated once per control-loop tick:
 
@@ -129,11 +127,10 @@ When a tuner is configured, a dispatch semaphore is created with
   revokes a permit already held by an in-flight task.
 
 **Fair-queue fallback for a busy worker.** `dispatch_task` spawns every
-claimed task as a queueing `semaphore.acquire()`. Claiming reads free
-permits, so withheld permits throttle it (issue #1787). The poll path holds
-its permit before it claims. On the dispatch-channel path, a task in the short
-window between its claim and its permit can still queue on the semaphore.
-`tokio::sync::Semaphore` always assigns a released permit
+claimed task as a queueing `semaphore.acquire()`, and claiming is not
+throttled against the live target — under a real backlog (claims outrunning
+dispatch capacity), the semaphore's wait queue can be continuously
+non-empty. `tokio::sync::Semaphore` always assigns a released permit
 directly to the oldest queued waiter before it is ever visible to a
 concurrent `try_acquire()`, so a shrink that only ever tried `try_acquire`
 could lose that race indefinitely for as long as the backlog persisted —
@@ -168,9 +165,7 @@ worker is trying to wind down and exactly when the tuner may have shrunk
 pressure. In practice the window is narrow (bounded by how many tasks were
 claimed beyond the current live target at the moment of shutdown) and every
 started task still completes normally — this does not corrupt state, only
-temporarily exceeds the tuned band during shutdown. Since issue #1787, a
-worker claims only against a free permit. Only a dispatch-channel task in the
-short window between its claim and its permit can wait here. A future fix would have
+temporarily exceeds the tuned band during shutdown. A future fix would have
 `drain_in_flight` wait for the tuner's live target directly instead of the
 full `max_slots`, removing the need to force-release withheld permits at
 all; tracked as follow-up work under issue #548.
@@ -209,13 +204,6 @@ moment — none of them is aware of, or adjusts, the others:
   enforced at claim/dispatch time. The slot tuner never grants extra tokens
   or bypasses a rate limit — a rate-limited activity can still be
   throttled even when the tuner has grown the semaphore to `max_slots`.
-- **Adaptive limit per activity type (issue #1836,
-  `WorkerConfig::with_adaptive_limit`)** caps the in-flight attempts of one
-  activity type. The cap follows the handler latency and the retryable
-  failures, not the permit wait. Use it when a dependency is the
-  bottleneck. The tuner grows on waits, and more calls then only add
-  latency. See [design decision 12](../architecture.md#key-design-decisions)
-  and [the adaptive-limit runbook](../runbooks/activity-concurrency-limit.md).
 
 ## Scope and cadence
 

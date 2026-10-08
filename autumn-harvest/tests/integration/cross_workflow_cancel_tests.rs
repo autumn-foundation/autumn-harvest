@@ -27,7 +27,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 static TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::test_init_sql().as_bytes().to_vec()
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
 }
 
 /// Rewrite the database segment of a `postgres://…/db?query` URL, preserving the
@@ -68,7 +68,7 @@ async fn setup_test_database_url() -> (String, Option<ContainerAsync<Postgres>>)
         let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&new_url)
             .await
             .expect("failed to connect to per-test database");
-        conn.batch_execute(&autumn_harvest::test_init_sql())
+        conn.batch_execute(autumn_harvest::full_migrations_sql())
             .await
             .expect("failed to apply migrations to per-test database");
         return (new_url, None);
@@ -179,7 +179,7 @@ fn default_start_params(
         exec_id,
         workflow_name,
         workflow_id,
-        input: input.into(),
+        input,
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,

@@ -46,8 +46,6 @@ const DEFAULT_KEY_PREFIX: &str = "harvest";
 const DEFAULT_CONSUMER_GROUP: &str = "harvest_workers";
 const DEFAULT_VISIBILITY_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_CLAIM_BATCH: usize = 16;
-/// Bound on the one-shot TLS handshake probe in [`RedisTaskQueue::connect`].
-const TLS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Configuration for [`RedisTaskQueue`].
 #[derive(Debug, Clone)]
@@ -120,45 +118,12 @@ impl RedisTaskQueue {
 
     /// Open a Redis connection and build a [`RedisTaskQueue`].
     ///
-    /// A `rediss://` URL connects over TLS and trusts the platform store
-    /// (issue #1834). Use [`connect_with_tls`](Self::connect_with_tls) for a
-    /// private CA or for mutual TLS.
-    ///
     /// # Errors
     ///
-    /// Returns [`RedisAdapterError::Redis`] if the URL cannot be parsed, the
-    /// connection cannot be established, or the TLS handshake fails. Returns
-    /// [`RedisAdapterError::ConnectTimeout`] when a TLS handshake does not
-    /// finish in 5 seconds. Returns [`RedisAdapterError::InvalidConfig`] for
-    /// the `#insecure` URL fragment.
+    /// Returns [`RedisAdapterError::Redis`] if the URL cannot be parsed or the
+    /// connection cannot be established.
     pub async fn connect(url: &str, config: RedisTaskQueueConfig) -> RedisAdapterResult<Self> {
-        Self::connect_inner(url, config, None).await
-    }
-
-    /// Like [`connect`](Self::connect), with explicit TLS certificates.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RedisAdapterError::InvalidConfig`] for a plain `redis://`
-    /// URL or for unusable PEM, before any network I/O. Otherwise see
-    /// [`connect`](Self::connect).
-    pub async fn connect_with_tls(
-        url: &str,
-        config: RedisTaskQueueConfig,
-        tls: crate::RedisTlsOptions,
-    ) -> RedisAdapterResult<Self> {
-        Self::connect_inner(url, config, Some(&tls)).await
-    }
-
-    async fn connect_inner(
-        url: &str,
-        config: RedisTaskQueueConfig,
-        tls: Option<&crate::RedisTlsOptions>,
-    ) -> RedisAdapterResult<Self> {
-        let client = crate::tls::client(url, tls)?;
-        if crate::tls::is_tls(&client) {
-            crate::tls::probe(&client, TLS_PROBE_TIMEOUT).await?;
-        }
+        let client = redis::Client::open(url)?;
         let conn = ConnectionManager::new(client).await?;
         Ok(Self::from_connection(conn, config))
     }
@@ -449,12 +414,9 @@ impl RedisTaskQueue {
         worker_id: &str,
     ) -> RedisAdapterResult<Option<ClaimedTask>> {
         for queue in queues {
-            // Make sure any due delayed tasks are on the stream before we ask
-            // for them. `promote_due` itself calls `ensure_group` first. It
-            // must, so the group exists before its Lua script's XADDs land.
-            // A second `ensure_group` call here would be a redundant round
-            // trip to Redis on every single claim attempt. The consumer group
-            // is idempotently ensured exactly once, in the call below.
+            // Make sure the consumer group exists *and* any due delayed tasks
+            // are on the stream before we ask for them.
+            self.ensure_group(queue).await?;
             let _ = self.promote_due(queue).await?;
 
             let mut conn = self.conn.clone();
@@ -595,7 +557,7 @@ impl TaskQueueAdapter for RedisTaskQueue {
     }
 }
 
-pub fn is_busygroup(err: &RedisError) -> bool {
+fn is_busygroup(err: &RedisError) -> bool {
     err.code() == Some("BUSYGROUP")
         || err.detail().is_some_and(|d| {
             d.contains("BUSYGROUP") || d.contains("Consumer Group name already exists")
@@ -604,10 +566,6 @@ pub fn is_busygroup(err: &RedisError) -> bool {
 
 /// Lua script that atomically promotes all due delayed tasks for a single
 /// queue onto its claimable stream.
-///
-/// Shared with the dispatch channel in [`crate::dispatch`]. The two key
-/// families differ. The promotion is the same operation over a sorted set, a
-/// payload hash and a stream.
 ///
 /// Arguments:
 /// - `KEYS[1]`: the per-queue sorted set of task ids keyed by `scheduled_at`.
@@ -619,7 +577,7 @@ pub fn is_busygroup(err: &RedisError) -> bool {
 /// supplied timestamp, looks the matching payload up in the hash, XADDs it to
 /// the stream, and removes both index entries. Returns the number of members
 /// promoted.
-pub const PROMOTE_LUA: &str = r"
+const PROMOTE_LUA: &str = r"
 local zset = KEYS[1]
 local payloads = KEYS[2]
 local stream = KEYS[3]
@@ -674,7 +632,7 @@ mod tests {
 
     #[test]
     fn propagate_redis_result_surfaces_redis_errors() {
-        let err = redis::RedisError::from((redis::ErrorKind::Io, "xread exploded"));
+        let err = redis::RedisError::from((redis::ErrorKind::IoError, "xread exploded"));
         let mapped = propagate_redis_result::<i64>(Err(err));
         assert!(
             matches!(mapped, Err(RedisAdapterError::Redis(_))),

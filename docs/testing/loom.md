@@ -21,8 +21,8 @@ RUSTFLAGS="--cfg loom" cargo test -p autumn-harvest --no-default-features --test
 
 Normal `cargo test` **never** runs these models: `tests/loom_models.rs` is
 gated with `#![cfg(loom)]`, so without the `--cfg loom` flag it compiles to an
-empty crate and runs nothing. The `loom` job in `.github/workflows/ci.yml`
-runs them on every PR (see "CI" below).
+empty crate and runs nothing. There is a manual, `workflow_dispatch`-only CI
+job at `.github/workflows/loom.yml` (see "CI" below).
 
 ## What loom can and cannot check
 
@@ -57,9 +57,9 @@ Do not read a green loom run as "harvest's concurrency is verified" — read it 
 |--------|--------------|-----|
 | `circuit_breaker.rs` | **Included** | `Mutex<HashMap<String, BreakerState>>` shared (behind an `Arc`) between the worker dispatch path and the management API. The generation-fence and single-half-open-probe invariants are exactly the kind of lock-ordering-sensitive safety properties loom is built to verify. |
 | `sessions.rs` (slot registry) | **Included** | `SessionSlotRegistry = Arc<Mutex<HashSet<SessionId>>>` shared between concurrent session-acquire task claims on one worker. The capacity bound and acquire/release balance are in-process invariants. |
-| `slot_tuner.rs` | **Excluded (Shuttle)** | Coordinates through `tokio::sync::Semaphore` / `OwnedSemaphorePermit` and async atomics. **Loom cannot model tokio async primitives**, so it cannot reach the withheld-permit accounting invariant. The Shuttle models check it — see [`shuttle.md`](shuttle.md). |
+| `slot_tuner.rs` | **Excluded (Shuttle candidate)** | Coordinates through `tokio::sync::Semaphore` / `OwnedSemaphorePermit` and async atomics. **Loom cannot model tokio async primitives**, so it cannot reach the withheld-permit accounting invariant (`withheld + available + in-flight == max`). This is the strongest argument for a Shuttle fast-follow — see `concurrency-model-checking.md`. |
 | `cache.rs` | **Excluded** | The LRU is a single-threaded `&mut self` structure with no internal locking; there is no interleaving to explore. Concurrency is provided externally by whoever owns the cache. |
-| `heartbeat.rs` | **Excluded (Shuttle)** | Coordinates through a `tokio::sync::mpsc` channel and the tokio runtime. Loom does not model tokio channels. The Shuttle models check the flush order — see [`shuttle.md`](shuttle.md). |
+| `heartbeat.rs` | **Excluded** | Coordinates through a `tokio::sync::mpsc` channel and the tokio runtime. Loom does not model tokio channels; this is async-runtime territory (Shuttle, not loom). |
 
 ## The models (`tests/loom_models.rs`)
 
@@ -128,7 +128,7 @@ normal build and only pulled in under `RUSTFLAGS="--cfg loom"`.
 ## Adding a new model
 
 1. Confirm the target is genuinely in-process and lock/atomic-based (not tokio
-   async; use Shuttle for that, see [`shuttle.md`](shuttle.md)).
+   async — that's a Shuttle candidate).
 2. Route its `Arc`/`Mutex`/atomics through `crate::loom_sync` (or `loom::sync::*`
    in an atomic's case), gated so the non-loom path stays `std`.
 3. Add a `#[test]` in `tests/loom_models.rs` wrapping the body in
@@ -161,17 +161,19 @@ and per-thread operations. Guidance, strongest first:
 
 ## Candidate backlog
 
+- **`slot_tuner.rs` withheld-permit accounting** — needs Shuttle (async /
+  tokio semaphore), not loom. Top of the fast-follow list; see
+  `concurrency-model-checking.md`.
+- **`heartbeat.rs` mpsc flush ordering** — Shuttle candidate (tokio mpsc).
 - Any future in-process lock-coordinated state machine added to the engine.
-
-`slot_tuner.rs` and `heartbeat.rs` use tokio primitives. The Shuttle models
-cover them (issue #1800); see [`shuttle.md`](shuttle.md).
 
 ## CI
 
-The `loom` job in `.github/workflows/ci.yml` runs the suite on every PR and
-every push to `trunk` and `trunk-dev` (issue #1800). It has the same draft and
-docs-only skips as the other jobs. The job sets `RUSTFLAGS="--cfg loom"` and
-runs the command in "TL;DR — running the models" above.
+`.github/workflows/loom.yml` runs the suite on **`workflow_dispatch` only** —
+it is never part of the required-status matrix in `ci.yml`, so it adds no cost
+to normal PR/push runs. Trigger it manually from the GitHub Actions tab
+("Loom model checking" → "Run workflow") or with the CLI:
 
-The guard `autumn-harvest/tests/integration/concurrency_model_ci.rs` fails if
-the job stops running the target, or loses its cfg.
+```bash
+gh workflow run loom.yml --ref <branch>
+```

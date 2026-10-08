@@ -73,8 +73,7 @@ async fn batch_processor(ctx: &WorkflowContext, _input: ()) -> Result<(), String
     // Simulate batch work (in a real workflow these would be activities).
     for i in 0..total {
         *processed.lock().unwrap() = i + 1;
-        // A real workflow would await an activity here, e.g.
-        // `ctx.execute_activity_raw("process_batch_chunk", ..)`.
+        // ctx.execute_activity_raw("process_batch_chunk", ...).await?;
     }
 
     Ok(())

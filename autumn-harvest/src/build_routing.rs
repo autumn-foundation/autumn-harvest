@@ -25,12 +25,10 @@
 //!
 //! A worker is eligible to claim a task when **any** of the following hold:
 //! 1. The task has no `required_build_id` (legacy / pre-policy execution).
-//! 2. The worker's `build_id` exactly equals the task's `required_build_id`.
-//! 3. There is an explicit compatibility declaration: worker build is declared
+//! 2. The worker's `build_id` is empty (legacy worker, pre-dates routing).
+//! 3. The worker's `build_id` exactly equals the task's `required_build_id`.
+//! 4. There is an explicit compatibility declaration: worker build is declared
 //!    compatible with the task's `required_build_id`.
-//!
-//! An empty worker `build_id` matches no pinned task (issue #1805). Pinning
-//! fails closed, so one misconfigured worker cannot take pinned work.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
@@ -53,6 +51,7 @@ use crate::types::ExecutionId;
 ///
 /// ```text
 /// eligible = task.required_build_id is None
+///          OR worker.build_id == ""           -- legacy worker
 ///          OR worker.build_id == required
 ///          OR compat_set contains (worker.build_id → required)
 /// ```
@@ -96,9 +95,9 @@ impl BuildCompatibilitySet {
             // No requirement — any worker may claim.
             None => true,
             Some(req) => {
-                // An empty build_id never matches a pinned task (issue #1805).
+                // Legacy worker (empty build_id) can claim anything.
                 if worker_build.is_empty() {
-                    return false;
+                    return true;
                 }
                 // Same build always compatible.
                 if worker_build == req {
@@ -111,27 +110,6 @@ impl BuildCompatibilitySet {
             }
         }
     }
-}
-
-/// Queues where a worker with an empty `build_id` cannot claim pinned work.
-///
-/// Returns each of `worker_queues` that has a row in `policies`, but only
-/// when `worker_build` is empty (issue #1805). Callers warn and set a gauge
-/// for each returned queue.
-#[must_use]
-pub fn empty_build_policy_queues(
-    worker_build: &str,
-    worker_queues: &[String],
-    policies: &[BuildPolicy],
-) -> Vec<String> {
-    if !worker_build.is_empty() {
-        return Vec::new();
-    }
-    worker_queues
-        .iter()
-        .filter(|queue| policies.iter().any(|p| &p.queue_name == *queue))
-        .cloned()
-        .collect()
 }
 
 // ── DB model structs ──────────────────────────────────────────────────────────
@@ -323,11 +301,6 @@ impl From<BuildPolicyRow> for BuildPolicy {
 /// `required_build_id = build_id`. Existing in-flight executions are not
 /// affected.
 ///
-/// A policy update keeps an active ramp, but it starts a new ramp step. So
-/// it gives the ramp a fresh `ramp_id` (issue #1814). A fan-out over shard
-/// pools uses [`set_build_policy_with_ramp_id`] to give every pool with the
-/// same target one id. An old ramp guard abort marker does not match it.
-///
 /// # Errors
 ///
 /// Returns `HarvestError::Database` on failure.
@@ -338,216 +311,26 @@ pub async fn set_build_policy(
     build_id: &str,
     deployment_name: Option<&str>,
 ) -> HarvestResult<BuildPolicy> {
-    set_build_policy_with_ramp_id(conn, queue_name, build_id, deployment_name, Uuid::new_v4()).await
-}
-
-/// The `ramp_id` that a ramp write stores for one ramp generation (issue
-/// #1814).
-///
-/// A fan-out passes one caller id to every pool. Each pool stores this
-/// function of that id, the queue, its base build and its target. The id is
-/// the first 16 bytes of the SHA-256 of
-/// `{ramp_id}/{len(queue)}:{queue}/{len(base)}:{base}/{len(target)}:{target}`,
-/// where `len` is the UTF-8 byte length. The writes compute the same value in
-/// SQL.
-///
-/// Queue names and build ids are free text. The length prefixes make the
-/// encoding one-to-one, so a `/` in a name cannot make two inputs collide.
-/// The queue is part of the input, so one caller id on two queues gives two
-/// ids. The report ledger keys on the id, so each queue keeps its report.
-///
-/// So pools with the same base and target share one id. A partial fan-out
-/// can leave pools with different bases or targets. Those ramps then get
-/// different ids, as the guard judges them apart. So an abort of one cannot
-/// finish the other, and the report ledger keeps their reports apart.
-#[must_use]
-pub fn ramp_generation_id(ramp_id: Uuid, queue: &str, base: &str, target: &str) -> Uuid {
-    use sha2::Digest;
-
-    let digest = sha2::Sha256::digest(
-        format!(
-            "{ramp_id}/{}:{queue}/{}:{base}/{}:{target}",
-            queue.len(),
-            base.len(),
-            target.len()
-        )
-        .as_bytes(),
-    );
-    let mut bytes = [0_u8; 16];
-    bytes.copy_from_slice(&digest[..16]);
-    Uuid::from_bytes(bytes)
-}
-
-/// The retired id of one caller's ramp to one target on `queue`, whatever its
-/// base (issue #1814).
-///
-/// The ramp guard retires it on every pool when it aborts a ramp. A fan-out
-/// can miss a pool, and a retry there can have another base. Its stored
-/// [`ramp_generation_id`] then differs, but this id is the same. It holds
-/// the target, so one policy fan-out that keeps two targets under one
-/// caller id keeps them apart. It is [`ramp_generation_id`] with an empty
-/// base, so a real empty base gives the same id for the same caller and
-/// target.
-#[must_use]
-pub fn ramp_caller_target_id(caller: Uuid, queue: &str, target: &str) -> Uuid {
-    ramp_generation_id(caller, queue, "", target)
-}
-
-/// The SQL form of [`ramp_caller_target_id`]. The arguments are SQL
-/// expressions.
-#[cfg(feature = "db")]
-pub(crate) fn ramp_caller_target_id_sql(caller: &str, queue: &str, target: &str) -> String {
-    ramp_generation_id_sql(caller, queue, "''", target)
-}
-
-/// The SQL form of [`ramp_generation_id`]. `{id}`, `{queue}`, `{base}` and
-/// `{target}` are SQL expressions.
-#[cfg(feature = "db")]
-pub(crate) fn ramp_generation_id_sql(id: &str, queue: &str, base: &str, target: &str) -> String {
-    format!(
-        "encode(substring(sha256(convert_to({id}::text \
-         || '/' || octet_length(convert_to({queue}, 'UTF8')) || ':' || {queue} \
-         || '/' || octet_length(convert_to({base}, 'UTF8')) || ':' || {base} \
-         || '/' || octet_length(convert_to({target}, 'UTF8')) || ':' || {target}, \
-         'UTF8')) FROM 1 FOR 16), 'hex')::uuid"
-    )
-}
-
-/// [`set_build_policy`] with a caller-chosen `ramp_id` for a retained ramp
-/// (issue #1814).
-///
-/// A fan-out passes one `ramp_id` to every pool. A retained ramp stores
-/// [`ramp_generation_id`] of that id, the new base and its target. So the
-/// ramp keeps one identity across pools, and a ramp that diverged on one
-/// pool keeps its own.
-///
-/// A retained ramp gets the id even when it had none, for example from a
-/// writer from before the `ramp_id` column. A row with no ramp keeps
-/// `ramp_id` NULL.
-///
-/// The write is idempotent. A row that already holds this `ramp_id`, build
-/// and deployment is left as is, and its step stays. So a retried fan-out, or
-/// two logical shards on one pool, cannot split the ramp identity.
-///
-/// The write never re-ids a retained ramp to a generation that the ramp
-/// guard aborted. A retried fan-out can reach a pool that the first attempt
-/// missed, after the guard aborted the new generation on another pool. The
-/// write then applies the new base and drops the ramp, as the abort did on
-/// the other pools. The check reads the abort markers of the row and the
-/// report ledger of this database.
-///
-/// A later writer can supersede this request on the pool. It then retires
-/// the request's `ramp_id`. The ramp guard does the same when it clears the
-/// ramp that the request wrote. A late retry of the request then changes no
-/// ramp, so it cannot drop or re-id a newer one. A retry whose build and
-/// deployment the row already holds is a no-op. Any other retry is refused.
-///
-/// # Errors
-///
-/// Returns `HarvestError::Database` on failure, and `HarvestError::Config`
-/// when a later write superseded this request on the pool and the row holds
-/// another build or deployment.
-#[cfg(feature = "db")]
-pub async fn set_build_policy_with_ramp_id(
-    conn: &mut AsyncPgConnection,
-    queue_name: &str,
-    build_id: &str,
-    deployment_name: Option<&str>,
-    ramp_id: Uuid,
-) -> HarvestResult<BuildPolicy> {
-    conn.build_transaction()
-        .read_committed()
-        .run(async |conn| {
-            lock_ramp_generations(conn, queue_name).await?;
-            if request_retired(conn, queue_name, ramp_id).await? {
-                return match get_build_policy(conn, queue_name).await? {
-                    Some(policy)
-                        if policy.build_id == build_id
-                            && policy.deployment_name.as_deref() == deployment_name =>
-                    {
-                        Ok(policy)
-                    }
-                    _ => Err(superseded_policy_error(queue_name)),
-                };
-            }
-            let old = current_ramp_id(conn, queue_name).await?;
-            let policy = upsert_build_policy_with_ramp_id(
-                conn,
-                queue_name,
-                build_id,
-                deployment_name,
-                ramp_id,
-            )
-            .await?;
-            let new = current_ramp_id(conn, queue_name).await?;
-            retire_replaced_ramp_id(conn, queue_name, old, new).await?;
-            Ok(policy)
-        })
-        .await
-}
-
-/// The write of [`set_build_policy_with_ramp_id`], under the ramp
-/// generation lock of the queue.
-#[cfg(feature = "db")]
-async fn upsert_build_policy_with_ramp_id(
-    conn: &mut AsyncPgConnection,
-    queue_name: &str,
-    build_id: &str,
-    deployment_name: Option<&str>,
-    ramp_id: Uuid,
-) -> HarvestResult<BuildPolicy> {
-    let derived = ramp_generation_id_sql(
-        "$5",
-        "EXCLUDED.queue_name",
-        "EXCLUDED.build_id",
-        "harvest_build_policies.target_build_id",
-    );
-    let caller_target = ramp_caller_target_id_sql(
-        "$5",
-        "EXCLUDED.queue_name",
-        "harvest_build_policies.target_build_id",
-    );
-    let aborted = generation_aborted_sql(&derived, &caller_target);
     let rows: Vec<BuildPolicyRow> = diesel::sql_query(format!(
         "INSERT INTO harvest_build_policies (id, queue_name, build_id, deployment_name) \
          VALUES ($1, $2, $3, $4) \
          ON CONFLICT (queue_name) DO UPDATE \
              SET build_id = EXCLUDED.build_id, \
                  deployment_name = EXCLUDED.deployment_name, \
-                 target_build_id = CASE WHEN {aborted} THEN NULL \
-                                        ELSE harvest_build_policies.target_build_id END, \
-                 ramp_percent = CASE WHEN {aborted} THEN NULL \
-                                     ELSE harvest_build_policies.ramp_percent END, \
-                 ramp_id = CASE WHEN harvest_build_policies.target_build_id IS NULL THEN NULL \
-                                WHEN {aborted} THEN NULL \
-                                ELSE {derived} END, \
-                 ramp_caller_id = CASE \
-                                WHEN harvest_build_policies.target_build_id IS NULL THEN NULL \
-                                WHEN {aborted} THEN NULL \
-                                ELSE $5 END, \
                  updated_at = NOW() \
-             WHERE harvest_build_policies.target_build_id IS NULL \
-                OR harvest_build_policies.ramp_id IS DISTINCT FROM {derived} \
-                OR harvest_build_policies.build_id IS DISTINCT FROM EXCLUDED.build_id \
-                OR harvest_build_policies.deployment_name \
-                   IS DISTINCT FROM EXCLUDED.deployment_name \
          RETURNING {BUILD_POLICY_COLUMNS}"
     ))
     .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
     .bind::<diesel::sql_types::Text, _>(queue_name)
     .bind::<diesel::sql_types::Text, _>(build_id)
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(deployment_name)
-    .bind::<diesel::sql_types::Uuid, _>(ramp_id)
     .load(conn)
     .await
     .map_err(database_error)?;
 
-    if let Some(row) = rows.into_iter().next() {
-        return Ok(BuildPolicy::from(row));
-    }
-    // The row already held this write, so the UPDATE changed nothing.
-    get_build_policy(conn, queue_name)
-        .await?
+    rows.into_iter()
+        .next()
+        .map(BuildPolicy::from)
         .ok_or_else(|| database_error("set_build_policy: no row returned"))
 }
 
@@ -614,338 +397,30 @@ pub async fn set_build_ramp(
     target_build_id: &str,
     percent: i32,
 ) -> HarvestResult<BuildPolicy> {
-    set_build_ramp_with_id(conn, queue_name, target_build_id, percent, Uuid::new_v4()).await
-}
-
-/// [`set_build_ramp`] with a caller-chosen `ramp_id` (issue #1814).
-///
-/// A fan-out over shard pools passes one `ramp_id` to every pool. Each pool
-/// stores [`ramp_generation_id`] of that id, its base and the target. The
-/// ramp guard's abort marker records the stored id that it cleared. A later
-/// guard matches the marker to the ramp by this id, not by database clocks,
-/// so it can finish a partial abort safely.
-///
-/// The write is idempotent. A row that already holds this ramp is left as
-/// is, and its step stays. So a retried fan-out, or two logical shards on
-/// one pool, cannot split the ramp identity.
-///
-/// The write never installs a generation that the ramp guard aborted. A
-/// keyed retry derives the same `ramp_id`, so without this check a retry
-/// after an abort would bring the aborted ramp back. The check reads the
-/// abort markers of the row and the report ledger of this database, as
-/// [`ramp_generation_aborted`] does.
-///
-/// # Errors
-///
-/// The same as [`set_build_ramp`], and `HarvestError::Config` when the ramp
-/// guard aborted this generation.
-#[cfg(feature = "db")]
-pub async fn set_build_ramp_with_id(
-    conn: &mut AsyncPgConnection,
-    queue_name: &str,
-    target_build_id: &str,
-    percent: i32,
-    ramp_id: Uuid,
-) -> HarvestResult<BuildPolicy> {
     validate_ramp_percent(percent)?;
-    conn.build_transaction()
-        .read_committed()
-        .run(async |conn| {
-            lock_ramp_generations(conn, queue_name).await?;
-            let old = current_ramp_id(conn, queue_name).await?;
-            let policy =
-                update_build_ramp_with_id(conn, queue_name, target_build_id, percent, ramp_id)
-                    .await?;
-            let new = current_ramp_id(conn, queue_name).await?;
-            retire_replaced_ramp_id(conn, queue_name, old, new).await?;
-            Ok(policy)
-        })
-        .await
-}
 
-/// The write of [`set_build_ramp_with_id`], under the ramp generation lock
-/// of the queue.
-#[cfg(feature = "db")]
-async fn update_build_ramp_with_id(
-    conn: &mut AsyncPgConnection,
-    queue_name: &str,
-    target_build_id: &str,
-    percent: i32,
-    ramp_id: Uuid,
-) -> HarvestResult<BuildPolicy> {
-    let derived = ramp_generation_id_sql("$4", "$1", "build_id", "$2");
-    let caller_target = ramp_caller_target_id_sql("$4", "$1", "$2");
-    let aborted = generation_aborted_sql(&derived, &caller_target);
     let rows: Vec<BuildPolicyRow> = diesel::sql_query(format!(
         "UPDATE harvest_build_policies \
-         SET target_build_id = $2, ramp_percent = $3, ramp_id = {derived}, \
-             ramp_caller_id = $4, updated_at = NOW() \
+         SET target_build_id = $2, ramp_percent = $3, updated_at = NOW() \
          WHERE queue_name = $1 \
-           AND (ramp_id IS DISTINCT FROM {derived} \
-                OR target_build_id IS DISTINCT FROM $2 \
-                OR ramp_percent IS DISTINCT FROM $3) \
-           AND NOT {aborted} \
-           AND NOT EXISTS (SELECT 1 FROM harvest_ramp_retired_ids x \
-                           WHERE x.queue_name = $1 AND x.ramp_id = $4) \
          RETURNING {BUILD_POLICY_COLUMNS}"
     ))
     .bind::<diesel::sql_types::Text, _>(queue_name)
     .bind::<diesel::sql_types::Text, _>(target_build_id)
     .bind::<diesel::sql_types::Integer, _>(percent)
-    .bind::<diesel::sql_types::Uuid, _>(ramp_id)
     .load(conn)
     .await
     .map_err(database_error)?;
 
-    if let Some(row) = rows.into_iter().next() {
-        return Ok(BuildPolicy::from(row));
-    }
-    // The row already held this ramp, the guard aborted this generation, or
-    // the queue has no base policy yet.
-    let policy = get_build_policy(conn, queue_name).await?.ok_or_else(|| {
-        HarvestError::Config(format!(
-            "cannot set a build ramp for queue '{queue_name}': no base build policy is \
+    rows.into_iter()
+        .next()
+        .map(BuildPolicy::from)
+        .ok_or_else(|| {
+            HarvestError::Config(format!(
+                "cannot set a build ramp for queue '{queue_name}': no base build policy is \
              registered for this queue yet — call set_build_policy first"
-        ))
-    })?;
-    let stored = ramp_generation_id(ramp_id, queue_name, &policy.build_id, target_build_id);
-    let caller_target = ramp_caller_target_id(ramp_id, queue_name, target_build_id);
-    if ramp_generation_aborted(conn, queue_name, &[stored, ramp_id, caller_target]).await? {
-        return Err(aborted_generation_error(queue_name, target_build_id));
-    }
-    Ok(policy)
-}
-
-/// Take the transaction advisory lock of the ramp generations of
-/// `queue_name` (issue #1814).
-///
-/// Call it inside a `READ COMMITTED` transaction. Under `REPEATABLE READ`
-/// the lock statement fixes the snapshot before the wait, so a later
-/// statement could miss the commit of the lock holder before it. Each
-/// caller pins its transaction for that reason, whatever the database
-/// default is.
-///
-/// The ramp guard takes it before it writes the abort tombstones of a
-/// queue. [`set_build_ramp_with_id`] and [`set_build_policy_with_ramp_id`]
-/// take it before their write. A writer can commit before the tombstone.
-/// The abort markers then still refuse the aborted generation. Otherwise
-/// its statement starts after the tombstone, and the ledger refuses it.
-/// Without the lock, an upsert could read the ledger from before the
-/// tombstone and the row from after the marker prune.
-///
-/// It also sets `harvest.ramp_id_aware` for the transaction. The reset
-/// trigger of `harvest_build_policies` then leaves the writes of the
-/// transaction alone. Only a writer from before the `ramp_id` column, which
-/// never takes this lock, gets its stale ids dropped.
-///
-/// # Errors
-///
-/// Returns `HarvestError::Database` on failure, for example when a
-/// `lock_timeout` expires.
-#[cfg(feature = "db")]
-pub async fn lock_ramp_generations(
-    conn: &mut AsyncPgConnection,
-    queue_name: &str,
-) -> HarvestResult<()> {
-    diesel::sql_query(
-        "SELECT pg_advisory_xact_lock(hashtextextended('harvest_ramp_generation:' || $1, 0))",
-    )
-    .bind::<diesel::sql_types::Text, _>(queue_name)
-    .execute(conn)
-    .await
-    .map_err(database_error)?;
-    // Every caller writes ramp ids on purpose. The reset trigger leaves its
-    // writes alone, so a write that keeps its id keeps it.
-    diesel::sql_query("SET LOCAL harvest.ramp_id_aware = 'on'")
-        .execute(conn)
-        .await
-        .map_err(database_error)?;
-    Ok(())
-}
-
-/// The ids of the ramp of `queue_name`, locked for the write: the stored
-/// `ramp_id` and the `ramp_caller_id` of the request that set it.
-#[cfg(feature = "db")]
-async fn current_ramp_id(
-    conn: &mut AsyncPgConnection,
-    queue_name: &str,
-) -> HarvestResult<[Option<Uuid>; 2]> {
-    use diesel::OptionalExtension;
-    use diesel::sql_types::{Nullable, Uuid as SqlUuid};
-
-    #[derive(diesel::QueryableByName)]
-    struct Row {
-        #[diesel(sql_type = Nullable<SqlUuid>)]
-        ramp_id: Option<Uuid>,
-        #[diesel(sql_type = Nullable<SqlUuid>)]
-        ramp_caller_id: Option<Uuid>,
-    }
-    let row: Option<Row> = diesel::sql_query(
-        "SELECT ramp_id, ramp_caller_id FROM harvest_build_policies \
-         WHERE queue_name = $1 FOR UPDATE",
-    )
-    .bind::<diesel::sql_types::Text, _>(queue_name)
-    .get_result(conn)
-    .await
-    .optional()
-    .map_err(database_error)?;
-    Ok(row.map_or([None, None], |row| [row.ramp_id, row.ramp_caller_id]))
-}
-
-/// Record each id of `old` as retired when a write replaced it (issue
-/// #1814). `old` and `new` hold the stored `ramp_id` and the
-/// `ramp_caller_id`. A later write of a retired id is refused, so a stale
-/// retry of the request that set it cannot undo the change. The caller id
-/// does not depend on the base, so a retry is refused after a base change
-/// too.
-#[cfg(feature = "db")]
-async fn retire_replaced_ramp_id(
-    conn: &mut AsyncPgConnection,
-    queue_name: &str,
-    old: [Option<Uuid>; 2],
-    new: [Option<Uuid>; 2],
-) -> HarvestResult<()> {
-    for (old, new) in old.into_iter().zip(new) {
-        let Some(old) = old else {
-            continue;
-        };
-        if new == Some(old) {
-            continue;
-        }
-        diesel::sql_query(
-            "INSERT INTO harvest_ramp_retired_ids (ramp_id, queue_name) VALUES ($1, $2) \
-             ON CONFLICT (queue_name, ramp_id) DO NOTHING",
-        )
-        .bind::<diesel::sql_types::Uuid, _>(old)
-        .bind::<diesel::sql_types::Text, _>(queue_name)
-        .execute(conn)
-        .await
-        .map_err(database_error)?;
-    }
-    Ok(())
-}
-
-/// The SQL test that the generation `{id}` must not come back, for the row
-/// of `harvest_build_policies` in scope.
-///
-/// It reads the abort markers of the row, the report ledger of this
-/// database and its retired ids. The guard prunes markers after a while,
-/// but the ledger keeps the id of every reported abort. A ramp writer or a
-/// manual clear records each id that it removes as retired. The guard's
-/// abort retires `{caller_target}`, the [`ramp_caller_target_id`] of the
-/// request, on every pool.
-#[cfg(feature = "db")]
-fn generation_aborted_sql(id: &str, caller_target: &str) -> String {
-    format!(
-        "(harvest_build_policies.ramp_aborted \
-              @> jsonb_build_array(jsonb_build_object('id', ({id})::text)) \
-          OR EXISTS (SELECT 1 FROM harvest_ramp_abort_reports r WHERE r.ramp_id = {id}) \
-          OR EXISTS (SELECT 1 FROM harvest_ramp_retired_ids x \
-                     WHERE x.queue_name = harvest_build_policies.queue_name \
-                       AND x.ramp_id IN ({id}, {caller_target})))"
-    )
-}
-
-/// Whether a writer retired the request id `ramp_id` of `queue_name` on this
-/// pool (issue #1814).
-///
-/// A writer retires the raw request id only when it replaces or clears what
-/// that request wrote. The ramp guard retires it only on a pool where it
-/// cleared the ramp of that request. On every pool it retires another id,
-/// the [`ramp_caller_target_id`]. So a hit means a later write superseded
-/// the request here.
-#[cfg(feature = "db")]
-async fn request_retired(
-    conn: &mut AsyncPgConnection,
-    queue_name: &str,
-    ramp_id: Uuid,
-) -> HarvestResult<bool> {
-    #[derive(diesel::QueryableByName)]
-    struct Row {
-        #[diesel(sql_type = diesel::sql_types::Bool)]
-        retired: bool,
-    }
-    let row: Row = diesel::sql_query(
-        "SELECT EXISTS (SELECT 1 FROM harvest_ramp_retired_ids \
-                        WHERE queue_name = $1 AND ramp_id = $2) AS retired",
-    )
-    .bind::<diesel::sql_types::Text, _>(queue_name)
-    .bind::<diesel::sql_types::Uuid, _>(ramp_id)
-    .get_result(conn)
-    .await
-    .map_err(database_error)?;
-    Ok(row.retired)
-}
-
-/// The error for a policy write that a later write superseded on the pool.
-///
-/// The management API returns it as `409 Conflict`.
-#[cfg(feature = "db")]
-#[must_use]
-pub fn superseded_policy_error(queue_name: &str) -> HarvestError {
-    HarvestError::Config(format!(
-        "this policy write for queue '{queue_name}' was superseded by a later write; a retry \
-         does not repeat it — send a new Idempotency-Key to write again"
-    ))
-}
-
-/// The error for a ramp write that would install an aborted generation.
-///
-/// The management API returns it as `409 Conflict`.
-#[cfg(feature = "db")]
-#[must_use]
-pub fn aborted_generation_error(queue_name: &str, target_build_id: &str) -> HarvestError {
-    HarvestError::Config(format!(
-        "this ramp of queue '{queue_name}' to build '{target_build_id}' was aborted by the \
-         ramp guard, or cleared or replaced since; a retry does not restore it — send a new \
-         Idempotency-Key to ramp again"
-    ))
-}
-
-/// Whether the ramp guard aborted one of the stored ramp generations `ids`
-/// of `queue_name`, as far as this database knows (issue #1814).
-///
-/// An id is aborted when an abort marker of the queue's row holds it, or
-/// when the report ledger of this database holds it. An id that an
-/// operator cleared or replaced counts too: its retired row holds it. Pass the ids that
-/// [`ramp_generation_id`] gives for each shard's base. Call it on each shard
-/// and on the audit pool, which holds the ledger.
-///
-/// # Errors
-///
-/// Returns `HarvestError::Database` on failure.
-#[cfg(feature = "db")]
-pub async fn ramp_generation_aborted(
-    conn: &mut AsyncPgConnection,
-    queue_name: &str,
-    ids: &[Uuid],
-) -> HarvestResult<bool> {
-    #[derive(diesel::QueryableByName)]
-    struct Row {
-        #[diesel(sql_type = diesel::sql_types::Bool)]
-        aborted: bool,
-    }
-    if ids.is_empty() {
-        return Ok(false);
-    }
-    let row: Row = diesel::sql_query(
-        "SELECT EXISTS ( \
-             SELECT 1 FROM harvest_build_policies p, unnest($2::uuid[]) AS g(id) \
-             WHERE p.queue_name = $1 \
-               AND p.ramp_aborted @> jsonb_build_array(jsonb_build_object('id', g.id::text)) \
-         ) OR EXISTS ( \
-             SELECT 1 FROM harvest_ramp_abort_reports WHERE ramp_id = ANY($2::uuid[]) \
-         ) OR EXISTS ( \
-             SELECT 1 FROM harvest_ramp_retired_ids \
-             WHERE queue_name = $1 AND ramp_id = ANY($2::uuid[]) \
-         ) AS aborted",
-    )
-    .bind::<diesel::sql_types::Text, _>(queue_name)
-    .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(ids)
-    .get_result(conn)
-    .await
-    .map_err(database_error)?;
-    Ok(row.aborted)
+            ))
+        })
 }
 
 /// Clear a queue's percentage ramp, immediately stopping new starts from
@@ -963,28 +438,18 @@ pub async fn clear_build_ramp(
     conn: &mut AsyncPgConnection,
     queue_name: &str,
 ) -> HarvestResult<Option<BuildPolicy>> {
-    // The clear retires the ramp's id, so a stale keyed retry of the request
-    // that set it cannot restore the ramp (issue #1814).
-    conn.build_transaction()
-        .read_committed()
-        .run(async |conn| {
-            lock_ramp_generations(conn, queue_name).await?;
-            let old = current_ramp_id(conn, queue_name).await?;
-            let rows: Vec<BuildPolicyRow> = diesel::sql_query(format!(
-                "UPDATE harvest_build_policies \
-             SET target_build_id = NULL, ramp_percent = NULL, ramp_id = NULL, \
-                 ramp_caller_id = NULL, updated_at = NOW() \
-             WHERE queue_name = $1 \
-             RETURNING {BUILD_POLICY_COLUMNS}"
-            ))
-            .bind::<diesel::sql_types::Text, _>(queue_name)
-            .load(conn)
-            .await
-            .map_err(database_error)?;
-            retire_replaced_ramp_id(conn, queue_name, old, [None, None]).await?;
-            Ok(rows.into_iter().next().map(BuildPolicy::from))
-        })
-        .await
+    let rows: Vec<BuildPolicyRow> = diesel::sql_query(format!(
+        "UPDATE harvest_build_policies \
+         SET target_build_id = NULL, ramp_percent = NULL, updated_at = NOW() \
+         WHERE queue_name = $1 \
+         RETURNING {BUILD_POLICY_COLUMNS}"
+    ))
+    .bind::<diesel::sql_types::Text, _>(queue_name)
+    .load(conn)
+    .await
+    .map_err(database_error)?;
+
+    Ok(rows.into_iter().next().map(BuildPolicy::from))
 }
 
 /// Declare that workers running `build_id` are compatible with executions
@@ -1216,83 +681,12 @@ pub async fn list_build_compat(
         .collect())
 }
 
-/// SQL for the distinct build-id catalog inside [`all_build_reachability`],
-/// exposed for shape tests.
-#[must_use]
-pub const fn all_build_ids_query() -> &'static str {
-    "SELECT DISTINCT build_id FROM ( \
-         SELECT assigned_build_id AS build_id \
-         FROM harvest_workflow_executions \
-         WHERE assigned_build_id IS NOT NULL AND assigned_build_id <> '' \
-         UNION \
-         SELECT required_build_id AS build_id \
-         FROM harvest_task_queue \
-         WHERE required_build_id IS NOT NULL AND required_build_id <> '' \
-         UNION \
-         SELECT build_id \
-         FROM harvest_workers \
-         WHERE build_id IS NOT NULL AND build_id <> '' \
-     ) sub \
-     ORDER BY build_id"
-}
-
-/// SQL for per-build open-execution counts, grouped in one pass rather than
-/// counted once per build (see [`all_build_reachability`]'s doc comment).
-/// Exposed for shape/EXPLAIN tests.
-#[must_use]
-pub const fn all_build_open_executions_query() -> &'static str {
-    "SELECT assigned_build_id AS build_id, COUNT(*) AS n \
-     FROM harvest_workflow_executions \
-     WHERE assigned_build_id IS NOT NULL AND assigned_build_id <> '' \
-       AND state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'TERMINATED', 'TIMED_OUT', 'CONTINUED_AS_NEW') \
-     GROUP BY assigned_build_id"
-}
-
-/// SQL for per-build pending-task counts, grouped in one pass. Exposed for
-/// shape/EXPLAIN tests.
-#[must_use]
-pub const fn all_build_pending_tasks_query() -> &'static str {
-    "SELECT required_build_id AS build_id, COUNT(*) AS n \
-     FROM harvest_task_queue \
-     WHERE required_build_id IS NOT NULL AND required_build_id <> '' AND state = 'PENDING' \
-     GROUP BY required_build_id"
-}
-
-/// SQL for per-build active/stale worker counts.
-///
-/// One conditional-aggregation pass over `harvest_workers` replaces the two
-/// `COUNT(*) WHERE build_id = $1` subqueries [`build_reachability`] issues
-/// per build. Exposed for shape/EXPLAIN tests.
-#[must_use]
-pub const fn all_build_worker_counts_query() -> &'static str {
-    "SELECT build_id, \
-         COUNT(*) FILTER ( \
-             WHERE status = 'Active' \
-               AND NOW() - last_heartbeat_at <= make_interval(secs => $1::float8) \
-         ) AS active_workers, \
-         COUNT(*) FILTER ( \
-             WHERE NOW() - last_heartbeat_at > make_interval(secs => $1::float8) \
-         ) AS stale_workers \
-     FROM harvest_workers \
-     WHERE build_id <> '' \
-     GROUP BY build_id"
-}
-
 /// Return reachability snapshots for all distinct build IDs present across
 /// `harvest_workflow_executions`, `harvest_task_queue`, and `harvest_workers`
 /// on a **single shard**.
 ///
 /// For multi-shard deployments prefer [`all_build_reachability_sharded`], which
 /// fans out to every shard and merges the per-build counters.
-///
-/// Computes every build's counters in **three** grouped passes total -- one
-/// per source table -- rather than by calling [`build_reachability`] once per
-/// build id. The per-build helper stays a correct, simple building block for
-/// its own single-build callers. Looping it here re-scanned all three tables
-/// once per distinct build: `N` round trips and `N` scans for `N` builds.
-/// `harvest_workers` carries no index on `build_id` at all, so its two
-/// per-build subqueries were a full sequential scan every single time. See
-/// `docs/performance-build-reachability-fanout.md` for measurements.
 ///
 /// # Errors
 ///
@@ -1307,104 +701,33 @@ pub async fn all_build_reachability(
         #[diesel(sql_type = diesel::sql_types::Text)]
         build_id: String,
     }
-    #[derive(diesel::QueryableByName, Debug)]
-    struct CountRow {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        build_id: String,
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        n: i64,
+
+    // Collect all distinct non-empty build IDs from the three tables.
+    let id_rows: Vec<IdRow> = diesel::sql_query(
+        "SELECT DISTINCT build_id FROM ( \
+             SELECT assigned_build_id AS build_id \
+             FROM harvest_workflow_executions \
+             WHERE assigned_build_id IS NOT NULL AND assigned_build_id <> '' \
+             UNION \
+             SELECT required_build_id AS build_id \
+             FROM harvest_task_queue \
+             WHERE required_build_id IS NOT NULL AND required_build_id <> '' \
+             UNION \
+             SELECT build_id \
+             FROM harvest_workers \
+             WHERE build_id IS NOT NULL AND build_id <> '' \
+         ) sub \
+         ORDER BY build_id",
+    )
+    .load(conn)
+    .await
+    .map_err(database_error)?;
+
+    let mut result = Vec::with_capacity(id_rows.len());
+    for row in id_rows {
+        result.push(build_reachability(conn, &row.build_id, stale_threshold).await?);
     }
-    #[derive(diesel::QueryableByName, Debug)]
-    struct WorkerCountRow {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        build_id: String,
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        active_workers: i64,
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        stale_workers: i64,
-    }
-
-    type ReachabilityQueryResults = (
-        Vec<IdRow>,
-        HashMap<String, i64>,
-        HashMap<String, i64>,
-        HashMap<String, (i64, i64)>,
-    );
-
-    let threshold_secs = i64::try_from(stale_threshold.as_secs()).unwrap_or(i64::MAX);
-
-    // The four queries below must read one consistent point in time.
-    // Under `READ COMMITTED`, each takes its own snapshot. A task could
-    // then move from `PENDING` to claimed between the open-executions and
-    // pending-tasks reads. The execution query runs too early to see the
-    // new execution. The task query runs too late to still see it
-    // pending. The merge then counts the build in neither column and
-    // reports `safe_to_retire: true` for a build that still has live
-    // work. `build_reachability`, the per-build helper this function
-    // replaces the *loop* over, avoided this. It folded all four counters
-    // into one `SELECT`, which PostgreSQL evaluates against a single
-    // snapshot. `REPEATABLE READ` restores that guarantee here. Every
-    // statement in the transaction shares the snapshot taken at its first
-    // query. The four grouped passes then observe one instant, the same
-    // way one multi-subquery `SELECT` did.
-    let (id_rows, open_executions, pending_tasks, worker_counts): ReachabilityQueryResults = conn
-        .build_transaction()
-        .repeatable_read()
-        .read_only()
-        .run(async |conn| -> HarvestResult<_> {
-            let id_rows: Vec<IdRow> = diesel::sql_query(all_build_ids_query())
-                .load(conn)
-                .await
-                .map_err(database_error)?;
-
-            let open_executions: HashMap<String, i64> =
-                diesel::sql_query(all_build_open_executions_query())
-                    .load::<CountRow>(conn)
-                    .await
-                    .map_err(database_error)?
-                    .into_iter()
-                    .map(|r| (r.build_id, r.n))
-                    .collect();
-
-            let pending_tasks: HashMap<String, i64> =
-                diesel::sql_query(all_build_pending_tasks_query())
-                    .load::<CountRow>(conn)
-                    .await
-                    .map_err(database_error)?
-                    .into_iter()
-                    .map(|r| (r.build_id, r.n))
-                    .collect();
-
-            let worker_counts: HashMap<String, (i64, i64)> =
-                diesel::sql_query(all_build_worker_counts_query())
-                    .bind::<diesel::sql_types::BigInt, _>(threshold_secs)
-                    .load::<WorkerCountRow>(conn)
-                    .await
-                    .map_err(database_error)?
-                    .into_iter()
-                    .map(|r| (r.build_id, (r.active_workers, r.stale_workers)))
-                    .collect();
-
-            Ok((id_rows, open_executions, pending_tasks, worker_counts))
-        })
-        .await?;
-
-    Ok(id_rows
-        .into_iter()
-        .map(|row| {
-            let open = open_executions.get(&row.build_id).copied().unwrap_or(0);
-            let pending = pending_tasks.get(&row.build_id).copied().unwrap_or(0);
-            let (active, stale) = worker_counts.get(&row.build_id).copied().unwrap_or((0, 0));
-            BuildReachability {
-                build_id: row.build_id,
-                open_executions: open,
-                pending_tasks: pending,
-                active_workers: active,
-                stale_workers: stale,
-                safe_to_retire: open == 0 && pending == 0,
-            }
-        })
-        .collect())
+    Ok(result)
 }
 
 /// Return reachability snapshots for all distinct build IDs, aggregated across
@@ -1436,7 +759,8 @@ pub async fn all_build_reachability_sharded(
         .map(|(_, shard_pool)| {
             let shard_pool = shard_pool.clone();
             async move {
-                let mut conn = crate::replication::fenced_checkout(&shard_pool)
+                let mut conn = shard_pool
+                    .get()
                     .await
                     .map_err(|e| crate::error::HarvestError::Database(e.to_string()))?;
                 all_build_reachability(&mut conn, stale_threshold).await

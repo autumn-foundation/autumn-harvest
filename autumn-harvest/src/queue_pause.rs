@@ -10,11 +10,11 @@
 //! | Primitive | What it does | Issue |
 //! |---|---|---|
 //! | Admission gate | Halts new workflow **starts**; in-flight runs keep scheduling activities | #377 / #618 |
-//! | Circuit breaker | **Short-circuits** dispatch: defers it by default, or fails it and pushes workflows down error branches (`FailFast`) | #369 / #1809 |
+//! | Circuit breaker | **Fast-fails** dispatch, burning retry budget and pushing workflows down error branches | #369 |
 //! | Per-execution pause | Holds **one** execution — useless when you know the queue, not the 50,000 executions | #383 / #609 |
 //! | **Queue pause (this)** | **Holds dispatch** on a named queue: nothing fails, nothing retries, nothing dead-letters | **#619** |
 //!
-//! Gate the *door*, breaker the *short circuit*, pause the *hold*.
+//! Gate the *door*, breaker the *fast-fail*, pause the *hold*.
 //!
 //! # Enforcement model — anti-join, not cache
 //!
@@ -284,13 +284,15 @@ pub async fn release_claim_if_queue_paused(
     task_id: uuid::Uuid,
     worker_id: &str,
 ) -> HarvestResult<bool> {
-    crate::queue::release_claim_via(
-        conn,
-        release_claim_if_queue_paused_query(),
-        task_id,
-        worker_id,
-    )
-    .await
+    use diesel_async::RunQueryDsl;
+
+    let released = diesel::sql_query(release_claim_if_queue_paused_query())
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .bind::<diesel::sql_types::Text, _>(worker_id)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(released > 0)
 }
 
 /// The shared prefix of both claim-release statements.
@@ -351,7 +353,15 @@ pub async fn release_claim(
     task_id: uuid::Uuid,
     worker_id: &str,
 ) -> HarvestResult<bool> {
-    crate::queue::release_claim_via(conn, release_claim_query(), task_id, worker_id).await
+    use diesel_async::RunQueryDsl;
+
+    let released = diesel::sql_query(release_claim_query())
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .bind::<diesel::sql_types::Text, _>(worker_id)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(released > 0)
 }
 
 /// SQL for [`try_lock_queue_for_claim`], exposed for shape tests.
@@ -847,6 +857,7 @@ pub const fn queue_pause_suppresses_timeout(
 /// needs a handoff covered by the grants the migration already issues (a real
 /// table keyed by a per-resume token), not a privilege the deployment may not
 /// have.
+///
 #[must_use]
 pub const fn resume_shift_scheduled_at_query() -> &'static str {
     "UPDATE harvest_task_queue \
@@ -1002,11 +1013,10 @@ pub const fn resumed_queue_notify_task_query() -> &'static str {
 /// Ring the queue's `LISTEN`/`NOTIFY` doorbell so parked workers re-poll as
 /// soon as this resume commits (issue #619 round-17 review).
 ///
-/// Must be called **inside** the resume transaction. The call stages the wake
-/// with the transaction id, and the sender sends it only after `COMMIT`
-/// (issue #1796). Listeners therefore wake exactly when the hold lifts. An
-/// earlier wake would still see the uncommitted pause row and skip the queue.
-/// A resume that rolls back sends no wake.
+/// Must be called **inside** the resume transaction: Postgres queues `NOTIFY`
+/// and delivers it at `COMMIT`, so listeners wake exactly when the hold lifts —
+/// never earlier (an early wake would still see the uncommitted pause row and
+/// skip the queue) and never at all if the resume rolls back.
 ///
 /// Reuses [`crate::notify::notify_task_enqueued`] rather than introducing a
 /// second channel or payload shape, because [`crate::notify::QueueListener`]
@@ -1014,8 +1024,7 @@ pub const fn resumed_queue_notify_task_query() -> &'static str {
 /// failure as an error — which the poll loop handles by logging and sleeping a
 /// full `poll_interval`, i.e. strictly worse than sending nothing. A synthetic
 /// or nil id would be a lie in a field that is typed as a real task; a genuine
-/// id is both honest and free (one indexed row). The sender can still merge
-/// this wake with others on the queue into one nil-id wake (issue #1796).
+/// id is both honest and free (one indexed row).
 ///
 /// A queue that raced to empty between the shift and this lookup needs no
 /// doorbell, so the lookup returning nothing is a silent no-op.
@@ -1400,15 +1409,8 @@ pub async fn resume_queue(
     // emits the level on the `BEGIN`, so it travels with the query. This
     // mirrors `queue::claim_task`, which pins the same level for the same
     // fresh-snapshot reason.
-    // Ids the shift below thawed, collected so the dispatch hints for them are
-    // published **after** this transaction commits (issue #1312). Publishing
-    // from inside would name rows a channel reader still sees as held.
-    let thawed: std::sync::Arc<std::sync::Mutex<Vec<uuid::Uuid>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let collector = std::sync::Arc::clone(&thawed);
-
     let mut tx = conn.build_transaction().read_committed();
-    let outcome = Box::pin(tx.run::<ResumeOutcome, HarvestError, _>(async |conn| {
+    Box::pin(tx.run::<ResumeOutcome, HarvestError, _>(async |conn| {
         // Same lock the pause path and the timeout enforcer take, so a
         // resume cannot interleave with either.
         //
@@ -1469,15 +1471,6 @@ pub async fn resume_queue(
             .await?;
         let released = shifted.len();
         let shifted_ids: Vec<uuid::Uuid> = shifted.into_iter().map(|r| r.id).collect();
-        // Only a deployment with a channel needs the thawed ids. Without one
-        // the collector stays empty, so a resume of a large backlog does not
-        // hold a second copy of every id it shifted.
-        if crate::dispatch::hints_wanted() {
-            collector
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .extend(shifted_ids.iter().copied());
-        }
 
         // Second pass, LAST so it sees the freshest snapshot: a task still
         // held (our DELETE has not committed, so concurrent claimers still
@@ -1512,10 +1505,11 @@ pub async fn resume_queue(
         // place, so the deployments most likely to be tuned this way are
         // the ones that would sit idle longest.
         //
-        // Staged INSIDE this transaction on purpose. The sender sends the
-        // wake only after COMMIT (issue #1796), so listeners wake exactly
-        // when the hold lifts. A worker woken earlier would still see the
-        // uncommitted pause row and skip the queue. A rollback sends no wake.
+        // Emitted INSIDE this transaction on purpose: Postgres queues
+        // `NOTIFY` and delivers it at COMMIT, so listeners are woken
+        // exactly when the hold actually lifts — never before (a worker
+        // woken early would still see the uncommitted pause row and skip
+        // the queue) and never lost to a rollback.
         //
         // Skipped when nothing was released: there is no held backlog to
         // wake for, and a spurious wake would just burn a poll cycle.
@@ -1532,18 +1526,7 @@ pub async fn resume_queue(
             released_paused_by: Some(row.paused_by),
         })
     }))
-    .await?;
-
-    // Dispatch hints for the thawed backlog (issue #1312). The channel dedupes
-    // by task id, so a row a reconcile sweep already published costs nothing.
-    let ids = std::mem::take(
-        &mut *thawed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-    );
-    crate::queue::record_pending_hints(conn, &ids).await;
-
-    Ok(outcome)
+    .await
 }
 
 /// Every currently-paused queue on this shard, with its held-task count.

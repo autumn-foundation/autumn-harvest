@@ -60,7 +60,7 @@ use uuid::Uuid;
 #[allow(clippy::redundant_pub_crate)]
 pub(crate) static TEST_SERIAL: Mutex<()> = Mutex::new(());
 
-// The test DB is seeded from `autumn_harvest::test_init_sql()` — the
+// The test DB is seeded from `autumn_harvest::full_migrations_sql()` — the
 // build.rs-generated full migration bundle (identical to `diesel migration run`),
 // regenerated automatically from the whole `migrations/` directory. There is
 // nothing to hand-maintain or regenerate here: every table/column
@@ -71,7 +71,7 @@ pub(crate) static TEST_SERIAL: Mutex<()> = Mutex::new(());
 // later migration were both missing from an earlier subset). The applied superset
 // never over-constrains a test.
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::test_init_sql().as_bytes().to_vec()
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
 }
 
 /// Per-workflow schedule columns the cross-shard test's fresh DBs need. These are
@@ -233,7 +233,7 @@ async fn start_source_completed_on(
             workflow_name: "ag_source_wf",
             workflow_id,
             exec_id,
-            input: json!({"hello": "world"}).into(),
+            input: json!({"hello": "world"}),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -1923,7 +1923,7 @@ async fn cross_shard_gate_check_resolves_target_queue_on_target_shard() {
     for u in [&s0_url, &s1_url] {
         let p = build_pool(u);
         let mut c = p.get().await.unwrap();
-        c.batch_execute(&autumn_harvest::test_init_sql())
+        c.batch_execute(autumn_harvest::full_migrations_sql())
             .await
             .expect("migrate fresh shard db");
         c.batch_execute(SCHED_COLS)
@@ -2092,7 +2092,7 @@ async fn immediate_outbox_relay_counts_the_bypass_exactly_once() {
     for u in [&s0_url, &s1_url] {
         let p = build_pool(u);
         let mut c = p.get().await.unwrap();
-        c.batch_execute(&autumn_harvest::test_init_sql())
+        c.batch_execute(autumn_harvest::full_migrations_sql())
             .await
             .expect("migrate fresh shard db");
     }
@@ -2159,7 +2159,6 @@ async fn immediate_outbox_relay_counts_the_bypass_exactly_once() {
         sla: None,
         retry_policy: None,
         max_workflow_attempts_ceiling: None,
-        codecs: autumn_harvest::payload_codec::PayloadCodecs::default(),
     };
     deferred.spawn();
 
@@ -2280,7 +2279,7 @@ async fn immediate_outbox_relay_blocks_on_real_queue_gate() {
     for u in [&s0_url, &s1_url] {
         let p = build_pool(u);
         let mut c = p.get().await.unwrap();
-        c.batch_execute(&autumn_harvest::test_init_sql())
+        c.batch_execute(autumn_harvest::full_migrations_sql())
             .await
             .expect("migrate fresh shard db");
     }
@@ -2375,7 +2374,6 @@ async fn immediate_outbox_relay_blocks_on_real_queue_gate() {
         sla: None,
         retry_policy: None,
         max_workflow_attempts_ceiling: None,
-        codecs: autumn_harvest::payload_codec::PayloadCodecs::default(),
     };
     deferred.spawn();
 
@@ -2644,7 +2642,7 @@ async fn scanner_delivers_a_stale_row_whose_target_already_exists() {
     for u in [&s0_url, &s1_url] {
         let p = build_pool(u);
         let mut c = p.get().await.unwrap();
-        c.batch_execute(&autumn_harvest::test_init_sql())
+        c.batch_execute(autumn_harvest::full_migrations_sql())
             .await
             .expect("migrate fresh shard db");
     }
@@ -2671,7 +2669,7 @@ async fn scanner_delivers_a_stale_row_whose_target_already_exists() {
                 workflow_name: "ag_target_wf",
                 workflow_id: "ct-stale-delivered",
                 exec_id: ExecutionId::new_for_shard(ShardId::new(1)),
-                input: json!({}).into(),
+                input: json!({}),
                 parent_id: None,
                 queue_name: "default",
                 execution_timeout: None,
@@ -2876,7 +2874,7 @@ async fn run_stale_sealed_delivered_case(
     for u in [&s0_url, &s1_url] {
         let p = build_pool(u);
         let mut c = p.get().await.unwrap();
-        c.batch_execute(&autumn_harvest::test_init_sql())
+        c.batch_execute(autumn_harvest::full_migrations_sql())
             .await
             .expect("migrate fresh shard db");
     }
@@ -2904,7 +2902,7 @@ async fn run_stale_sealed_delivered_case(
                 workflow_name: "ag_target_wf",
                 workflow_id: "ct-stale-sealed",
                 exec_id: ExecutionId::new_for_shard(ShardId::new(1)),
-                input: json!({}).into(),
+                input: json!({}),
                 parent_id: None,
                 queue_name: "default",
                 execution_timeout: None,
@@ -3173,7 +3171,7 @@ async fn start_webhook_delivery(conn: &mut AsyncPgConnection, workflow_id: &str)
             workflow_name: "webhook_delivery",
             workflow_id,
             exec_id,
-            input: json!({}).into(),
+            input: json!({}),
             parent_id: None,
             queue_name: "webhooks",
             execution_timeout: None,
@@ -3225,7 +3223,7 @@ fn webhook_replacement_params(workflow_id: &'static str) -> StartWorkflowParams<
         workflow_name: "webhook_delivery",
         workflow_id,
         exec_id: ExecutionId::new_for_shard(ShardId::new(0)),
-        input: json!({}).into(),
+        input: json!({}),
         parent_id: None,
         queue_name: "webhooks",
         execution_timeout: None,
@@ -3439,7 +3437,7 @@ fn ag_target_params(
         workflow_name: "ag_target_wf",
         workflow_id,
         exec_id: ExecutionId::new_for_shard(ShardId::new(0)),
-        input: json!({}).into(),
+        input: json!({}),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -3634,149 +3632,6 @@ async fn gate_skips_allow_duplicate_attach_to_a_completed_prior() {
         Err(e) => panic!("unexpected start error: {e}"),
     }
     // Still exactly one execution (the COMPLETED prior) — no fresh run created.
-    assert_eq!(target_exec_count(&mut conn).await, 1);
-}
-
-/// Seed a RECONCILED seal: a `MIGRATED` row whose live copy has already been
-/// observed terminal (`migrated_run_terminal_at` set), exactly what
-/// `reconcile_migrated_seal_terminality` produces. `try_load_active_execution_
-/// for_update` deliberately excludes this row, so the admission gate's own
-/// occupant read sees no prior at all.
-async fn seed_reconciled_seal(
-    conn: &mut AsyncPgConnection,
-    workflow_id: &str,
-    terminal_state: &str,
-) {
-    // `harvest_we_migrated_forward_check` requires a `MIGRATED` row to carry
-    // a forwarding pointer: `migrated_to_shard` and `migrated_at` both set.
-    // The pointer's target need not be a configured shard for this test.
-    // Nothing here ever resolves through it. Only the row's own reconciled
-    // fields matter to the code path under test.
-    diesel::sql_query(
-        "INSERT INTO harvest_workflow_executions \
-         (id, workflow_name, workflow_id, shard_id, input, queue_name, state, \
-          migrated_to_shard, migrated_at, \
-          completed_at, migrated_run_terminal_at, migrated_run_terminal_state) \
-         VALUES ($1, 'ag_target_wf', $2, 0, '{}'::jsonb, 'default', 'MIGRATED', \
-                 1, NOW(), NOW(), NOW(), $3)",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
-    .bind::<Text, _>(workflow_id)
-    .bind::<Text, _>(terminal_state)
-    .execute(conn)
-    .await
-    .expect("seed reconciled seal");
-}
-
-/// Issue #1596 review, `comment_id` 4055454416 (P2). A `RejectDuplicate`
-/// start against a business key whose only prior is a RECONCILED seal must
-/// refuse with `AlreadyExists`, never `AdmissionBlocked`. Nothing is
-/// admitted here — the refusal itself is the whole outcome — so an armed
-/// gate must not be allowed to relabel it.
-///
-/// Before this fix, the admission-gate block ran first. It saw no ACTIVE
-/// prior, since a reconciled seal is deliberately excluded from that
-/// check, and treated the request as a fresh create. It returned
-/// `AdmissionBlocked` under an armed gate, instead of ever reaching the
-/// reconciled-seal check below it.
-#[tokio::test]
-async fn gate_does_not_relabel_a_reject_duplicate_refusal_over_a_reconciled_seal() {
-    let _guard = TEST_SERIAL
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (url, _c) = setup_db().await;
-    let pool = build_pool(&url);
-    let mut conn = pool.get().await.unwrap();
-    scrub(&mut conn).await;
-    install_global_router(ShardRouter::default());
-
-    seed_reconciled_seal(&mut conn, "rd-reconciled-seal", "COMPLETED").await;
-    set_global_admission_gate_cache(Some(fleet_cache("reconciled-seal-incident")));
-
-    let outcome = autumn_harvest::start_or_load_workflow_execution_with_metrics(
-        &mut conn,
-        ag_target_params("rd-reconciled-seal", WorkflowIdReusePolicy::RejectDuplicate),
-        None,
-        Some(autumn_harvest::admission_gate::GateMode::Check),
-    )
-    .await;
-
-    set_global_admission_gate_cache(None);
-
-    match outcome {
-        Err(autumn_harvest::HarvestError::AlreadyExists { .. }) => {}
-        Err(autumn_harvest::HarvestError::AdmissionBlocked { .. }) => panic!(
-            "RejectDuplicate over a reconciled seal admits nothing -- the gate must not \
-             relabel the refusal as AdmissionBlocked"
-        ),
-        Ok(s) => panic!(
-            "RejectDuplicate over a reconciled seal must refuse, not start (created = {}, \
-             exec = {:?})",
-            s.created, s.exec_id
-        ),
-        Err(e) => panic!("unexpected start error: {e}"),
-    }
-    // Still exactly the one seeded seal — no fresh run created.
-    assert_eq!(target_exec_count(&mut conn).await, 1);
-}
-
-/// Issue #1596 review, `comment_id` 4055454416 (P2). An
-/// `AllowDuplicateFailedOnly` start against a reconciled seal whose live
-/// copy finished successfully (COMPLETED, not FAILED/CANCELLED) must
-/// ATTACH to it. It must never be blocked by an armed gate. An attach
-/// admits no new execution, so the gate has nothing to legitimately guard
-/// here.
-///
-/// Before this fix, the admission-gate block's own occupant read also
-/// missed the reconciled seal. It treated the request as a fresh create,
-/// and returned `AdmissionBlocked` under an armed gate, instead of ever
-/// reaching the attach below it.
-#[tokio::test]
-async fn gate_does_not_block_an_allow_duplicate_failed_only_attach_to_a_reconciled_seal() {
-    let _guard = TEST_SERIAL
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (url, _c) = setup_db().await;
-    let pool = build_pool(&url);
-    let mut conn = pool.get().await.unwrap();
-    scrub(&mut conn).await;
-    install_global_router(ShardRouter::default());
-
-    seed_reconciled_seal(&mut conn, "adfo-reconciled-seal", "COMPLETED").await;
-    set_global_admission_gate_cache(Some(fleet_cache("reconciled-seal-attach-incident")));
-
-    let outcome = autumn_harvest::start_or_load_workflow_execution_with_metrics(
-        &mut conn,
-        ag_target_params(
-            "adfo-reconciled-seal",
-            WorkflowIdReusePolicy::AllowDuplicateFailedOnly,
-        ),
-        None,
-        Some(autumn_harvest::admission_gate::GateMode::Check),
-    )
-    .await;
-
-    set_global_admission_gate_cache(None);
-
-    match outcome {
-        Ok(s) => {
-            assert!(
-                !s.created,
-                "AllowDuplicateFailedOnly over a non-failed reconciled seal ATTACHES \
-                 (created == false), not a fresh create"
-            );
-            assert_eq!(
-                s.state, "COMPLETED",
-                "the attach must report the live copy's own terminal state, not MIGRATED"
-            );
-        }
-        Err(autumn_harvest::HarvestError::AdmissionBlocked { .. }) => panic!(
-            "an AllowDuplicateFailedOnly attach to a non-failed reconciled seal admits \
-             nothing -- the gate must be SKIPPED, not block it"
-        ),
-        Err(e) => panic!("unexpected start error: {e}"),
-    }
-    // Still exactly the one seeded seal — no fresh run created.
     assert_eq!(target_exec_count(&mut conn).await, 1);
 }
 
@@ -4016,103 +3871,6 @@ fn update_with_start_fresh_params(workflow_id: &'static str) -> UpdateWithStartP
         workflow_retry_policy: None,
         max_workflow_attempts_ceiling: None,
         reject_fresh_if_debounced: false,
-    }
-}
-
-/// Issue #1596 review, `comment_id` 4055601101 (P2): `resolve_effective_
-/// signal_with_start_policy` takes `FOR UPDATE` on the incumbent row for
-/// `AllowDuplicate`/`AllowDuplicateFailedOnly`. A concurrent ordinary start
-/// takes the admission advisory lock FIRST, then waits on that same row.
-/// The two orders can form a row-lock/advisory-lock cycle, which Postgres
-/// resolves by aborting one side as a deadlock.
-///
-/// Reproduced by holding ONLY the advisory lock. That mimics a concurrent
-/// ordinary start that already has it and is still mid-transaction. A
-/// real `signal_with_start` call must then block on it IMMEDIATELY. It
-/// must not race ahead to take the row lock first. Before the fix, the
-/// advisory lock was acquired deep
-/// inside the nested start machinery, well after the row lock. A task
-/// racing ahead that far would not still be blocked here at all. Once
-/// the holder releases, the call must complete cleanly, with no deadlock
-/// error.
-#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
-async fn signal_with_start_acquires_the_admission_lock_before_any_row_lock() {
-    const WORKFLOW_ID: &str = "sws-lock-order";
-
-    let _guard = TEST_SERIAL
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (url, _c) = setup_db().await;
-    let pool = build_pool(&url);
-    let mut conn = pool.get().await.unwrap();
-    scrub(&mut conn).await;
-    install_global_router(ShardRouter::default());
-
-    seed_prior_ag_target(&mut conn, WORKFLOW_ID, "RUNNING").await;
-
-    // The same advisory-lock namespace `admission_lock_namespace` derives
-    // for this business key. Its format is private to execution.rs, so it
-    // is reproduced bit for bit here, letting the holder contend on the
-    // identical lock.
-    let namespace = format!(
-        "exec_admission:v1:{}:ag_target_wf:{WORKFLOW_ID}",
-        "ag_target_wf".len()
-    );
-
-    let mut holder = pool.get().await.unwrap();
-    {
-        use diesel_async::SimpleAsyncConnection;
-        holder.batch_execute("BEGIN").await.unwrap();
-        diesel::sql_query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
-            .bind::<Text, _>(&namespace)
-            .execute(&mut holder)
-            .await
-            .unwrap();
-    }
-
-    let sws_pool = pool.clone();
-    let sws_task = tokio::spawn(async move {
-        let mut a_conn = sws_pool.get().await.unwrap();
-        signal_with_start_workflow_execution_with_metrics(
-            &mut a_conn,
-            signal_with_start_fresh_params(WORKFLOW_ID),
-            None,
-            None,
-        )
-        .await
-    });
-
-    // Give the spawned call time to reach (and block on) the admission lock.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    assert!(
-        !sws_task.is_finished(),
-        "signal_with_start must block on the admission lock before doing any \
-         other work -- if it raced ahead instead, the fix did not move the \
-         lock acquisition first"
-    );
-
-    // Holder releases the admission lock.
-    {
-        use diesel_async::SimpleAsyncConnection;
-        holder.batch_execute("COMMIT").await.unwrap();
-    }
-
-    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), sws_task)
-        .await
-        .expect("signal_with_start must complete once the admission lock frees, not hang")
-        .expect("join sws task");
-
-    match outcome {
-        Ok(started) => {
-            assert!(
-                !started.started_fresh,
-                "AllowDuplicate over a RUNNING prior attaches, not a fresh start"
-            );
-        }
-        Err(e) => panic!(
-            "signal_with_start must complete cleanly once unblocked, not error -- a \
-             deadlock error here means the lock order regressed: {e}"
-        ),
     }
 }
 

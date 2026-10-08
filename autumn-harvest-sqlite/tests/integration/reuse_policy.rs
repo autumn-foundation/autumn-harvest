@@ -109,17 +109,6 @@ fn pending_task_count(path: &std::path::Path, exec: ExecutionId) -> i64 {
     .unwrap()
 }
 
-/// Number of undelivered (`delivered = 0`) staged signal rows for an execution.
-fn undelivered_signal_count(path: &std::path::Path, exec: ExecutionId) -> i64 {
-    let raw = rusqlite::Connection::open(path).unwrap();
-    raw.query_row(
-        "SELECT COUNT(*) FROM harvest_signals WHERE exec_id = ?1 AND delivered = 0",
-        rusqlite::params![exec.to_string()],
-        |row| row.get(0),
-    )
-    .unwrap()
-}
-
 /// Directly seed a pre-#1068 RUNNING `harvest_executions` row (bypassing the reuse
 /// matrix, which the public start path now enforces) for `(name, id)` on the file
 /// at `path`, plus its `WorkflowStarted` event so a driver can replay/run it, plus
@@ -441,120 +430,6 @@ async fn terminate_if_running_cleans_up_orphan_timer() {
     );
 }
 
-// A signal can reach a still-RUNNING execution whose workflow never reaches a
-// matching `wait_for_signal`/`wait_for_signal_timeout`. `TerminateIfRunning`
-// then replaces that execution. The signal must not stay in `harvest_signals`
-// forever. This backend has no retention/GC pass, so nothing else will ever
-// reclaim it.
-#[tokio::test]
-async fn terminate_if_running_orphans_an_undelivered_signal_across_repeated_cycles() {
-    let (_dir, path) = temp_db();
-    let mut rt = runtime_at(&path);
-
-    let mut priors = Vec::new();
-    for cycle in 0..3 {
-        let prior = rt
-            .start_workflow_with_id("timer_wait_wf", "sig-1", json!({}))
-            .unwrap();
-        let state = rt.run_until_blocked(prior).await.unwrap();
-        assert!(
-            matches!(state, RunState::WaitingTimer),
-            "prior #{cycle} blocks on the timer, never on this signal"
-        );
-        // A caller sends a signal the workflow's code never awaits before it is
-        // replaced — e.g. a stale webhook retry, or a signal sent to the wrong
-        // step of a long-running workflow.
-        rt.send_signal(prior, "never_consumed", json!({"cycle": cycle}))
-            .unwrap();
-        assert_eq!(
-            undelivered_signal_count(&path, prior),
-            1,
-            "prior #{cycle} has one staged, undelivered signal"
-        );
-
-        let out = rt
-            .start_workflow_with_reuse_policy(
-                "timer_wait_wf",
-                "sig-1",
-                json!({}),
-                WorkflowIdReusePolicy::TerminateIfRunning,
-            )
-            .unwrap();
-        assert!(out.created);
-        assert_eq!(raw_state(&path, prior), "CONTINUED_AS_NEW");
-        priors.push(prior);
-    }
-
-    let total_orphaned: i64 = priors
-        .iter()
-        .map(|&exec| undelivered_signal_count(&path, exec))
-        .sum();
-    assert_eq!(
-        total_orphaned,
-        0,
-        "every sealed prior's undelivered signal must be cleaned up, not left to \
-         accumulate forever with no retention pass to ever reclaim it (got {total_orphaned} \
-         orphaned rows across {} cycles)",
-        priors.len()
-    );
-}
-
-// A signal staged while the prior is RUNNING can outlive it. This happens even
-// when the prior reaches COMPLETED on its own: the workflow completes without
-// ever awaiting that signal name. That prior is sealed via the same
-// "already-terminal" path, which skips the cancellation branch. So the signal
-// cleanup must not live inside that branch.
-#[tokio::test]
-async fn terminate_if_running_orphans_an_undelivered_signal_on_an_already_completed_prior() {
-    let (_dir, path) = temp_db();
-    let mut rt = runtime_at(&path);
-
-    // Stage a signal while the prior is still RUNNING (pre-drive)...
-    let prior = rt
-        .start_workflow_with_id("echo_wf", "sig-2", json!({"seed": true}))
-        .unwrap();
-    rt.send_signal(prior, "never_consumed", json!({})).unwrap();
-    assert_eq!(
-        undelivered_signal_count(&path, prior),
-        1,
-        "prior has one staged, undelivered signal"
-    );
-
-    // ...then let it run to completion WITHOUT ever consuming that signal.
-    let state = rt.run_until_blocked(prior).await.unwrap();
-    assert!(
-        matches!(state, RunState::Completed(_)),
-        "echo_wf completes immediately, got {state:?}"
-    );
-    assert_eq!(raw_state(&path, prior), "COMPLETED");
-    assert_eq!(
-        undelivered_signal_count(&path, prior),
-        1,
-        "the signal is still undelivered after the prior completed on its own"
-    );
-
-    let out = rt
-        .start_workflow_with_reuse_policy(
-            "echo_wf",
-            "sig-2",
-            json!({}),
-            WorkflowIdReusePolicy::TerminateIfRunning,
-        )
-        .unwrap();
-    assert!(out.created);
-    assert_eq!(raw_state(&path, prior), "CONTINUED_AS_NEW");
-    assert!(
-        !has_cancelled_event(&rt, prior),
-        "an already-COMPLETED prior is sealed without a cancellation event"
-    );
-    assert_eq!(
-        undelivered_signal_count(&path, prior),
-        0,
-        "the already-completed prior's undelivered signal must be cleaned up too, \
-         not just a RUNNING prior's"
-    );
-}
-
 // ── FINDING (Codex #1080 P2): TerminateIfRunning seals ALL legacy active rows ─────
 //
 // A database written by the PRE-#1068 always-fresh `start_workflow_with_id` can
@@ -821,52 +696,6 @@ async fn failed_prior_allow_duplicate_failed_only_replaces() {
         "the FAILED prior is sealed"
     );
     assert_eq!(active_rows_for_key(&path, "fail_wf", "f-3"), 1);
-}
-
-#[tokio::test]
-async fn allow_duplicate_failed_only_orphans_an_undelivered_signal_on_the_replaced_prior() {
-    let (_dir, path) = temp_db();
-    let mut rt = runtime_at(&path);
-
-    // Stage a signal while the prior is still RUNNING (pre-drive), for a name
-    // fail_wf never awaits...
-    let prior = rt
-        .start_workflow_with_id("fail_wf", "afo-1", json!({"seed": true}))
-        .unwrap();
-    rt.send_signal(prior, "never_consumed", json!({})).unwrap();
-    assert_eq!(
-        undelivered_signal_count(&path, prior),
-        1,
-        "prior has one staged, undelivered signal"
-    );
-
-    // ...then let it run to FAILED on its own, without ever consuming that signal.
-    let _ = rt.run_until_blocked(prior).await;
-    assert_eq!(raw_state(&path, prior), "FAILED");
-    assert_eq!(
-        undelivered_signal_count(&path, prior),
-        1,
-        "the signal is still undelivered after the prior failed on its own"
-    );
-
-    let out = rt
-        .start_workflow_with_reuse_policy(
-            "fail_wf",
-            "afo-1",
-            json!({}),
-            WorkflowIdReusePolicy::AllowDuplicateFailedOnly,
-        )
-        .unwrap();
-    assert!(out.created, "a FAILED prior is replaced");
-    assert_eq!(raw_state(&path, prior), "CONTINUED_AS_NEW");
-
-    assert_eq!(
-        undelivered_signal_count(&path, prior),
-        0,
-        "the replaced FAILED prior's undelivered signal must be cleaned up too, \
-         exactly as issue #1374 fixed for the TerminateIfRunning seal path — \
-         otherwise it is orphaned forever (no retention/GC pass on this backend)"
-    );
 }
 
 #[tokio::test]

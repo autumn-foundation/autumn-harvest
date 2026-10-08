@@ -15,6 +15,7 @@
 
 use std::time::Duration;
 
+use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::envelope::{EnqueueParams, TaskEnvelope};
@@ -48,33 +49,20 @@ impl ClaimedTask {
     }
 }
 
-/// The future that a [`TaskQueueAdapter`] method returns.
-pub type AdapterFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
-
 /// Backend-agnostic task queue interface.
 ///
 /// Implementors must provide at-least-once delivery: a task that has been
 /// claimed but not subsequently acknowledged via [`Self::complete`],
 /// [`Self::fail`], or [`Self::requeue_for_retry`] before its visibility
 /// timeout expires must become claimable again.
-///
-/// Implement it with `#[async_trait]` on the `impl` block and `async fn`
-/// methods. The method signatures here are the ones that `#[async_trait]`
-/// generates. They are written out because `#[async_trait]` on the trait adds
-/// a `#[must_use]` that clippy rejects as `double_must_use`.
+#[async_trait]
 pub trait TaskQueueAdapter: Send + Sync {
     /// Add a new task to the queue.
     ///
     /// Returns the producer-assigned `task_id`. If `params.scheduled_at` is in
     /// the future, the task is parked in a delayed set until it becomes due
     /// rather than appearing immediately on the claimable stream.
-    fn enqueue<'life0, 'async_trait>(
-        &'life0 self,
-        params: EnqueueParams,
-    ) -> AdapterFuture<'async_trait, RedisAdapterResult<Uuid>>
-    where
-        'life0: 'async_trait,
-        Self: 'async_trait;
+    async fn enqueue(&self, params: EnqueueParams) -> RedisAdapterResult<Uuid>;
 
     /// Claim the next available task from any of `queues`.
     ///
@@ -82,74 +70,38 @@ pub trait TaskQueueAdapter: Send + Sync {
     /// expected to give the caller exclusive ownership of the returned
     /// envelope until the visibility timeout elapses or the caller
     /// acknowledges it.
-    fn claim<'life0, 'life1, 'life2, 'async_trait>(
-        &'life0 self,
-        queues: &'life1 [String],
-        worker_id: &'life2 str,
-    ) -> AdapterFuture<'async_trait, RedisAdapterResult<Option<ClaimedTask>>>
-    where
-        'life0: 'async_trait,
-        'life1: 'async_trait,
-        'life2: 'async_trait,
-        Self: 'async_trait;
+    async fn claim(
+        &self,
+        queues: &[String],
+        worker_id: &str,
+    ) -> RedisAdapterResult<Option<ClaimedTask>>;
 
     /// Acknowledge successful processing.
-    fn complete<'life0, 'life1, 'async_trait>(
-        &'life0 self,
-        task: &'life1 ClaimedTask,
+    async fn complete(
+        &self,
+        task: &ClaimedTask,
         output: serde_json::Value,
-    ) -> AdapterFuture<'async_trait, RedisAdapterResult<()>>
-    where
-        'life0: 'async_trait,
-        'life1: 'async_trait,
-        Self: 'async_trait;
+    ) -> RedisAdapterResult<()>;
 
     /// Acknowledge a failure that does not warrant a retry.
-    fn fail<'life0, 'life1, 'life2, 'async_trait>(
-        &'life0 self,
-        task: &'life1 ClaimedTask,
-        error: &'life2 str,
-    ) -> AdapterFuture<'async_trait, RedisAdapterResult<()>>
-    where
-        'life0: 'async_trait,
-        'life1: 'async_trait,
-        'life2: 'async_trait,
-        Self: 'async_trait;
+    async fn fail(&self, task: &ClaimedTask, error: &str) -> RedisAdapterResult<()>;
 
     /// Acknowledge the current attempt and requeue with a delay so the next
     /// attempt fires no earlier than `now + delay`.
-    fn requeue_for_retry<'life0, 'life1, 'async_trait>(
-        &'life0 self,
-        task: &'life1 ClaimedTask,
+    async fn requeue_for_retry(
+        &self,
+        task: &ClaimedTask,
         delay: Duration,
-    ) -> AdapterFuture<'async_trait, RedisAdapterResult<()>>
-    where
-        'life0: 'async_trait,
-        'life1: 'async_trait,
-        Self: 'async_trait;
+    ) -> RedisAdapterResult<()>;
 
     /// Refresh the visibility timeout on a task that is still being worked on.
     ///
     /// Equivalent to the heartbeat path on the Postgres adapter: it tells the
     /// queue "I'm still alive, don't reclaim this task yet".
-    fn record_heartbeat<'life0, 'life1, 'async_trait>(
-        &'life0 self,
-        task: &'life1 ClaimedTask,
-    ) -> AdapterFuture<'async_trait, RedisAdapterResult<()>>
-    where
-        'life0: 'async_trait,
-        'life1: 'async_trait,
-        Self: 'async_trait;
+    async fn record_heartbeat(&self, task: &ClaimedTask) -> RedisAdapterResult<()>;
 
     /// Return the depth (claimable + pending) of each queue.
-    fn queue_depths<'life0, 'life1, 'async_trait>(
-        &'life0 self,
-        queues: &'life1 [String],
-    ) -> AdapterFuture<'async_trait, RedisAdapterResult<Vec<(String, i64)>>>
-    where
-        'life0: 'async_trait,
-        'life1: 'async_trait,
-        Self: 'async_trait;
+    async fn queue_depths(&self, queues: &[String]) -> RedisAdapterResult<Vec<(String, i64)>>;
 }
 
 #[cfg(test)]

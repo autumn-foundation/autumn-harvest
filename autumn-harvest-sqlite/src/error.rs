@@ -10,32 +10,6 @@ pub enum SqliteError {
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
-    /// Another runtime holds the single-writer lock on this database file
-    /// (issue #1834).
-    ///
-    /// The holder is another process, or another runtime in this process. The
-    /// open fails before it changes the file. The lock dies with its holder,
-    /// so retry after that runtime drops or its process exits.
-    #[error(
-        "database is open in another process or runtime: the single-writer lock {} is held",
-        path.display()
-    )]
-    DatabaseLocked {
-        /// The lock file next to the database.
-        path: std::path::PathBuf,
-    },
-
-    /// A file-system error on a path this backend manages, such as the
-    /// single-writer lock file (issue #1834).
-    #[error("i/o error on {}: {source}", path.display())]
-    Io {
-        /// The path the operation used.
-        path: std::path::PathBuf,
-        /// The underlying error.
-        #[source]
-        source: std::io::Error,
-    },
-
     /// A JSON (de)serialization error while reading or writing a payload.
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
@@ -49,10 +23,6 @@ pub enum SqliteError {
     UnregisteredActivity(String),
 
     /// A referenced execution id does not exist in this database.
-    ///
-    /// Every public accessor that takes an `ExecutionId` returns this for an
-    /// unknown id (issue #1735). A list read never returns an empty list for
-    /// an unknown id.
     #[error("execution not found: {0}")]
     ExecutionNotFound(ExecutionId),
 
@@ -73,27 +43,9 @@ pub enum SqliteError {
         state: String,
     },
 
-    /// A decision cycle failed the workflow **task**, not the run
-    /// (issue #1797). The handler waited too long on a future that is not a
-    /// Harvest future. Nothing was persisted and the run stays `RUNNING`, so
-    /// a later drive retries it.
-    #[error("workflow task for execution {execution_id} failed and can be retried: {details}")]
-    TaskFailed {
-        /// The execution whose task failed.
-        execution_id: ExecutionId,
-        /// Why the task failed.
-        details: String,
-    },
-
     /// A workflow emitted a [`WorkflowCommand`](autumn_harvest::WorkflowCommand)
     /// outside the single-writer backend's supported subset (child workflows,
     /// external signals/cancels, continue-as-new, local activities, …).
-    ///
-    /// The run is terminal (issue #1834). The drive that returns this error
-    /// first rolls back the cycle. It then seals the run `FAILED` with a typed
-    /// `WorkflowFailed` event, whose `error_type` is
-    /// [`UNSUPPORTED_FEATURE_ERROR_TYPE`](crate::UNSUPPORTED_FEATURE_ERROR_TYPE).
-    /// A later drive returns [`RunState::Failed`](crate::RunState::Failed).
     #[error("unsupported workflow command for the sqlite backend: {0}")]
     Unsupported(String),
 

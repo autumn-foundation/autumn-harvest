@@ -25,6 +25,7 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
+use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -38,7 +39,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::test_init_sql().as_bytes().to_vec()
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
 }
 
 type HarvestApiApp = axum::Router;
@@ -78,7 +79,7 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::default(),
     ));
-    harvest_api_router(api_state)
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
 
 async fn get_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
@@ -115,7 +116,7 @@ async fn seed_execution(conn: &mut AsyncPgConnection, workflow_id: &str) -> Exec
             workflow_name: "history-pag-wf",
             workflow_id,
             exec_id,
-            input: json!({"n": 1}).into(),
+            input: json!({"n": 1}),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -267,9 +268,10 @@ async fn history_page_boundaries_no_drops_or_duplicates() {
     let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
 
     let exec_id = seed_execution(&mut conn, "page-bounds-wf").await;
-    // 7 TimerStarted + 7 TimerFired = 14 events, on top of the initial
-    // WorkflowStarted, for 15 in total.
-    append_mixed_events(&mut conn, exec_id, 7).await;
+    // Append 15 extra events (on top of the initial WorkflowStarted) = 16 total.
+    append_mixed_events(&mut conn, exec_id, 7).await; // 7 TimerStarted + 7 TimerFired = 14
+    // Also append 2 more so total is 1 + 14 + 1 = 16; actually let's just use 15 total extra.
+    // WorkflowStarted is event 0 → +14 = 15 events total.
 
     let limit = 5;
     let mut collected_ids: Vec<i64> = Vec::new();

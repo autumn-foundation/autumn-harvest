@@ -6,17 +6,6 @@ validate your client against it, and understand what counts as a breaking change
 
 ---
 
-## Prefer a generated client?
-
-`docs/openapi.json` is an OpenAPI 3.1 document generated from this contract, and
-`GET {api_path}/openapi.json` serves the same document. Point an OpenAPI
-generator at either one and skip hand-written HTTP entirely. See
-[`openapi.md`](openapi.md). Read on when you want the contract itself: its
-compatibility rules, its categories, and how to validate a hand-written client
-against it.
-
----
-
 ## Where to find the contract
 
 `docs/api-contract.json` is the single source of truth.  It is checked into the
@@ -63,33 +52,6 @@ Each route entry:
 | `error_responses` | array | Documented error status codes and conditions |
 | `idempotency` | string | (Optional) Idempotency semantics for the route |
 
-### Field lists
-
-A `fields` entry is a bare name or an object. Request and response lists both
-use it. The object form takes these keys, and no others (issue #1616):
-
-| Key | Meaning |
-|---|---|
-| `name` | The JSON key. |
-| `type` | `string`, `integer`, `number`, `boolean`, `object`, `array`, or `any`. The transform rejects other names. |
-| `nullable` | `true` when the value can be `null`. It needs a concrete `type`. |
-| `required` | `true` when the key is in every body. |
-| `fields` | The properties of an `object` field, in this same form. |
-| `items` | The element type of an `array` field: an object with `type`, and `nullable`, `fields`, `items` or `description` as needed. |
-| `description` | Text for the generated client. |
-
-Use `any` for a value the handler passes through, such as workflow input. The
-document marks it `x-harvest-any`, so a reader can tell it from a field with no
-type yet. A bare name has no type.
-
-The transform rejects an unknown key, a type outside the list, `nullable`
-without a concrete type, and a non-boolean `required` or `nullable`. It also
-rejects an empty `fields` list, because that closes the object.
-
-The routes in `autumn_harvest_plugin::openapi::CORE_CLIENT_ROUTES` must type
-every field, and every array element. `tests/openapi_response_conformance.rs`
-checks each type against the live handler.
-
 ---
 
 ## Compatibility rules
@@ -116,11 +78,8 @@ CHANGELOG entry before release):**
 
 ## Generating or validating a client
 
-An OpenAPI generator is the shortest path: see
-[`openapi.md`](openapi.md). The recipes below are for the cases a generator
-does not cover, such as scaffolding a client in a language with no OpenAPI
-tooling. Because the contract is plain JSON, any JSON-aware toolchain can read
-it:
+Because the contract is plain JSON, any JSON-aware toolchain can consume it.
+A 10-minute workflow to generate a typed Rust client:
 
 ```bash
 # 1. Extract routes into a simple TSV for code generation scaffolding
@@ -133,32 +92,10 @@ contract_paths=$(jq -r '.routes[].path' docs/api-contract.json | sort)
 # compare against your method list ...
 ```
 
-For languages with OpenAPI tooling, do not translate this file by hand. The
-translation already ships: `docs/openapi.json` is an OpenAPI 3.1 document
-generated from this contract, and `GET {api_path}/openapi.json` serves the same
-document. Point a generator at either. See [`openapi.md`](openapi.md).
-
----
-
-## Content negotiation: match each route's declared content type
-
-Send `Accept: application/json` to a route whose contract
-`content_type` is JSON (issue #1579). `curl` sends a bare `Accept: */*`
-by default. Autumn's error-page content negotiation treats that as
-browser navigation, and answers a validation error with a styled HTML
-page, not the JSON body this contract documents. The `harvest` CLI
-sends the explicit header for this reason, on every request its own
-commands make.
-
-Two route shapes are the exception, and want their own `Accept`
-instead of `application/json`. `docs/api-contract.json` marks each
-one's `content_type`:
-
-- A streaming route: send `Accept: text/event-stream` to
-  `.../events/stream` or `.../stream`.
-- A Prometheus-format route: `GET /admin/metrics` and
-  `GET /admin/queues/scaling?format=prometheus` return plain text, not
-  JSON.
+For languages with OpenAPI tooling: the contract is not OpenAPI, but its shape
+is straightforward to translate.  Each route entry maps 1-to-1 to an OpenAPI
+path item; `params` maps to OpenAPI parameters; `request_body.schema` maps to a
+`requestBody`.
 
 ---
 
@@ -206,11 +143,9 @@ live route set registered in `harvest_api_router` against `docs/api-contract.jso
 2. Update `management_api_routes()` in the same file (keeps the canonical list
    in sync with the router).
 3. Update `docs/api-contract.json` to reflect the new route or schema change.
-4. Run `scripts/regenerate-openapi.sh`. It rewrites both generated OpenAPI
-   copies from the contract (issue #694). Skipping it fails CI.
-5. Add a CHANGELOG entry under the current version marking the change as
+4. Add a CHANGELOG entry under the current version marking the change as
    breaking or non-breaking per the compatibility rules above.
-6. Run `cargo test -p autumn-harvest-plugin --test contract_regression --test openapi_spec`
-   to confirm the regression tests pass.
+5. Run `cargo test -p autumn-harvest-plugin --test contract_regression` to
+   confirm the regression test passes.
 
-The CI job will catch any drift between these artefacts.
+The CI job will catch any drift between these three artefacts.

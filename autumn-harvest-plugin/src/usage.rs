@@ -271,9 +271,21 @@ async fn observe_shard(
     query: &UsageQuery,
     row_limit: i64,
 ) -> ShardObservation<UsageShardRow> {
-    let mut conn = match shard_fanout::acquire_shard_conn(shard_id, pool).await {
-        Ok(conn) => conn,
-        Err(observation) => return observation,
+    let Some(pool) = pool else {
+        return ShardObservation {
+            shard_id,
+            rows: Vec::new(),
+            error: Some(format!("shard {shard_id} has no configured storage pool")),
+        };
+    };
+    let Ok(mut conn) = pool.get().await else {
+        return ShardObservation {
+            shard_id,
+            rows: Vec::new(),
+            error: Some(format!(
+                "database connection for shard {shard_id} could not be acquired"
+            )),
+        };
     };
     match autumn_harvest::usage::load_usage_grouped(&mut conn, shard_id, query, row_limit).await {
         Ok(rows) => ShardObservation {
@@ -703,7 +715,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(resp.status, UsageReportStatus::Unavailable);
-        assert_eq!(resp.groups, [] as [crate::usage::UsageGroupRecord; 0]);
+        assert!(resp.groups.is_empty());
         assert_eq!(resp.unavailable_shards.len(), 1);
     }
 

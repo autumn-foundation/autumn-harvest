@@ -45,6 +45,7 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
+use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -59,11 +60,11 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
 /// The full migration schema, mirroring every other plugin integration
-/// suite (e.g. `query_integration.rs`) — uses `test_init_sql()` so the
+/// suite (e.g. `query_integration.rs`) — uses `full_migrations_sql()` so the
 /// test schema always tracks trunk and never hand-rolls a bundle (which the
 /// `migration_hygiene` guard forbids).
 fn init_sql() -> Vec<u8> {
-    autumn_harvest::test_init_sql().as_bytes().to_vec()
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
 }
 
 // ── Published schemas ──────────────────────────────────────────────────────
@@ -431,7 +432,8 @@ fn build_app_with_state(pool: &DbPool) -> (HarvestApiApp, HarvestApiState) {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::default(),
     ));
-    let app = harvest_api_router(api_state.clone());
+    let app =
+        harvest_api_router(api_state.clone()).with_state(AppState::for_test().with_profile("test"));
     (app, api_state)
 }
 
@@ -470,7 +472,7 @@ fn build_app_two_shard_dead_second(live_pool: &DbPool) -> HarvestApiApp {
             ShardId::new(0),
         ),
     ));
-    harvest_api_router(api_state)
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
 
 async fn get(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
@@ -811,10 +813,7 @@ async fn interface_omits_schema_fields_for_schema_less_workflow() {
     assert_eq!(names(&body["signals"]), vec!["plain_sig"]);
     assert!(body["signals"][0].get("arg_schema").is_none());
     assert!(body["signals"][0].get("description").is_none());
-    assert_eq!(
-        body["queries"].as_array().unwrap().as_slice(),
-        [] as [serde_json::Value; 0]
-    );
+    assert!(body["queries"].as_array().unwrap().is_empty());
     assert_eq!(names(&body["updates"]), vec!["plain_upd"]);
     assert!(body["updates"][0].get("arg_schema").is_none());
     assert!(body["updates"][0].get("response_schema").is_none());

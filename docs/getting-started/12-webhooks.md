@@ -16,24 +16,6 @@ weak secret. Harvest's `#[webhook]` macro sits entirely downstream: it maps
 an **already-verified** delivery to a deterministic workflow trigger and
 dispatches it idempotently.
 
-## Enable the feature
-
-`#[webhook]`-annotated functions compile with no extra setup — `WebhookCtx`
-and the macro itself live in `autumn-harvest`'s unconditional core. The
-plugin wiring in [step 3](#3-wire-the-plugin) below is different:
-`HarvestPlugin::webhooks(...)` lives behind the `webhooks` Cargo feature on
-`autumn-harvest-plugin` — off by default, the same shape as
-[chapter 13](13-broker-connectors.md)'s `connectors` feature:
-
-```toml
-autumn-harvest-plugin = { version = "0.7", features = ["webhooks"] }
-```
-
-Skipping this fails at the `.webhooks(webhooks![...])` call in step 3, not at
-the `#[webhook]` function itself — the compiler error names neither
-"webhooks" nor this chapter (`no method named 'webhooks' found for struct
-'HarvestPlugin'`), so the fix is easy to miss without this note.
-
 ## 1. Configure the endpoint
 
 ```toml

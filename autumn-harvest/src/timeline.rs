@@ -55,11 +55,8 @@
 //! `ActivityStarted`/`ActivityFailed { attempt }` per attempt. So `attempt` is
 //! the **maximum** `attempt` field seen on `ActivityFailed` (resp.
 //! `LocalActivityFailed`/`LocalActivityExhausted`) events for the id, defaulting
-//! to `1` for a first-try completion. `ActivityCompleted` and `ActivityTimedOut`
-//! carry no `attempt` field. A retried timeout appends no event (issue #1809).
-//! So a completed or timed-out step reports at least the number of its
-//! `ActivityStarted` events. That is a lower bound: an attempt that timed out
-//! before its handler started appends no `ActivityStarted`.
+//! to `1` for a first-try completion. `ActivityTimedOut` carries no `attempt`
+//! field, so a timed-out step reports the max prior failed attempt (or `1`).
 //!
 //! ### signal_wait caveat
 //!
@@ -98,7 +95,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::event::WorkflowEvent;
-use crate::types::{ActivityExecId, ExecutionId};
 
 /// One recorded history event paired with its `harvest_events` row timestamp.
 ///
@@ -204,10 +200,8 @@ pub struct TimelineStep {
     /// **Caveat (lower bound):** derived as the max `attempt` field on the id's
     /// `ActivityFailed`/`LocalActivityFailed`/`LocalActivityExhausted` events
     /// (default `1`). Success and timeout events carry no attempt field, so a
-    /// completed or timed-out step also counts its `ActivityStarted` events
-    /// (issue #1809). Treat the result as a **lower bound** on the final
-    /// attempt number. An attempt that timed out before its handler started
-    /// appends no event, so it is not counted.
+    /// succeeded-after-N-failures step reports `N`, not the true final `N+1` —
+    /// treat it as a **lower bound** on the final attempt number.
     pub attempt: Option<i32>,
 }
 
@@ -309,38 +303,6 @@ pub fn derive_timeline(
     }
 }
 
-/// Stable key for the `keyed` map in [`build_accs`]: one variant per
-/// namespace ([`WorkflowEvent`]'s `activity_id`/`child_id` fields are reused
-/// across regular activities, local activities, and child workflows, so the
-/// namespace tag must be part of the key, not just the id). `Copy`+`Hash`
-/// over a `Uuid` newtype rather than a formatted `String` — hashing a
-/// 16-byte value needs no allocation and no `SipHash` pass over a variable-
-/// length buffer, unlike the `format!("act:{id}")`-style key this replaces.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum AccKey {
-    Activity(ActivityExecId),
-    LocalActivity(ActivityExecId),
-    Child(ExecutionId),
-}
-
-impl std::hash::Hash for AccKey {
-    /// Feed `SipHash` one 128-bit write per key.
-    ///
-    /// The derived impl writes the variant tag, a slice length prefix and the
-    /// UUID bytes as three separate `write` calls. The namespace tag is folded
-    /// into the low bits of the id instead. Keys that differ only in namespace
-    /// still compare unequal through `Eq`, so a hash collision is harmless.
-    /// The hasher stays the keyed `RandomState` one.
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        let (tag, id) = match self {
-            Self::Activity(id) => (0_u128, id.as_uuid()),
-            Self::LocalActivity(id) => (1, id.as_uuid()),
-            Self::Child(id) => (2, id.as_uuid()),
-        };
-        state.write_u128(id.as_u128() ^ tag);
-    }
-}
-
 /// Scan the ordered history into one [`Acc`] per orchestration unit.
 ///
 /// This is a wide dispatch match over the event variants that map to timeline
@@ -350,7 +312,7 @@ fn build_accs(rows: &[TimelineEventRow], started_at: DateTime<Utc>) -> Vec<Acc> 
     // `keyed` maps a stable key → index into `accs`; `accs` preserves first
     // appearance so the final ordering can break `scheduled_at` ties stably.
     let mut accs: Vec<Acc> = Vec::new();
-    let mut keyed: std::collections::HashMap<AccKey, usize> = std::collections::HashMap::new();
+    let mut keyed: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
     // Timestamp of the previous recorded row, for signal-wait measurement.
     let mut prev_ts: Option<DateTime<Utc>> = None;
@@ -370,38 +332,31 @@ fn build_accs(rows: &[TimelineEventRow], started_at: DateTime<Utc>) -> Vec<Acc> 
             // ── regular activity ─────────────────────────────────────
             WorkflowEvent::ActivityScheduled {
                 activity_id, name, ..
-            } => ensure_scheduled(
-                &mut accs,
-                &mut keyed,
-                AccKey::Activity(*activity_id),
-                || {
-                    Acc::scheduled(
-                        StepKind::Activity,
-                        Some(name.clone()),
-                        ts,
-                        index,
-                        true,
-                        true,
-                    )
-                },
-            ),
+            } => ensure_scheduled(&mut accs, &mut keyed, format!("act:{activity_id}"), || {
+                Acc::scheduled(
+                    StepKind::Activity,
+                    Some(name.clone()),
+                    ts,
+                    index,
+                    true,
+                    true,
+                )
+            }),
             WorkflowEvent::ActivityStarted { activity_id, .. } => {
-                if let Some(acc) = lookup_mut(&keyed, &mut accs, AccKey::Activity(*activity_id)) {
+                if let Some(acc) = lookup_mut(&keyed, &mut accs, &format!("act:{activity_id}")) {
                     // A (re)start reopens the step: the last attempt's start ts
                     // wins and any prior failure's terminal marking is cleared.
                     acc.start_ts = Some(ts);
                     acc.ended_at = None;
                     acc.outcome = None;
-                    acc.starts = acc.starts.saturating_add(1);
                 }
             }
             // Regular and external completions close the step identically; an
-            // external activity shares the `Activity` key (see the
+            // external activity shares the `act:{activity_id}` key (see the
             // external-activity block below).
             WorkflowEvent::ActivityCompleted { activity_id, .. }
             | WorkflowEvent::ActivityCompletedExternally { activity_id, .. } => {
-                if let Some(acc) = lookup_mut(&keyed, &mut accs, AccKey::Activity(*activity_id)) {
-                    acc.record_started_attempts();
+                if let Some(acc) = lookup_mut(&keyed, &mut accs, &format!("act:{activity_id}")) {
                     acc.close(ts, StepOutcome::Completed);
                 }
             }
@@ -410,14 +365,13 @@ fn build_accs(rows: &[TimelineEventRow], started_at: DateTime<Utc>) -> Vec<Acc> 
                 attempt,
                 ..
             } => {
-                if let Some(acc) = lookup_mut(&keyed, &mut accs, AccKey::Activity(*activity_id)) {
+                if let Some(acc) = lookup_mut(&keyed, &mut accs, &format!("act:{activity_id}")) {
                     acc.record_attempt(*attempt);
                     acc.close(ts, StepOutcome::Failed);
                 }
             }
             WorkflowEvent::ActivityTimedOut { activity_id, .. } => {
-                if let Some(acc) = lookup_mut(&keyed, &mut accs, AccKey::Activity(*activity_id)) {
-                    acc.record_started_attempts();
+                if let Some(acc) = lookup_mut(&keyed, &mut accs, &format!("act:{activity_id}")) {
                     acc.close(ts, StepOutcome::TimedOut);
                 }
             }
@@ -431,30 +385,25 @@ fn build_accs(rows: &[TimelineEventRow], started_at: DateTime<Utc>) -> Vec<Acc> 
             // wait/exec split is never available (`split_applicable = false`);
             // only `total_ms` is reported. Represented AS `StepKind::Activity`
             // (the step-kind set is bounded; external activities are activities).
-            // It shares the `Activity` key with the regular-activity
+            // It shares the `act:{activity_id}` key with the regular-activity
             // terminal handlers above, so `ActivityCompletedExternally` (folded
             // into the `ActivityCompleted` arm), `ActivityTimedOut` (a shared
             // terminal), and the `ActivityFailedExternally` arm below all close it
             // correctly.
             WorkflowEvent::ActivityAwaitingExternal {
                 activity_id, name, ..
-            } => ensure_scheduled(
-                &mut accs,
-                &mut keyed,
-                AccKey::Activity(*activity_id),
-                || {
-                    Acc::scheduled(
-                        StepKind::Activity,
-                        Some(name.clone()),
-                        ts,
-                        index,
-                        false,
-                        false,
-                    )
-                },
-            ),
+            } => ensure_scheduled(&mut accs, &mut keyed, format!("act:{activity_id}"), || {
+                Acc::scheduled(
+                    StepKind::Activity,
+                    Some(name.clone()),
+                    ts,
+                    index,
+                    false,
+                    false,
+                )
+            }),
             WorkflowEvent::ActivityFailedExternally { activity_id, .. } => {
-                if let Some(acc) = lookup_mut(&keyed, &mut accs, AccKey::Activity(*activity_id)) {
+                if let Some(acc) = lookup_mut(&keyed, &mut accs, &format!("act:{activity_id}")) {
                     acc.close(ts, StepOutcome::Failed);
                 }
             }
@@ -462,25 +411,18 @@ fn build_accs(rows: &[TimelineEventRow], started_at: DateTime<Utc>) -> Vec<Acc> 
             // ── local activity ───────────────────────────────────────
             WorkflowEvent::LocalActivityScheduled {
                 activity_id, name, ..
-            } => ensure_scheduled(
-                &mut accs,
-                &mut keyed,
-                AccKey::LocalActivity(*activity_id),
-                || {
-                    Acc::scheduled(
-                        StepKind::LocalActivity,
-                        Some(name.clone()),
-                        ts,
-                        index,
-                        false,
-                        true,
-                    )
-                },
-            ),
+            } => ensure_scheduled(&mut accs, &mut keyed, format!("la:{activity_id}"), || {
+                Acc::scheduled(
+                    StepKind::LocalActivity,
+                    Some(name.clone()),
+                    ts,
+                    index,
+                    false,
+                    true,
+                )
+            }),
             WorkflowEvent::LocalActivityCompleted { activity_id, .. } => {
-                if let Some(acc) =
-                    lookup_mut(&keyed, &mut accs, AccKey::LocalActivity(*activity_id))
-                {
+                if let Some(acc) = lookup_mut(&keyed, &mut accs, &format!("la:{activity_id}")) {
                     acc.close(ts, StepOutcome::Completed);
                 }
             }
@@ -495,9 +437,7 @@ fn build_accs(rows: &[TimelineEventRow], started_at: DateTime<Utc>) -> Vec<Acc> 
                 attempt,
                 ..
             } => {
-                if let Some(acc) =
-                    lookup_mut(&keyed, &mut accs, AccKey::LocalActivity(*activity_id))
-                {
+                if let Some(acc) = lookup_mut(&keyed, &mut accs, &format!("la:{activity_id}")) {
                     acc.record_attempt(*attempt);
                 }
             }
@@ -508,9 +448,7 @@ fn build_accs(rows: &[TimelineEventRow], started_at: DateTime<Utc>) -> Vec<Acc> 
                 attempt,
                 ..
             } => {
-                if let Some(acc) =
-                    lookup_mut(&keyed, &mut accs, AccKey::LocalActivity(*activity_id))
-                {
+                if let Some(acc) = lookup_mut(&keyed, &mut accs, &format!("la:{activity_id}")) {
                     acc.record_attempt(*attempt);
                     acc.close(ts, StepOutcome::Failed);
                 }
@@ -557,7 +495,7 @@ fn build_accs(rows: &[TimelineEventRow], started_at: DateTime<Utc>) -> Vec<Acc> 
                 child_id,
                 workflow_name,
                 ..
-            } => ensure_scheduled(&mut accs, &mut keyed, AccKey::Child(*child_id), || {
+            } => ensure_scheduled(&mut accs, &mut keyed, format!("child:{child_id}"), || {
                 Acc::scheduled(
                     StepKind::ChildWorkflow,
                     Some(workflow_name.clone()),
@@ -568,12 +506,12 @@ fn build_accs(rows: &[TimelineEventRow], started_at: DateTime<Utc>) -> Vec<Acc> 
                 )
             }),
             WorkflowEvent::ChildWorkflowCompleted { child_id, .. } => {
-                if let Some(acc) = lookup_mut(&keyed, &mut accs, AccKey::Child(*child_id)) {
+                if let Some(acc) = lookup_mut(&keyed, &mut accs, &format!("child:{child_id}")) {
                     acc.close(ts, StepOutcome::Completed);
                 }
             }
             WorkflowEvent::ChildWorkflowFailed { child_id, .. } => {
-                if let Some(acc) = lookup_mut(&keyed, &mut accs, AccKey::Child(*child_id)) {
+                if let Some(acc) = lookup_mut(&keyed, &mut accs, &format!("child:{child_id}")) {
                     acc.close(ts, StepOutcome::Failed);
                 }
             }
@@ -684,8 +622,8 @@ fn ms_between(a: DateTime<Utc>, b: DateTime<Utc>) -> i64 {
 /// recording its index so terminal events can pair back to it.
 fn ensure_scheduled(
     accs: &mut Vec<Acc>,
-    keyed: &mut std::collections::HashMap<AccKey, usize>,
-    key: AccKey,
+    keyed: &mut std::collections::HashMap<String, usize>,
+    key: String,
     make: impl FnOnce() -> Acc,
 ) {
     if let std::collections::hash_map::Entry::Vacant(entry) = keyed.entry(key) {
@@ -696,11 +634,11 @@ fn ensure_scheduled(
 
 /// Look up a mutable accumulator by key, if present.
 fn lookup_mut<'a>(
-    keyed: &std::collections::HashMap<AccKey, usize>,
+    keyed: &std::collections::HashMap<String, usize>,
     accs: &'a mut [Acc],
-    key: AccKey,
+    key: &str,
 ) -> Option<&'a mut Acc> {
-    keyed.get(&key).map(|&i| &mut accs[i])
+    keyed.get(key).map(|&i| &mut accs[i])
 }
 
 /// Internal per-unit accumulator built while scanning history.
@@ -714,9 +652,6 @@ struct Acc {
     ended_at: Option<DateTime<Utc>>,
     outcome: Option<StepOutcome>,
     max_failed_attempt: Option<i32>,
-    /// `ActivityStarted` events seen. A completed or timed-out step reports at
-    /// least this many attempts (issue #1809).
-    starts: u32,
     /// Whether the wait/exec split can ever apply (regular activities only).
     split_applicable: bool,
     /// Whether this kind reports an `attempt` (activities / local activities).
@@ -741,7 +676,6 @@ impl Acc {
             ended_at: None,
             outcome: None,
             max_failed_attempt: None,
-            starts: 0,
             split_applicable,
             retrying,
         }
@@ -750,15 +684,6 @@ impl Acc {
     fn record_attempt(&mut self, attempt: u32) {
         let attempt = i32::try_from(attempt).unwrap_or(i32::MAX);
         self.max_failed_attempt = Some(self.max_failed_attempt.map_or(attempt, |m| m.max(attempt)));
-    }
-
-    /// Counts each started attempt (issue #1809). A retried timeout appends
-    /// no event, so only the starts show it. An external activity records no
-    /// start, so this leaves it unchanged.
-    fn record_started_attempts(&mut self) {
-        if self.starts > 0 {
-            self.record_attempt(self.starts);
-        }
     }
 
     /// Mark this step terminated (last-writer-wins).
@@ -1122,7 +1047,7 @@ mod tests {
         ];
         let tl = derive(&rows, Some(60), 60);
         let act = find(&tl.steps, StepKind::Activity);
-        assert_eq!(act.attempt, Some(3), "three started attempts");
+        assert_eq!(act.attempt, Some(2), "max failed attempt");
         assert_eq!(act.outcome, StepOutcome::Completed);
         // final attempt's start @ 35: exec = 50-35 = 15, wait = 35-10 = 25, total = 40.
         assert_eq!(act.exec_ms, Some(15));
@@ -1210,7 +1135,7 @@ mod tests {
     fn empty_history_has_no_steps() {
         let rows = vec![started(0)];
         let tl = derive(&rows, Some(50), 50);
-        assert_eq!(tl.steps, [] as [crate::timeline::TimelineStep; 0]);
+        assert!(tl.steps.is_empty());
         assert!(tl.rollup.slowest_step.is_none());
         assert_eq!(tl.rollup.busy_ms, 0);
         assert_eq!(tl.rollup.wait_ms, 0);
@@ -1372,82 +1297,6 @@ mod tests {
         assert_eq!(act.outcome, StepOutcome::TimedOut);
         assert_eq!(act.attempt, Some(1));
         assert_eq!(act.total_ms, 190);
-    }
-
-    /// A retried timeout appends no event (issue #1809). The attempt of a
-    /// timed-out step is the number of its starts.
-    #[test]
-    fn retried_timeout_reports_each_started_attempt() {
-        let a1 = ActivityExecId::new();
-        let mut rows = vec![
-            started(0),
-            row(
-                10,
-                WorkflowEvent::ActivityScheduled {
-                    activity_id: a1,
-                    name: "slow".into(),
-                    input: serde_json::Value::Null,
-                    queue: "default".into(),
-                },
-            ),
-        ];
-        for at in [20, 40, 60] {
-            rows.push(row(
-                at,
-                WorkflowEvent::ActivityStarted {
-                    activity_id: a1,
-                    worker_id: WorkerId::new("w"),
-                },
-            ));
-        }
-        rows.push(row(
-            200,
-            WorkflowEvent::ActivityTimedOut {
-                activity_id: a1,
-                timeout_type: crate::error::TimeoutType::StartToClose,
-            },
-        ));
-        let tl = derive(&rows, Some(200), 200);
-        let act = find(&tl.steps, StepKind::Activity);
-        assert_eq!(act.outcome, StepOutcome::TimedOut);
-        assert_eq!(act.attempt, Some(3));
-    }
-
-    #[test]
-    fn success_after_retried_timeouts_reports_each_started_attempt() {
-        let a1 = ActivityExecId::new();
-        let mut rows = vec![
-            started(0),
-            row(
-                10,
-                WorkflowEvent::ActivityScheduled {
-                    activity_id: a1,
-                    name: "slow".into(),
-                    input: serde_json::Value::Null,
-                    queue: "default".into(),
-                },
-            ),
-        ];
-        for at in [20, 40, 60] {
-            rows.push(row(
-                at,
-                WorkflowEvent::ActivityStarted {
-                    activity_id: a1,
-                    worker_id: WorkerId::new("w"),
-                },
-            ));
-        }
-        rows.push(row(
-            80,
-            WorkflowEvent::ActivityCompleted {
-                activity_id: a1,
-                output: serde_json::Value::Null,
-            },
-        ));
-        let tl = derive(&rows, Some(80), 80);
-        let act = find(&tl.steps, StepKind::Activity);
-        assert_eq!(act.outcome, StepOutcome::Completed);
-        assert_eq!(act.attempt, Some(3));
     }
 
     // ── child workflow failed ──

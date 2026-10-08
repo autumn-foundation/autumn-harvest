@@ -84,10 +84,7 @@ A complete, runnable version is in
 - **Single-writer contract (`BEGIN IMMEDIATE`).** One writer process owns one
   SQLite file. A task claim takes the database write lock up front and flips the
   oldest ready task to `RUNNING` — exactly-once by construction, replacing
-  Postgres's `SELECT … FOR UPDATE SKIP LOCKED`. `open` enforces the contract
-  (issue #1834): it locks `<database>.lock`, and a second runtime on the same
-  file fails fast with `SqliteError::DatabaseLocked`. The lock dies with its
-  process, so a crash leaves no stale lock.
+  Postgres's `SELECT … FOR UPDATE SKIP LOCKED`.
 - **Polling drive model.** SQLite has no push notification, so instead of
   `LISTEN`/`NOTIFY` you *drive* the runtime: `poll_once` / `run_until_blocked` /
   `run_until_idle` drain all ready work and re-run the workflow until every run
@@ -98,12 +95,6 @@ A complete, runnable version is in
   deterministic replay. Activity execution is therefore **at-least-once** — write
   activity bodies to be idempotent. See
   [`examples/durability.rs`](examples/durability.rs).
-- **Idempotent starts by default (issue #1068).** `start_workflow_with_id`
-  applies the `AllowDuplicate` reuse policy. A duplicate `(workflow_name,
-  workflow_id)` **attaches** to the existing, non-sealed run instead of
-  starting a second one. The new call's input is discarded. Use
-  `start_workflow_with_reuse_policy` for the full `WorkflowIdReusePolicy`
-  matrix — reject, replace-if-failed, or terminate-and-restart.
 
 ## v0.1 non-goals
 
@@ -112,20 +103,18 @@ Out of scope for this backend (tracked as issue #1068 follow-ups):
 - Distributed / multi-writer workers; multi-server crash recovery.
 - `LISTEN`/`NOTIFY` push wake-ups.
 - Schedules, the management API, DAGs, worker sessions, retention, sharding.
+- Idempotent starts / the `WorkflowIdReusePolicy` matrix — every
+  `start_workflow` call creates a new, independent execution; dedupe upstream.
 - Child workflows, external signals/cancels, local activities, updates,
   search attributes, and `continue_as_new` — a workflow reaching one of these is
-  rejected **loudly, by name**, never silently dropped. The run then ends
-  `FAILED` with `error_type = "UnsupportedFeature"` (issue #1834).
+  rejected **loudly, by name**, never silently dropped.
 
 ## Learn more
 
 - **Docs guide:** [`docs/sqlite-backend.md`](../docs/sqlite-backend.md) — a
   task-oriented walkthrough of the whole surface.
 - **Runnable examples:** [`examples/quickstart.rs`](examples/quickstart.rs) and
-  [`examples/durability.rs`](examples/durability.rs). For a whole application on
-  this backend, see
-  [`examples/claude-agent-daemon/`](../examples/claude-agent-daemon/) — a local
-  daemon that runs Claude agent sessions as durable workflows.
+  [`examples/durability.rs`](examples/durability.rs).
 - **API reference:** `cargo doc --open -p autumn-harvest-sqlite` — the
   crate-level docs are the canonical design/contract document.
 - **Why this crate exists (and why it is not a core trait):**

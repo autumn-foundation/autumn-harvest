@@ -44,28 +44,20 @@
 //! The core completion-trigger path reaches the shared [`AdmissionGateCache`]
 //! through the process-global [`GLOBAL_ADMISSION_GATE_CACHE`] static (mirroring
 //! `GLOBAL_WORKFLOW_METADATA` / `GLOBAL_CALLBACK_CONFIG`), populated by the
-//! plugin at boot with the same `Arc` the management API uses. `HarvestEmbedding`
-//! publishes it the same way. When the static is unset (a hand-built
-//! standalone mount, or the brief boot window) the core gate check is skipped
-//! — byte-identical to pre-#618 behaviour.
+//! plugin at boot with the same `Arc` the management API uses. When the static
+//! is unset (standalone integrations, or the plugin's brief boot window) the
+//! core gate check is skipped — byte-identical to pre-#618 behaviour.
 //!
 //! ## Standalone router note
 //!
 //! [`AdmissionGateCache::new`] initialises the cache as **open** (no gates).
-//! A standalone integration starts through `HarvestEmbedding` (issue #1613).
-//! It loads the persisted gates before any worker spawns and publishes the
-//! cache. It also starts the refresh loop.
-//!
-//! An integration that mounts `harvest_api_router` without `HarvestEmbedding`
-//! must do this step itself. It calls `load_active_gates` at startup and
-//! passes the result to [`AdmissionGateCache::refresh`]. Without this step, a
-//! gate from a previous process lifetime is invisible on this replica.
-//!
-//! Such an integration declares its admin credential with
-//! `StandaloneAdminAuth` (issue #1608), which installs the scoped-API-token
-//! layer and the read-only-role layer in the one correct order.
-//!
-//! `docs/embedding.md` lists every step of the standalone path.
+//! Standalone integrations that mount `harvest_api_router` without the plugin
+//! boot loader (i.e. without calling `HarvestPlugin::on_startup`) must
+//! explicitly call `load_active_gates` from the DB and pass the result to
+//! [`AdmissionGateCache::refresh`] on startup to pick up any gates that were
+//! persisted before the process restarted. Without this step, gates created in
+//! a previous process lifetime are invisible until a local create/lift happens
+//! on the same replica.
 //!
 //! ## Scope semantics
 //!
@@ -79,14 +71,6 @@
 //!
 //! Multiple active gates are evaluated as OR: any match → blocked.
 //! Expired gates are never matched, regardless of scope.
-//!
-//! ## Automatic load shedding (issue #1794)
-//!
-//! The cache also owns a [`crate::load_shed::LoadShedder`]. It is a per-queue
-//! gate that trips on backlog age, not on an operator action. The start
-//! primitive consults it after the manual gates, for `GateMode::Check` only. A
-//! shed start gets `HarvestError::LoadShed`, which the API maps to `429` with
-//! `Retry-After`. See `docs/operations/load-shedding.md`.
 //!
 //! ## Upper bound on simultaneous gates
 //!
@@ -330,8 +314,6 @@ pub struct AdmissionGateCache {
     gates: std::sync::RwLock<Vec<AdmissionGate>>,
     /// Set to `true` after the first successful `refresh()`.
     initialized: std::sync::atomic::AtomicBool,
-    /// The automatic per-queue gate (issue #1794). It has no policy by default.
-    load_shedder: Arc<crate::load_shed::LoadShedder>,
 }
 
 impl Default for AdmissionGateCache {
@@ -339,7 +321,6 @@ impl Default for AdmissionGateCache {
         Self {
             gates: std::sync::RwLock::new(Vec::new()),
             initialized: std::sync::atomic::AtomicBool::new(false),
-            load_shedder: Arc::new(crate::load_shed::LoadShedder::new()),
         }
     }
 }
@@ -500,14 +481,6 @@ impl AdmissionGateCache {
     #[must_use]
     pub fn active_count(&self) -> usize {
         self.gates.read().map_or(0, |g| g.len())
-    }
-
-    /// The automatic load-shed gate (issue #1794).
-    ///
-    /// The fail-closed flag does not apply to it. It fails open on stale data.
-    #[must_use]
-    pub const fn load_shedder(&self) -> &Arc<crate::load_shed::LoadShedder> {
-        &self.load_shedder
     }
 }
 
@@ -880,61 +853,6 @@ pub fn global_admission_metrics() -> Option<Arc<dyn crate::telemetry::MetricsRec
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()
-}
-
-/// The result of [`resolve_metrics_with_global_fallback`].
-///
-/// Owns the process-global `Arc`, when it was the one resolved, so the
-/// reference [`Self::as_dyn`] hands back stays valid for as long as this
-/// value is kept alive.
-pub enum ResolvedMetrics<'a> {
-    /// The caller supplied a recorder directly.
-    Caller(&'a (dyn crate::telemetry::MetricsRecorder + Send + Sync)),
-    /// The caller supplied none; the process-global recorder was installed.
-    Global(Arc<dyn crate::telemetry::MetricsRecorder>),
-    /// The caller supplied none and no process-global recorder is installed.
-    Absent,
-}
-
-impl ResolvedMetrics<'_> {
-    /// Borrow the resolved recorder, if any.
-    #[must_use]
-    pub fn as_dyn(&self) -> Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)> {
-        match self {
-            // A tuple-free `match` still needs the explicit `+ Send + Sync`
-            // coercion at each arm: `dyn MetricsRecorder` alone (without the
-            // trait's own `Send + Sync` supertraits re-asserted at the
-            // reference site) does not unify with the annotated return type,
-            // even though every concrete implementor must already be
-            // `Send + Sync` (the trait declares them as supertraits).
-            Self::Caller(m) => Some(*m),
-            Self::Global(g) => Some(g.as_ref()),
-            Self::Absent => None,
-        }
-    }
-}
-
-/// Resolve an optional caller-supplied metrics recorder, falling back to the
-/// process-global recorder ([`global_admission_metrics`]) when the caller
-/// passed `None`.
-///
-/// Centralizes a fallback needed at every terminal chokepoint that has no
-/// caller-supplied recorder in scope — the cancel / terminate /
-/// parent-close-cascade paths in `execution.rs` all call
-/// `completion_trigger::evaluate_triggers_for_execution_collecting` (and,
-/// transitively, `concurrency::supersede_running_for_key`) with
-/// `metrics: None`. Without this fallback, a signal recorded at one of those
-/// chokepoints (an admission-gate block, issue #618 F-round5; a nested-
-/// admission residual, issue #1197 item 2) would be dropped-and-recorded but
-/// never counted.
-#[must_use]
-pub fn resolve_metrics_with_global_fallback(
-    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
-) -> ResolvedMetrics<'_> {
-    metrics.map_or_else(
-        || global_admission_metrics().map_or(ResolvedMetrics::Absent, ResolvedMetrics::Global),
-        ResolvedMetrics::Caller,
-    )
 }
 
 // ── DB layer (requires `db` feature) ─────────────────────────────────────────
@@ -1514,7 +1432,7 @@ mod tests {
                 ProducerGateStatus::GatedAtAdmission,
                 "{split} must be gated-at-admission"
             );
-            assert_ne!(e.rationale, "");
+            assert!(!e.rationale.is_empty());
         }
         // The cross-shard completion-trigger relay is gated authoritatively at
         // relay time (issue #618, F-round7).
@@ -1523,7 +1441,7 @@ mod tests {
             .find(|e| e.producer == "completion_trigger_outbox")
             .expect("completion_trigger_outbox entry");
         assert_eq!(cto.status, ProducerGateStatus::GatedAtRelay);
-        assert_ne!(cto.rationale, "");
+        assert!(!cto.rationale.is_empty());
         // Throttle is gated authoritatively at fire time (issue #1053): a closed
         // gate blocks the deferred fire and RE-DEFERS the row (nothing dropped).
         let throttle = contract
@@ -1531,7 +1449,7 @@ mod tests {
             .find(|e| e.producer == "throttle")
             .expect("throttle entry");
         assert_eq!(throttle.status, ProducerGateStatus::GatedAtRelay);
-        assert_ne!(throttle.rationale, "");
+        assert!(!throttle.rationale.is_empty());
         // The transactional in-process start (issue #763) is gated via
         // `check_cached`, not exempt — see `start_workflow_transactional`'s
         // doc comment for why `check_cached` (not `check`) is the right choice
@@ -1541,7 +1459,7 @@ mod tests {
             .find(|e| e.producer == "transactional")
             .expect("transactional entry");
         assert_eq!(transactional.status, ProducerGateStatus::Gated);
-        assert_ne!(transactional.rationale, "");
+        assert!(!transactional.rationale.is_empty());
     }
 
     #[test]
