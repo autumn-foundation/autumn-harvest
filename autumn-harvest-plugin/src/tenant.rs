@@ -414,7 +414,12 @@ pub(crate) async fn enforce_tenant_binding(
     };
     match stored_tenant(&api_state, exec_id).await {
         Ok(Some(Some(owner))) if owner == tenant => Response::from_parts(parts, Body::from(bytes)),
-        Err(StoreUnavailable) => unavailable(),
+        // The start has committed, and the engine has checked and stamped the
+        // tenant. A `503` here makes a retry start a second run.
+        Err(StoreUnavailable) => {
+            tracing::warn!(path = %path, "harvest: tenant start owner check skipped");
+            Response::from_parts(parts, Body::from(bytes))
+        }
         Ok(owner) => {
             let summary = format!(
                 "start resolved to a run of another tenant (tenant={tenant:?}, owner={:?})",
@@ -445,6 +450,44 @@ pub(crate) async fn refuse_tenant_bound_mcp_tool(request: Request, next: Next) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A committed start keeps its answer when the owner check cannot reach
+    /// the store (issue #1977). Otherwise a retry starts a second run.
+    #[tokio::test]
+    async fn a_committed_start_survives_an_unavailable_owner_check() {
+        use tower::ServiceExt as _;
+        let exec_id = ExecutionId::new_for_shard(autumn_harvest::types::ShardId::new(0));
+        let body = serde_json::json!({ "execution_id": exec_id.to_string() }).to_string();
+        let app = axum::Router::new()
+            .route(
+                "/workflows/{name}/start",
+                axum::routing::post(move || {
+                    let body = body.clone();
+                    async move { (StatusCode::CREATED, body) }
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                HarvestApiState::new(),
+                enforce_tenant_binding,
+            ))
+            .layer(axum::middleware::from_fn(
+                |mut request: Request, next: Next| async move {
+                    let tenant = VerifiedTenant::new("acme").expect("valid tenant");
+                    request.extensions_mut().insert(tenant);
+                    next.run(request).await
+                },
+            ));
+        let request = Request::post("/workflows/wf/start")
+            .body(Body::empty())
+            .expect("request");
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(value["execution_id"], exec_id.to_string());
+    }
 
     #[test]
     fn tenant_scoped_routes_are_classified_routes() {
