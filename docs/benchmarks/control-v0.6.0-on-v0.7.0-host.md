@@ -1,7 +1,7 @@
 # Same-box control: the 0.6.0 harness on the 0.7.0 host
 
 The 0.6.0 end-to-end suite (`b407659`, the commit that published
-[`results-v0.6.0.md`](results-v0.6.0.md)) run on the host and clusters of
+[`results-v0.6.0.md`](results-v0.6.0.md)) ran on the host and clusters of
 [`results-v0.7.0.md`](results-v0.7.0.md). It separates the host from the
 release. It is a control, not a published baseline: one sweep, post hoc, not
 pre-registered.

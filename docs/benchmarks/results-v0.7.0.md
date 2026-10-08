@@ -86,8 +86,8 @@ What it shows:
 * **0.7.0 is slower than 0.6.0 at one and two shards on this host.** It is
   14% lower at one shard and 11% lower at two. At four shards the two are
   level. Each figure is one sweep, and the 0.7.0 sweep's noise control read
-  7.9%, so the size of the change is uncertain. The direction is the same at both
-  shard counts.
+  7.9%, so the size of the change is uncertain. The direction is the same
+  at both shard counts.
 * **0.7.0 dispatches faster at low shard counts.** The dispatch p50 is 16.12
   ms against 45.31 at one shard, and 26.17 against 42.86 at two.
 * **0.6.0 broke down at four shards on this host.** Its dispatch p50 read

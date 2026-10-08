@@ -32,7 +32,6 @@ SIGNALS = [
     "persist_mean_ms",
     "scan_mean_ms",
     "heartbeat_mean_ms",
-    "wait_p99_ms",
     "in_use_mean",
 ]
 
@@ -41,11 +40,19 @@ TEMPORAL_REP_RE = re.compile(
     r"^rep \d+: ([0-9.]+) workflows/sec \(.*correctness (PASS|FAIL)(, TRUNCATED)?\)$",
     re.MULTILINE,
 )
+# The Go arm prints this when a seed fails. It is an invalid run.
+TEMPORAL_DISCARD_RE = re.compile(r"^rep \d+: seeded \d+ of \d+, discarded$", re.MULTILINE)
 
 
 def parse_cell_line(line):
     """Return the key=value pairs of one harvest `cell` line."""
     return dict(part.split("=", 1) for part in line.split()[1:] if "=" in part)
+
+
+def round_of(path):
+    """The round of a Temporal run, from its `r<round>-` file name."""
+    match = ROUND_FILE_RE.match(path.name)
+    return match.group(1) if match else "?"
 
 
 def load(directory):
@@ -63,14 +70,16 @@ def load(directory):
         backlog = BACKLOG_RE.search(text)
         if backlog and "Temporal arm" in text:
             depth = int(backlog.group(1))
+            for _ in TEMPORAL_DISCARD_RE.finditer(text):
+                run = {"wfps": 0.0, "valid": False, "file": path.name, "rep": round_of(path)}
+                runs.setdefault((TEMPORAL_TREE, TEMPORAL_ARM, depth), []).append(run)
             for match in TEMPORAL_REP_RE.finditer(text):
                 valid = match.group(2) == "PASS" and not match.group(3)
-                name_round = ROUND_FILE_RE.match(path.name)
                 run = {
                     "wfps": float(match.group(1)),
                     "valid": valid,
                     "file": path.name,
-                    "rep": name_round.group(1) if name_round else "?",
+                    "rep": round_of(path),
                 }
                 runs.setdefault((TEMPORAL_TREE, TEMPORAL_ARM, depth), []).append(run)
     return runs
@@ -115,6 +124,10 @@ def signal_mean(runs, key, signal):
 
 def fmt(value):
     return "n/a" if value is None else f"{value:.2f}"
+
+
+def fmt_x(value):
+    return "n/a" if value is None else f"{value:.2f}x"
 
 
 def cell_table(runs):
@@ -208,11 +221,16 @@ def lines(runs):
     # L2.
     verdicts, parts = [], []
     for depth in DEPTHS:
-        best = [cell_mean(runs, TRUNK, a, depth) for a in HARVEST_ARMS]
-        best = None if None in best else max(best)
+        means = {a: cell_mean(runs, TRUNK, a, depth) for a in HARVEST_ARMS}
+        best_arm = None if None in means.values() else max(means, key=means.get)
+        best = None if best_arm is None else means[best_arm]
         t = cell_mean(runs, TEMPORAL_TREE, TEMPORAL_ARM, depth)
         verdicts.append(None if best is None or t is None else best >= t)
-        parts.append(f"{depth}: {fmt(best)} against {fmt(t)}")
+        note = ""
+        if best_arm is not None:
+            o = overlap(runs, (TRUNK, best_arm, depth), (TEMPORAL_TREE, TEMPORAL_ARM, depth))
+            note = "" if o is None else (", ranges overlap" if o else ", no overlap")
+        parts.append(f"{depth}: {fmt(best)} against {fmt(t)}{note}")
     ok = None if None in verdicts else all(verdicts)
     out.append(f"* **L2** best mode on `{TRUNK}` at every depth ({'; '.join(parts)}): {grade(ok)}.")
 
@@ -233,7 +251,7 @@ def lines(runs):
     ratio = None if ok is None or before == 0 else deep / before
     out.append(
         f"* **L4** `postgres` at 2000, `{FIX}` over `{BASE}`: {fmt(deep)} / {fmt(before)} "
-        f"= {fmt(ratio)}x against a 2.0x line: {grade(ok)}."
+        f"= {fmt_x(ratio)} against a 2.0x line: {grade(ok)}."
         + overlap_note(runs, (FIX, "postgres", 2000), (BASE, "postgres", 2000))
     )
 
@@ -242,7 +260,8 @@ def lines(runs):
     ratio = None if ok is None else t2000 / deep
     out.append(
         f"* **L5** `temporal_go` over `postgres` on `{FIX}` at 2000: {fmt(t2000)} / "
-        f"{fmt(deep)} = {fmt(ratio)}x against a 2.5x line: {grade(ok)}."
+        f"{fmt(deep)} = {fmt_x(ratio)} against a 2.5x line: {grade(ok)}."
+        + overlap_note(runs, temporal_2000, (FIX, "postgres", 2000))
     )
     return "\n".join(out)
 

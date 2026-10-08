@@ -36,15 +36,19 @@ mkdir -p "$OUT"
 for round in $(seq 0 $((ROUNDS - 1))); do
   echo "==> round $round, $(date -u +%FT%TZ)"
   for depth in ${DEPTHS//,/ }; do
+    # A failed run stays in the record and leaves its cell incomplete. It does
+    # not stop the sweep.
     ASSAY11_REPS=1 ASSAY11_WORKFLOWS="$depth" "$TEMPORAL_DIR/run.sh" \
-      > "$OUT/r${round}-temporal-d${depth}.txt" 2>&1
+      > "$OUT/r${round}-temporal-d${depth}.txt" 2>&1 ||
+      echo "run failed: exit $?" >> "$OUT/r${round}-temporal-d${depth}.txt"
     grep '^rep ' "$OUT/r${round}-temporal-d${depth}.txt" || true
   done
   for pair in ${BINS//,/ }; do
     tree="${pair%%=*}"
     bin="${pair#*=}"
     ASSAY14_TREE="$tree" ASSAY14_ROUND="$round" ASSAY14_DEPTHS="$DEPTHS" "$bin" \
-      > "$OUT/r${round}-${tree}.txt" 2>&1
+      > "$OUT/r${round}-${tree}.txt" 2>&1 ||
+      echo "run failed: exit $?" >> "$OUT/r${round}-${tree}.txt"
     grep '^cell ' "$OUT/r${round}-${tree}.txt" | cut -d' ' -f2-7 || true
   done
 done

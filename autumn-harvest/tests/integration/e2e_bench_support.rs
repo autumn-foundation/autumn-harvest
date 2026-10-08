@@ -1235,7 +1235,7 @@ pub struct Baseline {
     pub value: f64,
 }
 
-/// The numbers published in `docs/benchmarks/results-v0.6.0.md`.
+/// The numbers published in `docs/benchmarks/results-v<PUBLISHED_RESULTS_VERSION>.md`.
 ///
 /// These are the *headline* metrics only — the ones issue #941's success metric
 /// names. The report also prints context metrics (sample counts, achieved pace,

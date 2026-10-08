@@ -24,9 +24,9 @@ Registered questions:
 
 | label | commit | what it is |
 |:--|:--|:--|
-| base | `0aeb887` | 0.7.0, the base of PR #2052 |
+| base | `0aeb887` | 0.7.0 before DR fencing (#1823), the base of PR #2052 |
 | fix | `513b7aa` | the head of PR #2052, with the #1971 claim fix |
-| trunk | `9f444b7` | the `trunk-dev` head that this change ships on |
+| trunk | `9f444b7` | 0.7.0 as it ships: the `trunk-dev` head when the sweep ran |
 | Temporal | `1.25.2` | `temporalio/auto-setup:1.25.2`, digest `b1edc1e20002`, Go SDK `v1.36.0` |
 
 - **Harvest arms.** Assay #10's workload, ported by value. One binary per
@@ -61,6 +61,26 @@ or the workload.
 that probe never saw a dispatch key. The residue checks of assays #10 and #11
 therefore verified nothing. This assay's probe reads both key families. A
 smoke run saw 167 tagged keys mid-run, then a residue of `0/0/0`.
+
+### Changes after the sweep
+
+Review (PR #2055) found four grader and driver gaps after the sweep. None
+changes a grade. `grade.py` reproduces every grade above from the same raw
+output.
+
+- L2 and L5 now print the overlap note that the pre-registration's
+  separation rule asks for. No pair overlaps.
+- A Temporal seed failure (`seeded N of M, discarded`) now counts as an
+  invalid run. None occurred.
+- The attribution set drops `wait_p99_ms`, because the rule names means
+  only. The named signal does not change.
+- `run.sh` records a failed run and goes on, in place of stopping the sweep.
+  No run failed.
+
+The #1815 samples also cover the worker shutdown, a few claims and scans per
+run. At depth 2,000 that is about 3 claims in 14,000.
+
+### Smoke runs
 
 Two smoke runs checked the apparatus after the fixes: a harvest run at depth
 300 and a Temporal run at depth 50. They are not cells and no table uses them.
@@ -123,7 +143,7 @@ All 84 runs are valid: every workflow completed, activity runs equal
 
 `9f444b7` / `postgres` / depth 500, round 2, reads **6.59** against 13.83 and
 13.78 in rounds 0 and 1. The run is valid, so the registered rules keep it.
-Its load average at start was 3.76, as in its siblings. Its claim p99 was
+Its load average at start was 3.76, between its siblings' 3.32 and 3.85. Its claim p99 was
 241 ms, against 17 to 19 ms in its siblings. That is the claim signature of
 depth 1,000 and 2,000 on the unfixed trees, here at depth 500. Assay #12 saw
 a wide, possibly bimodal spread on this arm at depth 1,000. This assay shows
@@ -138,10 +158,10 @@ cell, but its grade does not depend on it: 13.81 is still below `redis_pg`'s
 The lines, as `grade.py` printed them:
 
 * **L1** `postgres` on `9f444b7` at 2000: 4.00 against `temporal_go` 28.69: **KILL**. Ranges do not overlap.
-* **L2** best mode on `9f444b7` at every depth (250: 14.27 against 24.77; 500: 14.61 against 26.43; 1000: 13.89 against 28.14; 2000: 13.67 against 28.69): **KILL**.
+* **L2** best mode on `9f444b7` at every depth (250: 14.27 against 24.77, no overlap; 500: 14.61 against 26.43, no overlap; 1000: 13.89 against 28.14, no overlap; 2000: 13.67 against 28.69, no overlap): **KILL**.
 * **L3** `postgres` on `513b7aa`, depth 2000 over depth 250: 21.14 / 21.30 = 0.99 against a 0.80 line: **PASS**. Ranges overlap.
 * **L4** `postgres` at 2000, `513b7aa` over `0aeb887`: 21.14 / 4.05 = 5.23x against a 2.0x line: **PASS**. Ranges do not overlap.
-* **L5** `temporal_go` over `postgres` on `513b7aa` at 2000: 28.69 / 21.14 = 1.36x against a 2.5x line: **PASS**.
+* **L5** `temporal_go` over `postgres` on `513b7aa` at 2000: 28.69 / 21.14 = 1.36x against a 2.5x line: **PASS**. Ranges do not overlap.
 
 The L3 ranges overlap, as a flat curve predicts. Overlap does not change a
 grade.
@@ -157,6 +177,7 @@ What the lines say:
    falls from 13.86 to 4.05. At depth 2,000 the fix is 5.23x faster.
 3. **After the fix, Temporal still wins at every depth, by 1.16x to 1.36x.**
    Assay #11 predicted "roughly 2x". The measured gap is smaller.
+
 Items 4 and 5 are post hoc. No line registered them.
 
 4. **The fix also helps the shallow backlog.** At depth 250, `513b7aa`
@@ -211,8 +232,8 @@ when it merges, not what 0.7.0 ships.
    concurrent claimer, or a batched claim, is the next lever. Re-run this
    matrix after it lands.
 2. **The depth-500 outlier.** The claim-p99 signature points to a plan flip
-   on the unfixed trees. Fresh statistics after the seed are the untested
-   candidate, as in assay #13.
+   on the unfixed trees. Stale planner statistics after a fresh seed are the
+   untested candidate, as in assay #13.
 3. **The open-benchmark stretch goals of #1972.** Crash-recovery time, a run
    long enough to expose bloat, and payload and step-count sweeps.
 4. **A tuned Temporal arm**, configured by someone who operates Temporal.

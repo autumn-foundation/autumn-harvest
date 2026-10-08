@@ -63,10 +63,10 @@
 ## Lines
 
 * **L1** `postgres` on `9f444b7` at 2000: 4.00 against `temporal_go` 28.69: **KILL**. Ranges do not overlap.
-* **L2** best mode on `9f444b7` at every depth (250: 14.27 against 24.77; 500: 14.61 against 26.43; 1000: 13.89 against 28.14; 2000: 13.67 against 28.69): **KILL**.
+* **L2** best mode on `9f444b7` at every depth (250: 14.27 against 24.77, no overlap; 500: 14.61 against 26.43, no overlap; 1000: 13.89 against 28.14, no overlap; 2000: 13.67 against 28.69, no overlap): **KILL**.
 * **L3** `postgres` on `513b7aa`, depth 2000 over depth 250: 21.14 / 21.30 = 0.99 against a 0.80 line: **PASS**. Ranges overlap.
 * **L4** `postgres` at 2000, `513b7aa` over `0aeb887`: 21.14 / 4.05 = 5.23x against a 2.0x line: **PASS**. Ranges do not overlap.
-* **L5** `temporal_go` over `postgres` on `513b7aa` at 2000: 28.69 / 21.14 = 1.36x against a 2.5x line: **PASS**.
+* **L5** `temporal_go` over `postgres` on `513b7aa` at 2000: 28.69 / 21.14 = 1.36x against a 2.5x line: **PASS**. Ranges do not overlap.
 
 ## Attribution
 

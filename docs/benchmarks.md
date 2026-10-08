@@ -49,18 +49,19 @@ full environment, the per-cell notes and the verbatim run output are in
 | `signal_roundtrip` | p99 ms | 92.99 | 95.52 | 118.00 |
 | `replay_throughput` | events/sec | 9 750 423.86 | 9 063 901.37 | 8 981 387.93 |
 
-Read these four points before the table:
+Read these four points with the table:
 
 * **This is a different host from 0.6.0, and most of the drop is the host.**
-  The results file runs the 0.6.0 suite on this host as a control. There,
+  A same-box control, linked from the results file, runs the 0.6.0 suite on
+  this host. There,
   0.6.0 reads 17.91 workflows/sec at one shard, against 23.73 on its own
   host. On the same host, 0.7.0 is 14% below 0.6.0 at one shard, 11% below at
   two and level at four. It dispatches faster: a 1-shard p50 of 16.12 ms
   against 45.31.
 * **The box was quiet, but less quiet than for 0.6.0.** The replay control
   spread **7.9%** against 0.8% for 0.6.0. That is inside the 10% bar. On four
-  cores, a concurrent build once moved a published latency by more than 10x,
-  so check your own run's noise-control section before you compare anything.
+  cores, a concurrent build once moved a published latency by more than 10x.
+  Check your own run's noise-control section before you compare anything.
 * **Sharding bought 1.22x at two shards and 1.26x at four.** Four shards
   share four cores with four Postgres clusters and the harness. See
   [what the shard sweep can and cannot show](#what-the-shard-sweep-can-and-cannot-show).

@@ -73,6 +73,8 @@ Ways to meet each criterion:
 |:--|:--|
 | `assay_rerun_docs::the_preregistration_is_committed_and_cited` | the files do not exist |
 | `assay_rerun_docs::the_report_publishes_every_registered_cell` | no report |
+| `assay_rerun_docs::the_report_cells_match_the_grader_output` | added in review; pins the hand copy to `graded.md` |
+| `benchmarks_docs::every_headline_number_sits_in_its_own_cell_on_the_index_page` | added in review; catches swapped cells |
 | `assay_rerun_docs::the_ledger_lists_the_rerun` | no row 14 |
 | `assay_rerun_docs::comparison_cites_the_rerun_instead_of_disclaiming` | the page disclaims |
 | `benchmarks_docs` (version `0.7.0`) | no `results-v0.7.0.md` |
