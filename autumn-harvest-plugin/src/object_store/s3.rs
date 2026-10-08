@@ -6,9 +6,10 @@
 //!
 //! Grant `s3:ListBucket` as well as `s3:GetObject`. Without it, AWS answers a
 //! read of a missing key with 403, and the backend reports an error, not a
-//! missing object. For a
-//! store that is not AWS, set `endpoint_url` and `force_path_style(true)` on
-//! the client config.
+//! missing object.
+//!
+//! For a store that is not AWS, set `endpoint_url` and `force_path_style(true)`
+//! on the client config.
 //!
 //! ```text
 //! use autumn_harvest_plugin::object_store::s3::{S3Backend, aws_sdk_s3};
