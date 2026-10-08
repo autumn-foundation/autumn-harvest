@@ -239,6 +239,8 @@ pub mod calendar;
 /// Reserved names + predicates for the throwaway workflow that probes the live
 /// execution path. Distinct from the #512 replay canary.
 pub mod canary;
+/// Cancellation scopes and non-cancellable blocks (issue #1984).
+pub mod cancellation_scope;
 /// Deterministic chaos/fault-injection test harness (issue #940).
 ///
 /// [`chaos::points`] is unconditional (a zero-cost const catalogue of named
@@ -602,6 +604,7 @@ pub use calendar::{
 pub use canary::{
     CANARY_ACTIVITY_NAME, CANARY_WORKFLOW_NAME_PREFIX, is_canary_workflow, is_reserved_canary_name,
 };
+pub use cancellation_scope::CancellationScope;
 pub use completion_trigger::{
     CompletionTrigger, ConditionGate, InputMapping, MAX_CONDITION_DEPTH, MAX_CONDITION_IN_VALUES,
     MAX_CONDITION_NODES, TerminalState, TriggerCondition, gate_stored_condition,

@@ -9,6 +9,7 @@ pub use crate::builder::{HarvestBuilder, WorkerConfig};
 pub use crate::calendar::{
     Calendar, ScheduleFirePreview, apply_skip_policy, calendar_excludes_weekends, is_excluded_date,
 };
+pub use crate::cancellation_scope::CancellationScope;
 pub use crate::circuit_breaker::{
     AttemptOutcome, CircuitBreakerRegistry, CircuitPhase, CircuitSnapshot, CircuitTransition,
     DispatchDecision, DispatchToken,

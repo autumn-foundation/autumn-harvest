@@ -94,6 +94,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          business_day_timer_tests
 linux        autumn-harvest         integration                      -                          cache_delta_load_tests
 linux        autumn-harvest         integration                      -                          canary_tests
+linux        autumn-harvest         integration                      -                          cancellation_scope_tests
 linux        autumn-harvest         integration                      -                          cancellation_tests
 linux        autumn-harvest         integration                      -                          capability_miss_tests
 linux        autumn-harvest         integration                      -                          chain_timeout_tests
