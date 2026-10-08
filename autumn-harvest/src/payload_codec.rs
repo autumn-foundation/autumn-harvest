@@ -1714,8 +1714,8 @@ impl PayloadCodecs {
 
     /// [`PayloadCodecs::encode_column`] for a shared value.
     ///
-    /// While column encoding is off and no escape is needed, this returns a
-    /// second handle to the same allocation, so a large input is not copied.
+    /// While column encoding is off, this usually returns a second handle to
+    /// the same allocation. So a large input is not copied.
     ///
     /// # Errors
     ///
