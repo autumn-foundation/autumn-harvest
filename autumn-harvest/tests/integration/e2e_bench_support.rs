@@ -2653,6 +2653,9 @@ pub mod db {
         /// run on a shared server can see the databases are in use. Same
         /// rationale as the claim harness's lease.
         leases: BTreeMap<ShardId, AsyncPgConnection>,
+        /// Shards whose setup-counter reset failed. Their views hold the setup
+        /// too, so teardown writes no snapshot for them and reports why.
+        reset_failures: BTreeMap<ShardId, String>,
     }
 
     static DB_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -2874,7 +2877,7 @@ pub mod db {
         admin_url: &str,
         shard: ShardId,
         sweep: bool,
-    ) -> Result<(String, String, AsyncPgConnection), SkipReason> {
+    ) -> Result<(String, String, AsyncPgConnection, Option<String>), SkipReason> {
         let (url, name, mut conn) = if sweep {
             with_stale_sweep(admin_url, create_shard_database_lease(admin_url, shard)).await?
         } else {
@@ -2887,13 +2890,16 @@ pub mod db {
         }
         // With a stats snapshot to come, clear the setup out of both views.
         // The teardown snapshot then holds the scenario only, warmup included.
+        // A failed reset is kept, so teardown can refuse that snapshot.
         let raw = std::env::var(STATS_DIR_ENV_VAR).ok();
-        if stats_dir_from(raw.as_deref()).is_some()
-            && let Err(e) = super::super::pg_stats_snapshot::reset_counters(&mut conn).await
-        {
-            eprintln!("warning: shard {name}: {e}. Its stats snapshot includes the setup.");
-        }
-        Ok((url, name, conn))
+        let reset_failure = if stats_dir_from(raw.as_deref()).is_some() {
+            super::super::pg_stats_snapshot::reset_counters(&mut conn)
+                .await
+                .err()
+        } else {
+            None
+        };
+        Ok((url, name, conn, reset_failure))
     }
 
     /// Provision the first `count` of `admin_urls`, one shard per server.
@@ -2934,16 +2940,20 @@ pub mod db {
         }
         let mut urls = BTreeMap::new();
         let mut leases = BTreeMap::new();
+        let mut reset_failures = BTreeMap::new();
         let mut created = Vec::new();
         for (idx, admin) in admin_urls.iter().take(count).enumerate() {
             let shard = ShardId::new(i32::try_from(idx).unwrap_or(0));
             // Each admin URL is potentially a different server, so the
             // stale-database sweep and its lock are per-shard here.
             match provision_one_shard(admin, shard, true).await {
-                Ok((url, name, lease)) => {
+                Ok((url, name, lease, reset_failure)) => {
                     urls.insert(shard, url);
                     created.push(((*admin).to_owned(), name));
                     leases.insert(shard, lease);
+                    if let Some(e) = reset_failure {
+                        reset_failures.insert(shard, e);
+                    }
                 }
                 // Shard 3 of 4 failing is the common case (one server slower
                 // to accept connections). Without this, shards 0-2 are
@@ -2961,6 +2971,7 @@ pub mod db {
             created,
             _container: None,
             leases,
+            reset_failures,
         })
     }
 
@@ -3019,6 +3030,7 @@ pub mod db {
 
         let mut urls = BTreeMap::new();
         let mut leases = BTreeMap::new();
+        let mut reset_failures = BTreeMap::new();
         let mut created = Vec::new();
         // Every shard shares this one server, so each gets its own sweep and
         // lock hold. This is skipped only on the testcontainer path. Nothing
@@ -3027,10 +3039,13 @@ pub mod db {
         for idx in 0..count {
             let shard = ShardId::new(i32::try_from(idx).unwrap_or(0));
             match provision_one_shard(&admin_url, shard, sweep).await {
-                Ok((url, name, lease)) => {
+                Ok((url, name, lease, reset_failure)) => {
                     urls.insert(shard, url);
                     created.push((admin_url.clone(), name));
                     leases.insert(shard, lease);
+                    if let Some(e) = reset_failure {
+                        reset_failures.insert(shard, e);
+                    }
                 }
                 Err(e) => {
                     drop(leases);
@@ -3045,6 +3060,7 @@ pub mod db {
             created,
             _container: container,
             leases,
+            reset_failures,
         })
     }
 
@@ -3121,6 +3137,13 @@ pub mod db {
             for (shard, lease) in &mut self.leases {
                 let index = usize::try_from(shard.as_i32()).unwrap_or_default();
                 let label = stats_label(scenario, shards, index);
+                if let Some(e) = self.reset_failures.get(shard) {
+                    failures.push(format!(
+                        "{label} stats snapshot: not written, because the setup reset failed \
+                         and the views hold the setup too: {e}"
+                    ));
+                    continue;
+                }
                 match tokio::time::timeout(
                     SNAPSHOT_BOUND,
                     snapshot_conn_to_dir(lease, &dir, &label),
