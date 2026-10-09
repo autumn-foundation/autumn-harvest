@@ -3,7 +3,8 @@
 //! Each test drives the task route of a full plugin-wired app against a real
 //! Postgres. The tests prove the three acceptance criteria of the issue:
 //!
-//! 1. A task moves through the spec states, and each move is legal.
+//! 1. A task moves through the spec states, and each move is legal. A
+//!    terminal status does not change on later polls.
 //! 2. A retried task-create request starts one execution.
 //! 3. An `input_required` task resumes when the client supplies input.
 //!
@@ -13,12 +14,13 @@
 #![cfg(feature = "mcp")]
 #![allow(clippy::unused_async, clippy::used_underscore_binding)]
 
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use autumn_harvest::prelude::*;
 use autumn_harvest_plugin::HarvestPlugin;
 use autumn_harvest_plugin::mcp_tasks::{
-    CLIENT_CAPABILITIES_META, START_KEY_META, TASKS_EXTENSION, TaskStatus,
+    CLIENT_CAPABILITIES_META, PAYLOAD_FIELD, START_KEY_META, TASKS_EXTENSION, TaskStatus,
 };
 use autumn_web::test::{TestApp, TestClient};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -30,6 +32,7 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 const TASKS: &str = "/api/harvest/mcp/tasks";
+const RETENTION: Duration = Duration::from_secs(30 * 86_400);
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
@@ -81,6 +84,42 @@ async fn task_parked_flow(ctx: &WorkflowContext, _input: String) -> Result<(), S
     Ok(())
 }
 
+/// The inputs that `flaky_gate` has failed once.
+static FLAKY_SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Fails the first time it sees an input. An activity holds this state,
+/// because a workflow body must not touch process globals.
+#[activity]
+async fn flaky_gate(_ctx: &ActivityContext, input: String) -> Result<(), String> {
+    let mut seen = FLAKY_SEEN.lock().unwrap_or_else(PoisonError::into_inner);
+    if seen.contains(&input) {
+        return Ok(());
+    }
+    seen.push(input);
+    Err("transient".to_string())
+}
+
+/// Fails on the first attempt for each input. The gate has no activity
+/// retry, so the workflow retry policy runs a second attempt. That attempt
+/// holds the run open for 1 s and then succeeds.
+#[workflow(mcp)]
+async fn task_flaky_flow(ctx: &WorkflowContext, input: String) -> Result<String, String> {
+    ctx.execute_activity_raw_with_opts(
+        "flaky_gate",
+        json!(input),
+        "default",
+        Some(autumn_harvest::policy::RetryPolicy::exponential(
+            1,
+            Duration::from_millis(100),
+        )),
+        None,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    ctx.timer("settle", 1).await.map_err(|e| e.to_string())?;
+    Ok("recovered".to_string())
+}
+
 /// Not an MCP workflow. Its runs are not tasks.
 #[workflow]
 async fn task_hidden_flow(ctx: &WorkflowContext, _input: String) -> Result<(), String> {
@@ -97,9 +136,18 @@ fn harvest_plugin() -> HarvestPlugin {
             __autumn_workflow_info_task_two_step_flow(),
             __autumn_workflow_info_task_failing_flow(),
             __autumn_workflow_info_task_parked_flow(),
+            __autumn_workflow_info_task_flaky_flow().with_retry_policy(
+                autumn_harvest::policy::RetryPolicy::exponential(3, Duration::from_millis(200)),
+            ),
             __autumn_workflow_info_task_hidden_flow(),
         ])
+        .activities(activities![flaky_gate])
         .worker(WorkerConfig::default())
+        // A long retention gives an ended task a TTL. No run is old enough to
+        // be deleted during a test.
+        .retention(autumn_harvest::retention::RetentionConfig::with_max_age(
+            RETENTION,
+        ))
         .api("/api/harvest")
         .mcp_tasks()
         // Issue #1802: set the opt-out. These tests exercise tasks, not auth.
@@ -164,8 +212,12 @@ async fn setup_db() -> TestPg {
     }
 }
 
+/// The client capabilities of a client that takes tasks and elicitations.
 fn declared() -> Value {
-    json!({CLIENT_CAPABILITIES_META: {"extensions": {TASKS_EXTENSION: {}}}})
+    json!({CLIENT_CAPABILITIES_META: {
+        "extensions": {TASKS_EXTENSION: {}},
+        "elicitation": {},
+    }})
 }
 
 async fn rpc_with(client: &TestClient, body: Value, idempotency_key: Option<&str>) -> Value {
@@ -252,17 +304,31 @@ fn only_key(task: &Value) -> String {
     requests.keys().next().unwrap().clone()
 }
 
-async fn answer(client: &TestClient, task_id: &str, key: &str, content: Value) -> Value {
-    rpc(
-        client,
-        "tasks/update",
-        json!({
+fn update_call(task_id: &str, key: &str, action: &str, content: &Value) -> Value {
+    json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tasks/update",
+        "params": {
             "taskId": task_id,
-            "inputResponses": {key: {"action": "accept", "content": content}},
+            "inputResponses": {key: {"action": action, "content": content}},
             "_meta": declared(),
-        }),
-    )
-    .await
+        }
+    })
+}
+
+async fn answer(client: &TestClient, task_id: &str, key: &str, content: Value) -> Value {
+    let out = rpc_with(client, update_call(task_id, key, "accept", &content), None).await;
+    assert!(out.get("error").is_none(), "tasks/update: {out}");
+    out["result"].clone()
+}
+
+/// After a terminal status, a few more polls see the same status and result.
+async fn assert_settled(client: &TestClient, task_id: &str, done: &Value) {
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let again = get_task(client, task_id).await;
+        assert_eq!(again["status"], done["status"], "a terminal status moved");
+        assert_eq!(again["result"], done["result"], "a terminal result moved");
+    }
 }
 
 async fn count_runs(db: &TestPg, workflow: &str) -> i64 {
@@ -296,7 +362,8 @@ fn assert_legal(seen: &[TaskStatus]) {
 // ── AC 1: spec state transitions ──────────────────────────────────────────────
 
 /// A task moves `working` -> `input_required` -> `working` -> `completed`.
-/// Every observed move is legal under the spec state diagram.
+/// Every observed move is legal under the spec state diagram, and the
+/// terminal status does not move on later polls.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_task_moves_through_the_spec_states() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -319,15 +386,25 @@ async fn a_task_moves_through_the_spec_states() {
     assert_eq!(waiting["resultType"], "complete");
     assert_eq!(waiting["createdAt"], created["createdAt"]);
     let key = only_key(&waiting);
-    assert!(key.contains(":signal:approval:1"), "{key}");
+    assert!(key.contains(":signal:approval:"), "{key}");
     let request = &waiting["inputRequests"][&key];
     assert_eq!(request["method"], "elicitation/create");
 
     // The key is stable while the run waits, so a client asks once.
-    let again = get_task(&client, &task_id).await;
+    let again = poll_until(&client, &task_id, &mut seen, |t| {
+        t["status"] == "input_required"
+    })
+    .await;
     assert_eq!(only_key(&again), key);
 
-    let ack = answer(&client, &task_id, &key, json!({"decision": "approve"})).await;
+    // A form client sends the payload as JSON text in the one field.
+    let ack = answer(
+        &client,
+        &task_id,
+        &key,
+        json!({PAYLOAD_FIELD: "{\"decision\": \"approve\"}"}),
+    )
+    .await;
     assert_eq!(ack, json!({"resultType": "complete"}));
 
     let done = poll_until(&client, &task_id, &mut seen, |t| status_of(t).is_terminal()).await;
@@ -335,17 +412,91 @@ async fn a_task_moves_through_the_spec_states() {
     assert_eq!(done["result"]["isError"], false);
     assert_eq!(done["result"]["content"][0]["text"], "\"r1:approve\"");
     assert_eq!(done["createdAt"], created["createdAt"]);
+    assert_settled(&client, &task_id, &done).await;
 
-    assert_legal(&seen);
-    let input = seen
+    // The first status can be `working` or `input_required`, as the run may
+    // park before the create returns.
+    let tail: Vec<TaskStatus> = seen
         .iter()
-        .position(|s| *s == TaskStatus::InputRequired)
-        .expect("input_required seen");
-    assert!(
-        seen[input..].contains(&TaskStatus::Working),
-        "the task must go back to working after the input: {seen:?}"
+        .copied()
+        .skip_while(|s| *s == TaskStatus::Working)
+        .collect();
+    assert_eq!(
+        tail,
+        [
+            TaskStatus::InputRequired,
+            TaskStatus::Working,
+            TaskStatus::Completed
+        ],
+        "{seen:?}"
     );
-    assert_eq!(seen.last(), Some(&TaskStatus::Completed));
+    assert_legal(&seen);
+}
+
+/// An ended task carries a TTL from the retention policy, counted from
+/// `createdAt`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ended_task_has_a_ttl_from_retention() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let db = setup_db().await;
+    let client = build_app(&db).await;
+
+    let created = create_task(&client, "start_task_failing_flow", json!("x")).await;
+    let task_id = created["taskId"].as_str().unwrap().to_string();
+    let mut seen = Vec::new();
+    let done = poll_until(&client, &task_id, &mut seen, |t| status_of(t).is_terminal()).await;
+    let ttl = done["ttlMs"].as_u64().expect("an ended task has a TTL");
+    let retention = u64::try_from(RETENTION.as_millis()).unwrap();
+    assert!(ttl >= retention, "{ttl} < {retention}");
+    assert!(ttl < retention + 60_000, "{ttl}");
+}
+
+/// A client that takes no elicitation sees no input request. The task reads
+/// as `working`, and its message names the signal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_without_elicitation_sees_no_input_request() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let db = setup_db().await;
+    let client = build_app(&db).await;
+
+    let created = create_task(&client, "start_task_parked_flow", json!("x")).await;
+    let task_id = created["taskId"].as_str().unwrap().to_string();
+    let mut seen = Vec::new();
+    poll_until(&client, &task_id, &mut seen, |t| {
+        t["status"] == "input_required"
+    })
+    .await;
+    let tasks_only = json!({CLIENT_CAPABILITIES_META: {"extensions": {TASKS_EXTENSION: {}}}});
+    let task = rpc(
+        &client,
+        "tasks/get",
+        json!({"taskId": task_id, "_meta": tasks_only}),
+    )
+    .await;
+    assert_eq!(task["status"], "working", "{task}");
+    assert_eq!(task["statusMessage"], "waiting for signal: never");
+    assert!(task.get("inputRequests").is_none(), "{task}");
+}
+
+/// A run with a workflow retry policy fails once and then succeeds. The task
+/// shows no terminal status until the retry ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retried_run_shows_no_early_terminal_status() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let db = setup_db().await;
+    let client = build_app(&db).await;
+
+    let input = uuid::Uuid::new_v4().to_string();
+    let created = create_task(&client, "start_task_flaky_flow", json!(input)).await;
+    let task_id = created["taskId"].as_str().unwrap().to_string();
+    let mut seen = vec![status_of(&created)];
+    let done = poll_until(&client, &task_id, &mut seen, |t| status_of(t).is_terminal()).await;
+    assert_eq!(done["status"], "completed", "{done}");
+    assert_eq!(done["result"]["isError"], false, "{done}");
+    assert_eq!(done["result"]["content"][0]["text"], "\"recovered\"");
+    assert_eq!(seen, [TaskStatus::Working, TaskStatus::Completed]);
+    assert_settled(&client, &task_id, &done).await;
+    assert_eq!(count_runs(&db, "task_flaky_flow").await, 2);
 }
 
 /// A workflow error is a tool error. The task is `completed` with
@@ -372,9 +523,8 @@ async fn a_workflow_error_completes_the_task_as_a_tool_error() {
     assert!(!seen.contains(&TaskStatus::Failed), "{seen:?}");
     assert_legal(&seen);
 
-    // A later poll reads the same result, and no retry run exists.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(get_task(&client, &task_id).await["status"], "completed");
+    // Later polls read the same result, and no retry run exists.
+    assert_settled(&client, &task_id, &done).await;
     assert_eq!(count_runs(&db, "task_failing_flow").await, 1);
 }
 
@@ -404,6 +554,7 @@ async fn tasks_cancel_moves_the_task_to_cancelled() {
     assert_eq!(done["status"], "cancelled", "{done}");
     assert!(done.get("result").is_none(), "{done}");
     assert_legal(&seen);
+    assert_settled(&client, &task_id, &done).await;
 
     assert_eq!(
         rpc(&client, "tasks/cancel", params).await,
@@ -438,19 +589,27 @@ async fn a_retried_task_create_starts_one_execution() {
     assert_eq!(first["result"]["taskId"], retry["result"]["taskId"]);
     assert_eq!(count_runs(&db, "task_parked_flow").await, 2);
 
+    // The header wins over `_meta`. A call that carries header `create-3`
+    // and `_meta` key `create-2` is a new task, not the `create-2` task.
+    let mut both = call.clone();
+    both["params"]["_meta"][START_KEY_META] = json!("create-2");
+    let header_wins = rpc_with(&client, both, Some("create-3")).await;
+    assert_ne!(header_wins["result"]["taskId"], first["result"]["taskId"]);
+    assert_eq!(count_runs(&db, "task_parked_flow").await, 3);
+
     // With no key, each call is a new task.
     let a = rpc_with(&client, call.clone(), None).await;
     let b = rpc_with(&client, call, None).await;
     assert_ne!(a["result"]["taskId"], b["result"]["taskId"]);
-    assert_eq!(count_runs(&db, "task_parked_flow").await, 4);
+    assert_eq!(count_runs(&db, "task_parked_flow").await, 5);
 }
 
 // ── AC 3: input_required resumes on input ─────────────────────────────────────
 
-/// Two waits on one signal name get two keys. A retried answer to the first
-/// key delivers nothing more, so the run sees each answer once.
+/// Two waits on one signal name get two keys. Two answers to one key that
+/// race each other deliver one signal, so the run sees each answer once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn each_wait_gets_its_own_key_and_a_retried_answer_is_ignored() {
+async fn each_wait_gets_its_own_key_and_a_raced_answer_lands_once() {
     let _ = tracing_subscriber::fmt::try_init();
     let db = setup_db().await;
     let client = build_app(&db).await;
@@ -464,26 +623,31 @@ async fn each_wait_gets_its_own_key_and_a_retried_answer_is_ignored() {
     })
     .await;
     let key1 = only_key(&first);
-    answer(&client, &task_id, &key1, json!({"n": 1})).await;
-    // A retry of the same answer, with a new payload, must not land.
-    answer(&client, &task_id, &key1, json!({"n": 99})).await;
+    assert!(key1.contains(":signal:étape:"), "{key1}");
+    // Both calls read the wait as open, so the signal idempotency key is
+    // what lets only one of them land.
+    let (a, b) = tokio::join!(
+        answer(&client, &task_id, &key1, json!({"n": 1})),
+        answer(&client, &task_id, &key1, json!({"n": 1})),
+    );
+    assert_eq!(a, json!({"resultType": "complete"}));
+    assert_eq!(b, json!({"resultType": "complete"}));
 
     let second = poll_until(&client, &task_id, &mut seen, |t| {
         t["status"] == "input_required" && only_key(t) != key1
     })
     .await;
     let key2 = only_key(&second);
-    assert!(key2.ends_with(":signal:étape:2"), "{key2}");
+    assert!(key2.contains(":signal:étape:"), "{key2}");
     // A key that is not open now is ignored.
     answer(&client, &task_id, &key1, json!({"n": 98})).await;
     answer(&client, &task_id, &key2, json!({"n": 2})).await;
 
     let done = poll_until(&client, &task_id, &mut seen, |t| status_of(t).is_terminal()).await;
     assert_eq!(done["status"], "completed", "{done}");
-    assert_eq!(
-        done["result"]["structuredContent"],
-        Value::Null,
-        "an array output has no structured content"
+    assert!(
+        done["result"].get("structuredContent").is_none(),
+        "an array output has no structured content: {done}"
     );
     let output: Value =
         serde_json::from_str(done["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
@@ -491,7 +655,40 @@ async fn each_wait_gets_its_own_key_and_a_retried_answer_is_ignored() {
     assert_legal(&seen);
 }
 
-/// A task outlives the process that created it: the task is the run.
+/// A `decline` answer is an error, and the wait stays open with its key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declined_answer_is_an_error_and_the_wait_stays_open() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let db = setup_db().await;
+    let client = build_app(&db).await;
+
+    let created = create_task(&client, "start_task_parked_flow", json!("x")).await;
+    let task_id = created["taskId"].as_str().unwrap().to_string();
+    let mut seen = Vec::new();
+    let waiting = poll_until(&client, &task_id, &mut seen, |t| {
+        t["status"] == "input_required"
+    })
+    .await;
+    let key = only_key(&waiting);
+    let out = rpc_with(
+        &client,
+        update_call(&task_id, &key, "decline", &json!({})),
+        None,
+    )
+    .await;
+    assert_eq!(out["error"]["code"], -32602, "{out}");
+    let again = poll_until(&client, &task_id, &mut seen, |t| {
+        t["status"] == "input_required"
+    })
+    .await;
+    assert_eq!(only_key(&again), key);
+}
+
+/// A task outlives the app that created it, because the task is the run.
+///
+/// This builds a second app on the same database. As in
+/// `mcp_tools_integration.rs`, the first app runs no shutdown hook, so this
+/// does not prove that its worker stopped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_task_survives_a_daemon_restart() {
     let _ = tracing_subscriber::fmt::try_init();

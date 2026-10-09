@@ -67,14 +67,19 @@ route behind the existing `mcp` cargo feature.
 | R2 | A retried `tools/call` starts a second run. | The start runs through `start_workflow` with the request key. Test: `a_retried_task_create_starts_one_execution`. |
 | R3 | A workflow error shows as `failed`, so a client treats it as a protocol fault and retries. | A `FAILED` or `TIMED_OUT` run maps to `completed` with `isError: true`. A unit test pins the mapping. |
 | R4 | A retried `tasks/update` delivers the signal twice. | The input key is the signal idempotency key. The second delivery is a no-op. |
-| R5 | A stale key from an earlier wait delivers a signal to a later wait. | Each key holds the run id and the ordinal of the wait. The handler delivers only for a key that is outstanding now. |
-| R6 | The key of one wait changes between polls, so the client asks the user twice. | The ordinal is the count of `SignalReceived` events of that name, plus one. It is constant while the run waits. |
+| R5 | A stale key from an earlier wait delivers a signal to a later wait. | Each key holds the run id and the history position at the park. The handler delivers only for a key that is outstanding now. |
+| R6 | A later wait reuses the key of an earlier one, for example after a `wait_for_signal_timeout` that timed out. | The position is the id of the last history event. A later wait comes after a new event, such as `SignalReceived` or `TimerFired`, so its key is new. |
+| R6a | An event lands during the replay, so a key names a wait that just ended. | The handler reads the position before and after the replay. If it moved, the read reports no wait this time. |
+| R6b | A user declines, or the signal refuses the payload, and the client gets an ack. The task then waits forever. | Both get `-32602`, so the client knows that the run did not take the answer. |
+| R6c | Another caller with mutate rights sends a signal with the next predictable key, so the answer of the real client is a no-op. | Accepted. That caller can already cancel or terminate the run. |
 | R7 | A continue-as-new successor reuses an ordinal. | The key holds the live run id, so a successor has new keys. |
 | R8 | A client that did not declare the extension gets a task it cannot read. | No declaration means a plain `CallToolResult` with the handle, as `start_{wf}` returns today. |
 | R9 | A cross-site form posts to the route with the session cookie. | The route takes `application/json` only. A browser sends that cross-site only after a CORS preflight. |
 | R10 | The route skips the tool-route auth layers. | It reuses the layer stack of a mutating tool route. A test proves a read-only principal gets `403`. |
 | R11 | A task outlives retention and `tasks/get` fails with a 500. | A missing row is `-32602` "Task not found", as the spec allows. `ttlMs` reports retention once the run ends. |
-| R12 | `tasks/get` replays history on each poll and loads the database. | `pollIntervalMs` asks for 5 s. The replay has its own drive timeout, and it runs only for a non-terminal run. |
+| R12 | `tasks/get` replays history on each poll and loads the database. | The route caches the waits of each run at each history position, so a poll with no new event does not replay. `pollIntervalMs` asks for 5 s. |
+| R13 | A cross-type continue-as-new moves the live run to a workflow outside the catalog. | `tasks/update` and `tasks/cancel` refuse such a run. |
+| R14 | The read after a start fails, so the client sees an error and retries. | The create then returns a `working` seed task. The run is never hidden. |
 
 ### 0.4 Six thinking hats
 
@@ -100,19 +105,23 @@ route behind the existing `mcp` cargo feature.
    |-----------|-------------|---------|
    | `COMPLETED` | `completed` | `CallToolResult`, `isError: false`, the output |
    | `FAILED` (no retry left), `TIMED_OUT` | `completed` | `CallToolResult`, `isError: true`, the error |
-   | `CANCELLED`, `TERMINATED` | `cancelled` | — |
+   | `CANCELLED`, `TERMINATED` | `cancelled` | `statusMessage`: the reason |
    | Any other state, parked on a signal | `input_required` | one `elicitation/create` per wait |
-   | Any other state | `working` | — |
+   | Any other state | `working` | `statusMessage`: `current_details` |
 
    `CONTINUED_AS_NEW` and a retried `FAILED` follow the chain first.
    Harvest never reports `failed`.
-4. An input key is `{run id}:signal:{name}:{ordinal}`. An `accept` answer
-   sends `content` as the signal payload, with the key as the idempotency
-   key. Other actions are ignored.
+4. An input key is `{run id}:signal:{name}:{position}`, where `position` is
+   the id of the last history event at the park. The elicitation asks for
+   one string field, `payload`, which holds the payload as JSON text. An
+   `accept` answer delivers the signal, with the key as the idempotency key.
+   Another action is an error. A client without the `elicitation`
+   capability sees `working` and the signal names.
 5. `tasks/cancel` cancels the live attempt. It acknowledges a run that is
    already terminal.
 6. `ttlMs` is `null` while the run is live. After it ends, `ttlMs` runs from
-   `createdAt` to the retention cut-off, or stays `null` with no retention.
+   `createdAt` to the retention cut-off of the row that holds the task id,
+   or stays `null` with no retention.
 
 ### 0.6 Out of scope
 
@@ -121,5 +130,7 @@ route behind the existing `mcp` cargo feature.
 - An update wait as `input_required`. The engine does not run an admitted
   update yet (issue #2035), and no history marks a wait for one.
 - A `tasks/list`. The spec removed it.
+- A reset fork. An operator reset of an ended run seals it as `TERMINATED`,
+  so the task reads `cancelled` and does not follow the fork.
 - A `#[dag(mcp)]` task. `trigger_dag_run_inner` has no start key, so a
   task-create for a DAG is not crash-safe.

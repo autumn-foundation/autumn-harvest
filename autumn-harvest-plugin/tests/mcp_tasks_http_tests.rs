@@ -12,7 +12,8 @@ use std::collections::HashMap;
 use autumn_harvest::prelude::*;
 use autumn_harvest_plugin::HarvestApiState;
 use autumn_harvest_plugin::mcp_tasks::{
-    CLIENT_CAPABILITIES_META, MISSING_CLIENT_CAPABILITY, TASKS_EXTENSION, build_mcp_task_route,
+    CLIENT_CAPABILITIES_META, MISSING_CLIENT_CAPABILITY, START_KEY_META, TASKS_EXTENSION,
+    build_mcp_task_route,
 };
 use autumn_harvest_plugin::mcp_tools::collect_descriptors;
 use autumn_web::AppState;
@@ -211,6 +212,47 @@ async fn a_start_that_fails_is_a_tool_error_not_a_task() {
 }
 
 #[tokio::test]
+async fn a_start_key_in_meta_must_be_a_string() {
+    let out = rpc(
+        &router(),
+        call(
+            "tools/call",
+            &json!({
+                "name": "start_review_flow",
+                "arguments": {"body": "d1"},
+                "_meta": {START_KEY_META: 7},
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(out["error"]["code"], -32602, "{out}");
+}
+
+#[tokio::test]
+async fn tasks_update_needs_input_responses() {
+    let out = rpc(
+        &router(),
+        call(
+            "tasks/update",
+            &json!({"taskId": uuid::Uuid::new_v4().to_string(), "_meta": declared()}),
+        ),
+    )
+    .await;
+    assert_eq!(out["error"]["code"], -32602, "{out}");
+}
+
+/// MCP forbids a null request id.
+#[tokio::test]
+async fn a_null_id_is_an_invalid_request() {
+    let out = rpc(
+        &router(),
+        json!({"jsonrpc": "2.0", "id": null, "method": "ping"}),
+    )
+    .await;
+    assert_eq!(out["error"]["code"], -32600, "{out}");
+}
+
+#[tokio::test]
 async fn an_unknown_method_is_method_not_found() {
     let out = rpc(&router(), call("tasks/list", &json!({"_meta": declared()}))).await;
     assert_eq!(out["error"]["code"], -32601, "{out}");
@@ -304,4 +346,19 @@ async fn an_anonymous_caller_is_refused_outside_dev() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     let (status, _) = post_raw(&app, "application/json", body, Some(session("admin"))).await;
     assert_eq!(status, StatusCode::OK);
+}
+
+/// A tenant-bound caller never reaches the route (issue #1977).
+#[tokio::test]
+async fn a_tenant_bound_caller_is_refused() {
+    let tenant = autumn_harvest_plugin::tenant::VerifiedTenant::new("acme").expect("tenant");
+    let mut req = Request::builder()
+        .method("POST")
+        .uri(TASKS)
+        .header("content-type", "application/json")
+        .body(Body::from(call("ping", &json!({})).to_string()))
+        .unwrap();
+    req.extensions_mut().insert(tenant);
+    let resp = router().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }

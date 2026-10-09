@@ -256,6 +256,7 @@ route does not need `mcp_tools()` or `mount_mcp`.
 | Method | What Harvest does |
 |---|---|
 | `initialize`, `server/discover` | Advertise `capabilities.extensions["io.modelcontextprotocol/tasks"]`. |
+| `ping` | Answer `{}`. |
 | `tools/list` | One `start_{wf}` tool for each MCP workflow. Its `inputSchema` is the same as on `/mcp`. |
 | `tools/call` | Start the run. A client that declares the extension gets a `CreateTaskResult` (`resultType: "task"`). Any other client gets the plain start handle. |
 | `tasks/get` | Read the run and return the `DetailedTask`. |
@@ -274,7 +275,7 @@ loses nothing. A retry or continue-as-new chain is followed to the live run.
 |---|---|---|
 | `COMPLETED` | `completed` | `result`: a `CallToolResult` with the output, `isError: false` |
 | `FAILED` with no retry left, `TIMED_OUT` | `completed` | `result`: a `CallToolResult` with the error, `isError: true` |
-| `CANCELLED`, `TERMINATED` | `cancelled` | — |
+| `CANCELLED`, `TERMINATED` | `cancelled` | `statusMessage`: the cancel reason |
 | Live, parked on `wait_for_signal` | `input_required` | `inputRequests`: one `elicitation/create` for each wait |
 | Live, any other wait | `working` | `statusMessage`: the `current_details` text |
 
@@ -290,15 +291,34 @@ with no key starts a new run each time.
 
 **Input.** The awaitables replay (issue #615) finds each parked
 `wait_for_signal`. Each wait gets the key `{run id}:signal:{name}:{n}`, where
-`n` counts the waits on that signal name. The key does not change while the
-run waits. An `accept` answer in `tasks/update` sends its `content` object as
-the signal payload. The key is also the signal idempotency key, so a retried
-answer is a no-op. Harvest ignores an answer to a key that is not open, and
-any action other than `accept`.
+`n` is the id of the last history event when the run parks. A later wait,
+also one after a timeout, comes after a new event, so it gets a new key. An
+unrelated event during the wait gives the wait a new key too. The old key
+is then not open.
+
+The elicitation asks for one string field, `payload`, with the signal payload
+as JSON text. Text that is not JSON is sent as a JSON string. An answer whose
+`content` has other fields is sent as is. The key is also the signal
+idempotency key, so a retried answer is a no-op.
+
+- Harvest ignores an answer to a key that is not open.
+- A `decline` or `cancel` answer gets `-32602`, and the wait stays open.
+  Use `tasks/cancel` to stop the task.
+- A payload that the signal refuses, for example by its schema or size cap,
+  gets `-32602` with the reason in `data`.
+- A client must declare `elicitation` in its client capabilities to get
+  `inputRequests`. Without it, the task reads as `working`, and
+  `statusMessage` names each signal. Such a client can use `signal_{wf}`.
+
+The route caches the replay result for each run and history position. So a
+fast poll of a parked run does not replay it again.
 
 **TTL.** `ttlMs` is `null` while the run is live. After the run ends, `ttlMs`
-runs from `createdAt` to the time that retention can delete the run. With no
-retention, it stays `null`. After the run is deleted, `tasks/get` answers
+runs from `createdAt` to the time that retention can delete the row of the
+task id. With no retention, it stays `null`. Retention keys a retry chain on
+the business id, which each attempt changes. So for a retried run, `ttlMs`
+counts from the failure of the first attempt, and can be set while a retry
+still runs. After the run is deleted, `tasks/get` answers
 `-32602` "Task not found". `pollIntervalMs` is 5000.
 
 **Limits.**
@@ -308,16 +328,27 @@ retention, it stays `null`. After the run is deleted, `tasks/get` answers
 - A debounced or batched workflow is not served, as on `/mcp`.
 - Only a signal wait is `input_required`. An update wait and an
   `await_condition` park read as `working` (issue #2035).
-- `requestedSchema` is an open object. The client answer is the signal
-  payload as is.
 - Harvest does not push `notifications/tasks`. Poll `tasks/get`.
+- A continue-as-new to a workflow that is not an MCP workflow leaves the
+  catalog. `tasks/get` still reads the run, but `tasks/update` and
+  `tasks/cancel` answer `-32602`.
+- An operator reset of an ended run seals that run as `TERMINATED`. The task
+  then reads `cancelled`, even after `completed`, and does not follow the
+  fork.
 
 **Auth.** The route takes the layers of a mutating tool route:
 `api_with_auth`, the custom-role gate, the read-only role gate, the
 fail-closed mutation gate (issue #1802) and the tenant refusal (issue #1977).
 Every method on the route counts as a mutation, because the route can start
-and cancel runs. The route takes `application/json` only. A browser cannot
-send that cross-site without a CORS preflight.
+and cancel runs. So a read-only principal cannot poll a task either. The
+route takes `application/json` only. A browser cannot send that cross-site
+without a CORS preflight.
+
+A task is not bound to the caller that created it. Any caller that passes
+these layers can read, answer or cancel a task whose id it knows, as with
+the `signal_{wf}` tool. The id is unguessable, but the management API shows
+it. Two callers with mutate rights on one run can also block each other's
+answers, for example with a signal that claims the next input key.
 
 ## Testing
 

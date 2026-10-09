@@ -49,6 +49,8 @@ pub const START_KEY_META: &str = "io.autumn-harvest/idempotencyKey";
 pub const MISSING_CLIENT_CAPABILITY: i64 = -32021;
 /// The poll interval sent with each task.
 pub const DEFAULT_POLL_INTERVAL_MS: u64 = 5_000;
+/// The one form field of a signal elicitation. It holds the payload as JSON.
+pub const PAYLOAD_FIELD: &str = "payload";
 
 const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
@@ -172,12 +174,51 @@ pub fn tool_result(state: &str, output: Option<&Value>, error: Option<&str>) -> 
 
 /// The input-request key of one signal wait.
 ///
-/// The key holds the live run id and the ordinal of the wait for that signal
-/// name. So it stays the same while the run waits. It is new for each later
-/// wait, and for each run of a continue-as-new chain.
+/// `position` is the id of the last history event when the run parks. A later
+/// wait on the same name comes after a new event, so it gets a new key. A
+/// timed-out wait writes a `TimerFired` event, so this holds for it too. The
+/// run id makes the key new for each run of a chain.
 #[must_use]
-pub fn input_request_key(run: uuid::Uuid, signal: &str, ordinal: usize) -> String {
-    format!("{run}:signal:{signal}:{ordinal}")
+pub fn input_request_key(run: uuid::Uuid, signal: &str, position: i32) -> String {
+    format!("{run}:signal:{signal}:{position}")
+}
+
+/// `true` when the request declares the client capability `name`.
+fn client_declares(params: &Value, name: &str) -> bool {
+    params
+        .pointer("/_meta")
+        .and_then(|meta| meta.get(CLIENT_CAPABILITIES_META))
+        .and_then(|caps| caps.get(name))
+        .is_some_and(Value::is_object)
+}
+
+/// `true` when the request declares the elicitation capability.
+///
+/// A server must not send an elicitation to a client without it.
+#[must_use]
+pub fn client_accepts_elicitation(params: &Value) -> bool {
+    client_declares(params, "elicitation")
+}
+
+/// The signal payload in the `content` of an `accept` answer.
+///
+/// A form client fills the one string field, [`PAYLOAD_FIELD`]. Its text is
+/// parsed as JSON, and text that is not JSON is sent as a JSON string. Any
+/// other `content` object is the payload as is.
+#[must_use]
+pub fn signal_payload(content: Option<&Value>) -> Value {
+    let Some(content) = content else {
+        return json!({});
+    };
+    match content.as_object() {
+        Some(fields) if fields.len() == 1 => match fields.get(PAYLOAD_FIELD) {
+            Some(Value::String(text)) => {
+                serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.clone()))
+            }
+            _ => content.clone(),
+        },
+        _ => content.clone(),
+    }
 }
 
 /// `true` when the request declares the Tasks extension.
@@ -200,8 +241,8 @@ pub fn tasks_path(tools_prefix: &str) -> String {
 /// The TTL of a task in milliseconds, or `None` for no expiry.
 ///
 /// Retention counts from completion, and the spec counts from creation. So a
-/// live run has no TTL yet. An ended run keeps its task until the retention
-/// sweep can delete the run.
+/// run with no `completed_at` yet has no TTL. Pass the completion of the row
+/// that holds the task id, because the sweep deletes that row.
 #[must_use]
 pub fn ttl_ms(
     created_at: DateTime<Utc>,
@@ -255,6 +296,19 @@ impl TaskSnapshot {
         status_for_state(&self.state, !self.waits.is_empty())
     }
 
+    /// Show the waits as text, for a client that cannot take an elicitation.
+    ///
+    /// The task is then `working`, and `statusMessage` names each signal. The
+    /// client can still send the signal with the `signal_{wf}` tool.
+    pub fn hide_input_requests(&mut self) {
+        if self.waits.is_empty() {
+            return;
+        }
+        let names: Vec<&str> = self.waits.iter().map(|w| w.signal_name.as_str()).collect();
+        self.current_details = Some(format!("waiting for signal: {}", names.join(", ")));
+        self.waits.clear();
+    }
+
     fn status_message(&self) -> Option<String> {
         match self.status() {
             TaskStatus::InputRequired => {
@@ -303,8 +357,14 @@ fn elicitation(wait: &SignalWait) -> Value {
             ),
             "requestedSchema": {
                 "type": "object",
-                "description": format!("Payload of the '{}' signal", wait.signal_name),
-                "properties": {},
+                "properties": {
+                    PAYLOAD_FIELD: {
+                        "type": "string",
+                        "title": format!("'{}' payload", wait.signal_name),
+                        "description": "The signal payload as JSON text",
+                    },
+                },
+                "required": [PAYLOAD_FIELD],
             },
         },
     })
@@ -356,9 +416,19 @@ struct TaskTool {
     input_schema: Value,
 }
 
+/// The most runs whose signal waits [`TaskCatalog`] keeps.
+const WAITS_CACHE_CAP: usize = 1024;
+
+/// The signal names a run waits on at one history position.
+type CachedWaits = (i32, Vec<String>);
+
 /// The tools of the task route, in workflow-name order.
 struct TaskCatalog {
     tools: Vec<TaskTool>,
+    /// The waits of each run at its last seen history position. The replay
+    /// is a pure function of the history, so a poll with no new event reuses
+    /// it. This bounds the replay cost of a client that polls fast.
+    waits: std::sync::Mutex<std::collections::HashMap<uuid::Uuid, CachedWaits>>,
 }
 
 impl TaskCatalog {
@@ -393,7 +463,32 @@ impl TaskCatalog {
                 }
             })
             .collect();
-        Self { tools }
+        Self {
+            tools,
+            waits: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn cached_waits(&self, run: uuid::Uuid, position: i32) -> Option<Vec<String>> {
+        let cache = self
+            .waits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache
+            .get(&run)
+            .filter(|(at, _)| *at == position)
+            .map(|(_, names)| names.clone())
+    }
+
+    fn cache_waits(&self, run: uuid::Uuid, position: i32, names: Vec<String>) {
+        let mut cache = self
+            .waits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.len() >= WAITS_CACHE_CAP && !cache.contains_key(&run) {
+            cache.clear();
+        }
+        cache.insert(run, (position, names));
     }
 
     fn tool(&self, name: &str) -> Option<&TaskTool> {
@@ -537,9 +632,8 @@ async fn serve(
         return rpc_response(&Value::Null, Err(RpcError::new(INVALID_REQUEST, reason)));
     };
     let id = object.get("id").cloned();
-    let id_ok = id
-        .as_ref()
-        .is_none_or(|v| v.is_string() || v.is_number() || v.is_null());
+    // MCP forbids a null id, unlike plain JSON-RPC.
+    let id_ok = id.as_ref().is_none_or(|v| v.is_string() || v.is_number());
     let method = object.get("method").and_then(Value::as_str);
     let (true, Some(method), true) = (
         object.get("jsonrpc").and_then(Value::as_str) == Some("2.0"),
@@ -583,7 +677,7 @@ async fn dispatch(
                 .and_then(Value::as_str)
                 .ok_or_else(|| RpcError::new(INVALID_PARAMS, "taskId is required"))?;
             match method {
-                "tasks/get" => tasks_get(api_state, catalog, task_id).await,
+                "tasks/get" => tasks_get(api_state, catalog, task_id, params).await,
                 "tasks/update" => tasks_update(api_state, catalog, headers, task_id, params).await,
                 _ => tasks_cancel(api_state, catalog, headers, task_id).await,
             }
@@ -715,28 +809,58 @@ async fn tools_call(
             "isError": true,
         }));
     }
-    if !client_declares_tasks(params) {
+    let task_id = started.get("execution_id").and_then(Value::as_str);
+    let (true, Some(task_id)) = (client_declares_tasks(params), task_id) else {
+        // A start with no run id yet, such as a deferred one, is no task.
         return Ok(json!({
             "resultType": "complete",
             "content": [{"type": "text", "text": started.to_string()}],
             "structuredContent": started,
             "isError": false,
         }));
-    }
-    let task_id = started
-        .get("execution_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| RpcError::new(INTERNAL_ERROR, "the start returned no execution id"))?;
+    };
     // The start has committed, so this read resolves, as the spec requires
-    // before a `CreateTaskResult`.
-    let snapshot = load_task(api_state, catalog, task_id).await?;
+    // before a `CreateTaskResult`. A failed read must not hide the run: a
+    // client that saw an error could retry and start a second run.
+    let snapshot = match load_task(api_state, catalog, task_id).await {
+        Ok((snapshot, _)) => snapshot,
+        Err(err) => {
+            tracing::warn!(task_id, error = %err.message, "mcp tasks: read after start failed");
+            seed_snapshot(task_id)
+        }
+    };
     let mut task = task_object(&snapshot);
     task["resultType"] = json!("task");
     Ok(task)
 }
 
-async fn tasks_get(api_state: &HarvestApiState, catalog: &TaskCatalog, task_id: &str) -> RpcResult {
-    let snapshot = load_task(api_state, catalog, task_id).await?;
+/// A `working` task with the time of now, for a run that cannot be read yet.
+fn seed_snapshot(task_id: &str) -> TaskSnapshot {
+    let now = Utc::now();
+    TaskSnapshot {
+        task_id: task_id.to_string(),
+        run_id: uuid::Uuid::nil(),
+        created_at: now,
+        last_updated_at: now,
+        state: "RUNNING".to_string(),
+        current_details: None,
+        output: None,
+        error: None,
+        waits: Vec::new(),
+        ttl_ms: None,
+    }
+}
+
+async fn tasks_get(
+    api_state: &HarvestApiState,
+    catalog: &TaskCatalog,
+    task_id: &str,
+    params: &Value,
+) -> RpcResult {
+    let (mut snapshot, _) = load_task(api_state, catalog, task_id).await?;
+    if !client_accepts_elicitation(params) {
+        snapshot.hide_input_requests();
+    }
     let mut task = detailed_task(&snapshot);
     task["resultType"] = json!("complete");
     Ok(task)
@@ -746,7 +870,8 @@ async fn tasks_get(api_state: &HarvestApiState, catalog: &TaskCatalog, task_id: 
 ///
 /// The input key is the signal idempotency key, so a retried answer is a
 /// no-op. An answer to a key that is not open now is ignored, as the spec
-/// asks. Another action leaves the wait open.
+/// asks. A `decline` or `cancel` answer, or a payload that the signal refuses,
+/// is an error. Then the client knows that the run did not take the answer.
 async fn tasks_update(
     api_state: &HarvestApiState,
     catalog: &TaskCatalog,
@@ -758,15 +883,33 @@ async fn tasks_update(
         .get("inputResponses")
         .and_then(Value::as_object)
         .ok_or_else(|| RpcError::new(INVALID_PARAMS, "inputResponses is required"))?;
-    let snapshot = load_task(api_state, catalog, task_id).await?;
-    for wait in &snapshot.waits {
-        let Some(answer) = responses.get(&wait.key) else {
-            continue;
-        };
-        if answer.get("action").and_then(Value::as_str) != Some("accept") {
-            continue;
-        }
-        let payload = answer.get("content").cloned().unwrap_or_else(|| json!({}));
+    let (snapshot, live_served) = load_task(api_state, catalog, task_id).await?;
+    let answers: Vec<(&SignalWait, &Value)> = snapshot
+        .waits
+        .iter()
+        .filter_map(|wait| responses.get(&wait.key).map(|answer| (wait, answer)))
+        .collect();
+    if answers.is_empty() {
+        return Ok(json!({"resultType": "complete"}));
+    }
+    if !live_served {
+        return Err(outside_catalog());
+    }
+    // Check every action first, so a refusal delivers no answer at all.
+    if let Some((wait, _)) = answers
+        .iter()
+        .find(|(_, answer)| answer.get("action").and_then(Value::as_str) != Some("accept"))
+    {
+        return Err(RpcError::new(
+            INVALID_PARAMS,
+            format!(
+                "the answer to {} is not accept; the run still waits. \
+                 Use tasks/cancel to stop the task",
+                wait.key
+            ),
+        ));
+    }
+    for (wait, answer) in answers {
         // The input key is the delivery key. A header key wins over the
         // query key, so the header from the request must not ride along.
         let mut headers = headers.clone();
@@ -776,17 +919,39 @@ async fn tasks_update(
             Path((snapshot.run_id.to_string(), wait.signal_name.clone())),
             Query(crate::api::SignalQuery::with_key(wait.key.clone())),
             headers,
-            Json(payload),
+            Json(signal_payload(answer.get("content"))),
         )
         .await;
         let (status, body) = read_response(response).await;
-        // A run that ended after the read refuses the signal with a 4xx.
-        // The ack stays valid: the spec makes it eventually consistent.
         if status.is_server_error() {
             return Err(RpcError::new(INTERNAL_ERROR, text_of(&body)));
         }
+        // A run that ended after the read answers 404 or 409. The spec makes
+        // the ack eventually consistent, so that is still an ack.
+        if status.is_client_error()
+            && status != StatusCode::NOT_FOUND
+            && status != StatusCode::CONFLICT
+        {
+            let mut err = RpcError::new(
+                INVALID_PARAMS,
+                format!("the run refused the answer to {}", wait.key),
+            );
+            err.data = Some(body);
+            return Err(err);
+        }
     }
     Ok(json!({"resultType": "complete"}))
+}
+
+/// The error for a task whose live run left the catalog.
+///
+/// A cross-type continue-as-new can move the chain to a workflow that is not
+/// an MCP workflow. The task route then does not act on it.
+fn outside_catalog() -> RpcError {
+    RpcError::new(
+        INVALID_PARAMS,
+        "the live run of this task is not an MCP workflow",
+    )
 }
 
 /// Cancel the live run of the task.
@@ -799,9 +964,12 @@ async fn tasks_cancel(
     headers: &HeaderMap,
     task_id: &str,
 ) -> RpcResult {
-    let snapshot = load_task(api_state, catalog, task_id).await?;
+    let (snapshot, live_served) = load_task(api_state, catalog, task_id).await?;
     if snapshot.status().is_terminal() {
         return Ok(json!({"resultType": "complete"}));
+    }
+    if !live_served {
+        return Err(outside_catalog());
     }
     let outcome = crate::api::cancel_workflow(
         Extension(api_state.clone()),
@@ -824,12 +992,13 @@ async fn tasks_cancel(
 /// Load the task: the start row, its live run and the open signal waits.
 ///
 /// A malformed id, an unknown id and a run outside the catalog all get the
-/// same error, so the route is no existence oracle.
+/// same error, so the route is no existence oracle. The flag is `true` when
+/// the live run is also an MCP workflow.
 async fn load_task(
     api_state: &HarvestApiState,
     catalog: &TaskCatalog,
     task_id: &str,
-) -> Result<TaskSnapshot, RpcError> {
+) -> Result<(TaskSnapshot, bool), RpcError> {
     let exec_id = crate::api::parse_execution_id(task_id).map_err(|_| RpcError::not_found())?;
     let mut conn = crate::api::db_conn_for_execution(api_state, exec_id)
         .await
@@ -844,9 +1013,18 @@ async fn load_task(
         return Err(RpcError::not_found());
     }
     let created_at = origin.created_at;
+    // Retention keys a retry chain on the business id, which each attempt
+    // changes. So the sweep can delete the `FAILED` start row while a retry
+    // runs, and the TTL counts from that row.
+    let row_completed_at = if origin.state == "FAILED" {
+        origin.completed_at
+    } else {
+        None
+    };
     let live = crate::mcp_tools::resolve_if_chained(api_state, origin)
         .await
         .map_err(|_| RpcError::new(INTERNAL_ERROR, "could not resolve the live run"))?;
+    let live_served = catalog.serves(&live.workflow_name);
 
     let retention = api_state
         .runtime()
@@ -856,105 +1034,132 @@ async fn load_task(
     let (waits, last_event_at) = if terminal {
         (Vec::new(), None)
     } else {
-        open_signal_waits(api_state, &live).await?
+        open_signal_waits(api_state, catalog, &live).await?
     };
     let last_updated_at = live
         .completed_at
         .or(last_event_at)
         .unwrap_or(live.started_at);
-    Ok(TaskSnapshot {
+    let snapshot = TaskSnapshot {
         task_id: task_id.to_string(),
         run_id: live.id,
         created_at,
         last_updated_at,
-        ttl_ms: ttl_ms(created_at, live.completed_at, retention),
+        ttl_ms: ttl_ms(
+            created_at,
+            row_completed_at.or(live.completed_at),
+            retention,
+        ),
         state: live.state,
         current_details: live.current_details,
         output: live.output,
         error: live.error,
         waits,
-    })
+    };
+    Ok((snapshot, live_served))
 }
 
-/// The open signal waits of a live run, and the time of its last event.
-///
-/// The awaitables replay (issue #615) names each parked `wait_for_signal`.
-/// A wait whose signal is already queued but not yet consumed is left out:
-/// the run is about to wake.
-async fn open_signal_waits(
+/// The id and the time of the last history event of a run.
+async fn history_head(
     api_state: &HarvestApiState,
-    live: &autumn_harvest::models::WorkflowExecution,
-) -> Result<(Vec<SignalWait>, Option<DateTime<Utc>>), RpcError> {
-    use autumn_harvest::awaitables::AwaitableKind;
-    use autumn_harvest::schema::{harvest_events, harvest_signals};
+    run: uuid::Uuid,
+) -> Result<Option<(i32, DateTime<Utc>)>, RpcError> {
+    use autumn_harvest::schema::harvest_events;
     use diesel::{ExpressionMethods as _, QueryDsl as _};
     use diesel_async::RunQueryDsl as _;
 
-    let exec_id = autumn_harvest::ExecutionId::from_uuid(live.id);
-    let internal = |e: &dyn std::fmt::Display| RpcError::new(INTERNAL_ERROR, e.to_string());
-
-    // The replay degrades to a history scan when it cannot run, and that
-    // scan cannot see a signal wait. The task then reads as working.
-    let report = crate::api::build_awaitables_report(api_state, exec_id)
-        .await
-        .map_err(|e| internal(&e))?;
-    let mut names: Vec<String> = Vec::new();
-    for awaitable in report.awaitables {
-        if awaitable.kind == AwaitableKind::Signal
-            && let Some(name) = awaitable.name
-            && !names.contains(&name)
-        {
-            names.push(name);
-        }
-    }
-
+    let exec_id = autumn_harvest::ExecutionId::from_uuid(run);
     let mut conn = crate::api::db_conn_for_execution(api_state, exec_id)
         .await
-        .map_err(|e| internal(&e))?;
-    let last_event_at: Option<DateTime<Utc>> = harvest_events::table
-        .filter(harvest_events::workflow_exec_id.eq(live.id))
-        .select(diesel::dsl::max(harvest_events::timestamp))
+        .map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))?;
+    let (position, at): (Option<i32>, Option<DateTime<Utc>>) = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(run))
+        .select((
+            diesel::dsl::max(harvest_events::event_id),
+            diesel::dsl::max(harvest_events::timestamp),
+        ))
         .first(&mut conn)
         .await
-        .map_err(|e| internal(&e))?;
+        .map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))?;
+    Ok(position.zip(at))
+}
+
+/// The open signal waits of a live run, and the time it last changed.
+///
+/// The awaitables replay (issue #615) names each parked `wait_for_signal`.
+/// The replay degrades to a history scan when it cannot run, and that scan
+/// cannot see a signal wait. The task then reads as `working`.
+///
+/// A wait whose signal is queued but not yet consumed is left out, because
+/// the run is about to wake. The queue time then counts as a change.
+async fn open_signal_waits(
+    api_state: &HarvestApiState,
+    catalog: &TaskCatalog,
+    live: &autumn_harvest::models::WorkflowExecution,
+) -> Result<(Vec<SignalWait>, Option<DateTime<Utc>>), RpcError> {
+    use autumn_harvest::awaitables::AwaitableKind;
+    use autumn_harvest::schema::harvest_signals;
+    use diesel::{ExpressionMethods as _, QueryDsl as _};
+    use diesel_async::RunQueryDsl as _;
+
+    let Some((position, last_event_at)) = history_head(api_state, live.id).await? else {
+        return Ok((Vec::new(), None));
+    };
+    let names = if let Some(names) = catalog.cached_waits(live.id, position) {
+        names
+    } else {
+        let exec_id = autumn_harvest::ExecutionId::from_uuid(live.id);
+        let report = crate::api::build_awaitables_report(api_state, exec_id)
+            .await
+            .map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))?;
+        let mut names: Vec<String> = Vec::new();
+        for awaitable in report.awaitables {
+            if awaitable.kind == AwaitableKind::Signal
+                && let Some(name) = awaitable.name
+                && !names.contains(&name)
+            {
+                names.push(name);
+            }
+        }
+        // An event that lands during the replay can end these waits. Their
+        // keys would then name the next wait, so report none this time.
+        let after = history_head(api_state, live.id).await?.map(|(at, _)| at);
+        if after != Some(position) {
+            return Ok((Vec::new(), Some(last_event_at)));
+        }
+        catalog.cache_waits(live.id, position, names.clone());
+        names
+    };
     if names.is_empty() {
-        return Ok((Vec::new(), last_event_at));
+        return Ok((Vec::new(), Some(last_event_at)));
     }
-    let queued: Vec<String> = harvest_signals::table
+
+    let exec_id = autumn_harvest::ExecutionId::from_uuid(live.id);
+    let mut conn = crate::api::db_conn_for_execution(api_state, exec_id)
+        .await
+        .map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))?;
+    let queued: Vec<(String, DateTime<Utc>)> = harvest_signals::table
         .filter(harvest_signals::workflow_exec_id.eq(live.id))
         .filter(harvest_signals::consumed.eq(false))
-        .select(harvest_signals::signal_name)
+        .select((harvest_signals::signal_name, harvest_signals::received_at))
         .load(&mut conn)
         .await
-        .map_err(|e| internal(&e))?;
-    // The ordinal of a wait counts the signals of that name the run has
-    // consumed. The signal name is not a payload field, so no codec hides it.
-    let received: Vec<Value> = harvest_events::table
-        .filter(harvest_events::workflow_exec_id.eq(live.id))
-        .filter(harvest_events::event_type.eq("SignalReceived"))
-        .select(harvest_events::event_data)
-        .load(&mut conn)
-        .await
-        .map_err(|e| internal(&e))?;
+        .map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))?;
     drop(conn);
 
-    let waits = names
-        .into_iter()
-        .filter(|name| !queued.contains(name))
-        .map(|name| {
-            let consumed = received
-                .iter()
-                .filter(|event| {
-                    event.pointer("/data/signal_name").and_then(Value::as_str) == Some(&name)
-                })
-                .count();
-            SignalWait {
-                key: input_request_key(live.id, &name, consumed + 1),
+    let mut last_updated_at = last_event_at;
+    let mut waits = Vec::new();
+    for name in names {
+        if let Some((_, queued_at)) = queued.iter().find(|(queued, _)| *queued == name) {
+            last_updated_at = last_updated_at.max(*queued_at);
+        } else {
+            waits.push(SignalWait {
+                key: input_request_key(live.id, &name, position),
                 signal_name: name,
-            }
-        })
-        .collect();
-    Ok((waits, last_event_at))
+            });
+        }
+    }
+    Ok((waits, Some(last_updated_at)))
 }
 
 #[cfg(test)]
@@ -1016,14 +1221,30 @@ mod tests {
         }
     }
 
-    /// The spec state diagram: a live status may move to any other status.
-    /// A terminal status never moves.
+    /// The spec state diagram, written out by hand. `W` is working, `I` is
+    /// input_required, `C` is completed, `F` is failed and `X` is cancelled.
     #[test]
     fn transitions_follow_the_spec_state_diagram() {
+        use TaskStatus::{
+            Cancelled as X, Completed as C, Failed as F, InputRequired as I, Working as W,
+        };
+        let legal = [
+            (W, I),
+            (W, C),
+            (W, F),
+            (W, X),
+            (I, W),
+            (I, C),
+            (I, F),
+            (I, X),
+        ];
         for from in ALL {
             for to in ALL {
-                let expected = !from.is_terminal() && from != to;
-                assert_eq!(from.can_transition_to(to), expected, "{from:?} -> {to:?}");
+                assert_eq!(
+                    from.can_transition_to(to),
+                    legal.contains(&(from, to)),
+                    "{from:?} -> {to:?}"
+                );
             }
         }
     }
@@ -1120,15 +1341,74 @@ mod tests {
     }
 
     #[test]
-    fn an_input_key_names_the_run_the_signal_and_the_ordinal() {
+    fn an_input_key_names_the_run_the_signal_and_the_position() {
         let run = uuid::Uuid::from_u128(7);
-        let first = input_request_key(run, "approval", 1);
-        assert_eq!(first, format!("{run}:signal:approval:1"));
-        assert_ne!(first, input_request_key(run, "approval", 2));
+        let first = input_request_key(run, "approval", 4);
+        assert_eq!(first, format!("{run}:signal:approval:4"));
+        assert_ne!(first, input_request_key(run, "approval", 9));
+        assert_ne!(first, input_request_key(run, "other", 4));
         assert_ne!(
             first,
-            input_request_key(uuid::Uuid::from_u128(8), "approval", 1)
+            input_request_key(uuid::Uuid::from_u128(8), "approval", 4)
         );
+    }
+
+    #[test]
+    fn the_client_declares_elicitation_in_request_meta() {
+        let declared = json!({"_meta": {CLIENT_CAPABILITIES_META: {"elicitation": {}}}});
+        assert!(client_accepts_elicitation(&declared));
+        let tasks_only = json!({
+            "_meta": {CLIENT_CAPABILITIES_META: {"extensions": {TASKS_EXTENSION: {}}}}
+        });
+        assert!(!client_accepts_elicitation(&tasks_only));
+        assert!(!client_accepts_elicitation(&Value::Null));
+    }
+
+    #[test]
+    fn a_form_answer_carries_the_payload_as_json_text() {
+        assert_eq!(
+            signal_payload(Some(&json!({PAYLOAD_FIELD: "{\"decision\": \"approve\"}"}))),
+            json!({"decision": "approve"})
+        );
+        assert_eq!(
+            signal_payload(Some(&json!({PAYLOAD_FIELD: "approve"}))),
+            json!("approve")
+        );
+        assert_eq!(
+            signal_payload(Some(&json!({PAYLOAD_FIELD: "[1, 2]"}))),
+            json!([1, 2])
+        );
+    }
+
+    #[test]
+    fn other_answer_content_is_the_payload_as_is() {
+        assert_eq!(
+            signal_payload(Some(&json!({"decision": "approve"}))),
+            json!({"decision": "approve"})
+        );
+        assert_eq!(
+            signal_payload(Some(&json!({PAYLOAD_FIELD: 3}))),
+            json!({PAYLOAD_FIELD: 3})
+        );
+        assert_eq!(
+            signal_payload(Some(&json!({PAYLOAD_FIELD: "x", "more": 1}))),
+            json!({PAYLOAD_FIELD: "x", "more": 1})
+        );
+        assert_eq!(signal_payload(None), json!({}));
+    }
+
+    #[test]
+    fn hidden_input_requests_read_as_working_with_the_signal_names() {
+        let mut snap = snapshot("RUNNING");
+        snap.waits = vec![SignalWait {
+            key: "k1".into(),
+            signal_name: "approval".into(),
+        }];
+        snap.hide_input_requests();
+        let task = detailed_task(&snap);
+        assert_eq!(task["status"], "working");
+        assert_eq!(task["statusMessage"], "waiting for signal: approval");
+        assert!(task.get("inputRequests").is_none(), "{task}");
     }
 
     #[test]
@@ -1195,7 +1475,11 @@ mod tests {
         let request = &task["inputRequests"]["k1"];
         assert_eq!(request["method"], "elicitation/create");
         assert_eq!(request["params"]["mode"], "form");
-        assert_eq!(request["params"]["requestedSchema"]["type"], "object");
+        let schema = &request["params"]["requestedSchema"];
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"][PAYLOAD_FIELD]["type"], "string");
+        assert_eq!(schema["required"], json!([PAYLOAD_FIELD]));
+        assert!(schema.get("description").is_none(), "{schema}");
         assert!(
             request["params"]["message"]
                 .as_str()
