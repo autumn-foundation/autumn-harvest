@@ -337,6 +337,7 @@ pub struct RunVerdict {
 
 impl RunVerdict {
     /// Add a finding, and raise the verdict to match it.
+    #[cfg(feature = "db")]
     fn push(&mut self, finding: Finding) {
         self.verdict = self.verdict.max(finding.kind.verdict());
         self.findings.push(finding);
@@ -915,6 +916,7 @@ fn schema_finding(
 /// A run with no assigned build ran whatever the fleet ran, so the operator
 /// vouches for it. A run assigned to another build than the baseline ran
 /// other code. With no baseline build named, the check cannot tell.
+#[cfg(feature = "db")]
 fn build_finding(run_build: Option<&str>, baseline_build: Option<&str>) -> Option<Finding> {
     let run_build = run_build?;
     match baseline_build {
@@ -935,6 +937,7 @@ fn build_finding(run_build: Option<&str>, baseline_build: Option<&str>) -> Optio
 /// The id encodes the shard the run started on. A rebalanced run keeps that
 /// id but lives elsewhere. So an encoded shard outside the group, or no
 /// encoded shard, gives the group's first shard id.
+#[cfg(feature = "db")]
 fn shard_of(execution_id: ExecutionId, shards: &[ShardId]) -> ShardId {
     let encoded = execution_id.shard();
     if !encoded.is_unencoded() && shards.contains(&encoded) {
