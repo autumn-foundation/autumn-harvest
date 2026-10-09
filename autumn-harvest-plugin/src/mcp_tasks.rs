@@ -366,6 +366,10 @@ fn check_modern_meta(params: &Value) -> Result<(), (i64, String, Option<Value>)>
 }
 
 /// The body value that the `Mcp-Name` header mirrors for `method`.
+///
+/// The base transport names `tools/call`. The Tasks extension adds the
+/// `tasks/*` methods. There, a client must set `Mcp-Name` to `params.taskId`.
+/// A load balancer can then route each request for one task the same way.
 fn mirrored_name<'a>(method: &str, params: &'a Value) -> Option<&'a str> {
     let field = match method {
         "tools/call" => "name",
@@ -711,10 +715,14 @@ pub fn detailed_task(snapshot: &TaskSnapshot) -> Value {
 /// `#/$defs/Inner` in the workflow schema names its own root, so it must
 /// gain the path of that new place, `root`. A remote ref stays as it is.
 /// An anchor ref such as `#inner` is not a path and stays valid in the whole
-/// document, so it stays as it is too.
+/// document, so it stays as it is too. A subschema with a `$id` is its own
+/// resource, and its local refs resolve against it, so it stays as it is.
 #[must_use]
 pub fn rebase_refs(schema: Value, root: &str) -> Value {
     match schema {
+        Value::Object(fields) if fields.get("$id").is_some_and(Value::is_string) => {
+            Value::Object(fields)
+        }
         Value::Object(fields) => Value::Object(
             fields
                 .into_iter()
@@ -2287,6 +2295,15 @@ mod tests {
         assert_eq!(props["remote"]["$ref"], "https://example.com/s.json");
         assert_eq!(props["anchored"]["$ref"], "#inner");
         assert_eq!(moved["$defs"]["Inner"], json!({"type": "string"}));
+
+        // A `$id` starts a new resource, so its local refs stay as they are.
+        let nested = json!({"$id": "https://example.com/n", "$ref": "#/$defs/A"});
+        let schema = json!({"properties": {"n": nested}, "$ref": "#/$defs/B"});
+        let moved = rebase_refs(schema, "#/$defs/X");
+        assert_eq!(moved["properties"]["n"], nested);
+        assert_eq!(moved["$ref"], "#/$defs/X/$defs/B");
+        let rooted = json!({"$id": "urn:wf", "$ref": "#/$defs/A"});
+        assert_eq!(rebase_refs(rooted.clone(), "#/$defs/X"), rooted);
     }
 
     /// A rerun seal keeps the end that the run had. A terminate reads as
