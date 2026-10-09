@@ -474,7 +474,9 @@ same activity.
 
 The policy runs live, so use a policy with no side effects. It sees the
 recorded run id and the aligned call ids. A retryable model failure retries
-under the retry policy of `agent_model_turn`, as on a worker.
+under the retry policy of `agent_model_turn`, as on a worker. A turn over the
+harness result cap (`AgentHarness::max_result_bytes`) fails, as on a worker
+with no payload store.
 
 A recorded outcome answers a call with the same step, tool name and
 arguments. A candidate call that equals the recorded call at the same turn
@@ -494,7 +496,9 @@ example `Completed` and `TokensExhausted`. `diverged()` reads both.
 
 Each candidate turn is a live model call. `Candidate::max_turns` caps them.
 The default cap is the recorded turn count plus `DEFAULT_EXTRA_TURNS`. The
-report sets `turn_cap_reached` when the cap stops the candidate.
+report sets `turn_cap_reached` when the cap stops the candidate. Each engine
+cycle replays the history so far, so the time of an evaluation grows with the
+square of the run length.
 
 The harness refuses an erased source, a source that has not ended, a source
 that was cancelled or timed out, and a history that is not an agent run. A history with payload-store references or

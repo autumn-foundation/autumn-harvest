@@ -10,7 +10,8 @@
 //!
 //! - `agent_model_turn` asks the candidate model, then the candidate policy.
 //!   These are the only live calls. A retryable failure retries under the
-//!   retry policy of the activity, as on a worker.
+//!   retry policy of the activity, as on a worker. A turn over the worker
+//!   result cap fails, as on a worker with no payload store.
 //! - `agent_tool_call` returns the recorded outcome of the same call. A call
 //!   with no recorded outcome gets an error stub. No tool runs.
 //! - `agent_memory_snapshot` returns the recorded snapshot, or an empty one.
@@ -65,6 +66,10 @@
 //! them. The default cap is the recorded turn count plus
 //! [`DEFAULT_EXTRA_TURNS`].
 //!
+//! Each engine cycle replays the history so far. So the time of an
+//! evaluation grows with the square of the run length. Evaluate long runs
+//! offline, not on a request path.
+//!
 //! # Runtime
 //!
 //! The test engine resolves activities synchronously. The model call is
@@ -77,14 +82,15 @@ use std::time::Duration;
 
 use autumn_harvest::erase::is_erasure_tombstone;
 use autumn_harvest::event::WorkflowEvent;
-use autumn_harvest::failure::parse_typed_payload;
+use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString, parse_typed_payload};
 use autumn_harvest::policy::RetryPolicy;
-use autumn_harvest::testing::WorkflowTestEnv;
+use autumn_harvest::testing::{MAX_TEST_ITERATIONS, WorkflowTestEnv};
 use autumn_harvest::types::ActivityExecId;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::bounds::exceeds_bytes;
 use crate::harness::AgentHarness;
 use crate::message::{ContentPart, StopReason, ToolCall};
 use crate::policy::ToolDecision;
@@ -103,6 +109,10 @@ pub const NOT_RUN: &str =
 
 /// The default number of live turns past the recorded turn count.
 pub const DEFAULT_EXTRA_TURNS: usize = 8;
+
+/// The engine cycles allowed for one candidate turn: the model call, its tool
+/// calls and its waits.
+const CYCLES_PER_TURN: usize = 64;
 
 /// The failure of a model turn past the turn cap.
 const TURN_CAP_ERROR: &str = "the evaluation reached its turn cap";
@@ -383,37 +393,7 @@ pub async fn evaluate(
         stubbed: 0,
     }));
 
-    let model = {
-        let session = Arc::clone(&session);
-        let harness = Arc::clone(&candidate.harness);
-        let run_id = recording.run_id.clone();
-        let taken: HashSet<String> = recording
-            .turns
-            .iter()
-            .flat_map(ModelTurn::calls)
-            .map(|call| call.id)
-            .collect();
-        let retry = agent_model_turn_info()
-            .default_retry_policy
-            .unwrap_or_default();
-        move |input: Value| -> Result<Value, String> {
-            let mut request: ModelTurnRequest = decode(input)?;
-            // The test engine has its own ids. The policy sees the recorded
-            // run id instead.
-            if let Some(run_id) = &run_id {
-                request.run_id.clone_from(run_id);
-            }
-            let (index, recorded) = lock(&session).next_turn()?;
-            let turn = live_turn(
-                &handle,
-                &harness,
-                &request,
-                (&recorded, &taken, index),
-                &retry,
-            )?;
-            encode(&turn)
-        }
-    };
+    let model = model_mock(&session, &candidate.harness, &recording, handle);
     let tool = {
         let session = Arc::clone(&session);
         move |input: Value| -> Result<Value, String> {
@@ -430,7 +410,14 @@ pub async fn evaluate(
         }
     };
 
+    // Each sequential await costs one engine cycle. A long source needs more
+    // cycles than the test engine allows by default.
+    let cycles = history
+        .len()
+        .saturating_add(max_turns.saturating_mul(CYCLES_PER_TURN))
+        .max(MAX_TEST_ITERATIONS);
     let mut env = WorkflowTestEnv::new()
+        .with_max_iterations(cycles)
         .with_workflow_name(WORKFLOW_NAME)
         .mock_activity(agent_model_turn_info().name, model)
         .mock_activity(agent_tool_call_info().name, tool)
@@ -572,6 +559,12 @@ impl Recording {
                         signals.push((signal_name.clone(), payload.clone()));
                     }
                 }
+                // A redrive reopens a failed run. A later terminal event ends
+                // it again.
+                WorkflowEvent::WorkflowRedriven { .. } => {
+                    end = None;
+                    last_failure = None;
+                }
                 other => {
                     if let Some(found) = run_end(other)? {
                         end = Some(found);
@@ -582,13 +575,8 @@ impl Recording {
         // A source that failed on a tool or snapshot activity replays that
         // failure, so the candidate fails at the same activity.
         if let (Some(RunEnd::Failed(_)), Some((activity_id, error))) = (&end, last_failure) {
-            match scheduled.get(&activity_id) {
-                Some((name, input)) if *name == tool_name => {
-                    tools.push(recorded_tool(input, Err(error))?);
-                }
-                Some((name, _)) if *name == snapshot_name => snapshots.push(Err(error)),
-                _ => {}
-            }
+            let scheduled = scheduled.get(&activity_id).copied();
+            push_failure(scheduled, error, &mut tools, &mut snapshots)?;
         }
         // Only a signal for a wait that the source opened is sent again. A
         // wait opens with its deadline timer. A signal that arrived before
@@ -606,6 +594,26 @@ impl Recording {
             end: end.ok_or(EvalError::InFlightSource)?,
         })
     }
+}
+
+/// Record the terminal failure of the `scheduled` activity, when it is a
+/// tool call or a snapshot.
+fn push_failure(
+    scheduled: Option<(&str, &Value)>,
+    error: String,
+    tools: &mut Vec<RecordedTool>,
+    snapshots: &mut Vec<Result<String, String>>,
+) -> Result<(), EvalError> {
+    match scheduled {
+        Some((name, input)) if name == agent_tool_call_info().name => {
+            tools.push(recorded_tool(input, Err(error))?);
+        }
+        Some((name, _)) if name == agent_memory_snapshot_info().name => {
+            snapshots.push(Err(error));
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// The task of an agent run history.
@@ -760,6 +768,44 @@ fn align_call_ids(
     }
 }
 
+/// The mock of the model activity: the live candidate turn.
+fn model_mock(
+    session: &Arc<Mutex<Session>>,
+    harness: &Arc<AgentHarness>,
+    recording: &Recording,
+    handle: tokio::runtime::Handle,
+) -> impl Fn(Value) -> Result<Value, String> + Send + Sync + 'static {
+    let session = Arc::clone(session);
+    let harness = Arc::clone(harness);
+    let run_id = recording.run_id.clone();
+    let taken: HashSet<String> = recording
+        .turns
+        .iter()
+        .flat_map(ModelTurn::calls)
+        .map(|call| call.id)
+        .collect();
+    let retry = agent_model_turn_info()
+        .default_retry_policy
+        .unwrap_or_default();
+    move |input: Value| -> Result<Value, String> {
+        let mut request: ModelTurnRequest = decode(input)?;
+        // The test engine has its own ids. The policy sees the recorded run
+        // id instead.
+        if let Some(run_id) = &run_id {
+            request.run_id.clone_from(run_id);
+        }
+        let (index, recorded) = lock(&session).next_turn()?;
+        let turn = live_turn(
+            &handle,
+            &harness,
+            &request,
+            (&recorded, &taken, index),
+            &retry,
+        )?;
+        encode(&turn)
+    }
+}
+
 /// Ask the candidate for turn `index`. The call ids change before the policy
 /// runs, so the policy sees the ids that the transcript records.
 ///
@@ -784,13 +830,30 @@ fn live_turn(
             handle.block_on(harness.model_turn_with(request.clone(), align))
         });
         let payload = match result {
-            Ok(turn) => return Ok(turn),
+            Ok(turn) => return fit_result_cap(turn, harness.result_cap()),
             Err(payload) => payload,
         };
         let delay = retry_delay(&payload, retry, attempt).ok_or(payload)?;
         tokio::task::block_in_place(|| handle.block_on(tokio::time::sleep(delay)));
         attempt += 1;
     }
+}
+
+/// Refuse a turn over the worker result cap, as a worker with no payload
+/// store does.
+///
+/// # Errors
+///
+/// Returns a non-retryable `PayloadTooLarge` failure payload.
+fn fit_result_cap(turn: ModelTurn, cap: u64) -> Result<ModelTurn, String> {
+    if exceeds_bytes(&turn, cap) {
+        return Err(ActivityFailure::non_retryable(
+            "PayloadTooLarge",
+            format!("the model turn is larger than the result cap of {cap} bytes"),
+        )
+        .into_error_payload());
+    }
+    Ok(turn)
 }
 
 /// The wait before attempt `attempt + 1` of a failed model turn, or `None`

@@ -143,6 +143,12 @@ impl AgentHarness {
         self
     }
 
+    /// The activity-result cap of the workers, in bytes.
+    #[cfg(feature = "eval")]
+    pub(crate) const fn result_cap(&self) -> u64 {
+        self.max_result_bytes
+    }
+
     /// Set the time budget of one model call.
     #[must_use]
     pub const fn model_timeout(mut self, timeout: Duration) -> Self {

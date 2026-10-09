@@ -511,6 +511,60 @@ async fn a_recorded_tool_failure_fails_the_candidate_at_the_same_call() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_turn_over_the_worker_result_cap_fails_as_in_production() {
+    let source = one_lookup().await;
+    let long = "x".repeat(2_000);
+    let model = ScriptedModel::new(vec![
+        calls(&[("c1", "lookup", json!({"q": "x"}))], 5),
+        answer(&long, 5),
+    ]);
+    let (harness, _) = candidate(model);
+
+    let evaluation = evaluate(&source, &Candidate::new(harness.max_result_bytes(1_000)))
+        .await
+        .unwrap();
+
+    let RunEnd::Failed(error) = &evaluation.candidate else {
+        panic!("the oversized turn fails: {:?}", evaluation.candidate);
+    };
+    assert!(error.contains("PayloadTooLarge"), "{error}");
+    assert!(evaluation.end_diverged);
+    assert_eq!(
+        evaluation.turns[1].verdict,
+        Verdict::Diverged(Divergence::Missing(Side::Candidate))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_redriven_source_that_has_not_ended_is_refused() {
+    let failed = WorkflowEvent::WorkflowFailed {
+        error: "provider down".into(),
+        error_type: None,
+        details: None,
+        non_retryable: None,
+    };
+    let mut source = with_end(one_lookup().await, Some(failed));
+    let redriven = json!({
+        "type": "WorkflowRedriven",
+        "data": {
+            "redriven_at": chrono::Utc::now(),
+            "dead_letter_id": "00000000-0000-0000-0000-000000000000",
+        },
+    });
+    source.push(serde_json::from_value(redriven).unwrap());
+    let model = ScriptedModel::new(vec![answer("done", 1)]);
+    let (harness, _) = candidate(model.clone());
+
+    let result = evaluate(&source, &Candidate::new(harness)).await;
+
+    assert!(
+        matches!(result, Err(EvalError::InFlightSource)),
+        "{result:?}"
+    );
+    assert_eq!(model.calls(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_cancelled_source_is_refused() {
     let cancelled = WorkflowEvent::WorkflowCancelled {
         reason: "operator".into(),

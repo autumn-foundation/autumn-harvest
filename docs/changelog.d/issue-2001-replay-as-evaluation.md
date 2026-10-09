@@ -25,7 +25,13 @@ get `Reworded`. `first_divergence` names the first divergent turn.
 `end_diverged` compares how the two runs end.
 
 **Cost.** `Candidate::max_turns` caps the live model calls. The default cap
-is the recorded turn count plus `DEFAULT_EXTRA_TURNS`.
+is the recorded turn count plus `DEFAULT_EXTRA_TURNS`. Each engine cycle
+replays the history so far, so the time grows with the square of the run
+length.
+
+**Engine.** `WorkflowTestEnv::with_max_iterations` sets the cycle cap of one
+test run. The default stays `MAX_TEST_ITERATIONS` (1000). The evaluation
+raises it to fit a long source.
 
 **Fork rules.** An evaluation is an in-memory fork at the first event. The
 harness leaves the source unchanged, accepts a completed source, records or
