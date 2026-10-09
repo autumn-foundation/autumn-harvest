@@ -12367,7 +12367,7 @@
             "description": "Execution not found."
           },
           "503": {
-            "description": "Streaming is unavailable server-side (retriable): the LISTEN/NOTIFY notification URL is not configured, or that database is unreachable."
+            "description": "Streaming is unavailable server-side (retriable) for a live run: the LISTEN/NOTIFY notification URL is not configured, or that database is unreachable. A terminal run needs no LISTEN connection, so it never gets this response."
           }
         },
         "summary": "Server-Sent Events stream of the DURABLE output chunks a workflow stores via ctx.publish_durable_progress (issue #1974).",

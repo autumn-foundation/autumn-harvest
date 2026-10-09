@@ -228,10 +228,18 @@ fn build_app(pool: &DbPool, url: &str) -> axum::Router {
 }
 
 fn build_app_with_keepalive(pool: &DbPool, url: &str, keepalive: Duration) -> axum::Router {
+    build_app_inner(pool, Some(url), keepalive)
+}
+
+/// `notify_url` is the LISTEN/NOTIFY database URL. `None` models a
+/// deployment with no live streaming configured.
+fn build_app_inner(pool: &DbPool, notify_url: Option<&str>, keepalive: Duration) -> axum::Router {
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     // Required so the stream handler can open a LISTEN connection for the shard.
-    api_state.set_workflow_result_notification_database_url(url.to_string());
+    if let Some(url) = notify_url {
+        api_state.set_workflow_result_notification_database_url(url.to_string());
+    }
     api_state.set_sse_keepalive_interval(keepalive);
     api_state.install(HarvestApiRuntime::new(
         test_registry(),
@@ -868,6 +876,42 @@ async fn durable_stream_backfills_a_terminal_run_from_any_offset() {
     let (tail, _) = read_sse(resp, Duration::from_secs(10)).await;
     assert_eq!(durable_progress(&tail), expected_tokens(7..10));
     assert_eq!(tail.last().and_then(|f| f.event.as_deref()), Some("end"));
+}
+
+/// A finished run needs no LISTEN connection, so its stored chunks stay
+/// readable where live streaming is not configured.
+#[tokio::test]
+async fn durable_stream_reads_a_terminal_run_without_a_notification_url() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let live_app = build_app(&pool, &url);
+    let mut conn = pool.get().await.unwrap();
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    start_or_load_workflow_execution(
+        &mut conn,
+        start_params_named(exec_id, "durable_stream_wf", "durable-no-notify"),
+        None,
+    )
+    .await
+    .unwrap();
+    let (worker, worker_handle) = spawn_worker(&pool, "durable-no-notify-worker");
+    send_go_signal(&pool, exec_id).await;
+    wait_for_state(&pool, exec_id, "COMPLETED").await;
+    worker.shutdown();
+    let _ = worker_handle.await;
+    drop(live_app);
+
+    let app = build_app_inner(&pool, None, Duration::from_millis(150));
+    let resp = durable_response(&app, exec_id, "", None).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a finished run needs no LISTEN URL"
+    );
+    let (frames, _) = read_sse(resp, Duration::from_secs(10)).await;
+    assert_eq!(durable_progress(&frames), expected_tokens(0..10));
+    assert_eq!(frames.last().and_then(|f| f.event.as_deref()), Some("end"));
 }
 
 /// AC: back-pressure does not drop chunks in durable mode. The client reads

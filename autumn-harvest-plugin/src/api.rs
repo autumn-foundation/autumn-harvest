@@ -45760,7 +45760,8 @@ async fn durable_stream_producer(
 ///   the drain that follows its terminal state.
 ///
 /// The frames are the `/stream` frames, and the SSE `id:` is the offset.
-/// Auth and the 400, 404 and 503 responses are the same as for `/stream`.
+/// Auth and the 400 and 404 responses are the same as for `/stream`. The 503
+/// for a missing or unreachable LISTEN database applies to a live run only.
 /// A live stream holds one `LISTEN` connection. A pooled connection is held
 /// for one page read only.
 async fn stream_workflow_progress_durable(
@@ -45780,18 +45781,6 @@ async fn stream_workflow_progress_durable(
         Ok(cursor) => cursor,
         Err(e) => return e.into_response(),
     };
-    let Some(shard) = resolve_shard_best_effort(&api_state, exec_id).await else {
-        return AutumnError::service_unavailable_msg(
-            "progress streaming is not configured (no LISTEN/NOTIFY database URL)",
-        )
-        .into_response();
-    };
-    let Ok(notification_url) = api_state.sse_notification_url(shard) else {
-        return AutumnError::service_unavailable_msg(
-            "progress streaming is not configured (no LISTEN/NOTIFY database URL)",
-        )
-        .into_response();
-    };
     let state = {
         let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
             Ok(c) => c,
@@ -45802,9 +45791,23 @@ async fn stream_workflow_progress_durable(
             Err(e) => return map_error(e).into_response(),
         }
     };
+    // A terminal run reads stored rows only, so it needs no LISTEN URL. A
+    // deployment without live streaming can still read finished runs.
     let start = if is_terminal_state(&state) {
         DurableStart::Terminal(state.to_lowercase().replace('_', "-"))
     } else {
+        let Some(shard) = resolve_shard_best_effort(&api_state, exec_id).await else {
+            return AutumnError::service_unavailable_msg(
+                "progress streaming is not configured (no LISTEN/NOTIFY database URL)",
+            )
+            .into_response();
+        };
+        let Ok(notification_url) = api_state.sse_notification_url(shard) else {
+            return AutumnError::service_unavailable_msg(
+                "progress streaming is not configured (no LISTEN/NOTIFY database URL)",
+            )
+            .into_response();
+        };
         // LISTEN before the first read, so no commit falls between the two.
         match DurableStreamListener::connect(&notification_url, exec_id.as_uuid()).await {
             Ok(listener) => DurableStart::Live { listener, shard },
