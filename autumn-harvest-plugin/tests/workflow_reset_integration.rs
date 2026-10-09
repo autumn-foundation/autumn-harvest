@@ -774,11 +774,19 @@ async fn batch_reset_skips_an_erased_source_and_resets_the_rest() {
         "the skip must name erasure, not an infrastructure error: {skipped}"
     );
     assert!(skipped.get("new_exec_id").is_none(), "item: {skipped}");
-    assert_eq!(fork_count(&mut conn, erased).await, 0, "no fork of the erased run");
+    assert_eq!(
+        fork_count(&mut conn, erased).await,
+        0,
+        "no fork of the erased run"
+    );
 
     let reset = batch_item(&body, intact);
     assert_eq!(reset["outcome"], json!("reset"), "item: {reset}");
-    assert_eq!(fork_count(&mut conn, intact).await, 1, "the intact run forks");
+    assert_eq!(
+        fork_count(&mut conn, intact).await,
+        1,
+        "the intact run forks"
+    );
 }
 
 /// The dry run must predict the real outcome. It reports the erased run as
@@ -801,6 +809,14 @@ async fn batch_reset_preview_reports_an_erased_source_as_skipped() {
     assert_eq!(skipped["outcome"], json!("skipped"), "item: {skipped}");
     assert_eq!(skipped["skip_reason"], json!({ "type": "erased_source" }));
     assert_eq!(batch_item(&body, intact)["outcome"], json!("previewed"));
-    assert_eq!(fork_count(&mut conn, erased).await, 0, "a preview forks nothing");
-    assert_eq!(fork_count(&mut conn, intact).await, 0, "a preview forks nothing");
+    assert_eq!(
+        fork_count(&mut conn, erased).await,
+        0,
+        "a preview forks nothing"
+    );
+    assert_eq!(
+        fork_count(&mut conn, intact).await,
+        0,
+        "a preview forks nothing"
+    );
 }

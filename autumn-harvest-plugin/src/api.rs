@@ -97,7 +97,7 @@ use autumn_harvest::queue::{self, ConcurrencyKeyStats};
 use autumn_harvest::reset::{
     BatchResetItem, BatchResetOutcome, ResetInvalidPoint, ResetPoint, ResetResult,
     ResetSignalReapplyPolicy, ResetSkipReason, WorkflowResetError, WorkflowResetRequest,
-    preview_workflow_reset, reset_workflow_execution, resolve_batch_reset_one,
+    batch_skip_reason, preview_workflow_reset, reset_workflow_execution, resolve_batch_reset_one,
 };
 use autumn_harvest::retention::{RetentionConfig, RetentionMonitor, RetentionStatus};
 use autumn_harvest::scheduler::{
@@ -21529,9 +21529,7 @@ async fn batch_reset_workflows(
                                 outcome: BatchResetOutcome::Skipped,
                                 resolved_event_id: Some(resolved_event_id),
                                 new_exec_id: None,
-                                skip_reason: Some(ResetSkipReason::InfrastructureError {
-                                    message: format!("reset failed: {reset_err}"),
-                                }),
+                                skip_reason: Some(batch_skip_reason(&reset_err)),
                             });
                             skipped_count += 1;
                         }

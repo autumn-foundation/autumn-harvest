@@ -796,9 +796,7 @@ async fn reset_refuses_an_erased_source_under_its_own_row_lock() {
 /// Otherwise a preview approves a fork that the reset then refuses.
 #[tokio::test]
 async fn preview_refuses_an_erased_source() {
-    use autumn_harvest::reset::{
-        WorkflowResetError, WorkflowResetRequest, preview_workflow_reset,
-    };
+    use autumn_harvest::reset::{WorkflowResetError, WorkflowResetRequest, preview_workflow_reset};
 
     let (url, _container) = setup_database().await;
     let mut conn = establish(&url).await;

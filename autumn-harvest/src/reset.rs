@@ -117,6 +117,9 @@ pub enum ResetSkipReason {
     ChildWorkflow,
     /// The execution has no history at all (no `WorkflowStarted` event).
     EmptyHistory,
+    /// The execution's payloads were PII-erased (issue #495). A fork would
+    /// resume on tombstones, so no fork path accepts it (issue #1999).
+    ErasedSource,
     /// An infrastructure failure (UUID parse, DB connection, or reset engine
     /// error) prevented the execution from being processed. This is distinct
     /// from a domain skip — the execution was not examined and should be
@@ -765,6 +768,8 @@ pub async fn preview_workflow_reset(
     let mut request = request.normalized();
     let execution = load_source_execution(conn, exec_id, false).await?;
     validate_source_execution(exec_id, &execution, request.allow_terminal_source)?;
+    // A preview must return the refusal that the reset returns (issue #1999).
+    reject_if_source_erased(exec_id, &execution)?;
     // A reset while the source holds a durable mutex would phantom-grant the
     // lock to the fork; surface that in the preview so the operator sees the
     // same rejection the actual reset would return (issue #691).
@@ -826,11 +831,7 @@ pub async fn reset_workflow_execution(
             // decision consistent with the fork it guards: erasure either
             // committed before this lock (we see it and refuse) or must wait
             // behind it (the fork completes on intact events).
-            if request.refuse_erased_source
-                && crate::erase::execution_input_is_erased(&source.input)
-            {
-                return Err(WorkflowResetError::ErasedSource { exec_id });
-            }
+            reject_if_source_erased(exec_id, &source)?;
 
             let rows = load_event_rows(conn, exec_id).await?;
             let events = decode_events(&rows)?;
@@ -1044,6 +1045,7 @@ fn skip_reason_to_error(exec_id: ExecutionId, reason: ResetSkipReason) -> Workfl
             nearest_valid_before,
             nearest_valid_after,
         }),
+        ResetSkipReason::ErasedSource => WorkflowResetError::ErasedSource { exec_id },
         ResetSkipReason::InfrastructureError { message } => {
             WorkflowResetError::InvalidPoint(ResetInvalidPoint {
                 message,
@@ -1055,6 +1057,35 @@ fn skip_reason_to_error(exec_id: ExecutionId, reason: ResetSkipReason) -> Workfl
             })
         }
     }
+}
+
+/// Map a failed batch fork to the skip reason of its item.
+///
+/// An erasure can commit after the batch resolve and before the fork lock.
+/// The fork then refuses, and the item keeps the typed `ErasedSource`
+/// reason (issue #1999). Any other failure is an `InfrastructureError`.
+#[must_use]
+pub fn batch_skip_reason(error: &WorkflowResetError) -> ResetSkipReason {
+    match error {
+        WorkflowResetError::ErasedSource { .. } => ResetSkipReason::ErasedSource,
+        other => ResetSkipReason::InfrastructureError {
+            message: format!("reset failed: {other}"),
+        },
+    }
+}
+
+/// Refuse a PII-erased source (issue #495).
+///
+/// Every fork path calls this, with no opt-out (issue #1999). The check is
+/// O(1): erasure always tombstones the row's own `input` column.
+fn reject_if_source_erased(
+    exec_id: ExecutionId,
+    execution: &WorkflowExecution,
+) -> Result<(), WorkflowResetError> {
+    if crate::erase::execution_input_is_erased(&execution.input) {
+        return Err(WorkflowResetError::ErasedSource { exec_id });
+    }
+    Ok(())
 }
 
 /// Read-only per-execution resolver for batch reset.
@@ -1108,6 +1139,12 @@ pub async fn resolve_batch_reset_one(
     // Skip child workflows in v1.
     if execution.parent_id.is_some() {
         return Ok(Err(ResetSkipReason::ChildWorkflow));
+    }
+
+    // Skip an erased source, so a preview predicts the fork (issue #1999).
+    // The fork rechecks under its row lock.
+    if crate::erase::execution_input_is_erased(&execution.input) {
+        return Ok(Err(ResetSkipReason::ErasedSource));
     }
 
     let rows = load_event_rows(conn, exec_id).await?;
