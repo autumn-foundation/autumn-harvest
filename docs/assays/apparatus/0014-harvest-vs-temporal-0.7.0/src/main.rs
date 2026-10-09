@@ -97,18 +97,23 @@ impl Settings {
             .split(',')
             .map(|raw| raw.trim().parse().expect("a depth is a whole number"))
             .collect();
+        let database_url = env_string(
+            "ASSAY14_DATABASE_URL",
+            "postgres://postgres@127.0.0.1:5432/assay14",
+        );
+        // The reset must drop the database the harness then uses. So the name
+        // comes from the URL, unless `ASSAY14_DB_NAME` sets it.
+        let database_name = std::env::var("ASSAY14_DB_NAME")
+            .unwrap_or_else(|_| database_name_of(&database_url));
         Self {
             tree: env_string("ASSAY14_TREE", "unknown"),
             round: env_usize("ASSAY14_ROUND", 0),
-            database_url: env_string(
-                "ASSAY14_DATABASE_URL",
-                "postgres://postgres@127.0.0.1:5432/assay14",
-            ),
+            database_url,
             admin_url: env_string(
                 "ASSAY14_ADMIN_URL",
                 "postgres://postgres@127.0.0.1:5432/postgres",
             ),
-            database_name: env_string("ASSAY14_DB_NAME", "assay14"),
+            database_name,
             redis_url: env_string("ASSAY14_REDIS_URL", "redis://127.0.0.1:6379"),
             input_json: env_string("ASSAY14_INPUT_JSON", INPUT_JSON),
             depths,
@@ -117,6 +122,12 @@ impl Settings {
             arms,
         }
     }
+}
+
+/// The database name in a Postgres URL: the last path segment, without a query.
+fn database_name_of(url: &str) -> String {
+    let path = url.split('?').next().unwrap_or(url);
+    path.rsplit('/').next().unwrap_or("assay14").to_string()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

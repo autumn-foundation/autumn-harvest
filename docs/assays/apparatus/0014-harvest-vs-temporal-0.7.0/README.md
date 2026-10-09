@@ -80,6 +80,7 @@ ASSAY14_BINS=0aeb887=/tgt/0aeb887/release/harvest_vs_temporal_070_assay,\
 | `ASSAY14_INPUT_JSON` | assay #11's payload | the seeded workflow input |
 | `ASSAY14_CAP_SECS` | `900` | cap on one run |
 | `ASSAY14_DATABASE_URL` | `postgres://postgres@127.0.0.1:5432/assay14` | the assay database |
+| `ASSAY14_DB_NAME` | the database in `ASSAY14_DATABASE_URL` | the database that each run drops and recreates |
 | `ASSAY14_ADMIN_URL` | `postgres://postgres@127.0.0.1:5432/postgres` | drops and creates it |
 | `ASSAY14_REDIS_URL` | `redis://127.0.0.1:6379` | the dispatch Redis |
 

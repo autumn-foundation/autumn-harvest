@@ -64,7 +64,7 @@ smoke run saw 167 tagged keys mid-run, then a residue of `0/0/0`.
 
 ### Changes after the sweep
 
-Review (PR #2055) found five apparatus gaps after the sweep. None
+Review (PR #2055) found six apparatus gaps after the sweep. None
 changes a grade. `grade.py` reproduces every grade above from the same raw
 output.
 
@@ -79,6 +79,8 @@ output.
 - A worker that overruns its 20 s shutdown is now aborted and awaited. Before,
   the abort did not wait. No run overran: every run's claim and activity
   counts are exact.
+- The database that each run resets now follows `ASSAY14_DATABASE_URL`. The
+  sweep used the defaults, where both name `assay14`.
 
 The #1815 samples also cover the worker shutdown, a few claims and scans per
 run. At depth 2,000 that is about 3 claims in 14,000.
