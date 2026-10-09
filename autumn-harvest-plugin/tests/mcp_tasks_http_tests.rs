@@ -598,3 +598,25 @@ async fn a_modern_invalid_params_error_is_http_400() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{out}");
     assert_eq!(out["error"]["code"], -32602, "{out}");
 }
+
+/// A malformed 2026-07-28 envelope gets HTTP 400 before dispatch, and an
+/// older request with the same fault keeps HTTP 200.
+#[tokio::test]
+async fn a_modern_malformed_envelope_is_http_400() {
+    let modern = [
+        ("mcp-protocol-version", "2026-07-28"),
+        ("mcp-method", "ping"),
+    ];
+    for body in [
+        json!({"id": 1, "method": "ping"}),
+        json!({"jsonrpc": "2.0", "id": 1}),
+        json!({"jsonrpc": "2.0", "id": null, "method": "ping"}),
+        json!([call("ping", &json!({}))]),
+    ] {
+        let (status, out) = post_with_headers(&router(), &body, &modern).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body} -> {out}");
+        assert_eq!(out["error"]["code"], -32600, "{out}");
+        let (status, _) = post_with_headers(&router(), &body, &[]).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+}

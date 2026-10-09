@@ -1004,6 +1004,9 @@ async fn serve(
     body: Result<Json<Value>, JsonRejection>,
 ) -> Response {
     let headers = &caller.headers;
+    let modern = headers
+        .get("mcp-protocol-version")
+        .is_some_and(|v| v == LATEST_PROTOCOL_VERSION);
     let message = match body {
         Ok(Json(message)) => message,
         // The JSON content type is the CSRF guard: a browser sends it
@@ -1012,9 +1015,10 @@ async fn serve(
             return rejection.into_response();
         }
         Err(rejection) => {
-            return rpc_response(
+            return reply(
                 &Value::Null,
                 Err(RpcError::new(PARSE_ERROR, rejection.body_text())),
+                modern,
             );
         }
     };
@@ -1025,7 +1029,11 @@ async fn serve(
         } else {
             "Invalid Request: expected a JSON object"
         };
-        return rpc_response(&Value::Null, Err(RpcError::new(INVALID_REQUEST, reason)));
+        return reply(
+            &Value::Null,
+            Err(RpcError::new(INVALID_REQUEST, reason)),
+            modern,
+        );
     };
     let id = object.get("id").cloned();
     // MCP forbids a null id, unlike plain JSON-RPC.
@@ -1037,9 +1045,10 @@ async fn serve(
         id_ok,
     ) else {
         let err_id = id.filter(|v| v.is_string() || v.is_number());
-        return rpc_response(
+        return reply(
             &err_id.unwrap_or(Value::Null),
             Err(RpcError::new(INVALID_REQUEST, "Invalid Request")),
+            modern,
         );
     };
     // A notification gets no response body.
@@ -1060,21 +1069,28 @@ async fn serve(
         return response;
     }
     let result = dispatch(&api_state, &catalog, &caller, method, &params).await;
-    let modern = headers
-        .get("mcp-protocol-version")
-        .is_some_and(|v| v == LATEST_PROTOCOL_VERSION);
+    reply(&id, result, modern)
+}
+
+/// The JSON-RPC response with the HTTP status its error needs.
+///
+/// `modern` is `true` for a 2026-07-28 request. That revision maps some
+/// errors to an HTTP status. An older request gets 200 for them.
+fn reply(id: &Value, result: RpcResult, modern: bool) -> Response {
     let status = match &result {
         // The 2026-07-28 transport answers an unknown method with 404.
         Err(err) if modern && err.code == METHOD_NOT_FOUND => Some(StatusCode::NOT_FOUND),
         // The 2026-07-28 revision answers a malformed request with 400.
-        Err(err) if modern && matches!(err.code, INVALID_PARAMS | INVALID_REQUEST) => {
+        Err(err)
+            if modern && matches!(err.code, PARSE_ERROR | INVALID_PARAMS | INVALID_REQUEST) =>
+        {
             Some(StatusCode::BAD_REQUEST)
         }
         // The schema requires HTTP 400 for a missing client capability.
         Err(err) if err.code == MISSING_CLIENT_CAPABILITY => Some(StatusCode::BAD_REQUEST),
         _ => None,
     };
-    let mut response = rpc_response(&id, result);
+    let mut response = rpc_response(id, result);
     if let Some(status) = status {
         *response.status_mut() = status;
     }
@@ -1626,6 +1642,10 @@ async fn open_signal_waits(
         let report = crate::api::build_awaitables_report(api_state, exec_id)
             .await
             .map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))?;
+        // A degraded report cannot see a signal wait. Parking on a wait adds
+        // no history event, so a cached empty list would hide the wait for
+        // good. Only a full replay is cached.
+        let replayed = report.wait_set == "replayed";
         let mut names: Vec<String> = Vec::new();
         for awaitable in report.awaitables {
             if awaitable.kind == AwaitableKind::Signal
@@ -1641,7 +1661,9 @@ async fn open_signal_waits(
         if after != Some(position) {
             return Ok((Vec::new(), Some(last_event_at)));
         }
-        catalog.cache_waits(live.id, position, names.clone());
+        if replayed {
+            catalog.cache_waits(live.id, position, names.clone());
+        }
         names
     };
     if names.is_empty() {

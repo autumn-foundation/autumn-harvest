@@ -78,7 +78,7 @@ route behind the existing `mcp` cargo feature.
 | R9a | A hostile page rebinds its DNS name to the server, so `Origin` and `Host` agree. | A same-origin `Origin` passes only on a trusted host, as on autumn-web's `/mcp`. Any other origin must be in the CORS allowlist, or it gets `403`. |
 | R10 | The route skips the tool-route auth layers. | It reuses the layer stack of a mutating tool route. A test proves a read-only principal gets `403`. |
 | R11 | A task outlives retention and `tasks/get` fails with a 500. | A missing row is `-32602` "Task not found", as the spec allows. `ttlMs` reports retention once the run ends. |
-| R12 | `tasks/get` replays history on each poll and loads the database. | The route caches the waits of each run at each history position, so a poll with no new event does not replay. `pollIntervalMs` asks for 5 s. |
+| R12 | `tasks/get` replays history on each poll and loads the database. | The route caches the waits of each run at each history position, so a poll with no new event does not replay. Only a full replay is cached: a degraded scan cannot see a signal wait. `pollIntervalMs` asks for 5 s. |
 | R13 | A cross-type continue-as-new moves the live run to a workflow outside the catalog. | `tasks/update` and `tasks/cancel` refuse such a run. |
 | R14 | The read after a start fails, so the client sees an error and retries. | The create retries the read. If it still fails, the client gets the plain run handle, not a task, because the spec sends a task only once `tasks/get` resolves. The run is never hidden. |
 | R16 | A gateway authorizes on `Mcp-Method: ping`, and the body runs `tools/call`. | The route compares `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` with the body and refuses a mismatch with `400` and `-32020`. |
