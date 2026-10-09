@@ -1,4 +1,4 @@
-# ADR 0006: Standalone durable activity
+# ADR 0007: Standalone durable activity
 
 ## Status
 
