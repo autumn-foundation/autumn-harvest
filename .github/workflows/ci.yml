@@ -431,6 +431,8 @@ jobs:
       - name: Clippy autumn-harvest-agent (sqlite feature)
         run: cargo clippy -p autumn-harvest-agent --all-targets --features sqlite --no-deps -- -D warnings
       - name: Clippy autumn-harvest-agent (eval feature, issue #2001)
+        run: cargo clippy -p autumn-harvest-agent --all-targets --features eval --no-deps -- -D warnings
+      - name: Clippy autumn-harvest-agent (sqlite and eval features, issue #2001)
         run: cargo clippy -p autumn-harvest-agent --all-targets --features sqlite,eval --no-deps -- -D warnings
       - name: Check autumn-harvest-agent depends on no Autumn crate outside the engine
         run: ./scripts/check-agent-adapter-deps.sh

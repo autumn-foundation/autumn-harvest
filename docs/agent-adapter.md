@@ -441,12 +441,14 @@ tool whose result changes, does not trip it. Use `max_steps`,
 ## 11. Evaluate a candidate model or prompt
 
 `eval::evaluate` re-drives a recorded `agent_loop` run with a candidate model
-or prompt (issue #2001). It reports where the decisions diverge. Turn on the
-`eval` feature.
+or prompt (issue #2001). It reports where the decisions of the two runs
+diverge. Turn on the `eval` feature.
 
 ```rust,ignore
 use autumn_harvest_agent::eval::{Candidate, evaluate};
 
+// The source history, for example from SqliteRuntime::load_history.
+let history = rt.load_history(exec)?;
 let candidate = Candidate::new(AgentHarness::new(new_model).tools(tools))
     .system_prompt("Answer in one sentence.");
 let evaluation = evaluate(&history, &candidate).await?;
@@ -461,25 +463,37 @@ change.
 
 | Activity | In an evaluation |
 |---|---|
-| `agent_model_turn` | The candidate model answers. This is the only live call. |
+| `agent_model_turn` | The candidate model answers, then the candidate policy decides. These are the only live calls. |
 | `agent_tool_call` | The recorded outcome of the same call, or an error stub. No tool runs. |
 | `agent_memory_snapshot` | The recorded snapshot, or an empty one. |
 | `agent_deliver` | A stub. No report leaves the harness. |
+| Any other activity, such as `agent_precheck` | No mock. The candidate run fails. |
+
+The policy runs live, so use a policy with no side effects. It sees the
+recorded run id.
 
 A recorded outcome answers a call with the same step, tool name and
 arguments. A candidate call that equals the recorded call at the same turn
-and position takes the recorded call id. So the recorded approvals stay
-valid. An approval that arrived after its deadline is dropped.
+and position takes the recorded call id. Approval signal names hold the call
+id, so the recorded approvals stay valid. Any other call gets a new `eval_`
+id, so no recorded approval can release it. The harness drops a signal that
+arrived after its deadline.
 
 The report holds one `TurnDiff` per model turn. A turn diverges when the
 calls, the arguments, the policy decisions or the stop reason differ. Two
-final answers in other words are `Reworded`, not a divergence.
+final answers with the same stop reason and different text get `Reworded`.
+That is not a divergence. `end_diverged` compares how the two runs end, for
+example `Completed` and `TokensExhausted`. `diverged()` reads both.
 `stubbed_tool_calls` counts the calls with no recorded outcome.
 
-The harness refuses an erased source and a history that is not an agent run.
-A history with payload-store references or encrypted payloads needs decoding
-first. The model call blocks in place, so run the evaluation on a
-multi-thread Tokio runtime.
+Each candidate turn is a live model call. `Candidate::max_turns` caps them.
+The default cap is the recorded turn count plus `DEFAULT_EXTRA_TURNS`. The
+report sets `turn_cap_reached` when the cap stops the candidate.
+
+The harness refuses an erased source, a source that has not ended, and a
+history that is not an agent run. A history with payload-store references or
+encrypted payloads needs decoding first. The model call blocks in place, so
+run the evaluation on a multi-thread Tokio runtime.
 
 The evaluation is an in-memory fork at the first event. The database fork of
 issue #2000 is a separate feature.

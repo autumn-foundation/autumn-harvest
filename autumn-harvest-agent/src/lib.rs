@@ -9,8 +9,11 @@
 //! The crate owns its agent primitives: [`AgentModel`], [`Tool`],
 //! [`ToolPolicy`], [`Approval`] and the message types. It also has the
 //! always-on primitives: [`heartbeat`], [`followup`], [`delivery`],
-//! [`memory`] and [`loop_guard`]. It depends on the core
-//! engine only, with no default features. It has no Autumn plugin dependency.
+//! [`memory`] and [`loop_guard`]. The `eval` feature adds the `eval` module.
+//! That module re-drives a recorded run with a candidate model or prompt.
+//!
+//! The crate depends on the core engine only, with no default features. It
+//! has no Autumn plugin dependency.
 //! An app implements [`AgentModel`] for its provider, or bridges a framework
 //! it already uses.
 //!
