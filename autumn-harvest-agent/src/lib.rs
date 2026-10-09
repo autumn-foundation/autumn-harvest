@@ -59,6 +59,8 @@ pub mod approval;
 pub mod bounds;
 pub mod delivery;
 pub mod error;
+#[cfg(feature = "eval")]
+pub mod eval;
 pub mod followup;
 pub mod harness;
 pub mod heartbeat;
