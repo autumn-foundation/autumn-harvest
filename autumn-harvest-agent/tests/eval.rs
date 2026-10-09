@@ -20,8 +20,8 @@ use autumn_harvest_agent::{
 };
 use autumn_harvest_sqlite::RunState;
 use common::{
-    CountingPolicy, Recorder, Reply, ScriptedModel, answer, calls, recorded_tool, report,
-    runtime, tool_results,
+    CountingPolicy, Recorder, Reply, ScriptedModel, answer, calls, recorded_tool, report, runtime,
+    tool_results,
 };
 use serde_json::{Value, json};
 
@@ -143,7 +143,10 @@ async fn another_tool_diverges_at_that_turn_and_never_runs() {
 
     assert!(evaluation.diverged());
     assert_eq!(evaluation.first_divergence, Some(0));
-    assert_eq!(first(&evaluation).verdict, Verdict::Diverged(Divergence::Calls));
+    assert_eq!(
+        first(&evaluation).verdict,
+        Verdict::Diverged(Divergence::Calls)
+    );
     assert_eq!(evaluation.replayed_tool_calls, 0);
     assert_eq!(evaluation.stubbed_tool_calls, 1);
     assert!(recorder.runs().is_empty(), "the payment never runs");
@@ -161,9 +164,12 @@ async fn changed_arguments_diverge() {
     let evaluation = evaluate(&source, &Candidate::new(harness)).await.unwrap();
 
     assert_eq!(evaluation.first_divergence, Some(0));
-    assert_eq!(first(&evaluation).verdict, Verdict::Diverged(Divergence::Calls));
+    assert_eq!(
+        first(&evaluation).verdict,
+        Verdict::Diverged(Divergence::Calls)
+    );
     assert_eq!(evaluation.stubbed_tool_calls, 1);
-    assert!(recorder.runs().is_empty());
+    assert_eq!(recorder.runs(), Vec::<Value>::new(), "no tool runs live");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -187,13 +193,16 @@ async fn a_later_divergence_names_its_turn() {
 
     assert_eq!(evaluation.turns[0].verdict, Verdict::Same);
     assert_eq!(evaluation.first_divergence, Some(1));
-    assert_eq!(first(&evaluation).verdict, Verdict::Diverged(Divergence::Shape));
+    assert_eq!(
+        first(&evaluation).verdict,
+        Verdict::Diverged(Divergence::Shape)
+    );
     assert_eq!(
         evaluation.turns[2].verdict,
         Verdict::Diverged(Divergence::Missing(Side::Candidate))
     );
     assert_eq!(evaluation.replayed_tool_calls, 1);
-    assert!(recorder.runs().is_empty());
+    assert_eq!(recorder.runs(), Vec::<Value>::new(), "no tool runs live");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -228,8 +237,11 @@ async fn a_changed_policy_decision_diverges() {
         .unwrap();
 
     assert_eq!(evaluation.first_divergence, Some(0));
-    assert_eq!(first(&evaluation).verdict, Verdict::Diverged(Divergence::Policy));
-    assert!(recorder.runs().is_empty());
+    assert_eq!(
+        first(&evaluation).verdict,
+        Verdict::Diverged(Divergence::Policy)
+    );
+    assert_eq!(recorder.runs(), Vec::<Value>::new(), "no tool runs live");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -299,7 +311,11 @@ async fn no_tool_activity_executes_live_during_evaluation() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn no_report_is_delivered_during_evaluation() {
-    let source = record(&AgentTask::new("report it").deliver(), vec![answer("ok", 1)]).await;
+    let source = record(
+        &AgentTask::new("report it").deliver(),
+        vec![answer("ok", 1)],
+    )
+    .await;
     let inbox = Arc::new(Inbox::default());
     let model = ScriptedModel::new(vec![answer("ok", 1)]);
     let (harness, _) = candidate(model);
@@ -342,9 +358,19 @@ async fn a_history_that_is_not_an_agent_run_is_refused() {
 
     let result = evaluate(&source, &Candidate::new(harness)).await;
 
-    assert!(matches!(result, Err(EvalError::NotAnAgentRun(_))), "{result:?}");
-    let empty = evaluate(&[], &Candidate::new(candidate(ScriptedModel::new(Vec::new())).0)).await;
-    assert!(matches!(empty, Err(EvalError::NotAnAgentRun(_))), "{empty:?}");
+    assert!(
+        matches!(result, Err(EvalError::NotAnAgentRun(_))),
+        "{result:?}"
+    );
+    let empty = evaluate(
+        &[],
+        &Candidate::new(candidate(ScriptedModel::new(Vec::new())).0),
+    )
+    .await;
+    assert!(
+        matches!(empty, Err(EvalError::NotAnAgentRun(_))),
+        "{empty:?}"
+    );
 }
 
 #[tokio::test]
@@ -384,11 +410,15 @@ async fn a_failed_candidate_model_is_reported_not_raised() {
         evaluation.turns[0].verdict,
         Verdict::Diverged(Divergence::Missing(Side::Candidate))
     );
-    assert!(recorder.runs().is_empty());
+    assert_eq!(recorder.runs(), Vec::<Value>::new(), "no tool runs live");
 }
 
 /// Record a source with two gated `pay` calls. The first approval arrives
 /// after its deadline. The second arrives in time.
+///
+/// SQLite drops a signal that arrives after its wait ends. Postgres keeps it
+/// in history, unread. So the fixture adds the late signal after the first
+/// deadline, where Postgres records it.
 async fn gated_source() -> Vec<WorkflowEvent> {
     let (_dir, db) = fresh_db();
     let recorder = Arc::new(Recorder::default());
@@ -414,7 +444,6 @@ async fn gated_source() -> Vec<WorkflowEvent> {
     let RunState::WaitingSignal(second) = state else {
         panic!("expected the second approval wait, got {state:?}");
     };
-    sqlite::decide(&mut rt, exec, &late, &Approval::Approve).unwrap();
     sqlite::decide(&mut rt, exec, &second, &Approval::Approve).unwrap();
     let final_report = report(rt.run_until_blocked(exec).await.unwrap());
     assert_eq!(final_report.stop, AgentStop::Completed);
@@ -423,7 +452,22 @@ async fn gated_source() -> Vec<WorkflowEvent> {
         vec![json!({"amount": 2})],
         "only the call approved in time runs in the source"
     );
-    rt.load_history(exec).unwrap()
+    let mut history = rt.load_history(exec).unwrap();
+    let deadline = history
+        .iter()
+        .position(|event| {
+            matches!(event, WorkflowEvent::TimerFired { timer_id }
+                if timer_id.as_str().ends_with(&late))
+        })
+        .expect("the first deadline fires in the source");
+    history.insert(
+        deadline + 1,
+        WorkflowEvent::SignalReceived {
+            signal_name: late,
+            payload: serde_json::to_value(Approval::Approve).unwrap(),
+        },
+    );
+    history
 }
 
 fn gated_candidate(replies: Vec<Reply>) -> (AgentHarness, Arc<Recorder>, Arc<ScriptedModel>) {
@@ -458,7 +502,7 @@ async fn a_late_approval_is_not_delivered_and_new_ids_take_the_recorded_ids() {
         evaluation.stubbed_tool_calls, 0,
         "the late approval releases nothing"
     );
-    assert!(recorder.runs().is_empty());
+    assert_eq!(recorder.runs(), Vec::<Value>::new(), "no tool runs live");
     let RunEnd::Completed(report) = &evaluation.candidate else {
         panic!("the candidate completes: {:?}", evaluation.candidate);
     };
