@@ -179,7 +179,7 @@ calls (from `pg_stat_statements`). Calls are context, not a decider.
 ### 1.3 Outputs
 
 - `docs/performance-standalone-activity-overhead.md`: the measurement.
-- `docs/adr/0006-standalone-activity.md`: the decision.
+- `docs/adr/0007-standalone-activity.md`: the decision.
 - `docs/getting-started/activities.md`: the pattern.
 - A changelog fragment.
 

@@ -1204,6 +1204,7 @@ mod tests {
                 .insert(crate::api_token::TokenPrincipal {
                     id: uuid::Uuid::nil(),
                     scope: TokenScope::Mutate,
+                    tenant: None,
                 });
         };
         assert_eq!(post_start(layered(token)).await, StatusCode::OK);

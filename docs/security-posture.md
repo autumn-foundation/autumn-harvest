@@ -423,7 +423,8 @@ needs I/O implements `HarvestAuthorizer` directly and returns a boxed future.
 |---|---|
 | `principal` | `Token { id, scope }` for a verified `hvst_` token. `Embedder` for every other caller; read its claims from `extensions`. |
 | `route_class` | `CLASSIFIED_ROUTES`. An unclassified path is `Mutating`. |
-| `tenant_key` | The `x-harvest-tenant` header, trimmed. A repeated header, a blank value, a non-ASCII byte or more than 128 bytes gets `400`. |
+| `tenant_key` | The verified tenant, when the credential carries one (issue #1977). Otherwise the `x-harvest-tenant` header, trimmed. A repeated header, a blank value, a non-ASCII byte or more than 128 bytes gets `400`. |
+| `tenant_verified` | `true` when `tenant_key` is the verified tenant. `false` when it is the header. Do not grant access on an unverified tenant. |
 | `shard` | Only a source the route's handler uses. See the table below. |
 | `method`, `path`, `extensions` | The request. |
 
@@ -456,9 +457,10 @@ shard by hash. To confine a caller to some shards, deny `None` too.
 - **A deny is a generic `403`.** The body is
   `{"error":"forbidden by authorization policy"}`. The reason goes only to the
   audit row, so the policy is not an oracle.
-- **The tenant key is caller-declared.** Harvest does not bind it to stored
-  executions. The hook decides if the principal may act for that tenant. To
-  confine a caller to its own executions, also check the target in `path`.
+- **An unverified tenant key is caller-declared.** With `tenant_verified =
+  false`, the key is the header. Do not grant access on it. A tenant-bound
+  caller gets its verified tenant instead, and Harvest checks the run's
+  tenant itself. See [Tenant binding](#tenant-binding-issue-1977).
 - **An execution id gives every shard its handler can reach.** That is the
   entry shard and the live shard after a rebalance. Some routes act on the
   live attempt: `/result`, `cancel`, `terminate`, `pause`, `resume`, `signal`,
@@ -787,12 +789,12 @@ After you turn it on, watch `harvest_api_rate_limited_total`.
 
 The limiter runs directly inside the token layer. It keys a bucket on the
 verified token id, so a random `hvst_` bearer cannot open a new bucket. It
-runs before the read-only, authorizer and `require_admin` layers, so a
-refused request reaches no handler. The request order is: embedder auth ->
-pre-auth charge -> token layer -> rate limiter -> read-only layer ->
-authorizer -> `require_admin` -> handler. A standalone token-only mount also
-puts `require_token_for_non_public` first. It refuses a request with no token
-before any lookup.
+runs before the tenant binding, read-only, authorizer and `require_admin`
+layers, so a refused request reaches no handler. The request order is:
+embedder auth -> pre-auth charge -> token layer -> rate limiter -> tenant
+binding -> read-only layer -> authorizer -> `require_admin` -> handler. A
+standalone token-only mount also puts `require_token_for_non_public` first. It
+refuses a request with no token before any lookup.
 
 With API tokens on, the same limiter also runs outside the token layer. This
 pre-auth charge takes one request from the client address bucket of each
@@ -935,12 +937,118 @@ for the mechanism. Security-relevant properties:
   `ChildPlacement::ResidencyKey` place a child on any shard. The hook does
   not see that decision. Do not build a child pin from caller input.
 - **The tenant header is not an identity.** The caller declares
-  `x-harvest-tenant`. Harvest does not bind it to stored executions.
+  `x-harvest-tenant`. A tenant-bound credential overrides it, and a header
+  that names another tenant gets `403`. See
+  [Tenant binding](#tenant-binding-issue-1977).
 - **Name cells, not tenants.** A cell residency key appears in requests,
   CLI calls and audit rows. Use `cell-a`, not a customer name. Keep the
   tenant-to-cell map in the application.
 - **Harvest has no namespaces.** All tenants on one shard share its
-  tables. Harvest has no per-tenant row scoping.
+  tables. Harvest has no per-tenant filter on list routes. A tenant-bound
+  caller cannot use list routes at all.
+
+---
+
+## Tenant binding (issue #1977)
+
+[ADR 0004](./adr/0004-tenant-isolation-cells.md#amendment-tenant-binding-issue-1977)
+records the decision. A credential can carry a tenant. A caller with such a
+credential is *tenant-bound*. Harvest then confines it without an authorizer.
+
+### Bind a credential
+
+- **A Harvest token.** Mint it with `tenant`:
+  `POST /admin/tokens {"name": "acme-ci", "scope": "mutate", "tenant": "acme"}`,
+  `harvest token create acme-ci --scope mutate --tenant acme`, or
+  `harvest token bootstrap --tenant acme`. `harvest token rotate` does not
+  copy the old tenant, so pass `--tenant` again. A tenant key is 1 to 128 bytes of
+  visible ASCII, with no spaces.
+- **The embedder's own principal.** In the auth middleware that wraps the
+  Harvest router, insert
+  `autumn_harvest_plugin::tenant::VerifiedTenant::new(tenant)?` as a request
+  extension.
+
+A request with a token tenant and an embedder tenant that differ gets `403`.
+
+### What a tenant-bound caller can do
+
+It can use only the routes in `TENANT_SCOPED_ROUTES`:
+
+- `POST /workflows/{name}/start`. The new run is stamped with the tenant.
+- `GET /workflows/{id}`, `/history` and `/result`.
+- `POST /workflows/{id}/cancel` and `/terminate`.
+- `POST /workflows/{id}/signal/{name}`.
+- `GET` and `POST /workflows/{id}/query/{name}`, and `GET /workflows/{id}/queries`.
+- `POST /workflows/{id}/update/{name}` and `GET /workflows/{id}/update/{update_id}/result`.
+
+Public routes such as `/health` also answer. The token scope still applies,
+so a `read` tenant token cannot cancel.
+
+### What Harvest refuses
+
+| Request | Answer |
+|---|---|
+| An `x-harvest-tenant` header that names another tenant | `403` |
+| Any route not in the list: list routes, admin routes, token mint and revoke, Vantage, signal-with-start, update-with-start, reset, erase, legal hold | `403` |
+| A run of another tenant, or a run with no tenant | `404`, the same as an unknown id |
+| A start whose workflow id is in use by a run of another tenant, with any reuse or conflict policy | `409`. The engine refuses before it attaches, cancels, replaces or seals the run. |
+| A start that resolves to a run of another tenant through an idempotency key | `409`, or the body error for a malformed body. The committed-replay check and the engine both refuse to return the run. |
+| A start of a throttled, debounced or batched workflow | `400`. A deferred start cannot carry the tenant. |
+
+Every `409` of a bound start has the body `{"error": "workflow id is in
+use"}`. It names no run and no state. Each `403`, each refused run and each
+`409` writes one `authz.deny` audit row. The answer body names no tenant and
+no reason. The rate limiter runs before the binding layer, so it also bounds
+refused requests.
+
+After a start succeeds, the binding layer reads the owner of the run that the
+answer names. A different owner turns the answer into the `409`. If that read
+fails, a fresh start keeps its answer, because the engine checked and stamped
+the tenant. A retry of it would start a second run. A replayed answer gets
+`503` instead, because a retry of a replay starts no run.
+
+### Where the tenant goes
+
+- The start route writes the tenant to `harvest_workflow_executions.tenant`.
+  The start body has no tenant field. A start by an unbound caller writes
+  no tenant, even with the header.
+- Children, cross-shard children, retries, continue-as-new successors,
+  reset forks and re-runs copy the tenant of their source run. A rebalance
+  moves it with the row. PII erasure does not touch it.
+- Completion-trigger targets copy the tenant of their source run. A
+  cross-shard trigger keeps it on its outbox row, so it survives retention
+  of the source run.
+- In-process code sets `StartWorkflowParams::tenant`,
+  `SignalWithStartParams::tenant`, `UpdateWithStartParams::tenant`, or the
+  `tenant` field of the typed start options. Set it only from a verified
+  source. With a tenant, the engine refuses to touch a prior run of another
+  tenant with `HarvestError::TenantConflict`. It also refuses to return one
+  as an idempotency duplicate.
+- These start paths carry no tenant: transactional starts, the outbox,
+  debounce, throttle, event batches, schedules, webhooks, broker connectors
+  and the MCP tools. Their runs have no tenant.
+- The retention janitor reads it for
+  [per-tenant overrides](./archival.md#per-tenant-retention-overrides-issue-1977).
+
+### Limits
+
+- **Workflow ids are shared.** Two tenants that start the same
+  `(workflow_name, workflow_id)` collide. The second gets `409`, so it learns
+  that the id is in use. It cannot change the other run. Prefix workflow ids
+  with the tenant. Idempotency keys are shared the same way.
+- **Workflow code is trusted.** A workflow can signal or cancel any run
+  by id or business key, and can pin a child into any cell. The binding
+  covers the management API only.
+- **MCP tool routes refuse a bound caller.** Each generated tool route
+  answers `403` when the embedder middleware sets `VerifiedTenant`. The token
+  layer does not run on these routes. If you install
+  `enforce_token_scope_mcp_mutation` on them, it refuses a tenant token on
+  the mutating tools. It does not cover the read tools.
+- **Concurrency supersede is not tenant-aware.** A `cancel_running`
+  concurrency policy can cancel another tenant's run that resolves to the
+  same concurrency key. Put the tenant in the concurrency key expression.
+- **A cell still bounds load, not access.** The binding is the access
+  boundary. Use cells to bound load.
 
 ---
 
@@ -1315,9 +1423,23 @@ Load each data key once, at startup, through a `KeyProvider`:
 | `FileKeyProvider` | `<dir>/<key_id>.key` that holds base64, for example a secret volume. |
 | `KmsKeyProvider` | A wrapped data key that a KMS unwraps (envelope encryption). |
 
-The `autumn-harvest-plugin` `aws-kms` feature adds `aws_kms::AwsKms`, which
-implements `KmsDecrypt` for AWS KMS. The core crate has no cloud dependency. To
-make a wrapped key, call `GenerateDataKey` with the codec key id as the
+`KmsKeyProvider` calls a KMS through the one-method `KmsDecrypt` trait. The
+core crate has no cloud dependency. `autumn-harvest-plugin` features supply
+the supported KMS bindings:
+
+| KMS | Plugin feature | Binding | Context binding |
+|-----|----------------|---------|-----------------|
+| AWS KMS | `aws-kms` | `aws_kms::AwsKms` | Encryption context |
+| HashiCorp Vault Transit | `vault-transit` | `vault_transit::VaultTransit` | Key derivation context |
+
+Each binding passes one shared test suite (`kms_conformance`, issue #1981).
+Vault Transit runs on any cloud and on premises. Harvest has no GCP Cloud KMS
+or Azure Key Vault binding yet. For another KMS, implement `KmsDecrypt` and
+send the context to the KMS as authenticated data.
+
+#### AWS KMS
+
+To make a wrapped key, call `GenerateDataKey` with the codec key id as the
 encryption context:
 
 ```sh
@@ -1350,6 +1472,83 @@ let harvest = HarvestBuilder::new()
     .aead_payload_codec_key(AeadCodec::load(&keys, "2026-10").await?)
     .try_build()?;
 ```
+
+#### HashiCorp Vault Transit
+
+The `vault-transit` feature uses the `reqwest` client that the plugin already
+has. It adds no crate to the lockfile. Make a Transit key with key derivation. Vault uses
+the context only for a derived key, so the binding refuses any other key.
+
+```sh
+vault secrets enable transit
+vault write transit/keys/harvest derived=true
+vault write -field=ciphertext transit/datakey/wrapped/harvest bits=256 \
+  context="$(printf '{"harvest_codec_key_id":"2026-10"}' | base64 | tr -d '\n')" \
+  > 2026-10.wrapped
+```
+
+The context is the base64 of the compact JSON object above. Use the codec key
+id as the value, and add no spaces. The `datakey/wrapped` endpoint returns the
+ciphertext only, so the plaintext key never leaves Vault. Vault refuses to unwrap the key under
+another key id or another Transit key.
+
+Give the Harvest token this policy. The binding reads the key to check that
+derivation is on. With another mount or a namespace, change the paths to match.
+
+```hcl
+path "transit/keys/harvest"    { capabilities = ["read"] }
+path "transit/decrypt/harvest" { capabilities = ["update"] }
+```
+
+```toml
+[dependencies]
+autumn-harvest-plugin = { version = "0.7", features = ["vault-transit"] }
+```
+
+```rust,ignore
+use autumn_harvest::aead_codec::{AeadCodec, KmsKeyProvider};
+use autumn_harvest_plugin::vault_transit::VaultTransit;
+
+let vault = VaultTransit::new(std::env::var("VAULT_ADDR")?, std::env::var("VAULT_TOKEN")?);
+let wrapped = std::fs::read_to_string("2026-10.wrapped")?;
+let keys = KmsKeyProvider::new(vault, "harvest")
+    .with_wrapped_key("2026-10", wrapped.trim().as_bytes().to_vec());
+let harvest = HarvestBuilder::new()
+    .aead_payload_codec_key(AeadCodec::load(&keys, "2026-10").await?)
+    .try_build()?;
+```
+
+The wrapped key is the `vault:v1:` text. Load it with `with_wrapped_key`, not
+`with_wrapped_key_base64`.
+
+- `with_mount` sets another Transit mount. Each mount segment uses letters,
+  digits, `_`, `-` and `.` only.
+- `with_namespace` sets a Vault Enterprise namespace.
+- The address must use `https`. Plain `http` is allowed for a loopback host,
+  for example a Vault Agent sidecar. `allow_plain_http` allows it for other
+  hosts, for development only.
+- The default client follows no redirect, so the token goes to the configured
+  address only. It sends plain `http` direct, never through a proxy. It trusts the bundled public CA roots, not the OS store, and
+  it ignores `VAULT_CACERT`.
+- Each request times out after 30 seconds, also with `with_client`.
+- `VaultTransit::new` takes the token once. The binding does not renew it. The
+  token must be valid when the process loads its keys.
+
+For a private CA, pass your own client to `with_client`. Turn off redirects on
+it. The module re-exports `reqwest`.
+
+```rust,ignore
+use autumn_harvest_plugin::vault_transit::reqwest;
+
+let ca = reqwest::Certificate::from_pem(&std::fs::read("vault-ca.pem")?)?;
+let client = reqwest::Client::builder()
+    .add_root_certificate(ca)
+    .redirect(reqwest::redirect::Policy::none())
+    .build()?;
+let vault = VaultTransit::new(vault_addr, vault_token).with_client(client);
+```
+
+### Codec rollout
 
 Use `aead_payload_codec_key`, not `payload_codec`, from the first deployment.
 It writes the key id into each envelope, so a later rotation needs no

@@ -2599,11 +2599,11 @@ fn classify_force_fail_target(
 ///   [`enforce_activity_timeout`] and the worker's `finalize_activity_*`
 ///   paths use, so a concurrent late worker result serializes with this call
 ///   rather than racing it).
-/// - **Late results are ignored**: after this commits, a late `Ok` hits
-///   `complete_task`'s `state = 'RUNNING'` filter (no-op error), a late
-///   retryable `Err` hits `requeue_for_retry`'s `state = 'RUNNING'` filter
-///   (cannot resurrect the FAILED row), and a late non-retryable `Err` no-ops
-///   in `finalize_activity_failure`'s terminal-history/row-state guards.
+/// - **Late results are ignored.** After this commits, the row is `FAILED`
+///   and the activity is not pending. A late `Ok` writes nothing, because its
+///   claim is lost (issue #1789). A late retryable `Err` cannot requeue the
+///   `FAILED` row. A late non-retryable `Err` no-ops in the terminal-history
+///   and row-state guards of `finalize_activity_failure`.
 /// - **Idempotent**: re-issuing the call on an already-forced task returns
 ///   `Ok` with `already_forced: true` and performs zero writes — including
 ///   after the owning run has since sealed (the woken workflow consuming the

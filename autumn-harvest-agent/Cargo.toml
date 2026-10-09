@@ -44,6 +44,10 @@ required-features = ["sqlite"]
 name = "crash_resume"
 required-features = ["sqlite"]
 
+[[test]]
+name = "always_on"
+required-features = ["sqlite"]
+
 [lints]
 workspace = true
 

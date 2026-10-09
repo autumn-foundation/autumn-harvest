@@ -1224,6 +1224,8 @@ pub struct DeferredTriggerStart {
     /// detached from the evaluating call's own scope, so the registry rides
     /// along on the struct rather than through a process-global static.
     pub codecs: crate::payload_codec::PayloadCodecs,
+    /// Tenant of the source run (issue #1977). The target run gets it.
+    pub tenant: Option<String>,
 }
 
 #[cfg(feature = "db")]
@@ -1319,6 +1321,8 @@ impl DeferredTriggerStart {
                 max_workflow_attempts_ceiling: self.max_workflow_attempts_ceiling,
                 start_source: crate::types::StartSource::CompletionTrigger,
                 start_source_ref: Some(source_exec_id_str.as_str()),
+                // A target run belongs to the tenant of its source (issue #1977).
+                tenant: self.tenant.as_deref(),
                 // `origin` and `completion_callbacks` keep their `None` default.
                 // A completion-trigger start is not a schedule fire (issue #534).
                 // Only builder-wide callback targets apply (issue #605).
@@ -1972,6 +1976,9 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                         max_workflow_attempts_ceiling,
                         start_source: crate::types::StartSource::CompletionTrigger,
                         start_source_ref: Some(source_exec_id_str.as_str()),
+                        // A target run belongs to the tenant of its source
+                        // (issue #1977).
+                        tenant: execution.tenant.as_deref(),
                         // `target_input` is cloned, not moved. The `QuotaExceeded`
                         // outbox-fallback arm below needs the original values to
                         // build a `DeferredTriggerStart` for retry (issue #946).
@@ -2121,6 +2128,7 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                                 .unwrap_or(Value::Null),
                             max_workflow_input_bytes: i64::try_from(max_workflow_input_bytes)
                                 .unwrap_or(i64::MAX),
+                            tenant: execution.tenant.clone(),
                         })
                         .get_result::<crate::models::CompletionTriggerOutboxDb>(conn)
                         .await
@@ -2149,6 +2157,7 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                             retry_policy: target_retry_policy,
                             max_workflow_attempts_ceiling,
                             codecs: codecs.clone(),
+                            tenant: execution.tenant.clone(),
                         });
 
                         continue;
@@ -2209,6 +2218,7 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                         concurrency_limit: concurrency_limit.map(|l| i32::try_from(l).unwrap_or(i32::MAX)),
                         priority: serde_json::to_value(Priority::default()).unwrap_or(Value::Null),
                         max_workflow_input_bytes: i64::try_from(max_workflow_input_bytes).unwrap_or(i64::MAX),
+                        tenant: execution.tenant.clone(),
                     })
                     .get_result::<crate::models::CompletionTriggerOutboxDb>(conn)
                     .await
@@ -2237,6 +2247,7 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                     retry_policy: target_retry_policy,
                     max_workflow_attempts_ceiling,
                     codecs: codecs.clone(),
+                    tenant: execution.tenant.clone(),
                 });
             }
         }
@@ -2576,6 +2587,10 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
 
         // Provenance ref is the triggering (source) execution id (#740).
         let source_exec_id_str = task.source_exec_id.to_string();
+        // The row keeps the source tenant (issue #1977). A row with no tenant
+        // starts an untenanted target. A missing source run is not read as an
+        // untenanted one.
+        let source_tenant = task.tenant.clone();
         let params = crate::execution::StartWorkflowParams {
             concurrency_key: task.concurrency_key,
             concurrency_limit: task
@@ -2592,6 +2607,8 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
             max_workflow_attempts_ceiling,
             start_source: crate::types::StartSource::CompletionTrigger,
             start_source_ref: Some(source_exec_id_str.as_str()),
+            // A target run belongs to the tenant of its source (issue #1977).
+            tenant: source_tenant.as_deref(),
             // `origin` and `completion_callbacks` keep their `None` default.
             // A completion-trigger start is not a schedule fire (issue #534).
             // Only builder-wide callback targets apply (issue #605).

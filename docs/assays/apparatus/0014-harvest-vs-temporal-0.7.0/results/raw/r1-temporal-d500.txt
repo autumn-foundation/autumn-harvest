@@ -1,0 +1,12 @@
+# Assay #11 — Temporal arm, 1 repetition(s)
+
+## resetting Temporal persistence before repetition 1
+# Assay #11 — Temporal arm
+
+Backlog 500 workflows, 1 reps, cap 900 s, slots 8/16.
+
+rep 0: 28.19 workflows/sec (500 completed in 17.74 s, 1500 activity runs, 0 workflow task failures, 0 unread histories, correctness PASS)
+
+**mean 28.19 workflows/sec** over 1 valid rep(s).
+
+==> Temporal container removed

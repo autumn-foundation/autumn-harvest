@@ -164,6 +164,7 @@ async fn add_item_atomic(
             workflow_retry_policy: None,
             max_workflow_attempts_ceiling: None,
             reject_fresh_if_debounced: false,
+            tenant: None,
         },
     )
     .await?;
