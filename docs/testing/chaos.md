@@ -11,6 +11,9 @@ by default and **never** part of `default`. This is *not* production/runtime
 chaos (that is issue #796); the harness exists purely to reproduce and guard the
 engine's internal race classes.
 
+The [safety report](../safety-report.md) collects the results of this harness
+by guarantee, with a command for each result (issue #2004).
+
 ```toml
 # autumn-harvest/Cargo.toml
 [features]

@@ -1851,6 +1851,9 @@ randomized- and model-checking-based testing layers, and CI run coverage:
 * [`docs/testing/ci-db-suite-allowlist.md`](testing/ci-db-suite-allowlist.md)
   — the DB suites that CI does not run from the manifest, each with a
   reason, and an owner for debt (issue #1799).
+* [`docs/safety-report.md`](safety-report.md) — the four safety guarantees,
+  with the tests, the results, a command for each result and the known
+  limits (issue #2004).
 
 ---
 

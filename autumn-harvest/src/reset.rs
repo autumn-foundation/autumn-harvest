@@ -30,7 +30,8 @@ pub enum ResetSignalReapplyPolicy {
     /// Discard undelivered source signals.
     #[default]
     Drop,
-    /// Re-enqueue undelivered source signals onto the fork as fresh rows.
+    /// Re-enqueue undelivered source signals onto the fork as fresh rows, in
+    /// their source order.
     Buffer,
 }
 
@@ -1557,8 +1558,15 @@ struct SignalForReset {
     signal_name: String,
     payload: Value,
     idempotency_key: Option<String>,
+    received_at: chrono::DateTime<Utc>,
 }
 
+/// A buffered signal on the fork.
+///
+/// It keeps the source `received_at`, because the ingest sorts by that
+/// column. One INSERT writes every row, so a default `NOW()` would give each
+/// row the same time. The random row id would then set the order (issue
+/// #2004).
 #[derive(Insertable)]
 #[diesel(table_name = harvest_signals)]
 struct NewSignalForReset {
@@ -1566,6 +1574,7 @@ struct NewSignalForReset {
     signal_name: String,
     payload: Value,
     idempotency_key: Option<String>,
+    received_at: chrono::DateTime<Utc>,
 }
 
 async fn reapply_or_drop_signals(
@@ -1586,6 +1595,7 @@ async fn reapply_or_drop_signals(
             harvest_signals::signal_name,
             harvest_signals::payload,
             harvest_signals::idempotency_key,
+            harvest_signals::received_at,
         ))
         .load(conn)
         .await
@@ -1599,6 +1609,7 @@ async fn reapply_or_drop_signals(
                 signal_name: signal.signal_name.clone(),
                 payload: signal.payload.clone(),
                 idempotency_key: signal.idempotency_key.clone(),
+                received_at: signal.received_at,
             })
             .collect::<Vec<_>>();
         diesel::insert_into(harvest_signals::table)
