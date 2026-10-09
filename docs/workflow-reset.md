@@ -24,8 +24,11 @@ Erasure (issue #495) replaces each payload field with the
 The engine refuses an erased source on every fork path (issue #1999). The
 check runs under the `FOR UPDATE` row lock that the fork takes, before the
 fork copies an event. An erasure either commits before that lock, and the fork
-refuses, or it waits behind the lock, and the fork copies intact events. A dry
-run returns the same refusal.
+refuses, or it waits behind the lock, and the fork copies intact events.
+
+A dry run returns the same refusal for an erasure that committed before it. A
+dry run reads without a lock, so it is a forecast. An erasure can commit after
+it, and the real reset then refuses. Only the locked check is a guarantee.
 
 | Surface | Result for an erased source |
 |---|---|
