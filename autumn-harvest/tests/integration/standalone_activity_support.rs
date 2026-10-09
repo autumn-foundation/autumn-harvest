@@ -10,7 +10,7 @@
 pub const PERF_DOC: &str = "docs/performance-standalone-activity-overhead.md";
 
 /// The decision record.
-pub const ADR_DOC: &str = "docs/adr/0006-standalone-activity.md";
+pub const ADR_DOC: &str = "docs/adr/0007-standalone-activity.md";
 
 /// The guide page that shows the one-step pattern.
 pub const GUIDE_DOC: &str = "docs/getting-started/activities.md";
