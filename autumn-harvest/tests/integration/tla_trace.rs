@@ -24,7 +24,7 @@ use std::collections::btree_map::Entry;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
-use diesel::QueryableByName;
+#[cfg(feature = "db")]
 use diesel_async::{AsyncPgConnection, SimpleAsyncConnection};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -54,6 +54,7 @@ const ACTIVITY_RESULTS: &[&str] = &[
     "ActivityFailedExternally",
 ];
 
+#[cfg(feature = "db")]
 const INSTALL_SQL: &str = r"
 CREATE TABLE IF NOT EXISTS harvest_tla_trace (
     id bigserial PRIMARY KEY,
@@ -103,6 +104,7 @@ CREATE TRIGGER harvest_tla_trace_event AFTER INSERT ON harvest_events
 TRUNCATE harvest_tla_trace;
 ";
 
+#[cfg(feature = "db")]
 const UNINSTALL_SQL: &str = r"
 DROP TRIGGER IF EXISTS harvest_tla_trace_task ON harvest_task_queue;
 DROP TRIGGER IF EXISTS harvest_tla_trace_event ON harvest_events;
@@ -120,6 +122,7 @@ pub fn trace_dir() -> Option<PathBuf> {
 
 /// Install the recorder and clear its log, when recording is on. Otherwise
 /// remove a recorder that an earlier run left on a shared database.
+#[cfg(feature = "db")]
 pub async fn install(conn: &mut AsyncPgConnection) {
     if trace_dir().is_some() {
         install_now(conn).await;
@@ -129,6 +132,7 @@ pub async fn install(conn: &mut AsyncPgConnection) {
 }
 
 /// Install the recorder and clear its log.
+#[cfg(feature = "db")]
 pub async fn install_now(conn: &mut AsyncPgConnection) {
     conn.batch_execute(INSTALL_SQL)
         .await
@@ -138,6 +142,7 @@ pub async fn install_now(conn: &mut AsyncPgConnection) {
 /// Remove the recorder when recording is off. A test that calls
 /// [`install_now`] calls this last, so a run without recording leaves no
 /// trigger on a shared database.
+#[cfg(feature = "db")]
 pub async fn uninstall_unless_recording(conn: &mut AsyncPgConnection) {
     if trace_dir().is_none() {
         conn.batch_execute(UNINSTALL_SQL)
@@ -162,39 +167,24 @@ pub fn actor_url(url: &str, task: Uuid, worker: &str, attempt: i32) -> String {
     format!("{url}{sep}options={encoded}")
 }
 
-#[derive(QueryableByName, Debug, Clone)]
+/// One row of `harvest_tla_trace`.
+#[derive(serde::Deserialize, Debug, Clone)]
 struct LogRow {
-    #[diesel(sql_type = diesel::sql_types::BigInt)]
     id: i64,
-    #[diesel(sql_type = diesel::sql_types::Text)]
     tx: String,
-    #[diesel(sql_type = diesel::sql_types::Text)]
     kind: String,
-    #[diesel(sql_type = diesel::sql_types::Text)]
     op: String,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
     task_id: Option<Uuid>,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     task_type: Option<String>,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
     exec_id: Option<Uuid>,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
     activity_id: Option<Uuid>,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     state: Option<String>,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     worker_id: Option<String>,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
     attempt: Option<i32>,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
     crash_strikes: Option<i32>,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     heartbeat_at: Option<String>,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     event_type: Option<String>,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     event_worker: Option<String>,
-    #[diesel(sql_type = diesel::sql_types::Text)]
     actor: String,
 }
 
@@ -420,19 +410,29 @@ fn trace_line(op: &str, view: &View, actor: Option<&(String, i32)>) -> Value {
 }
 
 /// Read the log, build the traces and clear the log.
+#[cfg(feature = "db")]
 pub async fn take(conn: &mut AsyncPgConnection) -> Vec<TaskTrace> {
     // Scoped here: the trait puts a `first` method on every type.
     use diesel_async::RunQueryDsl;
 
-    let log: Vec<LogRow> = diesel::sql_query(
-        "SELECT id, tx::text AS tx, kind, op, task_id, task_type, exec_id, activity_id, \
-                state, worker_id, attempt, crash_strikes, heartbeat_at::text AS heartbeat_at, \
-                event_type, event_worker, actor \
-         FROM harvest_tla_trace ORDER BY id",
+    #[derive(diesel::QueryableByName)]
+    struct LogJson {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        rows: String,
+    }
+
+    // One JSON column, so the row type needs no `db` feature.
+    let json: LogJson = diesel::sql_query(
+        "SELECT COALESCE(json_agg(t ORDER BY t.id), '[]')::text AS rows FROM ( \
+           SELECT id, tx::text AS tx, kind, op, task_id, task_type, exec_id, activity_id, \
+                  state, worker_id, attempt, crash_strikes, \
+                  heartbeat_at::text AS heartbeat_at, event_type, event_worker, actor \
+           FROM harvest_tla_trace) t",
     )
-    .load(conn)
+    .get_result(conn)
     .await
     .expect("read the TLA+ trace log");
+    let log: Vec<LogRow> = serde_json::from_str(&json.rows).expect("parse the TLA+ trace log");
     conn.batch_execute("TRUNCATE harvest_tla_trace")
         .await
         .expect("clear the TLA+ trace log");
@@ -503,6 +503,7 @@ pub fn reject_last(trace: &TaskTrace, pre_fix: &str) -> Value {
 ///
 /// Panics when recording is on and the case wrote no trace, because the
 /// export would then check nothing.
+#[cfg(feature = "db")]
 pub async fn export(url: &str, case: &str) {
     if trace_dir().is_none() {
         return;
