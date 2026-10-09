@@ -11505,11 +11505,9 @@ async fn persist_scheduled_activities(
         start.spawn();
     }
 
-    // The synthesized SessionBroken failure(s) and fork outcomes above are
-    // not tied to any external wake source (they were resolved entirely
-    // within this transaction), so the workflow must be woken
-    // unconditionally to observe them on its next decision cycle --
-    // `had_wake_requested` alone would miss this case.
+    // The transaction above resolved SessionBroken failures and fork outcomes
+    // itself. No external source wakes the workflow for them. So wake it
+    // here. `had_wake_requested` alone misses this case.
     if had_wake_requested || synthesized_outcome {
         queue::wake_workflow_task(conn, exec_id).await?;
     }

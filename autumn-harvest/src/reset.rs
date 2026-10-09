@@ -1653,12 +1653,13 @@ async fn reapply_or_drop_signals(
     Ok(signals.len())
 }
 
+/// Enqueue the first workflow task of a fork.
 pub(crate) async fn enqueue_fork_workflow_task(
     conn: &mut AsyncPgConnection,
     fork: &WorkflowExecution,
     new_exec_id: ExecutionId,
     registry: Option<&HandlerRegistry>,
-) -> Result<(), WorkflowResetError> {
+) -> Result<(), HarvestError> {
     // The fork row holds the source's stored input, which may be an envelope
     // (issue #1979). The concurrency key needs the plaintext. The task stores
     // the input encoded or not, as the switch says. A process with no codec

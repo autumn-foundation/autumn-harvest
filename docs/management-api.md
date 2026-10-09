@@ -794,6 +794,15 @@ earlier attempt stays readable after that attempt fails and a retry starts. See
 }
 ```
 
+## Fork a run (`POST /workflows/{id}/fork`)
+
+A fork copies the start of a run to a new execution with a new workflow id.
+The source does not change, so a run in any state can be forked. By default,
+the fork takes each activity result from the source record and never runs an
+effect for real. `"effects": "live"` opts in to real effects. An erased source
+is always refused. See the [fork runbook](runbooks/fork-a-run.md) (issue
+#2000).
+
 ## Signal delivery (`POST /workflows/{id}/signal/{signal_name}`)
 
 Delivers a named signal to a running workflow execution. The request body is

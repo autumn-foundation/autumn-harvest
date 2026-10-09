@@ -298,12 +298,7 @@ async fn fork_in_transaction(
     let tail_start = i32::try_from(plan.events_carried_over)
         .map_err(|_| HarvestError::Database("fork carried too many events".to_string()))?;
     crate::store::append_events_with_codecs(conn, new_exec_id, &tail, tail_start, codecs).await?;
-    crate::reset::enqueue_fork_workflow_task(conn, &fork, new_exec_id, registry)
-        .await
-        .map_err(|error| match error {
-            crate::reset::WorkflowResetError::Harvest(error) => WorkflowForkError::Harvest(error),
-            other => WorkflowForkError::Harvest(HarvestError::Config(other.to_string())),
-        })?;
+    crate::reset::enqueue_fork_workflow_task(conn, &fork, new_exec_id, registry).await?;
 
     Ok(ForkResult {
         new_exec_id,
@@ -642,8 +637,8 @@ pub async fn is_recorded_fork(
 /// The order is: a caller override, then (in recorded mode) the source
 /// record with the same name, occurrence and input, then a non-retryable
 /// [`ERROR_TYPE_FORK_EFFECT_UNAVAILABLE`] failure. `None` means that the
-/// activity runs as usual: the history is not a fork, the fork is live with
-/// no override, or the activity already has an outcome.
+/// activity runs as usual. That is so when the history is not a fork, when
+/// the fork is live with no override, or when the activity has an outcome.
 #[must_use]
 pub fn served_outcome(
     fork_events: &[WorkflowEvent],

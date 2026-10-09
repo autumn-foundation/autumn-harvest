@@ -335,6 +335,7 @@ linux        autumn-harvest-plugin  worker_shard_filter_integration  -          
 linux        autumn-harvest-plugin  workflow_children_traversal_perf -                          -
 linux        autumn-harvest-plugin  workflow_count_integration       -                          -
 linux        autumn-harvest-plugin  workflow_filter_integration      -                          -
+linux        autumn-harvest-plugin  workflow_fork_integration        -                          -
 linux        autumn-harvest-plugin  workflow_history_pagination_integration  -                          -
 linux        autumn-harvest-plugin  workflow_logs_integration        -                          -
 linux        autumn-harvest-plugin  workflow_reachability_integration  -                          -
