@@ -849,11 +849,8 @@ async fn tools_call(
     let task_id = started.get("execution_id").and_then(Value::as_str);
     let (true, Some(task_id)) = (client_declares_tasks(params), task_id) else {
         // A start with no run id yet, such as a deferred one, is no task.
-        return Ok(plain_start_result(started));
+        return Ok(plain_start_result(&started));
     };
-    // `started` moves into the fallback result below, so own the id.
-    let owned_id = task_id.to_string();
-    let task_id = owned_id.as_str();
     // The spec sends a `CreateTaskResult` only once `tasks/get` resolves, so
     // the read must succeed first. A failed read must not hide the run
     // either: a client that saw an error could retry and start a second run.
@@ -871,11 +868,11 @@ async fn tools_call(
             }
         }
     }
-    Ok(plain_start_result(started))
+    Ok(plain_start_result(&started))
 }
 
 /// The plain `CallToolResult` of a start: the run handle, with no task.
-fn plain_start_result(started: Value) -> Value {
+fn plain_start_result(started: &Value) -> Value {
     json!({
         "resultType": "complete",
         "content": [{"type": "text", "text": started.to_string()}],
