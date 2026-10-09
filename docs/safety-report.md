@@ -13,10 +13,10 @@ commands and check the results yourself.
 
 | Guarantee | Claim in one line | Result | Main limit |
 |---|---|---|---|
-| Leases | A crashed or cut-off worker loses its task, and a live worker keeps it. | All checks pass. | A live worker can look dead. Then its activity can run twice. |
+| Leases | A crashed or cut-off worker loses its task. A worker that renews its lease in time keeps it. | All checks pass. | A live worker can look dead. Then its activity can run twice. |
 | Fencing | Only the current claim of a task row can write it. | All checks pass. Each pre-fix model fails, as designed. | No model covers shard-generation fencing. |
 | Exactly-once completion | Each task records at most one terminal event. | All checks pass. | Activity side effects are at least once. #1871 is fixed only in part. |
-| Signal ordering | History records signals in the order that their send transactions started. | All checks pass. | Two signals sent in one transaction have no defined order. |
+| Signal ordering | If each send starts after the previous send commits, history records the signals in send order. | All checks pass. | Two signals sent in one transaction have no defined order. |
 
 The results come from a run on 2026-10-09, on `trunk-dev` at `24621be` with
 this change applied. The run used Linux x86-64 with 4 cores, Rust 1.99,
@@ -343,8 +343,8 @@ their order. Signals that share one time have no defined order on either run.
   breaks the tie, so their order can differ from the send order. A decision
   that signals one workflow twice does this.
 - `NOW()` is the start time of the send transaction, not its commit time.
-  Two concurrent sends can reach history in the opposite order of their
-  commits.
+  Two overlapping sends have no defined order. The ingest only sorts the rows
+  that it sees, so history can hold them in start order or in commit order.
 - A signal sent during the final decision of a run is lost when the run
   completes or fails (#2079, open). The sender sees success.
 - At continue-as-new, a signal that history holds but the body did not read
