@@ -719,6 +719,101 @@ async fn a_reset_of_a_fork_keeps_its_overrides() {
     );
 }
 
+/// An in-memory blob store for the offload test.
+#[derive(Default)]
+struct MemStore {
+    blobs: Mutex<HashMap<String, Vec<u8>>>,
+}
+
+impl autumn_harvest::payload_store::PayloadStore for MemStore {
+    fn store_id(&self) -> &'static str {
+        "fork-test"
+    }
+    fn put(&self, bytes: &[u8]) -> autumn_harvest::payload_store::PayloadStoreFuture<'_, String> {
+        let key = format!("blob/{}", Uuid::new_v4());
+        self.blobs
+            .lock()
+            .expect("blobs lock")
+            .insert(key.clone(), bytes.to_vec());
+        Box::pin(async move { Ok(key) })
+    }
+    fn get(&self, key: &str) -> autumn_harvest::payload_store::PayloadStoreFuture<'_, Vec<u8>> {
+        let found = self.blobs.lock().expect("blobs lock").get(key).cloned();
+        let key = key.to_string();
+        Box::pin(async move {
+            found.ok_or_else(|| {
+                autumn_harvest::payload_store::PayloadStoreError(format!("missing {key}"))
+            })
+        })
+    }
+    fn delete(&self, key: &str) -> autumn_harvest::payload_store::PayloadStoreFuture<'_, ()> {
+        self.blobs.lock().expect("blobs lock").remove(key);
+        Box::pin(async move { Ok(()) })
+    }
+}
+
+/// A reset of a fork keeps a reference to each offloaded override blob, so
+/// retention of the sealed fork cannot collect it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reset_of_a_fork_references_its_offloaded_overrides() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("reset-blob");
+    let mut conn = connect(&url).await;
+    let source = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+    let offloader = Arc::new(autumn_harvest::payload_store::PayloadOffloader::new(
+        Arc::new(MemStore::default()),
+        64,
+        Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+    ));
+    let offloading = Arc::new(
+        HandlerRegistry::new(
+            vec![fork_pay_wf_info()],
+            activities![fork_charge, fork_receipt],
+        )
+        .with_payload_offloader(Some(offloader)),
+    );
+
+    let mut live = request(ForkEffects::Live);
+    live.activity_overrides = vec![ForkActivityOverride {
+        activity_name: "fork_charge".to_string(),
+        occurrence: 1,
+        output: json!({ "charge_id": "X".repeat(512) }),
+    }];
+    let forked = fork_workflow_execution(&mut conn, source, live, Some(&offloading))
+        .await
+        .expect("fork")
+        .new_exec_id;
+    let fork_refs = store::load_payload_refs(&mut conn, forked)
+        .await
+        .expect("refs");
+    assert_eq!(fork_refs.len(), 1, "the override output is offloaded");
+
+    let reset = reset_workflow_execution(
+        &mut conn,
+        forked,
+        WorkflowResetRequest {
+            reset_to_event_id: Some(0),
+            reset_point: None,
+            reason: "retry".to_string(),
+            operator_id: "tester".to_string(),
+            signal_reapply: autumn_harvest::reset::ResetSignalReapplyPolicy::Drop,
+            allow_terminal_source: false,
+            refuse_erased_source: false,
+        },
+        Some(&offloading),
+    )
+    .await
+    .expect("reset the fork");
+    let reset_refs = store::load_payload_refs(&mut conn, reset.new_exec_id)
+        .await
+        .expect("refs");
+    assert_eq!(
+        reset_refs.iter().map(|r| &r.blob_key).collect::<Vec<_>>(),
+        fork_refs.iter().map(|r| &r.blob_key).collect::<Vec<_>>(),
+        "the reset references the override blob"
+    );
+}
+
 /// A source erased after the fork exists serves no record. The fork fails
 /// closed and never charges.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

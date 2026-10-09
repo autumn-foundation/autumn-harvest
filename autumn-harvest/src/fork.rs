@@ -465,6 +465,17 @@ fn reachable_refs(
     if keeps_source_input {
         text.push_str(&source_input.to_string());
     }
+    refs_named_in(refs, &text)
+}
+
+/// The references in `refs` whose blob key appears in `text`.
+///
+/// A blob key is a unique string, so a text search finds each envelope that
+/// names it.
+pub(crate) fn refs_named_in(
+    refs: Vec<crate::payload_store::OffloadedRef>,
+    text: &str,
+) -> Vec<crate::payload_store::OffloadedRef> {
     refs.into_iter()
         .filter(|blob| text.contains(&blob.blob_key))
         .collect()

@@ -1607,6 +1607,15 @@ async fn append_fork_marker(
         .execute(conn)
         .await
         .map_err(database_error)?;
+    // An override output can be an offload envelope. The reset needs its own
+    // reference, or retention of the sealed fork can collect the blob.
+    let named = override_rows
+        .iter()
+        .map(|row| row.event_data.to_string())
+        .collect::<String>();
+    let refs = crate::store::load_payload_refs(conn, source_exec_id).await?;
+    crate::store::insert_payload_refs(conn, new_exec_id, &crate::fork::refs_named_in(refs, &named))
+        .await?;
     Ok(())
 }
 
