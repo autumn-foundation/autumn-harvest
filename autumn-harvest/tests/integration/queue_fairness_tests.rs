@@ -8,7 +8,7 @@
 //! 3. Under 3:1 weights the observed claim distribution is ≈3:1 (±10%).
 //! 4. The low-weight queue always drains to completion (no-starvation guarantee).
 
-use autumn_harvest::queue::{EnqueueParams, TaskType};
+use autumn_harvest::queue::{EnqueueParams, TaskClaim, TaskType};
 use autumn_harvest::queue_fairness::{effective_queue_weights, weighted_queue_order};
 use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::telemetry::MetricsRecorder;
@@ -226,9 +226,13 @@ async fn weighted_claim_distribution_tracks_3_to_1_ratio() {
                     latency_claims += 1;
                 }
                 // Mark it as completed so the row doesn't block re-claims.
-                queue::complete_task(&mut conn, task.id, serde_json::json!(null))
-                    .await
-                    .expect("complete_task");
+                queue::complete_task(
+                    &mut conn,
+                    &TaskClaim::of(&task).expect("a claimed task"),
+                    serde_json::json!(null),
+                )
+                .await
+                .expect("complete_task");
                 break; // dispatch at most one task per poll iteration
             }
         }
@@ -305,9 +309,13 @@ async fn no_starvation_low_weight_queue_drains_to_completion() {
                 if task.queue_name == "light" {
                     light_claims += 1;
                 }
-                queue::complete_task(&mut conn, task.id, serde_json::json!(null))
-                    .await
-                    .expect("complete_task");
+                queue::complete_task(
+                    &mut conn,
+                    &TaskClaim::of(&task).expect("a claimed task"),
+                    serde_json::json!(null),
+                )
+                .await
+                .expect("complete_task");
                 break;
             }
         }
@@ -362,9 +370,13 @@ async fn dispatch_counter_records_per_queue_claims() {
         match result {
             Some(task) => {
                 recorder.record_task_dispatched(&task.queue_name);
-                queue::complete_task(&mut conn, task.id, serde_json::json!(null))
-                    .await
-                    .expect("complete_task");
+                queue::complete_task(
+                    &mut conn,
+                    &TaskClaim::of(&task).expect("a claimed task"),
+                    serde_json::json!(null),
+                )
+                .await
+                .expect("complete_task");
             }
             None => break,
         }

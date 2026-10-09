@@ -4238,26 +4238,27 @@ pub async fn release_abandoned_claim(
     Ok(ClaimWrite::Applied)
 }
 
-/// Mark a task as completed with the given output.
+/// Mark the task that `claim` holds as completed with the given output.
 ///
 /// Terminal completion clears any heartbeat checkpoint payload so it cannot be
 /// observed after the activity has successfully finished.
 ///
-/// This write is not fenced. The activity owner uses
-/// [`complete_claimed_task`] instead.
+/// The write is fenced by `claim` (issue #1992). Use
+/// [`complete_claimed_task`] when a lost claim is not an error.
 ///
 /// # Errors
 ///
-/// Returns [`crate::error::HarvestError::NotFound`] when the task is not
-/// running, and [`crate::error::HarvestError::Database`] on update failure.
+/// Returns [`crate::error::HarvestError::NotFound`] when `claim` is not
+/// current, and [`crate::error::HarvestError::Database`] on update failure.
 pub async fn complete_task(
     conn: &mut AsyncPgConnection,
-    task_id: Uuid,
+    claim: &TaskClaim,
     output: serde_json::Value,
 ) -> HarvestResult<()> {
-    if !complete_task_inner(conn, task_id, None, output).await? {
+    if !complete_task_inner(conn, claim.task_id, Some(claim), output).await? {
         return Err(crate::error::HarvestError::NotFound(format!(
-            "task queue item {task_id} is not running"
+            "task queue item {} is not running under this claim",
+            claim.task_id
         )));
     }
 

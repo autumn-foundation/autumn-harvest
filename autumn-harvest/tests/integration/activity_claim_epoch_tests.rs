@@ -482,7 +482,8 @@ async fn stale_owner_cannot_complete_a_reclaimed_row_through_complete_task() {
     let (a, b) = a_then_b(&mut conn, &fx).await;
     let before = row(&mut conn, fx.task_id).await;
 
-    let stale = queue::complete_task(&mut conn, a.id, serde_json::json!("from A")).await;
+    let claim_a = TaskClaim::of(&a).expect("A held a claim");
+    let stale = queue::complete_task(&mut conn, &claim_a, serde_json::json!("from A")).await;
 
     assert!(
         matches!(stale, Err(autumn_harvest::HarvestError::NotFound(_))),
@@ -494,7 +495,8 @@ async fn stale_owner_cannot_complete_a_reclaimed_row_through_complete_task() {
         "A's stale completion must leave B's claim untouched"
     );
 
-    queue::complete_task(&mut conn, b.id, serde_json::json!("from B"))
+    let claim_b = TaskClaim::of(&b).expect("B holds a claim");
+    queue::complete_task(&mut conn, &claim_b, serde_json::json!("from B"))
         .await
         .expect("B completes");
     let after = row(&mut conn, fx.task_id).await;
