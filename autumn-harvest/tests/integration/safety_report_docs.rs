@@ -50,12 +50,7 @@ const GUARANTEES: &[&str] = &[
 ];
 
 /// The parts of each guarantee section, in order.
-const PARTS: &[&str] = &[
-    "### Claim",
-    "### Tests",
-    "### Results",
-    "### Known limits",
-];
+const PARTS: &[&str] = &["### Claim", "### Tests", "### Results", "### Known limits"];
 
 /// The header of each results table.
 const RESULTS_HEADER: &str = "| Check | Result | Reproduce |";
@@ -600,7 +595,7 @@ fn parse_cargo_test(args: &[&str]) -> Result<CargoTest, String> {
             inline
                 .map(str::to_owned)
                 .or_else(|| words.next().map(str::to_owned))
-                .ok_or(format!("`{flag}` needs a value"))
+                .ok_or_else(|| format!("`{flag}` needs a value"))
         };
         match (harness, flag) {
             (false, "--") => harness = true,
@@ -611,10 +606,9 @@ fn parse_cargo_test(args: &[&str]) -> Result<CargoTest, String> {
                 .features
                 .extend(value()?.split(',').map(str::to_owned)),
             (false, "--no-default-features") => parsed.no_default_features = true,
-            (false, "--release") => {}
             (true, "--exact") => parsed.exact = true,
             (true, "--ignored" | "--include-ignored") => parsed.ignored = true,
-            (true, "--nocapture") => {}
+            (false, "--release") | (true, "--nocapture") => {}
             (true, "--test-threads" | "--skip") => {
                 value()?;
             }
@@ -800,7 +794,7 @@ fn collect_tests(
         if line.starts_with("//") || line.is_empty() {
             continue;
         }
-        let live = inline.iter().all(|(_, _, live)| *live)
+        let enabled = inline.iter().all(|(_, _, on)| *on)
             && attrs
                 .iter()
                 .filter_map(|attr| attr.strip_prefix("#[cfg("))
@@ -819,29 +813,15 @@ fn collect_tests(
             .find_map(|vis| line.strip_prefix(vis))
             .unwrap_or(line);
         if let Some(rest) = item.strip_prefix("mod ") {
-            let name: String = rest
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '_')
-                .collect();
+            let name = ident(rest);
             if rest[name.len()..].starts_with(';') {
-                if live {
-                    let child = attrs
-                        .iter()
-                        .find_map(|attr| attr.strip_prefix("#[path = \""))
-                        .map(|rel| dir.join(rel.trim_end_matches("\"]")))
-                        .unwrap_or_else(|| {
-                            let flat = dir.join(format!("{name}.rs"));
-                            if flat.is_file() {
-                                flat
-                            } else {
-                                dir.join(&name).join("mod.rs")
-                            }
-                        });
+                if enabled {
+                    let child = child_module(&dir, &name, &attrs);
                     let child_root = child.file_name().is_some_and(|f| f == "mod.rs");
                     collect_tests(&child, &path(&name), child_root, features, tests);
                 }
             } else if line.ends_with('{') {
-                inline.push((name, indent, live));
+                inline.push((name, indent, enabled));
             }
         } else if let Some(rest) = item
             .strip_prefix("async fn ")
@@ -850,19 +830,40 @@ fn collect_tests(
             let is_test = attrs
                 .iter()
                 .any(|attr| attr == "#[test]" || attr.starts_with("#[tokio::test"));
-            if is_test && live {
-                let name: String = rest
-                    .chars()
-                    .take_while(|c| c.is_alphanumeric() || *c == '_')
-                    .collect();
+            if is_test && enabled {
                 tests.push(TestFn {
-                    path: path(&name),
+                    path: path(&ident(rest)),
                     ignored: attrs.iter().any(|attr| attr.starts_with("#[ignore")),
                 });
             }
         }
         attrs.clear();
     }
+}
+
+/// The identifier at the start of `text`.
+fn ident(text: &str) -> String {
+    text.chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect()
+}
+
+/// The file of `mod name;` in `dir`, or the file that `#[path]` names.
+fn child_module(dir: &Path, name: &str, attrs: &[String]) -> PathBuf {
+    attrs
+        .iter()
+        .find_map(|attr| attr.strip_prefix("#[path = \""))
+        .map_or_else(
+            || {
+                let flat = dir.join(format!("{name}.rs"));
+                if flat.is_file() {
+                    flat
+                } else {
+                    dir.join(name).join("mod.rs")
+                }
+            },
+            |rel| dir.join(rel.trim_end_matches("\"]")),
+        )
 }
 
 /// Whether a `cfg` predicate holds for a test build on Linux.
