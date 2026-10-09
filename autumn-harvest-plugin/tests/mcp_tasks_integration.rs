@@ -612,6 +612,46 @@ async fn a_rerun_leaves_an_ended_task_settled() {
     assert_settled(&client, &task_id, &done).await;
 }
 
+/// An operator reset of a failed run seals it as `TERMINATED` and clears its
+/// error. The task keeps its `completed` status and its error text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reset_leaves_a_failed_task_settled() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let db = setup_db().await;
+    let client = build_app(&db).await;
+
+    let created = create_task(&client, "start_task_failing_flow", json!("x")).await;
+    let task_id = created["taskId"].as_str().unwrap().to_string();
+    let mut seen = vec![status_of(&created)];
+    let done = poll_until(&client, &task_id, &mut seen, |t| status_of(t).is_terminal()).await;
+    assert_eq!(done["result"]["isError"], true, "{done}");
+
+    let mut conn = db.pool.get().await.expect("pool connection");
+    let source = autumn_harvest::ExecutionId::from_uuid(task_id.parse().unwrap());
+    autumn_harvest::reset::reset_workflow_execution(
+        &mut conn,
+        source,
+        autumn_harvest::reset::WorkflowResetRequest {
+            reset_to_event_id: Some(0),
+            reset_point: None,
+            reason: "operator retry".to_string(),
+            operator_id: "op-1".to_string(),
+            signal_reapply: autumn_harvest::reset::ResetSignalReapplyPolicy::default(),
+            allow_terminal_source: true,
+            refuse_erased_source: false,
+        },
+        None,
+    )
+    .await
+    .expect("reset");
+    drop(conn);
+
+    let after = get_task(&client, &task_id).await;
+    assert_eq!(after["status"], "completed", "{after}");
+    assert_eq!(after["result"], done["result"], "{after}");
+    assert_settled(&client, &task_id, &done).await;
+}
+
 /// `tasks/cancel` moves a live task to `cancelled`. A second cancel and a
 /// late answer are acknowledged and change nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

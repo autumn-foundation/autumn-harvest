@@ -360,9 +360,9 @@ while the chain still runs. After the run is deleted, `tasks/get` answers
 - A continue-as-new to a workflow that is not an MCP workflow leaves the
   catalog. `tasks/get` still reads the run, but `tasks/update` and
   `tasks/cancel` answer `-32602`.
-- An operator reset of an ended run seals that run as `TERMINATED`. The task
-  then reads `cancelled`, even after `completed`, and does not follow the
-  fork.
+- An operator reset seals the source run as `TERMINATED`. A task that had
+  failed or timed out keeps that end and its error text, from history. A
+  reset of a live run reads `cancelled`. The task never follows the fork.
 - An operator rerun that reuses the business id seals the ended run as
   `CONTINUED_AS_NEW`. The task keeps the status and result that the run had,
   from its last history event, and does not follow the new run.

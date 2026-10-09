@@ -133,7 +133,7 @@ route behind the existing `mcp` cargo feature.
 - An update wait as `input_required`. The engine does not run an admitted
   update yet (issue #2035), and no history marks a wait for one.
 - A `tasks/list`. The spec removed it.
-- A reset fork. An operator reset of an ended run seals it as `TERMINATED`,
-  so the task reads `cancelled` and does not follow the fork.
+- A reset fork. The task does not follow it. A reset of a live run reads
+  `cancelled`. A failed or timed-out run keeps that end, from history.
 - A `#[dag(mcp)]` task. `trigger_dag_run_inner` has no start key, so a
   task-create for a DAG is not crash-safe.

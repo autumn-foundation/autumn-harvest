@@ -1632,15 +1632,45 @@ async fn resolve_live(
     // A chain walk ends on a `CONTINUED_AS_NEW` row only when no successor
     // follows, as after a rerun seal. That run ended, so the task keeps the
     // state that the seal hid and never reads `working` again.
-    if live.state == "CONTINUED_AS_NEW"
-        && let Some(state) = last_event_type(api_state, live.id)
-            .await?
-            .as_deref()
+    if live.state == "CONTINUED_AS_NEW" {
+        let events = last_events(api_state, live.id).await?;
+        if let Some(state) = events
+            .first()
+            .and_then(|(kind, _)| kind.as_deref())
             .and_then(state_before_rerun_seal)
+        {
+            live.state = state.to_string();
+        }
+    }
+    // A reset of an ended run seals it as `TERMINATED` and clears its error.
+    // The event before `WorkflowResetTerminated` still names the end, so a
+    // failed or timed-out task keeps that end and its error text.
+    if live.state == "TERMINATED"
+        && let [(Some(last), _), (Some(prior), error)] =
+            last_events(api_state, live.id).await?.as_slice()
+        && last == "WorkflowResetTerminated"
+        && let Some(state) = state_before_reset_seal(prior)
     {
         live.state = state.to_string();
+        live.error.clone_from(error);
+        live.output = None;
     }
     Ok(live)
+}
+
+/// The state that a reset seal hid, from the event before the
+/// `WorkflowResetTerminated` event.
+///
+/// A reset seals only a live run or a run that failed, timed out or was
+/// cancelled. A live run and a cancelled run read as cancelled anyway, so
+/// they give `None`.
+#[must_use]
+pub fn state_before_reset_seal(prior_event_type: &str) -> Option<&'static str> {
+    match prior_event_type {
+        "WorkflowFailed" => Some("FAILED"),
+        "WorkflowExecutionTimedOut" => Some("TIMED_OUT"),
+        _ => None,
+    }
 }
 
 /// The state that a rerun seal hid, from the last history event of the run.
@@ -1660,30 +1690,35 @@ pub fn state_before_rerun_seal(last_event_type: &str) -> Option<&'static str> {
     }
 }
 
-/// The `type` of the last history event of a run.
-async fn last_event_type(
+/// The last two history events of a run, newest first: the `type` of each,
+/// and its `data.error` when that is a string.
+async fn last_events(
     api_state: &HarvestApiState,
     run: uuid::Uuid,
-) -> Result<Option<String>, RpcError> {
+) -> Result<Vec<(Option<String>, Option<String>)>, RpcError> {
     use autumn_harvest::schema::harvest_events;
-    use diesel::{ExpressionMethods as _, OptionalExtension as _, QueryDsl as _};
+    use diesel::sql_types::{Nullable, Text};
+    use diesel::{ExpressionMethods as _, QueryDsl as _};
     use diesel_async::RunQueryDsl as _;
 
     let exec_id = autumn_harvest::ExecutionId::from_uuid(run);
     let mut conn = crate::api::db_conn_for_execution(api_state, exec_id)
         .await
         .map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))?;
-    let found: Option<Option<String>> = harvest_events::table
+    harvest_events::table
         .filter(harvest_events::workflow_exec_id.eq(run))
         .order(harvest_events::event_id.desc())
-        .select(diesel::dsl::sql::<
-            diesel::sql_types::Nullable<diesel::sql_types::Text>,
-        >("event_data->>'type'"))
-        .first(&mut conn)
+        .limit(2)
+        .select((
+            diesel::dsl::sql::<Nullable<Text>>("event_data->>'type'"),
+            diesel::dsl::sql::<Nullable<Text>>(
+                "CASE WHEN jsonb_typeof(event_data->'data'->'error') = 'string' \
+                 THEN event_data->'data'->>'error' END",
+            ),
+        ))
+        .load(&mut conn)
         .await
-        .optional()
-        .map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))?;
-    Ok(found.flatten())
+        .map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))
 }
 
 /// The id and the time of the last history event of a run.
@@ -2337,6 +2372,20 @@ mod tests {
         ] {
             let state = state_before_rerun_seal(event).unwrap();
             assert_eq!(status_for_state(state, false), status, "{event}");
+        }
+    }
+
+    /// A reset seal keeps a failed or timed-out end. A reset of a live or a
+    /// cancelled run gives no state, because it reads as cancelled anyway.
+    #[test]
+    fn a_reset_seal_keeps_a_failed_end() {
+        assert_eq!(state_before_reset_seal("WorkflowFailed"), Some("FAILED"));
+        assert_eq!(
+            state_before_reset_seal("WorkflowExecutionTimedOut"),
+            Some("TIMED_OUT")
+        );
+        for other in ["WorkflowCancelled", "ActivityCompleted", "WorkflowStarted"] {
+            assert_eq!(state_before_reset_seal(other), None, "{other}");
         }
     }
 
