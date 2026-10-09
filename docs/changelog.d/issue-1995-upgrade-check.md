@@ -33,8 +33,9 @@ Design decisions:
   from a crate outside the analysis adds an `external-const` boundary,
   because its value is not in the reader's MIR.
 - The replay runs with the candidate worker's setup: its query handlers
-  (`queries`), its payload caps (`with_payload_caps`) and its offload
-  threshold (`with_offloader`). A run whose next payload is over a
+  (`queries`), its payload caps (`with_payload_caps`), its offload
+  threshold (`with_offloader`), its history policy (`with_history_policy`)
+  and its build id (`with_build_id`). A run whose next payload is over a
   candidate cap gets `pin`.
 - A run verdict holds ids, names, finding kinds and event indexes. It holds
   no payload and no error text, because a serde error quotes the value it

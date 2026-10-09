@@ -4,6 +4,7 @@
 //! workflow's own MIR is the same against both builds of `limits`. From this
 //! directory, on rustc 1.99.0 (b940084d7 2026-09-28):
 //!
+//! ```sh
 //!   for v in 1 2; do
 //!     rustc --crate-type lib --edition 2024 --crate-name limits \
 //!           --emit=mir -o limits_v$v.mir limits_v$v.rs
@@ -14,6 +15,7 @@
 //!   done
 //!   cmp flow_v1.mir flow_v2.mir && mv flow_v1.mir flow.mir
 //!   rm flow_v2.mir liblimits_v1.rlib liblimits_v2.rlib
+//! ```
 //!
 //! The `cmp` is the point: the workflow's MIR does not change.
 #![allow(dead_code, unused_variables)]

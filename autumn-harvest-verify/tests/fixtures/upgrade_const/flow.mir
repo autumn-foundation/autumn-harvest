@@ -1,7 +1,7 @@
 // WARNING: This output format is intended for human consumers only
 // and is subject to change without notice. Knock yourself out.
 // HINT: See also -Z dump-mir for MIR at specific points during compilation.
-fn <impl at flow.rs:26:1: 26:21>::execute_activity_raw(_1: &WorkflowContext, _2: &str, _3: u64) -> std::future::Ready<Result<u64, String>> {
+fn <impl at flow.rs:28:1: 28:21>::execute_activity_raw(_1: &WorkflowContext, _2: &str, _3: u64) -> std::future::Ready<Result<u64, String>> {
     debug self => _1;
     debug name => _2;
     debug input => _3;
@@ -33,7 +33,7 @@ fn wf_dep_const(_1: &WorkflowContext, _2: u64) -> {async fn body of wf_dep_const
     let mut _0: {async fn body of wf_dep_const()};
 
     bb0: {
-        _0 = {coroutine@flow.rs:37:87: 42:2 (#0)} { ctx: copy _1, attempt: copy _2 };
+        _0 = {coroutine@flow.rs:39:87: 44:2 (#0)} { ctx: copy _1, attempt: copy _2 };
         return;
     }
 }

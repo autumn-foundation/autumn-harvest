@@ -61,7 +61,18 @@ async fn seed(
     events: &[WorkflowEvent],
     codecs: &PayloadCodecs,
 ) -> ExecutionId {
-    let exec_id = ExecutionId::new();
+    seed_on(conn, ExecutionId::new(), name, state, events, codecs).await
+}
+
+/// Seed one run with the id `exec_id`, which can encode a shard.
+async fn seed_on(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    name: &str,
+    state: &str,
+    events: &[WorkflowEvent],
+    codecs: &PayloadCodecs,
+) -> ExecutionId {
     let input: Value = json!({});
     let workflow_id = format!("wf-{}", exec_id.as_uuid());
     let row = NewWorkflowExecution {
@@ -394,6 +405,45 @@ async fn a_shard_over_its_own_limit_makes_the_check_incomplete() {
     assert_eq!(report.runs.len(), 2, "{report:#?}");
     assert_eq!(report.incomplete.len(), 1, "{report:#?}");
     assert_eq!(report.exit_code(), 2);
+}
+
+#[tokio::test]
+async fn the_report_names_the_shard_over_its_limit() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let codecs = aead_codecs();
+    let name = unique_name();
+    for _ in 0..3 {
+        let id = ExecutionId::new_for_shard(ShardId::new(1));
+        seed_on(&mut conn, id, &name, "RUNNING", &waiting_to_ship(), &codecs).await;
+    }
+    // Shard 1, not the group's first shard id, holds the runs.
+    let pool = ShardedDbPool::from_dsns(
+        [
+            (ShardId::new(0), url.clone()),
+            (ShardId::new(1), url.clone()),
+        ],
+        ShardId::new(0),
+        2,
+    )
+    .expect("pool");
+    let report = check_for(&name, &codecs)
+        .run(
+            &pool,
+            &UpgradeCheckOptions {
+                workflow_name: Some(name.clone()),
+                limit_per_shard: 2,
+                ..UpgradeCheckOptions::default()
+            },
+        )
+        .await;
+    assert_eq!(report.runs.len(), 2, "{report:#?}");
+    assert_eq!(report.incomplete.len(), 1, "{report:#?}");
+    assert!(
+        report.incomplete[0].starts_with("shard 1: "),
+        "{:?}",
+        report.incomplete
+    );
 }
 
 #[tokio::test]

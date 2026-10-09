@@ -88,7 +88,7 @@ verdicts, and each fix has a test:
 6. A future type in generic arguments made a real call look like a resume.
    Only `into_future`, `poll` and the `Pin` constructors resume now.
 
-A later review of the merged branch found three gaps in the candidate setup:
+Later review rounds of the merged branch found more gaps:
 
 7. The replay had no query handlers. A workflow that branches on
    `ctx.list_query_names()` took another path than the worker. `queries`
@@ -99,11 +99,18 @@ A later review of the merged branch found three gaps in the candidate setup:
 9. With an offloader, the replay had no offload threshold. A next payload
    that the worker offloads failed the cap, and the run got `pin`.
    `with_offloader` now passes the threshold, but not the offloader.
-10. The digest read `const` items only from the reader's own crate. MIR
+10. The replay used the default history policy and no build id. A
+    workflow that branches on `ctx.should_continue_as_new()` or
+    `ctx.build_id()` took another path than the worker.
+    `with_history_policy` and `with_build_id` now pass them.
+11. The digest read `const` items only from the reader's own crate. MIR
     prints `const dep::LIMIT` for a read from another crate, so a change
     there left the digest the same. The digest now reads the item from the
     analyzed crate that holds it. A crate outside the analysis adds an
     `external-const` boundary.
+12. With aliased shards, an over-limit line named the group's first shard.
+    It now names each shard over its own limit. When the group read itself
+    stops at its limit, the line names every shard of the group.
 
 ---
 

@@ -616,8 +616,24 @@ impl UpgradeCheck {
         self
     }
 
-    /// Configure the replayer further, for example with shared state or the
-    /// candidate build id.
+    /// The candidate worker's history policy. A workflow can branch on
+    /// `ctx.should_continue_as_new()`, which reads it. Build it with the
+    /// values the candidate `HarvestBuilder` sets.
+    #[must_use]
+    pub fn with_history_policy(mut self, policy: crate::context::WorkflowHistoryPolicy) -> Self {
+        self.replayer = self.replayer.with_history_policy(policy);
+        self
+    }
+
+    /// The candidate worker's build id. A workflow can branch on
+    /// `ctx.build_id()`.
+    #[must_use]
+    pub fn with_build_id(mut self, build_id: impl Into<String>) -> Self {
+        self.replayer = self.replayer.with_build_id(build_id);
+        self
+    }
+
+    /// Configure the replayer further, for example with shared state.
     #[must_use]
     pub fn map_replayer(mut self, f: impl FnOnce(WorkflowReplayer) -> WorkflowReplayer) -> Self {
         self.replayer = f(self.replayer);
@@ -993,6 +1009,47 @@ fn shard_of(execution_id: ExecutionId, shards: &[ShardId]) -> ShardId {
         return encoded;
     }
     shards.first().copied().unwrap_or(encoded)
+}
+
+/// Keep at most `limit_per_shard` rows of each shard id in `shards`. Return
+/// a line for each shard whose runs the check did not all read.
+#[cfg(feature = "db")]
+fn hold_to_limit(
+    rows: &mut Vec<InFlightRow>,
+    shards: &[ShardId],
+    limit_per_shard: usize,
+    group_limit: usize,
+) -> Vec<String> {
+    let limit_text =
+        |ids: &str| format!("{ids}: more than {limit_per_shard} in-flight runs; raise the limit");
+    let mut over_limit = Vec::new();
+    if rows.len() > group_limit {
+        // The read stopped at the group limit, so the rows it did not
+        // read belong to no known shard. Name every shard of the group.
+        let ids: Vec<String> = shards.iter().map(|s| s.as_i32().to_string()).collect();
+        over_limit.push(limit_text(&format!("shards {}", ids.join(", "))));
+    }
+    rows.truncate(group_limit);
+    // The limit holds for each shard id on its own, not only for the
+    // group. A shard over its limit makes the check incomplete.
+    let mut per_shard: HashMap<ShardId, usize> = HashMap::new();
+    let mut over: Vec<ShardId> = Vec::new();
+    rows.retain(|row| {
+        let shard = shard_of(ExecutionId::from_uuid(row.id), shards);
+        let count = per_shard.entry(shard).or_insert(0);
+        *count = count.saturating_add(1);
+        let keep = *count <= limit_per_shard;
+        if !keep && !over.contains(&shard) {
+            over.push(shard);
+        }
+        keep
+    });
+    over.sort_by_key(|s| s.as_i32());
+    over_limit.extend(
+        over.into_iter()
+            .map(|s| limit_text(&format!("shard {}", s.as_i32()))),
+    );
+    over_limit
 }
 
 /// A payload field of `events` is a claim-check reference.
@@ -1424,15 +1481,9 @@ impl UpgradeCheck {
                 continue;
             };
             match self.run_shard(&shards, shard_pool, options).await {
-                Ok((shard_runs, truncated)) => {
+                Ok((shard_runs, over_limit)) => {
                     runs.extend(shard_runs);
-                    if truncated {
-                        incomplete.push(format!(
-                            "shard {}: more than {} in-flight runs; raise the limit",
-                            shard.as_i32(),
-                            options.limit_per_shard
-                        ));
-                    }
+                    incomplete.extend(over_limit);
                 }
                 Err(e) => incomplete.push(format!("shard {}: {e}", shard.as_i32())),
             }
@@ -1443,13 +1494,14 @@ impl UpgradeCheck {
     }
 
     /// Check the in-flight runs of one physical database. `shards` are the
-    /// shard ids that alias it, first one first.
+    /// shard ids that alias it, first one first. Also return a line for each
+    /// shard whose runs the check did not all read.
     async fn run_shard(
         &self,
         shards: &[ShardId],
         pool: &crate::worker::DbPool,
         options: &UpgradeCheckOptions,
-    ) -> crate::error::HarvestResult<(Vec<RunVerdict>, bool)> {
+    ) -> crate::error::HarvestResult<(Vec<RunVerdict>, Vec<String>)> {
         use diesel_async::RunQueryDsl as _;
 
         let mut conn = pool
@@ -1483,20 +1535,7 @@ impl UpgradeCheck {
                     .map_err(crate::error::database_error)
             })
             .await?;
-        let mut truncated = rows.len() > group_limit;
-        rows.truncate(group_limit);
-        // The limit holds for each shard id on its own, not only for the
-        // group. A shard over its limit makes the check incomplete.
-        let mut per_shard: HashMap<ShardId, usize> = HashMap::new();
-        rows.retain(|row| {
-            let count = per_shard
-                .entry(shard_of(ExecutionId::from_uuid(row.id), shards))
-                .or_insert(0);
-            *count = count.saturating_add(1);
-            let keep = *count <= options.limit_per_shard;
-            truncated |= !keep;
-            keep
-        });
+        let over_limit = hold_to_limit(&mut rows, shards, options.limit_per_shard, group_limit);
 
         let mut verdicts = Vec::with_capacity(rows.len());
         for row in rows {
@@ -1546,7 +1585,7 @@ impl UpgradeCheck {
             verdict.build_id = row.assigned_build_id;
             verdicts.push(verdict);
         }
-        Ok((verdicts, truncated))
+        Ok((verdicts, over_limit))
     }
 
     /// The replay input for `row`. `None` when the candidate codecs cannot

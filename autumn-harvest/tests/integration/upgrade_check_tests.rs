@@ -1042,3 +1042,70 @@ async fn a_next_input_the_candidate_offloads_migrates() {
         .await;
     assert_eq!(run.verdict, Verdict::Migrate, "{run:#?}");
 }
+
+/// The candidate checkpoints first when `should_continue_as_new` says so.
+pub fn order_by_policy_wf(ctx: &WorkflowContext, input: Value) -> WfFuture<'_> {
+    Box::pin(async move {
+        if ctx.should_continue_as_new() {
+            return ctx
+                .execute_activity_raw("checkpoint", json!({}), "default")
+                .await
+                .map_err(|e| e.to_string());
+        }
+        order_wf(ctx, input).await
+    })
+}
+
+/// The candidate takes another first step on build `v2`.
+pub fn order_by_build_wf(ctx: &WorkflowContext, input: Value) -> WfFuture<'_> {
+    Box::pin(async move {
+        if ctx.build_id() == Some("v2") {
+            return ctx
+                .execute_activity_raw("checkpoint", json!({}), "default")
+                .await
+                .map_err(|e| e.to_string());
+        }
+        order_wf(ctx, input).await
+    })
+}
+
+fn check_of(workflow: autumn_harvest::info::WorkflowHandlerFn) -> UpgradeCheck {
+    UpgradeCheck::new()
+        .register_fn(ORDER, workflow)
+        .with_structure(
+            manifest(vec![order_graph(&[])]),
+            manifest(vec![order_graph(&[])]),
+        )
+}
+
+#[tokio::test]
+async fn the_replay_uses_the_candidate_history_policy() {
+    // The run has two events. Under a threshold of one, the candidate
+    // checkpoints instead of the recorded `reserve`.
+    let blind = check_of(order_by_policy_wf)
+        .check_snapshot(snapshot(reserving()))
+        .await;
+    assert_eq!(blind.verdict, Verdict::Migrate, "{blind:#?}");
+    let policy =
+        autumn_harvest::context::WorkflowHistoryPolicy::default().with_continue_as_new_threshold(1);
+    let run = check_of(order_by_policy_wf)
+        .with_history_policy(policy)
+        .check_snapshot(snapshot(reserving()))
+        .await;
+    assert_eq!(run.verdict, Verdict::Pin, "{run:#?}");
+    assert_eq!(kinds(&run), [FindingKind::Nondeterminism]);
+}
+
+#[tokio::test]
+async fn the_replay_uses_the_candidate_build_id() {
+    let blind = check_of(order_by_build_wf)
+        .check_snapshot(snapshot(reserving()))
+        .await;
+    assert_eq!(blind.verdict, Verdict::Migrate, "{blind:#?}");
+    let run = check_of(order_by_build_wf)
+        .with_build_id("v2")
+        .check_snapshot(snapshot(reserving()))
+        .await;
+    assert_eq!(run.verdict, Verdict::Pin, "{run:#?}");
+    assert_eq!(kinds(&run), [FindingKind::Nondeterminism]);
+}

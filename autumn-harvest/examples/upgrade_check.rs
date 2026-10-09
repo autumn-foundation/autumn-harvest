@@ -39,8 +39,8 @@ async fn place_order(ctx: &WorkflowContext, sku: String) -> Result<u32, String> 
 
 #[tokio::main]
 async fn main() {
-    // Register the same workflows, signals, updates, queries, payload caps and
-    // codecs as the worker.
+    // Register the same workflows, signals, updates, queries, codecs, payload
+    // caps, history policy and build id as the worker.
     let check = UpgradeCheck::new().register(workflows![place_order]);
     std::process::exit(run_command(check, std::env::args().collect()).await);
 }

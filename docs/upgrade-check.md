@@ -63,20 +63,31 @@ async fn main() {
 ```
 
 The `upgrade_check` example in `autumn-harvest/examples/` is a complete
-binary. The replay registers each query, because a workflow can branch on
-`ctx.list_query_names()`.
+binary.
 
-When the worker sets `max_activity_input_bytes`, `max_signal_payload_bytes`
-or `max_workflow_input_bytes`, pass the same three values to
-`with_payload_caps`. The defaults match the worker defaults. The replay
-applies the caps to the commands that a run sends next. A run whose next
-payload is over a candidate cap gets `pin`, because the candidate worker
-rejects that payload.
+The replay must run as the candidate worker runs. A workflow can branch on
+what the worker sets, and a builder-only change leaves both structure
+manifests the same. So give the check each value the candidate worker sets:
 
-Use `with_offloader` when the worker offloads large payloads. The replay
-then takes the offload threshold too, so a payload above it is not held to
-the cap. Use `map_replayer` to give the replay shared state or the
-candidate build id.
+| The candidate worker sets | Pass it to the check with |
+|---|---|
+| Workflows, with their input caps | `register` |
+| Signals | `signals` |
+| Updates | `updates` |
+| Queries. A workflow can branch on `ctx.list_query_names()`. | `queries` |
+| Codecs | `with_codecs` |
+| A payload store and its offload threshold | `with_offloader` |
+| `max_activity_input_bytes`, `max_signal_payload_bytes`, `max_workflow_input_bytes` | `with_payload_caps` |
+| `history_continue_as_new_threshold`, `history_continue_as_new_deadline_fraction`, `history_event_hard_cap` | `with_history_policy` |
+| A build id. A workflow can branch on `ctx.build_id()`. | `with_build_id` |
+
+Each default matches the worker default. The replay applies the payload
+caps to the commands that a run sends next. A run whose next payload is
+over a candidate cap gets `pin`, because the candidate worker rejects that
+payload. With an offloader, the replay also takes the offload threshold, so
+a payload above it is not held to the cap. Build the history policy from
+`WorkflowHistoryPolicy::default()` with the same values as the worker. Use
+`map_replayer` for anything else, such as shared state.
 
 ## 3. Run the check
 
