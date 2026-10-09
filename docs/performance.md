@@ -1583,6 +1583,39 @@ without a capped key pay nothing.
 - **A production fleet.** The fixture follows issue #1956's shape, but no
   production trace was replayed.
 
+## Claim concurrency
+
+Assay #14 measured the claim-loop occupancy of one worker: claims per second
+times the mean claim time. It read 0.91 to 0.99 in every harvest run. That
+fits one claim in flight at a time. A worker now runs up to
+`max_concurrent_claims` claims at once, 2 by default. Design record:
+[`DESIGN-claim-concurrency.md`](../DESIGN-claim-concurrency.md).
+
+### Mechanism
+
+- The poll loop is the **leader**. It keeps the listener, the timer and the
+  capacity wake. After a successful Postgres claim it wakes one follower.
+- A **follower** claims until a claim returns nothing. It wakes one more
+  follower after each success. It has no timer and no listener, so an idle
+  worker polls at the single-loop rate.
+- Each loop takes its own permits before it claims, so the loops never
+  claim past the local slots.
+- The claim statement does not change. Two loops can take rows slightly out
+  of order, as two workers can (see [fairness](#fairness)).
+
+### Method
+
+The harvest `postgres` arm of assay #14, unchanged except for one setting:
+[`apparatus.patch`](perf-artifacts/claim-concurrency/apparatus.patch) reads
+the claim cap from `ASSAY14_MAX_CONCURRENT_CLAIMS`. One release binary runs
+caps 1, 2 and 4. Cap 1 is the old serial loop. Temporal 1.25.2 runs on the
+same box in the same session, through assay #11's runner.
+[`run.sh`](perf-artifacts/claim-concurrency/run.sh) runs three rounds.
+[`grade.py`](perf-artifacts/claim-concurrency/grade.py) prints the tables.
+
+**Claims in flight** is the claim count times the mean claim time, divided
+by the elapsed time. One serial loop cannot exceed 1.
+
 ## Enqueue throughput
 
 8 concurrent writers enqueueing into an already-populated queue:
