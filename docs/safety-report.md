@@ -310,7 +310,8 @@ adds a second signal
 ([`management-api.md`](management-api.md#idempotent-delivery-issues-521--753)).
 
 A reset with the `Buffer` policy moves pending signals to the new run. The
-new rows keep the source `received_at`, so they keep their order.
+new rows keep the source `received_at`, so signals with different times keep
+their order. Signals that share one time have no defined order on either run.
 
 ### Tests
 

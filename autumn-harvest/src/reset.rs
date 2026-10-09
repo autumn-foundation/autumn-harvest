@@ -30,8 +30,8 @@ pub enum ResetSignalReapplyPolicy {
     /// Discard undelivered source signals.
     #[default]
     Drop,
-    /// Re-enqueue undelivered source signals onto the fork as fresh rows, in
-    /// their source order.
+    /// Re-enqueue undelivered source signals onto the fork as fresh rows. Each
+    /// row keeps its source `received_at`, so the fork reads them in time order.
     Buffer,
 }
 
@@ -1566,7 +1566,8 @@ struct SignalForReset {
 /// It keeps the source `received_at`, because the ingest sorts by that
 /// column. One INSERT writes every row, so a default `NOW()` would give each
 /// row the same time. The random row id would then set the order (issue
-/// #2004).
+/// #2004). Source rows that share one `received_at` have no defined order on
+/// the source either, so the fork keeps none.
 #[derive(Insertable)]
 #[diesel(table_name = harvest_signals)]
 struct NewSignalForReset {

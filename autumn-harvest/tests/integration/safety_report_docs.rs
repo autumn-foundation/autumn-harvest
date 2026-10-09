@@ -64,24 +64,55 @@ const REQUIRED_LIMITS: &[(&str, &str)] = &[
     ("## Limits of this report", "#1818"),
 ];
 
-/// A page section that lists limits, and the number of bullets it holds.
+/// A page section that lists limits, and how the report restates each one.
 ///
-/// The report must link each section. A new bullet in a source section
-/// changes its count and fails the guard. Restate the new limit in the
-/// report, then update the count here.
-const LIMIT_SOURCES: &[(&str, &str, &str, usize)] = &[
-    (
-        "docs/testing/formal-methods.md",
-        "## Not modelled yet",
-        "testing/formal-methods.md#not-modelled-yet",
-        2,
-    ),
-    (
-        "docs/testing/simulation.md",
-        "## Limits",
-        "testing/simulation.md#limits",
-        3,
-    ),
+/// Each limit pairs a phrase from its source bullet with a phrase from the
+/// report. A source bullet that is added, removed or reworded fails the
+/// guard. So does a report that drops a restatement. Update the pairs here
+/// in the same change as the report.
+struct LimitSource {
+    page: &'static str,
+    heading: &'static str,
+    link: &'static str,
+    limits: &'static [(&'static str, &'static str)],
+}
+
+const LIMIT_SOURCES: &[LimitSource] = &[
+    LimitSource {
+        page: "docs/testing/formal-methods.md",
+        heading: "## Not modelled yet",
+        link: "testing/formal-methods.md#not-modelled-yet",
+        limits: &[
+            (
+                "Model (d), shard-generation fencing and rebalance.",
+                "No model covers shard-generation fencing or the rebalance cutover.",
+            ),
+            (
+                "Trace conformance.",
+                "No check compares test traces with the models.",
+            ),
+        ],
+    },
+    LimitSource {
+        page: "docs/testing/simulation.md",
+        heading: "## Limits",
+        link: "testing/simulation.md#limits",
+        limits: &[
+            (
+                "drives the store statements, not the `worker.rs` loop.",
+                "The simulator drives store statements, not the `worker.rs` loop.",
+            ),
+            (
+                "draws actions from fixed weights.",
+                "It draws actions from fixed weights.",
+            ),
+            (
+                "does not model the timeout sweeper, the `FAILED` state or the poison-pill \
+                 quarantine.",
+                "does not model the timeout sweeper, the `FAILED` state or quarantine.",
+            ),
+        ],
+    },
 ];
 
 /// Pages that must link the report, so an evaluator can find it.
@@ -264,15 +295,17 @@ fn every_required_limit_is_stated() {
 
 /// The report cannot drop a limit that a source page records.
 #[test]
-fn every_limit_source_is_linked_and_counted() {
-    let report = read(REPORT);
-    for (page, heading, link, count) in LIMIT_SOURCES {
+fn every_source_limit_is_restated() {
+    let report = flat(&read(REPORT));
+    for source in LIMIT_SOURCES {
+        let (page, heading) = (source.page, source.heading);
         assert!(
-            report.contains(link),
-            "{REPORT} must link the limits in `{page}` as `{link}`"
+            report.contains(source.link),
+            "{REPORT} must link the limits in `{page}` as `{}`",
+            source.link
         );
-        let source = read(page);
-        let body = section(&source, &format!("\n{heading}\n"), "\n## ")
+        let text = read(page);
+        let body = section(&text, &format!("\n{heading}\n"), "\n## ")
             .unwrap_or_else(|| panic!("{page} lacks `{heading}`"));
         let bullets = body
             .lines()
@@ -283,11 +316,29 @@ fn every_limit_source_is_linked_and_counted() {
             })
             .count();
         assert_eq!(
-            bullets, *count,
+            bullets,
+            source.limits.len(),
             "`{heading}` in {page} now lists {bullets} limits. Restate each new limit in \
-             {REPORT}, then set its count in LIMIT_SOURCES"
+             {REPORT}, then add it to LIMIT_SOURCES"
         );
+        let body = flat(body);
+        for (in_source, in_report) in source.limits {
+            assert!(
+                body.contains(in_source),
+                "`{heading}` in {page} no longer says `{in_source}`. Check that {REPORT} \
+                 still states the limit, then update LIMIT_SOURCES"
+            );
+            assert!(
+                report.contains(in_report),
+                "{REPORT} must restate the limit `{in_source}` from {page} as `{in_report}`"
+            );
+        }
     }
+}
+
+/// Squash text to one line, so a phrase can wrap.
+fn flat(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[test]

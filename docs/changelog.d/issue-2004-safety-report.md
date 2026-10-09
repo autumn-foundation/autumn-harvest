@@ -17,7 +17,8 @@ have no defined order. The report also cites the open signal bug #2079.
 wrote the pending signals of the source run in one INSERT. Each new row took
 a default `received_at`, so every row got the same `NOW()`. The random row id
 then set the order in which the new run read them. `reapply_or_drop_signals`
-now copies the source `received_at`, as continue-as-new already does. No
+now copies the source `received_at`, as continue-as-new already does. Rows
+that share one `received_at` have no defined order, as on the source run. No
 migration and no new `WorkflowEvent` variant.
 
 **New tests.** `signal_tests::committed_sends_are_recorded_in_send_order`
@@ -32,9 +33,10 @@ results row holds one command. A cargo filter that matches no test exits 0.
 So the guard lists the tests that each command compiles, with its features
 and `cfg` gates. Each filter must match a test that runs. A TLC row must
 state the verdict of `formal/tla/models.txt`. The report must cite each bug
-that `docs/testing/chaos.md` records. The guard pins the bullet count of the
-limit sections in `formal-methods.md` and `simulation.md`. A new limit there
-fails the guard until the report states it. No prose sentence may exceed 25
+that `docs/testing/chaos.md` records. The guard pairs each bullet in the limit
+sections of `formal-methods.md` and `simulation.md` with a phrase in the
+report. A new, removed or reworded limit there fails the guard until the
+report states it. No prose sentence may exceed 25
 words.
 
 **Refactor.** `docs_guard_support.rs` holds the prose and CI-step helpers
