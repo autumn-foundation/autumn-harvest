@@ -656,7 +656,14 @@ impl UpgradeCheck {
     /// verdict. The plaintext stays in memory.
     pub async fn check_encoded(&self, history: EncodedHistory) -> RunVerdict {
         let mut events = Vec::with_capacity(history.event_data.len());
-        for (index, value) in history.event_data.into_iter().enumerate() {
+        for (index, mut value) in history.event_data.into_iter().enumerate() {
+            // The worker encodes, then offloads. So the check inflates first,
+            // then decodes, as `load_history_inflated` does.
+            if let Some(offloader) = &self.offloader
+                && offloader.inflate_event_value(&mut value).await.is_err()
+            {
+                return undecodable(history.execution_id, history.workflow_name, Some(index));
+            }
             match self.codecs.decode_event(value) {
                 Ok(event) => events.push(event),
                 Err(_) => {

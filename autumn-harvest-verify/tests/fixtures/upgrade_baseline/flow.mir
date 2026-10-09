@@ -164,7 +164,7 @@ fn __autumn_activity_info_charge() -> ActivityInfo {
     }
 }
 
-alloc17 (size: 6, align: 1) {
+alloc19 (size: 6, align: 1) {
     63 68 61 72 67 65                               │ charge
 }
 
@@ -3288,4 +3288,615 @@ fn wf_condition::{closure#0}(_1: Pin<&mut {async fn body of wf_condition()}>, _2
 
 alloc13 (size: 5, align: 1) {
     61 66 74 65 72                                  │ after
+}
+
+const <impl at flow.rs:199:1: 199:21>::MAX: u64 = const 5_u64;
+
+fn capped(_1: &WorkflowContext) -> {async fn body of capped()} {
+    debug ctx => _1;
+    let mut _0: {async fn body of capped()};
+
+    bb0: {
+        _0 = {coroutine@flow.rs:204:67: 207:2 (#0)} { ctx: copy _1 };
+        return;
+    }
+}
+
+fn capped::{closure#0}(_1: Pin<&mut {async fn body of capped()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    coroutine layout {
+        field _s0: std::future::Ready<Result<u64, String>>;
+        variant_fields = {
+            Unresumed(0): [],
+            Returned (1): [],
+            Panicked (2): [],
+            Suspend0 (3): [_s0],
+        }
+        storage_conflicts = BitMatrix(1x1) {(_s0, _s0)}
+    }
+    debug _task_context => _23;
+    debug ctx => ((*_22).0: &WorkflowContext);
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let _3: &WorkflowContext;
+    let mut _4: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, std::string::String>, u64>;
+    let mut _5: std::future::Ready<std::result::Result<u64, std::string::String>>;
+    let mut _6: std::future::Ready<std::result::Result<u64, std::string::String>>;
+    let mut _7: &str;
+    let mut _8: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let mut _9: std::pin::Pin<&mut std::future::Ready<std::result::Result<u64, std::string::String>>>;
+    let mut _10: &mut std::future::Ready<std::result::Result<u64, std::string::String>>;
+    let mut _11: &mut std::task::Context<'_>;
+    let mut _12: std::future::ResumeTy;
+    let mut _13: isize;
+    let mut _15: std::future::ResumeTy;
+    let mut _16: isize;
+    let mut _19: u64;
+    let mut _20: std::result::Result<u64, std::string::String>;
+    let mut _21: u32;
+    let mut _22: &mut {async fn body of capped()};
+    let mut _23: std::future::ResumeTy;
+    let mut _24: std::ptr::NonNull<std::task::Context<'_>>;
+    scope 1 {
+        debug ctx => _3;
+        coroutine debug __awaitee => _s0;
+        let _17: std::result::Result<std::convert::Infallible, std::string::String>;
+        let _18: u64;
+        scope 2 {
+            debug v => _18;
+        }
+        scope 3 {
+            debug __awaitee => (((*_22) as variant#3).0: std::future::Ready<std::result::Result<u64, std::string::String>>);
+            let _14: std::result::Result<u64, std::string::String>;
+            scope 4 {
+                debug result => _14;
+            }
+        }
+        scope 5 {
+            debug residual => _17;
+            scope 6 {
+            }
+        }
+        scope 7 {
+            debug val => _18;
+            scope 8 {
+            }
+        }
+    }
+
+    bb0: {
+        _24 = move _2 as std::ptr::NonNull<std::task::Context<'_>> (Transmute);
+        _23 = std::future::ResumeTy(move _24);
+        _22 = copy (_1.0: &mut {async fn body of capped()});
+        _21 = discriminant((*_22));
+        switchInt(move _21) -> [0: bb20, 1: bb19, 2: bb18, 3: bb17, otherwise: bb6];
+    }
+
+    bb1: {
+        _5 = <std::future::Ready<Result<u64, String>> as IntoFuture>::into_future(move _6) -> [return: bb2, unwind: bb16];
+    }
+
+    bb2: {
+        (((*_22) as variant#3).0: std::future::Ready<std::result::Result<u64, std::string::String>>) = move _5;
+        goto -> bb3;
+    }
+
+    bb3: {
+        _10 = &mut (((*_22) as variant#3).0: std::future::Ready<std::result::Result<u64, std::string::String>>);
+        _9 = Pin::<&mut std::future::Ready<Result<u64, String>>>::new_unchecked(copy _10) -> [return: bb4, unwind: bb15];
+    }
+
+    bb4: {
+        _12 = copy _23;
+        _11 = copy (_12.0: std::ptr::NonNull<std::task::Context<'_>>) as &mut std::task::Context<'_> (Transmute);
+        _8 = <std::future::Ready<Result<u64, String>> as Future>::poll(move _9, copy _11) -> [return: bb5, unwind: bb15];
+    }
+
+    bb5: {
+        _13 = discriminant(_8);
+        switchInt(move _13) -> [0: bb8, 1: bb7, otherwise: bb6];
+    }
+
+    bb6: {
+        unreachable;
+    }
+
+    bb7: {
+        _0 = Poll::<Result<u64, String>>::Pending;
+        discriminant((*_22)) = 3;
+        return;
+    }
+
+    bb8: {
+        _14 = move ((_8 as Ready).0: std::result::Result<u64, std::string::String>);
+        drop((((*_22) as variant#3).0: std::future::Ready<std::result::Result<u64, std::string::String>>)) -> [return: bb9, unwind: bb16];
+    }
+
+    bb9: {
+        _4 = <Result<u64, String> as Try>::branch(copy _14) -> [return: bb10, unwind: bb16];
+    }
+
+    bb10: {
+        _16 = discriminant(_4);
+        switchInt(move _16) -> [0: bb11, 1: bb12, otherwise: bb6];
+    }
+
+    bb11: {
+        _18 = copy ((_4 as Continue).0: u64);
+        _19 = <u64 as Ord>::min(copy _18, const <Plan as Limits>::MAX) -> [return: bb13, unwind: bb16];
+    }
+
+    bb12: {
+        _17 = move ((_4 as Break).0: std::result::Result<std::convert::Infallible, std::string::String>);
+        _20 = <Result<u64, String> as FromResidual<Result<Infallible, String>>>::from_residual(copy _17) -> [return: bb21, unwind: bb16];
+    }
+
+    bb13: {
+        _20 = Result::<u64, String>::Ok(move _19);
+        goto -> bb14;
+    }
+
+    bb14: {
+        _0 = Poll::<Result<u64, String>>::Ready(move _20);
+        discriminant((*_22)) = 1;
+        return;
+    }
+
+    bb15 (cleanup): {
+        drop((((*_22) as variant#3).0: std::future::Ready<std::result::Result<u64, std::string::String>>)) -> [return: bb16, unwind terminate(cleanup)];
+    }
+
+    bb16 (cleanup): {
+        discriminant((*_22)) = 2;
+        resume;
+    }
+
+    bb17: {
+        _15 = move _23;
+        _23 = move _15;
+        goto -> bb3;
+    }
+
+    bb18: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb18, unwind continue];
+    }
+
+    bb19: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb19, unwind continue];
+    }
+
+    bb20: {
+        _3 = copy ((*_22).0: &WorkflowContext);
+        _7 = const "capped";
+        _6 = WorkflowContext::execute_activity_raw(copy _3, move _7, const 1_u64) -> [return: bb1, unwind: bb16];
+    }
+
+    bb21: {
+        goto -> bb14;
+    }
+}
+
+alloc14 (size: 6, align: 1) {
+    63 61 70 70 65 64                               │ capped
+}
+
+fn __autumn_workflow_info_wf_assoc() -> u8 {
+    let mut _0: u8;
+
+    bb0: {
+        _0 = const 0_u8;
+        return;
+    }
+}
+
+fn wf_assoc(_1: &WorkflowContext) -> {async fn body of wf_assoc()} {
+    debug ctx => _1;
+    let mut _0: {async fn body of wf_assoc()};
+
+    bb0: {
+        _0 = {coroutine@flow.rs:214:69: 216:2 (#0)} { ctx: copy _1 };
+        return;
+    }
+}
+
+fn wf_assoc::{closure#0}(_1: Pin<&mut {async fn body of wf_assoc()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    coroutine layout {
+        field _s0: {async fn body of capped()};
+        variant_fields = {
+            Unresumed(0): [],
+            Returned (1): [],
+            Panicked (2): [],
+            Suspend0 (3): [_s0],
+        }
+        storage_conflicts = BitMatrix(1x1) {(_s0, _s0)}
+    }
+    debug _task_context => _16;
+    debug ctx => ((*_15).0: &WorkflowContext);
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let _3: &WorkflowContext;
+    let mut _4: {async fn body of capped()};
+    let mut _5: {async fn body of capped()};
+    let mut _6: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let mut _7: std::pin::Pin<&mut {async fn body of capped()}>;
+    let mut _8: &mut {async fn body of capped()};
+    let mut _9: &mut std::task::Context<'_>;
+    let mut _10: std::future::ResumeTy;
+    let mut _11: isize;
+    let mut _13: std::future::ResumeTy;
+    let mut _14: u32;
+    let mut _15: &mut {async fn body of wf_assoc()};
+    let mut _16: std::future::ResumeTy;
+    let mut _17: std::ptr::NonNull<std::task::Context<'_>>;
+    scope 1 {
+        debug ctx => _3;
+        coroutine debug __awaitee => _s0;
+        scope 2 {
+            debug __awaitee => (((*_15) as variant#3).0: {async fn body of capped()});
+            let _12: std::result::Result<u64, std::string::String>;
+            scope 3 {
+                debug result => _12;
+            }
+        }
+    }
+
+    bb0: {
+        _17 = move _2 as std::ptr::NonNull<std::task::Context<'_>> (Transmute);
+        _16 = std::future::ResumeTy(move _17);
+        _15 = copy (_1.0: &mut {async fn body of wf_assoc()});
+        _14 = discriminant((*_15));
+        switchInt(move _14) -> [0: bb15, 1: bb14, 2: bb13, 3: bb12, otherwise: bb6];
+    }
+
+    bb1: {
+        _4 = <{async fn body of capped()} as IntoFuture>::into_future(move _5) -> [return: bb2, unwind: bb11];
+    }
+
+    bb2: {
+        (((*_15) as variant#3).0: {async fn body of capped()}) = move _4;
+        goto -> bb3;
+    }
+
+    bb3: {
+        _8 = &mut (((*_15) as variant#3).0: {async fn body of capped()});
+        _7 = Pin::<&mut {async fn body of capped()}>::new_unchecked(copy _8) -> [return: bb4, unwind: bb10];
+    }
+
+    bb4: {
+        _10 = copy _16;
+        _9 = copy (_10.0: std::ptr::NonNull<std::task::Context<'_>>) as &mut std::task::Context<'_> (Transmute);
+        _6 = <{async fn body of capped()} as Future>::poll(move _7, copy _9) -> [return: bb5, unwind: bb10];
+    }
+
+    bb5: {
+        _11 = discriminant(_6);
+        switchInt(move _11) -> [0: bb8, 1: bb7, otherwise: bb6];
+    }
+
+    bb6: {
+        unreachable;
+    }
+
+    bb7: {
+        _0 = Poll::<Result<u64, String>>::Pending;
+        discriminant((*_15)) = 3;
+        return;
+    }
+
+    bb8: {
+        _12 = move ((_6 as Ready).0: std::result::Result<u64, std::string::String>);
+        drop((((*_15) as variant#3).0: {async fn body of capped()})) -> [return: bb9, unwind: bb11];
+    }
+
+    bb9: {
+        _0 = Poll::<Result<u64, String>>::Ready(copy _12);
+        discriminant((*_15)) = 1;
+        return;
+    }
+
+    bb10 (cleanup): {
+        drop((((*_15) as variant#3).0: {async fn body of capped()})) -> [return: bb11, unwind terminate(cleanup)];
+    }
+
+    bb11 (cleanup): {
+        discriminant((*_15)) = 2;
+        resume;
+    }
+
+    bb12: {
+        _13 = move _16;
+        _16 = move _13;
+        goto -> bb3;
+    }
+
+    bb13: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb13, unwind continue];
+    }
+
+    bb14: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb14, unwind continue];
+    }
+
+    bb15: {
+        _3 = copy ((*_15).0: &WorkflowContext);
+        _5 = capped(copy _3) -> [return: bb1, unwind: bb11];
+    }
+}
+
+fn tagged(_1: &WorkflowContext) -> {async fn body of tagged()} {
+    debug ctx => _1;
+    let mut _0: {async fn body of tagged()};
+
+    bb0: {
+        _0 = {coroutine@flow.rs:219:67: 221:2 (#0)} { ctx: copy _1 };
+        return;
+    }
+}
+
+fn tagged::{closure#0}(_1: Pin<&mut {async fn body of tagged()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    coroutine layout {
+        field _s0: std::future::Ready<Result<u64, String>>;
+        variant_fields = {
+            Unresumed(0): [],
+            Returned (1): [],
+            Panicked (2): [],
+            Suspend0 (3): [_s0],
+        }
+        storage_conflicts = BitMatrix(1x1) {(_s0, _s0)}
+    }
+    debug _task_context => _17;
+    debug ctx => ((*_16).0: &WorkflowContext);
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let _3: &WorkflowContext;
+    let mut _4: std::future::Ready<std::result::Result<u64, std::string::String>>;
+    let mut _5: std::future::Ready<std::result::Result<u64, std::string::String>>;
+    let mut _6: &str;
+    let mut _7: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let mut _8: std::pin::Pin<&mut std::future::Ready<std::result::Result<u64, std::string::String>>>;
+    let mut _9: &mut std::future::Ready<std::result::Result<u64, std::string::String>>;
+    let mut _10: &mut std::task::Context<'_>;
+    let mut _11: std::future::ResumeTy;
+    let mut _12: isize;
+    let mut _14: std::future::ResumeTy;
+    let mut _15: u32;
+    let mut _16: &mut {async fn body of tagged()};
+    let mut _17: std::future::ResumeTy;
+    let mut _18: std::ptr::NonNull<std::task::Context<'_>>;
+    scope 1 {
+        debug ctx => _3;
+        coroutine debug __awaitee => _s0;
+        scope 2 {
+            debug __awaitee => (((*_16) as variant#3).0: std::future::Ready<std::result::Result<u64, std::string::String>>);
+            let _13: std::result::Result<u64, std::string::String>;
+            scope 3 {
+                debug result => _13;
+            }
+        }
+    }
+
+    bb0: {
+        _18 = move _2 as std::ptr::NonNull<std::task::Context<'_>> (Transmute);
+        _17 = std::future::ResumeTy(move _18);
+        _16 = copy (_1.0: &mut {async fn body of tagged()});
+        _15 = discriminant((*_16));
+        switchInt(move _15) -> [0: bb15, 1: bb14, 2: bb13, 3: bb12, otherwise: bb6];
+    }
+
+    bb1: {
+        _4 = <std::future::Ready<Result<u64, String>> as IntoFuture>::into_future(move _5) -> [return: bb2, unwind: bb11];
+    }
+
+    bb2: {
+        (((*_16) as variant#3).0: std::future::Ready<std::result::Result<u64, std::string::String>>) = move _4;
+        goto -> bb3;
+    }
+
+    bb3: {
+        _9 = &mut (((*_16) as variant#3).0: std::future::Ready<std::result::Result<u64, std::string::String>>);
+        _8 = Pin::<&mut std::future::Ready<Result<u64, String>>>::new_unchecked(copy _9) -> [return: bb4, unwind: bb10];
+    }
+
+    bb4: {
+        _11 = copy _17;
+        _10 = copy (_11.0: std::ptr::NonNull<std::task::Context<'_>>) as &mut std::task::Context<'_> (Transmute);
+        _7 = <std::future::Ready<Result<u64, String>> as Future>::poll(move _8, copy _10) -> [return: bb5, unwind: bb10];
+    }
+
+    bb5: {
+        _12 = discriminant(_7);
+        switchInt(move _12) -> [0: bb8, 1: bb7, otherwise: bb6];
+    }
+
+    bb6: {
+        unreachable;
+    }
+
+    bb7: {
+        _0 = Poll::<Result<u64, String>>::Pending;
+        discriminant((*_16)) = 3;
+        return;
+    }
+
+    bb8: {
+        _13 = move ((_7 as Ready).0: std::result::Result<u64, std::string::String>);
+        drop((((*_16) as variant#3).0: std::future::Ready<std::result::Result<u64, std::string::String>>)) -> [return: bb9, unwind: bb11];
+    }
+
+    bb9: {
+        _0 = Poll::<Result<u64, String>>::Ready(copy _13);
+        discriminant((*_16)) = 1;
+        return;
+    }
+
+    bb10 (cleanup): {
+        drop((((*_16) as variant#3).0: std::future::Ready<std::result::Result<u64, std::string::String>>)) -> [return: bb11, unwind terminate(cleanup)];
+    }
+
+    bb11 (cleanup): {
+        discriminant((*_16)) = 2;
+        resume;
+    }
+
+    bb12: {
+        _14 = move _17;
+        _17 = move _14;
+        goto -> bb3;
+    }
+
+    bb13: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb13, unwind continue];
+    }
+
+    bb14: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb14, unwind continue];
+    }
+
+    bb15: {
+        _3 = copy ((*_16).0: &WorkflowContext);
+        _6 = const "note.rs:7:2";
+        _5 = WorkflowContext::execute_activity_raw(copy _3, move _6, const 1_u64) -> [return: bb1, unwind: bb11];
+    }
+}
+
+alloc15 (size: 11, align: 1) {
+    6e 6f 74 65 2e 72 73 3a 37 3a 32                │ note.rs:7:2
+}
+
+fn __autumn_workflow_info_wf_literal() -> u8 {
+    let mut _0: u8;
+
+    bb0: {
+        _0 = const 0_u8;
+        return;
+    }
+}
+
+fn wf_literal(_1: &WorkflowContext) -> {async fn body of wf_literal()} {
+    debug ctx => _1;
+    let mut _0: {async fn body of wf_literal()};
+
+    bb0: {
+        _0 = {coroutine@flow.rs:228:71: 230:2 (#0)} { ctx: copy _1 };
+        return;
+    }
+}
+
+fn wf_literal::{closure#0}(_1: Pin<&mut {async fn body of wf_literal()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    coroutine layout {
+        field _s0: {async fn body of tagged()};
+        variant_fields = {
+            Unresumed(0): [],
+            Returned (1): [],
+            Panicked (2): [],
+            Suspend0 (3): [_s0],
+        }
+        storage_conflicts = BitMatrix(1x1) {(_s0, _s0)}
+    }
+    debug _task_context => _16;
+    debug ctx => ((*_15).0: &WorkflowContext);
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let _3: &WorkflowContext;
+    let mut _4: {async fn body of tagged()};
+    let mut _5: {async fn body of tagged()};
+    let mut _6: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let mut _7: std::pin::Pin<&mut {async fn body of tagged()}>;
+    let mut _8: &mut {async fn body of tagged()};
+    let mut _9: &mut std::task::Context<'_>;
+    let mut _10: std::future::ResumeTy;
+    let mut _11: isize;
+    let mut _13: std::future::ResumeTy;
+    let mut _14: u32;
+    let mut _15: &mut {async fn body of wf_literal()};
+    let mut _16: std::future::ResumeTy;
+    let mut _17: std::ptr::NonNull<std::task::Context<'_>>;
+    scope 1 {
+        debug ctx => _3;
+        coroutine debug __awaitee => _s0;
+        scope 2 {
+            debug __awaitee => (((*_15) as variant#3).0: {async fn body of tagged()});
+            let _12: std::result::Result<u64, std::string::String>;
+            scope 3 {
+                debug result => _12;
+            }
+        }
+    }
+
+    bb0: {
+        _17 = move _2 as std::ptr::NonNull<std::task::Context<'_>> (Transmute);
+        _16 = std::future::ResumeTy(move _17);
+        _15 = copy (_1.0: &mut {async fn body of wf_literal()});
+        _14 = discriminant((*_15));
+        switchInt(move _14) -> [0: bb15, 1: bb14, 2: bb13, 3: bb12, otherwise: bb6];
+    }
+
+    bb1: {
+        _4 = <{async fn body of tagged()} as IntoFuture>::into_future(move _5) -> [return: bb2, unwind: bb11];
+    }
+
+    bb2: {
+        (((*_15) as variant#3).0: {async fn body of tagged()}) = move _4;
+        goto -> bb3;
+    }
+
+    bb3: {
+        _8 = &mut (((*_15) as variant#3).0: {async fn body of tagged()});
+        _7 = Pin::<&mut {async fn body of tagged()}>::new_unchecked(copy _8) -> [return: bb4, unwind: bb10];
+    }
+
+    bb4: {
+        _10 = copy _16;
+        _9 = copy (_10.0: std::ptr::NonNull<std::task::Context<'_>>) as &mut std::task::Context<'_> (Transmute);
+        _6 = <{async fn body of tagged()} as Future>::poll(move _7, copy _9) -> [return: bb5, unwind: bb10];
+    }
+
+    bb5: {
+        _11 = discriminant(_6);
+        switchInt(move _11) -> [0: bb8, 1: bb7, otherwise: bb6];
+    }
+
+    bb6: {
+        unreachable;
+    }
+
+    bb7: {
+        _0 = Poll::<Result<u64, String>>::Pending;
+        discriminant((*_15)) = 3;
+        return;
+    }
+
+    bb8: {
+        _12 = move ((_6 as Ready).0: std::result::Result<u64, std::string::String>);
+        drop((((*_15) as variant#3).0: {async fn body of tagged()})) -> [return: bb9, unwind: bb11];
+    }
+
+    bb9: {
+        _0 = Poll::<Result<u64, String>>::Ready(copy _12);
+        discriminant((*_15)) = 1;
+        return;
+    }
+
+    bb10 (cleanup): {
+        drop((((*_15) as variant#3).0: {async fn body of tagged()})) -> [return: bb11, unwind terminate(cleanup)];
+    }
+
+    bb11 (cleanup): {
+        discriminant((*_15)) = 2;
+        resume;
+    }
+
+    bb12: {
+        _13 = move _16;
+        _16 = move _13;
+        goto -> bb3;
+    }
+
+    bb13: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb13, unwind continue];
+    }
+
+    bb14: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb14, unwind continue];
+    }
+
+    bb15: {
+        _3 = copy ((*_15).0: &WorkflowContext);
+        _5 = tagged(copy _3) -> [return: bb1, unwind: bb11];
+    }
 }

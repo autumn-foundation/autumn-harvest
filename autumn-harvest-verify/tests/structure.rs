@@ -75,9 +75,11 @@ fn the_manifest_names_its_format_and_every_workflow() {
         have,
         [
             "wf_activity_only",
+            "wf_assoc",
             "wf_closure",
             "wf_condition",
             "wf_const",
+            "wf_literal",
             "wf_loop",
             "wf_match",
             "wf_param_key",
@@ -275,6 +277,30 @@ fn a_changed_const_item_changes_the_digest_of_its_reader() {
         body(b, "limited::{closure#0}").digest
     );
     assert_eq!(body(a, &a.root).digest, body(b, &b.root).digest);
+}
+
+#[test]
+fn a_changed_associated_const_changes_the_digest_of_its_reader() {
+    let base = manifest("upgrade_baseline");
+    let cand = manifest("upgrade_candidate");
+    let a = workflow(&base, "wf_assoc");
+    let b = workflow(&cand, "wf_assoc");
+    assert_ne!(
+        body(a, "capped::{closure#0}").digest,
+        body(b, "capped::{closure#0}").digest
+    );
+}
+
+#[test]
+fn a_changed_span_like_string_literal_changes_the_digest() {
+    let base = manifest("upgrade_baseline");
+    let cand = manifest("upgrade_candidate");
+    let a = workflow(&base, "wf_literal");
+    let b = workflow(&cand, "wf_literal");
+    assert_ne!(
+        body(a, "tagged::{closure#0}").digest,
+        body(b, "tagged::{closure#0}").digest
+    );
 }
 
 #[test]

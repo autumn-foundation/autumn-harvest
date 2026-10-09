@@ -534,18 +534,21 @@ impl DocIndex {
         let mut rest = text;
         while let Some(at) = rest.find("const ") {
             let tail = rest.get(at.saturating_add(6)..).unwrap_or_default();
-            let end = tail
-                .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':'))
-                .unwrap_or(tail.len());
-            let name = tail.get(..end).unwrap_or_default().trim_end_matches(':');
+            let name = const_name(tail);
             let last = name.rsplit("::").next().unwrap_or(name);
             if let Some(paths) = self.consts.get(last) {
+                // An associated constant, `<X as T>::NAME`, names its impl
+                // by type. The impl body has another path. So every `const`
+                // item with that last segment counts: a false match only
+                // costs a review.
+                let qualified = name.starts_with('<');
                 let suffix = format!("::{name}");
                 out.extend(
                     paths
                         .iter()
                         .filter(|p| {
-                            p.as_str() == name
+                            qualified
+                                || p.as_str() == name
                                 || p.ends_with(&suffix)
                                 || name.ends_with(&format!("::{p}"))
                         })
@@ -556,6 +559,38 @@ impl DocIndex {
         }
         out
     }
+}
+
+/// The path after `const `, such as `m::LIMIT` or `<X as T>::LIMIT`.
+///
+/// A leading `<...>` group is kept whole. The path ends at the first
+/// character that cannot be part of it.
+fn const_name(tail: &str) -> &str {
+    let mut end = 0;
+    if tail.starts_with('<') {
+        let mut depth = 0_usize;
+        for (i, c) in tail.char_indices() {
+            match c {
+                '<' => depth = depth.saturating_add(1),
+                '>' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            if depth == 0 {
+                end = i.saturating_add(c.len_utf8());
+                break;
+            }
+        }
+        if end == 0 {
+            return "";
+        }
+    }
+    let rest = tail.get(end..).unwrap_or_default();
+    let more = rest
+        .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':'))
+        .unwrap_or(rest.len());
+    tail.get(..end.saturating_add(more))
+        .unwrap_or_default()
+        .trim_end_matches(':')
 }
 
 /// Append the footer of each `allocN` that `text` names, and of each alloc
@@ -608,12 +643,26 @@ fn alloc_names(text: &str) -> Vec<String> {
 ///
 /// A span is `FILE.rs:L:C: L:C` or `FILE.rs:L:C`. The file name stays, and
 /// the numbers go. An `allocN` becomes the static it names, or `alloc`.
+///
+/// Text inside a string literal is user data, so it stays as it is. MIR
+/// escapes a newline in a string literal, so a literal never spans lines.
 #[must_use]
 pub fn normalize(text: &str, allocs: Option<&BTreeMap<String, String>>) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
+    let mut in_string = false;
     let mut i = 0;
     while let Some(&c) = chars.get(i) {
+        if c == '\n' {
+            in_string = false;
+        } else if c == '"' && !is_escaped(&chars, i) && !is_char_literal(&chars, i) {
+            in_string = !in_string;
+        }
+        if in_string || c == '"' {
+            out.push(c);
+            i = i.saturating_add(1);
+            continue;
+        }
         if c == '.' && starts_with_at(&chars, i, ".rs:") {
             out.push_str(".rs");
             i = skip_span_numbers(&chars, i.saturating_add(3));
@@ -646,6 +695,22 @@ pub fn normalize(text: &str, allocs: Option<&BTreeMap<String, String>>) -> Strin
         i = i.saturating_add(1);
     }
     out
+}
+
+/// An odd number of backslashes comes before `at`.
+fn is_escaped(chars: &[char], at: usize) -> bool {
+    let mut count = 0_usize;
+    let mut i = at;
+    while i > 0 && chars.get(i - 1) == Some(&'\\') {
+        count = count.saturating_add(1);
+        i -= 1;
+    }
+    count % 2 == 1
+}
+
+/// The quote at `at` is the char literal `'"'`.
+fn is_char_literal(chars: &[char], at: usize) -> bool {
+    at > 0 && chars.get(at - 1) == Some(&'\'') && chars.get(at.saturating_add(1)) == Some(&'\'')
 }
 
 fn starts_with_at(chars: &[char], at: usize, needle: &str) -> bool {
@@ -932,6 +997,27 @@ mod tests {
         assert!(!is_resume("m::f"));
         // A helper that takes a future is a real start of that helper.
         assert!(!is_resume("guarded::<{async fn body of charge()}>"));
+    }
+
+    #[test]
+    fn a_string_literal_keeps_span_like_text() {
+        assert_eq!(
+            normalize("_1 = const \"msg.rs:7:2 alloc3\"; // at a.rs:1:2", None),
+            "_1 = const \"msg.rs:7:2 alloc3\"; // at a.rs"
+        );
+        // An escaped quote does not end the literal, and a char quote does
+        // not start one.
+        assert_eq!(
+            normalize("const \"a\\\"b.rs:1:2\" const '\"' x.rs:3:4", None),
+            "const \"a\\\"b.rs:1:2\" const '\"' x.rs"
+        );
+    }
+
+    #[test]
+    fn a_const_name_keeps_a_qualified_self_type() {
+        assert_eq!(const_name("<X as T>::LIMIT) -> x"), "<X as T>::LIMIT");
+        assert_eq!(const_name("m::LIMIT, y"), "m::LIMIT");
+        assert_eq!(const_name("<X as T<u8>>::N;"), "<X as T<u8>>::N");
     }
 
     #[test]

@@ -191,3 +191,44 @@ pub async fn wf_condition(ctx: &WorkflowContext) -> Result<u64, String> {
     wait_ready(ctx).await?;
     ctx.execute_activity_raw("after", 1).await
 }
+
+/// A trait with an associated constant.
+pub trait Limits {
+    const MAX: u64;
+}
+
+pub struct Plan;
+
+/// The candidate changes the associated constant.
+impl Limits for Plan {
+    const MAX: u64 = 6; // CHANGED
+}
+
+/// A step that reads `<Plan as Limits>::MAX`.
+pub async fn capped(ctx: &WorkflowContext) -> Result<u64, String> {
+    let v = ctx.execute_activity_raw("capped", 1).await?;
+    Ok(v.min(<Plan as Limits>::MAX))
+}
+
+pub fn __autumn_workflow_info_wf_assoc() -> u8 {
+    0
+}
+
+/// Calls the step that reads the associated constant.
+pub async fn wf_assoc(ctx: &WorkflowContext) -> Result<u64, String> {
+    capped(ctx).await
+}
+
+/// A step whose string literal looks like a span. The candidate changes it.
+pub async fn tagged(ctx: &WorkflowContext) -> Result<u64, String> {
+    ctx.execute_activity_raw("note.rs:7:3", 1).await // CHANGED
+}
+
+pub fn __autumn_workflow_info_wf_literal() -> u8 {
+    0
+}
+
+/// Calls the step with the span-like literal.
+pub async fn wf_literal(ctx: &WorkflowContext) -> Result<u64, String> {
+    tagged(ctx).await
+}

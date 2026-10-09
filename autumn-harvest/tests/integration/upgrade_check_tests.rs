@@ -14,6 +14,9 @@ use autumn_harvest::aead_codec::{AeadCodec, DataKey};
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::info::{SignalHandlerInfo, UpdateHandlerInfo};
 use autumn_harvest::payload_codec::PayloadCodecs;
+use autumn_harvest::payload_store::{
+    PayloadOffloader, PayloadStore, PayloadStoreError, PayloadStoreFuture,
+};
 use autumn_harvest::testing::HistorySnapshot;
 use autumn_harvest::types::{ActivityExecId, ExecutionId, TimerId, UpdateId};
 use autumn_harvest::upgrade_check::{
@@ -712,6 +715,56 @@ fn encoded(codecs: &PayloadCodecs, events: &[WorkflowEvent]) -> EncodedHistory {
         event_data,
         pending_signals: Vec::new(),
     }
+}
+
+/// A payload store in memory, for the offload tests.
+#[derive(Default)]
+struct MemStore(std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>);
+
+impl PayloadStore for MemStore {
+    fn store_id(&self) -> &str {
+        "mem"
+    }
+    fn put(&self, bytes: &[u8]) -> PayloadStoreFuture<'_, String> {
+        let mut blobs = self.0.lock().expect("lock");
+        let key = format!("k{}", blobs.len());
+        blobs.insert(key.clone(), bytes.to_vec());
+        Box::pin(async move { Ok(key) })
+    }
+    fn get(&self, key: &str) -> PayloadStoreFuture<'_, Vec<u8>> {
+        let found = self.0.lock().expect("lock").get(key).cloned();
+        Box::pin(async move { found.ok_or_else(|| PayloadStoreError("missing".into())) })
+    }
+    fn delete(&self, key: &str) -> PayloadStoreFuture<'_, ()> {
+        self.0.lock().expect("lock").remove(key);
+        Box::pin(async move { Ok(()) })
+    }
+}
+
+/// An encrypted, offloaded history: the worker encodes each event, then
+/// offloads its payloads. The check must inflate first, then decode.
+#[tokio::test]
+async fn an_encrypted_offloaded_history_is_inflated_then_decoded() {
+    let codecs = aead_codecs();
+    let offloader = Arc::new(PayloadOffloader::new(
+        Arc::new(MemStore::default()),
+        0,
+        Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+    ));
+    let mut events = vec![started()];
+    events.extend(reserve_done(json!({ "amount": 5 })));
+    let mut history = encoded(&codecs, &events);
+    for value in &mut history.event_data {
+        offloader.offload_event_value(value).await.expect("offload");
+    }
+    let stored = serde_json::to_string(&history.event_data).expect("json");
+    assert!(stored.contains("_harvest_offload_envelope"), "{stored}");
+    let run = unchanged_check()
+        .with_codecs(Arc::new(codecs))
+        .with_offloader(offloader)
+        .check_encoded(history)
+        .await;
+    assert_eq!(run.verdict, Verdict::Migrate, "{run:#?}");
 }
 
 #[tokio::test]
