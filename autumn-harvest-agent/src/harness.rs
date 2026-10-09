@@ -12,9 +12,10 @@ use crate::delivery::{Delivery, LogDelivery, Report};
 use crate::error::AgentError;
 use crate::heartbeat::{HeartbeatTask, Precheck};
 use crate::memory::{MEMORY_TOOL, MemoryScope, MemoryStore, MemoryTool, render_snapshot};
-use crate::message::{RunId, ToolDefinition};
-use crate::model::{AgentModel, BoxFuture, ChatRequest};
+use crate::message::{RunId, TokenUsage, ToolDefinition};
+use crate::model::{AgentModel, BoxFuture, ChatRequest, ChatResponse};
 use crate::policy::{AllowAll, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules};
+use crate::response_cache::{CacheKey, KeyTenant, ResponseCache};
 use crate::tool::{Tool, ToolContext, ToolEffect};
 use autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
@@ -26,8 +27,9 @@ pub const DEFAULT_TOOL_OUTPUT_LIMIT: usize = 8_000;
 
 /// The default time budget of one model call: 13 minutes.
 ///
-/// With [`DEFAULT_POLICY_TIMEOUT`], it stays below the 15-minute
-/// `start_to_close` of `agent_model_turn`. A slow call therefore ends as a
+/// With [`DEFAULT_POLICY_TIMEOUT`] and three [`DEFAULT_CACHE_TIMEOUT`]
+/// budgets, it stays below the 15-minute `start_to_close` of
+/// `agent_model_turn`. A slow call therefore ends as a
 /// retryable failure that the harness reports. It does not end as an engine
 /// timeout, which SQLite reports only after the body returns.
 pub const DEFAULT_MODEL_TIMEOUT: Duration = Duration::from_secs(13 * 60);
@@ -52,6 +54,12 @@ pub const DEFAULT_POLICY_TIMEOUT: Duration = Duration::from_secs(60);
 /// activities. SQLite cannot end a stalled call from outside.
 pub const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The default time budget of one response-cache call: 5 seconds.
+///
+/// One turn makes at most three cache calls: the tenant read, the lookup and
+/// the store. Each call has this budget. A cache call over it is a miss.
+pub const DEFAULT_CACHE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The bytes that the `ToolOutcome` JSON adds around its content.
 const OUTCOME_ENVELOPE_BYTES: u64 = 64;
 
@@ -74,9 +82,11 @@ pub struct AgentHarness {
     tool_timeout: Duration,
     policy_timeout: Duration,
     hook_timeout: Duration,
+    cache_timeout: Duration,
     memory: Option<Arc<dyn MemoryStore>>,
     delivery: Arc<dyn Delivery>,
     precheck: Option<Arc<dyn Precheck>>,
+    cache: Option<ResponseCache>,
 }
 
 impl AgentHarness {
@@ -94,9 +104,11 @@ impl AgentHarness {
             tool_timeout: DEFAULT_TOOL_TIMEOUT,
             policy_timeout: DEFAULT_POLICY_TIMEOUT,
             hook_timeout: DEFAULT_HOOK_TIMEOUT,
+            cache_timeout: DEFAULT_CACHE_TIMEOUT,
             memory: None,
             delivery: Arc::new(LogDelivery),
             precheck: None,
+            cache: None,
         }
     }
 
@@ -194,10 +206,49 @@ impl AgentHarness {
         self
     }
 
+    /// Serve an identical model call from `cache`, across runs.
+    ///
+    /// The model must name itself through [`AgentModel::model_id`]. A model
+    /// with no id is never cached.
+    #[must_use]
+    pub fn response_cache(mut self, cache: ResponseCache) -> Self {
+        if self.client.model_id().is_none() {
+            tracing::warn!("the model has no model_id, so the response cache serves nothing");
+        }
+        self.cache = Some(cache);
+        self
+    }
+
+    /// Set the time budget of one response-cache call. One turn makes at
+    /// most three. Keep the sum of the model, policy and cache budgets below
+    /// the 15-minute `start_to_close` of `agent_model_turn`.
+    #[must_use]
+    pub const fn cache_timeout(mut self, timeout: Duration) -> Self {
+        self.cache_timeout = timeout;
+        self
+    }
+
+    /// Whether a turn can use the response cache: the harness has a cache,
+    /// and the model has an id.
+    pub(crate) fn cache_active(&self) -> bool {
+        self.cache.is_some() && self.client.model_id().is_some()
+    }
+
+    /// The time budget of one response-cache call, the tenant read included.
+    pub(crate) const fn cache_budget(&self) -> Duration {
+        self.cache_timeout
+    }
+
     /// Run one model call, then ask the policy about each tool call.
     ///
     /// The decisions are part of the result. Replay reads them back, so a
     /// policy that reads changing state cannot change a recorded run.
+    ///
+    /// With a response cache, `request.tenant` scopes the key. This method
+    /// does not read the verified tenant of the run. The `agent_model_turn`
+    /// activity does, so register [`activities`](crate::activities) on
+    /// Postgres. A hit skips the model call. The policy still decides each
+    /// tool call.
     ///
     /// # Errors
     ///
@@ -205,6 +256,17 @@ impl AgentHarness {
     /// retryable: a rate limit, a transport fault, a provider outage, or the
     /// time budget. Every other failure is not.
     pub async fn model_turn(&self, request: ModelTurnRequest) -> Result<ModelTurn, String> {
+        let tenant = CacheTenant::declared(request.tenant.as_deref());
+        self.model_turn_in(request, tenant).await
+    }
+
+    /// [`model_turn`](Self::model_turn), with the tenant that scopes the
+    /// response cache.
+    pub(crate) async fn model_turn_in(
+        &self,
+        request: ModelTurnRequest,
+        tenant: CacheTenant,
+    ) -> Result<ModelTurn, String> {
         let builtins = self.builtins(
             request.memory_scope.as_ref(),
             request.extra_tools.iter().cloned(),
@@ -216,22 +278,31 @@ impl AgentHarness {
             max_tokens: request.max_output_tokens,
             temperature: self.temperature,
         };
-        let response = match tokio::time::timeout(self.model_timeout, self.client.chat(&chat)).await
-        {
-            Ok(response) => response.map_err(|err| model_failure(&err))?,
-            Err(_) => {
-                return Err(ActivityFailure::retryable(
-                    "ModelTimeout",
-                    format!("the model did not answer within {:?}", self.model_timeout),
-                )
-                .into_error_payload());
+        let key = self.cache_key(&tenant, &chat);
+        let cached = match &key {
+            Some(key) => self.cache_lookup(key).await,
+            None => None,
+        };
+        let cache_hit = cached.is_some();
+        let response = if let Some(response) = cached {
+            // No model call ran, so the turn spent no tokens.
+            ChatResponse {
+                usage: TokenUsage::default(),
+                ..response
             }
+        } else {
+            let response = self.call_model(&chat).await?;
+            if let Some(key) = &key {
+                self.cache_store(key, &response).await;
+            }
+            response
         };
         let mut turn = ModelTurn {
             content: response.content,
             stop: response.stop_reason,
             usage: response.usage,
             decisions: Vec::new(),
+            cache_hit,
         };
         let info = RunInfo {
             run_id: RunId::new(request.run_id),
@@ -270,6 +341,69 @@ impl AgentHarness {
             turn.decisions.push(decision);
         }
         Ok(turn)
+    }
+
+    /// Send `chat` to the model within the model time budget.
+    async fn call_model(&self, chat: &ChatRequest) -> Result<ChatResponse, String> {
+        tokio::time::timeout(self.model_timeout, self.client.chat(chat))
+            .await
+            .map_err(|_| {
+                ActivityFailure::retryable(
+                    "ModelTimeout",
+                    format!("the model did not answer within {:?}", self.model_timeout),
+                )
+                .into_error_payload()
+            })?
+            .map_err(|err| model_failure(&err))
+    }
+
+    /// The cache key of `chat`, or `None` when this turn skips the cache.
+    ///
+    /// The turn skips the cache when the harness has no cache, the model has
+    /// no id, or the tenant says to skip.
+    fn cache_key(&self, tenant: &CacheTenant, chat: &ChatRequest) -> Option<CacheKey> {
+        let cache = self.cache.as_ref()?;
+        let model_id = self.client.model_id()?;
+        let tenant = match tenant {
+            CacheTenant::None => KeyTenant::None,
+            CacheTenant::Verified(name) => KeyTenant::Verified(name),
+            CacheTenant::Declared(name) => KeyTenant::Declared(name),
+            CacheTenant::Skip => return None,
+        };
+        cache
+            .key(tenant, model_id, chat)
+            .inspect_err(|err| tracing::warn!(error = %err, "the response cache skips this turn"))
+            .ok()
+    }
+
+    /// The cached answer for `key`. A fault or a slow cache is a miss.
+    async fn cache_lookup(&self, key: &CacheKey) -> Option<ChatResponse> {
+        let cache = self.cache.as_ref()?;
+        match tokio::time::timeout(self.cache_timeout, cache.lookup(key)).await {
+            Ok(Ok(found)) => found,
+            Ok(Err(err)) => {
+                tracing::warn!(error = %err, "response cache read failed; calling the model");
+                None
+            }
+            Err(_) => {
+                tracing::warn!(budget = ?self.cache_timeout, "response cache read timed out; calling the model");
+                None
+            }
+        }
+    }
+
+    /// Store a fresh answer. A fault or a slow cache is only a warning.
+    async fn cache_store(&self, key: &CacheKey, response: &ChatResponse) {
+        let Some(cache) = &self.cache else {
+            return;
+        };
+        match tokio::time::timeout(self.cache_timeout, cache.store(key, response)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => tracing::warn!(error = %err, "response cache write failed"),
+            Err(_) => {
+                tracing::warn!(budget = ?self.cache_timeout, "response cache write timed out");
+            }
+        }
     }
 
     /// Run one tool call.
@@ -434,6 +568,27 @@ impl AgentHarness {
     }
 }
 
+/// The tenant that scopes the response cache for one turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CacheTenant {
+    /// The run has no tenant.
+    None,
+    /// The engine verified this tenant for the run.
+    Verified(String),
+    /// The task names this tenant.
+    Declared(String),
+    /// The turn skips the cache. For example, the activity cannot read the
+    /// verified tenant.
+    Skip,
+}
+
+impl CacheTenant {
+    /// The tenant that a task field names, if any.
+    pub(crate) fn declared(task: Option<&str>) -> Self {
+        task.map_or(Self::None, |name| Self::Declared(name.to_owned()))
+    }
+}
+
 /// A tool that the workflow runs itself, such as `schedule_followup`.
 ///
 /// The policy sees it as a known tool with the `Internal` effect. The harness
@@ -563,6 +718,12 @@ mod tests {
         }
         assert_eq!(fit_result("short".into(), cap), "short");
         assert!(fit_result("x".repeat(100), 300).ends_with(TRUNCATED));
+    }
+
+    #[test]
+    fn the_default_budgets_fit_the_model_turn_start_to_close() {
+        let turn = DEFAULT_MODEL_TIMEOUT + DEFAULT_POLICY_TIMEOUT + 3 * DEFAULT_CACHE_TIMEOUT;
+        assert!(turn < Duration::from_secs(15 * 60), "{turn:?}");
     }
 
     #[test]

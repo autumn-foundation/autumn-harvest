@@ -14,15 +14,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use autumn_harvest::context::ActivityContext;
 use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::policy::{JitterPolicy, RetryPolicy};
+use autumn_harvest::prelude::activity;
 use autumn_harvest::types::ParentClosePolicy;
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{
     ExecutionId, ShardId, StartWorkflowParams, WorkflowContext, WorkflowResetRequest,
     reset_workflow_execution, start_or_load_workflow_execution,
 };
-use diesel::sql_types::{Nullable, Text};
+use diesel::sql_types::{Jsonb, Nullable, Text};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use serde_json::{Value, json};
@@ -77,6 +79,23 @@ fn tp_parent(ctx: &WorkflowContext, input: Value) -> HandlerFuture<'_> {
 
 fn tp_child(_ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
     Box::pin(async move { Ok(json!("child done")) })
+}
+
+/// Returns the verified tenant that the activity reads (issue #1998).
+#[activity(start_to_close = "30s")]
+async fn tp_read_tenant(ctx: &ActivityContext, input: Value) -> Result<Value, String> {
+    let _ = input;
+    let tenant = ctx.run_tenant().await.map_err(|e| e.to_string())?;
+    Ok(json!(tenant))
+}
+
+/// Runs `tp_read_tenant` and returns its result.
+fn tp_tenant_reader(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+    Box::pin(async move {
+        ctx.execute_activity(&tp_read_tenant_info(), json!({}))
+            .await
+            .map_err(|e| e.to_string())
+    })
 }
 
 static RETRY_FAILED_ONCE: AtomicBool = AtomicBool::new(false);
@@ -539,5 +558,76 @@ async fn a_tenant_start_refuses_an_idempotency_claim_of_another_tenant() {
         ),
         "{other:?}"
     );
+    scrub(&mut conn, &names).await;
+}
+
+#[derive(diesel::QueryableByName, Debug)]
+struct OutputRow {
+    #[diesel(sql_type = Text)]
+    state: String,
+    #[diesel(sql_type = Nullable<Jsonb>)]
+    output: Option<Value>,
+}
+
+/// An activity reads the verified tenant of its run, and `None` for a run
+/// with no tenant (issue #1998).
+#[tokio::test]
+async fn an_activity_reads_the_verified_tenant() {
+    let (url, _container) = setup_db().await;
+    let names = ["tp_tenant_reader"];
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn, &names).await;
+
+    let suffix = uuid::Uuid::new_v4();
+    let tenanted = format!("reader-acme-{suffix}");
+    let untenanted = format!("reader-none-{suffix}");
+    let reader = "tp_tenant_reader";
+    start(&mut conn, reader, &tenanted, json!({}), Some("acme"), None).await;
+    start(&mut conn, reader, &untenanted, json!({}), None, None).await;
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![info("tp_tenant_reader", tp_tenant_reader, None)],
+        vec![tp_read_tenant_info()],
+    ));
+    let worker = Arc::new(make_worker(registry));
+    let pool = build_pool(&url);
+    let runner = worker.clone();
+    let handle = tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(60), runner.run(&pool)).await;
+    });
+
+    let output = |workflow_id: String| {
+        diesel::sql_query(
+            "SELECT state, output FROM harvest_workflow_executions WHERE workflow_id = $1",
+        )
+        .bind::<Text, _>(workflow_id)
+    };
+    let mut settled: Vec<OutputRow> = Vec::new();
+    for _ in 0..400 {
+        settled = Vec::new();
+        for id in [&tenanted, &untenanted] {
+            let mut rows: Vec<OutputRow> = output(id.clone())
+                .load(&mut conn)
+                .await
+                .expect("load output");
+            settled.append(&mut rows);
+        }
+        if settled.len() == 2 && settled.iter().all(|r| r.state == "COMPLETED") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    worker.shutdown();
+    let _ = handle.await;
+
+    assert_eq!(settled.len(), 2, "{settled:?}");
+    assert!(
+        settled.iter().all(|r| r.state == "COMPLETED"),
+        "{settled:?}"
+    );
+    assert_eq!(settled[0].output, Some(json!("acme")), "{settled:?}");
+    // The engine can store a JSON null output as SQL NULL.
+    let none = settled[1].output.clone().unwrap_or(Value::Null);
+    assert_eq!(none, Value::Null, "{settled:?}");
     scrub(&mut conn, &names).await;
 }

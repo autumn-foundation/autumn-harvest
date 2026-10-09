@@ -1317,6 +1317,38 @@ with access to `harvest_events` can copy a ciphertext to another field, event
 or execution under the same key, and it decodes. Restrict write access to the
 Harvest database.
 
+### Agent response cache (issue #1998)
+
+The agent response cache is opt-in. It stores each answer in the embedder's
+`PayloadStore`, encoded by the `PayloadCodecs` that the embedder passes in.
+Pass a clone of the engine registry, so an active codec encrypts each entry.
+A registry with no active codec stores entries in clear. The entry holds the
+answer, its stop reason and its token usage. It holds no prompt. With an
+active codec, a read refuses an entry that is not a codec envelope.
+
+These cache fields stay in clear:
+
+- The cache key. It is an unkeyed SHA-256 hash of the request and the tenant.
+  A reader of the index can test a guessed prompt against a key. Set a secret
+  `ResponseCache::namespace` to stop that.
+- The blob key that the `PayloadStore` returns.
+
+The default scope is the tenant. On Postgres, the activity reads the verified
+tenant of the run (issue #1977). `AgentTask::tenant` cannot change it. A run
+with no verified tenant uses `AgentTask::tenant` as a declared tenant. Only a
+principal with no tenant binding can start such a run. A declared tenant
+never shares an entry with a verified tenant of the same name. A local
+activity cannot read the tenant, so it skips the cache.
+
+`CacheScope::Shared` lets every tenant read every entry. A hit records
+`cache_hit: true` in the run history. A tenant can therefore learn that
+another tenant sent the same request.
+
+Erasure (issue #495) does not reach the cache. Key rotation (issue #948) does
+not re-encrypt cache entries. `ResponseCache::max_age` limits what the cache
+serves, not what the store keeps. Give the cache its own store, with an
+expiry of at least `max_age`.
+
 ### Column coverage (issue #1979)
 
 Column encoding is off by default. Turn it on with

@@ -22,6 +22,7 @@ autumn-harvest = { version = "0.7.0", path = "../autumn-harvest", default-featur
 autumn-harvest-sqlite = { version = "0.7.0", path = "../autumn-harvest-sqlite", optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.11"
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -46,6 +47,10 @@ required-features = ["sqlite"]
 
 [[test]]
 name = "always_on"
+required-features = ["sqlite"]
+
+[[test]]
+name = "response_cache"
 required-features = ["sqlite"]
 
 [lints]
