@@ -225,6 +225,7 @@ async fn seed_workflows(database_url: &str, workflow_name: &str, count: usize) -
                 start_source: autumn_harvest::StartSource::Api,
                 start_source_ref: None,
                 started_by: None,
+                tenant: None,
             },
             None,
         )

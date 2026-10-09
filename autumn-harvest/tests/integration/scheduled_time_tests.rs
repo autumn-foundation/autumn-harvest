@@ -335,6 +335,7 @@ async fn manual_start_has_no_scheduled_time() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )

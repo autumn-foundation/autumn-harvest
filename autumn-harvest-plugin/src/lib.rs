@@ -51,6 +51,9 @@ pub mod dag_retry;
 pub mod dev;
 /// One entry point for a standalone embedding (issue #1613).
 pub mod embedding;
+/// One test suite for every KMS binding (issue #1981).
+#[cfg(all(test, any(feature = "aws-kms", feature = "vault-transit")))]
+mod kms_conformance;
 pub mod lineage;
 /// OIDC login for Vantage and the management API (issue #1978).
 #[cfg(feature = "oidc")]
@@ -78,8 +81,12 @@ pub mod status_summary;
 /// pair list (issue #1151, extracted from the issue #774 `queue-coverage`
 /// fix).
 pub mod strict_query;
+/// Tenant binding for the management API (issue #1977).
+pub mod tenant;
 pub mod ui;
 pub mod usage;
+#[cfg(feature = "vault-transit")]
+pub mod vault_transit;
 pub mod version_gate_retirement;
 pub mod version_usage;
 pub mod workflow_count;

@@ -34,6 +34,11 @@ primitives:
 | `Approval` | `Approval` | Signal with a deadline |
 | `ErrorKind::is_retryable` | `ErrorKind` | Retry policy |
 | `agent_loop` | `Agent` loop and budgets | Workflow |
+| `agent_heartbeat`, `Precheck` | `Heartbeat` | Workflow, started by a schedule |
+| `Followups`, `schedule_followup` tool | `FollowupTool` | Durable timer |
+| `Delivery` | `Delivery` | Activity `agent_deliver` |
+| `MemoryStore`, `memory` tool | `MemoryStore`, `MemoryTool` | Activity `agent_memory_snapshot` |
+| `LoopGuard` | `LoopGuard` | Workflow code over recorded results |
 
 An app implements `AgentModel` for its provider, or bridges a framework it
 already uses. The adapter ships no HTTP client.
@@ -72,6 +77,12 @@ already uses. The adapter ships no HTTP client.
 - The daemon example keeps its Anthropic-native turn, because it replays
   thinking blocks verbatim. It takes the approval names, the durable
   approval wait and the payload checks from the adapter.
-- The always-on primitives of `autumn-plugin-agent` (heartbeats,
-  follow-ups, delivery, memory, the loop guard) can map onto engine
-  primitives the same way: schedules, durable timers and activities.
+- The always-on primitives follow the same rule. Heartbeats, follow-ups,
+  delivery, memory and the loop guard are in this crate, modelled on
+  `autumn-plugin-agent`. A heartbeat is a one-tick workflow that an engine
+  schedule starts. A follow-up is a durable timer in the same workflow.
+  Delivery and the memory snapshot are activities. The loop guard runs in
+  the workflow over recorded results.
+- An unattended run, a heartbeat tick or a follow-up segment, is read-only
+  by default. It can neither act outside nor write memory unless the app
+  opts in.
