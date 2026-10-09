@@ -334,8 +334,6 @@ fn activity_info() -> ActivityInfo {
         is_local: false,
         max_input_bytes: None,
         max_result_bytes: None,
-        input_schema: None,
-        output_schema: None,
         requires: None,
         handler: act_noop,
         input_schema: None,
