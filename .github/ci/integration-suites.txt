@@ -46,6 +46,7 @@
 # per-suite `cargo test` runs CI executes. One suite per line. Read by
 # two PRs each appending a line both land with no textual conflict; a
 # union-merge duplicate/reorder is caught (never a conflict) by
+allos        autumn-harvest         integration                      -                          assay_rerun_docs
 allos        autumn-harvest         integration                      -                          benchmarks_docs
 allos        autumn-harvest         integration                      -                          hot_code_swap_docs
 allos        autumn-harvest         integration                      -                          lock_order_docs
@@ -198,6 +199,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          sticky_routing_tests
 linux        autumn-harvest         integration                      -                          telemetry_span_tests
 linux        autumn-harvest         integration                      -                          tenant_cell_isolation_tests
+linux        autumn-harvest         integration                      -                          tenant_propagation_tests
 linux        autumn-harvest         integration                      -                          terminal_task_gc_tests
 linux        autumn-harvest         integration                      -                          terminal_write_ownership_tests
 linux        autumn-harvest         integration                      -                          throttle_bucket_prelock_batch_perf
@@ -319,6 +321,7 @@ linux        autumn-harvest-plugin  start_throttle_integration       -          
 linux        autumn-harvest-plugin  status_summary_integration       -                          -
 linux        autumn-harvest-plugin  status_summary_stalled_perf      -                          -
 linux        autumn-harvest-plugin  telemetry_propagation_tests      -                          -
+linux        autumn-harvest-plugin  tenant_binding_integration       -                          -
 linux        autumn-harvest-plugin  terminate_integration            -                          -
 linux        autumn-harvest-plugin  timeline_integration             -                          -
 linux        autumn-harvest-plugin  token_auth_integration           -                          -

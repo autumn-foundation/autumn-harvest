@@ -1441,6 +1441,8 @@ async fn insert_fork_execution(
         // ledger rows would never count for the tenant. The copy needs no
         // workflow registry, so a reset from an API-only process keeps it too.
         quota_key: source.quota_key.as_deref(),
+        // A reset fork belongs to the tenant of its source (issue #1977).
+        tenant: source.tenant.as_deref(),
     };
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -1733,6 +1735,7 @@ mod tests {
             migrated_run_terminal_state: None,
             staging_vacated_state: None,
             staging_vacated_by: None,
+            tenant: None,
         }
     }
 

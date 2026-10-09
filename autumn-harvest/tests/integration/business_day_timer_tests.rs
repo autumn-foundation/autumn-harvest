@@ -263,6 +263,7 @@ async fn seed_workflow(conn: &mut AsyncPgConnection, input: serde_json::Value) -
         start_source: None,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)

@@ -1333,6 +1333,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         workflow_retry_policy: info.retry_policy.clone(),
                         max_workflow_attempts_ceiling: client.max_workflow_attempts(),
                         start_source: ::autumn_harvest::types::StartSource::Api,
+                        tenant: opts.tenant.as_deref(),
                         ..::autumn_harvest::execution::StartWorkflowParams::new(
                             info.name,
                             &workflow_id,
@@ -1461,6 +1462,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         workflow_info: None,
                         start_source_override: None,
                         start_source_ref_override: None,
+                        tenant: opts.tenant.as_deref(),
                     };
 
                     let outcome = ::autumn_harvest::execution::signal_with_start_workflow_execution(conn, params).await?;

@@ -9718,6 +9718,9 @@ pub async fn persist_workflow_failure(
                     ),
                     start_source_ref: exec_ref.start_source_ref.as_deref(),
                     started_by: exec_ref.started_by.as_deref(),
+                    // A retry belongs to the tenant of the run it retries
+                    // (issue #1977).
+                    tenant: exec_ref.tenant.as_deref(),
                     ..crate::execution::StartWorkflowParams::new(
                         &exec_ref.workflow_name,
                         &retry_workflow_id,
@@ -12519,7 +12522,7 @@ const POSTGRES_MAX_BIND_PARAMS: usize = 65_535;
 
 /// [`NewWorkflowExecution`]'s field count. Pinned by a regression test
 /// below so an added column is caught, not silently under-counted.
-const NEW_WORKFLOW_EXECUTION_COLUMNS: usize = 35;
+const NEW_WORKFLOW_EXECUTION_COLUMNS: usize = 36;
 
 /// Rows per chunk, floored so `ROWS_PER_EXECUTION_INSERT_CHUNK *
 /// NEW_WORKFLOW_EXECUTION_COLUMNS` never reaches [`POSTGRES_MAX_BIND_PARAMS`].
@@ -12727,6 +12730,8 @@ fn build_child_row<'p>(
         start_source_ref: Some(parent_exec_id_str),
         started_by: None,
         quota_key: plan.child_quota_key.as_deref(),
+        // A child belongs to the tenant of its parent (issue #1977).
+        tenant: parent_execution.tenant.as_deref(),
     })
 }
 
@@ -12820,6 +12825,7 @@ fn cross_shard_child_spec(
         queue_name: parent_execution.queue_name.clone(),
         assigned_build_id: parent_execution.assigned_build_id.clone(),
         context_headers: parent_execution.context_headers.clone(),
+        tenant: parent_execution.tenant.clone(),
         owner: defaults.owner.map(str::to_string),
         runbook_url: defaults.runbook_url.map(str::to_string),
         severity: defaults.severity.map(str::to_string),
@@ -13084,6 +13090,8 @@ async fn insert_awaited_child_execution(
         start_source_ref: Some(parent_exec_id_str.as_str()),
         started_by: None,
         quota_key: child_quota_key.as_deref(),
+        // A child belongs to the tenant of its parent (issue #1977).
+        tenant: parent_execution.tenant.as_deref(),
     };
     let child_started_event = WorkflowEvent::WorkflowStarted {
         input: child.input.clone(),
@@ -15515,6 +15523,8 @@ async fn create_detached_child_executions(
             start_source_ref: Some(parent_exec_id_str.as_str()),
             started_by: None,
             quota_key: child_quota_key.as_deref(),
+            // A detached child belongs to the tenant of its parent (issue #1977).
+            tenant: parent_execution.tenant.as_deref(),
         };
 
         diesel::insert_into(harvest_workflow_executions::table)
@@ -23018,6 +23028,8 @@ async fn persist_workflow_continue_as_new_with_verdict(
         start_source_ref: Some(predecessor_exec_id_str.as_str()),
         started_by: None,
         quota_key: successor_quota_key.as_deref(),
+        // A successor belongs to the tenant of its predecessor (issue #1977).
+        tenant: execution.tenant.as_deref(),
     };
     // Per-key concurrency (issue #247). Same-type: propagate the current task's
     // key so the continued run stays under the same fair-share cap. Cross-type
@@ -39205,6 +39217,7 @@ mod tests {
             start_source_ref: None,
             started_by: None,
             quota_key: None,
+            tenant: None,
         };
         let crate::models::NewWorkflowExecution {
             id: _,
@@ -39242,9 +39255,10 @@ mod tests {
             start_source_ref: _,
             started_by: _,
             quota_key: _,
+            tenant: _,
         } = sample;
         const {
-            assert!(NEW_WORKFLOW_EXECUTION_COLUMNS == 35);
+            assert!(NEW_WORKFLOW_EXECUTION_COLUMNS == 36);
             assert!(
                 ROWS_PER_EXECUTION_INSERT_CHUNK * NEW_WORKFLOW_EXECUTION_COLUMNS
                     <= POSTGRES_MAX_BIND_PARAMS
@@ -50320,6 +50334,7 @@ mod tests {
             migrated_run_terminal_state: None,
             staging_vacated_state: None,
             staging_vacated_by: None,
+            tenant: None,
         }
     }
 

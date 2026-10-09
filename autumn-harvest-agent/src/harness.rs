@@ -1,18 +1,21 @@
-//! The activity bodies: one model call and one tool call.
+//! The activity bodies: model calls, tool calls, and the always-on hooks.
 //!
 //! [`AgentHarness`] holds the parts that do real work: the
-//! [`AgentModel`], the [`Tool`]s, and the [`ToolPolicy`]. The engine runs its
-//! two methods as activities, so each result is recorded once and replayed
-//! after that.
+//! [`AgentModel`], the [`Tool`]s, the [`ToolPolicy`], the memory store, the
+//! delivery and the precheck. The engine runs its methods as activities, so
+//! each result is recorded once and replayed after that.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::delivery::{Delivery, LogDelivery, Report};
 use crate::error::AgentError;
-use crate::message::{RunId, TokenUsage};
-use crate::model::{AgentModel, ChatRequest};
-use crate::policy::{AllowAll, RunInfo, ToolDecision, ToolPolicy};
-use crate::tool::{Tool, ToolContext};
+use crate::heartbeat::{HeartbeatTask, Precheck};
+use crate::memory::{MEMORY_TOOL, MemoryScope, MemoryStore, MemoryTool, render_snapshot};
+use crate::message::{RunId, TokenUsage, ToolDefinition};
+use crate::model::{AgentModel, BoxFuture, ChatRequest};
+use crate::policy::{AllowAll, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules};
+use crate::tool::{Tool, ToolContext, ToolEffect};
 use autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
 use autumn_harvest::llm_budget::LlmUsage;
@@ -43,6 +46,13 @@ pub const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(9 * 60);
 /// the model turn, and SQLite cannot end the turn from outside.
 pub const DEFAULT_POLICY_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The default time budget of one memory read, delivery or precheck: 30
+/// seconds.
+///
+/// It is below the one-minute `start_to_close` of the shortest of those
+/// activities. SQLite cannot end a stalled call from outside.
+pub const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The bytes that the `ToolOutcome` JSON adds around its content.
 const OUTCOME_ENVELOPE_BYTES: u64 = 64;
 
@@ -64,6 +74,10 @@ pub struct AgentHarness {
     model_timeout: Duration,
     tool_timeout: Duration,
     policy_timeout: Duration,
+    hook_timeout: Duration,
+    memory: Option<Arc<dyn MemoryStore>>,
+    delivery: Arc<dyn Delivery>,
+    precheck: Option<Arc<dyn Precheck>>,
 }
 
 impl AgentHarness {
@@ -80,6 +94,10 @@ impl AgentHarness {
             model_timeout: DEFAULT_MODEL_TIMEOUT,
             tool_timeout: DEFAULT_TOOL_TIMEOUT,
             policy_timeout: DEFAULT_POLICY_TIMEOUT,
+            hook_timeout: DEFAULT_HOOK_TIMEOUT,
+            memory: None,
+            delivery: Arc::new(LogDelivery),
+            precheck: None,
         }
     }
 
@@ -148,6 +166,35 @@ impl AgentHarness {
         self
     }
 
+    /// Set the time budget of one memory read, delivery or precheck.
+    #[must_use]
+    pub const fn hook_timeout(mut self, timeout: Duration) -> Self {
+        self.hook_timeout = timeout;
+        self
+    }
+
+    /// Set the memory store. A run with a memory scope reads a snapshot from
+    /// it and gets the `memory` tool.
+    #[must_use]
+    pub fn memory(mut self, store: Arc<dyn MemoryStore>) -> Self {
+        self.memory = Some(store);
+        self
+    }
+
+    /// Set where reports go. The default is [`LogDelivery`].
+    #[must_use]
+    pub fn delivery(mut self, delivery: Arc<dyn Delivery>) -> Self {
+        self.delivery = delivery;
+        self
+    }
+
+    /// Set the cheap check that can skip a heartbeat before any model call.
+    #[must_use]
+    pub fn precheck(mut self, precheck: Arc<dyn Precheck>) -> Self {
+        self.precheck = Some(precheck);
+        self
+    }
+
     /// Run one model call, then ask the policy about each tool call.
     ///
     /// The decisions are part of the result. Replay reads them back, so a
@@ -194,9 +241,14 @@ impl AgentHarness {
         &self,
         request: ModelTurnRequest,
     ) -> Result<(ModelTurn, Duration), String> {
+        let builtins = self.builtins(
+            request.memory_scope.as_ref(),
+            request.extra_tools.iter().cloned(),
+        );
+        let tools: Vec<_> = self.visible(&builtins).map(Tool::definition).collect();
         let chat = ChatRequest {
             messages: request.messages,
-            tools: self.tools.iter().map(|tool| tool.definition()).collect(),
+            tools,
             max_tokens: request.max_output_tokens,
             temperature: self.temperature,
         };
@@ -229,8 +281,23 @@ impl AgentHarness {
         // One deadline bounds the whole decision phase. A per-call budget
         // would let many stalled calls add up past `start_to_close`.
         let deadline = tokio::time::Instant::now() + self.policy_timeout;
+        let read_only: Arc<dyn ToolPolicy>;
+        let policy: &dyn ToolPolicy = if request.read_only {
+            // The read-only rules go first. Their deny ends the decision, so
+            // the app policy is not asked about a call that cannot run.
+            read_only = Arc::new(Strictest::new(vec![
+                Arc::new(ToolRules::read_only()),
+                Arc::clone(&self.policy),
+            ]));
+            read_only.as_ref()
+        } else {
+            self.policy.as_ref()
+        };
         for call in turn.calls() {
-            let decide = self.policy.decide(&call, self.find(&call.name), &info);
+            let tool = self
+                .visible(&builtins)
+                .find(|tool| tool.name() == call.name);
+            let decide = policy.decide(&call, tool, &info);
             // A stalled policy denies the call. That fails closed, and the
             // model reads why.
             let decision = tokio::time::timeout_at(deadline, decide)
@@ -254,9 +321,18 @@ impl AgentHarness {
     /// the activity signature.
     pub async fn tool_call(&self, request: ToolCallRequest) -> Result<ToolOutcome, String> {
         let call = request.call;
-        let Some(tool) = self.find(&call.name) else {
+        let builtins = self.builtins(request.memory_scope.as_ref(), std::iter::empty());
+        let Some(tool) = self
+            .visible(&builtins)
+            .find(|tool| tool.name() == call.name)
+        else {
             return Ok(self.error_outcome(&format!("unknown tool {:?}", call.name)));
         };
+        // A second check of the read-only rule. The decision and the call can
+        // run on workers with different tool lists, for example in a deploy.
+        if request.read_only && tool.effect() >= ToolEffect::Write {
+            return Ok(self.error_outcome("this run may only read data"));
+        }
         let ctx = ToolContext {
             run_id: RunId::new(request.run_id),
             call_id: call.id,
@@ -309,11 +385,146 @@ impl AgentHarness {
         .with_latency(latency)
     }
 
-    fn find(&self, name: &str) -> Option<&dyn Tool> {
-        self.tools
-            .iter()
-            .find(|tool| tool.name() == name)
-            .map(AsRef::as_ref)
+    /// Load the memory of `scope` and render it as the frozen snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a non-retryable error when no store is installed, and the
+    /// store error otherwise.
+    pub async fn memory_snapshot(&self, scope: MemoryScope) -> Result<String, String> {
+        let Some(store) = &self.memory else {
+            return Err(ActivityFailure::non_retryable(
+                "MemoryStoreMissing",
+                "the run has a memory scope, but no memory store is installed: call AgentHarness::memory",
+            )
+            .into_error_payload());
+        };
+        let blocks = tokio::time::timeout(self.hook_timeout, store.load(&scope))
+            .await
+            .map_err(|_| self.hook_timed_out("MemoryTimeout", "the memory store"))?
+            .map_err(|err| model_failure(&err))?;
+        Ok(fit_result(render_snapshot(&blocks), self.max_result_bytes))
+    }
+
+    /// Send one report to the delivery.
+    ///
+    /// # Errors
+    ///
+    /// Returns the delivery error. A retryable kind retries, and so does a
+    /// send over its time budget.
+    pub async fn deliver(&self, report: Report) -> Result<(), String> {
+        tokio::time::timeout(self.hook_timeout, self.delivery.deliver(&report))
+            .await
+            .map_err(|_| self.hook_timed_out("DeliveryTimeout", "the delivery"))?
+            .map_err(|err| model_failure(&err))
+    }
+
+    /// Ask the precheck whether a heartbeat tick should run. With no
+    /// precheck, every tick runs. A precheck over its time budget skips the
+    /// tick.
+    ///
+    /// # Errors
+    ///
+    /// This method returns `Ok` for every answer. The `Result` matches the
+    /// activity signature.
+    pub async fn precheck_tick(&self, task: HeartbeatTask) -> Result<bool, String> {
+        let Some(precheck) = &self.precheck else {
+            return Ok(true);
+        };
+        let answer = tokio::time::timeout(self.hook_timeout, precheck.should_run(&task)).await;
+        Ok(answer.unwrap_or_else(|_| {
+            tracing::warn!(
+                budget = ?self.hook_timeout,
+                "heartbeat precheck timed out; the tick is skipped"
+            );
+            false
+        }))
+    }
+
+    fn hook_timed_out(&self, kind: &str, what: &str) -> String {
+        ActivityFailure::retryable(
+            kind,
+            format!("{what} did not answer within {:?}", self.hook_timeout),
+        )
+        .into_error_payload()
+    }
+
+    /// The tools that the crate provides for one call: the memory tool, and
+    /// a stand-in for each tool the workflow handles itself.
+    fn builtins(
+        &self,
+        scope: Option<&MemoryScope>,
+        extra: impl Iterator<Item = ToolDefinition>,
+    ) -> Vec<Arc<dyn Tool>> {
+        let memory =
+            self.memory.as_ref().zip(scope).map(|(store, scope)| {
+                Arc::new(MemoryTool::new(Arc::clone(store), scope.clone())) as _
+            });
+        memory
+            .into_iter()
+            .chain(extra.map(|definition| Arc::new(WorkflowTool(definition)) as _))
+            .collect()
+    }
+
+    /// The built-in tools, then each app tool whose name no built-in takes.
+    ///
+    /// A built-in wins a name clash. Two tools with one name would make many
+    /// providers refuse the request.
+    fn visible<'a>(&'a self, builtins: &'a [Arc<dyn Tool>]) -> impl Iterator<Item = &'a dyn Tool> {
+        // With a store installed, `memory` stays reserved even when this run
+        // gets no memory tool. An app tool of that name could otherwise slip
+        // past the memory-write opt-in.
+        let reserved = self.memory.is_some();
+        let taken = move |name: &str| {
+            (reserved && name == MEMORY_TOOL) || builtins.iter().any(|tool| tool.name() == name)
+        };
+        builtins.iter().map(AsRef::as_ref).chain(
+            self.tools
+                .iter()
+                .map(AsRef::as_ref)
+                .filter(move |tool| !taken(tool.name())),
+        )
+    }
+}
+
+/// A tool that the workflow runs itself, such as `schedule_followup`.
+///
+/// The policy sees it as a known tool with the `Internal` effect. The harness
+/// never runs it.
+#[derive(Debug)]
+struct WorkflowTool(ToolDefinition);
+
+impl Tool for WorkflowTool {
+    fn name(&self) -> &str {
+        &self.0.name
+    }
+
+    fn description(&self) -> &str {
+        &self.0.description
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        self.0.input_schema.clone()
+    }
+
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::Internal
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _input: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> BoxFuture<'a, Result<serde_json::Value, AgentError>> {
+        let err = AgentError::new(
+            crate::error::ErrorKind::Tool,
+            format!("{} runs in the workflow, not in the harness", self.0.name),
+        );
+        Box::pin(std::future::ready(Err(err)))
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        self.0.clone()
     }
 }
 
@@ -473,6 +684,9 @@ mod tests {
                 "go",
             )],
             max_output_tokens: None,
+            read_only: false,
+            memory_scope: None,
+            extra_tools: Vec::new(),
         }
     }
 

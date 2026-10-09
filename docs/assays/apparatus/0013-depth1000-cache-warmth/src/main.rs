@@ -730,6 +730,7 @@ async fn start_one(
             start_source: StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
