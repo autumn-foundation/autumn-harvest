@@ -385,6 +385,9 @@ llm_metrics AS (
     -- - a sealed `MIGRATED` source counts while its move is `COMMITTED`, so
     --   the gap before the target activates still reports the run;
     -- - after the move is `DONE`, the `RUNNING` target counts instead.
+    -- Activation commits the target, then marks the source `DONE` on its own
+    -- database. Between the two commits both shards count the run. Recovery
+    -- ends that window if the second commit fails.
     SELECT
         {group_key_expr} AS grp,
         -- `SUM(BIGINT)` is NUMERIC. `LEAST` saturates it, so the cast to

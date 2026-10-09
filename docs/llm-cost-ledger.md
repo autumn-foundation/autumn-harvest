@@ -129,7 +129,10 @@ tokens still count. See [the agent adapter](agent-adapter.md).
   archive does not hold them, so retention deletes the cost data too.
 - **Shard moves.** The rows move with the run. The report skips the staged
   target copy. It counts the sealed source until the move is done. So one
-  shard reports each run in every phase.
+  shard reports each run, with one exception. Activation commits the target
+  first, then marks the source done on its own database. Between the two
+  commits, both shards count the run. If the second commit fails, the
+  window lasts until migration recovery ends it.
 - **Reset.** A fork copies events, not ledger rows. The cost counts once.
 - **Erasure.** Erasure keeps the rows. They hold no payload. The model id
   is the only free-form text, and it must not hold PII.
