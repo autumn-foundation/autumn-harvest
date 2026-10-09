@@ -3846,6 +3846,9 @@ pub(crate) async fn claim_handler_started(
 
 /// Complete the task that `claim` holds. A stale claim changes nothing.
 ///
+/// Returns [`ClaimWrite::LeaseLost`] for a stale claim. [`complete_task`] is
+/// the same write, but returns `NotFound` for a stale claim.
+///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on update failure.
@@ -3854,7 +3857,7 @@ pub async fn complete_claimed_task(
     claim: &TaskClaim,
     output: serde_json::Value,
 ) -> HarvestResult<ClaimWrite> {
-    complete_task_inner(conn, claim.task_id, Some(claim), output)
+    complete_task_inner(conn, claim, output)
         .await
         .map(claim_write)
 }
@@ -4238,54 +4241,55 @@ pub async fn release_abandoned_claim(
     Ok(ClaimWrite::Applied)
 }
 
-/// Mark a task as completed with the given output.
+/// Mark the task that `claim` holds as `COMPLETED` with `output`.
 ///
-/// Terminal completion clears any heartbeat checkpoint payload so it cannot be
-/// observed after the activity has successfully finished.
+/// `claim` fences the write (issue #1992). The row must be `RUNNING` under
+/// the `worker_id` and `attempt` of `claim`. The write also clears the
+/// heartbeat checkpoint, so no reader sees it after the task completes.
 ///
-/// This write is not fenced. The activity owner uses
-/// [`complete_claimed_task`] instead.
+/// Use this function when a lost claim is a bug, for example after
+/// [`claim_still_held_for_update`] returns `true` in the same transaction.
+/// Use [`complete_claimed_task`] when a lost claim is a normal outcome.
 ///
 /// # Errors
 ///
-/// Returns [`crate::error::HarvestError::NotFound`] when the task is not
-/// running, and [`crate::error::HarvestError::Database`] on update failure.
+/// Returns [`crate::error::HarvestError::NotFound`] when the row is not
+/// `RUNNING` under `claim`, and [`crate::error::HarvestError::Database`] on
+/// update failure.
 pub async fn complete_task(
     conn: &mut AsyncPgConnection,
-    task_id: Uuid,
+    claim: &TaskClaim,
     output: serde_json::Value,
 ) -> HarvestResult<()> {
-    if !complete_task_inner(conn, task_id, None, output).await? {
+    if !complete_task_inner(conn, claim, output).await? {
         return Err(crate::error::HarvestError::NotFound(format!(
-            "task queue item {task_id} is not running"
+            "task queue item {} is not running under this claim",
+            claim.task_id
         )));
     }
 
     Ok(())
 }
 
+/// The one task completion write. It always takes a claim, so every
+/// completion is fenced.
 async fn complete_task_inner(
     conn: &mut AsyncPgConnection,
-    task_id: Uuid,
-    claim: Option<&TaskClaim>,
+    claim: &TaskClaim,
     output: serde_json::Value,
 ) -> HarvestResult<bool> {
     use crate::schema::harvest_task_queue::dsl;
 
-    let update = diesel::update(
-        dsl::harvest_task_queue
-            .find(task_id)
-            .filter(dsl::state.eq("RUNNING")),
-    )
-    .set((
-        dsl::state.eq("COMPLETED"),
-        dsl::output.eq(Some(output)),
-        dsl::heartbeat_details.eq(None::<serde_json::Value>),
-        dsl::error.eq(None::<String>),
-        dsl::completed_at.eq(Some(Utc::now())),
-    ))
-    .into_boxed();
-    let updated = fence(update, claim)
+    let update = diesel::update(dsl::harvest_task_queue.find(claim.task_id))
+        .set((
+            dsl::state.eq("COMPLETED"),
+            dsl::output.eq(Some(output)),
+            dsl::heartbeat_details.eq(None::<serde_json::Value>),
+            dsl::error.eq(None::<String>),
+            dsl::completed_at.eq(Some(Utc::now())),
+        ))
+        .into_boxed();
+    let updated = fence(update, Some(claim))
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;

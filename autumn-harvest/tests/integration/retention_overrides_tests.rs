@@ -805,3 +805,156 @@ async fn a_worker_sealed_run_is_a_retention_candidate() {
     );
     assert_eq!(result.deleted_count, 1);
 }
+
+/// Inserts a terminal execution stamped with `tenant` (issue #1977).
+async fn insert_completed_for_tenant(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    workflow_id: &str,
+    tenant: Option<&str>,
+    completed_at: DateTime<Utc>,
+) -> uuid::Uuid {
+    let id = insert_completed(conn, workflow_name, workflow_id, completed_at).await;
+    diesel::sql_query("UPDATE harvest_workflow_executions SET tenant = $2 WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(id)
+        .bind::<Nullable<Text>, _>(tenant)
+        .execute(conn)
+        .await
+        .expect("stamp tenant");
+    id
+}
+
+/// The `workflow_id`s that survive, sorted.
+async fn surviving_ids(conn: &mut AsyncPgConnection) -> Vec<String> {
+    #[derive(diesel::QueryableByName)]
+    struct IdText {
+        #[diesel(sql_type = Text)]
+        workflow_id: String,
+    }
+    diesel::sql_query("SELECT workflow_id FROM harvest_workflow_executions ORDER BY workflow_id")
+        .load::<IdText>(conn)
+        .await
+        .expect("load survivors")
+        .into_iter()
+        .map(|r| r.workflow_id)
+        .collect()
+}
+
+// Issue #1977: a tenant override applies to every run of that tenant. It wins
+// over the type override and the global age. Runs of other tenants, and runs
+// with no tenant, keep the type and global ages.
+//
+// The rows are two hours old. The tenant override is one hour. The global age
+// is one day, and the type override for `long_wf` is thirty days.
+#[tokio::test]
+async fn tenant_override_deletes_only_that_tenants_runs() {
+    let (url, _container) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn).await;
+
+    let two_hours_ago = Utc::now() - chrono::Duration::hours(2);
+    insert_completed_for_tenant(
+        &mut conn,
+        "plain_wf",
+        "acme-plain",
+        Some("acme"),
+        two_hours_ago,
+    )
+    .await;
+    insert_completed_for_tenant(
+        &mut conn,
+        "long_wf",
+        "acme-long",
+        Some("acme"),
+        two_hours_ago,
+    )
+    .await;
+    insert_completed_for_tenant(
+        &mut conn,
+        "plain_wf",
+        "globex-plain",
+        Some("globex"),
+        two_hours_ago,
+    )
+    .await;
+    insert_completed_for_tenant(&mut conn, "plain_wf", "none-plain", None, two_hours_ago).await;
+
+    let config = history_only(Some(Duration::from_secs(86_400)))
+        .with_workflow_override("long_wf", Duration::from_secs(30 * 86_400))
+        .with_tenant_override("acme", Duration::from_secs(3_600));
+
+    let metrics = Arc::new(CapturingMetrics::default());
+    let result = run_one_tick(pool, config, Arc::clone(&metrics)).await;
+
+    assert_eq!(
+        surviving_ids(&mut conn).await,
+        vec!["globex-plain".to_string(), "none-plain".to_string()],
+        "both acme runs expire under the tenant override; the others keep the global age"
+    );
+    assert_eq!(result.deleted_count, 2);
+}
+
+// Issue #1977: a tenant override alone turns on history retention. A run of
+// another tenant is never deleted, because no global age is set.
+#[tokio::test]
+async fn tenant_override_only_config_keeps_other_tenants() {
+    let (url, _container) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn).await;
+
+    let old = Utc::now() - chrono::Duration::days(2);
+    insert_completed_for_tenant(&mut conn, "plain_wf", "acme-old", Some("acme"), old).await;
+    insert_completed_for_tenant(&mut conn, "plain_wf", "globex-old", Some("globex"), old).await;
+    insert_completed_for_tenant(&mut conn, "plain_wf", "none-old", None, old).await;
+
+    let config = history_only(None).with_tenant_override("acme", Duration::from_secs(86_400));
+    let metrics = Arc::new(CapturingMetrics::default());
+    let result = run_one_tick(pool, config, Arc::clone(&metrics)).await;
+
+    assert_eq!(
+        surviving_ids(&mut conn).await,
+        vec!["globex-old".to_string(), "none-old".to_string()]
+    );
+    assert_eq!(result.deleted_count, 1);
+}
+
+// Issue #1977: a tenant override LONGER than the global age keeps the run.
+// This guards the precedence against a `min()` of the ages. A dry run reports
+// the tenant's would-be deletes and deletes nothing.
+#[tokio::test]
+async fn longer_tenant_override_keeps_runs_and_dry_run_deletes_nothing() {
+    let (url, _container) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn).await;
+
+    let two_days_ago = Utc::now() - chrono::Duration::days(2);
+    insert_completed_for_tenant(
+        &mut conn,
+        "plain_wf",
+        "acme-old",
+        Some("acme"),
+        two_days_ago,
+    )
+    .await;
+    insert_completed_for_tenant(&mut conn, "plain_wf", "none-old", None, two_days_ago).await;
+
+    let config = history_only(Some(Duration::from_secs(86_400)))
+        .with_tenant_override("acme", Duration::from_secs(30 * 86_400));
+    let metrics = Arc::new(CapturingMetrics::default());
+    let result = run_one_tick(pool.clone(), config, Arc::clone(&metrics)).await;
+    assert_eq!(
+        surviving_ids(&mut conn).await,
+        vec!["acme-old".to_string()],
+        "the 30-day tenant override keeps the acme run past the 1-day global"
+    );
+    assert_eq!(result.deleted_count, 1);
+
+    let mut dry = history_only(None).with_tenant_override("acme", Duration::from_secs(3_600));
+    dry.dry_run = true;
+    let result = run_one_tick(pool, dry, Arc::clone(&metrics)).await;
+    assert_eq!(surviving_ids(&mut conn).await, vec!["acme-old".to_string()]);
+    assert_eq!(result.deleted_by_workflow.get("plain_wf"), Some(&1));
+}

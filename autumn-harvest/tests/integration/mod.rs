@@ -24,6 +24,7 @@ mod admission_gate_tests;
 mod alert_pack_docs;
 #[cfg(feature = "db")]
 mod append_only_guard_tests;
+mod assay_rerun_docs;
 #[cfg(feature = "db")]
 mod audit_chain_tests;
 mod audit_export_docs;
@@ -327,6 +328,8 @@ mod telemetry_span_tests;
 #[cfg(feature = "db")]
 mod tenant_cell_isolation_tests;
 mod tenant_isolation_docs;
+#[cfg(feature = "db")]
+mod tenant_propagation_tests;
 #[cfg(feature = "db")]
 mod terminal_task_gc_tests;
 #[cfg(feature = "db")]

@@ -28,7 +28,7 @@ use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
-use autumn_harvest::queue::{self, EnqueueParams, TaskType};
+use autumn_harvest::queue::{self, EnqueueParams, TaskClaim, TaskType};
 
 use super::pg_stats_snapshot::{self as stats, Statements, StatsSnapshot};
 use super::throwaway_db::ThrowawayDb;
@@ -1043,7 +1043,8 @@ async fn run_claimer(
         tally.claims.fetch_add(1, Ordering::Relaxed);
         // A claimed task finishes its cycle even past the deadline. A cycle
         // cut halfway would change the table depth that the run measures.
-        let complete = queue::complete_task(conn, task.id, serde_json::json!({}));
+        let fenced = TaskClaim::new(task.id, worker, task.attempt);
+        let complete = queue::complete_task(conn, &fenced, serde_json::json!({}));
         match bounded(CYCLE_STEP_BOUND, complete).await {
             Some(Ok(())) => {
                 tally.completions.fetch_add(1, Ordering::Relaxed);

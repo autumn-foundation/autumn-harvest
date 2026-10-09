@@ -1,4 +1,4 @@
-//! The two activities on the engine path: the `#[activity]` handlers read the
+//! The activities on the engine path: the `#[activity]` handlers read the
 //! harness from worker state, as `HarvestBuilder::state` installs it.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -56,6 +56,9 @@ fn turn_request() -> ModelTurnRequest {
         usage: TokenUsage::default(),
         messages: vec![ChatMessage::text(ChatRole::User, "go")],
         max_output_tokens: Some(64),
+        read_only: false,
+        memory_scope: None,
+        extra_tools: Vec::new(),
     }
 }
 
@@ -109,6 +112,8 @@ async fn the_tool_handler_runs_the_named_tool_with_its_context() {
         run_id: "run-1".into(),
         session_id: None,
         step: 0,
+        memory_scope: None,
+        read_only: false,
         call: ToolCall {
             id: "c1".into(),
             name: "read".into(),
@@ -198,11 +203,96 @@ fn the_engine_registration_builds() {
         .activities(activities())
         .state(AgentHarness::new(ScriptedModel::new(Vec::new())))
         .build();
-    assert_eq!(built.workflow_count(), 1);
+    assert_eq!(built.workflow_count(), 2);
     assert!(built.state::<AgentHarness>().is_some());
     let names: Vec<&str> = activities().iter().map(|a| a.name).collect();
-    assert_eq!(names, ["agent_model_turn", "agent_tool_call"]);
-    assert_eq!(workflows()[0].name, autumn_harvest_agent::WORKFLOW_NAME);
+    assert_eq!(
+        names,
+        [
+            "agent_model_turn",
+            "agent_tool_call",
+            "agent_memory_snapshot",
+            "agent_deliver",
+            "agent_precheck",
+        ]
+    );
+    let flows: Vec<&str> = workflows().iter().map(|w| w.name).collect();
+    assert_eq!(
+        flows,
+        [
+            autumn_harvest_agent::WORKFLOW_NAME,
+            autumn_harvest_agent::heartbeat::HEARTBEAT_WORKFLOW_NAME,
+        ]
+    );
+}
+
+#[tokio::test]
+async fn the_memory_handler_renders_the_snapshot_of_the_scope() {
+    use autumn_harvest_agent::memory::{InMemoryMemoryStore, MemoryScope};
+    use autumn_harvest_agent::workflow::agent_memory_snapshot_info;
+
+    let harness = AgentHarness::new(ScriptedModel::new(Vec::new()))
+        .memory(Arc::new(InMemoryMemoryStore::new()));
+    let ctx = with_harness(harness);
+    let raw = (agent_memory_snapshot_info().handler)(
+        &ctx,
+        serde_json::to_value(MemoryScope::new("u1")).unwrap(),
+    )
+    .await
+    .unwrap();
+    let snapshot: String = serde_json::from_value(raw).unwrap();
+    assert!(snapshot.contains("block=\"user\""), "{snapshot}");
+}
+
+#[tokio::test]
+async fn a_memory_scope_without_a_store_is_a_permanent_failure() {
+    use autumn_harvest_agent::memory::MemoryScope;
+    use autumn_harvest_agent::workflow::agent_memory_snapshot_info;
+
+    let ctx = with_harness(AgentHarness::new(ScriptedModel::new(Vec::new())));
+    let err = (agent_memory_snapshot_info().handler)(
+        &ctx,
+        serde_json::to_value(MemoryScope::new("u1")).unwrap(),
+    )
+    .await
+    .unwrap_err();
+    let failure = parse_typed_payload(&err).expect("a typed failure");
+    assert_eq!(failure.error_type, "MemoryStoreMissing");
+    assert!(failure.non_retryable);
+}
+
+#[tokio::test]
+async fn the_precheck_handler_runs_every_tick_without_a_precheck() {
+    use autumn_harvest_agent::heartbeat::HeartbeatTask;
+    use autumn_harvest_agent::workflow::agent_precheck_info;
+
+    let ctx = with_harness(AgentHarness::new(ScriptedModel::new(Vec::new())));
+    let raw =
+        (agent_precheck_info().handler)(&ctx, serde_json::to_value(HeartbeatTask::new()).unwrap())
+            .await
+            .unwrap();
+    assert_eq!(raw, json!(true));
+}
+
+#[tokio::test]
+async fn the_deliver_handler_hands_the_report_to_the_delivery() {
+    use autumn_harvest_agent::delivery::{Report, ReportSource};
+    use autumn_harvest_agent::workflow::agent_deliver_info;
+    use autumn_harvest_agent::{AgentStop, RunId};
+
+    let ctx = with_harness(AgentHarness::new(ScriptedModel::new(Vec::new())));
+    let report = Report {
+        source: ReportSource::Run,
+        run_id: RunId::new("run-1"),
+        segment: 0,
+        session_id: None,
+        text: "done".into(),
+        stop: AgentStop::Completed,
+    };
+    let raw = (agent_deliver_info().handler)(&ctx, serde_json::to_value(report).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(raw, serde_json::Value::Null);
 }
 
 #[tokio::test]
@@ -230,6 +320,8 @@ async fn a_huge_tool_error_still_fits_the_result_cap() {
             run_id: "run-1".into(),
             session_id: None,
             step: 0,
+            memory_scope: None,
+            read_only: false,
             call: ToolCall {
                 id: "c".into(),
                 name: "fail".into(),
@@ -402,4 +494,32 @@ async fn a_refused_model_id_still_records_the_turn_as_unknown() {
         autumn_harvest_agent::model::UNKNOWN_MODEL_ID
     );
     assert_eq!(ledger[0].input_tokens(), 7);
+}
+
+#[tokio::test]
+async fn a_read_only_call_refuses_a_write_tool_at_run_time() {
+    let recorder = Arc::new(Recorder::default());
+    let harness = AgentHarness::new(ScriptedModel::new(Vec::new())).tool(recorded_tool(
+        "write",
+        ToolEffect::Write,
+        &recorder,
+    ));
+    let outcome = harness
+        .tool_call(ToolCallRequest {
+            run_id: "run-1".into(),
+            session_id: None,
+            step: 0,
+            memory_scope: None,
+            read_only: true,
+            call: ToolCall {
+                id: "c".into(),
+                name: "write".into(),
+                arguments: json!({}),
+            },
+        })
+        .await
+        .unwrap();
+    assert!(outcome.is_error);
+    assert!(outcome.content.contains("may only read"));
+    assert_eq!(recorder.runs(), Vec::<serde_json::Value>::new());
 }

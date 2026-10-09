@@ -1363,18 +1363,21 @@ impl WorkflowHandleClient {
                     exec_id,
                     workflow_id,
                     state,
-                } => Ok((
-                    StartedWorkflowExecution {
-                        exec_id,
-                        workflow_name,
-                        workflow_id,
-                        state,
-                        created: false,
-                    },
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                )),
+                } => {
+                    crate::execution::refuse_other_tenant_claim(conn, &params, exec_id).await?;
+                    Ok((
+                        StartedWorkflowExecution {
+                            exec_id,
+                            workflow_name,
+                            workflow_id,
+                            state,
+                            created: false,
+                        },
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    ))
+                }
                 StartIdempotencyReservation::Reserved => {
                     let (started, deferred_starts, deferred_checks, cancel_metrics) =
                         start_or_load_workflow_execution_collect_with_codecs(

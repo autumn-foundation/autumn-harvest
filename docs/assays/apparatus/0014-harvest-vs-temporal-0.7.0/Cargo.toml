@@ -1,0 +1,26 @@
+# NON-PRODUCTION APPARATUS. See
+# ../../0014-harvest-vs-temporal-0.7.0-depth-sweep.md
+#
+# Kept for reproducibility only. It is not a member of the workspace, and it
+# must never become one.
+[package]
+name = "harvest_vs_temporal_070_assay"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Detached from the root workspace.
+[workspace]
+
+[dependencies]
+autumn-harvest = { path = "../../../../autumn-harvest", features = ["db", "testing"] }
+autumn-harvest-redis = { path = "../../../../autumn-harvest-redis" }
+deadpool = "0.13"
+diesel = { version = "2.3", features = ["postgres_backend", "uuid", "chrono", "serde_json", "64-column-tables"] }
+diesel-async = { version = "0.9", features = ["deadpool", "postgres"] }
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "streams", "script"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+
+[profile.release]
+opt-level = 3

@@ -267,6 +267,9 @@ pub struct WorkflowExecution {
     /// cross-database write and no retry race.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub staging_vacated_by: Option<Uuid>,
+    /// Verified tenant of the run (issue #1977). `None` means no tenant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
 }
 
 impl WorkflowExecution {
@@ -404,6 +407,10 @@ pub struct NewWorkflowExecution<'a> {
     /// required for the quota-usage aggregate queries in `quota.rs` to find
     /// this execution's active-executions/history-bytes contribution.
     pub quota_key: Option<&'a str>,
+    /// Verified tenant of the run (issue #1977). `None` means no tenant.
+    /// The start path sets it from [`crate::StartWorkflowParams::tenant`].
+    /// Every path that derives a run from another run copies it.
+    pub tenant: Option<&'a str>,
 }
 
 // ── HarvestEvent ──────────────────────────────────────────────────────────────
@@ -1211,6 +1218,9 @@ pub struct ApiToken {
     pub last_used_at: Option<DateTime<Utc>>,
     pub revoked_at: Option<DateTime<Utc>>,
     pub created_by: String,
+    /// Tenant claim of the token (issue #1977). `None` means not
+    /// tenant-bound.
+    pub tenant: Option<String>,
 }
 
 /// Insert struct for minting a new API token (issue #942).
@@ -1225,6 +1235,9 @@ pub struct NewApiToken<'a> {
     pub scope: &'a str,
     pub expires_at: Option<DateTime<Utc>>,
     pub created_by: &'a str,
+    /// Tenant claim of the token (issue #1977). `None` means not
+    /// tenant-bound.
+    pub tenant: Option<&'a str>,
 }
 
 impl std::fmt::Debug for NewApiToken<'_> {
@@ -1235,6 +1248,7 @@ impl std::fmt::Debug for NewApiToken<'_> {
             .field("scope", &self.scope)
             .field("expires_at", &self.expires_at)
             .field("created_by", &self.created_by)
+            .field("tenant", &self.tenant)
             .finish()
     }
 }
@@ -1474,6 +1488,8 @@ pub struct CompletionTriggerOutboxDb {
     pub max_workflow_input_bytes: i64,
     pub created_at: DateTime<Utc>,
     pub next_attempt_at: Option<DateTime<Utc>>,
+    /// Tenant of the source run (issue #1977). The target run gets it.
+    pub tenant: Option<String>,
 }
 
 /// Insertable model for registering a deferred completion trigger outbox task.
@@ -1491,6 +1507,8 @@ pub struct NewCompletionTriggerOutboxDb {
     pub concurrency_limit: Option<i32>,
     pub priority: serde_json::Value,
     pub max_workflow_input_bytes: i64,
+    /// Tenant of the source run (issue #1977). The target run gets it.
+    pub tenant: Option<String>,
 }
 
 // ── Cross-shard child workflows (issue #956) ─────────────────────────────────
@@ -1994,6 +2012,7 @@ mod effective_terminal_state_tests {
             migrated_run_terminal_state: None,
             staging_vacated_state: None,
             staging_vacated_by: None,
+            tenant: None,
         }
     }
 
