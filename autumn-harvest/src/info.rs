@@ -1115,10 +1115,11 @@ fn validate_node(
     }
 
     // required fields
-    if let (Some(required), Some(obj)) = (
-        schema_obj.get("required").and_then(|v| v.as_array()),
-        value.as_object(),
-    ) {
+    // Keyword lookups are gated on the value's kind: a map lookup against a
+    // non-matching value is wasted work on the leaf-heavy common case.
+    if let Some(obj) = value.as_object()
+        && let Some(required) = schema_obj.get("required").and_then(|v| v.as_array())
+    {
         for req in required {
             if let Some(field) = req.as_str()
                 && !obj.contains_key(field)
@@ -1136,10 +1137,9 @@ fn validate_node(
     }
 
     // properties — recurse
-    if let (Some(properties), Some(obj)) = (
-        schema_obj.get("properties").and_then(|v| v.as_object()),
-        value.as_object(),
-    ) {
+    if let Some(obj) = value.as_object()
+        && let Some(properties) = schema_obj.get("properties").and_then(|v| v.as_object())
+    {
         for (prop_name, prop_schema) in properties {
             if let Some(prop_value) = obj.get(prop_name) {
                 let child_path = JsonPointerPath::Prop {
@@ -1162,7 +1162,9 @@ fn validate_node(
     }
 
     // array items — recurse into each element
-    if let (Some(items_schema), Some(arr)) = (schema_obj.get("items"), value.as_array()) {
+    if let Some(arr) = value.as_array()
+        && let Some(items_schema) = schema_obj.get("items")
+    {
         for (i, elem) in arr.iter().enumerate() {
             let child_path = JsonPointerPath::Index {
                 parent: path,
@@ -1222,8 +1224,8 @@ fn validate_node(
     }
 
     // additionalProperties — reject unknown keys (false) or validate them against a sub-schema
-    if let (Some(add_props), Some(obj)) =
-        (schema_obj.get("additionalProperties"), value.as_object())
+    if let Some(obj) = value.as_object()
+        && let Some(add_props) = schema_obj.get("additionalProperties")
     {
         // Known-property membership is checked directly against the schema's
         // own `properties` map (already a `BTreeMap`) rather than collecting

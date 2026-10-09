@@ -41,16 +41,24 @@ this page says nothing about what they cost in *that* table; see
 
 ## TL;DR
 
-* **Claim latency scales superlinearly with pending-backlog depth.** 1k → 10k
+* **Since issue #1971, the default claim no longer scans the whole backlog.**
+  It reads a bounded seek window from the head of each queue. On the issue
+  #1956 fixture, from 10K to 1M pending rows, claim buffers grow from 721 to
+  3,649. The full scan reads 1,551 to 124,641, and its sort spills. The new
+  claim does not spill. At 100K, 8 claimers sustain 573 claims/s against 1.2 before. The
+  full scan that the rest of this page measures now runs only as a
+  fallback. See [the seek window](#the-seek-window-issue-1971).
+* **Before issue #1971, claim latency scaled superlinearly with
+  pending-backlog depth.** The bullets below describe the full scan. 1k → 10k
   rows (10x) costs ~19x latency; 10k → 100k (10x) costs a further ~15x. Claim
   cost is a function of how deep your queue is, not how much work you dispatch.
   **This is the single biggest lever on this page** — bigger than any individual
   predicate, and it dominates the per-gate table below.
 * **The cause is structural, not incidental — and it is not only the `CASE`
   key.** The claim query's `ORDER BY` leads with a non-indexable `CASE`
-  expression, so `idx_harvest_tq_poll` cannot serve the ordering, and Postgres
-  sequentially scans and sorts every eligible pending row on every single
-  claim. See [the plan](#the-plan) below.
+  expression, so `idx_harvest_tq_poll` cannot serve the ordering, and the full
+  scan reads and sorts every eligible pending row on each claim. See
+  [the plan](#the-plan) below.
   **Fixing that key would not be sufficient on its own**: issue #1177 shows
   any single one of ten other residual `WHERE` predicates it tested
   independently defeats sort-elision and `LIMIT` pushdown too, even at zero
@@ -86,8 +94,8 @@ this page says nothing about what they cost in *that* table; see
   [the queue-pause anti-join fix](#the-queue-pause-anti-join-fix).
 * **Enqueue is not the problem.** ~4 800 rows/s sustained at p50 ~1.5 ms, flat
   from 1k to 100k backlog (inside run-to-run noise). At 100k the write side
-  sustains ~4 600 rows/s while the read side manages ~3 claims/s — **a queue
-  that deep does not drain.**
+  sustains ~4 600 rows/s while the full-scan read side managed ~3 claims/s —
+  **before issue #1971, a queue that deep did not drain.**
 * Issue #786 deliberately **measures without tuning**: the claim query is
   byte-for-byte unchanged by this work.
 
@@ -193,6 +201,11 @@ With the variable unset the benchmark starts a `postgres:16` testcontainer
 instead; with neither available it prints a skip notice and exits 0.
 
 ## Claim latency vs backlog depth
+
+> **Follow-up (issue #1971):** this table measures the full scan. The default
+> claim now reads a bounded window first. See
+> [the seek window](#the-seek-window-issue-1971) for a sweep of the new path.
+> It uses another fixture and harness, so compare ratios only.
 
 Baseline gate (no build policy, no concurrency key, no rate limit, no pauses),
 8 concurrent claimers across 4 queues:
@@ -426,6 +439,10 @@ What each row exercises, and what it means:
   establish](#what-that-control-does-not-establish).
 
 ## The plan
+
+> **Follow-up (issue #1971):** this plan is the full scan. The default claim
+> now runs it only as a fallback. See
+> [the seek window](#the-seek-window-issue-1971).
 
 `EXPLAIN (ANALYZE, BUFFERS)` of a single headline claim, trimmed to the nodes
 that matter (the benchmark prints it in full). The worker-id literal is
@@ -701,6 +718,12 @@ is not decided here; it is tracked separately as issue #1340.
 `docs/performance-claim-batched-seek-and-refine.md` measures a real,
 DB-tested implementation (`queue::claim_task_batched`, additive, not wired
 into the default claim path) against the single-row query above.
+
+> **Follow-up (issue #1971):** the default claim now reads a bounded,
+> index-ordered window per queue head before this scan, and runs this scan
+> only as a fallback. It keeps the claim order exactly, so it needs no
+> sign-off on a fairness change. See
+> [the seek window](#the-seek-window-issue-1971).
 
 This also corrects, without fully resolving, the
 [known limitations](#known-limitations) bullet that called `schedule_to_close`
@@ -1253,9 +1276,10 @@ figure is the median of 12 runs.
 | 5k expired runs | 33.3 ms | 34.9 ms | 56.6 ms | 26.4 ms |
 
 - **The gate costs about nothing.** It runs as a hashed subplan, once per
-  claim. A `BitmapOr` of `idx_harvest_executions_deadline` and
-  `idx_harvest_executions_chain_deadline` reads the set. Rows that the gate
-  removes also shrink the sort.
+  claim. It reads `idx_harvest_executions_deadline` and
+  `idx_harvest_executions_chain_deadline`. Since issue #1971 each index has
+  its own branch, because the claim turns bitmap scans off. Rows that the
+  gate removes also shrink the sort.
 - **The order term costs about 18 ms at this depth.** The plan shape does not
   change: an index scan on `idx_harvest_tq_poll`, then a sort. Before, the
   sort keys followed the index order, so the sort input was almost sorted.
@@ -1267,6 +1291,297 @@ figure is the median of 12 runs.
 
 No index can remove the sort. The sticky `CASE` key already forces it. See
 [any residual predicate defeats sort-elision](#any-residual-predicate-defeats-sort-elision-issue-1177).
+
+## The seek window (issue #1971)
+
+The sections above measure the full scan. Since issue #1971, the default
+claim runs that scan only as a fallback. It first reads a bounded **seek
+window** from the head of each polled queue. The claim order does not
+change. Design record: [`DESIGN-1971.md`](../DESIGN-1971.md).
+
+### Mechanism
+
+- Each polled queue has four heads: one per task type, for continuations
+  and for new starts. A new start is a row with `new_start AND
+  attempt = 0`. Each head reads at most `queue::CLAIM_SEEK_WINDOW` (32)
+  due rows from one ordered range of `idx_harvest_tq_claim_seek`.
+- Inside one head, the claim due time follows `scheduled_at`. A
+  continuation is due at `scheduled_at`, a new start 30 s later. So each
+  head is already in claim order, `priority DESC, due ASC`. The due time
+  itself cannot be an index key: `timestamptz + interval` is not
+  immutable, and Harvest supports Postgres 12 and later.
+- The task type in the index lets a claim for one kind skip the heads of
+  the other kind. A saturated worker claims for one kind only.
+- A pin head reads every live pin of this worker through
+  `idx_harvest_tq_sticky_poll` and keeps the best 32.
+- Each head scan skips the rows that a row-local gate rejects. These are a
+  live pin to another worker, a session pin, an expired
+  `schedule_to_close_at`, a paused activity, a `$6` name and a saturated
+  type. Such a row then does not use a window slot.
+- A guard keeps a window row only if no row outside the window can sort
+  before it. A row outside a head sorts at or after the last row of that
+  head. So a row must sort at or before the last row of each full head. A
+  row pinned to this worker outranks the queue heads, and only a full pin
+  head bounds it.
+- The window candidate scan reads the rows that pass the guard by primary
+  key and applies every gate. Its row test matches no partial index on
+  `PENDING` rows, and the claim turns bitmap scans off. So stale statistics
+  leave only a primary-key probe or a scan of the whole table. See the
+  stale-statistics result below.
+- When the window finds no candidate and a head is full, or when priority
+  ageing is on, the same statement runs the full scan. A one-time filter
+  gates it, and `EXPLAIN` shows it as `never executed` otherwise.
+- The rate-limit debit, the advisory-lock recheck and the `claimed` update
+  are unchanged.
+- After the claim, the claim counts a capped key again in a fresh snapshot.
+  Every claim path does this: the default, the by-id and the batched claim. See
+  [the concurrency cap](#the-concurrency-cap-holds-through-commit).
+
+### The claim transaction
+
+- `diesel::sql_query` never caches a statement, so the old claim parsed and
+  planned its statement on every call. The default claim now goes through
+  `CachedClaimQuery`, which diesel caches once per connection.
+- The claim returns a fixed column list. A migration that adds a column to
+  `harvest_task_queue` therefore does not change the result type of the
+  cached statement.
+- The transaction first sends `queue::CLAIM_PLAN_SETTINGS_SQL` in one
+  batch: `SET LOCAL jit = off`, `SET LOCAL plan_cache_mode =
+  force_generic_plan` and `SET LOCAL enable_bitmapscan = off`.
+  - The plan carries the cost estimate of the full scan, which passes
+    `jit_above_cost`.
+  - A custom plan costs about 6 ms to plan on each call. On a small backlog
+    that is more than the claim costs to run.
+  - A bitmap scan reads every due row of a head and sorts them. The planner
+    picks it when it estimates a head below the window size. A generic plan,
+    skewed queues and stale statistics all give that estimate. On the issue
+    #1956 fixture at 10K pending rows, the bitmap form read 2,515 buffers.
+    The ordered form read 721.
+- A claim with priority ageing on sends `queue::CLAIM_AGEING_PLAN_SETTINGS_SQL`
+  instead, without the bitmap setting. Ageing always runs the full scan,
+  which reads faster with bitmap scans: 16K buffers against 46K at 100K
+  pending rows. Postgres keeps a cached plan when a setting changes, so the
+  ageing claim starts with a comment and caches as its own statement.
+
+### Claim cost against backlog depth
+
+The fixture is the deep-backlog generator of issue #1956, from PR #2045.
+It is the shape that issue #1956 asks every claim change to report against:
+
+- seed 1971 and 64 queues with power-skewed sizes;
+- 4,096 concurrency keys on half the runs, capped at 32;
+- 1% `RUNNING` rows, up to a fleet of 1,024 slots;
+- 5% future rows and 10% dead tuples at the head of the backlog;
+- one workflow task per four rows.
+
+Each figure is the median of four `EXPLAIN (ANALYZE, BUFFERS)` runs of the
+prepared claim statement, each rolled back, on Postgres 16 with JIT off. The
+old claim runs with a custom plan, as it did. The new claim runs with the
+generic plan and the planner settings that it uses. "4 queues" polls the
+four largest queues. "64 queues" polls all of them.
+
+| pending rows | 4 queues, old | 4 queues, new | 64 queues, old | 64 queues, new |
+|--:|--:|--:|--:|--:|
+| 1,000 | 189 buf, 3.4 ms | 554 buf, 4.4 ms | 315 buf, 5.7 ms | 1,901 buf, 8.2 ms |
+| 10,000 | 1,551 buf, 28 ms | 721 buf, 6.8 ms | 1,665 buf, 61 ms | 4,646 buf, 31 ms |
+| 100,000 | 15,820 buf, spill, 560 ms | 2,884 buf, 12 ms | 15,538 buf, spill, 1.4 s | 7,920 buf, 46 ms |
+| 1,000,000 | 124,641 buf, spill, 6.5 s | 3,649 buf, 38 ms | 986,040 buf, spill, 18 s | 8,700 buf, 185 ms |
+
+- **The old claim grows with the backlog.** From 10K to 1M on 4 queues it
+  reads 80 times the buffers, and it spills its sort from 100K.
+- **The new claim does not.** From 10K to 1M its buffers grow 5 times on
+  4 queues and 2 times on 64 queues, for 100 times the backlog.
+- **The rest follows the `RUNNING` population.** `seek_running_counts`
+  walks every `RUNNING` row: 9 rows at 1K, 897 at 100K and the fleet cap of
+  1,024 at 1M. The dead tuples at the head cost a heap visit once, until
+  Postgres marks their index entries dead.
+- **A small backlog costs more, in milliseconds.** At 1K the window reads
+  almost every row by index. The old full scan reads the small table at
+  once. On 64 queues the window holds up to about 8,200 rows. Both cost a few
+  milliseconds, and the old claim also planned on every call.
+
+`claim_buffers_stay_flat_from_1k_to_100k_pending_rows` asserts the flat
+shape in CI on the synthetic `claim_seek_tests` fixture. Its red run, before the
+change, measured 1,248, 8,739 and 109,675 buffers, with a spill at 100K.
+
+The issue #1215 case, 199 paused activities at a 100K backlog, no longer
+spills: 109,321 buffers and a spill before, 535 buffers and no spill after.
+
+**Stale statistics do not change the plan.** An `ANALYZE` saw 20 `PENDING`
+rows among 400K terminal rows. Then 30K rows arrived. The claim reads 479 to
+496 buffers, within 1% of the fresh plan. The window scan gives the planner
+no partial index on `PENDING` rows, so it probes the primary key. Before
+that fix, the same case read 11,704 buffers through a bitmap head scan, then
+30,278 through a partial index.
+
+### Latency and throughput under contention
+
+`pgbench` with 8 concurrent claimers on the 4-core box, each claim its own
+transaction, on the issue #1956 fixture, polling the four largest queues.
+200 claims per row, 800 for the new claim at 1M.
+
+- "Old" is the old claim: the full scan, parsed and planned on every call
+  (`-M extended`). "JIT on" is the server default.
+- "New" is the new claim: the seek window, cached once per connection
+  (`-M prepared`), with the planner settings of the claim transaction.
+
+| pending rows | old, JIT on | old, JIT off | new |
+|--:|--:|--:|--:|
+| 1,000 | 575/s, 11.8 / 46.9 ms | 574/s, 12.2 / 40.9 ms | 994/s, 5.7 / 53.8 ms |
+| 10,000 | 19.6/s, 396 / 556 ms | 136/s, 56 / 92 ms | 689/s, 9.2 / 53.1 ms |
+| 100,000 | 1.2/s, 6,596 / 7,056 ms | 7.1/s, 1,120 / 1,400 ms | 573/s, 10.2 / 84.3 ms |
+| 1,000,000 | not run | 0.6/s, 13,598 / 14,082 ms | 372/s, 11.9 / 846 ms |
+
+Each cell is claims per second, then p50 / p99 latency.
+
+- **JIT alone cost 7 times at 10K.** The full-scan estimate passes
+  `jit_above_cost`, so JIT compiled about 330 functions on each claim.
+- **The new claim is flat.** From 1K to 1M the p50 stays between 6 and
+  12 ms, and the throughput stays within a factor of 3.
+- **The p99 at 1M is the first claim of each connection.** It prepares the
+  statement on a cold cache, 8 claims in 800. Every other claim took less
+  than 200 ms.
+- **A fallback costs what the old claim cost.** In an earlier run at 1M, one
+  claim in 800 fell back and took 9.1 s, and the run reached 62 claims/s.
+  The claimers never complete their tasks, so hot concurrency keys fill up.
+  See [when the window falls back](#when-the-window-falls-back).
+
+These are loopback figures, from the same box as the rest of this page.
+Read the ratios, not the absolute numbers.
+
+### Fairness
+
+The guard makes the window pick the row that the full scan would pick.
+Ties may go either way, as before. So with ageing off, the claim order does
+not change. With ageing on, the full scan runs, as before.
+
+`randomized_drains_follow_the_reference_order` checks this. It seeds random
+backlogs and drains them. Each claim must take a row with the best
+reference key. The backlogs mix priorities, new starts, pins to this worker
+and to others, a paused activity and a saturated concurrency key. The order
+tests cover a continuation behind a new-start storm, a deep pin, a
+saturated head in a higher-priority queue, `$6` and saturated types at the
+head, ageing and a kind filter. An independent review drove about 360
+random drains through both forms, with locks held by a second session, and
+found no difference in the claimed keys.
+
+Under contention, `SKIP LOCKED` lets claimers take rows slightly out of
+order in both paths. `pgbench` runs on the `claim_seek_tests` fixture, with
+800 claims per row, counted the claimed pairs that left in the wrong key
+order:
+
+| pending rows | before | after |
+|--:|--:|--:|
+| 1,000 | 0.21% | 0.22% |
+| 10,000 | 0.17% | 0.16% |
+| 100,000 | 0.06% | 0.02% |
+
+The window does not add a measurable inversion.
+
+### When the window falls back
+
+The window cannot decide when a full head holds only rows that the
+row-local gates do not catch. These rows are:
+
+- rows on a saturated concurrency key, or with an empty rate-limit bucket;
+- rows with a build or capability mismatch;
+- rows of a paused workflow or an expired run;
+- rows locked by other claimers. The guard passes only the rows that sort
+  before the last row of every full head. When gates reject the other rows
+  of the tightest head, that set can be smaller than the number of claims
+  in flight.
+
+Priority ageing also falls back. The fallback costs the full scan plus the
+window.
+
+Measured with 200 rows on a saturated concurrency key at the head of the
+queues:
+
+| pending rows | full scan alone | seek window with fallback |
+|--:|--:|--:|
+| 1,000 | 199 buffers, 5.5 ms | 903 buffers, 12.1 ms |
+| 100,000 | 4,601 buffers, 1,720 temp blocks, 393 ms | 103,023 buffers, 2,037 temp blocks, 418 ms |
+
+So a blocked head costs about what it cost before. Issue #1971 does not fix
+that case. See [what this does not establish](#what-the-seek-window-does-not-establish).
+
+### The concurrency cap holds through commit
+
+`concurrent_claimers_never_exceed_a_cap_at_depth` found a cap race that
+predates the seek window. Eight claimers claimed from a backlog with a
+capped key at its head. Four rows ran on a key capped at three.
+
+- The `claimed` CTE takes the advisory lock of the key, then counts the
+  `RUNNING` rows of the key.
+- Under `READ COMMITTED`, every subquery of one statement reads the snapshot
+  from the start of the statement. That snapshot predates the lock.
+- A claim on the same key can commit after the snapshot and before the
+  lock. The count misses it. Several claimers can miss earlier claims in
+  turn, so the key can run more than one task over its cap.
+
+The fix is `release_claim_if_over_cap`, one more statement after a claim on
+a capped key. It counts in a fresh snapshot while the transaction holds the
+lock, and gives the row back if the key is over its cap. A later claim
+cannot take the lock until this transaction commits. It skips the row, or
+it takes the lock after the commit and sees this claim. Every claim path
+runs the re-check: the default, the by-id and the batched claim. Claims
+without a capped key pay nothing.
+
+### Costs of the seek window
+
+- **One more index.** `idx_harvest_tq_claim_seek` is a partial index on
+  `PENDING` rows. It adds one index entry per enqueue and per non-HOT
+  update of a `PENDING` row. It was 33 MB for 700,000 pending rows with distinct due times, against
+  27 MB for `idx_harvest_tq_poll`, and took 2.0 s to build.
+- **One more round trip.** The planner settings go in one batch before the
+  claim. A claim on a capped key adds one more for the cap re-check. See
+  [what is actually timed](#what-is-actually-timed).
+- **Generic plan.** Postgres builds it once per connection, and an
+  `ANALYZE` of the table invalidates it.
+- **A misjudged gate, avoided.** The planner cannot read the arrays of the
+  activity-pause and saturated-type gates at plan time. In their plain form
+  it may judge that no row passes, and then read the whole head. The head
+  scans write those gates as one `CASE`, which gets a fixed default
+  estimate. `a_single_activity_type_backlog_keeps_the_window_bounded` pins
+  this.
+
+### What the seek window does not establish
+
+- **A blocked head is still O(backlog).** A fully blocked head falls back
+  to the full scan. Moving parked rows out of the ready index would remove
+  that. See the follow-ups in [`DESIGN-1971.md`](../DESIGN-1971.md).
+- **Ageing is still O(backlog).** With `priority_aging_secs` set, every
+  claim runs the full scan, as before.
+- **A long run of skipped rows.** A head scan reads past each row that a
+  row-local gate skips, one heap read per row. A deep run of live pins to
+  other workers, session pins, paused activities or saturated types at a
+  head makes each claim read the whole run. Live pins last one sticky
+  timeout, so they follow the claim rate. Session pins and paused
+  activities do not.
+- **A large live pin set.** The pin head reads every live pin of this
+  worker. More than 32 of them that pass the gates also make every rank-0
+  row wait for the fallback.
+- **Many polled queues.** The window has four heads per queue, so its cost
+  grows with the number of polled queues. At 64 queues on the issue #1956
+  fixture it read 7,920 buffers in 46 ms at 100K, and 8,700 buffers in
+  185 ms at 1M. The full scan took 1.4 s and 18 s.
+- **The `RUNNING` population.** `seek_running_counts` walks every `RUNNING`
+  row, so its cost follows the size of the fleet: about 900 buffers with
+  1,024 tasks in flight.
+- **Future-dated rows in a higher band.** A head scan steps over the index
+  entries of rows that are not yet due, inside a higher priority band.
+  Those steps read index pages only.
+- **A held snapshot.** A long transaction, `pg_dump` or a standby with
+  `hot_standby_feedback` keeps the index entries of claimed rows alive at
+  the queue head. Each claim then reads them again. Every Postgres queue
+  has this.
+- **Postgres 12 to 15.** Measured on Postgres 16 only. A review checked
+  that the index definition and the settings work on 12 and 17.
+- **A remote database.** Every figure here is loopback. Across a network,
+  the round-trip count dominates, as [what is actually
+  timed](#what-is-actually-timed) explains.
+- **A production fleet.** The fixture follows issue #1956's shape, but no
+  production trace was replayed.
 
 ## Enqueue throughput
 
@@ -1291,6 +1606,10 @@ Put the two sides together and the operational picture is stark: at a 100 000-ro
 backlog this machine sustains ~4 600 enqueues/s against ~3 claims/s — three
 orders of magnitude apart. **A queue that deep does not drain.** Nothing in the
 write path warns you about it; the backlog table above is the warning.
+
+> **Follow-up (issue #1971):** these figures describe the full scan. With the
+> seek window, the claim side no longer falls with depth. See
+> [the seek window](#the-seek-window-issue-1971).
 
 Two caveats on this table. `queue::enqueue` is not a bare `INSERT`: it resolves
 defaults and writes one row inside its own transaction, so the per-row latency
@@ -1429,33 +1748,52 @@ whole transaction**, not the single statement the `EXPLAIN` below shows — and 
 a single round trip either. It issues, in order:
 
 1. `BEGIN ISOLATION LEVEL READ COMMITTED`. The level is pinned on the `BEGIN`
-   itself rather than inherited, so step 4 always gets a fresh snapshot.
-2. **The claim CTE.** The rate-limit debit and the per-key concurrency
+   itself rather than inherited, so steps 5 and 6 always get a fresh snapshot.
+2. `SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan;
+   SET LOCAL enable_bitmapscan = off` (issue #1971), one batch, one round
+   trip. The claim plan carries the cost estimate of its fallback scan, and
+   that estimate can pass `jit_above_cost`. A custom plan costs more to plan
+   than the claim costs to run. A bitmap scan would read a whole queue head
+   instead of the window. Since issue #1971 the claim statement is also cached once per
+   connection. See [the seek window](#the-seek-window-issue-1971).
+3. **The claim CTE.** The rate-limit debit and the per-key concurrency
    advisory-lock re-check are branches *within* this statement, not extra ones —
-   this is the statement the `EXPLAIN` below plans. With cross-region DR fencing
-   enabled (issue #954, off by default) it carries one additional
-   `MATERIALIZED` CTE probing `harvest_shard_generation` — still the same single
-   statement and the same round-trip count, and the published figures below were
-   measured with fencing off, which is the default and the configuration the
-   plan applies to.
-3. *(hit only)* `queue_pause::try_lock_queue_for_claim` — a
+   this is the statement the `EXPLAIN` below plans. When the DR fence is in
+   force (issue #954; by default only on a database with a DR marker, issue
+   #1823) it carries one additional `MATERIALIZED` CTE probing
+   `harvest_shard_generation` — still the same single statement and the same
+   round-trip count. The published figures below were measured unfenced: the
+   configuration on a database with no DR marker, and the one the plan
+   applies to.
+4. *(hit only)* `queue_pause::try_lock_queue_for_claim` — a
    `pg_try_advisory_xact_lock` on the queue. If it loses the race against a
    concurrent pause or resume, `queue_pause::release_claim` hands the row back
    and the call returns "no task": same round-trip count, no claim.
-4. *(hit only)* `queue_pause::release_claim_if_queue_paused` — the authoritative
+5. *(hit only)* `queue_pause::release_claim_if_queue_paused` — the authoritative
    queue-pause re-check. It is a *separate statement* precisely so it takes a
    snapshot the claim could not have; folding it into the CTE would defeat it.
-5. `COMMIT`.
+   The activity-pause and workflow-pause re-checks follow, each only for the
+   task type it can hold.
+6. *(hit on a capped concurrency key only)* `release_claim_if_over_cap`
+   (issue #1971). The claim counts the key under its own snapshot, which
+   predates the advisory lock. This statement counts again in a fresh
+   snapshot, under the lock, and gives the row back if the key is over its
+   cap.
+7. `COMMIT`.
 
-So a published number is **five** client↔server round trips when the claim lands
-on a row and **three** when the queue is empty — plus transaction overhead — and
-the `EXPLAIN` plan explains the *dominant* statement rather than the whole
+So a published number is **seven** client↔server round trips when the claim
+lands on a row, **eight** on a capped key and **four** when the queue is empty —
+plus transaction overhead. A workflow task without a run skips the type-gated
+pause re-check, so it takes six. The
+`EXPLAIN` plan explains the *dominant* statement rather than the whole
 measured operation. The seeded scenarios claim at most a fifth of the backlog
-they seed, so their samples are overwhelmingly hits.
+they seed, so their samples are overwhelmingly hits. The tables
+measured before issue #1971 had no step 2 and no step 6, so they count one
+fewer, two fewer on a capped key.
 
 That distinction is the first thing to reason about when moving this workload to
 a **remote** database: the round-trip count, not the query plan, is what network
-latency multiplies. Five round trips at 1 ms of network RTT is 5 ms of floor per
+latency multiplies. Seven round trips at 1 ms of network RTT is 7 ms of floor per
 claim that no amount of index tuning removes. Every number on this page was
 measured against a loopback server, so that floor is ~0 here and the plan
 dominates; that ordering inverts across a network.
@@ -1597,6 +1935,10 @@ from the benchmark are directly comparable.
     realistic on its own, at the headline depth. See
     [the pause-array-size sweep](#the-pause-array-size-sweep-issue-1215) for
     the full measurement. No query-shape fix is proposed here.
+    **Follow-up (issue #1971):** the seek window sorts at most a few hundred
+    window rows, so this spill no longer occurs when the window decides the
+    claim. The full scan still spills when it runs as a fallback. See
+    [the seek window](#the-seek-window-issue-1971).
   * **`schedule_to_close` (#378)** — measured directly:
     [`docs/performance-schedule-to-close.md`](performance-schedule-to-close.md) seeds `schedule_to_close_at`
     (rather than leaving it null) and **confirms this page's own suspicion on
@@ -1806,6 +2148,8 @@ from the benchmark are directly comparable.
   per RUNNING execution on every timeout-scanner tick.
 * Issue #1177 — reproduction and full `EXPLAIN` captures for
   [any residual predicate defeats sort-elision](#any-residual-predicate-defeats-sort-elision-issue-1177).
+* [`DESIGN-1971.md`](../DESIGN-1971.md) — the planning record and design of
+  [the seek window](#the-seek-window-issue-1971).
 * [`docs/performance-claim-batched-seek-and-refine.md`](performance-claim-batched-seek-and-refine.md) —
   issue #1340's batched seek-and-refine claim (`queue::claim_task_batched`,
   additive, not wired into the default claim path), measured against the
@@ -1830,6 +2174,8 @@ standalone note rather than part of the claim-path attribution table above:
   maintainer override after falling short of the autonomous gate.
 * [`docs/performance-schema-validation-lazy-path.md`](performance-schema-validation-lazy-path.md)
   — lazy JSON-Pointer path construction in schema validation (issue #373).
+* [`docs/performance-schema-validate-kind-gated-lookups.md`](performance-schema-validate-kind-gated-lookups.md)
+  — kind-gated keyword lookups in schema validation (Ir -18.8%).
 * [`docs/performance-det-check.md`](performance-det-check.md) — fusing a
   redundant per-line comment scan in `harvest det-check` (issue #778).
 * [`docs/performance-det-check-line-trim.md`](performance-det-check-line-trim.md)

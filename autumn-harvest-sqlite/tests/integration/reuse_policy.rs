@@ -441,10 +441,11 @@ async fn terminate_if_running_cleans_up_orphan_timer() {
     );
 }
 
-// A signal sent to a still-RUNNING execution that the workflow never reaches a
-// matching `wait_for_signal`/`wait_for_signal_timeout` for, before it's replaced
-// via `TerminateIfRunning`, must not stay in `harvest_signals` forever — this
-// backend has no retention/GC pass, so nothing else will ever reclaim it.
+// A signal can reach a still-RUNNING execution whose workflow never reaches a
+// matching `wait_for_signal`/`wait_for_signal_timeout`. `TerminateIfRunning`
+// then replaces that execution. The signal must not stay in `harvest_signals`
+// forever. This backend has no retention/GC pass, so nothing else will ever
+// reclaim it.
 #[tokio::test]
 async fn terminate_if_running_orphans_an_undelivered_signal_across_repeated_cycles() {
     let (_dir, path) = temp_db();
@@ -498,10 +499,11 @@ async fn terminate_if_running_orphans_an_undelivered_signal_across_repeated_cycl
     );
 }
 
-// A signal staged while the prior is RUNNING can outlive it even when the prior
-// reaches COMPLETED on its own (the workflow completes without ever awaiting that
-// signal name) — that prior is sealed via the same "already-terminal" path, which
-// skips the cancellation branch, so the signal cleanup must not live inside it.
+// A signal staged while the prior is RUNNING can outlive it. This happens even
+// when the prior reaches COMPLETED on its own: the workflow completes without
+// ever awaiting that signal name. That prior is sealed via the same
+// "already-terminal" path, which skips the cancellation branch. So the signal
+// cleanup must not live inside that branch.
 #[tokio::test]
 async fn terminate_if_running_orphans_an_undelivered_signal_on_an_already_completed_prior() {
     let (_dir, path) = temp_db();

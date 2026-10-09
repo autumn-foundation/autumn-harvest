@@ -4430,9 +4430,9 @@ pub async fn enforce_external_signals_outbox(
                         // and holding a cold connect to 250 ms would fail it
                         // forever rather than slowly. See
                         // `external_target_location::peer_acquire_bound`.
-                        let mut target_conn = match tokio::time::timeout(
+                        let mut target_conn = match crate::replication::fenced_get_within(
+                            pool,
                             crate::external_target_location::peer_acquire_bound(pool),
-                            pool.get(),
                         )
                         .await
                         {
@@ -4983,9 +4983,9 @@ pub async fn enforce_external_cancels_outbox(
 
                     // Bounded for the same reason as the signal outbox above
                     // (issue #1146, Codex round 1 P1).
-                    let mut target_conn = match tokio::time::timeout(
+                    let mut target_conn = match crate::replication::fenced_get_within(
+                        pool,
                         crate::external_target_location::peer_acquire_bound(pool),
-                        pool.get(),
                     )
                     .await
                     {
@@ -5344,9 +5344,9 @@ pub async fn enforce_external_cancels_outbox(
                         // This check is best-effort already: it logs its own
                         // errors instead of propagating them. It logs a
                         // timed-out acquisition and skips it the same way.
-                        match tokio::time::timeout(
+                        match crate::replication::fenced_get_within(
+                            pool,
                             crate::external_target_location::peer_acquire_bound(pool),
-                            pool.get(),
                         )
                         .await
                         {
@@ -5630,9 +5630,9 @@ pub async fn enforce_external_awaits_outbox(
                     // another pool in the same process. One timeout checker
                     // runs per assigned shard. See
                     // `external_target_location::peer_acquire_bound`.
-                    let mut target_conn = match tokio::time::timeout(
+                    let mut target_conn = match crate::replication::fenced_get_within(
+                        pool,
                         crate::external_target_location::peer_acquire_bound(pool),
-                        pool.get(),
                     )
                     .await
                     {
@@ -6417,6 +6417,16 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
                 }
                 () = tokio::time::sleep(sleep) => {}
             }
+            // Issue #1823: a held shard skips the tick before it takes a connection.
+            // It can be an unreachable standby, so a checkout could wait on it.
+            if crate::replication::shard_writes_held(pool_shard) {
+                skip_tick(&mut ran_last_tick, &mut leader_failures);
+                // The loop is still alive, so a skipped tick still counts.
+                for owner in &owners {
+                    crate::scanner_health::record_scanner_tick(&*telemetry.metrics, *owner);
+                }
+                continue;
+            }
 
             // Bounded to `interval`. Unbounded pool contention here would
             // silently stretch this loop's actual period past `interval`,
@@ -6449,6 +6459,19 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
             for label in &metric_shards {
                 telemetry.metrics.record_db_pool_wait(*label, waited);
             }
+            // The fence opens only after the checkout. A tick that waits for a
+            // connection holds no barrier, so pool pressure cannot block a bump. The
+            // tick runs under the barrier of this shard and each pinned shard
+            // colocated with it. A fenced shard skips the tick, and a lost barrier
+            // stops it.
+            let Some(fence) = crate::replication::begin_shard_tick(&pool, pool_shard).await else {
+                skip_tick(&mut ran_last_tick, &mut leader_failures);
+                // The loop is still alive, so a skipped tick still counts.
+                for owner in &owners {
+                    crate::scanner_health::record_scanner_tick(&*telemetry.metrics, *owner);
+                }
+                continue;
+            };
             match get_result {
                 Ok(Ok(mut conn)) => {
                     let abdicated =
@@ -6487,25 +6510,39 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
                     }
                     ran_last_tick = role.runs_pass();
                     if role.runs_pass() {
-                        let failed = match enforce_timeouts_once_on_conn_shard(
-                            &mut conn,
-                            pool_shard,
-                            &metric_shards,
-                            TaskScan::Batch {
-                                cursor: &mut cursor,
-                                limit: task_batch_size,
-                            },
-                            &*telemetry.metrics,
-                            unknown_target_grace_window,
-                            &sharded_pool,
-                            &shard_assignments,
-                            Some(&circuit_breakers),
-                            max_workflow_history_events,
-                            session_worker_stale_secs,
-                            &payload_codecs,
-                            codec_rotation_batch_size,
+                        // Issue #1823: the pass runs under the tick's fence
+                        // barrier. A lost barrier stops it before its next
+                        // write.
+                        let failed = match crate::replication::run_fenced_pass(
+                            &fence,
+                            Box::pin(async {
+                                // Issue #1823: the older connection joins the pass.
+                                // A lost guard then ends its backend.
+                                let _member =
+                                    crate::replication::join_fenced_pass(&pool, &mut conn).await;
+                                enforce_timeouts_once_on_conn_shard(
+                                    &mut conn,
+                                    pool_shard,
+                                    &metric_shards,
+                                    TaskScan::Batch {
+                                        cursor: &mut cursor,
+                                        limit: task_batch_size,
+                                    },
+                                    &*telemetry.metrics,
+                                    unknown_target_grace_window,
+                                    &sharded_pool,
+                                    &shard_assignments,
+                                    Some(&circuit_breakers),
+                                    max_workflow_history_events,
+                                    session_worker_stale_secs,
+                                    &payload_codecs,
+                                    codec_rotation_batch_size,
+                                )
+                                .await
+                            }),
                         )
                         .await
+                        .and_then(|done| done)
                         {
                             Ok(enforced_count) => {
                                 if enforced_count > 0 {
@@ -6602,10 +6639,24 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
         //
         // The bound is fixed, not the scan interval. Worker shutdown awaits
         // each checker in turn, so a long interval would add up per shard.
+        //
+        // Issue #1823: the tick's fence is gone by now, so the release takes a
+        // fresh one. A held or fenced shard skips it, and the lease expires
+        // after its TTL. A stale release could expire a lease that the
+        // promoted region holds under the same worker id.
         if let Some(lease) = &lease {
             let release = async {
-                let mut conn = pool.get().await.map_err(|e| e.to_string())?;
-                lease.release(&mut conn).await.map_err(|e| e.to_string())
+                let fence = crate::replication::begin_shard_tick(&pool, pool_shard)
+                    .await
+                    .ok_or_else(|| "the shard is held or fenced".to_string())?;
+                crate::replication::run_fenced_pass(&fence, async {
+                    let mut conn = crate::replication::fenced_checkout(&pool)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    lease.release(&mut conn).await.map_err(|e| e.to_string())
+                })
+                .await
+                .map_err(|e| e.to_string())?
             };
             match tokio::time::timeout(crate::scanner_lease::LEASE_RELEASE_BOUND, release).await {
                 Ok(Ok(())) => {}

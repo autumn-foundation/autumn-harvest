@@ -6892,9 +6892,11 @@ pub(crate) const fn shard_acquire_bound(
 async fn acquire_shard_conn(
     pool: &DbPool,
     acquire_bound: Option<Duration>,
-) -> HarvestResult<crate::pool::PooledConn> {
+) -> HarvestResult<crate::replication::FencedConn> {
     let bound = acquire_bound.unwrap_or_else(|| crate::pool::acquire_bound(pool));
-    crate::pool::acquire(pool, bound).await
+    // A startup write runs under a fence (issue #1823). There the wait stays
+    // below a bump's lock timeout, and a failed checkout drops the guards.
+    crate::replication::fenced_acquire(pool, bound).await
 }
 
 /// Register the static rate-limit buckets of `registry`'s activities.
@@ -12459,16 +12461,16 @@ async fn persist_all_started_child_workflows(
         // capability-miss pre-check and handler resolution already
         // succeeded, so capability is proven -- only the quota-governed
         // key's admission is blocked (Codex round-3 review).
-        // Issue #1227 (follow-up to #946/#1221's Codex round-6 review):
-        // a park immediately followed by an unconditional wake degenerates
-        // into a zero-delay retry loop against a durably exhausted quota
-        // (e.g. `max_dead_letters`, which only clears via manual operator
-        // action) -- hot-spinning this parent's decision cycle on every
-        // poll with no backoff at all. Route through the same bounded
-        // jittered backoff `recover_from_child_quota_exceeded` already
-        // gives the three other `QuotaExceeded` catch sites in this file
-        // instead of re-implementing the park+wake pattern its own doc
-        // comment warns against.
+        // Issue #1227 (follow-up to #946/#1221): a park immediately
+        // followed by an unconditional wake degenerates into a zero-delay
+        // retry loop against a durably exhausted quota. An example is
+        // `max_dead_letters`, which only clears via manual operator action.
+        // The loop hot-spins this parent's decision cycle on every poll
+        // with no backoff at all. So route through the bounded jittered
+        // backoff of `recover_from_child_quota_exceeded`. That helper
+        // already serves the three other `QuotaExceeded` catch sites in
+        // this file. Do not re-implement the park+wake pattern that its
+        // own doc comment warns against.
         Err(error @ HarvestError::QuotaExceeded { .. }) => {
             recover_from_child_quota_exceeded(conn, task_id, parent_exec_id, &error).await?;
             return Ok(());
@@ -13404,12 +13406,12 @@ async fn persist_child_timeout_race(
             // capacity condition. The whole transaction above rolled back
             // (no child row, no timer row, no parent events persisted).
             //
-            // Issue #1227 (follow-up to #946/#1221's Codex round-6 review):
-            // park immediately followed by an unconditional wake is a
-            // zero-delay retry loop against a durably exhausted quota, so
-            // route through `recover_from_child_quota_exceeded`'s bounded
-            // jittered backoff rather than re-implementing the anti-pattern
-            // its own doc comment warns against.
+            // Issue #1227 (follow-up to #946/#1221): park immediately
+            // followed by an unconditional wake is a zero-delay retry loop
+            // against a durably exhausted quota. So route through the
+            // bounded jittered backoff of `recover_from_child_quota_exceeded`.
+            // Do not re-implement the anti-pattern that its own doc comment
+            // warns against.
             Err(error @ HarvestError::QuotaExceeded { .. }) => {
                 recover_from_child_quota_exceeded(conn, task_id, parent_exec_id, &error).await?;
                 return Ok(());
@@ -13950,13 +13952,14 @@ async fn persist_mixed_suspension_batch(
         // key, never a genuine failure of THIS parent. The whole transaction
         // above rolled back (no child rows, no timer rows, no events).
         //
-        // Issue #1227 (follow-up sweep after the original fix, which named
-        // only the two OTHER child-persist paths as "mirrored" here): a park
+        // Issue #1227 (follow-up sweep): the original fix named only the
+        // two OTHER child-persist paths as "mirrored" here. A park
         // immediately followed by an unconditional wake is the same
-        // zero-delay retry loop those two paths were rewritten to avoid, so
-        // this third site gets the identical fix -- route through
-        // `recover_from_child_quota_exceeded`'s bounded jittered backoff
-        // rather than re-implementing the anti-pattern.
+        // zero-delay retry loop that those two paths were rewritten to
+        // avoid. So this third site gets the identical fix. It routes
+        // through the bounded jittered backoff of
+        // `recover_from_child_quota_exceeded` and does not re-implement
+        // the anti-pattern.
         Err(error @ HarvestError::QuotaExceeded { .. }) => {
             recover_from_child_quota_exceeded(conn, task_id, exec_id, &error).await?;
             return Ok(());
@@ -30449,6 +30452,9 @@ fn spawn_replication_sampler(
                 .await
                 {
                     ShardSample::Fenced => {
+                        // Shutdown skips its database writes after this. See
+                        // `FenceRegistry::is_fenced_out` (issue #1823).
+                        crate::replication::FenceRegistry::mark_fenced_out();
                         cancel.cancel();
                         return;
                     }
@@ -30462,6 +30468,68 @@ fn spawn_replication_sampler(
             }
         }
     })
+}
+
+/// Run one startup write for `shard` under its fence barrier (issue #1823).
+///
+/// `None` means the write did not run, or stopped: the shard is held or
+/// fenced, or the barrier was lost. The caller then retries later, under the
+/// fence again. With no pin, the write runs as before.
+async fn fenced_startup_write<T>(
+    pool: &DbPool,
+    shard: crate::types::ShardId,
+    write: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    let fence = crate::replication::begin_shard_tick(pool, Some(shard)).await?;
+    crate::replication::run_fenced_pass(&fence, Box::pin(write))
+        .await
+        .ok()
+}
+
+/// Whether a shutdown write must be skipped because this process lost write
+/// authority (issue #1823). Another region owns the rows now, and may reuse
+/// this worker id. The new region's orphan reclaim recovers the claims.
+fn skip_fenced_shutdown_write(worker_id: &str, what: &str) -> bool {
+    let fenced = crate::replication::FenceRegistry::is_fenced_out();
+    if fenced {
+        tracing::warn!(
+            worker_id,
+            what,
+            "skipping a shutdown write: this process lost DR write authority"
+        );
+    }
+    fenced
+}
+
+/// Run one shutdown write under the shard's live fence (issue #1823).
+///
+/// The fenced-out flag alone is not enough. The sampler stops with the
+/// worker, so a bump during shutdown never sets it. The guard holds the
+/// barrier while the write runs, so a bump cannot commit in between.
+///
+/// `None` means the write was skipped. The process lost write authority, the
+/// shard is held, the fence is unreadable, or the guard session ended.
+async fn fenced_shutdown_write<T>(
+    pool: &DbPool,
+    shard: Option<crate::types::ShardId>,
+    worker_id: &str,
+    what: &str,
+    write: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    if skip_fenced_shutdown_write(worker_id, what) {
+        return None;
+    }
+    let KeeperFence::Write(fence) = keeper_fence(pool, shard, worker_id, what).await else {
+        tracing::warn!(
+            worker_id,
+            what,
+            "skipping a shutdown write: the shard fence forbids it"
+        );
+        return None;
+    };
+    crate::replication::run_fenced_pass(&fence, write)
+        .await
+        .ok()
 }
 
 /// What one shard's DR sample concluded.
@@ -30515,7 +30583,9 @@ async fn sample_one_shard(
         // same condition.
         return ShardSample::Continue;
     };
-    match crate::replication::assert_fence(&mut conn, shard_id).await {
+    // The group covers every pinned shard colocated with this one (issue
+    // #1823), so a bump of a colocated peer stops this worker too.
+    match crate::replication::assert_fence_group(&mut conn, shard_id).await {
         Ok(()) => {}
         Err(crate::error::HarvestError::ShardFenced {
             shard_id: fenced,
@@ -30531,6 +30601,18 @@ async fn sample_one_shard(
                  another region now holds write authority. Shutting down. Do NOT \
                  restart against the old region — see \
                  docs/runbooks/cross-region-failover.md"
+            );
+            return ShardSample::Fenced;
+        }
+        // A generation row this process did not pin (issue #1823). Claims
+        // already fail closed. The worker stops, and a restart pins the row.
+        Err(crate::error::HarvestError::Config(message)) => {
+            telemetry.metrics.record_shard_fenced(shard_u16);
+            tracing::error!(
+                shard_id = shard_id.as_i32(),
+                %message,
+                "stopping: this database holds a shard row this process did not pin. \
+                 Restart the process to pin it."
             );
             return ShardSample::Fenced;
         }
@@ -31071,7 +31153,7 @@ struct WorkerMonitoringHandles {
     stranded_work_sampler: Option<tokio::task::JoinHandle<()>>,
     /// Cross-region DR sampler (issue #954): replication watermark beat,
     /// measured-RPO gauges, and this worker's periodic self-fence check.
-    /// `Some` only when `dr_fencing` is enabled and a sharded pool exists.
+    /// `Some` only when this worker is fenced (issue #1823).
     replication_sampler: Option<tokio::task::JoinHandle<()>>,
     /// Overdue-schedule gauge sampler (issue #696). `Some` under `db` (the task
     /// itself no-ops when metrics are disabled); `None` without `db`.
@@ -31125,6 +31207,13 @@ fn spawn_pause_auto_resumer(
                 () = cancel.cancelled() => break,
                 () = tokio::time::sleep(interval) => {}
             }
+            // Issue #1823: a held shard skips the tick before it takes a connection.
+            // It can be an unreachable standby, so a checkout could wait on it.
+            if crate::replication::shard_writes_held(shard) {
+                // The loop is still alive, so a skipped tick still counts.
+                crate::scanner_health::record_scanner_tick(&*telemetry.metrics, owner);
+                continue;
+            }
 
             // Selected against `cancel` (issue #1426). See the comment
             // above `spawn_worker_heartbeat`'s own `pool.get()` call for
@@ -31134,14 +31223,35 @@ fn spawn_pause_auto_resumer(
                 () = cancel.cancelled() => break,
                 result = pool.get() => result,
             };
+            // The fence opens only after the checkout. A tick that waits for a
+            // connection holds no barrier, so pool pressure cannot block a bump. The
+            // tick runs under the barrier of this shard and each pinned shard
+            // colocated with it. A fenced shard skips the tick, and a lost barrier
+            // stops it.
+            let Some(fence) = crate::replication::begin_shard_tick(&pool, shard).await else {
+                // The loop is still alive, so a skipped tick still counts.
+                crate::scanner_health::record_scanner_tick(&*telemetry.metrics, owner);
+                continue;
+            };
             match get_result {
                 Ok(mut conn) => {
-                    match crate::execution::auto_resume_expired_pauses(
-                        &mut conn,
-                        max_pause_duration,
-                        &*telemetry.metrics,
+                    match crate::replication::run_fenced_pass(
+                        &fence,
+                        Box::pin(async {
+                            // Issue #1823: the older connection joins the pass.
+                            // A lost guard then ends its backend.
+                            let _member =
+                                crate::replication::join_fenced_pass(&pool, &mut conn).await;
+                            crate::execution::auto_resume_expired_pauses(
+                                &mut conn,
+                                max_pause_duration,
+                                &*telemetry.metrics,
+                            )
+                            .await
+                        }),
                     )
                     .await
+                    .and_then(|done| done)
                     {
                         Ok(n) if n > 0 => {
                             tracing::warn!(resumed = n, "auto-resumed over-long paused executions");
@@ -32233,6 +32343,9 @@ struct UnstartedClaim {
     /// claim settled, so the lease keeper never counts it as abandoned.
     claims: LiveClaims,
     key: Option<ClaimKey>,
+    /// The task's shard, from its execution id. The release runs under that
+    /// shard's fence (issue #1823).
+    shard: crate::types::ShardId,
 }
 
 impl UnstartedClaim {
@@ -32249,6 +32362,11 @@ impl UnstartedClaim {
             key: task
                 .started_at
                 .map(|started_at| (task.id, task.attempt, started_at)),
+            shard: task
+                .workflow_exec_id
+                .map_or(crate::types::ShardId::UNENCODED, |id| {
+                    crate::types::ShardId::from_uuid(&id)
+                }),
         }
     }
 
@@ -32262,11 +32380,29 @@ impl UnstartedClaim {
     /// does not drop the release or the refund. The body stays live
     /// meanwhile, so the lease keeper does not release this claim too.
     async fn release(self, pool: &DbPool) {
+        let Some(worker_id) = self.claim.as_ref().map(|claim| claim.worker_id.clone()) else {
+            return;
+        };
+        let shard = Some(self.shard);
+        fenced_shutdown_write(
+            pool,
+            shard,
+            &worker_id,
+            "unstarted-claim release",
+            Box::pin(self.release_now(pool)),
+        )
+        .await;
+    }
+
+    /// [`Self::release`], once the fence allows the write.
+    async fn release_now(self, pool: &DbPool) {
         let Some(claim) = self.claim else {
             return;
         };
         let mut conn =
-            match crate::pool::acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS).await {
+            match crate::replication::fenced_acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS)
+                .await
+            {
                 Ok(conn) => conn,
                 Err(error) => {
                     tracing::warn!(
@@ -33443,10 +33579,13 @@ impl Worker {
         // it had not yet pinned. A subsequent `pin_dr_generations` failure
         // then left those registrations behind, with no heartbeat started
         // to clean them up.
-        if !self.pin_dr_generations(default_pool).await {
+        let Ok((dr_targets, held)) = self.pin_dr_generations(default_pool).await else {
             self.shutdown.cancel();
             return;
-        }
+        };
+        // A fence anywhere in this process stops this worker too (issue #1823).
+        crate::replication::FenceRegistry::register_worker_shutdown(&self.shutdown);
+        let _held_resolver = self.spawn_held_resolver(held);
 
         // The retry guards live as long as this run (issue #1788).
         let (registration_pending_per_shard, _bucket_retries) =
@@ -33462,7 +33601,8 @@ impl Worker {
         // `default_pool`.
         let shard_pools_for_pressure: Vec<DbPool> =
             shard_targets.iter().map(|(_, p)| p.clone()).collect();
-        let monitors = self.spawn_monitoring_tasks(default_pool, &shard_pools_for_pressure);
+        let monitors =
+            self.spawn_monitoring_tasks(default_pool, &shard_pools_for_pressure, dr_targets);
         let heartbeat_cancel = CancellationToken::new();
 
         // Spawn one heartbeat task per shard pool so every shard's harvest_workers
@@ -33473,13 +33613,14 @@ impl Worker {
             .iter()
             .zip(&registration_pending_per_shard)
             .enumerate()
-            .map(|(index, ((_, shard_pool), pending))| {
+            .map(|(index, ((shard, shard_pool), pending))| {
                 AbortOnDrop::new(self.spawn_heartbeat_task(
                     shard_pool,
                     Arc::clone(&monitors.workflow_slot_target),
                     Arc::clone(&monitors.activity_slot_target),
                     heartbeat_cancel.clone(),
                     Arc::clone(pending),
+                    *shard,
                     index,
                 ))
             })
@@ -33520,9 +33661,10 @@ impl Worker {
             .await;
 
         // Stopped: mark every shard pool's worker row stopped, then cancel heartbeats.
-        for (_, shard_pool) in &shard_targets {
+        for (shard, shard_pool) in &shard_targets {
             self.transition_fleet_status(
                 shard_pool,
+                Some(*shard),
                 crate::workers::WorkerStatus::Stopped,
                 shutdown_acquire_bound,
             )
@@ -33924,20 +34066,38 @@ impl Worker {
         // `may_claim_tasks` for why an unregistered worker must not claim.
         // Fence FIRST: pinning must precede fleet registration and the first
         // poll, so a DR-enabled worker is never briefly unfenced (issue #954).
-        if !self.pin_dr_generations(pool).await {
+        let Ok((dr_targets, held)) = self.pin_dr_generations(pool).await else {
             self.shutdown.cancel();
             return;
-        }
+        };
+        // A fence anywhere in this process stops this worker too (issue #1823).
+        crate::replication::FenceRegistry::register_worker_shutdown(&self.shutdown);
+        let _held_resolver = self.spawn_held_resolver(held);
 
-        let registration_pending =
-            Arc::new(AtomicBool::new(self.register_in_fleet(pool, None).await));
+        // A held or fenced shard gets no startup write (issue #1823). The
+        // heartbeat and the bucket retry write later, under the fence.
+        let held_gate = self
+            .dr_fence_targets(pool)
+            .map_or(crate::types::ShardId::UNENCODED, |(_, shard)| shard);
+        let registration_pending = Arc::new(AtomicBool::new(
+            fenced_startup_write(pool, held_gate, self.register_in_fleet(pool, None))
+                .await
+                .unwrap_or(true),
+        ));
 
         // Auto-register rate limit buckets for the activities configured on this worker.
         // A registration that does not complete runs again in the background.
-        let _bucket_retry = (!self.register_rate_limit_buckets(pool, None).await)
-            .then(|| self.spawn_rate_limit_bucket_retry(pool, None));
+        let buckets_done = fenced_startup_write(
+            pool,
+            held_gate,
+            self.register_rate_limit_buckets(pool, None),
+        )
+        .await
+        .unwrap_or(false);
+        let _bucket_retry =
+            (!buckets_done).then(|| self.spawn_rate_limit_bucket_retry(pool, None, held_gate));
 
-        let monitors = self.spawn_monitoring_tasks(pool, std::slice::from_ref(pool));
+        let monitors = self.spawn_monitoring_tasks(pool, std::slice::from_ref(pool), dr_targets);
         let heartbeat_cancel = CancellationToken::new();
         let heartbeat_handle = AbortOnDrop::new(self.spawn_heartbeat_task(
             pool,
@@ -33945,6 +34105,7 @@ impl Worker {
             Arc::clone(&monitors.activity_slot_target),
             heartbeat_cancel.clone(),
             Arc::clone(&registration_pending),
+            held_gate,
             0,
         ));
 
@@ -33992,21 +34153,22 @@ impl Worker {
         // from the signal. A slow pool cannot spend the grace period on
         // this bookkeeping first (issue #1813).
         let bookkeeping = async {
-            self.transition_fleet_status(pool, crate::workers::WorkerStatus::Draining, None)
+            self.transition_fleet_status(pool, None, crate::workers::WorkerStatus::Draining, None)
                 .await;
-            self.release_sticky_pins(pool, None).await;
+            self.release_sticky_pins(pool, None, None).await;
         };
         tracing::info!(worker_id = %self.config.worker_id, "draining in-flight tasks");
         tokio::join!(bookkeeping, self.drain_in_flight());
-        self.keep_lease_while_handlers_run(vec![pool.clone()]);
+        // A single pool names its shard through the default pin.
+        self.keep_lease_while_handlers_run(vec![(None, pool.clone())]);
 
         // A decision that parked during the drain pinned its task again.
         // Release once more. A task that outlived the drain keeps its pin.
-        self.release_sticky_pins(pool, None).await;
+        self.release_sticky_pins(pool, None, None).await;
         self.close_workflow_cache().await;
 
         // All tasks complete — mark Stopped, then stop the heartbeat task.
-        self.transition_fleet_status(pool, crate::workers::WorkerStatus::Stopped, None)
+        self.transition_fleet_status(pool, None, crate::workers::WorkerStatus::Stopped, None)
             .await;
         heartbeat_cancel.cancel();
 
@@ -34034,145 +34196,126 @@ impl Worker {
     // alone, matching the pre-existing single-default-pool pattern
     // documented below.
     /// Pin this worker's cross-region DR write-authority epoch for every shard
-    /// it can reach (issue #954).
+    /// it can reach (issues #954, #1823).
     ///
     /// Runs **before** the worker registers in the fleet or claims anything, so
-    /// there is no window in which a DR-enabled worker is unfenced. For each
-    /// shard it provisions the `harvest_shard_generation` row if absent and
-    /// pins whatever epoch is in force; from then on the claim gate and the
-    /// persist assert compare against that pinned value.
+    /// there is no window in which a fenced worker is unfenced.
+    /// [`crate::replication::pin_process_fence`] resolves the mode. `Auto`
+    /// fences when a shard database carries a DR marker. For each fenced shard
+    /// it provisions the `harvest_shard_generation` row if absent and pins the
+    /// epoch in force. From then on the claim gate and the persist assert
+    /// compare against that pinned value.
+    ///
+    /// Returns the fenced `(shard, pool)` targets (`None` when the worker runs
+    /// unfenced) and the shards it holds, or `Err(())` when it must not start.
+    /// A held shard is one the worker could not probe. See
+    /// [`crate::replication::pin_worker_fence`].
     ///
     /// # Fail closed
     ///
-    /// If a shard's epoch cannot be read, this **refuses to start the worker**
-    /// rather than running unfenced. An operator who asked for `dr_fencing`
-    /// asked for a guarantee, and a worker that silently downgraded to
-    /// "no fencing today" because of a startup blip is worse than one that does
-    /// not start: the blip is visible and a supervisor retries it, whereas the
-    /// silent downgrade is discovered during a failover.
-    ///
-    /// A no-op when `dr_fencing` is off — no statement is issued.
+    /// If a shard's epoch cannot be read, or the configuration disagrees with
+    /// the database, this **refuses to start the worker** rather than running
+    /// unfenced. A silent downgrade to "no fencing today" is worse than a
+    /// failed start. A failed start is visible, and a supervisor retries it.
+    /// A silent downgrade is found only during a failover.
     #[cfg(feature = "db")]
-    async fn pin_dr_generations(&self, fallback_pool: &DbPool) -> bool {
-        use crate::replication::FenceRegistry;
-
-        if !self.config.dr.fencing {
-            return true;
-        }
-
-        let Some((targets, default_shard)) = self.dr_fence_targets(fallback_pool) else {
+    #[allow(clippy::type_complexity)]
+    async fn pin_dr_generations(
+        &self,
+        fallback_pool: &DbPool,
+    ) -> Result<
+        (
+            Option<Vec<(crate::types::ShardId, DbPool)>>,
+            Vec<(crate::types::ShardId, DbPool)>,
+        ),
+        (),
+    > {
+        crate::replication::pin_worker_fence(
+            self.config.dr.fencing,
+            &self.config.dr.slot_prefix,
+            self.dr_fence_targets(fallback_pool),
+            fallback_pool,
+            &self.config.shard_assignments,
+        )
+        .await
+        .map_err(|error| {
             tracing::error!(
                 worker_id = %self.config.worker_id,
-                "dr_fencing is enabled but this worker has no shard identity: no sharded pool and \
-                 no shard assignments, so there is no shard number an operator could address it \
-                 by with `harvest dr fence`. Refusing to start rather than pinning a fabricated \
-                 shard 0."
+                error = %error,
+                "refusing to start: cross-region DR fencing could not be resolved"
             );
-            return false;
-        };
-
-        // Built locally and published in ONE write below. Registering shard by
-        // shard would leave a partially-published, `ENABLED = true` registry
-        // with no default shard behind on a mid-loop failure — under which
-        // `expected(UNENCODED)` returns `None` and every pre-sharding execution
-        // id in the process silently persists UNFENCED.
-        let mut pinned: Vec<(crate::types::ShardId, crate::replication::ShardGeneration)> =
-            Vec::with_capacity(targets.len());
-        for (shard_id, pool) in &targets {
-            let mut conn = match crate::pool::acquire_within_pool_bound(pool).await {
-                Ok(conn) => conn,
-                Err(error) => {
-                    tracing::error!(
-                        worker_id = %self.config.worker_id,
-                        shard_id = %shard_id.as_i32(),
-                        error = %error,
-                        "dr_fencing is enabled but this shard's connection could not be \
-                         acquired; refusing to start unfenced"
-                    );
-                    return false;
-                }
-            };
-            match crate::replication::ensure_generation_row(&mut conn, *shard_id).await {
-                Ok(generation) => {
-                    pinned.push((*shard_id, generation));
-                    tracing::info!(
-                        worker_id = %self.config.worker_id,
-                        shard_id = %shard_id.as_i32(),
-                        generation = generation.as_i64(),
-                        "pinned shard write-authority generation for cross-region DR fencing"
-                    );
-                }
-                Err(error) => {
-                    tracing::error!(
-                        worker_id = %self.config.worker_id,
-                        shard_id = %shard_id.as_i32(),
-                        error = %error,
-                        "dr_fencing is enabled but this shard's generation could not be \
-                         provisioned or read; refusing to start unfenced"
-                    );
-                    return false;
-                }
-            }
-        }
-        if let Err(conflict) = FenceRegistry::publish(&pinned, default_shard) {
-            match conflict {
-                crate::replication::PublishConflict::Generation(c) => tracing::error!(
-                    worker_id = %self.config.worker_id,
-                    shard_id = c.shard_id,
-                    already_pinned = c.pinned,
-                    attempted = c.attempted,
-                    "refusing to start: {conflict}"
-                ),
-                crate::replication::PublishConflict::DefaultShard(c) => tracing::error!(
-                    worker_id = %self.config.worker_id,
-                    already_pinned_default_shard = c.pinned,
-                    attempted_default_shard = c.attempted,
-                    "refusing to start: {conflict}"
-                ),
-            }
-            return false;
-        }
-        true
+        })
     }
 
-    /// The `(shard, pool)` set this worker fences, and the shard that
-    /// [`crate::types::ShardId::UNENCODED`] execution ids resolve to.
+    /// Re-probe the shards this worker held at startup (issue #1823).
     ///
-    /// `None` means this worker has no shard identity at all and so cannot be
-    /// fenced coherently — see `pin_dr_generations`.
-    ///
-    /// The default shard is [`crate::shard::ShardedDbPool::default_shard`], not
-    /// the numerically lowest member. `ShardedDbPool::from_map` accepts any
-    /// member as its default and `pool_for_execution` routes unencoded ids
-    /// there, so taking `min(shard_ids)` instead would make `assert_fence`
-    /// query the wrong shard's row against the default shard's *database*,
-    /// find nothing, and fail closed — a permanent spurious fence on every
-    /// execution id minted before sharding.
+    /// Retries with backoff until every held shard is released. A held shard
+    /// that now carries a DR marker stops the worker, so it restarts and pins.
+    /// The task ends with the run, because the guard aborts it on drop.
+    #[cfg(feature = "db")]
+    fn spawn_held_resolver(
+        &self,
+        held: Vec<(crate::types::ShardId, DbPool)>,
+    ) -> Option<AbortOnDrop> {
+        /// Releases this worker's remaining holds when the task ends or is
+        /// aborted, so a stopped worker leaves no hold behind. A shard found
+        /// to carry a DR marker leaves this list and stays held.
+        struct HeldShards(Vec<(crate::types::ShardId, DbPool)>);
+        impl Drop for HeldShards {
+            fn drop(&mut self) {
+                for (shard, _) in &self.0 {
+                    crate::replication::FenceRegistry::release_held(*shard);
+                }
+            }
+        }
+
+        if held.is_empty() {
+            return None;
+        }
+        let shutdown = self.shutdown.clone();
+        let worker_id = self.config.worker_id.clone();
+        let slot_prefix = self.config.dr.slot_prefix.clone();
+        // Built before the spawn, so a task aborted before its first poll
+        // still drops the guard and releases the holds.
+        let mut held = HeldShards(held);
+        Some(AbortOnDrop::new(tokio::spawn(async move {
+            let mut delay = Duration::from_secs(1);
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => return,
+                    () = tokio::time::sleep(delay) => {}
+                }
+                if let Err(error) =
+                    crate::replication::resolve_held(&mut held.0, &slot_prefix).await
+                {
+                    tracing::error!(
+                        worker_id = %worker_id,
+                        error = %error,
+                        "stopping: a held shard needs a DR pin"
+                    );
+                    // The process must restart and pin, so the holds stay.
+                    // The shard may be an unpromoted standby, so shutdown
+                    // writes nothing to the database (issue #1823).
+                    held.0.clear();
+                    crate::replication::FenceRegistry::mark_fenced_out();
+                    shutdown.cancel();
+                    return;
+                }
+                if held.0.is_empty() {
+                    return;
+                }
+                delay = (delay * 2).min(Duration::from_secs(10));
+            }
+        })))
+    }
+
+    /// This worker's DR fence targets. See [`dr_fence_targets`].
     #[cfg(feature = "db")]
     fn dr_fence_targets(
         &self,
         fallback_pool: &DbPool,
     ) -> Option<(Vec<(crate::types::ShardId, DbPool)>, crate::types::ShardId)> {
-        if let Some(sp) = self.config.sharded_pool.as_ref() {
-            let targets: Vec<(crate::types::ShardId, DbPool)> = sp
-                .iter_shards()
-                .map(|(id, pool)| (id, pool.clone()))
-                .collect();
-            if targets.is_empty() {
-                return None;
-            }
-            return Some((targets, sp.default_shard()));
-        }
-        // No sharded pool: this worker's single database is whichever shard its
-        // assignments name. An empty list is NOT collapsed to shard 0 — that is
-        // the fabrication `resolve_shard_assignments` deliberately refuses to
-        // make, and here it would pin a `shard_id = 0` row into a database whose
-        // logical shard is numbered something else, so an operator's
-        // `harvest dr fence --shard 7=...` would bump a different row and fence
-        // nothing at all.
-        // UFCS: diesel's blanket `RunQueryDsl::first` shadows `slice::first`.
-        let shard = <[crate::types::ShardId]>::first(&self.config.shard_assignments).copied()?;
-        Some((vec![(shard, fallback_pool.clone())], shard))
+        dr_fence_targets(&self.config, fallback_pool)
     }
 
     #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
@@ -34180,6 +34323,7 @@ impl Worker {
         &self,
         pool: &DbPool,
         pressure_pools: &[DbPool],
+        dr_targets: Option<Vec<(crate::types::ShardId, DbPool)>>,
     ) -> WorkerMonitoringHandles {
         // Pools the queue-depth/age, concurrency, rate-limit, and history-
         // oversized samplers aggregate over (issue #522 review). When a
@@ -34397,12 +34541,13 @@ impl Worker {
         // same interval via `enforce_timeouts_once`).
         let session_slot_reconcilers: Vec<_> = shard_pools_for_monitors
             .iter()
-            .map(|(shard_pool, _shard)| {
+            .map(|(shard_pool, shard)| {
                 crate::sessions::spawn_session_slot_reconciler(
                     shard_pool.clone(),
                     Arc::clone(&self.session_slots_in_use),
                     self.shutdown.clone(),
                     self.config.worker_heartbeat_interval,
+                    *shard,
                 )
             })
             .collect();
@@ -34739,9 +34884,8 @@ impl Worker {
         });
 
         // Cross-region DR sampler (issue #954): measured RPO + this worker's
-        // periodic self-fence check. Only started when the operator opted into
-        // `dr_fencing` AND a sharded pool is available; a deployment that has
-        // not opted in spawns nothing and pays nothing.
+        // periodic self-fence check. Only started when this worker is fenced
+        // (issue #1823). An unfenced worker spawns nothing and pays nothing.
         //
         // Deliberately NOT gated on `metrics.is_enabled()`, unlike the samplers
         // around it: two of its three jobs are correctness, not observability.
@@ -34750,7 +34894,7 @@ impl Worker {
         // authority. Neither may be silently switched off by a deployment that
         // simply has no metrics sink.
         #[cfg(feature = "db")]
-        let replication_sampler = if self.config.dr.fencing {
+        let replication_sampler = dr_targets.map(|targets| {
             // Every deployment shape, not just sharded ones. Gating this on
             // `sharded_pool.is_some()` left the DOCUMENTED single-database
             // configuration — `.with_dr_fencing(true)` and nothing else — with
@@ -34758,22 +34902,23 @@ impl Worker {
             // the RPO reads `unknown` forever) and no self-fence check (so a
             // fenced worker never stops, keeps heartbeating fleet coverage, and
             // polls silently claiming nothing: the exact state this sampler's
-            // docs say must never exist).
-            self.dr_fence_targets(pool).map(|(targets, _)| {
-                spawn_replication_sampler(
-                    targets,
-                    self.shutdown.clone(),
-                    self.registry.telemetry().clone(),
-                    self.config.dr.sample_interval,
-                    self.config.dr.watermark_retain,
-                    self.config.dr.slot_prefix.clone(),
-                )
-            })
-        } else {
+            // docs say must never exist). `dr_targets` is what
+            // `pin_dr_generations` fenced, so the sampler watches exactly the
+            // pinned shards (issue #1823).
+            spawn_replication_sampler(
+                targets,
+                self.shutdown.clone(),
+                self.registry.telemetry().clone(),
+                self.config.dr.sample_interval,
+                self.config.dr.watermark_retain,
+                self.config.dr.slot_prefix.clone(),
+            )
+        });
+        #[cfg(not(feature = "db"))]
+        let replication_sampler: Option<tokio::task::JoinHandle<()>> = {
+            drop(dr_targets);
             None
         };
-        #[cfg(not(feature = "db"))]
-        let replication_sampler: Option<tokio::task::JoinHandle<()>> = None;
 
         // Stranded-work sampler (issue #522): emits a gauge per shard showing
         // how many claimable tasks have no live covering worker. Iterates ALL
@@ -34867,6 +35012,7 @@ impl Worker {
     /// on `Worker`: `run_multi_shard` spawns one heartbeat per shard, and a
     /// shared flag would let a shard whose registration succeeded clear the
     /// retry a *failed* shard still needs (issue #804, Codex round-50 P1).
+    #[allow(clippy::too_many_arguments)]
     fn spawn_heartbeat_task(
         &self,
         pool: &DbPool,
@@ -34874,6 +35020,7 @@ impl Worker {
         activity_slot_target: Arc<AtomicUsize>,
         heartbeat_cancel: CancellationToken,
         registration_pending: Arc<AtomicBool>,
+        held_gate: crate::types::ShardId,
         // Issue #1815: this heartbeat's slot in the worker's shard peer views.
         // The single pool uses slot 0. `run_multi_shard` gives each shard its
         // own slot.
@@ -34923,6 +35070,7 @@ impl Worker {
             Arc::clone(&self.session_slots_in_use),
             registration_pending,
             self.registry.payload_codecs().clone(),
+            Some(held_gate),
             crate::workers::OutlierProbe {
                 window: Arc::clone(&self.task_outcomes),
                 metrics: Arc::clone(&self.registry.telemetry().metrics),
@@ -34969,7 +35117,10 @@ impl Worker {
                         workflow_panic_max_attempts: self.config.workflow_panic_max_attempts,
                         poison_pill_threshold: self.config.poison_pill_threshold,
                         cancellation_grace_period: self.config.cancellation_grace_period,
-                        dr_fencing: self.config.dr.fencing,
+                        // The resolved state, not the mode: `Auto` fences
+                        // only a database with a DR marker (issue #1823).
+                        // The fence is pinned before the heartbeat starts.
+                        dr_fencing: crate::replication::FenceRegistry::is_enabled(),
                     },
                     payload: self.registry.payload_policy(),
                 }),
@@ -36227,15 +36378,25 @@ impl Worker {
         let startup_bound = shard_acquire_bound(true, self.config.poll_interval);
         let mut registration_pending_per_shard = Vec::with_capacity(shard_targets.len());
         let mut bucket_retries = Vec::new();
-        for (_, shard_pool) in shard_targets {
+        for (shard, shard_pool) in shard_targets {
+            // A held or fenced shard gets no startup write (issue #1823). Its
+            // heartbeat and bucket retry write later, under the fence.
+            let registration = self.register_in_fleet(shard_pool, startup_bound);
             registration_pending_per_shard.push(Arc::new(AtomicBool::new(
-                self.register_in_fleet(shard_pool, startup_bound).await,
+                fenced_startup_write(shard_pool, *shard, registration)
+                    .await
+                    .unwrap_or(true),
             )));
-            if !self
-                .register_rate_limit_buckets(shard_pool, startup_bound)
+            let buckets = self.register_rate_limit_buckets(shard_pool, startup_bound);
+            if !fenced_startup_write(shard_pool, *shard, buckets)
                 .await
+                .unwrap_or(false)
             {
-                bucket_retries.push(self.spawn_rate_limit_bucket_retry(shard_pool, startup_bound));
+                bucket_retries.push(self.spawn_rate_limit_bucket_retry(
+                    shard_pool,
+                    startup_bound,
+                    *shard,
+                ));
             }
         }
         (registration_pending_per_shard, bucket_retries)
@@ -36271,6 +36432,7 @@ impl Worker {
         &self,
         pool: &DbPool,
         acquire_bound: Option<Duration>,
+        held_gate: crate::types::ShardId,
     ) -> AbortOnDrop {
         let pool = pool.clone();
         let registry = Arc::clone(&self.registry);
@@ -36283,13 +36445,16 @@ impl Worker {
                 let registry = Arc::clone(&registry);
                 let worker_id = worker_id.clone();
                 async move {
-                    let done = register_static_rate_limit_buckets(
+                    // A held or fenced shard gets no write (issue #1823).
+                    let write = register_static_rate_limit_buckets(
                         &pool,
                         acquire_bound,
                         &registry,
                         &worker_id,
-                    )
-                    .await;
+                    );
+                    let done = fenced_startup_write(&pool, held_gate, write)
+                        .await
+                        .unwrap_or(false);
                     if done {
                         tracing::info!(
                             worker_id = %worker_id,
@@ -36306,29 +36471,45 @@ impl Worker {
     /// Release the sticky pins of this worker on one pool (issue #1798).
     ///
     /// Best effort. A failure only makes a peer wait up to one sticky window.
-    async fn release_sticky_pins(&self, pool: &DbPool, acquire_bound: Option<Duration>) {
+    async fn release_sticky_pins(
+        &self,
+        pool: &DbPool,
+        shard: Option<crate::types::ShardId>,
+        acquire_bound: Option<Duration>,
+    ) {
         let worker_id = self.config.worker_id.as_str();
-        match acquire_shard_conn(pool, acquire_bound).await {
-            Ok(mut conn) => match queue::release_worker_sticky_pins(&mut conn, worker_id).await {
-                Ok(released) => {
-                    tracing::debug!(worker_id, released, "released sticky pins at shutdown");
-                }
+        let release = async {
+            match acquire_shard_conn(pool, acquire_bound).await {
+                Ok(mut conn) => match queue::release_worker_sticky_pins(&mut conn, worker_id).await
+                {
+                    Ok(released) => {
+                        tracing::debug!(worker_id, released, "released sticky pins at shutdown");
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            worker_id,
+                            error = %error,
+                            "failed to release sticky pins at shutdown"
+                        );
+                    }
+                },
                 Err(error) => {
                     tracing::warn!(
                         worker_id,
                         error = %error,
-                        "failed to release sticky pins at shutdown"
+                        "failed to get pool connection to release sticky pins"
                     );
                 }
-            },
-            Err(error) => {
-                tracing::warn!(
-                    worker_id,
-                    error = %error,
-                    "failed to get pool connection to release sticky pins"
-                );
             }
-        }
+        };
+        fenced_shutdown_write(
+            pool,
+            shard,
+            worker_id,
+            "sticky-pin release",
+            Box::pin(release),
+        )
+        .await;
     }
 
     /// Drain in-flight tasks of a multi-shard worker, with a sticky-pin
@@ -36349,25 +36530,31 @@ impl Worker {
         acquire_bound: Option<Duration>,
     ) {
         let bookkeeping = async {
-            for (_, shard_pool) in shard_targets {
+            for (shard, shard_pool) in shard_targets {
                 self.transition_fleet_status(
                     shard_pool,
+                    Some(*shard),
                     crate::workers::WorkerStatus::Draining,
                     acquire_bound,
                 )
                 .await;
             }
-            for (_, shard_pool) in shard_targets {
-                self.release_sticky_pins(shard_pool, acquire_bound).await;
+            for (shard, shard_pool) in shard_targets {
+                self.release_sticky_pins(shard_pool, Some(*shard), acquire_bound)
+                    .await;
             }
         };
         tracing::info!(worker_id = %self.config.worker_id, "draining in-flight tasks (multi-shard)");
         tokio::join!(bookkeeping, self.drain_in_flight());
         self.keep_lease_while_handlers_run(
-            shard_targets.iter().map(|(_, pool)| pool.clone()).collect(),
+            shard_targets
+                .iter()
+                .map(|(shard, pool)| (Some(*shard), pool.clone()))
+                .collect(),
         );
-        for (_, shard_pool) in shard_targets {
-            self.release_sticky_pins(shard_pool, acquire_bound).await;
+        for (shard, shard_pool) in shard_targets {
+            self.release_sticky_pins(shard_pool, Some(*shard), acquire_bound)
+                .await;
         }
         self.close_workflow_cache().await;
     }
@@ -36382,31 +36569,42 @@ impl Worker {
     async fn transition_fleet_status(
         &self,
         pool: &DbPool,
+        shard: Option<crate::types::ShardId>,
         status: crate::workers::WorkerStatus,
         acquire_bound: Option<Duration>,
     ) {
-        match acquire_shard_conn(pool, acquire_bound).await {
-            Ok(mut conn) => {
-                if let Err(error) =
-                    crate::workers::transition_status(&mut conn, &self.config.worker_id, status)
-                        .await
-                {
+        let update = async {
+            match acquire_shard_conn(pool, acquire_bound).await {
+                Ok(mut conn) => {
+                    if let Err(error) =
+                        crate::workers::transition_status(&mut conn, &self.config.worker_id, status)
+                            .await
+                    {
+                        tracing::warn!(
+                            worker_id = %self.config.worker_id,
+                            ?status,
+                            error = %error,
+                            "failed to update worker fleet status"
+                        );
+                    }
+                }
+                Err(error) => {
                     tracing::warn!(
                         worker_id = %self.config.worker_id,
-                        ?status,
                         error = %error,
-                        "failed to update worker fleet status"
+                        "failed to get pool connection for fleet status update"
                     );
                 }
             }
-            Err(error) => {
-                tracing::warn!(
-                    worker_id = %self.config.worker_id,
-                    error = %error,
-                    "failed to get pool connection for fleet status update"
-                );
-            }
-        }
+        };
+        fenced_shutdown_write(
+            pool,
+            shard,
+            &self.config.worker_id,
+            "fleet status update",
+            Box::pin(update),
+        )
+        .await;
     }
 
     /// Emit rate-limit throttle metrics for all bound queues.
@@ -36485,7 +36683,7 @@ impl Worker {
         pool: &DbPool,
         acquire_bound: Option<Duration>,
         shard: Option<crate::types::ShardId>,
-    ) -> HarvestResult<crate::pool::PooledConn> {
+    ) -> HarvestResult<crate::replication::FencedConn> {
         let started = std::time::Instant::now();
         let result = acquire_shard_conn(pool, acquire_bound).await;
         let waited = started.elapsed().as_secs_f64();
@@ -37580,16 +37778,20 @@ impl Worker {
     /// [`observe_task_cancellation`]. Two live instances with the same worker
     /// id share one lease row, so each hides the other while both run. That
     /// is true of the normal heartbeat too.
-    fn keep_lease_while_handlers_run(&self, pools: Vec<DbPool>) {
+    fn keep_lease_while_handlers_run(&self, pools: Vec<(Option<crate::types::ShardId>, DbPool)>) {
+        if skip_fenced_shutdown_write(&self.config.worker_id, "shutdown lease keeper") {
+            return;
+        }
         let interval = keeper_interval(self.config.worker_heartbeat_interval);
         if self.dispatched.tracker.is_empty() {
             // Every body ended in the drain. One of them can still have left
             // its claim `RUNNING` after a failed write, so sweep anyway.
-            for pool in pools {
+            for (shard, pool) in pools {
                 let worker_id = self.config.worker_id.clone();
                 let live_claims = Arc::clone(&self.dispatched.live);
                 tokio::spawn(async move {
-                    final_abandoned_claim_sweep(&pool, &worker_id, &live_claims, interval).await;
+                    final_abandoned_claim_sweep(&pool, shard, &worker_id, &live_claims, interval)
+                        .await;
                 });
             }
             return;
@@ -37603,7 +37805,7 @@ impl Worker {
         // One task for each pool, so a stalled shard pool cannot stop the
         // refresh of another shard. Detached on purpose: the handlers they
         // guard are detached too.
-        for pool in pools {
+        for (shard, pool) in pools {
             let dispatched = self.dispatched.tracker.clone();
             let worker_id = self.config.worker_id.clone();
             let live_claims = Arc::clone(&self.dispatched.live);
@@ -37621,13 +37823,27 @@ impl Worker {
                             // A replacement worker with the same id can keep
                             // the row fresh, so orphan reclaim may never take
                             // that claim. Sweep until it succeeds.
-                            final_abandoned_claim_sweep(&pool, &worker_id, &live_claims, interval)
-                                .await;
+                            final_abandoned_claim_sweep(
+                                &pool, shard, &worker_id, &live_claims, interval,
+                            )
+                            .await;
                             return;
                         }
                         () = tokio::time::sleep_until(next) => {
-                            let touched = tokio::time::timeout(bound, async {
-                                let mut conn = crate::pool::acquire(&pool, bound).await?;
+                            // Issue #1823: this task outlives the sampler, so
+                            // each refresh checks the fence itself.
+                            let fence = match keeper_fence(&pool, shard, &worker_id, "shutdown lease keeper").await {
+                                KeeperFence::Stop => return,
+                                KeeperFence::Skip => None,
+                                KeeperFence::Write(fence) => Some(fence),
+                            };
+                            let Some(fence) = fence else {
+                                next = tokio::time::Instant::now()
+                                    + next_lease_refresh(interval, false);
+                                continue;
+                            };
+                            let touched = tokio::time::timeout(bound, crate::replication::run_fenced_pass(&fence, Box::pin(async {
+                                let mut conn = crate::replication::fenced_acquire(&pool, bound).await?;
                                 let touched =
                                     crate::workers::touch_worker_liveness(&mut conn, &worker_id)
                                         .await?;
@@ -37645,8 +37861,10 @@ impl Worker {
                                 // each claim that no body holds.
                                 release_abandoned_claims(&mut conn, &worker_id, &live_claims)
                                     .await
-                            })
-                            .await;
+                            })))
+                            .await
+                            .map(|done| done.and_then(|done| done));
+                            drop(fence);
                             let error = match touched {
                                 Ok(Ok(_)) => None,
                                 Ok(Err(error)) => Some(error.to_string()),
@@ -37743,6 +37961,7 @@ fn next_lease_refresh(heartbeat_interval: Duration, refreshed: bool) -> Duration
 /// the first failure is logged.
 async fn final_abandoned_claim_sweep(
     pool: &DbPool,
+    shard: Option<crate::types::ShardId>,
     worker_id: &str,
     claims: &LiveClaims,
     heartbeat_interval: Duration,
@@ -37758,11 +37977,31 @@ async fn final_abandoned_claim_sweep(
         if !pending {
             return;
         }
-        let swept = tokio::time::timeout(bound, async {
-            let mut conn = crate::pool::acquire(pool, bound).await?;
-            release_abandoned_claims(&mut conn, worker_id, claims).await
-        })
-        .await;
+        // Issue #1823: this task outlives the sampler, so each attempt
+        // checks the fence itself.
+        let fence = match keeper_fence(pool, shard, worker_id, "abandoned-claim sweep").await {
+            KeeperFence::Stop => return,
+            KeeperFence::Skip => None,
+            KeeperFence::Write(fence) => Some(fence),
+        };
+        let swept = match &fence {
+            Some(fence) => tokio::time::timeout(
+                bound,
+                crate::replication::run_fenced_pass(
+                    fence,
+                    Box::pin(async {
+                        let mut conn = crate::replication::fenced_acquire(pool, bound).await?;
+                        release_abandoned_claims(&mut conn, worker_id, claims).await
+                    }),
+                ),
+            )
+            .await
+            .map(|done| done.and_then(|done| done)),
+            None => Ok(Err(crate::error::HarvestError::Database(
+                "the shard is held or its fence check failed".to_string(),
+            ))),
+        };
+        drop(fence);
         if matches!(swept, Ok(Ok(_))) {
             return;
         }
@@ -37774,6 +38013,56 @@ async fn final_abandoned_claim_sweep(
             );
         }
         tokio::time::sleep(next_lease_refresh(heartbeat_interval, true)).await;
+    }
+}
+
+/// What a shutdown lease-keeper write may do (issue #1823).
+enum KeeperFence {
+    /// Write under these guards. Empty when this process pins nothing.
+    Write(Vec<crate::replication::FencePassGuard>),
+    /// Skip this attempt and try again later: the shard is held, or the
+    /// fence could not be read.
+    Skip,
+    /// Stop for good: this process lost write authority.
+    Stop,
+}
+
+/// Open the fence for one lease-keeper write (issue #1823).
+///
+/// The keeper outlives the sampler, so it checks the fence on each write. A
+/// superseded pin marks the process fenced out, and the keeper stops.
+async fn keeper_fence(
+    pool: &DbPool,
+    shard: Option<crate::types::ShardId>,
+    worker_id: &str,
+    what: &str,
+) -> KeeperFence {
+    if crate::replication::FenceRegistry::is_fenced_out() {
+        return KeeperFence::Stop;
+    }
+    if crate::replication::shard_writes_held(shard) {
+        return KeeperFence::Skip;
+    }
+    let key = shard.unwrap_or(crate::types::ShardId::UNENCODED);
+    match crate::replication::begin_fenced_group(pool, key).await {
+        Ok(fence) => KeeperFence::Write(fence),
+        Err(
+            error @ (crate::error::HarvestError::ShardFenced { .. }
+            | crate::error::HarvestError::Config(_)),
+        ) => {
+            tracing::error!(
+                worker_id,
+                what,
+                %error,
+                "a shutdown write stops: this process lost DR write authority"
+            );
+            crate::replication::FenceRegistry::mark_fenced_out();
+            KeeperFence::Stop
+        }
+        Err(error) => {
+            tracing::warn!(worker_id, what, %error, "a shutdown write could not read the fence");
+            KeeperFence::Skip
+        }
     }
 }
 
@@ -38800,6 +39089,76 @@ pub(crate) fn under_provisioned_shard_pools(
             })
         })
         .collect()
+}
+
+/// The `(shard, pool)` set this worker fences, and the shard that
+/// [`crate::types::ShardId::UNENCODED`] execution ids resolve to.
+///
+/// `None` means this worker has no shard identity at all and so cannot be
+/// fenced coherently — see `pin_dr_generations`.
+///
+/// The default shard is [`crate::shard::ShardedDbPool::default_shard`], not
+/// the numerically lowest member. `ShardedDbPool::from_map` accepts any
+/// member as its default and `pool_for_execution` routes unencoded ids
+/// there, so taking `min(shard_ids)` instead would make `assert_fence`
+/// query the wrong shard's row against the default shard's *database*,
+/// find nothing, and fail closed — a permanent spurious fence on every
+/// execution id minted before sharding.
+#[cfg(feature = "db")]
+#[must_use]
+pub fn dr_fence_targets(
+    config: &WorkerRuntimeConfig,
+    fallback_pool: &DbPool,
+) -> Option<(Vec<(crate::types::ShardId, DbPool)>, crate::types::ShardId)> {
+    if let Some(sp) = config.sharded_pool.as_ref() {
+        // A runner given one plain pool wraps it as shard 0. Its logical
+        // assignments then all live in that one database, so pin those
+        // (issue #1823).
+        if sp.len() == 1
+            && let Some(first) = <[crate::types::ShardId]>::first(&config.shard_assignments)
+            && let Some((_, pool)) = sp.iter_shards().next()
+        {
+            let targets = config
+                .shard_assignments
+                .iter()
+                .map(|shard| (*shard, pool.clone()))
+                .collect();
+            return Some((targets, *first));
+        }
+        // Shards in one physical pool group share one pool here, even when
+        // `from_dsns` built a pool per DSN alias. The fence sees them as one
+        // database by pool identity, so a claim checks every pin there
+        // (issue #1823).
+        let mut targets: Vec<(crate::types::ShardId, DbPool)> = sp
+            .pool_groups()
+            .into_iter()
+            .flat_map(|(pool, shards)| shards.into_iter().map(|id| (id, pool.clone())))
+            .collect();
+        targets.sort_by_key(|(id, _)| *id);
+        if targets.is_empty() {
+            return None;
+        }
+        return Some((targets, sp.default_shard()));
+    }
+    // No sharded pool: this worker's single database is whichever shard its
+    // assignments name. An empty list is NOT collapsed to shard 0 — that is
+    // the fabrication `resolve_shard_assignments` deliberately refuses to
+    // make, and here it would pin a `shard_id = 0` row into a database whose
+    // logical shard is numbered something else, so an operator's
+    // `harvest dr fence --shard 7=...` would bump a different row and fence
+    // nothing at all.
+    //
+    // Several logical shards may share this one database, and one poll loop
+    // drains them all. Every one is pinned, so fencing any of them stops
+    // this worker's claims and appends for it (issue #1823).
+    // UFCS: diesel's blanket `RunQueryDsl::first` shadows `slice::first`.
+    let shard = <[crate::types::ShardId]>::first(&config.shard_assignments).copied()?;
+    let targets = config
+        .shard_assignments
+        .iter()
+        .map(|shard| (*shard, fallback_pool.clone()))
+        .collect();
+    Some((targets, shard))
 }
 
 #[cfg(test)]
@@ -41137,7 +41496,7 @@ mod tests {
     #[test]
     fn worker_config_from_builder() {
         let builder_cfg = WorkerConfig {
-            dr_fencing: false,
+            dr_fencing: crate::replication::DrFencing::Auto,
             replication_slot_prefix: crate::replication::DEFAULT_DR_SLOT_PREFIX.to_string(),
             replication_sample_interval: Duration::from_secs(15),
             replication_watermark_retain: Duration::from_secs(3600),
@@ -42894,6 +43253,38 @@ mod tests {
         assert_eq!(
             drain_cancel_at(start, deadline, Duration::from_secs(5)),
             start
+        );
+    }
+
+    /// The shutdown lease keeper checks the fence on each write (issue
+    /// #1823). A held shard and an unreadable fence each skip the write. The
+    /// keeper then tries again later.
+    #[test]
+    fn the_lease_keeper_skips_a_write_it_cannot_fence() {
+        use crate::replication::{FenceRegistry, ShardGeneration};
+        let _serial = crate::replication::tests::registry_guard();
+        FenceRegistry::clear();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let pool = unreachable_pool("postgres://127.0.0.1:1/keeper");
+        let shard = crate::types::ShardId::new(3);
+
+        FenceRegistry::hold(&[shard], shard).expect("hold");
+        let held = runtime.block_on(keeper_fence(&pool, Some(shard), "w", "test"));
+        FenceRegistry::clear();
+        FenceRegistry::publish(&[(shard, ShardGeneration::INITIAL)], shard).expect("pin");
+        let unreadable = runtime.block_on(keeper_fence(&pool, Some(shard), "w", "test"));
+        FenceRegistry::clear();
+
+        assert!(
+            matches!(held, KeeperFence::Skip),
+            "a held shard gets no keeper write"
+        );
+        assert!(
+            matches!(unreadable, KeeperFence::Skip),
+            "an unreadable fence skips the write"
         );
     }
 

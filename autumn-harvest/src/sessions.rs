@@ -374,6 +374,8 @@ pub fn spawn_session_slot_reconciler(
     registry: SessionSlotRegistry,
     cancel: tokio_util::sync::CancellationToken,
     interval: std::time::Duration,
+    // The shard this pool serves (issue #1823). A held shard gets no write.
+    shard: Option<crate::types::ShardId>,
 ) -> tokio::task::JoinHandle<()> {
     // Keep the worker dispatch binding for hints (issue #1431).
     crate::dispatch::spawn_bound(async move {
@@ -381,6 +383,11 @@ pub fn spawn_session_slot_reconciler(
             tokio::select! {
                 () = cancel.cancelled() => break,
                 () = tokio::time::sleep(interval) => {}
+            }
+            // Issue #1823: a held shard skips the tick before it takes a connection.
+            // It can be an unreachable standby, so a checkout could wait on it.
+            if crate::replication::shard_writes_held(shard) {
+                continue;
             }
             // Selected against `cancel` (issue #1426). A pool may have no
             // deadpool `Timeouts`, so `pool.get()` alone can park this task
@@ -392,8 +399,27 @@ pub fn spawn_session_slot_reconciler(
                 () = cancel.cancelled() => break,
                 result = pool.get() => result,
             };
+            // The fence opens only after the checkout. A tick that waits for a
+            // connection holds no barrier, so pool pressure cannot block a bump. The
+            // tick runs under the barrier of this shard and each pinned shard
+            // colocated with it. A fenced shard skips the tick, and a lost barrier
+            // stops it.
+            let Some(fence) = crate::replication::begin_shard_tick(&pool, shard).await else {
+                continue;
+            };
             match get_result {
-                Ok(mut conn) => match reconcile_local_sessions(&mut conn, &registry).await {
+                Ok(mut conn) => match crate::replication::run_fenced_pass(
+                    &fence,
+                    Box::pin(async {
+                        // Issue #1823: the older connection joins the pass.
+                        // A lost guard then ends its backend.
+                        let _member = crate::replication::join_fenced_pass(&pool, &mut conn).await;
+                        reconcile_local_sessions(&mut conn, &registry).await
+                    }),
+                )
+                .await
+                .and_then(|done| done)
+                {
                     Ok(released) if released > 0 => {
                         tracing::warn!(
                             released,

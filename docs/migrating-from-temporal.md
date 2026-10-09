@@ -85,6 +85,14 @@ the claim yourself.
 | `SignalWithStart` | `signal_with_start_workflow_execution`, `POST /workflows/{name}/signal-with-start` | issue #244 |
 | Non-blocking signal check (no first-class Temporal equivalent) | `ctx.try_receive_signal` / `ctx.drain_signals` | issue #775 |
 | Duplicate-safe signal delivery (Temporal has no first-class dedup key) | `Idempotency-Key` header on standalone signal delivery | issue #521, issue #753 |
+| Entity workflow pattern: one run per key, a signal loop, `continueAsNew` (no first-class Temporal primitive) | `autumn_harvest::entity::Entity` | [ADR 0006](adr/0006-keyed-entity.md) |
+
+Port a Temporal entity workflow to `autumn_harvest::entity`. Do not copy
+its hand-written signal loop. The library loop drains waiting signals into
+the continue-as-new input. It also records each checkpoint decision, so a
+replay takes the checkpoint at the same signal. A hand-written loop over
+`should_continue_as_new()` can lose a signal or diverge on replay. See
+[ADR 0006](adr/0006-keyed-entity.md).
 
 `condition()` in Temporal accepts any predicate over workflow state. It is
 not limited to one named signal. A predicate such as `approved ||
