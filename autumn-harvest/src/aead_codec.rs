@@ -12,7 +12,8 @@
 //! - [`EnvKeyProvider`] reads a base64 key from an environment variable.
 //! - [`FileKeyProvider`] reads a base64 key from `<dir>/<key_id>.key`.
 //! - [`KmsKeyProvider`] unwraps a wrapped data key through a KMS. The
-//!   `autumn-harvest-plugin` `aws-kms` feature connects it to AWS KMS. This
+//!   `autumn-harvest-plugin` `aws-kms` feature connects it to AWS KMS. The
+//!   `vault-transit` feature connects it to Vault Transit. This
 //!   crate has no cloud dependency.
 //!
 //! ## Rotation
@@ -492,12 +493,13 @@ impl KeyProvider for FileKeyProvider {
 
 /// The one KMS call that [`KmsKeyProvider`] needs.
 ///
-/// The `autumn-harvest-plugin` `aws-kms` feature implements this for AWS
-/// KMS. Other KMS products can implement it too. Implement it with
-/// `#[async_trait]`, as for [`KeyProvider`].
+/// The `autumn-harvest-plugin` `aws-kms` and `vault-transit` features
+/// implement this for AWS KMS and Vault Transit. Other KMS products can
+/// implement it too. Implement it with `#[async_trait]`, as for
+/// [`KeyProvider`].
 pub trait KmsDecrypt: Send + Sync {
-    /// Unwrap `wrapped` with the KMS key `kms_key_id`. Send `context` as
-    /// the encryption context.
+    /// Unwrap `wrapped` with the KMS key `kms_key_id`. Bind the unwrap to
+    /// `context`, so that another context fails.
     ///
     /// The future fails with a reason string when the KMS refuses or cannot
     /// be reached. The string must not hold key material.
@@ -517,9 +519,10 @@ pub trait KmsDecrypt: Send + Sync {
 
 /// Unwraps wrapped data keys through a KMS (envelope encryption).
 ///
-/// Make each wrapped key with the KMS `GenerateDataKey` call. Use the
-/// encryption context `harvest_codec_key_id=<key id>`, see
-/// [`KMS_CONTEXT_KEY_ID`]. Store the wrapped key, not the plaintext key.
+/// Make each wrapped key with the KMS. Bind it to the context
+/// `harvest_codec_key_id=<key id>`, see [`KMS_CONTEXT_KEY_ID`]. On AWS, call
+/// `GenerateDataKey`. On Vault Transit, call `datakey/wrapped`. Store the
+/// wrapped key, not the plaintext key.
 pub struct KmsKeyProvider<D> {
     kms: D,
     kms_key_id: String,
@@ -547,6 +550,8 @@ impl<D: KmsDecrypt> KmsKeyProvider<D> {
     }
 
     /// Add the wrapped data key for `key_id` as raw bytes.
+    ///
+    /// For Vault Transit, pass the `vault:v1:` text as bytes.
     #[must_use]
     pub fn with_wrapped_key(mut self, key_id: impl Into<String>, wrapped: Vec<u8>) -> Self {
         self.wrapped.insert(key_id.into(), wrapped);

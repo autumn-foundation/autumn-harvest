@@ -63,10 +63,7 @@ impl KmsDecrypt for AwsKms {
         for (key, value) in context {
             request = request.encryption_context(key, value);
         }
-        let output = request
-            .send()
-            .await
-            .map_err(|err| aws_sdk_kms::error::DisplayErrorContext(&err).to_string())?;
+        let output = request.send().await.map_err(|err| error_chain(&err))?;
         output
             .plaintext
             .map(|blob| Zeroizing::new(blob.into_inner()))
@@ -74,89 +71,105 @@ impl KmsDecrypt for AwsKms {
     }
 }
 
+/// Join the `Display` text of `err` and each of its sources.
+///
+/// `DisplayErrorContext` also prints the raw HTTP response. That response can
+/// hold the plaintext data key, so this function uses `Display` only.
+fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut text = err.to_string();
+    let mut source = err.source();
+    while let Some(next) = source {
+        text.push_str(": ");
+        text.push_str(&next.to_string());
+        source = next.source();
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use std::collections::BTreeMap;
+
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+
     use super::*;
-    use autumn_harvest::aead_codec::{AeadCodec, DataKey, KMS_CONTEXT_KEY_ID, KmsKeyProvider};
-    use autumn_harvest::payload_codec::PayloadCodec;
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use crate::kms_conformance::{
+        Backend, GARBAGE, HttpRequest, HttpResponse, KmsCall, REFUSAL, Reply,
+    };
 
-    const KEY: [u8; 32] = [0x42; 32];
+    /// AWS KMS speaks JSON 1.1 over HTTP.
+    struct Aws;
 
-    /// Serve one KMS `Decrypt` call on a local port. Return the request body.
-    async fn fake_kms(listener: tokio::net::TcpListener) -> serde_json::Value {
-        let (mut socket, _) = listener.accept().await.unwrap();
-        let mut buf = Vec::new();
-        let body_start = loop {
-            let mut chunk = [0u8; 4096];
-            let n = socket.read(&mut chunk).await.unwrap();
-            buf.extend_from_slice(&chunk[..n]);
-            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                break i + 4;
-            }
-        };
-        let head = String::from_utf8_lossy(&buf[..body_start]).to_lowercase();
-        assert!(
-            head.contains("x-amz-target: trentservice.decrypt"),
-            "{head}"
-        );
-        let length: usize = head
-            .lines()
-            .find_map(|line| line.strip_prefix("content-length:"))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        while buf.len() < body_start + length {
-            let mut chunk = [0u8; 4096];
-            let n = socket.read(&mut chunk).await.unwrap();
-            buf.extend_from_slice(&chunk[..n]);
+    impl Backend for Aws {
+        type Kms = AwsKms;
+        const KMS_KEY_ID: &'static str = "arn:aws:kms:us-east-1:1:key/abc";
+        const WRAPPED: &'static [u8] = b"wrapped-blob";
+
+        fn client(endpoint: &str) -> AwsKms {
+            let config = aws_sdk_kms::Config::builder()
+                .behavior_version(aws_sdk_kms::config::BehaviorVersion::latest())
+                .region(aws_sdk_kms::config::Region::new("us-east-1"))
+                .credentials_provider(aws_sdk_kms::config::Credentials::new(
+                    "AKID", "SECRET", None, None, "test",
+                ))
+                .retry_config(aws_sdk_kms::config::retry::RetryConfig::disabled())
+                .endpoint_url(endpoint)
+                .build();
+            AwsKms::new(aws_sdk_kms::Client::from_conf(config))
         }
-        let request: serde_json::Value =
-            serde_json::from_slice(&buf[body_start..body_start + length]).unwrap();
-        let body = serde_json::json!({
-            "KeyId": "arn:aws:kms:us-east-1:1:key/abc",
-            "Plaintext": DataKey::from_bytes(&KEY).unwrap().to_base64().as_str(),
-        })
-        .to_string();
-        let response = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/x-amz-json-1.1\r\n\
-             content-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        socket.write_all(response.as_bytes()).await.unwrap();
-        request
-    }
 
-    #[tokio::test]
-    async fn aws_kms_unwraps_a_data_key_with_the_key_id_and_context() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(fake_kms(listener));
+        fn respond(_request: &HttpRequest, reply: &Reply) -> HttpResponse {
+            let (status, body) = match reply {
+                Reply::Unwrap(plaintext) => (
+                    200,
+                    serde_json::json!({
+                        "KeyId": Self::KMS_KEY_ID,
+                        "Plaintext": STANDARD.encode(plaintext),
+                    }),
+                ),
+                Reply::Garbage => (
+                    200,
+                    serde_json::json!({"KeyId": Self::KMS_KEY_ID, "Plaintext": GARBAGE}),
+                ),
+                Reply::Refuse => (
+                    400,
+                    serde_json::json!({
+                        "__type": "AccessDeniedException",
+                        "message": REFUSAL,
+                    }),
+                ),
+            };
+            HttpResponse {
+                status,
+                content_type: "application/x-amz-json-1.1",
+                body: body.to_string(),
+                extra_headers: String::new(),
+            }
+        }
 
-        let config = aws_sdk_kms::Config::builder()
-            .behavior_version(aws_sdk_kms::config::BehaviorVersion::latest())
-            .region(aws_sdk_kms::config::Region::new("us-east-1"))
-            .credentials_provider(aws_sdk_kms::config::Credentials::new(
-                "AKID", "SECRET", None, None, "test",
+        fn decrypt_call(request: &HttpRequest) -> Option<KmsCall> {
+            if request.headers.get("x-amz-target")?.as_str() != "TrentService.Decrypt" {
+                return None;
+            }
+            assert_eq!(
+                (request.method.as_str(), request.path.as_str()),
+                ("POST", "/")
+            );
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let context: BTreeMap<String, String> =
+                serde_json::from_value(body["EncryptionContext"].clone()).unwrap();
+            Some((
+                body["KeyId"].as_str().unwrap().to_string(),
+                STANDARD
+                    .decode(body["CiphertextBlob"].as_str().unwrap())
+                    .unwrap(),
+                context,
             ))
-            .endpoint_url(endpoint)
-            .build();
-        let kms = AwsKms::new(aws_sdk_kms::Client::from_conf(config));
-        let keys = KmsKeyProvider::new(kms, "arn:aws:kms:us-east-1:1:key/abc")
-            .with_wrapped_key("2026-10", b"wrapped-blob".to_vec());
-        let codec = AeadCodec::load(&keys, "2026-10").await.unwrap();
-
-        let reference = AeadCodec::new("2026-10", &DataKey::from_bytes(&KEY).unwrap()).unwrap();
-        let stored = reference.encode(b"x").unwrap();
-        assert_eq!(codec.decode(&stored).unwrap(), b"x");
-
-        let request = server.await.unwrap();
-        assert_eq!(request["KeyId"], "arn:aws:kms:us-east-1:1:key/abc");
-        // Base64 of `wrapped-blob`.
-        assert_eq!(request["CiphertextBlob"], "d3JhcHBlZC1ibG9i");
-        assert_eq!(request["EncryptionContext"][KMS_CONTEXT_KEY_ID], "2026-10");
+        }
     }
+
+    crate::kms_conformance::kms_conformance_suite!(Aws);
 }
