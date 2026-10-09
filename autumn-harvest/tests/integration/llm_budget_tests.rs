@@ -651,6 +651,13 @@ async fn a_reset_fork_counts_toward_the_tenant_budget() {
 
     // The fork replays the same input. Its tenant already spent 300 of 250,
     // so its first LLM step is refused.
+    //
+    // The reset runs as an API-only process would: with no workflow metadata
+    // in the process. The fork must still keep the key of its source.
+    let metadata = autumn_harvest::completion_trigger::GLOBAL_WORKFLOW_METADATA
+        .write()
+        .expect("metadata lock")
+        .take();
     let fork = reset_workflow_execution(
         &mut conn,
         source,
@@ -665,9 +672,11 @@ async fn a_reset_fork_counts_toward_the_tenant_budget() {
         },
         None,
     )
-    .await
-    .expect("reset")
-    .new_exec_id;
+    .await;
+    *autumn_harvest::completion_trigger::GLOBAL_WORKFLOW_METADATA
+        .write()
+        .expect("metadata lock") = metadata;
+    let fork = fork.expect("reset").new_exec_id;
     let output = harness.output(fork).await;
     assert_eq!(output["ran"], 0, "{output}");
     assert_eq!(refused(&output), Some("tenant_llm_tokens"));

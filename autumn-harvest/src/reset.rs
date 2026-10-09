@@ -1343,25 +1343,6 @@ async fn terminate_source_execution(
     Ok((deferred, closed_children))
 }
 
-/// The key of a reset fork: the key of its source when the workflow type has a
-/// tenant LLM cap (issue #1997), else `None`.
-fn fork_quota_key(source: &WorkflowExecution) -> Option<&str> {
-    let tenant_budget = crate::completion_trigger::GLOBAL_WORKFLOW_METADATA
-        .read()
-        .ok()
-        .and_then(|lock| {
-            lock.as_ref()
-                .and_then(|map| map.get(&source.workflow_name))
-                .and_then(|meta| meta.quota)
-        })
-        .is_some_and(|policy| policy.has_tenant_llm_cap());
-    if tenant_budget {
-        source.quota_key.as_deref()
-    } else {
-        None
-    }
-}
-
 async fn insert_fork_execution(
     conn: &mut AsyncPgConnection,
     source: &WorkflowExecution,
@@ -1452,17 +1433,14 @@ async fn insert_fork_execution(
         // enforcement) -- issue #946 AC3 scopes quota enforcement to
         // registry-aware *start* paths (plain start, signal-/update-with-start,
         // batch, schedule tick/backfill, debounce/throttle fires), which does
-        // not include reset. `None` here keeps the fork invisible to quota
-        // accounting rather than silently double-counting it against
-        // whatever key its original admission resolved: `load_quota_usage`'s
-        // `WHERE quota_key = $2` never matches NULL, and `list_quota_usage`
-        // filters `WHERE quota_key IS NOT NULL`, so a reset fork neither
-        // consumes headroom nor is blocked by one.
+        // not include reset. The fork is never refused here.
         //
-        // A type with a tenant LLM cap (issue #1997) is the exception. The
-        // fork keeps the key of its source, so its LLM steps count toward the
-        // same tenant budget from the first step.
-        quota_key: fork_quota_key(source),
+        // The fork keeps the key of its source (issue #1997). The key is the
+        // same value that `quota_reconcile` would backfill from the same
+        // input. Without it the fork would read no tenant LLM spend, and its
+        // ledger rows would never count for the tenant. The copy needs no
+        // workflow registry, so a reset from an API-only process keeps it too.
+        quota_key: source.quota_key.as_deref(),
     };
 
     diesel::insert_into(harvest_workflow_executions::table)
