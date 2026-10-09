@@ -2435,4 +2435,4 @@ standalone note rather than part of the claim-path attribution table above:
   — the cost of a one-step workflow against a bare activity (issue #1987).
   It writes 17 rows per job with a regular activity and 10 with a local
   activity. A bare task row writes 3, and a modelled standalone job 6.
-  [ADR 0006](adr/0006-standalone-activity.md) records the decision.
+  [ADR 0007](adr/0007-standalone-activity.md) records the decision.

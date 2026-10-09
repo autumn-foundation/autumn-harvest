@@ -189,5 +189,5 @@ cases:
 - [Worker routing and queue weights](getting-started/09-worker-routing.md)
 - [Claim order under overload](operations/claim-order.md)
 - [Tenant cells](sharding.md#tenant-cells-issue-1837)
-- ADR: [0006](adr/0006-fairness-keys-start-time-fair-queuing.md)
+- ADR: [0008](adr/0008-fairness-keys-start-time-fair-queuing.md)
 - Design record: `DESIGN-1976.md`

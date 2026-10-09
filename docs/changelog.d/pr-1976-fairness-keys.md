@@ -30,7 +30,7 @@ claim statement is byte-identical.
   task.
 - **Invariants.** No new `WorkflowEvent` variant. Migration
   `20261008040947_harvest_fairness_keys` adds a nullable column and two
-  tables. ADR 0006 records the design.
+  tables. ADR 0008 records the design.
 - **Evidence.** Red test
   `tenant_flood_holds_tenant_b_within_the_bound_with_fairness_keys` (B waited
   199 claims before; at most 1 after). Property proofs in

@@ -376,4 +376,6 @@ mod workflow_retry_tests;
 mod workflow_schema_contract_tests;
 mod workflow_task_timeout_tests;
 #[cfg(feature = "testing")]
+mod workflow_test_env_mid_run_tests;
+#[cfg(feature = "testing")]
 mod workflow_test_env_tests;

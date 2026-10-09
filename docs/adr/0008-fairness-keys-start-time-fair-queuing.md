@@ -1,4 +1,4 @@
-# ADR 0006: Fairness keys use start-time fair queuing in the claim
+# ADR 0008: Fairness keys use start-time fair queuing in the claim
 
 ## Status
 
