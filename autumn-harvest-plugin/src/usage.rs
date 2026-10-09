@@ -364,6 +364,25 @@ mod tests {
             activity_executions: 0,
             activity_executions_failed: 0,
             activity_compute_seconds: 0.0,
+            llm_calls: 0,
+            llm_input_tokens: 0,
+            llm_output_tokens: 0,
+            llm_cost_usd_micros: 0,
+            llm_unpriced_calls: 0,
+            llm_latency_ms: 0,
+        }
+    }
+
+    /// A row that carries only agent cost ledger figures (issue #1996).
+    fn llm_row(group: &str, calls: i64, tokens: (i64, i64), cost: i64, unpriced: i64) -> UsageShardRow {
+        UsageShardRow {
+            llm_calls: calls,
+            llm_input_tokens: tokens.0,
+            llm_output_tokens: tokens.1,
+            llm_cost_usd_micros: cost,
+            llm_unpriced_calls: unpriced,
+            llm_latency_ms: calls * 100,
+            ..row(group, 0, 0, 0)
         }
     }
 
@@ -750,7 +769,7 @@ mod tests {
     }
 
     #[test]
-    fn record_serializes_exactly_the_nine_ac_fields() {
+    fn record_serializes_the_issue_596_fields_and_the_ledger_fields() {
         let record = UsageGroupRecord {
             group: "acme".to_string(),
             workflow_starts: 1,
@@ -768,6 +787,12 @@ mod tests {
         keys.sort_unstable();
         let mut expected = vec![
             "group",
+            "llm_calls",
+            "llm_input_tokens",
+            "llm_output_tokens",
+            "llm_cost_usd_micros",
+            "llm_unpriced_calls",
+            "llm_latency_ms",
             "workflow_starts",
             "completed",
             "failed",
@@ -779,6 +804,54 @@ mod tests {
         ];
         expected.sort_unstable();
         assert_eq!(keys, expected);
+    }
+
+    #[test]
+    fn merge_sums_the_llm_ledger_fields_across_shards() {
+        let response = build_usage_response(
+            at(0),
+            at(3600),
+            &UsageGroupBy::SearchAttr("tenant_id".to_string()),
+            vec![
+                obs(0, vec![llm_row("acme", 2, (1_000, 200), 5_000, 0)], None),
+                obs(1, vec![llm_row("acme", 1, (50, 5), 0, 1)], None),
+            ],
+            TEST_MAX_GROUPS,
+        )
+        .unwrap();
+        let value = serde_json::to_value(&response).unwrap();
+        let acme = &value["groups"][0];
+        assert_eq!(acme["group"], "acme");
+        assert_eq!(acme["llm_calls"], 3);
+        assert_eq!(acme["llm_input_tokens"], 1_050);
+        assert_eq!(acme["llm_output_tokens"], 205);
+        assert_eq!(acme["llm_cost_usd_micros"], 5_000);
+        assert_eq!(acme["llm_unpriced_calls"], 1);
+        assert_eq!(acme["llm_latency_ms"], 300);
+    }
+
+    #[test]
+    fn a_group_with_no_ledger_rows_reports_zero_llm_figures() {
+        let response = build_usage_response(
+            at(0),
+            at(3600),
+            &UsageGroupBy::WorkflowName,
+            vec![obs(0, vec![row("billing", 4, 4, 0)], None)],
+            TEST_MAX_GROUPS,
+        )
+        .unwrap();
+        let value = serde_json::to_value(&response).unwrap();
+        let billing = &value["groups"][0];
+        for field in [
+            "llm_calls",
+            "llm_input_tokens",
+            "llm_output_tokens",
+            "llm_cost_usd_micros",
+            "llm_unpriced_calls",
+            "llm_latency_ms",
+        ] {
+            assert_eq!(billing[field], 0, "{field}");
+        }
     }
 
     #[test]

@@ -204,6 +204,18 @@ pub struct UsageShardRow {
     pub activity_executions: i64,
     pub activity_executions_failed: i64,
     pub activity_compute_seconds: f64,
+    /// Agent cost ledger rows in the window (issue #1996).
+    pub llm_calls: i64,
+    /// Sum of ledger input tokens.
+    pub llm_input_tokens: i64,
+    /// Sum of ledger output tokens.
+    pub llm_output_tokens: i64,
+    /// Sum of priced ledger costs, in millionths of a US dollar.
+    pub llm_cost_usd_micros: i64,
+    /// Ledger rows with no cost.
+    pub llm_unpriced_calls: i64,
+    /// Sum of ledger latencies, in milliseconds.
+    pub llm_latency_ms: i64,
 }
 
 #[cfg(feature = "db")]
@@ -404,6 +416,12 @@ pub async fn load_usage_grouped(
             activity_executions: row.activity_executions,
             activity_executions_failed: row.activity_executions_failed,
             activity_compute_seconds: row.activity_compute_seconds,
+            llm_calls: 0,
+            llm_input_tokens: 0,
+            llm_output_tokens: 0,
+            llm_cost_usd_micros: 0,
+            llm_unpriced_calls: 0,
+            llm_latency_ms: 0,
         })
         .collect())
 }

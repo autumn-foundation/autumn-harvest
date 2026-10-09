@@ -372,6 +372,9 @@ pub mod info;
 pub mod interceptor;
 /// Every persisted workflow execution state and every sanctioned transition.
 pub mod lifecycle;
+/// Agent cost ledger: model, tokens, cost and latency per LLM step (issue
+/// #1996).
+pub mod llm_ledger;
 /// `cfg(loom)` synchronization-primitive shim (std under normal builds).
 ///
 /// Contained to the modules that opt into loom model checking; see

@@ -16676,6 +16676,58 @@ mod usage_cli_tests {
     }
 
     #[test]
+    fn format_usage_table_renders_the_llm_ledger_columns() {
+        let value = serde_json::json!({
+            "status": "complete",
+            "from": "2026-01-01T00:00:00Z",
+            "to": "2026-02-01T00:00:00Z",
+            "group_by": "search_attr:tenant_id",
+            "groups": [
+                {
+                    "group": "acme",
+                    "workflow_starts": 1,
+                    "completed": 1,
+                    "failed": 0,
+                    "cancelled": 0,
+                    "timed_out": 0,
+                    "activity_executions": 2,
+                    "activity_executions_failed": 0,
+                    "activity_compute_seconds": 1.0,
+                    "llm_calls": 3,
+                    "llm_input_tokens": 1_250,
+                    "llm_output_tokens": 340,
+                    "llm_cost_usd_micros": 1_234_567,
+                    "llm_unpriced_calls": 0,
+                    "llm_latency_ms": 900
+                }
+            ],
+            "unavailable_shards": []
+        });
+        let rendered = format_usage_table(&value);
+        for column in ["LLM_CALLS", "LLM_IN", "LLM_OUT", "LLM_COST_USD"] {
+            assert!(rendered.contains(column), "{column}: {rendered}");
+        }
+        assert!(rendered.contains("1250"), "{rendered}");
+        assert!(rendered.contains("340"), "{rendered}");
+        assert!(rendered.contains("1.234567"), "{rendered}");
+    }
+
+    #[test]
+    fn format_usage_table_leaves_llm_cells_blank_for_an_older_server() {
+        let value = serde_json::json!({
+            "status": "complete",
+            "from": "2026-01-01T00:00:00Z",
+            "to": "2026-02-01T00:00:00Z",
+            "group_by": "workflow_name",
+            "groups": [{"group": "onboarding", "workflow_starts": 1}],
+            "unavailable_shards": []
+        });
+        let rendered = format_usage_table(&value);
+        assert!(rendered.contains("LLM_COST_USD"), "{rendered}");
+        assert!(!rendered.contains("0.000000"), "{rendered}");
+    }
+
+    #[test]
     fn format_usage_table_notes_unavailable_shards() {
         let value = serde_json::json!({
             "status": "partial",

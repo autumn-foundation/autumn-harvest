@@ -646,6 +646,71 @@ async fn a_timer_parked_execution_migrates_end_to_end() {
     assert_eq!(attrs.value.as_deref(), Some("acme"));
 }
 
+/// Issue #1996: the agent cost ledger moves with the run. A row left on the
+/// source would drop out of the usage report of the target shard.
+#[tokio::test]
+async fn the_llm_ledger_moves_with_the_run() {
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "entity-ledger").await;
+    let mut source = shards.source().await;
+    diesel::sql_query(
+        "INSERT INTO harvest_llm_ledger \
+             (workflow_exec_id, event_id, call_index, activity_name, model, \
+              input_tokens, output_tokens, cost_usd_micros, latency_ms) \
+         VALUES ($1, 1, 0, 'llm_step', 'model-moved', 120, 30, 450, 800)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut source)
+    .await
+    .expect("seed a ledger row");
+
+    let outcome = migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migration must not error");
+    assert!(
+        matches!(outcome, MigrationOutcome::Migrated { .. }),
+        "expected a completed migration, got {outcome:?}"
+    );
+
+    let mut target = shards.target().await;
+    let moved: ScalarText = diesel::sql_query(
+        "SELECT concat_ws('/', event_id, call_index, activity_name, model, input_tokens, \
+                output_tokens, cost_usd_micros, latency_ms) AS value \
+           FROM harvest_llm_ledger WHERE workflow_exec_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .get_result(&mut target)
+    .await
+    .expect("the ledger row is on the target");
+    assert_eq!(
+        moved.value.as_deref(),
+        Some("1/0/llm_step/model-moved/120/30/450/800")
+    );
+
+    // The sealed source keeps its copy, but only the target reports it.
+    let query = autumn_harvest::usage::UsageQuery {
+        group_by: autumn_harvest::usage::UsageGroupBy::WorkflowName,
+        from: Utc::now() - Duration::hours(1),
+        to: Utc::now() + Duration::hours(1),
+    };
+    let llm_calls = |rows: Vec<autumn_harvest::usage::UsageShardRow>| {
+        rows.iter()
+            .filter(|row| row.group == "entity_flow")
+            .map(|row| row.llm_calls)
+            .sum::<i64>()
+    };
+    let on_source =
+        autumn_harvest::usage::load_usage_grouped(&mut source, SOURCE.as_i32(), &query, 100)
+            .await
+            .expect("usage on the source");
+    let on_target =
+        autumn_harvest::usage::load_usage_grouped(&mut target, TARGET.as_i32(), &query, 100)
+            .await
+            .expect("usage on the target");
+    assert_eq!(llm_calls(on_source), 0, "the sealed source reports nothing");
+    assert_eq!(llm_calls(on_target), 1, "the target reports the call once");
+}
+
 /// Issue #1317 review, P1: a retained terminal copy of an UNRELATED
 /// execution can already occupy the target's active-uniqueness slot for
 /// this business key. Reconciliation lets a fresh run start on the shard a
