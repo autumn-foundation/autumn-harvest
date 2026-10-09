@@ -6249,6 +6249,12 @@ impl WorkflowTestEnv {
         self
     }
 
+    /// The cap on executor iterations of one run.
+    #[must_use]
+    pub const fn max_iterations(&self) -> usize {
+        self.max_iterations
+    }
+
     /// Set the business-level `workflow_id` for the contexts this env builds
     /// (issue #698), so a no-DB test can prove `ctx.info().workflow_id` reports
     /// the configured value. `workflow_id` lives in no `WorkflowEvent`, so it is

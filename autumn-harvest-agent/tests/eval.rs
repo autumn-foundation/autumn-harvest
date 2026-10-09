@@ -511,32 +511,6 @@ async fn a_recorded_tool_failure_fails_the_candidate_at_the_same_call() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_turn_with_many_tool_calls_is_not_cut_by_the_engine() {
-    let source = one_lookup().await;
-    let many: Vec<(String, Value)> = (0..1_100)
-        .map(|n| (format!("m{n}"), json!({ "q": n })))
-        .collect();
-    let list: Vec<(&str, &str, Value)> = many
-        .iter()
-        .map(|(id, arguments)| (id.as_str(), "lookup", arguments.clone()))
-        .collect();
-    let model = ScriptedModel::new(vec![calls(&list, 1), answer("done", 1)]);
-    let (harness, recorder) = candidate(model);
-
-    let evaluation = evaluate(&source, &Candidate::new(harness).max_turns(2))
-        .await
-        .unwrap();
-
-    assert!(
-        matches!(evaluation.candidate, RunEnd::Completed(_)),
-        "{:?}",
-        evaluation.candidate
-    );
-    assert_eq!(evaluation.stubbed_tool_calls, 1_100);
-    assert_eq!(recorder.runs(), Vec::<Value>::new());
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn a_turn_over_the_worker_result_cap_fails_as_in_production() {
     let source = one_lookup().await;
     let long = "x".repeat(2_000);

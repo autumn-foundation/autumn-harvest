@@ -406,12 +406,7 @@ pub async fn evaluate(
         }
     };
 
-    // Each sequential await costs one engine cycle, and one turn can hold any
-    // number of tool calls. The engine cap guards against an endless loop.
-    // The turn cap already bounds this loop, so the harness lifts the cap.
-    let mut env = WorkflowTestEnv::new()
-        .with_max_iterations(usize::MAX)
-        .with_workflow_name(WORKFLOW_NAME)
+    let mut env = engine()
         .mock_activity(agent_model_turn_info().name, model)
         .mock_activity(agent_tool_call_info().name, tool)
         .mock_activity(agent_memory_snapshot_info().name, snapshot)
@@ -759,6 +754,17 @@ fn align_call_ids(
             }
         }
     }
+}
+
+/// The test engine that runs the candidate.
+///
+/// Each sequential await costs one engine cycle, and one turn can hold any
+/// number of tool calls. The engine cap guards against an endless loop. The
+/// turn cap already bounds this loop, so the harness lifts the cap.
+fn engine() -> WorkflowTestEnv {
+    WorkflowTestEnv::new()
+        .with_max_iterations(usize::MAX)
+        .with_workflow_name(WORKFLOW_NAME)
 }
 
 /// The mock of the model activity: the live candidate turn.
@@ -1201,6 +1207,11 @@ mod tests {
             fit_result_cap(turn, &original, 0).is_ok(),
             "a zero cap is no cap"
         );
+    }
+
+    #[test]
+    fn the_engine_does_not_cap_the_cycles_of_a_turn() {
+        assert_eq!(engine().max_iterations(), usize::MAX);
     }
 
     #[test]
