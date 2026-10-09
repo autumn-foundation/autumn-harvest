@@ -9405,7 +9405,12 @@ pub async fn persist_workflow_completion(
             // The row and the task get the same stored form (issue #1979).
             let stored_output = codecs.encode_column(&output)?;
             update_workflow_execution_completed(conn, exec_id, worker_id, &stored_output).await?;
-            queue::complete_task(conn, task_id, stored_output).await?;
+            queue::complete_task(
+                conn,
+                &queue::TaskClaim::new(task_id, worker_id, attempt),
+                stored_output,
+            )
+            .await?;
             let (mut deferred, closed_children) =
                 apply_parent_close_cascade(conn, exec_id, codecs).await?;
             let mut tx_cancel_metrics = Vec::new();
@@ -15076,7 +15081,12 @@ pub async fn persist_child_workflow_completion(
             // The row and the task get the same stored form (issue #1979).
             let stored_output = codecs.encode_column(&output)?;
             update_workflow_execution_completed(conn, exec_id, worker_id, &stored_output).await?;
-            queue::complete_task(conn, task_id, stored_output).await?;
+            queue::complete_task(
+                conn,
+                &queue::TaskClaim::new(task_id, worker_id, attempt),
+                stored_output,
+            )
+            .await?;
             let (mut deferred, closed_children) =
                 apply_parent_close_cascade(conn, exec_id, codecs).await?;
             let mut tx_cancel_metrics = Vec::new();
@@ -23171,7 +23181,12 @@ async fn persist_workflow_continue_as_new_with_verdict(
         .map_err(crate::error::database_error)?;
 
         queue::enqueue(conn, &enqueue).await?;
-        queue::complete_task(conn, task_id, serde_json::Value::Null).await?;
+        queue::complete_task(
+            conn,
+            &queue::TaskClaim::new(task_id, worker_id, attempt),
+            serde_json::Value::Null,
+        )
+        .await?;
         Ok(false)
     }))
     .await

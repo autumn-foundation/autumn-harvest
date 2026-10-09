@@ -125,6 +125,11 @@ STALE_CLAIMS = [
         r"TODO\(#606 step 9\)",
         "#606 step 9 is wired: build_activity_enqueue_plan pins session tasks",
     ),
+    (
+        "docs/comparison.md",
+        r"No\s+cell\s+on\s+this\s+page\s+claims\s+a\s+throughput\s+or\s+latency\s+comparison",
+        "assay #14 reran the comparison on 0.7.0 (issue #1972)",
+    ),
 ]
 
 
@@ -472,6 +477,7 @@ def self_test():
             "cross-shard workflows are explicitly out of scope per the contract.\n"
             "and cross-shard workflows are out of\n  scope by design.\n"
             "- **No cross-shard workflows.** A single workflow's state.\n"
+            "No cell on this page\n  claims a throughput or latency comparison.\n"
         ),
         "docs/architecture.md": (
             "Cross-shard rebalancing of existing workflows is out of scope.\n"
@@ -484,7 +490,7 @@ def self_test():
     }
     claims = [c for c in STALE_CLAIMS if c[0] in old_claims]
     found = stale_claim_findings(old_claims.get, claims)
-    assert len(found) == 11, found
+    assert len(found) == 12, found
 
     # True statements that a pin must not match.
     current = {

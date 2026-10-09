@@ -21,7 +21,7 @@ use autumn_harvest::failure::{
     parse_error_payload_full,
 };
 use autumn_harvest::models::NewWorkflowExecution;
-use autumn_harvest::queue;
+use autumn_harvest::queue::{self, TaskClaim};
 use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::store;
 use autumn_harvest::timeout::force_fail_activity;
@@ -596,9 +596,13 @@ async fn completed_task_returns_conflict() {
     let activity_id = ActivityExecId::new();
     seed_scheduled_activity_history(&mut conn, exec_id, activity_id).await;
     let task_id = insert_running_activity_task(&mut conn, exec_id, activity_id, 1, 5).await;
-    queue::complete_task(&mut conn, task_id, serde_json::json!("done"))
-        .await
-        .expect("complete");
+    queue::complete_task(
+        &mut conn,
+        &TaskClaim::new(task_id, "hung-worker", 1),
+        serde_json::json!("done"),
+    )
+    .await
+    .expect("complete");
 
     let result = force_fail_activity(
         &mut conn,
@@ -853,7 +857,8 @@ async fn late_completion_after_force_fail_is_ignored() {
 
     // The still-running worker attempt finally returns Ok — the queue-layer
     // transition rejects it because the row is no longer RUNNING.
-    let late = queue::complete_task(&mut conn, task_id, serde_json::json!("late result")).await;
+    let claim = TaskClaim::new(task_id, "hung-worker", 1);
+    let late = queue::complete_task(&mut conn, &claim, serde_json::json!("late result")).await;
     assert!(
         matches!(late, Err(HarvestError::NotFound(_))),
         "late completion must be rejected, got: {late:?}"

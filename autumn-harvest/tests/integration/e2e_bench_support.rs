@@ -103,7 +103,7 @@ pub const SHARD_COUNTS: [u32; 3] = [1, 2, 4];
 /// on every bump until somebody re-measured. Bump this constant in the same
 /// commit that adds a new results file and updates the baselines below; see
 /// "Publishing a new release's numbers" in `docs/benchmarks.md`.
-pub const PUBLISHED_RESULTS_VERSION: &str = "0.6.0";
+pub const PUBLISHED_RESULTS_VERSION: &str = "0.7.0";
 
 /// Published reproduction tolerance (issue #941 AC3): a fresh clone on the
 /// documented hardware should land within this percentage of the published
@@ -1288,7 +1288,7 @@ pub struct Baseline {
     pub value: f64,
 }
 
-/// The numbers published in `docs/benchmarks/results-v0.6.0.md`.
+/// The numbers published in `docs/benchmarks/results-v<PUBLISHED_RESULTS_VERSION>.md`.
 ///
 /// These are the *headline* metrics only — the ones issue #941's success metric
 /// names. The report also prints context metrics (sample counts, achieved pace,
@@ -1311,109 +1311,109 @@ pub const PUBLISHED_BASELINES: &[Baseline] = &[
         scenario: BenchScenario::Throughput,
         shards: 1,
         metric: "workflows_per_sec",
-        value: 23.73,
+        value: 15.46,
     },
     Baseline {
         scenario: BenchScenario::Throughput,
         shards: 2,
         metric: "workflows_per_sec",
-        value: 35.70,
+        value: 18.84,
     },
     Baseline {
         scenario: BenchScenario::Throughput,
         shards: 4,
         metric: "workflows_per_sec",
-        value: 33.58,
+        value: 19.50,
     },
     Baseline {
         scenario: BenchScenario::DispatchLatency,
         shards: 1,
         metric: "p50_ms",
-        value: 40.98,
+        value: 16.12,
     },
     Baseline {
         scenario: BenchScenario::DispatchLatency,
         shards: 1,
         metric: "p99_ms",
-        value: 58.63,
+        value: 90.86,
     },
     Baseline {
         scenario: BenchScenario::DispatchLatency,
         shards: 2,
         metric: "p50_ms",
-        value: 47.22,
+        value: 26.17,
     },
     Baseline {
         scenario: BenchScenario::DispatchLatency,
         shards: 2,
         metric: "p99_ms",
-        value: 65.49,
+        value: 107.79,
     },
     Baseline {
         scenario: BenchScenario::DispatchLatency,
         shards: 4,
         metric: "p50_ms",
-        value: 58.02,
+        value: 69.98,
     },
     Baseline {
         scenario: BenchScenario::DispatchLatency,
         shards: 4,
         metric: "p99_ms",
-        value: 111.75,
+        value: 183.13,
     },
     Baseline {
         scenario: BenchScenario::SignalRoundtrip,
         shards: 1,
         metric: "p50_ms",
-        value: 53.59,
+        value: 47.53,
     },
     Baseline {
         scenario: BenchScenario::SignalRoundtrip,
         shards: 1,
         metric: "p99_ms",
-        value: 65.96,
+        value: 92.99,
     },
     Baseline {
         scenario: BenchScenario::SignalRoundtrip,
         shards: 2,
         metric: "p50_ms",
-        value: 44.74,
+        value: 51.10,
     },
     Baseline {
         scenario: BenchScenario::SignalRoundtrip,
         shards: 2,
         metric: "p99_ms",
-        value: 71.16,
+        value: 95.52,
     },
     Baseline {
         scenario: BenchScenario::SignalRoundtrip,
         shards: 4,
         metric: "p50_ms",
-        value: 54.23,
+        value: 62.27,
     },
     Baseline {
         scenario: BenchScenario::SignalRoundtrip,
         shards: 4,
         metric: "p99_ms",
-        value: 92.90,
+        value: 118.00,
     },
     Baseline {
         scenario: BenchScenario::ReplayThroughput,
         shards: 1,
         metric: "events_per_sec",
-        value: 9_204_142.19,
+        value: 9_750_423.86,
     },
     Baseline {
         scenario: BenchScenario::ReplayThroughput,
         shards: 2,
         metric: "events_per_sec",
-        value: 9_282_928.36,
+        value: 9_063_901.37,
     },
     Baseline {
         scenario: BenchScenario::ReplayThroughput,
         shards: 4,
         metric: "events_per_sec",
-        value: 9_240_557.56,
+        value: 8_981_387.93,
     },
 ];
 

@@ -33,7 +33,7 @@ version `1` binary refuses a version `2` file. The artifact's `description`
 and `compatibility` text changed, so `--require-current` asks for one
 `harvest schema update`. A struct literal of `ActivityInfo` needs the two new
 fields. `SchemaRole` and `ChangeKind` have new variants. See
-`docs/upgrading/0.8.0.md` section 1.3.
+`docs/upgrading/0.8.0.md` section 1.4.
 
 **No migration. No new `WorkflowEvent` variant. No route change. No engine
 change.**
