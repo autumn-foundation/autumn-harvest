@@ -1967,10 +1967,13 @@ async fn the_llm_ledger_moves_with_the_run() {
     );
 }
 
-/// Issue #1997: until activation, the staged ledger rows count for no tenant on
-/// the target. The run still lives on the source, which counts them there.
+/// Issue #1997: the tenant spend of a moving run counts on at least one shard
+/// in every phase, and each row keeps its own key.
+///
+/// The source keeps the ledger through the cutover. Activation copies it to
+/// the target with the original keys. The source then deletes it.
 #[tokio::test]
-async fn staged_ledger_rows_count_for_the_tenant_only_after_activation() {
+async fn the_llm_ledger_counts_on_one_shard_in_every_phase_and_keeps_its_keys() {
     let shards = setup_two_shards().await;
     let exec_id = quiescent_fixture(&shards, "entity-ledger-stage").await;
     {
@@ -1982,20 +1985,26 @@ async fn staged_ledger_rows_count_for_the_tenant_only_after_activation() {
         .execute(&mut source)
         .await
         .expect("tag the run with a key");
+        // One row recorded under the key, and one recorded before the
+        // reconciler set it. The second never counts for the tenant.
         diesel::sql_query(
             "INSERT INTO harvest_llm_ledger \
                  (execution_id, workflow_name, quota_key, activity_name, activity_id, attempt, \
                   model, input_tokens, output_tokens, cost_micros, latency_ms) \
              VALUES ($1, 'entity_flow', 'acme', 'llm_step', gen_random_uuid(), 1, \
-                     'm-1', 60, 40, 0, 1)",
+                     'm-1', 60, 40, 0, 1), \
+                    ($1, 'entity_flow', NULL, 'llm_step', gen_random_uuid(), 1, \
+                     'm-1', 5, 5, 0, 1)",
         )
         .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
         .execute(&mut source)
         .await
-        .expect("seed a ledger row");
+        .expect("seed the ledger rows");
     }
     let tenant_rows = "SELECT count(*)::BIGINT AS value FROM harvest_llm_ledger \
                         WHERE execution_id = $1 AND quota_key = 'acme'";
+    let unkeyed_rows = "SELECT count(*)::BIGINT AS value FROM harvest_llm_ledger \
+                         WHERE execution_id = $1 AND quota_key IS NULL";
 
     let (mut source, mut target) = (shards.source().await, shards.target().await);
     begin_migration(&mut source, exec_id, SOURCE, TARGET)
@@ -2004,12 +2013,6 @@ async fn staged_ledger_rows_count_for_the_tenant_only_after_activation() {
     stage_copy(&mut source, &mut target, exec_id, TARGET)
         .await
         .expect("stage");
-    assert_eq!(
-        count(&mut target, tenant_rows, exec_id).await,
-        0,
-        "a staged row must not count for the tenant on the target before activation"
-    );
-
     verify_target_copy(&mut source, &mut target, exec_id, &codecs())
         .await
         .expect("verify");
@@ -2019,13 +2022,43 @@ async fn staged_ledger_rows_count_for_the_tenant_only_after_activation() {
             .expect("cutover"),
         "the cutover must commit"
     );
+    // A crash here leaves the run cut over but not active. The source still
+    // counts the spend, and the target does not count it yet.
+    assert_eq!(count(&mut source, tenant_rows, exec_id).await, 1);
+    assert_eq!(count(&mut target, tenant_rows, exec_id).await, 0);
+
     activate_target(&mut source, &mut target, exec_id)
         .await
         .expect("activate");
+    assert_eq!(count(&mut target, tenant_rows, exec_id).await, 1);
     assert_eq!(
-        count(&mut target, tenant_rows, exec_id).await,
+        count(&mut target, unkeyed_rows, exec_id).await,
         1,
-        "activation must restore the key of the moved rows"
+        "a row recorded without a key must not gain one on the move"
+    );
+    assert_eq!(
+        count(
+            &mut source,
+            "SELECT count(*)::BIGINT AS value FROM harvest_llm_ledger WHERE execution_id = $1",
+            exec_id
+        )
+        .await,
+        0,
+        "the source drops its copy once the target holds it"
+    );
+
+    // A second activation, as a resume would run it, copies nothing twice.
+    activate_target(&mut source, &mut target, exec_id)
+        .await
+        .expect("activate again");
+    assert_eq!(
+        count(
+            &mut target,
+            "SELECT count(*)::BIGINT AS value FROM harvest_llm_ledger WHERE execution_id = $1",
+            exec_id
+        )
+        .await,
+        2
     );
 }
 
