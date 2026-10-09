@@ -143,7 +143,8 @@ pub struct LlmSpend {
 ///
 /// The order is fixed: run tokens, run cost, tenant tokens, tenant cost. The
 /// first spent cap is the result. The rule is the quota rule: a spend equal
-/// to its cap refuses the next step.
+/// to its cap refuses the next step. A cap above `i64::MAX` counts as
+/// `i64::MAX`, the ceiling of the ledger sums.
 #[must_use]
 pub fn check_llm_budget(spend: &LlmSpend, policy: &QuotaPolicy) -> Option<QuotaViolation> {
     let clamp = |n: i64| -> u64 { u64::try_from(n).unwrap_or(0) };
@@ -171,7 +172,9 @@ pub fn check_llm_budget(spend: &LlmSpend, policy: &QuotaPolicy) -> Option<QuotaV
     ]
     .into_iter()
     .find_map(|(resource, cap, spent)| {
-        let limit = cap?;
+        // The ledger sums saturate at `i64::MAX`. A larger cap is clamped to
+        // that ceiling, so it can still be reached.
+        let limit = cap?.min(i64::MAX.unsigned_abs());
         let current = clamp(spent);
         (current >= limit).then_some(QuotaViolation {
             resource,
@@ -552,6 +555,20 @@ mod tests {
             QuotaResource::TenantLlmCostMicros
         );
         assert_eq!(check_llm_budget(&spend, &QuotaPolicy::new("tenant")), None);
+    }
+
+    #[test]
+    fn a_cap_above_the_ledger_ceiling_is_still_reachable() {
+        // The ledger sums saturate at `i64::MAX`, so a larger cap must refuse
+        // there instead of never.
+        let policy = QuotaPolicy::new("tenant").with_max_tenant_llm_cost_micros(u64::MAX);
+        let spend = LlmSpend {
+            tenant_cost_micros: i64::MAX,
+            ..LlmSpend::default()
+        };
+        let violation = check_llm_budget(&spend, &policy).unwrap();
+        assert_eq!(violation.resource, QuotaResource::TenantLlmCostMicros);
+        assert_eq!(violation.limit, i64::MAX.unsigned_abs());
     }
 
     #[test]
