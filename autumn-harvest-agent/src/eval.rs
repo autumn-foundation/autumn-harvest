@@ -14,6 +14,8 @@
 //! - `agent_tool_call` returns the recorded outcome of the same call. A call
 //!   with no recorded outcome gets an error stub. No tool runs.
 //! - `agent_memory_snapshot` returns the recorded snapshot, or an empty one.
+//! - A tool or snapshot activity that failed the source fails the candidate
+//!   at the same activity.
 //! - `agent_deliver` is a stub. No report leaves the harness.
 //! - Any other activity has no mock, so it fails the candidate run.
 //!
@@ -381,6 +383,12 @@ pub async fn evaluate(
         let session = Arc::clone(&session);
         let harness = Arc::clone(&candidate.harness);
         let run_id = recording.run_id.clone();
+        let taken: HashSet<String> = recording
+            .turns
+            .iter()
+            .flat_map(ModelTurn::calls)
+            .map(|call| call.id)
+            .collect();
         let retry = agent_model_turn_info()
             .default_retry_policy
             .unwrap_or_default();
@@ -392,7 +400,13 @@ pub async fn evaluate(
                 request.run_id.clone_from(run_id);
             }
             let (index, recorded) = lock(&session).next_turn()?;
-            let turn = live_turn(&handle, &harness, &request, &recorded, index, &retry)?;
+            let turn = live_turn(
+                &handle,
+                &harness,
+                &request,
+                (&recorded, &taken, index),
+                &retry,
+            )?;
             encode(&turn)
         }
     };
@@ -400,15 +414,15 @@ pub async fn evaluate(
         let session = Arc::clone(&session);
         move |input: Value| -> Result<Value, String> {
             let request: ToolCallRequest = decode(input)?;
-            let outcome = lock(&session).answer(&request);
+            let outcome = lock(&session).answer(&request)?;
             encode(&outcome)
         }
     };
     let snapshot = {
         let session = Arc::clone(&session);
         move |_scope: Value| -> Result<Value, String> {
-            let snapshot = lock(&session).snapshots.pop_front().unwrap_or_default();
-            encode(&snapshot)
+            let snapshot = lock(&session).snapshots.pop_front();
+            encode(&snapshot.unwrap_or_else(|| Ok(String::new()))?)
         }
     };
 
@@ -457,7 +471,9 @@ struct Recording {
     run_id: Option<String>,
     turns: Vec<ModelTurn>,
     tools: Vec<RecordedTool>,
-    snapshots: Vec<String>,
+    /// The recorded snapshots, and the error of a snapshot that failed for
+    /// good.
+    snapshots: Vec<Result<String, String>>,
     /// Signals that the source received in time, in order.
     signals: Vec<(String, Value)>,
     end: RunEnd,
@@ -469,26 +485,15 @@ struct RecordedTool {
     step: u32,
     name: String,
     arguments: Value,
-    outcome: ToolOutcome,
+    /// The recorded outcome, or the error of a call that failed for good.
+    outcome: Result<ToolOutcome, String>,
     /// A recorded outcome answers one candidate call at most.
     used: bool,
 }
 
 impl Recording {
     fn read(history: &[WorkflowEvent]) -> Result<Self, EvalError> {
-        let Some(WorkflowEvent::WorkflowStarted { input, .. }) = history.first() else {
-            return Err(EvalError::NotAnAgentRun(
-                "the history does not start with WorkflowStarted".to_owned(),
-            ));
-        };
-        // The erasure check runs first. An erased payload must not reach a
-        // decoder or a prompt.
-        if history.iter().any(holds_tombstone) {
-            return Err(EvalError::ErasedSource);
-        }
-        let task: AgentTask = serde_json::from_value(input.clone())
-            .map_err(|e| EvalError::NotAnAgentRun(format!("the input is not an AgentTask: {e}")))?;
-
+        let task = task_of(history)?;
         let model_name = agent_model_turn_info().name;
         let tool_name = agent_tool_call_info().name;
         let snapshot_name = agent_memory_snapshot_info().name;
@@ -499,7 +504,13 @@ impl Recording {
         let mut timed_out: HashSet<&str> = HashSet::new();
         let mut signals = Vec::new();
         let mut end = None;
+        // The last tool or snapshot failure with no later completion. A
+        // failed source can end on it.
+        let mut last_failure: Option<(ActivityExecId, String)> = None;
         for event in history {
+            if matches!(event, WorkflowEvent::ActivityCompleted { .. }) {
+                last_failure = None;
+            }
             match event {
                 WorkflowEvent::ActivityScheduled {
                     activity_id,
@@ -514,23 +525,25 @@ impl Recording {
                     }
                     scheduled.insert(*activity_id, (name.as_str(), input));
                 }
+                WorkflowEvent::ActivityFailed {
+                    activity_id, error, ..
+                } => last_failure = Some((*activity_id, error.clone())),
+                WorkflowEvent::ActivityTimedOut {
+                    activity_id,
+                    timeout_type,
+                } => {
+                    last_failure = Some((*activity_id, format!("timed out: {timeout_type:?}")));
+                }
                 WorkflowEvent::ActivityCompleted {
                     activity_id,
                     output,
                 } => match scheduled.get(activity_id) {
                     Some((name, input)) if *name == tool_name => {
-                        let request: ToolCallRequest =
-                            decode((*input).clone()).map_err(EvalError::Undecodable)?;
-                        tools.push(RecordedTool {
-                            step: request.step,
-                            name: request.call.name,
-                            arguments: request.call.arguments,
-                            outcome: decode(output.clone()).map_err(EvalError::Undecodable)?,
-                            used: false,
-                        });
+                        let outcome = decode(output.clone()).map_err(EvalError::Undecodable)?;
+                        tools.push(recorded_tool(input, Ok(outcome))?);
                     }
                     Some((name, _)) if *name == snapshot_name => {
-                        snapshots.push(decode(output.clone()).map_err(EvalError::Undecodable)?);
+                        snapshots.push(Ok(decode(output.clone()).map_err(EvalError::Undecodable)?));
                     }
                     _ => {}
                 },
@@ -549,20 +562,21 @@ impl Recording {
                         signals.push((signal_name.clone(), payload.clone()));
                     }
                 }
-                WorkflowEvent::WorkflowCompleted { output } => {
-                    end = Some(RunEnd::Completed(
-                        decode(output.clone()).map_err(EvalError::Undecodable)?,
-                    ));
+                other => {
+                    if let Some(found) = run_end(other)? {
+                        end = Some(found);
+                    }
                 }
-                WorkflowEvent::WorkflowFailed { error, .. } => {
-                    end = Some(RunEnd::Failed(error.clone()));
+            }
+        }
+        // A source that failed on a tool or snapshot activity replays that
+        // failure, so the candidate fails at the same activity.
+        if let (Some(RunEnd::Failed(_)), Some((activity_id, error))) = (&end, last_failure) {
+            match scheduled.get(&activity_id) {
+                Some((name, input)) if *name == tool_name => {
+                    tools.push(recorded_tool(input, Err(error))?);
                 }
-                WorkflowEvent::WorkflowCancelled { reason } => {
-                    end = Some(RunEnd::Failed(format!("cancelled: {reason}")));
-                }
-                WorkflowEvent::WorkflowExecutionTimedOut { .. } => {
-                    end = Some(RunEnd::Failed("timed out".to_owned()));
-                }
+                Some((name, _)) if *name == snapshot_name => snapshots.push(Err(error)),
                 _ => {}
             }
         }
@@ -578,6 +592,59 @@ impl Recording {
     }
 }
 
+/// The task of an agent run history.
+///
+/// # Errors
+///
+/// Returns [`EvalError::ErasedSource`] for an erased history, and
+/// [`EvalError::NotAnAgentRun`] for any history that is not an agent run.
+fn task_of(history: &[WorkflowEvent]) -> Result<AgentTask, EvalError> {
+    let Some(WorkflowEvent::WorkflowStarted { input, .. }) = history.first() else {
+        return Err(EvalError::NotAnAgentRun(
+            "the history does not start with WorkflowStarted".to_owned(),
+        ));
+    };
+    // The erasure check runs first. An erased payload must not reach a
+    // decoder or a prompt.
+    if history.iter().any(holds_tombstone) {
+        return Err(EvalError::ErasedSource);
+    }
+    serde_json::from_value(input.clone())
+        .map_err(|e| EvalError::NotAnAgentRun(format!("the input is not an AgentTask: {e}")))
+}
+
+/// The recorded tool call of the tool-call activity `input`, with `outcome`.
+fn recorded_tool(
+    input: &Value,
+    outcome: Result<ToolOutcome, String>,
+) -> Result<RecordedTool, EvalError> {
+    let request: ToolCallRequest = decode(input.clone()).map_err(EvalError::Undecodable)?;
+    Ok(RecordedTool {
+        step: request.step,
+        name: request.call.name,
+        arguments: request.call.arguments,
+        outcome,
+        used: false,
+    })
+}
+
+/// How a terminal event ends a run, or `None` for another event.
+fn run_end(event: &WorkflowEvent) -> Result<Option<RunEnd>, EvalError> {
+    Ok(match event {
+        WorkflowEvent::WorkflowCompleted { output } => Some(RunEnd::Completed(
+            decode(output.clone()).map_err(EvalError::Undecodable)?,
+        )),
+        WorkflowEvent::WorkflowFailed { error, .. } => Some(RunEnd::Failed(error.clone())),
+        WorkflowEvent::WorkflowCancelled { reason } => {
+            Some(RunEnd::Failed(format!("cancelled: {reason}")))
+        }
+        WorkflowEvent::WorkflowExecutionTimedOut { .. } => {
+            Some(RunEnd::Failed("timed out".to_owned()))
+        }
+        _ => None,
+    })
+}
+
 /// The mutable state that the activity mocks share.
 struct Session {
     /// The tool calls of each recorded turn, for id alignment.
@@ -587,7 +654,7 @@ struct Session {
     max_turns: usize,
     cap_reached: bool,
     tools: Vec<RecordedTool>,
-    snapshots: VecDeque<String>,
+    snapshots: VecDeque<Result<String, String>>,
     replayed: u32,
     stubbed: u32,
 }
@@ -611,7 +678,11 @@ impl Session {
     }
 
     /// The recorded outcome of the same call, or the stub outcome.
-    fn answer(&mut self, request: &ToolCallRequest) -> ToolOutcome {
+    ///
+    /// # Errors
+    ///
+    /// Returns the recorded error of a call that failed for good.
+    fn answer(&mut self, request: &ToolCallRequest) -> Result<ToolOutcome, String> {
         let recorded = self.tools.iter_mut().find(|tool| {
             !tool.used
                 && tool.step == request.step
@@ -624,7 +695,7 @@ impl Session {
             tool.outcome.clone()
         } else {
             self.stubbed = self.stubbed.saturating_add(1);
-            ToolOutcome::error(NOT_RUN)
+            Ok(ToolOutcome::error(NOT_RUN))
         }
     }
 }
@@ -633,9 +704,14 @@ impl Session {
 /// recorded turn.
 ///
 /// A call that equals the recorded call at the same position takes the
-/// recorded id. Any other call gets a new `eval_` id, so no recorded approval
-/// name can match it.
-fn align_call_ids(content: &mut [ContentPart], recorded: &[ToolCall], index: usize) {
+/// recorded id. Any other call gets a new `eval_` id that no recorded call
+/// holds, so no recorded approval name can match it.
+fn align_call_ids(
+    content: &mut [ContentPart],
+    recorded: &[ToolCall],
+    taken: &HashSet<String>,
+    index: usize,
+) {
     let calls = content.iter_mut().filter_map(|part| match part {
         ContentPart::ToolCall {
             id,
@@ -649,7 +725,16 @@ fn align_call_ids(content: &mut [ContentPart], recorded: &[ToolCall], index: usi
             Some(original) if *name == original.name && *arguments == original.arguments => {
                 id.clone_from(&original.id);
             }
-            _ => *id = format!("{EVAL_ID_PREFIX}{index}_{position}_{id}"),
+            _ => {
+                let base = format!("{EVAL_ID_PREFIX}{index}_{position}_{id}");
+                let mut fresh = base.clone();
+                let mut suffix = 0_u32;
+                while taken.contains(&fresh) {
+                    suffix = suffix.saturating_add(1);
+                    fresh = format!("{base}_{suffix}");
+                }
+                *id = fresh;
+            }
         }
     }
 }
@@ -667,13 +752,13 @@ fn live_turn(
     handle: &tokio::runtime::Handle,
     harness: &AgentHarness,
     request: &ModelTurnRequest,
-    recorded: &[ToolCall],
-    index: usize,
+    (recorded, taken, index): (&[ToolCall], &HashSet<String>, usize),
     retry: &RetryPolicy,
 ) -> Result<ModelTurn, String> {
     let mut attempt = 1;
     loop {
-        let align = |content: &mut Vec<ContentPart>| align_call_ids(content, recorded, index);
+        let align =
+            |content: &mut Vec<ContentPart>| align_call_ids(content, recorded, taken, index);
         let result = tokio::task::block_in_place(|| {
             handle.block_on(harness.model_turn_with(request.clone(), align))
         });
@@ -981,9 +1066,20 @@ mod tests {
     fn only_an_equal_call_takes_the_recorded_id() {
         let recorded = vec![call("r1", "a", json!(1)), call("r2", "b", json!(2))];
         let mut turn = turn_of(&[call("c1", "a", json!(1)), call("c2", "b", json!(3))]);
-        align_call_ids(&mut turn.content, &recorded, 4);
+        align_call_ids(&mut turn.content, &recorded, &HashSet::new(), 4);
         let ids: Vec<String> = turn.calls().into_iter().map(|call| call.id).collect();
         assert_eq!(ids, vec!["r1".to_owned(), "eval_4_1_c2".to_owned()]);
+    }
+
+    #[test]
+    fn a_new_id_never_equals_a_recorded_id() {
+        let recorded = vec![call("eval_0_0_c1", "a", json!(1))];
+        let taken: HashSet<String> = recorded.iter().map(|call| call.id.clone()).collect();
+        let mut turn = turn_of(&[call("c1", "b", json!(2))]);
+        align_call_ids(&mut turn.content, &recorded, &taken, 0);
+        let id = turn.calls()[0].id.clone();
+        assert!(id.starts_with("eval_0_0_c1"), "{id}");
+        assert_ne!(id, "eval_0_0_c1");
     }
 
     #[test]

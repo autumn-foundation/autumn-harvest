@@ -469,6 +469,9 @@ change.
 | `agent_deliver` | A stub. No report leaves the harness. |
 | Any other activity, such as `agent_precheck` | No mock. The candidate run fails. |
 
+A tool or snapshot activity that failed the source fails the candidate at the
+same activity.
+
 The policy runs live, so use a policy with no side effects. It sees the
 recorded run id and the aligned call ids. A retryable model failure retries
 under the retry policy of `agent_model_turn`, as on a worker.

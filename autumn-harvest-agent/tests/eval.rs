@@ -446,6 +446,70 @@ async fn a_rate_limited_model_turn_retries_as_in_production() {
     assert!(!evaluation.turn_cap_reached);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_recorded_tool_failure_fails_the_candidate_at_the_same_call() {
+    // The source tool activity failed for good, so the run failed.
+    let mut source = with_end(
+        one_lookup().await,
+        Some(WorkflowEvent::WorkflowFailed {
+            error: "the tool timed out".into(),
+            error_type: None,
+            details: None,
+            non_retryable: None,
+        }),
+    );
+    let tool_id = source
+        .iter()
+        .find_map(|event| match event {
+            WorkflowEvent::ActivityScheduled {
+                activity_id, name, ..
+            } if name == "agent_tool_call" => Some(*activity_id),
+            _ => None,
+        })
+        .unwrap();
+    let completed = source
+        .iter()
+        .position(|event| {
+            matches!(event, WorkflowEvent::ActivityCompleted { activity_id, .. }
+                if *activity_id == tool_id)
+        })
+        .unwrap();
+    source[completed] = WorkflowEvent::ActivityFailed {
+        activity_id: tool_id,
+        error: "the tool timed out".into(),
+        attempt: 1,
+        error_type: "Timeout".into(),
+        non_retryable: true,
+        details: None,
+    };
+    // Drop the recorded answer turn: the source never reached it.
+    let answer_turn = source
+        .iter()
+        .rposition(|event| {
+            matches!(event, WorkflowEvent::ActivityScheduled { name, .. }
+                if name == "agent_model_turn")
+        })
+        .unwrap();
+    source.drain(answer_turn..answer_turn + 2);
+    let model = ScriptedModel::new(vec![
+        calls(&[("c1", "lookup", json!({"q": "x"}))], 5),
+        answer("done", 5),
+    ]);
+    let (harness, recorder) = candidate(model.clone());
+
+    let evaluation = evaluate(&source, &Candidate::new(harness)).await.unwrap();
+
+    assert!(
+        matches!(evaluation.candidate, RunEnd::Failed(_)),
+        "{:?}",
+        evaluation.candidate
+    );
+    assert!(!evaluation.diverged(), "{evaluation:#?}");
+    assert_eq!(model.calls(), 1, "no model call runs past the failure");
+    assert_eq!(evaluation.stubbed_tool_calls, 0);
+    assert_eq!(recorder.runs(), Vec::<Value>::new());
+}
+
 /// Record a source with two gated `pay` calls. The first approval arrives
 /// after its deadline. The second arrives in time.
 ///
