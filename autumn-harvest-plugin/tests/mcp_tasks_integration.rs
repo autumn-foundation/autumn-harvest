@@ -220,10 +220,13 @@ async fn setup_db() -> TestPg {
 
 /// The client capabilities of a client that takes tasks and elicitations.
 fn declared() -> Value {
-    json!({CLIENT_CAPABILITIES_META: {
-        "extensions": {TASKS_EXTENSION: {}},
-        "elicitation": {},
-    }})
+    json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        CLIENT_CAPABILITIES_META: {
+            "extensions": {TASKS_EXTENSION: {}},
+            "elicitation": {},
+        },
+    })
 }
 
 async fn rpc_with(client: &TestClient, body: Value, idempotency_key: Option<&str>) -> Value {
@@ -231,9 +234,32 @@ async fn rpc_with(client: &TestClient, body: Value, idempotency_key: Option<&str
     if let Some(key) = idempotency_key {
         request = request.header("idempotency-key", key);
     }
+    // A 2026-07-28 body needs its Streamable HTTP headers.
+    let params = &body["params"];
+    if let Some(version) = params
+        .pointer("/_meta/io.modelcontextprotocol~1protocolVersion")
+        .and_then(Value::as_str)
+    {
+        let method = body["method"].as_str().unwrap_or_default();
+        request = request
+            .header("mcp-protocol-version", version)
+            .header("mcp-method", method);
+        let name = if method == "tools/call" {
+            "name"
+        } else {
+            "taskId"
+        };
+        if let Some(name) = params.get(name).and_then(Value::as_str) {
+            request = request.header("mcp-name", name);
+        }
+    }
     let resp = request.json(&body).send().await;
-    resp.assert_ok();
-    resp.json::<Value>()
+    let out = resp.json::<Value>();
+    // A 2026-07-28 error can carry an HTTP error status.
+    if out.get("error").is_none() {
+        resp.assert_ok();
+    }
+    out
 }
 
 async fn rpc(client: &TestClient, method: &str, params: Value) -> Value {
@@ -471,7 +497,10 @@ async fn a_client_without_elicitation_sees_no_input_request() {
         t["status"] == "input_required"
     })
     .await;
-    let tasks_only = json!({CLIENT_CAPABILITIES_META: {"extensions": {TASKS_EXTENSION: {}}}});
+    let tasks_only = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        CLIENT_CAPABILITIES_META: {"extensions": {TASKS_EXTENSION: {}}},
+    });
     let task = rpc(
         &client,
         "tasks/get",

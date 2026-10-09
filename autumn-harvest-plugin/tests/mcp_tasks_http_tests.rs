@@ -73,7 +73,36 @@ fn router() -> Router {
 }
 
 fn declared() -> Value {
-    json!({CLIENT_CAPABILITIES_META: {"extensions": {TASKS_EXTENSION: {}}}})
+    json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        CLIENT_CAPABILITIES_META: {"extensions": {TASKS_EXTENSION: {}}},
+    })
+}
+
+/// The Streamable HTTP headers that a 2026-07-28 body needs. An older body
+/// needs none.
+fn mcp_headers(body: &Value) -> Vec<(&'static str, String)> {
+    let params = &body["params"];
+    let Some(version) = params
+        .pointer("/_meta/io.modelcontextprotocol~1protocolVersion")
+        .and_then(Value::as_str)
+    else {
+        return Vec::new();
+    };
+    let method = body["method"].as_str().unwrap_or_default();
+    let mut headers = vec![
+        ("mcp-protocol-version", version.to_string()),
+        ("mcp-method", method.to_string()),
+    ];
+    let name = if method == "tools/call" {
+        "name"
+    } else {
+        "taskId"
+    };
+    if let Some(name) = params.get(name).and_then(Value::as_str) {
+        headers.push(("mcp-name", name.to_string()));
+    }
+    headers
 }
 
 async fn post_raw(
@@ -97,10 +126,16 @@ async fn post_raw(
     (status, String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// Send `body` with the headers it needs. A 2026-07-28 error can carry an
+/// HTTP error status, so only a success must be 200.
 async fn rpc(app: &Router, body: Value) -> Value {
-    let (status, text) = post_raw(app, "application/json", body.to_string(), None).await;
-    assert_eq!(status, StatusCode::OK, "{text}");
-    serde_json::from_str(&text).unwrap_or_else(|e| panic!("not JSON ({e}): {text}"))
+    let headers = mcp_headers(&body);
+    let pairs: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let (status, out) = post_with_headers(app, &body, &pairs).await;
+    if out.get("error").is_none() {
+        assert_eq!(status, StatusCode::OK, "{out}");
+    }
+    out
 }
 
 fn call(method: &str, params: &Value) -> Value {
@@ -111,15 +146,41 @@ fn call(method: &str, params: &Value) -> Value {
 async fn initialize_advertises_the_tasks_extension() {
     let out = rpc(
         &router(),
-        call("initialize", &json!({"protocolVersion": "2025-06-18"})),
+        call("initialize", &json!({"protocolVersion": "2026-07-28"})),
     )
     .await;
     assert_eq!(out["id"], 7);
     let caps = &out["result"]["capabilities"];
     assert_eq!(caps["extensions"][TASKS_EXTENSION], json!({}));
     assert!(caps["tools"].is_object(), "{out}");
-    assert_eq!(out["result"]["protocolVersion"], "2025-06-18");
+    assert_eq!(out["result"]["protocolVersion"], "2026-07-28");
     assert!(out["result"]["serverInfo"]["name"].is_string(), "{out}");
+}
+
+/// The Tasks extension is defined for 2026-07-28 only. A 2025 session does
+/// not see it, and a 2025 request cannot use it.
+#[tokio::test]
+async fn a_2025_client_gets_no_tasks() {
+    let out = rpc(
+        &router(),
+        call("initialize", &json!({"protocolVersion": "2025-06-18"})),
+    )
+    .await;
+    assert_eq!(out["result"]["protocolVersion"], "2025-06-18");
+    let caps = &out["result"]["capabilities"];
+    assert!(caps.get("extensions").is_none(), "{out}");
+    assert!(caps["tools"].is_object(), "{out}");
+
+    let old = json!({
+        "io.modelcontextprotocol/protocolVersion": "2025-11-25",
+        CLIENT_CAPABILITIES_META: {"extensions": {TASKS_EXTENSION: {}}},
+    });
+    let out = rpc(
+        &router(),
+        call("tasks/get", &json!({"taskId": "x", "_meta": old})),
+    )
+    .await;
+    assert_eq!(out["error"]["code"], -32021, "{out}");
 }
 
 #[tokio::test]

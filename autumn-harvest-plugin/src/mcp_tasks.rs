@@ -510,15 +510,20 @@ pub fn signal_payload(content: Option<&Value>) -> Value {
     }
 }
 
-/// `true` when the request declares the Tasks extension.
+/// `true` when a 2026-07-28 request declares the Tasks extension.
+///
+/// The extension is defined for that revision only. The 2025-11-25 task API
+/// is not wire-compatible, so an older request never gets a task.
 #[must_use]
 pub fn client_declares_tasks(params: &Value) -> bool {
-    params
-        .pointer("/_meta")
-        .and_then(|meta| meta.get(CLIENT_CAPABILITIES_META))
-        .and_then(|caps| caps.get("extensions"))
-        .and_then(|extensions| extensions.get(TASKS_EXTENSION))
-        .is_some_and(Value::is_object)
+    let meta = params.pointer("/_meta");
+    meta.and_then(|meta| meta.get(PROTOCOL_VERSION_META))
+        .is_some_and(|version| version == LATEST_PROTOCOL_VERSION)
+        && meta
+            .and_then(|meta| meta.get(CLIENT_CAPABILITIES_META))
+            .and_then(|caps| caps.get("extensions"))
+            .and_then(|extensions| extensions.get(TASKS_EXTENSION))
+            .is_some_and(Value::is_object)
 }
 
 /// The task route path under a tool prefix.
@@ -1132,11 +1137,14 @@ async fn dispatch(
     }
 }
 
-fn capabilities() -> Value {
-    json!({
-        "tools": {"listChanged": false},
-        "extensions": {TASKS_EXTENSION: {}},
-    })
+/// The server capabilities. Only a 2026-07-28 session gets the Tasks
+/// extension.
+fn capabilities(modern: bool) -> Value {
+    let mut caps = json!({"tools": {"listChanged": false}});
+    if modern {
+        caps["extensions"] = json!({TASKS_EXTENSION: {}});
+    }
+    caps
 }
 
 fn server_info() -> Value {
@@ -1150,7 +1158,7 @@ fn initialize_result(params: &Value) -> Value {
         .unwrap_or(LATEST_PROTOCOL_VERSION);
     json!({
         "protocolVersion": version,
-        "capabilities": capabilities(),
+        "capabilities": capabilities(version == LATEST_PROTOCOL_VERSION),
         "serverInfo": server_info(),
     })
 }
@@ -1171,7 +1179,7 @@ fn cacheable(mut result: Value) -> Value {
 fn discover_result() -> Value {
     cacheable(json!({
         "supportedVersions": PROTOCOL_VERSIONS,
-        "capabilities": capabilities(),
+        "capabilities": capabilities(true),
         "_meta": {"io.modelcontextprotocol/serverInfo": server_info()},
     }))
 }
@@ -2131,11 +2139,14 @@ mod tests {
 
     #[test]
     fn the_client_declares_tasks_in_request_meta() {
+        let caps = json!({"extensions": {TASKS_EXTENSION: {}}});
         let declared = json!({
-            "_meta": {CLIENT_CAPABILITIES_META: {"extensions": {TASKS_EXTENSION: {}}}}
+            "_meta": {PROTOCOL_VERSION_META: LATEST_PROTOCOL_VERSION, CLIENT_CAPABILITIES_META: caps}
         });
         assert!(client_declares_tasks(&declared));
         for params in [
+            json!({"_meta": {CLIENT_CAPABILITIES_META: caps}}),
+            json!({"_meta": {PROTOCOL_VERSION_META: "2025-11-25", CLIENT_CAPABILITIES_META: caps}}),
             json!({}),
             Value::Null,
             json!({"_meta": {}}),

@@ -255,7 +255,7 @@ route does not need `mcp_tools()` or `mount_mcp`.
 
 | Method | What Harvest does |
 |---|---|
-| `initialize`, `server/discover` | Advertise `capabilities.extensions["io.modelcontextprotocol/tasks"]`. |
+| `initialize`, `server/discover` | Advertise `capabilities.extensions["io.modelcontextprotocol/tasks"]`. A 2025 `initialize` does not get it. |
 | `ping` | Answer an empty result. |
 | `tools/list` | One `start_{wf}` tool for each MCP workflow. Its `inputSchema` is the same as on `/mcp`. |
 | `tools/call` | Start the run. A client that declares the extension gets a `CreateTaskResult` (`resultType: "task"`). Any other client gets the plain start handle. |
@@ -280,7 +280,10 @@ and `-32602`. A 2026-07-28 request for an unknown method gets `404`.
 
 A `tasks/*` call needs the extension in its own
 `params._meta["io.modelcontextprotocol/clientCapabilities"]`. Without it, the
-call gets HTTP `400` with error `-32021`.
+call gets HTTP `400` with error `-32021`. The extension is defined for
+2026-07-28 only, and the 2025-11-25 task API is not wire-compatible. So a
+request with an older `protocolVersion` never gets a task, and its `tasks/*`
+call gets `-32021` too.
 
 **The task is the run.** The task id is the execution id. Each read derives
 the task from the execution row, so no task state is stored and a restart

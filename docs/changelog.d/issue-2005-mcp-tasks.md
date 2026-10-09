@@ -26,6 +26,8 @@ JSON-RPC route at `{tools prefix}/tasks`, default `/api/harvest/mcp/tasks`.
   answer in `tasks/update` delivers the signal, with the key as its
   idempotency key. A `decline`, or a payload that the signal refuses, gets
   `-32602`. A client without the `elicitation` capability sees `working`.
+- Only a 2026-07-28 request can use the extension. A 2025 session does not
+  see it advertised.
 - A DAG, and a debounced or batched workflow, is not served.
 - The route takes the auth layers of a mutating tool route and accepts
   `application/json` only.
