@@ -36,6 +36,10 @@ winning row even carries a concurrency key. The batched path defers that
 entirely to `claim_batched_candidate_attempt_query`, which touches only the
 one winning candidate's own key.
 
+> **Follow-up (issue #1971):** the default claim now reads these CTEs only
+> when it falls back to the full scan. Its seek window counts the `RUNNING`
+> rows of the window keys only. See `docs/performance.md`, "The seek window".
+
 **This does not resolve the O(backlog) scaling question ledger #5 left
 open.** Both queries plan as a full scan at this fixture depth; the win
 measured here is the concurrency-key aggregate's cost, not a `LIMIT`

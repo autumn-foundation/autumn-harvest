@@ -89,6 +89,10 @@ checking your app's full route list for `start_*`/`*_status`/`signal_*`/
 | `foo_update_bar` | POST `{prefix}/workflows/foo/{handle}/update/bar` | `handle`, `body` = update input | **Synchronous** request/response: validated, durably admitted, executed, result returned (default 30 s wait) |
 | `foo_watch` | GET `{prefix}/workflows/foo/{handle}/watch` | `handle` | Streaming progress over MCP `notifications/progress`; terminates with the final state |
 
+**Known limitation (issue #2035):** the engine admits a declarative update
+but does not run its handler yet. `foo_update_bar` validates and admits the
+update, and then returns 504 after the 30 s wait.
+
 `{prefix}` defaults to `{api_path}/mcp` (`/api/harvest/mcp` when no management
 API is mounted); override with `mcp_tools_at`.
 

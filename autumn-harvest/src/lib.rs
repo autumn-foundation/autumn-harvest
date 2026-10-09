@@ -315,6 +315,8 @@ pub mod durable_promise;
 /// tunable is a compile error until it is surfaced.
 pub mod effective_config;
 pub mod eligibility;
+/// Keyed entity: serialized handlers over durable state for each key (issue #1975).
+pub mod entity;
 /// Targeted PII erasure for completed workflow executions (issue #495).
 ///
 /// Provides [`erase::erase_workflow_payloads`] (DB-gated) plus the pure

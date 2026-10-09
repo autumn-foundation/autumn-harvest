@@ -2027,6 +2027,18 @@ impl HistoryMatcher {
         u64::try_from(self.events.len()).unwrap_or(u64::MAX)
     }
 
+    /// Serialized JSON bytes of the events loaded into this matcher.
+    ///
+    /// It estimates the stored history size. The store can encode or offload
+    /// a payload, so the stored size can differ (issue #1975).
+    #[must_use]
+    pub(crate) fn loaded_bytes(&self) -> u64 {
+        self.events
+            .iter()
+            .map(|event| serde_json::to_vec(event).map_or(0, |json| json.len() as u64))
+            .sum()
+    }
+
     /// Returns `true` if there are unconsumed events that are not terminal
     /// lifecycle events (`WorkflowCompleted`, `WorkflowFailed`,
     /// `WorkflowCancelled`, `WorkflowContinuedAsNew`), or if there are buffered

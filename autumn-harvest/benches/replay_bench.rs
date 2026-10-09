@@ -31,6 +31,12 @@
 mod claim_bench_support;
 #[path = "../tests/integration/e2e_bench_support.rs"]
 mod e2e_bench_support;
+// The `db` section also reaches `pg_stats_snapshot` through the crate root,
+// for its teardown snapshot (issue #1956). That module needs `diesel`, so it
+// has the same `db` gate as the code that uses it.
+#[cfg(feature = "db")]
+#[path = "../tests/integration/pg_stats_snapshot.rs"]
+mod pg_stats_snapshot;
 
 use std::sync::{Arc, Mutex};
 
