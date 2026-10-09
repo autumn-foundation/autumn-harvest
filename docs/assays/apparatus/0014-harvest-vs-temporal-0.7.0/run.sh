@@ -52,6 +52,11 @@ for round in $(seq 0 $((ROUNDS - 1))); do
     # A failed run can skip assay #11's own cleanup. A Temporal server left
     # running would load every harvest cell after it.
     docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+    # Fail closed: stop the sweep when the removal cannot be confirmed.
+    if ! left="$(docker ps -aq --filter "name=^${CONTAINER}\$")" || [ -n "$left" ]; then
+      echo "cannot confirm that $CONTAINER is gone; stopping the sweep" >&2
+      exit 1
+    fi
     grep '^rep ' "$OUT/r${round}-temporal-d${depth}.txt" || true
   done
   for pair in ${BINS//,/ }; do
