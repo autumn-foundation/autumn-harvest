@@ -1991,6 +1991,10 @@ struct ScheduledActivityCommand {
     /// internal session-acquire dispatch. `None` for every ordinary
     /// activity.
     schedule_to_start_override: Option<std::time::Duration>,
+    /// Write the result through the `PayloadStore` (issue #1986).
+    ///
+    /// `build_activity_enqueue_plan` adds `RESULT_WRITER_HEADER` to the row.
+    result_writer: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2880,6 +2884,7 @@ fn extract_all_scheduled_activities(
                 session_id,
                 session_worker_id,
                 schedule_to_start_override,
+                result_writer,
                 ..
             } => {
                 scheduled.push(ScheduledActivityCommand {
@@ -2892,6 +2897,7 @@ fn extract_all_scheduled_activities(
                     session_id: *session_id,
                     session_worker_id: session_worker_id.clone(),
                     schedule_to_start_override: *schedule_to_start_override,
+                    result_writer: *result_writer,
                 });
             }
             _ => return None,
@@ -3242,6 +3248,7 @@ fn extract_mixed_suspension_batch(commands: &[WorkflowCommand]) -> Option<MixedS
                 session_id,
                 session_worker_id,
                 schedule_to_start_override,
+                result_writer,
                 ..
             } => batch.scheduled_activities.push(ScheduledActivityCommand {
                 activity_id: *activity_id,
@@ -3253,6 +3260,7 @@ fn extract_mixed_suspension_batch(commands: &[WorkflowCommand]) -> Option<MixedS
                 session_id: *session_id,
                 session_worker_id: session_worker_id.clone(),
                 schedule_to_start_override: *schedule_to_start_override,
+                result_writer: *result_writer,
             }),
             WorkflowCommand::WaitForActivity { activity_id, .. } => {
                 batch.activity_waits.push(*activity_id);
@@ -9409,7 +9417,12 @@ pub async fn persist_workflow_completion(
             // The row and the task get the same stored form (issue #1979).
             let stored_output = codecs.encode_column(&output)?;
             update_workflow_execution_completed(conn, exec_id, worker_id, &stored_output).await?;
-            queue::complete_task(conn, task_id, stored_output).await?;
+            queue::complete_task(
+                conn,
+                &queue::TaskClaim::new(task_id, worker_id, attempt),
+                stored_output,
+            )
+            .await?;
             let (mut deferred, closed_children) =
                 apply_parent_close_cascade(conn, exec_id, codecs).await?;
             let mut tx_cancel_metrics = Vec::new();
@@ -11052,6 +11065,80 @@ struct ActivityEnqueuePlan {
     dynamic_rate_buckets: Vec<(String, f64, f64)>,
 }
 
+/// The context headers for one activity row (issue #1986).
+///
+/// Only the engine sets `RESULT_WRITER_HEADER`. A caller can set any
+/// execution header, so this function removes an inherited copy of the
+/// reserved header. A row with the result writer gets the header. The header
+/// rides in the row's existing `context_headers` column, so it needs no
+/// migration.
+fn activity_row_context_headers(
+    context_headers: Option<&serde_json::Value>,
+    result_writer: bool,
+) -> Option<serde_json::Value> {
+    let key = crate::fan_out::RESULT_WRITER_HEADER;
+    let inherited = context_headers.and_then(serde_json::Value::as_object);
+    if !result_writer && !inherited.is_some_and(|headers| headers.contains_key(key)) {
+        return context_headers.cloned();
+    }
+    let mut headers = inherited.cloned().unwrap_or_default();
+    headers.remove(key);
+    if result_writer {
+        headers.insert(key.to_string(), serde_json::Value::from("1"));
+    }
+    Some(serde_json::Value::Object(headers))
+}
+
+#[cfg(test)]
+mod result_writer_header_tests {
+    use super::activity_row_context_headers;
+    use crate::fan_out::RESULT_WRITER_HEADER;
+    use serde_json::json;
+
+    #[test]
+    fn a_plain_row_keeps_the_execution_headers() {
+        let headers = json!({ "tenant": "a" });
+        assert_eq!(
+            activity_row_context_headers(Some(&headers), false),
+            Some(headers)
+        );
+        assert_eq!(activity_row_context_headers(None, false), None);
+    }
+
+    #[test]
+    fn a_writer_row_adds_the_header() {
+        let headers = json!({ "tenant": "a" });
+        assert_eq!(
+            activity_row_context_headers(Some(&headers), true),
+            Some(json!({ "tenant": "a", RESULT_WRITER_HEADER: "1" }))
+        );
+        assert_eq!(
+            activity_row_context_headers(None, true),
+            Some(json!({ RESULT_WRITER_HEADER: "1" }))
+        );
+    }
+
+    /// A caller can set execution headers. A plain row never inherits the
+    /// reserved header, so a caller cannot turn on the writer.
+    #[test]
+    fn a_plain_row_drops_a_caller_supplied_writer_header() {
+        let headers = json!({ "tenant": "a", RESULT_WRITER_HEADER: "1" });
+        assert_eq!(
+            activity_row_context_headers(Some(&headers), false),
+            Some(json!({ "tenant": "a" }))
+        );
+    }
+}
+
+/// Whether the task row asks the worker to write the result (issue #1986).
+fn task_writes_result(task: &TaskQueueItem) -> bool {
+    task.context_headers
+        .as_ref()
+        .and_then(|headers| headers.get(crate::fan_out::RESULT_WRITER_HEADER))
+        .and_then(serde_json::Value::as_str)
+        == Some("1")
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn build_activity_enqueue_plan(
     registry: &HandlerRegistry,
@@ -11338,7 +11425,8 @@ fn build_activity_enqueue_plan(
             { ATTR_QUEUE } = %queue_name,
         )
         .in_scope(|| registry.telemetry().capture_trace_context());
-        params.context_headers = context_headers.cloned();
+        params.context_headers =
+            activity_row_context_headers(context_headers, scheduled.result_writer);
         enqueued.push(params);
     }
 
@@ -14537,9 +14625,18 @@ pub async fn finalize_activity_completion(
     // encodes under the same codecs replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
-    finalize_activity_completion_write(conn, task, exec_id, activity_id, output, offloader, codecs)
-        .await
-        .map(|_| ())
+    finalize_activity_completion_write(
+        conn,
+        task,
+        exec_id,
+        activity_id,
+        output,
+        offloader,
+        codecs,
+        None,
+    )
+    .await
+    .map(|_| ())
 }
 
 /// [`finalize_activity_completion`], and whether the completion applied
@@ -14547,6 +14644,11 @@ pub async fn finalize_activity_completion(
 ///
 /// It returns [`queue::ClaimWrite::LeaseLost`] when this attempt no longer
 /// owns the outcome: the claim is lost, or the activity is no longer pending.
+///
+/// `stored` is the result writer's reference (issue #1986). When it is set,
+/// history records it in place of `output`, and the transaction adds its
+/// `harvest_payload_refs` row.
+#[allow(clippy::too_many_arguments)]
 async fn finalize_activity_completion_write(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
@@ -14555,18 +14657,15 @@ async fn finalize_activity_completion_write(
     output: serde_json::Value,
     offloader: Option<&crate::payload_store::PayloadOffloader>,
     codecs: &crate::payload_codec::PayloadCodecs,
+    stored: Option<&crate::fan_out::StoredResult>,
 ) -> HarvestResult<queue::ClaimWrite> {
     let Some(activity_name) = task.activity_name.as_deref() else {
         return Ok(queue::ClaimWrite::LeaseLost);
     };
-    let completion_event = WorkflowEvent::ActivityCompleted {
-        activity_id,
-        output: output.clone(),
-    };
 
     let result = Box::pin(
         conn.transaction::<queue::ClaimWrite, HarvestError, _>(async |conn| {
-            let output = output.clone();
+            let mut output = output.clone();
             let history = lock_workflow_execution_and_load_history(conn, exec_id, codecs).await?;
             if pending_activity_id_for_task(&history.events, task, activity_name)?.is_none() {
                 return Ok(queue::ClaimWrite::LeaseLost);
@@ -14577,6 +14676,28 @@ async fn finalize_activity_completion_write(
                 log_lease_lost(task, "activity completion");
                 return Ok(queue::ClaimWrite::LeaseLost);
             }
+            // The blob is already in the store (issue #1986). Its reference
+            // row commits with the event, so retention can delete the blob.
+            if let Some(stored) = stored {
+                store::insert_payload_refs(
+                    conn,
+                    exec_id,
+                    &[crate::payload_store::OffloadedRef {
+                        blob_key: stored.key.clone(),
+                        store_id: stored.store_id.clone(),
+                        byte_len: stored.len,
+                    }],
+                )
+                .await?;
+                output = stored.to_recorded_value();
+            }
+            let completion_event = WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: output.clone(),
+            };
+            // A stored reference is already out of line. Ordinary offload
+            // would upload it again under a low threshold.
+            let offloader = offloader.filter(|_| stored.is_none());
             store::append_events_offloaded_with_codecs(
                 conn,
                 exec_id,
@@ -15083,7 +15204,12 @@ pub async fn persist_child_workflow_completion(
             // The row and the task get the same stored form (issue #1979).
             let stored_output = codecs.encode_column(&output)?;
             update_workflow_execution_completed(conn, exec_id, worker_id, &stored_output).await?;
-            queue::complete_task(conn, task_id, stored_output).await?;
+            queue::complete_task(
+                conn,
+                &queue::TaskClaim::new(task_id, worker_id, attempt),
+                stored_output,
+            )
+            .await?;
             let (mut deferred, closed_children) =
                 apply_parent_close_cascade(conn, exec_id, codecs).await?;
             let mut tx_cancel_metrics = Vec::new();
@@ -15909,13 +16035,37 @@ async fn handle_activity_result(
     // Issue #1243: configured codecs, so this write encodes under the
     // same registry replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
+    // Issue #1986: the result writer's reference, written before the call.
+    stored: Option<&crate::fan_out::StoredResult>,
 ) -> HarvestResult<queue::ClaimWrite> {
     match activity_result {
+        // Issue #1986: a writer row that this worker cannot write records the
+        // value inline. A value that carries the reserved key would then read
+        // as a reference, so it fails instead (compare issue #1758).
+        Ok(output)
+            if stored.is_none()
+                && task_writes_result(task)
+                && output.get(crate::fan_out::STORED_RESULT_KEY).is_some() =>
+        {
+            use crate::failure::IntoActivityErrorString as _;
+            let error = crate::failure::ActivityFailure::non_retryable(
+                "ReservedResultKey",
+                format!(
+                    "activity '{activity_name_for_cap}' result carries the reserved key \
+                     '{}' and this worker has no PayloadStore to write it",
+                    crate::fan_out::STORED_RESULT_KEY
+                ),
+            )
+            .into_error_payload();
+            finalize_activity_failure_write(conn, task, exec_id, activity_id, &error, codecs).await
+        }
         Ok(output) => {
             let observed_bytes = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
             // Issue #524: an over-threshold result will be offloaded into a tiny
             // reference envelope, so it does not trip the #252 result cap.
-            let offload_applies = offloader.is_some_and(|o| observed_bytes > o.threshold());
+            // Issue #1986: a stored result is already out of line.
+            let offload_applies =
+                stored.is_some() || offloader.is_some_and(|o| observed_bytes > o.threshold());
             if max_result_bytes > 0 && observed_bytes > max_result_bytes && !offload_applies {
                 use crate::failure::IntoActivityErrorString as _;
                 let error = crate::failure::ActivityFailure::non_retryable(
@@ -15944,6 +16094,7 @@ async fn handle_activity_result(
                 output,
                 offloader,
                 codecs,
+                stored,
             )
             .await
         }
@@ -16067,6 +16218,7 @@ pub async fn write_activity_result_for_task(
         &crate::telemetry::NoOpMetrics,
         crate::builder::DEFAULT_RETRY_AFTER_CEILING,
         codecs,
+        None,
     )
     .await
 }
@@ -17782,9 +17934,18 @@ async fn handle_session_acquire(
         crate::telemetry::SessionAcquisitionOutcome::Acquired,
     );
     let output = serde_json::json!(actual_host);
-    finalize_activity_completion_write(&mut conn, task, exec_id, activity_id, output, None, codecs)
-        .await
-        .map(Some)
+    finalize_activity_completion_write(
+        &mut conn,
+        task,
+        exec_id,
+        activity_id,
+        output,
+        None,
+        codecs,
+        None,
+    )
+    .await
+    .map(Some)
 }
 
 /// Handle the internal session-release activity (issue #606), dispatched by
@@ -17843,9 +18004,18 @@ async fn handle_session_release(
     crate::sessions::release_session_slot(session_slots_in_use, session_id);
 
     let output = serde_json::Value::Null;
-    finalize_activity_completion_write(&mut conn, task, exec_id, activity_id, output, None, codecs)
-        .await
-        .map(Some)
+    finalize_activity_completion_write(
+        &mut conn,
+        task,
+        exec_id,
+        activity_id,
+        output,
+        None,
+        codecs,
+        None,
+    )
+    .await
+    .map(Some)
 }
 
 /// Settle the local slot of a session acquire that failed on a transient
@@ -18847,6 +19017,8 @@ async fn process_activity_task(
             activity_id,
             claim: activity_claim.clone(),
             max_result_bytes: effective_result_cap,
+            result_writer: task_writes_result(task),
+            offloader: registry.payload_offloader_arc(),
         });
 
     let telemetry = registry.telemetry().clone();
@@ -19170,9 +19342,10 @@ async fn process_activity_task(
     let activity_result = match activity_result {
         Ok(output) if effective_result_cap > 0 => {
             let observed = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
+            // Issue #1986: the result writer moves every result to the store.
             let offload_applies = registry
                 .payload_offloader()
-                .is_some_and(|o| observed > o.threshold());
+                .is_some_and(|o| observed > o.threshold() || task_writes_result(task));
             if observed > effective_result_cap && !offload_applies {
                 use crate::failure::IntoActivityErrorString as _;
                 let error = crate::failure::ActivityFailure::non_retryable(
@@ -19764,6 +19937,22 @@ async fn write_activity_result(
         .map(crate::payload_store::PayloadOffloader::counting_uploads);
     let offloader = counted.as_ref().map(|(offloader, _)| offloader);
     let uploaded = || counted.as_ref().is_some_and(|(_, uploads)| uploads.any());
+    // Issue #1986: write the result once, before any lock is taken. Each try
+    // then records the same reference and uploads nothing, so the repeats stay
+    // safe. A lost claim leaves one blob without a reference row, as a
+    // rolled-back offload does.
+    let stored = match (activity_result, registry.payload_offloader()) {
+        (Ok(output), Some(offloader)) if task_writes_result(task) => Some(
+            crate::fan_out::StoredResult::write(
+                offloader.store().as_ref(),
+                registry.payload_codecs(),
+                activity_id,
+                output,
+            )
+            .await?,
+        ),
+        _ => None,
+    };
     let mut attempt = 1;
     loop {
         let outcome = handle_activity_result(
@@ -19780,6 +19969,7 @@ async fn write_activity_result(
             registry.telemetry().metrics.as_ref(),
             registry.retry_after_ceiling,
             registry.payload_codecs(),
+            stored.as_ref(),
         )
         .await;
         match outcome {
@@ -23181,7 +23371,12 @@ async fn persist_workflow_continue_as_new_with_verdict(
         .map_err(crate::error::database_error)?;
 
         queue::enqueue(conn, &enqueue).await?;
-        queue::complete_task(conn, task_id, serde_json::Value::Null).await?;
+        queue::complete_task(
+            conn,
+            &queue::TaskClaim::new(task_id, worker_id, attempt),
+            serde_json::Value::Null,
+        )
+        .await?;
         Ok(false)
     }))
     .await
@@ -44309,6 +44504,7 @@ mod tests {
                 session_id: None,
                 session_worker_id: None,
                 schedule_to_start_override: None,
+                result_writer: false,
                 result_tx: tx,
             },
         ];
@@ -44331,6 +44527,7 @@ mod tests {
             session_id: Some(session_id),
             session_worker_id: Some("worker-7".to_string()),
             schedule_to_start_override: Some(std::time::Duration::from_secs(30)),
+            result_writer: false,
             result_tx: tx,
         }];
         let scheduled = extract_all_scheduled_activities(&commands)
@@ -44433,6 +44630,7 @@ mod tests {
             session_id: None,
             session_worker_id: None,
             schedule_to_start_override: None,
+            result_writer: false,
             result_tx: oneshot::channel::<Result<serde_json::Value, String>>().0,
         });
         assert!(
@@ -44563,6 +44761,7 @@ mod tests {
             session_id: None,
             session_worker_id: None,
             schedule_to_start_override: None,
+            result_writer: false,
             result_tx: oneshot::channel::<Result<serde_json::Value, String>>().0,
         }
     }
@@ -47616,6 +47815,7 @@ mod tests {
             session_id: None,
             session_worker_id: None,
             schedule_to_start_override: None,
+            result_writer: false,
             result_tx,
         }
     }
@@ -51478,6 +51678,7 @@ mod tests {
             session_id: None,
             session_worker_id: None,
             schedule_to_start_override: None,
+            result_writer: false,
             result_tx: oneshot::channel::<Result<Value, String>>().0,
         }
     }
