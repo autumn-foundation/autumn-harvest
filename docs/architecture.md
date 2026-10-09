@@ -202,6 +202,7 @@ The capability-miss release keys on `(worker_id, crash_strikes, attempt)` (issue
 - Writes: `complete_claimed_task`, `fail_claimed_task`, `requeue_claimed_task_for_retry`, `defer_claimed_rate_limited_task`, `defer_claimed_retry_for_budget`, `defer_claimed_task_for_open_circuit`, `mark_claim_handler_started`, `release_unstarted_claim`, `release_abandoned_claim` and `record_heartbeat`.
 - Drain release of a joined activity (issue #1813): `requeue_claimed_task_for_retry`. It keeps `attempt`, because the handler ran.
 - Workflow-task writes: `requeue_claimed_workflow_task_after_deadlock` (issue #1797) and `requeue_claimed_workflow_task_after_panic` (issue #1815).
+- `complete_task`. It takes a `TaskClaim` and returns `NotFound` when the claim is not current (issue #1992). The three workflow-task completions in `worker.rs` call it after the `claim_still_held_for_update` guard.
 - `lock_claim_for_update`. The start fence, both finalize paths, the in-worker schedule-to-close and session-acquire timeouts, and `run_transactional` take it after the execution row lock.
 - `claim_is_current` and `task_status_for_claim`. The cancellation observer and `ActivityContext::check_durable_cancellation` read them.
 - `claim_still_held_for_update`. The workflow-task terminal guard takes `claim_held` and adds `crash_strikes = $c` (issue #1806). The stuck-running requeue keeps `crash_strikes`, so only `attempt` tells a same-worker re-claim apart.
@@ -211,7 +212,7 @@ The capability-miss release keys on `(worker_id, crash_strikes, attempt)` (issue
 
 *Lease lost.* A path that gets `ClaimLock::Lost` appends no event and returns `Ok`. It must not return an error, because `fail_execution_on_error` would then fail the workflow. After `Held`, a `LeaseLost` write is a bug, and `require_applied` rolls the transaction back. A fenced write outside the lock returns `LeaseLost` when it matches 0 rows. The heartbeat flusher, the cancellation observer and `check_durable_cancellation` stop the activity.
 
-*Not fenced.* `complete_task`, `fail_task`, `requeue_for_retry` and `defer_rate_limited_task` stay unfenced. The timeout sweeper in `timeout.rs`, cancellation and operator actions use them on purpose: they act on a row whatever its claim. Workflow-task writes use `claim_still_held_for_update`, which also checks `attempt` (issues #804, #1184 and #1806).
+*Not fenced.* `fail_task`, `requeue_for_retry` and `defer_rate_limited_task` stay unfenced. The timeout sweeper in `timeout.rs`, cancellation and operator actions use them on purpose: they act on a row whatever its claim. Workflow-task writes use `claim_still_held_for_update`, which also checks `attempt` (issues #804, #1184 and #1806).
 
 *Timeout retries (issue #1809).* A start-to-close or heartbeat timeout acts only on the scanned claim. The sweeper skips the row when a later claim holds it. It requeues a retry with `requeue_claimed_task_for_retry` under the scanned claim.
 
@@ -402,7 +403,7 @@ Current implementation scope: `ExecutionId`/`ShardId` encoding, `ShardRouter`, `
 | `entity.rs` | 3.x | Keyed entity (issue #1975, [ADR 0006](adr/0006-keyed-entity.md)): `Entity::new(ctx, checkpoint).run(handler)`, `EntityMessage`, `EntityCheckpoint`, `EntityStats`. Sugar over a workflow: the key is the `workflow_id`, an operation is a `harvest.entity.op` signal, and the queries `harvest.entity.state` / `harvest.entity.stats` read committed state. One loop runs one handler at a time. Each checkpoint decision is a recorded side effect, so replay takes it at the same op. Waiting ops ride in the continue-as-new input while it fits the workflow input cap. The crate-private `WorkflowContext::history_policy`, `continue_as_new_input_budget` and `loaded_history_bytes` feed that decision. No new event variant, no migration. See `examples/agent_session_entity.rs`. |
 | `erase.rs` | 3.30 | Targeted PII erasure (issue #495): `ERASURE_TOMBSTONE_KEY`, `erasure_tombstone()`, `tombstone_payload_fields(event_value)` (pure, no-DB), `is_terminal_state(state)`, `EraseOutcome`/`SkippedChild`/`EraseFailure`; DB-gated `erase_workflow_payloads(conn, exec_id, reason)`. **Sanctioned in-place mutation exception** to the append-only invariant (alongside codec key re-encryption): only `data` field contents are mutated, never event structure. Terminal-only, irreversible, idempotent, cascades to terminal children on the same shard. |
 | `payload_codec.rs` | 3.40 | Payload encryption/compression boundary at the event-write path (`PayloadCodec` trait, `PayloadCodecs` registry, `IdentityCodec`; see [ADR-0003](adr/0003-payload-codec-event-boundary.md)). Key rotation (issue #948): `register_key`/`set_active_key`/`active_key_id`/`retire_key_local`, `CODEC_LEGACY_KEY_ID`. The `_harvest_codec_envelope` shape (`codec_envelope_parts`): a genuinely rotated key still writes the flat version-2 shape unchanged; only `encode_payload`'s collision-escape guard (issue #1253, `CODEC_ENVELOPE_VERSION_NESTED`) writes the new nested shape, deliberately un-gated (see that method's doc for why nesting a keyed write instead would reopen a rollout hazard). Decode reads all three shapes. `advertise_codec_capability` (issue #1244) merges this build's `CODEC_ENVELOPE_VERSION_KEYED` support into a worker's `harvest_workers.labels`, consumed by `codec_rotation::activate_codec_key`'s reader-capability handshake — unchanged by issue #1253. |
-| `aead_codec.rs` | 3.x | Production AES-256-GCM payload codec (issue #1825). `AeadCodec`: `codec_id` `aes-256-gcm`, a random 96-bit nonce, and an authenticated header with the format version and key id. Also `DataKey` (zeroized on drop), the `KeyProvider` trait and `EnvKeyProvider`/`FileKeyProvider`/`KmsKeyProvider`. The plugin crate's `aws-kms` feature adds `aws_kms::AwsKms`, which implements `KmsDecrypt`, so the core crate has no cloud dependency. `AeadCodec::register_with` and `HarvestBuilder::aead_payload_codec_key` register one codec per key id, so the issue #948 sweep rotates it. See [`docs/security-posture.md`](security-posture.md#payload-encryption-at-rest-issue-1825). |
+| `aead_codec.rs` | 3.x | Production AES-256-GCM payload codec (issue #1825). `AeadCodec`: `codec_id` `aes-256-gcm`, a random 96-bit nonce, and an authenticated header with the format version and key id. Also `DataKey` (zeroized on drop), the `KeyProvider` trait and `EnvKeyProvider`/`FileKeyProvider`/`KmsKeyProvider`. The plugin crate's `aws-kms` feature adds `aws_kms::AwsKms`, and its `vault-transit` feature adds `vault_transit::VaultTransit` (issue #1981). Both implement `KmsDecrypt`, so the core crate has no cloud dependency. Both pass one shared `kms_conformance` test suite. `AeadCodec::register_with` and `HarvestBuilder::aead_payload_codec_key` register one codec per key id, so the issue #948 sweep rotates it. See [`docs/security-posture.md`](security-posture.md#payload-encryption-at-rest-issue-1825). |
 | `codec_rotation.rs` | 3.40 | Lazy re-encryption sweep for payload-codec key rotation (issue #948): `sweep_codec_reencryption`/`sweep_codec_reencryption_once` (folded into `timeout::enforce_timeouts_once`, shard-local, batched via `harvest_codec_rotation_cursor`), `load_shard_rotation_progress` (census), `retire_codec_key` (fail-closed retirement gate). **Sanctioned in-place mutation exception #3** — see CLAUDE.md's Engine Invariants. Issue #1244 adds the two structural fleet-wide preconditions #948 left to operator discipline: `activate_codec_key` (refuses while any live worker cannot read the keyed envelope; durably records the key lifecycle in `harvest_codec_key_state`) and `refresh_active_codec_key` (bounded-staleness refresh, folded into the same scanner tick beside the sweep). `retire_codec_key`'s `FleetWriteFence::NotConfirmed` path now reads that durable table instead of trusting an operator attestation alone; `ConfirmedByOperator` remains as a single-process-embedder escape hatch. See [`docs/operations/codec-key-rotation.md`](operations/codec-key-rotation.md). |
 | `append_only.rs` | 3.x | Database guard on append-only `harvest_events` (issue #1817): `EventRewrite` (`Erase`, `CodecRotation`), `sanction`/`revoke` for the transaction-local `harvest.sanctioned_event_rewrite` setting, the guard trigger's names, and `with_guard_off` for test fixtures only. See Key Design Decisions. |
 | `payload_store.rs` | 3.37 | Large-payload claim-check offloading (issue #524): `PayloadStore` async trait (embedder-supplied backend, no cloud client in core), `PayloadOffloader` (`offload_event_value`/`inflate_event_value`/`extract_offload_ref`/`refs_in_event_value`), reference-envelope + sha256 checksum helpers. Composes after `PayloadCodec`; no new `WorkflowEvent` variant. Store seam in `store.rs` (`append_events_offloaded`/`load_history_inflated`); GC via `harvest_payload_refs` (migration `20260627000001`). |
@@ -960,6 +961,8 @@ See `autumn-harvest/examples/signal_handlers_subscription.rs` for a complete sub
 | `execute_activity_fan_out_collect_windowed(info, inputs, max_in_flight)` | **Bounded** collect-all: at most `W` in flight at a time |
 | `execute_activity_fan_out_raw_windowed(activities, max_in_flight)` | **Bounded** raw fail-fast |
 | `execute_activity_fan_out_collect_raw_windowed(activities, max_in_flight)` | **Bounded** raw collect-all |
+| `execute_activity_fan_out_with(info, inputs, &options)` | Collect-all with `FanOutOptions`: window, failure tolerance, result writer (issue #1986) |
+| `execute_activity_fan_out_raw_with(activities, &options)` | Raw form of the above |
 
 ```rust
 // Typed, homogeneous fan-out — all slots run the same activity
@@ -1010,6 +1013,92 @@ The `_windowed` variants add a `max_in_flight: usize` (`W`) argument to each of 
 - The two `try_join_all` known limitations of the unbounded fan-out (documented in the fan-out sections above) carry over **per-wave** — narrowed to a single wave's width, not widened.
 
 See `autumn-harvest/examples/fanout_batch.rs` for a complete end-to-end example covering all shapes (static N, dynamic N from a prior activity, collect-all with partial failure, and a windowed fan-out over a collection larger than the window).
+
+#### Failure tolerance and result writer (issue #1986)
+
+`FanOutOptions` configures `execute_activity_fan_out_with` and
+`execute_activity_fan_out_raw_with`. Both return `FanOutResults`, the
+manifest. It holds one `FanOutItem` per input, in input order: `Value`,
+`Stored` or `Failed`. It is serializable, so a workflow can pass it to a later
+step.
+
+```rust
+use autumn_harvest::fan_out::{FailureTolerance, FanOutItem, FanOutOptions, FanOutResults};
+
+let options = FanOutOptions::new()
+    .with_max_in_flight(50)
+    .with_tolerance(FailureTolerance::Percent(5))
+    .with_result_writer(true);
+let manifest: FanOutResults<ItemResult> = ctx
+    .execute_activity_fan_out_with(&process_item_info(), items, &options)
+    .await
+    .map_err(|e| e.to_string())?;
+for item in manifest.items() {
+    match item {
+        FanOutItem::Value(result) => { /* an inline result */ }
+        FanOutItem::Stored(reference) => { /* an activity reads it with `fetch` */ }
+        FanOutItem::Failed(error) => { /* a tolerated failure */ }
+    }
+}
+```
+
+- **Failure tolerance.** `FailureTolerance::Count(n)` tolerates `n` failed
+  items. `Percent(p)` tolerates `total * p / 100`, rounded down. A `p` over
+  100 counts as 100. The default tolerates none. One more failure fails the
+  fan-out with `HarvestError::FanOutFailureThresholdExceeded { tolerated,
+  total }`. A windowed fan-out then dispatches no further wave. Only
+  `ActivityFailed` and `Timeout` count. Other errors abort, as in the
+  collect-all helpers.
+- **Replay.** History does not record the tolerance. Each wave polls every
+  slot before it decides, so a workflow can catch the error and go on (issue
+  #1791). A fan-out that stops records `fan_out_stop:{n}` with the number of
+  slots it dispatched. Replay reads it ahead, so the fan-out never takes an
+  activity that the workflow scheduled after the stop. The stop also consumes
+  the start events of slots that still run, and cancels those slots as
+  `ctx.race()` cancels its losers. Their synthetic terminal reads "lost race
+  to a sibling branch". The error carries no failure
+  count, because a replay can see more results. Change a tolerance for
+  in-flight runs behind `ctx.version()`.
+- **Result writer.** `with_result_writer(true)` sets the row header
+  `x-harvest-result-writer`. Only the engine sets it; it removes a copy that a
+  caller supplies. The worker encodes the result with the payload codecs and
+  writes it through the `PayloadStore` once, before it takes any lock. The
+  blob holds the activity id, so two runs never share a key.
+  `ActivityCompleted.output` then holds a small `StoredResult`, and the
+  completion transaction adds its `harvest_payload_refs` row. Replay fetches
+  no blob.
+- **Reading a result.** `StoredResult::fetch` reads one back. Call it from an
+  activity, never from workflow code. Pass it the store and codecs that the
+  worker has. The reference is not proof of ownership: read only the
+  references that your own runs recorded.
+- **No store.** A fresh dispatch fails with `HarvestError::Config` when the
+  workflow worker has no store. An activity worker without a store records the
+  value inline, and the item is a `Value`. It fails an activity whose result
+  carries the reserved key `_harvest_stored_result`. An older worker records
+  such a result as is. A transactional activity (`run_transactional`) writes
+  its result the same way, inside its own transaction.
+- **Result cap.** With a store, the result cap (issue #252) does not apply to
+  a writer row. Every result goes to the store.
+- **History size.** Each item still records its activity events. With the
+  writer, their size does not depend on the result. So history grows by a
+  fixed amount per item, not by the result size. A map run with an item
+  reader would remove the per-item events too. Harvest does not have it yet.
+- **Lifetime.** Retention deletes a blob when it purges the run that wrote
+  it. A manifest passed to another run (a child, or a continue-as-new
+  successor) is valid only while the writing run exists. Read or copy the
+  results before then.
+- **Concurrent windowed fan-out.** Do not run a windowed fan-out in a
+  `join!` with other activity dispatch. On resume, it treats the recorded
+  schedules after it as its own, so a sibling's schedule can shift its slots.
+  The `_windowed` helpers have the same limit (issue #750). An unwindowed
+  fan-out records all its slots in one batch, so it is safe.
+- **Writer mode.** A fresh dispatch with the writer records
+  `fan_out_writer:{n}`. Replay reads the mode from history, so a deploy that
+  changes the option keeps an in-flight run consistent.
+- **Known gaps.** PII erasure replaces the reference but leaves the blob in
+  the store until retention purges the run. The codec rotation sweep does
+  not re-encrypt blobs, so keep a retired key decode-only while its blobs
+  remain. Both gaps exist for offloaded payloads (issue #524) too.
 
 ### External Workflow Family — signal / cancel / await
 

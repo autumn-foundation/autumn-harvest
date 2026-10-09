@@ -18,7 +18,7 @@ use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
 use autumn_harvest::models::{
     HarvestTimer, NewWorkflowExecution, TaskQueueItem, WorkflowExecution,
 };
-use autumn_harvest::queue::{EnqueueParams, StickyHint, TaskType};
+use autumn_harvest::queue::{EnqueueParams, StickyHint, TaskClaim, TaskType};
 use autumn_harvest::schema::{harvest_task_queue, harvest_timers, harvest_workflow_executions};
 use autumn_harvest::store;
 use autumn_harvest::types::{ActivityExecId, ExecutionId, Priority};
@@ -1936,7 +1936,8 @@ async fn full_workflow_lifecycle() {
     assert_eq!(claimed.state, "RUNNING");
 
     // 5. Complete the task
-    queue::complete_task(&mut conn, task_id, serde_json::json!({"sent": true}))
+    let claim = TaskClaim::of(&claimed).expect("a claimed task");
+    queue::complete_task(&mut conn, &claim, serde_json::json!({"sent": true}))
         .await
         .expect("complete_task failed");
 
@@ -7768,7 +7769,8 @@ async fn concurrency_cap_limits_concurrent_claims_cluster_wide() {
     );
 
     // Complete one in-flight task to free a slot.
-    queue::complete_task(&mut conn, t1.unwrap().id, serde_json::json!(null))
+    let claim = TaskClaim::of(&t1.unwrap()).expect("a claimed task");
+    queue::complete_task(&mut conn, &claim, serde_json::json!(null))
         .await
         .expect("complete_task failed");
 
@@ -11074,7 +11076,7 @@ async fn per_key_concurrency_cap_enforced_across_fleet() {
     // Repeatedly claim a task, assert the in-flight count respects the cap,
     // then immediately complete one held task to free a slot.  Repeat until all
     // TOTAL tasks have been claimed and completed.
-    let mut held: Vec<Uuid> = Vec::new();
+    let mut held: Vec<TaskClaim> = Vec::new();
 
     loop {
         // Try to claim one more task.
@@ -11091,7 +11093,7 @@ async fn per_key_concurrency_cap_enforced_across_fleet() {
         .expect("claim query failed");
 
         if let Some(task) = claimed {
-            held.push(task.id);
+            held.push(TaskClaim::of(&task).expect("a claimed task"));
             let in_flight = u32::try_from(held.len()).unwrap();
             assert!(
                 in_flight <= LIMIT,
@@ -11102,8 +11104,8 @@ async fn per_key_concurrency_cap_enforced_across_fleet() {
             }
         } else if !held.is_empty() {
             // Cap is saturated; complete the oldest held task to free a slot.
-            let id = held.remove(0);
-            queue::complete_task(&mut conn, id, serde_json::json!(null))
+            let claim = held.remove(0);
+            queue::complete_task(&mut conn, &claim, serde_json::json!(null))
                 .await
                 .expect("complete_task failed");
             completed_count += 1;
@@ -11126,7 +11128,7 @@ async fn per_key_concurrency_cap_enforced_across_fleet() {
             .await
             .expect("claim query failed")
             .is_some_and(|t| {
-                held.push(t.id);
+                held.push(TaskClaim::of(&t).expect("a claimed task"));
                 true
             })
         {
@@ -11139,8 +11141,8 @@ async fn per_key_concurrency_cap_enforced_across_fleet() {
     }
 
     // Complete any remaining held tasks.
-    for id in held {
-        queue::complete_task(&mut conn, id, serde_json::json!(null))
+    for claim in held {
+        queue::complete_task(&mut conn, &claim, serde_json::json!(null))
             .await
             .expect("final complete_task failed");
         completed_count += 1;
@@ -11227,7 +11229,8 @@ async fn per_key_concurrency_does_not_block_other_keys() {
             );
             quiet_claimed += 1;
             // Immediately complete quiet tasks so they don't hold state.
-            queue::complete_task(&mut conn, task.id, serde_json::json!(null))
+            let claim = TaskClaim::of(&task).expect("a claimed task");
+            queue::complete_task(&mut conn, &claim, serde_json::json!(null))
                 .await
                 .expect("complete quiet task failed");
         } else {
@@ -11244,7 +11247,8 @@ async fn per_key_concurrency_does_not_block_other_keys() {
     );
 
     // Complete the held loud task; verify the next loud task is now claimable.
-    queue::complete_task(&mut conn, loud_task.id, serde_json::json!(null))
+    let claim = TaskClaim::of(&loud_task).expect("a claimed task");
+    queue::complete_task(&mut conn, &claim, serde_json::json!(null))
         .await
         .expect("complete loud task failed");
 
@@ -11950,7 +11954,7 @@ fn windowed_fanout_e2e_registry() -> Arc<HandlerRegistry> {
 }
 
 /// Insert a RUNNING execution row for `(workflow_name, workflow_id)`.
-async fn insert_named_execution(
+pub(crate) async fn insert_named_execution(
     conn: &mut AsyncPgConnection,
     workflow_name: &'static str,
     workflow_id: &'static str,

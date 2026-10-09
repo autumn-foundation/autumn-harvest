@@ -402,6 +402,8 @@ jobs:
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features sqs -- -D warnings
       - name: Clippy autumn-harvest-plugin (aws-kms feature, issue #1825)
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features aws-kms -- -D warnings
+      - name: Clippy autumn-harvest-plugin (vault-transit feature, issue #1981)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features vault-transit -- -D warnings
       # Issue #1978: the OIDC login module is `cfg`d out of the default build.
       - name: Clippy autumn-harvest-plugin (oidc feature, issue #1978)
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features oidc -- -D warnings
@@ -1092,6 +1094,11 @@ jobs:
       - name: Run plugin lib tests (aws-kms feature, issue #1825)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test -p autumn-harvest-plugin --features aws-kms --lib aws_kms
+      # Issue #1981. The Vault Transit binding runs the same KMS conformance
+      # suite as AWS, against a local fake Vault server.
+      - name: Run plugin lib tests (vault-transit feature, issue #1981)
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
+        run: cargo test -p autumn-harvest-plugin --features vault-transit --lib vault_transit
       # Issue #1978. The OIDC unit tests and the `api_with_oidc` builder test
       # compile only with the feature. The MCP tool gate test also needs
       # `mcp`. The round-trip suite runs from the manifest (`oidc_login`).
