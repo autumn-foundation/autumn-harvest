@@ -345,10 +345,9 @@ pub enum ConditionGate {
 
 /// Pure gate: `None` = unconditional (byte-identical legacy behavior).
 ///
-/// Evaluates the stored condition against the source output **as stored** —
-/// raw bytes from `harvest_workflow_executions.output`. Engine write paths
-/// always store the plaintext handler output there (payload codecs/offload
-/// apply only to the `harvest_events` copy), so guards see real output today.
+/// Evaluates the stored condition against the source output. The caller
+/// decodes `harvest_workflow_executions.output` first, because that column
+/// can hold a codec envelope (issue #1979). So guards see the real output.
 #[must_use]
 pub fn gate_stored_condition(stored: Option<&Value>, source_output: &Value) -> ConditionGate {
     let Some(raw) = stored else {
@@ -1542,8 +1541,10 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
         // callback config has ever been registered
         // (`completion_callback::GLOBAL_CALLBACK_CONFIG` is `None`) or when
         // no target matches this terminal state.
-        crate::completion_callback::enqueue_completion_deliveries(conn, &execution, exec_id, state)
-            .await?;
+        crate::completion_callback::enqueue_completion_deliveries(
+            conn, &execution, exec_id, state, codecs,
+        )
+        .await?;
 
         // Durable mutex terminal auto-release (issue #691): this is the single
         // per-terminal-transition chokepoint (complete/fail/cancel/terminate/
@@ -1565,6 +1566,13 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
         // Provenance ref for every completion-triggered target start is the
         // triggering (source) execution id (#740).
         let source_exec_id_str = exec_id.to_string();
+        // The output column can hold an envelope (issue #1979). Guards and
+        // input mapping read the plaintext. Decode only when a trigger exists.
+        let decoded_output = if triggers.is_empty() {
+            None
+        } else {
+            codecs.decode_column_opt(execution.output.as_ref())?
+        };
 
         for trigger_db in triggers {
             let terminal_states: Vec<TerminalState> = serde_json::from_value(trigger_db.terminal_states)
@@ -1575,7 +1583,7 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
             }
 
             let trigger_name = trigger_db.id.to_string();
-            let source_output = execution.output.clone().unwrap_or(Value::Null);
+            let source_output = decoded_output.clone().unwrap_or(Value::Null);
 
             // Output guard (issue #810): evaluated against the RAW source
             // output — deliberately before (and independent of) input

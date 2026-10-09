@@ -33,7 +33,5 @@ compares this table with `ALLOWLIST`. Change both in the same commit.
 | `core:audit_log_unexported_idx_write_cost_perf` | won't wire | Manual evidence harness (issue #1272). Its one test is `#[ignore]`d by design (500k-row fixture, `VACUUM FULL`). Run it by hand with `--ignored`. |
 | `core:chaos_tests` | won't wire | Runs nightly in `.github/workflows/chaos.yml` with the `chaos` feature (issue #940). It is too slow for each PR. |
 | `plugin:connector_kafka_broker` | won't wire | Runs in CI from its own Linux step in `ci.yml` (issue #944). The step installs `librdkafka` build dependencies first. |
-| `plugin:mcp_tools_integration` | @madmax983 (#1959) | All tests are `#[ignore]`d, and the manifest row is `compileonly`. |
 | `plugin:outbox_start_relay_perf` | won't wire | Manual `pg_stat_statements` evidence (issue #1620). Run it by hand, as `docs/performance-outbox-start-relay.md` tells. |
-| `plugin:webhook_durable_integration` | @madmax983 (#1959) | All tests are `#[ignore]`d, and no row enables `webhooks`. On a current-thread runtime the test hangs, as `webhook_receiver_integration` did before its fix. |
 <!-- allowlist-tracking:end -->
