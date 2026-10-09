@@ -148,6 +148,7 @@ async fn insert_execution(conn: &mut AsyncPgConnection, i: u128) -> ExecutionId 
     let wf_id = format!("broken-session-perf-{i}");
     let row = NewWorkflowExecution {
         quota_key: None,
+        tenant: None,
         continued_from_exec_id: None,
         first_exec_id: None,
         id,
