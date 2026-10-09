@@ -84,6 +84,10 @@ ASSAY14_BINS=0aeb887=/tgt/0aeb887/release/harvest_vs_temporal_070_assay,\
 | `ASSAY14_ADMIN_URL` | `postgres://postgres@127.0.0.1:5432/postgres` | drops and creates it |
 | `ASSAY14_REDIS_URL` | `redis://127.0.0.1:6379` | the dispatch Redis |
 
+Each `run.sh` call writes to a new `results/rerun-<UTC time>/` directory,
+which git ignores. `results/raw/` holds the published sweep and stays as it
+is. Set `ASSAY14_OUT` to choose another empty directory.
+
 `grade.py` grades the registered matrix only: rounds 0 to 2 and depths 250
 to 2,000. A sweep with other `ASSAY14_ROUNDS` or `ASSAY14_DEPTHS` values
 leaves every line indeterminate.

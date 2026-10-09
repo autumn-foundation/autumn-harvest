@@ -11,7 +11,8 @@
 # Optional:
 #   ASSAY14_ROUNDS   rounds, default 3
 #   ASSAY14_DEPTHS   default 250,500,1000,2000
-#   ASSAY14_OUT      output directory, default results/raw next to this file
+#   ASSAY14_OUT      output directory, default a new results/rerun-<UTC time>
+#                    next to this file. results/raw holds the published sweep.
 #   ASSAY11_TEMPORAL_IMAGE  passed through to assay #11's runner
 set -euo pipefail
 
@@ -19,7 +20,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 TEMPORAL_DIR="$HERE/../0011-harvest-vs-temporal"
 ROUNDS="${ASSAY14_ROUNDS:-3}"
 DEPTHS="${ASSAY14_DEPTHS:-250,500,1000,2000}"
-OUT="${ASSAY14_OUT:-$HERE/results/raw}"
+OUT="${ASSAY14_OUT:-$HERE/results/rerun-$(date -u +%Y%m%dT%H%M%SZ)}"
 BINS="${ASSAY14_BINS:?set ASSAY14_BINS to tree=binary pairs}"
 
 [ -x "$TEMPORAL_DIR/assay11" ] || {

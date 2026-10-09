@@ -269,4 +269,5 @@ buys, not what 0.7.0 ships.
 See the [apparatus README](apparatus/0014-harvest-vs-temporal-0.7.0/README.md).
 In short: build one harness binary per tree, build assay #11's Temporal arm,
 start Redis, then run `run.sh` with `ASSAY14_BINS` set. It writes
-`results/raw/` and prints the graded Markdown.
+a new `results/rerun-<UTC time>/` directory and prints the graded Markdown.
+The published sweep stays in `results/raw/`.
