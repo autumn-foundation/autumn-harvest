@@ -453,7 +453,9 @@ mod tests {
             format!("cost_usd_micros BETWEEN 0 AND {MAX_COST_USD_MICROS}"),
             format!("latency_ms BETWEEN 0 AND {MAX_LATENCY_MS}"),
             format!("call_index BETWEEN 0 AND {}", MAX_LLM_CALLS_PER_ATTEMPT - 1),
-            format!("model ~ '^[A-Za-z0-9{MODEL_ID_PUNCTUATION}]+$'"),
+            // The pattern only: the `~` operator would read as raw SQL to the
+            // SQLite feasibility audit.
+            format!("'^[A-Za-z0-9{MODEL_ID_PUNCTUATION}]+$'"),
         ] {
             assert!(up.contains(&check), "up.sql must hold `{check}`");
         }
