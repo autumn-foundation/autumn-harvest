@@ -130,6 +130,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          external_outbox_scan_tests
 linux        autumn-harvest         integration                      -                          fairness_key_tests
 linux        autumn-harvest         integration                      -                          fairness_key_worker_tests
+linux        autumn-harvest         integration                      -                          fanout_result_writer_db_tests
 linux        autumn-harvest         integration                      -                          force_fail
 linux        autumn-harvest         integration                      -                          history_ceiling_claim_tests
 linux        autumn-harvest         integration                      -                          history_crash_tests
