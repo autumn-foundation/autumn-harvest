@@ -91,12 +91,18 @@ static FLAKY_SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// because a workflow body must not touch process globals.
 #[activity]
 async fn flaky_gate(_ctx: &ActivityContext, input: String) -> Result<(), String> {
-    let mut seen = FLAKY_SEEN.lock().unwrap_or_else(PoisonError::into_inner);
-    if seen.contains(&input) {
-        return Ok(());
+    let first = {
+        let mut seen = FLAKY_SEEN.lock().unwrap_or_else(PoisonError::into_inner);
+        let first = !seen.contains(&input);
+        if first {
+            seen.push(input);
+        }
+        first
+    };
+    if first {
+        return Err("transient".to_string());
     }
-    seen.push(input);
-    Err("transient".to_string())
+    Ok(())
 }
 
 /// Fails on the first attempt for each input. The gate has no activity

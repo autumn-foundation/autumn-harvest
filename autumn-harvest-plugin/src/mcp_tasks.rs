@@ -1222,7 +1222,7 @@ mod tests {
     }
 
     /// The spec state diagram, written out by hand. `W` is working, `I` is
-    /// input_required, `C` is completed, `F` is failed and `X` is cancelled.
+    /// `input_required`, `C` is completed, `F` is failed and `X` is cancelled.
     #[test]
     fn transitions_follow_the_spec_state_diagram() {
         use TaskStatus::{
