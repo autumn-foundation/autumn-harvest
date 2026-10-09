@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use autumn_harvest::dst::SeedPlan;
 use autumn_harvest::dst::world::{
-    self, Decision, Effect, ExecFacts, Fact, Plant, Snapshot, World, WorldAction, WorldConfig,
+    self, Effect, ExecFacts, Fact, Plant, Ran, Snapshot, World, WorldAction, WorldConfig,
     WorldInvariant,
 };
 
@@ -54,6 +54,7 @@ struct ToyWorld {
     runs: usize,
     max_runs: usize,
     incarnation: Vec<u32>,
+    abandoned: u64,
 }
 
 /// Toy executions start once per process, so this counter differs between
@@ -84,6 +85,7 @@ impl ToyWorld {
             runs: 0,
             max_runs: 2,
             incarnation: vec![1; config.workers],
+            abandoned: 0,
         }
     }
 
@@ -106,11 +108,11 @@ impl ToyWorld {
         let worker = w * 100 + self.incarnation[w] as usize;
         let toy = &mut self.execs[index];
         let decision = if toy.seen_by.contains(&worker) {
-            Decision::Warm
+            Ran::Warm
         } else if toy.seen_by.is_empty() {
-            Decision::Cold
+            Ran::Cold
         } else {
-            Decision::Declined
+            Ran::Declined
         };
         toy.seen_by.push(worker);
         match toy.step {
@@ -143,18 +145,19 @@ impl ToyWorld {
                 name: "go".to_string(),
             }),
             _ => {
-                let mut output = toy.expected.clone();
-                if bug == Bug::WrongOutput {
-                    output = serde_json::json!("wrong");
-                }
+                let output = if bug == Bug::WrongOutput {
+                    serde_json::json!("wrong")
+                } else {
+                    toy.expected.clone()
+                };
                 if bug == Bug::Blocked && toy.label == "c1" {
                     toy.blocked = true;
-                    return Effect::Polled(Some(decision));
+                    return Effect::Polled(decision);
                 }
                 if bug == Bug::StatusWithoutEvent {
                     toy.status = "COMPLETED";
                     toy.step += 1;
-                    return Effect::Polled(Some(decision));
+                    return Effect::Polled(decision);
                 }
                 toy.events.push(Fact::Completed {
                     output: output.to_string(),
@@ -168,7 +171,7 @@ impl ToyWorld {
             }
         }
         toy.step += 1;
-        Effect::Polled(Some(decision))
+        Effect::Polled(decision)
     }
 
     fn fire(&mut self, s: usize) -> Effect {
@@ -213,8 +216,8 @@ impl ToyWorld {
     }
 }
 
-impl World for ToyWorld {
-    async fn apply(&mut self, action: WorldAction, now_tick: u64) -> Effect {
+impl ToyWorld {
+    fn step(&mut self, action: WorldAction, now_tick: u64) -> Effect {
         self.now = now_tick;
         match action {
             WorldAction::Poll(w) => self.poll(w),
@@ -235,7 +238,11 @@ impl World for ToyWorld {
                 }
             }
             WorldAction::ScheduleFire(s) => self.fire(s),
-            WorldAction::Reclaim => Effect::Reclaimed(0),
+            WorldAction::Abandon(_) => {
+                self.abandoned += 1;
+                Effect::Done
+            }
+            WorldAction::Reclaim => Effect::Reclaimed(std::mem::take(&mut self.abandoned)),
             WorldAction::Sweep => Effect::Swept(0),
             WorldAction::Advance
             | WorldAction::Beat(_)
@@ -244,7 +251,7 @@ impl World for ToyWorld {
         }
     }
 
-    async fn snapshot(&mut self) -> Snapshot {
+    fn view(&self) -> Snapshot {
         Snapshot {
             executions: self
                 .execs
@@ -262,23 +269,33 @@ impl World for ToyWorld {
     }
 }
 
+impl World for ToyWorld {
+    fn apply(&mut self, action: WorldAction, now_tick: u64) -> impl Future<Output = Effect> {
+        std::future::ready(self.step(action, now_tick))
+    }
+
+    fn snapshot(&mut self) -> impl Future<Output = Snapshot> {
+        std::future::ready(self.view())
+    }
+}
+
 /// A toy world whose first execution depends on a process-wide counter.
 struct FlakyWorld(ToyWorld);
 
 impl World for FlakyWorld {
-    async fn apply(&mut self, action: WorldAction, now_tick: u64) -> Effect {
-        self.0.apply(action, now_tick).await
+    fn apply(&mut self, action: WorldAction, now_tick: u64) -> impl Future<Output = Effect> {
+        std::future::ready(self.0.step(action, now_tick))
     }
 
-    async fn snapshot(&mut self) -> Snapshot {
-        let mut snapshot = self.0.snapshot().await;
+    fn snapshot(&mut self) -> impl Future<Output = Snapshot> {
+        let mut snapshot = self.0.view();
         let starts = GLOBAL_STARTS.fetch_add(1, Ordering::SeqCst);
         if starts == 0 {
             snapshot.executions[0]
                 .events
                 .push(Fact::Other("Extra".to_string()));
         }
-        snapshot
+        std::future::ready(snapshot)
     }
 }
 
@@ -312,7 +329,41 @@ async fn a_toy_sweep_converges_and_covers_every_action() {
     assert!(stats.timers_fired > 0 && stats.signals > 0, "{stats:?}");
     assert!(stats.fires > 0 && stats.lost_fires > 0, "{stats:?}");
     assert!(stats.stalls > 0 && stats.crashes > 0, "{stats:?}");
+    assert!(stats.abandons > 0 && stats.reclaimed > 0, "{stats:?}");
     assert!(stats.advances > 0 && stats.idle_polls > 0, "{stats:?}");
+}
+
+/// FNV-1a over the trace text.
+fn trace_hash(report: &world::WorldReport) -> u64 {
+    report
+        .trace
+        .join("\n")
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+        })
+}
+
+/// The driver traces of a few toy seeds are fixed.
+///
+/// A seed that a nightly run reports must replay on a later commit and on
+/// every platform. A change to the planner, its weights or its draws
+/// changes these values on purpose. Update them in the same change.
+#[tokio::test]
+async fn golden_world_traces_are_equal_on_every_platform() {
+    let golden = [
+        (0, 86, 0xf10b_2b92_93ad_b137),
+        (1, 86, 0x14b4_c534_1177_e2c2),
+        (2, 86, 0xf9b7_d969_c2c4_cc6b),
+    ];
+    for (seed, lines, hash) in golden {
+        let report = run_toy(&toy_config(seed), Bug::None).await;
+        assert_eq!(
+            (report.trace.len(), trace_hash(&report)),
+            (lines, hash),
+            "seed {seed}: the trace changed"
+        );
+    }
 }
 
 #[tokio::test]
@@ -372,7 +423,7 @@ async fn the_trace_names_the_step_the_tick_and_each_new_fact() {
         report
             .trace
             .iter()
-            .any(|line| line.contains("c0 + TimerStarted nap 3600s")),
+            .any(|line| line.contains(&format!("c0 + TimerStarted nap {}s", world::TICK_SECS))),
         "{}",
         report.trace.join("\n")
     );
@@ -403,7 +454,9 @@ async fn the_drain_phase_injects_no_fault() {
             .trace
             .iter()
             .filter(|line| line[..4].parse::<usize>().unwrap_or(0) >= config.fault_steps)
-            .filter(|line| line.contains(" stall ") || line.contains(" crash "))
+            .filter(|line| {
+                line.contains(" stall ") || line.contains(" crash ") || line.contains(" abandon ")
+            })
             .count();
         assert_eq!(late_faults, 0, "{}", report.trace.join("\n"));
     }
@@ -455,9 +508,9 @@ async fn a_sweep_failure_prints_a_replay_command_that_rebuilds_the_config() {
     );
     assert!(text.contains("ExpectedOutput"), "{text}");
 
-    let checks: Vec<&str> = failure.config.checks.iter().map(|c| c.name()).collect();
-    let rebuilt = world::config_from_vars(seed, Some("foreign-state"), Some(&checks.join(",")))
-        .expect("valid");
+    let checks = world::checks_arg(&failure.config.checks);
+    let rebuilt =
+        world::config_from_vars(seed, Some("foreign-state"), Some(&checks)).expect("valid");
     assert_eq!(rebuilt.plant, Plant::ForeignState);
     assert_eq!(rebuilt.checks, failure.config.checks);
     assert_eq!(rebuilt.seed, seed);

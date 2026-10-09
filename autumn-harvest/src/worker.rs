@@ -37883,13 +37883,25 @@ impl Worker {
     /// Run one poll-loop iteration and wait for the task it claims.
     ///
     /// This is a hook for the world simulation of issue #2002. It is not a
-    /// stable API. It runs the Postgres path of `run_poll_loop` once. The
-    /// simulator then runs one actor at a time, so a seed fixes the order of
-    /// every claim and every decision.
+    /// stable API. It runs the Postgres path of `run_poll_loop` once, for
+    /// the first assigned shard only. The simulator then runs one actor at a
+    /// time, so a seed fixes the order of every claim and every decision.
     ///
-    /// Returns `true` when the poll claimed a task.
+    /// Call [`Self::dst_register`] first. Never call this on a worker that
+    /// runs [`Self::run`]: a drain closes the same task tracker.
+    ///
+    /// Returns `true` when the poll claimed a task. Returns `false` with no
+    /// claim when the worker is not registered, has a slot tuner, or shuts
+    /// down.
     #[doc(hidden)]
     pub async fn dst_poll_once(&self, pool: &DbPool) -> bool {
+        let registered = std::sync::atomic::AtomicBool::load(
+            &self.monitoring_started,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        if !registered || self.config.slot_tuner.is_some() || self.shutdown.is_cancelled() {
+            return false;
+        }
         let shard = match self.config.shard_assignments.as_slice() {
             [shard, ..] => Some(*shard),
             [] => None,

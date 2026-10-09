@@ -52,10 +52,12 @@ scheduler fire claim must be in scope. A failure must replay from its seed.
 | R2 | A random id leaks into the trace. | The trace uses labels: `c0`, `s1`, `w2.3`. Activity ids become ordinals. |
 | R3 | The time warp misses a column, so a deadline never comes due. | The warp shifts every `timestamptz` column of the in-scope tables, read from `information_schema`. The convergence check fails on a stuck run. |
 | R4 | The hooks change production behaviour. | `dst_poll_once` calls `poll_once`, then waits for the tracker. `dst_register` calls `register_in_fleet`. Neither runs on a production path. |
-| R5 | A test-side query copies production SQL and drifts. | Only the due-list scan is test-side. The claim itself is production code. |
-| R6 | The sweep is too slow for CI. | PR CI runs 4 seeds. The nightly runs 2,000 in release mode. |
+| R5 | A test-side query copies production SQL and drifts. | The scan calls `scheduler::due_workflow_schedules`, which the tick also uses. The claim is production code. |
+| R6 | The sweep is too slow for CI. | PR CI runs 4 seeds. The nightly runs 1,000 in 4 shards, after a separate build step. |
 | R7 | A planted bug leaks into the default run. | The plant is off by default. Only `HARVEST_DST_WORLD_PLANT` turns it on. |
 | R8 | The harness passes vacuously. | A sweep asserts coverage counters: warm resumes, declines, cold loads, activities, timer fires, signals, lost fire claims, stalls and crashes. |
+| R10 | A sub-tick engine duration compares by real time. Review found the 30 s claim handicap of a new start. | Each step shifts the clock one minute. A step over 20 s of real time stops the run. |
+| R11 | The reclaimer and the sweeper run but never act. Review found it. | The `Abandon` fault leaves a claim. The coverage test asserts that both act. |
 | R9 | The warp maps two virtual instants to one stored instant. | Found in the first trace: two schedule slots got one workflow id, and a run was lost. Each advance now shifts by one tick plus 1 ms. `FireStartsRun` catches a lost run. |
 
 ### 0.4 Six thinking hats
@@ -87,14 +89,15 @@ scheduler fire claim must be in scope. A failure must replay from its seed.
 | Resident path | `WorkflowCache` with resident state, sticky routing |
 | Timers | `persist_started_timer`, `ingest_due_timers_and_signals` |
 | Signals | `signal::send_signal`, signal ingest in the decision |
-| Scheduler fire claim | `scheduler::claim_and_fire_workflow_schedule` |
+| Scheduler fire claim | `scheduler::due_workflow_schedules`, `scheduler::claim_and_fire_workflow_schedule` |
 | Orphan reclaimer | `poison_pill::reclaim_orphaned_tasks` |
 | Timeout sweeper | `timeout::enforce_timeouts_once` |
 | Liveness | `workers::heartbeat_worker` |
 
-Faults: a worker stall and a worker crash. A crash drops the `Worker`, so
-its resident state goes. A stall keeps it, so a stale resident must
-decline.
+Faults: a worker stall, a worker crash and an abandoned claim. A crash
+drops the `Worker`, so its resident state goes. A stall keeps it, so a
+stale resident must decline. An abandoned claim leaves a row for the
+reclaimer or the sweeper.
 
 ## 2. Design
 
@@ -117,19 +120,22 @@ and checks the invariants.
 
 ### 2.3 The virtual clock
 
-The clock moves in ticks of one hour. `Advance` subtracts one tick plus
-1 ms from every `timestamptz` column of each `harvest_*` table, except the
-event log. A stored instant is then `virtual time + e`, where `e` is the
-real time at the write.
+The clock moves in ticks of one day. A shift subtracts an interval from
+every `timestamptz` column of each `harvest_*` table, except the event log.
+Each step shifts one minute. `Advance` shifts one more tick plus 1 ms. A
+stored instant is then `virtual time + e`, where `e` is the real time at
+the write.
 
-- Every workload duration is a whole number of ticks.
-- Two instants with different virtual times differ by at least one tick.
-  `e` is less than a run's real length, which is far below one tick. So
-  the virtual parts decide the comparison.
+- Every workload duration is a whole number of ticks. A run has at most
+  1,000 steps, so its minute shifts stay below one tick.
+- Two writes in two steps are at least one minute apart. A shorter engine
+  duration, such as the 30 s claim handicap of a new start, thus compares
+  by virtual time.
 - Two instants with equal virtual times compare by `e`. `e` follows the
   order of the writes, and the seed fixes that order.
 - The extra millisecond keeps two virtual instants apart. The engine builds
   ids from instants, such as the workflow id of a schedule slot.
+- A step over 20 s of real time stops the run as a harness error.
 
 ### 2.4 Invariants
 

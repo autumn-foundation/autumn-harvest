@@ -11,9 +11,10 @@
 //! function of the seed, and a failing seed replays exactly.
 //!
 //! The clock moves in ticks of [`TICK_SECS`]. A world must make every
-//! deadline in its workload a whole number of ticks. The Postgres world
-//! moves its clock by a shift of every stored instant. See
-//! `docs/testing/simulation.md`.
+//! deadline in its workload a whole number of ticks. A world can also move
+//! its clock a little in each step, if a whole run moves it less than one
+//! tick. The Postgres world moves its clock by a shift of every stored
+//! instant. See `docs/testing/simulation.md`.
 //!
 //! A run has two phases. The fault phase can stall or crash a worker. The
 //! drain phase injects no fault, and it ends when all work is complete.
@@ -24,17 +25,17 @@ use std::fmt;
 use std::future::Future;
 
 use super::rng::SplitMix64;
-use super::sweep::{Nondeterminism, SEED_VAR, SeedPlan, TAIL_LINES, first_divergence};
+use super::sweep::{Nondeterminism, SEED_VAR, SeedPlan, TAIL_LINES, diverged};
 use crate::event::WorkflowEvent;
 
-/// The length of one clock tick, in seconds.
-pub const TICK_SECS: u64 = 3_600;
+/// The length of one clock tick, in seconds: one day.
+pub const TICK_SECS: u64 = 86_400;
 
 /// The planted defect: `none` (the default) or `foreign-state`.
 pub const PLANT_VAR: &str = "HARVEST_DST_WORLD_PLANT";
 
 /// A comma list of world invariant names. The default is all of them.
-pub const CHECKS_VAR: &str = "HARVEST_DST_WORLD_CHECKS";
+pub const WORLD_CHECKS_VAR: &str = "HARVEST_DST_WORLD_CHECKS";
 
 /// A defect that a world plants in its workload on purpose.
 ///
@@ -119,7 +120,7 @@ impl WorldInvariant {
         Self::Converges,
     ];
 
-    /// The name that [`CHECKS_VAR`] accepts.
+    /// The name that [`WORLD_CHECKS_VAR`] accepts.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -251,6 +252,11 @@ pub enum WorldAction {
     Stall(usize),
     /// Worker `n` dies. Its memory goes with it.
     Crash(usize),
+    /// Worker `n` claims a task and dies before it runs the task.
+    ///
+    /// The claim stays on the row, so the reclaimer or the sweeper must
+    /// recover it.
+    Abandon(usize),
     /// Worker `n` starts again with a new id.
     Restart(usize),
     /// The client sends a signal to workflow `n`.
@@ -265,15 +271,22 @@ pub enum WorldAction {
     Sweep,
 }
 
-/// How a worker decided a workflow task.
+/// What a poll ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Decision {
-    /// A cache miss. The worker replayed the full history.
+pub enum Ran {
+    /// An activity task.
+    Activity,
+    /// A workflow decision after a cache miss. It replayed the full history.
     Cold,
-    /// A cache hit that resumed the resident workflow. No replay ran.
+    /// A workflow decision on a cache hit that resumed the resident
+    /// workflow. No replay ran.
     Warm,
-    /// A cache hit that dropped the resident workflow and replayed.
+    /// A workflow decision on a cache hit that dropped the resident
+    /// workflow and replayed.
     Declined,
+    /// A task that ran neither an activity nor a decision, such as a stale
+    /// workflow task.
+    Other,
 }
 
 /// The result of one action.
@@ -283,16 +296,16 @@ pub enum Effect {
     Done,
     /// The poll claimed no task.
     Idle,
-    /// The poll ran one task. `None` is an activity task.
-    Polled(Option<Decision>),
+    /// The poll ran one task.
+    Polled(Ran),
     /// The scan read this many due schedules.
     Scanned(usize),
     /// The fire claim won the slot with this due tick, or lost (`None`).
     Fired(Option<u64>),
     /// The reclaimer requeued this many rows.
-    Reclaimed(usize),
+    Reclaimed(u64),
     /// The sweeper acted on this many rows.
-    Swept(usize),
+    Swept(u64),
 }
 
 impl fmt::Display for Effect {
@@ -300,10 +313,11 @@ impl fmt::Display for Effect {
         match self {
             Self::Done => f.write_str("ok"),
             Self::Idle => f.write_str("idle"),
-            Self::Polled(None) => f.write_str("activity"),
-            Self::Polled(Some(Decision::Cold)) => f.write_str("cold"),
-            Self::Polled(Some(Decision::Warm)) => f.write_str("warm"),
-            Self::Polled(Some(Decision::Declined)) => f.write_str("declined"),
+            Self::Polled(Ran::Activity) => f.write_str("activity"),
+            Self::Polled(Ran::Cold) => f.write_str("cold"),
+            Self::Polled(Ran::Warm) => f.write_str("warm"),
+            Self::Polled(Ran::Declined) => f.write_str("declined"),
+            Self::Polled(Ran::Other) => f.write_str("other"),
             Self::Scanned(due) => write!(f, "due {due}"),
             Self::Fired(Some(slot)) => write!(f, "fired slot t={slot:03}"),
             Self::Fired(None) => f.write_str("lost"),
@@ -426,13 +440,24 @@ impl Fact {
 
     /// Whether the fact ends the execution.
     #[must_use]
-    pub const fn is_terminal(&self) -> bool {
-        matches!(
-            self,
-            Self::Completed { .. } | Self::Failed | Self::Cancelled
-        )
+    pub fn is_terminal(&self) -> bool {
+        match self {
+            Self::Completed { .. } | Self::Failed | Self::Cancelled => true,
+            Self::Other(name) => OTHER_TERMINALS.contains(&name.as_str()),
+            _ => false,
+        }
     }
 }
+
+/// The other events that end an execution, by type name.
+const OTHER_TERMINALS: [&str; 3] = [
+    "WorkflowExecutionTimedOut",
+    "WorkflowContinuedAsNew",
+    "WorkflowResetTerminated",
+];
+
+/// The `state` values of an execution that has not ended.
+pub const ACTIVE_STATES: [&str; 2] = ["RUNNING", "PAUSED"];
 
 /// The serde tag of `event`, such as `DecisionCommitted`.
 fn type_name(event: &WorkflowEvent) -> String {
@@ -479,7 +504,7 @@ pub struct ExecFacts {
 }
 
 /// The state of a world after a step.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Snapshot {
     /// Every execution, in a stable order.
     pub executions: Vec<ExecFacts>,
@@ -505,8 +530,6 @@ pub trait World {
 /// Counters that show what a run covered.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorldStats {
-    /// Polls that ran a task.
-    pub polls: u64,
     /// Polls that found no task.
     pub idle_polls: u64,
     /// Activity tasks.
@@ -517,6 +540,8 @@ pub struct WorldStats {
     pub warm: u64,
     /// Workflow decisions that dropped a resident workflow.
     pub declined: u64,
+    /// Polls that ran a task with no activity and no decision.
+    pub other_tasks: u64,
     /// `TimerFired` events.
     pub timers_fired: u64,
     /// Signals sent.
@@ -537,17 +562,19 @@ pub struct WorldStats {
     pub stalls: u64,
     /// Injected crashes.
     pub crashes: u64,
+    /// Injected crashes that left a claim behind.
+    pub abandons: u64,
 }
 
 impl WorldStats {
     /// Add the counters of `other`.
     pub const fn merge(&mut self, other: &Self) {
-        self.polls += other.polls;
         self.idle_polls += other.idle_polls;
         self.activities += other.activities;
         self.cold += other.cold;
         self.warm += other.warm;
         self.declined += other.declined;
+        self.other_tasks += other.other_tasks;
         self.timers_fired += other.timers_fired;
         self.signals += other.signals;
         self.scans += other.scans;
@@ -558,6 +585,7 @@ impl WorldStats {
         self.advances += other.advances;
         self.stalls += other.stalls;
         self.crashes += other.crashes;
+        self.abandons += other.abandons;
     }
 }
 
@@ -603,37 +631,28 @@ pub async fn run_twice<W: World>(
 ) -> Result<WorldReport, Nondeterminism> {
     let first = run(config, make().await).await;
     let second = run(config, make().await).await;
-    compare(config.seed, first, second)
+    compare(config.seed, first, &second)
 }
 
 /// The first report when `first` and `second` are equal.
 fn compare(
     seed: u64,
     first: WorldReport,
-    second: WorldReport,
+    second: &WorldReport,
 ) -> Result<WorldReport, Nondeterminism> {
-    if let Some(line) = first_divergence(&first.trace, &second.trace) {
-        let at = |trace: &[String]| trace.get(line).cloned().unwrap_or_default();
-        return Err(Nondeterminism {
-            seed,
-            line,
-            first: at(&first.trace),
-            second: at(&second.trace),
-        });
-    }
-    if first != second {
-        return Err(Nondeterminism {
-            seed,
-            line: first.trace.len(),
-            first: "equal trace, different stats or snapshot".to_string(),
-            second: String::new(),
-        });
-    }
-    Ok(first)
+    let note = "equal trace, different stats or snapshot";
+    diverged(seed, &first.trace, &second.trace, first == *second, note).map_or(Ok(first), Err)
+}
+
+/// The names of `checks` as a comma list, as [`WORLD_CHECKS_VAR`] takes them.
+#[must_use]
+pub fn checks_arg(checks: &[WorldInvariant]) -> String {
+    let names: Vec<&str> = checks.iter().map(|i| i.name()).collect();
+    names.join(",")
 }
 
 /// The config for `seed` with the values of [`PLANT_VAR`] and
-/// [`CHECKS_VAR`]. A missing value keeps the default.
+/// [`WORLD_CHECKS_VAR`]. A missing value keeps the default.
 ///
 /// # Errors
 ///
@@ -663,7 +682,7 @@ pub fn config_from_vars(
 /// Returns a message when a value is not a known name.
 pub fn config_from_env(seed: u64) -> Result<WorldConfig, String> {
     let plant = std::env::var(PLANT_VAR).ok();
-    let checks = std::env::var(CHECKS_VAR).ok();
+    let checks = std::env::var(WORLD_CHECKS_VAR).ok();
     config_from_vars(seed, plant.as_deref(), checks.as_deref())
 }
 
@@ -672,14 +691,13 @@ pub fn config_from_env(seed: u64) -> Result<WorldConfig, String> {
 /// It sets every variable that [`config_from_env`] reads.
 #[must_use]
 pub fn repro_command(config: &WorldConfig) -> String {
-    let checks: Vec<&str> = config.checks.iter().map(|i| i.name()).collect();
     format!(
-        "{SEED_VAR}={} {PLANT_VAR}={} {CHECKS_VAR}={} cargo test -p autumn-harvest \
+        "{SEED_VAR}={} {PLANT_VAR}={} {WORLD_CHECKS_VAR}={} cargo test -p autumn-harvest \
          --test integration dst_world_tests::replay_one_world_seed -- --nocapture \
          --test-threads=1",
         config.seed,
         config.plant.as_str(),
-        checks.join(",")
+        checks_arg(&config.checks)
     )
 }
 
@@ -731,13 +749,18 @@ pub async fn sweep<W: World>(
         let config = config(seed);
         let first = run(&config, make(&config).await).await;
         let second = run(&config, make(&config).await).await;
-        let report = compare(seed, first, second).map_err(|error| {
-            Box::new(WorldSweepFailure {
-                config: config.clone(),
+        let note = "equal trace, different stats or snapshot";
+        if let Some(error) = diverged(seed, &first.trace, &second.trace, first == second, note) {
+            // Print the first run up to the line that differs.
+            let end = (error.line + 1).min(first.trace.len());
+            let start = end.saturating_sub(TAIL_LINES);
+            return Err(Box::new(WorldSweepFailure {
+                trace_tail: first.trace[start..end].join("\n"),
+                config,
                 reason: error.to_string(),
-                trace_tail: String::new(),
-            })
-        })?;
+            }));
+        }
+        let report = first;
         if let Some(violation) = &report.violation {
             return Err(Box::new(WorldSweepFailure {
                 config,
@@ -780,6 +803,7 @@ const W_POLL: u64 = 8;
 const W_BEAT: u64 = 2;
 const W_STALL: u64 = 1;
 const W_CRASH: u64 = 1;
+const W_ABANDON: u64 = 1;
 const W_RESTART: u64 = 4;
 const W_SIGNAL: u64 = 1;
 const W_SCAN: u64 = 2;
@@ -796,7 +820,7 @@ struct Driver<'a, W> {
     workers: Vec<Actor>,
     signalled: Vec<bool>,
     held: Vec<bool>,
-    fired: BTreeSet<u64>,
+    fired_slots: BTreeSet<u64>,
     seen: BTreeMap<String, Seen>,
     report: WorldReport,
 }
@@ -818,7 +842,7 @@ impl<'a, W: World> Driver<'a, W> {
             ],
             signalled: vec![false; config.workflows],
             held: vec![false; config.schedulers],
-            fired: BTreeSet::new(),
+            fired_slots: BTreeSet::new(),
             seen: BTreeMap::new(),
             report: WorldReport {
                 config: config.clone(),
@@ -826,10 +850,7 @@ impl<'a, W: World> Driver<'a, W> {
                 violation: None,
                 stats: WorldStats::default(),
                 converged: false,
-                last: Snapshot {
-                    executions: Vec::new(),
-                    schedules_done: false,
-                },
+                last: Snapshot::default(),
             },
         }
     }
@@ -881,23 +902,29 @@ impl<'a, W: World> Driver<'a, W> {
             && last
                 .executions
                 .iter()
-                .all(|exec| exec.status != "RUNNING" && !exec.blocked)
+                .all(|exec| !ACTIVE_STATES.contains(&exec.status.as_str()) && !exec.blocked)
     }
 
     fn worker_id(&self, w: usize) -> String {
         format!("w{}.{}", w + 1, self.workers[w].incarnation)
     }
 
-    /// Every enabled action with its weight, in a fixed order.
-    fn enabled(&mut self) -> Vec<(u64, WorldAction)> {
-        let faults = !self.draining();
-        let mut actions = vec![(W_ADVANCE, WorldAction::Advance)];
-        for (w, worker) in self.workers.iter_mut().enumerate() {
+    /// Wake each worker whose stall has ended.
+    fn wake_stalled(&mut self) {
+        for worker in &mut self.workers {
             if let Life::Stalled { until } = worker.life
                 && self.tick >= until
             {
                 worker.life = Life::Up;
             }
+        }
+    }
+
+    /// Every enabled action with its weight, in a fixed order.
+    fn enabled(&self) -> Vec<(u64, WorldAction)> {
+        let faults = !self.draining();
+        let mut actions = vec![(W_ADVANCE, WorldAction::Advance)];
+        for (w, worker) in self.workers.iter().enumerate() {
             match worker.life {
                 Life::Up => {
                     actions.push((W_POLL, WorldAction::Poll(w)));
@@ -905,6 +932,7 @@ impl<'a, W: World> Driver<'a, W> {
                     if faults {
                         actions.push((W_STALL, WorldAction::Stall(w)));
                         actions.push((W_CRASH, WorldAction::Crash(w)));
+                        actions.push((W_ABANDON, WorldAction::Abandon(w)));
                     }
                 }
                 Life::Down { until } if self.tick >= until || !faults => {
@@ -930,6 +958,7 @@ impl<'a, W: World> Driver<'a, W> {
     }
 
     fn choose(&mut self) -> WorldAction {
+        self.wake_stalled();
         let actions = self.enabled();
         let total: u64 = actions.iter().map(|(weight, _)| weight).sum();
         let mut pick = self.rng.below(total);
@@ -943,7 +972,7 @@ impl<'a, W: World> Driver<'a, W> {
     }
 
     /// A fault length: 1 to `stale_ticks + 2` ticks.
-    fn fault_ticks(&mut self) -> u64 {
+    const fn fault_ticks(&mut self) -> u64 {
         1 + self.rng.below(self.config.stale_ticks.saturating_add(2))
     }
 
@@ -970,7 +999,7 @@ impl<'a, W: World> Driver<'a, W> {
                 self.workers[w].life = Life::Stalled { until };
                 self.report.stats.stalls += 1;
             }
-            WorldAction::Crash(w) => {
+            WorldAction::Crash(w) | WorldAction::Abandon(w) => {
                 until += self.fault_ticks();
                 self.workers[w].life = Life::Down { until };
                 self.report.stats.crashes += 1;
@@ -1001,6 +1030,13 @@ impl<'a, W: World> Driver<'a, W> {
             WorldAction::Crash(w) => {
                 format!("{} crash -> restart at t={until:03}", self.worker_id(w))
             }
+            WorldAction::Abandon(w) => {
+                if effect == Effect::Done {
+                    self.report.stats.abandons += 1;
+                }
+                let id = self.worker_id(w);
+                format!("{id} abandon -> {effect}, restart at t={until:03}")
+            }
             WorldAction::Restart(w) => format!("{} restart -> {effect}", self.worker_id(w)),
             WorldAction::Beat(w) => format!("{} beat -> {effect}", self.worker_id(w)),
             WorldAction::Poll(w) => {
@@ -1018,19 +1054,19 @@ impl<'a, W: World> Driver<'a, W> {
             WorldAction::ScheduleFire(s) => format!("sched{} fire -> {effect}", s + 1),
             WorldAction::Reclaim => {
                 if let Effect::Reclaimed(rows) = effect {
-                    self.report.stats.reclaimed += rows as u64;
+                    self.report.stats.reclaimed += rows;
                 }
                 format!("reclaimer pass -> {effect}")
             }
             WorldAction::Sweep => {
                 if let Effect::Swept(rows) = effect {
-                    self.report.stats.swept += rows as u64;
+                    self.report.stats.swept += rows;
                 }
                 format!("sweeper pass -> {effect}")
             }
         };
         self.log(&line);
-        self.fired(effect);
+        self.check_fire(effect);
     }
 
     /// Check that a won fire claim started exactly one execution.
@@ -1051,21 +1087,17 @@ impl<'a, W: World> Driver<'a, W> {
         let stats = &mut self.report.stats;
         match effect {
             Effect::Idle => stats.idle_polls += 1,
-            Effect::Polled(decision) => {
-                stats.polls += 1;
-                match decision {
-                    None => stats.activities += 1,
-                    Some(Decision::Cold) => stats.cold += 1,
-                    Some(Decision::Warm) => stats.warm += 1,
-                    Some(Decision::Declined) => stats.declined += 1,
-                }
-            }
+            Effect::Polled(Ran::Activity) => stats.activities += 1,
+            Effect::Polled(Ran::Cold) => stats.cold += 1,
+            Effect::Polled(Ran::Warm) => stats.warm += 1,
+            Effect::Polled(Ran::Declined) => stats.declined += 1,
+            Effect::Polled(Ran::Other) => stats.other_tasks += 1,
             _ => {}
         }
     }
 
     /// Check a fire claim. A slot fires once, and not before it is due.
-    fn fired(&mut self, effect: Effect) {
+    fn check_fire(&mut self, effect: Effect) {
         let Effect::Fired(slot) = effect else {
             return;
         };
@@ -1075,7 +1107,7 @@ impl<'a, W: World> Driver<'a, W> {
         };
         self.report.stats.fires += 1;
         let mut found = Vec::new();
-        if !self.fired.insert(slot) {
+        if !self.fired_slots.insert(slot) {
             let detail = format!("slot t={slot:03} fired twice");
             found.push((WorldInvariant::ScheduleSlotOnce, detail));
         }
@@ -1153,7 +1185,7 @@ fn check_exec(exec: &ExecFacts, ticks: &[u64], first_new: usize) -> Vec<(WorldIn
         );
         found.push((WorldInvariant::OneTerminal, detail));
     }
-    if (exec.status == "RUNNING") == (terminals > 0) {
+    if ACTIVE_STATES.contains(&exec.status.as_str()) == (terminals > 0) {
         let detail = format!(
             "{label} is {} with {terminals} terminal events",
             exec.status

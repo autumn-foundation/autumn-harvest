@@ -7,7 +7,7 @@
 //!
 //! The scope is the claim, the decision, the resident path, timers,
 //! signals, the scheduler fire claim, the orphan reclaimer and the timeout
-//! sweeper. Faults are worker stalls and crashes.
+//! sweeper. Faults are worker stalls, crashes and abandoned claims.
 //!
 //! Each run gets a fresh database, cloned from a migrated template. The
 //! clock moves by a shift of every stored instant. See
@@ -19,25 +19,26 @@
 //! ```
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use autumn_harvest::context::SharedStateMap;
-use autumn_harvest::dst::SeedPlan;
 use autumn_harvest::dst::world::{
-    self, Decision, Effect, ExecFacts, Fact, Plant, Snapshot, TICK_SECS, World, WorldAction,
+    self, Effect, ExecFacts, Fact, Plant, Ran, Snapshot, TICK_SECS, World, WorldAction,
     WorldConfig, WorldInvariant, WorldReport,
 };
+use autumn_harvest::dst::{SeedPlan, TAIL_LINES};
 use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
 use autumn_harvest::models::HarvestSchedule;
-use autumn_harvest::policy::{Schedule, WorkflowSchedule};
+use autumn_harvest::policy::{JitterPolicy, RetryPolicy, Schedule, WorkflowSchedule};
 use autumn_harvest::schema::{harvest_schedules, harvest_workflow_executions};
 use autumn_harvest::telemetry::{MetricsRecorder, NoOpMetrics, TelemetryConfig};
 use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker};
-use autumn_harvest::{ActivityContext, StartWorkflowParams, WorkflowContext};
+use autumn_harvest::{ActivityContext, StartSource, StartWorkflowParams, WorkflowContext};
 use chrono::{DateTime, Utc};
 use diesel::prelude::*;
 use diesel::sql_types::Text;
@@ -45,6 +46,7 @@ use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncC
 use serde_json::{Value, json};
 
 use crate::integration_e2e::{build_test_pool, runtime_config, setup_test_database_url_or_env};
+use crate::throwaway_db::{ThrowawayDb, with_database};
 
 /// The sweep size of a normal test run. The nightly job sets
 /// `HARVEST_DST_SEEDS` higher.
@@ -64,17 +66,39 @@ const CHAIN: &str = "dst_chain";
 const TICKER: &str = "dst_tick";
 const ADD: &str = "dst_add";
 
-/// One advance shifts every instant back by one tick plus 1 ms.
+/// One tick of the world clock, in milliseconds.
+const TICK_MS: i64 = 86_400_000;
+
+/// Each step moves the clock one minute.
+///
+/// Two writes in two steps are then at least one minute apart. A shorter
+/// engine duration thus compares by the seed, not by the speed of the host.
+/// An example is the claim handicap of a new start.
+const STEP_MS: i64 = 60_000;
+
+/// One advance moves the clock one tick plus 1 ms.
 ///
 /// The engine builds ids from instants, such as the workflow id of a
-/// schedule slot. With a whole tick, slot 6 seen at tick 6 has the stored
-/// instant of slot 2 seen at tick 2. The two slots then share one id. The
-/// extra millisecond keeps the stored instants of two slots apart. A deadline of
-/// whole ticks still comes due after the same number of advances.
-const WARP_MS: i64 = 3_600_001;
+/// schedule slot. The extra millisecond keeps the stored instants of two
+/// slots apart. A deadline of whole ticks still comes due after the same
+/// number of advances.
+const WARP_MS: i64 = TICK_MS + 1;
 
-/// The tables whose instants the clock shifts. `harvest_events` is
-/// append-only, and no decision reads its timestamps.
+/// The steps of one run must move the clock less than one tick.
+const MAX_STEPS: usize = 1_000;
+
+/// A step that takes longer than this in real time voids the clock
+/// argument. The run then stops as a harness error.
+const MAX_STEP_REAL: Duration = Duration::from_secs(20);
+
+/// The orphan reclaimer quarantines a task at this many strikes. The
+/// workload does not cover quarantine, so the value is out of reach.
+const QUARANTINE_STRIKES: i32 = 1_000;
+
+/// The tables whose instants the clock does not shift.
+///
+/// `harvest_events` is append-only. The sweeper reads its timestamps only
+/// for external signals and awaits, which this workload does not use.
 const SKIPPED_TABLES: &str = "harvest_events%";
 
 // ── Workload ────────────────────────────────────────────────────────────────
@@ -88,14 +112,19 @@ struct WorkerTag {
     plant: bool,
     /// Workflow bodies that started from the top on this worker.
     body_starts: AtomicU64,
+    /// Activity bodies that ran on this worker.
+    activities: AtomicU64,
 }
 
 /// `{"x": n}` becomes `n + 1`.
 fn add_activity<'a>(
-    _ctx: &'a ActivityContext,
+    ctx: &'a ActivityContext,
     input: Value,
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
+        if let Some(tag) = ctx.state::<Arc<WorkerTag>>() {
+            tag.activities.fetch_add(1, Ordering::SeqCst);
+        }
         let x = input["x"].as_i64().ok_or("missing x")?;
         Ok(json!(x + 1))
     })
@@ -153,7 +182,7 @@ fn tick_workflow<'a>(
 
 /// The output of chain `i`: `a = i + 1`, `v = 10 i`, `b = a + v + 1`.
 fn chain_output(i: usize) -> Value {
-    let i = i64::try_from(i).unwrap_or(0);
+    let i = i64::try_from(i).expect("a small chain index");
     json!({ "result": 11 * i + 2 })
 }
 
@@ -188,13 +217,30 @@ fn workflow_info(
     }
 }
 
+fn workflows() -> Vec<WorkflowInfo> {
+    vec![
+        workflow_info(CHAIN, chain_workflow),
+        workflow_info(TICKER, tick_workflow),
+    ]
+}
+
 fn add_info() -> ActivityInfo {
+    let tick = Duration::from_secs(TICK_SECS);
     ActivityInfo {
         name: ADD,
         module: "dst_world_tests",
-        default_retry_policy: None,
+        // A retry waits one whole tick, with no jitter. A jittered delay
+        // comes from a random task id, so it would differ between runs.
+        default_retry_policy: Some(RetryPolicy {
+            max_attempts: 100,
+            initial_interval: tick,
+            backoff_coefficient: 1.0,
+            max_interval: tick,
+            non_retryable_errors: Vec::new(),
+            jitter: JitterPolicy::None,
+        }),
         // Whole ticks, so the clock decides every deadline.
-        default_start_to_close: Some(Duration::from_secs(TICK_SECS)),
+        default_start_to_close: Some(tick),
         default_heartbeat_timeout: None,
         default_schedule_to_start: None,
         default_queue: None,
@@ -233,110 +279,10 @@ impl MetricsRecorder for CacheCounts {
 
 // ── Databases ───────────────────────────────────────────────────────────────
 
-/// `url` with its database name replaced by `name`.
-fn with_database(url: &str, name: &str) -> String {
-    let (base, query) = url
-        .split_once('?')
-        .map_or((url, None), |(b, q)| (b, Some(q)));
-    let root = base.rsplit_once('/').map_or(base, |(root, _)| root);
-    query.map_or_else(
-        || format!("{root}/{name}"),
-        |query| format!("{root}/{name}?{query}"),
-    )
-}
-
 async fn connect(url: &str) -> AsyncPgConnection {
     AsyncPgConnection::establish(url)
         .await
         .unwrap_or_else(|error| panic!("connect to {url}: {error}"))
-}
-
-/// Creates one fresh database per world run, from a migrated template.
-struct Databases {
-    admin_url: String,
-    template: String,
-    created: Mutex<Vec<String>>,
-}
-
-impl Databases {
-    /// Build the template on the server of `url`.
-    ///
-    /// The template name holds a hash of the migrations, so a template from
-    /// an older schema is never used.
-    async fn new(url: &str) -> Self {
-        let init = autumn_harvest::test_init_sql();
-        let hash = init.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
-            (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
-        });
-        let template = format!("dst_world_tmpl_{hash:016x}");
-        let admin_url = with_database(url, "postgres");
-        let mut admin = connect(&admin_url).await;
-        // The lock stops two test processes from building one template.
-        admin
-            .batch_execute("SELECT pg_advisory_lock(2002)")
-            .await
-            .expect("lock");
-        if !database_exists(&mut admin, &template).await {
-            let building = format!("{template}_build");
-            admin
-                .batch_execute(&format!("DROP DATABASE IF EXISTS {building} WITH (FORCE)"))
-                .await
-                .expect("drop a half-built template");
-            admin
-                .batch_execute(&format!("CREATE DATABASE {building}"))
-                .await
-                .expect("create the template");
-            let mut conn = connect(&with_database(url, &building)).await;
-            conn.batch_execute(&init)
-                .await
-                .expect("migrate the template");
-            drop(conn);
-            admin
-                .batch_execute(&format!("ALTER DATABASE {building} RENAME TO {template}"))
-                .await
-                .expect("publish the template");
-        }
-        admin
-            .batch_execute("SELECT pg_advisory_unlock(2002)")
-            .await
-            .expect("unlock");
-        Self {
-            admin_url,
-            template,
-            created: Mutex::new(Vec::new()),
-        }
-    }
-
-    /// A fresh database URL. It drops the databases of earlier runs first.
-    async fn fresh(&self, url: &str) -> String {
-        self.drop_created().await;
-        let name = format!("dst_world_{}", uuid::Uuid::new_v4().simple());
-        let mut admin = connect(&self.admin_url).await;
-        admin
-            .batch_execute(&format!(
-                "CREATE DATABASE {name} TEMPLATE {}",
-                self.template
-            ))
-            .await
-            .expect("clone the template");
-        self.created.lock().expect("lock").push(name.clone());
-        with_database(url, &name)
-    }
-
-    /// Drop every database that this value created.
-    async fn drop_created(&self) {
-        let names: Vec<String> = std::mem::take(&mut *self.created.lock().expect("lock"));
-        if names.is_empty() || std::env::var(KEEP_VAR).is_ok() {
-            return;
-        }
-        let mut admin = connect(&self.admin_url).await;
-        for name in names {
-            admin
-                .batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
-                .await
-                .expect("drop a world database");
-        }
-    }
 }
 
 #[derive(QueryableByName)]
@@ -345,13 +291,69 @@ struct Count {
     n: i64,
 }
 
-async fn database_exists(admin: &mut AsyncPgConnection, name: &str) -> bool {
-    let row: Count = diesel::sql_query("SELECT count(*) AS n FROM pg_database WHERE datname = $1")
-        .bind::<Text, _>(name)
-        .get_result(admin)
+/// Turn off autovacuum and autoanalyze on every table.
+///
+/// They run at real-time moments that the seed does not pick. A vacuum moves
+/// rows in the heap, and an analyze can change a plan. A query with no
+/// `ORDER BY`, such as the orphan scan, then returns rows in another order.
+/// The claim order then differs between two runs of one seed.
+const NO_AUTOVACUUM: &str = "DO $$ DECLARE r record; BEGIN \
+     FOR r IN SELECT c.oid::regclass AS t FROM pg_class c \
+       JOIN pg_namespace n ON n.oid = c.relnamespace \
+       WHERE n.nspname = 'public' AND c.relkind = 'r' LOOP \
+       EXECUTE format('ALTER TABLE %s SET (autovacuum_enabled = false, \
+         toast.autovacuum_enabled = false)', r.t); \
+     END LOOP; END $$";
+
+/// A migrated template database on the server of `admin_url`. Each world
+/// run clones it.
+///
+/// The name holds a hash of the migrations and of [`NO_AUTOVACUUM`], so a
+/// template from an older schema is never used. An advisory lock stops two
+/// test processes from building one template.
+async fn template_database(admin_url: &str) -> String {
+    let init = format!("{};\n{NO_AUTOVACUUM}", autumn_harvest::test_init_sql());
+    let hash = init.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    });
+    let template = format!("dst_world_tmpl_{hash:016x}");
+    let mut admin = connect(admin_url).await;
+    admin
+        .batch_execute("SELECT pg_advisory_lock(2002)")
         .await
-        .expect("read pg_database");
-    row.n > 0
+        .expect("lock");
+    let exists: Count =
+        diesel::sql_query("SELECT count(*) AS n FROM pg_database WHERE datname = $1")
+            .bind::<Text, _>(&template)
+            .get_result(&mut admin)
+            .await
+            .expect("read pg_database");
+    if exists.n == 0 {
+        let building = format!("{template}_build");
+        for sql in [
+            format!("DROP DATABASE IF EXISTS {building}"),
+            format!("CREATE DATABASE {building}"),
+        ] {
+            admin
+                .batch_execute(&sql)
+                .await
+                .expect("prepare the template");
+        }
+        let mut conn = connect(&with_database(admin_url, &building)).await;
+        conn.batch_execute(&init)
+            .await
+            .expect("migrate the template");
+        drop(conn);
+        admin
+            .batch_execute(&format!("ALTER DATABASE {building} RENAME TO {template}"))
+            .await
+            .expect("publish the template");
+    }
+    admin
+        .batch_execute("SELECT pg_advisory_unlock(2002)")
+        .await
+        .expect("unlock");
+    template
 }
 
 #[derive(QueryableByName)]
@@ -362,8 +364,8 @@ struct InstantColumn {
     column_name: String,
 }
 
-/// One `UPDATE` per table that moves every instant back by one tick.
-async fn warp_statements(conn: &mut AsyncPgConnection) -> Vec<String> {
+/// Every `timestamptz` column of each `harvest_*` table, by table.
+async fn instant_columns(conn: &mut AsyncPgConnection) -> Vec<(String, Vec<String>)> {
     let columns: Vec<InstantColumn> = diesel::sql_query(
         "SELECT c.table_name::text AS table_name, c.column_name::text AS column_name \
          FROM information_schema.columns c \
@@ -385,16 +387,7 @@ async fn warp_statements(conn: &mut AsyncPgConnection) -> Vec<String> {
             .or_default()
             .push(column.column_name);
     }
-    tables
-        .into_iter()
-        .map(|(table, columns)| {
-            let sets: Vec<String> = columns
-                .iter()
-                .map(|c| format!("\"{c}\" = \"{c}\" - INTERVAL '{WARP_MS} milliseconds'"))
-                .collect();
-            format!("UPDATE {table} SET {}", sets.join(", "))
-        })
-        .collect()
+    tables.into_iter().collect()
 }
 
 // ── The world ───────────────────────────────────────────────────────────────
@@ -407,67 +400,88 @@ struct SimWorker {
     tag: Arc<WorkerTag>,
 }
 
+/// A schedule row that a scan read, with what the scan knew.
+struct Held {
+    schedule: HarvestSchedule,
+    /// The tick of the slot.
+    slot: u64,
+    /// The clock shift at the scan.
+    shift_ms: i64,
+}
+
 /// A world of real workers on one fresh database.
 struct PgWorld {
+    db: Option<ThrowawayDb>,
     url: String,
     plant: bool,
+    stale_secs: i64,
     conn: AsyncPgConnection,
-    warp: Vec<String>,
-    /// The real time at which tick 0 began.
+    columns: Vec<(String, Vec<String>)>,
+    /// The real time at which the clock began.
     t0: DateTime<Utc>,
-    /// The ticks that the clock has moved.
-    ticks: u64,
+    /// The total clock shift so far.
+    shift_ms: i64,
     workers: Vec<Option<SimWorker>>,
     incarnation: Vec<u32>,
     chains: Vec<ExecutionId>,
-    labels: BTreeMap<uuid::Uuid, String>,
-    held: BTreeMap<usize, HarvestSchedule>,
+    /// The label and the expected output of each execution.
+    labels: BTreeMap<uuid::Uuid, (String, Value)>,
+    scheduled: usize,
+    held: BTreeMap<usize, Held>,
+    registry: HandlerRegistry,
 }
 
 impl PgWorld {
-    async fn new(databases: &Databases, base_url: &str, config: &WorldConfig) -> Self {
-        let url = databases.fresh(base_url).await;
+    async fn new(admin_url: &str, template: &str, config: &WorldConfig) -> Self {
+        assert!(
+            config.fault_steps + config.drain_steps <= MAX_STEPS,
+            "the steps of one run must move the clock less than one tick"
+        );
+        let db = ThrowawayDb::clone_on(admin_url, "dst_world", template).await;
+        let url = db.url();
         let mut conn = connect(&url).await;
-        let warp = warp_statements(&mut conn).await;
+        let columns = instant_columns(&mut conn).await;
         let t0 = Utc::now();
         let mut chains = Vec::new();
         let mut labels = BTreeMap::new();
         for i in 0..config.workflows {
             let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
             let workflow_id = format!("dst-chain-{i}");
-            autumn_harvest::start_or_load_workflow_execution(
-                &mut conn,
-                start_params(CHAIN, exec_id, &workflow_id, json!({ "i": i })),
-                None,
-            )
-            .await
-            .expect("start a chain");
-            labels.insert(exec_id.as_uuid(), format!("c{i}"));
+            let params = StartWorkflowParams {
+                start_source: StartSource::Api,
+                ..StartWorkflowParams::new(CHAIN, &workflow_id, exec_id, json!({ "i": i }), QUEUE)
+            };
+            autumn_harvest::start_or_load_workflow_execution(&mut conn, params, None)
+                .await
+                .expect("start a chain");
+            labels.insert(exec_id.as_uuid(), (format!("c{i}"), chain_output(i)));
             chains.push(exec_id);
         }
-        let schedule = WorkflowSchedule::new(
-            TICKER,
-            Schedule::Interval(Duration::from_secs(2 * TICK_SECS)),
-        )
-        .with_input(json!({ "x": 100 }))
-        .with_queue_name(QUEUE)
-        .with_max_active_runs(10)
-        .with_max_runs(3);
+        let every = Duration::from_secs(2 * TICK_SECS);
+        let schedule = WorkflowSchedule::new(TICKER, Schedule::Interval(every))
+            .with_input(json!({ "x": 100 }))
+            .with_queue_name(QUEUE)
+            .with_max_active_runs(10)
+            .with_max_runs(3);
         autumn_harvest::scheduler::register_workflow_schedules(&mut conn, &[schedule])
             .await
             .expect("register the schedule");
         let mut world = Self {
+            db: Some(db),
             url,
             plant: config.plant == Plant::ForeignState,
+            stale_secs: i64::try_from(config.stale_ticks * TICK_SECS).expect("a small stale time"),
             conn,
-            warp,
+            columns,
             t0,
-            ticks: 0,
+            shift_ms: 0,
             workers: Vec::new(),
             incarnation: vec![1; config.workers],
             chains,
             labels,
+            scheduled: 0,
             held: BTreeMap::new(),
+            registry: HandlerRegistry::new(workflows(), vec![add_info()]),
         };
         for w in 0..config.workers {
             let worker = world.start_worker(w).await;
@@ -476,13 +490,18 @@ impl PgWorld {
         world
     }
 
+    fn worker_id(&self, w: usize) -> String {
+        format!("w{}.{}", w + 1, self.incarnation[w])
+    }
+
     async fn start_worker(&self, w: usize) -> SimWorker {
-        let id = format!("w{}.{}", w + 1, self.incarnation[w]);
+        let id = self.worker_id(w);
         let counts = Arc::new(CacheCounts::default());
         let tag = Arc::new(WorkerTag {
             index: w,
             plant: self.plant,
             body_starts: AtomicU64::new(0),
+            activities: AtomicU64::new(0),
         });
         let mut state = SharedStateMap::new();
         state.insert(
@@ -495,19 +514,17 @@ impl PgWorld {
                 .build(),
         );
         let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
-            vec![
-                workflow_info(CHAIN, chain_workflow),
-                workflow_info(TICKER, tick_workflow),
-            ],
+            workflows(),
             vec![add_info()],
             Arc::new(state),
             telemetry,
         ));
-        let mut config = runtime_config(&id, 1, 1, Duration::from_secs(TICK_SECS));
+        let tick = Duration::from_secs(TICK_SECS);
+        let mut config = runtime_config(&id, 1, 1, tick);
         config.queues = vec![QUEUE.to_string()];
-        config.sticky_timeout = Duration::from_secs(TICK_SECS);
+        config.sticky_timeout = tick;
         config.workflow_cache_size = 16;
-        config.worker_heartbeat_interval = Duration::from_secs(TICK_SECS);
+        config.worker_heartbeat_interval = tick;
         let worker = Worker::new(config, registry).expect("build a worker");
         let pool = build_test_pool(&self.url);
         assert!(worker.dst_register(&pool).await, "register {id}");
@@ -519,124 +536,184 @@ impl PgWorld {
         }
     }
 
-    async fn poll(&mut self, w: usize) -> Effect {
+    /// Move every stored instant back by `ms`.
+    async fn shift(&mut self, ms: i64) {
+        let mut script = String::from("BEGIN;\n");
+        for (table, columns) in &self.columns {
+            let sets: Vec<String> = columns
+                .iter()
+                .map(|c| format!("\"{c}\" = \"{c}\" - INTERVAL '{ms} milliseconds'"))
+                .collect();
+            writeln!(script, "UPDATE {table} SET {};", sets.join(", ")).expect("a string write");
+        }
+        script.push_str("COMMIT;");
+        self.conn
+            .batch_execute(&script)
+            .await
+            .expect("shift every instant back");
+        self.shift_ms += ms;
+    }
+
+    /// The tick that holds a stored instant.
+    fn tick_of(&self, at: DateTime<Utc>) -> u64 {
+        let virtual_ms = (at - self.t0).num_milliseconds() + self.shift_ms;
+        u64::try_from(virtual_ms.div_euclid(TICK_MS)).expect("an instant after the start")
+    }
+
+    async fn poll(&self, w: usize) -> Effect {
         let Some(sim) = self.workers[w].as_ref() else {
             return Effect::Idle;
         };
-        let hits = AtomicU64::load(&sim.counts.hits, Ordering::SeqCst);
-        let misses = AtomicU64::load(&sim.counts.misses, Ordering::SeqCst);
-        let starts = AtomicU64::load(&sim.tag.body_starts, Ordering::SeqCst);
+        let read = |counter: &AtomicU64| counter.load(Ordering::SeqCst);
+        let before = [
+            read(&sim.counts.hits),
+            read(&sim.counts.misses),
+            read(&sim.tag.body_starts),
+            read(&sim.tag.activities),
+        ];
         if !sim.worker.dst_poll_once(&sim.pool).await {
             return Effect::Idle;
         }
-        let hit = AtomicU64::load(&sim.counts.hits, Ordering::SeqCst) > hits;
-        let miss = AtomicU64::load(&sim.counts.misses, Ordering::SeqCst) > misses;
-        let restarted = AtomicU64::load(&sim.tag.body_starts, Ordering::SeqCst) > starts;
-        let decision = match (hit, miss, restarted) {
-            (_, true, _) => Some(Decision::Cold),
-            (true, false, false) => Some(Decision::Warm),
-            (true, false, true) => Some(Decision::Declined),
-            (false, false, _) => None,
+        let after = [
+            read(&sim.counts.hits),
+            read(&sim.counts.misses),
+            read(&sim.tag.body_starts),
+            read(&sim.tag.activities),
+        ];
+        let grew = |i: usize| after[i] > before[i];
+        let ran = match (grew(0), grew(1), grew(2), grew(3)) {
+            (_, _, _, true) => Ran::Activity,
+            (_, true, _, false) => Ran::Cold,
+            (true, false, false, false) => Ran::Warm,
+            (true, false, true, false) => Ran::Declined,
+            (false, false, _, false) => Ran::Other,
         };
-        Effect::Polled(decision)
+        Effect::Polled(ran)
     }
 
     async fn beat(&mut self, w: usize) -> Effect {
-        let id = format!("w{}.{}", w + 1, self.incarnation[w]);
+        let id = self.worker_id(w);
         autumn_harvest::workers::heartbeat_worker(&mut self.conn, &id, 0, &json!({}), 0, &[])
             .await
             .expect("beat");
         Effect::Done
     }
 
-    async fn advance(&mut self) -> Effect {
-        self.ticks += 1;
-        let script = self.warp.join(";\n");
-        self.conn
-            .batch_execute(&format!("BEGIN;\n{script};\nCOMMIT;"))
+    fn crash(&mut self, w: usize) {
+        if let Some(sim) = self.workers[w].take() {
+            sim.worker.shutdown();
+        }
+    }
+
+    /// Claim one task as worker `w`, start it if it is an activity, and
+    /// crash before the body runs.
+    async fn abandon(&mut self, w: usize) -> Effect {
+        if self.workers[w].is_none() {
+            return Effect::Idle;
+        }
+        let id = self.worker_id(w);
+        let claimed = autumn_harvest::queue::claim_task(
+            &mut self.conn,
+            &[QUEUE.to_string()],
+            &id,
+            "",
+            None,
+            &[],
+            &[],
+        )
+        .await
+        .expect("claim a task");
+        self.crash(w);
+        let Some(task) = claimed else {
+            return Effect::Idle;
+        };
+        if task.task_type == "activity" {
+            let exec_id = ExecutionId::from_uuid(task.workflow_exec_id.expect("an execution"));
+            let name = task.activity_name.clone().expect("an activity name");
+            autumn_harvest::worker::append_activity_started_for_test(
+                &mut self.conn,
+                &task,
+                exec_id,
+                &name,
+                &id,
+                &autumn_harvest::payload_codec::PayloadCodecs::default(),
+            )
             .await
-            .expect("shift every instant back");
+            .expect("start the activity");
+        }
         Effect::Done
     }
 
-    /// The tick of a real instant that the clock has shifted.
-    fn tick_of(&self, at: DateTime<Utc>) -> u64 {
-        let tick = i64::try_from(TICK_SECS * 1_000).unwrap_or(i64::MAX);
-        let ticks = i64::try_from(self.ticks).unwrap_or(0);
-        let shifted = (at - self.t0).num_milliseconds() + WARP_MS * ticks;
-        u64::try_from((shifted + tick / 2).div_euclid(tick)).unwrap_or(0)
-    }
-
-    /// The due schedules, by the filter of `tick_workflow_schedules`.
+    /// The due schedules, by the query of the scheduler tick.
     async fn scan(&mut self, s: usize) -> Effect {
-        use harvest_schedules::dsl;
-        let due: Vec<HarvestSchedule> = dsl::harvest_schedules
-            .filter(dsl::workflow_name.is_not_null())
-            .filter(dsl::is_paused.eq(false))
-            .filter(dsl::auto_paused_at.is_null())
-            .filter(dsl::exhausted_at.is_null())
-            .filter(dsl::next_run_at.is_not_null())
-            .filter(dsl::next_run_at.le(Utc::now()))
-            .order(dsl::next_run_at.asc())
-            .select(HarvestSchedule::as_select())
-            .load(&mut self.conn)
+        let due = autumn_harvest::scheduler::due_workflow_schedules(&mut self.conn, Utc::now())
             .await
             .expect("scan the schedules");
         let count = due.len();
-        if let Some(first) = due.into_iter().next() {
-            self.held.insert(s, first);
-        } else {
-            self.held.remove(&s);
+        match due.into_iter().next() {
+            Some(schedule) => {
+                let at = schedule.next_run_at.expect("a due row has a next run");
+                let held = Held {
+                    slot: self.tick_of(at),
+                    shift_ms: self.shift_ms,
+                    schedule,
+                };
+                self.held.insert(s, held);
+            }
+            None => {
+                self.held.remove(&s);
+            }
         }
         Effect::Scanned(count)
     }
 
     /// Run the production fire claim on the snapshot of the last scan.
     async fn fire(&mut self, s: usize) -> Effect {
-        let Some(snapshot) = self.held.remove(&s) else {
+        let Some(Held {
+            mut schedule,
+            slot,
+            shift_ms,
+        }) = self.held.remove(&s)
+        else {
             return Effect::Fired(None);
         };
-        let slot = snapshot.next_run_at.map(|at| self.tick_of(at));
-        let before = runs_started(&mut self.conn, snapshot.id).await;
-        let registry = HandlerRegistry::new(
-            vec![
-                workflow_info(CHAIN, chain_workflow),
-                workflow_info(TICKER, tick_workflow),
-            ],
-            vec![add_info()],
-        );
+        // The clock moved the stored row since the scan, so the snapshot
+        // moves with it. The claim compares `next_run_at` exactly.
+        let moved = chrono::Duration::milliseconds(self.shift_ms - shift_ms);
+        schedule.next_run_at = schedule.next_run_at.map(|at| at - moved);
+        let before = runs_started(&mut self.conn, schedule.id).await;
         let metrics: Arc<dyn MetricsRecorder> = Arc::new(NoOpMetrics);
         autumn_harvest::scheduler::claim_and_fire_workflow_schedule(
             &mut self.conn,
-            &snapshot,
+            &schedule,
             Utc::now(),
             ShardId::new(0),
             &autumn_harvest::scheduler::DagCatalog::new(),
-            &registry,
+            &self.registry,
             &metrics,
             &[],
         )
         .await
         .expect("fire claim");
-        let after = runs_started(&mut self.conn, snapshot.id).await;
-        Effect::Fired(if after > before { slot } else { None })
+        let after = runs_started(&mut self.conn, schedule.id).await;
+        Effect::Fired((after > before).then_some(slot))
     }
 
-    async fn reclaim(&mut self, stale_ticks: u64) -> Effect {
+    async fn reclaim(&mut self) -> Effect {
         let summary = autumn_harvest::poison_pill::reclaim_orphaned_tasks(
             &mut self.conn,
-            3,
-            i64::try_from(stale_ticks * TICK_SECS).unwrap_or(i64::MAX),
+            QUARANTINE_STRIKES,
+            self.stale_secs,
             None,
             &NoOpMetrics,
             &autumn_harvest::payload_codec::PayloadCodecs::default(),
         )
         .await
         .expect("reclaim");
-        Effect::Reclaimed(summary.requeued)
+        Effect::Reclaimed(u64::try_from(summary.total()).expect("a row count"))
     }
 
-    async fn sweep(&mut self, stale_ticks: u64) -> Effect {
+    async fn sweep(&mut self) -> Effect {
         let rows = autumn_harvest::timeout::enforce_timeouts_once(
             &mut self.conn,
             &NoOpMetrics,
@@ -645,17 +722,17 @@ impl PgWorld {
             &[ShardId::new(0)],
             None,
             None,
-            i64::try_from(stale_ticks * TICK_SECS).unwrap_or(i64::MAX),
+            self.stale_secs,
             &autumn_harvest::payload_codec::PayloadCodecs::default(),
             0,
         )
         .await
         .expect("sweep");
-        Effect::Swept(rows)
+        Effect::Swept(u64::try_from(rows).expect("a row count"))
     }
 
     async fn signal(&mut self, i: usize) -> Effect {
-        let v = i64::try_from(i).unwrap_or(0) * 10;
+        let v = i64::try_from(i).expect("a small chain index") * 10;
         autumn_harvest::signal::send_signal(
             &mut self.conn,
             self.chains[i],
@@ -669,34 +746,24 @@ impl PgWorld {
 
     async fn read_snapshot(&mut self) -> Snapshot {
         use harvest_workflow_executions::dsl;
-        let rows: Vec<(
-            uuid::Uuid,
-            String,
-            Option<DateTime<Utc>>,
-            Option<uuid::Uuid>,
-        )> = dsl::harvest_workflow_executions
-            .order((dsl::started_at.asc(), dsl::id.asc()))
-            .select((dsl::id, dsl::state, dsl::nd_blocked_at, dsl::schedule_id))
-            .load(&mut self.conn)
-            .await
-            .expect("read executions");
+        let rows: Vec<(uuid::Uuid, String, Option<DateTime<Utc>>)> =
+            dsl::harvest_workflow_executions
+                .order((dsl::started_at.asc(), dsl::id.asc()))
+                .select((dsl::id, dsl::state, dsl::nd_blocked_at))
+                .load(&mut self.conn)
+                .await
+                .expect("read executions");
         let mut executions = Vec::new();
-        for (id, status, blocked, schedule_id) in rows {
-            let next = self
-                .labels
-                .values()
-                .filter(|label| label.starts_with('s'))
-                .count();
-            let label = self
+        for (id, status, blocked) in rows {
+            // Only the schedule starts executions after the start.
+            let (label, expected) = self
                 .labels
                 .entry(id)
-                .or_insert_with(|| format!("s{next}"))
+                .or_insert_with(|| {
+                    self.scheduled += 1;
+                    (format!("s{}", self.scheduled - 1), json!({ "result": 101 }))
+                })
                 .clone();
-            let expected = match label.strip_prefix('c') {
-                Some(i) => chain_output(i.parse().unwrap_or(0)),
-                None => json!({ "result": 101 }),
-            };
-            debug_assert!(label.starts_with('c') || schedule_id.is_some());
             let history =
                 autumn_harvest::store::load_history(&mut self.conn, ExecutionId::from_uuid(id))
                     .await
@@ -724,6 +791,16 @@ impl PgWorld {
     }
 }
 
+impl Drop for PgWorld {
+    fn drop(&mut self) {
+        if std::env::var(KEEP_VAR).is_ok()
+            && let Some(db) = self.db.take()
+        {
+            println!("kept the world database {}", db.keep());
+        }
+    }
+}
+
 async fn runs_started(conn: &mut AsyncPgConnection, id: uuid::Uuid) -> i32 {
     harvest_schedules::table
         .find(id)
@@ -733,127 +810,76 @@ async fn runs_started(conn: &mut AsyncPgConnection, id: uuid::Uuid) -> i32 {
         .expect("read runs_started")
 }
 
-/// A world plus the config values that its actions read.
-struct Bound {
-    world: PgWorld,
-    stale_ticks: u64,
-}
-
-impl World for Bound {
+impl World for PgWorld {
     async fn apply(&mut self, action: WorldAction, _now_tick: u64) -> Effect {
-        let world = &mut self.world;
-        match action {
-            WorldAction::Advance => world.advance().await,
-            WorldAction::Beat(w) => world.beat(w).await,
-            WorldAction::Poll(w) => world.poll(w).await,
+        let started = Instant::now();
+        self.shift(STEP_MS).await;
+        let effect = match action {
+            WorldAction::Advance => {
+                self.shift(WARP_MS).await;
+                Effect::Done
+            }
+            WorldAction::Beat(w) => self.beat(w).await,
+            WorldAction::Poll(w) => self.poll(w).await,
             WorldAction::Stall(_) => Effect::Done,
             WorldAction::Crash(w) => {
-                if let Some(sim) = world.workers[w].take() {
-                    sim.worker.shutdown();
-                }
+                self.crash(w);
                 Effect::Done
             }
+            WorldAction::Abandon(w) => self.abandon(w).await,
             WorldAction::Restart(w) => {
-                world.incarnation[w] += 1;
-                let sim = world.start_worker(w).await;
-                world.workers[w] = Some(sim);
+                self.incarnation[w] += 1;
+                let sim = self.start_worker(w).await;
+                self.workers[w] = Some(sim);
                 Effect::Done
             }
-            WorldAction::Signal(i) => world.signal(i).await,
-            WorldAction::ScheduleScan(s) => world.scan(s).await,
-            WorldAction::ScheduleFire(s) => world.fire(s).await,
-            WorldAction::Reclaim => world.reclaim(self.stale_ticks).await,
-            WorldAction::Sweep => world.sweep(self.stale_ticks).await,
-        }
+            WorldAction::Signal(i) => self.signal(i).await,
+            WorldAction::ScheduleScan(s) => self.scan(s).await,
+            WorldAction::ScheduleFire(s) => self.fire(s).await,
+            WorldAction::Reclaim => self.reclaim().await,
+            WorldAction::Sweep => self.sweep().await,
+        };
+        let took = started.elapsed();
+        assert!(
+            took < MAX_STEP_REAL,
+            "{action:?} took {took:?}: a step must take less than {MAX_STEP_REAL:?}, or real \
+             time can change a claim order"
+        );
+        effect
     }
 
     async fn snapshot(&mut self) -> Snapshot {
-        self.world.read_snapshot().await
+        self.read_snapshot().await
     }
 }
 
-fn start_params<'a>(
-    workflow_name: &'a str,
-    exec_id: ExecutionId,
-    workflow_id: &'a str,
-    input: Value,
-) -> StartWorkflowParams<'a> {
-    StartWorkflowParams {
-        workflow_name,
-        workflow_id,
-        exec_id,
-        input: input.into(),
-        parent_id: None,
-        queue_name: QUEUE,
-        execution_timeout: None,
-        memo: None,
-        search_attrs: None,
-        reuse_policy: autumn_harvest::WorkflowIdReusePolicy::AllowDuplicate,
-        conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
-        trace_context: None,
-        max_execution_timeout_ceiling: None,
-        chain_execution_timeout: None,
-        max_workflow_chain_timeout_ceiling: None,
-        inherited_chain_deadline_at: None,
-        concurrency_key: None,
-        concurrency_limit: None,
-        concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
-        priority: autumn_harvest::types::Priority::default(),
-        max_workflow_input_bytes: 0,
-        start_at: None,
-        delay: None,
-        max_workflow_start_delay: None,
-        owner: None,
-        runbook_url: None,
-        severity: None,
-        context_headers: None,
-        sla: None,
-        schedule_id: None,
-        scheduled_for: None,
-        workflow_attempt: 1,
-        workflow_retry_policy: None,
-        retry_of_exec_id: None,
-        max_workflow_attempts_ceiling: None,
-        origin: None,
-        completion_callbacks: None,
-        start_source: autumn_harvest::StartSource::Api,
-        start_source_ref: None,
-        started_by: None,
-        tenant: None,
-    }
-}
-
-/// A server, a template, and a way to make one world per run.
+/// A server and a template, to make one world per run.
 struct Harness {
-    url: String,
-    databases: Databases,
+    admin_url: String,
+    template: String,
     _container: Option<testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>>,
 }
 
 impl Harness {
     async fn new() -> Self {
         let (url, container) = setup_test_database_url_or_env().await;
-        let databases = Databases::new(&url).await;
+        let admin_url = with_database(&url, "postgres");
+        let template = template_database(&admin_url).await;
         Self {
-            url,
-            databases,
+            admin_url,
+            template,
             _container: container,
         }
     }
 
-    async fn world(&self, config: &WorldConfig) -> Bound {
-        Bound {
-            world: PgWorld::new(&self.databases, &self.url, config).await,
-            stale_ticks: config.stale_ticks,
-        }
+    async fn world(&self, config: &WorldConfig) -> PgWorld {
+        PgWorld::new(&self.admin_url, &self.template, config).await
     }
 
     async fn run_twice(&self, config: &WorldConfig) -> WorldReport {
-        let report = world::run_twice(config, async || self.world(config).await)
+        world::run_twice(config, async || self.world(config).await)
             .await
-            .unwrap_or_else(|error| panic!("{error}"));
-        self.databases.drop_created().await;
-        report
+            .unwrap_or_else(|error| panic!("{error}"))
     }
 
     async fn sweep(
@@ -861,12 +887,19 @@ impl Harness {
         plan: &SeedPlan,
         config: impl Fn(u64) -> WorldConfig,
     ) -> Result<world::WorldSweepSummary, Box<world::WorldSweepFailure>> {
-        let result = world::sweep(plan, config, async |config: &WorldConfig| {
+        world::sweep(plan, config, async |config: &WorldConfig| {
             self.world(config).await
         })
-        .await;
-        self.databases.drop_created().await;
-        result
+        .await
+    }
+
+    /// Run `config` twice, as the replay command does, and print the trace.
+    async fn replay(&self, config: &WorldConfig) -> WorldReport {
+        let report = self.run_twice(config).await;
+        for line in &report.trace {
+            println!("{line}");
+        }
+        report
     }
 }
 
@@ -882,18 +915,6 @@ async fn first_planted_failure(harness: &Harness) -> Box<world::WorldSweepFailur
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
-#[test]
-fn with_database_swaps_only_the_name() {
-    assert_eq!(
-        with_database("postgres://u:p@h:5432/postgres", "x"),
-        "postgres://u:p@h:5432/x"
-    );
-    assert_eq!(
-        with_database("postgres://u:p@h/db?sslmode=disable", "x"),
-        "postgres://u:p@h/x?sslmode=disable"
-    );
-}
-
 /// The hook runs one claim and the whole task body before it returns.
 #[tokio::test]
 async fn dst_poll_once_runs_the_claimed_task_to_completion() {
@@ -903,10 +924,9 @@ async fn dst_poll_once_runs_the_claimed_task_to_completion() {
         workers: 1,
         ..WorldConfig::new(0)
     };
-    let mut bound = harness.world(&config).await;
-    let world = &mut bound.world;
+    let mut world = harness.world(&config).await;
 
-    assert_eq!(world.poll(0).await, Effect::Polled(Some(Decision::Cold)));
+    assert_eq!(world.poll(0).await, Effect::Polled(Ran::Cold));
     let after_decision = world.read_snapshot().await;
     let chain = &after_decision.executions[0];
     assert_eq!(
@@ -919,7 +939,7 @@ async fn dst_poll_once_runs_the_claimed_task_to_completion() {
         chain.events
     );
 
-    assert_eq!(world.poll(0).await, Effect::Polled(None), "the activity");
+    assert_eq!(world.poll(0).await, Effect::Polled(Ran::Activity));
     let after_activity = world.read_snapshot().await;
     assert!(
         after_activity.executions[0]
@@ -930,29 +950,78 @@ async fn dst_poll_once_runs_the_claimed_task_to_completion() {
     );
 
     // The next decision resumes the parked workflow on the same worker.
-    assert_eq!(world.poll(0).await, Effect::Polled(Some(Decision::Warm)));
+    assert_eq!(world.poll(0).await, Effect::Polled(Ran::Warm));
     let timer = world.read_snapshot().await.executions[0].events.clone();
-    assert!(
-        timer.contains(&Fact::TimerStarted {
-            timer: "nap".to_string(),
-            secs: TICK_SECS
-        }),
-        "{timer:?}"
+    let started = Fact::TimerStarted {
+        timer: "nap".to_string(),
+        secs: TICK_SECS,
+    };
+    assert!(timer.contains(&started), "{timer:?}");
+
+    // The timer is not due before the clock moves one tick, however many
+    // steps pass.
+    for _ in 0..30 {
+        assert_eq!(world.apply(WorldAction::Poll(0), 0).await, Effect::Idle);
+    }
+    world.apply(WorldAction::Advance, 1).await;
+    assert_eq!(world.poll(0).await, Effect::Polled(Ran::Warm));
+    let fired = world.read_snapshot().await.executions[0].events.clone();
+    let fire = Fact::TimerFired {
+        timer: "nap".to_string(),
+    };
+    assert!(fired.contains(&fire), "{fired:?}");
+}
+
+/// An abandoned claim comes back through the reclaimer or the sweeper.
+#[tokio::test]
+async fn an_abandoned_claim_is_recovered() {
+    let harness = Harness::new().await;
+    let config = WorldConfig {
+        workflows: 1,
+        workers: 2,
+        ..WorldConfig::new(0)
+    };
+    let mut world = harness.world(&config).await;
+
+    // Worker 1 dies holding the first workflow task.
+    assert_eq!(world.apply(WorldAction::Abandon(0), 0).await, Effect::Done);
+    assert_eq!(world.apply(WorldAction::Poll(1), 0).await, Effect::Idle);
+    assert_eq!(
+        world.apply(WorldAction::Reclaim, 0).await,
+        Effect::Reclaimed(0),
+        "the dead worker is not stale yet"
+    );
+    for tick in 1..=config.stale_ticks {
+        world.apply(WorldAction::Advance, tick).await;
+    }
+    assert_eq!(
+        world.apply(WorldAction::Reclaim, 2).await,
+        Effect::Reclaimed(1)
+    );
+    assert_eq!(
+        world.apply(WorldAction::Poll(1), 2).await,
+        Effect::Polled(Ran::Cold)
     );
 
-    // The timer is not due before the clock moves one tick.
-    assert_eq!(world.poll(0).await, Effect::Idle);
-    world.advance().await;
-    assert_eq!(world.poll(0).await, Effect::Polled(Some(Decision::Warm)));
-    let fired = world.read_snapshot().await.executions[0].events.clone();
-    assert!(
-        fired.contains(&Fact::TimerFired {
-            timer: "nap".to_string()
-        }),
-        "{fired:?}"
+    // Worker 2 dies holding the started activity. Its deadline is one tick.
+    assert_eq!(world.apply(WorldAction::Abandon(1), 2).await, Effect::Done);
+    world.incarnation[1] += 1;
+    let restarted = world.start_worker(1).await;
+    world.workers[1] = Some(restarted);
+    world.apply(WorldAction::Advance, 3).await;
+    let swept = world.apply(WorldAction::Sweep, 3).await;
+    assert_eq!(swept, Effect::Swept(1), "start-to-close timed out");
+
+    // The retry waits one whole tick. Then a live worker runs it.
+    assert_eq!(world.apply(WorldAction::Poll(1), 3).await, Effect::Idle);
+    world.apply(WorldAction::Advance, 4).await;
+    assert_eq!(
+        world.apply(WorldAction::Poll(1), 4).await,
+        Effect::Polled(Ran::Activity)
     );
-    drop(bound);
-    harness.databases.drop_created().await;
+    let events = world.read_snapshot().await.executions[0].events.clone();
+    let done = Fact::ActivityCompleted { activity: 0 };
+    assert!(events.contains(&done), "{events:?}");
 }
 
 /// Two runs of one seed, each on a fresh database, give equal reports.
@@ -960,15 +1029,18 @@ async fn dst_poll_once_runs_the_claimed_task_to_completion() {
 async fn a_world_seed_runs_twice_with_equal_traces() {
     let harness = Harness::new().await;
     let report = harness.run_twice(&WorldConfig::new(0)).await;
-    assert_eq!(report.violation, None, "{}", report.trace_tail(40));
-    assert!(report.converged, "{}", report.trace_tail(40));
+    assert_eq!(report.violation, None, "{}", report.trace_tail(TAIL_LINES));
+    assert!(report.converged, "{}", report.trace_tail(TAIL_LINES));
 }
 
 /// The scope of issue #2002 runs: every action and every resident outcome.
 #[tokio::test]
 async fn a_world_sweep_covers_the_scope() {
     let harness = Harness::new().await;
-    let plan = SeedPlan { first: 0, count: 6 };
+    let plan = SeedPlan {
+        first: 10,
+        count: 6,
+    };
     let summary = harness
         .sweep(&plan, WorldConfig::new)
         .await
@@ -983,6 +1055,8 @@ async fn a_world_sweep_covers_the_scope() {
     assert!(stats.timers_fired > 0 && stats.signals > 0, "{stats:?}");
     assert!(stats.fires > 0 && stats.lost_fires > 0, "{stats:?}");
     assert!(stats.stalls > 0 && stats.crashes > 0, "{stats:?}");
+    assert!(stats.abandons > 0, "{stats:?}");
+    assert!(stats.reclaimed > 0 && stats.swept > 0, "{stats:?}");
 }
 
 /// The plant fails a seed. The seed alone replays the same failure.
@@ -1011,23 +1085,21 @@ async fn a_planted_failure_replays_from_its_seed_alone() {
         "{command}"
     );
 
-    // A config from those variables alone gives the same violation.
-    let checks: Vec<&str> = failure.config.checks.iter().map(|c| c.name()).collect();
-    let replay = world::config_from_vars(seed, Some("foreign-state"), Some(&checks.join(",")))
+    // A config from those variables alone gives the same violation, through
+    // the replay path of `replay_one_world_seed`.
+    let checks = world::checks_arg(&failure.config.checks);
+    let replay = world::config_from_vars(seed, Some("foreign-state"), Some(&checks))
         .expect("valid variables");
     assert_eq!(replay, failure.config);
-    let report = harness.run_twice(&replay).await;
+    let report = harness.replay(&replay).await;
     let violation = report.violation.clone().expect("the replay fails too");
     assert_eq!(violation.invariant, WorldInvariant::Deterministic);
     assert_eq!(failure.reason, violation.to_string());
-    assert_eq!(
-        failure.trace_tail,
-        report.trace_tail(autumn_harvest::dst::TAIL_LINES)
-    );
+    assert_eq!(failure.trace_tail, report.trace_tail(TAIL_LINES));
 
     // The same seed with no plant passes.
     let clean = harness.run_twice(&WorldConfig::new(seed)).await;
-    assert_eq!(clean.violation, None, "{}", clean.trace_tail(40));
+    assert_eq!(clean.violation, None, "{}", clean.trace_tail(TAIL_LINES));
 }
 
 /// The sweep that CI and the nightly job run.
@@ -1068,11 +1140,7 @@ async fn replay_one_world_seed() {
     };
     let plan = SeedPlan::parse(Some(&text), None, None, 1).unwrap_or_else(|e| panic!("{e}"));
     let config = world::config_from_env(plan.first).unwrap_or_else(|error| panic!("{error}"));
-    let harness = Harness::new().await;
-    let report = harness.run_twice(&config).await;
-    for line in &report.trace {
-        println!("{line}");
-    }
+    let report = Harness::new().await.replay(&config).await;
     if let Some(violation) = report.violation {
         panic!("seed {}: {violation}", plan.first);
     }

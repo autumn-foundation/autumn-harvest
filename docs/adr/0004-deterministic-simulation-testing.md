@@ -68,14 +68,14 @@ one thread and a seed that picks each step. It drops the oracle, so it runs
 
 - One step is one whole action, such as one iteration of the worker poll
   loop. Steps never overlap, so the seed fixes the order of every write.
-- The clock is virtual. An advance shifts the stored instants of each
-  `harvest_*` table back by one tick plus 1 ms. No clock seam enters
-  production code.
+- The clock is virtual. A shift moves the stored instants of each
+  `harvest_*` table back: one minute per step, and one day plus 1 ms per
+  advance. No clock seam enters production code.
 - Each run uses a fresh database. Each seed runs twice, and the reports must
   be equal.
 - The scope is the resident path, timers, signals, the scheduler fire
-  claim, the reclaimer and the timeout sweeper, under worker stalls and
-  crashes.
+  claim, the reclaimer and the timeout sweeper. The faults are worker
+  stalls, crashes and abandoned claims.
 
 This closes the first consequence above for the poll loop. A race between
 two statements of one cycle is still out of scope. Next scope: a crash
