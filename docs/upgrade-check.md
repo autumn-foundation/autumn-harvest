@@ -210,6 +210,10 @@ logs.
 - Nothing ties a manifest to the binary under test. Write both from the
   commits that the two binaries come from.
 - The replay timeout cannot stop candidate code that never yields.
+- Code in std and in the crates that `harvest-verify` trusts, such as
+  `chrono` and `serde_json`, is not in the call graph. A new version of a
+  trusted crate can change a value with no manifest change. Review a bump
+  of such a crate as you review an activity change.
 - The check sees the signals and updates that exist when it reads. One that
   arrives later, before you declare compat, is not in the report. The
   build policy stops new starts, not input to existing runs. Pause the

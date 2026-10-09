@@ -658,6 +658,32 @@ async fn an_offloaded_payload_with_no_offloader_needs_review() {
     assert_eq!(kinds(&run), [FindingKind::PayloadOffloaded]);
 }
 
+#[tokio::test]
+async fn a_pending_signal_is_checked_when_history_is_offloaded() {
+    let mut events = vec![started()];
+    events.extend(reserve_done(json!({
+        "_harvest_offload_envelope": 1,
+        "store": "s3",
+        "key": "k",
+        "size": 9,
+        "sha256": "00"
+    })));
+    // History holds a stub, but a pending signal is never offloaded.
+    let run = unchanged_check()
+        .signals(vec![approve_signal()])
+        .check_snapshot_with(snapshot(events), &[approve(json!({ "by": 7 }))])
+        .await;
+    assert_eq!(run.verdict, Verdict::Pin, "{run:#?}");
+    assert_eq!(
+        kinds(&run),
+        [
+            FindingKind::PayloadOffloaded,
+            FindingKind::PayloadSchemaViolation
+        ],
+        "{run:#?}"
+    );
+}
+
 /// Business data can hold a nested value shaped like a claim check. The
 /// offloader replaces only direct payload fields, so it is not offloaded.
 #[tokio::test]

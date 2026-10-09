@@ -705,11 +705,13 @@ impl UpgradeCheck {
             ));
         } else if self.offloader.is_none() && has_offloaded_payload(&snapshot.events) {
             // A claim-check stub is not the payload. Replay and schema checks
-            // over it would pin a run that may well fit, so neither runs.
+            // over it would pin a run that may well fit, so neither runs over
+            // history. A pending signal is never offloaded, so it is checked.
             findings.push(Finding::new(
                 FindingKind::PayloadOffloaded,
                 "the run holds offloaded payloads; pass the offloader to check them",
             ));
+            findings.extend(self.payload_findings(&name, &[], pending_signals));
         } else {
             findings.extend(self.replay_findings(&snapshot).await);
             findings.extend(self.payload_findings(&name, &snapshot.events, pending_signals));

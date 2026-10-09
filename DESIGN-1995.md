@@ -122,6 +122,9 @@ Later review rounds of the merged branch found more gaps:
     two crates. The digest read only the first analyzed one, which can
     hold an unrelated `MAX`. It now reads each analyzed crate the path
     names. A crate outside the analysis, or no match, adds the boundary.
+15. With offloaded history and no offloader, the check skipped every
+    payload check, the pending signals too. A pending signal is never
+    offloaded, so it is now checked against the candidate schema.
 
 ---
 
@@ -329,3 +332,9 @@ $ my-worker-upgrade-check \
 - The baseline manifest describes one build. A run with an assigned build
   is compared only when `--baseline-build` names that build. A run with no
   assigned build is trusted to have run the baseline.
+- A call into std or a `[[trusted]]` crate has no body in the analysis,
+  so it is not in the digest. A new version of a trusted crate can change
+  a value with no manifest change. rustc trims many of those paths, such as
+  `Utc::now`, so a workflow cannot be tied to the crates it calls. A
+  version check would then review every run on each trusted-crate bump.
+  Review such a bump as you review an activity change.
