@@ -1258,7 +1258,11 @@ impl HarvestApiState {
             WorkflowHandleClient::new(pool.sharded_pool().clone(), runtime.router().clone(), urls)
                 // Issue #684: wire the engine recorder so the in-process typed-update
                 // path emits harvest.update.admitted.
-                .with_metrics(runtime.registry.telemetry().metrics.clone()),
+                .with_metrics(runtime.registry.telemetry().metrics.clone())
+                // Issue #1979: the route decodes the output itself, through the
+                // gated read-path decoder (issue #608).
+                .with_codecs(self.payload_codecs())
+                .with_stored_result_output(),
         )
     }
 
@@ -5444,6 +5448,9 @@ pub struct StandaloneAdminAuth {
     deployment_profile: Option<String>,
     admin_auth_session_key: Option<String>,
     rate_limit: Option<crate::api_rate_limit::ApiRateLimit>,
+    roles: Option<crate::roles::HarvestRoles>,
+    #[cfg(feature = "oidc")]
+    oidc: Option<crate::oidc::OidcLogin>,
 }
 
 impl StandaloneAdminAuth {
@@ -5500,6 +5507,36 @@ impl StandaloneAdminAuth {
         rate_limit: crate::api_rate_limit::ApiRateLimit,
     ) -> Self {
         self.rate_limit = Some(rate_limit);
+        self
+    }
+
+    /// Install the custom-role layer (issue #1978).
+    ///
+    /// Each request needs a role that allows its route. Roles come from a
+    /// [`crate::roles::RoleGrant`] extension or the session key
+    /// [`crate::roles::SESSION_ROLES_KEY`]. A verified token skips the check.
+    /// See [`crate::roles`].
+    #[must_use]
+    pub fn with_roles(mut self, roles: crate::roles::HarvestRoles) -> Self {
+        self.roles = Some(roles);
+        self
+    }
+
+    /// Install OIDC login and its session boundary (issue #1978).
+    ///
+    /// This also installs the role layer with the roles of `login`, and
+    /// declares the auth boundary. The roles of `login` replace any set by
+    /// [`Self::with_roles`]. It turns off [`Self::with_read_only_role`]. The login routes sit outside the boundary.
+    /// The host must apply an autumn-web session layer outside the mounted
+    /// router. See [`crate::oidc`].
+    #[cfg(feature = "oidc")]
+    #[must_use]
+    pub fn with_oidc(mut self, login: crate::oidc::OidcLogin) -> Self {
+        self.admin_auth_boundary = true;
+        // The read-only role reads host session keys. The login replaces that
+        // host auth, so the custom roles decide alone.
+        self.read_only_role = false;
+        self.oidc = Some(login);
         self
     }
 
@@ -5580,6 +5617,14 @@ impl StandaloneAdminAuth {
         if let Some(session_key) = &self.admin_auth_session_key {
             api_state.set_admin_auth_session_key(session_key.clone());
         }
+        #[cfg(feature = "oidc")]
+        let roles = self
+            .oidc
+            .as_ref()
+            .map(|login| login.roles().clone())
+            .or_else(|| self.roles.clone());
+        #[cfg(not(feature = "oidc"))]
+        let roles = self.roles.clone();
         let router = apply_admin_auth_layers(
             router,
             api_state,
@@ -5588,8 +5633,13 @@ impl StandaloneAdminAuth {
                 read_only_role: self.read_only_role,
                 authorizer: self.authorizer.clone(),
                 rate_limit: self.rate_limit.clone(),
+                roles,
             },
         );
+        #[cfg(feature = "oidc")]
+        if let Some(login) = &self.oidc {
+            return crate::oidc::apply_oidc(router, login, self.api_tokens);
+        }
         if self.api_tokens && !self.admin_auth_boundary {
             router.layer(middleware::from_fn(
                 crate::api_token::require_token_for_non_public,
@@ -5610,6 +5660,8 @@ pub(crate) struct AdminAuthLayers {
     pub authorizer: Option<crate::authz::SharedAuthorizer>,
     /// The per-client rate limiter (issue #1827).
     pub rate_limit: Option<crate::api_rate_limit::ApiRateLimit>,
+    /// The custom-role layer (issue #1978).
+    pub roles: Option<crate::roles::HarvestRoles>,
 }
 
 /// Wrap a composed Harvest router in the admin-auth layer stack.
@@ -5635,10 +5687,20 @@ pub(crate) struct AdminAuthLayers {
 /// layer. It runs after both built-in gates, so it can only deny. It sees the
 /// `TokenPrincipal` the token layer sets.
 ///
+/// Issue #1978: the custom-role layer sits INSIDE the read-only-class layer
+/// and OUTSIDE the authorizer. A verified token skips it. An allowed request
+/// carries a `RolePrincipal`, which the admin gate and the #1802 gate admit.
+/// The authorizer can then only narrow what a role allows.
+///
 /// Issue #1827: the rate-limit layer sits directly INSIDE the token layer. It
 /// keys a bucket on the verified `TokenPrincipal`, so an unverified bearer
 /// cannot open a new bucket. It runs before the read-only and authorizer
 /// layers, so a refused request reaches no handler.
+///
+/// With tokens on, a pre-auth layer of the same limiter sits OUTSIDE the token
+/// layer. It charges each claimed token to its address before the lookup. A
+/// flood of made-up tokens thus gets `429` and never reaches the pool. The
+/// inner layer refunds that charge when the token verifies.
 ///
 /// No layer is installed unless asked for, so a deployment that declares none
 /// does an identical amount of work as before.
@@ -5654,15 +5716,22 @@ pub(crate) fn apply_admin_auth_layers(
             crate::authz::enforce_authorizer,
         ));
     }
+    if let Some(roles) = &layers.roles {
+        router = router.layer(middleware::from_fn_with_state(
+            (api_state.clone(), roles.clone()),
+            crate::roles::enforce_custom_roles,
+        ));
+    }
     if layers.read_only_role {
         router = router.layer(middleware::from_fn(enforce_read_only_class));
     }
-    if let Some(rate_limit) = &layers.rate_limit {
+    let limiter = layers
+        .rate_limit
+        .clone()
+        .map(crate::api_rate_limit::ApiRateLimiter::new);
+    if let Some(limiter) = &limiter {
         router = router.layer(middleware::from_fn_with_state(
-            (
-                api_state.clone(),
-                crate::api_rate_limit::ApiRateLimiter::new(rate_limit.clone()),
-            ),
+            (api_state.clone(), limiter.clone()),
             crate::api_rate_limit::enforce_api_rate_limit,
         ));
     }
@@ -5671,6 +5740,12 @@ pub(crate) fn apply_admin_auth_layers(
             api_state.clone(),
             crate::api_token::enforce_token_scope,
         ));
+        if let Some(limiter) = limiter {
+            router = router.layer(middleware::from_fn_with_state(
+                (api_state.clone(), limiter),
+                crate::api_rate_limit::enforce_pre_auth_rate_limit,
+            ));
+        }
     }
     router
 }
@@ -5694,6 +5769,14 @@ pub(crate) async fn require_harvest_admin(
     if request
         .extensions()
         .get::<crate::api_token::TokenPrincipal>()
+        .is_some()
+    {
+        return next.run(request).await;
+    }
+    // Issue #1978: the role layer already allowed this route for this caller.
+    if request
+        .extensions()
+        .get::<crate::roles::RolePrincipal>()
         .is_some()
     {
         return next.run(request).await;
@@ -5752,10 +5835,15 @@ async fn admit_mutation(
     request: axum::extract::Request,
     next: Next,
 ) -> axum::response::Response {
+    // Issue #1978: a role principal counts as a credential, as a token does.
     let has_token = request
         .extensions()
         .get::<crate::api_token::TokenPrincipal>()
-        .is_some();
+        .is_some()
+        || request
+            .extensions()
+            .get::<crate::roles::RolePrincipal>()
+            .is_some();
     let session = request.extensions().get::<Session>().cloned();
     if !mutation_admitted(api_state, has_token, session).await {
         return AutumnError::unauthorized_msg("authentication required").into_response();
@@ -5890,6 +5978,11 @@ pub(crate) async fn has_harvest_admin_access(
     api_state: &HarvestApiState,
     session: Option<Session>,
 ) -> bool {
+    // Issue #1978: under the role layer, only an `admin`-scope role passes.
+    // A declared boundary must not widen a narrower role.
+    if let Some(admin) = crate::roles::role_admin_access() {
+        return admin;
+    }
     if api_state.admin_auth_boundary() {
         return true;
     }
@@ -6412,6 +6505,13 @@ pub(crate) const fn decode_gate(flag: bool, is_admin: bool) -> bool {
     flag && is_admin
 }
 
+/// The error a route returns when a stored codec column does not decode
+/// (issue #1979). It never carries the codec's own error text, which is
+/// embedder-controlled.
+fn undecodable_stored_payload() -> HarvestError {
+    HarvestError::Config("a stored payload could not be decoded".to_string())
+}
+
 /// Resolve the codec registry for read-path decoding, or `None` when this
 /// request must see today's bytes (issue #608).
 ///
@@ -6726,12 +6826,12 @@ pub(crate) fn decode_workflow_execution_fields(
     execution: &mut WorkflowExecution,
     codecs: &PayloadCodecs,
 ) -> LossyDecodeOutcome {
-    let mut outcome = codecs.decode_value_lossy(&mut execution.input);
+    let mut outcome = codecs.decode_column_lossy(&mut execution.input);
     if let Some(output) = execution.output.as_mut() {
-        outcome = outcome.merged(codecs.decode_value_lossy(output));
+        outcome = outcome.merged(codecs.decode_column_lossy(output));
     }
     if let Some(memo) = execution.memo.as_mut() {
-        outcome = outcome.merged(codecs.decode_value_lossy(memo));
+        outcome = outcome.merged(codecs.decode_column_lossy(memo));
     }
     if let Some(search_attrs) = execution.search_attrs.as_mut() {
         outcome = outcome.merged(codecs.decode_value_lossy(search_attrs));
@@ -11893,7 +11993,7 @@ async fn respond_with_workflow_result(
     if let Some(codecs) = decoder {
         let mut outcome = LossyDecodeOutcome::default();
         if let Some(output) = result.output.as_mut() {
-            outcome = outcome.merged(codecs.decode_value_lossy(output));
+            outcome = outcome.merged(codecs.decode_column_lossy(output));
         }
         if let Some(error) = result.error.as_mut() {
             outcome = outcome.merged(decode_error_field(codecs, error));
@@ -13671,7 +13771,11 @@ pub(crate) async fn build_awaitables_report(
             {
                 ctx.register_declarative_update_handler(h);
             }
-            let input = std::mem::take(&mut execution.input);
+            // The replayed handler gets the plaintext input (issue #1979).
+            let input = api_state
+                .payload_codecs()
+                .decode_column(&std::mem::take(&mut execution.input))
+                .map_err(|_| map_error(undecodable_stored_payload()))?;
             let outcome =
                 drive_query_replay_async(&ctx, workflow.handler, input, api_state.query_timeout())
                     .await;
@@ -16010,7 +16114,7 @@ async fn get_workflow_stack(
                     decode_outcome = decode_outcome.merged(codecs.decode_value_lossy(checkpoint));
                 }
                 let mut input = t.input;
-                decode_outcome = decode_outcome.merged(codecs.decode_value_lossy(&mut input));
+                decode_outcome = decode_outcome.merged(codecs.decode_column_lossy(&mut input));
                 Some(input)
             } else {
                 None
@@ -23675,9 +23779,23 @@ async fn rerun_workflow(
             .into_response();
     }
 
-    let effective_input = input_override
-        .clone()
-        .unwrap_or_else(|| source.input.clone());
+    // The start path encodes the input itself, so it gets the plaintext
+    // (issue #1979).
+    let effective_input = if let Some(input) = input_override.clone() {
+        input
+    } else if let Ok(input) = api_state.payload_codecs().decode_column(&source.input) {
+        input
+    } else {
+        // A rejected re-run is audited like every other rejection.
+        audit_rerun_failure_on(
+            &mut conn,
+            &audit_ctx,
+            Some(&exec_id_str),
+            "stored input could not be decoded",
+        )
+        .await;
+        return map_error(undecodable_stored_payload()).into_response();
+    };
 
     // Deferred-start policies are incompatible with a re-run: they admit the
     // start without creating an execution, so there is no execution_id to
@@ -26095,13 +26213,14 @@ pub(crate) async fn signal_workflow(
             Ok(b) => b,
             Err(e) => return map_error(e).into_response(),
         };
-        signal::send_signal_from_resolved(
+        signal::send_signal_from_resolved_with_codecs(
             bound.as_mut(),
             exec_id,
             target,
             &signal_name,
             payload,
             idempotency_key.as_deref(),
+            &api_state.payload_codecs(),
         )
         .await
     };
@@ -26310,13 +26429,13 @@ async fn hydrate_ctx_for_query(
     // resolve via pre-sent oneshot channels so the entire history replays
     // synchronously; this is read-only and appends no events / performs no
     // writes (issue #612 AC4).
-    let outcome = drive_query_replay_async(
-        &ctx,
-        workflow.handler,
-        execution.input.clone(),
-        api_state.query_timeout(),
-    )
-    .await;
+    // The replayed handler gets the plaintext input (issue #1979).
+    let input = api_state
+        .payload_codecs()
+        .decode_column(&execution.input)
+        .map_err(|_| map_error(undecodable_stored_payload()))?;
+    let outcome =
+        drive_query_replay_async(&ctx, workflow.handler, input, api_state.query_timeout()).await;
 
     if terminal {
         // Drift guard (Codex P2, PR #986 follow-up): if the driven handler
@@ -32409,7 +32528,7 @@ async fn list_dead_letters(
         // only; one audit row per request that touched ≥1 envelope.
         let mut outcome = LossyDecodeOutcome::default();
         for dl in &mut dead_letters {
-            outcome = outcome.merged(codecs.decode_value_lossy(&mut dl.input));
+            outcome = outcome.merged(codecs.decode_column_lossy(&mut dl.input));
             outcome = outcome.merged(decode_error_field(codecs, &mut dl.error));
         }
         // No live connection here: the per-shard DLQ loads are scoped inside

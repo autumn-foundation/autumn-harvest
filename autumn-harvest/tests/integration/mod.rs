@@ -83,6 +83,10 @@ mod claim_budget_tests;
 mod claim_continuation_priority_tests;
 #[cfg(feature = "db")]
 mod claim_run_deadline_tests;
+#[cfg(feature = "db")]
+mod claim_seek_tests;
+#[cfg(feature = "db")]
+mod codec_column_coverage_tests;
 #[cfg(all(feature = "db", feature = "testing"))]
 mod codec_rotation_db_tests;
 #[cfg(feature = "db")]
@@ -125,6 +129,10 @@ mod debugger_tests;
 mod decision_boundary_db_tests;
 #[cfg(feature = "testing")]
 mod decision_boundary_replay_tests;
+#[cfg(feature = "db")]
+mod deep_backlog_fixture_tests;
+#[cfg(feature = "db")]
+mod deep_backlog_support;
 mod delayed_start_tests;
 mod det_check_tests;
 mod determinism_static_analysis_docs;
@@ -134,6 +142,8 @@ mod drain_release_tests;
 mod dst_differential_tests;
 mod e2e_bench_cell_timeout_tests;
 mod e2e_bench_support;
+#[cfg(feature = "db")]
+mod entity_tests;
 mod event_batch_tests;
 mod event_partitioning_tests;
 mod executor_span_tests;
@@ -206,6 +216,8 @@ mod payload_offload_db_tests;
 #[cfg(feature = "testing")]
 mod payload_offload_replay_tests;
 mod performance_docs;
+#[cfg(feature = "db")]
+mod pg_stats_snapshot;
 #[cfg(feature = "db")]
 mod pg_timeouts_tests;
 #[cfg(feature = "db")]
