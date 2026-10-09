@@ -495,23 +495,14 @@ pub fn check_request_headers(
 
 /// The signal payload in the `content` of an `accept` answer.
 ///
-/// A form client fills the one string field, [`PAYLOAD_FIELD`]. Its text is
-/// parsed as JSON, and text that is not JSON is sent as a JSON string. Any
-/// other `content` object is the payload as is.
+/// The requested schema has one required string field, [`PAYLOAD_FIELD`].
+/// Its text is parsed as JSON, and text that is not JSON is sent as a JSON
+/// string. Content without that string field does not match the schema, so
+/// the result is `None`.
 #[must_use]
-pub fn signal_payload(content: Option<&Value>) -> Value {
-    let Some(content) = content else {
-        return json!({});
-    };
-    match content.as_object() {
-        Some(fields) if fields.len() == 1 => match fields.get(PAYLOAD_FIELD) {
-            Some(Value::String(text)) => {
-                serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.clone()))
-            }
-            _ => content.clone(),
-        },
-        _ => content.clone(),
-    }
+pub fn signal_payload(content: Option<&Value>) -> Option<Value> {
+    let text = content?.get(PAYLOAD_FIELD)?.as_str()?;
+    Some(serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_string())))
 }
 
 /// `true` when a 2026-07-28 request declares the Tasks extension.
@@ -1375,21 +1366,32 @@ async fn tasks_update(
     if !live_served {
         return Err(outside_catalog());
     }
-    // Check every action first, so a refusal delivers no answer at all.
-    if let Some((wait, _)) = answers
-        .iter()
-        .find(|(_, answer)| answer.get("action").and_then(Value::as_str) != Some("accept"))
-    {
-        return Err(RpcError::new(
-            INVALID_PARAMS,
-            format!(
-                "the answer to {} is not accept; the run still waits. \
-                 Use tasks/cancel to stop the task",
-                wait.key
-            ),
-        ));
-    }
+    // Check every answer first, so a refusal delivers no answer at all.
+    let mut payloads = Vec::with_capacity(answers.len());
     for (wait, answer) in answers {
+        if answer.get("action").and_then(Value::as_str) != Some("accept") {
+            return Err(RpcError::new(
+                INVALID_PARAMS,
+                format!(
+                    "the answer to {} is not accept; the run still waits. \
+                     Use tasks/cancel to stop the task",
+                    wait.key
+                ),
+            ));
+        }
+        let payload = signal_payload(answer.get("content")).ok_or_else(|| {
+            RpcError::new(
+                INVALID_PARAMS,
+                format!(
+                    "the answer to {} needs content with the string field \
+                     {PAYLOAD_FIELD}; the run still waits",
+                    wait.key
+                ),
+            )
+        })?;
+        payloads.push((wait, payload));
+    }
+    for (wait, payload) in payloads {
         // The wait can end between the read and this delivery, by a timeout
         // or another signal. A late answer would then reach a later wait, so
         // the wait is checked again just before the signal goes in. The
@@ -1406,7 +1408,7 @@ async fn tasks_update(
             Path((snapshot.run_id.to_string(), wait.signal_name.clone())),
             Query(crate::api::SignalQuery::with_key(wait.key.clone())),
             headers,
-            Json(signal_payload(answer.get("content"))),
+            Json(payload),
         )
         .await;
         let (status, body) = read_response(response).await;
@@ -2180,33 +2182,31 @@ mod tests {
     fn a_form_answer_carries_the_payload_as_json_text() {
         assert_eq!(
             signal_payload(Some(&json!({PAYLOAD_FIELD: "{\"decision\": \"approve\"}"}))),
-            json!({"decision": "approve"})
+            Some(json!({"decision": "approve"}))
         );
         assert_eq!(
             signal_payload(Some(&json!({PAYLOAD_FIELD: "approve"}))),
-            json!("approve")
+            Some(json!("approve"))
         );
         assert_eq!(
             signal_payload(Some(&json!({PAYLOAD_FIELD: "[1, 2]"}))),
-            json!([1, 2])
+            Some(json!([1, 2]))
         );
     }
 
+    /// Content that does not match the requested schema is no payload.
     #[test]
-    fn other_answer_content_is_the_payload_as_is() {
-        assert_eq!(
-            signal_payload(Some(&json!({"decision": "approve"}))),
-            json!({"decision": "approve"})
-        );
-        assert_eq!(
-            signal_payload(Some(&json!({PAYLOAD_FIELD: 3}))),
-            json!({PAYLOAD_FIELD: 3})
-        );
-        assert_eq!(
-            signal_payload(Some(&json!({PAYLOAD_FIELD: "x", "more": 1}))),
-            json!({PAYLOAD_FIELD: "x", "more": 1})
-        );
-        assert_eq!(signal_payload(None), json!({}));
+    fn answer_content_must_match_the_requested_schema() {
+        for content in [
+            json!({"decision": "approve"}),
+            json!({PAYLOAD_FIELD: 3}),
+            json!({PAYLOAD_FIELD: null}),
+            json!({}),
+            json!("approve"),
+        ] {
+            assert_eq!(signal_payload(Some(&content)), None, "{content}");
+        }
+        assert_eq!(signal_payload(None), None);
     }
 
     #[test]

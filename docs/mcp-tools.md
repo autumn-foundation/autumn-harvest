@@ -319,10 +319,11 @@ also one after a timeout, comes after a new event, so it gets a new key. An
 unrelated event during the wait gives the wait a new key too. The old key
 is then not open.
 
-The elicitation asks for one string field, `payload`, with the signal payload
-as JSON text. Text that is not JSON is sent as a JSON string. An answer whose
-`content` has other fields is sent as is. The key is also the signal
-idempotency key, so a retried answer is a no-op.
+The elicitation asks for one required string field, `payload`, with the
+signal payload as JSON text. Text that is not JSON is sent as a JSON string.
+An `accept` answer without that string field gets `-32602`, and the wait
+stays open. The key is also the signal idempotency key, so a retried answer
+is a no-op.
 
 - Harvest ignores an answer to a key that is not open.
 - A `decline` or `cancel` answer gets `-32602`, and the wait stays open.

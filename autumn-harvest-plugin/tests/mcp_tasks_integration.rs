@@ -347,6 +347,11 @@ fn update_call(task_id: &str, key: &str, action: &str, content: &Value) -> Value
     })
 }
 
+/// The form content of an answer: the payload as JSON text.
+fn form(payload: &Value) -> Value {
+    json!({PAYLOAD_FIELD: payload.to_string()})
+}
+
 async fn answer(client: &TestClient, task_id: &str, key: &str, content: Value) -> Value {
     let out = rpc_with(client, update_call(task_id, key, "accept", &content), None).await;
     assert!(out.get("error").is_none(), "tasks/update: {out}");
@@ -639,7 +644,7 @@ async fn tasks_cancel_moves_the_task_to_cancelled() {
         rpc(&client, "tasks/cancel", params).await,
         json!({"resultType": "complete"})
     );
-    answer(&client, &task_id, &key, json!({})).await;
+    answer(&client, &task_id, &key, form(&json!({}))).await;
     assert_eq!(get_task(&client, &task_id).await["status"], "cancelled");
 }
 
@@ -706,8 +711,8 @@ async fn each_wait_gets_its_own_key_and_a_raced_answer_lands_once() {
     // Both calls read the wait as open, so the signal idempotency key is
     // what lets only one of them land.
     let (a, b) = tokio::join!(
-        answer(&client, &task_id, &key1, json!({"n": 1})),
-        answer(&client, &task_id, &key1, json!({"n": 1})),
+        answer(&client, &task_id, &key1, form(&json!({"n": 1}))),
+        answer(&client, &task_id, &key1, form(&json!({"n": 1}))),
     );
     assert_eq!(a, json!({"resultType": "complete"}));
     assert_eq!(b, json!({"resultType": "complete"}));
@@ -719,8 +724,8 @@ async fn each_wait_gets_its_own_key_and_a_raced_answer_lands_once() {
     let key2 = only_key(&second);
     assert!(key2.contains(":signal:étape:"), "{key2}");
     // A key that is not open now is ignored.
-    answer(&client, &task_id, &key1, json!({"n": 98})).await;
-    answer(&client, &task_id, &key2, json!({"n": 2})).await;
+    answer(&client, &task_id, &key1, form(&json!({"n": 98}))).await;
+    answer(&client, &task_id, &key2, form(&json!({"n": 2}))).await;
 
     let done = poll_until(&client, &task_id, &mut seen, |t| status_of(t).is_terminal()).await;
     assert_eq!(done["status"], "completed", "{done}");
@@ -756,6 +761,21 @@ async fn a_declined_answer_is_an_error_and_the_wait_stays_open() {
     )
     .await;
     assert_eq!(out["error"]["code"], -32602, "{out}");
+    // An accept whose content does not match the requested schema is refused
+    // the same way, and no signal goes in.
+    for content in [
+        json!({}),
+        json!({"decision": "ship"}),
+        json!({PAYLOAD_FIELD: 1}),
+    ] {
+        let out = rpc_with(
+            &client,
+            update_call(&task_id, &key, "accept", &content),
+            None,
+        )
+        .await;
+        assert_eq!(out["error"]["code"], -32602, "{content}: {out}");
+    }
     let again = poll_until(&client, &task_id, &mut seen, |t| {
         t["status"] == "input_required"
     })
@@ -792,7 +812,7 @@ async fn a_task_survives_a_daemon_restart() {
     })
     .await;
     let key = only_key(&waiting);
-    answer(&client, &task_id, &key, json!({"decision": "ship"})).await;
+    answer(&client, &task_id, &key, form(&json!({"decision": "ship"}))).await;
     let done = poll_until(&client, &task_id, &mut seen, |t| status_of(t).is_terminal()).await;
     assert_eq!(done["result"]["content"][0]["text"], "\"r2:ship\"");
 }
