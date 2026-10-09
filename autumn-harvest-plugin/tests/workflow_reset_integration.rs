@@ -69,6 +69,8 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
     // Issue #1802: set the opt-out. This test exercises the handler, not auth.
     api_state.set_allow_unauthenticated_mutations(true);
+    // `POST /workflows/batch_reset` is admin-only. The host owns that boundary.
+    api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
         Arc::new(HandlerRegistry::new(vec![], vec![])),
