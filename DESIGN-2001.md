@@ -64,6 +64,13 @@ The harness is a new `eval` module in `autumn-harvest-agent`, behind a new
 | R12 | A crafted history makes the evaluation spend without bound. | A turn cap stops the live model. The default is the recorded turn count plus `DEFAULT_EXTRA_TURNS`. |
 | R13 | An in-flight source drives the candidate past the recorded frontier. | The harness refuses a source with no terminal event. |
 | R14 | The policy sees another run id and decides otherwise. | The candidate request takes the recorded run id. The docs name the policy as a live call. |
+| R15 | The policy sees new call ids and decides otherwise. | The harness aligns the ids before the policy runs. |
+| R16 | One rate limit fails the candidate. | The model mock applies the retry policy of `agent_model_turn`. |
+| R17 | A source that failed on a tool goes on past the failure. | The recorded terminal failure of a tool or snapshot fails the candidate at the same activity. |
+| R18 | A cancelled, timed-out or redriven source has no recorded end. | The harness refuses it. |
+| R19 | A stray approval releases a call. | The harness sends again only an approval for a wait that the source opened. |
+| R20 | A long source passes the test-engine cycle cap. | `WorkflowTestEnv::with_max_iterations` lets the harness size the cap. |
+| R21 | An oversized candidate turn passes. | The harness applies the worker result cap. |
 
 ### 0.4 Six thinking hats
 
