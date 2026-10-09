@@ -40,8 +40,8 @@
 //! arguments. A model gives new call ids on each call, so the key holds no id.
 //!
 //! A candidate call that equals the recorded call at the same turn and
-//! position takes the recorded id. Approval signal names hold the id, so the
-//! recorded approvals stay valid. Any other candidate call gets a new id with
+//! position takes the recorded id. The ids change before the policy runs.
+//! Approval signal names hold the id, so the recorded approvals stay valid. Any other candidate call gets a new id with
 //! the prefix `eval_`. A recorded approval therefore never releases it.
 //!
 //! # The diff
@@ -385,9 +385,12 @@ pub async fn evaluate(
                 request.run_id.clone_from(run_id);
             }
             let (index, recorded) = lock(&session).next_turn()?;
-            let mut turn =
-                tokio::task::block_in_place(|| handle.block_on(harness.model_turn(request)))?;
-            align_call_ids(&mut turn, &recorded, index);
+            // The ids change before the policy runs, so the policy sees the
+            // ids that the transcript records.
+            let align = |content: &mut Vec<ContentPart>| align_call_ids(content, &recorded, index);
+            let turn = tokio::task::block_in_place(|| {
+                handle.block_on(harness.model_turn_with(request, align))
+            })?;
             encode(&turn)
         }
     };
@@ -624,13 +627,14 @@ impl Session {
     }
 }
 
-/// Align the call ids of candidate turn `index` with the recorded turn.
+/// Align the call ids in the content of candidate turn `index` with the
+/// recorded turn.
 ///
 /// A call that equals the recorded call at the same position takes the
 /// recorded id. Any other call gets a new `eval_` id, so no recorded approval
 /// name can match it.
-fn align_call_ids(turn: &mut ModelTurn, recorded: &[ToolCall], index: usize) {
-    let calls = turn.content.iter_mut().filter_map(|part| match part {
+fn align_call_ids(content: &mut [ContentPart], recorded: &[ToolCall], index: usize) {
+    let calls = content.iter_mut().filter_map(|part| match part {
         ContentPart::ToolCall {
             id,
             name,
@@ -913,7 +917,7 @@ mod tests {
     fn only_an_equal_call_takes_the_recorded_id() {
         let recorded = vec![call("r1", "a", json!(1)), call("r2", "b", json!(2))];
         let mut turn = turn_of(&[call("c1", "a", json!(1)), call("c2", "b", json!(3))]);
-        align_call_ids(&mut turn, &recorded, 4);
+        align_call_ids(&mut turn.content, &recorded, 4);
         let ids: Vec<String> = turn.calls().into_iter().map(|call| call.id).collect();
         assert_eq!(ids, vec!["r1".to_owned(), "eval_4_1_c2".to_owned()]);
     }

@@ -643,6 +643,50 @@ async fn the_candidate_policy_sees_the_recorded_run_id() {
     assert_eq!(*policy.0.lock().unwrap(), vec![recorded_run_id]);
 }
 
+/// A policy that allows every call and keeps the call ids it sees.
+#[derive(Debug, Default)]
+struct CallIds(Mutex<Vec<String>>);
+
+impl ToolPolicy for CallIds {
+    fn decide<'a>(
+        &'a self,
+        call: &'a ToolCall,
+        _tool: Option<&'a dyn Tool>,
+        _info: &'a RunInfo,
+    ) -> BoxFuture<'a, ToolDecision> {
+        self.0.lock().unwrap().push(call.id.clone());
+        Box::pin(async { ToolDecision::Allow })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_candidate_policy_sees_the_recorded_call_ids() {
+    let source = one_lookup().await;
+    let policy = Arc::new(CallIds::default());
+    // The same calls with new provider ids.
+    let model = ScriptedModel::new(vec![
+        calls(
+            &[
+                ("n1", "lookup", json!({"q": "x"})),
+                ("n2", "lookup", json!({"q": "z"})),
+            ],
+            5,
+        ),
+        answer("done", 5),
+    ]);
+    let (harness, _) = candidate(model);
+
+    evaluate(&source, &Candidate::new(harness.policy(policy.clone())))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *policy.0.lock().unwrap(),
+        vec!["c1".to_owned(), "eval_0_1_n2".to_owned()],
+        "the policy sees the ids that the transcript records"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_recorded_approval_never_releases_another_call_with_a_reused_id() {
     // The source approves `pay 5` with an edit. The provider reuses ids.

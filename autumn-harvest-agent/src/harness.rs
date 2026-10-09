@@ -12,7 +12,7 @@ use crate::delivery::{Delivery, LogDelivery, Report};
 use crate::error::AgentError;
 use crate::heartbeat::{HeartbeatTask, Precheck};
 use crate::memory::{MEMORY_TOOL, MemoryScope, MemoryStore, MemoryTool, render_snapshot};
-use crate::message::{RunId, ToolDefinition};
+use crate::message::{ContentPart, RunId, ToolDefinition};
 use crate::model::{AgentModel, BoxFuture, ChatRequest};
 use crate::policy::{AllowAll, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules};
 use crate::tool::{Tool, ToolContext, ToolEffect};
@@ -205,6 +205,23 @@ impl AgentHarness {
     /// retryable: a rate limit, a transport fault, a provider outage, or the
     /// time budget. Every other failure is not.
     pub async fn model_turn(&self, request: ModelTurnRequest) -> Result<ModelTurn, String> {
+        self.model_turn_with(request, |_content| {}).await
+    }
+
+    /// Run one model call, let `prepare` edit the model content, then ask
+    /// the policy about each tool call.
+    ///
+    /// The evaluation harness uses `prepare` to set the recorded call ids
+    /// before the policy reads them.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`model_turn`](Self::model_turn).
+    pub(crate) async fn model_turn_with(
+        &self,
+        request: ModelTurnRequest,
+        prepare: impl FnOnce(&mut Vec<ContentPart>),
+    ) -> Result<ModelTurn, String> {
         let builtins = self.builtins(
             request.memory_scope.as_ref(),
             request.extra_tools.iter().cloned(),
@@ -227,8 +244,10 @@ impl AgentHarness {
                 .into_error_payload());
             }
         };
+        let mut content = response.content;
+        prepare(&mut content);
         let mut turn = ModelTurn {
-            content: response.content,
+            content,
             stop: response.stop_reason,
             usage: response.usage,
             decisions: Vec::new(),
